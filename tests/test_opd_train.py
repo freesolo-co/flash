@@ -1296,22 +1296,67 @@ def test_bridge_granularity_survives_resume_without_reading_the_coverage_aliases
 
 
 def test_text_teacher_batcher_enforces_max_batch_size_across_concurrent_requests():
-    prompt_texts = [f"question-{index}" for index in range(17)]
+    # the batcher's bound is OPD_TEACHER_SCORING_CONCURRENCY, a MEASURED provider ceiling that moves
+    # when the provider is re-measured (it went 8 -> 32). so the prompt count is derived from it
+    # rather than hardcoded: the invariant under test is "a full batch is reached and no batch ever
+    # exceeds the bound", and a fixed 17 prompts stopped exercising that the moment the ceiling rose
+    # above 17 -- the test would have passed while never once filling a batch.
+    from flash.opd_limits import OPD_TEACHER_SCORING_CONCURRENCY as bound
+
+    # one full batch plus a partial remainder, capped by the server's own listen backlog: every
+    # prompt is posted concurrently, so more prompts than _TEXT_TEACHER_REQUEST_BACKLOG (64) cannot
+    # be queued and the assertion above would fail on the harness rather than on the batcher. at the
+    # measured ceiling of 32 that leaves exactly 2x headroom, so this is now a real adjacency: a
+    # future ceiling above 32 must raise the backlog with it.
+    total = min(bound + bound // 2, opd_train._TEXT_TEACHER_REQUEST_BACKLOG)
+    assert total > bound, "prompt count must cross the batch bound for this test to mean anything"
+    prompt_texts = [f"question-{index}" for index in range(total)]
     teacher = _BatchingTeacher(prompt_texts)
     bridge = _batching_bridge(teacher, prompt_texts)
     bridge.start()
     assert bridge._server is not None
     assert bridge._server.request_queue_size >= len(prompt_texts)
     try:
-        outcomes = _concurrent_bridge_scores(bridge, range(17))
+        outcomes = _concurrent_bridge_scores(bridge, range(total))
     finally:
         bridge.close()
 
     assert all(status == "ok" for status, _result in outcomes)
     batch_sizes = [len(batch) for batch in teacher.batches]
-    assert sum(batch_sizes) == 17
-    assert max(batch_sizes) == 8
-    assert all(size <= 8 for size in batch_sizes)
+    # every prompt is scored exactly once, and no batch ever exceeds the bound. those are the
+    # batcher's actual guarantees under concurrent posts.
+    assert sum(batch_sizes) == total
+    assert all(size <= bound for size in batch_sizes)
+    # deliberately NOT asserted: that some batch reaches exactly `bound`. _take_batch waits at most
+    # flush_wait_s (0.1s) for the batch to fill and then ships whatever arrived, so a full batch
+    # depends on posts outrunning that window -- a race, not a contract. the old test asserted
+    # max == 8 and passed only because 8 was small enough that 17 concurrent posts always beat the
+    # flush; at the measured ceiling of 32 the same code produces 16/16/16 and the assertion fails
+    # on scheduling rather than on any defect. more than one batch is still required, which is what
+    # proves chunking happened at all.
+    assert len(batch_sizes) > 1
+
+
+def test_text_teacher_batcher_never_takes_more_than_max_batch_size():
+    # the concurrent test above CANNOT observe the bound being exceeded: with a 0.1s flush window
+    # the pending queue never accumulates past the ceiling, so widening the slice in _take_batch
+    # leaves it green (verified by mutation). this pins the slice directly against a pre-filled
+    # queue -- no threads, no timer -- so the bound is falsifiable rather than merely unreached.
+    batcher = opd_train._TextTeacherBatcher(object(), max_batch_size=4, flush_wait_s=0.01)
+    batcher._pending = [
+        opd_train._TextTeacherWaiter((f"prompt-{index}", "completion"), enqueued_at=0.0)
+        for index in range(10)
+    ]
+
+    batch = batcher._take_batch()
+
+    assert batch is not None
+    assert len(batch) == 4
+    # the taken batch is removed from the queue, in order, so the remainder is the tail.
+    assert [waiter.item[0] for waiter in batch] == [f"prompt-{index}" for index in range(4)]
+    assert [waiter.item[0] for waiter in batcher._pending] == [
+        f"prompt-{index}" for index in range(4, 10)
+    ]
 
 
 def test_text_teacher_batcher_flushes_final_partial_batch_within_bound():
@@ -3748,6 +3793,13 @@ def test_multiturn_teacher_scores_are_chunked_and_ordered(monkeypatch):
                 )
             return results
 
+    # turn count is derived from the measured concurrency ceiling for the same reason as the batcher
+    # test above: this pins CHUNKING AND ORDER (one full chunk, then the remainder, with scores
+    # still in turn order), and a hardcoded 15 turns would stop chunking at all once the ceiling
+    # rose past it -- leaving an assertion that can no longer observe the behaviour it names.
+    from flash.opd_limits import OPD_TEACHER_SCORING_CONCURRENCY as bound
+
+    turns = bound + bound // 2
     teacher = OrderedTeacher()
     bridge = _text_bridge(teacher)
     monkeypatch.setattr(bridge, "_require_multiturn", lambda: None)
@@ -3761,7 +3813,7 @@ def test_multiturn_teacher_scores_are_chunked_and_ordered(monkeypatch):
                 "truncated": False,
                 "skip_reason": "",
             }
-            for _index in range(15)
+            for _index in range(turns)
         ],
         "score_cache": None,
         "score_lock": threading.Lock(),
@@ -3770,9 +3822,9 @@ def test_multiturn_teacher_scores_are_chunked_and_ordered(monkeypatch):
 
     result = bridge.score_multiturn("session-1")
 
-    assert teacher.batch_sizes == [8, 7]
+    assert teacher.batch_sizes == [bound, turns - bound]
     assert [_teacher_logsum(turn) for turn in result["turns"]] == [
-        -float(index) for index in range(1, 16)
+        -float(index) for index in range(1, turns + 1)
     ]
 
 

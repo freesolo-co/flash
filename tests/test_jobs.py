@@ -775,7 +775,6 @@ def test_runpod_submit_failure_is_retryable_only_after_confirmed_endpoint_deleti
     handles = []
     deleted = []
     monkeypatch.setattr(train, "build_worker_env", lambda *_args, **_kwargs: {})
-    monkeypatch.setattr(train, "chalk_extra_pip", lambda _spec: [])
     monkeypatch.setattr(
         jobs,
         "deploy_train_endpoint",
@@ -822,7 +821,6 @@ def test_runpod_submit_failure_persists_endpoint_only_cleanup_handle(monkeypatch
     )
     handles = []
     monkeypatch.setattr(train, "build_worker_env", lambda *_args, **_kwargs: {})
-    monkeypatch.setattr(train, "chalk_extra_pip", lambda _spec: [])
     monkeypatch.setattr(
         jobs,
         "deploy_train_endpoint",
