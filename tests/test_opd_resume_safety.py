@@ -1090,6 +1090,26 @@ def test_resume_validator_accepts_alignment_granularity_and_states_without_it():
     validate_opd_resume_state_metadata(without, expected_seed=42, checkpoint_step=2)
 
 
+@pytest.mark.parametrize(
+    ("overrides", "missing"),
+    [
+        ({"align_group_sum": 3.0}, "align_group_n"),
+        ({"align_group_n": 2}, "align_group_sum"),
+    ],
+)
+def test_resume_validator_rejects_a_half_present_alignment_pair(overrides, missing):
+    # Regression (codex[bot], opd_retry_contract.py): the two accumulators were checked
+    # INDEPENDENTLY, so a state carrying one of them passed. the reader then defaults the absent one
+    # to 0 (opd_train reads each with its own .get default), and the published
+    # mean_align_granularity divides a real sum by a zeroed count -- or reports 0.0 for a run that
+    # measured alignment on every group. absent-together stays valid (trl writes neither, which the
+    # test above pins); only the half-present state is a corrupt one.
+    state = _valid_resume_state(2, **overrides)
+
+    with pytest.raises(ValueError, match=missing):
+        validate_opd_resume_state_metadata(state, expected_seed=42, checkpoint_step=2)
+
+
 def test_shared_resume_metadata_validator_returns_a_copy():
     state = _valid_resume_state(3)
 
