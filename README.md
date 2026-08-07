@@ -12,8 +12,9 @@ flash train run.toml
 ```
 
 The allocator picks the cheapest validated GPU class that fits the run — one dedicated
-worker allocation per run, on a single GPU today — supervised server-side (stall watchdog,
-bounded auto-retry resuming from the last streamed checkpoint, endpoint GC).
+worker allocation per run, which may hold several cards when the run needs them — supervised
+server-side (stall watchdog, bounded auto-retry resuming from the last streamed checkpoint,
+endpoint GC).
 
 ## What this repository is
 
