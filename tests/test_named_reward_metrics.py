@@ -1,9 +1,6 @@
 import inspect
 
-from flash.engine.worker.heartbeat import (
-    _latest_named_reward_metrics,
-    _mean_named_reward_metrics,
-)
+from flash.engine.worker.heartbeat import _mean_named_reward_metrics
 from flash.engine.worker.rl_train import run_rl_train, score_single_turn
 
 
@@ -30,20 +27,6 @@ def test_failed_scoring_attempt_counts_as_zero() -> None:
     breakdowns = [{"success": 1.0, "total": 1.0}, None]
 
     assert _mean_named_reward_metrics(breakdowns) == {"success": 0.5}
-
-
-def test_named_metrics_repeat_until_new_breakdowns_replace_them() -> None:
-    pending = [{"success": 1.0, "total": 1.0}]
-    pending.extend([{"success": 0.0, "total": 0.0}, None])
-    latest: dict[str, float] = {}
-
-    expected = {"success": 1.0 / 3.0}
-    assert _latest_named_reward_metrics(pending, latest) == expected
-    assert pending == []
-    assert _latest_named_reward_metrics(pending, latest) == expected
-
-    pending.extend([{"success": 1.0, "total": 1.0}])
-    assert _latest_named_reward_metrics(pending, latest) == {"success": 1.0}
 
 
 def test_non_finite_named_metric_counts_as_zero() -> None:

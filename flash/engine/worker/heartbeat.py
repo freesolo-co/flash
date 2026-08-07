@@ -322,23 +322,6 @@ def _mean_named_reward_metrics(breakdowns: list[dict[str, float] | None]) -> dic
     return {name: total / denominator for name, total in totals.items()}
 
 
-def _latest_named_reward_metrics(
-    breakdowns: list[dict[str, float] | None], latest: dict[str, float]
-) -> dict[str, float]:
-    if breakdowns:
-        metrics = _mean_named_reward_metrics(breakdowns)
-        breakdowns.clear()
-        if metrics:
-            latest.clear()
-            latest.update(metrics)
-        elif latest:
-            # every completion failed scoring this generation: surface the known metrics as
-            # zeros instead of dropping them, so a full scoring outage shows a flat 0 rather
-            # than hiding behind missing heartbeat fields.
-            latest.update(dict.fromkeys(latest, 0.0))
-    return dict(latest)
-
-
 class RewardObservabilityBuffer:
     """Rolling rollout samples and per-name reward components for an out-of-process trainer.
 

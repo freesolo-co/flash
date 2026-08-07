@@ -5893,6 +5893,24 @@ def test_a_generation_that_reports_no_components_at_all_leaves_the_metrics_stand
     assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 1.0}, "read as an outage"
 
 
+def test_a_generation_whose_every_grading_failed_publishes_the_known_names_as_zero():
+    """The opposite case to the test above, and the two are only distinguishable by whether any
+    breakdown was attempted. Here the env DOES report components and every completion failed to
+    score, so the names are known and their true value this generation is 0. Leaving the previous
+    generation's numbers standing would show a healthy reward through a total scoring outage --
+    the metric would keep reading 1.0 while nothing was being graded at all."""
+    buffer = RewardObservabilityBuffer()
+    buffer.record("p", "a", 1.0, [{"success": 1.0, "total": 1.0}])
+    buffer.close_generation(1)
+    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 1.0}
+
+    # a breakdown slot per failed grading: attempted, produced nothing
+    buffer.record("p", "b", 0.0, [None])
+    buffer.close_generation(2)
+
+    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 0.0}
+
+
 @pytest.mark.usefixtures("_identity_graded")
 def test_one_non_finite_score_cannot_poison_a_whole_components_mean():
     """Summing a NaN in makes the running total NaN forever: every later completion adds to it and
