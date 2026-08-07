@@ -165,9 +165,10 @@ def build_sft_overrides(cfg: dict) -> list[str]:
         ),
         f"model.lora_adapter_path={_hydra_val(cfg.get('lora_adapter_path'))}",
         # remove-padding concatenates the micro-batch into one (1, total_nnz) row -- real packing.
-        # a GDN hybrid may only take it when the child can reset linear-attention state at the
-        # example boundaries; otherwise state bleeds between packed examples and every example after
-        # the first trains on its neighbour's residue. see gdn_boundary_resets in the caller.
+        # a GDN hybrid only gets packed NEIGHBOURS when the profile says "packed", which it never
+        # does for gdn (see the caller): those runs train one example per update, so there is no
+        # neighbour whose linear-attention residue could bleed in. the flag itself must stay on
+        # regardless -- it selects the nested-tensor layout verl's no_padding sft_loss requires.
         f"model.use_remove_padding={_hydra_val(cfg.get('use_remove_padding', True))}",
         # 32k contexts: the fused linear-CE forward never materializes the [tokens, vocab] logits
         # tensor (~130 GB at 32k on a 248k vocab), computing loss from hidden states + lm_head in
@@ -1099,26 +1100,28 @@ def run_sft_train(spec=None) -> None:
     os.makedirs(shim_dir, exist_ok=True)
     custom_dataset_path = os.path.join(shim_dir, "flash_verl_sft_dataset.py")
 
+    # the gdn boundary shim resets conv and recurrent state at packed example boundaries, but only
+    # when the verl child has the kernels that read seq_idx and cu_seqlens; the no-fla fallbacks
+    # accept both and discard them. so the shim is installed only when the child proves it can reset.
+    # `gdn_hybrid`/`gdn_module` and the child's answer are resolved above, inside the configuring
+    # liveness wrap, because the probe is part of the setup silence that wrap exists to cover.
     gdn_reset_arch = gdn_reset_arch_from_caps(caps, gdn_module) if gdn_hybrid else None
-    gdn_boundary_resets = gdn_reset_arch is not None
-    # remove-padding is verl's TENSOR LAYOUT switch, not this run's packing/step contract, so the
-    # profile must not gate it. verl defaults to `pad_mode: no_padding`, whose sft_loss reads
-    # `log_prob.values()` -- valid only on the nested tensor built by the remove-padding path. the
-    # padded path hands it a strided tensor and the first optimizer step dies with "values expected
-    # sparse tensor layout but got Strided". an earlier revision ANDed in `packing_mode == "packed"`
-    # here, reasoning that the probe may only narrow what the profile priced; that is true of the
-    # QUOTE but narrowing this flag also selects a verl code path the loss cannot consume, and every
-    # gdn-hybrid catalog model profiles as exact-unpacked, so it broke text sft on all of them.
-    # the step contract is already pinned to the profile independently: train_batch_size is
-    # profile.examples_per_update and total_training_steps is profile.authoritative_steps, neither of
-    # which reads this flag -- so a layout choice here cannot move the quoted horizon.
-    use_remove_padding = not gdn_hybrid or gdn_boundary_resets
-    if gdn_hybrid and not gdn_boundary_resets:
-        print(
-            "[sft] gdn hybrid without child-side boundary resets: disabling remove-padding so "
-            "packed examples cannot contaminate each other (slower, correct)",
-            flush=True,
-        )
+    # remove-padding is verl's TENSOR LAYOUT switch, not this run's packing/step contract, so nothing
+    # here may gate it. verl defaults to `pad_mode: no_padding`, whose sft_loss reads
+    # `log_prob.values()` -- valid only on the nested tensor the remove-padding path builds. turning
+    # it off hands that loss a strided tensor and the first optimizer step dies with "values expected
+    # sparse tensor layout but got Strided". flash cannot switch to the padded path instead: its
+    # `pad_mode: right` branch collates with `default_collate` (uniform rows only) and its loss reads
+    # `response_mask`, and FlashTokenizedSFTDataset emits neither -- variable-length rows carrying
+    # input_ids/position_ids/loss_mask. no_padding is the only mode this dataset fits.
+    #
+    # a gdn hybrid without child-side resets is safe here anyway, because it has no packed
+    # neighbours to contaminate: `_packing_mode` answers "exact-unpacked" for every gdn model
+    # (supported=False), that pins `examples_per_update` to 1, and train_batch_size below is exactly
+    # profile.examples_per_update. one example per update leaves nothing to carry -- the same
+    # argument the profile makes in sft_workload._packing_mode. batch=1 is the isolation lever;
+    # this flag never was, and gating it only selected a code path the loss cannot consume.
+    use_remove_padding = True
 
     config = {
         "train_files": train_file,
@@ -1403,12 +1406,13 @@ def run_sft_train(spec=None) -> None:
             # example was allowed to share a concatenated batch, which is what a reader of these
             # metrics needs in order to compare a run's step count against its row count.
             "packing": profile.packing_mode,
-            # what the run ACTUALLY executed. this is the profile's mode narrowed by the child
-            # probe, so it can differ from `packing` above (packed -> none_padded) when a gdn
-            # child could not honor the boundaries; a reader comparing realized step time against
-            # the quote needs the executed mode, not the quoted one.
-            "realized_packing": "verl_remove_padding" if use_remove_padding else "none_padded",
-            "gdn_boundary_resets": gdn_boundary_resets if gdn_hybrid else None,
+            # the tensor layout verl actually ran. always remove-padding now: it is the only layout
+            # FlashTokenizedSFTDataset fits, and the quoted step count comes from
+            # profile.examples_per_update rather than from this. kept because a reader comparing
+            # realized step time against the quote still needs the executed layout stated, not
+            # inferred.
+            "realized_packing": "verl_remove_padding",
+            "gdn_boundary_resets": (gdn_reset_arch is not None) if gdn_hybrid else None,
             "loss_curve": loss_curve[:400],
             "peak_gpu_gb": device_peak_gpu_gb,
             "device_peak_gpu_gb": device_peak_gpu_gb,
