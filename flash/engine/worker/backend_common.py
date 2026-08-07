@@ -76,8 +76,13 @@ CAUSAL_CONV1D_REQUIREMENT = "causal-conv1d==1.6.2.post1"
 # verl-only stamp would let a retry reuse that venv, skip the install, and return an interpreter
 # missing exactly the package this path exists to guarantee. fla is in the stamp for the same
 # reason: a venv from a release that predates it holds no fla, and reusing it would train gdn
-# models padded (or, worse, look patched) forever without ever reprovisioning.
-VERL_VENV_STAMP = f"{VERL_REQUIREMENT}\n{FLASH_ATTN_SPEC}\n{FLA_REQUIREMENT}"
+# models padded (or, worse, look patched) forever without ever reprovisioning. the conv kernel is in
+# it on the same argument, and it is the stricter case: a venv provisioned before this stamp learned
+# the requirement was stamped whether or not the kernel landed, so without it here those venvs keep
+# matching and grpo/opd keep raising in require_gdn_boundary_resets with no path to a rebuild.
+VERL_VENV_STAMP = (
+    f"{VERL_REQUIREMENT}\n{FLASH_ATTN_SPEC}\n{FLA_REQUIREMENT}\n{CAUSAL_CONV1D_REQUIREMENT}"
+)
 
 
 # how many times the prebuilt-wheel install is attempted before the arm is handed back to the plane.
@@ -139,7 +144,30 @@ def _install_causal_conv1d(py: str) -> bool:
         env={**os.environ, "CAUSAL_CONV1D_FORCE_BUILD": "TRUE"},
     )
     # a fake subprocess.run in a test may return None; treat only an explicit nonzero as failure.
-    return getattr(completed, "returncode", 0) == 0
+    if getattr(completed, "returncode", 0) != 0:
+        return False
+    # a zero exit is not the kernel landing. this is a compiled cuda extension, and an ABI or symbol
+    # mismatch installs cleanly and then fails at import -- Dockerfile.worker gates the same package
+    # on the same import for the same reason, and uninstalls on failure. transformers'
+    # is_causal_conv1d_available() is only a find_spec probe, so a present-but-broken package passes
+    # it, and the run crashes at model load instead of safely training unpacked. importing is the
+    # only check that distinguishes the two, and reporting the truth here is what keeps the venv
+    # unstamped so a later attempt can rebuild it.
+    imported = subprocess.run(
+        [py, "-c", "import causal_conv1d"],
+        check=False,
+        capture_output=True,
+    )
+    if getattr(imported, "returncode", 0) != 0:
+        # leave nothing importable behind: a broken build that stays installed would keep passing
+        # find_spec probes on this pod for the life of the workdir.
+        subprocess.run(
+            ["uv", "pip", "uninstall", "--python", py, "causal-conv1d"],
+            check=False,
+            capture_output=True,
+        )
+        return False
+    return True
 
 
 def clamp_engine_len(engine_len: int, max_position_embeddings: int | None) -> int:
