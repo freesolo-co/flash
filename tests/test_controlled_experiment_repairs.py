@@ -427,3 +427,124 @@ def test_resolve_vocab_size_is_revision_aware_for_open_policy_model(monkeypatch,
     got = resolve_vocab_size("open-org/Open-Model-3B", revision="d" * 40)
     assert got == 151936
     assert got != _DEFAULT_VOCAB_SIZE
+
+
+def _stub_structured_opd_hub(monkeypatch):
+    """Pin revision resolution, which runs before the preflight and would otherwise hit the hub."""
+    import huggingface_hub
+
+    class Api:
+        def __init__(self, *, token=None):
+            pass
+
+        def model_info(self, model, **kwargs):
+            return SimpleNamespace(sha="a" * 40)
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", Api)
+    # the structured path calls this with kwargs the shared stub's lambda does not accept.
+    monkeypatch.setattr(
+        "flash.lora_rank.preflight_train_context_within_serving",
+        lambda _spec, **_kwargs: None,
+    )
+
+
+def _structured_opd_spec(structured_outputs: str):
+    """An opd spec carrying a structured-output constraint, ready for prepare_job."""
+    from flash.spec import EnvironmentSpec, JobSpec, TrainSpec
+
+    return JobSpec(
+        model="Qwen/Qwen3.5-0.8B",
+        model_revision="a" * 40,
+        algorithm="opd",
+        environment=EnvironmentSpec(id="freesolo/gsm8k", resolved_sha="e" * 40),
+        train=TrainSpec(
+            epochs=1,
+            max_examples=1,
+            teacher_model="parasail-kimi-k3-fast",
+            structured_outputs=structured_outputs,
+        ),
+        run_id="structured-preflight",
+    )
+
+
+def test_structured_opd_guidance_only_feature_is_rejected_before_allocation(monkeypatch):
+    """A constraint the worker refuses deterministically must not reach a rented gpu.
+
+    `format`, `multipleOf` and `uniqueItems` need vLLM's guidance backend, and verl OPD pins
+    xgrammar for exact forced-token replay -- so the job can NEVER run. That check lived only in the
+    worker, past allocation, so the user paid for a card to receive a permanent validation failure
+    (codex[bot]). The generic serving preflight does not catch it: it validates the schema's shape,
+    and this schema is perfectly valid.
+    """
+    import flash.runner as runner
+
+    _stub_prepare_dependencies(monkeypatch)
+    _stub_structured_opd_hub(monkeypatch)
+    # allocation-side work must not be reached. estimate_for_spec is the last step of preparation
+    # and the gate the run is priced through, so a rejection that happens before it happens before
+    # anything is persisted or provisioned.
+    monkeypatch.setattr(
+        "flash.cost.spec.estimate_for_spec",
+        lambda _spec: (_ for _ in ()).throw(AssertionError("preparation must reject first")),
+    )
+    schema = {
+        "type": "object",
+        "properties": {"a": {"type": "string", "format": "email"}},
+        "required": ["a"],
+        "additionalProperties": False,
+    }
+    spec = _structured_opd_spec(json.dumps({"json": schema}))
+
+    with pytest.raises(ValueError, match="guidance fallback"):
+        runner.prepare_job(spec)
+
+
+def test_structured_opd_mistral_tokenizer_model_is_rejected_before_allocation(monkeypatch):
+    """The other permanently-failing input: a vLLM MistralTokenizer model.
+
+    Decided by the model id alone, so it needs no allocation to judge either.
+    """
+    import flash.runner as runner
+
+    _stub_prepare_dependencies(monkeypatch)
+    _stub_structured_opd_hub(monkeypatch)
+    monkeypatch.setattr(
+        "flash.cost.spec.estimate_for_spec",
+        lambda _spec: (_ for _ in ()).throw(AssertionError("preparation must reject first")),
+    )
+    monkeypatch.setattr(
+        "flash.opd_validation._resolve_structured_model_metadata",
+        lambda _model, _rev: (151936, ("tekken.json",)),
+    )
+    spec = _structured_opd_spec(json.dumps({"json": {"type": "object"}}))
+
+    with pytest.raises(ValueError, match="MistralTokenizer"):
+        runner.prepare_job(spec)
+
+
+def test_a_valid_structured_opd_constraint_still_prepares(monkeypatch):
+    """The preflight must reject only what the worker rejects.
+
+    A constraint xgrammar can compile has to pass preparation untouched -- otherwise the fix trades
+    a paid failure for a submission that refuses valid work, which is worse.
+    """
+    import flash.runner as runner
+
+    _stub_prepare_dependencies(monkeypatch)
+    _stub_structured_opd_hub(monkeypatch)
+    monkeypatch.setattr(
+        "flash.opd_validation._resolve_structured_model_metadata",
+        lambda _model, _rev: (151936, ("tokenizer.json",)),
+    )
+    schema = {
+        "type": "object",
+        "properties": {"a": {"type": "string"}},
+        "required": ["a"],
+        "additionalProperties": False,
+    }
+    spec = _structured_opd_spec(json.dumps({"json": schema}))
+
+    prepared = runner.prepare_job(spec)
+
+    assert prepared.public_spec.algorithm == "opd"
+    assert prepared.public_spec.train.structured_outputs
