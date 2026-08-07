@@ -395,6 +395,8 @@ def _overrides_cfg(**over):
         "seed": 42,
         "ppo_epochs": 1,
         "steps": 60,
+        # an arbitrary passthrough value for the override-rendering tests below, NOT the budget the
+        # worker launches -- that is sized per run by resolve_gpu_mem_util.
         "gpu_mem_util": 0.5,
         "n_gpus": 1,
         "loggers": ["console"],
@@ -684,6 +686,173 @@ def test_build_verl_training_cfg_carries_the_multimodal_flag():
     # a cfg that dropped it would produce a text-shaped override list from a multimodal parquet.
     source = inspect.getsource(rl_train._build_verl_training_cfg)
     assert '"multimodal": bool(inp.get("multimodal"))' in source
+
+
+def _mem_util_inp(**over):
+    inp = {
+        "model_id": "Qwen/Qwen3.5-4B",
+        "model_revision": "",
+        "engine_len": 2048,
+        "group_size": 8,
+    }
+    inp.update(over)
+    return inp
+
+
+def test_gpu_mem_util_is_the_sized_budget_not_a_constant():
+    """VERL-155: the launched executor budget must be the one ``colocate_kv_util`` computes.
+
+    ``gpu_memory_utilization`` shipped as a flat 0.5 while ``estimate_vram_gb``'s admission check
+    documented itself as mirroring ``colocate_kv_util``'s cap -- so preflight sized a run against one
+    budget and the worker requested another. The assertion is deliberately made against the model's
+    OWN output rather than a copied literal: pinning the number here is exactly what let the previous
+    constant look intended, and it would have to be hand-edited (i.e. re-decided) on any retune.
+    """
+    from flash.catalog import MODELS
+    from flash.engine.vram import colocate_kv_util
+    from flash.providers.base import get_gpu_info
+
+    info = MODELS["Qwen/Qwen3.5-4B"]
+    want = colocate_kv_util(
+        float(info.params_b),
+        2048,
+        float(get_gpu_info("H100").vram_gb),
+        sleep_mode=True,
+        num_generations=8,
+        active_params_b=None,
+        fp8_kv=False,
+        model_info=info,
+    )
+    got = rl_train.resolve_gpu_mem_util(
+        _mem_util_inp(), gpu_type="H100", n_gpus=1, fp8_kv=False, sleep_unsupported=False
+    )
+    assert got == want
+    # and it is genuinely NOT the old constant, so the test cannot pass on an unwired build.
+    assert got != rl_train._DEFAULT_GPU_MEM_UTIL
+    assert got < rl_train._DEFAULT_GPU_MEM_UTIL
+
+
+def test_gpu_mem_util_sizing_reaches_the_launch_config():
+    """The sized value must survive into the cfg dict and the override list, not just the helper."""
+    cfg = rl_train._build_verl_training_cfg(
+        {
+            **_mem_util_inp(),
+            "lora_rank": 32,
+            "lora_alpha": 64,
+            "lr": 1e-5,
+            "prompts_per_step": 16,
+            "mask_truncated_completions": True,
+            "max_prompt_len": 1024,
+            "max_completion": 1024,
+            "max_response_len": 1024,
+            "multi_turn": False,
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "kl_coef": 0.0,
+            "entropy_quantile": None,
+            "stop_sequences": (),
+            "structured_outputs": None,
+            "seed": 42,
+            "ppo_epochs": 1,
+            "steps": 60,
+            "warmstart_adapter": "",
+            "verl_total_epochs": 1,
+            "save_freq": 20,
+            "ckpt_to_keep": 1,
+        },
+        train_files="/w/t.parquet",
+        val_files="/w/v.parquet",
+        model_id="Qwen/Qwen3.5-4B",
+        thinking=False,
+        loggers=["console"],
+        fp8_kv=False,
+        enforce_eager=False,
+        attention_backend=None,
+        mm_encoder_attn_backend=None,
+        reward_path="/w/r.py",
+        local_dir="/w/ckpt",
+        project_name="flash",
+        experiment_name="flash-rl-run123",
+        gpu_type="H100",
+        n_gpus=1,
+    )
+    want = rl_train.resolve_gpu_mem_util(
+        _mem_util_inp(), gpu_type="H100", n_gpus=1, fp8_kv=False, sleep_unsupported=False
+    )
+    assert cfg["gpu_mem_util"] == want
+    assert (
+        f"actor_rollout_ref.rollout.gpu_memory_utilization={want}"
+        in rl_train.build_verl_overrides(cfg)
+    )
+
+
+def test_gpu_mem_util_keeps_the_constant_where_the_model_does_not_apply():
+    """The three shapes ``colocate_kv_util`` cannot size are left on the conservative constant.
+
+    Multi-gpu is the load-bearing one: the rollout is tensor-parallel, so vLLM's weight copy is
+    sharded ACROSS cards while the model sizes one whole copy against ONE card. Sizing it here would
+    over-reserve per rank on exactly the shapes that are already tight.
+    """
+    default = rl_train._DEFAULT_GPU_MEM_UTIL
+    # multi-gpu: sharded rollout, unmodelled.
+    assert (
+        rl_train.resolve_gpu_mem_util(
+            _mem_util_inp(), gpu_type="H100", n_gpus=2, fp8_kv=False, sleep_unsupported=False
+        )
+        == default
+    )
+    # unknown card: the budget is a FRACTION of the card, so there is nothing to take a fraction of.
+    for unknown in ("", "   ", "Nonexistent9000"):
+        assert (
+            rl_train.resolve_gpu_mem_util(
+                _mem_util_inp(), gpu_type=unknown, n_gpus=1, fp8_kv=False, sleep_unsupported=False
+            )
+            == default
+        )
+    # unresolvable model size: the weight copy is the dominant term.
+    assert (
+        rl_train.resolve_gpu_mem_util(
+            _mem_util_inp(model_id="not-a-real-org/not-a-real-model-xyz"),
+            gpu_type="H100",
+            n_gpus=1,
+            fp8_kv=False,
+            sleep_unsupported=False,
+        )
+        == default
+    )
+
+
+def test_gpu_mem_util_does_not_credit_an_offload_a_resident_engine_never_takes():
+    """A sleep_unsupported model stays RESIDENT, so it must not get the sleep path's 1.5x KV pool.
+
+    ``colocate_kv_util``'s sleep branch budgets a larger pool because the engine is offloaded during
+    the backward. For a model flagged sleep_unsupported the engine never leaves the card, so that
+    larger pool would be sized against a peak the run does not have.
+    """
+    resident = rl_train.resolve_gpu_mem_util(
+        _mem_util_inp(), gpu_type="H100", n_gpus=1, fp8_kv=False, sleep_unsupported=True
+    )
+    sleeping = rl_train.resolve_gpu_mem_util(
+        _mem_util_inp(), gpu_type="H100", n_gpus=1, fp8_kv=False, sleep_unsupported=False
+    )
+    assert resident < sleeping
+
+
+def test_gpu_mem_util_raises_the_kv_pool_where_the_constant_starves_it():
+    """The sizing is not uniformly a reduction: it must be free to ask for MORE than 0.5.
+
+    A long-context 35B MoE on a 180 GB B200 is the shape the 0.55 cap lift exists for -- the flat
+    0.5 caps the KV pool and with it rollout concurrency. A wiring that could only ever lower the
+    budget would silently keep that case starved.
+    """
+    got = rl_train.resolve_gpu_mem_util(
+        _mem_util_inp(model_id="Qwen/Qwen3.6-35B-A3B", engine_len=8192),
+        gpu_type="B200",
+        n_gpus=1,
+        fp8_kv=False,
+        sleep_unsupported=True,
+    )
+    assert got > rl_train._DEFAULT_GPU_MEM_UTIL
 
 
 def test_sleep_unsupported_models_keep_the_rollout_engine_resident():
@@ -1168,11 +1337,10 @@ def test_the_resolved_eager_flag_reaches_the_verl_config():
     built = inspect.getsource(rl_train.run_rl_train)
     assert "enforce_eager = resolve_rollout_enforce_eager(verl_cc)" in built
     assert "enforce_eager=enforce_eager," in built
-    # and the capability it decides from is the one probe both rollout decisions share.
-    assert "verl_cc = resolve_verl_device_capability(python_bin)" in built
-    assert (
-        "resolve_blackwell_attention_backends(\n            python_bin, verl_cc\n        )" in built
-    )
+    # and the capability it decides from is the one batched child probe every question shares.
+    assert "caps = probe_verl_capabilities(python_bin, gdn_module)" in built
+    assert "verl_cc = verl_device_capability(caps)" in built
+    assert "resolve_blackwell_attention_backends(\n            caps, verl_cc\n        )" in built
     cfg = inspect.getsource(rl_train._build_verl_training_cfg)
     assert '"enforce_eager": enforce_eager,' in cfg
 
@@ -3921,24 +4089,51 @@ def test_multi_turn_child_modules_do_not_import_flash(tmp_path):
                 )
 
 
-def test_the_run_body_puts_the_shim_dir_on_the_child_path_for_multi_turn():
+def test_the_run_body_always_puts_the_shim_dir_on_the_child_path():
     # the copies above are useless unless shim_dir is importable. the condition used to be
     # `if shim_source:` -- true only when some OTHER feature wanted a sitecustomize patch, so a
     # plain multi-turn job copied three modules the child could never import. source-level because
     # the assignment sits inside run_rl_train, past the subprocess launch.
     src = inspect.getsource(rl_train.run_rl_train)
-    # matched on the guard's TERMS rather than its exact text: the condition legitimately grows a
-    # disjunct whenever another feature writes into shim_dir (the gdn boundary shim did), and an
-    # exact-string assertion fails on that without anything being wrong. what must stay true is that
-    # a multi-turn job reaches the PYTHONPATH assignment on its own.
-    lines = src.splitlines()
-    assign = next(i for i, line in enumerate(lines) if 'env_for_verl["PYTHONPATH"]' in line)
-    guard = next(
-        line for line in reversed(lines[:assign]) if line.strip().startswith("if shim_source")
-    )
-    assert 'inp["multi_turn"]' in guard, (
-        f"PYTHONPATH is not extended for a multi-turn job with no other shim; guard was: {guard!r}"
-    )
+    # the assignment is now unconditional (the tf32 fragment means the shim is never empty), which
+    # satisfies this invariant strictly more than any guard could. assert THAT rather than the terms
+    # of a guard: re-introducing one is the regression, since every disjunct it could carry is a
+    # feature that might be off while multi-turn is on -- and the tf32 fragment needs the entry on
+    # EVERY run, so there is no longer a condition under which skipping it is correct.
+    #
+    # walk the ast rather than matching indentation: an earlier `if` block that has already closed
+    # is not a guard on this assignment, and only the tree knows which blocks actually enclose it.
+    tree = ast.parse(textwrap.dedent(src))
+
+    def _assigns_pythonpath(node):
+        return any(
+            isinstance(sub, ast.Subscript)
+            and isinstance(sub.slice, ast.Constant)
+            and sub.slice.value == "PYTHONPATH"
+            for target in getattr(node, "targets", [])
+            for sub in ast.walk(target)
+        )
+
+    def _guards(node, stack):
+        if isinstance(node, ast.Assign) and _assigns_pythonpath(node):
+            found.append(list(stack))
+        if isinstance(node, ast.If):
+            for sub in node.body:
+                _guards(sub, [*stack, ast.unparse(node.test)])
+            for sub in node.orelse:
+                _guards(sub, [*stack, f"not ({ast.unparse(node.test)})"])
+            return
+        for child in ast.iter_child_nodes(node):
+            _guards(child, stack)
+
+    found: list[list[str]] = []
+    _guards(tree, [])
+    assert found, "run_rl_train no longer assigns env_for_verl['PYTHONPATH']"
+    for stack in found:
+        assert not stack, (
+            "PYTHONPATH is conditionally extended again; a multi-turn job (or the tf32 fragment) "
+            f"can miss shim_dir. enclosing conditions were: {stack!r}"
+        )
     assert 'if inp["multi_turn"]:\n        copy_multi_turn_child_modules(shim_dir)' in src
 
 

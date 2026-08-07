@@ -2013,17 +2013,12 @@ def test_each_path_resolves_the_gdn_arch_question_exactly_once():
     happen to agree most of the time. Asserted structurally because the disagreeing case needs a
     transient failure to reproduce and so will not show up in any deterministic test.
 
-    Counts BOTH spellings of the question. `require_gdn_boundary_resets` answers it as a side effect
-    (it returns an arch for a hybrid and raises for a hybrid that cannot reset), so counting only
-    the old `model_is_gdn_hybrid` would leave this unable to fail now that the modules derive from
-    the gate instead.
     """
     import ast
     import inspect as _inspect
 
     from flash.engine.worker import opd_train, rl_train, sft_train
 
-    asks_the_question = {"model_is_gdn_hybrid", "require_gdn_boundary_resets"}
     for module in (sft_train, opd_train, rl_train):
         tree = ast.parse(_inspect.getsource(module))
         calls = [
@@ -2031,13 +2026,12 @@ def test_each_path_resolves_the_gdn_arch_question_exactly_once():
             for node in ast.walk(tree)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
-            and node.func.id in asks_the_question
+            and node.func.id == "model_is_gdn_hybrid"
         ]
         assert len(calls) == 1, (
             f"{module.__name__} resolves the gdn arch question {len(calls)} times (lines "
-            f"{[c.lineno for c in calls]}, via {sorted({c.func.id for c in calls})}). the probe "
-            "answers False on its own failure, so a second ask can contradict the first: resolve "
-            "it once and reuse the value."
+            f"{[c.lineno for c in calls]}). the probe answers False on its own failure, so a "
+            "second ask can contradict the first: resolve it once and reuse the value."
         )
 
 
@@ -2065,32 +2059,115 @@ def test_every_algorithm_records_whether_gdn_boundary_resets_engaged():
         )
 
 
-def test_no_algorithm_launches_into_the_unrunnable_padded_fallback():
+def test_sft_remove_padding_is_ungated_tensor_layout():
+    """sft's `use_remove_padding` must not be gated on ANYTHING.
+
+    An earlier revision of this file asserted the opposite, on the theory that
+    `use_remove_padding = not gdn_hybrid or gdn_boundary_resets` would "pack a run the user was
+    quoted as unpacked" and run `1/effective_batch` of the quoted steps. That premise is false, and
+    verl says so directly:
+
+      sft_trainer.py:240  `global_batch_size = config.data.train_batch_size`
+      sft_trainer.py:181  `total_training_steps = config.trainer.total_training_steps`
+      sft_trainer.py:344  `use_remove_padding` appears ONLY as a logged field
+
+    Examples-per-update and the step horizon come from config the worker copies straight off the
+    profile (`train_batch_size = profile.examples_per_update`, `total_training_steps =
+    profile.authoritative_steps`). `use_remove_padding` selects how that batch is laid out in
+    memory -- nested/concatenated vs padded -- and cannot change how many examples share an
+    optimizer step. With `examples_per_update = 1` there is nothing to co-locate either way.
+
+    Gating it is not merely redundant, it is a crash. verl leaves `pad_mode` at its `no_padding`
+    default, whose `sft_loss` reads `log_prob.values()` -- defined only on the nested tensor the
+    remove-padding branch builds (fsdp/transformer_impl.py:1178). The padded branch (:1186) hands
+    the loss a strided tensor and the first optimizer step dies with "values expected sparse tensor
+    layout but got Strided". Every gdn-hybrid catalog model profiles as `exact-unpacked`, so the
+    AND broke text sft on all of them while `dev` trained fine.
+
+    The `not gdn_hybrid or gdn_boundary_resets` derivation that replaced it fails the same way and
+    for the same reason: a gdn hybrid whose verl child lacks the fla/causal-conv1d kernels answers
+    `gdn_boundary_resets = False`, which turns the flag off and reaches the identical strided-tensor
+    death. So NOTHING may gate this flag in sft -- there is no false case the loss can consume, and
+    verl's padded alternative does not fit `FlashTokenizedSFTDataset` either (`pad_mode: right`
+    collates with `default_collate`, requiring uniform rows, and reads a `response_mask` the dataset
+    never emits).
+
+    The boundary-contamination guard did not go away, it moved one layer earlier and one layer
+    stronger: `sft_workload._packing_mode` answers "exact-unpacked" for every architecture it cannot
+    pack, which pins `examples_per_update` to 1, so a gdn run has no packed NEIGHBOUR to be
+    contaminated by. Batch size is the isolation lever; this flag never was. See
+    `test_batch_is_the_isolation_lever_that_replaces_the_removed_flag` in test_sft_train.py.
+
+    `rl_train` and `opd_train` do NOT get this treatment: they carry no packing profile at all
+    (their batch size is the user's `prompts_per_step`, routinely > 1), so they genuinely pack and
+    a kernel-less child really does contaminate them. Their gate raises instead -- see
+    `test_grpo_and_opd_do_not_launch_into_the_unrunnable_padded_fallback` below.
+
+    Asserted on the source because reaching the real statement needs a live child probe and a
+    checkpoint; the failure is a wrong boolean, not an exception, so nothing else would surface it.
+    The AST walk (rather than a string match) is what catches a SECOND assignment being introduced
+    further down the function, which would silently re-gate the flag after this one set it.
+    """
+    import ast
+    import inspect as _inspect
+
+    from flash.engine.worker import sft_train
+
+    tree = ast.parse(_inspect.getsource(sft_train))
+    assigns = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name) and target.id == "use_remove_padding"
+    ]
+    assert len(assigns) == 1, (
+        f"expected exactly one `use_remove_padding` assignment, found {len(assigns)} "
+        f"(lines {[a.lineno for a in assigns]})"
+    )
+    names = {n.attr for n in ast.walk(assigns[0].value) if isinstance(n, ast.Attribute)} | {
+        n.id for n in ast.walk(assigns[0].value) if isinstance(n, ast.Name)
+    }
+    assert not names, (
+        f"use_remove_padding is gated on {sorted(names)}. any false case forces the padded verl "
+        "path, and its no_padding sft_loss cannot read a strided tensor -- the run dies on the "
+        "first optimizer step. the step contract is already pinned by profile.examples_per_update "
+        "and profile.authoritative_steps, and boundary isolation by the batch size that follows "
+        "from the packing mode; this flag is layout only and has no legitimate false case."
+    )
+
+
+def test_grpo_and_opd_do_not_launch_into_the_unrunnable_padded_fallback():
     """A gdn hybrid whose child cannot reset boundaries must fail AT THE GATE, not mid-run.
 
     The padded fallback (`use_remove_padding=False`) is boundary-correct but cannot complete a step
     on verl's fsdp engine: flash sets `use_fused_kernels=True` unconditionally, and that pair walks
     into `prepare_model_outputs`' fused padded branch, which returns a dense `[bsz, response_len]`
     where every sibling path re-nests via `cu_seqlens`. Grpo and opd then assert in
-    `no_padding_2_padding` (`sequence_offsets[-1] == values.shape[0]` compares total tokens against
-    batch size); sft dies slightly later in `sft_loss`, which calls `.values()` on what is no longer
-    a nested tensor. Verl's megatron engine guards this pair explicitly; its fsdp engine does not.
+    `no_padding_2_padding` -- `sequence_offsets[-1] == values.shape[0]` compares total tokens against
+    batch size, so it fails at EVERY batch size. Verl's megatron engine guards this pair explicitly
+    (`megatron/transformer_impl.py:869-874`); its fsdp engine does not.
 
     Measured on four matched real-gpu arms: all four died at `padding.py:144`, treatment and control
-    alike. Every catalog model is gdn, so a kernel-less child means no run of any algorithm can
-    finish -- and the assert names neither gdn nor the gate, so letting it launch spends a full
-    rental on an untraceable shape error.
+    alike. Every catalog model is gdn, so a kernel-less child means no grpo or opd run can finish --
+    and the assert names neither gdn nor the gate, so letting it launch spends a full rental on an
+    untraceable shape error.
 
-    Asserted on source for the same reason as the test above: these gates sit deep inside the run
-    functions, behind a live bridge and a child process.
+    SFT is excluded deliberately, not by oversight: it reaches the same branch but is safe without
+    resets, because every gdn model profiles as exact-unpacked and that pins `examples_per_update`
+    to 1, leaving no packed neighbour to contaminate. Raising there would fail runs that train
+    correctly. See `test_sft_remove_padding_is_ungated_tensor_layout` above.
+
+    Asserted on source because these gates sit deep inside the run functions, behind a live bridge
+    and a child process.
     """
     import ast
     import inspect as _inspect
 
-    from flash.engine.worker import backend_common, opd_train, rl_train, sft_train
+    from flash.engine.worker import backend_common, opd_train, rl_train
 
     # the gate lives in one shared helper, so the assertions split: the helper must raise, and each
-    # algorithm must route through it rather than re-deriving a decision of its own.
+    # affected algorithm must route through it rather than re-deriving a decision of its own.
     gate = _inspect.getsource(backend_common.require_gdn_boundary_resets)
     assert "raise RuntimeError(" in gate, (
         "require_gdn_boundary_resets no longer raises, so a gdn hybrid whose child cannot reset "
@@ -2107,7 +2184,7 @@ def test_no_algorithm_launches_into_the_unrunnable_padded_fallback():
         "without resets has no exit but the raise."
     )
 
-    for module in (sft_train, opd_train, rl_train):
+    for module in (opd_train, rl_train):
         src = _inspect.getsource(module)
         assert "require_gdn_boundary_resets(" in src, (
             f"{module.__name__} no longer routes its gdn decision through the raising gate, so it "

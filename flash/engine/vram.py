@@ -390,12 +390,23 @@ _LIGER_LONG_CTX_TOKENS = 2048
 # [b, s, vocab] logits tensor -- is what this set gates, and it holds for both. liger is NOT part
 # of that property: verl disables liger's fused linear ce, and liger zeroed the sft lora gradient
 # (GRAD-001), so sft runs with use_liger=false.
+#
+# membership is decided by the checkpoint's ``model_type``, because that is what verl's
+# patch_forward_with_backends dispatches on: ``qwen3_5`` and ``qwen3_5_moe`` both resolve to
+# verl/models/transformers/qwen3_5.py's forward_with_torch_backend, which computes ce from hidden
+# states via FusedLinearForPPO and never builds the dense tensor. every catalog model reports one of
+# those two types (the 27B is ``qwen3_5``/``Qwen3_5ForConditionalGeneration`` despite its 3.6 name),
+# so the set must list the whole sft-capable catalog -- an omission does not disable the fused
+# kernel, it only makes the allocator reserve logits vram the run never allocates and collapse the
+# micro-batch to 1. contrast kimi_vl, which returns before the fused patch ("Not support fused
+# kernels for KimiVL") and would genuinely keep dense logits.
 _SFT_CHUNKED_NLL_MODELS = frozenset(
     {
         "Qwen/Qwen3.5-0.8B",
         "Qwen/Qwen3.5-2B",
         "Qwen/Qwen3.5-4B",
         "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.6-27B",
         "Qwen/Qwen3.6-35B-A3B",
     }
 )
@@ -736,11 +747,40 @@ def grpo_fits_resident(
 # OFF they all stay resident -- so this term is ~num_layers x the per-layer (residual stream + qkv/out
 # + MoE SwiGLU intermediate) activations per token. With FlashAttention / cuDNN-SDPA there is NO s^2
 # attention-score tensor, and the GatedDeltaNet linear layers store only a small recurrent/conv state,
-# so it is LINEAR in seq. K folds the per-layer multiplier (relative to hidden) into one constant. It
-# is set ABOVE the Megatron FlashAttention factor (~34 bytes/(s.b.h) == K 17) so we OVER-reserve and
-# keep GC ON rather than risk an OOM; the MoE's small active FFN (8 x 512 vs a dense 4 x 2048) makes
-# the true value lower still. bf16 activations (2 bytes/elem). Calibrate K from the live H200 peak.
-_GC_OFF_ACT_K = 18.0
+# so it is LINEAR in seq. K folds the per-layer multiplier (relative to hidden) into one constant.
+# bf16 activations (2 bytes/elem).
+#
+# K is GEOMETRY-SPECIFIC, so there are two. What K multiplies is layers x batch x seq x hidden, i.e.
+# it is the per-layer activation cost measured RELATIVE TO HIDDEN -- and a dense block stores far more
+# of it per unit of hidden than a sparse-MoE block does, because the dense FFN intermediate is
+# 4 x 2048 against the MoE's 8 x 512 active. One constant cannot describe both.
+#
+# DENSE: measured on a live RTX 5090, Qwen3.5-0.8B (hidden 1024, 24 layers), LoRA rank 32
+# all-linear, bs 4, bf16, chunked dense-logit-free CE matching the worker's use_fused_kernels path:
+#   seq 1024 -> 15.09 GB peak,  seq 2048 -> 28.18 GB peak,  seq 4096 -> OOM on 31.37 GB usable
+# Fitting across seq points (the fixed base cancels) gives gc_off = 2.00 + 0.012785 * seq, i.e.
+# K_dense = 65.0. Confirmed linear, not s^2: the gc-on slope is identical across both segments
+# (2.262 GB per 1024 tokens) and the gc-off extra ratio is 1.981 against 2.000 ideal. Out-of-sample
+# check the fit never saw: it predicts 54.4 GB at seq 4096 -> must OOM, and the card OOMed at
+# 30.97 GB. The old shared 18.0 predicted 20.76 GB there, i.e. it would have called that run a FIT.
+#
+# SCOPE of that measurement: fit on ONE dense geometry (1024 hidden x 24 layers) and assumed
+# invariant across dense sizes, which is what K being a per-layer-relative-to-hidden factor asserts.
+# 130 bytes per (token, hidden-unit, layer) is ~3.8x the fused-Megatron figure, which is the expected
+# direction for all-linear LoRA on HF -- every wrapped linear retains its input for the adapter
+# backward, on top of HF's unfused per-block intermediates -- but the SIZE-invariance is untested.
+# Anyone loosening the >= 120 GB card gate should re-measure at the geometry they are enabling rather
+# than trust this extrapolation; at 27B it implies ~410 GB at seq 2048, far outside what was observed.
+#
+# MOE: 18.0 is UNVALIDATED against a live peak -- it is the pre-existing value, kept deliberately.
+# It sits just above the Megatron FlashAttention factor (~34 bytes/(s.b.h) == K 17) so we over-reserve
+# and keep GC ON rather than risk an OOM. The dense 65.0 must NOT be applied here: it would flip the
+# 35B-A3B (the only model whose active_params_b is truthy, hence the only one that reaches this gate
+# today) from GC-off to GC-on at seq >= 2048 and pay the ~+33% recompute tax on every step, on
+# evidence gathered from a model whose FFN geometry it does not share. Calibrate from a live H200
+# peak before changing it.
+_GC_OFF_ACT_K_DENSE = 65.0
+_GC_OFF_ACT_K_MOE = 18.0
 
 
 def sft_gc_off_peak_gb(
@@ -761,7 +801,7 @@ def sft_gc_off_peak_gb(
     GC-off impossible at a 248k vocab). Unknown architecture dims -> ``inf`` (caller keeps GC on).
 
     MoE: the activation backbone scales with the model's real ``hidden`` x ``num_layers`` (geometry),
-    NOT params_b -- the ~3B-active expert FFN is already folded into ``_GC_OFF_ACT_K``. ``weights``
+    NOT params_b -- the ~3B-active expert FFN is already folded into ``_GC_OFF_ACT_K_MOE``. ``weights``
     still reserves the FULL ``params_b`` (every expert is resident)."""
     if not (hidden and num_layers and seq_len):
         return float("inf")
@@ -770,7 +810,10 @@ def sft_gc_off_peak_gb(
     weights = float(params_b) * bpp
     lora_opt = _lora_memory_gb(lora_rank, eff_b, "sft", model_info)
     base = weights + _BASE_OVERHEAD_GB + lora_opt
-    act = _GC_OFF_ACT_K * int(num_layers) * int(batch) * int(seq_len) * int(hidden) * 2.0 / 1e9
+    # a truthy active_params_b IS the sparse-MoE signal -- it is set only for a model whose active
+    # parameter count differs from its total, which is what makes the per-layer FFN activation small.
+    act_k = _GC_OFF_ACT_K_MOE if active_params_b else _GC_OFF_ACT_K_DENSE
+    act = act_k * int(num_layers) * int(batch) * int(seq_len) * int(hidden) * 2.0 / 1e9
     return base + act
 
 
@@ -792,10 +835,12 @@ def sft_grad_checkpoint_can_disable(
     so GC -- a ~+33% recompute tax on every step -- can be turned off for the speed win.
 
     Conservative by construction: an unknown card / unknown architecture dims, or a peak that doesn't
-    clear the ``margin_gb`` headroom, returns False (keep GC ON). The estimate over-reserves (high
-    ``_GC_OFF_ACT_K`` + a fixed margin) precisely because the allocator sized the card for the
-    GC-*on* peak -- this is the independent check that the larger GC-off peak still fits the REAL
-    card (mirrors ``grpo_fits_resident``'s resident-fit guard)."""
+    clear the ``margin_gb`` headroom, returns False (keep GC ON). The MoE estimate over-reserves
+    (``_GC_OFF_ACT_K_MOE`` above the Megatron factor, plus a fixed margin) precisely because the
+    allocator sized the card for the GC-*on* peak -- this is the independent check that the larger
+    GC-off peak still fits the REAL card (mirrors ``grpo_fits_resident``'s resident-fit guard). The
+    dense constant is a live measurement rather than a safety pad, so the ``margin_gb`` headroom is
+    what carries the conservatism there."""
     if not card_vram_gb or card_vram_gb <= 0 or not (hidden and num_layers and seq_len):
         return False
     peak = sft_gc_off_peak_gb(

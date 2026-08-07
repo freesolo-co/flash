@@ -90,7 +90,11 @@ def _spec() -> JobSpec:
         tokenizer_revision=spec.model_revision,
         producer_version="1.2.3",
     )
-    return replace(spec, workload_profile_input_digest=digest)
+    return replace(
+        spec,
+        workload_profile_input_digest=digest,
+        workload_profile_producer_version="1.2.3",
+    )
 
 
 def _prepare(spec: JobSpec, *, packed: bool = True):
@@ -141,7 +145,9 @@ def test_exact_unpacked_mode_trains_one_example_per_update() -> None:
     assert prepared.profile.derived_steps == 4
     # the mode selects how examples are grouped into an update, not a different token layout: same
     # rows, same tokens, more updates. isolation here is bought by giving each example its own
-    # update instead of by boundary metadata, and that longer horizon is what the quote must price.
+    # update rather than by boundary metadata, because verl packs unconditionally and its fsdp
+    # engine never sends the gdn reset kwargs -- a batch of two would let the second example train
+    # on the first's carried state. that longer horizon is what the quote must price.
     assert prepared.rows == packed.rows
     assert prepared.profile.real_tokens_per_epoch == packed.profile.real_tokens_per_epoch
     assert prepared.profile.derived_steps > packed.profile.derived_steps
@@ -153,7 +159,11 @@ def _rebuild_digest(spec: JobSpec) -> JobSpec:
         tokenizer_revision=spec.model_revision,
         producer_version="1.2.3",
     )
-    return replace(spec, workload_profile_input_digest=digest)
+    return replace(
+        spec,
+        workload_profile_input_digest=digest,
+        workload_profile_producer_version="1.2.3",
+    )
 
 
 def _spec_with_max_steps(max_steps: int) -> JobSpec:
@@ -231,4 +241,51 @@ def test_zero_updates_consume_no_tokens() -> None:
             examples_per_update=2,
             updates=-1,
             field="input_ids",
+        )
+
+
+def test_probe_failure_fails_the_profile_instead_of_freezing_a_wrong_label(monkeypatch) -> None:
+    """A transient config-fetch failure must not mint an ``unsupported`` architecture label.
+
+    The label is frozen into the profile and compared byte-for-byte by the training worker. If a
+    hub blip could answer "unsupported" here, a later re-derivation that reached the config would
+    say "gdn-hybrid" and every training run built on that profile would die with a false
+    "sft workload changed after the quote was frozen" -- with no takeover path, because the profile
+    itself stays ``done``.
+    """
+    from flash.engine import sft_workload
+
+    def _boom(model_id, revision=""):
+        raise OSError("hub read timed out")
+
+    monkeypatch.setattr(sft_workload, "probe_is_pure_attention", _boom)
+
+    with pytest.raises(RuntimeError, match="could not resolve the model config"):
+        prepare_sft_workload(
+            _spec(),
+            FakeEnvironment(),
+            tokenizer_loader=lambda _model, _revision: FakeTokenizer(),
+            producer_version="1.2.3",
+        )
+
+
+def test_gdn_probe_failure_also_fails_closed(monkeypatch) -> None:
+    """The second probe carries the same risk: False-on-error would freeze ``unsupported``."""
+    from flash.engine import sft_workload
+
+    monkeypatch.setattr(
+        sft_workload, "probe_is_pure_attention", lambda model_id, revision="": False
+    )
+
+    def _boom(model_id, revision=""):
+        raise OSError("hub read timed out")
+
+    monkeypatch.setattr(sft_workload, "probe_is_gdn_hybrid", _boom)
+
+    with pytest.raises(RuntimeError, match="could not resolve the model config"):
+        prepare_sft_workload(
+            _spec(),
+            FakeEnvironment(),
+            tokenizer_loader=lambda _model, _revision: FakeTokenizer(),
+            producer_version="1.2.3",
         )

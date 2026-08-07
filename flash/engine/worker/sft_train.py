@@ -25,12 +25,15 @@ from flash.engine.steps import final_save_due, validate_save_steps
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.backend_common import (
     export_peft_adapter,
+    gdn_probe_module,
+    gdn_reset_arch_from_caps,
     latest_global_step_dir,
     parse_verl_metric,
     parse_wandb_link,
+    probe_verl_capabilities,
     render_gdn_varlen_shim,
+    render_tf32_shim,
     render_wandb_link_shim,
-    require_gdn_boundary_resets,
     resolve_checkpoint_actor_dir,
     resolve_verl_loggers,
     resolve_verl_python,
@@ -40,6 +43,7 @@ from flash.engine.worker.backend_common import (
     verl_step_number,
 )
 from flash.engine.worker.heartbeat import join_while_draining, liveness_heartbeat
+from flash.engine.worker.packing import model_is_gdn_hybrid
 from flash.engine.worker.rng import seed_training_rngs
 from flash.engine.worker.sft import _model_arch_dims, sft_under_ran
 
@@ -161,12 +165,11 @@ def build_sft_overrides(cfg: dict) -> list[str]:
         ),
         f"model.lora_adapter_path={_hydra_val(cfg.get('lora_adapter_path'))}",
         # remove-padding concatenates the micro-batch into one (1, total_nnz) row -- real packing.
-        # a GDN hybrid may only take it when the child can reset linear-attention state at the
-        # example boundaries; otherwise state bleeds between packed examples and every example after
-        # the first trains on its neighbour's residue. see gdn_boundary_resets in the caller.
-        # always true: the gdn gate raises rather than selecting the padded path, which cannot
-        # complete a step alongside the fused kernels this recipe sets.
-        "model.use_remove_padding=true",
+        # a GDN hybrid only gets packed NEIGHBOURS when the profile says "packed", which it never
+        # does for gdn (see the caller): those runs train one example per update, so there is no
+        # neighbour whose linear-attention residue could bleed in. the flag itself must stay on
+        # regardless -- it selects the nested-tensor layout verl's no_padding sft_loss requires.
+        f"model.use_remove_padding={_hydra_val(cfg.get('use_remove_padding', True))}",
         # 32k contexts: the fused linear-CE forward never materializes the [tokens, vocab] logits
         # tensor (~130 GB at 32k on a 248k vocab), computing loss from hidden states + lm_head in
         # chunks instead. torch backend = numerically exact CE, no extra deps.
@@ -401,7 +404,10 @@ def _render_sft_sitecustomize(
     reentrant_gradient_checkpointing: bool,
 ) -> str:
     required_steps = tuple(int(step) for step in save_at_steps)
+    # the tf32 fragment goes first, above the verl imports: grpo and opd share the same renderer,
+    # and putting it ahead of them means an import that raises cannot cost the run its throughput.
     source = f"""# generated flash sft runtime patches for verl 0.8
+{render_tf32_shim()}
 import random as _flash_random
 
 import numpy as _flash_numpy
@@ -415,9 +421,6 @@ _flash_seed = {int(seed)}
 _flash_random.seed(_flash_seed)
 _flash_numpy.random.seed(_flash_seed % (2**32))
 _flash_torch.manual_seed(_flash_seed)
-_flash_torch.set_float32_matmul_precision("high")
-_flash_torch.backends.cuda.matmul.allow_tf32 = True
-_flash_torch.backends.cudnn.allow_tf32 = True
 
 _flash_original_loader = _flash_sft_trainer.StatefulDataLoader
 
@@ -939,9 +942,12 @@ def run_sft_train(spec=None) -> None:
     os.makedirs(local_dir, exist_ok=True)
 
     with liveness_heartbeat("sft_data_loading"):
-        from flash import __version__
         from flash.workload_profile import require_matching_sft_profile
 
+        # carried on the spec, not read from `flash.__version__` here: the worker runs the plane's
+        # source snapshot off PYTHONPATH with no flash distribution installed, so a locally derived
+        # version is the "0+unknown" fallback and would reject every profile the plane ever froze.
+        producer_version = spec.workload_profile_producer_version
         prepared_workload = prepare_sft_workload(
             spec,
             env,
@@ -949,14 +955,14 @@ def run_sft_train(spec=None) -> None:
                 candidate,
                 revision=revision,
             ),
-            producer_version=__version__,
+            producer_version=producer_version,
             image_dir=image_dir,
             allow_packing=True,
         )
         expected_profile = require_matching_sft_profile(
             spec.workload_profile,
             input_digest=spec.workload_profile_input_digest,
-            producer_version=__version__,
+            producer_version=producer_version,
             tokenizer_revision=model_revision,
         )
         if prepared_workload.profile != expected_profile:
@@ -1072,27 +1078,50 @@ def run_sft_train(spec=None) -> None:
         python_bin = resolve_verl_python(
             workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
         )
+        # remove-padding packs the micro-batch into one row, which is correct for softmax attention
+        # (transformers rebuilds its varlen boundaries from the restarting position ids) but NOT for
+        # a gated-deltanet hybrid: its conv and recurrent state only reset if the child can honor
+        # seq_idx and cu_seqlens, and the no-fla fallbacks accept both and discard them. so pack a
+        # gdn model only when the child proves it can reset, and otherwise fall back to verl's
+        # padded path, which carries a real attention_mask and is boundary-correct by construction.
+        # the modeling module is resolved HERE, in the parent, because it needs a hub/cache read the
+        # child must not repeat; "" skips the question for a non-hybrid.
+        gdn_hybrid = model_is_gdn_hybrid(model_id, model_revision)
+        gdn_module = gdn_probe_module(model_id, model_revision) if gdn_hybrid else ""
+        # ONE child answers every independent capability question. each used to cost its own
+        # interpreter, and the torch/verl import -- not the question -- was the price.
+        caps = probe_verl_capabilities(python_bin, gdn_module)
     model_path = _cached_model_path(model_id, model_revision)
-    # verl logs from python_bin, so gate wandb on THAT interpreter (see resolve_verl_loggers).
-    loggers = resolve_verl_loggers(python_bin)
+    # verl logs from the verl interpreter, so gate wandb on THAT env (see resolve_verl_loggers).
+    loggers = resolve_verl_loggers(caps)
     project_name = (spec.wandb.project if spec and spec.wandb else None) or "flash"
     experiment_name = _w.wandb_run_name()
     shim_dir = os.path.join(workdir, "shim")
     os.makedirs(shim_dir, exist_ok=True)
     custom_dataset_path = os.path.join(shim_dir, "flash_verl_sft_dataset.py")
 
-    # remove-padding packs the micro-batch into one row, which is correct for softmax attention
-    # (transformers rebuilds its varlen boundaries from the restarting position ids) but NOT for a
-    # gated-deltanet hybrid: its conv and recurrent state only reset if the child can honor seq_idx
-    # and cu_seqlens, and the no-fla fallbacks accept both and discard them. so pack a gdn model
-    # only when the child proves it can reset. there is no usable fallback for a child that cannot:
-    # verl's padded path is boundary-correct but dies in sft_loss, which calls `.values()` on a
-    # tensor the padded+fused branch leaves dense. so require_gdn_boundary_resets raises instead.
-    gdn_reset_arch = require_gdn_boundary_resets(python_bin, model_id, model_revision)
-    # an arch comes back for every gdn hybrid and ONLY for a gdn hybrid: the helper raises rather
-    # than returning None for a hybrid whose child cannot reset. so this is also the "is it gdn"
-    # answer, with no second probe that could disagree with the first.
-    gdn_hybrid = gdn_reset_arch is not None
+    # the gdn boundary shim resets conv and recurrent state at packed example boundaries, but only
+    # when the verl child has the kernels that read seq_idx and cu_seqlens; the no-fla fallbacks
+    # accept both and discard them. so the shim is installed only when the child proves it can reset.
+    # `gdn_hybrid`/`gdn_module` and the child's answer are resolved above, inside the configuring
+    # liveness wrap, because the probe is part of the setup silence that wrap exists to cover.
+    gdn_reset_arch = gdn_reset_arch_from_caps(caps, gdn_module) if gdn_hybrid else None
+    # remove-padding is verl's TENSOR LAYOUT switch, not this run's packing/step contract, so nothing
+    # here may gate it. verl defaults to `pad_mode: no_padding`, whose sft_loss reads
+    # `log_prob.values()` -- valid only on the nested tensor the remove-padding path builds. turning
+    # it off hands that loss a strided tensor and the first optimizer step dies with "values expected
+    # sparse tensor layout but got Strided". flash cannot switch to the padded path instead: its
+    # `pad_mode: right` branch collates with `default_collate` (uniform rows only) and its loss reads
+    # `response_mask`, and FlashTokenizedSFTDataset emits neither -- variable-length rows carrying
+    # input_ids/position_ids/loss_mask. no_padding is the only mode this dataset fits.
+    #
+    # a gdn hybrid without child-side resets is safe here anyway, because it has no packed
+    # neighbours to contaminate: `_packing_mode` answers "exact-unpacked" for every gdn model
+    # (supported=False), that pins `examples_per_update` to 1, and train_batch_size below is exactly
+    # profile.examples_per_update. one example per update leaves nothing to carry -- the same
+    # argument the profile makes in sft_workload._packing_mode. batch=1 is the isolation lever;
+    # this flag never was, and gating it only selected a code path the loss cannot consume.
+    use_remove_padding = True
 
     config = {
         "train_files": train_file,
@@ -1132,6 +1161,7 @@ def run_sft_train(spec=None) -> None:
         "gradient_checkpointing": gradient_checkpointing and not reentrant_gradient_checkpointing,
         "total_training_steps": update_horizon if max_steps > 0 else None,
         "total_epochs": epochs if max_steps <= 0 else None,
+        "use_remove_padding": use_remove_padding,
     }
     overrides = build_sft_overrides(config)
 
@@ -1147,7 +1177,7 @@ def run_sft_train(spec=None) -> None:
     # forward to reset linear-attention state at packed example boundaries. different objects,
     # no interaction -- a gdn hybrid needs both, and dropping either is a silent correctness bug.
     shim_source += render_exact_sft_dataloader_shim()
-    if gdn_hybrid:
+    if gdn_reset_arch is not None:
         shim_source += render_gdn_varlen_shim(gdn_reset_arch)
     if "wandb" in loggers:
         shim_source += render_wandb_link_shim()
@@ -1372,8 +1402,17 @@ def run_sft_train(spec=None) -> None:
             "runtime_max_length": realized_max_length,
             "per_device_train_batch_size": micro_batch,
             "gradient_accumulation_steps": math.ceil(train_batch_size / micro_batch),
-            "packing": "verl_remove_padding",
-            "gdn_boundary_resets": gdn_hybrid or None,
+            # verl concatenates either way; the profile's mode records whether more than one
+            # example was allowed to share a concatenated batch, which is what a reader of these
+            # metrics needs in order to compare a run's step count against its row count.
+            "packing": profile.packing_mode,
+            # the tensor layout verl actually ran. always remove-padding now: it is the only layout
+            # FlashTokenizedSFTDataset fits, and the quoted step count comes from
+            # profile.examples_per_update rather than from this. kept because a reader comparing
+            # realized step time against the quote still needs the executed layout stated, not
+            # inferred.
+            "realized_packing": "verl_remove_padding",
+            "gdn_boundary_resets": (gdn_reset_arch is not None) if gdn_hybrid else None,
             "loss_curve": loss_curve[:400],
             "peak_gpu_gb": device_peak_gpu_gb,
             "device_peak_gpu_gb": device_peak_gpu_gb,

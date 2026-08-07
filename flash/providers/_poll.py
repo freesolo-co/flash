@@ -357,6 +357,7 @@ SETUP_HEARTBEAT_STAGES = frozenset(
         "sft_model_load",
         "sft_pretokenizing",
         "sft_configuring",
+        "rl_configuring",
         "rl_train_start",
         "sft_initializing",
         "rl_initializing",

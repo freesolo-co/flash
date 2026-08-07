@@ -59,21 +59,23 @@ from flash.engine.worker.backend_common import (
     append_step_metrics,
     clamp_engine_len,
     export_peft_adapter,
+    gdn_probe_module,
     kill_process_group,
     latest_global_step_dir,
     model_max_position_embeddings,
     parse_verl_metric,
     parse_verl_step_metrics,
     parse_wandb_link,
+    probe_verl_capabilities,
     raise_for_classified_verl_exit,
     ray_num_cpus,
     reap_stragglers,
     render_gdn_varlen_shim,
+    render_tf32_shim,
     render_wandb_link_shim,
     require_gdn_boundary_resets,
     resolve_blackwell_attention_backends,
     resolve_rollout_enforce_eager,
-    resolve_verl_device_capability,
     resolve_verl_loggers,
     resolve_verl_python,
     rollout_resident_overrides,
@@ -81,7 +83,8 @@ from flash.engine.worker.backend_common import (
     stage_verl_resume,
     stamp_adapter_dir_provenance,
     trainer_dtype_overrides,
-    verl_supports_rollout_field,
+    verl_declares_rollout_field,
+    verl_device_capability,
 )
 from flash.engine.worker.heartbeat import (
     GRPO_METRIC_HISTORY_LIMIT,
@@ -93,7 +96,8 @@ from flash.engine.worker.heartbeat import (
 from flash.engine.worker.hf import _deployable_adapter_on_hf
 from flash.engine.worker.multiturn_glue import validate_glue_template
 from flash.engine.worker.opd_gkd import generation_eos_from_cached_config
-from flash.engine.worker.perf import gpu_diagnostics, setup_perf_backends, wait_for_gpu
+from flash.engine.worker.packing import model_is_gdn_hybrid
+from flash.engine.worker.perf import gpu_diagnostics, wait_for_gpu
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
 from flash.engine.worker.rollout_samples import (
     sample_completion_text,
@@ -562,6 +566,88 @@ def build_verl_overrides(cfg: dict) -> list[str]:
     return o
 
 
+_DEFAULT_GPU_MEM_UTIL = 0.5
+
+
+def resolve_gpu_mem_util(
+    inp: dict,
+    *,
+    gpu_type: str,
+    n_gpus: int,
+    fp8_kv: bool,
+    sleep_unsupported: bool,
+) -> float:
+    """vLLM's colocated executor budget, sized from this run's geometry rather than assumed.
+
+    ``gpu_memory_utilization`` is the WHOLE model-executor budget (vLLM's second bf16 weight copy
+    plus the KV pool), and ``colocate_kv_util`` computes exactly that from the model, card, context
+    and group size. It shipped unwired: the launch config carried a flat 0.5 while
+    ``estimate_vram_gb``'s admission check documented itself as mirroring the same 0.45/0.55 cap, so
+    the preflight admitted a run against one budget and the worker then requested a different one.
+    Sizing here is what makes the two agree.
+
+    The flat constant is kept for the shapes the model does NOT cover, because a wrong number is
+    worse than a conservative one:
+
+    - an UNKNOWN CARD (empty/unmanaged ``gpu.type``): the budget is a fraction of the card, so
+      without the card's size there is nothing to take a fraction of.
+    - MULTI-GPU (``n_gpus > 1``): the rollout runs tensor-parallel, so vLLM's weight copy is sharded
+      ACROSS cards while ``colocate_kv_util`` sizes one whole copy against one card. Handing it a
+      single-card number would over-reserve per rank on exactly the shapes that are already tight.
+    - an UNCATALOGED / pinned-revision model with no resolvable parameter count: the weight term is
+      the dominant one, so a guessed size is not worth acting on.
+    """
+    if n_gpus > 1 or not (gpu_type or "").strip():
+        return _DEFAULT_GPU_MEM_UTIL
+    try:
+        from flash.catalog import MODELS
+        from flash.engine.vram import colocate_kv_util, resolve_params_b
+        from flash.providers.base import get_gpu_info
+
+        total_vram_gb = float(get_gpu_info(gpu_type).vram_gb)
+        if total_vram_gb <= 0:
+            return _DEFAULT_GPU_MEM_UTIL
+        model_id = str(inp["model_id"])
+        revision = str(inp.get("model_revision") or "")
+        catalog_info = MODELS.get(model_id)
+        # a pinned revision is sized on generic architecture geometry, matching grpo_fits_resident:
+        # the commit's real geometry is not validated, so the curated kv/lora shape may not describe
+        # it. the parameter count still comes from the pinned config.
+        info = None if revision else catalog_info
+        # the ONE way the worker, the preflight and the cost estimator agree on a model's size:
+        # curated catalog params_b, else the real HF parameter count for an open-policy model.
+        # the catalog is consulted FIRST and answers locally, so the common path adds no network
+        # call to launch; resolve_params_b's HF lookup is reached only for an uncataloged or
+        # pinned-revision model, where the config for this same model was already fetched upstream
+        # (model_max_position_embeddings) and is warm in the hub cache.
+        params_b = float(
+            (getattr(catalog_info, "params_b", 0.0) or 0.0)
+            if (catalog_info is not None and not revision)
+            else (resolve_params_b(model_id, revision=revision) or 0.0)
+        )
+        if params_b <= 0:
+            return _DEFAULT_GPU_MEM_UTIL
+        return colocate_kv_util(
+            params_b,
+            int(inp["engine_len"]),
+            total_vram_gb,
+            # the engine stays RESIDENT for a model whose vLLM wake/reload hangs, and the sleep
+            # branch budgets a 1.5x larger pool on the grounds that the engine is offloaded during
+            # the backward. crediting an offload that never happens would size the pool against a
+            # peak the run does not have.
+            sleep_mode=not sleep_unsupported,
+            num_generations=int(inp["group_size"]),
+            active_params_b=float(getattr(info, "active_params_b", 0.0) or 0.0) or None,
+            fp8_kv=fp8_kv,
+            model_info=info,
+        )
+    except Exception as e:  # sizing must never be what stops a run from launching
+        print(
+            f"[rl-verl] gpu_memory_utilization sizing failed ({e}); using {_DEFAULT_GPU_MEM_UTIL}"
+        )
+        return _DEFAULT_GPU_MEM_UTIL
+
+
 def _build_verl_training_cfg(
     inp: dict,
     *,
@@ -578,9 +664,11 @@ def _build_verl_training_cfg(
     local_dir: str,
     project_name: str,
     experiment_name: str,
+    gpu_type: str = "",
     n_gpus: int = 1,
 ) -> dict:
     engine_len = int(inp["engine_len"])
+    sleep_unsupported = rollout_sleep_unsupported(inp["model_id"])
     return {
         "train_files": train_files,
         "val_files": val_files,
@@ -617,14 +705,20 @@ def _build_verl_training_cfg(
         "ppo_epochs": inp["ppo_epochs"],
         "steps": int(inp["steps"]),
         "warmstart_adapter": inp["warmstart_adapter"],
-        "gpu_mem_util": 0.5,
+        "gpu_mem_util": resolve_gpu_mem_util(
+            inp,
+            gpu_type=gpu_type,
+            n_gpus=n_gpus,
+            fp8_kv=fp8_kv,
+            sleep_unsupported=sleep_unsupported,
+        ),
         "n_gpus": n_gpus,
         "loggers": loggers,
         "fp8_kv": fp8_kv,
         "enforce_eager": enforce_eager,
         "attention_backend": attention_backend,
         "mm_encoder_attn_backend": mm_encoder_attn_backend,
-        "sleep_unsupported": rollout_sleep_unsupported(inp["model_id"]),
+        "sleep_unsupported": sleep_unsupported,
         "reward_path": reward_path,
         "reward_name": "compute_score",
         "total_epochs": inp["verl_total_epochs"],
@@ -3130,7 +3224,9 @@ def run_rl_train():
         _w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None,
         gpu_type=_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else "",
     )
-    setup_perf_backends()
+    # no setup_perf_backends() here: torch's tf32 flags are per-process state that a subprocess does
+    # not inherit, and this process trains nothing -- verl does, out of process. the child opts in
+    # from its own sitecustomize instead (render_tf32_shim, wired into shim_source below).
 
     # env load, prompt render and tokenization run for minutes on a large split and emit nothing of
     # their own; without the wrap the provider sees silence from rl_start until rl_train_start.
@@ -3204,17 +3300,21 @@ def run_rl_train():
     with open(reward_py, "w") as f:
         f.write(render_reward_module())
 
-    # runtime patches for the verl interpreter. only written when something needs patching, so the
-    # default path puts nothing on the child's import path. a stale shim from a prior attempt would
-    # otherwise keep patching this one, so the file is removed when no patch is wanted.
+    # runtime patches for the verl interpreter. a stale shim from a prior attempt would otherwise
+    # keep patching this one, so the file is rewritten every time.
     shim_dir = os.path.join(workdir, "shim")
     os.makedirs(shim_dir, exist_ok=True)
     shim_py = os.path.join(shim_dir, "sitecustomize.py")
     # one sitecustomize holds every patch: python imports it once, so a second file would never be
-    # loaded. each renderer returns "" when its feature is off, so the default path writes nothing.
+    # loaded. each feature renderer returns "" when its feature is off; the tf32 fragment is
+    # unconditional, so this source is never empty.
     shim_source = "".join(
         part
         for part in (
+            # first: torch's matmul flags are process-wide state, and reading them back is how the
+            # rest of the child sees the choice. nothing below depends on it, but a later fragment
+            # that raised would otherwise cost the whole run its tensor-core throughput.
+            render_tf32_shim(),
             render_reentrant_checkpointing_shim(
                 inp["reentrant_checkpointing"], multimodal=bool(inp["multimodal"])
             ),
@@ -3234,11 +3334,8 @@ def run_rl_train():
         )
         if part
     )
-    if shim_source:
-        with open(shim_py, "w") as f:
-            f.write(shim_source)
-    elif os.path.exists(shim_py):
-        os.remove(shim_py)
+    with open(shim_py, "w") as f:
+        f.write(shim_source)
 
     # multi-turn: copy the child-side agent loop next to the shim so the verl interpreter can
     # import it (see copy_multi_turn_child_modules for why it is a copy and not an import).
@@ -3336,14 +3433,32 @@ def run_rl_train():
     gpu_sampler = _NvidiaSmiPeakSampler().start()
     device_peak_gpu_gb: float | None = None
     try:
-        python_bin = resolve_verl_python(
-            workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
-        )
+        # provisioning the verl interpreter builds a venv and installs the whole training stack when
+        # the run has no prebuilt worker image, and the batched capability probe that follows pays a
+        # cold torch/verl import. that is minutes of silence with no training step to report and no
+        # liveness thread otherwise running here -- long enough for the stall watchdog to fail a
+        # healthy run. sft and opd have wrapped this since #442; grpo never did.
+        # no progress= : there is no monotonic counter to read, only the keepalive.
+        with liveness_heartbeat("rl_configuring"):
+            python_bin = resolve_verl_python(
+                workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
+            )
+            # gdn boundary resets need the CHILD to have fla + causal_conv1d: without them the
+            # kwargs are accepted and discarded, so packed examples bleed state into each other.
+            # the modeling module is resolved HERE, in the parent, because it needs a hub/cache read
+            # the child must not repeat; "" skips the question for a non-hybrid.
+            gdn_hybrid = model_is_gdn_hybrid(inp["model_id"], inp["model_revision"])
+            gdn_module = (
+                gdn_probe_module(inp["model_id"], inp["model_revision"]) if gdn_hybrid else ""
+            )
+            # ONE child answers every independent capability question. each used to cost its own
+            # interpreter, and the torch/verl import -- not the question -- was the price.
+            caps = probe_verl_capabilities(python_bin, gdn_module)
         # masking truncated completions is a fork-only rollout field. FLASH_VERL_PYTHON can point at a
         # stock verl, and hydra would compose the unknown key only to abort in dataclass conversion.
         # fail here with the cause instead, and never silently train on truncated completions.
-        if inp["mask_truncated_completions"] and not verl_supports_rollout_field(
-            python_bin, "mask_truncated_completions"
+        if inp["mask_truncated_completions"] and not verl_declares_rollout_field(
+            caps, "mask_truncated_completions"
         ):
             raise RuntimeError(
                 f"grpo requested mask_truncated_completions but the verl at {python_bin} does not "
@@ -3351,28 +3466,19 @@ def run_rl_train():
                 f"interpreter with '{VERL_REQUIREMENT}' installed, or set it EMPTY under "
                 '[worker_env] as FLASH_VERL_PYTHON = "" to provision one.'
             )
-        # gdn boundary resets need the CHILD to have fla + causal_conv1d: without them the kwargs
-        # are accepted and discarded, so packed examples bleed state into each other. appended here
-        # rather than with the shims above because the probe needs python_bin, which is resolved in
-        # this block; sitecustomize is imported by the child, which has not started yet.
-        # raises when the child cannot honor resets: the padded fallback that used to handle that
+        # the shim is appended here rather than with the shims above because the answer needs
+        # python_bin, resolved in the block above; sitecustomize is imported by the child, which has
+        # not started yet.
+        # raises when a gdn child cannot honor resets: the padded fallback that used to handle that
         # case cannot complete a step on verl's fsdp engine. see require_gdn_boundary_resets.
-        gdn_reset_arch = require_gdn_boundary_resets(
-            python_bin, inp["model_id"], inp["model_revision"]
-        )
-        # an arch comes back for every gdn hybrid and ONLY for a gdn hybrid: the helper raises
-        # rather than returning None for a hybrid whose child cannot reset. so this is also the
-        # "is it gdn" answer, and reusing it avoids a second model_is_gdn_hybrid call that could
-        # disagree with the first (that probe returns False when it raises, which would turn fp8
-        # kv on for the very hybrid it crashes).
-        gdn_hybrid = gdn_reset_arch is not None
-        if gdn_hybrid:
+        gdn_reset_arch = require_gdn_boundary_resets(caps, gdn_module)
+        if gdn_reset_arch is not None:
             with open(shim_py, "a") as f:
                 f.write(render_gdn_varlen_shim(gdn_reset_arch))
 
         expected_steps = int(inp["steps"])
         # verl logs from its own interpreter; gate wandb on that env (see resolve_verl_loggers).
-        loggers = resolve_verl_loggers(python_bin)
+        loggers = resolve_verl_loggers(caps)
         _spec = _w.JOB_SPEC
         project_name = (_spec.wandb.project if _spec and _spec.wandb else None) or "flash"
         experiment_name = _w.wandb_run_name()
@@ -3391,12 +3497,12 @@ def run_rl_train():
         fp8_kv = _cc_ok and not gdn_hybrid
         # one capability probe, both rollout decisions below. asked of the verl interpreter, whose
         # torch/vllm stack is the one that has to run the rollout.
-        verl_cc = resolve_verl_device_capability(python_bin)
+        verl_cc = verl_device_capability(caps)
         # blackwell needs both rollout attention backends pinned; vllm 0.19.1's own defaults pick
         # flash-attn, which is PTX-unreliable on sm120 (silent empty rollouts) and routes the ViT
         # into an unimportable CUTE kernel on sm100/sm120. no-op off blackwell.
         attention_backend, mm_encoder_attn_backend = resolve_blackwell_attention_backends(
-            python_bin, verl_cc
+            caps, verl_cc
         )
         # sm86 is the one arch whose vllm 0.19.1 graph capture is a measured failure (completions
         # repeat to the token cap without emitting EOS), so only it runs the rollout eagerly. see
@@ -3417,9 +3523,17 @@ def run_rl_train():
             local_dir=local_dir,
             project_name=project_name,
             experiment_name=experiment_name,
+            gpu_type=(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else ""),
             n_gpus=gpu_count_of(_w.JOB_SPEC),
         )
         overrides = build_verl_overrides(cfg)
+        # the executor budget is sized per run now, so print what this one actually asked for --
+        # a vllm init failure reports the demand against the free memory, and the demand is
+        # otherwise invisible in the log.
+        print(
+            f"[rl-verl] rollout gpu_memory_utilization={cfg['gpu_mem_util']:.4f}",
+            flush=True,
+        )
 
         setup_seconds = time.time() - t_start
         _w.heartbeat("rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
@@ -3467,14 +3581,14 @@ def run_rl_train():
             env_for_verl.update(
                 multi_turn_child_env(inp, reward_url=reward_url, thinking=bool(_w.THINKING))
             )
-        if shim_source or inp["multi_turn"] or gdn_hybrid:
-            # python imports sitecustomize automatically at startup, so the shim patches verl before
-            # main_ppo runs. prepend rather than replace: an inherited PYTHONPATH may carry the verl
-            # install itself, and ray workers inherit this env so every actor gets the same patch.
-            # multi-turn needs the same entry for its copied-in agent loop modules.
-            env_for_verl["PYTHONPATH"] = os.pathsep.join(
-                item for item in (shim_dir, os.environ.get("PYTHONPATH", "")) if item
-            )
+        # python imports sitecustomize automatically at startup, so the shim patches verl before
+        # main_ppo runs. prepend rather than replace: an inherited PYTHONPATH may carry the verl
+        # install itself, and ray workers inherit this env so every actor gets the same patch.
+        # multi-turn needs the same entry for its copied-in agent loop modules. unconditional: the
+        # shim always carries at least the tf32 fragment, so a skipped entry would silently drop it.
+        env_for_verl["PYTHONPATH"] = os.pathsep.join(
+            item for item in (shim_dir, os.environ.get("PYTHONPATH", "")) if item
+        )
         step_re = re.compile(r"step:\s*(\d+)")
         reward_history: list[float] = []
         resp_len_history: list[float] = []
