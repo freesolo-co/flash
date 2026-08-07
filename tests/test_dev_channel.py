@@ -170,6 +170,25 @@ def test_read_dev_version():
     assert build.read_dev_version(src) == "2.3.4"
 
 
+def test_channel_only_flips_channel_without_touching_pyproject(tmp_path):
+    """--channel-only (publish-image.yml, before the `:dev` Docker build) touches only
+    flash/_channel.py. The Docker image ships the checked-in package name/scripts unchanged and
+    has no PyPI dist step, so pyproject.toml must be left exactly as checked in."""
+    build = _load_build_module()
+    (tmp_path / "flash").mkdir()
+    channel_path = tmp_path / "flash" / "_channel.py"
+    channel_path.write_text('CHANNEL = "prod"\n')
+    pyproject_text = '[project]\nname = "freesolo-flash"\nversion = "1.0.0"\n'
+    pyproject_path = tmp_path / "pyproject.toml"
+    pyproject_path.write_text(pyproject_text)
+
+    rc = build.main(["--root", str(tmp_path), "--channel-only"])
+
+    assert rc == 0
+    assert channel_path.read_text() == 'CHANNEL = "dev"\n'
+    assert pyproject_path.read_text() == pyproject_text
+
+
 def test_channels_are_at_the_same_version():
     # The prod (freesolo-flash) and dev (freesolo-flash-dev) channels must ship the same version;
     # .github/workflows/version-parity.yml enforces this in CI too.

@@ -17,6 +17,10 @@ This MUTATES the working tree in place (pyproject.toml + flash/_channel.py), so 
 disposable checkout — which is exactly the CI case (.github/workflows/publish-dev.yml). The prod
 build path (uv build with no transform) is unaffected: the checked-in source always ships the prod
 channel.
+
+`--channel-only` applies just the flash/_channel.py flip (no pyproject rewrite, no uv build) --
+used by .github/workflows/publish-image.yml before building the `:dev` Docker image, which ships
+the checked-in package name/scripts unchanged and has no PyPI dist step to hook into.
 """
 
 from __future__ import annotations
@@ -111,7 +115,22 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="apply the source rewrites but skip `uv build` (for inspecting the transform).",
     )
+    parser.add_argument(
+        "--channel-only",
+        action="store_true",
+        help=(
+            'flip flash/_channel.py to CHANNEL="dev" only -- skip the pyproject rewrite and '
+            "uv build. For the Docker image build (publish-image.yml), which ships the checked-in "
+            "package name/scripts as-is and never runs `uv build`."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.channel_only:
+        channel = args.root / "flash" / "_channel.py"
+        channel.write_text(rewrite_channel(channel.read_text()))
+        print('Flipped flash/_channel.py to CHANNEL = "dev".')
+        return 0
 
     dev_version = transform_tree(args.root)
     print(f"Transformed source to dev channel: {DEV_DIST_NAME} {dev_version}")

@@ -9,6 +9,7 @@ on:
       - "flash/**"
       - "Dockerfile"
       - "pyproject.toml"
+      - "scripts/build_dev_dist.py"
       - ".github/workflows/publish-image.yml"
   workflow_dispatch:
 
@@ -61,6 +62,21 @@ jobs:
             echo "${IMAGE}:sha-${short_sha}"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
+
+      # The checked-in source always ships CHANNEL="prod" (scripts/_channel.py) -- the PyPI
+      # dev-channel package (publish-dev.yml) already flips it via the same script before its
+      # own build. The Docker image build never did, so `:dev` shipped with CHANNEL="prod" and
+      # every channel-derived default (serving URL, control-plane URL, CLI/dist names) resolved
+      # to prod instead of dev. Flip it here too, dev branch only -- :main must ship as checked in.
+      - name: Set up Python
+        if: github.ref_name == 'dev'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Flip release channel for the dev image
+        if: github.ref_name == 'dev'
+        run: python3 scripts/build_dev_dist.py --channel-only
 
       - name: Build and push
         uses: docker/build-push-action@v6
