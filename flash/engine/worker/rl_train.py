@@ -2588,8 +2588,11 @@ class _VerlResumeUploader:
     def _completed_step(self) -> int:
         return completed_checkpoint_step(self.local_dir)
 
-    def _pending(self, completed_step: int) -> list[tuple[int, str]]:
-        return unprocessed_checkpoint_dirs(self.local_dir, completed_step, self.processed_steps)
+    def _pending(self) -> list[tuple[int, str]]:
+        """the completed checkpoint dirs this uploader has not handled yet, oldest first."""
+        return unprocessed_checkpoint_dirs(
+            self.local_dir, self._completed_step(), self.processed_steps
+        )
 
     def _stage_deployable(self, step: int, checkpoint_dir: str) -> str:
         """export a required step's checkpoint into a servable adapter under export_root.
@@ -2648,7 +2651,7 @@ class _VerlResumeUploader:
                 # newest resume checkpoint routinely appears in that window; exiting without
                 # sweeping it would drop durable work a preemption then has to redo.
                 stopping = self._stop.is_set()
-                for step, path in self._pending(self._completed_step()):
+                for step, path in self._pending():
                     # stage while verl's checkpoint still exists; publication happens below, once
                     # the gate opens. the two have different deadlines -- the source expires with
                     # verl's retention, the permission arrives with the first varying-reward group --
@@ -2688,7 +2691,7 @@ class _VerlResumeUploader:
                 # stop() had made visible, and only after running it may the loop exit. staged
                 # steps still awaiting the gate cannot hold the loop open -- with the gate shut they
                 # never clear, and waiting would hang stop(); raise_if_incomplete() reports them.
-                if stopping and not self._pending(self._completed_step()):
+                if stopping and not self._pending():
                     return
                 time.sleep(0.5)
         except BaseException as error:
