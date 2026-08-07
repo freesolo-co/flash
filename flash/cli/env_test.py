@@ -98,18 +98,10 @@ def _check_messages(messages: object, label: str) -> list[dict]:
 
 
 def _message_text(content: object) -> str:
-    # mirror flash.multimodal.assistant_completion_text block handling: a message's replay
-    # text is its string content, or the concatenation of its openai-style text blocks; any
-    # other shape (null tool-call content, image-only blocks) yields no replay text.
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(
-            str(block.get("text") or "")
-            for block in content
-            if isinstance(block, dict) and block.get("type") == "text"
-        )
-    return ""
+    # the canonical definition, so replay text and the reward path's own extraction cannot drift.
+    from flash.multimodal import message_content_text
+
+    return message_content_text(content)
 
 
 def _reference_turns(env, example: dict) -> list[str]:

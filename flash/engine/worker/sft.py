@@ -17,6 +17,20 @@ from flash.engine.worker.packing import (
 )
 
 
+def has_real_target(input_ids, loss_mask, special_ids: set[int]) -> bool:
+    """Does this row supervise at least one token that is not a special token?
+
+    A row whose entire supervised span is padding/EOS teaches nothing, and both SFT paths drop such
+    rows. They spell the mask field differently (``completion_mask`` when pretokenizing, ``loss_mask``
+    once packed), so the check takes the two sequences rather than a row dict: the emptiness rule
+    cannot then depend on which name the caller happens to use.
+    """
+    return any(
+        mask and token_id not in special_ids
+        for token_id, mask in zip(input_ids, loss_mask, strict=True)
+    )
+
+
 def _pretokenize_completion_only(texts, tokenizer, max_length):
     """Pre-tokenize SFT rows into ``{input_ids, completion_mask}``, dropping rows with no real completion target.
 
@@ -31,14 +45,11 @@ def _pretokenize_completion_only(texts, tokenizer, max_length):
         for ids, pids in zip(full_ids, prompt_ids, strict=True)
     ]
     special_ids = set(getattr(tokenizer, "all_special_ids", None) or [])
-
-    def _has_real_target(row) -> bool:
-        return any(
-            m and tid not in special_ids
-            for tid, m in zip(row["input_ids"], row["completion_mask"], strict=True)
-        )
-
-    kept = [(t, r) for t, r in zip(texts, pretok, strict=True) if _has_real_target(r)]
+    kept = [
+        (t, r)
+        for t, r in zip(texts, pretok, strict=True)
+        if has_real_target(r["input_ids"], r["completion_mask"], special_ids)
+    ]
     return [t for t, _ in kept], [r for _, r in kept], len(pretok) - len(kept)
 
 
