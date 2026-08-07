@@ -4958,6 +4958,67 @@ def test_bridge_close_releases_the_session():
     assert bridge.close({"session_id": "a"}) == {"closed": True}
 
 
+def _age_session(bridge, session_id, seconds):
+    """Backdate a session's lease clock, so lease tests need no sleeps and cannot flake.
+
+    White-box on purpose: the alternative is a tiny lease plus a real sleep, and the
+    still-being-driven direction below would then race the lease it is trying to prove renews.
+    """
+    session = bridge._sessions[session_id]
+    assert "touched_at" in session, "sessions carry no lease clock, so nothing can ever reap one"
+    session["touched_at"] -= seconds
+    return session
+
+
+def test_bridge_reaps_a_session_whose_actor_died_before_it_could_close(capsys):
+    # a ray rollout actor that dies between /multiturn/start and its `finally` /multiturn/close
+    # leaves an entry nobody will ever remove. verl restarts the actor, the replacement starts a
+    # fresh session, and the dead one's env state and transcript are retained for the rest of the
+    # worker's life -- so the leak grows with every actor death, unbounded (codex[bot]).
+    env = _BridgeEnv()
+    bridge = _bridge(env, session_lease_s=60.0)
+    bridge.start({"index": 0, "session_id": "dead"})
+    _age_session(bridge, "dead", 3600.0)
+
+    bridge.start({"index": 1, "session_id": "live"})
+
+    assert bridge.open_sessions() == 1, "the abandoned session outlived the actor that owned it"
+    assert "dead" not in bridge._sessions
+    # the leak it prevents is silent, so the reap must not be: repeated reaps mean actors are dying
+    # mid-episode, which is a rollout problem worth seeing in the log.
+    assert "reaped 1 abandoned multi-turn session(s)" in capsys.readouterr().out
+    # reaping is a memory release, never a training event. scoring a dead episode would hand the
+    # group baseline a reward for a rollout that never finished.
+    assert env.scored == []
+
+
+def test_bridge_never_reaps_a_session_that_is_still_being_driven():
+    # the failure this guards is worse than the leak: reaping a live episode fails a working
+    # rollout, because its next /multiturn/step gets `unknown multi-turn session`. an episode is
+    # idle between turns for as long as a generate plus an env reply takes, so the lease has to be
+    # renewed by activity rather than measured from the session's birth.
+    bridge = _bridge(_BridgeEnv(done_after=99), session_lease_s=60.0)
+    bridge.start({"index": 0, "session_id": "slow"})
+    _age_session(bridge, "slow", 3600.0)
+
+    bridge.step({"session_id": "slow", "completion_text": "a turn that took a very long time"})
+    bridge.start({"index": 1, "session_id": "other"})
+
+    assert bridge.open_sessions() == 2, "a live episode was reaped and its next turn will fail"
+    assert bridge.step({"session_id": "slow", "completion_text": "next"})["messages"]
+
+
+def test_bridge_lease_can_be_disabled_and_then_nothing_is_ever_reaped():
+    # `0` is the off switch a caller reaches for when reaping is suspected of breaking a rollout.
+    # without an explicit guard, a non-positive lease reads as "everything is stale" and reaps
+    # every session on the next start -- the exact opposite of what disabling it should mean.
+    bridge = _bridge(_BridgeEnv(), session_lease_s=0.0)
+    bridge.start({"index": 0, "session_id": "dead"})
+    _age_session(bridge, "dead", 10_000_000.0)
+    bridge.start({"index": 1, "session_id": "live"})
+    assert bridge.open_sessions() == 2
+
+
 def test_bridge_routes_are_served_alongside_single_turn_scoring():
     # one server, one port: the child gets a single url and posts both /score and /multiturn/* to
     # it. mounting the bridge on its own server would leave the child's reward path pointing at a
