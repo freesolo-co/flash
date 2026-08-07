@@ -212,6 +212,18 @@ def prepare_assistant_turn(
     }
 
 
+def turn_is_unusable(turn: dict[str, Any]) -> bool:
+    """Whether the environment neither saw nor scored this turn.
+
+    The bridge returns before ``record_model_turn`` for a truncated, empty, or replacement-char
+    turn, so it never enters environment state and earns no reward. Both consequences follow from
+    this one predicate: the turn's tokens must stay out of the loss (a zeroed ``response_mask``,
+    the same way environment glue is excluded), and it must NOT take a turn span (``score_rollouts``
+    rejects a span/reward count mismatch and drops the whole group to episode credit).
+    """
+    return bool(turn["truncated"] or turn["skip_reason"])
+
+
 def sum_preemptions(current: int, value: int | None) -> int:
     if value is None:
         return current
