@@ -1459,6 +1459,67 @@ def test_zero_grad_guard_clears_on_a_recovered_step(monkeypatch):
     assert captured["meta"]["notes"]["loss_curve"] == [1.0, 1.0, 1.0, 1.0]
 
 
+def test_a_single_step_run_with_no_gradient_is_rejected(monkeypatch):
+    """Regression (codex[bot], sft_train.py): the consecutive-run guard needs _MAX_ZERO_GRAD_STEPS
+    steps to fire, so a horizon SHORTER than that could not trip it at all.
+
+    a one-update horizon is ordinary (the retained rows fit a single batch). such a run appended its
+    single grad_norm 0.0, never reached the threshold, and then published and billed an adapter
+    identical to the base weights -- exactly the GRAD-001 outcome the guard exists to prevent, on the
+    one horizon it could not see. driven through run_sft_train so the assertion is about the shipped
+    code path, not a local reimplementation of the check.
+    """
+    from flash.engine.worker import sft_train
+
+    spec, _ = _stub_sft_run(monkeypatch, watcher_cls=_TolerantWatcher)
+    # a fresh run, not a resume: the guard abstains on a resume because the restored weights carry
+    # earlier updates this session never observed.
+    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir: 0)
+
+    def fake_training(command, *, env, on_step, on_line, heartbeat):
+        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
+        # both updates report a dead gradient. the in-loop guard would also fire on two consecutive
+        # zeros, so the horizon is cut to one below to isolate the end-of-run check.
+        on_line(
+            "step:1 - train/loss:0.5464 - train/grad_norm:0.0 - train/lr:5e-05 "
+            "- train/global_tokens:6588\n"
+        )
+        on_step(1)
+        return 0
+
+    monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
+
+    assert _MAX_ZERO_GRAD_STEPS > 1, "this regression only exists while the in-loop guard needs >1"
+    with pytest.raises(RuntimeError, match=re.escape("grad_norm=0.0")):
+        sft_train.run_sft_train(spec)
+
+
+def test_a_single_healthy_step_run_still_completes(monkeypatch):
+    """The end-of-run check must reject only an ALL-zero session, never a short healthy one.
+
+    pairs with the test above: same one-step horizon, one real gradient. without this the obvious
+    over-broad spelling of that guard (any zero, or any short run) would pass its own test while
+    failing every legitimate single-update run.
+    """
+    from flash.engine.worker import sft_train
+
+    spec, captured = _stub_sft_run(monkeypatch)
+
+    def fake_training(command, *, env, on_step, on_line, heartbeat):
+        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
+        on_line(
+            "step:1 - train/loss:1.0 - train/grad_norm:1.4 - train/lr:5e-05 "
+            "- train/global_tokens:8\n"
+        )
+        on_step(1)
+        return 0
+
+    monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
+
+    sft_train.run_sft_train(spec)
+    assert captured["meta"]["notes"]["loss_curve"] == [1.0]
+
+
 def test_overrides_enable_fused_linear_ce_for_long_context():
     # 32k contexts must not materialize [tokens, vocab] logits; the fused torch-backend
     # linear-CE computes loss from hidden states in chunks (numerically exact CE).

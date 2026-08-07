@@ -104,6 +104,7 @@ from flash.engine.worker.rollout_samples import (
     sanitize_rollout_text,
 )
 from flash.engine.worker.sft_train import (
+    _build_verl_child_env,
     _cached_model_path,
     _hydra_val,
     _NvidiaSmiPeakSampler,
@@ -3578,7 +3579,13 @@ def run_rl_train():
         def _progress():
             return step_box[0]
 
-        env_for_verl = dict(os.environ)
+        # allowlist rather than dict(os.environ): scoring stays in THIS process behind the localhost
+        # reward bridge, so the child and its ray actors never need the platform HF_TOKEN, the
+        # GITHUB_TOKEN, or any user-declared environment secret -- and verl fans this env out to
+        # every actor. the sft and opd paths already build their child env this way; the FLA_ kernel
+        # choice the comment on _CHILD_ENV_PREFIXES calls out still crosses, because that prefix is
+        # on the allowlist.
+        env_for_verl = _build_verl_child_env(shim_dir=shim_dir, wandb_enabled="wandb" in loggers)
         env_for_verl["FLASH_VERL_REWARD_URL"] = reward_url
         # the model is prefetched above; keep the subprocess off hf's rate-limited api.
         env_for_verl["HF_HUB_OFFLINE"] = "1"
@@ -3826,6 +3833,11 @@ def run_rl_train():
         train_wall=train_wall,
         setup_seconds=setup_seconds,
         train_tokens=0,
+        # carry the completed step, as the sft and opd finalizers already do. without it the
+        # rl_train_done and done heartbeats land stepless and overwrite the stepped rl_trained ping
+        # above, so a cancel arriving between here and DONE reprices a fully trained run at zero
+        # steps (actual_steps_run returns 0 for a non-training stage with no step).
+        step=steps_run,
         heartbeat_fields={"metrics_last": list(metrics_last)},
         generated_tokens=int(
             sum(resp_len_history)
