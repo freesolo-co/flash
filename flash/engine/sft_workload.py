@@ -17,6 +17,7 @@ from flash.engine.worker.sft import (
     _pretokenize_completion_only,
     _reject_image_completion,
     _select_indexed_sft_examples,
+    has_real_target,
 )
 from flash.workload_profile import SftWorkloadProfile, sft_sample_policy
 
@@ -119,13 +120,6 @@ def _processor_tokenized_row(
     loss_mask = completion_mask_from_ids(prompt_ids, input_ids)
     full.pop("attention_mask", None)
     return input_ids, loss_mask, _serialize_multimodal_inputs(full)
-
-
-def _has_real_target(row: dict, special_ids: set[int]) -> bool:
-    return any(
-        mask and token_id not in special_ids
-        for token_id, mask in zip(row["input_ids"], row["loss_mask"], strict=True)
-    )
 
 
 def _materialize_verl_images(
@@ -371,7 +365,7 @@ def prepare_sft_workload(
     unpacked_rows = []
     for row_index in sorted(row_by_index):
         row = row_by_index[row_index]
-        if _has_real_target(row, special_ids):
+        if has_real_target(row["input_ids"], row["loss_mask"], special_ids):
             unpacked_rows.append(row)
         else:
             dropped += 1
