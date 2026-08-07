@@ -1494,30 +1494,35 @@ def test_a_single_step_run_with_no_gradient_is_rejected(monkeypatch):
         sft_train.run_sft_train(spec)
 
 
-def test_a_single_healthy_step_run_still_completes(monkeypatch):
-    """The end-of-run check must reject only an ALL-zero session, never a short healthy one.
+@pytest.mark.parametrize("grads", [[1.4], [0.0, 1.4], [1.4, 0.0]])
+def test_a_fresh_run_with_any_real_gradient_still_completes(monkeypatch, grads):
+    """The end-of-run check must reject only an ALL-zero session, never one that trained.
 
-    pairs with the test above: same one-step horizon, one real gradient. without this the obvious
-    over-broad spelling of that guard (any zero, or any short run) would pass its own test while
-    failing every legitimate single-update run.
+    pairs with the test above, and every case here is a FRESH run, so the guard is actually reached
+    -- on a resume it abstains and the test could not fail however the check is spelled. `[1.4]`
+    covers the short healthy horizon; the mixed cases pin the boundary, because the obvious
+    over-broad spelling (`not all`, i.e. reject on any zero at all) fails a run that demonstrably
+    trained. an isolated zero inside a longer run stays tolerated by contract.
     """
     from flash.engine.worker import sft_train
 
     spec, captured = _stub_sft_run(monkeypatch)
+    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir: 0)
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
         on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
-        on_line(
-            "step:1 - train/loss:1.0 - train/grad_norm:1.4 - train/lr:5e-05 "
-            "- train/global_tokens:8\n"
-        )
-        on_step(1)
+        for step, grad in enumerate(grads, start=1):
+            on_line(
+                f"step:{step} - train/loss:1.0 - train/grad_norm:{grad} - train/lr:5e-05 "
+                "- train/global_tokens:8\n"
+            )
+            on_step(step)
         return 0
 
     monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
 
     sft_train.run_sft_train(spec)
-    assert captured["meta"]["notes"]["loss_curve"] == [1.0]
+    assert captured["meta"]["notes"]["loss_curve"] == [1.0] * len(grads)
 
 
 def test_overrides_enable_fused_linear_ce_for_long_context():
