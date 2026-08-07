@@ -15,6 +15,7 @@ Two properties make that safe to bill separately from training, and both are ass
 from __future__ import annotations
 
 import builtins
+import random
 import sys
 from dataclasses import replace
 
@@ -90,6 +91,7 @@ def _profile_spec() -> JobSpec:
         spec,
         workload_profile_kind=SFT_PROFILE_KIND,
         workload_profile_input_digest=digest,
+        workload_profile_producer_version=_PRODUCER_VERSION,
     )
 
 
@@ -97,21 +99,35 @@ def _profile_spec() -> JobSpec:
 def profile_worker(monkeypatch):
     """The profile entrypoint with its worker-module boundary stubbed, nothing else.
 
-    Only the four things a worker cannot do inside a test are replaced: the job spec, the loaded
-    environment, the tokenizer, and the terminal upload. prepare_sft_workload runs for real, because
-    it is the measurement under test.
+    Only the things a worker cannot do inside a test are replaced: the job spec, the loaded
+    environment, the tokenizer, the architecture probe, and the terminal upload. prepare_sft_workload
+    runs for real, because it is the measurement under test.
+
+    The architecture probe is pinned rather than left live because it reads the model config off the
+    hub. Unpinned it makes the measurement depend on network reachability -- and since a probe that
+    cannot answer now fails the profile closed (it must not freeze a guessed label into a digest),
+    an offline run would fail these tests for a reason that has nothing to do with what they assert.
     """
     import flash.engine.worker as worker
+    from flash.engine import sft_workload
     from flash.engine.worker import sft_profile
 
+    monkeypatch.setattr(
+        sft_workload,
+        "probe_is_pure_attention",
+        lambda _model, revision="": True,
+    )
     monkeypatch.setattr(worker, "JOB_SPEC", _profile_spec(), raising=False)
     monkeypatch.setattr(worker, "require_active_env", lambda: _Environment(), raising=False)
     monkeypatch.setattr(
         worker, "load_tokenizer", lambda _model, revision=None: _Tokenizer(), raising=False
     )
     monkeypatch.setattr(worker, "heartbeat", lambda *_a, **_kw: None, raising=False)
-    monkeypatch.setattr(sft_profile, "__version__", _PRODUCER_VERSION, raising=False)
-    monkeypatch.setattr("flash.__version__", _PRODUCER_VERSION, raising=False)
+    # `flash.__version__` is deliberately NOT pinned to the producer version here. On a real worker
+    # it is the "0+unknown" fallback (no flash distribution is installed there), and pinning it
+    # would make every assertion below pass for a worker that reads it -- the exact reason this
+    # class of defect shipped. The spec carries the producer version; the worker must use that.
+    monkeypatch.setattr("flash.__version__", "0+unknown", raising=False)
 
     finalized: list = []
     monkeypatch.setattr(
@@ -223,6 +239,69 @@ def test_a_profile_that_cannot_be_measured_never_reaches_terminal_success(
     with pytest.raises(RuntimeError, match="environment dataset unreadable"):
         sft_profile.run_sft_profile()
     assert finalized == [], "a failed measurement must not publish DONE or metrics"
+
+
+def test_profile_seeds_after_loading_the_environment_like_training_does(
+    monkeypatch, profile_worker
+) -> None:
+    """The seed must land on the same side of env load in both workers, not merely be applied.
+
+    `run_sft_train` loads the environment and only then calls `seed_training_rngs`. If the profile
+    seeded first, anything drawing on the global generators during env load -- the loader's retry
+    jitter, a user module consuming random/numpy at import -- would advance the profile's RNG after
+    its seed while training's seed reset it afterwards. The two workers would then build different
+    rows and the drift guard would reject a profile the user already paid for.
+
+    Asserting on the ORDER rather than on two equal digests is deliberate: with both sides seeded
+    the digests match whichever way round it is, so a test comparing them cannot fail.
+    """
+    import flash.engine.worker as worker
+    from flash.engine.worker import sft_profile
+
+    order: list[str] = []
+
+    def _env_that_draws():
+        order.append("env")
+        random.random()
+        return _Environment()
+
+    monkeypatch.setattr(worker, "require_active_env", _env_that_draws, raising=False)
+    monkeypatch.setattr(
+        sft_profile,
+        "seed_host_rngs",
+        lambda seed: order.append("seed"),
+    )
+
+    sft_profile.run_sft_profile()
+
+    assert order == ["env", "seed"]
+
+
+def test_profile_keys_its_digest_off_the_carried_version_not_the_installed_one(
+    profile_worker,
+) -> None:
+    """The producer version must travel on the spec, because the worker cannot re-derive it.
+
+    `flash.__version__` reads `importlib.metadata.version("freesolo-flash")`, and a worker instance
+    has NO flash distribution installed: Dockerfile.worker ships dependencies only, and the flash
+    package arrives as the plane's own source snapshot on PYTHONPATH (`/runcode`). So on every real
+    instance that lookup raises and `__version__` is the "0+unknown" fallback, while the plane that
+    froze the digest resolved a real version like "1.0.88". A worker deriving the version locally
+    therefore computes a digest the plane can never produce, and the gate rejects 100% of profile
+    runs -- which is what took down both live runs before this was found.
+
+    The fixture pins `flash.__version__` to the fallback precisely so this test can fail: with the
+    worker reading it, `run_sft_profile` raises on the digest gate.
+    """
+    sft_profile, finalized = profile_worker
+    import flash
+
+    assert flash.__version__ != _PRODUCER_VERSION, "the fixture must not pin the installed version"
+
+    sft_profile.run_sft_profile()
+
+    metrics, _kwargs = finalized[0]
+    assert metrics.workload_profile["producer_version"] == _PRODUCER_VERSION
 
 
 def test_profile_measurement_is_reproducible_across_two_runs(profile_worker) -> None:
