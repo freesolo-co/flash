@@ -38,7 +38,6 @@ from flash.engine.worker.backend_common import (
     agent_loop_workers,
     clamp_engine_len,
     gdn_probe_module,
-    gdn_reset_arch_from_caps,
     latest_global_step_dir,
     model_max_position_embeddings,
     parse_verl_metric,
@@ -48,6 +47,7 @@ from flash.engine.worker.backend_common import (
     render_gdn_varlen_shim,
     render_tf32_shim,
     render_wandb_link_shim,
+    require_gdn_boundary_resets,
     resolve_blackwell_attention_backends,
     resolve_rollout_enforce_eager,
     resolve_verl_loggers,
@@ -1551,9 +1551,10 @@ def build_opd_overrides(config: dict) -> list[str]:
         f"actor_rollout_ref.model.path={_hydra_val(config['model_path'])}",
         "actor_rollout_ref.model.trust_remote_code=true",
         # packing the micro-batch into one row is only safe for a gdn hybrid when the child can
-        # reset linear-attention state at the example boundaries; see the caller's gdn gate.
-        "actor_rollout_ref.model.use_remove_padding="
-        + _hydra_val(config.get("use_remove_padding", True)),
+        # reset linear-attention state at the example boundaries -- and the caller's gdn gate now
+        # RAISES when it cannot, because the padded alternative cannot complete a step alongside the
+        # fused kernels below. always true by the time we get here.
+        "actor_rollout_ref.model.use_remove_padding=true",
         # 32k contexts: the fused linear-CE forward computes per-token log_probs from hidden states
         # + lm_head in chunks (FusedLinearForPPO), never materializing the [tokens, vocab] logits
         # tensor (~130 GB at 32k on a 248k vocab). the distillation loss consumes exactly
@@ -2480,15 +2481,11 @@ def run_opd_train(spec=None) -> None:
 
     # a gdn hybrid may only pack when the CHILD can honor seq_idx + cu_seqlens; the no-fla fallbacks
     # accept both and discard them, which silently bleeds state across packed example boundaries.
-    gdn_reset_arch = gdn_reset_arch_from_caps(caps, gdn_module) if gdn_hybrid else None
-    gdn_boundary_resets = gdn_reset_arch is not None
-    use_remove_padding = not gdn_hybrid or gdn_boundary_resets
-    if gdn_hybrid and not gdn_boundary_resets:
-        print(
-            "[opd] gdn hybrid without child-side boundary resets: disabling remove-padding so "
-            "packed examples cannot contaminate each other (slower, correct)",
-            flush=True,
-        )
+    # raises when the child cannot -- opd reaches no_padding_2_padding through
+    # trainer/distillation/losses.py exactly as grpo reaches it through ray_trainer, so the padded
+    # fallback that used to handle this cannot complete a step either. see
+    # require_gdn_boundary_resets.
+    gdn_reset_arch = require_gdn_boundary_resets(caps, gdn_module)
 
     # sm86's vllm 0.19.1 graph capture degenerates, so only that arch runs the rollout eagerly. grpo
     # has resolved this since the trl driver; opd never did, and opd is the MORE exposed of the two
@@ -2581,7 +2578,6 @@ def run_opd_train(spec=None) -> None:
     bridge.start()
     try:
         config = {
-            "use_remove_padding": use_remove_padding,
             "train_files": [train_file],
             "val_files": [val_file],
             "train_batch_size": prompts_per_step,
@@ -2912,7 +2908,7 @@ def run_opd_train(spec=None) -> None:
                 # whether it packed with resets or took the padded fallback. for a gate whose failure
                 # mode is silent contamination that is the one thing worth recording. None for a
                 # non-gdn model, where the question does not arise.
-                "gdn_boundary_resets": gdn_boundary_resets if gdn_hybrid else None,
+                "gdn_boundary_resets": gdn_hybrid or None,
                 "peak_gpu_gb": peak_gpu_gb,
                 "warm_started": bool(warmstart_adapter),
                 "resumed": bool(resume_step),

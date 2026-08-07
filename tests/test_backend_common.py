@@ -523,8 +523,10 @@ def test_provisioned_venv_can_import_the_entrypoints_flash_launches(monkeypatch,
 
 
 def test_provisioned_venv_gets_flash_attn_for_the_remove_padding_path(monkeypatch, tmp_path):
-    # all three backends default remove-padding ON (only a gdn model whose child cannot reset packed
-    # boundaries turns it off) and verl's cuda remove-padding path imports flash_attn.bert_padding
+    # all three backends hardcode remove-padding ON (a gdn model whose child cannot reset packed
+    # boundaries now raises rather than switching it off, because verl's fsdp engine cannot run the
+    # padded path alongside the fused kernels flash sets) and verl's cuda remove-padding path
+    # imports flash_attn.bert_padding
     # UNGUARDED (verl/utils/attention_utils.py:30, torch_functional.py:627). there is no sdpa
     # fallback on that path, so a venv without the wheel dies at the first training batch on a paid
     # gpu. Dockerfile.worker already treats it as REQUIRED in /opt/verl-venv; this fallback
@@ -582,6 +584,8 @@ def test_the_capability_probe_imports_nothing_from_flash():
         "inspect",
         "json",
         "torch",
+        # stdlib, imported only inside the gdn handler to report WHY the answer was negative.
+        "traceback",
         "transformers",
         "verl",
         "wandb",
@@ -807,6 +811,107 @@ def test_a_child_that_omits_a_key_leaves_it_fail_closed(monkeypatch):
     assert caps["flashinfer"] is True
     assert caps["capability"] is None
     assert caps["wandb"] is False
+
+
+def test_an_unavailable_gdn_gate_says_why():
+    """The gdn probe must print WHY it answered no, in the child, where the cause exists.
+
+    Failing closed silently is what made this expensive to diagnose. `require_gdn_boundary_resets`
+    raises on a negative answer, but the raise happens in the PARENT, which has only a boolean --
+    a missing fla wheel, a built-but-broken causal_conv1d ABI, and a conv kernel compiled without
+    this arch are indistinguishable from there. The exception object only exists inside the child,
+    so the diagnostic has to be emitted there or it does not exist at all.
+
+    Asserted on the probe SOURCE rather than by running it, because the probe is a string executed
+    in a different interpreter: there is nothing importable here to call. The syntax of that string
+    is covered by `test_the_capability_probe_is_valid_python`, so this only has to prove the
+    diagnostic is present on both negative paths -- the clean "checked, unavailable" and the
+    "the probe itself fell over".
+    """
+    probe = vc._CAPABILITY_PROBE
+    # the clean negative: which of the checks failed is the difference between "install fla" and
+    # "rebuild causal_conv1d for this arch".
+    assert probe.count("gdn boundary resets unavailable in the child") == 2, (
+        "both gdn negative paths must say why: the clean negative (checks returned False) and the "
+        "exception path. a bare emit(False) on either leaves the parent's raise unexplainable."
+    )
+    _, _, tail = probe.partition("    except Exception as e:")
+    assert tail, "the gdn handler no longer binds its exception, so it cannot report the cause"
+    assert "traceback" in tail.split('emit("gdn_boundary_resets", False)')[0], (
+        "the gdn exception handler discards the traceback. that is exactly the bare `except: "
+        "emit(False)` that made a kernel-less child indistinguishable from a broken probe."
+    )
+
+
+def test_child_diagnostics_survive_the_answered_early_return(monkeypatch, capsys):
+    """A child `[verl] ...` line must reach the parent log EVEN WHEN the probe answered.
+
+    THE regression for a defect that shipped inside this same change. The gdn question prints why it
+    answered no, but `probe_verl_capabilities` returned as soon as any answer parsed, and the gdn
+    question is asked LAST. So on every real run something earlier answered, the early return fired,
+    and the diagnostic was discarded -- while `require_gdn_boundary_resets` raised telling operators
+    to read a line that was never printed.
+
+    The stdout capture is what makes this invisible without a test: the child's print goes into
+    `subprocess.run(capture_output=True)`, so it exists, it is just never forwarded. Nothing crashes.
+
+    Note the fixture answers `flashinfer` AND emits the diagnostic. A fixture that answered nothing
+    would pass against the broken code too, because the no-answer path already reported stderr --
+    the bug lived exclusively on the answered path, so the test has to take it.
+    """
+    monkeypatch.setattr(
+        vc.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "[verl] gdn boundary resets unavailable in the child: fla=True causal_conv1d=False\n"
+                'FLASH_VERL_CAPS={"flashinfer": true}\n'
+            ),
+            stderr="",
+        ),
+    )
+    caps = vc.probe_verl_capabilities(
+        "/verl/bin/python", "transformers.models.qwen3_5.modeling_qwen3_5"
+    )
+    # the early return still happens -- this is not asking the probe to stop short-circuiting.
+    assert caps["flashinfer"] is True
+    out = capsys.readouterr().out
+    assert "gdn boundary resets unavailable" in out, (
+        "the child's diagnostic was swallowed by the answered-early-return. the gate's raise points "
+        "operators at that line, so losing it makes a kernel-less child indistinguishable from a "
+        "broken probe -- exactly the silence this change set out to remove."
+    )
+    # and the CAUSE has to survive, not just the verdict.
+    assert "causal_conv1d=False" in out
+
+
+def test_the_gdn_gate_has_exactly_three_outcomes():
+    """None for non-gdn, an arch for a resettable hybrid, a raise for everything else.
+
+    Both callers (`rl_train`, `opd_train`) treat `arch is not None` as interchangeable with "is this
+    a gdn hybrid" -- rl_train renders the shim on it, and both record it as run metadata. That is
+    only sound because the gate cannot return None for a hybrid: if it ever did, a gdn run would
+    skip the boundary shim while the metadata still said the question did not arise, which is the
+    packed-and-contaminated-but-labelled-fine case the shim exists to prevent.
+
+    The `caps` variants matter as much as the happy path. `_CAPABILITIES_UNAVAILABLE` seeds
+    `gdn_boundary_resets` as None (child died / timed out / printed nothing readable), and a partial
+    read can drop the key entirely. Both are "could not answer", and for THIS question that must
+    fail closed into the raise -- not into None, which the callers would read as "not a hybrid".
+    """
+    module = "transformers.models.qwen3_5.modeling_qwen3_5"
+
+    # non-gdn: the parent passes "" and never asked the child, so there is nothing to check.
+    assert vc.require_gdn_boundary_resets({"gdn_boundary_resets": None}, "") is None
+
+    # gdn + child cleared: the arch, recovered from the literal the child was handed.
+    assert vc.require_gdn_boundary_resets({"gdn_boundary_resets": True}, module) == "qwen3_5"
+
+    # gdn + any non-affirmative answer: raise. never None.
+    for caps in ({"gdn_boundary_resets": False}, {"gdn_boundary_resets": None}, {}):
+        with pytest.raises(RuntimeError, match="without child-side boundary resets"):
+            vc.require_gdn_boundary_resets(caps, module)
 
 
 def test_fla_stays_in_lockstep_with_the_worker_image():

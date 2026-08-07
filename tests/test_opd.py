@@ -1167,6 +1167,7 @@ def test_opd_worker_fp8_kv_flag_matches_the_sizing_assumption():
 
     src = inspect.getsource(opd_train.run_opd_train)
     assert "model_is_gdn_hybrid(model_id, revision=model_revision)" in src
+    assert "fp8_kv = _cc_ok and not gdn_hybrid" in src
     assert "get_device_capability() >= (8, 9)" in src
 
     # and the override is emitted only when the resolved flag is true, so a bf16 worker never sends
