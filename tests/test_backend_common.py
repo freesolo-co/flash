@@ -617,6 +617,110 @@ def test_no_optional_package_is_imported_at_the_probes_top_level():
     )
 
 
+def _run_gdn_probe_branch(monkeypatch, tmp_path, *, forward_src, gdn_present=True):
+    """Execute the probe's gdn branch against a stub transformers module, returning its stdout.
+
+    Runs the REAL rendered probe rather than a paraphrase, with both package checks answering True
+    so the source check is the only thing that can fail -- which is exactly the case the two
+    package flags cannot express.
+    """
+    import importlib.util
+    import io as _io
+    import sys as _sys
+    import types as _types
+
+    # the probe imports causal_conv1d before the source check to fail a broken ABI early; this
+    # interpreter has no gpu wheel, so stub it. the case under test is the check AFTER it.
+    monkeypatch.setitem(_sys.modules, "causal_conv1d", _types.ModuleType("causal_conv1d"))
+
+    module_name = "flash_test_gdn_probe_mod"
+    stub = _types.ModuleType(module_name)
+
+    if gdn_present:
+        # the probe reads the forward with inspect.getsource, which needs a real file on disk --
+        # an exec'd function raises OSError and would land in the traceback branch instead of the
+        # clean-negative one under test. so write the stub module out and import it for real.
+        source = f"class Qwen3GatedDeltaNet:\n    def forward(self):\n        {forward_src}\n"
+        path = tmp_path / f"{module_name}.py"
+        path.write_text(source)
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        stub = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(stub)
+
+    monkeypatch.setitem(_sys.modules, module_name, stub)
+
+    import transformers.utils.import_utils as import_utils
+
+    monkeypatch.setattr(import_utils, "is_flash_linear_attention_available", lambda: True)
+    monkeypatch.setattr(import_utils, "is_causal_conv1d_available", lambda: True)
+
+    probe = vc._CAPABILITY_PROBE % {"gdn_module": module_name}
+    # keep only the gdn block: the rest of the probe imports verl/flashinfer/wandb, which this
+    # process has no reason to have, and their absence would drown the line under test.
+    start = probe.index(f"if {module_name!r}:")
+    captured = _io.StringIO()
+    namespace = {"emit": lambda *_a, **_k: None}
+    with contextlib.redirect_stdout(captured):
+        exec(probe[start:], namespace)
+    return captured.getvalue()
+
+
+def test_a_gdn_source_check_failure_does_not_tell_operators_to_install_present_packages(
+    monkeypatch, tmp_path
+):
+    # the diagnostic feeds require_gdn_boundary_resets, whose raise says "installing fla +
+    # causal_conv1d in the verl interpreter is the fix" and points AT this line. when the source
+    # check is what failed, both packages are already installed -- so printing "fla=True
+    # causal_conv1d=True" sends an operator to reinstall something that is not broken, on a paid
+    # gpu, with no other clue about which of the three checks fell over.
+    out = _run_gdn_probe_branch(monkeypatch, tmp_path, forward_src="return None")
+
+    assert "gdn boundary resets unavailable" in out
+    assert "fla=True causal_conv1d=True" not in out, (
+        "a source-check failure reported both packages as present, which reads as "
+        "'install these' for packages that ARE installed"
+    )
+    assert "installing packages will not fix it" in out
+    assert "cu_seq_lens_q" in out
+    assert "seq_idx" in out
+
+
+def test_a_gdn_probe_names_the_single_missing_forward_kwarg(monkeypatch, tmp_path):
+    # a forward that takes one of the two is a different repair from one that takes neither, so
+    # the line must not collapse both into the same text.
+    out = _run_gdn_probe_branch(monkeypatch, tmp_path, forward_src="return cu_seq_lens_q")
+
+    assert "missing seq_idx" in out, out
+    assert "takes neither" not in out
+
+
+def test_a_gdn_probe_reports_a_missing_class_rather_than_a_missing_kwarg(monkeypatch, tmp_path):
+    # no *GatedDeltaNet at all is a wrong-module/wrong-transformers problem, not a kwarg one.
+    out = _run_gdn_probe_branch(monkeypatch, tmp_path, forward_src="", gdn_present=False)
+
+    assert "no *GatedDeltaNet class" in out, out
+
+
+def test_a_missing_package_still_names_which_package(monkeypatch):
+    # the case the old line DID handle correctly must keep working: here "install it" is right.
+    import transformers.utils.import_utils as import_utils
+
+    monkeypatch.setattr(import_utils, "is_flash_linear_attention_available", lambda: False)
+    monkeypatch.setattr(import_utils, "is_causal_conv1d_available", lambda: True)
+
+    import io as _io
+
+    probe = vc._CAPABILITY_PROBE % {"gdn_module": "flash_test_absent_mod"}
+    start = probe.index(f"if {'flash_test_absent_mod'!r}:")
+    captured = _io.StringIO()
+    with contextlib.redirect_stdout(captured):
+        exec(probe[start:], {"emit": lambda *_a, **_k: None})
+    out = captured.getvalue()
+
+    assert "fla=False causal_conv1d=True" in out, out
+    assert "install the missing package" in out
+
+
 def test_the_capability_probe_is_valid_python():
     # the probe is a template string, so a syntax error in it would surface as a silent
     # "every capability unavailable" on a paid gpu rather than at import time here. check BOTH
