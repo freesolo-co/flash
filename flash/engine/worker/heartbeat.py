@@ -17,13 +17,13 @@ import threading
 import time
 from typing import Any
 
-from flash.engine.worker._pkg import W as _w
-from flash.engine.worker.perf import gpu_diagnostics
-from flash.engine.worker.rollout_samples import (
+from flash.engine.rollout_samples import (
     sampled_completion_scalar,
     sanitize_rollout_text,
     select_rollout_samples,
 )
+from flash.engine.worker._pkg import W as _w
+from flash.engine.worker.perf import gpu_diagnostics
 
 # Setup-phase liveness stages: emitted from a 30s liveness thread WITH a progress callback during the
 # cold download / model-load / split-scan phase, kept on the tighter setup-liveness upload cadence
