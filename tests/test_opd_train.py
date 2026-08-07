@@ -2415,6 +2415,128 @@ def test_stop_trimming_slices_response_ids_and_forced_mask_identically():
     assert kept_forced == [True, False]
 
 
+class _RecordingEnv:
+    """Environment that records every turn it is shown, and rejects an empty action.
+
+    the rejection is the point: a real environment that parses each action is entitled to raise on
+    a truncated or empty one, and that is what turns a no-signal rollout into a paid run failure.
+    """
+
+    def __init__(self):
+        self.recorded: list[str] = []
+
+    def new_rollout_state(self, _example):
+        return {"messages": [{"role": "user", "content": "q"}], "prompt": None}
+
+    def record_model_turn(self, state, content):
+        if not content.strip():
+            raise ValueError("environment rejects an empty action")
+        self.recorded.append(content)
+        return state
+
+    def env_reply(self, _messages, _state):
+        return [{"role": "user", "content": "next"}]
+
+    def rollout_done(self, _state, _turn_limit):
+        return False
+
+
+class _MultiTurnBridgeTokenizer(_BridgeTokenizer):
+    """``_BridgeTokenizer`` plus the chat-template surface the env-glue tokenizer needs."""
+
+    def apply_chat_template(self, messages, **_kwargs):
+        return "".join(str(message.get("content", "")) for message in messages)
+
+    def __call__(self, text, **_kwargs):
+        return {"input_ids": [ord(char) % 64 for char in text]}
+
+
+def _multiturn_bridge(env, *, max_turns=4):
+    return _TeacherAlignmentBridge(
+        prompts=[
+            _BridgePrompt(
+                student_messages=[{"role": "user", "content": "q"}],
+                teacher_messages=[{"role": "user", "content": "q"}],
+                prompt_ids=(10, 11),
+                image_descriptors=(),
+                package_root=None,
+                example=object(),
+            )
+        ],
+        tokenizer=_MultiTurnBridgeTokenizer(),
+        teacher=object(),
+        thinking_prefill="",
+        eos_token_ids=frozenset({99}),
+        stop_sequences=(),
+        mutation_callback=lambda: None,
+        active_env=env,
+        multi_turn=True,
+        max_turns=max_turns,
+    )
+
+
+def test_an_unusable_opd_turn_is_never_shown_to_the_environment():
+    """A truncated or skipped turn must not reach ``record_model_turn``.
+
+    such a turn is already excluded from teacher scoring, so showing it to the environment buys no
+    signal and can cost the whole paid run: an env that validates each action may raise on it. the
+    grpo bridge returns before its own ``record_model_turn`` on exactly this predicate.
+    """
+    env = _RecordingEnv()
+    bridge = _multiturn_bridge(env)
+    bridge.start_multiturn(
+        index=0, session_id="s1", prompt_ids=[10, 11], raw_prompt=[{"role": "user", "content": "q"}]
+    )
+
+    response = bridge.step_multiturn(
+        {
+            "session_id": "s1",
+            "turn_ordinal": 0,
+            "accepted_prefix": [10, 11],
+            "raw_response_ids": [],
+            "response_ids": [],
+            "completion_text": "",
+            "termination": "truncated",
+            "stop_reason": "length",
+            "truncated": True,
+            "skip_reason": "truncated_rollout",
+        }
+    )
+
+    assert env.recorded == [], "an unusable turn was pushed into environment state"
+    assert response["terminal"] is True
+    # the turn is still accounted for -- it is skipped, not erased
+    assert bridge.truncated_rollouts == 1
+    assert bridge.skip_counts == {"truncated_rollout": 1}
+
+
+def test_a_usable_opd_turn_still_reaches_the_environment():
+    """The guard must key on the unusable predicate, not disable multi-turn recording."""
+    env = _RecordingEnv()
+    bridge = _multiturn_bridge(env)
+    bridge.start_multiturn(
+        index=0, session_id="s1", prompt_ids=[10, 11], raw_prompt=[{"role": "user", "content": "q"}]
+    )
+
+    response = bridge.step_multiturn(
+        {
+            "session_id": "s1",
+            "turn_ordinal": 0,
+            "accepted_prefix": [10, 11],
+            "raw_response_ids": [65],
+            "response_ids": [65],
+            "completion_text": "A",
+            "termination": "stop",
+            "stop_reason": "stop",
+            "truncated": False,
+            "skip_reason": "",
+        }
+    )
+
+    assert env.recorded == ["A"]
+    assert response["terminal"] is False
+
+
 def test_multimodal_bridge_rejects_managed_teacher_scoring():
     bridge = _TeacherAlignmentBridge(
         prompts=[
