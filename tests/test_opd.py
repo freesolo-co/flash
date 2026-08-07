@@ -639,6 +639,21 @@ def test_opd_filtering_stage_is_setup_not_training():
     )  # progress count doesn't flip it
 
 
+def test_opd_preprocessing_stages_are_setup_on_the_provider_side():
+    """Regression (codex[bot], _poll.py): the worker-side registry gained opd_prompt_scan and
+    opd_image_prep, but SETUP_HEARTBEAT_STAGES kept only the retired opd_filtering_prompts. Both
+    stages carry a progress callback, so is_training_heartbeat classified a run that was still
+    preprocessing as TRAINING and judged it by the tight (sticky) stall window instead of the
+    cold-start grace -- a large split is torn down as "stalled" before its first step."""
+    from flash.providers._poll import SETUP_HEARTBEAT_STAGES, is_training_heartbeat
+
+    for stage in ("opd_prompt_scan", "opd_image_prep"):
+        assert stage in SETUP_HEARTBEAT_STAGES
+        assert is_training_heartbeat(stage, 0) is False
+        # these emit a REAL progress heartbeat per advance; a nonzero count must not flip them.
+        assert is_training_heartbeat(stage, 5) is False
+
+
 def test_opd_liveness_stages_are_throttled_at_setup_cadence():
     """opd liveness threads must use the throttled setup-liveness cadence."""
     from flash.engine.worker.heartbeat import _HB_SETUP_LIVENESS_STAGES, _HB_THROTTLED_STAGES
@@ -1152,6 +1167,7 @@ def test_opd_worker_fp8_kv_flag_matches_the_sizing_assumption():
 
     src = inspect.getsource(opd_train.run_opd_train)
     assert "model_is_gdn_hybrid(model_id, revision=model_revision)" in src
+    assert "fp8_kv = _cc_ok and not gdn_hybrid" in src
     assert "get_device_capability() >= (8, 9)" in src
 
     # and the override is emitted only when the resolved flag is true, so a bf16 worker never sends
