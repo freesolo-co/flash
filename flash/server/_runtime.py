@@ -514,15 +514,16 @@ def _ray_log_name_for_attempt(phase: str, error_name: str) -> str | None:
     raylet that died an attempt ago (codex[bot]). Pinning to the traceback's attempt means the pair
     always describes one attempt, and the fetch simply misses when this attempt produced no ray logs.
 
-    Returns None for a legacy unscoped traceback: there is no attempt to pin to, and guessing would
+    Returns None for an unscoped traceback: there is no attempt to pin to, and guessing would
     reintroduce exactly the mismatch this exists to prevent.
 
-    Built the same way ``ray_log_artifact_name`` builds it worker-side, so the two cannot drift.
+    Built from the writer's own definition, so the two cannot drift: restating the format here
+    would make worker and reader agree only for as long as nobody edits one of them.
     """
     attempt = _attempt_of(error_name)
     if attempt is None:
         return None
-    return f"raylogs_{phase}_attempt{attempt}.txt"
+    return attempt_scoped_artifact_name("raylogs", phase, attempt)
 
 
 def _worker_artifacts(spec) -> dict[str, str]:
