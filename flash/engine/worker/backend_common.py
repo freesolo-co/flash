@@ -464,7 +464,20 @@ if %(gdn_module)r:
             is_flash_linear_attention_available,
         )
 
+        # the reason the LAST failing check produced, so a clean negative can name it. the two
+        # package flags cannot express the source check: it fails with both installed, and an
+        # operator reading "fla=True causal_conv1d=True" alongside "install fla + causal_conv1d"
+        # is being sent to fix something that is not broken.
+        why = ""
         ok = is_flash_linear_attention_available() and is_causal_conv1d_available()
+        if not ok:
+            why = (
+                "fla="
+                + str(is_flash_linear_attention_available())
+                + " causal_conv1d="
+                + str(is_causal_conv1d_available())
+                + " (install the missing package into the verl interpreter)"
+            )
         if ok:
             import causal_conv1d  # noqa: F401  -- fail a built-but-broken ABI here, not at model load
 
@@ -479,6 +492,23 @@ if %(gdn_module)r:
             )
             src = inspect.getsource(gdn.forward) if gdn is not None else ""
             ok = ("cu_seq_lens_q" in src) and ("seq_idx" in src)
+            if not ok:
+                # both packages are present, so this is the transformers version, not the env.
+                why = (
+                    "fla and causal_conv1d are both installed, but "
+                    + (
+                        "no *GatedDeltaNet class in " + %(gdn_module)r
+                        if gdn is None
+                        else (
+                            "its forward() takes neither cu_seq_lens_q nor seq_idx"
+                            if ("cu_seq_lens_q" not in src) and ("seq_idx" not in src)
+                            else "its forward() is missing "
+                            + ("cu_seq_lens_q" if "cu_seq_lens_q" not in src else "seq_idx")
+                        )
+                    )
+                    + " -- this transformers build cannot reset gdn state at packed boundaries; "
+                    + "installing packages will not fix it"
+                )
         if ok:
             import torch
 
@@ -497,10 +527,7 @@ if %(gdn_module)r:
             # say WHY on a clean negative too: which of the three checks failed is the difference
             # between "install fla" and "rebuild causal_conv1d for this arch".
             print(
-                "[verl] gdn boundary resets unavailable in the child: fla="
-                + str(is_flash_linear_attention_available())
-                + " causal_conv1d="
-                + str(is_causal_conv1d_available()),
+                "[verl] gdn boundary resets unavailable in the child: " + why,
                 flush=True,
             )
         emit("gdn_boundary_resets", bool(ok))
