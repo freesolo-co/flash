@@ -358,6 +358,14 @@ SETUP_HEARTBEAT_STAGES = frozenset(
         "opd_start",
         "opd_configuring",
         "opd_filtering_prompts",
+        # the prompt-budget scan and image preparation opd_train actually emits today
+        # (opd_train.py `liveness_heartbeat("opd_prompt_scan")` / `("opd_image_prep")`). both carry a
+        # progress callback, so without them here is_training_heartbeat flips the run into the tight
+        # training stall window while it is still preprocessing, and a large split is torn down as
+        # "stalled" before the first step. the worker-side registry in heartbeat.py already lists
+        # both; this is the provider half of the same pair.
+        "opd_prompt_scan",
+        "opd_image_prep",
         "opd_model_load",
         "opd_initializing",
     }
