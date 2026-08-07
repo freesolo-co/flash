@@ -1057,9 +1057,15 @@ class _TeacherAlignmentBridge:
                 )
             context_messages = [dict(message) for message in session["messages"]]
             state = session["state"]
-            self.active_env.record_model_turn(state, completion_text)
-            session["messages"].append({"role": "assistant", "content": completion_text})
             terminal = bool(payload.get("truncated")) or bool(skip_reason)
+            # an unusable turn is excluded from teacher scoring below (see the `scorable` filter),
+            # so showing it to the environment buys nothing and can cost the whole run: an env that
+            # parses or validates each action may raise on a truncated or empty action, turning a
+            # routine no-signal rollout into a permanent paid failure. the grpo bridge already
+            # returns before its own `record_model_turn` on exactly this predicate.
+            if not terminal:
+                self.active_env.record_model_turn(state, completion_text)
+                session["messages"].append({"role": "assistant", "content": completion_text})
             messages: list[dict] = []
             next_prefix = [*accepted_prefix, *response_ids]
             if not terminal:
