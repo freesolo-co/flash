@@ -316,6 +316,9 @@ def _runpod_completed_metrics(handle, *, deadline_at: float | None = None) -> di
         allocated_gpu = original.get("allocated_gpu")
         if allocated_gpu:
             metrics.setdefault("allocated_gpu", allocated_gpu)
+        allocated_count = original.get("allocated_gpu_count")
+        if allocated_count:
+            metrics.setdefault("allocated_gpu_count", int(allocated_count))
         return metrics
     except _CompletedAttemptPending:
         raise
@@ -684,6 +687,11 @@ def _submit_seed_supervised(
                 **canonical_handle,
                 "seed": int(seed),
                 "allocated_gpu": current_gpu.get("name"),
+                # carried beside the gpu name for the same reason and by the same route: the
+                # canonical provider handle drops unknown keys, so a recovering process can only
+                # learn the shape from what was persisted here. without the count a run adopted
+                # after a control-plane restart prices its wall as a single card.
+                "allocated_gpu_count": current_gpu.get("count"),
                 "on_last_gpu": bool(current_on_last_gpu["value"]),
                 "code_prefix": code_prefix,
             }
@@ -742,6 +750,11 @@ def _submit_seed_supervised(
             metrics.setdefault("allocated_gpu", current_gpu["name"])
         if current_gpu.get("provider"):
             metrics.setdefault("allocated_provider", current_gpu["provider"])
+        # the runpod serverless route returns here rather than through the `res.ok` stamp below, so
+        # the card count has to be recorded on both or a sharded serverless run is still priced as
+        # one card. same source either way: the candidate allocation actually chose.
+        if current_gpu.get("count"):
+            metrics.setdefault("allocated_gpu_count", int(current_gpu["count"]))
         return metrics
 
     max_retries = int(spec.gpu.max_retries)
@@ -984,6 +997,7 @@ def _submit_seed_supervised(
                 raise
             current_gpu["name"] = chosen.gpu
             current_gpu["provider"] = chosen.provider
+            current_gpu["count"] = int(getattr(chosen, "gpu_count", 1) or 1)
             current_attempt["value"] = attempt
             retry_delay = 0
             submission_lock = _deploy_lock(spec.run_id)
@@ -1113,6 +1127,11 @@ def _submit_seed_supervised(
                 # the provider that actually billed this run, so cost attribution prices the
                 # class on ITS substrate rather than assuming RunPod's table.
                 res.metrics.setdefault("allocated_provider", chosen.provider)
+                # and how many cards of it. `hourly_rate(gpu_type)` is per CARD, so a fallback that
+                # prices the wall once records a 2x/4x run at half or a quarter of its real spend.
+                # the spec's own gpu.count cannot stand in: it is a ceiling, and allocation
+                # routinely picks fewer (see TRAINING.md, "a ceiling, not an exact count").
+                res.metrics.setdefault("allocated_gpu_count", int(getattr(chosen, "gpu_count", 1)))
             return res.metrics
         # cancel wins over any retry-shaped failure.
         try:
