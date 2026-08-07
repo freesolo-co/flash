@@ -398,6 +398,12 @@ class JobSpec:
     # platform-managed workload-profile carrier. public configs never author these fields.
     workload_profile_kind: str = ""
     workload_profile_input_digest: str = ""
+    # the flash version that keyed the digest above. it has to travel with the spec because the
+    # worker cannot re-derive it: `flash.__version__` reads distribution metadata, and the worker
+    # instance never installs a flash distribution -- it runs the plane's own source snapshot off
+    # PYTHONPATH (Dockerfile.worker ships deps only). there `__version__` is the "0+unknown"
+    # fallback, so a worker deriving this locally keys a digest the plane can never produce.
+    workload_profile_producer_version: str = ""
     workload_profile: dict[str, Any] = field(default_factory=dict)
     # canonical freesolo project uuid. every config, control-plane record, and worker round trip
     # carries the same explicit identity; there is no name/default/sole-project resolution.
@@ -416,6 +422,8 @@ class JobSpec:
             raise ValueError("workload profile input digest must be lowercase sha256 hex")
         if not isinstance(self.workload_profile, dict):
             raise TypeError("workload_profile must be an object")
+        if profile_digest and not str(self.workload_profile_producer_version or ""):
+            raise ValueError("workload profile digest requires its producer version")
         validate_worker_env_reserved(self.worker_env)
 
     @property
@@ -438,6 +446,7 @@ class JobSpec:
         data.pop("model_policy", None)
         data.pop("workload_profile_kind", None)
         data.pop("workload_profile_input_digest", None)
+        data.pop("workload_profile_producer_version", None)
         data.pop("workload_profile", None)
         train = data["train"]
         train.pop("init_from_adapter_revision", None)
@@ -578,6 +587,9 @@ class JobSpec:
             seed=parse_seed(data.get("seed", FIXED_SEED)),
             workload_profile_kind=str(data.get("workload_profile_kind") or ""),
             workload_profile_input_digest=str(data.get("workload_profile_input_digest") or ""),
+            workload_profile_producer_version=str(
+                data.get("workload_profile_producer_version") or ""
+            ),
             workload_profile=dict(data.get("workload_profile") or {}),
             project=project,
         )

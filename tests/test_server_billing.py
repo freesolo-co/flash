@@ -690,6 +690,7 @@ def _pending_profile(monkeypatch, *, profile_run_id: str, estimate_usd: float = 
             run_id=profile_run_id,
             workload_profile_kind="sft",
             workload_profile_input_digest="c" * 64,
+            workload_profile_producer_version="1.2.3",
         )
         raise runner.WorkloadProfilePending(
             profile_run_id,
