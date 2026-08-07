@@ -1,8 +1,8 @@
 """Pure GPU/perf/optimizer probes for the fine-tuning worker.
 
-The perf-backend + fla/tilelang/cudart fixup group stays IN THIS MODULE on purpose: tests
-monkeypatch ``perf._find_real_libcudart`` / ``perf._remove_fla_from_disk`` and the callers
-resolve them through the patched module globals. Do NOT move this group into a submodule.
+The fla/tilelang/cudart fixup group stays IN THIS MODULE on purpose: tests monkeypatch
+``perf._find_real_libcudart`` / ``perf._remove_fla_from_disk`` and the callers resolve them
+through the patched module globals. Do NOT move this group into a submodule.
 
 NOTE: ``tests/test_worker_stack.py`` reads THIS file as TEXT to assert the fla SHA /
 TILELANG_PIN stay in lockstep with WORKER_DEPS / Dockerfile.worker.
@@ -56,21 +56,6 @@ from flash.engine.worker.perf.memory import (
     grpo_use_reentrant,
     make_multimodal_input_require_grads_callback,
 )
-
-
-def setup_perf_backends() -> None:
-    """Enable TF32 matmul/cuDNN (no-op pre-Ampere)."""
-    try:
-        import torch
-
-        if not torch.cuda.is_available():
-            return
-        torch.set_float32_matmul_precision("high")
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        print("[perf] TF32 matmul/cuDNN enabled")
-    except Exception as e:
-        print("setup_perf_backends skipped:", e)
 
 
 def _remove_fla_from_disk() -> tuple[list[str], bool]:
@@ -485,6 +470,5 @@ __all__ = [
     "loraplus_optimizer_cls",
     "make_multimodal_input_require_grads_callback",
     "optimal_attn_impl",
-    "setup_perf_backends",
     "wait_for_gpu",
 ]
