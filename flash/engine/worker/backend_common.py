@@ -118,22 +118,28 @@ def _install_flash_attn(py: str) -> None:
             time.sleep(FLASH_ATTN_INSTALL_BACKOFF_S * (attempt + 1))
 
 
-def _install_causal_conv1d(py: str) -> None:
+def _install_causal_conv1d(py: str) -> bool:
     """Install the causal conv kernel that resets GDN conv state at packed example boundaries.
 
-    Best-effort, deliberately: unlike flash-attn this cannot fail the provisioning. Without it
-    ``gdn_reset_arch_from_caps`` answers None, the caller turns remove-padding off, and
-    the model trains on verl's padded path -- slower, but boundary-correct. Dying here instead would
-    turn a compiler hiccup into a dead paid run.
+    Best-effort, deliberately: unlike flash-attn this cannot fail the provisioning. Dying here would
+    turn a compiler hiccup into a dead paid run, and SFT still trains correctly without the kernel
+    (``_packing_mode`` pins gdn to one example per update, so there is nothing to contaminate).
+
+    Returns whether the kernel landed, because the caller must NOT stamp a venv that lacks it. GRPO
+    and OPD do pack, so ``require_gdn_boundary_resets`` raises for them without this kernel -- and a
+    stamped venv is reused verbatim by every later attempt on the same pod, which would turn one
+    transient build miss into a permanently unrunnable interpreter with no reinstall path.
 
     FORCE_BUILD is passed per-call rather than exported, so provisioning leaves no trace in the
     environment verl inherits.
     """
-    subprocess.run(
+    completed = subprocess.run(
         ["uv", "pip", "install", "--python", py, "--no-build-isolation", CAUSAL_CONV1D_REQUIREMENT],
         check=False,
         env={**os.environ, "CAUSAL_CONV1D_FORCE_BUILD": "TRUE"},
     )
+    # a fake subprocess.run in a test may return None; treat only an explicit nonzero as failure.
+    return getattr(completed, "returncode", 0) == 0
 
 
 def clamp_engine_len(engine_len: int, max_position_embeddings: int | None) -> int:
@@ -837,11 +843,25 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
         # verl's cuda path imports flash_attn.bert_padding unguarded with no sdpa fallback, so a venv
         # without it dies at the first training batch on a paid gpu rather than degrading.
         _install_flash_attn(py)
-        _install_causal_conv1d(py)
-        # written only after BOTH installs succeed, so a venv that died between them is unstamped
+        conv_installed = _install_causal_conv1d(py)
+        # written only after ALL installs succeed, so a venv that died between them is unstamped
         # and the next attempt rebuilds it rather than reusing a half-provisioned interpreter.
-        with open(stamp, "w") as f:
-            f.write(VERL_VENV_STAMP)
+        #
+        # the conv kernel is best-effort to INSTALL but not optional to RECORD. grpo and opd pack,
+        # so require_gdn_boundary_resets raises for a gdn model whose child lacks it; stamping a
+        # venv that missed the build would hand every later attempt on this pod the same broken
+        # interpreter, with the stamp asserting it is fully provisioned. leaving it unstamped costs
+        # one rebuild and gives the next attempt a real chance at the kernel.
+        if conv_installed:
+            with open(stamp, "w") as f:
+                f.write(VERL_VENV_STAMP)
+        else:
+            print(
+                f"[verl] {CAUSAL_CONV1D_REQUIREMENT} did not install; leaving the venv unstamped so "
+                "the next attempt rebuilds it rather than reusing an interpreter that cannot honor "
+                "gdn boundary resets",
+                flush=True,
+            )
         if install_wandb:
             # verl does not pull wandb; install it best-effort so logger setup can fall back to console.
             subprocess.run(["uv", "pip", "install", "--python", py, "wandb"], check=False)
