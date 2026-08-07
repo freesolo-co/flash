@@ -57,14 +57,20 @@ class _FakeGrpoProcess:
     but a grandchild holds the merged stdout pipe, so the stream ends while ``wait`` would block.
     """
 
-    def __init__(self, lines, *, wait_code, stale_return_code, never_exits=False):
+    def __init__(self, lines, *, wait_code, stale_return_code, never_exits=False, poll_code=None):
         self.stdout = iter(lines)
         self.pid = 424242
         self.returncode = stale_return_code
         self._wait_code = wait_code
         self._never_exits = never_exits
+        # what the watchdog thread sees. None keeps the child "running" so the watchdog never arms,
+        # which is what every test that is not about the watchdog wants.
+        self._poll_code = poll_code
         self.wait_calls = 0
         self.wait_timeouts: list[float | None] = []
+
+    def poll(self):
+        return self._poll_code
 
     # matches subprocess.Popen.wait; a stub that omitted `timeout` would make an unbounded wait
     # impossible to write a failing test for.
@@ -160,6 +166,47 @@ def test_grpo_wait_is_bounded_so_a_pipe_holding_grandchild_cannot_park_the_attem
     # the stub never collects, standing in for a member wedged in uninterruptible io. that is a
     # failure however it reads, so it must not surface as a success.
     assert return_code != 0
+
+
+def test_grpo_consumer_inside_one_long_step_is_not_read_as_a_stuck_reader(monkeypatch):
+    """This is a generator, so the consumer's work for a line runs while it is suspended at `yield`.
+
+    A grpo step -- generation, reward, an optimizer pass -- easily outlasts the orphaned-pipe grace.
+    Progress counted at the arrival of a line cannot advance during it, so the consumer looks
+    exactly like a reader blocked on a pipe nobody will close, and the group is torn down under a
+    run that is working (cursor). The child polls as exited here, which is the state that arms the
+    watchdog at all, so the only thing keeping the group alive is the in-flight line.
+    """
+    monkeypatch.setattr(rl_train, "_ORPHANED_PIPE_GRACE_S", 0.1)
+    terminated = []
+    # patch the binding the WATCHDOG resolves, which is backend_common's -- it calls the name from
+    # its own module, so patching rl_train's copy here would intercept nothing and the test would
+    # pass against the very defect it names.
+    monkeypatch.setattr(
+        backend_common,
+        "kill_process_group",
+        lambda proc, *, process_group_id: terminated.append((proc, process_group_id)),
+    )
+    proc = _FakeGrpoProcess(["step: 1\n"], wait_code=0, stale_return_code=0, poll_code=0)
+    stream = rl_train._GrpoSubprocessStream(proc)
+
+    consumed = []
+    for line in stream:
+        # one step several graces long, taken while suspended inside the generator. must also clear
+        # the watchdog's own 0.5s poll interval, or the arming it is meant to survive never happens.
+        time.sleep(1.5)
+        consumed.append(line)
+
+    assert consumed == ["step: 1\n"]
+    assert terminated == [], (
+        "the group was torn down while the consumer was working through a single long step"
+    )
+    assert not stream._orphaned_pipe, (
+        "the watchdog recorded a leaked pipe for a consumer that was working the whole time"
+    )
+    assert stream.wait_and_classify() == 0, (
+        "a successful grpo attempt was failed because one step outlasted the grace"
+    )
 
 
 def test_grpo_subprocess_stream_does_not_classify_a_zero_exit():
