@@ -301,7 +301,16 @@ def create_run(
                         # that never ran and every later submitter waits on it forever. this is
                         # right for a takeover too: the row it replaced was already spent, so
                         # dropping it returns the id to the plain claim-by-insert path.
-                        db.delete_run(profile_run_id)
+                        #
+                        # but submit_job persists the queued status BEFORE the steps that can still
+                        # raise (_report_status, and starting the background thread), so a failure
+                        # after that point leaves a real run under this id. deleting the claim then
+                        # is the worse wedge of the two: ownership answers 404 for the key that
+                        # launched it, while later submitters read a live queued/running record and
+                        # wait forever on a run nobody can reclaim. keep the claim whenever a run
+                        # record exists -- its lifecycle then ends the normal way.
+                        if not os.path.exists(runs_file_path(profile_run_id, ".json")):
+                            db.delete_run(profile_run_id)
                         raise
                     # set only after submit_job returns: a launch that raised deleted the row and
                     # charged nothing, so reporting it as launched would name a charge that was
