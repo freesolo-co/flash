@@ -352,7 +352,7 @@ _SKIP_TRACES = ""  # sentinel option value: scaffold the starter rows instead of
 
 def _require_setup_project(args) -> str:
     """Resolve and validate the one explicit project used by the whole scaffold."""
-    from flash.client import ApiError, ClientError, get_project, list_projects
+    from flash.client import ClientError, list_projects, resolve_project_id
     from flash.client.config import load_credentials
 
     _api_url, api_key = load_credentials()
@@ -361,20 +361,9 @@ def _require_setup_project(args) -> str:
             "not logged in. Run `flash login` before `flash env setup` so the project can be validated"
         )
 
-    def resolve_project(project_id: str) -> str:
-        try:
-            return str(get_project(project_id, api_key)["id"])
-        except ApiError as exc:
-            if exc.status not in {403, 404}:
-                raise
-            raise ClientError(
-                f"project {project_id!r} is not accessible; run `flash projects list` "
-                "and pass a project UUID from the current organization"
-            ) from exc
-
     supplied = str(getattr(args, "project", "") or "").strip()
     if supplied:
-        return resolve_project(supplied)
+        return resolve_project_id(supplied, api_key)
     if not _setup_interactive(args):
         raise ClientError(
             "--project PROJECT_UUID is required in noninteractive mode, with redirected stdin, or with --yes"
@@ -387,7 +376,7 @@ def _require_setup_project(args) -> str:
             "no Freesolo projects are available for this organization; create one with `flash projects create NAME`"
         )
     selected = render.select_required("Choose the Freesolo project for this environment", options)
-    return resolve_project(selected)
+    return resolve_project_id(selected, api_key)
 
 
 def _validate_existing_config_projects(project_id: str) -> None:
