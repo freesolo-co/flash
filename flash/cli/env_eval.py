@@ -485,7 +485,7 @@ def _require_accessible_project(project_id: object) -> str:
     site: a project that cannot be resolved is not a project to record against, whether it is
     malformed, deleted, or owned by another organization. Raises ClientError in every one of
     those cases, so the refusal happens before a single generation is bought."""
-    from flash.client import ApiError, ClientError, get_project
+    from flash.client import ClientError, resolve_project_id
     from flash.client.config import load_credentials
     from flash.spec import require_project_id
 
@@ -499,15 +499,7 @@ def _require_accessible_project(project_id: object) -> str:
         raise ClientError(
             "not logged in — run `flash login` with your freesolo API key (or set FREESOLO_API_KEY)"
         )
-    try:
-        return str(get_project(project_id, api_key)["id"])
-    except ApiError as exc:
-        if exc.status not in {403, 404}:
-            raise
-        raise ClientError(
-            f"project {project_id!r} is not accessible; run `flash projects list` "
-            "and pass a project UUID from the current organization"
-        ) from exc
+    return resolve_project_id(project_id, api_key)
 
 
 def _upload_report(

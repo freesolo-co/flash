@@ -23,6 +23,7 @@ from flash.envs.archive_policy import (
     archive_stream_limit,
     tar_member_segments,
 )
+from flash.envs.loader import _github_token
 
 _MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
@@ -164,16 +165,6 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
         raise EnvPublishError(f"env package is not a valid .tar.gz archive: {exc}") from exc
     except OSError as exc:
         raise EnvPublishError(f"env package could not be extracted: {exc}") from exc
-
-
-def _github_token() -> str | None:
-    """The GitHub token, or ``None`` when unset OR blank.
-
-    Blank collapses to ``None`` so the ``if not token`` guards below report a missing credential
-    instead of pushing a malformed one, and so ``_redact`` is never handed a whitespace needle it
-    would substitute across every space in the message.
-    """
-    return (os.environ.get("GITHUB_TOKEN") or "").strip() or None
 
 
 def _redact(value: str, token: str) -> str:
@@ -374,7 +365,7 @@ def _github_publish(dest: Path, *, name: str, key: dict) -> str:
     token = _github_token()
     if not token:
         raise EnvPublishError(
-            "GITHUB_TOKEN is required to upload environments to Freesolo",
+            "GITHUB_TOKEN is required for the Flash control plane to publish environments",
             status=503,
         )
     repo = _DEFAULT_GITHUB_REPO
@@ -579,17 +570,32 @@ def _github_download(slug: str, *, token: str) -> bytes:
     return _github_download_once(repo=_DEFAULT_GITHUB_REPO, token=token, publish_root=slug)
 
 
-def download_package(*, slug: str, key: dict) -> bytes:
-    """Return a tar.gz package for a published environment from the GitHub hub."""
+def _authorized_hub_request(slug: str, key: dict, *, action: str) -> tuple[str, str]:
+    """Resolve one hub operation's target and credential, or refuse it.
+
+    Every hub operation asks the same two questions in the same order -- is this key allowed to touch
+    this namespace, and does the control plane have a hub credential at all -- and they must stay in
+    that order: a caller with no access should be told so whether or not the server happens to be
+    configured. Returns the canonical ``namespace/name`` and the token.
+    """
     namespace, name = _validate_slug(slug)
     canonical = f"{namespace}/{name}"
-    _require_namespace_access(canonical, key, action="download")
+    _require_namespace_access(canonical, key, action=action)
     token = _github_token()
     if not token:
+        # both halves are load-bearing and each has a test: GITHUB_TOKEN names the variable to set,
+        # and "control plane" says whose it is -- this is a 503 because the SERVER is unconfigured,
+        # not a 4xx telling the caller to supply a credential of their own.
         raise EnvPublishError(
-            "Flash control plane is missing its GitHub environment-hub credential",
+            f"GITHUB_TOKEN is required for the Flash control plane to {action} environments",
             status=503,
         )
+    return canonical, token
+
+
+def download_package(*, slug: str, key: dict) -> bytes:
+    """Return a tar.gz package for a published environment from the GitHub hub."""
+    canonical, token = _authorized_hub_request(slug, key, action="download")
     return _github_download(canonical, token=token)
 
 
@@ -699,13 +705,5 @@ def delete_package(*, slug: str, key: dict) -> bool:
     only environments in its own org-slug namespace, while the internal service key
     (``auth_kind == "internal"``) may delete any environment.
     """
-    namespace, name = _validate_slug(slug)
-    canonical = f"{namespace}/{name}"
-    _require_namespace_access(canonical, key, action="delete")
-    token = _github_token()
-    if not token:
-        raise EnvPublishError(
-            "GITHUB_TOKEN is required to delete environments from Freesolo",
-            status=503,
-        )
+    canonical, token = _authorized_hub_request(slug, key, action="delete")
     return _github_delete(canonical, token=token)

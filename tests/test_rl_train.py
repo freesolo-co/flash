@@ -28,7 +28,7 @@ import numpy as np
 import pytest
 
 import flash.engine.worker as W
-from flash.engine.worker import backend_common, rl, rl_train, sft_train
+from flash.engine.worker import backend_common, rl, rl_train, sft_train, verl_shims
 from flash.engine.worker.heartbeat import RewardObservabilityBuffer
 
 
@@ -2432,7 +2432,7 @@ def test_entropy_quantile_shim_is_emitted_only_when_masking_is_requested():
     # trl thresholds at 1 - top_entropy_quantile: keeping the top 20% means cutting at the 0.8
     # quantile. carrying the flash value through unconverted would keep the BOTTOM 20% instead.
     assert "_flash_entropy_threshold_q = 0.8" in source
-    assert rl_train._ENTROPY_QUANTILE_MARKER in source
+    assert verl_shims._ENTROPY_QUANTILE_MARKER in source
 
 
 def test_entropy_quantile_shim_refuses_to_wrap_itself_twice():
@@ -2481,7 +2481,7 @@ def test_stop_sequences_shim_is_emitted_only_when_stop_strings_are_requested():
     # the exact list must survive into the child verbatim, escaping included -- a mangled delimiter
     # would silently never fire and the run would look normal.
     assert "_flash_stop_sequences = ['</answer>', '\\n\\nQ:']" in source
-    assert rl_train._STOP_SEQUENCES_MARKER in source
+    assert verl_shims._STOP_SEQUENCES_MARKER in source
 
 
 def test_stop_sequences_shim_patches_the_per_sample_params_not_the_config():
@@ -2507,7 +2507,7 @@ def test_image_pad_ban_shim_is_emitted_only_on_a_multimodal_job():
     source = rl_train.render_image_pad_ban_shim(151655)
     assert source
     assert "151655" in source
-    assert rl_train._IMAGE_PAD_BAN_MARKER in source
+    assert verl_shims._IMAGE_PAD_BAN_MARKER in source
     # -100.0 matches the bias trl applies through generation_kwargs (rl.py), so the two backends
     # suppress the token equally hard rather than one of them merely discouraging it.
     assert "logit_bias[_flash_image_pad_token_id] = -100.0" in source
@@ -2694,7 +2694,7 @@ def test_exact_save_steps_shim_is_emitted_only_when_exact_saves_are_requested():
     assert rl_train.render_exact_save_steps_shim((), 20) == ""
     source = rl_train.render_exact_save_steps_shim((7, 13), 20)
     assert source
-    assert rl_train._EXACT_SAVE_STEPS_MARKER in source
+    assert verl_shims._EXACT_SAVE_STEPS_MARKER in source
 
 
 def test_exact_save_steps_shim_keeps_required_steps_and_the_final_step():
@@ -2722,7 +2722,7 @@ def test_structured_outputs_shim_is_emitted_only_when_a_constraint_is_requested(
     source = rl_train.render_structured_outputs_shim(spec)
     assert source
     assert repr(spec) in source
-    assert rl_train._STRUCTURED_OUTPUTS_MARKER in source
+    assert verl_shims._STRUCTURED_OUTPUTS_MARKER in source
 
 
 def test_structured_outputs_shim_wraps_the_spec_rather_than_passing_a_raw_dict():
@@ -2794,7 +2794,7 @@ def test_kl_ref_adapter_shim_is_emitted_only_for_a_warm_start():
     assert rl_train.render_kl_ref_adapter_shim(False) == ""
     source = rl_train.render_kl_ref_adapter_shim(True)
     assert source
-    assert rl_train._KL_REF_ADAPTER_MARKER in source
+    assert verl_shims._KL_REF_ADAPTER_MARKER in source
 
 
 def test_kl_ref_adapter_shim_is_wired_only_when_warm_start_and_kl_are_both_on():
