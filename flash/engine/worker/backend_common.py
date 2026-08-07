@@ -21,9 +21,12 @@ import re
 import shutil
 import signal
 import subprocess
+import threading
 import time
+import weakref
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import thread as _thread_module
 from http.server import ThreadingHTTPServer
 
 from flash.diagnostics import sanitize_diagnostic
@@ -192,6 +195,49 @@ def agent_loop_workers(rollout_batch: int, *, cap: int = 8) -> int:
 _BRIDGE_WORKER_THREADS = 16
 
 
+class _DaemonBridgeThreadPool(ThreadPoolExecutor):
+    """A ``ThreadPoolExecutor`` whose workers cannot hold the interpreter open.
+
+    The stock executor registers every worker in ``concurrent.futures.thread._threads_queues``,
+    which an interpreter-exit hook joins. ``shutdown(wait=False, cancel_futures=True)`` does not
+    change that: cancelling drops only the QUEUED futures, and a handler already running keeps its
+    thread alive, so exit blocks on it. Measured: a 30-second handler delays exit by the full 30
+    seconds even after ``shutdown(wait=False)`` returns.
+
+    That is the opposite of what a bridge needs. A hung environment reward or teacher callback must
+    not stop the worker from publishing its terminal result and releasing a paid GPU -- and it is
+    also the property the old daemon ``ThreadingHTTPServer`` had before requests moved onto a pool.
+
+    So: start the workers as daemons and skip the exit-hook registration. Only the thread creation
+    differs from the stdlib; queueing, idle reuse, and shutdown are inherited unchanged.
+    """
+
+    def _adjust_thread_count(self) -> None:
+        if self._idle_semaphore.acquire(timeout=0):
+            return
+
+        def weakref_cb(_, q=self._work_queue):
+            q.put(None)
+
+        num_threads = len(self._threads)
+        if num_threads < self._max_workers:
+            thread = threading.Thread(
+                name=f"{self._thread_name_prefix or self}_{num_threads}",
+                target=_thread_module._worker,
+                args=(
+                    weakref.ref(self, weakref_cb),
+                    self._work_queue,
+                    self._initializer,
+                    self._initargs,
+                ),
+                daemon=True,
+            )
+            thread.start()
+            self._threads.add(thread)
+            # deliberately NOT added to _thread_module._threads_queues: that mapping is exactly
+            # what the interpreter-exit hook walks to join workers.
+
+
 class BoundedThreadingHTTPServer(ThreadingHTTPServer):
     """an http server that serves requests from a fixed thread pool instead of one thread each.
 
@@ -212,13 +258,16 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
     """
 
     # daemon threads so a stuck handler can never keep the worker process alive at shutdown.
+    # `daemon_threads` is a ThreadingMixIn flag, read only by the `process_request` this class
+    # overrides, so it does nothing here on its own -- _DaemonBridgeThreadPool below is what
+    # actually delivers the property it names.
     daemon_threads = True
 
     # measured: at the socketserver default of 5, 13 of 64 simultaneous callers were reset by peer.
     request_queue_size = 128
 
     def __init__(self, *args, worker_threads: int = _BRIDGE_WORKER_THREADS, **kwargs):
-        self._bridge_pool = ThreadPoolExecutor(
+        self._bridge_pool = _DaemonBridgeThreadPool(
             max_workers=worker_threads, thread_name_prefix="flash-bridge"
         )
         super().__init__(*args, **kwargs)
