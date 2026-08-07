@@ -947,9 +947,10 @@ def test_the_verl_venv_gets_the_gdn_kernels(monkeypatch, tmp_path):
 
 
 def test_causal_conv1d_install_is_best_effort_and_leaves_no_env_residue(monkeypatch):
-    # best-effort on purpose: without the kernel the boundary gate answers False and the run trains
-    # padded, so failing the provisioning would turn a compiler hiccup into a dead paid run. and the
-    # build flag must not leak into the environment verl inherits from this process.
+    # best-effort on purpose: failing the provisioning would turn a compiler hiccup into a dead paid
+    # run, and sft is fine without the kernel (one example per update, so nothing to contaminate).
+    # the OUTCOME is not optional though -- see the stamp tests below, since grpo/opd raise without
+    # it. and the build flag must not leak into the environment verl inherits from this process.
     seen = {}
 
     def fake_run(command, check, env=None):
@@ -961,7 +962,7 @@ def test_causal_conv1d_install_is_best_effort_and_leaves_no_env_residue(monkeypa
     vc._install_causal_conv1d("/venv/bin/python")
 
     assert vc.CAUSAL_CONV1D_REQUIREMENT in seen["command"]
-    assert seen["check"] is False, "a failed conv build must degrade to padded, not kill the run"
+    assert seen["check"] is False, "a failed conv build must not kill provisioning"
     # compiles against the venv's torch, so build isolation would resolve a different one.
     assert "--no-build-isolation" in seen["command"]
     assert seen["env"]["CAUSAL_CONV1D_FORCE_BUILD"] == "TRUE"
