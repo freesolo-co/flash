@@ -4178,25 +4178,38 @@ def test_the_child_puts_no_deadline_or_retry_on_a_generation_call():
     # doubles the load on an engine that is already struggling.
     from flash.engine.worker import grpo_multiturn
 
-    body = " ".join(inspect.getsource(grpo_multiturn).split())
+    source = inspect.getsource(grpo_multiturn)
     # checked before the anchor below, because the usual way to add a deadline is to wrap the call
     # -- which moves the anchor and would otherwise report as "the call vanished".
-    assert "asyncio.wait_for" not in body, (
+    assert "asyncio.wait_for" not in " ".join(source.split()), (
         "a deadline wrapper is back around generation; without an abort primitive the timed-out "
         "request keeps running, so TRAINING.md's request-policy paragraph must be rewritten"
     )
-    assert "generated = await self.server_manager.generate(" in body, (
+    # the kwargs come from the parsed call, not from slicing the text. the first argument is
+    # `request_id=uuid4().hex`, so any scan that stops at the first ")" stops inside `uuid4(` and
+    # never reaches the later kwargs -- which is exactly where a timeout would be added.
+    calls = [
+        node
+        for node in ast.walk(ast.parse(textwrap.dedent(source)))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "generate"
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "server_manager"
+    ]
+    assert calls, (
         "the generation call moved; re-point this guard so a deadline cannot slip in unnoticed"
     )
-    call = body.split("generated = await self.server_manager.generate(")[1].split(")")[0]
-    assert "timeout" not in call, (
-        "a per-request timeout is back on the generation call; TRAINING.md's request-policy "
-        "paragraph says there is none and has to be rewritten alongside it"
-    )
-    assert "deadline" not in call, (
-        "a per-request deadline is back on the generation call; TRAINING.md's request-policy "
-        "paragraph says there is none and has to be rewritten alongside it"
-    )
+    for call in calls:
+        names = {kw.arg for kw in call.keywords if kw.arg}
+        assert "timeout" not in names, (
+            "a per-request timeout is back on the generation call; TRAINING.md's request-policy "
+            "paragraph says there is none and has to be rewritten alongside it"
+        )
+        assert "deadline" not in names, (
+            "a per-request deadline is back on the generation call; TRAINING.md's request-policy "
+            "paragraph says there is none and has to be rewritten alongside it"
+        )
 
 
 def test_the_parent_sends_the_per_turn_cap_from_the_configured_completion_budget():
