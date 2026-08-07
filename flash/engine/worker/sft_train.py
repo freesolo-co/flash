@@ -550,6 +550,9 @@ class _VerlCheckpointWatcher:
     ) -> None:
         self.local_dir = local_dir
         self.export_root = export_root
+        # sibling of export_root so it shares its filesystem: _staged_source hardlinks into it, and
+        # os.link cannot cross a mount. holds one step at a time and is cleaned up after each publish.
+        self.staging_root = os.path.join(export_root, "_staging")
         self.python_bin = python_bin
         self.model_id = model_id
         self.model_revision = model_revision
@@ -591,10 +594,58 @@ class _VerlCheckpointWatcher:
     def _should_publish(self, step: int) -> bool:
         return not self.required_steps or step in self.required_steps
 
+    def _staged_source(self, step: int, checkpoint_dir: str) -> str:
+        """Pin a completed checkpoint against verl's retention before the slow work reads it.
+
+        This watcher publishes on its own thread, so the merge and the multi-GB upload below both
+        overlap training. verl owns `local_dir` and prunes it from the CHILD process: under
+        `trainer.max_ckpt_to_keep=1`, `register_checkpoint` calls `shutil.rmtree` on global_step_N as
+        soon as N+1 finishes saving. Nothing the parent sets can pin a directory across that, so a
+        required save still exporting or uploading when the next save lands reads a tree being
+        deleted underneath it, and an otherwise successful paid run fails its required save. Close
+        `save_at_steps` (say `[2, 3]`) make that likely rather than theoretical.
+
+        HARDLINKS, not a copy and not a rename:
+        - a copy of tens of GB is itself slow enough to lose the same race it is meant to close.
+        - a rename would win the race but break in-pod resume: verl resolves
+          `latest_checkpointed_iteration.txt` to `global_step_N` (`find_latest_ckpt_path`), so moving
+          the directory leaves the tracker pointing at nothing if the pod is preempted afterwards.
+
+        Linking is O(1) per file and leaves the original in place, so verl's retention and resume see
+        exactly what they saw before while the link keeps the DATA alive for as long as this watcher
+        needs it. A pruned original just drops its own reference; the inode survives.
+
+        Best-effort by design: any failure returns the original path, which is the previous
+        (race-exposed) behaviour. Degrading beats failing a run that would otherwise complete.
+        """
+        staged = os.path.join(self.staging_root, f"global_step_{step}")
+        try:
+            shutil.rmtree(staged, ignore_errors=True)
+            shutil.copytree(checkpoint_dir, staged, copy_function=os.link)
+        except OSError as error:
+            print(
+                f"[ckpt] step {step} could not be staged out of verl's retention tree "
+                f"({error}); publishing from verl's copy",
+                flush=True,
+            )
+            shutil.rmtree(staged, ignore_errors=True)
+            return checkpoint_dir
+        return staged
+
     def _publish(self, step: int, checkpoint_dir: str) -> None:
         if not self._should_publish(step):
             self.processed_steps.add(step)
             return
+        staged_dir = self._staged_source(step, checkpoint_dir)
+        try:
+            self._publish_from(step, staged_dir)
+        finally:
+            if staged_dir != checkpoint_dir:
+                # the links have served their purpose once the upload returns; the originals and the
+                # exported adapter are untouched by this.
+                shutil.rmtree(staged_dir, ignore_errors=True)
+
+    def _publish_from(self, step: int, checkpoint_dir: str) -> None:
         actor_dir = resolve_checkpoint_actor_dir(checkpoint_dir)
         adapter_dir = os.path.join(self.export_root, f"step-{step}")
         _export_checkpoint_adapter(
