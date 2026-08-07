@@ -138,6 +138,13 @@ DATA_SOURCE = "flash_env"
 _MULTI_TURN_SCORE_BATCH_SIZE = 64
 _MULTI_TURN_SCORE_FLUSH_WAIT_S = 0.1
 _MULTI_TURN_SCORE_SHUTDOWN_WAIT_S = 5.0
+# how long a bridge session may go untouched before it is treated as abandoned. a ray rollout actor
+# that dies between `/multiturn/start` and its `finally` `/multiturn/close` leaves an entry nobody
+# will ever remove, so repeated actor restarts retain every dead episode's env state and transcript
+# for the rest of the worker's life (codex[bot]). generously sized against a LIVE session's quietest
+# interval -- one turn is a full generate plus an env reply -- because reaping a live episode would
+# fail a working rollout, while reaping a dead one late merely holds memory a little longer.
+_MULTI_TURN_SESSION_LEASE_S = 1800.0
 _SINGLE_TURN_SCORE_BATCH_SIZE = 64
 _SINGLE_TURN_SCORE_FLUSH_WAIT_S = 0.1
 _SINGLE_TURN_SCORE_SHUTDOWN_WAIT_S = 5.0
@@ -1440,6 +1447,7 @@ class MultiTurnBridge:
         on_episode_scored: Callable[[object, object, float], None] | None = None,
         score_batch_size: int = _MULTI_TURN_SCORE_BATCH_SIZE,
         score_flush_wait_s: float = _MULTI_TURN_SCORE_FLUSH_WAIT_S,
+        session_lease_s: float = _MULTI_TURN_SESSION_LEASE_S,
     ) -> None:
         if len(env_prompts) != len(examples):
             raise ValueError("multi-turn env prompts must align one-to-one with examples")
@@ -1453,6 +1461,7 @@ class MultiTurnBridge:
         # every stateful episode touch below happens under this lock.
         self._lock = threading.Lock()
         self._sessions: dict[str, dict] = {}
+        self._session_lease_s = float(session_lease_s)
         # episode scoring still happens under that lock, but ONE call now covers many episodes.
         # scoring is the one env call that is both batchable and expensive (a judge round-trip),
         # and score_rollouts hands a whole batch to `score_episodes`, which the env runs at its own
@@ -1487,7 +1496,24 @@ class MultiTurnBridge:
         session = self._sessions.get(session_id)
         if session is None:
             raise KeyError(f"unknown multi-turn session {session_id}")
+        # every touch renews the lease, so only a session nobody is driving can ever age out. all
+        # callers already hold the lock.
+        session["touched_at"] = time.monotonic()
         return session
+
+    def _reap_abandoned_sessions(self) -> list[str]:
+        """Drop sessions whose owner stopped driving them. Caller holds the lock.
+
+        `monotonic` rather than wall time: a clock step must not expire a live episode, nor keep a
+        dead one alive.
+        """
+        if self._session_lease_s <= 0:
+            return []
+        cutoff = time.monotonic() - self._session_lease_s
+        stale = [sid for sid, s in self._sessions.items() if s.get("touched_at", 0.0) <= cutoff]
+        for session_id in stale:
+            self._sessions.pop(session_id, None)
+        return stale
 
     def start(self, payload: dict) -> dict:
         index = int(payload["index"])
@@ -1498,6 +1524,10 @@ class MultiTurnBridge:
         session_id = str(payload["session_id"])
         example = self._examples[index]
         with self._lock:
+            # swept here rather than on a timer thread: a session is only ever abandoned by an
+            # actor that stopped calling, and the actors that replace it announce themselves
+            # exactly here. no extra thread, and nothing to shut down.
+            reaped = self._reap_abandoned_sessions()
             if session_id in self._sessions:
                 raise KeyError(f"duplicate multi-turn session {session_id}")
             state = self._env.new_rollout_state(example)
@@ -1510,7 +1540,19 @@ class MultiTurnBridge:
             env_prompt = [dict(message) for message in self._env_prompts[index]]
             state["prompt"] = env_prompt
             state["messages"] = [dict(message) for message in env_prompt]
-            self._sessions[session_id] = {"example": example, "state": state}
+            self._sessions[session_id] = {
+                "example": example,
+                "state": state,
+                "touched_at": time.monotonic(),
+            }
+        if reaped:
+            # loud, because it means rollout actors are dying mid-episode. the leak it prevents is
+            # silent, so the reap must not be.
+            print(
+                f"[rl-verl] reaped {len(reaped)} abandoned multi-turn session(s) after "
+                f"{self._session_lease_s:.0f}s idle: {', '.join(sorted(reaped))}",
+                flush=True,
+            )
         # the per-example budget wins over the batch-wide cap, same precedence as rollout_done.
         episode_turns = state.get("max_episode_turns")
         turns = self._max_turns if episode_turns is None else int(episode_turns)

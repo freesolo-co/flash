@@ -121,6 +121,38 @@ def _uses_vllm_mistral_tokenizer(repo_files: tuple[str, ...]) -> bool:
     return any(_MISTRAL_TOKENIZER_FILE.search(path) is not None for path in repo_files)
 
 
+def _require_non_mistral_tokenizer(repo_files: tuple[str, ...]) -> None:
+    if _uses_vllm_mistral_tokenizer(repo_files):
+        raise ValueError(
+            "structured OPD does not support vLLM MistralTokenizer models; exact replay parity is "
+            "only proven for the non-Mistral xgrammar tokenizer path"
+        )
+
+
+def preflight_opd_structured_outputs(
+    structured_outputs: str | None,
+    *,
+    model_id: str,
+    model_revision: str = "",
+) -> None:
+    """Reject the structured-OPD inputs that need no allocation to judge.
+
+    Split out of the full validation below so submission can run it: both of these are decided by
+    the constraint and the model id alone, and both reject the run permanently, so leaving them to
+    the worker charged the user for a gpu to learn the job could never have run (codex[bot]).
+
+    Deliberately NOT the whole validation. The vocab-size comparison depends on the allocated card
+    count, and applying it here -- before the allocator has placed the run -- would re-raise "does
+    not fit" for a shardable shape submission legitimately accepted.
+    """
+    constraint = parse_structured_outputs(structured_outputs)
+    if constraint is None:
+        return
+    _require_exact_replay_constraint(constraint)
+    _, repo_files = _resolve_structured_model_metadata(model_id, model_revision)
+    _require_non_mistral_tokenizer(repo_files)
+
+
 def validate_opd_structured_outputs(
     structured_outputs: str | None,
     *,
@@ -152,11 +184,7 @@ def validate_opd_structured_outputs(
         )
     compiler_vocab_size = int(compiler_vocab_size)
     actual_vocab_size, repo_files = _resolve_structured_model_metadata(model_id, model_revision)
-    if _uses_vllm_mistral_tokenizer(repo_files):
-        raise ValueError(
-            "structured OPD does not support vLLM MistralTokenizer models; exact replay parity is "
-            "only proven for the non-Mistral xgrammar tokenizer path"
-        )
+    _require_non_mistral_tokenizer(repo_files)
     if actual_vocab_size <= 0 or compiler_vocab_size != actual_vocab_size:
         raise ValueError(
             "structured OPD model vocabulary size does not match the xgrammar compiler vocabulary"
