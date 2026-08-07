@@ -58,6 +58,7 @@ from flash.engine.worker.backend_common import (
     agent_loop_workers,
     append_step_metrics,
     clamp_engine_len,
+    completed_checkpoint_step,
     export_peft_adapter,
     gdn_probe_module,
     gdn_reset_arch_from_caps,
@@ -83,6 +84,7 @@ from flash.engine.worker.backend_common import (
     stage_verl_resume,
     stamp_adapter_dir_provenance,
     trainer_dtype_overrides,
+    unprocessed_checkpoint_dirs,
     verl_declares_rollout_field,
     verl_device_capability,
 )
@@ -2584,28 +2586,10 @@ class _VerlResumeUploader:
             return False
 
     def _completed_step(self) -> int:
-        tracker = os.path.join(self.local_dir, "latest_checkpointed_iteration.txt")
-        try:
-            with open(tracker) as file:
-                return int(file.read().strip())
-        except (FileNotFoundError, OSError, ValueError):
-            return 0
+        return completed_checkpoint_step(self.local_dir)
 
     def _pending(self, completed_step: int) -> list[tuple[int, str]]:
-        found: list[tuple[int, str]] = []
-        try:
-            names = os.listdir(self.local_dir)
-        except OSError:
-            return found
-        for name in names:
-            match = re.fullmatch(r"global_step_(\d+)", name)
-            if match is None:
-                continue
-            step = int(match.group(1))
-            path = os.path.join(self.local_dir, name)
-            if step <= completed_step and step not in self.processed_steps and os.path.isdir(path):
-                found.append((step, path))
-        return sorted(found)
+        return unprocessed_checkpoint_dirs(self.local_dir, completed_step, self.processed_steps)
 
     def _stage_deployable(self, step: int, checkpoint_dir: str) -> str:
         """export a required step's checkpoint into a servable adapter under export_root.
