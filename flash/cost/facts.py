@@ -49,9 +49,11 @@ _DEFAULT_TFLOPS = 100.0
 # part do not (the 4090 dropped nvlink entirely). anything absent is treated as pcie, which is the
 # conservative side: it under-credits a combination rather than ranking it on bandwidth it lacks.
 #
-# classify by the board a MULTI-CARD run actually lands on. multi-card provisioning is runpod-only
-# (vast and lambda have no gpu_count path), so what matters per class is runpod's pin, not the
-# cheapest board the class can serve a single-gpu run on.
+# classify by the board a MULTI-CARD run actually lands on, which is runpod's pin -- not the
+# cheapest board the class can serve a single-gpu run on. vast also searches multi-card now (it
+# iterates rentable_gpu_counts with num_gpus=count), and it sells the class as a market rather than
+# a pinned board, so membership here is NOT sufficient for a vast combination: see
+# _PCIE_AMBIGUOUS_PROVIDERS below. lambda still has no gpu_count path.
 _NVLINK_CLASSES: frozenset[str] = frozenset(
     {
         # MEASURED: 2x A100-SXM4-80GB on RunPod reached 1.7675x (see MULTI_CARD_SCALING_NVLINK).
@@ -72,18 +74,36 @@ _NVLINK_CLASSES: frozenset[str] = frozenset(
 )
 
 
+# providers that sell a canonical class as a market rather than a pinned board, so an nvlink
+# class membership cannot be trusted for a multi-card combination there. vast lists pcie parts under
+# aliases that normalize into nvlink-classed entries and its offers carry no interconnect field.
+# runpod is absent because it pins an exact gpu id per class; lambda is absent because it has no
+# multi-card path at all, so no scaling question arises.
+_PCIE_AMBIGUOUS_PROVIDERS: frozenset[str] = frozenset({"vast"})
+
+
 def gpu_tflops(name: str) -> float:
     """Peak bf16 tensor TFLOPS for a managed GPU class."""
     return GPU_COMPUTE_TFLOPS.get(name, _DEFAULT_TFLOPS)
 
 
-def has_nvlink(name: str) -> bool:
+def has_nvlink(name: str, provider: str = "") -> bool:
     """Whether cards of class ``name`` are interconnected by nvlink rather than pcie.
 
     Unknown classes report False: a class nobody has classified is far more likely to be a pcie
     board than an sxm one, and guessing wrong in that direction only under-credits scaling.
+
+    ``provider`` narrows the same way. Membership in ``_NVLINK_CLASSES`` is justified by RunPod's
+    pin, which names one board; vast sells a whole market under the same canonical class, including
+    the explicit pcie aliases (``H100 PCIE`` -> H100, ``A100 PCIE`` -> A100 SXM 40GB). A vast
+    multi-card combination can therefore land on pcie boards while the class says nvlink, and the
+    offer carries no topology to distinguish them. Report pcie for those, which under-credits a
+    genuine sxm host rather than pricing a pcie one on bandwidth it does not have -- the direction
+    the scaling constants themselves are chosen for.
     """
-    return name in _NVLINK_CLASSES
+    if name not in _NVLINK_CLASSES:
+        return False
+    return provider.strip().lower() not in _PCIE_AMBIGUOUS_PROVIDERS
 
 
 # realized TRAINING throughput sits well below peak when a class's training kernels don't reach it.
