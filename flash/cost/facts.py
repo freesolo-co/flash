@@ -257,8 +257,8 @@ def total_params_b(model_id: str, revision: str = "") -> float:
     made an authorized open-model run unsubmittable (it failed at quoting, after parsing and
     authorizing). ``resolve_params_b`` is the single source of truth VRAM sizing already uses for
     exactly this question; using it here is what stops cost and sizing from disagreeing about how
-    big a model is. It raises on its own when HF cannot answer, which keeps the quote fail-closed
-    rather than silently pricing an unknown model as free.
+    big a model is. Unsizeable by both raises, keeping the quote fail-closed rather than silently
+    pricing an unknown model as free.
     """
     info = MODELS.get(model_id)
     if info is not None and info.params_b > 0 and not revision:
@@ -279,8 +279,14 @@ def total_params_b(model_id: str, revision: str = "") -> float:
 # _is_moe asking twice per call). For a catalog model those are dict reads; for an open-policy model
 # each one would be an HF round trip, turning a submit into ~30 sequential network calls and making
 # the estimate hostage to hub latency. Memoized per process: a model id and revision name immutable
-# weights, so a SUCCESSFUL answer cannot change under us. Not on `fetch_hf_params_b` itself, which
-# tests monkeypatch -- caching there would leak a stubbed size across tests.
+# weights, so a SUCCESSFUL answer cannot change under us.
+#
+# Not `functools.cache` on total_params_b: it keys on the literal argument tuple, so a caller that
+# omits `revision` and one that passes "" are two entries and the model gets fetched twice. Keying
+# the normalized pair here is also what lets the "only cache a hit" rule below be stated outright,
+# rather than resting on the unobvious stdlib detail that `cache` does not store exceptions.
+# Not on `fetch_hf_params_b` either, which tests monkeypatch -- caching there would leak a stubbed
+# size across tests.
 _SIZE_MEMO: dict[tuple[str, str], float] = {}
 
 
