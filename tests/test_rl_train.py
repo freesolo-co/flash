@@ -51,15 +51,33 @@ def test_run_rl_always_delegates_to_verl(monkeypatch, stale):
 
 
 class _FakeGrpoProcess:
-    def __init__(self, lines, *, wait_code, stale_return_code):
+    """Stand-in for the verl Popen.
+
+    ``never_exits`` models the real hazard the bounded wait exists for: the direct child is gone
+    but a grandchild holds the merged stdout pipe, so the stream ends while ``wait`` would block.
+    """
+
+    def __init__(self, lines, *, wait_code, stale_return_code, never_exits=False):
         self.stdout = iter(lines)
         self.pid = 424242
         self.returncode = stale_return_code
         self._wait_code = wait_code
+        self._never_exits = never_exits
         self.wait_calls = 0
+        self.wait_timeouts: list[float | None] = []
 
-    def wait(self):
+    # matches subprocess.Popen.wait; a stub that omitted `timeout` would make an unbounded wait
+    # impossible to write a failing test for.
+    def wait(self, timeout=None):
         self.wait_calls += 1
+        self.wait_timeouts.append(timeout)
+        if self._never_exits:
+            if timeout is None:
+                raise AssertionError(
+                    "waited on the verl child with no timeout; a grandchild holding the merged "
+                    "stdout pipe parks the attempt on a paid gpu with nothing left to report"
+                )
+            raise subprocess.TimeoutExpired(cmd="verl", timeout=timeout)
         return self._wait_code
 
 
@@ -84,6 +102,64 @@ def test_grpo_subprocess_stream_classifies_the_recorded_nonzero_exit(monkeypatch
     assert "cudaErrorDevicesUnavailable" in str(exc_info.value)
     assert proc.wait_calls == 1
     assert terminated == [(proc, proc.pid)]
+
+
+def test_grpo_unclassified_nonzero_exit_still_tears_down_the_group(monkeypatch):
+    """The one failing path the classifier lets through must still reach teardown.
+
+    `raise_for_classified_verl_exit` RETURNS rather than raising when a nonzero exit carries no oom
+    evidence and no retriable signature, so this path reaches neither the except-clause teardown nor
+    the exception the caller would otherwise tear down on. the direct child is gone, but its group
+    need not be: a surviving EngineCore holds its cuda context and the next attempt on this worker
+    gets an occupied gpu.
+    """
+    terminated = []
+    monkeypatch.setattr(
+        rl_train,
+        "kill_process_group",
+        lambda proc, *, process_group_id: terminated.append((proc, process_group_id)),
+    )
+    # deliberately unclassifiable: no oom evidence, no retriable infra signature.
+    proc = _FakeGrpoProcess(["unrelated trainer failure\n"], wait_code=9, stale_return_code=0)
+    stream = rl_train._GrpoSubprocessStream(proc)
+
+    assert list(stream) == ["unrelated trainer failure\n"]
+    # returned, not raised: the status stays terminal and the caller still sees 9.
+    assert stream.wait_and_classify() == 9
+    assert terminated == [(proc, proc.pid)], (
+        "an unclassified nonzero exit left the process group alive; a surviving EngineCore strands "
+        "the gpu for every later attempt on this worker"
+    )
+
+
+def test_grpo_wait_is_bounded_so_a_pipe_holding_grandchild_cannot_park_the_attempt(monkeypatch):
+    """The stream ends on stdout EOF, which is not the direct child's exit.
+
+    verl spawns vllm's EngineCore as a grandchild that inherits the same merged pipe. the reverse
+    shape -- child dead, grandchild holding the pipe -- ends the iterator early; this one is a child
+    that outlives its own stdout, where an unbounded wait blocks forever on a paid gpu with nothing
+    left to report. the fake asserts on `timeout is None` directly, so an unbounded wait fails here
+    rather than hanging the suite.
+    """
+    terminated = []
+    monkeypatch.setattr(
+        rl_train,
+        "kill_process_group",
+        lambda proc, *, process_group_id: terminated.append((proc, process_group_id)),
+    )
+    proc = _FakeGrpoProcess(["step: 1\n"], wait_code=0, stale_return_code=None, never_exits=True)
+    stream = rl_train._GrpoSubprocessStream(proc)
+
+    assert list(stream) == ["step: 1\n"]
+    return_code = stream.wait_and_classify()
+
+    assert proc.wait_timeouts == [backend_common._TEARDOWN_GRACE_S], (
+        "the wait on the verl child must carry the teardown grace, not block indefinitely"
+    )
+    assert terminated == [(proc, proc.pid)], "a child that outlived its stdout was never torn down"
+    # the stub never collects, standing in for a member wedged in uninterruptible io. that is a
+    # failure however it reads, so it must not surface as a success.
+    assert return_code != 0
 
 
 def test_grpo_subprocess_stream_does_not_classify_a_zero_exit():

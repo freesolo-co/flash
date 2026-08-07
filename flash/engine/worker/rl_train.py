@@ -55,9 +55,12 @@ from flash.engine.structured_outputs import (
 )
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.backend_common import (
+    _ORPHANED_PIPE_GRACE_S,
+    _TEARDOWN_GRACE_S,
     VERL_REQUIREMENT,
     BoundedThreadingHTTPServer,
     ChildOutputTail,
+    _ChildExitWatchdog,
     adopt_orphaned_descendants,
     agent_loop_workers,
     append_step_metrics,
@@ -2460,12 +2463,25 @@ class _GrpoSubprocessStream:
         self._process_group_id = proc.pid
         self._tail = ChildOutputTail()
         self._terminated = False
+        self._orphaned_pipe = False
 
     def __iter__(self):
         assert self._proc.stdout is not None
-        for line in self._proc.stdout:
-            self._tail.record(line)
-            yield line
+        # the child's exit is watched independently of pipe EOF: verl's vllm EngineCore grandchild
+        # inherits this same pipe, so a trainer that dies while it lives leaves a pipe nobody will
+        # close and this loop would run forever on a paid gpu (PR #730 review). the watchdog tears
+        # the group down, which frees the cuda context AND closes the pipe, ending this loop.
+        with _ChildExitWatchdog(
+            self._proc, process_group_id=self._process_group_id, grace_s=_ORPHANED_PIPE_GRACE_S
+        ) as watchdog:
+            for line in self._proc.stdout:
+                watchdog.note_line()
+                self._tail.record(line)
+                yield line
+        if watchdog.tore_down:
+            self._orphaned_pipe = True
+            # the group is already gone, so teardown must not be attempted a second time.
+            self._terminated = True
 
     def terminate(self) -> None:
         if self._terminated:
@@ -2474,12 +2490,40 @@ class _GrpoSubprocessStream:
         self._terminated = True
 
     def wait_and_classify(self) -> int:
-        return_code = int(self._proc.wait())
+        # BOUNDED. the iterator above ends on stdout EOF, which is not the direct child's exit: verl
+        # spawns vllm's EngineCore as a grandchild holding this same merged pipe, so a trainer that
+        # dies while the EngineCore lives keeps the pipe open and an unbounded wait parks the
+        # attempt on a paid gpu. a child that has not exited within the grace after its own stdout
+        # closed is not going to, so tear the group down; `terminate` waits on it.
+        try:
+            return_code = int(self._proc.wait(timeout=_TEARDOWN_GRACE_S))
+        except subprocess.TimeoutExpired:
+            self.terminate()
+            # `terminate` waits, so the child is normally collected by now. it is still not
+            # guaranteed -- a member wedged in uninterruptible io outlives even the SIGKILL -- and a
+            # survivor is a failure however the exit reads, so an uncollected child is reported as
+            # one rather than defaulted to zero.
+            collected = self._proc.returncode
+            return_code = int(collected) if collected is not None else 1
         try:
             raise_for_classified_verl_exit(return_code, self._tail)
         except BaseException:
             self.terminate()
             raise
+        if return_code != 0:
+            # an unclassified nonzero exit RETURNS from the classifier rather than raising, so this
+            # is the failing path that reached no teardown. the direct child is gone but its group
+            # need not be, and a surviving EngineCore strands the gpu for the next attempt.
+            self.terminate()
+        if self._orphaned_pipe and return_code == 0:
+            # the trainer exited 0 but a descendant held the pipe open past the grace, so the group
+            # was killed to release it. the trainer's status says nothing about that descendant, and
+            # returning 0 here would publish a partial run as a completed one.
+            raise RuntimeError(
+                f"verl subprocess {self._proc.pid} exited 0 but a descendant held its output pipe "
+                f"open for {_ORPHANED_PIPE_GRACE_S:.0f}s; the process group was torn down to "
+                "release the gpu"
+            )
         return return_code
 
 
