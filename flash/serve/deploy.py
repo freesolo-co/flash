@@ -15,6 +15,7 @@ from urllib.parse import quote
 
 import httpx
 
+from flash._channel import CHANNEL
 from flash._logging import get_logger
 from flash.adapter_artifacts import ADAPTER_WEIGHT_FILES
 from flash.engine.structured_outputs import parse_structured_outputs
@@ -24,7 +25,28 @@ from flash.serve.urls import is_freesolo_hosted_url, openai_base_url, serving_co
 
 logger = get_logger(__name__)
 
-DEFAULT_FREESOLO_SERVING_URL = "https://serve.freesolo.co"
+PROD_FREESOLO_SERVING_URL = "https://serve.freesolo.co"
+DEV_FREESOLO_SERVING_URL = "https://serve-dev.freesolo.co"
+
+
+def default_serving_url(channel: str = CHANNEL) -> str:
+    """Default serving control root for the given release channel.
+
+    The serving plane is per-channel for the same reason the control plane is: each is backed by
+    its own Supabase project, and an org row exists in exactly one of them. `flash-dev` sending a
+    dev org_id to prod serving fails the prod `org_id` foreign key -- a 23503 no amount of retrying
+    or GPU warming can fix, because the row is in the other database.
+
+    This constant was the last hosted endpoint that did not derive from CHANNEL: `client.config`
+    has split prod/dev since the channel was introduced, so `flash-dev` talked to
+    `flash-dev.freesolo.co` for control and `serve.freesolo.co` for serving. freesolo #667 stood up
+    the isolated dev serving plane at `serve-dev.freesolo.co` (Modal env `dev`, dev Supabase,
+    `api-dev.freesolo.co`) and named this fallback as the defect; this is the flash half of it.
+    """
+    return DEV_FREESOLO_SERVING_URL if channel == "dev" else PROD_FREESOLO_SERVING_URL
+
+
+DEFAULT_FREESOLO_SERVING_URL = default_serving_url()
 READBACK_DELAY_SECONDS = 0.5
 READBACK_MAX_DELAY_SECONDS = 2.0
 REVISION_READY_BUDGET_SECONDS = 5 * 60.0
