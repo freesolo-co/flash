@@ -87,6 +87,37 @@ def _client_train_schema(payload: dict) -> dict | None:
     }
 
 
+def _schema_disagreement_detail(
+    exc: HTTPException, schema: dict | None, submitted_train: object
+) -> str | None:
+    """Explain a 400 as a client/server ``[train]`` schema disagreement, or ``None`` if it is not one.
+
+    A spec rejected for naming a key this server has never heard of is an out-of-date server, not a
+    malformed request, and the bare parse error would send the user hunting a typo that isn't there.
+    Only keys the CLIENT says it authored count: a key the client did not send cannot be the reason
+    its spec failed to parse.
+    """
+    if exc.status_code != 400 or not schema or not isinstance(submitted_train, dict):
+        return None
+    server_fields = train_schema_metadata()
+    unsupported = sorted(
+        name
+        for name in schema["authored_keys"]
+        if name in submitted_train and name not in server_fields
+    )
+    if not unsupported:
+        return None
+    declared = ", ".join(
+        f"{name} (minimum released Flash version {schema['fields'][name]})" for name in unsupported
+    )
+    client_only = ", ".join(schema["compatibility"]["client_only"]) or "none"
+    return (
+        f"{exc.detail}. Unsupported authored [train] key(s): {declared}; "
+        f"client/server [train] schemas disagree (client Flash {schema['version']}; "
+        f"client-only keys: {client_only})"
+    )
+
+
 def _precheck_budget_or_block(*, run_id: str, estimate_usd: float, org_id: str) -> bool:
     """Reject an unaffordable prepared run before recording or allocating it.
 
@@ -128,29 +159,10 @@ def create_run(
     try:
         spec = _parse_spec(payload, run_id=new_run_id())
     except HTTPException as exc:
-        server_fields = train_schema_metadata()
-        unsupported = (
-            sorted(
-                name
-                for name in schema["authored_keys"]
-                if name in submitted_train and name not in server_fields
-            )
-            if exc.status_code == 400 and schema and isinstance(submitted_train, dict)
-            else []
-        )
-        if unsupported:
-            declared = ", ".join(
-                f"{name} (minimum released Flash version {schema['fields'][name]})"
-                for name in unsupported
-            )
-            client_only = ", ".join(schema["compatibility"]["client_only"]) or "none"
-            detail = (
-                f"{exc.detail}. Unsupported authored [train] key(s): {declared}; "
-                f"client/server [train] schemas disagree (client Flash {schema['version']}; "
-                f"client-only keys: {client_only})"
-            )
-            raise HTTPException(status_code=400, detail=detail) from exc
-        raise
+        detail = _schema_disagreement_detail(exc, schema, submitted_train)
+        if detail is None:
+            raise
+        raise HTTPException(status_code=400, detail=detail) from exc
     from flash.server.projects import require_project_access
 
     project_id = require_project_access(
