@@ -563,6 +563,88 @@ def build_verl_overrides(cfg: dict) -> list[str]:
     return o
 
 
+_DEFAULT_GPU_MEM_UTIL = 0.5
+
+
+def resolve_gpu_mem_util(
+    inp: dict,
+    *,
+    gpu_type: str,
+    n_gpus: int,
+    fp8_kv: bool,
+    sleep_unsupported: bool,
+) -> float:
+    """vLLM's colocated executor budget, sized from this run's geometry rather than assumed.
+
+    ``gpu_memory_utilization`` is the WHOLE model-executor budget (vLLM's second bf16 weight copy
+    plus the KV pool), and ``colocate_kv_util`` computes exactly that from the model, card, context
+    and group size. It shipped unwired: the launch config carried a flat 0.5 while
+    ``estimate_vram_gb``'s admission check documented itself as mirroring the same 0.45/0.55 cap, so
+    the preflight admitted a run against one budget and the worker then requested a different one.
+    Sizing here is what makes the two agree.
+
+    The flat constant is kept for the shapes the model does NOT cover, because a wrong number is
+    worse than a conservative one:
+
+    - an UNKNOWN CARD (empty/unmanaged ``gpu.type``): the budget is a fraction of the card, so
+      without the card's size there is nothing to take a fraction of.
+    - MULTI-GPU (``n_gpus > 1``): the rollout runs tensor-parallel, so vLLM's weight copy is sharded
+      ACROSS cards while ``colocate_kv_util`` sizes one whole copy against one card. Handing it a
+      single-card number would over-reserve per rank on exactly the shapes that are already tight.
+    - an UNCATALOGED / pinned-revision model with no resolvable parameter count: the weight term is
+      the dominant one, so a guessed size is not worth acting on.
+    """
+    if n_gpus > 1 or not (gpu_type or "").strip():
+        return _DEFAULT_GPU_MEM_UTIL
+    try:
+        from flash.catalog import MODELS
+        from flash.engine.vram import colocate_kv_util, resolve_params_b
+        from flash.providers.base import get_gpu_info
+
+        total_vram_gb = float(get_gpu_info(gpu_type).vram_gb)
+        if total_vram_gb <= 0:
+            return _DEFAULT_GPU_MEM_UTIL
+        model_id = str(inp["model_id"])
+        revision = str(inp.get("model_revision") or "")
+        catalog_info = MODELS.get(model_id)
+        # a pinned revision is sized on generic architecture geometry, matching grpo_fits_resident:
+        # the commit's real geometry is not validated, so the curated kv/lora shape may not describe
+        # it. the parameter count still comes from the pinned config.
+        info = None if revision else catalog_info
+        # the ONE way the worker, the preflight and the cost estimator agree on a model's size:
+        # curated catalog params_b, else the real HF parameter count for an open-policy model.
+        # the catalog is consulted FIRST and answers locally, so the common path adds no network
+        # call to launch; resolve_params_b's HF lookup is reached only for an uncataloged or
+        # pinned-revision model, where the config for this same model was already fetched upstream
+        # (model_max_position_embeddings) and is warm in the hub cache.
+        params_b = float(
+            (getattr(catalog_info, "params_b", 0.0) or 0.0)
+            if (catalog_info is not None and not revision)
+            else (resolve_params_b(model_id, revision=revision) or 0.0)
+        )
+        if params_b <= 0:
+            return _DEFAULT_GPU_MEM_UTIL
+        return colocate_kv_util(
+            params_b,
+            int(inp["engine_len"]),
+            total_vram_gb,
+            # the engine stays RESIDENT for a model whose vLLM wake/reload hangs, and the sleep
+            # branch budgets a 1.5x larger pool on the grounds that the engine is offloaded during
+            # the backward. crediting an offload that never happens would size the pool against a
+            # peak the run does not have.
+            sleep_mode=not sleep_unsupported,
+            num_generations=int(inp["group_size"]),
+            active_params_b=float(getattr(info, "active_params_b", 0.0) or 0.0) or None,
+            fp8_kv=fp8_kv,
+            model_info=info,
+        )
+    except Exception as e:  # sizing must never be what stops a run from launching
+        print(
+            f"[rl-verl] gpu_memory_utilization sizing failed ({e}); using {_DEFAULT_GPU_MEM_UTIL}"
+        )
+        return _DEFAULT_GPU_MEM_UTIL
+
+
 def _build_verl_training_cfg(
     inp: dict,
     *,
@@ -579,10 +661,12 @@ def _build_verl_training_cfg(
     local_dir: str,
     project_name: str,
     experiment_name: str,
+    gpu_type: str = "",
     n_gpus: int = 1,
     use_remove_padding: bool = True,
 ) -> dict:
     engine_len = int(inp["engine_len"])
+    sleep_unsupported = rollout_sleep_unsupported(inp["model_id"])
     return {
         "use_remove_padding": use_remove_padding,
         "train_files": train_files,
@@ -620,14 +704,20 @@ def _build_verl_training_cfg(
         "ppo_epochs": inp["ppo_epochs"],
         "steps": int(inp["steps"]),
         "warmstart_adapter": inp["warmstart_adapter"],
-        "gpu_mem_util": 0.5,
+        "gpu_mem_util": resolve_gpu_mem_util(
+            inp,
+            gpu_type=gpu_type,
+            n_gpus=n_gpus,
+            fp8_kv=fp8_kv,
+            sleep_unsupported=sleep_unsupported,
+        ),
         "n_gpus": n_gpus,
         "loggers": loggers,
         "fp8_kv": fp8_kv,
         "enforce_eager": enforce_eager,
         "attention_backend": attention_backend,
         "mm_encoder_attn_backend": mm_encoder_attn_backend,
-        "sleep_unsupported": rollout_sleep_unsupported(inp["model_id"]),
+        "sleep_unsupported": sleep_unsupported,
         "reward_path": reward_path,
         "reward_name": "compute_score",
         "total_epochs": inp["verl_total_epochs"],
@@ -3438,9 +3528,17 @@ def run_rl_train():
             local_dir=local_dir,
             project_name=project_name,
             experiment_name=experiment_name,
+            gpu_type=(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else ""),
             n_gpus=gpu_count_of(_w.JOB_SPEC),
         )
         overrides = build_verl_overrides(cfg)
+        # the executor budget is sized per run now, so print what this one actually asked for --
+        # a vllm init failure reports the demand against the free memory, and the demand is
+        # otherwise invisible in the log.
+        print(
+            f"[rl-verl] rollout gpu_memory_utilization={cfg['gpu_mem_util']:.4f}",
+            flush=True,
+        )
 
         setup_seconds = time.time() - t_start
         _w.heartbeat("rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
