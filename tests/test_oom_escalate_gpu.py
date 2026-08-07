@@ -35,6 +35,53 @@ def test_is_cuda_oom_is_structured(monkeypatch):
     assert lc.is_cuda_oom(MemoryError("host ram: out of memory")) is False
 
 
+def test_a_child_process_oom_is_classified_from_its_output():
+    """A verl child's OOM must reach the lifecycle as an OOM, not a permanent job_failed.
+
+    The parent classifies an in-process OOM from `torch.cuda.OutOfMemoryError` and the allocator
+    counter. Neither crosses a process boundary: the verl child is a separate interpreter, its
+    `num_ooms` is its own, and the terminal raise carries only "subprocess exited with status N".
+    So the child's own output is the only evidence, and without it the one OOM shape that happens
+    DURING training (rather than at vllm startup) is never retried on a larger card.
+    """
+    from flash.engine.worker.backend_common import ChildOutputTail, raise_for_classified_verl_exit
+    from flash.engine.worker.perf.lifecycle import is_cuda_oom
+
+    tail = ChildOutputTail()
+    tail.record(
+        "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB "
+        "(GPU 0; 79.15 GiB total capacity)\n"
+    )
+    assert tail.cuda_oom_evidence is not None, "the child's torch OOM left no evidence on the tail"
+    with pytest.raises(RuntimeError, match="outofmemoryerror") as raised:
+        raise_for_classified_verl_exit(1, tail)
+    # the raised error is what the lifecycle classifies, so the evidence has to survive into it
+    assert is_cuda_oom(raised.value) is True, (
+        "the classified error does not read back as an oom, so the run would not be retried "
+        "on a larger card"
+    )
+
+
+def test_child_output_that_merely_mentions_memory_is_not_an_oom():
+    """The widened matcher must not escalate the GPU for a failure a bigger card cannot fix.
+
+    Pairs with the test above: matching a bare "out of memory" would classify a host-RAM OOM, an
+    environment's own error text, or a Triton message as a CUDA OOM and burn a retry on a larger
+    card for a run that would fail there identically.
+    """
+    from flash.engine.worker.backend_common import ChildOutputTail, raise_for_classified_verl_exit
+
+    for line in (
+        "MemoryError: host ram: out of memory",
+        "Triton Error [CUDA]: out of memory",
+        "ValueError: the grader ran out of memory budget",
+    ):
+        tail = ChildOutputTail()
+        tail.record(line + "\n")
+        assert tail.cuda_oom_evidence is None, f"{line!r} was wrongly read as a cuda oom"
+        raise_for_classified_verl_exit(1, tail)  # must not raise
+
+
 def test_is_cuda_oom_typed_torch_error():
     torch = pytest.importorskip("torch")  # skipped on the torch-less offline CI image
     from flash.engine.worker.perf.lifecycle import is_cuda_oom
@@ -62,6 +109,40 @@ def test_oom_escalated_keeps_only_strictly_larger_cards():
     ]  # no OOM -> unchanged
     assert {c.gpu for c in _oom_escalated(cands, 80)} == {"Pro6000", "B200"}  # >80 only
     assert _oom_escalated(cands, 180) == []  # OOM'd the biggest -> nowhere larger
+
+
+def _shape(gpu, vram, count):
+    return types.SimpleNamespace(
+        gpu=gpu, vram_gb=vram, gpu_count=count, provider="runpod", hourly_usd=1.0
+    )
+
+
+def test_an_oom_retry_never_moves_to_a_shape_the_fit_model_calls_smaller():
+    """The escalation filter must measure candidates the way the allocator sized them.
+
+    the raw `gpu_count * vram_gb` product is not the allocator's fit model: `combined_vram_gb`
+    subtracts a replicated-per-card floor and applies a shard efficiency, so a sharded pair is worth
+    materially less than its card count suggests. mixing the two scales let a retry go BACKWARDS --
+    2x80 raw-counts as 160 GB against a 141 GB card that just OOM'd, but the same pair is modelled as
+    130.4 GB usable, so the "larger" retry is smaller than the shape that already failed and burns a
+    paid attempt to reach the same OOM.
+    """
+    from flash.providers.base import combined_vram_gb
+    from flash.runner.lifecycle import _candidate_usable_vram_gb, _oom_escalated
+
+    single_h200 = _shape("H200", 141, 1)
+    pair_h100 = _shape("H100x2", 80, 2)
+    assert combined_vram_gb(80, 2) < 141  # the premise: the pair is the smaller shape
+
+    floor = _candidate_usable_vram_gb(single_h200)
+    assert pair_h100 not in _oom_escalated([pair_h100], floor)
+
+    # and the floor is recorded on the same scale: a sharded shape that OOMs must not write a floor
+    # so inflated that genuinely larger single cards get filtered out. 3x40 raw-counts as 120 GB,
+    # which would wrongly exclude a 96 GB card that the fit model rates higher (89.6 GB usable).
+    triple_40 = _shape("L40Sx3", 40, 3)
+    single_96 = _shape("Pro6000", 96, 1)
+    assert single_96 in _oom_escalated([single_96], _candidate_usable_vram_gb(triple_40))
 
 
 def test_surfaced_worker_flags_reads_both_flags_in_one_pass():
