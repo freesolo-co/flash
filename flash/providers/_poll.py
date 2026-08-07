@@ -10,7 +10,7 @@ from collections.abc import Callable
 from typing import Any
 
 from flash.diagnostics import neutralize_control_chars
-from flash.engine.worker.rollout_samples import sampled_completion_scalar
+from flash.engine.rollout_samples import sampled_completion_scalar
 from flash.providers._deadline import remaining_seconds
 
 # Generous grace past embedded deadline before orphan sweep reaps a driver-lost warm box.

@@ -34,6 +34,10 @@ from math import gcd
 
 from flash.engine.multiturn_reward_scoring import RolloutScoreRequest, score_rollouts
 from flash.engine.recipe import RECIPE
+from flash.engine.rollout_samples import (
+    sample_completion_text,
+    sanitize_rollout_text,
+)
 from flash.engine.sft_workload import (
     _materialize_verl_images,
     _multimodal_messages_with_images,
@@ -101,10 +105,6 @@ from flash.engine.worker.opd_gkd import generation_eos_from_cached_config
 from flash.engine.worker.packing import model_is_gdn_hybrid
 from flash.engine.worker.perf import gpu_diagnostics, wait_for_gpu
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
-from flash.engine.worker.rollout_samples import (
-    sample_completion_text,
-    sanitize_rollout_text,
-)
 from flash.engine.worker.sft_train import (
     _build_verl_child_env,
     _cached_model_path,
