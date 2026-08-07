@@ -1904,6 +1904,85 @@ def _classified_exit_command(marker: pathlib.Path) -> list[str]:
     return [sys.executable, "-c", leader]
 
 
+def _unclassified_exit_command(marker: pathlib.Path) -> list[str]:
+    """Same shape as `_classified_exit_command`, but the leader says nothing recognizable.
+
+    the tail carries no oom evidence and no retriable infra signature, so
+    `raise_for_classified_verl_exit` RETURNS instead of raising -- and a teardown that only runs on
+    the exception never fires. everything else is identical, which is what makes the pair a
+    controlled comparison rather than two unrelated scripts.
+    """
+    grandchild = (
+        "import signal,time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "print('ready', flush=True)\n"
+        "time.sleep(300)\n"
+    )
+    leader = (
+        "import pathlib,subprocess,sys\n"
+        f"g = subprocess.Popen([sys.executable, '-c', {grandchild!r}], "
+        "stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)\n"
+        "assert g.stdout.readline().strip() == 'ready'\n"
+        "g.stdout.close()\n"
+        f"pathlib.Path({str(marker)!r}).write_text(str(g.pid))\n"
+        "print('unrelated trainer failure', flush=True)\n"
+        "raise SystemExit(9)\n"
+    )
+    return [sys.executable, "-c", leader]
+
+
+def _orphaned_pipe_command(marker: pathlib.Path, *, leader_status: int) -> list[str]:
+    """The reviewers' lead case: the leader EXITS while a grandchild holds the merged pipe open.
+
+    This is the reverse of `_outlives_its_stdout_command`. The direct child is gone within a second,
+    but the grandchild inherited the same stdout descriptor and never writes or closes it, so the
+    parent's read loop sees neither a line nor EOF -- it simply blocks, on a paid gpu, having already
+    lost the process it was reading. Only watching the child's exit independently of the pipe ends it.
+    """
+    grandchild = (
+        "import pathlib,signal,sys,time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        # inherits the leader's stdout and holds it. never writes, never closes: the parent's loop
+        # has nothing to read and no EOF to end on.
+        f"pathlib.Path({str(marker)!r}).write_text(str(__import__('os').getpid()))\n"
+        "sys.stderr.close()\n"
+        "time.sleep(300)\n"
+    )
+    leader = (
+        "import pathlib,subprocess,sys,time\n"
+        f"g = subprocess.Popen([sys.executable, '-c', {grandchild!r}])\n"
+        f"m = pathlib.Path({str(marker)!r})\n"
+        "for _ in range(500):\n"
+        "    if m.exists() and m.read_text().strip():\n"
+        "        break\n"
+        "    time.sleep(0.02)\n"
+        f"raise SystemExit({leader_status})\n"
+    )
+    return [sys.executable, "-c", leader]
+
+
+def _outlives_its_stdout_command() -> list[str]:
+    """A leader that closes its own stdout and then refuses to die.
+
+    the read loop in `run_verl_training` ends on stdout EOF, which is not the child's exit. an
+    unbounded wait after that EOF parks the attempt on a paid gpu indefinitely, so this child closes
+    the pipe, ignores SIGTERM, and sleeps -- only a bounded wait escalating to SIGKILL ends the call.
+    """
+    leader = (
+        "import os,signal,sys,time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "print('step: 1', flush=True)\n"
+        # BOTH descriptors. the parent merges the child's stderr into stdout, so fd 1 and fd 2 are
+        # the same pipe: closing only fd 1 leaves the write end open and the parent never sees EOF,
+        # which makes this the wrong scenario (a live child holding its own pipe) rather than the
+        # one the test names.
+        "os.close(1)\n"
+        "os.close(2)\n"
+        "time.sleep(300)\n"
+    )
+    return [sys.executable, "-c", leader]
+
+
 def _assert_process_reaped(pid: int) -> None:
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
@@ -1932,6 +2011,159 @@ def test_classified_run_verl_exit_drains_group_after_leader_is_reaped(
                 os.kill(grandchild_pid, signal.SIGKILL)
             with contextlib.suppress(ChildProcessError):
                 os.waitpid(grandchild_pid, 0)
+
+
+@_needs_process_teardown
+def test_unclassified_run_verl_exit_drains_the_group_it_leaves_behind(
+    tmp_path, quick_teardown_grace
+):
+    """The failing path that raises nothing must still tear the group down.
+
+    the classified sibling above is torn down by the except-clause around the classifier. this one
+    is the same leak with the trigger removed: an unrecognized nonzero exit RETURNS from
+    `raise_for_classified_verl_exit`, so before the fix it reached no teardown at all and a
+    reusable worker handed the next attempt a gpu still held by the survivor's cuda context.
+    """
+    marker = tmp_path / "unclassified-grandchild.pid"
+    grandchild_pid = None
+    try:
+        code = vc.run_verl_training(_unclassified_exit_command(marker), env=dict(os.environ))
+
+        # returned, not raised: the status stays terminal and the caller still sees 9.
+        assert code == 9
+        assert marker.exists(), "leader exited before recording its surviving grandchild"
+        grandchild_pid = int(marker.read_text())
+        _assert_process_reaped(grandchild_pid)
+    finally:
+        if grandchild_pid is not None:  # pragma: no cover - only on an unexpected failure
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(grandchild_pid, signal.SIGKILL)
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(grandchild_pid, 0)
+
+
+@_needs_process_teardown
+def test_run_verl_training_bounds_its_wait_on_a_child_that_outlives_its_stdout(
+    quick_teardown_grace,
+):
+    """stdout EOF is not the child's exit, so the wait after the read loop has to be bounded.
+
+    verl spawns vllm's EngineCore as a grandchild holding the same merged pipe, and the pipe closing
+    says nothing about the direct child. an unbounded wait here blocks forever on a paid gpu with
+    nothing left to report -- the child below reproduces that by closing its own stdout, ignoring
+    SIGTERM and sleeping for five minutes.
+    """
+    started = time.monotonic()
+    code = vc.run_verl_training(_outlives_its_stdout_command(), env=dict(os.environ))
+    elapsed = time.monotonic() - started
+
+    # the child sleeps 300s. any bound at all beats that; assert on a budget derived from the
+    # patched grace so this stays meaningful if the grace is retuned, rather than on a bare literal.
+    budget = quick_teardown_grace * 20 + 10
+    assert elapsed < budget, (
+        f"waited {elapsed:.1f}s on a child that outlived its stdout; an unbounded wait parks the "
+        "attempt on a paid gpu until the job's own wall-clock limit"
+    )
+    # the group was torn down, so the child died on a signal and its status says so. it must NOT
+    # read as success: the trainer never finished, and a zero here would publish whatever partial
+    # artifacts exist as a completed run.
+    assert code != 0, "a child killed at teardown was reported as a successful run"
+    assert code < 0, f"expected a signal-terminated status, got exit code {code}"
+
+
+@_needs_process_teardown
+def test_run_verl_training_ends_when_a_grandchild_holds_the_pipe_after_the_child_exits(
+    tmp_path, monkeypatch, quick_teardown_grace
+):
+    """The reviewers' lead case: the read loop never ends, so no teardown below it is reached.
+
+    The direct child exits almost immediately, but vllm's EngineCore grandchild inherited the merged
+    stdout pipe and neither writes to it nor closes it. `for line in proc.stdout` therefore blocks
+    forever -- not on a slow trainer, but on a trainer that is already gone -- and the paid attempt
+    stalls until the provider's own wall-clock limit while the survivor holds the cuda context.
+
+    Without a watchdog on the child's exit this test HANGS rather than failing, which is exactly the
+    production symptom, so it is bounded by a short grace and asserts on elapsed time.
+    """
+    monkeypatch.setattr(vc, "_ORPHANED_PIPE_GRACE_S", 1.0)
+    marker = tmp_path / "pipe-holder.pid"
+    grandchild_pid = None
+    started = time.monotonic()
+    try:
+        # exit 0: the trainer "succeeded", so nothing about its own status hints at the survivor.
+        # returning 0 here would publish a partial run as a completed one.
+        with pytest.raises(RuntimeError, match="held its output pipe open"):
+            vc.run_verl_training(
+                _orphaned_pipe_command(marker, leader_status=0), env=dict(os.environ)
+            )
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 60, (
+            f"blocked {elapsed:.1f}s reading a pipe whose writer had already exited; in production "
+            "this runs until the provider's wall-clock limit on a paid gpu"
+        )
+        assert marker.exists(), "grandchild never recorded its pid"
+        grandchild_pid = int(marker.read_text())
+        _assert_process_reaped(grandchild_pid)
+    finally:
+        if grandchild_pid is not None:  # pragma: no cover - only on an unexpected failure
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(grandchild_pid, signal.SIGKILL)
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(grandchild_pid, 0)
+
+
+@_needs_process_teardown
+def test_child_exit_watchdog_does_not_kill_a_reader_still_draining_a_backlog(monkeypatch):
+    """The child's exit alone must not arm the teardown -- the reader's progress also counts.
+
+    A child can exit having left a full pipe behind, and the reader then works through that backlog
+    with per-line callbacks: `on_step` uploads a checkpoint, which takes minutes. Arming on the exit
+    alone would kill that mid-upload and report a SUCCESSFUL run as a failure, which is a worse
+    outcome than the leak being fixed. A stuck reader cannot advance the line counter; a busy one
+    does, and that is the whole distinction.
+    """
+    # a grace this short fires between consecutive callbacks, so only progress-awareness saves it.
+    monkeypatch.setattr(vc, "_ORPHANED_PIPE_GRACE_S", 0.2)
+    # the child writes its whole backlog and exits immediately, so every line below is read AFTER
+    # the direct child is already gone -- exactly the state that arms the watchdog.
+    script = "import sys\nfor i in range(8): print(f'step: {i}', flush=True)\nsys.exit(0)"
+    seen = []
+
+    def slow_step(step: int) -> None:
+        # stands in for a checkpoint upload on the step boundary.
+        seen.append(step)
+        time.sleep(0.15)
+
+    code = vc.run_verl_training(
+        [sys.executable, "-c", script], env=dict(os.environ), on_step=slow_step
+    )
+
+    assert code == 0, "a run whose reader was still draining a backlog was reported as failed"
+    assert seen == list(range(8)), (
+        f"only {len(seen)} of 8 steps were processed; the reader was torn down while it was still "
+        "making progress through the child's remaining output"
+    )
+
+
+@_needs_process_teardown
+def test_child_exit_watchdog_leaves_a_healthy_quiet_child_alone(quick_teardown_grace):
+    """The watchdog arms on the child's EXIT, never on silence.
+
+    A trainer loading shards or running a long generation is quiet for minutes with its pipe open,
+    and that is normal. If the watchdog fired on quiet it would kill working runs -- so it must be
+    the child's exit, not the absence of output, that arms it. Silence is `ChildTailStaleness`'s job.
+    """
+    # a grace of 0 would fire the instant the child exits, so any teardown observed here is
+    # attributable to quiet alone.
+    script = "import time,sys; time.sleep(2); print('step: 1', flush=True); sys.exit(0)"
+    code = vc.run_verl_training(
+        [sys.executable, "-c", script],
+        env=dict(os.environ),
+        heartbeat_interval_s=0.1,
+    )
+
+    assert code == 0, "a healthy child that was merely quiet was torn down as if it had leaked"
 
 
 @_needs_process_teardown
