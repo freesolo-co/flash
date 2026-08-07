@@ -2268,7 +2268,13 @@ def run_opd_train(spec=None) -> None:
     multimodal = any(record_has_images(example, messages) for example, messages in prompt_rows)
     if multimodal:
         validate_multimodal_training(model_id, "opd")
-    random.Random(_w.SEED).shuffle(train)
+    # shuffle the RENDERED rows, not the examples, so the pass below reuses this rendering instead
+    # of calling back into the environment. prompt_messages is user code: a stateful or seeded
+    # implementation returns something different the second time, and a second-pass image the scan
+    # never saw would reach `assert processor is not None` with multimodal already latched false
+    # (codex[bot]). same seed over the same length is the same permutation, so data order is
+    # unchanged and a resume fingerprint still matches.
+    random.Random(_w.SEED).shuffle(prompt_rows)
 
     started_at = time.time()
     # validate the control-panel broker transport before the gpu probe and model prefetch so a malformed
@@ -2328,9 +2334,8 @@ def run_opd_train(spec=None) -> None:
     package_root = str(Path(package_root_value).resolve()) if package_root_value else None
     _prepped = [0]
     with liveness_heartbeat("opd_image_prep", progress=lambda: _prepped[0]):
-        for example in train:
+        for example, messages in prompt_rows:
             _prepped[0] += 1
-            messages = env.prompt_messages(example)
             if multi_turn:
                 messages = validate_transcript_messages(
                     messages, source="environment initial prompt"
