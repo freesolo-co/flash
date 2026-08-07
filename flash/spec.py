@@ -315,7 +315,6 @@ class TrainSpec:
     temperature: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     max_completion_tokens: int | None = field(default=None, metadata={"introduced_in": "0.2.49"})
     kl_penalty_coef: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
-    advantage_clip: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     entropy_quantile: float | None = field(default=None, metadata={"introduced_in": "1.0.15"})
     thinking_length_penalty_coef: float | None = field(
         default=None, metadata={"introduced_in": "0.2.0"}
@@ -459,6 +458,8 @@ class JobSpec:
         for managed in MANAGED_GPU_KEYS:
             gpu.pop(managed, None)
         data["environment"].pop("resolved_sha", None)  # resolve-once env ref pin
+        # platform-managed worker requirement list, resolved by worker_pip_for_env at submit.
+        data["environment"].pop("pip", None)
         return data
 
     def to_internal_dict(self) -> dict[str, Any]:
@@ -558,7 +559,6 @@ class JobSpec:
                 temperature=_opt_float(train.get("temperature")),
                 max_completion_tokens=_opt_int(train.get("max_completion_tokens")),
                 kl_penalty_coef=_opt_float(train.get("kl_penalty_coef")),
-                advantage_clip=_opt_float(train.get("advantage_clip")),
                 entropy_quantile=_opt_float(train.get("entropy_quantile")),
                 thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
                 teacher_model=str(train.get("teacher_model") or ""),

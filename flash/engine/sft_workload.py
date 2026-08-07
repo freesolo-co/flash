@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import math
 import os
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -82,7 +83,7 @@ def _processor_tokenized_row(
     *,
     max_length: int,
     thinking: bool,
-) -> tuple[list[int], list[int], bytes]:
+) -> tuple[list[int], list[int], bytes, int]:
     from flash.engine.worker.packing import completion_mask_from_ids
 
     prepared_prompt = _multimodal_messages_with_images(prompt_messages, images)
@@ -115,11 +116,15 @@ def _processor_tokenized_row(
             value = value[0]
         return [int(item) for item in value]
 
-    input_ids = ids(full.pop("input_ids"))[:max_length]
+    untruncated_ids = ids(full.pop("input_ids"))
+    # true length BEFORE the cap: realized_max_length is measured after this slice, so it can never
+    # report more than max_length and cannot say whether the cap actually bound.
+    untruncated_length = len(untruncated_ids)
+    input_ids = untruncated_ids[:max_length]
     prompt_ids = ids(prompt["input_ids"])[:max_length]
     loss_mask = completion_mask_from_ids(prompt_ids, input_ids)
     full.pop("attention_mask", None)
-    return input_ids, loss_mask, _serialize_multimodal_inputs(full)
+    return input_ids, loss_mask, _serialize_multimodal_inputs(full), untruncated_length
 
 
 def _materialize_verl_images(
@@ -288,6 +293,9 @@ def prepare_sft_workload(
         tokenizer.pad_token = tokenizer.eos_token
 
     row_by_index: dict[int, dict[str, Any]] = {}
+    # kept OUT of the row dicts: a row carries exactly the columns the parquet schema declares, and
+    # an extra key would be dropped on the way to verl. this is measurement, not training input.
+    untruncated_by_index: dict[int, int] = {}
     text_specs: list[dict[str, Any]] = []
     sampled_texts: list[str] = []
     multiturn_targets = 0
@@ -301,7 +309,7 @@ def prepare_sft_workload(
             normalized = normalize_prompt_images(example, prompt_messages, package_root)
             completion_messages = text_only_prompt_messages(completion_messages)
             decoded_images = decode_image_descriptors(normalized.descriptors, package_root)
-            input_ids, loss_mask, multimodal_inputs = _processor_tokenized_row(
+            input_ids, loss_mask, multimodal_inputs, untruncated_length = _processor_tokenized_row(
                 processor,
                 normalized.messages,
                 completion_messages,
@@ -309,6 +317,7 @@ def prepare_sft_workload(
                 max_length=max_length,
                 thinking=bool(spec.thinking),
             )
+            untruncated_by_index[row_index] = untruncated_length
             row_by_index[row_index] = {
                 "input_ids": input_ids,
                 "loss_mask": loss_mask,
@@ -354,6 +363,7 @@ def prepare_sft_workload(
         dropped += text_dropped
         for spec_row, tokenized in zip(kept_specs, tokenized_rows, strict=True):
             input_ids = tokenized["input_ids"]
+            untruncated_by_index[spec_row["row_index"]] = tokenized["untruncated_length"]
             row_by_index[spec_row["row_index"]] = {
                 "input_ids": input_ids,
                 "loss_mask": tokenized["completion_mask"],
@@ -363,10 +373,14 @@ def prepare_sft_workload(
 
     special_ids = set(getattr(tokenizer, "all_special_ids", None) or [])
     unpacked_rows = []
+    retained_untruncated: list[int] = []
     for row_index in sorted(row_by_index):
         row = row_by_index[row_index]
         if has_real_target(row["input_ids"], row["loss_mask"], special_ids):
             unpacked_rows.append(row)
+            # appended in lockstep with the row it measures, so the truncation counts below describe
+            # the rows that are actually trained on rather than the ones that were dropped.
+            retained_untruncated.append(untruncated_by_index[row_index])
         else:
             dropped += 1
     if not unpacked_rows:
@@ -387,6 +401,20 @@ def prepare_sft_workload(
     supervised_tokens = sum(sum(int(item) for item in row["loss_mask"]) for row in rows)
     padded_compute_tokens = real_tokens
     realized_max_length = max(len(row["input_ids"]) for row in rows)
+    # measured against the UNTRUNCATED encode, so it reports what the rows actually need rather
+    # than what the cap allowed. realized_max_length cannot do this: it is taken after the slice,
+    # so it saturates at max_length exactly when the cap binds and the censoring becomes invisible.
+    # mirrors the rollout profile's truncated_rollouts/truncation_rate reasoning.
+    untruncated_max_length = max(retained_untruncated)
+    truncated_rows = sum(1 for length in retained_untruncated if length > max_length)
+    if truncated_rows:
+        print(
+            f"warning: [train] max_context_tokens {max_length} truncated {truncated_rows} of "
+            f"{len(rows)} sft rows; the longest row needs {untruncated_max_length} tokens. "
+            "training on the truncated rows as configured; set max_context_tokens to at least "
+            f"{untruncated_max_length} to keep every row whole.",
+            file=sys.stderr,
+        )
     # one example per update is this layer's isolation lever for an architecture it cannot pack.
     # a micro-batch reaches the model as one (1, total_nnz) row with `attention_mask=None`: softmax
     # layers recover their boundaries from the per-example `position_ids` restarts, but
@@ -447,6 +475,8 @@ def prepare_sft_workload(
         authoritative_supervised_tokens=authoritative_supervised_tokens,
         authoritative_compute_tokens=authoritative_real_tokens,
         realized_max_length=realized_max_length,
+        untruncated_max_length=untruncated_max_length,
+        truncated_examples=truncated_rows,
         examples_per_update=examples_per_update,
         derived_steps=derived_steps,
         authoritative_steps=authoritative_steps,

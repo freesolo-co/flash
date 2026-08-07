@@ -1841,3 +1841,20 @@ def test_workload_profile_mismatch_fails_fast_instead_of_retrying(orch, monkeypa
 
     assert submits == []  # never reached a provider
     assert slept == []  # and never backed off waiting for it to clear
+
+
+def test_submit_supplies_the_worker_pip_the_payload_no_longer_carries() -> None:
+    """``[environment] pip`` left the public surface, so the provider must resolve it here.
+
+    The knob was platform-managed all along: ``worker_pip_for_env`` ignores the env id and returns
+    one constant. Removing it from the wire without this substitution would ship a worker with no
+    Freesolo SDK, and the failure would only appear once a GPU was already rented.
+    """
+    from flash.providers._instance import build_payload
+
+    spec = _spec()
+    assert not spec.environment.pip
+
+    payload = build_payload(spec, spec.seed, 0, arm="a", deadline_at=1_800_000_000.0)
+
+    assert payload["extra_pip"] == ["freesolo>=0.4.0"]
