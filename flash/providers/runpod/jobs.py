@@ -936,6 +936,34 @@ def poll_job(
     # fire while a worker is initializing or usable; carry that same observation forward so the
     # capacity timer gets it too, and a heavy image can never self-report as no_capacity.
     worker_coming_up_at: float | None = None
+
+    def _worker_is_coming_up(at: float | None, now: float) -> bool:
+        """Whether a worker sighting at ``at`` is recent enough to still suppress the capacity timer."""
+        return at is not None and (now - at) <= WORKER_COMING_UP_TTL_S
+
+    def _probe_worker_coming_up_at(now: float) -> float | None:
+        """One health read answering only "has runpod granted a worker yet".
+
+        Same question and same evidence as the periodic probe below -- a worker that is usable OR
+        initializing means the gpu is ours and the wait is startup, not starvation. Kept to that one
+        question deliberately: the unhealthy/throttled timers are CONTINUOUS-state timers driven once
+        per poll, and feeding them an extra out-of-band reading would shorten their windows.
+
+        A failed probe answers None, which leaves the caller's existing evidence untouched: an api
+        blip must not be read as "no worker".
+        """
+        try:
+            h = runpod_api.endpoint_health_for_fingerprint(
+                handle.endpoint_id,
+                handle.key_fingerprint,
+                **deadline_kwargs(runpod_api.endpoint_health_for_fingerprint, absolute_deadline),
+            )
+        except Exception:
+            return None
+        workers = h.get("workers") or {}
+        usable = workers.get("running") or workers.get("ready") or workers.get("idle")
+        return now if (usable or workers.get("initializing")) else None
+
     while True:
         if absolute_deadline is not None and time.time() >= absolute_deadline:
             return PollResult(False, failure="stalled", detail="run wall deadline exceeded")
@@ -998,10 +1026,27 @@ def poll_job(
                 detail=f"[{status}] {detail}",
             )
         now = time.time()
-        coming_up = (
-            worker_coming_up_at is not None
-            and (now - worker_coming_up_at) <= WORKER_COMING_UP_TTL_S
+
+        coming_up = _worker_is_coming_up(worker_coming_up_at, now)
+        would_expire = (
+            status == "IN_QUEUE"
+            and not coming_up
+            and queued_timer.since is not None
+            and now - queued_timer.since > queue_grace_s
         )
+        if would_expire:
+            # `worker_coming_up_at` is only as fresh as the last probe, which is up to 90s old. a
+            # worker that began initializing inside that window is invisible here, so abandoning the
+            # attempt now discards a gpu runpod has ALREADY granted and pays a fresh cold start to
+            # get back to the same place. one probe at the boundary is cheap next to that (codex[bot]).
+            #
+            # at most one probe per attempt: if it finds nothing the timer expires immediately below,
+            # and if it finds a worker the TTL suppresses `would_expire` for the next 300s. stamping
+            # `last_health_probe` also stops the periodic probe re-reading in this same iteration.
+            last_health_probe = now
+            coming_up = _worker_is_coming_up(_probe_worker_coming_up_at(now), now)
+            if coming_up:
+                worker_coming_up_at = now
         if queued_timer.expired(status == "IN_QUEUE" and not coming_up, now, queue_grace_s):
             return PollResult(
                 False,
