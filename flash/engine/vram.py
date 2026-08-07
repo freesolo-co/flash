@@ -390,12 +390,23 @@ _LIGER_LONG_CTX_TOKENS = 2048
 # [b, s, vocab] logits tensor -- is what this set gates, and it holds for both. liger is NOT part
 # of that property: verl disables liger's fused linear ce, and liger zeroed the sft lora gradient
 # (GRAD-001), so sft runs with use_liger=false.
+#
+# membership is decided by the checkpoint's ``model_type``, because that is what verl's
+# patch_forward_with_backends dispatches on: ``qwen3_5`` and ``qwen3_5_moe`` both resolve to
+# verl/models/transformers/qwen3_5.py's forward_with_torch_backend, which computes ce from hidden
+# states via FusedLinearForPPO and never builds the dense tensor. every catalog model reports one of
+# those two types (the 27B is ``qwen3_5``/``Qwen3_5ForConditionalGeneration`` despite its 3.6 name),
+# so the set must list the whole sft-capable catalog -- an omission does not disable the fused
+# kernel, it only makes the allocator reserve logits vram the run never allocates and collapse the
+# micro-batch to 1. contrast kimi_vl, which returns before the fused patch ("Not support fused
+# kernels for KimiVL") and would genuinely keep dense logits.
 _SFT_CHUNKED_NLL_MODELS = frozenset(
     {
         "Qwen/Qwen3.5-0.8B",
         "Qwen/Qwen3.5-2B",
         "Qwen/Qwen3.5-4B",
         "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.6-27B",
         "Qwen/Qwen3.6-35B-A3B",
     }
 )
