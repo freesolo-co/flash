@@ -85,7 +85,7 @@ def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision=""):
         logger.debug("total-cost ranking unavailable; ranking on $/hr")
         return None
 
-    from flash.cost.analytical import multi_card_speedup, step_seconds_split
+    from flash.cost.analytical import sharded_step_seconds
 
     # the same one-step config the cost key was built from, so the single- and multi-card branches
     # below cannot price a run off different knobs.
@@ -98,9 +98,10 @@ def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision=""):
             # identical to the single-card key the preview and estimate use, so the three paths
             # agree exactly whenever one card is enough.
             return cost_key(candidate.gpu, candidate.hourly_usd)
-        gpu_bound, fixed = step_seconds_split(config, candidate.gpu)
-        # scaling is per-class: an nvlink pair keeps ~0.88 of linear per card, a pcie pair ~0.71.
-        seconds = gpu_bound / multi_card_speedup(candidate.gpu_count, candidate.gpu) + fixed
+        # scaling is per-class (an nvlink pair keeps ~0.88 of linear per card, a pcie pair ~0.71),
+        # and for grpo/opd the step floor is only ~80% shardable -- sharded_step_seconds owns both,
+        # so ranking cannot drift from the quote the run is actually billed against.
+        seconds = sharded_step_seconds(config, candidate.gpu, candidate.gpu_count)
         return candidate.total_hourly_usd * seconds / 3600.0
 
     return cost_per_step

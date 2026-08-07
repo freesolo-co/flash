@@ -220,3 +220,100 @@ def test_the_card_reaches_the_floor_through_the_real_quote_path(monkeypatch):
     assert "RTX 5090" in seen
     assert "H200" in seen
     assert fast != slow
+
+
+# --- the floor under sharding -------------------------------------------------------------------
+# Only ~80% of the floor shards. update_weights is a weight copy every rank pays and save_checkpoint
+# is disk i/o; dividing them by the card count credits a wide run with time it still spends.
+
+
+@pytest.mark.parametrize("method", ["grpo", "opd"])
+def test_part_of_the_floor_survives_any_card_count(method):
+    """The unshardable phases are a floor under the floor.
+
+    Whatever the card count, a grpo/opd step can never drop below the part of the floor every rank
+    pays. Dividing the whole floor makes the step tend to (gpu_bound/N + fixed), which understates
+    a wide run without bound as N grows.
+    """
+    from flash.cost.analytical import (
+        STEP_FLOOR_SHARDED_FRACTION,
+        _step_floor_seconds_for,
+        sharded_step_seconds,
+        step_seconds_split,
+    )
+
+    config = _config(method)
+    _gpu_bound, fixed = step_seconds_split(config, "H100")
+    floor = _step_floor_seconds_for(config, "H100")
+    unshardable = floor * (1.0 - STEP_FLOOR_SHARDED_FRACTION)
+    assert unshardable > 0.0, "a floor that fully shards makes this test vacuous"
+
+    for count in (1, 2, 4, 8, 64):
+        sps = sharded_step_seconds(config, "H100", count)
+        assert sps >= fixed + unshardable - 1e-9, (
+            f"{method} at {count} cards quotes {sps:.3f}s, below the {fixed + unshardable:.3f}s "
+            "every rank pays regardless of width"
+        )
+
+
+@pytest.mark.parametrize("method", ["grpo", "opd"])
+def test_sharding_the_whole_floor_would_under_quote_a_wide_run(method, monkeypatch):
+    """Mutation guard on STEP_FLOOR_SHARDED_FRACTION.
+
+    Setting the fraction to 1.0 restores the old divide-everything behaviour. That must change the
+    multi-card quote (and only the multi-card quote) or the constant is not load-bearing. Guards the
+    exact defect: the whole floor sitting in the gpu-bound half and being divided entire.
+    """
+    import flash.cost.analytical as analytical
+
+    config = _config(method)
+    corrected = {n: analytical.sharded_step_seconds(config, "H100", n) for n in (1, 2, 4, 8)}
+    monkeypatch.setattr(analytical, "STEP_FLOOR_SHARDED_FRACTION", 1.0)
+    naive = {n: analytical.sharded_step_seconds(config, "H100", n) for n in (1, 2, 4, 8)}
+
+    assert naive[1] == pytest.approx(corrected[1]), "one card must be unaffected by the split"
+    for n in (2, 4, 8):
+        assert naive[n] < corrected[n], (
+            f"{method} at {n} cards: dividing the whole floor must under-quote against the split"
+        )
+    # and the error grows with width -- that is why it matters for wide runs specifically
+    assert (corrected[8] - naive[8]) > (corrected[2] - naive[2])
+
+
+def test_sft_is_untouched_by_the_floor_split():
+    """sft runs no rollout, so it has no floor and must shard exactly as before.
+
+    Without this, a future change could route sft through the grpo/opd correction and silently
+    inflate every sft quote -- the split is a rollout-only correction.
+    """
+    from flash.cost.analytical import (
+        _step_floor_seconds_for,
+        multi_card_speedup,
+        sharded_step_seconds,
+        step_seconds_split,
+    )
+
+    config = _config("sft")
+    assert _step_floor_seconds_for(config, "H100") == 0.0
+    gpu_bound, fixed = step_seconds_split(config, "H100")
+    for count in (1, 2, 4, 8):
+        plain = gpu_bound / multi_card_speedup(count, "H100") + fixed
+        assert sharded_step_seconds(config, "H100", count) == pytest.approx(plain)
+
+
+@pytest.mark.parametrize("method", ["grpo", "opd"])
+def test_multi_card_still_beats_single_card(method):
+    """The correction must not overshoot into modelling extra cards as useless.
+
+    Sharding still has to pay off: each added card must strictly shorten the step while the
+    shardable part dominates. A split that swallowed the whole benefit would make the allocator
+    refuse cards that genuinely help.
+    """
+    from itertools import pairwise
+
+    from flash.cost.analytical import sharded_step_seconds
+
+    config = _config(method)
+    seconds = [sharded_step_seconds(config, "H100", n) for n in (1, 2, 4, 8)]
+    for narrow, wide in pairwise(seconds):
+        assert wide < narrow, f"{method}: adding cards must still shorten the step ({seconds})"
