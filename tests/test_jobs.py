@@ -5075,6 +5075,13 @@ def test_an_adopted_instance_run_is_still_priced_for_every_card_it_occupied(monk
             "prices as a single card"
         )
         assert adopted["allocated_gpu"] == "RTX 4090"
+        # same argument for the substrate: _gpu_rate falls back to whichever configured provider
+        # offers the class, normally RunPod, so an adopted vast run is otherwise priced at RunPod's
+        # rate and its notes name a provider that never ran it.
+        assert adopted["allocated_provider"] == "vast", (
+            "an adopted vast run reached persistence with no provider, so it is priced on "
+            "whichever provider the plane happens to try first"
+        )
 
 
 def test_attach_reconciler_does_not_clobber_newer_remote(monkeypatch):

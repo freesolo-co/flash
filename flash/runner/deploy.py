@@ -82,9 +82,10 @@ def _carry_allocation_stamp(metrics: dict, remote: dict | None) -> None:
     """Carry the allocation stamp from a persisted remote onto adopted metrics.
 
     `_completed_attempt_metrics` returns the worker's own metrics.json verbatim, and the worker
-    does not know which card or how many of them the allocator picked -- the plane stamps that at
-    launch. Without this, a multi-card vast/lambda run recovered after a control-plane restart is
-    priced as ONE card, because `_persist_metrics` reads the count from the metrics it is handed.
+    does not know which card, how many of them, or which substrate the allocator picked -- the plane
+    stamps all three at launch. Without this, a multi-card vast/lambda run recovered after a
+    control-plane restart is priced as ONE card on the WRONG provider, because `_persist_metrics`
+    reads each of them from the metrics it is handed.
     `setdefault`, so a stamp the worker somehow did carry always wins over the persisted copy.
     """
     if not isinstance(metrics, dict) or not isinstance(remote, dict):
@@ -95,6 +96,13 @@ def _carry_allocation_stamp(metrics: dict, remote: dict | None) -> None:
     allocated_count = remote.get("allocated_gpu_count")
     if allocated_count:
         metrics.setdefault("allocated_gpu_count", int(allocated_count))
+    # the substrate that billed the run. `_gpu_rate` falls back to whichever configured provider
+    # offers the class, which on a multi-provider plane is normally RunPod -- so an adopted lambda
+    # or vast run is otherwise priced at RunPod's rate and its notes name the wrong provider.
+    # `provider` is required on a persisted JobHandle, so it is always present here.
+    provider = remote.get("provider")
+    if provider:
+        metrics.setdefault("allocated_provider", provider)
 
 
 def _deployment_state_and_requires_revocation(
