@@ -13,6 +13,7 @@ import logging
 import os
 import threading
 
+from flash.adapter_artifacts import attempt_scoped_artifact_name
 from flash.runner import adapter_prefix, get_status, runs_file_path
 from flash.spec import JobSpec
 
@@ -451,13 +452,23 @@ def _deferred_resubmit_loop(spec) -> None:
 def _latest_worker_artifact_name(repo: str, prefix: str, phase: str, kind: str) -> str:
     """Newest worker artifact file under prefix.
 
-    Workers historically wrote stable files (``console_rl.txt``), and newer workers may write
-    attempt-scoped files (e.g. ``console_rl_attempt2.txt`` / ``error_rl_attempt2.txt``). On a retried run only the highest attempt is
-    the real current evidence. Falls back to the legacy/default name when the repo can't be listed.
+    ``console`` is uploaded under one stable name that each attempt overwrites; ``error`` and
+    ``raylogs`` are attempt-scoped, so on a retried run only the highest attempt is the real
+    current evidence. Falls back to the default name when the repo can't be listed.
+
+    The attempt-scoped name comes from the writer's own definition rather than being spelled
+    again here: this is the read half of a name the worker chose, and a reader that formats it
+    independently agrees only by coincidence. The failure is silent -- a name that disagrees
+    finds no file, which is indistinguishable from "the worker uploaded nothing", exactly the
+    case these artifacts exist to explain.
     """
     import re
 
-    default = f"{kind}_{phase}.txt" if kind == "console" else f"{kind}_{phase}_attempt0.txt"
+    default = (
+        f"{kind}_{phase}.txt"
+        if kind == "console"
+        else attempt_scoped_artifact_name(kind, phase, 0)
+    )
     try:
         from huggingface_hub import HfApi
 
