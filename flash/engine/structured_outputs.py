@@ -1,10 +1,7 @@
-"""Structured-outputs (guided decoding) helpers shared by the GRPO and OPD rollout paths.
+"""Structured-output helpers shared by GRPO and OPD rollouts.
 
-TrainSpec.structured_outputs carries the constraint as canonical JSON — exactly the kwargs of
-vLLM's ``StructuredOutputsParams`` (one of json/regex/choice/json_object plus backend options),
-normalized once at TOML parse time (schema/fields.py). The helpers here
-decode that string and describe it for worker logs; they import no GPU deps so every caller
-stays CPU-importable.
+``TrainSpec.structured_outputs`` is canonical JSON for vLLM ``StructuredOutputsParams``, normalized
+in ``schema/fields.py``. Keep this module free of GPU dependencies.
 """
 
 from __future__ import annotations
@@ -15,14 +12,8 @@ import json
 # schema-time normalizer (schema/fields.py) imports this so the two layers can never drift.
 CONSTRAINT_KEYS = ("json", "regex", "choice", "json_object")
 
-# vLLM reasoning parser for Flash's <think>...</think> thinking format. Set as the rollout engine's
-# EngineArgs.reasoning_parser, it makes vLLM's V1 structured-output gate hold the guided grammar
-# until the reasoning block closes (</think>) instead of binding from the very first token — so a
-# thinking model reasons freely, then only its post-</think> answer is constrained. It is
-# format-based, not weight-specific: the deepseek_r1 parser resolves the </think> boundary from the
-# model's own tokenizer, so it fits every Flash thinking model (Qwen3.x, GLM, ...), all of which
-# delimit reasoning with <think>. Without it, a json/regex/choice constraint would forbid the free
-# <think> phase entirely (it forces the first token to open the schema, e.g. `{`).
+# vllm's `deepseek_r1` parser delays guided decoding until `</think>`, so the answer is constrained
+# without forbidding free reasoning. it is format-based and fits flash models using `<think>`.
 THINKING_REASONING_PARSER = "deepseek_r1"
 
 

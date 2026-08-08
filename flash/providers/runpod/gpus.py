@@ -16,17 +16,10 @@ def _gpu_enum():
     return GpuType
 
 
-# RunPod's ADA_80_PRO pool really holds three cards; the SDK's POOLS_TO_TYPES lists only the HBM3
-# one. The SDK contradicts itself here -- GpuGroup.ADA_80_PRO's own docstring reads "NVIDIA H100
-# PCIe, NVIDIA H100 80GB HBM3, NVIDIA H100 NVL" -- and to_gpu_ids_str derives its negations from
-# that short table, so an explicit H100 pin serializes to a bare gpuIds='ADA_80_PRO' with ZERO
-# negations, which means "any card in the H100 pool". RunPod then legitimately returns an H100 NVL
-# and verify_gpu rejects it as an exact-class mismatch, retrying onto the same widened pin.
-#
-# The names below are verbatim RunPod gpu-type ids (confirmed against the live gpuTypes catalog),
-# and negation tokens are matched in RunPod's id space rather than the SDK's enum, so a member the
-# enum lacks is still expressible. Only pools flash actually pins are corrected. Enum member
-# docstrings evaluate to None at runtime, so this cannot be read back off the SDK.
+# ADA_80_PRO contains H100 PCIe, HBM3, and NVL, but the SDK omits members when serializing pins.
+# emit live RunPod gpu-type ids as negations so an exact H100 request cannot widen to another
+# member.
+# only pools flash pins are corrected; SDK enum docstrings are unavailable at runtime.
 _POOL_MEMBERS_MISSING_FROM_SDK = {
     "ADA_80_PRO": ("NVIDIA H100 PCIe", "NVIDIA H100 NVL"),
 }

@@ -86,23 +86,19 @@ MIN_PROVIDER_WALL_SECONDS = 60
 _WORKLOAD_PROFILE_WALL_SECONDS = 10 * 60
 _WORKLOAD_PROFILE_MAX_RETRIES = 1
 # a profile's wall bounds the WORK it does, not the wait for a machine to do it on. each provider
-# attempt gets its own IN_QUEUE grace (300s) and the infra retry floor allows several of them, so a
-# 600s deadline measured from submission cannot survive even two capacity cycles: the run dies "run
-# wall deadline exceeded" having profiled nothing, on hardware it never got. queue time gets this
-# separate explicit allowance and the wall itself starts at the first heartbeat, so the quote stays
-# wall x hourly (see estimate_profile_cost) rather than paying for the queue.
+# attempt gets its own IN_QUEUE grace (300s) and the infra retry floor allows several of them, so
+# a 600s deadline measured from submission cannot survive even two capacity cycles: the run dies
+# "run wall deadline exceeded" having profiled nothing, on hardware it never got. queue time gets
+# this separate explicit allowance and the wall itself starts at the first heartbeat, so the quote
+# stays wall x hourly (see estimate_profile_cost) rather than paying for the queue.
 _WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS = 30 * 60
-# provisioning a rented box is not work, and not queue either: the plane arms the work budget at the
-# first heartbeat, but the box self-enforces the absolute deadline it was handed AT RENT TIME (see
-# _worker_deadline_at -> payload deadline_at -> _instance_bootstrap._canonical_deadline_at). Between
-# those two clocks sits everything cloud-init does before the worker can speak -- waiting for
-# docker+gpu (itself budgeted up to ~600s), image pull with retries, extra_pip install and the HF
-# code fetch. Charging that to a 600s work budget kills healthy profiles that never got to measure
-# anything: a real run rented at 19:38:15, reached `running` at 19:46:51 and self-terminated at
-# 19:48:15 -- rent + exactly 600s -- with no heartbeat, so the plane never armed. Its retry survived
-# with 22s to spare, which is why this reads as flaky rather than broken. The box timer is only a
-# backstop against a silent box: the plane re-reads the run deadline every poll, tightens it the
-# moment arming happens, and tears the box down when it gives up.
+# the plane arms work time at the first heartbeat, but the box enforces a deadline minted when the
+# machine was RENTED. between those two clocks sits everything cloud-init does before the worker
+# can speak -- waiting
+# for docker+gpu (itself budgeted up to ~600s), image pull with retries, extra_pip install and the
+# HF code fetch. The box timer is only a backstop against a silent box: the plane re-reads the run
+# deadline every poll, tightens it the moment arming happens, and tears the box down when it gives
+# up.
 _WORKLOAD_PROFILE_PROVISION_ALLOWANCE_SECONDS = 20 * 60
 
 
@@ -127,10 +123,10 @@ def _internal_spec_from_status(status: RunStatus) -> JobSpec:
     """Reconstruct the run's complete internal job spec for the runner's lifecycle logic.
 
     status.spec is the public representation and omits platform-managed fields (hf_repo,
-    max_wall_seconds, run_id, ...); their authoritative values are persisted verbatim in the internal
-    worker spec under effective_preparation (recorded for every provisioned run). Prefer that
-    carrier; fall back to the public spec for runs recorded before an effective worker spec exists,
-    where those fields carry their managed defaults.
+    max_wall_seconds, run_id, ...); their authoritative values are persisted verbatim in the
+    internal worker spec under effective_preparation (recorded for every provisioned run). Prefer
+    that carrier; fall back to the public spec for runs recorded before an effective worker spec
+    exists, where those fields carry their managed defaults.
     """
     snapshot = status.effective_preparation
     raw_worker = snapshot.get("worker_spec") if isinstance(snapshot, dict) else None
@@ -144,12 +140,11 @@ def _internal_spec_from_status(status: RunStatus) -> JobSpec:
 
 def _adapter_ref_for_status(status: RunStatus) -> str | None:
     """The public short adapter reference (`<run_id>`) shown by `flash runs status` once a run's trained
-    adapter is registered; exactly what users paste into train.init_from_adapter (`<run_id>/step-N`
-    targets a saved checkpoint).
 
-    hf_repo, the control-plane-assigned artifact repo that signals the adapter exists, is
-    platform-managed and read from the internal worker spec (see _internal_spec_from_status); run_id
-    comes from the RunStatus itself.
+    adapter is registered; exactly what users paste into train.init_from_adapter (`<run_id>/step-N`
+    targets a saved checkpoint). hf_repo, the control-plane-assigned artifact repo that signals the
+    adapter exists, is platform-managed and read from the internal worker spec (see
+    _internal_spec_from_status); run_id comes from the RunStatus itself.
     """
     if not (status.effective_preparation or {}).get("worker_spec"):
         return None
@@ -170,12 +165,9 @@ def _adapter_ref_for_status(status: RunStatus) -> str | None:
 def _gpu_rate(gpu_type: str, provider: str = "") -> float:
     """Static representative $/hr for cost projection.
 
-    Prices on the provider that actually ran the job when it is known; provider rates for the
-    same class differ (a RunPod-priced table misreports a Lambda or Vast run). Falls back to any
-    configured provider that offers the class, so a plane without RunPod still prices its runs.
-
-    Never raises: this feeds cost ANNOTATION on an already-finished run, so a provider-registry
-    problem must degrade to the flat estimate rather than fail the metrics write.
+    Falls back to any configured provider that offers the class, so a plane without RunPod still
+    prices its runs. Never raises: this feeds cost ANNOTATION on an already-finished run, so a
+    provider-registry problem must degrade to the flat estimate rather than fail the metrics write.
     """
     try:
         from flash.providers import available_providers, get_provider
@@ -251,11 +243,10 @@ _TRAINING_STAGES = frozenset({"rl_step", "sft_step", "opd_step"})
 def actual_steps_run(status: RunStatus) -> int:
     """How many optimizer steps to bill a (cancelled) run for.
 
-    The worker streams a per-step heartbeat whose ``step`` field is the last COMPLETED optimizer step
-    (1-indexed; the last one we persisted is the furthest it reached). Cancelled after N steps -> N.
-    The first step reports no ``step`` until it completes, so a cancel mid-first-step would look like
-    0 steps despite real GPU time -- we floor to 1 whenever a training-stage heartbeat is present.
-    Returns 0 only when no training heartbeat was seen (cancelled during cold-start/setup) -> $0."""
+    Cancelled after N steps -> N. The first step reports no ``step`` until it completes, so a cancel
+    mid-first-step would look like 0 steps despite real GPU time -- we floor to 1 whenever a
+    training-stage heartbeat is present.
+    """
     hb = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else {}
     step = hb.get("step")
     if isinstance(step, (int, float)) and step > 0:
@@ -269,23 +260,14 @@ def actual_steps_run(status: RunStatus) -> int:
 def profile_steps_run(status: RunStatus) -> int:
     """Whether a cancelled profile job rented anything: 1 if it started, 0 if it never did.
 
-    A profile has no optimizer steps, so ``actual_steps_run`` reads 0 for every one of them -- it
-    looks for training-stage heartbeats a profile never emits. Billing a cancel on that number
-    would hand back the rented wall of a profile that ran to completion. Billing the quote
-    unconditionally has the opposite failure: a profile cancelled while still queued would charge
-    the whole wall cap for work no gpu did, and because the id is derived from the workload rather
-    than the account, that charge lands on whichever submitter won the claim.
-
-    The distinguishing signal is that a worker spoke, but on a RELAUNCH the stored word may not be
-    this lifecycle's: a profile's run id is derived from the workload, so a relaunch reuses it, and
-    ``record_heartbeat`` keeps whatever arrives under it for visibility while refusing to arm the
-    wall from a heartbeat whose provenance it rejected. Billing the stored stage there charges a
-    relaunch cancelled in the queue for a machine it never rented. So a relaunch -- and only a
-    relaunch, marked by the attempt floor its takeover records -- is billed on the arm, which is
-    written only for a heartbeat that passed ``_heartbeat_attempt_is_current``. A first lifecycle
-    has no earlier worker to be confused with and bills on the stored word as before.
-    The charge is all-or-nothing rather than prorated because a profile is quoted as a wall cap,
-    not a per-step price -- see ``charge_usd_for_spec``."""
+    The signal is that a worker spoke, but a profile's run id is derived from the workload, so a
+    relaunch REUSES it and the stored word may belong to the previous lifecycle. Billing the stored
+    stage there charges a relaunch cancelled in the queue for a machine it never rented. So a
+    relaunch -- and only a relaunch, marked by the attempt floor its takeover records -- is
+    billed on the arm, which is written only for a heartbeat that passed
+    ``_heartbeat_attempt_is_current``. A first lifecycle has no earlier worker to be confused with
+    and bills on the stored word as before.
+    """
     hb = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else {}
     if not hb.get("stage"):
         return 0
@@ -377,32 +359,10 @@ def _remaining_run_wall_seconds(run_id: str, *, now: float | None = None) -> flo
 def _worker_deadline_at(run_id: str, spec: JobSpec, *, now: float | None = None) -> float:
     """Return the absolute deadline the worker may enforce for this launch.
 
-    The persisted run deadline is submission-to-terminal and, for an unarmed profile, still holds
-    the queue allowance on top of the work budget. The bootstrap enforces whatever absolute
-    deadline it is handed (see ``_worker_execution_deadline``) independently of max_wall_seconds,
-    so passing the run-global one lets a profile that got capacity immediately work through the
-    queue window on a job priced for its wall alone. Bound it to the work budget from launch, so
-    the deadline the worker enforces matches the wall ``_spec_with_remaining_wall`` grants.
-
-    Once armed, the persisted deadline is already work-budget-from-arm, and it is the authority:
-    taking the min keeps a relaunched or slow-to-speak worker from extending past it.
-
-    While UNARMED the stored deadline is not a ceiling on the work, because it still carries the
-    queue allowance that arming discards: it runs to created_at + queue + work, so once the wait
-    passes the allowance the remainder is SHORTER than the work budget. Taking the min there hands
-    the worker whatever is left of a window measured from submission -- at a 2100s wait, 300s of a
-    600s budget -- while `_spec_with_remaining_wall` grants the provider a full one and the first
-    heartbeat expands the plane's own deadline to armed_at + work. The worker never learns of that
-    expansion, so it would die mid-measurement on exactly the slow-capacity day the allowance
-    exists to survive. Unarmed, the work budget from launch is the authority.
-
-    That launch, though, is when the box is RENTED, not when its worker starts: the deadline handed
-    over here is absolute and the box enforces it from cloud-init onward. So an unarmed profile also
-    carries the provisioning allowance -- otherwise docker+gpu waits, the image pull, pip install and
-    the code fetch all come out of the work budget, and a slow-to-boot box self-terminates before it
-    can emit the first heartbeat that would have armed the plane's own clock. Arming discards the
-    remainder exactly like the queue allowance: once the worker speaks, `stored` is
-    armed_at + work and the min() below makes it binding again.
+    Unarmed, the work budget from launch is the authority. So an unarmed profile also carries the
+    provisioning allowance -- otherwise docker+gpu waits, the image pull, pip install and the code
+    fetch all come out of the work budget, and a slow-to-boot box self-terminates before it can emit
+    the first heartbeat that would have armed the plane's own clock.
     """
     stored = _load_run_deadline_at(run_id)
     if not spec.workload_profile_kind:
@@ -430,20 +390,9 @@ def _spec_with_remaining_wall(
     if remaining <= 0:
         raise RuntimeError("run wall deadline exhausted; no further provisioning is allowed")
     if spec.workload_profile_kind:
-        # an unarmed profile's remaining allowance still holds the queue budget, which exists to
-        # outlast capacity waits -- not to be spent working. handing it to the worker would let a
-        # profile that got capacity immediately run for the whole queue budget too, on a job billed
-        # for its wall alone (estimate_profile_cost prices wall x hourly).
-        #
-        # grant the WORK budget flat rather than min(remaining, work): `remaining` is measured
-        # against a deadline that still contains the unspent queue allowance, so once the queue wait
-        # passes that allowance the min() starts truncating. at a 1900s wait the provider would get
-        # 500s while the plane grants a full 600s the moment a heartbeat arms -- the shorter number
-        # goes to the side actually doing the work, killing the profile mid-measurement on exactly
-        # the slow-capacity days the queue allowance exists to survive.
-        #
-        # the run-global deadline still bounds the work: _worker_deadline_at hands the worker
-        # min(stored, now + work_budget), so this grant sets the wall, not a licence to outlive it.
+        # grant an unarmed profile its full work budget, not remaining submission allowance. the latter
+        # still contains queue time and later truncates work after a long capacity wait; the run-global
+        # deadline remains enforced by ``_worker_deadline_at``.
         remaining = float(_WORKLOAD_PROFILE_WALL_SECONDS)
     if require_provider_minimum and remaining < MIN_PROVIDER_WALL_SECONDS:
         raise RuntimeError(
@@ -466,12 +415,12 @@ def _infer_next_attempt(raw: dict) -> int:
 def _heartbeat_attempt_is_current(hb: object, raw: dict) -> bool:
     """True when a heartbeat carries the attempt identity this run most recently reserved.
 
-    The plane-side half of ``_heartbeat_matches_attempt``. That one runs provider-side where the
-    launch timestamp is in hand; here the equivalent identity is the reserved attempt, which the
-    worker stamps on every heartbeat and ``_save_status`` already persists as ``next_attempt``
-    (the NEXT id to hand out, so the live attempt is one below it -- same arithmetic as
-    ``_latest_reserved_attempt``, computed from the caller's already-loaded record because this runs
-    inside the status guard and must not re-read it).
+    This is the plane-side counterpart of ``_heartbeat_matches_attempt``, which runs provider-side
+    where the launch timestamp is in hand; here the equivalent identity
+    is the reserved attempt, which the worker stamps on every heartbeat and ``_save_status`` already
+    persists as ``next_attempt`` (the NEXT id to hand out, so the live attempt is one below it --
+    same arithmetic as ``_latest_reserved_attempt``, computed from the caller's already-loaded
+    record because this runs inside the status guard and must not re-read it).
     """
     if not isinstance(hb, dict):
         return False
@@ -670,15 +619,10 @@ def _public_status_spec(raw):
 def _redact_internal_adapter_ref(data: dict) -> None:
     """Never surface an internal storage locator in the public spec.
 
-    A worker/effective or legacy record can persist ``train.init_from_adapter`` as the internal
-    storage ref ``<hf_repo>:<phase>/<run_id>[/checkpoints/step-N]``, which embeds the private HF
-    repo. Rewrite it back to the user-facing checkpoint ref (``<run_id>[/step-N]``).
-
-    A ref is published only when it is PROVEN user-facing, never merely because this build failed
-    to parse it as internal. Those are different claims: a persisted locator whose phase this build
-    no longer knows (``opsd``, removed in #784) stops parsing as internal, and inferring "public"
-    from that published the private repo verbatim (chatgpt-codex-connector). Unrecognized shapes are
-    dropped, which is what the malformed-prefix branch below has always done.
+    A ref is published only when it is PROVEN user-facing, never merely because this build failed to
+    parse it as internal. Those are different claims: a persisted locator whose phase this build no
+    longer knows (``opsd``, removed in #784) stops parsing as internal, and inferring "public" from
+    that published the private repo verbatim.
     """
     train = data.get("train")
     if not isinstance(train, dict):
@@ -824,12 +768,9 @@ def artifact_namespace() -> str:
 
     Flash streams code, checkpoints and adapters through HF dataset repos that the control plane
     CREATES, so the namespace has to be one the operator's ``HF_TOKEN`` can write to. Hardcoding
-    Freesolo's made self-hosting impossible: ``_assign_managed_hf_repo`` runs on every submit, and
-    a self-hoster's token cannot create ``Freesolo-Co/flashrun-*``, so the run failed at upload
-    before any training started.
-
-    ``FLASH_HF_NAMESPACE`` overrides it (a user or an org). Defaults to the managed namespace, so
-    the hosted deployment is unaffected.
+    Freesolo's made self-hosting impossible: ``_assign_managed_hf_repo`` runs on every submit, and a
+    self-hoster's token cannot create ``Freesolo-Co/flashrun-*``, so the run failed at upload before
+    any training started.
     """
     return (os.environ.get("FLASH_HF_NAMESPACE") or "").strip() or _DEFAULT_ARTIFACT_NAMESPACE
 
@@ -934,8 +875,8 @@ def _download_gb(info: ModelInfo) -> float:
     """Full bf16 checkpoint size in GB, from catalog geometry (2 bytes/param).
 
     Same rule as ``cost.facts.download_weight_gb``, which cannot be reused here: it resolves a model
-    *id* and fail-closes on anything off-catalog, while cache sizing runs on a ``ModelInfo`` that may
-    legitimately carry no ``params_b``.
+    *id* and fail-closes on anything off-catalog, while cache sizing runs on a ``ModelInfo`` that
+    may legitimately carry no ``params_b``.
     """
     return (info.params_b or 0.0) * 2.0
 
@@ -948,11 +889,8 @@ def _peak_gb(info: ModelInfo) -> float:
 def _fits_weight_cache(info: ModelInfo) -> bool:
     """Whether the model's peak download footprint fits the shared weight-cache volume.
 
-    Sizes the model against an EMPTY volume. That is the right question for "may this model use
-    the cache at all", but it is NOT sufficient to prove the whole catalog can be warmed onto one
-    volume -- the cache is shared and never evicted, so a later model meets a volume already
-    holding every earlier one. ``weight_cache_catalog_peak_gb`` answers that cumulative question;
-    keep both in agreement when adding a large model.
+    Sizes the model against an EMPTY volume. ``weight_cache_catalog_peak_gb`` answers that
+    cumulative question; keep both in agreement when adding a large model.
     """
     if not info.params_b:
         return (
@@ -964,14 +902,10 @@ def _fits_weight_cache(info: ModelInfo) -> bool:
 def weight_cache_catalog_peak_gb() -> float:
     """Peak GB the volume must hold to warm the WHOLE catalog onto one shared volume.
 
-    Every catalog model ends up resident together and nothing is ever evicted, so the worst moment
-    is the largest model downloading -- needing room for its scratch -- while all the others are
-    already on disk. That is strictly more than any single model's own peak, which is why sizing the
-    volume per-model let the 35B fail with "Disk quota exceeded" on every datacenter at 200 GB.
-
-    Derived from ``params_b``, so it slightly understates a repo that also ships tokenizer/config/
-    index files; the measured-bytes figure for today's catalog is ~5 GB higher. Keep real headroom
-    over this number rather than sizing to it exactly.
+    That is strictly more than any single model's own peak, which is why sizing the volume per-model
+    let the 35B fail with "Disk quota exceeded" on every datacenter at 200 GB. Derived from
+    ``params_b``, so it slightly understates a repo that also ships tokenizer/config/ index files;
+    the measured-bytes figure for today's catalog is ~5 GB higher.
     """
     from flash.catalog import MODELS
 
@@ -1081,7 +1015,8 @@ def _prepare_init_from_adapter(
     Failures here are genuinely about the warm-start source, so they are tagged
     ``WarmStartPreparationError`` for the submit route. Everything else in ``prepare_job`` (gpu
     sizing, budget, environment resolution) must keep its own message rather than be reported as a
-    bad adapter, since those run for non-warm-start runs too and have nothing to do with the adapter.
+    bad adapter, since those run for non-warm-start runs too and have nothing to do with the
+    adapter.
     """
     try:
         return _prepare_init_from_adapter_inner(
@@ -1198,14 +1133,11 @@ def _prepare_init_from_adapter_inner(
 def _mark_warmstart_source(worker_spec: JobSpec, child_run_id: str) -> None:
     """Drop a 0-byte ``referenced_by/<child_run_id>`` marker into the warm-start SOURCE run's HF repo.
 
-    The always-on artifact GC (``flash.server.repo_cleanup``) treats a source repo carrying a RECENT
-    such marker as still-referenced and spares its artifacts for the GC age window — so a child that
-    warm-starts (``init_from_adapter``) off an aged, undeployed source is not reaped out from under it.
     ``worker_spec`` is post-resolution, so its ``init_from_adapter`` is the internal
-    ``<repo>:<phase>/<run_id>...`` storage ref whose repo is the source. Best-effort: a failed marker
-    never blocks submission — it only forfeits the GC grace (the source can still be spared by being
-    deployed or recently written). Emitted on submit AND re-emitted on recovery (``_runtime``), so a
-    child recovered across restarts keeps its source's marker fresh past the age window."""
+    ``<repo>:<phase>/<run_id>...`` storage ref whose repo is the source. Best-effort: a failed
+    marker never blocks submission -- it only forfeits the GC grace (the source can still be spared
+    by being deployed or recently written).
+    """
     import io
 
     ref = worker_spec.train.init_from_adapter
@@ -1246,9 +1178,9 @@ def _preparation_digest(
     # above: the digest has to reproduce the bytes that were hashed, not today's serialization. A
     # pre-upgrade snapshot hashed `model_policy` in (to_internal_dict was asdict, so it emitted the
     # defaulted value), and the field no longer exists -- so rehashing without it mismatches and a
-    # still-valid warm-start or workload-profile run fails integrity validation on recovery
-    # (cursor[bot], codex[bot]). Only keys the spec itself has dropped are honoured; anything the
-    # dataclass still defines comes from worker_spec, so this cannot be used to forge a field.
+    # still-valid warm-start or workload-profile run fails integrity validation on recovery. Only
+    # keys the spec itself has dropped are honoured; anything the dataclass still defines comes from
+    # worker_spec, so this cannot be used to forge a field.
     for key, value in (legacy_keys or {}).items():
         if key in _DROPPED_TOP_LEVEL_KEYS:
             worker_payload[key] = value
@@ -1304,12 +1236,12 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
     effective["environment"] = effective_environment
     public_gpu = dict(public["gpu"])
     effective_gpu = {**effective["gpu"], "type": public_gpu["type"]}
-    # gpu.count is a CEILING, and the allocator may satisfy it with fewer cards (2x of a class when
-    # 4 was allowed). _spec_with_gpu writes the SELECTED count onto the worker spec -- the worker
-    # sizes its rank count from it and the provider payload rents it -- so comparing it against the
-    # authored ceiling would fail every narrowed run here, before any provider is reached. narrowing
-    # only: a worker spec claiming MORE cards than the run authorized is a real integrity failure and
-    # still raises. the exact selected count is digest-protected and persisted for launch.
+    # _spec_with_gpu writes the SELECTED count onto the worker spec -- the worker sizes its
+    # rank count from it and the provider payload rents it -- so comparing it against the
+    # authored ceiling would fail every narrowed run here, before any provider is reached.
+    # narrowing only: a worker spec claiming MORE cards than the run authorized is a real
+    # integrity failure and still raises. the exact selected count is digest-protected and
+    # persisted for launch.
     effective_count = int(effective_gpu.get("count", 1) or 1)
     public_count = int(public_gpu.get("count", 1) or 1)
     if 1 <= effective_count <= public_count:
@@ -1400,17 +1332,9 @@ def _require_pinned_profile_environment(spec: JobSpec) -> JobSpec:
 def _prepared_sft_profile_job(spec: JobSpec, *, input_digest: str) -> PreparedJob:
     """Prepare the cpu-only profile job that measures ``spec``'s exact sft workload.
 
-    Deliberately NOT ``prepare_job()``: that path prepares a *training* run, and every step of it
-    is about weights this job never loads. Running it here would resolve revision-specific model
-    geometry, reserve model-sized disk, attach the shared weight cache, prepare warm-start adapter
-    continuation, and finally price the training shape -- which needs the very profile this job
-    exists to produce. The profile loads a tokenizer and the pinned environment, then exits.
-
-    What it does keep is the small set of things the worker genuinely needs: the deterministic
-    run id, the immutable model/env revisions the caller already pinned, a bounded wall and retry
-    policy, and the managed artifact repo the worker downloads its code prefix from and uploads
-    metrics.json/DONE/console to. GPU type and provider pins are dropped: they describe where the
-    training run must land, and inheriting them would rent an H100 to tokenize on cpu.
+    The profile loads a tokenizer and the pinned environment, then exits. GPU type and provider pins
+    are dropped: they describe where the training run must land, and inheriting them would rent an
+    H100 to tokenize on cpu.
     """
     from flash.workload_profile import SFT_PROFILE_KIND, sft_profile_run_id
 
@@ -1567,15 +1491,15 @@ def prepare_job(
             raise ValueError(f"no configured provider can provision gpu.type {spec.gpu.type!r}")
     info = resolve_model(spec.model, spec.algorithm, model_revision=spec.model_revision)
     if spec.algorithm == "opd" and spec.train.structured_outputs:
-        # the generic serving preflight above validates the schema's SHAPE, but the constraint can
-        # still be one verl OPD deterministically refuses: a guidance-only json feature (format,
-        # multipleOf, uniqueItems) or a vllm MistralTokenizer model. that check lived only on the
-        # worker, so the user rented a gpu to receive a permanent validation failure (codex[bot]).
-        #
-        # only the allocation-independent half runs here. the vocab-size comparison needs the
-        # ALLOCATED card count -- judging a shardable run on one card would reject a shape the
-        # allocator would have placed -- so it stays on the worker, which also keeps that check as
-        # defense in depth for any path that reaches training without passing through here.
+        # the generic serving preflight above validates the schema's SHAPE, but the
+        # constraint can still be one verl OPD deterministically refuses: a guidance-only
+        # json feature (format, multipleOf, uniqueItems) or a vllm MistralTokenizer model.
+        # that check lived only on the worker, so the user rented a gpu to receive a
+        # permanent validation failure. only the allocation-independent half runs here.
+        # the vocab-size comparison needs the ALLOCATED card count -- judging a shardable
+        # run on one card would reject a shape the allocator would have placed -- so it
+        # stays on the worker, which also keeps that check as defense in depth for any
+        # path that reaches training without passing through here.
         from flash.opd_validation import preflight_opd_structured_outputs
 
         preflight_opd_structured_outputs(
@@ -1676,31 +1600,26 @@ def _persist_profile_submission(status: RunStatus, save_kwargs: dict) -> RunStat
         # a spent one is replaced. the caller only reaches this after winning the takeover on that
         # exact spent record, so overwriting it is the relaunch, not a lost update.
         if raw_existing is not None:
-            # the RECORD is replaced but the ARTIFACTS are not: the reused id means this lifecycle
-            # uploads to the HF prefix ({phase}/{run_id}) the spent one left behind, so two private
-            # keys have to carry across the overwrite rather than restart with it.
-            #
-            # attempt identity stays globally monotonic. error_<phase>_attempt<N>.txt is
-            # attempt-scoped, and _instance_poll treats a present one as THIS handle's crash
-            # ("error files are attempt-scoped, so a present file already belongs to this exact
-            # handle") -- sound only while an id never repeats. restarting at 0 hands the fresh run
-            # the spent one's attempt-0 error file, and it dies job_failed seconds after launch,
-            # deterministically, on hardware it never used.
+            # reused profile ids share artifact prefixes, so attempt ids must remain globally monotonic.
+            # restarting at zero can bind the new worker to the spent lifecycle's attempt-scoped error
+            # file and fail before using its hardware.
             carried_attempt = _infer_next_attempt(raw_existing)
             save_kwargs["_next_attempt"] = carried_attempt
-            # carrying the counter keeps the ids monotonic, but it also means that until THIS
-            # lifecycle reserves one, `next_attempt - 1` still names the SPENT lifecycle's attempt.
-            # a prior worker that outlived its record stamps exactly that id, and its heartbeats are
-            # genuinely recent, so the provenance check would accept one and arm this run's work
-            # budget while it is still queuing for a machine. record the carried counter as this
-            # lifecycle's floor: every attempt below it belongs to the run that already ended.
+            # carrying the counter keeps the ids monotonic, but it also means that
+            # until THIS lifecycle reserves one, `next_attempt - 1` still names the
+            # SPENT lifecycle's attempt. a prior worker that outlived its record
+            # stamps exactly that id, and its heartbeats are genuinely recent, so the
+            # provenance check would accept one and arm this run's work budget while
+            # it is still queuing for a machine. record the carried counter as this
+            # lifecycle's floor: every attempt below it belongs to the run that
+            # already ended.
             save_kwargs["_profile_attempt_floor"] = carried_attempt
-            # the wall, by contrast, must NOT carry: an arm records that a worker spoke, and that
-            # worker was the previous lifecycle's. inheriting it dates this run's budget to a
-            # heartbeat predating its own submission -- and since _canonical_run_deadline rebuilds
-            # the deadline from that basis, the stored pair stops matching and every read fails the
-            # tamper check, wedging this workload's profile id for every submitter. None drops the
-            # stored key rather than carrying it forward.
+            # the wall, by contrast, must NOT carry: an arm records that a worker
+            # spoke, and that worker was the previous lifecycle's. inheriting it dates
+            # this run's budget to a heartbeat predating its own submission -- and
+            # since _canonical_run_deadline rebuilds the deadline from that basis, the
+            # stored pair stops matching and every read fails the tamper check,
+            # wedging this workload's profile id for every submitter.
             save_kwargs["_profile_wall_armed_at"] = None
         _save_status_unlocked(status, **save_kwargs)
     return None
@@ -1718,14 +1637,11 @@ def submit_job(
 ) -> RunStatus:
     """Submit a prepared job, allocating resources only outside dry-run mode.
 
-    A missing sft workload profile propagates as ``WorkloadProfilePending`` rather than being
-    launched from here. Launching a profile requires claiming its deterministic id FIRST
-    (``db.claim_profile_run`` / ``db.reclaim_spent_profile_run``), because the id is derived from
-    the workload rather than the account: without the claim two submitters of the same config both
-    launch, the work is profiled and billed twice, and the takeover that unwedges a spent profile
-    loses the ordering it compares against. That claim lives in the server db, which this module
-    deliberately does not depend on, so the caller that owns the key performs it -- see
-    ``flash/server/routes/runs.py``, which claims and only then submits.
+    Launching a profile requires claiming its deterministic id FIRST (``db.claim_profile_run`` /
+    ``db.reclaim_spent_profile_run``), because the id is derived from the workload rather than the
+    account: without the claim two submitters of the same config both launch, the work is profiled
+    and billed twice, and the takeover that unwedges a spent profile loses the ordering it compares
+    against.
     """
     if prepared_job is not None:
         prepared = prepared_job
@@ -1823,13 +1739,9 @@ def submit_job(
 
 
 def _runstatus_from_json(d: dict) -> RunStatus:
-    # Tolerant load: drop unknown keys before constructing RunStatus. A status JSON written by an
-    # OLDER control plane can carry a since-removed field (e.g. ``resume_seed_index`` from the
-    # pre-#317 multi-seed era) -- and `~/.flash/runs/*.json` is never GC'd, so those files exist in
-    # prod RIGHT NOW. A strict ``RunStatus(**d)`` raises TypeError on such a key; the read sites
-    # (get_status callers, recover/reconcile) catch only FileNotFoundError, so it would escape and
-    # 500 runs-list / poll / recover / reconcile. This is operational tolerance for data already on
-    # disk, NOT feature back-compat -- the removed field itself stays gone (it's simply ignored).
+    # Tolerant load: drop unknown keys before constructing RunStatus. ``resume_seed_index``
+    # from the pre-#317 multi-seed era) -- and `~/.flash/runs/*.json` is never GC'd, so those
+    # files exist in prod RIGHT NOW.
     return RunStatus(**{k: v for k, v in d.items() if k in RunStatus.__dataclass_fields__})
 
 
@@ -1936,16 +1848,11 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
 def reallocation_spec_from_status(status: RunStatus, *, verify_source: bool = False) -> JobSpec:
     """Effective worker spec for RE-ALLOCATING a recovered run.
 
-    Identical to effective_spec_from_status, except gpu.type and gpu.count are restored to the run's
-    original public values. Both are narrowed by allocation: _spec_with_gpu bakes the *allocated*
-    class into gpu.type and the *selected* count into gpu.count. Feeding that straight back to
-    allocate() would re-enter recovery with the prior attempt's answer as its input -- hard-pinning
-    an originally-unpinned run to one class (blocking OOM escalation and retries on other
-    providers/classes), and lowering the ceiling to the one shape that already failed, so a run
-    authored for up to 4 cards can never again be offered a 4-card shape. gpu.count is a CEILING, so
-    restoring it re-widens the search rather than forcing a size.
-    Use this only where recovery re-enters allocate(); polling a live attempt and endpoint cleanup
-    keep the concrete effective spec.
+    Feeding that straight back to allocate() would re-enter recovery with the prior attempt's answer
+    as its input -- hard-pinning an originally-unpinned run to one class (blocking OOM escalation
+    and retries on other providers/classes), and lowering the ceiling to the one shape that already
+    failed, so a run authored for up to 4 cards can never again be offered a 4-card shape. gpu.count
+    is a CEILING, so restoring it re-widens the search rather than forcing a size.
     """
     worker_spec = effective_spec_from_status(status, verify_source=verify_source)
     public_gpu = JobSpec.from_dict(status.spec).gpu
@@ -2025,15 +1932,9 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
             status = get_status(run_id)
         except FileNotFoundError:
             return
-        # first word from a profile's worker starts its work budget. the arm and the deadline it
-        # implies are written together under this guard so a reader never sees one without the
-        # other -- _checked_stored_run_deadline rejects that pair as tampering and halts the run.
-        #
-        # only a heartbeat from THIS run may arm it. a profile's run id is derived from the
-        # workload, so a relaunch reuses the id and its artifact prefix, and the first heartbeat
-        # read back can be the previous lifecycle's leftover (observed: a 2.8-hour-old one arming a
-        # 5-second-old run). the same provenance requirement _heartbeat_matches_attempt enforces
-        # provider-side, applied to the boundary available here.
+        # atomically store a profile's first current-attempt heartbeat arm and deadline; readers reject
+        # a partial pair as tampering. reused run ids can retain an earlier lifecycle's heartbeat, so
+        # provenance must pass before the work budget starts.
         arm_kwargs: dict[str, float] = {}
         raw = _load_status_json(run_id)
         armed_spec = _internal_spec_from_status(status)
@@ -2453,10 +2354,10 @@ def _preserve_cleanup_remote(run_id: str, remote: dict) -> bool:
 def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **updates) -> bool:
     """Atomically transition run state with terminal-stickiness. Returns False if rejected.
 
-    Returns ``True`` if the transition was applied, ``False`` if it was rejected because
-    the run was already in a terminal state (the sticky compare-and-set below). Callers
-    that gate PAID work on a transition (e.g. the recovery path resuming ``_run_training``)
-    must check this return so a run concurrently flipped terminal does not get resumed.
+    Returns ``True`` if the transition was applied, ``False`` if it was rejected because the run was
+    already in a terminal state (the sticky compare-and-set below). Callers that gate PAID work on a
+    transition (e.g. the recovery path resuming ``_run_training``) must check this return so a run
+    concurrently flipped terminal does not get resumed.
     """
     report_status: RunStatus | None = None
     with _status_guard(run_id):

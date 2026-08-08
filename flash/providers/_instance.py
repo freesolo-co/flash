@@ -62,12 +62,8 @@ def instance_label(run_id: str, seed: int, attempt: int) -> str:
 class InstanceJobHandle:
     """Fields + (de)serialization common to every rent-a-box provider handle (Lambda, Vast).
 
-    Persisted in ``RunStatus.remote`` so any process can reattach/cancel (cf. ``base.JobHandle``). Each
-    provider subclass tags its ``provider`` and adds its own locator fields (via ``_extra_to_dict`` /
-    ``_extra_from_dict``); the shared ``to_dict``/``from_dict`` carry the common set so the serialized
-    shape stays byte-identical across providers. ``instance_id`` is the poll/destroy target, so unlike
-    every other field it has NO safe default — a missing/uncoercible one is a corrupt handle that must
-    fail with a clear, actionable error (not a bare KeyError/ValueError that crashes reattach/recovery).
+    Persisted in `RunStatus.remote` for reattach and cancellation. Subclasses add locator fields;
+    `instance_id` has no safe default because it is the poll/destroy target.
     """
 
     instance_id: int | str

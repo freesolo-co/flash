@@ -473,7 +473,7 @@ def test_structured_opd_guidance_only_feature_is_rejected_before_allocation(monk
     `format`, `multipleOf` and `uniqueItems` need vLLM's guidance backend, and verl OPD pins
     xgrammar for exact forced-token replay -- so the job can NEVER run. That check lived only in the
     worker, past allocation, so the user paid for a card to receive a permanent validation failure
-    (codex[bot]). The generic serving preflight does not catch it: it validates the schema's shape,
+    The generic serving preflight does not catch it: it validates the schema's shape,
     and this schema is perfectly valid.
     """
     import flash.runner as runner

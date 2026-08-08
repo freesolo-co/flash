@@ -24,19 +24,9 @@ from flash.providers.runpod.gpus import flash_gpu
 # runpod_flash asyncio singleton is bound to one event loop; serialize all deploy/undeploy.
 FLASH_SDK_LOCK = threading.Lock()
 
-# 58 leaves a 2-slot buffer under RunPod's 60-worker account quota. Shared via Postgres when an
-# internal key is set; falls back to in-process semaphore otherwise. Releases only after the
-# remote endpoint is provably gone.
-#
-# NOTE: nothing enforces this today. The only claim site is `_acquire_endpoint_slot`, reached
-# only from `get_train_endpoint`, which has had no production caller since 3b2689f2 (the
-# multi-account waterfall, 28 minutes after the slot store landed) gave `jobs.py::_deploy_once`
-# its own `Endpoint(...)` path that never claims. flash.runpod_endpoint_slots has 0 rows on prod
-# and dev because nothing has ever leased, not because nothing is leased right now. The startup
-# `reconcile_endpoint_slots()` still runs, but it only deletes rows for endpoints that are gone.
-#
-# So this constant is the intended value, not an enforced one. Wiring the claim into the live
-# deploy path is a separate change: it alters endpoint provisioning, not a number.
+# intended limit is 58, leaving two slots under RunPod's 60-worker quota.
+# it is not enforced on the live jobs.py deployment path; the slot table remains unused.
+# wiring claims into provisioning is separate from changing this constant.
 RUNPOD_ENDPOINT_SLOT_CAP = 58
 _SLOT_QUEUE_WAIT_S = 10.0
 _SLOT_STORE_MAX_ERRORS = 6
@@ -726,12 +716,8 @@ def get_train_endpoint(
                 weight_cache_endpoint_kwargs,
             )
 
-            # Reconcile before attaching: the SDK returns an existing volume at its provisioned
-            # size, so a pre-bump volume stays small and the run fails on "Disk quota exceeded".
-            # Re-read the key HERE, not before _acquire_endpoint_slot: another thread can
-            # advance_key() while this one waits for the slot, and Endpoint below reads whatever the
-            # env var now holds. A key captured earlier would grow one account's volume and attach
-            # another's, leaving the attached one stale.
+            # resize before attach because existing volumes keep their provisioned size.
+            # reread the key after waiting for a slot so resize and Endpoint use the same account.
             grow_weight_cache_volumes(spec, ensure_auth())
             kwargs.update(weight_cache_endpoint_kwargs(spec))
             ep = Endpoint(**kwargs)
