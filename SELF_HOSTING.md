@@ -221,9 +221,9 @@ Gated repos (Llama among them) still require you to have accepted the licence on
 account, and private repos need `HF_TOKEN` to have read access.
 
 > **RunPod endpoint concurrency is not capped by Flash**, on a self-hosted plane or a
-> managed one. The slot store and the in-process semaphore behind it are both claimed from
-> a code path the live deploy no longer uses, so neither enforces the intended 58-endpoint
-> ceiling; `flash/providers/runpod/train/endpoints.py` documents this at the constant. If
+> managed one. Flash used to carry a slot store intended to hold the account to a
+> 58-endpoint ceiling, but it was claimed from a code path the live deploy replaced and so
+> never enforced anything; it has been removed rather than left to imply a guarantee. If
 > you expect many concurrent runs, cap them upstream of Flash or raise the worker quota on
 > your RunPod account - otherwise a large enough burst hits RunPod's account limit and the
 > excess deploys fail there.
