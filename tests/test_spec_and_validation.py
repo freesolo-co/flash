@@ -84,8 +84,6 @@ def test_parse_adapter_revision_rejects_zero_padded_steps(step):
         ({"algorithm": 5}, "algorithm must be a string"),
         ({"algorithm": ["grpo"]}, "algorithm must be a string"),
         ({"algorithm": True}, "algorithm must be a string"),
-        # NOTE: model_policy is no longer a user knob (it's read from the FLASH_MODEL_POLICY env on
-        # the control plane), so a bad user-supplied model_policy is ignored, not rejected here.
         # Unknown config sections/keys are rejected (not silently dropped → 16x-cost defaults).
         # The classic footgun: rollout knobs under a [grpo] table instead of [train].
         ({"grpo.group_size": 4}, "unknown config section"),

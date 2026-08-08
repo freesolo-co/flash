@@ -389,8 +389,6 @@ class JobSpec:
     seed: int = FIXED_SEED
     # per-run env overrides forwarded to the gpu worker; never put secrets here.
     worker_env: dict[str, str] = field(default_factory=dict)
-    # "catalog" (curated models only) or "allow" (any hf model that fits the gpu).
-    model_policy: str = "catalog"
     thinking: bool = False
     wandb: WandbSpec = field(default_factory=WandbSpec)
     model_revision: str = ""
@@ -442,11 +440,6 @@ class JobSpec:
         data = asdict(self)
         # server-assigned identity — never authored in a config.
         data.pop("run_id", None)
-        # `model_policy` IS authorable (a self-hosted plane honours "allow"), so it has to survive
-        # the client -> server round trip or the config could never reach the plane that authorizes
-        # it. Emitted only when it differs from the default, so a managed payload is unchanged.
-        if data.get("model_policy") == "catalog":
-            data.pop("model_policy", None)
         data.pop("workload_profile_kind", None)
         data.pop("workload_profile_input_digest", None)
         data.pop("workload_profile_producer_version", None)
@@ -585,7 +578,6 @@ class JobSpec:
             ),
             run_id=data.get("run_id", "local"),
             worker_env=_coerce_str_map(data.get("worker_env")),
-            model_policy=data.get("model_policy", "catalog"),
             thinking=coerce_bool(data.get("thinking", False)),
             wandb=_coerce_wandb(data.get("wandb")),
             seed=parse_seed(data.get("seed", FIXED_SEED)),

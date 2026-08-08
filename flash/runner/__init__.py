@@ -31,7 +31,7 @@ from flash.opd_retry_contract import (
     require_opd_retry_contract_version,
 )
 from flash.providers._poll import _attempt_int
-from flash.spec import MANAGED_GPU_KEYS, TRAINER_BACKEND, GpuSpec, JobSpec, gpu_count_of
+from flash.spec import MANAGED_GPU_KEYS, TRAINER_BACKEND, GpuSpec, JobSpec
 
 _STATE_DIR = str(data_dir())
 RUNS_DIR = os.path.join(_STATE_DIR, "runs")
@@ -978,16 +978,16 @@ def weight_cache_catalog_peak_gb() -> float:
 
 
 def _assign_weight_cache_volume(spec: JobSpec, info: ModelInfo | None = None) -> JobSpec:
-    """Attach the shared weight-cache volume for PUBLIC catalog models only.
+    """Attach the shared weight-cache volume, which every run is now eligible for.
 
-    Open-model ("allow") runs are never given the shared cache — private weights must not reach the
-    shared cross-tenant mount. A pre-set non-shared volume is always honored as-is.
+    Only curated models are trainable, and their weights are public, so the shared cross-tenant
+    mount holds nothing private. A pre-set non-shared volume is always honored as-is, and an
+    oversized model still fails ``_fits_weight_cache``.
     """
-    is_catalog = getattr(spec, "model_policy", "catalog") == "catalog"
     existing = getattr(spec.gpu, "network_volume", None)
     if existing and existing != WEIGHT_CACHE_VOLUME_NAME:
         return spec
-    attach = is_catalog and (info is None or _fits_weight_cache(info))
+    attach = info is None or _fits_weight_cache(info)
     pinned = existing == WEIGHT_CACHE_VOLUME_NAME
     # An already-pinned spec is only "correct" if it also carries the CURRENT managed size. A stale
     # or internally-round-tripped spec can hold the shared name at a previous, smaller size; taking
@@ -1245,13 +1245,12 @@ def _preparation_digest(
 def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None:
     public = public_spec.to_internal_dict()
     effective = worker_spec.to_internal_dict()
-    # run_id and model_policy are platform-managed top-level fields stripped from the public spec, so
-    # the reconstructed public spec carries only their defaults ("local"/"catalog"). exclude them from
-    # the structural check; their integrity is covered by the sha256 preparation digest, and the
+    # run_id is a platform-managed top-level field stripped from the public spec, so the
+    # reconstructed public spec carries only its default ("local"). exclude these from the
+    # structural check; their integrity is covered by the sha256 preparation digest, and the
     # worker spec is already keyed by run_id at the persist boundary.
     for managed_top in (
         "run_id",
-        "model_policy",
         "workload_profile_kind",
         "workload_profile_input_digest",
         "workload_profile_producer_version",
@@ -1546,39 +1545,7 @@ def prepare_job(
                 raise ValueError(f"requested gpu.provider {provider!r} is not configured")
         elif not any(name in configured for name in providers_for(spec.gpu.type)):
             raise ValueError(f"no configured provider can provision gpu.type {spec.gpu.type!r}")
-    from flash.providers.allocator import geometry_safe_gpu_cap
-
-    preflight_gpu_count = geometry_safe_gpu_cap(
-        spec.model, gpu_count_of(spec), model_revision=spec.model_revision
-    )
-    preflight_gpu = spec.gpu.type
-    if not preflight_gpu and spec.model_policy == "allow":
-        # open-model auto runs size this fit preflight against the provisional class the schema
-        # already validated against, not the empty public gpu.type: resolve_model ->
-        # _resolve_open_model falls back to DEFAULT_GPU on empty, which would reject an uncatalogued
-        # model larger than the default but fitting a managed class -- after it passed schema.
-        from flash.providers.base import provisional_gpu
-
-        preflight_gpu = provisional_gpu(
-            spec.model,
-            spec.algorithm,
-            train=spec.train,
-            thinking=spec.thinking,
-            model_revision=spec.model_revision,
-            # same card ceiling the allocator will honour, so this preflight cannot reject a shape
-            # allocation would have accepted.
-            gpu_count=preflight_gpu_count,
-        )
-    info = resolve_model(
-        spec.model,
-        spec.algorithm,
-        policy=spec.model_policy,
-        gpu=preflight_gpu,
-        model_revision=spec.model_revision,
-        # same ceiling the preflight class was chosen under, so this cannot reject a shape
-        # allocation would have accepted.
-        gpu_count=preflight_gpu_count,
-    )
+    info = resolve_model(spec.model, spec.algorithm, model_revision=spec.model_revision)
     if spec.algorithm == "opd" and spec.train.structured_outputs:
         # the generic serving preflight above validates the schema's SHAPE, but the constraint can
         # still be one verl OPD deterministically refuses: a guidance-only json feature (format,
@@ -1626,7 +1593,7 @@ def _reject_managed_volume_removal(snapshot: object, worker_spec: JobSpec) -> No
     network_volume is platform-managed and no longer travels in the public spec, so the committed
     volume lives only in the prior preparation snapshot. The SHARED platform cache
     (WEIGHT_CACHE_VOLUME_NAME) may be dropped on a capacity fallback, but a per-org escape-hatch
-    volume an open-model run opted into must never be silently removed or swapped.
+    volume a run opted into must never be silently removed or swapped.
     """
     if not isinstance(snapshot, dict):
         return
