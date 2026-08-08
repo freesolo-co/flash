@@ -216,7 +216,7 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
 
 def test_entropy_knobs_parse_from_toml_roundtrip_and_override(tmp_path, monkeypatch) -> None:
     import flash.engine.worker as w
-    from flash.schema import spec_from_file
+    from flash.schema import spec_and_train_keys_from_file
 
     config = tmp_path / "grpo.toml"
     config.write_text(
@@ -234,7 +234,7 @@ def test_entropy_knobs_parse_from_toml_roundtrip_and_override(tmp_path, monkeypa
         )
     )
 
-    spec = spec_from_file(str(config), run_id="entropy")
+    spec = spec_and_train_keys_from_file(str(config), run_id="entropy")[0]
     assert spec.train.entropy_quantile == 0.2
 
     roundtripped = JobSpec.from_dict(spec.to_dict())
