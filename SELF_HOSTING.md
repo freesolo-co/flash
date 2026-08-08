@@ -51,7 +51,10 @@ auth backend, pass `--freesolo-url` and verification happens against it.)
 
 Every run config needs a top-level `project` uuid - it groups runs and is required in
 standalone mode too (see [project ids](#what-flashstandalone1-does)). Any uuid works
-on a standalone plane, so you can pick one once and reuse it:
+on a standalone plane, so you can pick one once and reuse it. `flash projects create` and
+`flash projects list` are **hosted-only** - they talk to the Freesolo org directory, which
+a standalone plane does not have - so generate one yourself (`python -c "import uuid;
+print(uuid.uuid4())"`) and pass it explicitly to `flash env setup --project <uuid>`:
 
 ```toml
 project = "11111111-1111-4111-8111-111111111111"
@@ -171,6 +174,33 @@ With it set:
   reconciliation, checkpoint registration, the shared RunPod slot store, and the hosted
   artifact GC sweep. Otherwise these would send your operator key to `api.freesolo.co`
   (and, for the GC, `serve.freesolo.co`) and log a warning per run or per startup.
+- **`model_policy = "allow"` is honoured**, so you are not limited to the curated catalog.
+  See [any HuggingFace model](#any-huggingface-model).
+
+## Any HuggingFace model
+
+The catalog (`flash models list`) is six curated Qwen checkpoints with validated GPU sizing.
+You are not restricted to them. Set `model_policy` at the top level of the config and Flash
+accepts any HuggingFace model that fits the GPU:
+
+```toml
+project = "11111111-1111-4111-8111-111111111111"
+model = "meta-llama/Llama-3.1-8B"
+model_policy = "allow"
+algorithm = "sft"
+```
+
+Flash reads the parameter count from HuggingFace, estimates VRAM for your algorithm, and
+rejects the run up front if it cannot fit the card (warning instead when it is merely tight).
+Private repos need `HF_TOKEN` to have read access to them.
+
+What you give up is curation, not function: an uncurated model has no validated multi-GPU
+sizing, no cost estimate calibrated against real runs, and no serving capacity entry. Gated
+repos (Llama among them) still require you to have accepted the licence on your HF account.
+
+**This is a self-hosted capability.** The managed service rejects `model_policy = "allow"`
+with a 403 - its runs are billed against curated hardware profiles. Your plane, your GPUs,
+your call.
 
 > **RunPod endpoint concurrency is not capped by Flash**, on a self-hosted plane or a
 > managed one. The slot store and the in-process semaphore behind it are both claimed from

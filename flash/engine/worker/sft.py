@@ -14,6 +14,7 @@ from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.packing import (
     completion_mask_from_ids,
     tokenize_for_packing,
+    untruncated_lengths_for_packing,
 )
 
 
@@ -34,15 +35,23 @@ def has_real_target(input_ids, loss_mask, special_ids: set[int]) -> bool:
 def _pretokenize_completion_only(texts, tokenizer, max_length):
     """Pre-tokenize SFT rows into ``{input_ids, completion_mask}``, dropping rows with no real completion target.
 
-    Returns ``(kept_texts, pretok, n_dropped)``.
+    Returns ``(kept_texts, pretok, n_dropped)``. Each pretok row also carries
+    ``untruncated_length``: its token count BEFORE the cap. The post-slice length can never exceed
+    max_length, so it cannot say whether the cap actually bound; this can.
     """
     full_ids = tokenize_for_packing([t["text"] for t in texts], tokenizer, max_length)
+    # the same encode without the cap, so a truncated row reports its real size rather than the cap.
+    untruncated = untruncated_lengths_for_packing([t["text"] for t in texts], tokenizer)
     prompt_ids = tokenizer(
         [t["prompt_text"] for t in texts], truncation=True, max_length=max_length
     )["input_ids"]
     pretok = [
-        {"input_ids": ids, "completion_mask": completion_mask_from_ids(pids, ids)}
-        for ids, pids in zip(full_ids, prompt_ids, strict=True)
+        {
+            "input_ids": ids,
+            "completion_mask": completion_mask_from_ids(pids, ids),
+            "untruncated_length": length,
+        }
+        for ids, pids, length in zip(full_ids, prompt_ids, untruncated, strict=True)
     ]
     special_ids = set(getattr(tokenizer, "all_special_ids", None) or [])
     kept = [

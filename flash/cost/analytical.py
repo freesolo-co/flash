@@ -664,7 +664,9 @@ def _offline_gpu_shape(
     as allocation, then replace this provisional quote with the selected live candidate immediately
     before provisioning.
     """
-    total_params_b(config.model_id)  # catalog-only; no HF/network sizing in `--cost`
+    # Fail closed on a model that cannot be sized at all. Curated entries answer from the catalog
+    # with no network call; an open-policy model resolves via HF (self-hosted planes only).
+    total_params_b(config.model_id)
     need = required_vram_gb(
         config.model_id,
         config.method,

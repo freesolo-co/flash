@@ -224,16 +224,29 @@ epochs = 1                  # one pass over the retained train rows
 max_examples = 2            # rows to train on (the starter dataset has 2)
 # max_steps = 100           # positive values set the exact optimizer-update horizon
 # save_at_steps = [10, 50, 100]  # requires max_steps; overrides save_every
-# multi-turn GRPO defaults to one reward per rollout; "per_turn" gives turn-level credit.
-# credit_assignment = "per_episode"   # "per_turn" needs per_turn_rewards metadata and is
-                                      # unsupported for tool-calling envs — see below
 lora_rank = 32              # lora_alpha is managed: always derived as 2 x lora_rank
-# All SFT/GRPO knobs live under [train]. Do not add [sft] or [grpo] tables.
+# All knobs live under [train]. Do not add [sft], [grpo], or [opd] tables.
 
 [wandb]
 # project  = "my-project"   # the table allows exactly `project` and `run_name`;
 # run_name = "sft-run-1"    # `name` is rejected
 ```
+
+**Knobs are scoped by algorithm.** `[train]` is one flat table shared by all three algorithms,
+but a knob the run's algorithm cannot consume is REJECTED at parse time rather than silently
+ignored. Everything in the block above (`epochs`, `max_examples`, `max_steps`, `save_every`,
+`save_at_steps`, `lora_rank`, `learning_rate`, `batch_size`, `max_context_tokens`,
+`init_from_adapter`) applies everywhere. These do not:
+
+| knob                                                                                                            | sft      | grpo     | opd      |
+| --------------------------------------------------------------------------------------------------------------- | -------- | -------- | -------- |
+| `group_size`, `temperature`, `max_completion_tokens`, `kl_penalty_coef`, `stop_sequences`, `structured_outputs` | rejected | yes      | yes      |
+| `entropy_quantile`, `thinking_length_penalty_coef`, `credit_assignment`                                         | rejected | yes      | rejected |
+| `teacher_model`                                                                                                 | rejected | rejected | yes      |
+
+So `credit_assignment` (multi-turn GRPO defaults to one reward per rollout; `"per_turn"` gives
+turn-level credit, needs `per_turn_rewards` metadata, and is unsupported for tool-calling envs —
+see below) belongs on a `grpo` run, and setting it on `sft` or `opd` is a submit-time error.
 
 **Key placement that is easy to get wrong.** Every one of these is a real submit-time
 error or a wrong-config-that-still-runs; `--dry-run` catches the loud ones for free.

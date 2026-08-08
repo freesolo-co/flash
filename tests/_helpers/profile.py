@@ -72,6 +72,10 @@ def sft_profile_for(spec: Any, *, input_digest: str, producer_version: str):
         authoritative_supervised_tokens=real // 2 * epochs,
         authoritative_compute_tokens=real * epochs,
         realized_max_length=min(256, max_length),
+        # synthetic like the token counts above: these rows never hit the cap, so the true max
+        # equals the realized max and nothing was truncated.
+        untruncated_max_length=min(256, max_length),
+        truncated_examples=0,
         examples_per_update=per_update,
         derived_steps=blocks * epochs,
         authoritative_steps=int(train.max_steps or blocks * epochs),
