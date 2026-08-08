@@ -31,6 +31,7 @@ from flash._logging import get_logger
 from flash.diagnostics import sanitize_diagnostic
 from flash.providers._deadline import (
     deadline_kwargs,
+    remaining_seconds,
     require_create_allowance,
     require_deadline_at,
 )
@@ -120,6 +121,27 @@ def _exact_search_aliases(info) -> tuple[str, ...]:
         except UnsupportedGpuError:
             pass
     return tuple(kept)
+
+
+def _rent_duration_floor(spec, deadline_at: float, *, now: float | None = None) -> float:
+    """Seconds an offer must outlast to serve THIS launch: rent-to-deadline, not the wall grant.
+
+    ``spec.gpu.max_wall_seconds`` is the wall the plane GRANTS the work. For most jobs the box's
+    absolute deadline sits exactly that far out and the two agree. An unarmed workload profile is
+    the exception: its deadline carries a provisioning allowance on top of the work budget (see
+    ``_worker_deadline_at``), because the box enforces that deadline from cloud-init onward and the
+    boot has to fit inside it. Searching on the grant alone would accept a host whose remaining
+    duration outlasts 600s of work but expires part-way through the boot it was widened to survive,
+    which is the exact failure the allowance exists to prevent.
+
+    Derived from the deadline actually handed to this launch, so it needs no profile special-casing
+    and stays correct if either budget moves. Never shortens the floor below the granted wall.
+    """
+    grant = float(getattr(spec.gpu, "max_wall_seconds", 0) or 0)
+    remaining = remaining_seconds(deadline_at, now=now)
+    if not math.isfinite(remaining) or remaining <= 0:
+        return grant
+    return max(grant, remaining)
 
 
 def usable_offers(
@@ -431,7 +453,7 @@ def deploy_and_submit(
                             min(o.vram_gb for o in offers),
                             _effective_disk_gb(spec),
                             exclude_machine_ids={o.machine_id for o in tried},
-                            max_wall_seconds=float(getattr(spec.gpu, "max_wall_seconds", 0) or 0),
+                            max_wall_seconds=_rent_duration_floor(spec, absolute_deadline),
                             # the transient attempt spec always carries the concrete allocated class.
                             gpu_type=spec.gpu.type,
                             # refresh the SHAPE the allocator chose: dropping the count here would
@@ -664,7 +686,7 @@ def submit_run_vast(
         for o in usable_offers(
             info.vram_gb,
             _effective_disk_gb(spec),
-            max_wall_seconds=float(getattr(spec.gpu, "max_wall_seconds", 0) or 0),
+            max_wall_seconds=_rent_duration_floor(spec, absolute_deadline),
             # the transient attempt spec always carries the concrete allocated class.
             gpu_type=spec.gpu.type,
             # rent the SHAPE the allocator chose: the worker spawns gpu.count ranks, so a
