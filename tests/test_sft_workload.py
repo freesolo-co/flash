@@ -31,19 +31,19 @@ class FakeTokenizer:
         text = "".join(str(message.get("content") or "") for message in messages)
         return text + (">" if add_generation_prompt else "")
 
-    def __call__(self, texts, *, truncation, max_length):
-        assert truncation
+    def __call__(self, texts, *, truncation=False, max_length=None):
         if isinstance(texts, str):
             texts = [texts]
-        return {
-            "input_ids": [
-                [
-                    self.eos_token_id if char == self.eos_token else 3 + ord(char) % 89
-                    for char in text
-                ][:max_length]
-                for text in texts
-            ]
-        }
+        ids = [
+            [self.eos_token_id if char == self.eos_token else 3 + ord(char) % 89 for char in text]
+            for text in texts
+        ]
+        if not truncation:
+            # the cap must not apply when the caller did not ask for it: the untruncated encode
+            # is how a truncated row reports its real size instead of the cap.
+            return {"input_ids": ids}
+        assert max_length is not None, "truncation=True requires an explicit max_length"
+        return {"input_ids": [row[:max_length] for row in ids]}
 
 
 class FakeEnvironment:
@@ -289,3 +289,71 @@ def test_gdn_probe_failure_also_fails_closed(monkeypatch) -> None:
             tokenizer_loader=lambda _model, _revision: FakeTokenizer(),
             producer_version="1.2.3",
         )
+
+
+class LongRowEnvironment(FakeEnvironment):
+    """One row far past any cap under test, one comfortably inside it.
+
+    FakeTokenizer emits one id per character, so an answer of N characters is N tokens. The long
+    row is what gives the truncation assertions the ability to fail: a fixture where nothing
+    exceeds the cap would report zero truncated rows no matter what the measurement did.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._rows = [
+            {"prompt": "short", "answer": "alpha"},
+            {"prompt": "long", "answer": "z" * 400},
+        ]
+
+
+def _measured(max_context_tokens: int):
+    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=max_context_tokens))
+    spec = replace(
+        spec,
+        workload_profile_input_digest=sft_profile_input_digest(
+            spec,
+            tokenizer_revision=spec.model_revision,
+            producer_version="1.2.3",
+        ),
+    )
+    return prepare_sft_workload(
+        spec,
+        LongRowEnvironment(),
+        tokenizer_loader=lambda _model, _revision: FakeTokenizer(),
+        producer_version="1.2.3",
+        packing_support=lambda _model, _revision: ("pure-attention", True),
+    )
+
+
+def test_binding_cap_reports_the_true_length_not_the_censored_one(capsys) -> None:
+    """The profile must say how long the rows really are, and the warning must name that number.
+
+    ``realized_max_length`` is measured after the slice, so it saturates at the cap exactly when the
+    cap binds -- the one case where the number matters. Asserting it equals the cap while
+    ``untruncated_max_length`` runs past it is what distinguishes a real measurement from reading
+    the setting back.
+    """
+    prepared = _measured(64)
+
+    assert prepared.profile.max_length == 64
+    assert prepared.profile.realized_max_length == 64
+    assert prepared.profile.untruncated_max_length > 64
+    assert prepared.profile.truncated_examples == 1
+
+    warning = capsys.readouterr().err
+    assert "warning: [train] max_context_tokens 64 truncated 1 of 2 sft rows" in warning
+    # the actionable half: the number to set. a warning that only says "some rows truncated"
+    # cannot be acted on without a second run.
+    assert str(prepared.profile.untruncated_max_length) in warning
+
+
+def test_a_cap_that_does_not_bind_reports_no_truncation_and_stays_quiet(capsys) -> None:
+    """The paired control. Without it the assertions above pass for a measurement wired to a constant."""
+    prepared = _measured(4096)
+
+    assert prepared.profile.truncated_examples == 0
+    assert prepared.profile.untruncated_max_length == prepared.profile.realized_max_length
+    assert prepared.profile.untruncated_max_length < 4096
+
+    assert "max_context_tokens" not in capsys.readouterr().err

@@ -272,7 +272,10 @@ _TOP_LEVEL_KEYS = frozenset(
 _GPU_KEYS = frozenset(item.name for item in dataclass_fields(GpuSpec)) - MANAGED_GPU_KEYS
 # [environment] user-authorable keys, derived from EnvironmentSpec (mirrors _GPU_KEYS) so a new field
 # is accepted automatically; resolved_sha is control-plane-pinned (see _assign_resolved_env_sha).
-_ENV_MANAGED_KEYS = frozenset({"resolved_sha"})
+# pip is platform-managed: worker_pip_for_env ignores the env id and returns one constant worker
+# requirement, so an override only ever selected the same list or a broken one. EnvironmentSpec still
+# carries the field, and spec_payload/provider submit keep populating it from worker_pip_for_env.
+_ENV_MANAGED_KEYS = frozenset({"resolved_sha", "pip"})
 _ENVIRONMENT_KEYS = (
     frozenset(item.name for item in dataclass_fields(EnvironmentSpec)) - _ENV_MANAGED_KEYS
 )
@@ -386,21 +389,14 @@ def spec_from_dict(
             f"(allowed: {', '.join(sorted(_ENVIRONMENT_KEYS))})"
         )
     # Validate the [environment] sub-fields before they reach EnvironmentSpec(...). The
-    # constructor's ``dict(... or {})`` / ``tuple(str(p) for p in ... or ())`` papers over a falsy
-    # value (false -> {}/()) but a present-but-wrong-typed value otherwise crashes opaquely or
-    # silently misbehaves: ``params = "x"`` -> ``dict("x")`` ValueError, ``params = 1`` ->
-    # ``dict(1)`` TypeError (a 500), and ``pip = "x"`` is char-split into ('x',) (the worker then
-    # tries to install bogus one-char packages). A MISSING sub-field — absent OR ``None`` (e.g.
-    # JSON ``null``) — keeps its default; any present, NON-None value must be the right type. A
-    # falsy ``params = false`` is still rejected, mirroring the section-level rule that
-    # ``environment = false`` must fail rather than silently coerce. Mirrors the ``must be a
-    # table`` style; a string is never char-split.
+    # constructor's ``dict(... or {})`` papers over a falsy value (false -> {}) but a
+    # present-but-wrong-typed value otherwise crashes opaquely: ``params = "x"`` -> ``dict("x")``
+    # ValueError, ``params = 1`` -> ``dict(1)`` TypeError (a 500). A MISSING sub-field — absent OR
+    # ``None`` (e.g. JSON ``null``) — keeps its default; any present, NON-None value must be the
+    # right type. A falsy ``params = false`` is still rejected, mirroring the section-level rule
+    # that ``environment = false`` must fail rather than silently coerce.
     if env_raw.get("params") is not None and not isinstance(env_raw["params"], dict):
         raise ConfigError("[environment] params must be a table")
-    if env_raw.get("pip") is not None and not isinstance(env_raw["pip"], (list, tuple)):
-        raise ConfigError("[environment] pip must be a list of strings")
-    if env_raw.get("pip") is not None and not all(isinstance(p, str) for p in env_raw["pip"]):
-        raise ConfigError("[environment] pip entries must be strings")
     environment_secrets = _environment_secrets(env_raw.get("secrets"))
     train_raw = raw.get("train")
     if train_raw is None:
@@ -559,7 +555,6 @@ def spec_from_dict(
             temperature=_train_float(train_raw, "temperature", minimum=0.0),
             max_completion_tokens=_train_int(train_raw, "max_completion_tokens", minimum=1),
             kl_penalty_coef=_train_float(train_raw, "kl_penalty_coef", minimum=0.0),
-            advantage_clip=_train_float(train_raw, "advantage_clip", minimum=0.0),
             entropy_quantile=_train_float(train_raw, "entropy_quantile", minimum=0.0, maximum=1.0),
             thinking_length_penalty_coef=_train_float(
                 train_raw, "thinking_length_penalty_coef", minimum=0.0, maximum=1.0
@@ -616,20 +611,94 @@ def spec_from_dict(
     return spec
 
 
-def _validate_sft(spec: JobSpec) -> None:
-    """validate the sft structured-output constraint.
+# [train] knobs no algorithm-specific worker reads, mapped to the reason they do nothing there.
+# the flat [train] table is shared by all three algorithms, so without this an sft run silently
+# accepted a rollout knob (group_size, teacher_model, ...) and trained as if it had never been set.
+# sft's own validator already rejected exactly one of these (structured_outputs); this generalizes
+# that precedent to every knob the algorithm's worker cannot consume.
+#
+# keyed by the algorithm that must REJECT the knob, so the consuming algorithms stay silent.
+_INAPPLICABLE_TRAIN_KNOBS: dict[str, dict[str, str]] = {
+    "sft": {
+        "structured_outputs": (
+            "only applies to rollout algorithms (grpo, opd); SFT trains on dataset completions "
+            "and never generates"
+        ),
+        "group_size": (
+            "only applies to rollout algorithms (grpo, opd); it sizes the generations per prompt, "
+            "and SFT never generates"
+        ),
+        "temperature": (
+            "only applies to rollout algorithms (grpo, opd); SFT trains on dataset completions "
+            "and never samples"
+        ),
+        "max_completion_tokens": (
+            "only applies to rollout algorithms (grpo, opd); SFT never generates, so cap the "
+            "training rows with max_context_tokens instead"
+        ),
+        "kl_penalty_coef": (
+            "only applies to rollout algorithms (grpo, opd); SFT's objective has no KL term"
+        ),
+        "entropy_quantile": "only applies to grpo; SFT has no rollout tokens to rank by entropy",
+        "thinking_length_penalty_coef": (
+            "only applies to grpo; it penalizes generated reasoning length, and SFT never generates"
+        ),
+        "teacher_model": "only applies to opd; SFT trains on dataset completions, not a teacher",
+        "credit_assignment": (
+            "only applies to grpo; it distributes rollout advantage across turns, and SFT has no "
+            "rollouts"
+        ),
+        "stop_sequences": (
+            "only applies to rollout algorithms (grpo, opd); they bound sampling, and SFT never "
+            "generates"
+        ),
+    },
+    "opd": {
+        "entropy_quantile": (
+            "only applies to grpo; opd distils every sampled token against the teacher rather than "
+            "ranking tokens by entropy"
+        ),
+        "thinking_length_penalty_coef": (
+            "only applies to grpo; it shapes the grpo reward, and opd optimizes a distillation "
+            "objective with no reward term"
+        ),
+        "credit_assignment": (
+            "only applies to grpo; it distributes group-relative advantage, and opd has no "
+            "advantages to assign"
+        ),
+    },
+    "grpo": {
+        "teacher_model": (
+            "only applies to opd; grpo optimizes its environment reward and has no teacher"
+        ),
+    },
+}
 
-    ``max_examples`` carries no row-count requirement: an sft quote is backed by a workload
-    profile that materializes and tokenizes the real dataset, so an omitted or zero cap means
-    "every row" and is measured rather than guessed.
+
+# unset value per [train] field, read off TrainSpec so a changed default cannot silently turn an
+# omitted knob into a rejection.
+_TRAIN_DEFAULTS = {item.name: item.default for item in dataclass_fields(TrainSpec)}
+
+
+def _reject_inapplicable_train_knobs(spec: JobSpec) -> None:
+    """reject [train] knobs the run's algorithm cannot consume.
+
+    Keyed off a MEANINGFUL VALUE rather than key presence: ``JobSpec.to_dict()`` serializes every
+    TrainSpec field (including unset ones), and both the client -> server submit round trip and
+    ``_public_status_spec`` re-parse that full dict through this parser. A presence check would
+    reject those round trips even though the user authored none of the keys.
     """
-    if spec.train.structured_outputs:
-        # SFT never generates — a constraint here would silently do nothing; reject at parse time
-        # like other no-op configs (see the opd kl_penalty_coef=0 guard).
-        raise ConfigError(
-            "train.structured_outputs only applies to rollout algorithms (grpo, opd); "
-            "SFT trains on dataset completions and never generates"
-        )
+    inapplicable = _INAPPLICABLE_TRAIN_KNOBS.get(spec.algorithm)
+    if not inapplicable:
+        return
+    for key, reason in inapplicable.items():
+        # unset sentinels differ by field (None, "", (), and credit_assignment's non-falsy
+        # "per_episode"), so compare against the dataclass default rather than assuming one
+        # falsy spelling. a value equal to the default is indistinguishable from unset and is
+        # what a full-dict round trip carries, so it must not be rejected.
+        if getattr(spec.train, key) == _TRAIN_DEFAULTS[key]:
+            continue
+        raise ConfigError(f"train.{key} {reason}")
 
 
 def _validate_grpo(spec: JobSpec) -> None:
@@ -666,9 +735,11 @@ def _validate_opd(spec: JobSpec) -> None:
     _validate_on_policy_prompt_budget(spec, "opd")
 
 
-# each algorithm's spec-level contract lives in one validator, dispatched by name.
+# each algorithm's spec-level contract lives in one validator, dispatched by name. sft has no entry:
+# its one rule (structured_outputs) moved into _INAPPLICABLE_TRAIN_KNOBS, and it needs no row-count
+# requirement because an sft quote is backed by a workload profile that materializes and tokenizes
+# the real dataset -- an omitted or zero max_examples means "every row" and is measured, not guessed.
 _ALGO_VALIDATORS = {
-    "sft": _validate_sft,
     "grpo": _validate_grpo,
     "opd": _validate_opd,
 }
@@ -689,6 +760,7 @@ def _validate_spec(spec: JobSpec) -> None:
             )
     if spec.gpu.provider and spec.gpu.provider not in PROVIDER_NAMES:
         raise ConfigError(f"unknown gpu.provider {spec.gpu.provider!r}")
+    _reject_inapplicable_train_knobs(spec)
     validator = _ALGO_VALIDATORS.get(spec.algorithm)
     if validator is not None:
         validator(spec)

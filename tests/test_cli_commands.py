@@ -477,19 +477,22 @@ def test_train_dry_run_enriches_legacy_unknown_authored_key_rejection(
 ) -> None:
     from flash.client import ApiError
 
-    detail = "[train] unknown key(s): teacher_model (allowed: epochs, hf_repo, max_examples)"
+    detail = "[train] unknown key(s): save_at_steps (allowed: epochs, hf_repo, max_examples)"
 
     def reject(*_args, **_kwargs):
         raise ApiError(400, detail)
 
     monkeypatch.setattr(fake_client, "create_run", reject)
-    config = _train_config(tmp_path, extra_train='teacher_model = "glm-5.2"\n')
+    # the authored key has to be one THIS algorithm accepts: an sft config authoring a
+    # rollout-only knob is now rejected by the client's own parser, so the request would never
+    # reach the server whose response this test is about.
+    config = _train_config(tmp_path, extra_train="max_steps = 4\nsave_at_steps = [1]\n")
 
     assert _run(["train", str(config), "--dry-run"]) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
     assert detail in captured.err
-    assert "teacher_model (minimum released Flash version 0.2.56)" in captured.err
+    assert "save_at_steps (minimum released Flash version 0.2.57)" in captured.err
     assert "client/server [train] schemas disagree" in captured.err
 
 
@@ -507,7 +510,7 @@ def test_train_dry_run_enriches_legacy_unknown_authored_key_rejection(
         ),
         (
             500,
-            "[train] unknown key(s): teacher_model (allowed: epochs, hf_repo, max_examples)",
+            "[train] unknown key(s): save_at_steps (allowed: epochs, hf_repo, max_examples)",
         ),
     ],
 )
@@ -520,7 +523,8 @@ def test_train_dry_run_does_not_enrich_unrelated_or_unknown_errors(
         raise ApiError(status, detail)
 
     monkeypatch.setattr(fake_client, "create_run", reject)
-    config = _train_config(tmp_path, extra_train='teacher_model = "glm-5.2"\n')
+    # sft-applicable by necessity: see the enrichment test above.
+    config = _train_config(tmp_path, extra_train="max_steps = 4\nsave_at_steps = [1]\n")
 
     assert _run(["train", str(config), "--dry-run"]) == 1
     captured = capsys.readouterr()
@@ -1664,27 +1668,26 @@ def test_unknown_run_errors_surface_as_nonzero_exit(monkeypatch, capsys) -> None
     assert "unknown run" in capsys.readouterr().err
 
 
-def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
+def test_submit_payload_carries_no_pip_and_the_worker_resolves_it(monkeypatch, tmp_path) -> None:
+    """pip is platform-managed: it leaves the wire, and the submit path supplies it instead.
+
+    Both halves matter. Dropping the key from the payload without the provider still resolving it
+    would ship a worker with no Freesolo SDK, and the failure would surface only on a real GPU.
+    """
     from flash.client.specs import spec_payload
+    from flash.envs.registry import worker_pip_for_env
     from flash.spec import EnvironmentSpec, JobSpec
 
-    # An unrecorded env resolves to the Freesolo SDK; the env is loaded lazily by the worker.
     spec = JobSpec(
         model="Qwen/Qwen3.5-0.8B",
         project="11111111-1111-4111-8111-111111111111",
         environment=EnvironmentSpec(id="owner/env"),
     )
-    assert spec_payload(spec)["environment"]["pip"] == ["freesolo>=0.4.0"]
 
-    # ...and an explicit pip list (the documented escape hatch) wins untouched.
-    spec = JobSpec(
-        model="Qwen/Qwen3.5-0.8B",
-        project="11111111-1111-4111-8111-111111111111",
-        environment=EnvironmentSpec(
-            id="github:owner/repo@main:env/environment.py", pip=("custom==1",)
-        ),
-    )
-    assert list(spec_payload(spec)["environment"]["pip"]) == ["custom==1"]
+    # not an unauthorable key the server would reject, and not a duplicated constant on the wire.
+    assert "pip" not in spec_payload(spec)["environment"]
+    # the value the submit paths substitute for it, unchanged.
+    assert worker_pip_for_env(spec.environment.id) == ["freesolo>=0.4.0"]
 
 
 def test_export_uses_api_key_flag_and_forwards_args(fake_client, capsys, monkeypatch) -> None:

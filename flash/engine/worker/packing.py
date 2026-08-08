@@ -180,17 +180,33 @@ def gdn_packing_available(model_id: str | None = None, revision: str = "") -> bo
         return False
 
 
-def tokenize_for_packing(texts: list[str], tokenizer, max_length: int) -> list[list[int]]:
-    """Tokenize texts for packing: EOS appended, tokenizer's default add_special_tokens.
+def _eos_terminated(texts: list[str], tokenizer) -> list[str]:
+    """Append EOS (once) to each text.
 
-    EOS is appended (once) because a packed row concatenates examples with no separator, so it is
-    the only thing marking where one example ends -- without it the model learns to run past the
-    end of an answer into the next one.
+    EOS is appended because a packed row concatenates examples with no separator, so it is the only
+    thing marking where one example ends -- without it the model learns to run past the end of an
+    answer into the next one.
     """
     eos = tokenizer.eos_token or ""
-    rows = [t if (eos and t.endswith(eos)) else t + eos for t in texts]
-    enc = tokenizer(rows, truncation=True, max_length=max_length)
+    return [t if (eos and t.endswith(eos)) else t + eos for t in texts]
+
+
+def tokenize_for_packing(texts: list[str], tokenizer, max_length: int) -> list[list[int]]:
+    """Tokenize texts for packing: EOS appended, tokenizer's default add_special_tokens."""
+    enc = tokenizer(_eos_terminated(texts, tokenizer), truncation=True, max_length=max_length)
     return enc["input_ids"]
+
+
+def untruncated_lengths_for_packing(texts: list[str], tokenizer) -> list[int]:
+    """Token count per text with NO cap, under the same EOS rule ``tokenize_for_packing`` applies.
+
+    Sharing ``_eos_terminated`` is what makes the two measurements comparable. Encoding the raw text
+    instead would drop the appended EOS, so every row that does not already end in one would measure
+    a token SHORT of its own realized length -- and "untruncated < realized" is exactly the
+    contradiction that makes a truncation count untrustworthy.
+    """
+    enc = tokenizer(_eos_terminated(texts, tokenizer), truncation=False)
+    return [len(ids) for ids in enc["input_ids"]]
 
 
 def completion_mask_from_ids(prompt_ids: list[int], full_ids: list[int]) -> list[int]:
