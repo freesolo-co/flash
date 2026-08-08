@@ -90,5 +90,6 @@ RUN chmod +x /usr/local/bin/flash-infisical-entrypoint
 ENTRYPOINT ["/usr/local/bin/flash-infisical-entrypoint"]
 
 # Docker resets a derived image's inherited CMD to null when that image declares its own
-# ENTRYPOINT, so any overlay built FROM this one must restate this line verbatim.
+# ENTRYPOINT, so any image built FROM this one must restate this line verbatim. Without it the
+# entrypoint receives no arguments and stops with "no command given".
 CMD ["python", "-m", "flash.server", "--host", "0.0.0.0", "--port", "8080"]

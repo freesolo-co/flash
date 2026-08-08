@@ -10,6 +10,8 @@
 #                                 Secret, or any orchestrator's secret store, as before.
 #   INFISICAL_CLIENT_ID set    -> `infisical login` (universal-auth), then `infisical run`
 #                                 injects the vault's secrets before exec'ing the command.
+#   ...set but EMPTY           -> refuse to start. That is what a broken interpolation looks
+#                                 like, not a request for the passthrough.
 #
 # Both paths are supported and tested; neither is a fallback for the other. The image is the
 # same either way -- only the environment differs -- so a deployment can move between them
@@ -29,15 +31,29 @@ set -eu
 
 # `exec "$@"` with ZERO arguments is a no-op that FALLS THROUGH to the injection path below,
 # where `set -u` then blames INFISICAL_CLIENT_ID for what is really a missing command. Setting
-# ENTRYPOINT in a derived image resets the inherited CMD to null, so an overlay that forgets to
-# restate CMD lands here. Fail with the actual cause instead.
+# ENTRYPOINT in a derived image resets the inherited CMD to null, so an image built FROM ours
+# that forgets to restate CMD lands here. Fail with the actual cause instead.
 if [ "$#" -eq 0 ]; then
   echo "flash infisical entrypoint: no command given (the image's CMD is empty)" >&2
   exit 2
 fi
 
-if [ -z "${INFISICAL_CLIENT_ID:-}" ]; then
+# Presence, not truthiness: `${VAR+set}` is non-empty only when VAR is SET, empty value included.
+# This is the same distinction the INFISICAL_KEEP loop below makes, for the same reason.
+if [ -z "${INFISICAL_CLIENT_ID+set}" ]; then
   exec "$@"
+fi
+
+# Set-but-empty is not how you turn the switch off. It is what a compose file's `${VAR}` with
+# nothing behind it, or a kubernetes secretKeyRef to an absent key, produces -- an accident, not
+# a choice. Reading it as "unset" would boot the control plane on whatever ambient environment
+# happened to be there, which is precisely the silent-credentials failure this switch exists to
+# prevent. Unset the variable to take the passthrough deliberately.
+if [ -z "$INFISICAL_CLIENT_ID" ]; then
+  echo "flash infisical entrypoint: INFISICAL_CLIENT_ID is set but empty -- refusing to start" \
+       "on ambient credentials. Give it a value to use the vault, or unset it entirely to take" \
+       "secrets from the container environment" >&2
+  exit 2
 fi
 
 # The switch is on but the binary is absent: the image was built without INSTALL_INFISICAL=true

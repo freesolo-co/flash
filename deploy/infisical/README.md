@@ -9,7 +9,7 @@ docker run -p 8080:8080 --env-file .env -v flash-state:/root/.flash \
 ```
 
 Kubernetes Secrets, systemd `EnvironmentFile`, Docker secrets mounted into env, and every
-orchestrator secret store already produce that environment. **If that covers you, you are done** —
+orchestrator secret store already produce that environment. **If that covers you, you are done**:
 nothing below is required.
 
 This directory covers the other case: fetching secrets from [Infisical](https://infisical.com) at
@@ -42,7 +42,7 @@ two without a rebuild.
 Injection needs the `infisical` binary present. The published images
 (`ghcr.io/freesolo-co/freesolo-flash:main`, `:latest`, `:dev`) already have it.
 
-Building from a checkout does **not**, by default — a plain `docker build .` produces a
+Building from a checkout does **not**, by default. A plain `docker build .` produces a
 vendor-free image, which is the right default for an open-source consumer who is not an
 Infisical user. Ask for it explicitly:
 
@@ -57,23 +57,9 @@ authentication failure much later, far from the cause.
 
 The CLI is installed from the vendor's published `.deb`, pinned by version and verified against
 its SHA-256 before `dpkg` sees it. This repository deliberately does not pipe a setup script into
-a shell — that executes whatever the vendor serves at request time, which is neither reviewable
+a shell, because that executes whatever the vendor serves at request time, which is neither reviewable
 nor reproducible. Bump `INFISICAL_VERSION` and both digests together; a stale digest fails the
 build rather than installing an unverified binary.
-
-### The overlay Dockerfile
-
-`deploy/infisical/Dockerfile` adds the CLI to an image that was built **without** it, for when
-you cannot rebuild from source — a published tag, or an artifact from a pipeline you do not
-control:
-
-```bash
-docker build -f deploy/infisical/Dockerfile \
-  --build-arg FLASH_IMAGE=some-image-you-were-given \
-  -t flash-control-plane-infisical .
-```
-
-If you can rebuild, prefer `--build-arg INSTALL_INFISICAL=true` on the base image.
 
 ## Another secret manager
 
@@ -86,7 +72,7 @@ when the switch is on but unusable, and the `INFISICAL_KEEP` handling described 
 
 | Variable                  | Required | Default | Purpose                                                                                                                                                                                                                                                                                                                            |
 | ------------------------- | -------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `INFISICAL_CLIENT_ID`     | yes      | unset   | Universal-auth machine identity. **Unset makes the wrapper a no-op passthrough**, so the container behaves exactly like the base image.                                                                                                                                                                                            |
+| `INFISICAL_CLIENT_ID`     | yes      | unset   | Universal-auth machine identity. **Unset makes the wrapper a no-op passthrough**, so the container behaves exactly like the base image. Set but _empty_ aborts startup: that is a broken `${VAR}` interpolation, not a request for the passthrough.                                                                               |
 | `INFISICAL_CLIENT_SECRET` | yes      | unset   | Machine identity secret.                                                                                                                                                                                                                                                                                                           |
 | `INFISICAL_PROJECT_ID`    | yes      | unset   | Infisical project (workspace) id.                                                                                                                                                                                                                                                                                                  |
 | `INFISICAL_PATH`          | yes      | unset   | Secret folder path for this service, e.g. `/flash`.                                                                                                                                                                                                                                                                                |
