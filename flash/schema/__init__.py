@@ -243,13 +243,18 @@ def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
 
 
 # unknown tables are rejected loudly: a stray [grpo] table silently dropped grpo knobs and trained
-# at 16x-cost defaults. platform-managed fields (run_id, model_policy; and per-section hf_repo,
-# gpu disk/volume, environment resolved_sha) are NOT accepted here: they are assigned by the control
-# plane / runner, so JobSpec.to_dict() omits them and this parser rejects a user who sets them.
+# at 16x-cost defaults. platform-managed fields (run_id; and per-section hf_repo, gpu disk/volume,
+# environment resolved_sha) are NOT accepted here: they are assigned by the control plane / runner,
+# so JobSpec.to_dict() omits them and this parser rejects a user who sets them.
+#
+# `model_policy` is the exception: it is authorable but not self-authorizing. The parser accepts it
+# so a self-hosted config can carry it, and `authorize_model_policy` (called by the control plane,
+# which is the only side that can see FLASH_STANDALONE) decides whether this deployment honours it.
 _TOP_LEVEL_KEYS = frozenset(
     {
         "model",
         "model_revision",
+        "model_policy",
         "algorithm",
         "thinking",
         "seed",
@@ -295,6 +300,28 @@ def validate_train_keys(keys: Collection[str]) -> None:
             f"[train] unknown key(s): {', '.join(unknown)} "
             f"(allowed: {', '.join(sorted(TRAIN_SCHEMA_KEYS))})"
         )
+
+
+MODEL_POLICIES = ("catalog", "allow")
+
+
+def _model_policy(raw: dict[str, Any]) -> str:
+    """Parse the authored ``model_policy``, defaulting to the curated catalog.
+
+    Parsing is deliberately separate from AUTHORIZING it. This parser runs on the client too, and
+    the client cannot see ``FLASH_STANDALONE`` (it is server-side env, and the client would have to
+    authenticate to learn it), so rejecting ``allow`` here would reject it for the self-hosted
+    deployments the policy exists to serve. The control plane calls ``authorize_model_policy``
+    after parsing to decide whether this deployment honours it.
+    """
+    value = raw.get("model_policy", "catalog")
+    if not isinstance(value, str) or value.strip().lower() not in MODEL_POLICIES:
+        raise ConfigError(
+            f"model_policy must be one of: {', '.join(MODEL_POLICIES)} "
+            '("catalog" trains only curated models; "allow" accepts any HuggingFace model that '
+            "fits the GPU, and is available on self-hosted control planes only)"
+        )
+    return value.strip().lower()
 
 
 def spec_from_dict(
@@ -344,7 +371,7 @@ def spec_from_dict(
         algorithm = normalize_algorithm(raw.get("algorithm"))
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
-    model_policy = "catalog"  # not a user knob; "allow" path exists for internal use only
+    model_policy = _model_policy(raw)
     thinking = raw.get("thinking", False)
     if not isinstance(thinking, bool):
         raise ConfigError("thinking must be a boolean")

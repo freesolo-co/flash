@@ -77,11 +77,38 @@ def test_spec_model_policy_default_catalog():
     assert spec.model_policy == "catalog"
 
 
-def test_spec_user_model_policy_is_rejected():
-    # model_policy is not a user knob: managed runs always use the curated catalog, so a user who
-    # sets it in the config is rejected loudly rather than having their value silently dropped.
-    with pytest.raises(ConfigError, match=r"unknown config key\(s\): model_policy"):
-        spec_from_dict(_raw(model="Qwen/Qwen3.5-4B", model_policy="allow"))
+def test_spec_accepts_an_authored_model_policy():
+    # Parsing is not authorizing. The parser runs client-side too, where FLASH_STANDALONE is
+    # invisible, so it accepts the key; the control plane's _authorize_model_policy is what
+    # rejects it on a managed plane (see tests/test_server_standalone.py).
+    spec = spec_from_dict(_raw(model="Qwen/Qwen3.5-4B", model_policy="allow"))
+    assert spec.model_policy == "allow"
+
+
+@pytest.mark.parametrize("value", ["", "ALLOW ", "permissive", 1, True, None])
+def test_spec_rejects_a_model_policy_outside_the_known_set(value):
+    # An unknown policy must not silently degrade to "catalog": a self-hoster who typoed it would
+    # get the curated-model rejection and no hint that their policy key was the problem.
+    if value == "ALLOW ":
+        assert spec_from_dict(_raw(model="Qwen/Qwen3.5-4B", model_policy=value)).model_policy == (
+            "allow"
+        )
+        return
+    with pytest.raises(ConfigError, match="model_policy must be one of"):
+        spec_from_dict(_raw(model="Qwen/Qwen3.5-4B", model_policy=value))
+
+
+def test_an_authored_model_policy_survives_the_submit_round_trip():
+    # to_dict() is what the client SENDS. If it stripped model_policy the self-hosted config could
+    # never reach the plane that authorizes it, and "allow" would be unreachable in practice.
+    spec = spec_from_dict(_raw(model="Qwen/Qwen3.5-4B", model_policy="allow"))
+    assert spec.to_dict()["model_policy"] == "allow"
+    assert spec_from_dict(spec.to_dict()).model_policy == "allow"
+
+
+def test_the_default_policy_is_still_absent_from_the_public_payload():
+    # Only a non-default policy is emitted, so a managed submit payload is byte-identical to before.
+    assert "model_policy" not in spec_from_dict(_raw()).to_dict()
 
 
 def test_spec_unlisted_model_under_catalog_policy_fails():

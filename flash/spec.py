@@ -440,9 +440,13 @@ class JobSpec:
         control plane and worker use to_internal_dict(), which retains every field.
         """
         data = asdict(self)
-        # server-assigned identity and internal-only policy — never authored in a config.
+        # server-assigned identity — never authored in a config.
         data.pop("run_id", None)
-        data.pop("model_policy", None)
+        # `model_policy` IS authorable (a self-hosted plane honours "allow"), so it has to survive
+        # the client -> server round trip or the config could never reach the plane that authorizes
+        # it. Emitted only when it differs from the default, so a managed payload is unchanged.
+        if data.get("model_policy") == "catalog":
+            data.pop("model_policy", None)
         data.pop("workload_profile_kind", None)
         data.pop("workload_profile_input_digest", None)
         data.pop("workload_profile_producer_version", None)
