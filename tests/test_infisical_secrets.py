@@ -83,6 +83,9 @@ _FLAGS_WITH_OPERAND = {
 # are opposites: one steps over the operand, this one steps INTO it.
 _SPLITS_ITS_OPERAND = {"-S", "--split-string"}
 
+# The same flag with its operand fused into the token: `-S'bash -s'`, `--split-string='bash -s'`.
+_FUSED_SPLIT_STRING = re.compile(r"(?:-S|--split-string=)(?P<command>.+)")
+
 # A bare numeric operand sitting between a wrapper and its command: `timeout 30 sh` requires one,
 # and an unrecognized flag may introduce one (`nohup -n 5 bash`). Skipped after ANY wrapper rather
 # than special-cased to `timeout`, because nothing is ever *named* `30` -- so treating a bare
@@ -260,16 +263,29 @@ def _stage_runs_a_shell(tokens: list[str]) -> bool:
     """
     inner = [t for t in tokens if t not in ("(", ")", "{", "}")]
     word, at = _command_word(inner)
-    if at is None:
-        return False
-    if _SHELL_NAME.fullmatch(word):
+    if at is not None and _SHELL_NAME.fullmatch(word):
         return True
-    # `env -S 'bash -s'` runs the words of its operand. The operand is the command, not a value,
-    # and the flag introducing it sits to the LEFT of the word the walk stopped on.
-    return any(
-        flag in _SPLITS_ITS_OPERAND and _stage_runs_a_shell(_tokenize(operand))
-        for flag, operand in itertools.pairwise(inner)
-    )
+    # Checked even when the walk found no command word: `env -S'bash -s'` fuses the operand into
+    # the flag, so every token is a flag and the walk runs off the end with the shell still in it.
+    return any(_stage_runs_a_shell(_tokenize(cmd)) for cmd in _split_string_operands(inner))
+
+
+def _split_string_operands(tokens: list[str]) -> list[str]:
+    """The command strings introduced by `env -S`, in every spelling it accepts.
+
+    The operand may be a separate token (`-S 'bash -s'`) or fused into the flag itself
+    (`-S'bash -s'`, `--split-string='bash -s'`). Normalized here rather than handled at two call
+    sites: the separate and fused forms are the same instruction, and splitting them across two
+    mechanisms is how the fused one went missing in the first place.
+    """
+    operands: list[str] = []
+    for flag, following in itertools.zip_longest(tokens, tokens[1:], fillvalue=""):
+        fused = _FUSED_SPLIT_STRING.fullmatch(flag)
+        if fused:
+            operands.append(fused["command"].strip("\"'"))
+        elif flag in _SPLITS_ITS_OPERAND and following:
+            operands.append(following)
+    return operands
 
 
 # A line ending in any of these does not end the command -- the next line continues it. `\` is
@@ -540,6 +556,15 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
             "RUN curl -sSL https://x.example/i.sh | env --split-string 'sh -e'\n",
             id="env-split-string-long",
         ),
+        # The same flag with its operand FUSED into the token. Every token is then a flag, so the
+        # walk runs off the end of the stage with the shell still inside one of them.
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | env -S'bash -s'\n", id="env-split-string-fused"
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | env --split-string='bash -s'\n",
+            id="env-split-string-fused-long",
+        ),
         # A subshell runs its contents in a shell of its own.
         pytest.param("RUN curl -sSL https://x.example/i.sh | ( bash )\n", id="subshell-stage"),
         # A redirection may be written apart from its target, which is not the command word.
@@ -663,6 +688,9 @@ def test_the_guard_catches_a_yaml_line_that_both_folds_back_and_continues_on(tmp
         pytest.param("curl -s https://x.example/f | git stash", id="stash-is-not-a-shell"),
         # `-S` splits its operand and runs it -- but only when the operand really is a shell.
         pytest.param("curl -s https://x.example/f | env -S 'jq .version'", id="split-into-jq"),
+        pytest.param("curl -s https://x.example/f | env -S'jq .version'", id="split-fused-into-jq"),
+        # `-S` on something that is not `env` is an ordinary flag: jq's is --sort-keys.
+        pytest.param("curl -s https://x.example/f | jq -S .", id="dash-s-on-a-non-env"),
         # A shell OPTION's operand is skipped, so a shell-named one must not read as a command.
         # `bash -o bash script.sh` sets an (invalid) option and runs a script, not a nested shell.
         pytest.param("curl -s https://x.example/f | jq -o bash .", id="option-operand-not-command"),
