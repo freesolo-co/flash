@@ -61,15 +61,10 @@ INSTALLER_FILES = _installer_files()
 # `ash` is BusyBox's shell and therefore `/bin/sh` on every Alpine image, which is the base a
 # vendor install script is most likely to run under.
 #
-# `su` is a shell under another name: it starts the target user's login shell with stdin intact,
-# so a piped download is executed exactly as `sh` would. It belongs here rather than in
-# _EXEC_WRAPPERS because there is no command after it to judge -- it IS the command.
-# Confirmed rather than assumed (as root, so no password prompt intervenes):
-#     printf 'echo PWNED\n' | sudo -n su        -> PWNED
-#     printf 'echo PWNED\n' | sudo -n su -      -> PWNED
-#     printf 'echo PWNED\n' | sudo -n su root   -> PWNED
-# It also takes `-c` like a shell (`su -c 'sh'` runs the piped stream, `su -c 'echo hi'` does
-# not), which the `-c` handling below then reads for free.
+#
+# `su` is deliberately NOT here. It starts a shell by default, but `-s`/`--shell` can point it at
+# any program, so matching it as a shell NAME flagged safe pipelines too. It is modelled as a
+# privilege tool below, where the program it actually starts is the thing being judged.
 _SHELL_NAME = re.compile(r"(?:[\w./-]*/)?(?:(?:ba|a|z|k|da)?sh)$")
 
 # Privilege tools that START A PROGRAM as another user, defaulting to that user's SHELL. They are
@@ -222,7 +217,10 @@ def _shell_part(line: str) -> str:
     scalar = _QUOTED_SCALAR.fullmatch(stripped)
     # Only unwrap when the quotes enclose the WHOLE value. `curl 'https://h/a|b' | bash` also
     # starts and ends with a quote, and stripping those would splice a URL onto a shell name.
-    if scalar and not _TOKEN.findall(scalar.group("body"))[0].startswith(("'", '"')):
+    # An EMPTY scalar (`run: ""`) tokenizes to nothing, so indexing the first token raised
+    # IndexError and aborted the entire scan -- a crash where the answer is simply "clean".
+    body_tokens = _TOKEN.findall(scalar.group("body")) if scalar else []
+    if scalar and body_tokens and not body_tokens[0].startswith(("'", '"')):
         return scalar.group("body")
     return stripped
 
@@ -578,7 +576,7 @@ def _is_a_group(tokens: list[str]) -> bool:
     return len(tokens) > 2 and (tokens[0], tokens[-1]) in (("(", ")"), ("{", "}"))
 
 
-def _privilege_tool_at(tokens: list[str]) -> int | None:
+def _privilege_tool_at(tokens: list[str], wrapper: str = "") -> int | None:
     """Where the privilege tool sits, stepping over any wrappers in front of it.
 
     `_command_word` cannot answer this. `sudo` is itself an exec wrapper, so that walk steps
@@ -589,7 +587,6 @@ def _privilege_tool_at(tokens: list[str]) -> int | None:
     Walking to the tool rather than testing `tokens[0]` is what lets a wrapper sit in front:
     `env sudo -s` and `nice sudo -s` both execute the pipe.
     """
-    wrapper = ""
     skip_next = False
     for index, tok in enumerate(tokens):
         if skip_next:
@@ -597,12 +594,25 @@ def _privilege_tool_at(tokens: list[str]) -> int | None:
             continue
         name = tok.rsplit("/", 1)[-1]
         if name in _PRIVILEGE_TOOLS:
-            return index
+            # These CHAIN, and the LAST one decides. `sudo su` is the ordinary spelling, and
+            # stopping at `sudo` reads `su` as an ordinary command that replaces the shell --
+            # while it starts one:  printf 'echo PWNED\n' | sudo -n su  ->  PWNED
+            # The tool becomes the wrapper for what follows, so its OWN flag arities are known:
+            # `sudo -u root su` must read `root` as -u's operand, not as a command.
+            later = _privilege_tool_at(tokens[index + 1 :], name)
+            return index + 1 + later if later is not None else index
         if tok.startswith(("-", "+")):
             # A flag may take a SEPARATE operand, and that operand is not a command. Without
             # this, `env -u LANG sudo -s` stopped at `LANG` and never reached sudo -- while it
             # executes the download:  printf 'echo PWNED\n' | env -u LANG sudo -n -s  ->  PWNED
             skip_next = "=" not in tok and _takes_a_separate_operand(wrapper, tok)
+            continue
+        # Assignments and redirections may PRECEDE the tool, exactly as they may precede any
+        # command: `MODE=x su` and `2>/dev/null su` both start a shell on the pipe.
+        if re.fullmatch(r"[A-Za-z_]\w*=.*", tok):
+            continue
+        if re.fullmatch(r"\d*[<>]{1,2}.*", tok):
+            skip_next = tok.rstrip().endswith((">", "<"))
             continue
         # A wrapper's own numeric operand is not a command either: `timeout 30 sudo -s` and
         # `nice -n 5 sudo -s` both reach sudo. Same rule the command-word walk applies.

@@ -269,6 +269,25 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
             "RUN curl -sSL https://x.example/i.sh | nice -n 5 sudo -s\n",
             id="nice-operand-then-sudo",
         ),
+        # Privilege tools CHAIN, and the last one decides. `sudo su` is the ordinary spelling;
+        # stopping at `sudo` reads `su` as a command that replaces the shell, while it starts one:
+        #   printf 'echo PWNED\n' | sudo -n su           ->  PWNED
+        #   printf 'echo PWNED\n' | sudo -n env MODE=x su ->  PWNED
+        pytest.param("RUN curl -sSL https://x.example/i.sh | sudo su\n", id="sudo-then-su"),
+        pytest.param("RUN curl -sSL https://x.example/i.sh | sudo su -\n", id="sudo-then-login-su"),
+        # The first tool's own flag operand must not be read as that command.
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | sudo -u root su\n", id="sudo-user-then-su"
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | sudo runuser -u root sh\n",
+            id="sudo-then-runuser",
+        ),
+        # Assignments and redirections may precede the tool, as they may precede any command.
+        pytest.param("RUN curl -sSL https://x.example/i.sh | MODE=x su\n", id="assignment-then-su"),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | 2>/dev/null su\n", id="redirection-then-su"
+        ),
         # A wrapper FLAG's own operand is not a command either. `LANG` is not numeric, so the
         # walk stopped on it and never reached sudo -- while the line executes the download:
         #   printf 'echo PWNED\n' | env -u LANG sudo -n -s     ->  PWNED
@@ -548,6 +567,18 @@ def test_the_guard_catches_a_yaml_line_that_both_folds_back_and_continues_on(tmp
         # `-s`/`-i` start a shell only when NOTHING follows them. With a command present, sudo
         # runs THAT and the stream is never executed -- so the flag alone cannot be the signal.
         # Confirmed: printf 'echo X\n' | sudo -n -s echo hi   ->   hi
+        # A chained tool still honours the LAST tool's own selection and `-c`, so the safe
+        # spellings stay safe through the chain.
+        pytest.param(
+            "curl -s https://x.example/f | sudo su -s /usr/bin/sha256sum nobody",
+            id="sudo-then-su-selects-a-non-shell",
+        ),
+        pytest.param(
+            "curl -s https://x.example/f | sudo su -s /bin/sh -c 'jq .'",
+            id="sudo-then-su-defers-to-c",
+        ),
+        pytest.param("curl -s https://x.example/f | sudo -u root jq .", id="sudo-user-then-jq"),
+        pytest.param("curl -s https://x.example/f | 2>/dev/null jq .", id="redirection-then-jq"),
         # `-s`/`--shell` CHOOSES which program `su`/`runuser` starts, and it need not be a shell.
         # Matching `su` as a shell NAME made every spelling dangerous, including safe ones:
         #   printf 'hello\n' | sudo -n su -s /usr/bin/sha256sum nobody  ->  5891b5b5…  (hashed)
@@ -749,6 +780,25 @@ def test_the_pipe_to_shell_guard_does_not_flag_ordinary_pipelines(line: str, tmp
     planted.write_text(f"FROM scratch\nRUN {line}\n")
 
     test_nothing_pipes_a_downloaded_script_into_a_shell(planted)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        pytest.param('run: ""', id="empty-double-quoted-scalar"),
+        pytest.param("run: ''", id="empty-single-quoted-scalar"),
+        pytest.param('run: "   "', id="whitespace-only-scalar"),
+    ],
+)
+def test_an_empty_quoted_scalar_is_clean_rather_than_a_crash(line: str):
+    """An empty `run:` value must answer "clean", not abort the scan.
+
+    Unwrapping a quoted scalar reads its first token to tell file syntax from a command whose
+    own ARGUMENT is quoted. An empty body has no first token, so indexing it raised IndexError
+    -- and an exception here fails the whole repo-wide guard rather than one line, turning a
+    trivially clean input into a broken build.
+    """
+    assert not _piped_into_a_shell(line)
 
 
 def test_the_installer_scan_covers_every_dockerfile_in_the_repo():
