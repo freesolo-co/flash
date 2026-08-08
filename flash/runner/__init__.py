@@ -31,7 +31,13 @@ from flash.opd_retry_contract import (
     require_opd_retry_contract_version,
 )
 from flash.providers._poll import _attempt_int
-from flash.spec import MANAGED_GPU_KEYS, TRAINER_BACKEND, GpuSpec, JobSpec
+from flash.spec import (
+    _DROPPED_TOP_LEVEL_KEYS,
+    MANAGED_GPU_KEYS,
+    TRAINER_BACKEND,
+    GpuSpec,
+    JobSpec,
+)
 
 _STATE_DIR = str(data_dir())
 RUNS_DIR = os.path.join(_STATE_DIR, "runs")
@@ -1220,7 +1226,11 @@ def _mark_warmstart_source(worker_spec: JobSpec, child_run_id: str) -> None:
 
 
 def _preparation_digest(
-    public_spec: JobSpec, worker_spec: JobSpec, adapter_identity: dict | None
+    public_spec: JobSpec,
+    worker_spec: JobSpec,
+    adapter_identity: dict | None,
+    *,
+    legacy_keys: dict | None = None,
 ) -> str:
     worker_payload = worker_spec.to_internal_dict()
     # omit empty fields so existing version-1 snapshots keep their historical digest.
@@ -1232,6 +1242,16 @@ def _preparation_digest(
     ):
         if not worker_payload.get(key):
             worker_payload.pop(key, None)
+    # Restore since-removed keys the STORED payload carried, for the same reason as the omissions
+    # above: the digest has to reproduce the bytes that were hashed, not today's serialization. A
+    # pre-upgrade snapshot hashed `model_policy` in (to_internal_dict was asdict, so it emitted the
+    # defaulted value), and the field no longer exists -- so rehashing without it mismatches and a
+    # still-valid warm-start or workload-profile run fails integrity validation on recovery
+    # (cursor[bot], codex[bot]). Only keys the spec itself has dropped are honoured; anything the
+    # dataclass still defines comes from worker_spec, so this cannot be used to forge a field.
+    for key, value in (legacy_keys or {}).items():
+        if key in _DROPPED_TOP_LEVEL_KEYS:
+            worker_payload[key] = value
     payload = {
         "version": 1,
         "public_spec": public_spec.to_dict(),
@@ -1846,6 +1866,9 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     _validate_effective_spec(public_spec, worker_spec)
     expected = snapshot.get("adapter_identity")
     stored_digest = snapshot.get("preparation_digest")
+    # A pre-upgrade snapshot hashed since-removed keys into its digest, and `worker_spec` no longer
+    # carries them -- so reproducing that digest needs the values the STORED payload holds.
+    legacy_keys = {k: raw_worker[k] for k in _DROPPED_TOP_LEVEL_KEYS if k in raw_worker}
     has_workload_profile = bool(
         worker_spec.workload_profile_kind
         or worker_spec.workload_profile_input_digest
@@ -1855,7 +1878,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
         if snapshot.get("workload_profile") != (worker_spec.workload_profile or None):
             raise ValueError("persisted workload profile does not match the worker spec")
         if not isinstance(stored_digest, str) or stored_digest != _preparation_digest(
-            public_spec, worker_spec, expected
+            public_spec, worker_spec, expected, legacy_keys=legacy_keys
         ):
             raise ValueError("persisted effective preparation failed integrity validation")
     if public_spec.train.init_from_adapter:
@@ -1865,7 +1888,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
                 "because its original artifact identity is unavailable"
             )
         if not isinstance(stored_digest, str) or stored_digest != _preparation_digest(
-            public_spec, worker_spec, expected
+            public_spec, worker_spec, expected, legacy_keys=legacy_keys
         ):
             raise ValueError("persisted effective preparation failed integrity validation")
     if verify_source and public_spec.train.init_from_adapter:

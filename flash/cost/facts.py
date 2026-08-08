@@ -291,8 +291,16 @@ def total_params_b(model_id: str, revision: str = "") -> float:
     return _PINNED_SIZE_MEMO[key]
 
 
-def active_params_b(model_id: str) -> float:
-    """Active params per token (billions); falls back to total for dense models. Use for FLOPs, not VRAM."""
+def active_params_b(model_id: str, revision: str = "") -> float:
+    """Active params per token (billions); falls back to total for dense models. Use for FLOPs, not VRAM.
+
+    ``revision`` is accepted and ignored: an active-parameter count is architecture metadata, which a
+    pinned commit of the same catalog entry does not change. It stays in the signature because the
+    callers that size a pinned run pass it positionally alongside ``total_params_b``, where it DOES
+    matter. (On dev it also fed an uncataloged fallback; uncataloged models are rejected now, so an
+    unknown id raises here rather than being priced as dense.)
+    """
+    _ = revision
     info = _catalog_model_info(model_id)
     return info.active_params_b or info.params_b
 

@@ -80,6 +80,72 @@ def test_the_dropped_key_is_tolerated_on_read_only_never_authored():
         spec_from_dict(_raw(model="Qwen/Qwen3.5-4B", model_policy="allow"))
 
 
+def test_a_pre_upgrade_snapshot_still_passes_its_integrity_digest(tmp_path, monkeypatch):
+    """Parsing an old record is not enough -- its stored DIGEST has to reproduce too.
+
+    Letting the key through from_dict fixes deserialization, but _preparation_digest rehashes the
+    spec, and to_internal_dict no longer emits model_policy. A pre-upgrade snapshot hashed it in, so
+    a workload-profile or warm-start run parses and THEN fails "persisted effective preparation
+    failed integrity validation" -- still blocking recovery, deploy and serving (cursor[bot],
+    codex[bot]). The digest must be reproduced from the bytes that were hashed.
+    """
+    import hashlib
+    import json
+
+    monkeypatch.setenv("FLASH_HOME", str(tmp_path))
+    import flash.runner as runner
+
+    spec = spec_from_dict(_raw(model="Qwen/Qwen3.5-4B"))
+    spec = type(spec).from_dict(
+        {
+            **spec.to_internal_dict(),
+            "workload_profile_kind": "sft",
+            "workload_profile": {"steps": 10},
+        }
+    )
+    public, worker = spec.to_dict(), spec.to_internal_dict()
+
+    # Recompute the digest exactly as the OLD plane did: its worker payload carried model_policy,
+    # and it dropped empty workload_profile_* keys (the version-1 omission rule) before hashing.
+    old_worker = {**worker, "model_policy": "catalog"}
+    hashed_worker = {
+        k: v
+        for k, v in old_worker.items()
+        if v
+        or k
+        not in (
+            "workload_profile_kind",
+            "workload_profile_input_digest",
+            "workload_profile_producer_version",
+            "workload_profile",
+        )
+    }
+    payload = {
+        "version": 1,
+        "public_spec": public,
+        "worker_spec": hashed_worker,
+        "adapter_identity": None,
+    }
+    old_digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=public,
+            effective_preparation={
+                "worker_spec": old_worker,
+                "workload_profile": {"steps": 10},
+                "preparation_digest": old_digest,
+            },
+        )
+    )
+    loaded = runner.effective_spec_from_status(runner.get_status(spec.run_id))
+    assert loaded.model == "Qwen/Qwen3.5-4B"
+
+
 # ---------------------------------------------------------------------------
 # Estimator sanity: calibrated against catalog anchors
 # ---------------------------------------------------------------------------

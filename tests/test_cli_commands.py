@@ -333,6 +333,52 @@ def test_env_setup_still_rejects_a_malformed_project_when_self_hosted(monkeypatc
         env_setup._require_setup_project(Namespace(project="not-a-uuid"))
 
 
+def test_env_setup_self_hosted_interactive_requires_an_explicit_project(monkeypatch) -> None:
+    from argparse import Namespace
+
+    from flash.cli import env_setup
+    from flash.client import ClientError
+
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("http://127.0.0.1:8080", "operator-key")
+    )
+    monkeypatch.setattr(env_setup, "_setup_interactive", lambda _args: True)
+    monkeypatch.setattr(
+        "flash.client.list_projects",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("a self-hosted plane has no project directory to enumerate")
+        ),
+    )
+
+    with pytest.raises(ClientError, match=r"--project PROJECT_UUID.*self-hosted plane"):
+        env_setup._require_setup_project(Namespace(project=""))
+
+
+def test_env_setup_hosted_interactive_still_selects_a_project(monkeypatch) -> None:
+    from argparse import Namespace
+
+    from flash.cli import env_setup
+
+    project_id = "11111111-1111-4111-8111-111111111111"
+    api_url = "https://flash.freesolo.co"
+    seen = {}
+    monkeypatch.setattr("flash.client.config.load_credentials", lambda: (api_url, "key-1"))
+    monkeypatch.setattr(env_setup, "_setup_interactive", lambda _args: True)
+    monkeypatch.setattr(
+        "flash.client.list_projects", lambda api_key: [{"id": project_id, "name": "Example"}]
+    )
+    monkeypatch.setattr(env_setup.render, "select_required", lambda _prompt, _options: project_id)
+
+    def _resolve(selected, api_key, selected_api_url):
+        seen.update(selected=selected, api_key=api_key, api_url=selected_api_url)
+        return selected
+
+    monkeypatch.setattr("flash.client.resolve_project_id", _resolve)
+
+    assert env_setup._require_setup_project(Namespace(project="")) == project_id
+    assert seen == {"selected": project_id, "api_key": "key-1", "api_url": api_url}
+
+
 def test_login_shows_who_you_are(monkeypatch, capsys) -> None:
     # Verify + store are stubbed; login should still surface the identity card itself so the
     # user sees who they are without a separate `flash whoami`. The card is built from the
@@ -1354,6 +1400,20 @@ def test_env_setup_reasoning_conflict_names_every_stale_config(
         assert "thinking" not in parsed, f"{name} kept reasoning after a --no-reasoning re-scaffold"
 
 
+def test_existing_reasoning_ignores_thinking_text_in_comments(tmp_path) -> None:
+    from flash.cli import env_setup
+
+    sft = tmp_path / "sft.toml"
+    rl = tmp_path / "rl.toml"
+    sft.write_text(
+        'model = "Qwen/Qwen3.5-4B"\n'
+        "# reasoning is on (thinking = true): gold outputs need think tags\n"
+    )
+    rl.write_text('model = "Qwen/Qwen3.5-4B"\n')
+
+    assert env_setup._existing_reasoning((sft, rl)) is False
+
+
 def _drop_thinking(path) -> None:
     """Rewrite a config the way the pre-#824 release left opd.toml: no `thinking` key at all."""
     path.write_text(path.read_text().replace("thinking = true\n", ""))
@@ -1619,6 +1679,9 @@ def test_env_setup_interactive_survey_picks_multi_and_reasoning(monkeypatch, tmp
     monkeypatch.delenv("CI", raising=False)
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setattr("sys.stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("https://flash.freesolo.co", "fslo-test")
+    )
     answers = iter(["1", "", "2", "2"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(answers))
     assert _run(["env", "setup"]) == 0
@@ -1635,6 +1698,9 @@ def test_env_setup_interactive_enter_takes_defaults(monkeypatch, tmp_path) -> No
     monkeypatch.delenv("CI", raising=False)
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setattr("sys.stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("https://flash.freesolo.co", "fslo-test")
+    )
     answers = iter(["1", "", "", ""])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(answers))
     assert _run(["env", "setup"]) == 0

@@ -28,6 +28,47 @@ def test_active_params_defaults_to_total_for_dense(model_id):
     assert active_params_b(model_id) == pytest.approx(info.params_b)
 
 
+def test_catalog_dense_active_params_ignore_revision_without_hf_lookup(monkeypatch):
+    import flash.engine.vram as vram
+
+    model_id = "Qwen/Qwen3.5-4B"
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("catalog active params must not query huggingface")
+
+    monkeypatch.setattr(vram, "fetch_hf_params_b", _boom, raising=False)
+    monkeypatch.setattr(vram, "_validated_revision_geometry", _boom)
+
+    assert active_params_b(model_id, "a" * 40) == pytest.approx(MODELS[model_id].params_b)
+
+
+@pytest.mark.parametrize(
+    ("model_id", "expected"),
+    [
+        ("Qwen/Qwen3.5-4B", False),
+        ("Qwen/Qwen3.6-35B-A3B", True),
+    ],
+)
+def test_catalog_moe_classification_never_queries_huggingface(monkeypatch, model_id, expected):
+    """MoE routing is curated architecture metadata: a catalog read, never a hub lookup.
+
+    This used to also assert that passing a revision changed nothing. `_is_moe` no longer TAKES a
+    revision -- with uncataloged models rejected, the branch that compared active against total
+    params over HF is unreachable, so "ignores the revision" is now enforced by the signature rather
+    than by a test. What still needs guarding is that classification stays offline.
+    """
+    import flash.engine.vram as vram
+    from flash.cost.analytical import _is_moe
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("catalog moe classification must not query huggingface")
+
+    monkeypatch.setattr(vram, "fetch_hf_params_b", _boom, raising=False)
+    monkeypatch.setattr(vram, "_validated_revision_geometry", _boom)
+
+    assert _is_moe(model_id) is expected
+
+
 def test_active_params_uses_the_active_count_for_the_moe():
     # The MoE's per-token FLOPs size is the ~3B active count, far below its 35B total — so cost/step
     # time isn't ~10x overstated. Memory/size terms still use the 35B total (asserted just below).

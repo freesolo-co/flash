@@ -572,6 +572,7 @@ def test_offline_estimate_applies_the_pinned_revision_geometry_cap(monkeypatch):
     from flash.cost.analytical import _offline_gpu_shape
 
     monkeypatch.setattr("flash.cost.analytical.required_vram_gb", lambda *a, **k: 700)
+    monkeypatch.setattr("flash.cost.analytical.total_params_b", lambda *a, **k: 4.7)
     config = RunConfig(
         "Qwen/Qwen3.5-4B",
         "sft",
@@ -582,6 +583,52 @@ def test_offline_estimate_applies_the_pinned_revision_geometry_cap(monkeypatch):
 
     with pytest.raises(ValueError, match="across up to 4 cards"):
         _offline_gpu_shape(config)
+
+
+def test_the_offline_probe_sizes_a_pinned_catalog_model_by_its_revision(monkeypatch):
+    """The offline shape probe must size the PINNED commit, not the catalog's default revision.
+
+    (This replaces an open-model version of the same test: it used an uncataloged id sized over HF,
+    and uncataloged models are rejected now. The invariant it protected -- the probe passes the
+    revision through rather than quoting default-revision weights -- still holds for a pinned
+    catalog model, which is the only way to reach revision-specific sizing at all.)
+    """
+    import flash.engine.vram as vram
+    from flash.catalog import MODELS
+    from flash.cost.analytical import _offline_gpu_shape
+    from flash.cost.facts import _PINNED_SIZE_MEMO
+
+    model = "Qwen/Qwen3.5-9B"
+    info = MODELS[model]
+    expected_revision = "f" * 40
+    seen_revisions = []
+
+    def _pinned_geometry(model_id, revision="", strict=False):
+        assert model_id == model
+        seen_revisions.append(revision)
+        return (info.params_b, info.vocab_size, info.hidden_size, info.num_layers)
+
+    monkeypatch.setattr(vram, "fetch_hf_model_geometry", _pinned_geometry)
+    monkeypatch.setattr("flash.cost.facts._PINNED_SIZE_MEMO", dict(_PINNED_SIZE_MEMO))
+    _PINNED_SIZE_MEMO.pop((model, expected_revision), None)
+
+    gpu, count, need, provider, rate = _offline_gpu_shape(
+        RunConfig(model, "sft", 1, model_revision=expected_revision)
+    )
+
+    assert gpu
+    assert count >= 1
+    assert need > 0
+    assert provider
+    assert rate > 0
+    # TWO independent sites size a pinned run here -- the fail-closed params check and the VRAM
+    # requirement -- and each must carry the pin. Asserting only "some call saw the revision" cannot
+    # tell them apart: dropping the pin from either one still leaves the other populating the list,
+    # so the count is what makes this test able to fail.
+    assert len(seen_revisions) == 2, (
+        f"expected both the params check and the VRAM sizing to pass the pin, saw {seen_revisions}"
+    )
+    assert set(seen_revisions) == {expected_revision}
 
 
 def test_allocator_selected_gpu_count_renders_and_applies_speedup():

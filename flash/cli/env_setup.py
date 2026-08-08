@@ -353,6 +353,7 @@ def _require_setup_project(args) -> str:
     """Resolve and validate the one explicit project used by the whole scaffold."""
     from flash.client import ClientError, list_projects, resolve_project_id
     from flash.client.config import load_credentials
+    from flash.serve.urls import is_freesolo_hosted_url
 
     api_url, api_key = load_credentials()
     if not api_key:
@@ -367,6 +368,11 @@ def _require_setup_project(args) -> str:
         raise ClientError(
             "--project PROJECT_UUID is required in noninteractive mode, with redirected stdin, or with --yes"
         )
+    if api_url is not None and not is_freesolo_hosted_url(api_url):
+        raise ClientError(
+            "--project PROJECT_UUID is required for interactive setup against a self-hosted plane, "
+            "which has no project directory"
+        )
 
     projects = list_projects(api_key)
     options = traces.project_options(projects)
@@ -375,7 +381,7 @@ def _require_setup_project(args) -> str:
             "no Freesolo projects are available for this organization; create one with `flash projects create NAME`"
         )
     selected = render.select_required("Choose the Freesolo project for this environment", options)
-    return resolve_project_id(selected, api_key)
+    return resolve_project_id(selected, api_key, api_url)
 
 
 def _validate_existing_config_projects(project_id: str) -> None:
@@ -414,9 +420,15 @@ def _existing_reasoning(configs: tuple[Path, ...]) -> bool | None:
     """
     from flash.client import ClientError
 
-    found = {
-        cfg: "thinking = true" in cfg.read_text(encoding="utf-8") for cfg in configs if cfg.exists()
-    }
+    found: dict[Path, bool] = {}
+    for cfg in configs:
+        if not cfg.exists():
+            continue
+        try:
+            raw = tomllib.loads(cfg.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            raise ClientError(f"cannot read existing {cfg}: {exc}") from exc
+        found[cfg] = raw.get("thinking") is True
     if len(set(found.values())) > 1:
         # no anchor exists: the configs disagree, so there is no "existing state" to keep. picking a
         # side would rewrite nothing (configs are only written when absent) and leave the project
