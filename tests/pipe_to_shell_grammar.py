@@ -13,6 +13,13 @@ confirmed by running it, not read off a man page -- the comments record which.
 The rule that uses this lives in `test_no_pipe_to_shell.py`. Kept separate because the grammar
 is the part with the subtle cases, and it is easier to reason about without 500 lines of
 parametrized fixtures underneath it.
+
+WHICH text gets scanned -- the files discovered, and how continued lines are joined back into one
+command -- is `pipe_to_shell_scan`. That half needs no notion of a shell, and this half needs no
+notion of a file; keeping them apart is what stops either from being debugged through the other.
+
+What the stream BECOMES once a wrapper has had its say -- argv rather than stdin, an `sh -c`
+program, an `env -S` operand -- is `pipe_to_shell_argv`.
 """
 
 from __future__ import annotations
@@ -21,35 +28,15 @@ import itertools
 import json
 import re
 import shlex
-from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+from tests.pipe_to_shell_argv import (
+    _TAKES_A_COMMAND_STRING,
+    _arguments_reach_a_command_slot,
+    _dash_c_operand,
+    _split_string_operands,
+    _stream_becomes_arguments,
+)
 
-
-def _installer_files() -> tuple[Path, ...]:
-    """Every file that may install software from the network.
-
-    DISCOVERED, not enumerated: a hand-kept list silently stops covering the next Dockerfile
-    someone adds, and a guard that quietly narrows its own scope reports the same green as one
-    that found nothing. `docker/Dockerfile.kernelcache*` were both missed by an enumerated list
-    that claimed to be repo-wide.
-
-    A function rather than a module constant so the coverage tests can re-run the real discovery
-    against a planted file. Asserting instead on a copy of these patterns would test the copy.
-    """
-    workflows = REPO_ROOT / ".github" / "workflows"
-    return (
-        *sorted(REPO_ROOT.glob("Dockerfile*")),
-        *sorted(REPO_ROOT.glob("docker/Dockerfile*")),
-        # Both extensions: GitHub Actions accepts `.yaml` too, and a workflow renamed to it would
-        # drop out of a `*.yml`-only scan silently.
-        *sorted(p for ext in ("*.yml", "*.yaml") for p in workflows.glob(ext)),
-    )
-
-
-# Resolved once for parametrization; the tests below call `_installer_files()` directly when they
-# need discovery re-run.
-INSTALLER_FILES = _installer_files()
 # `curl … | bash`, `wget … | sh`, and friends: a fetch whose output is piped into a shell.
 #
 # This was a single regex through eleven rounds of review, and each fix created the next hole:
@@ -158,13 +145,6 @@ _FLAGS_WITH_OPERAND = {
     "unshare": {"-S", "-G", "--setuid", "--setgid", "--propagation", "--setgroups"},
 }
 
-# `env -S 'bash -s'` splits its operand into words and runs them, so the operand is not a value
-# to skip -- it is the command. Kept apart from _FLAGS_WITH_OPERAND because those two treatments
-# are opposites: one steps over the operand, this one steps INTO it.
-_SPLITS_ITS_OPERAND = {"-S", "--split-string"}
-
-# The same flag with its operand fused into the token: `-S'bash -s'`, `--split-string='bash -s'`.
-_FUSED_SPLIT_STRING = re.compile(r"(?:-S|--split-string=)(?P<command>.+)")
 
 # A bare numeric operand sitting between a wrapper and its command: `timeout 30 sh` requires one,
 # and an unrecognized flag may introduce one (`nohup -n 5 bash`). Skipped after ANY wrapper rather
@@ -184,7 +164,16 @@ def _piped_into_a_shell(line: str) -> bool:
     The file's own keyword is dropped first. `RUN`/`run:` introduces a shell command but is not
     part of one, and a walk that reads it as the command word stops before reaching the shell.
     """
-    return any(_stage_runs_a_shell(s) for s in _pipeline_stages_after_a_fetch(_shell_part(line)))
+    command = _shell_part(line)
+    if any(_stage_runs_a_shell(s) for s in _pipeline_stages_after_a_fetch(command)):
+        return True
+    # A whole pipeline may sit INSIDE a group or clause, where the enclosing construct is a single
+    # stage and the fetch never appears at this level at all. `_pipeline_stages_after_a_fetch`
+    # therefore finds nothing, while the shell inside runs the download exactly as it would at the
+    # top level. Confirmed to execute:
+    #   if true; then cat p.sh | bash; fi   ->  ran
+    #   ( cat p.sh | bash )                 ->  ran
+    return any(_piped_into_a_shell(inner) for inner in _nested_command_lists(command))
 
 
 # What the file writes BEFORE the shell command: a Dockerfile `RUN`, a workflow `run:` (with the
@@ -279,7 +268,6 @@ _FETCH = re.compile(r"(?:[\w./-]*/)?(?:curl|wget)")
 # as the command. Matching the flag exactly as `-c` missed every fused spelling -- including
 # `bash -lc '…'`, which this repo already writes in docker/bake_kernel_cache.py. A long `--command`
 # counts too; `--config` and other `c`-words must not, hence the exact long-form match.
-_TAKES_A_COMMAND_STRING = re.compile(r"-[A-Za-z]*c|--command")
 
 
 def _tokenize(line: str) -> list[str]:
@@ -358,6 +346,26 @@ def _command_word(tokens: list[str]) -> tuple[str, int | None]:
     return "", None
 
 
+# A compound command delimited by KEYWORDS rather than punctuation. `curl … | if true; then
+# bash; fi` is one pipeline stage, and the download is on its stdin for every command inside it --
+# exactly like the `{ …; }` group below, but `if`/`fi` are words, so the depth counter never saw
+# them and the clause's own `;` split the pipeline, detaching `bash`. Confirmed to execute:
+#   printf 'echo PWNED\n' | if true; then bash; fi      ->  PWNED
+_COMPOUND_OPENERS = {"if", "while", "until", "for", "select", "case"}
+_COMPOUND_CLOSERS = {"fi", "done", "esac"}
+# Words that are shell syntax inside a compound, not commands in its body.
+_COMPOUND_INTERNALS = {"then", "else", "elif", "do", "in"}
+# A keyword is only a keyword in COMMAND position. `echo done` is an argument -- reading it as a
+# closer would unbalance the counter and split the very clause it is meant to hold together:
+#   if true; then echo done; fi   ->  `done` here is a word being printed, not the closer
+_KEYWORD_FOLLOWS = {";", "&", "|", "|&", "||", "&&", "(", "{"} | _COMPOUND_INTERNALS
+
+
+def _in_command_position(stage: list[str]) -> bool:
+    """Would the next token start a command, rather than continue one as an argument?"""
+    return not stage or stage[-1] in _KEYWORD_FOLLOWS
+
+
 def _pipelines_in(text: str) -> list[list[list[str]]]:
     """Split a command list into pipelines, and each pipeline into its stages.
 
@@ -371,11 +379,27 @@ def _pipelines_in(text: str) -> list[list[list[str]]]:
     """
     pipelines: list[list[list[str]]] = [[[]]]
     depth = 0
+    opened: list[str] = []
     for tok in _tokenize(text):
         if tok in ("(", "{"):
             depth += 1
+            opened.append(tok)
+            pipelines[-1][-1].append(tok)
+        # A `)` that closes nothing is a `case` PATTERN terminator, not a group closer:
+        # `case x in x) bash;; esac` has one per branch and never an opening `(`. Decrementing
+        # there unbalanced the counter, so the clause's `;;` split the pipeline and detached the
+        # shell from the fetch. Confirmed to execute:
+        #   printf 'echo PWNED\n' | case x in x) bash;; esac   ->  PWNED
+        elif tok in (")", "}") and opened:
+            depth = max(depth - 1, 0)
+            opened.pop()
             pipelines[-1][-1].append(tok)
         elif tok in (")", "}"):
+            pipelines[-1][-1].append(tok)
+        elif tok in _COMPOUND_OPENERS and _in_command_position(pipelines[-1][-1]):
+            depth += 1
+            pipelines[-1][-1].append(tok)
+        elif tok in _COMPOUND_CLOSERS and _in_command_position(pipelines[-1][-1]):
             depth = max(depth - 1, 0)
             pipelines[-1][-1].append(tok)
         # A separator INSIDE a group belongs to the group's own command list, not to the
@@ -426,6 +450,27 @@ def _pipeline_stages_after_a_fetch(line: str) -> list[list[str]]:
 #   printf '%s' "`cat p.sh`" | bash    ->  ran
 _SUBSTITUTED_FETCH = re.compile(r"(?:\$\(|`)[^)`]*\b(?:curl|wget)\b")
 
+# The same fetch UNQUOTED. `echo $(curl URL) | bash` is not one token: the tokenizer's fallback
+# alternation excludes `(` and `)`, so it splits to `echo`, `$`, `(`, `curl`, `)`, and no single
+# token carries both `$(` and the fetch name -- the pattern above never fires. Joining the stage
+# back together and matching across the whole string catches both spellings with one rule.
+# Confirmed to execute:  echo $(cat p.sh) | bash  ->  ran
+_SUBSTITUTION_OPENS = ("$(", "`")
+
+
+def _stage_substitutes_a_fetch(stage: list[str]) -> bool:
+    """Does a command substitution anywhere in this stage run a fetch?
+
+    Matched against the joined stage rather than token by token, because the tokenizer breaks an
+    unquoted `$(curl …)` apart while keeping a quoted `"$(curl …)"` whole. Both reach the shell
+    downstream, so both must match.
+    """
+    # Joined WITHOUT a separator: the tokenizer split `$(` into `$` and `(`, and a space between
+    # them would stop `\$\(` matching the very spelling this exists to catch. Testing the tokens
+    # individually fails for the same reason -- no single one carries both halves. The pattern's
+    # own `\b` still keeps `curl` a whole word, so `$(curlie …)` does not match.
+    return bool(_SUBSTITUTED_FETCH.search("".join(stage)))
+
 
 def _stage_fetches(stage: list[str]) -> bool:
     """Does this stage download something, as its own command or inside a substitution?
@@ -439,7 +484,7 @@ def _stage_fetches(stage: list[str]) -> bool:
     """
     word, at = _command_word(stage)
     if at is None:
-        return bool(any(_SUBSTITUTED_FETCH.search(tok) for tok in stage))
+        return _stage_substitutes_a_fetch(stage)
     if _FETCH.fullmatch(word):
         return True
     # A `sh -c "curl … | bash"` program is spliced INLINE into its stage, so the stage's own
@@ -451,7 +496,7 @@ def _stage_fetches(stage: list[str]) -> bool:
         for index, tok in enumerate(stage[at + 1 :], start=at + 1):
             if _TAKES_A_COMMAND_STRING.fullmatch(tok):
                 return _stage_fetches(stage[index + 1 :])
-    return any(_SUBSTITUTED_FETCH.search(tok) for tok in stage)
+    return _stage_substitutes_a_fetch(stage)
 
 
 def _stage_runs_a_shell(tokens: list[str]) -> bool:
@@ -467,6 +512,11 @@ def _stage_runs_a_shell(tokens: list[str]) -> bool:
     # `true bash`, whose command word is `true` -- clean, while it executes the download.
     if _is_a_group(tokens):
         return any(_stage_runs_a_shell(cmd) for cmd in _commands_in(" ".join(tokens[1:-1])))
+    # A keyword compound is a command list too, for the same reason a group is: the download stays
+    # on stdin for every command inside the clause. Its command word is `if`, so without this the
+    # stage reads clean while `then bash` executes the stream.
+    if _is_a_compound(tokens):
+        return any(_stage_runs_a_shell(cmd) for cmd in _compound_body_commands(tokens))
     inner = [t for t in tokens if t not in ("(", ")", "{", "}")]
     if _requests_a_shell_by_flag(inner) or _sources_stdin(inner) or _evals_stdin(inner):
         return True
@@ -632,6 +682,81 @@ def _is_a_group(tokens: list[str]) -> bool:
     return len(tokens) > 2 and (tokens[0], tokens[-1]) in (("(", ")"), ("{", "}"))
 
 
+def _is_a_compound(tokens: list[str]) -> bool:
+    """Does this stage START with a compound keyword (`if`, `while`, `for`, `case`, …)?
+
+    Keyed on the opener alone, not on a matching closer: a `RUN` line continued across several
+    physical lines can put `fi` out of reach, and a clause whose body runs a shell executes the
+    download whether or not this scanner can see the end of it.
+    """
+    return bool(tokens) and tokens[0] in _COMPOUND_OPENERS
+
+
+def _compound_body_commands(tokens: list[str]) -> list[list[str]]:
+    """The commands inside a keyword compound, with the syntax words removed.
+
+    A `case` BRANCH is `pattern)` followed by its commands, and the pattern is matched text rather
+    than anything that runs. Dropping only the keywords left `case x in x) bash` reading as the
+    command `x`, so the body's real command was never reached and the clause scanned clean while
+    executing the download. Everything up to and including each `)` is therefore discarded.
+    """
+    return _commands_in(_compound_body_text(tokens))
+
+
+def _nested_command_lists(command: str) -> list[str]:
+    """The interior of every group and keyword clause in this command, as shell text.
+
+    Returned as text rather than token lists so the caller re-enters the whole pipeline analysis
+    on it: what is inside a clause is an ordinary command list, and may contain its own fetch,
+    its own pipe, and its own nested clause. Recursion terminates because each step strips at
+    least the enclosing construct's own tokens.
+    """
+    inner: list[str] = []
+    for stage in _commands_in(command):
+        if _is_a_group(stage):
+            inner.append(" ".join(stage[1:-1]))
+        elif _is_a_compound(stage):
+            # The body as ONE text, not its commands joined back together: `_compound_body_commands`
+            # has already split across the `|`, so re-joining those pieces loses the pipe and the
+            # fetch inside the clause stops flowing into the shell inside the clause.
+            inner.append(_compound_body_text(stage))
+    return inner
+
+
+def _compound_body_text(tokens: list[str]) -> str:
+    """A keyword compound's interior, with the syntax words and `case` labels removed."""
+    body = [
+        tok
+        for tok in tokens
+        if tok not in _COMPOUND_OPENERS | _COMPOUND_CLOSERS | _COMPOUND_INTERNALS
+    ]
+    if tokens and tokens[0] == "case":
+        body = _drop_case_patterns(body)
+    return " ".join(body)
+
+
+def _drop_case_patterns(body: list[str]) -> list[str]:
+    """Remove each `pattern)` label from a `case` body, keeping the commands it guards.
+
+    The subject word (`case SUBJECT in …`) is dropped by the same rule: it sits before the first
+    `)` and is a value being matched, never a command.
+    """
+    kept: list[str] = []
+    pending: list[str] = []
+    for tok in body:
+        if tok == ")":
+            pending = []
+            continue
+        if tok in (";", "&&", "||", "|", "&"):
+            kept.extend(pending)
+            kept.append(tok)
+            pending = []
+            continue
+        pending.append(tok)
+    kept.extend(pending)
+    return kept
+
+
 def _privilege_tool_at(tokens: list[str], wrapper: str = "") -> int | None:
     """Where the privilege tool sits, stepping over any wrappers in front of it.
 
@@ -718,260 +843,3 @@ def _takes_a_separate_operand(wrapper: str, flag: str) -> bool:
     if flag in known:
         return True
     return not flag.startswith("--") and len(flag) > 2 and f"-{flag[-1]}" in known
-
-
-def _stream_becomes_arguments(wrappers: list[str]) -> bool:
-    """Does an `xargs` in the wrapper prefix redirect the pipe from stdin into argv?
-
-    `xargs` reads the stream itself to build an ARGUMENT list and runs its command with stdin on
-    /dev/null. So `curl … | xargs bash` hands the shell the download as a FILENAME to open, and
-    the bytes are never executed.
-
-    `-a`/`--arg-file` takes the argument list from a file instead and leaves the pipe connected,
-    which puts the stream back on the child's stdin -- the ordinary route, not this one.
-
-    Confirmed rather than assumed, against GNU findutils:
-        printf 'echo PWNED\\n' | xargs -0 sh      -> sh: cannot open 'echo PWNED'  (argv)
-        printf 'echo PWNED\\n' | xargs -a f sh    -> PWNED                         (stdin)
-    """
-    if not any(tok.rsplit("/", 1)[-1] == "xargs" for tok in wrappers):
-        return False
-    # Every spelling of the operand: `-a f`, `-af`, `-0a f`, `--arg-file f`, `--arg-file=f`.
-    return not any(
-        tok in ("-a", "--arg-file")
-        or tok.startswith("--arg-file=")
-        or (tok.startswith("-") and not tok.startswith("--") and "a" in tok[1:])
-        for tok in wrappers
-    )
-
-
-def _arguments_reach_a_command_slot(wrappers: list[str], command: list[str]) -> bool:
-    """Once the stream is argv, does it still land somewhere the shell EXECUTES?
-
-    Being argv is normally harmless -- a shell given a filename tries to open it. But two
-    spellings feed argv straight back into the shell's command string:
-
-      `xargs sh -c`     the `-c` operand is MISSING, so the first argument xargs appends becomes
-                        the program text. The download is executed verbatim.
-      `xargs -I{} sh -c '… {} …'`   the placeholder is substituted INTO the operand, so the
-                        download is executed as part of it.
-
-    Confirmed rather than assumed, against GNU findutils:
-        printf 'echo PWNED\\n' | xargs -0 sh -c              -> PWNED
-        printf 'echo PWNED\\n' | xargs -I{} sh -c '{}'       -> PWNED
-        printf 'echo PWNED\\n' | xargs -0 sh -c 'echo SAFE'  -> SAFE   (operand present)
-    """
-    program = _dash_c_operand(command)
-    if program is None:
-        # No `-c` at all: the shell opens argv as a file. `-s` also lands here, but xargs gave
-        # the shell /dev/null for stdin, so there is nothing to read.
-        return False
-    if program == "":
-        return True
-    return any(holder in program for holder in _replacement_placeholders(wrappers))
-
-
-def _replacement_placeholders(wrappers: list[str]) -> list[str]:
-    """The strings xargs will substitute the stream into, or NOTHING if it substitutes at all.
-
-    An empty result is the common case and it matters: with no replace flag, `{}` in the command
-    is ordinary text. `curl … | xargs -0 sh -c 'jq {}'` runs a jq filter, and treating `{}` as a
-    placeholder there fails CI on a legitimate pipeline. So this returns [] rather than defaulting
-    to `{}` -- the default belongs to the FLAG, not to the absence of one.
-
-    The two flags differ in arity, which is the whole subtlety:
-
-      `-I` REQUIRES an operand      -- `-I{}` fused, or `-I {}` separate.
-      `-i` / `--replace` OPTIONAL   -- `-i` alone means `{}`; `-iQQ` / `--replace=QQ` fuse a custom
-                                       one. A SEPARATE word is never its operand, so `xargs -i -0`
-                                       is `-i` (meaning `{}`) plus `-0`, not the placeholder `-0`.
-
-    Confirmed rather than assumed, against GNU findutils:
-        printf 'echo PWNED\\n' | xargs -i -0 sh -c '{}'        -> PWNED   (`-0` was NOT the operand)
-        printf 'echo PWNED\\n' | xargs -iQQ sh -c 'echo got QQ' -> got echo PWNED
-        printf 'X\\n'          | xargs -0 sh -c 'echo {}'       -> {}      (literal, no flag)
-    """
-    placeholders: list[str] = []
-    for flag, following in itertools.zip_longest(wrappers, wrappers[1:], fillvalue=""):
-        if flag == "-I":
-            # Required operand, so the next word IS it even when it looks like an option.
-            placeholders.append(following)
-        elif flag == "--replace":
-            placeholders.append("{}")
-        elif flag.startswith("--replace="):
-            placeholders.append(flag.split("=", 1)[1])
-        elif not flag.startswith("--"):
-            placeholders.append(_fused_replacement(flag))
-    return [p for p in placeholders if p]
-
-
-def _fused_replacement(flag: str) -> str:
-    """The placeholder inside a short-flag cluster, or "" when the cluster has no `-i`/`-I`.
-
-    Short flags cluster, and `-i`/`-I` may sit at the end of one: `xargs -0i` is `-0` plus `-i`.
-    Everything after that letter is the placeholder, not more flags -- `-in1` means the
-    placeholder is literally `n1`, not `-i -n 1`. So the search is for the LAST `i`/`I`, and only
-    when nothing before it could have consumed the rest.
-
-    Confirmed rather than assumed, against GNU findutils:
-        printf 'echo PWNED\\n' | xargs -0i sh -c '{}'        -> PWNED    (clustered, default `{}`)
-        printf 'echo PWNED\\n' | xargs -in1 sh -c '{}'       -> {}: not found  (`n1` is the name)
-    """
-    for position, letter in enumerate(flag):
-        if letter in ("i", "I") and position > 0:
-            return flag[position + 1 :] or "{}"
-    return ""
-
-
-def _dash_c_operand(tokens: list[str]) -> str | None:
-    """The program string a shell's `-c` supplies, or None when the shell has no `-c`.
-
-    Returns the operand even when it is empty, so `sh -c ''` is distinguishable from a shell
-    invoked with no `-c` at all -- the first runs nothing, the second runs the piped stream.
-
-    When BOTH `-s` and `-c` appear the answer is SHELL-DEPENDENT, so it cannot be read off the
-    flags alone. Confirmed by running each:
-
-        printf 'echo FROM_STDIN\\n' | bash       -s -c 'echo FROM_C'  -> FROM_C
-        printf 'echo FROM_STDIN\\n' | busybox ash -s -c 'echo FROM_C' -> FROM_C
-        printf 'echo FROM_STDIN\\n' | dash       -s -c 'echo FROM_C'  -> FROM_C
-                                                                         FROM_STDIN  <-- executed
-
-    bash and busybox ash run the `-c` program and leave the pipe as data. dash runs the program
-    AND THEN reads stdin, so the download is executed. `/bin/sh` IS dash on Debian and Ubuntu --
-    where a Dockerfile `RUN` lands -- so `sh -s -c '…'` is a real evasion, while `bash -s -c '…'`
-    is a legitimate verified-download spelling that must stay clean.
-    """
-    if _reads_stdin_despite_dash_c(tokens):
-        return None
-    for index, tok in enumerate(tokens):
-        if _TAKES_A_COMMAND_STRING.fullmatch(tok):
-            return tokens[index + 1] if index + 1 < len(tokens) else ""
-    return None
-
-
-# Shells confirmed to IGNORE stdin once `-c` supplies the program, even with `-s` also given.
-# dash is deliberately absent: it runs the `-c` program and THEN executes stdin, and it is what
-# `/bin/sh` points at on Debian and Ubuntu.
-_IGNORES_STDIN_GIVEN_DASH_C = ("bash", "ash", "busybox")
-
-
-def _reads_stdin_despite_dash_c(tokens: list[str]) -> bool:
-    """Would this shell still execute the pipe even though `-c` gave it a program?
-
-    Only when `-s` is present AND the shell is not one of the few confirmed to ignore stdin.
-    Unknown shell names are treated as reading stdin, so a miss is a false POSITIVE (a CI failure
-    someone investigates) rather than a silent hole.
-    """
-    if not any(t.startswith("-") and not t.startswith("--") and "s" in t[1:] for t in tokens[1:]):
-        return False
-    name = tokens[0].rsplit("/", 1)[-1] if tokens else ""
-    return name not in _IGNORES_STDIN_GIVEN_DASH_C
-
-
-def _split_string_operands(tokens: list[str]) -> list[str]:
-    """The command strings introduced by `env -S`, in every spelling it accepts.
-
-    The operand may be a separate token (`-S 'bash -s'`) or fused into the flag itself
-    (`-S'bash -s'`, `--split-string='bash -s'`). Normalized here rather than handled at two call
-    sites: the separate and fused forms are the same instruction, and splitting them across two
-    mechanisms is how the fused one went missing in the first place.
-    """
-    operands: list[str] = []
-    for flag, following in itertools.zip_longest(tokens, tokens[1:], fillvalue=""):
-        fused = _FUSED_SPLIT_STRING.fullmatch(flag)
-        if fused:
-            operands.append(fused["command"].strip("\"'"))
-        elif flag in _SPLITS_ITS_OPERAND and following:
-            operands.append(following)
-    return operands
-
-
-# A line ending in any of these does not end the command -- the next line continues it. `\` is
-# the explicit continuation; a trailing `|`, `&&`, or `||` is an incomplete construct the shell
-# keeps reading past (verified: `echo x |` newline `cat` runs as one pipeline). Enumerated rather
-# than matched one spelling at a time: this guard has now been evaded three separate ways, each
-# time by a different way of writing the SAME command across two lines.
-_CONTINUERS = ("\\", "|", "&&", "||")
-
-# The mirror image: a line that BEGINS with one of these continues the line above it, even when
-# that line looked complete. YAML's folded scalar (`run: >`) joins its physical lines with
-# spaces, so
-#     run: >
-#       curl -fsSL URL
-#       | bash
-# reaches the shell as one `curl … | bash` while neither physical line ends in a continuer.
-# Matching on the leading operator catches the folded form without parsing YAML -- the guard
-# scans Dockerfiles too, and must not become contingent on a yaml library (pyyaml reaches this
-# environment only as a transitive dependency of the ML stack).
-_LEADING_CONTINUERS = ("|", "&&", "||", "&")
-
-
-def _strip_comment(line: str) -> str:
-    """Drop a trailing `#` comment, but not a `#` that is part of the command itself.
-
-    A URL fragment (`curl 'https://host/install.sh#v1' | bash`) puts a hash INSIDE a shell word,
-    where it is data rather than a comment. Splitting on the first `#` truncated the line before
-    the `| bash` and the guard went green on a live piped installer. A comment starts at an
-    unquoted `#`; in shell it must also begin a word, so a bare `#` mid-word (as in a URL that
-    was never quoted) does not start one either.
-    """
-    quote = ""
-    for i, ch in enumerate(line):
-        if quote:
-            if ch == quote:
-                quote = ""
-        elif ch in "\"'":
-            quote = ch
-        elif ch == "#" and (i == 0 or line[i - 1].isspace()):
-            return line[:i]
-    return line
-
-
-def _logical_lines(text: str) -> list[str]:
-    """Strip `#` comments, then join continued commands into single logical lines.
-
-    Both steps are load-bearing. Without comment stripping, prose ABOUT the banned pattern --
-    including the comments in these very files explaining why they avoid it -- reads as an
-    instance of it. Without joining, the multi-line spellings of `curl … | bash` slip past a
-    line-scoped scan: the idiomatic way to write the exact command being prohibited.
-
-    Joining is deliberately more permissive than any single parser. A Dockerfile `RUN` and a
-    YAML `run:` block have different rules (docker rejects a bare trailing `|` that a shell
-    accepts, and strips comments BETWEEN a `\\` and its continuation), and this file is scanned
-    for both. Over-joining at worst concatenates two unrelated lines, which cannot hide a `curl
-    … | bash` -- under-joining silently lets one through, which is the failure that matters.
-    """
-    joined: list[str] = []
-    pending = ""
-    for raw in text.splitlines():
-        code = _strip_comment(raw).rstrip()
-        # A comment BETWEEN a continuation and the rest of the command does not end it: docker
-        # removes comment lines before joining, so `curl … \` / `# note` / `| bash` is one RUN.
-        # Treating the stripped-empty line as a terminator would drop the join.
-        if pending and not code:
-            continue
-        # Fold BACKWARD first. A line STARTING with an operator continues the one above it (YAML
-        # folded scalars put the `|` at the head of the next physical line, not the tail of this
-        # one), and it may ALSO end in a continuer -- `| tee /tmp/i.sh |` does both. Testing the
-        # trailing continuer first swallowed such a line into `pending`, leaving the `curl` above
-        # it stranded on its own logical line with the `bash` below it: the pipe-to-shell split
-        # across three physical lines and matched nothing.
-        if joined and not pending and code.lstrip().startswith(_LEADING_CONTINUERS):
-            joined[-1] = f"{joined[-1]} {code.strip()}"
-            # Re-enter the loop body's trailing-continuer logic against the merged line, so a
-            # line that folds backward AND continues forward keeps absorbing what follows.
-            if joined[-1].endswith(_CONTINUERS):
-                pending = joined.pop() + " "
-            continue
-        if code.endswith("\\"):
-            pending += code[:-1] + " "
-            continue
-        if code.endswith(_CONTINUERS):
-            pending += code + " "
-            continue
-        joined.append((pending + code).strip())
-        pending = ""
-    if pending:
-        joined.append(pending.strip())
-    return joined
