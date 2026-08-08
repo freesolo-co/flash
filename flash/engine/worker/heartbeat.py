@@ -52,12 +52,8 @@ _HB_SETUP_LIVENESS_STAGES = frozenset(
         "opd_finalizing",
     }
 )
-# Mid-training the per-step checkpoint upload runs SYNCHRONOUSLY on the trainer thread (dev #445),
-# which freezes the trainer's global_step — so the ``rl_step``/``sft_step`` liveness daemon can only
-# emit bare liveness pings for the whole upload, and those DON'T advance the provider's stall clock.
-# A ``checkpoint_uploading`` keepalive daemon (liveness_heartbeat(keepalive=True)) wraps the upload to
-# keep that clock fed; it rides the SAME tight, throttled cadence as a setup stage. Kept OUT of
-# _HB_SETUP_LIVENESS_STAGES so that set's "setup-phase" meaning (and its tests) stay honest.
+# synchronous checkpoint uploads freeze global_step (dev #445), so checkpoint_uploading must
+# advance the provider stall clock. keep it outside the setup set but on the same tight cadence.
 _HB_UPLOAD_LIVENESS_STAGES = frozenset({"checkpoint_uploading"})
 # Liveness stages that ride the tighter setup-liveness upload interval (setup + mid-train upload).
 _HB_TIGHT_LIVENESS_STAGES = _HB_SETUP_LIVENESS_STAGES | _HB_UPLOAD_LIVENESS_STAGES
@@ -209,13 +205,8 @@ def heartbeat(
             _HB_CLAIM_SEQ += 1
             my_claim = _HB_CLAIM_SEQ
             _w._HB_LAST_UPLOAD = now
-            # Arm the forced-commit floor on ANY committing force=True heartbeat -- not only ones the
-            # force branch let through. A force=True ping that commits because the regular throttle was
-            # already due (900s elapsed) still refreshed the persisted step, so the NEXT sub-floor
-            # forced ping must be coalesced; keying this off the force branch alone left the clock stale
-            # and defeated the burst throttle that protects the HF commit cap (cursor[bot]). A non-forced
-            # liveness/mid-step commit deliberately does NOT arm it, so a post-update force still punches
-            # through immediately after one steals the slot.
+            # any committing force=True heartbeat arms the burst floor, even when the regular
+            # throttle was due. non-forced commits stay exempt so the next forced update lands.
             if force:
                 _w._HB_LAST_FORCED_UPLOAD = now
             _committed_step = kw.get("step")
@@ -301,48 +292,10 @@ _REWARD_METRIC_LIMIT = 12
 _REWARD_METRIC_PRIORITY_NAMES = ("success",)
 
 
-def _mean_named_reward_metrics(breakdowns: list[dict[str, float] | None]) -> dict[str, float]:
-    totals: dict[str, float] = {}
-    denominator = len(breakdowns)
-    for breakdown in breakdowns:
-        if not isinstance(breakdown, dict):
-            continue
-        for name, value in breakdown.items():
-            if name == "total":
-                continue
-            totals.setdefault(name, 0.0)
-            try:
-                score = float(value)
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(score):
-                totals[name] += score
-    if denominator == 0:
-        return {}
-    return {name: total / denominator for name, total in totals.items()}
-
-
 class RewardObservabilityBuffer:
-    """Rolling rollout samples and per-name reward components for an out-of-process trainer.
-
-    trl publishes both signals from a TrainerCallback running on the trainer's own thread. verl's
-    trainer is a child process, so its reward bridge fills this from the scoring server's threads
-    while the heartbeat drains it from the liveness thread -- the lock below is the whole reason
-    this is an object rather than three locals.
-
-    Both signals describe a GENERATION, so both are published per generation rather than per
-    heartbeat. trl gets that boundary for free (its callback fires at ``on_log``, after the step is
-    scored); here the caller supplies it via ``close_generation``. Draining on the heartbeat cadence
-    instead would publish whichever completions happened to be graded when a 30s tick landed --
-    a latency-biased subset -- and stamp samples left over from earlier generations with the
-    current step (codex[bot]).
-
-    ``generation_size`` makes that boundary COUNTED rather than observed. The verl caller knows a
-    generation is exactly ``prompts_per_step * group_size`` completions, so the last one closes it
-    on the scoring thread itself. Closing on the arriving ``step:N`` stdout line instead would be a
-    race: the child's pipe is delivered asynchronously, so generation N+1 can already be scoring
-    into this buffer when the parent finally reads N's line, sealing both generations under step N
-    and leaving N+1 to republish it (codex[bot]).
+    """Buffer generation-scoped rollout samples and rewards from a child trainer.
+    Scoring and heartbeat threads share one lock. Close counted generations on the scoring thread;
+    asynchronous ``step:N`` stdout can mix N+1 into N, while heartbeat cadence exposes partial data.
     """
 
     _SAMPLE_BUFFER_LIMIT = 64
@@ -359,8 +312,8 @@ class RewardObservabilityBuffer:
         self._scored_this_generation = 0
         # generations the count has already sealed, oldest first, each waiting for the step line
         # that names it. a QUEUE rather than a flag: stdout can fall a whole generation behind, and
-        # a flag would let the second seal overwrite the first, dropping a generation and relabelling
-        # the next one under its step (cursor, codex[bot]).
+        # a flag would let the second seal overwrite the first, dropping a generation and
+        # relabelling the next one under its step.
         self._sealed_by_count: list[
             tuple[list[tuple[Any, Any, float]], dict[str, float] | None]
         ] = []
@@ -380,17 +333,10 @@ class RewardObservabilityBuffer:
         self._latest_metrics: dict[str, float] = {}
 
     def record(self, prompt: Any, completion: Any, reward: float, breakdowns=()) -> None:
-        """Buffer one scored rollout. Call AFTER grading: this takes the lock, grading must not.
+        """Buffer one rollout after grading; grading must not run under this lock.
 
-        ``breakdowns`` is the 0-or-1 element accumulator ``score_single_turn`` filled for this
-        completion, empty for a multi-turn episode (the env scores a whole episode to a scalar).
-
-        The breakdown is folded into a running sum instead of being retained. A generation is
-        ``[train].batch_size * group_size`` completions, both arbitrary positive integers, so any
-        retention bound is one a valid large-batch run can exceed -- and evicting to honour it drops
-        completions out of the mean silently, biasing the published metric toward whichever ones
-        happened to be graded last (codex[bot]). Sums cost one float per NAME, which
-        ``_bounded_reward_metrics`` already caps at 12, so the generation size stops mattering.
+        Fold breakdowns into per-name sums. Retaining bounded rows would silently evict valid
+        large-batch completions and bias the mean; ``_bounded_reward_metrics`` already caps names.
         """
         with self._lock:
             self._samples.append((prompt, completion, float(reward)))
@@ -412,7 +358,7 @@ class RewardObservabilityBuffer:
                         # OverflowError too: an int larger than a float can hold raises it rather
                         # than ValueError. `_score` calls this OUTSIDE score_single_turn's guard, so
                         # anything escaping here 400s the reward request and aborts the run over a
-                        # component that is only ever a diagnostic (codex[bot]).
+                        # component that is only ever a diagnostic.
                         continue
                     if math.isfinite(score):
                         self._pending_totals[name] += score
@@ -429,16 +375,13 @@ class RewardObservabilityBuffer:
                     del self._sealed_by_count[:dropped]
                     # their step lines are still coming. counting the drops lets `close_generation`
                     # spend one line per dropped generation instead of handing it the next survivor,
-                    # which would offset every remaining step for the rest of the run (cursor,
-                    # codex[bot]).
+                    # which would offset every remaining step for the rest of the run.
                     self._dropped_unnamed += dropped
 
     def _close(self) -> tuple[list[tuple[Any, Any, float]], dict[str, float] | None]:
-        """Take the open generation's samples and mean metrics. Caller holds the lock.
+        """Take the open generation's samples and mean metrics while holding the lock.
 
-        The metrics are ``None`` when this generation counted no breakdowns at all -- a multi-turn
-        episode grades to a scalar and never reports named components -- which is NOT the same as
-        counting completions that all failed to report one. See ``_publish``.
+        ``None`` means no breakdowns existed, unlike a generation whose breakdowns all failed.
         """
         metrics: dict[str, float] | None = None
         if self._pending_count:
@@ -476,15 +419,10 @@ class RewardObservabilityBuffer:
         self._publish(*self._close(), step=step)
 
     def close_generation(self, step: int) -> None:
-        """Name the generation verl logged as ``step``, sealing it if the count has not already.
+        """Name the generation verl logged as ``step``, sealing it when needed.
 
-        Call once per new trainer step. When ``generation_size`` is known this is a RELABEL: the
-        scoring thread already sealed on the last completion, and this only corrects the ordinal to
-        the step verl printed (they agree unless verl skipped or resumed). When it is not, this is
-        the boundary itself.
-
-        A boundary with no gradings leaves the previous generation published under its OWN step: a
-        step that generated nothing must not relabel older samples as newly generated.
+        With ``generation_size`` this labels an already sealed generation; otherwise it closes one.
+        A step with no gradings must not relabel older samples.
         """
         with self._lock:
             if self._dropped_unnamed:
@@ -492,14 +430,14 @@ class RewardObservabilityBuffer:
                 # than on the oldest survivor: that generation's own line is still to come, and
                 # publishing it now would shift it and every one after it for the rest of the run.
                 # the reading stays on the last generation that was named, which is stale by a known
-                # number of steps rather than confidently wrong (cursor, codex[bot]).
+                # number of steps rather than confidently wrong.
                 self._dropped_unnamed -= 1
             elif self._sealed_by_count:
-                # the count already sealed this step's generation, and what is open now belongs to
-                # a LATER one -- sealing again here is exactly the leak this avoids. this line names
+                # the count already sealed this step's generation, and what is open now belongs to a
+                # LATER one -- sealing again here is exactly the leak this avoids. this line names
                 # the oldest generation still waiting for one, so a stdout delivery that falls a
                 # whole generation behind names them in the order they were produced instead of
-                # overwriting the earlier one (cursor, codex[bot]).
+                # overwriting the earlier one.
                 self._publish(*self._sealed_by_count.pop(0), step=step)
             elif self._samples or self._pending_count:
                 self._seal(step)
@@ -507,19 +445,9 @@ class RewardObservabilityBuffer:
             # did produce them: relabelling would republish old text as freshly generated.
 
     def latest(self) -> tuple[Any, Any, float] | None:
-        """One ``(prompt, completion, reward)`` from the PUBLISHED generation, for a step preview.
-
-        The caller prints this under the step it just closed, so it reads what that step published
-        rather than what is being scored now. Those differ exactly when the step line is late: the
-        next generation is already recording, and preferring it would label its completion with the
-        previous step's number -- the same mislabelling the queue exists to prevent, reintroduced one
-        line later, and disagreeing with the heartbeat over the very same step (codex[bot]).
-
-        Falls back to the open generation only before anything has been published, so a caller that
-        previews before the first boundary still sees a rollout instead of nothing.
-
-        Prefer ``latest_for_step`` when the row is about to be labelled with a step number: this
-        answers with rows whose own step may be older, which a caller cannot detect from here.
+        """Return one published sample for an unlabelled preview.
+        Prefer published rows so late step lines cannot mislabel the next generation. Before the
+        first publish, use the open generation; use ``latest_for_step`` when printing a step number.
         """
         with self._lock:
             if self._published:
@@ -527,17 +455,10 @@ class RewardObservabilityBuffer:
             return self._samples[-1] if self._samples else None
 
     def latest_for_step(self, step: int) -> tuple[Any, Any, float] | None:
-        """``latest()``, but only when the published rows really were generated at ``step``.
+        """Return ``latest()`` only when its published rows belong to ``step``.
 
-        A preview that prints a row under a step number must not print one that belongs to an older
-        generation. ``close_generation`` publishes nothing when it spends its line on a generation
-        the queue already dropped, so ``latest`` keeps answering with the previous generation's rows
-        -- and the caller, which cannot see that no publish happened, labels them with the new step
-        (cursor). Skipping the preview for that step is right: the rows for the step being named
-        were dropped and no longer exist, so there is nothing truthful left to show.
-
-        The pre-publication fallback is deliberately not offered here. Those rows are from the open
-        generation, which by definition has not been named, so no step number is correct for them.
+        Dropped generations leave the prior publish in place, so an unverified preview mislabels old
+        rows. Open-generation rows have no valid step and are never returned here.
         """
         with self._lock:
             if self._published and self._published_step == int(step):
@@ -545,18 +466,9 @@ class RewardObservabilityBuffer:
             return None
 
     def heartbeat_fields(self) -> dict:
-        """The bounded ``reward_metrics`` / ``sampled_completions`` fragment of one heartbeat.
-
-        Non-destructive: every heartbeat between two generations republishes that generation's
-        reading. ``close_generation`` owns the drain.
-
-        Metrics are bounded here (name sanitization, 12-metric cap). Samples are not: unlike the trl
-        callback -- which bounds an opaque caller-supplied list -- these come straight from
-        ``select_rollout_samples``, which already sanitizes, drops non-finite scalars, and caps at
-        three, so ``_bounded_sampled_completions`` would be a no-op over its own output.
-
-        Empty signals are omitted rather than sent as ``{}``/``[]``: a renderer tells "no metrics
-        this step" apart from "this backend does not report them" by the key's absence.
+        """Return bounded reward metrics and sampled completions for one heartbeat.
+        Reads are non-destructive; ``close_generation`` owns draining. Metrics are bounded here and
+        samples upstream. Omit empty signals so renderers can distinguish absence from emptiness.
         """
         with self._lock:
             # one acquisition covering both reads, or the payload tears: the two fields would
@@ -685,30 +597,10 @@ _STALL_DUMP_S = 1200.0
 
 @contextlib.contextmanager
 def liveness_heartbeat(stage, progress=None, fields=None, progress_step=False, keepalive=False):
-    """Emit liveness pings for ``stage`` while the wrapped block runs on the main thread.
-
-    ``keepalive``: the wrapped block is legitimate BLOCKING I/O with no per-step progress signal the
-    daemon can observe — a synchronous checkpoint/adapter upload (dev #445) or the finalize upload —
-    so EVERY tick emits a REAL (non-liveness) heartbeat instead of a bare ping. Bare liveness pings do
-    NOT advance the provider's stall clock (`_poll.surface_heartbeat` returns stage=None for them), so
-    without this a healthy multi-minute upload that outlasts STALL_AFTER_S (1500s) is wrongly killed
-    mid-save. Safe because a genuinely wedged upload surfaces as an EXCEPTION through its own retry
-    budget (ending this context), not an infinite silent hang — so it does not mask a real stall. Pair
-    with a throttled stage (see _HB_UPLOAD_LIVENESS_STAGES) so the 30s re-emit can't blow the HF cap.
-
-    ``progress``: optional ``() -> float | None`` monotonic counter; advances emit a REAL heartbeat.
-    ``fields``: optional ``() -> dict`` of EXTRA payload fields merged into every emission (liveness
-    and progress alike). Use it to carry the billing/stall ``step`` on a stage the poller step-gates:
-    without it this thread emits ``stage=<stage>`` with NO ``step``, and because it shares the
-    ``opd_step`` upload-throttle slot it can win the slot and overwrite the main thread's stepped
-    heartbeat -- ``actual_steps_run`` then sees a training-stage heartbeat with no step and floors a
-    cancelled run to 1 step, mis-billing it (codex[bot]).
-    ``progress_step``: the counter IS the trainer global step; stamp it as ``step`` on every emit so
-    the poller's step gate and cancel billing see the true step even when this daemon wins the
-    upload slot ahead of the trainer's own per-step callback (dev #442). ``fields`` (OPD's custom
-    loop) and ``progress_step`` (sft/rl trainers) are complementary ways to carry the step; both are
-    applied below, with ``progress_step`` winning if a caller somehow set both.
-    Uses nvidia-smi-only diagnostics (main thread holds CUDA/allocator locks).
+    """Emit liveness heartbeats while a main-thread block runs.
+    ``keepalive`` marks blocking uploads as progress (dev #445); use a throttled stage. ``fields``
+    carries payload data, while ``progress_step`` wins for trainer steps (dev #442). Missing a step
+    can misbill cancellation. Use nvidia-smi because the main thread may hold CUDA allocator locks.
     """
     done = threading.Event()
     spawner = threading.current_thread()
@@ -761,21 +653,9 @@ def liveness_heartbeat(stage, progress=None, fields=None, progress_step=False, k
         t.join(timeout=_HB_UPLOAD_LOCK_TIMEOUT_S)
 
 
-# a full-state checkpoint upload is synchronous inside the watcher thread, so `stop()` waits on the
-# same thread that is doing the uploading. sizing that wait as a constant is wrong: the bound scales
-# with model size and network throughput. a measured 35B-A3B upload needed 607.6s against the old
-# fixed 600s deadline and was killed while healthy and still uploading, turning a run that had
-# already trained AND published into `failed`. see VERL-131.
-#
-# the drain needs no invented deadline of its own, because the upload it is waiting on is already
-# bounded from the inside: `upload_resume_checkpoint` runs a finite retry budget
-# (_CKPT_UPLOAD_RETRIES) and re-checks `_require_hf_deadline_allowance()` before every attempt, so a
-# wedged upload surfaces as an EXCEPTION against the run wall deadline rather than hanging forever.
-# the only correct job here is to not impose a SECOND, tighter deadline on top of that one.
-#
-# FLASH_RUN_DEADLINE_AT is the canonical ceiling for everything this worker does. honoring it (and
-# nothing else) means a drain can never outlive the run it belongs to, and can never be killed while
-# the run still has time left to finish it.
+# checkpoint drain time scales with model size and network throughput; a fixed timeout killed a
+# healthy upload in VERL-131. upload retries already obey FLASH_RUN_DEADLINE_AT, so the drain must
+# add no tighter deadline.
 _DRAIN_POLL_S = 5.0
 # only used when the worker has no wall deadline configured (local runs, tests). generous: at this
 # point the upload's own retry budget has long since been the real bound.
@@ -783,11 +663,9 @@ _DRAIN_NO_DEADLINE_MAX_S = 14400.0
 
 
 def join_while_draining(thread: threading.Thread, what: str) -> None:
-    """Wait for ``thread`` to finish publishing, bounded only by the run's own wall deadline.
+    """Wait for publishing until the run's wall deadline.
 
-    A drain that still has run budget left is allowed to finish however long it takes, because
-    killing it discards work that has already succeeded (VERL-131). It is cut off only when the run
-    itself is out of time, at which point every other worker path would raise too.
+    Killing an in-budget drain discards completed work (VERL-131); only the run deadline stops it.
     """
     started = time.monotonic()
     while True:

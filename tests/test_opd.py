@@ -188,7 +188,7 @@ def test_student_tokens_use_sampled_ids_with_offsets_into_completion_text():
 
 
 def test_student_tokens_share_span_for_split_multibyte_char():
-    """Regression (codex[bot], opd.py): a byte-level tokenizer can split one multi-byte char across
+    """Regression (opd.py): a byte-level tokenizer can split one multi-byte char across
     two ids; the first decodes to U+FFFD until the second arrives. Measuring each id's decoded length
     independently gave one id the whole char and the other a ZERO-WIDTH span — dropping a real
     byte-token from the alignment and undercounting the char's student logprob. Both byte-ids must
@@ -225,7 +225,7 @@ def test_student_tokens_share_span_for_split_multibyte_char():
 
 
 def test_student_tokens_do_not_over_merge_a_genuine_replacement_char():
-    """Regression (cursor[bot], opd.py:120-126): the U+FFFD merge heuristic must NOT fire when a token
+    """Regression (opd.py:120-126): the U+FFFD merge heuristic must NOT fire when a token
     LEGITIMATELY decodes to the replacement glyph (the model actually emitted U+FFFD as content). Such
     a token is already reflected in completion_text, so decode(prefix) is a prefix of it — the loop
     must stop and keep it as its own span instead of swallowing the following token."""
@@ -245,7 +245,7 @@ def test_student_tokens_do_not_over_merge_a_genuine_replacement_char():
 
 
 def test_student_tokens_offsets_decode_is_not_quadratic():
-    """Regression (codex[bot], opd.py): offsets must be built by decoding a SMALL window per step, not
+    """Regression (opd.py): offsets must be built by decoding a SMALL window per step, not
     the whole growing prefix ids[:i+1] (which was O(len^2) and dominated CPU on long completions).
     Assert the longest id-slice handed to tok.decode stays bounded regardless of completion length."""
     from flash.engine.worker.opd_gkd import student_tokens_with_offsets
@@ -289,7 +289,7 @@ def test_trim_trailing_stop_drops_delimiter_from_ids_and_text():
 
 
 def test_trim_trailing_stop_keeps_ids_and_text_synced_when_stop_starts_inside_token():
-    """Regression (codex[bot], opd.py): when the stop delimiter starts INSIDE the final sampled token
+    """Regression (opd.py): when the stop delimiter starts INSIDE the final sampled token
     (that token decodes to "B</answer>"), the whole token is dropped from the kept ids — so returning
     completion_text[:keep_len] would keep a "B" the ids can no longer represent, desyncing the
     teacher-scored text from the student ids. The returned text must equal decode(kept ids)."""
@@ -309,7 +309,7 @@ def test_trim_trailing_stop_keeps_ids_and_text_synced_when_stop_starts_inside_to
 
 
 def test_trim_trailing_stop_prefers_longest_overlapping_stop():
-    r"""Regression (codex[bot], opd.py:150): with overlapping delimiters like ["\n", "\n\n"] listed
+    r"""Regression (opd.py:150): with overlapping delimiters like ["\n", "\n\n"] listed
     shortest-first, a "\n\n" tail must have BOTH newlines trimmed (the longest/earliest matching stop),
     not just the first-listed "\n" — otherwise the teacher still scores a leftover delimiter newline."""
     from flash.engine.worker.opd_gkd import _trim_trailing_stop
@@ -328,7 +328,7 @@ def test_trim_trailing_stop_prefers_longest_overlapping_stop():
 
 
 def test_stop_detection_and_trim_handle_special_token_delimiter():
-    """Regression (codex[bot], opd.py): a [train] stop_sequence can be a tokenizer SPECIAL token (e.g.
+    """Regression (opd.py): a [train] stop_sequence can be a tokenizer SPECIAL token (e.g.
     <|im_end|>). A skip_special_tokens=True decode STRIPS it, so the clean text no longer ends with the
     delimiter — _rollout_terminated would misclassify the rollout as truncated and _trim_trailing_stop
     would never remove it, skipping every usable sample for that config. Detection/trim must run on the
@@ -358,7 +358,7 @@ def test_stop_detection_and_trim_handle_special_token_delimiter():
 
 
 def test_trim_trailing_stop_scans_from_end_not_quadratically():
-    """Regression (codex[bot], opd.py:153): trimming the stop must scan from the END (a few decodes of
+    """Regression (opd.py:153): trimming the stop must scan from the END (a few decodes of
     the dropped tail), not decode every growing prefix ids[:1..n] — which was O(completion^2) and could
     dominate CPU before teacher scoring once [train].max_completion_tokens is raised. Assert decode is called only
     a bounded number of times, independent of completion length."""
@@ -391,7 +391,7 @@ def test_rollout_terminated_requires_eos_or_stop_not_length():
     """A rollout is safe to distil only if it terminated NATURALLY — EOS in the ids, or (with
     stop_sequences) the decoded text ends with a stop delimiter. A max_new_tokens cap hit OR a
     gen_cfg.max_time cut ends without either and is a partial mid-output fragment OPD must skip (it
-    can't supervise the stop token). Length is NOT the criterion (codex[bot])."""
+    can't supervise the stop token). Length is NOT the criterion."""
     from flash.engine.worker.opd_gkd import _rollout_terminated
 
     EOS = frozenset({99})
@@ -400,8 +400,8 @@ def test_rollout_terminated_requires_eos_or_stop_not_length():
     # no EOS, no stops -> NOT terminated: a cap hit OR a max_time cut, both partial fragments -> skip.
     assert _rollout_terminated([1, 2, 3, 4], "abcd", EOS, ()) is False  # cap hit, no EOS
     assert _rollout_terminated([1, 2], "ab", EOS, ()) is False  # short: max_time cut, no EOS/stop
-    # A model with MULTIPLE eos ids (generation_config.eos_token_id is a list) stops on ANY member, so
-    # a completion ending in a SECONDARY eos is terminated, not a truncation to skip (codex[bot]).
+    # A model with MULTIPLE eos ids (generation_config.eos_token_id is a list) stops on ANY member,
+    # so a completion ending in a SECONDARY eos is terminated, not a truncation to skip.
     assert _rollout_terminated([1, 2, 88], "abc", frozenset({99, 88}), ()) is True
     # stop delimiter is the trailing text -> terminated even without EOS AND even at the cap (codex#587).
     assert _rollout_terminated([1, 2, 3, 4], "ans</answer>", frozenset(), ("</answer>",)) is True
@@ -416,7 +416,7 @@ def test_generation_eos_ids_unions_tokenizer_and_generation_config_lists():
     eos_token_id with the model's generation_config/config eos_token_id, each of which HF allows to be
     a scalar OR a list — so a model that halts on a secondary eos id from a list while its tokenizer
     exposes a different primary eos gets both ids, and the rollout is not misread as truncated
-    (codex[bot]). bool is an int subclass but never a token id, so it's excluded."""
+    bool is an int subclass but never a token id, so it's excluded."""
     from flash.engine.worker.opd_gkd import _generation_eos_ids
 
     tok = SimpleNamespace(eos_token_id=2)
@@ -627,7 +627,7 @@ class _CharTok:
 
 
 def test_opd_filtering_stage_is_setup_not_training():
-    """Regression (codex[bot], _poll.py): opd_filtering_prompts emits REAL progress heartbeats, so
+    """Regression (_poll.py): opd_filtering_prompts emits REAL progress heartbeats, so
     is_training_heartbeat would classify it as TRAINING (the tight, sticky stall window) mid-setup
     unless it's registered as a setup stage. It must be treated as cold-start setup."""
     from flash.providers._poll import SETUP_HEARTBEAT_STAGES, is_training_heartbeat
@@ -640,7 +640,7 @@ def test_opd_filtering_stage_is_setup_not_training():
 
 
 def test_opd_preprocessing_stages_are_setup_on_the_provider_side():
-    """Regression (codex[bot], _poll.py): the worker-side registry gained opd_prompt_scan and
+    """Regression (_poll.py): the worker-side registry gained opd_prompt_scan and
     opd_image_prep, but SETUP_HEARTBEAT_STAGES kept only the retired opd_filtering_prompts. Both
     stages carry a progress callback, so is_training_heartbeat classified a run that was still
     preprocessing as TRAINING and judged it by the tight (sticky) stall window instead of the
@@ -670,7 +670,7 @@ def test_opd_liveness_stages_are_throttled_at_setup_cadence():
 
 
 def test_liveness_heartbeat_merges_fields_into_every_emission(monkeypatch):
-    """Regression (codex[bot], heartbeat.py): the liveness thread emits stage=<stage> with NO step,
+    """Regression (heartbeat.py): the liveness thread emits stage=<stage> with NO step,
     and because it shares the opd_step upload-throttle slot it can win the slot and overwrite the
     main thread's stepped heartbeat -- actual_steps_run then sees a training-stage heartbeat with no
     step and floors a cancelled run to 1 step. A `fields` callback must be merged into every emission
@@ -702,7 +702,7 @@ def test_liveness_heartbeat_merges_fields_into_every_emission(monkeypatch):
 
 
 def test_opd_teacher_prompt_includes_thinking_prefill():
-    """Regression (codex[bot], opd.py:93): in thinking mode the student template opens a reasoning
+    """Regression (opd.py:93): in thinking mode the student template opens a reasoning
     block (e.g. <think>) AFTER the generation prompt and samples its completion after it. The teacher
     must condition on that SAME trailing prefill; the plain 'Assistant: ' prompt (empty prefill) would
     score every thinking-mode logprob against a prefix that never opened the block."""
@@ -716,7 +716,7 @@ def test_opd_teacher_prompt_includes_thinking_prefill():
 
 
 def test_thinking_prefill_text_is_template_delta(monkeypatch):
-    """Regression (codex[bot], opd.py): the thinking prefill is the DELTA a thinking-mode chat template
+    """Regression (opd.py): the thinking prefill is the DELTA a thinking-mode chat template
     opens after the generation prompt (enable_thinking True vs False). Empty when thinking is off (the
     plain teacher prompt already matches) or the template ignores enable_thinking."""
     from flash.engine.worker import opd as opd_mod
@@ -740,7 +740,7 @@ def test_thinking_prefill_text_is_template_delta(monkeypatch):
 
 
 def test_thinking_prefill_derives_opener_from_hybrid_template(monkeypatch):
-    """Regression (codex[bot], opd.py): _thinking_prefill_text must handle a HYBRID template where the
+    """Regression (opd.py): _thinking_prefill_text must handle a HYBRID template where the
     thinking render is NOT a prefix-extension of the non-thinking render — the opener is inserted BEFORE
     shared trailing template text, so base is not a prefix of think. The old think.startswith(base) test
     returned "", dropping the opener the student pre-fills so the teacher scored reasoning tokens against
@@ -759,7 +759,7 @@ def test_thinking_prefill_derives_opener_from_hybrid_template(monkeypatch):
 
 
 def test_thinking_prefill_recovers_opener_from_closed_block_hybrid(monkeypatch):
-    """Regression (codex[bot]/cursor, opd.py): a HYBRID template that disables thinking by force-CLOSING
+    """Regression (opd.py): a HYBRID template that disables thinking by force-CLOSING
     the block — enable_thinking=False -> '...<think></think>\\n', enable_thinking=True -> '...<think>\\n'
     — shares '<think>' in BOTH renders, so the common-prefix delta eats it and the previous fix returned
     only '\\n'. The student still pre-fills '<think>\\n', so the teacher must condition on the full
@@ -776,7 +776,7 @@ def test_thinking_prefill_recovers_opener_from_closed_block_hybrid(monkeypatch):
 
 
 def test_thinking_prefill_recovers_opener_from_whitespace_empty_block_hybrid(monkeypatch):
-    """Regression (codex[bot], opd.py): a hybrid whose disabled render is an EMPTY block WITH whitespace
+    """Regression (opd.py): a hybrid whose disabled render is an EMPTY block WITH whitespace
     (enable_thinking=False -> '...<think>\\n\\n</think>\\n', True -> '...<think>\\n') shares '<think>\\n'
     in the common prefix, so base's unique middle is '\\n</think>\\n' -- the closer behind a newline. The
     closed-block recovery must lstrip that intra-block whitespace before the '</' test, else it returns ''
@@ -796,7 +796,7 @@ def test_thinking_prefill_recovers_opener_from_whitespace_empty_block_hybrid(mon
 def test_thinking_prefill_recovers_opener_when_closed_block_leaves_whitespace_remainder(
     monkeypatch,
 ):
-    """Regression (codex[bot], opd.py:134): a closed-block hybrid whose disabled render closes IMMEDIATELY
+    """Regression (opd.py:134): a closed-block hybrid whose disabled render closes IMMEDIATELY
     after the opener (enable_thinking=False -> '...<think></think>', True -> '...<think>\\n') shares only
     '<think>' in the common prefix, so think_mid is the NON-EMPTY whitespace remainder '\\n'. The old
     `if think_mid: return think_mid` early-return handed back '\\n' and skipped the closed-block recovery,
@@ -814,7 +814,7 @@ def test_thinking_prefill_recovers_opener_when_closed_block_leaves_whitespace_re
 
 
 def test_student_tokens_absorb_dropped_leading_space_sentencepiece():
-    """Regression (codex[bot], opd.py:175): a SentencePiece/LLaMA tokenizer decodes a mid-completion
+    """Regression (opd.py:175): a SentencePiece/LLaMA tokenizer decodes a mid-completion
     word token IN ISOLATION without its leading word-boundary space (decode([▁world]) == 'world', not
     ' world'). prev + len(decode(window)) would then undercount that span by one char and drift every
     following offset, misassigning teacher spans to the wrong sampled ids. Offsets must be anchored to
@@ -839,7 +839,7 @@ def test_student_tokens_absorb_dropped_leading_space_sentencepiece():
 
 
 def test_groupwise_alignment_cursor_walk_groups_denser_student_span():
-    """Regression (codex[bot], tokenizer_align.py:73): the cursor walk that replaced the per-boundary
+    """Regression (tokenizer_align.py:73): the cursor walk that replaced the per-boundary
     rescan (O(C^2) -> O(S+T+B)) must still produce the coarsest common refinement — carrying a span's
     extra student tokens into the teacher-bearing span that closes it. Here the student tokenizes
     [0,3)+[3,6) where the teacher has one [0,6) token, so both student indices group under that
@@ -859,7 +859,7 @@ def test_groupwise_alignment_cursor_walk_groups_denser_student_span():
 
 
 def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
-    """Regression (codex[bot], opd.py): when every prompt exceeds the context budget the run fails
+    """Regression (opd.py): when every prompt exceeds the context budget the run fails
     deterministically — and that guard must fire BEFORE _student_model (which for a VL warm-start
     downloads the base and MERGES the SFT into it) AND before prefetch_model (the tens-of-GB base
     snapshot download), which is now deferred until after the pool is confirmed non-empty. Otherwise a
@@ -939,8 +939,8 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
     # escape pytest.raises(RuntimeError) and fail the test (its "before the fix" behavior).
     with pytest.raises(RuntimeError, match="every prompt exceeds"):
         opd_mod.run_opd()
-    # ...and the base-weight prefetch must have been deferred: an all-over-budget dataset fails without
-    # paying for the tens-of-GB snapshot download (codex[bot]).
+    # ...and the base-weight prefetch must have been deferred: an all-over-budget dataset fails
+    # without paying for the tens-of-GB snapshot download.
     assert prefetched == [], "prefetch_model must not run when every prompt is over budget"
 
 
@@ -1067,26 +1067,27 @@ def test_opd_fp8_kv_gate_does_not_downroute_below_the_fp8_ceiling():
     smaller OPD run that fits the 80 GB A100 (sm80, no fp8) must keep its bf16 KV sizing and its A100
     route — never dropping onto a card that would not actually use fp8 (and would then OOM)."""
     from flash.engine.vram import model_required_vram_gb
-    from flash.providers.base import cheapest_gpu, max_non_fp8_kv_vram_gb, supports_fp8_kv
+    from flash.providers.base import (
+        _FP8_KV_MIN_CAPABILITY,
+        _sm_capability,
+        cheapest_gpu,
+        get_gpu_info,
+        max_non_fp8_kv_vram_gb,
+    )
 
     train = {"max_completion_tokens": 128, "lora_rank": 32, "lora_alpha": 64}
     need = model_required_vram_gb("Qwen/Qwen3.5-2B", "opd", train=train, headroom=1.1)
     assert need <= max_non_fp8_kv_vram_gb()  # stays within the non-fp8 (<= 80 GB) band...
-    assert not supports_fp8_kv(
-        cheapest_gpu(need)
-    )  # ...on the A100 (sm80), which does NOT use fp8 KV
+    # ...on the A100 (sm80), which does NOT use fp8 KV
+    routed_capability = _sm_capability(get_gpu_info(cheapest_gpu(need)).sm)
+    assert routed_capability < _FP8_KV_MIN_CAPABILITY
 
 
 def test_gdn_fp8_exclusion_survives_a_pinned_revision():
     """The GDN fp8 exclusion must key off the model, not off the sizing struct, which pinning nulls.
 
-    `sizing_info = None if model_revision else info` (vram.py) drops to generic architecture sizing
-    for a pinned commit. That is right for geometry and wrong for attention family: a pinned commit
-    of a GDN hybrid is still a GDN hybrid, and the worker's runtime gate reads the pinned config and
-    refuses fp8 KV regardless. A guard reading only that nulled struct silently stopped excluding
-    every pinned run -- reserving the fp8 half of a cache vLLM allocates in bf16, which is the
-    under-reserving direction: measured, a pinned 35B at ctx1024/g16 was admitted onto a 180 GB B200
-    at 179 GB when its true bf16 need is 192 GB.
+    Pinned GDN models still allocate bf16 KV because runtime rejects hybrid fp8 wake; reading only
+    ``sizing_info`` under-reserves them. This exclusion is empirically validated and may drift.
     """
     import math
     from unittest import mock
@@ -1106,12 +1107,8 @@ def test_gdn_fp8_exclusion_survives_a_pinned_revision():
     assert not _declares_linear_attention(None, "")
     assert not _declares_linear_attention(None, "meta-llama/Llama-3.1-8B")
 
-    # end to end: the pinned reservation must cover the bf16 KV cache vLLM really allocates.
-    #
-    # Deliberately NOT asserted against the unpinned number: generic sizing inflates the pinned
-    # estimate enough that `pinned >= unpinned` holds even with the discount wrongly applied (179 vs
-    # 171 as measured), so that comparison cannot fail and would not be a test. The bf16 estimate is
-    # the quantity the discount actually halves, so it is the one that discriminates.
+    # compare the pinned reservation with the bf16 estimate, not the unpinned total: generic sizing
+    # can inflate both sides enough to hide an incorrectly applied fp8 discount.
     train = {
         "max_context_tokens": 1024,
         "max_completion_tokens": 512,
@@ -1293,7 +1290,7 @@ def test_opd_teacher_price_table_covers_exact_parasail_catalog():
 # teacher client (mocked HTTP)
 # --------------------------------------------------------------------------------------------------
 def test_resolve_opd_knobs_rejects_zero_kl_penalty(monkeypatch):
-    """Regression (codex[bot], opd.py:64): kl_penalty_coef scales the gkd objective, so an explicit 0
+    """Regression (opd.py:64): kl_penalty_coef scales the gkd objective, so an explicit 0
     (allowed by the shared schema for GRPO) makes every OPD backward a zero gradient while opt_steps
     still advances -> a fully-untrained adapter is published/charged. _resolve_opd_knobs must reject 0;
     omitting the field (None) still resolves to the positive recipe default."""
@@ -1506,7 +1503,6 @@ def test_opd_worker_rejects_images_before_gpu_or_teacher_use(monkeypatch):
                 train=train,
                 model="Qwen/Qwen3.5-4B",
                 model_revision="",
-                model_policy="catalog",
                 gpu=SimpleNamespace(type=None),
             ),
             heartbeat=lambda *args, **kwargs: None,

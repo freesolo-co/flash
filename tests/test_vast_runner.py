@@ -1,9 +1,6 @@
-"""Vast.ai run lifecycle: container onstart/bootstrap, offer walk, poll state machine (incl. the
-staged setup-vs-training stall grace that fixes the historical ~30-min death), guaranteed destroy,
-and orphan sweep (CPU-only; vast API + HF readers mocked).
+"""Test the Vast container lifecycle, polling, teardown, and orphan sweep.
 
-Vast is opt-in via VAST_API_KEY (the autouse offline fixture deletes it); these tests mock the vast
-API entirely, so no key is needed.
+The Vast API and HF readers are mocked; no API key is needed.
 """
 
 from __future__ import annotations
@@ -557,8 +554,8 @@ def test_deploy_rechecks_deadline_before_refreshed_offer_creation(monkeypatch):
 
 
 def test_deploy_adopts_instance_after_ambiguous_create(monkeypatch):
-    # Codex Mr72L: a 5xx/timeout on the NON-IDEMPOTENT create may have made a billed contract. The
-    # walk must reconcile by our unique label and ADOPT it, not rent the next offer (double-billing).
+    # a 5xx/timeout on the NON-IDEMPOTENT create may have made a billed contract. The walk must
+    # reconcile by our unique label and ADOPT it, not rent the next offer (double-billing).
     import io
     import urllib.error
 
@@ -586,16 +583,16 @@ def test_deploy_adopts_instance_after_ambiguous_create(monkeypatch):
     h = _deploy(vast, _spec(), seed=0, offers=offers, attempt=2)
     assert h.instance_id == 555  # adopted the existing contract, not a fresh rent
     assert h.offer_id == 1
-    assert h.started_ts == 1699999000.0  # Codex Mr72L / Cursor MsA6d: real launch time, not now
+    assert h.started_ts == 1699999000.0  # real launch time, not now
     assert rented == [1]  # did NOT walk on to offer 2 (no duplicate create)
 
 
 def test_deploy_aborts_walk_when_ambiguous_create_left_nothing(monkeypatch):
-    # Cursor MsA6X: an ambiguous failure with NO instance visible under our label must ABORT the walk
-    # (the contract may exist but not be visible yet) rather than rent another offer and double-bill.
-    # Codex MtbAD: the abort must raise the TERMINAL UnreconciledCreateError (not a plain VastApiError
-    # that the orchestrator retries as poll_error) — a phantom contract that surfaces AFTER the
-    # point-in-time destroy_run_instances sweep would otherwise bill under a retry's new instance.
+    # an ambiguous failure with NO instance visible under our label must ABORT the walk (the
+    # contract may exist but not be visible yet) rather than rent another offer and double-bill. the
+    # abort must raise the TERMINAL UnreconciledCreateError (not a plain VastApiError that the
+    # orchestrator retries as poll_error) — a phantom contract that surfaces AFTER the point-in-time
+    # destroy_run_instances sweep would otherwise bill under a retry's new instance.
     import io
     import urllib.error
 
@@ -613,7 +610,7 @@ def test_deploy_aborts_walk_when_ambiguous_create_left_nothing(monkeypatch):
 
     monkeypatch.setattr(vast_api, "create_instance", fake_create)
     monkeypatch.setattr(vast_api, "list_instances", list)  # nothing under our label
-    # Cursor MsECQ: the abort must proactively destroy this run's instances (kill any phantom)
+    # the abort must proactively destroy this run's instances (kill any phantom)
     destroyed_for = []
     monkeypatch.setattr(vast, "destroy_run_instances", lambda rid: destroyed_for.append(rid) or [])
     offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
@@ -762,8 +759,8 @@ def test_deploy_decoys_without_exact_match_abort_with_no_second_create(monkeypat
 
 
 def test_vast_image_honors_worker_image_override(monkeypatch):
-    # Codex Mr72Q: Vast must honor FLASH_WORKER_IMAGE (and per-SM) via worker_image_for_gpu like
-    # RunPod/Lambda, not always return the baked default.
+    # Vast must honor FLASH_WORKER_IMAGE (and per-SM) via worker_image_for_gpu like RunPod/Lambda,
+    # not always return the baked default.
     from flash.providers.vast.jobs.builders import vast_image
 
     monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/x/hotfix:test")
@@ -947,12 +944,8 @@ def test_poll_dead_host_waits_for_late_terminal_artifact(monkeypatch):
     ],
 )
 def test_poll_malformed_status_read_is_poll_error(monkeypatch, exc):
-    # a transient MALFORMED 200 body from the instance-detail API makes RestClient.request
-    # raise JSONDecodeError/UnicodeDecodeError, or IncompleteRead/http.client.HTTPException on a truncated
-    # body read (NOT a VastApiError — the _http wrapper only catches the OSError-family transients). The
-    # poll loop must treat all of those as a TRANSIENT poll error (count + keep polling, give up only once
-    # the budget is spent), never let it escape and misclassify a recoverable read blip as a terminal/gone
-    # instance.
+    # malformed 200 responses raise decode or HTTP exceptions outside VastApiError. treat them as
+    # transient poll errors so a recoverable status read does not become a terminal host loss.
     from flash.providers import _poll
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast
@@ -973,12 +966,8 @@ def test_poll_malformed_status_read_is_poll_error(monkeypatch, exc):
 
 
 def test_poll_fresh_heartbeat_disarms_load_timeout(monkeypatch):
-    # when Vast's detail API lags in 'loading'/'unknown' and never flips to
-    # 'running', a worker that HAS booted still uploads fresh heartbeats to HF. Those prove it
-    # started, so they disarm the load timeout — else a healthy, heartbeating box is torn down at
-    # LOAD_TIMEOUT_S (15m) on a stale status feed (deadline_s + the finally destroy stay the spend
-    # backstop). Status stays 'loading' the whole run; without the disarm the poller returns
-    # 'stalled' at LOAD_TIMEOUT_S; with it the box survives to see its (late) DONE and completes.
+    # a fresh HF heartbeat proves the worker booted even when Vast status remains loading. it must
+    # disarm LOAD_TIMEOUT_S so a stale provider status cannot tear down a healthy worker.
     clock = {"t": 10_000.0}
     vast = _wire_poll(
         monkeypatch,
@@ -1006,12 +995,8 @@ def test_poll_fresh_heartbeat_disarms_load_timeout(monkeypatch):
 
 
 def test_poll_first_heartbeat_on_timeout_tick_disarms_load_timeout(monkeypatch):
-    # the load-timeout guard must run AFTER the heartbeat read, so the FIRST fresh heartbeat arriving
-    # on the very tick elapsed crosses LOAD_TIMEOUT_S disarms it. if the guard is ordered BEFORE the
-    # read, seen_fresh_hb is still False on that tick
-    # -> a healthy, heartbeating box is torn down as 'stalled'. The heartbeat is ABSENT until the
-    # crossing tick (unlike the sibling test, whose heartbeat is present from iteration 1 and so can't
-    # expose the ordering race).
+    # read the heartbeat before enforcing LOAD_TIMEOUT_S. a first heartbeat on the crossing tick
+    # must disarm the timeout rather than lose an ordering race and report stalled.
     clock = {"t": 10_000.0}
     vast = _wire_poll(
         monkeypatch,
@@ -1575,7 +1560,7 @@ def test_poll_dead_host_rejects_unknown_launch_identity(monkeypatch):
 
 
 def test_poll_running_then_unknown_is_dead_host_preempted(monkeypatch):
-    """Codex MtrgK: a host that WAS running and then reports actual_status='unknown' (Vast's
+    """A host that WAS running and then reports actual_status='unknown' (Vast's
     no-recent-heartbeat-won't-progress state) is a host loss -> take the dead-host path NOW (preempted)
     instead of waiting out the stall window while the box keeps billing."""
     vast = _wire_poll(
@@ -1618,7 +1603,7 @@ def test_poll_unknown_before_running_is_not_dead(monkeypatch):
 
 
 def test_poll_done_waits_for_eventually_consistent_metrics(monkeypatch):
-    """Codex MtzrL: a fresh DONE can be visible before the separately-uploaded metrics.json is readable
+    """A fresh DONE can be visible before the separately-uploaded metrics.json is readable
     (HF read-after-write is eventually consistent). finish_ok must RE-READ metrics before failing — a
     successful run must not be classified job_failed on that transient gap. (time.sleep is mocked.)"""
     seq = {"n": 0}
@@ -1664,7 +1649,7 @@ def test_poll_done_without_metrics_is_infra_retryable(monkeypatch):
 def test_poll_done_with_corrupt_metrics_is_controlled_failure(monkeypatch):
     """A present-but-unparseable metrics.json (a truncated read-after-write / corrupt upload) after DONE
     must NOT escape poll_vast_job as a raw JSONDecodeError — that would abort the run past the teardown
-    finally. It is classified as a controlled failure instead (Cursor). Like the DONE-without-metrics
+    finally. It is classified as a controlled failure instead. Like the DONE-without-metrics
     case, it is the infra-retryable poll_error (a transient read gap on a DONE success), not job_failed."""
     vast = _wire_poll(
         monkeypatch,
@@ -1751,7 +1736,7 @@ def test_poll_running_no_heartbeat_first_liveness_fails_over(monkeypatch):
 
 
 def test_poll_container_log_output_protects_slow_bootstrap(monkeypatch):
-    """Codex MsMPz: a 'running' container with NO worker heartbeat but ACTIVE container-log output
+    """A 'running' container with NO worker heartbeat but ACTIVE container-log output
     (slow per-run pip install / code fetch) is a healthy cold start, not a wedged host — so the
     container-log signal latches and the run is governed by setup_grace_s, NOT fast-failed at
     first_liveness_s the way a genuinely silent box is. Mirrors Lambda's boot.log liveness."""
@@ -1934,7 +1919,7 @@ def test_runner_destroys_when_handle_persist_fails(monkeypatch):
 
 
 def test_submit_teardown_warns_on_unconfirmed_destroy_without_raising(monkeypatch, caplog):
-    """Copilot Mtjga: the PRIMARY teardown (submit_run_vast ``finally``) must NOT silently ignore a
+    """The PRIMARY teardown (submit_run_vast ``finally``) must NOT silently ignore a
     success:false from destroy_instance — a raise there would mask the poll result, so instead it WARNS
     so operators see a possible leak immediately (not only at the next sweep). The run still returns."""
     import logging
@@ -2142,7 +2127,7 @@ def test_best_effort_destroy_returns_confirmation(monkeypatch):
 
 
 def test_best_effort_destroy_passes_raw_id_and_never_int_raises(monkeypatch):
-    """Cursor MtlVb: the helper must NOT int()-convert the id itself — destroy_instance does that inside
+    """The helper must NOT int()-convert the id itself — destroy_instance does that inside
     its own try/except (-> False on a bad id, "never raises"), so converting in the wrapper would
     re-introduce a ValueError in the very finally/suppress paths this helper exists to keep quiet.
     Assert the id reaches destroy_instance UNCONVERTED and a non-numeric id returns False, no raise."""
@@ -2182,7 +2167,7 @@ def test_submit_uses_transient_concrete_gpu_type_for_exact_search(monkeypatch):
 
 
 def test_provider_destroy_raises_on_unconfirmed_teardown(monkeypatch):
-    """Codex MtbAK: ``destroy_instance`` returning False (success:false / breakdown) means the box is
+    """``destroy_instance`` returning False (success:false / breakdown) means the box is
     STILL billing. ``VastProvider.destroy`` must SURFACE that (raise) instead of returning normally —
     else the best-effort callers log "terminated" and clear the handle while it keeps billing."""
     from flash.providers.base import JobHandle
@@ -2303,7 +2288,7 @@ def test_instance_label_and_handle_roundtrip():
 
 
 def test_handle_from_dict_corrupt_instance_id_raises_clear_error():
-    """Copilot MuX0a: a corrupt/partial PERSISTED handle (reattach/recovery) must fail with a CLEAR,
+    """A corrupt/partial PERSISTED handle (reattach/recovery) must fail with a CLEAR,
     actionable error naming the bad instance_id — not a bare KeyError/ValueError that crashes recovery
     with an opaque cause. instance_id has no safe default (it's the poll/destroy target)."""
     from flash.providers.vast.jobs.builders import VastJobHandle
@@ -2384,7 +2369,7 @@ def test_run_instances_remaining_raises_on_label_match_with_unparseable_id(monke
 
 
 def test_cleanup_loops_skip_non_intable_id_without_raising(monkeypatch):
-    """Copilot Mtnjw/Mtnj2: destroy_run_instances and sweep_orphans are documented "never raises", but
+    """destroy_run_instances and sweep_orphans are documented "never raises", but
     a bare int(iid) on a non-intable id (unexpected Vast API shape) would raise mid-loop and abort the
     cleanup, leaving the remaining reapable boxes billing. A bad id must be SKIPPED, the GOOD ones still
     destroyed."""

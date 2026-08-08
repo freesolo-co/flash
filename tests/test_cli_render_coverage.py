@@ -252,13 +252,19 @@ def test_humanize_ts_formats_epoch_and_rejects_non_numbers() -> None:
 
 
 def test_humanize_age_buckets(monkeypatch) -> None:
+    # the age panel composes these two: _heartbeat_age_seconds turns a heartbeat ts into an age,
+    # _humanize_age_seconds buckets it. asserted as that pair rather than through a one-line
+    # wrapper, so the bucket edges stay pinned to the composition the panel actually renders.
+    def humanize(value: object) -> str | None:
+        return render._humanize_age_seconds(render._heartbeat_age_seconds(value))
+
     now = 1_000_000.0
     monkeypatch.setattr(render.time, "time", lambda: now)
-    assert render._humanize_age(now - 30) == "30s ago"  # < 90s
-    assert render._humanize_age(now - 600) == "10m ago"  # < 5400s -> minutes
-    assert render._humanize_age(now - 7200) == "2.0h ago"  # >= 5400s -> hours (line 533)
-    assert render._humanize_age(0) is None
-    assert render._humanize_age("x") is None
+    assert humanize(now - 30) == "30s ago"  # < 90s
+    assert humanize(now - 600) == "10m ago"  # < 5400s -> minutes
+    assert humanize(now - 7200) == "2.0h ago"  # >= 5400s -> hours
+    assert humanize(0) is None
+    assert humanize("x") is None
 
 
 # --------------------------------------------------------------------------- panels / tables

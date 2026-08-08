@@ -2237,8 +2237,8 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_spec_no_longer_parses
 def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, tmp_path):
     # when `_strict_teardown_handle` cannot confirm the delete, the handle is recorded for the
     # cleanup drain -- but this run's drain was already dispatched at the top of the loop and had
-    # snapshotted an empty list, and it returns early on empty (cursor). so the record sat there
-    # with nothing scheduled to retry it, and the worker kept billing until the next restart.
+    # snapshotted an empty list, and it returns early on empty. so the record sat there with nothing
+    # scheduled to retry it, and the worker kept billing until the next restart.
     import flash.providers as providers
     import flash.runner as runner
     import flash.server._runtime as runtime

@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from flash.catalog import ModelInfo
-from flash.schema import ConfigError, spec_from_dict, spec_from_file
+from flash.schema import ConfigError, spec_and_train_keys_from_file, spec_from_dict
 from flash.spec import JobSpec
 from tests._helpers.specs import raw_spec as _raw
 
@@ -54,7 +54,7 @@ def test_thinking_rejected_for_non_thinking_model():
 
 def test_always_thinking_model_requires_flag(monkeypatch):
     # No curated always-thinker yet; simulate one via the resolver. Stub the provisional GPU
-    # sizing too so the unlisted id never triggers the network-backed open-model sizing path.
+    # sizing too, so the unlisted id is never resolved through the real catalog path.
     info = ModelInfo(
         id="acme/r1-distill",
         display_name="acme r1",
@@ -75,26 +75,21 @@ def test_always_thinking_model_requires_flag(monkeypatch):
     assert spec.thinking is True
 
 
-def test_thinking_unknown_capability_warns_but_allows(monkeypatch, capsys):
-    # Open-model-policy entries resolve to thinking="unknown": the run proceeds with a
-    # warning rather than a hard error. Stub the resolver + provisional GPU sizing (no network).
-    info = ModelInfo(
-        id="acme/tiny-1b",
-        display_name="acme tiny",
-        params="1B",
-        params_b=1.0,
-        algos=("sft", "grpo"),
-        min_vram_gb=12,
-        thinking="unknown",
-    )
-    monkeypatch.setattr("flash.schema.resolve_model", lambda *a, **k: info)
-    monkeypatch.setattr("flash.schema.provisional_gpu", lambda *a, **k: "RTX 5090")
-    spec = spec_from_dict(_raw(model="acme/tiny-1b", thinking=True))
-    assert spec.thinking is True
-    captured = capsys.readouterr()
-    # Warning goes to stderr (stdout is reserved for machine-readable output).
-    assert "warning" in captured.err
-    assert "warning" not in captured.out
+def test_every_catalog_entry_states_a_thinking_capability():
+    """No trainable model has an UNKNOWN thinking capability, so nothing is admitted on a warning.
+
+    `thinking="unknown"` was produced by exactly one thing: the open-model path synthesizing a
+    ModelInfo for an id nobody had curated. Its chat template was never inspected, so the parser
+    admitted the run with a warning instead of a verdict. Every trainable model is now curated and
+    states its capability, which is what lets the two hard rejections above BE hard.
+    """
+    from flash.catalog import MODELS
+
+    for model_id, info in MODELS.items():
+        assert info.thinking in ("none", "always", "hybrid"), (
+            f"{model_id} states thinking={info.thinking!r}; a curated entry must state a real "
+            f"capability so the parser can accept or reject rather than warn"
+        )
 
 
 def test_thinking_must_be_boolean():
@@ -118,5 +113,5 @@ def test_thinking_set_override(tmp_path):
         '[environment]\nid = "github:owner/repo@main:env/environment.py"\n\n'
         "[train]\nepochs = 1\nmax_examples = 8\n"
     )
-    spec = spec_from_file(str(cfg), overrides=["thinking=true"])
+    spec = spec_and_train_keys_from_file(str(cfg), overrides=["thinking=true"])[0]
     assert spec.thinking is True

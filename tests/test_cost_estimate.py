@@ -302,9 +302,9 @@ def test_vast_live_pricing_duration_mirrors_launch(monkeypatch):
 
 def test_pick_gpu_vast_duration_bound_fetches_market_once(monkeypatch):
     # Copilot: pick_gpu ranks every fitting class by $/hr. A duration-bound Vast query bypasses the
-    # per-call rate cache (Codex MtzrI), so pricing each candidate individually inside min(key=...)
-    # would fire one identical full market fetch PER fitting class. pick_gpu must fetch the live rate
-    # map ONCE and rank from it -> exactly one usable_offers call no matter how many classes fit.
+    # per-call rate cache, so pricing each candidate individually inside min(key=...) would fire one
+    # identical full market fetch PER fitting class. pick_gpu must fetch the live rate map ONCE and
+    # rank from it -> exactly one usable_offers call no matter how many classes fit.
     from flash.cost.facts import pick_gpu
     from flash.providers.vast import jobs as vast
     from flash.providers.vast import pricing
@@ -585,23 +585,32 @@ def test_offline_estimate_applies_the_pinned_revision_geometry_cap(monkeypatch):
         _offline_gpu_shape(config)
 
 
-def test_offline_open_model_probe_uses_the_pinned_revision(monkeypatch):
-    import flash.engine.vram as vram
-    from flash.cost.analytical import _offline_gpu_shape
-    from flash.cost.facts import _SIZE_MEMO
+def test_the_offline_probe_sizes_a_pinned_catalog_model_by_its_revision(monkeypatch):
+    """The offline shape probe must size the PINNED commit, not the catalog's default revision.
 
-    model = "acme/pinned-only-4b"
+    (This replaces an open-model version of the same test: it used an uncataloged id sized over HF,
+    and uncataloged models are rejected now. The invariant it protected -- the probe passes the
+    revision through rather than quoting default-revision weights -- still holds for a pinned
+    catalog model, which is the only way to reach revision-specific sizing at all.)
+    """
+    import flash.engine.vram as vram
+    from flash.catalog import MODELS
+    from flash.cost.analytical import _offline_gpu_shape
+    from flash.cost.facts import _PINNED_SIZE_MEMO
+
+    model = "Qwen/Qwen3.5-9B"
+    info = MODELS[model]
     expected_revision = "f" * 40
     seen_revisions = []
 
-    def _pinned_only(model_id, revision="", *, strict=False):
+    def _pinned_geometry(model_id, revision="", strict=False):
         assert model_id == model
-        assert strict is True
         seen_revisions.append(revision)
-        return 4.0 if revision == expected_revision else None
+        return (info.params_b, info.vocab_size, info.hidden_size, info.num_layers)
 
-    monkeypatch.setattr(vram, "fetch_hf_params_b", _pinned_only)
-    _SIZE_MEMO.pop((model, expected_revision), None)
+    monkeypatch.setattr(vram, "fetch_hf_model_geometry", _pinned_geometry)
+    monkeypatch.setattr("flash.cost.facts._PINNED_SIZE_MEMO", dict(_PINNED_SIZE_MEMO))
+    _PINNED_SIZE_MEMO.pop((model, expected_revision), None)
 
     gpu, count, need, provider, rate = _offline_gpu_shape(
         RunConfig(model, "sft", 1, model_revision=expected_revision)
@@ -612,7 +621,13 @@ def test_offline_open_model_probe_uses_the_pinned_revision(monkeypatch):
     assert need > 0
     assert provider
     assert rate > 0
-    assert seen_revisions
+    # TWO independent sites size a pinned run here -- the fail-closed params check and the VRAM
+    # requirement -- and each must carry the pin. Asserting only "some call saw the revision" cannot
+    # tell them apart: dropping the pin from either one still leaves the other populating the list,
+    # so the count is what makes this test able to fail.
+    assert len(seen_revisions) == 2, (
+        f"expected both the params check and the VRAM sizing to pass the pin, saw {seen_revisions}"
+    )
     assert set(seen_revisions) == {expected_revision}
 
 

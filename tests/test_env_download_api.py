@@ -48,16 +48,12 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "server.db"))
 
     import flash.providers as providers_mod
-    import flash.providers.runpod.train.endpoints as rp_endpoints
     import flash.server.app as app_mod
     import flash.server.run_registry as run_registry
 
     importlib.reload(app_mod)
     monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
     monkeypatch.setattr(run_registry, "_post", lambda *a, **k: False, raising=False)
-    monkeypatch.setattr(
-        rp_endpoints, "reconcile_endpoint_slots", lambda *a, **k: None, raising=False
-    )
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token == _USER_TOKEN)
     monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)

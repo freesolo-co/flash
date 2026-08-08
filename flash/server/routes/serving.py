@@ -480,20 +480,9 @@ def recover_deployments() -> int:
                 error = "deployment lifecycle interrupted by control-plane restart"
                 detail = "deployment interrupted; retry `flash models deploy`"
             elif state in _DEPLOYMENT_READY_STATES and _spec_is_unservable(status):
-                # A ready deployment whose persisted spec this build can no longer parse is not
-                # servable: every serving route parses it before inference, so chat raises there
-                # instead of answering, while `/v1/deployments` keeps listing the record as active.
-                # Only busy states were recovered, so such a record survived every restart as a
-                # deployment that looks live and can never respond (chatgpt-codex-connector). Fail it
-                # HERE, at the same startup pass, so the state the API reports matches what it can do.
-                #
-                # Both readiness spellings, as everywhere else in this module: this pass reads records
-                # persisted by OTHER builds, which is the whole reason it exists, so the one spelling
-                # this build happens to write is not the set it can encounter (cursor).
-                #
-                # no staleness gate here: _deployment_attempt_is_stale answers only for busy states
-                # (it returns False for a ready one), and an unservable spec is not a deploy still in
-                # flight -- it is a record this build can never serve, however recently it was written.
+                # a ready record with an unparseable spec is unservable, so fail it during startup.
+                # handle both readiness spellings from persisted builds; staleness applies only to
+                # busy states.
                 error = "deployment spec is no longer supported by this control plane"
                 detail = "deployment retired: its algorithm was removed; submit a new run to deploy"
             else:
@@ -564,38 +553,26 @@ def _smoke_provenance(result: dict, adapter_revision: str, checkpoint: str) -> t
 def _thinking_tag_is_guaranteed(spec) -> bool:
     """Whether the catalog vouches that this model's chat template opens a thinking block.
 
-    A curated entry states its `thinking` capability, so the tag is required. Everything else is
-    the open-model policy's "unknown", which `flash.schema` already warns and proceeds for.
+    A curated entry states its ``thinking`` capability, so the tag is required. Only a stale caller
+    can present an uncataloged model -- submit rejects those -- and nothing vouches for its
+    template, so the tag is not demanded of it.
 
-    Asks the catalog directly rather than through `resolve_model`: for an uncataloged model that
-    call also runs a VRAM fit against the DEFAULT gpu and raises on `too_big`, which has nothing to
-    do with the chat template. Treating that as "guaranteed" would demand the tag from the very
-    models that cannot promise it, failing a valid tagless smoke over an unrelated sizing check on
-    a gpu the run may not even use (cursor[bot]). A missing entry is the open-model case by
-    definition, so no exception path is needed to reach the answer.
+    Asks the catalog DIRECTLY rather than through ``resolve_model``, which validates against an
+    algorithm and raises for an uncataloged id. Whether a chat template opens a ``<think>`` block
+    has nothing to do with either, and treating that raise as "guaranteed" would demand the tag
+    from precisely the models that cannot promise it.
     """
     from flash.catalog import MODELS
 
     model = getattr(spec, "model", None)
-    info = MODELS.get(model.strip()) if isinstance(model, str) else None
-    return info is not None and info.thinking != "unknown"
+    return isinstance(model, str) and model.strip() in MODELS
 
 
 def _thinking_answer(content: str, *, require_tag: bool = True) -> str:
     """Return the answer a thinking adapter emitted after its reasoning, or reject the smoke.
 
-    Applies to every thinking smoke, not only grammar-constrained ones. A run trained with
-    stop_sequences can emit its delimiter while still reasoning; serving folds that partial
-    reasoning into a nonempty ``<think>`` block, so without this the response passes the
-    empty-content check and activates a checkpoint that answers nothing on real requests. The stop
-    also makes ``finish_reason`` ``"stop"`` rather than ``"length"``, so the truncation guard above
-    cannot see it.
-
-    ``require_tag`` is False only when the catalog cannot confirm the model's chat template honors
-    ``enable_thinking``. Such a run is admitted with a warning and may answer with no block at all,
-    so demanding the tag would reject a correct answer and leave the adapter undeployable. An
-    answerless generation is still caught: `_smoke_provenance` has already rejected blank content,
-    so reaching here without a tag means real answer text.
+    Stop sequences can end during reasoning while still reporting ``finish_reason=stop``; require an
+    answer whenever the catalog guarantees a thinking tag. Unknown open models may omit the tag.
     """
     closed = content.find("</think>")
     if closed < 0:
@@ -666,12 +643,8 @@ def _run_deployment_smoke(
     train = getattr(spec, "train", None)
     constraint = parse_structured_outputs(getattr(train, "structured_outputs", ""))
     max_tokens = 256
-    # a thinking adapter spends tokens reasoning BEFORE it emits any content, so 256 buys it a
-    # truncated <think> block and no answer -- the smoke then fails with "returned no content
-    # (finish_reason='length')" and the deployment is rejected. that cost does not depend on
-    # whether a grammar is configured, and resolve_smoke_completion_tokens reads the run's own
-    # budget rather than the constraint, so gating the larger budget on structured_outputs left
-    # every thinking run that uses stop_sequences instead undeployable.
+    # thinking spends tokens before content, so use the run's own completion budget regardless of
+    # grammar; 256 tokens can truncate the think block and reject a healthy deployment.
     if spec.thinking:
         max_tokens = max(256, resolve_smoke_completion_tokens(spec))
         serving_capacity = serving_completion_token_capacity(

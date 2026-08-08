@@ -1,61 +1,11 @@
-"""Always-on GC for aged run artifacts inside the per-environment HF repos (``<ns>/flashrun-*``).
+"""Always-on GC for aged run artifacts in per-environment ``flashrun-*`` HF repos.
 
-``<ns>`` is ``artifact_namespace()`` -- ``Freesolo-Co`` on the managed plane, whatever a self-hoster
-set ``FLASH_HF_NAMESPACE`` to otherwise. Every managed run stores its code snapshot, adapter,
-checkpoints, and telemetry under a per-run prefix ``<phase>/<run_id>/`` inside a *private* HF dataset
-repo that is shared by every run of an environment (``managed_hf_repo_for_environment`` ->
-``<ns>/flashrun-<slug>-<digest>``). The deployable
-per-step adapters (``.../checkpoints/step-N/adapter``) are kept forever by the trainer and nothing else
-deletes old runs, so these repos grow without bound against the org's private-storage quota.
+The daily cross-plane sweep deletes non-serving ``<phase>/<run_id>`` prefixes whose newest commit is
+older than seven days. It never deletes whole repos, shared code snapshots, or unknown phases.
 
-An earlier GC (PR #311) deleted whole ``flashrun-<run_id>`` repos, but that predated the switch to
-environment-scoped repos (#346): a shared env repo holds live runs alongside stale ones, so a
-whole-repo delete is unsafe. This is its environment-scoped replacement — it deletes an aged run's
-PREFIX (``delete_folder`` on ``<phase>/<run_id>``), never the whole repo.
-
-CROSS-PLANE by design. The control plane runs this sweep AUTOMATICALLY
-(``flash.server._runtime._repo_cleanup_loop`` calls ``run_scheduled_cleanup`` daily). Unlike a
-plane-local scan, it does not consult this plane's run database at all — it works entirely from two
-GLOBAL sources of truth, so it reclaims artifacts left by EVERY plane/session, not just this one:
-
-* **What's live** = the serving registry (``GET /adapters`` on the Freesolo serving app). An adapter
-  that isn't in the registry isn't loadable/serving *anywhere*, so "not in the registry" is a stronger,
-  cross-plane "not deployed" than any single plane's SQLite db.
-* **What exists** = every ``<phase>/<run_id>/`` prefix under every ``flashrun-*`` dataset repo, listed
-  straight from HF.
-
-ONE fixed, opinionated policy:
-
-    Delete every ``<phase>/<run_id>/`` artifact prefix that is NOT in the global serving set and whose
-    newest file was committed more than the GC age (fixed: 7 days) ago.
-
-There is intentionally **no manual CLI and no tiers/flags**. A redeployable-but-undeployed run is not
-spared and contents are not trimmed selectively — the whole run prefix (including its final adapter)
-goes once it ages out and isn't serving. The shared ``code/<digest>/`` snapshot is content-addressed
-and is never touched; neither is anything outside ``ARTIFACT_PHASES``.
-
-Safety — the sweep NEVER deletes blind:
-
-* **Serving set is the do-not-touch set.** A prefix any plane is serving from is excluded, re-confirmed
-  immediately before every delete (TOCTOU). If the registry is unreachable, returns an empty set, or
-  lists a live adapter that can't be mapped to a repo/prefix, the sweep deletes NOTHING and retries
-  next cycle (fails closed).
-* **Age is last-activity, not submit time.** A prefix is reaped only if its newest COMMIT is >7d old,
-  so an in-flight run (still writing checkpoints) is protected without needing any run registry.
-* **Warm-start sources are protected.** When a run ``init_from_adapter``s off another,
-  ``flash.runner._mark_warmstart_source`` writes a 0-byte ``referenced_by/<child_run_id>`` marker into
-  the SOURCE repo at submit (and re-writes it on recovery). If a repo carries a marker committed within
-  the GC age, its artifacts are a source for a possibly-still-training child and are spared. Older
-  markers = finished children (which already baked a self-contained ``recomb`` adapter) and do not
-  protect. Residual: a child that trains continuously for longer than the age window WITHOUT any
-  control-plane restart lets its source's marker age out; the fail-closed-on-undatable age gate (a
-  still-writing source keeps recent commits) is the backstop there.
-* **Only ``flashrun-*`` repos, only ``ARTIFACT_PHASES``** (hard allowlists); a prefix whose age can't be
-  determined is left alone; the destructive delete holds this plane's per-run deploy/export lock; and
-  the prefix is re-stat'd for recent writes right before deletion.
-
-There is nothing to configure: the policy (7-day age, daily sweep) is fixed. The loop only runs on a
-plane with an operator ``HF_TOKEN`` — without it the sweep cannot delete operator-owned repos at all.
+Serving registry data is the fail-closed do-not-delete set and is rechecked before each delete.
+Recent warm-start markers, undatable prefixes, and in-flight writes are protected. The loop requires
+an operator ``HF_TOKEN`` and has no manual CLI or policy knobs.
 """
 
 from __future__ import annotations
@@ -90,14 +40,8 @@ RUN_REPO_PREFIX = "flashrun-"
 DELETE_AGE_SECONDS = 7.0 * 86400.0
 _DELETE_SLEEP_S = 0.5  # pause between deletes — HF repo-mutation rate-limit courtesy
 _SCAN_WORKERS = 8  # hf tree-listing concurrency
-# ``list_repo_tree(..., expand=True)`` is HF's most expensive listing mode (expand bypasses the
-# CDN and hits origin for a last_commit lookup per entry) -- it rate-limits well below the
-# general API quota. _scan_repo (one call per repo, fanned across _SCAN_WORKERS) and
-# _prefix_written_within (one call per delete target) both hit it; with no shared pacing, the
-# worker pool lets up to _SCAN_WORKERS calls land on HF in the same instant, which is enough on
-# its own to trip the rate limit on a sweep over more than a handful of repos. This floor paces
-# EVERY list_repo_tree call across the whole sweep (not per-thread), so concurrency no longer
-# translates into a request burst.
+# expanded HF tree listings hit origin and rate-limit below the general quota.
+# pace every call globally so _SCAN_WORKERS concurrency cannot create request bursts.
 _TREE_LIST_MIN_INTERVAL_S = 0.5  # cap ~2 req/s across the whole sweep, workers included
 _tree_list_lock = threading.Lock()
 _tree_list_last_call = 0.0
@@ -141,15 +85,9 @@ def _now() -> float:
 def repo_cleanup_enabled() -> bool:
     """Whether the always-on artifact GC should run on this control plane.
 
-    Requires an operator ``HF_TOKEN`` — the sweep deletes operator-owned ``flashrun-*`` dataset
-    prefixes, impossible (and meaningless) without it — so a plane without the token never schedules
-    the loop. This is a credential check, not a knob: there is no on/off env switch.
-
-    Never in standalone mode: the sweep confirms the live set against the Freesolo serving registry
-    before deleting anything, sending the operator's ``FREESOLO_INTERNAL_KEY`` to
-    ``serve.freesolo.co`` on every startup. On a self-hosted plane that registry is not the
-    authority on what is live, so the sweep would ship the plane's root credential to a service the
-    operator does not run in order to answer a question it cannot answer correctly."""
+    Require an operator ``HF_TOKEN`` and never run standalone: the hosted serving registry is not a
+    self-hosted authority and querying it would expose ``FREESOLO_INTERNAL_KEY``.
+    """
     from flash.server.auth import standalone
 
     return bool((os.environ.get("HF_TOKEN") or "").strip()) and not standalone()
@@ -169,17 +107,11 @@ def _is_managed_env_repo(repo_id) -> bool:
 
 
 def deployed_prefixes() -> tuple[set[tuple[str, str]], set[str], bool]:
-    """The GLOBAL live serving set from the serving registry (``GET /adapters``): every adapter live on
-    ANY control plane. Returns ``(prefixes, whole_repos, complete)`` where:
+    """Return the global serving do-not-delete set from ``GET /adapters``.
 
-    * ``prefixes`` — exact ``(repo_id, "<phase>/<run_id>")`` do-not-delete set.
-    * ``whole_repos`` — repos with a live record whose *subfolder* couldn't be mapped to a prefix; the
-      caller protects the ENTIRE repo (can't tell which prefix is live).
-    * ``complete`` — ``False`` if a live record had no ``repoId`` at all (unidentifiable live adapter);
-      the caller fails closed.
-
-    An adapter absent from this registry is not loadable/serving anywhere, so this is a strictly
-    stronger cross-plane "not deployed" than any single plane's run db."""
+    The tuple contains exact prefixes, whole repos with unmappable live records, and a completeness
+    flag; callers fail closed when any live adapter cannot be identified.
+    """
     from flash.serve import deploy as _sd
 
     resp = _sd._serving_request("GET", f"{_sd.serving_base_url()}/adapters")
@@ -360,13 +292,9 @@ def _collect_targets(api, live, whole, now: float, max_age_s: float) -> list[_Ru
 def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) -> int:
     """One sweep of the fixed policy. Returns the number of run prefixes deleted (0 in dry-run).
 
-    Fails closed: raises ``CleanupAborted`` (deleting nothing) when the global serving set can't be
-    confirmed up front. The HF + serving calls are blocking, so callers offload this to a thread.
-
-    ``should_stop`` is an optional cooperative-cancel callback checked BETWEEN deletes. The sweep runs
-    in a worker thread that ``task.cancel()`` cannot interrupt, so at shutdown the caller sets a stop
-    flag and this loop halts promptly instead of churning through more destructive deletes long after
-    the server was told to stop (mirrors the completion-charge retry sweeps)."""
+    Raise ``CleanupAborted`` before deleting if the serving set is unconfirmed. ``should_stop`` is
+    checked between deletes because cancelling the caller cannot interrupt the worker thread.
+    """
     global _warned_hf_unavailable
     if api is None:
         if HfApi is None:

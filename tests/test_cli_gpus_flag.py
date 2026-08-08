@@ -29,11 +29,13 @@ def _overrides(*argv: str) -> list[str]:
 
 def _spec(tmp_path, *argv: str, config: str = BASE):
     """parse argv through the real parser, then build the spec exactly as cmd_train does."""
-    from flash.schema import spec_from_file
+    from flash.schema import spec_and_train_keys_from_file
 
     cfg = tmp_path / "run.toml"
     cfg.write_text(config)
-    return spec_from_file(str(cfg), run_id="x", overrides=_overrides(*argv), project_required=True)
+    return spec_and_train_keys_from_file(
+        str(cfg), run_id="x", overrides=_overrides(*argv), project_required=True
+    )[0]
 
 
 def test_the_parser_turns_gpus_into_the_override_it_is_sugar_for():

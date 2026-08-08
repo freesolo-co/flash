@@ -1696,10 +1696,10 @@ def test_env_setup_multi_turn_scaffolds_runnable_evaluations(monkeypatch, tmp_pa
 def test_env_setup_multi_turn_eval_case_does_not_duplicate_the_episode_prompt(
     monkeypatch, tmp_path
 ) -> None:
-    # `env eval` builds the request through environment.prompt_messages(), so the scaffolded
-    # case's `input` is a dataset row, not a finished prompt. spelling the reply-instructions
-    # block into the case as well sent it twice and evaluated a prompt training never used,
-    # defeating the fix that made eval match training in the first place (cursor).
+    # `env eval` builds the request through environment.prompt_messages(), so the scaffolded case's
+    # `input` is a dataset row, not a finished prompt. spelling the reply-instructions block into
+    # the case as well sent it twice and evaluated a prompt training never used, defeating the fix
+    # that made eval match training in the first place.
     monkeypatch.chdir(tmp_path)
     assert (
         _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111", "--multi-turn"])
@@ -2216,7 +2216,7 @@ def test_deploy_wait_rollback_lookup_gets_a_usable_bound_near_the_deadline(
     poll before it lands the wait a hair short of the deadline, so the remainder is positive and
     tiny -- and passing it through means the listing read times out, `_rollback_record` swallows the
     error, and the CLI reports the run as vanished instead of printing `last_deploy_error`. The
-    zero-wait floor covers the expired case only, so it does not apply (cursor).
+    zero-wait floor covers the expired case only, so it does not apply.
     """
     _queued_deploy(monkeypatch, fake_client)
     clock = {"t": 0.0}
@@ -2587,7 +2587,7 @@ def test_deploy_wait_watches_the_final_window_to_its_deadline(fake_client, monke
 
     Splitting that window put its one read halfway through and then stopped, so the wait returned
     with half its advertised budget unspent: `--wait 1` read at t=0 and t=0.5 and reported a timeout
-    for a revision that went ready at t=0.75 (chatgpt-codex-connector). Sleeping the window whole
+    for a revision that went ready at t=0.75. Sleeping the window whole
     and reading at the deadline covers it without adding a read.
     """
     _queued_deploy(monkeypatch, fake_client)
@@ -2862,7 +2862,7 @@ def test_log_follow_progress_does_not_trust_a_ping_left_by_a_cleared_remote(
     not persist the new one until the provider handle lands, so throughout that window flash serves
     a running record whose only attempt identity is the superseded worker's ping. Falling back to it
     there reintroduced exactly what preferring `remote` was meant to fix: the first retry unlabelled
-    (its stale attempt is 0), later ones naming the *previous* attempt (codex[bot]).
+    (its stale attempt is 0), later ones naming the *previous* attempt.
 
     Both parametrizations are the same window one retry apart, and both must refuse the ping.
 
@@ -3119,7 +3119,7 @@ def test_log_follow_progress_shows_a_settled_zero_like_the_other_surfaces() -> N
 
     `runs list` and `runs status` both print $0.0000 for a settled zero because run_cost returns
     (0.0, False) there. Suppressing it only in follow made the same finished run read as costed in
-    one place and uncosted in another, which is the inconsistency, not the zero (cursor).
+    one place and uncosted in another, which is the inconsistency, not the zero.
     """
     for state in sorted(cli.render.SETTLED_COST_STATES):
         _state, progress = cli.commands._log_follow_progress(

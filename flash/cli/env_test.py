@@ -28,39 +28,22 @@ _TOML_STRUCTURAL_CHARS = frozenset("\"'[]{}=,\n")
 # _TOML_STRUCTURAL_CHARS, which describes values -- a key is checked before the `=` split, so the
 # structural characters of a value are not applicable to it.
 _TOML_KEY_STRUCTURAL_CHARS = frozenset(".\"'")
-# every TOML scalar that is not a bare `true`/`false`/`inf`/`nan` word starts here: integers,
-# floats, and the whole date/time family all begin with a digit, and a signed number with `+`/`-`.
-# so a token starting with one of these was reaching for a TOML scalar, and failing to parse means
-# it is malformed rather than prose -- the same reasoning _TOML_STRUCTURAL_CHARS applies to
-# delimiters, applied to the tokens that carry no delimiter at all.
-#
-# `.` is here for the leading-dot float. TOML requires a digit before the point, so `.5` is exactly
-# as malformed as `+.5` -- which the signs already caught, leaving the same spelling accepted or
-# rejected depending on whether it carried a sign (cursor). it is not in _TOML_STRUCTURAL_CHARS, so
-# it reaches this test rather than being read as a delimiter.
+# non-word TOML scalars start with a digit or sign; a parse failure is malformed syntax, not prose.
+# include `.` so unsigned `.5` is rejected consistently with signed `+.5`.
 _TOML_SCALAR_LEADING_CHARS = frozenset("0123456789+-.")
 # the TOML booleans, which are written as bare words rather than starting with a digit or sign and
 # are therefore the blind spot of _TOML_SCALAR_LEADING_CHARS. TOML spells them in lowercase only, so
 # a case variant is a malformed literal rather than prose and must not forward as a string.
 _TOML_BOOLEAN_WORDS = frozenset({"true", "false"})
-# the non-finite floats, the other bare-word family, spelled lowercase only and optionally signed.
-# lowercase `nan` parses and _reject_unsubmittable_param then turns it away for not being JSON, but a
-# case variant never reaches that check: it fails the TOML parse and falls through the bare-word test
-# as the literal STRING "NaN". the offline gate then validates a str where the config would hold a
-# float -- or an environment coercing it back gets the non-finite value the lowercase spelling was
-# rejected for (codex[bot]). so a case variant is malformed, not prose, either way.
-#
-# `infinity` is the same value written out. it is not a TOML spelling in any case, so it reaches the
-# bare-word test rather than the parse, and matching only the abbreviation let it through as the
-# string "Infinity" -- which an env normalizing with float() turns straight back into inf, the value
-# the abbreviation is rejected for (codex[bot]).
+# reject case variants of TOML's lowercase non-finite floats rather than forwarding them as strings.
+# include `infinity`: float coercion turns it back into the unsupported infinite value.
 _TOML_NON_FINITE_WORDS = frozenset({"inf", "infinity", "nan"})
 # TOML has no null. these are the spellings people reach for anyway, borrowed from json, python, and
 # yaml -- all bare words, so they land in the same blind spot: the parse fails, the value carries no
 # structural character, and it forwards as its own literal STRING. an env testing `if value is None`
 # or `if not value` then reads a truthy string, and no [environment.params] assignment could have
-# produced it, since the config has no way to spell an absent value either (codex[bot]). omitting the
-# parameter is what expresses that, so say so rather than forwarding text nothing asked for.
+# produced it, since the config has no way to spell an absent value either. omitting the parameter
+# is what expresses that, so say so rather than forwarding text nothing asked for.
 _TOML_NULL_WORDS = frozenset({"null", "none", "nil"})
 
 
@@ -132,7 +115,7 @@ def _junk_response(reference_turns: list[str]) -> str:
     and a reference answer that happens to be `test` collides with it, so the probe below fed the
     grader the correct answer and read back the gold reward -- making a scorer that separates
     perfectly look like one that pays junk as much as gold, and failing a working environment
-    (Cursor). Lengthening past every reference turn terminates: the turns are finite and each pass
+    Lengthening past every reference turn terminates: the turns are finite and each pass
     grows the string. Compared stripped, because a control differing from gold only in whitespace
     is one a grader may well still score as correct."""
     gold = {turn.strip() for turn in reference_turns}
@@ -150,7 +133,7 @@ def _carries_thinking_markup(reference_turns: list[str]) -> bool:
     `thinking` from -- it builds the environment locally, where it defaults off (adapter.py) -- so
     it replays the tagged reference verbatim. Against a strict answer-only grader every reference
     then scores zero, and the gate below reported a working environment as unable to recognize its
-    own gold answers (codex[bot]). The reward is still printed and still warned about; only the
+    own gold answers. The reward is still printed and still warned about; only the
     blocking conclusion is withheld, because the evidence for it cannot be produced here."""
     return any("<think>" in turn or "</think>" in turn for turn in reference_turns)
 
@@ -231,8 +214,8 @@ def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = Fa
         else:
             # a reference shorter than the episode is padded so the rollout still reaches its own
             # termination, but the trajectory graded at the end is then part gold and part junk.
-            # scoring it is not evidence about whether the grader recognizes its references, so
-            # the flag keeps it out of the blocking gate's totals (Cursor).
+            # scoring it is not evidence about whether the grader recognizes its references, so the
+            # flag keeps it out of the blocking gate's totals.
             if policy == "replay":
                 record["replay_incomplete"] = True
             content = _junk_response(reference_turns)
@@ -272,22 +255,12 @@ def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = Fa
 
 
 def _scores_gold_no_better_than_junk(env, example: dict, gold_reward: float) -> bool:
-    """Whether the grader pays a deliberately wrong answer at least as well as its own gold one.
+    """Whether junk scores at least as well as this gold answer.
 
-    This is the evidence the flat-reward gate needs. The reward's own value cannot supply it: a
-    centered scale that pays 0 for a correct answer and negative for an incorrect one separates
-    them perfectly, and reading that zero as failure rejected a trainable environment. What does
-    not train is a grader whose gold answer earns no more than junk, whatever number it prints.
-
-    The junk run drives the same env through the same code path as the real episode, with the
-    replay suppressed so the echo placeholder stands in for a wrong model answer. A grader that
-    raises on it is not evidence of anything -- an env may legitimately require a parseable answer
-    -- so treat that as separation and leave the episode to its own contract checks.
-
-    Call this only after every episode has been scored. The probe is an extra pass through the same
-    env, and an env that advances state per call (a scripted reward sequence, a cursor into a
-    dataset) would hand a later episode the answer meant for this one -- the probe deciding the
-    outcome of the run it exists to measure."""
+    A gold score of zero can still beat negative junk, so compare them directly. Run this extra
+    stateful-env pass only after all real episodes have been scored. A probe error is not evidence
+    of flat reward because an env may require parseable answers.
+    """
     try:
         probe = _new_record()
         if env.multi_turn:
@@ -303,18 +276,12 @@ def _scores_gold_no_better_than_junk(env, example: dict, gold_reward: float) -> 
 
 
 def _separates_on_turn_rewards(env, example: dict, state: dict | None) -> bool:
-    """Whether the env grades this episode on a per-turn vector the episode scalar cannot show.
+    """Whether per-turn rewards separate an episode whose scalar does not.
 
-    `credit_assignment = "per_turn"` trains from `per_turn_rewards` in the score result's metadata,
-    which reaches the trainer through `rollout_rewards_many` (flash/envs/adapter.py) and never
-    through `env.reward`. So a multi-turn env may legitimately return a flat episode scalar while
-    the vector it actually trains on distinguishes the turns, and reading only the scalar reported a
-    working environment as unable to recognize its references (Cursor).
-
-    Unlike the algorithm, this is answerable here: ask the env for the typed reward and look. A
-    vector holding more than one distinct value is separation the scalar could not express. Anything
-    else -- no such method, single-turn, no vector, a raise -- leaves the scalar as the only evidence
-    and the gate proceeds on it."""
+    ``credit_assignment = "per_turn"`` trains from metadata returned through
+    ``rollout_rewards_many`` (flash/envs/adapter.py), not ``env.reward``. Distinct turn values prove
+    separation; missing, invalid, or unavailable vectors leave the scalar authoritative.
+    """
     rollout_rewards_many = getattr(env, "rollout_rewards_many", None)
     if not callable(rollout_rewards_many):
         return False
@@ -363,11 +330,11 @@ def _normalize_prompt_images(env, example: dict, messages: list[dict]) -> None:
 
 def _evaluation_response(env, case) -> tuple[str, str]:
     example = _evaluation_example(case)
-    # build the prompt even though the replayed response does not need it. `flash env eval`
-    # sends every case through prompt_messages() (flash/cli/env_eval.py `_case_messages`), so a
-    # prompt that raises or returns malformed messages for a held-out case is a suite the online
-    # command records a prompt-construction error for. checking only the scorer let this offline
-    # gate print `overall: PASS` for exactly that sidecar (cursor[bot]).
+    # build the prompt even though the replayed response does not need it. `flash env eval` sends
+    # every case through prompt_messages() (flash/cli/env_eval.py `_case_messages`), so a prompt
+    # that raises or returns malformed messages for a held-out case is a suite the online command
+    # records a prompt-construction error for. checking only the scorer let this offline gate print
+    # `overall: PASS` for exactly that sidecar.
     build = getattr(env, "prompt_messages", None)
     if callable(build):
         messages = _check_messages(build(example), "prompt")
@@ -375,10 +342,10 @@ def _evaluation_response(env, case) -> tuple[str, str]:
         # `normalize_prompt_images` (`_remote_prompt_messages`), as every training worker does
         # before tokenization. the envelope check above sees only the message list, so a case
         # carrying a top-level `image`/`images` -- a missing or oversized package-relative file --
-        # or a malformed image block inside its prompt passed this gate, and the online command
-        # then recorded prompt-construction failures for a suite reported `overall: PASS`
-        # (chatgpt-codex-connector). run the same normalization here, against the environment's
-        # own package root, so both commands reject the same suites.
+        # or a malformed image block inside its prompt passed this gate, and the online command then
+        # recorded prompt-construction failures for a suite reported `overall: PASS`. run the same
+        # normalization here, against the environment's own package root, so both commands reject
+        # the same suites.
         _normalize_prompt_images(env, example, messages)
     reference_turns = _reference_turns(env, example)
     policy = _resolve_policy(reference_turns)
@@ -456,23 +423,11 @@ def _check_evaluation_suites(entrypoint: Path, env) -> bool:
 
 
 def _reject_unsubmittable_param(key: str, value: object) -> None:
-    """Reject a parsed TOML value that ``[environment.params]`` could not actually submit.
+    """Reject TOML values that ``[environment.params]`` could not submit.
 
-    TOML has date/time types that JSON does not, so ``--param cutoff=2026-01-01`` parses cleanly
-    into a ``datetime.date``. The equivalent config keeps that object in ``EnvironmentSpec.params``
-    and the submit fails later at ``json.dumps(body)`` in ``ApiClient._request()``. Approving it
-    here would mean the gate passed on a config that cannot be submitted at all.
-
-    ``allow_nan=False`` because the default does NOT raise on ``nan``/``inf``: it emits the
-    non-standard tokens ``NaN`` and ``Infinity``, which are not JSON at all. `--param
-    threshold=nan` therefore passed the gate and produced a request body a strict parser rejects
-    (codex[bot]). Raised as ValueError, which is a separate exception from the TypeError above.
-
-    ``ensure_ascii=False`` so the encode reaches the text itself rather than escaping it away. The
-    default renders every non-ascii character as ``\\uXXXX``, which a lone surrogate survives, and
-    the value then forwards to an env that can open the path while no UTF-8 config could carry it
-    (codex[bot]). Encoding what json produced is what makes this cover a surrogate nested inside a
-    list or table, not just a bare scalar.
+    JSON excludes TOML date/time objects and non-finite floats, so use ``allow_nan=False``.
+    ``ensure_ascii=False`` exposes lone surrogates; encoding the JSON result catches them even when
+    nested, because no UTF-8 config can carry that value.
     """
     try:
         encoded = json.dumps(value, allow_nan=False, ensure_ascii=False)
@@ -507,16 +462,16 @@ def _parse_param_value(key: str, raw: str) -> object:
         # ...and no delimiter is needed to be reaching for TOML syntax. `cutoff=2026-13-01` holds
         # none of those characters, so it forwarded as the string "2026-13-01" while the equivalent
         # `[environment.params]` entry fails to load -- the gate passing on a config that cannot be
-        # written. same for `1e`, `0x`, `007`, `1_`, `12:99:00` (codex[bot]). a leading digit or
-        # sign is the tell: every TOML scalar except the bare-word `true`/`false`/`inf`/`nan`
-        # spellings starts with one, so such a token is a malformed number or date, not prose.
+        # written. same for `1e`, `0x`, `007`, `1_`, `12:99:00`. a leading digit or sign is the
+        # tell: every TOML scalar except the bare-word `true`/`false`/`inf`/`nan` spellings starts
+        # with one, so such a token is a malformed number or date, not prose.
         if value and not (set(value) & _TOML_STRUCTURAL_CHARS):
             # the booleans are the family of TOML scalars that does NOT start with a digit or sign,
             # so the leading-character test below cannot see them. TOML spells them lowercase only,
             # which makes a python-style `strict=False` parse-fail and fall through here as the
             # STRING "False" -- and a non-empty string is truthy, so an env branching on `if strict`
             # reads it as enabled while the config spelling `false` disables it. the offline gate
-            # would pass on the opposite of what the run trains with (codex[bot]).
+            # would pass on the opposite of what the run trains with.
             if value.lower() in _TOML_BOOLEAN_WORDS:
                 raise ValueError(
                     f"--param {key} is not a valid TOML value: {exc}. TOML spells "
@@ -571,19 +526,10 @@ def _parse_param_value(key: str, raw: str) -> object:
 
 
 def _is_expressible_in_toml(text: str) -> bool:
-    """Report whether ``[environment.params]`` can carry ``text``, unchanged.
+    """Report whether ``[environment.params]`` can carry ``text`` unchanged.
 
-    The question is not whether the text is a TOML BARE key -- quoted keys and basic strings hold
-    spaces, slashes and non-ascii perfectly well -- but whether the config can express THIS text at
-    all. A basic string can: every character is either literal or has an escape, so the only text
-    left out is what the file cannot physically contain. The config is read as UTF-8
-    (``tomllib.load``, flash/schema/__init__.py), so that is exactly the un-encodable text -- a lone
-    surrogate, which reaches argv when a command line carries a byte that is not valid UTF-8.
-
-    Asked of both sides of an assignment. A surrogate is no more expressible on the right than on
-    the left, and guarding only the name let `--param dataset_path=<surrogate>` forward a path the
-    loader can open and the gate can PASS on, while no UTF-8 training TOML could submit the run that
-    was validated (codex[bot]).
+    TOML quoted keys and strings cover normal text; only values that cannot encode as UTF-8, such as
+    lone surrogates, cannot appear in the config. Apply this to both assignment sides.
     """
     try:
         text.encode("utf-8")
@@ -593,25 +539,11 @@ def _is_expressible_in_toml(text: str) -> bool:
 
 
 def _literal_param_key(key: str) -> str:
-    """Resolve one ``--param`` name to the literal name ``[environment.params]`` would produce.
+    """Resolve a ``--param`` TOML key to its literal parameter name.
 
-    The left side of a `[environment.params]` entry is a TOML key, not a literal name, so the
-    spelling and the name can differ. `difficulty.level = 3` in a config is
-    ``{"difficulty": {"level": 3}}``, but taking the source spelling literally forwarded
-    ``{"difficulty.level": 3}`` instead -- a different call, which an environment accepting
-    ``**kwargs`` swallows without ever exercising the nested parameter the run trains on. The gate
-    then passes on input it never actually tested (codex[bot]).
-
-    So a structural spelling is resolved through tomllib rather than guessed at, and that also
-    supplies the escape for a name that CONTAINS a dot: `"release.channel" = 3` is a quoted key and
-    yields the flat ``{"release.channel": 3}``. Classifying dots and quotes as structure outright
-    left that valid config with no `--param` spelling at all (codex[bot]) -- the quoted form is
-    both the remedy and the same text the config needs.
-
-    A genuinely nested table is still rejected. Params are splatted as keyword arguments
-    (``load_freesolo_environment(..., **params)``, flash/envs/registry.py), so `difficulty` would
-    have to arrive as a whole dict; `--param difficulty={level = 3}` already says that exactly, and
-    is what the error points at.
+    Parse dotted and quoted keys with tomllib so ``difficulty.level`` nests while
+    ``"release.channel"`` stays flat. Reject genuine nesting because params are splatted as kwargs
+    in ``flash/envs/registry.py``; pass the containing inline table instead.
     """
     name = key
     if set(key) & _TOML_KEY_STRUCTURAL_CHARS:
@@ -632,11 +564,11 @@ def _literal_param_key(key: str) -> str:
                 f"example --param {name}='{{ level = 3 }}', or quote the name "
                 f"(--param '\"{key}\"=...') if the dot is part of it"
             )
-    # whether the config can hold the name at all. almost always yes: a QUOTED key carries
-    # `bad key`, `a/b`, `café` and the rest, and the schema loader takes it, so those are configs a
-    # run really can receive. an earlier guard here rejected anything outside the BARE-key grammar,
-    # which blocked validating a working config while claiming the config could not hold the name
-    # (cursor). what is left is the names a UTF-8 config file cannot physically contain.
+    # whether the config can hold the name at all. almost always yes: a QUOTED key carries `bad
+    # key`, `a/b`, `café` and the rest, and the schema loader takes it, so those are configs a run
+    # really can receive. an earlier guard here rejected anything outside the BARE-key grammar,
+    # which blocked validating a working config while claiming the config could not hold the name.
+    # what is left is the names a UTF-8 config file cannot physically contain.
     if not _is_expressible_in_toml(name):
         raise ValueError(
             f"--param {key!r} is not valid UTF-8, so no config file could carry it and the run "
@@ -662,17 +594,10 @@ def _quoted_key_end(item: str, start: int) -> int | None:
 
 
 def _split_param_assignment(item: str) -> tuple[str, str, str]:
-    """Split one ``--param`` argument at the ``=`` that separates its key from its value.
+    """Split ``--param`` at the assignment ``=`` outside quoted key text.
 
-    Mirrors ``str.partition("=")`` in shape, but skips over quoted stretches of the key first. A
-    quoted TOML key may itself contain an ``=`` -- ``[environment.params]`` accepts ``"a=b" = 1``
-    as the flat key ``a=b`` -- and splitting at the first one turned that spelling into the key
-    ``"a`` and rejected it, leaving a loadable config with no CLI spelling that could validate it
-    (codex[bot]).
-
-    An unterminated quote is not a key this can find the end of, so it falls back to the first
-    ``=``; the key check then reports the malformed spelling rather than this returning something
-    arbitrary.
+    TOML permits flat keys such as ``"a=b"``. Unterminated quotes fall back to ``partition`` so the
+    key validator reports the malformed spelling.
     """
     index = 0
     while index < len(item):
@@ -784,13 +709,13 @@ def cmd_env_test(args) -> int:
 
         passed += 1
         if record["policy"] == "replay" and reward is not None:
-            # a reference written in reasoning markup cannot be replayed faithfully from here
-            # (see `_carries_thinking_markup`), so its score is not evidence about the grader and
-            # is kept out of the blocking gate's totals. neither is a multi-turn episode whose gold
-            # answer ran out before the rollout did: the graded trajectory is then part reference
-            # and part junk, and a zero says nothing about the reference the gate never ran
-            # (Cursor). the advisory warning below still fires for both: a low reward is worth
-            # surfacing either way, it just cannot be the reason to fail.
+            # a reference written in reasoning markup cannot be replayed faithfully from here (see
+            # `_carries_thinking_markup`), so its score is not evidence about the grader and is kept
+            # out of the blocking gate's totals. neither is a multi-turn episode whose gold answer
+            # ran out before the rollout did: the graded trajectory is then part reference and part
+            # junk, and a zero says nothing about the reference the gate never ran. the advisory
+            # warning below still fires for both: a low reward is worth surfacing either way, it
+            # just cannot be the reason to fail.
             if not record["thinking_markup"] and not record["replay_incomplete"]:
                 replayed += 1
                 # an exact zero is what a scorer that recognized nothing returns, so it stays the
@@ -811,26 +736,10 @@ def cmd_env_test(args) -> int:
     print(f"{passed}/{episode_count} episodes passed contract checks")
     if passed != episode_count:
         return _err("overall: FAIL")
-    # a grader that pays every one of its own reference answers zero cannot recognize them at all --
-    # a broken scorer or a missing runtime dependency (LS-005) -- and the run reaches a gpu able to
-    # see only flat reward. deliberately narrow: a PARTIAL failure stays the warning above and still
-    # passes, because a strict reward function with some hard rows is legitimate.
-    #
-    # zero alone does not settle it, though. a centered scale paying 0 for a correct answer and
-    # negative for an incorrect one separates them perfectly, which is all GRPO's relative advantage
-    # needs, and failing on its zero rejected those environments outright (codex[bot]). so ask the
-    # reward what a deliberately wrong answer is worth, and block only if it is worth as much. one
-    # probe settles it: the question is whether this reward can separate at all, and a grader that
-    # scored every gold answer identically will answer identically for each of them.
-    #
-    # and the whole gate presumes the reward IS the training signal, which is true of grpo alone.
-    # sft trains on a supervised loss and opd on a teacher token loss; neither reads `env.reward`,
-    # so a no-op scorer is legitimate for them and blocking on it failed the recommended pre-push
-    # check for environments that train perfectly well (Cursor). the algorithm lives in the run
-    # config (`JobSpec.algorithm`), which an environment directory does not carry, so it is asked
-    # for -- and defaults to grpo, the case that needs the gate.
-    # defaulting to the reward-driven algorithm keeps the gate for a caller that passes no
-    # algorithm at all: an absent field must not be the way to switch a blocking check off.
+    # LS-005: block only when every gold answer scores zero and deliberate junk scores at least as
+    # well; centered rewards may legitimately score gold at zero. partial failures remain warnings.
+    # this gate applies only to grpo, which trains from env.reward. sft and opd use other losses.
+    # default to grpo so omitting the algorithm cannot disable the blocking check.
     algorithm = getattr(args, "algorithm", None) or _REWARD_DRIVEN_ALGORITHM
     grader_recognizes_gold = not (
         algorithm == _REWARD_DRIVEN_ALGORITHM

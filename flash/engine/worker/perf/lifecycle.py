@@ -10,13 +10,8 @@ _CUDA_OOM_PREFLIGHT_RE = re.compile(
     r"free memory on device\s+cuda:\d+.*less than desired gpu memory utilization"
 )
 _CUDA_OOM_CACHE_BLOCKS = "no available memory for the cache blocks"
-# torch's own allocator OOM, which the two vllm STARTUP signatures above do not cover. the parent
-# classifies an in-process OOM off `torch.cuda.OutOfMemoryError` and the allocator counter, but a
-# verl child is a separate process: neither the exception type nor its `num_ooms` crosses, and the
-# terminal raise carries only "subprocess exited with status N". without this the one OOM shape that
-# happens DURING training reads as a permanent job_failed, so the lifecycle never retries it on a
-# larger gpu. anchored on torch's exact wording rather than a bare "out of memory", which a host-ram
-# OOM or an env's own error text would also match -- and those must not escalate the gpu.
+# verl child processes lose the torch exception type and allocator counter. match torch's exact cuda
+# OOM wording so training OOMs retry on larger GPUs without misclassifying host RAM or env errors.
 _CUDA_OOM_TORCH_RE = re.compile(r"(?:torch\.)?(?:cuda\.)?outofmemoryerror|cuda out of memory")
 
 
@@ -57,11 +52,10 @@ def cuda_oom_message_evidence(message: str) -> str | None:
 
 
 def is_cuda_oom(exc: BaseException | None) -> bool:
-    """Whether a failure was a CUDA OOM.
+    """Return whether a failure was a CUDA OOM.
 
-    Prefer structured torch allocator signals. Also classify vLLM's deterministic startup memory
-    preflight errors: those can fail before torch records a CUDA OOM counter, but a larger GPU is the
-    correct retry action.
+    Prefer torch signals, but include deterministic vLLM startup preflights that occur before the
+    allocator records an OOM.
     """
     if exc is None or isinstance(exc, MemoryError):
         return False

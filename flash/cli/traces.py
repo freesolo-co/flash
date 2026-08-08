@@ -1,21 +1,8 @@
-"""`flash traces export`: turn a project's recorded traces into training rows.
+"""export project traces as records, prompts, or raw rows.
 
-Three shapes, because these are the ones that actually differ:
-
-- ``records`` (default): ``{"input", "output"}`` freesolo environment records,
-  the same shape `flash env setup` scaffolds into dataset/train.jsonl, so an
-  exported file is a drop-in dataset. Traces with no usable reply are skipped.
-- ``prompts``: ``{"input"}`` only. GRPO samples its own completions and scores
-  them with the environment, so no gold reply is needed -- and a call whose
-  reply never arrived still exports, which ``records`` drops.
-- ``raw``: the stored trace rows with their spans, converted by nothing.
-
-There is deliberately no per-algorithm format: SFT and GRPO both read the same
-environment records, so an "export for SFT" and an "export for GRPO" would be
-byte-identical files.
-
-The conversion runs on the freesolo backend, which is also where the web app's
-trace export gets its rows, so both produce the same file.
+``records`` writes environment ``input``/``output`` rows and skips missing replies. ``prompts`` writes
+``input`` only, including traces without replies for grpo sampling. ``raw`` preserves stored trace rows.
+records serve both sft and grpo, and backend conversion matches the web export.
 """
 
 from __future__ import annotations
@@ -174,15 +161,9 @@ def cmd_traces_export(args) -> int:
 
     exported = fetch_records(project_id, api_key, export_format)
 
-    # a backend predating format support ignores the query param and reports no
-    # format at all, so a missing one is read as the records it must have sent.
-    # an explicit label is the backend telling us what it actually converted, and
-    # any value other than the one asked for means the rows are not what the
-    # caller requested -- writing them out would label {input, output} rows as
-    # prompts or raw, or land raw traces in dataset/train.jsonl as if they were
-    # environment records, where a later `env push` + `train` would feed them to a
-    # run that cannot read them. that mislabelling is possible in either
-    # direction, so the check cannot be skipped for the default format.
+    # old backends omit the format label and can only mean records. when a label is present it must
+    # match the request, or rows could be mislabeled and later fed to an incompatible env/train path.
+    # enforce this for the default format too because mismatch can occur in either direction.
     returned_format = exported.get("format") or RECORDS_FORMAT
     if returned_format != export_format:
         raise ClientError(

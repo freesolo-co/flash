@@ -7,7 +7,6 @@ import contextlib
 import os
 import re
 import threading
-import time
 from typing import Any
 
 from flash.diagnostics import sanitize_diagnostic
@@ -24,28 +23,7 @@ from flash.providers.runpod.gpus import flash_gpu
 # runpod_flash asyncio singleton is bound to one event loop; serialize all deploy/undeploy.
 FLASH_SDK_LOCK = threading.Lock()
 
-# 58 leaves a 2-slot buffer under RunPod's 60-worker account quota. Shared via Postgres when an
-# internal key is set; falls back to in-process semaphore otherwise. Releases only after the
-# remote endpoint is provably gone.
-#
-# NOTE: nothing enforces this today. The only claim site is `_acquire_endpoint_slot`, reached
-# only from `get_train_endpoint`, which has had no production caller since 3b2689f2 (the
-# multi-account waterfall, 28 minutes after the slot store landed) gave `jobs.py::_deploy_once`
-# its own `Endpoint(...)` path that never claims. flash.runpod_endpoint_slots has 0 rows on prod
-# and dev because nothing has ever leased, not because nothing is leased right now. The startup
-# `reconcile_endpoint_slots()` still runs, but it only deletes rows for endpoints that are gone.
-#
-# So this constant is the intended value, not an enforced one. Wiring the claim into the live
-# deploy path is a separate change: it alters endpoint provisioning, not a number.
-RUNPOD_ENDPOINT_SLOT_CAP = 58
-_SLOT_QUEUE_WAIT_S = 10.0
-_SLOT_STORE_MAX_ERRORS = 6
 _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
-
-_LOCAL_SLOTS = threading.Semaphore(RUNPOD_ENDPOINT_SLOT_CAP)
-# name -> "shared"|"local": tracks how this process acquired each slot so release routes correctly.
-_ACQUIRED: dict[str, str] = {}
-_ACQUIRED_LOCK = threading.Lock()
 
 _ENDPOINT_CACHE: dict[str, Any] = {}
 
@@ -70,134 +48,6 @@ def _reset_flash_resource_manager(rm_module) -> None:
                     setattr(target, attr, {})
     with contextlib.suppress(Exception):
         manager._resources_initialized = False
-
-
-def _acquire_local_slot(name: str) -> None:
-    """Claim an in-process semaphore slot."""
-    if not _LOCAL_SLOTS.acquire(blocking=False):
-        logger.info(
-            "Quota full (%d/%d slots) — waiting for a free slot...",
-            RUNPOD_ENDPOINT_SLOT_CAP,
-            RUNPOD_ENDPOINT_SLOT_CAP,
-        )
-        _LOCAL_SLOTS.acquire()
-    with _ACQUIRED_LOCK:
-        _ACQUIRED[name] = "local"
-
-
-def _acquire_endpoint_slot(name: str) -> None:
-    """Claim a quota slot for ``name``, blocking until one is free. Idempotent per name."""
-    with _ACQUIRED_LOCK:
-        if name in _ACQUIRED:
-            return
-    from flash.providers.runpod import slots
-
-    if slots.internal_key() is None:
-        _acquire_local_slot(name)
-        return
-
-    errors = 0
-    queued = False
-    while True:
-        try:
-            claimed, in_use = slots.claim(
-                name, cap=RUNPOD_ENDPOINT_SLOT_CAP, claimed_by=slots.claimed_by_ident()
-            )
-        except slots.SlotStoreError as exc:
-            errors += 1
-            logger.warning(
-                "slot-store claim failed for %s (%s) [%d/%d]",
-                name,
-                exc,
-                errors,
-                _SLOT_STORE_MAX_ERRORS,
-            )
-            if errors >= _SLOT_STORE_MAX_ERRORS:
-                logger.error(
-                    "slot store unreachable; falling back to the in-process cap for %s", name
-                )
-                _acquire_local_slot(name)
-                return
-            time.sleep(_SLOT_QUEUE_WAIT_S)
-            continue
-        errors = 0
-        if claimed:
-            if queued:
-                logger.info(
-                    "RunPod endpoint slot acquired for %s after queueing (%d/%d in use)",
-                    name,
-                    in_use,
-                    RUNPOD_ENDPOINT_SLOT_CAP,
-                )
-            with _ACQUIRED_LOCK:
-                _ACQUIRED[name] = "shared"
-            return
-        if not queued:
-            logger.info(
-                "RunPod quota full (%d/%d) — queueing for a free slot...",
-                in_use,
-                RUNPOD_ENDPOINT_SLOT_CAP,
-            )
-            queued = True
-        time.sleep(_SLOT_QUEUE_WAIT_S)
-
-
-def _release_endpoint_slot(name: str) -> bool:
-    """Release the quota slot for ``name``, routed to the store it was claimed from.
-
-    Returns True if a slot was released, False for a no-op.
-    """
-    with _ACQUIRED_LOCK:
-        mode = _ACQUIRED.pop(name, None)
-    if mode == "local":
-        _LOCAL_SLOTS.release()
-        return True
-    from flash.providers.runpod import slots
-
-    cross_replica = mode is None
-    if cross_replica and slots.internal_key() is None:
-        return False
-
-    try:
-        released = slots.release(name)
-    except slots.SlotStoreError as exc:
-        # Transient failure: reconcile on next startup will reclaim stale rows.
-        logger.warning(
-            "slot-store release failed for %s (%s); reconcile will reclaim it on restart",
-            name,
-            exc,
-        )
-        return not cross_replica
-    return released if cross_replica else True
-
-
-def reconcile_endpoint_slots() -> None:
-    """Reconcile the shared slot store against live RunPod endpoints on startup. Best-effort."""
-    from flash.providers.runpod import slots
-
-    if slots.internal_key() is None:
-        return
-    try:
-        from flash.providers.runpod import api as runpod_api
-        from flash.providers.runpod.jobs import _is_flash_endpoint
-
-        live = [
-            name
-            for e in runpod_api.list_endpoints()
-            if _is_flash_endpoint(name := (e.get("name") or ""))
-        ]
-    except Exception as exc:
-        logger.warning("slot reconcile skipped: could not list RunPod endpoints (%s)", exc)
-        return
-    try:
-        result = slots.reconcile(live)
-        logger.info(
-            "RunPod slot reconcile: %s in use, %s reclaimed",
-            result.get("inUse"),
-            result.get("reclaimed"),
-        )
-    except slots.SlotStoreError as exc:
-        logger.warning("slot reconcile failed (%s)", exc)
 
 
 def _train_body(input_data: dict) -> dict:
@@ -698,55 +548,41 @@ def get_train_endpoint(
         isolate_flash_state(name_suffix)
         if cache_handler and name in _ENDPOINT_CACHE:
             return _ENDPOINT_CACHE[name]
+        kwargs = {
+            "name": name,
+            "gpu": flash_gpu(friendly),
+            # one worker occupies gpu.count cards of this class; count == 1 is the historical path.
+            "gpu_count": gpu_count_of(spec),
+            "min_cuda_version": min_cuda_for(friendly),
+            "execution_timeout_ms": execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
+            "workers": (0, 1),
+        }
+        image = worker_image_for_gpu(friendly, allow_default=False)
+        if image:
+            kwargs["image"] = image
+        else:
+            kwargs["dependencies"] = resolve_worker_deps()
+            kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
+        # Local import: avoids a jobs<->endpoints import cycle (jobs imports this module).
+        from flash.providers.runpod.jobs import (
+            grow_weight_cache_volumes,
+            weight_cache_endpoint_kwargs,
+        )
 
-    _acquire_endpoint_slot(name)
-    try:
-        with FLASH_SDK_LOCK:
-            isolate_flash_state(name_suffix)
-            if cache_handler and name in _ENDPOINT_CACHE:
-                return _ENDPOINT_CACHE[name]
-            kwargs = {
-                "name": name,
-                "gpu": flash_gpu(friendly),
-                # one worker occupies gpu.count cards of this class; count == 1 is the historical path.
-                "gpu_count": gpu_count_of(spec),
-                "min_cuda_version": min_cuda_for(friendly),
-                "execution_timeout_ms": execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
-                "workers": (0, 1),
-            }
-            image = worker_image_for_gpu(friendly, allow_default=False)
-            if image:
-                kwargs["image"] = image
-            else:
-                kwargs["dependencies"] = resolve_worker_deps()
-                kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
-            # Local import: avoids a jobs<->endpoints import cycle (jobs imports this module).
-            from flash.providers.runpod.jobs import (
-                grow_weight_cache_volumes,
-                weight_cache_endpoint_kwargs,
-            )
+        # resize before attach because existing volumes keep their provisioned size.
+        # reread the key after waiting for the lock so resize and Endpoint use the same account.
+        grow_weight_cache_volumes(spec, ensure_auth())
+        kwargs.update(weight_cache_endpoint_kwargs(spec))
+        ep = Endpoint(**kwargs)
+        handler = ep(_train_body)
+        from flash.providers.runpod.jobs import apply_disk_gb, apply_image_override_constraints
 
-            # Reconcile before attaching: the SDK returns an existing volume at its provisioned
-            # size, so a pre-bump volume stays small and the run fails on "Disk quota exceeded".
-            # Re-read the key HERE, not before _acquire_endpoint_slot: another thread can
-            # advance_key() while this one waits for the slot, and Endpoint below reads whatever the
-            # env var now holds. A key captured earlier would grow one account's volume and attach
-            # another's, leaving the attached one stale.
-            grow_weight_cache_volumes(spec, ensure_auth())
-            kwargs.update(weight_cache_endpoint_kwargs(spec))
-            ep = Endpoint(**kwargs)
-            handler = ep(_train_body)
-            from flash.providers.runpod.jobs import apply_disk_gb, apply_image_override_constraints
-
-            cfg = ep._build_resource_config()
-            apply_disk_gb(cfg, disk_gb)
-            apply_image_override_constraints(cfg)
-            if cache_handler:
-                _ENDPOINT_CACHE[name] = handler
-            return handler
-    except Exception:
-        _release_endpoint_slot(name)
-        raise
+        cfg = ep._build_resource_config()
+        apply_disk_gb(cfg, disk_gb)
+        apply_image_override_constraints(cfg)
+        if cache_handler:
+            _ENDPOINT_CACHE[name] = handler
+        return handler
 
 
 def _run_suffix(run_id: str | None) -> str | None:
@@ -884,12 +720,10 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
             ]
 
     # registry-less cleanup must inspect every configured account and exact retry suffix.
-    rest_confirmed_clear = False
     try:
         from flash.providers.runpod import api as runpod_api
 
         by_fingerprint, failed_fingerprints = runpod_api.list_endpoints_by_key()
-        rest_confirmed_clear = not failed_fingerprints
         for fingerprint, endpoints in by_fingerprint.items():
             for endpoint in endpoints:
                 if not _endpoint_name_matches_run(endpoint.get("name", ""), target):
@@ -898,7 +732,6 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
                 if not endpoint_id or not runpod_api.delete_endpoint_for_fingerprint(
                     endpoint_id, fingerprint
                 ):
-                    rest_confirmed_clear = False
                     results.append(
                         {
                             "success": False,
@@ -926,10 +759,6 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
             )
     except Exception as exc:
         logger.warning("REST endpoint cleanup failed for %s: %s", target, exc)
-
-    # release only when every configured account authoritatively confirms cleanup.
-    if rest_confirmed_clear:
-        _release_endpoint_slot(target)
 
     with contextlib.suppress(Exception):
         stop_endpoint(friendly, name=target)

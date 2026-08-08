@@ -46,14 +46,8 @@ def styled() -> bool:
 def can_prompt() -> bool:
     """Whether a question can actually be answered by a human right now.
 
-    Stricter than ``styled()``, which only asks whether to draw the themed layout: a prompt that
-    nobody answers blocks the process forever, so CI is refused explicitly. A pseudo-TTY in CI
-    reports ``isatty()`` true, which is exactly the case that hangs, and a closed fd 0 can make
-    ``sys.stdin`` None, so that is guarded before ``.isatty()``.
-
-    One definition, because the two callers had drifted: env setup checked CI and traces export did
-    not, so `flash traces export` with no --project hung on a picker under CI -- and traces export
-    has no --yes to escape with.
+    ``styled()`` is insufficient because CI may expose a pseudo-TTY and hang forever. Require
+    non-CI interactive stdin; ``sys.stdin`` may also be None when fd 0 is closed.
     """
     if os.environ.get("CI", "").strip().lower() not in ("", "0", "false", "no"):
         return False
@@ -654,11 +648,6 @@ def _humanize_age_seconds(seconds: float | None) -> str | None:
     return f"{seconds / 3600:.1f}h ago"
 
 
-def _humanize_age(value) -> str | None:
-    """Format an epoch seconds value as a compact age ("3m ago"), None for non-numbers."""
-    return _humanize_age_seconds(_heartbeat_age_seconds(value))
-
-
 # heartbeat age past which the panel reminds that quiet is normal: worker uploads are throttled
 # (240s quiet phases, up to 900s mid-training), so a frozen ts is usually not a dead worker.
 _HB_QUIET_HINT_AFTER_S = 300.0
@@ -715,14 +704,14 @@ _QUIET_HEARTBEAT_HINT = (
     "heartbeat uploads are throttled; quiet is not dead - check flash runs log <run-id> -f"
 )
 # a throttled training step is never guaranteed current: the worker holds mid-training commits for
-# up to _HB_MIN_INTERVAL_S (900s), so from upload until the next commit the displayed step lags by an
-# unknown amount. gate on the same age at which the panel already flags the quiet (300s) rather than
-# on 900s -- the incident that motivated this reported 559s and 687s, squarely inside that window,
-# where a 900s gate would stay silent and leave only the dead-end quiet hint (codex[bot]).
+# up to _HB_MIN_INTERVAL_S (900s), so from upload until the next commit the displayed step lags by
+# an unknown amount. gate on the same age at which the panel already flags the quiet (300s) rather
+# than on 900s -- the incident that motivated this reported 559s and 687s, squarely inside that
+# window, where a 900s gate would stay silent and leave only the dead-end quiet hint.
 _STALE_STEP_AFTER_S = _HB_QUIET_HINT_AFTER_S
 # only the stages the worker actually holds on the 900s upload throttle. opd_step is excluded: its
-# post-update ping is force=True, so it re-commits at the 60s forced floor and an opd_step older than
-# 900s means a long step, failed uploads, or a real stall -- not reporting lag (codex[bot]).
+# post-update ping is force=True, so it re-commits at the 60s forced floor and an opd_step older
+# than 900s means a long step, failed uploads, or a real stall -- not reporting lag.
 _TRAINING_STEP_STAGES = frozenset({"rl_step", "sft_step"})
 
 
@@ -746,7 +735,7 @@ def _stale_step_hint(
     if not running or heartbeat_age_seconds is None:
         return None
     # a heartbeat from a superseded attempt describes a dead worker's step; calling that ordinary
-    # throttled progress hides that the replacement has published nothing (codex[bot]).
+    # throttled progress hides that the replacement has published nothing.
     if not current_attempt:
         return None
     if heartbeat_age_seconds <= _STALE_STEP_AFTER_S:
@@ -754,25 +743,15 @@ def _stale_step_hint(
     if str(heartbeat.get("stage") or "") not in _TRAINING_STEP_STAGES:
         return None
     # step 0 is the cold, still-running first step: no optimizer update has landed, so there is no
-    # later hidden step for the reassurance to point at. reuse the shared step-gated predicate rather
-    # than a bare presence check (codex[bot]).
+    # later hidden step for the reassurance to point at. reuse the shared step-gated predicate
+    # rather than a bare presence check.
     from flash.providers._poll import is_training_heartbeat
 
     if not is_training_heartbeat(heartbeat.get("stage"), heartbeat.get("step")):
         return None
-    # do NOT send them to `runs log -f` for worker output. it streams the control-plane log, which
-    # carries orchestration events rather than trainer progress, and the worker console it does
-    # print comes from _print_worker_output AFTER the run reaches a terminal state
-    # (flash/cli/commands.py cmd_log) -- so it cannot answer this question while the run is live.
-    # even reaching for that artifact mid-follow would not help: the worker uploads it on a 3600s
-    # interval (_CONSOLE_UPLOAD_INTERVAL_S), an hour of staleness against a hint that fires at 300s
-    # (codex[bot]).
-    #
-    # the always-available signal is the `age` row this hint hangs off, which is rendered from the
-    # same payload and therefore cannot be missing: below the 900s upload throttle the quiet is
-    # fully explained by throttling, so the age itself is what tells the user whether they have
-    # waited long enough to conclude anything. w&b stays as the optional live cross-check -- the
-    # trainer writes it directly rather than through the throttled upload -- hence "if configured".
+    # do not suggest `runs log -f`: it shows control-plane logs, and worker output arrives only after
+    # termination (flash/cli/commands.py cmd_log) on a 3600s upload interval. use heartbeat age against
+    # the 900s throttle, with w&b as the optional live signal.
     return (
         "the step above is the last one UPLOADED, not necessarily the one training is on; "
         "a throttled worker can hold it for many minutes while the trainer advances normally. "
@@ -964,8 +943,8 @@ def cost_panel(est) -> str:
         ("wall clock", f"{est.wall_clock_hours:.2f} h"),
         ("billable", f"{est.billable_hours:.2f} h  {_dim('(training only)')}"),
     ]
-    # opd teacher spend is itemized but not part of total_usd (billed by parasail on the managed key).
-    # Mirror CostEstimate.breakdown() so the styled panel doesn't silently drop it (cursor[bot]).
+    # opd teacher spend is itemized but not part of total_usd (billed by parasail on the managed
+    # key). Mirror CostEstimate.breakdown() so the styled panel doesn't silently drop it.
     if getattr(est, "teacher_api_usd", 0) > 0:
         pairs.append(
             (

@@ -16,8 +16,8 @@ from flash.schema import (
     TRAIN_SCHEMA_KEYS,
     ConfigError,
     parse_adapter_revision,
+    spec_and_train_keys_from_file,
     spec_from_dict,
-    spec_from_file,
     train_schema_metadata,
     validate_train_keys,
 )
@@ -84,8 +84,6 @@ def test_parse_adapter_revision_rejects_zero_padded_steps(step):
         ({"algorithm": 5}, "algorithm must be a string"),
         ({"algorithm": ["grpo"]}, "algorithm must be a string"),
         ({"algorithm": True}, "algorithm must be a string"),
-        # NOTE: model_policy is no longer a user knob (it's read from the FLASH_MODEL_POLICY env on
-        # the control plane), so a bad user-supplied model_policy is ignored, not rejected here.
         # Unknown config sections/keys are rejected (not silently dropped → 16x-cost defaults).
         # The classic footgun: rollout knobs under a [grpo] table instead of [train].
         ({"grpo.group_size": 4}, "unknown config section"),
@@ -176,7 +174,7 @@ def test_toml_config_requires_project(tmp_path) -> None:
     )
 
     with pytest.raises(ConfigError, match="project is required and must be nonblank"):
-        spec_from_file(str(config), project_required=True)
+        spec_and_train_keys_from_file(str(config), project_required=True)
 
 
 def test_project_id_is_required_canonicalized_and_roundtrips() -> None:
@@ -270,13 +268,8 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
     }
     baseline = {"epochs", "hf_repo", "max_examples"}
 
-    # the historical snapshots are immutable and still carry opd_eos_loss_coef, hf_repo,
-    # lora_alpha, and advantage_clip because those commits did (hf_repo was a user key then and
-    # lora_alpha a user knob; both are now platform-managed and dropped from the user schema -
-    # hf_repo assigned server-side, lora_alpha derived as 2 x lora_rank. advantage_clip was parsed
-    # and shipped but never applied, so it was deleted rather than left as a silent no-op).
-    # current adds save_at_steps, credit_assignment, and the entropy-control knobs, and removes the
-    # legacy opd eos key.
+    # historical snapshots remain exact to their commits, including fields now managed or removed.
+    # current adds save_at_steps, credit_assignment, and entropy_quantile; opd eos is removed.
     assert historical_shapes["861571e7"] - {
         "opd_eos_loss_coef",
         "hf_repo",
@@ -571,11 +564,9 @@ def test_train_knob_accepted_by_algorithms_that_consume_it(algorithm, knob, valu
 
 @pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
 def test_full_public_dict_round_trips_despite_knob_scoping(algorithm) -> None:
-    """to_dict() serializes EVERY TrainSpec field, including ones the user never authored.
+    """Round-trip every serialized TrainSpec field through algorithm scoping.
 
-    The client -> server submit round trip re-parses exactly that dict, so scoping keyed on key
-    PRESENCE would reject a config whose owner set none of the scoped knobs. Keying on a
-    meaningful value is what keeps this path working.
+    Scope on meaningful values, not key presence, because ``to_dict()`` includes unauthored fields.
     """
     spec = spec_from_dict(_raw(algorithm=algorithm))
 

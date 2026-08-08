@@ -1,10 +1,7 @@
-"""Regression test: `flash runs cancel` must reliably stop the REMOTE Flash worker.
+"""verify cancellation stops a remote flash worker across processes.
 
-Bug: ``cancel_run`` called ``stop_endpoint``, which only scales endpoints found in the
-*current process's* in-memory cache. In a fresh ``flash runs cancel`` invocation that cache is empty,
-so the remote RunPod worker kept running (and billing) until the wall-clock cap. Fix:
-``cancel_run`` uses ``terminate_endpoint`` to look the run's uniquely-named endpoint up in
-runpod_flash's persisted registry and delete it via the RunPod API (cross-process).
+``stop_endpoint`` only sees the current process cache. cancellation must use ``terminate_endpoint`` to
+find the persisted runpod resource and delete it through the api before billing continues.
 """
 
 from __future__ import annotations
@@ -131,10 +128,7 @@ def test_get_train_endpoint_locks_sdk_state_and_does_not_cache_run_scoped_handle
         assert ep_mod.FLASH_SDK_LOCK.locked()
         locked_events.append(("isolate", scope))
 
-    acquired = []
     monkeypatch.setattr(ep_mod, "isolate_flash_state", rec_isolate)
-    monkeypatch.setattr(ep_mod, "_acquire_endpoint_slot", lambda name: acquired.append(name))
-    monkeypatch.setattr(ep_mod, "_release_endpoint_slot", lambda _name: None)
     monkeypatch.setattr(ep_mod, "canonical_gpu", lambda gpu: gpu)
     monkeypatch.setattr(ep_mod, "flash_gpu", lambda gpu: gpu)
     monkeypatch.setattr(ep_mod, "gpu_short", lambda gpu: gpu.lower().replace(" ", ""))
@@ -146,18 +140,15 @@ def test_get_train_endpoint_locks_sdk_state_and_does_not_cache_run_scoped_handle
     run_handler = ep_mod.get_train_endpoint("RTX 5090", name_suffix="run-a")
     assert run_handler.endpoint.kwargs["name"] == "flash-rtx5090-run-a"
     assert ep_mod._ENDPOINT_CACHE == {}
-    assert acquired == ["flash-rtx5090-run-a"]
     assert ("isolate", "run-a") in locked_events
 
     default_handler = ep_mod.get_train_endpoint("RTX 5090")
     assert default_handler.endpoint.kwargs["name"] == "flash-rtx5090"
     assert {"flash-rtx5090": default_handler} == ep_mod._ENDPOINT_CACHE
-    assert acquired == ["flash-rtx5090-run-a", "flash-rtx5090"]
     assert ("isolate", None) in locked_events
 
     cached_handler = ep_mod.get_train_endpoint("RTX 5090")
     assert cached_handler is default_handler
-    assert acquired == ["flash-rtx5090-run-a", "flash-rtx5090"]
 
 
 def test_select_matches_live_prefixed_endpoint():
@@ -465,12 +456,9 @@ def test_cancel_wins_over_racing_undeploy_done(tmp_path, monkeypatch):
 
 
 def test_cancel_loses_to_racing_genuine_completion_done(tmp_path, monkeypatch):
-    # Cancel-race regression (the mirror of test_cancel_wins_over_racing_undeploy_done): while
-    # cancel_run tears down a NON-deployed `running` run, the run's OWN training thread finishes
-    # and writes a GENUINE training-completion `done` (real metrics: cost_usd + artifacts_dir).
-    # The run actually finished, so its result MUST be preserved — cancel must NOT clobber it to
-    # `cancelled`. (A blunt allow_from_terminal=True would discard the real result here; the
-    # override is scoped to runs that were `deployed` at entry, which a `running` run is not.)
+    # if a running job genuinely finishes while cancellation tears it down, preserve its done metrics
+    # and artifacts. only runs deployed at cancellation entry allow the terminal override; a blanket
+    # override would clobber real training results.
     import flash.runner as orch
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
@@ -524,12 +512,10 @@ def test_terminate_endpoint_holds_lock_across_isolation(monkeypatch):
 
 
 def test_terminate_endpoint_from_async_context_does_not_raise(monkeypatch):
-    """Regression: terminate_endpoint must not raise when called from a running event loop.
+    """verify terminate_endpoint works inside an active event loop.
 
-    The original code called asyncio.run(_undeploy_all()) directly, which raises
-    RuntimeError('cannot be called when another event loop is running') from FastAPI/Uvicorn
-    lifespan shutdown or any other async context. The fix detects a running loop and falls
-    back to a ThreadPoolExecutor thread where asyncio.run() always succeeds.
+    it must move ``asyncio.run`` to another thread because calling it directly from fastapi/uvicorn or
+    any async context raises RuntimeError.
     """
     import asyncio
     import sys
@@ -736,25 +722,14 @@ def test_cancel_run_marks_billing_failed_when_pricing_falls_back(tmp_path, monke
 
 
 def test_cancel_run_bills_a_profile_on_started_not_on_optimizer_steps(tmp_path, monkeypatch):
-    """Cancelling a profile charges its bounded wall only if it started, and $0 if it never did.
+    """charge cancelled profiles only when they started, using the persisted quote.
 
-    The wiring is the point here, not the arithmetic (``test_charge_pricing`` covers that): a
-    profile emits no rl_step/sft_step/opd_step heartbeat, so if this path fed it through
-    ``actual_steps_run`` every cancelled profile would price at 0 steps -- free even after it ran
-    its whole wall. Both directions are asserted because a one-sided test passes under exactly
-    that mistake.
+    profiles emit no training-step heartbeat, so ``actual_steps_run`` would incorrectly make all
+    cancellations free. started profiles must use the submitted quote, matching successful settlement;
+    never-started profiles cost zero.
 
-    The started case asserts the PERSISTED quote, not merely a nonzero number: re-deriving the
-    charge here prices against today's offline rate table, so a cancel could bill something other
-    than the figure the user was shown at submit and other than what the same profile bills on
-    success (measured: $23.76 re-derived against a $7.00 quote). ``lifecycle.py`` already settles a
-    completed profile through the persisted quote, so cancel agrees with success rather than
-    introducing a third number.
-
-    ``billing_state`` is asserted alongside every amount because pricing here fails CLOSED: any
-    exception inside ``charge_usd_for_spec`` becomes the nan fallback and lands on cost_usd 0.0
-    with billing_state "failed". Without that assertion a swallowed pricing failure is
-    indistinguishable from a correct $0, and the never-started case expects exactly $0.
+    assert ``billing_state`` because pricing fails closed to cost 0.0 on exceptions, which otherwise
+    looks identical to the expected never-started charge.
     """
     import flash.runner as orch
     from flash.spec import JobSpec
@@ -879,13 +854,11 @@ def _make_poll_provider(monkeypatch, *, on_poll):
 
 
 def test_attach_run_recovery_skips_training_when_raced_terminal(tmp_path, monkeypatch):
-    """Recovery-path TOCTOU regression (the reviewed bug). attach_run checks the terminal state
-    ONCE up front, then runs a long poll. If a concurrent thread/process flips the run terminal
-    (e.g. another attach_run marks it `failed`) DURING that poll, the not-ok recovery path must
-    NOT resume `_run_training` — doing so would submit PAID GPU work for an already-terminal run.
-    The atomic guard: _update(.., "running", ..)'s sticky CAS rejects the write (returns False),
-    so the resume is skipped. Here we flip the run to `failed` from inside the (mocked) poll, then
-    return a not-ok result, and assert training is never resumed."""
+    """verify recovery cannot restart paid work after a concurrent terminal transition.
+
+    flip the run to failed during polling; the sticky ``_update(..., "running", ...)`` cas must reject
+    resume so ``_run_training`` is never called.
+    """
     import flash.runner as orch
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
@@ -1005,163 +978,6 @@ def test_update_returns_false_when_terminal_sticky(tmp_path, monkeypatch):
     # Now terminal: a non-terminal transition is rejected and reported False.
     assert orch._update(spec.run_id, "running") is False
     assert orch.get_status(spec.run_id).state == "failed"
-
-
-# ---------------------------------------------------------------------------
-# Quota-slot release in terminate_endpoint: release ONLY when the remote endpoint is
-# provably gone — never on an undeploy failure (would oversubscribe RunPod's quota), but
-# DO release when we positively verify nothing exists (else the slot leaks → queue deadlock).
-# ---------------------------------------------------------------------------
-def target_for(run_id):
-    """The endpoint name terminate_endpoint reconstructs for ``run_id`` on RTX 5090."""
-    from flash.providers.base import canonical_gpu
-
-    return endpoint_name(canonical_gpu("RTX 5090"), _run_suffix(run_id))
-
-
-def _install_fake_sdk(monkeypatch, *, resources, undeploy, rest_find, rest_delete=lambda _id: True):
-    """Stub the runpod_flash ResourceManager + the RunPod REST API for terminate_endpoint.
-
-    ``resources`` is the registry dict returned by list_all_resources(); ``undeploy`` is an
-    async fn called per uid; ``rest_find``/``rest_delete`` back the registry-less REST fallback
-    (``rest_find`` may raise to simulate an unreachable API). Also drops the quota semaphore +
-    tracking set to a fresh pair (monkeypatch restores them) so the test owns one acquired slot.
-    Returns ``(ep_mod, target)``.
-    """
-    import sys
-    import threading
-    import types as _types
-
-    import flash.providers.runpod.api as runpod_api
-    import flash.providers.runpod.auth as auth
-    import flash.providers.runpod.train.endpoints as ep_mod
-    from flash.providers.base import canonical_gpu
-
-    monkeypatch.setattr(auth, "ensure_auth", lambda: None)
-    monkeypatch.setattr(ep_mod, "isolate_flash_state", lambda *a, **k: None)
-
-    fake_rm = _types.SimpleNamespace(
-        list_all_resources=lambda: resources,
-        undeploy_resource=undeploy,
-    )
-    fake_rm_mod = _types.ModuleType("runpod_flash.core.resources.resource_manager")
-    fake_rm_mod.ResourceManager = lambda: fake_rm
-    for mod_name in (
-        "runpod_flash",
-        "runpod_flash.core",
-        "runpod_flash.core.resources",
-        "runpod_flash.core.resources.resource_manager",
-    ):
-        if mod_name not in sys.modules:
-            stub = _types.ModuleType(mod_name)
-            stub.__path__ = []
-            monkeypatch.setitem(sys.modules, mod_name, stub)
-    monkeypatch.setitem(sys.modules, "runpod_flash.core.resources.resource_manager", fake_rm_mod)
-
-    def list_endpoints_by_key():
-        return {_RUNPOD_FINGERPRINT: rest_find(target)}, []
-
-    monkeypatch.setattr(runpod_api, "list_endpoints_by_key", list_endpoints_by_key)
-    monkeypatch.setattr(
-        runpod_api,
-        "delete_endpoint_for_fingerprint",
-        lambda endpoint_id, _fingerprint: rest_delete(endpoint_id),
-    )
-
-    # Fresh local semaphore + tracking map, with one slot already "acquired" (local mode, as a
-    # no-internal-key get_train_endpoint would have done). monkeypatch restores the globals after.
-    target = endpoint_name(canonical_gpu("RTX 5090"), _run_suffix("flash-q-1"))
-    monkeypatch.setattr(ep_mod, "_LOCAL_SLOTS", threading.Semaphore(28))
-    monkeypatch.setattr(ep_mod, "_ACQUIRED", {})
-    ep_mod._ACQUIRED[target] = "local"
-    ep_mod._LOCAL_SLOTS.acquire()  # 27 free; releasing puts it back to 28
-    return ep_mod, target
-
-
-async def _undeploy_ok(uid, **_):
-    return {"success": True}
-
-
-async def _undeploy_fail(uid, **_):
-    raise RuntimeError("undeploy boom")
-
-
-def test_terminate_releases_slot_when_undeploy_succeeds(monkeypatch):
-    # (a) at least one undeploy succeeded → the endpoint is gone → release the slot.
-    ep_mod, target = _install_fake_sdk(
-        monkeypatch,
-        resources={"u1": types.SimpleNamespace(name=f"live-{target_for('flash-q-1')}")},
-        undeploy=_undeploy_ok,
-        rest_find=lambda _s: [],
-    )
-    ftrain.terminate_endpoint("RTX 5090", "flash-q-1")
-    assert target not in ep_mod._ACQUIRED, "a successful undeploy must release the slot"
-
-
-def test_terminate_does_not_release_slot_on_undeploy_failure(monkeypatch):
-    # the endpoint exists, undeploy failed, and the account lookup cannot prove it absent.
-    def lookup_failed(_target):
-        raise RuntimeError("REST API down")
-
-    ep_mod, target = _install_fake_sdk(
-        monkeypatch,
-        resources={"u1": types.SimpleNamespace(name=f"live-{target_for('flash-q-1')}")},
-        undeploy=_undeploy_fail,
-        rest_find=lookup_failed,
-    )
-    ftrain.terminate_endpoint("RTX 5090", "flash-q-1")
-    assert target in ep_mod._ACQUIRED, "a failed undeploy must NOT release the slot"
-
-
-def test_terminate_releases_slot_when_no_remote_endpoint_exists(monkeypatch):
-    # (b) registry returned no uids AND the REST lookup confirms no endpoint of this name —
-    # the endpoint provably does not exist (e.g. it never finished deploying). Release the slot;
-    # otherwise it leaks forever and eventually deadlocks the queue.
-    ep_mod, target = _install_fake_sdk(
-        monkeypatch,
-        resources={},  # registry finds nothing
-        undeploy=_undeploy_ok,  # never called
-        rest_find=lambda _s: [],  # REST confirms nothing remote
-    )
-    ftrain.terminate_endpoint("RTX 5090", "flash-q-1")
-    assert target not in ep_mod._ACQUIRED, (
-        "a positively-verified-absent endpoint must release the slot (else the queue deadlocks)"
-    )
-
-
-def test_terminate_does_not_release_slot_when_rest_lookup_unreachable(monkeypatch):
-    # No uids in the registry, but the REST lookup RAISES (API unreachable) — we cannot prove
-    # the endpoint is gone. Releasing on an unverified absence risks oversubscribing the quota,
-    # so the slot stays held.
-    def _boom(_s):
-        raise RuntimeError("REST API down")
-
-    ep_mod, target = _install_fake_sdk(
-        monkeypatch,
-        resources={},
-        undeploy=_undeploy_ok,
-        rest_find=_boom,
-    )
-    out = ftrain.terminate_endpoint("RTX 5090", "flash-q-1")
-    assert target in ep_mod._ACQUIRED, (
-        "an unverifiable absence (REST unreachable) must NOT release the slot"
-    )
-    assert isinstance(out, list)  # still never raises
-
-
-def test_terminate_releases_slot_when_rest_deletes_orphan(monkeypatch):
-    # No uids in the registry, but the REST fallback FINDS and deletes a live orphan endpoint
-    # (e.g. the registry entry was lost across a container restart). That delete succeeds →
-    # the endpoint is gone → release the slot.
-    ep_mod, target = _install_fake_sdk(
-        monkeypatch,
-        resources={},
-        undeploy=_undeploy_ok,
-        rest_find=lambda _s: [{"id": "ep-orphan", "name": target_for("flash-q-1")}],
-        rest_delete=lambda _id: True,
-    )
-    ftrain.terminate_endpoint("RTX 5090", "flash-q-1")
-    assert target not in ep_mod._ACQUIRED, "a REST-deleted orphan must release the slot"
 
 
 def _run_spec(run_id: str):
@@ -2311,3 +2127,120 @@ def test_cancel_double_undeploy_failure_revokes_authority_and_is_retryable(tmp_p
     assert retried.state == "cancelled"
     assert retried.deployment["state"] == "undeployed"
     assert orch.read_verified_adapter_revisions(run_id) == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# registry-less REST fallback in terminate_endpoint: when the resource registry has lost the
+# endpoint (e.g. across a container restart), cleanup still has to find the orphan by name on
+# every configured account and delete it. an unconfirmed delete must surface as a failed result
+# rather than a silent success, or a live endpoint keeps billing while the run looks cleaned up.
+# ---------------------------------------------------------------------------
+def _fake_sdk_with_orphan(monkeypatch, *, rest_find, rest_delete, resources=None, undeploy=None):
+    """Stub auth + a resource registry so terminate_endpoint reaches the REST fallback.
+
+    ``resources`` defaults to an empty registry (nothing to undeploy, straight to REST). Pass one
+    plus ``undeploy`` to drive the registry leg too. ``rest_find`` may raise to model an
+    unreachable account-enumeration API.
+    """
+    import types as _types
+
+    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.auth as auth
+    import flash.providers.runpod.train.endpoints as ep_mod
+    from flash.providers.base import canonical_gpu
+
+    monkeypatch.setattr(auth, "ensure_auth", lambda: None)
+    monkeypatch.setattr(ep_mod, "isolate_flash_state", lambda *a, **k: None)
+
+    registry = resources or {}
+    fake_rm = _types.SimpleNamespace(
+        list_all_resources=lambda: registry,
+        undeploy_resource=undeploy,
+    )
+    fake_rm_mod = _types.ModuleType("runpod_flash.core.resources.resource_manager")
+    fake_rm_mod.ResourceManager = lambda: fake_rm
+    for mod_name in (
+        "runpod_flash",
+        "runpod_flash.core",
+        "runpod_flash.core.resources",
+        "runpod_flash.core.resources.resource_manager",
+    ):
+        if mod_name not in sys.modules:
+            stub = types.ModuleType(mod_name)
+            stub.__path__ = []
+            monkeypatch.setitem(sys.modules, mod_name, stub)
+    monkeypatch.setitem(sys.modules, "runpod_flash.core.resources.resource_manager", fake_rm_mod)
+
+    target = endpoint_name(canonical_gpu("RTX 5090"), _run_suffix("flash-q-1"))
+    monkeypatch.setattr(
+        runpod_api, "list_endpoints_by_key", lambda: ({_RUNPOD_FINGERPRINT: rest_find(target)}, [])
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda endpoint_id, _fingerprint: rest_delete(endpoint_id),
+    )
+    return target
+
+
+def test_terminate_deletes_a_rest_discovered_orphan(monkeypatch):
+    deleted = []
+    target = _fake_sdk_with_orphan(
+        monkeypatch,
+        rest_find=lambda t: [{"id": "ep-orphan", "name": t}],
+        rest_delete=lambda eid: deleted.append(eid) or True,
+    )
+
+    out = ftrain.terminate_endpoint("RTX 5090", "flash-q-1")
+
+    assert deleted == ["ep-orphan"], "an orphan matching the run must be deleted on its account"
+    assert {"success": True, "name": target, "message": "deleted via REST API"} in out
+
+
+def test_terminate_reports_an_unconfirmed_rest_delete_as_failure(monkeypatch):
+    # a delete the API would not confirm must NOT be reported as success: the endpoint may still
+    # be live and billing, and cancellation is what the caller believes just happened.
+    target = _fake_sdk_with_orphan(
+        monkeypatch,
+        rest_find=lambda t: [{"id": "ep-orphan", "name": t}],
+        rest_delete=lambda _eid: False,
+    )
+
+    out = ftrain.terminate_endpoint("RTX 5090", "flash-q-1")
+
+    assert {
+        "success": False,
+        "name": target,
+        "message": "REST endpoint deletion was unconfirmed",
+    } in out
+
+
+def test_terminate_keeps_undeploy_failures_when_rest_enumeration_is_unreachable(monkeypatch):
+    """terminate_endpoint is best-effort: it must never raise, and never lose what it learned.
+
+    An undeploy that raises becomes a failure row rather than escaping, and a REST enumeration that
+    is unreachable is swallowed -- but the earlier undeploy failure must survive that swallow. A
+    caller that saw an empty list here would read 'nothing to clean up' from what was really 'the
+    API could not tell us', and stop chasing an endpoint that is still billing.
+    """
+
+    async def _undeploy_boom(_uid, **_):
+        raise RuntimeError("undeploy boom")
+
+    def _enumeration_down(_target):
+        raise RuntimeError("REST API down")
+
+    _fake_sdk_with_orphan(
+        monkeypatch,
+        resources={"u1": _res(f"live-{endpoint_name('RTX 5090', _run_suffix('flash-q-1'))}")},
+        undeploy=_undeploy_boom,
+        rest_find=_enumeration_down,
+        rest_delete=lambda _eid: True,
+    )
+
+    out = ftrain.terminate_endpoint("RTX 5090", "flash-q-1")
+
+    assert isinstance(out, list), "an unreachable REST API must be swallowed, not raised"
+    assert any(
+        r.get("success") is False and "undeploy boom" in str(r.get("message")) for r in out
+    ), "the undeploy failure must survive the swallowed enumeration error"

@@ -11,8 +11,8 @@ from flash.cost import RunConfig, estimate_cost
 from flash.cost.analytical import (
     DEFAULT_WALL_CAP_S,
     VLLM_INIT_S,
+    _offline_gpu_shape,
     seconds_per_step,
-    select_gpu,
     setup_seconds,
 )
 
@@ -68,8 +68,8 @@ def test_bigger_model_costs_more_per_step():
 
 def test_grpo_requires_at_least_as_much_vram_as_sft():
     for model in (SMALL, MID, BIG):
-        _, sft_need = select_gpu(RunConfig(model, "sft", 100))
-        _, grpo_need = select_gpu(RunConfig(model, "grpo", 100))
+        _, sft_need, *_ = _offline_gpu_shape(RunConfig(model, "sft", 100))
+        _, grpo_need, *_ = _offline_gpu_shape(RunConfig(model, "grpo", 100))
         assert grpo_need >= sft_need
 
 
@@ -78,7 +78,7 @@ def test_omitted_sft_batch_sizes_like_the_real_allocator():
     from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
 
     cfg = RunConfig(MID, "sft", 100)  # batch_size omitted
-    _, need = select_gpu(cfg)
+    _, need, *_ = _offline_gpu_shape(cfg)
     real = alloc_required_vram_gb(MID, "sft", train={}, thinking=False)
     assert need == real
     assert "batch_size" not in cfg.train_knobs()  # omitted batch isn't forwarded (would inflate)
@@ -90,7 +90,7 @@ def test_explicit_sft_batch_is_still_forwarded_for_sizing():
     from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
 
     cfg = RunConfig(MID, "sft", 100, batch_size=32)
-    _, need = select_gpu(cfg)
+    _, need, *_ = _offline_gpu_shape(cfg)
     real = alloc_required_vram_gb(MID, "sft", train={"batch_size": 32}, thinking=False)
     assert cfg.train_knobs()["batch_size"] == 32
     assert need == real
@@ -185,13 +185,13 @@ def test_nonpositive_max_wall_seconds_is_accepted_and_floored():
     assert estimate_cost(capped).wall_clock_seconds == pytest.approx(3600.0)
 
 
-def test_select_gpu_picks_cheapest_including_unvalidated():
-    # No validation gate: select_gpu picks the cheapest fitting class (validated or not) at the
-    # static rate, and nothing fitting is cheaper.
+def test_offline_gpu_shape_picks_cheapest_including_unvalidated():
+    # No validation gate: the offline shape picks the cheapest fitting class (validated or not)
+    # at the static rate, and nothing fitting is cheaper.
     from flash.cost.facts import gpu_hourly_usd, pick_gpu
     from flash.providers.base import GPU_INFO
 
-    gpu, need = select_gpu(RunConfig(MID, "sft", 100))
+    gpu, need, *_ = _offline_gpu_shape(RunConfig(MID, "sft", 100))
     assert gpu == pick_gpu(need)
     cheaper = [
         g
@@ -210,15 +210,9 @@ def test_9b_bf16_grpo_needs_an_80gb_class():
 
 
 def test_35b_moe_long_context_grpo_sized_past_the_resident_wall():
-    # The 35B MoE is RESIDENT-ONLY for GRPO (sleep_unsupported: vLLM sleep HANGS its wake), so it's
-    # sized on the RESIDENT peak (two ~70 GB weight copies + KV pool, fp8 KV). What this pins is the
-    # resident WALL: context past ~4-5k tok at group 8 costs materially more, so it is sized past the
-    # allocation a moderate-context run gets rather than admitted-then-HUNG in the broken sleep path
-    # (the old sleep estimate wrongly admitted up to ~16k, then the worker stalled).
-    #
-    # 205 GB is between the moderate-context sizes (200-201) and the long-context ones (211+); it is
-    # deliberately not a card size, because training the routed experts moved every one of these past
-    # a single 180 GB B200 and a 180 bound would no longer separate short context from long.
+    # the 35b moe is resident-only for grpo because vllm sleep hangs its wake. 205 gb separates
+    # moderate from long contexts using the resident peak, preventing admission into the broken sleep
+    # path; it is intentionally not a card size.
     from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
 
     moe = "Qwen/Qwen3.6-35B-A3B"
@@ -259,7 +253,7 @@ def test_omitted_grpo_context_sizes_like_the_real_allocator():
     worker_len = max(1024, RECIPE.rl.max_prompt_len + RECIPE.rl.max_completion_len)
     assert cfg.normalized().seq_len == worker_len
     assert cfg.train_knobs()["max_context_tokens"] == worker_len
-    _, need = select_gpu(cfg)
+    _, need, *_ = _offline_gpu_shape(cfg)
     real = alloc_required_vram_gb(MID, "grpo", train={}, thinking=False)
     assert need == real
     # ...and never under-sizes vs the old bare-max_prompt_len default.
@@ -287,7 +281,7 @@ def test_explicit_grpo_context_still_wins():
     cfg = RunConfig(MID, "grpo", 100, seq_len=8192)
     assert cfg.normalized().seq_len == 8192
     assert cfg.train_knobs()["max_context_tokens"] == 8192
-    _, need = select_gpu(cfg)
+    _, need, *_ = _offline_gpu_shape(cfg)
     real = alloc_required_vram_gb(MID, "grpo", train={"max_context_tokens": 8192}, thinking=False)
     assert need == real
 
@@ -367,13 +361,9 @@ def test_opd_teacher_latency_uses_conservative_retry_and_turn_wave_policy(
 
     _gpu_seconds, fixed_seconds = step_seconds_split(config, "RTX 5090")
 
-    # the policy under test is HOW MANY REQUESTS ARE COUNTED -- retries and per-turn scoring are
-    # charged for even when they do not fire. that count is the hand-written fact in the table
-    # above. how many waves it takes is then just arithmetic over the concurrency ceiling, so the
-    # ceiling is read from the constant rather than baked into the expectations: hardcoding wave
-    # counts made this test fail purely because the measured ceiling moved 8 -> 32, which is not a
-    # policy change. recomputing the REQUEST COUNT with the same helper the code uses would instead
-    # make the test unable to fail.
+    # hand-write the policy request count, including retries and per-turn scoring, but derive waves
+    # from the measured concurrency constant. using the production count helper would make this test
+    # self-fulfilling.
     expected_waves = math.ceil(expected_scored_requests / OPD_TEACHER_SCORING_CONCURRENCY)
     assert fixed_seconds == pytest.approx(expected_waves * teacher_seconds_per_completion())
 

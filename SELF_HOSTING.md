@@ -171,46 +171,63 @@ With it set:
 - **Environment mirror validation is skipped.** The environment package itself is still
   resolved and authorized normally.
 - **Backend reporting is off** - billing precheck and charge, realized-cost
-  reconciliation, checkpoint registration, the shared RunPod slot store, and the hosted
-  artifact GC sweep. Otherwise these would send your operator key to `api.freesolo.co`
+  reconciliation, checkpoint registration, and the hosted artifact GC sweep. Otherwise these would send your operator key to `api.freesolo.co`
   (and, for the GC, `serve.freesolo.co`) and log a warning per run or per startup.
 - **Hosted-only CLI commands say so.** `flash projects create` mints a uuid locally instead
   of calling the org directory; `flash projects list` and `flash traces export` have no local
   store to read and refuse with the reason. Traces are recorded by the freesolo SDK into the
   hosted backend, so write the same `{"input", "output"}` JSONL rows yourself and train on
   them directly.
-- **`model_policy = "allow"` is honoured**, so you are not limited to the curated catalog.
-  See [any HuggingFace model](#any-huggingface-model).
 
-## Any HuggingFace model
+Self-hosting relaxes the billing boundaries, not the catalog. Trainable models are the
+curated ones on both deployments; see [adding a model](#adding-a-model).
 
-The catalog (`flash models list`) is six curated Qwen checkpoints with validated GPU sizing.
-You are not restricted to them. Set `model_policy` at the top level of the config and Flash
-accepts any HuggingFace model that fits the GPU:
+## Adding a model
 
-```toml
-project = "11111111-1111-4111-8111-111111111111"
-model = "meta-llama/Llama-3.1-8B"
-model_policy = "allow"
-algorithm = "sft"
+The catalog (`flash models list`) is six curated Qwen checkpoints. Anything else is rejected
+at config parse time, before a GPU is rented:
+
+```
+unsupported model 'meta-llama/Llama-3.1-8B'; choose one of: ... - or, to train another
+model, fork Flash and add a ModelInfo entry for it to flash/catalog.py
 ```
 
-Flash reads the parameter count from HuggingFace, estimates VRAM for your algorithm, and
-rejects the run up front if it cannot fit the card (warning instead when it is merely tight).
-Private repos need `HF_TOKEN` to have read access to them.
+That is the whole workflow: fork, add an entry to `MODELS` in `flash/catalog.py`, and the
+model is trainable. There is no config key that accepts an uncataloged id.
 
-What you give up is curation, not function: an uncurated model has no validated multi-GPU
-sizing, no cost estimate calibrated against real runs, and no serving capacity entry. Gated
-repos (Llama among them) still require you to have accepted the licence on your HF account.
+An entry is a `ModelInfo`. Copy the nearest existing one and correct it against the model's
+`config.json`. What matters:
 
-**This is a self-hosted capability.** The managed service rejects `model_policy = "allow"`
-with a 403 - its runs are billed against curated hardware profiles. Your plane, your GPUs,
-your call.
+| Field                                                               | Why                                                                                      |
+| ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `params_b`                                                          | The authoritative size. Every VRAM, disk, and cost term reads it. Must be > 0.           |
+| `vocab_size`                                                        | Drives the logits term, which dominates SFT peak memory on a large vocabulary.           |
+| `num_layers`, `hidden_size`, `num_key_value_heads`, `head_dim`      | The KV-cache geometry. Wrong here means a run that OOMs on the card it was sold.         |
+| `num_attention_layers`, `num_linear_attention_layers`, `linear_*`   | Hybrid/linear-attention geometry, if the model has any.                                  |
+| `algos`                                                             | Which of SFT/GRPO/OPD you are vouching for.                                              |
+| `min_vram_gb`, `min_disk_gb`, `grpo_min_vram_gb`, `sft_min_vram_gb` | Allocation floors. The generic estimate is a starting point, not a substitute.           |
+| `thinking`                                                          | `none`, `always`, or `hybrid` - whether the chat template opens a `<think>` block.       |
+| `serving`                                                           | Serving capacity, if you intend to serve the adapter. Omit to train only.                |
+| `active_params_b`                                                   | MoE only: the per-token active count, so FLOPs terms do not bill the full parameter set. |
+
+`test_every_catalog_entry_sets_params_b` enforces the `params_b > 0` floor, and
+`tests/test_catalog_consistency.py` checks the rest of the invariants - run it after adding
+an entry.
+
+This is more work than a config flag, and it produces a better-sized run. Flash used to have
+a `model_policy = "allow"` flag that took any HuggingFace id and synthesized a `ModelInfo`
+from a parameter-count lookup. It filled in four of the ~20 fields above; the KV geometry
+stayed zeroed and the vocabulary sat at a default, and those zeros went into the same VRAM
+equations a curated entry feeds, wearing the same type. Runs were sized against numbers
+nobody had checked. Writing the entry means the numbers are real.
+
+Gated repos (Llama among them) still require you to have accepted the licence on your HF
+account, and private repos need `HF_TOKEN` to have read access.
 
 > **RunPod endpoint concurrency is not capped by Flash**, on a self-hosted plane or a
-> managed one. The slot store and the in-process semaphore behind it are both claimed from
-> a code path the live deploy no longer uses, so neither enforces the intended 58-endpoint
-> ceiling; `flash/providers/runpod/train/endpoints.py` documents this at the constant. If
+> managed one. Flash used to carry a slot store intended to hold the account to a
+> 58-endpoint ceiling, but it was claimed from a code path the live deploy replaced and so
+> never enforced anything; it has been removed rather than left to imply a guarantee. If
 > you expect many concurrent runs, cap them upstream of Flash or raise the worker quota on
 > your RunPod account - otherwise a large enough burst hits RunPod's account limit and the
 > excess deploys fail there.

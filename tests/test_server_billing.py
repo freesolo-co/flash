@@ -276,14 +276,9 @@ def api(tmp_path, monkeypatch):
     import flash.server.app as app_mod
 
     importlib.reload(app_mod)
-    # The Lambda key above (required by the startup preflight) makes configured_providers()
-    # treat it as live, so startup recover_runs() would dispatch real sweep_orphans() list calls.
-    # And the dummy FREESOLO_INTERNAL_KEY enables the best-effort backend reporting path: every
-    # /v1/runs submit -> _report_status() -> run_registry._post() would urllib-POST the real backend
-    # (or wait out its 10s timeout). These billing tests assert on the API response, not on reporting,
-    # so stub both to keep startup + submit hermetic (CPU-only, no network).
+    # configured provider keys would trigger orphan sweeps and status reporting. stub both because
+    # these billing tests assert only on the API response and must remain network-free.
     import flash.providers as providers_mod
-    import flash.providers.runpod.train.endpoints as rp_endpoints
     import flash.server.projects as projects_mod
     import flash.server.run_registry as run_registry
 
@@ -294,11 +289,6 @@ def api(tmp_path, monkeypatch):
         lambda *, project_id, **_kwargs: project_id,
     )
     monkeypatch.setattr(run_registry, "_post", lambda *a, **k: False, raising=False)
-    # FREESOLO_INTERNAL_KEY also makes create_app() startup run the RunPod slot-store reconcile
-    # (reconcile_endpoint_slots() -> runpod.slots.reconcile() urllib POST). No-op it at the entry.
-    monkeypatch.setattr(
-        rp_endpoints, "reconcile_endpoint_slots", lambda *a, **k: None, raising=False
-    )
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
     monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
@@ -529,13 +519,8 @@ def test_billable_dry_run_without_an_org_is_rejected_like_a_real_submit(api, mon
 
 
 def test_unsupported_spec_reports_itself_rather_than_insufficient_balance(api, monkeypatch):
-    # a spec that cannot launch at ANY balance must say so: 402 would send the user to top up over a
-    # defect topping up cannot fix. submit_job runs the same gates, but only after this point, so
-    # with the precheck ahead of them the payment error won the race and hid the real cause.
-    #
-    # the example is image-bearing OPD on a multi-turn environment. it used to be gpu.count > 1,
-    # which is now legal on every provider -- the ORDERING is what this test is about, so it needs
-    # any spec that is still statically rejectable, not that particular one.
+    # static launch validation must precede billing. otherwise an unsupported spec reports 402 and
+    # sends the user to top up for a failure money cannot fix.
     import flash.server.billing as billing_mod
 
     def _block(**k):
@@ -782,13 +767,10 @@ def test_a_profile_that_cannot_be_launched_releases_its_claim(api, monkeypatch):
 
 
 def test_a_profile_that_failed_after_persisting_its_run_keeps_its_claim(api, monkeypatch, tmp_path):
-    """The other half: a launch that already wrote a run must NOT have its claim deleted.
+    """Keep the claim when launch already persisted its queued run.
 
-    ``submit_job`` persists the queued status before the steps that can still raise (reporting it,
-    and starting the background thread). Dropping the claim after that point is the worse of the
-    two wedges: ownership answers 404 for the key that launched it, while later submitters read a
-    live queued record under the deterministic id and wait forever, with no reclaim path -- the
-    spent-takeover route only fires on a run that reached a terminal state.
+    Deleting it makes the owner read 404 while later submitters wait on the live deterministic id,
+    which has no terminal-state takeover path.
     """
     import os
 
@@ -932,12 +914,8 @@ def test_route_blames_the_adapter_only_for_tagged_failures(api, monkeypatch):
 
 
 def test_route_does_not_blame_the_adapter_for_unrelated_failures(api, monkeypatch):
-    # the regression this guards: gpu sizing, budget, and environment resolution also run inside
-    # prepare_job, for every submit. those failures must reach the user as themselves instead of
-    # sending them to re-check an adapter that is fine.
-    #
-    # the spec MUST set train.init_from_adapter: the old bug only rewrote failures when that field
-    # was populated, so a submit without it cannot distinguish the fix from the bug.
+    # prepare_job also performs gpu, budget, and environment checks. with init_from_adapter set,
+    # unrelated failures must retain their own attribution.
     import flash.server.app as app_mod
 
     def _prepare(*args, **kwargs):
