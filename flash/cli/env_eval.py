@@ -494,14 +494,20 @@ def _require_accessible_project(project_id: object) -> str:
     except (TypeError, ValueError) as exc:
         raise ClientError(str(exc)) from exc
 
-    _api_url, api_key = load_credentials()
+    api_url, api_key = load_credentials()
     if not api_key:
         raise ClientError(
             "not logged in — run `flash login` with your freesolo API key (or set FREESOLO_API_KEY)"
         )
-    # eval reports upload to the hosted freesolo api even when generations use a self-hosted plane,
-    # so this preflight deliberately validates against the same hosted destination as upload_eval_run.
-    return resolve_project_id(project_id, api_key)
+    # ``api_url`` is passed deliberately, so a self-hosted plane gets the shape-only check rather
+    # than an ownership lookup against api.freesolo.co. The stored key on such a plane IS
+    # FREESOLO_INTERNAL_KEY, which controls the plane, and it must not travel to a service the
+    # operator does not run (SELF_HOSTING.md; the same boundary `_verifies_against_freesolo` draws
+    # for `flash login`). That leaves a known gap -- `upload_eval_run` posts to the hosted API, so a
+    # self-hosted `--project` run can still fail at upload after the suite is bought -- but closing
+    # it by resolving against the hosted backend would trade a late failure for a leaked
+    # plane-root credential, which is the worse outcome.
+    return resolve_project_id(project_id, api_key, api_url)
 
 
 def _upload_report(

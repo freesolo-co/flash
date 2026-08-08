@@ -593,28 +593,27 @@ def test_advantage_clip_is_no_longer_a_config_key() -> None:
         spec_from_dict(raw)
 
 
-def test_jobspec_drops_removed_train_keys_from_persisted_records() -> None:
+def test_jobspec_drops_advantage_clip_from_persisted_records() -> None:
+    """A run provisioned before #968 still parses; recovery would otherwise fail it and kill its worker."""
     original = _job_from_dict({})
     persisted = original.to_internal_dict()
-    persisted["train"].update(
-        {
-            "eval_every_steps": 10,
-            "eval_examples": 32,
-            "seeds": [0, 1],
-            "max_length": 2048,
-            "max_tokens": 512,
-            "steps": 100,
-            "opd_entropy_floor": 1.0,
-            "opd_entropy_floor_coef": 0.1,
-            "opd_eos_loss_coef": 0.2,
-            "checkpoint_landmarks": [25, 100],
-            "advantage_clip": 1.5,
-        }
-    )
+    persisted["train"]["advantage_clip"] = 1.5
 
     restored = JobSpec.from_dict(persisted)
 
+    # dropped, not resurrected: the key is gone from the schema and never reaches a worker.
     assert restored.train == original.train
+    assert not hasattr(restored.train, "advantage_clip")
+
+
+def test_jobspec_still_rejects_train_keys_that_were_never_tolerated() -> None:
+    """The drop set is one key, not an amnesty on every removed field.
+
+    `seeds` has its own rejection contract (test_from_dict_rejects_removed_legacy_train_seeds,
+    #536), so widening the drop set speculatively would silently overturn it.
+    """
+    with pytest.raises(ValueError, match=r"train has unknown key\(s\): seeds"):
+        JobSpec.from_dict({"train": {"seeds": [0, 1]}})
 
 
 def test_environment_pip_is_platform_managed() -> None:

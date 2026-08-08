@@ -284,25 +284,20 @@ class EnvironmentSpec:
     resolved_sha: str = ""
 
 
-# drop-on-parse only for internal persisted JobSpec records. these were real TrainSpec fields, so
-# historical status.spec and effective_preparation.worker_spec payloads can still carry them even
-# though stored run records are never rewritten. the public config schema remains derived from the
-# current TrainSpec and rejects every key here.
-REMOVED_PERSISTED_TRAIN_KEYS = frozenset(
-    {
-        "eval_every_steps",  # removed with the original in-training evaluation loop
-        "eval_examples",  # removed with the original in-training evaluation loop
-        "seeds",  # removed when one fixed seed replaced per-run multi-seed training
-        "max_length",  # removed when the context limit became max_context_tokens
-        "max_tokens",  # removed when the completion limit became max_completion_tokens
-        "steps",  # removed when epochs became the duration input
-        "opd_entropy_floor",  # removed with the student-side entropy-floor objective
-        "opd_entropy_floor_coef",  # removed with the student-side entropy-floor objective
-        "opd_eos_loss_coef",  # removed with the destabilizing terminal-eos objective
-        "checkpoint_landmarks",  # removed when exact required saves became save_at_steps
-        "advantage_clip",  # removed because the worker parsed but never applied it
-    }
-)
+# dropped on the INTERNAL persisted-record parse only, never by the public config schema.
+#
+# #968 deleted `advantage_clip` from TrainSpec, but runs provisioned before it serialized their spec
+# with asdict() into status.spec and effective_preparation.worker_spec, and stored run records are
+# never rewritten. from_dict is strict, so those records stopped parsing -- and attach_run treats an
+# unparseable spec as unrecoverable: it fails the run and tears the worker down. Dropping the key
+# costs nothing because the worker parsed but never applied it.
+#
+# Deliberately ONLY advantage_clip. Other since-removed train fields are not listed on the theory
+# that they might also appear: `seeds` in particular is REQUIRED to keep raising
+# (test_from_dict_rejects_removed_legacy_train_seeds, #536), so tolerating keys speculatively would
+# silently overturn a decision another change made on purpose. Add a key here when a real persisted
+# record is shown to carry it, not before.
+REMOVED_PERSISTED_TRAIN_KEYS = frozenset({"advantage_clip"})
 
 
 @dataclass(frozen=True)
