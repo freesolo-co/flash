@@ -22,15 +22,31 @@ BASE_DOCKERFILE = REPO_ROOT / "Dockerfile"
 PUBLISH_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "publish-image.yml"
 ENTRYPOINT = REPO_ROOT / "deploy" / "infisical" / "entrypoint.sh"
 
-# Every file that may install software from the network. DISCOVERED, not enumerated: a hand-kept
-# list silently stops covering the next Dockerfile someone adds, and a guard that quietly narrows
-# its own scope reports the same green as one that found nothing. `docker/Dockerfile.kernelcache*`
-# were both missed by an enumerated list that claimed to be repo-wide.
-INSTALLER_FILES = (
-    *sorted(REPO_ROOT.glob("Dockerfile*")),
-    *sorted(REPO_ROOT.glob("docker/Dockerfile*")),
-    *sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml")),
-)
+
+def _installer_files() -> tuple[Path, ...]:
+    """Every file that may install software from the network.
+
+    DISCOVERED, not enumerated: a hand-kept list silently stops covering the next Dockerfile
+    someone adds, and a guard that quietly narrows its own scope reports the same green as one
+    that found nothing. `docker/Dockerfile.kernelcache*` were both missed by an enumerated list
+    that claimed to be repo-wide.
+
+    A function rather than a module constant so the coverage tests can re-run the real discovery
+    against a planted file. Asserting instead on a copy of these patterns would test the copy.
+    """
+    workflows = REPO_ROOT / ".github" / "workflows"
+    return (
+        *sorted(REPO_ROOT.glob("Dockerfile*")),
+        *sorted(REPO_ROOT.glob("docker/Dockerfile*")),
+        # Both extensions: GitHub Actions accepts `.yaml` too, and a workflow renamed to it would
+        # drop out of a `*.yml`-only scan silently.
+        *sorted(p for ext in ("*.yml", "*.yaml") for p in workflows.glob(ext)),
+    )
+
+
+# Resolved once for parametrization; the tests below call `_installer_files()` directly when they
+# need discovery re-run.
+INSTALLER_FILES = _installer_files()
 
 # `curl … | bash`, `wget … | sh`, and friends: a fetch whose output is piped into a shell.
 # Applied to joined logical lines, so a continued command is one string here.
@@ -75,6 +91,27 @@ _CONTINUERS = ("\\", "|", "&&", "||")
 _LEADING_CONTINUERS = ("|", "&&", "||", "&")
 
 
+def _strip_comment(line: str) -> str:
+    """Drop a trailing `#` comment, but not a `#` that is part of the command itself.
+
+    A URL fragment (`curl 'https://host/install.sh#v1' | bash`) puts a hash INSIDE a shell word,
+    where it is data rather than a comment. Splitting on the first `#` truncated the line before
+    the `| bash` and the guard went green on a live piped installer. A comment starts at an
+    unquoted `#`; in shell it must also begin a word, so a bare `#` mid-word (as in a URL that
+    was never quoted) does not start one either.
+    """
+    quote = ""
+    for i, ch in enumerate(line):
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#" and (i == 0 or line[i - 1].isspace()):
+            return line[:i]
+    return line
+
+
 def _logical_lines(text: str) -> list[str]:
     """Strip `#` comments, then join continued commands into single logical lines.
 
@@ -92,7 +129,7 @@ def _logical_lines(text: str) -> list[str]:
     joined: list[str] = []
     pending = ""
     for raw in text.splitlines():
-        code = raw.split("#", 1)[0].rstrip()
+        code = _strip_comment(raw).rstrip()
         # A comment BETWEEN a continuation and the rest of the command does not end it: docker
         # removes comment lines before joining, so `curl … \` / `# note` / `| bash` is one RUN.
         # Treating the stripped-empty line as a terminator would drop the join.
@@ -170,6 +207,11 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
         # The shell need not be the FIRST stage after the fetch.
         pytest.param(
             "RUN curl -sSL https://x.example/i.sh | tee /tmp/i.sh | bash\n", id="multi-stage-pipe"
+        ),
+        # A `#` inside the URL is a fragment, not a comment -- splitting on it truncated the
+        # line before the `| bash`.
+        pytest.param(
+            "RUN curl 'https://x.example/install.sh#v1' | bash\n", id="hash-in-a-quoted-url"
         ),
     ],
 )
@@ -269,6 +311,30 @@ def test_the_installer_scan_covers_every_dockerfile_in_the_repo():
     scanned = {p.resolve() for p in INSTALLER_FILES}
     missed = on_disk - scanned
     assert not missed, f"Dockerfiles not covered by the installer scan: {sorted(missed)}"
+
+
+def test_the_installer_scan_covers_workflows_under_both_yaml_extensions():
+    """GitHub Actions runs `.yaml` as readily as `.yml`, so the scan must accept both.
+
+    There is no `.yaml` workflow today, which is exactly why this is worth pinning: a scan keyed
+    to one extension goes green forever, and the day a workflow is added or renamed under the
+    other one it silently leaves coverage. So plant one and re-run the REAL discovery. An earlier
+    version of this test rebuilt the glob patterns inline and asserted against that copy, which
+    passed unchanged when the production glob was narrowed back to `*.yml` -- it was testing its
+    own literal, not the scan.
+    """
+    workflows = REPO_ROOT / ".github" / "workflows"
+    on_disk = {p.resolve() for p in workflows.iterdir() if p.suffix in (".yml", ".yaml")}
+    assert not on_disk - {p.resolve() for p in INSTALLER_FILES}, "a workflow is outside the scan"
+
+    planted = workflows / "zz-extension-probe.yaml"
+    planted.write_text("name: probe\non: workflow_dispatch\njobs: {}\n")
+    try:
+        assert planted.resolve() in {p.resolve() for p in _installer_files()}, (
+            "a .yaml workflow would not be discovered"
+        )
+    finally:
+        planted.unlink()
 
 
 def test_the_infisical_cli_is_pinned_and_checksum_verified():
