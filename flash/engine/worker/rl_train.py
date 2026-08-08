@@ -618,8 +618,8 @@ def resolve_gpu_mem_util(
     - MULTI-GPU (``n_gpus > 1``): the rollout runs tensor-parallel, so vLLM's weight copy is sharded
       ACROSS cards while ``colocate_kv_util`` sizes one whole copy against one card. Handing it a
       single-card number would over-reserve per rank on exactly the shapes that are already tight.
-    - an UNCATALOGED / pinned-revision model with no resolvable parameter count: the weight term is
-      the dominant one, so a guessed size is not worth acting on.
+    - a PINNED-REVISION model with no resolvable parameter count: the weight term is the dominant
+      one, so a guessed size is not worth acting on.
     """
     if n_gpus > 1 or not (gpu_type or "").strip():
         return _DEFAULT_GPU_MEM_UTIL
@@ -639,10 +639,10 @@ def resolve_gpu_mem_util(
         # it. the parameter count still comes from the pinned config.
         info = None if revision else catalog_info
         # the ONE way the worker, the preflight and the cost estimator agree on a model's size:
-        # curated catalog params_b, else the real HF parameter count for an open-policy model.
+        # curated catalog params_b, else the pinned commit's real HF parameter count.
         # the catalog is consulted FIRST and answers locally, so the common path adds no network
-        # call to launch; resolve_params_b's HF lookup is reached only for an uncataloged or
-        # pinned-revision model, where the config for this same model was already fetched upstream
+        # call to launch; resolve_params_b's HF lookup is reached only for a pinned revision, where
+        # the config for this same model was already fetched upstream
         # (model_max_position_embeddings) and is warm in the hub cache.
         params_b = float(
             (getattr(catalog_info, "params_b", 0.0) or 0.0)

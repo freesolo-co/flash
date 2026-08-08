@@ -1,13 +1,9 @@
-"""Cost estimator: model-size facts. No network on the managed path.
+"""Cost estimator: model-size facts. Catalog-only, and never over the network.
 
-A curated model is sized from the catalog's ``params_b`` stat, read directly (no parsing of the
-``params`` display string) and with no network call. For the MoE the per-token FLOPs/step-time term
-reads the smaller ``active_params_b`` while memory/size terms (VRAM, disk, download) keep total
-``params_b``.
-
-An UNCATALOGED model reaches the estimator only under ``model_policy="allow"`` (self-hosted planes),
-and is sized from HF safetensors metadata via the same ``resolve_params_b`` the VRAM path uses, so
-cost and sizing cannot disagree. Unsizeable by both = rejected; the quote never guesses.
+Every trainable model is curated, so a quote is sized from the catalog's ``params_b`` stat, read
+directly (no parsing of the ``params`` display string). For the MoE the per-token FLOPs/step-time
+term reads the smaller ``active_params_b`` while memory/size terms (VRAM, disk, download) keep
+total ``params_b``. An uncataloged id is rejected rather than guessed at.
 """
 
 from __future__ import annotations
@@ -53,9 +49,14 @@ def test_catalog_dense_active_params_ignore_revision_without_hf_lookup(monkeypat
         ("Qwen/Qwen3.6-35B-A3B", True),
     ],
 )
-def test_catalog_moe_classification_ignores_revision_without_hf_lookup(
-    monkeypatch, model_id, expected
-):
+def test_catalog_moe_classification_never_queries_huggingface(monkeypatch, model_id, expected):
+    """MoE routing is curated architecture metadata: a catalog read, never a hub lookup.
+
+    This used to also assert that passing a revision changed nothing. `_is_moe` no longer TAKES a
+    revision -- with uncataloged models rejected, the branch that compared active against total
+    params over HF is unreachable, so "ignores the revision" is now enforced by the signature rather
+    than by a test. What still needs guarding is that classification stays offline.
+    """
     import flash.engine.vram as vram
     from flash.cost.analytical import _is_moe
 
@@ -65,7 +66,7 @@ def test_catalog_moe_classification_ignores_revision_without_hf_lookup(
     monkeypatch.setattr(vram, "fetch_hf_params_b", _boom, raising=False)
     monkeypatch.setattr(vram, "_validated_revision_geometry", _boom)
 
-    assert _is_moe(model_id, "b" * 40) is expected
+    assert _is_moe(model_id) is expected
 
 
 def test_active_params_uses_the_active_count_for_the_moe():
@@ -95,73 +96,20 @@ def test_download_weight_gb_is_total_params_bf16():
     assert download_weight_gb(nine) == pytest.approx(total_params_b(nine) * 2.0)
 
 
-def test_an_unsizeable_model_is_rejected():
-    # Fail closed: uncataloged AND unsizeable by HF (the autouse _offline fixture returns None)
-    # raises rather than pricing an unknown model as free.
-    with pytest.raises(ValueError, match="could not size model"):
+def test_an_uncataloged_model_is_rejected(monkeypatch):
+    # Fail closed: an id with no catalog entry raises rather than being priced as free. Even with
+    # HF reachable it must not be sized over the network -- a quote is a catalog read, full stop.
+    import flash.engine.vram as vram
+
+    monkeypatch.setattr(vram, "fetch_hf_params_b", lambda *_a, **_k: 8.03, raising=False)
+    with pytest.raises(ValueError, match="cost estimation supports catalog models only"):
         total_params_b("nobody/never-heard-of-it")
-    with pytest.raises(ValueError, match="could not size model"):
+    with pytest.raises(ValueError, match="cost estimation supports catalog models only"):
         active_params_b("nobody/never-heard-of-it")
 
 
-def test_an_open_policy_model_is_priced_from_huggingface(monkeypatch):
-    """An authorized open-model run must be PRICEABLE, not just parseable.
-
-    Regression: `model_policy="allow"` parsed and authorized, then died in prepare_job ->
-    estimate_for_spec -> total_params_b, which was catalog-only. The open-model path was
-    reachable and unusable -- a quoting error, not a policy one.
-    """
-    import flash.engine.vram as vram
-
-    monkeypatch.setattr(vram, "fetch_hf_params_b", lambda _m, **_k: 8.03, raising=False)
-    assert total_params_b("meta-llama/Llama-3.1-8B") == pytest.approx(8.03)
-    # No curated MoE routing data for an unlisted model, so it prices as dense (active == total).
-    assert active_params_b("meta-llama/Llama-3.1-8B") == pytest.approx(8.03)
-    assert download_weight_gb("meta-llama/Llama-3.1-8B") == pytest.approx(16.06)
-
-
-def test_an_open_model_is_sized_over_the_network_once(monkeypatch):
-    """A quote asks for the model size ~30 times (every FLOPs/memory/disk/save term, and _is_moe
-    twice per call). Unmemoized that is ~30 sequential HF round trips per submit, with the estimate
-    hostage to hub latency. Weights at a given id+revision are immutable, so one lookup is enough."""
-    import flash.engine.vram as vram
-
-    calls: list[str] = []
-
-    def _probe(model_id, **_kwargs):
-        calls.append(model_id)
-        return 8.03
-
-    monkeypatch.setattr(vram, "fetch_hf_params_b", _probe, raising=False)
-    for _ in range(12):
-        total_params_b("meta-llama/Llama-3.1-8B")
-        active_params_b("meta-llama/Llama-3.1-8B")
-        download_weight_gb("meta-llama/Llama-3.1-8B")
-    assert len(calls) == 1
-
-
-def test_a_failed_lookup_is_retried_not_remembered(monkeypatch):
-    """A miss is a transient hub error, a rate limit, or an HF_TOKEN without access yet -- not a
-    fact about the model. Memoizing it made the first blip permanent: on a long-lived self-hosted
-    plane every later submit for that model kept failing until the operator restarted the plane."""
-    import flash.engine.vram as vram
-
-    healthy = False
-
-    def _flaky(_model_id, **_kwargs):
-        return 8.03 if healthy else None
-
-    monkeypatch.setattr(vram, "fetch_hf_params_b", _flaky, raising=False)
-    with pytest.raises(ValueError, match="could not size model"):
-        total_params_b("meta-llama/Llama-3.1-8B")
-
-    healthy = True
-    assert total_params_b("meta-llama/Llama-3.1-8B") == pytest.approx(8.03)
-
-
 def test_a_catalog_model_is_never_sized_over_the_network(monkeypatch):
-    """The curated entry answers first: adding the HF fallback must not put a network call on the
-    managed path, where every model is cataloged."""
+    """Pricing reads the curated entry and nothing else: no quote may depend on hub reachability."""
     import flash.engine.vram as vram
 
     def _boom(*_args, **_kwargs):
@@ -169,3 +117,63 @@ def test_a_catalog_model_is_never_sized_over_the_network(monkeypatch):
 
     monkeypatch.setattr(vram, "fetch_hf_params_b", _boom, raising=False)
     assert total_params_b("Qwen/Qwen3.5-9B") == pytest.approx(MODELS["Qwen/Qwen3.5-9B"].params_b)
+
+
+def _stub_geometry(monkeypatch, model_id: str, calls: list):
+    """Answer the pinned-geometry fetch with the catalog's own numbers, counting each call."""
+    import flash.engine.vram as vram
+
+    info = MODELS[model_id]
+
+    def _counting(_mid, revision="", strict=False):
+        calls.append(revision)
+        return (info.params_b, info.vocab_size, info.hidden_size, info.num_layers)
+
+    monkeypatch.setattr(vram, "fetch_hf_model_geometry", _counting)
+
+
+def test_a_pinned_revision_is_fetched_once_per_quote(monkeypatch):
+    """One quote sizes a pinned model several times; only the FIRST may reach the hub.
+
+    Setup download and required-save serialization both ask total_params_b with the pin, so an
+    uncached lookup turns one quote into repeated HfApi.model_info round trips -- and a transient
+    failure on a later call rejects a run the earlier ones already validated (codex[bot]).
+    """
+    from flash.cost import facts
+
+    calls: list = []
+    _stub_geometry(monkeypatch, "Qwen/Qwen3.5-9B", calls)
+    monkeypatch.setattr(facts, "_PINNED_SIZE_MEMO", {})
+
+    rev = "a" * 40
+    first = facts.total_params_b("Qwen/Qwen3.5-9B", rev)
+    assert facts.total_params_b("Qwen/Qwen3.5-9B", rev) == first
+    assert facts.download_weight_gb("Qwen/Qwen3.5-9B", rev) == pytest.approx(first * 2.0)
+    assert len(calls) == 1, f"pinned sizing hit the hub {len(calls)} times in one quote"
+
+
+def test_a_failed_pinned_lookup_is_not_cached(monkeypatch):
+    """A hub blip must not become permanent for the life of the process.
+
+    A failure is a rate limit or an ungranted token, not a fact about the model -- caching it would
+    keep rejecting a valid pin until the plane restarted, indistinguishable from a real defect.
+    """
+    import flash.engine.vram as vram
+    from flash.cost import facts
+
+    monkeypatch.setattr(facts, "_PINNED_SIZE_MEMO", {})
+    rev = "b" * 40
+
+    def _blip(*_a, **_k):
+        raise RuntimeError("transient hub error")
+
+    monkeypatch.setattr(vram, "fetch_hf_model_geometry", _blip)
+    with pytest.raises(RuntimeError):
+        facts.total_params_b("Qwen/Qwen3.5-9B", rev)
+    assert facts._PINNED_SIZE_MEMO == {}
+
+    calls: list = []
+    _stub_geometry(monkeypatch, "Qwen/Qwen3.5-9B", calls)
+    assert facts.total_params_b("Qwen/Qwen3.5-9B", rev) == pytest.approx(
+        MODELS["Qwen/Qwen3.5-9B"].params_b
+    )

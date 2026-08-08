@@ -5520,9 +5520,8 @@ def test_unstructured_validator_does_not_resolve_model_metadata(monkeypatch):
 
     result = validate_opd_structured_outputs(
         None,
-        model_id="open-org/cached-model",
+        model_id="Qwen/Qwen3.5-4B",
         model_revision="d" * 40,
-        model_policy="allow",
     )
 
     assert result.constraint is None
@@ -5811,7 +5810,6 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
             "run_id": "r-alloc",
             "algorithm": "opd",
             "model": "Qwen/Qwen3.5-4B",
-            "model_policy": "catalog",
             "environment": {"repo": "x/y", "name": "e"},
             "train": {"hf_repo": "a/b", "teacher_model": "", "max_examples": 1},
             "gpu": {"type": "B200", "count": 1, "provider": "runpod"},
@@ -5840,7 +5838,6 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
             "run_id": "r-sft",
             "algorithm": "sft",
             "model": "Qwen/Qwen3.5-4B",
-            "model_policy": "catalog",
             "environment": {"repo": "x/y", "name": "e"},
             "train": {"hf_repo": "a/b", "teacher_model": "", "max_examples": 1},
             "gpu": {"type": "B200", "count": 1, "provider": "runpod"},
@@ -6084,7 +6081,6 @@ def test_opd_missing_managed_teacher_broker_fails_before_the_gpu_probe(monkeypat
                 train=train,
                 model="Qwen/Qwen3.5-4B",
                 model_revision="",
-                model_policy="catalog",
                 gpu=SimpleNamespace(type=None),
             ),
             heartbeat=lambda *args, **kwargs: None,

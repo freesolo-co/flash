@@ -2233,15 +2233,11 @@ def run_opd_train(spec=None) -> None:
     model_id = spec.model if spec else RECIPE.hf_model_id
     model_revision = getattr(spec, "model_revision", "") if spec else ""
     from flash.opd_validation import validate_opd_structured_outputs
-    from flash.spec import gpu_count_of
 
     structured_validation = validate_opd_structured_outputs(
         knobs.structured_outputs,
         model_id=model_id,
         model_revision=model_revision,
-        model_policy=getattr(spec, "model_policy", "catalog") if spec else "catalog",
-        gpu=spec.gpu.type if spec else None,
-        gpu_count=gpu_count_of(spec) if spec else 1,
     )
     structured_outputs = structured_validation.constraint
     model_vocab_size = structured_validation.model_vocab_size

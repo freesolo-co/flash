@@ -779,7 +779,7 @@ def test_cmd_train_cost_rejects_context_above_serving_cap(tmp_path):
 
 
 def test_cmd_train_cost_rejects_unlisted_model(tmp_path):
-    """Cost is catalog-only: ``--cost`` on a non-catalog model errors cleanly (no open-model
+    """Cost is catalog-only: ``--cost`` on a non-catalog model errors cleanly (no
     sizing)."""
     cfg = tmp_path / "run.toml"
     cfg.write_text(
