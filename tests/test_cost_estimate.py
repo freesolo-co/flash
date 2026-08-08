@@ -572,6 +572,7 @@ def test_offline_estimate_applies_the_pinned_revision_geometry_cap(monkeypatch):
     from flash.cost.analytical import _offline_gpu_shape
 
     monkeypatch.setattr("flash.cost.analytical.required_vram_gb", lambda *a, **k: 700)
+    monkeypatch.setattr("flash.cost.analytical.total_params_b", lambda *a, **k: 4.7)
     config = RunConfig(
         "Qwen/Qwen3.5-4B",
         "sft",
@@ -582,6 +583,37 @@ def test_offline_estimate_applies_the_pinned_revision_geometry_cap(monkeypatch):
 
     with pytest.raises(ValueError, match="across up to 4 cards"):
         _offline_gpu_shape(config)
+
+
+def test_offline_open_model_probe_uses_the_pinned_revision(monkeypatch):
+    import flash.engine.vram as vram
+    from flash.cost.analytical import _offline_gpu_shape
+    from flash.cost.facts import _SIZE_MEMO
+
+    model = "acme/pinned-only-4b"
+    expected_revision = "f" * 40
+    seen_revisions = []
+
+    def _pinned_only(model_id, revision="", *, strict=False):
+        assert model_id == model
+        assert strict is True
+        seen_revisions.append(revision)
+        return 4.0 if revision == expected_revision else None
+
+    monkeypatch.setattr(vram, "fetch_hf_params_b", _pinned_only)
+    _SIZE_MEMO.pop((model, expected_revision), None)
+
+    gpu, count, need, provider, rate = _offline_gpu_shape(
+        RunConfig(model, "sft", 1, model_revision=expected_revision)
+    )
+
+    assert gpu
+    assert count >= 1
+    assert need > 0
+    assert provider
+    assert rate > 0
+    assert seen_revisions
+    assert set(seen_revisions) == {expected_revision}
 
 
 def test_allocator_selected_gpu_count_renders_and_applies_speedup():

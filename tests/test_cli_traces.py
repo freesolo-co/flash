@@ -295,7 +295,11 @@ def test_env_setup_does_not_fallback_when_project_listing_fails(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(env_setup, "_setup_interactive", lambda args: True)
-    monkeypatch.setattr("flash.client.config.load_credentials", lambda: ("https://flash", "fs-key"))
+    # a HOSTED url, because listing is the hosted path: against a self-hosted plane there is no
+    # project directory to enumerate, so setup refuses before it would ever call list_projects.
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("https://flash.freesolo.co", "fs-key")
+    )
     monkeypatch.setattr(
         "flash.client.list_projects",
         lambda api_key: (_ for _ in ()).throw(ClientError("project service offline")),
