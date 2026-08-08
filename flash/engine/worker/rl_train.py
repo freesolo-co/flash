@@ -108,6 +108,7 @@ from flash.engine.worker.opd_gkd import generation_eos_from_cached_config
 from flash.engine.worker.packing import model_is_gdn_hybrid
 from flash.engine.worker.perf import gpu_diagnostics, wait_for_gpu
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
+from flash.engine.worker.score_batcher import ScoreBatcher
 from flash.engine.worker.sft_train import (
     _build_verl_child_env,
     _cached_model_path,
@@ -1270,44 +1271,16 @@ def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_
 # --------------------------------------------------------------------------------------------
 # reward rpc bridge: verl subprocess -> flash live env.
 # --------------------------------------------------------------------------------------------
-class _ScoreWaiter:
-    """one request waiting on a batched scoring call."""
+class _ScoreBatcher(ScoreBatcher):
+    """Coalesce concurrent verl requests into one ordered env scoring call.
 
-    def __init__(self, request, enqueued_at: float, *, label: str) -> None:
-        self.request = request
-        self.enqueued_at = enqueued_at
-        self.label = label
-        self.done = threading.Event()
-        self.result = None
-        self.error: Exception | None = None
-        self._lock = threading.Lock()
+    One thread means the env still sees exactly one top-level scoring call at a time; concurrency
+    lives inside the env's own batched scorer. Errors propagate as raised: an env's scoring failure
+    is the caller's to classify, and the reward routes already translate it for the child.
 
-    def complete(self, *, result=None, error: Exception | None = None) -> None:
-        with self._lock:
-            if self.done.is_set():
-                return
-            self.result = result
-            self.error = error
-            self.done.set()
-
-    def wait(self):
-        # no deadline: the wait is the env's own scoring time plus however long the batch ahead of
-        # it takes, and the stall watchdog is what catches a genuinely wedged env.
-        self.done.wait()
-        if self.error is not None:
-            raise self.error
-        if self.result is None:
-            raise RuntimeError(f"{self.label} score waiter completed without a result")
-        return self.result
-
-
-class _ScoreBatcher:
-    """coalesce concurrent requests into one ordered env scoring call.
-
-    a single daemon thread takes whatever is pending once the oldest waiter's grace period expires,
-    scores it in one call, and scatters the results back in request order. one thread means the env
-    still sees exactly one top-level scoring call at a time; concurrency lives inside the env's own
-    batched scorer.
+    ``recheck_closed_after_wait`` stays off: an env batch assembled during the flush window costs
+    nothing external to finish, so scoring it lets the last requests of a run answer normally
+    instead of failing on a shutdown that arrived while they were queued.
     """
 
     def __init__(
@@ -1319,107 +1292,16 @@ class _ScoreBatcher:
         label: str,
         thread_name: str,
     ) -> None:
-        if max_batch_size <= 0:
-            raise ValueError(f"{label} score batch size must be positive")
-        if flush_wait_s <= 0:
-            raise ValueError(f"{label} score flush wait must be positive")
-        self._score_batch = score_batch
-        self.max_batch_size = int(max_batch_size)
-        self.flush_wait_s = float(flush_wait_s)
-        self.label = label
-        self.thread_name = thread_name
-        self._condition = threading.Condition()
-        self._pending: list[_ScoreWaiter] = []
-        self._in_flight: list[_ScoreWaiter] = []
-        self._closed = False
-        self._thread: threading.Thread | None = None
-
-    def _ensure_running(self) -> None:
-        """start the consumer thread lazily; idempotent and safe to race."""
-        with self._condition:
-            if self._closed:
-                raise RuntimeError(f"{self.label} score batcher shut down")
-            if self._thread is not None:
-                return
-            self._thread = threading.Thread(target=self._run, name=self.thread_name, daemon=True)
-            thread = self._thread
-        thread.start()
+        super().__init__(
+            score_batch,
+            max_batch_size=max_batch_size,
+            flush_wait_s=flush_wait_s,
+            label=f"{label} score batcher",
+            thread_name=thread_name,
+        )
 
     def score(self, request):
-        self._ensure_running()
-        with self._condition:
-            if self._closed:
-                raise RuntimeError(f"{self.label} score batcher shut down")
-            waiter = _ScoreWaiter(request, enqueued_at=time.monotonic(), label=self.label)
-            self._pending.append(waiter)
-            self._condition.notify_all()
-        return waiter.wait()
-
-    def _take_batch(self) -> list[_ScoreWaiter] | None:
-        with self._condition:
-            while not self._pending:
-                if self._closed:
-                    return None
-                self._condition.wait()
-            deadline = self._pending[0].enqueued_at + self.flush_wait_s
-            while len(self._pending) < self.max_batch_size and not self._closed:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                self._condition.wait(remaining)
-            batch = self._pending[: self.max_batch_size]
-            del self._pending[: len(batch)]
-            self._in_flight = batch
-            return batch
-
-    def _run(self) -> None:
-        try:
-            while True:
-                batch = self._take_batch()
-                if batch is None:
-                    return
-                try:
-                    results = self._score_batch([waiter.request for waiter in batch])
-                    # validate the full vector before completing any waiter. a strict zip checked while
-                    # scattering would resolve a prefix before discovering a length mismatch.
-                    scattered = list(zip(batch, results, strict=True))
-                    for waiter, result in scattered:
-                        waiter.complete(result=result)
-                except Exception as error:
-                    for waiter in batch:
-                        waiter.complete(error=error)
-                finally:
-                    with self._condition:
-                        self._in_flight = []
-                        self._condition.notify_all()
-        finally:
-            error = RuntimeError(f"{self.label} score batcher stopped")
-            with self._condition:
-                stranded = [*self._pending, *self._in_flight]
-                self._pending.clear()
-                self._in_flight = []
-                self._closed = True
-                self._condition.notify_all()
-            for waiter in stranded:
-                waiter.complete(error=error)
-
-    def close(self, timeout_s: float) -> None:
-        with self._condition:
-            self._closed = True
-            pending = list(self._pending)
-            self._pending.clear()
-            self._condition.notify_all()
-            thread = self._thread
-        error = RuntimeError(f"{self.label} score batcher shut down")
-        for waiter in pending:
-            waiter.complete(error=error)
-        if thread is not None:
-            thread.join(timeout=timeout_s)
-            if thread.is_alive():
-                with self._condition:
-                    in_flight = list(self._in_flight)
-                for waiter in in_flight:
-                    waiter.complete(error=error)
+        return self.submit(request)
 
 
 class MultiTurnBridge:

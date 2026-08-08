@@ -21,7 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.engine.worker import opd_train, rl_train
+from flash.engine.worker import opd_train, rl_train, score_batcher
 from flash.engine.worker.opd_plugin import (
     FlashTeacherBridgeError,
     _AllNoSignalBatch,
@@ -1344,7 +1344,9 @@ def test_text_teacher_batcher_never_takes_more_than_max_batch_size():
     # queue -- no threads, no timer -- so the bound is falsifiable rather than merely unreached.
     batcher = opd_train._TextTeacherBatcher(object(), max_batch_size=4, flush_wait_s=0.01)
     batcher._pending = [
-        opd_train._TextTeacherWaiter((f"prompt-{index}", "completion"), enqueued_at=0.0)
+        score_batcher._Waiter(
+            (f"prompt-{index}", "completion"), enqueued_at=0.0, label="test teacher"
+        )
         for index in range(10)
     ]
 
@@ -1353,8 +1355,8 @@ def test_text_teacher_batcher_never_takes_more_than_max_batch_size():
     assert batch is not None
     assert len(batch) == 4
     # the taken batch is removed from the queue, in order, so the remainder is the tail.
-    assert [waiter.item[0] for waiter in batch] == [f"prompt-{index}" for index in range(4)]
-    assert [waiter.item[0] for waiter in batcher._pending] == [
+    assert [waiter.request[0] for waiter in batch] == [f"prompt-{index}" for index in range(4)]
+    assert [waiter.request[0] for waiter in batcher._pending] == [
         f"prompt-{index}" for index in range(4, 10)
     ]
 
@@ -1688,6 +1690,68 @@ def test_text_teacher_batcher_shutdown_cannot_strand_pending_bridge_waiter(monke
     assert error.value.classification == "permanent"
     assert not teacher.called.is_set()
     assert bridge.teacher_error == 1
+
+
+def test_text_teacher_batcher_shutdown_raises_a_permanent_teacher_error():
+    """The shutdown error must be a permanent ``TeacherError``, not a bare ``RuntimeError``.
+
+    ``_score_sample`` catches ``TeacherError`` alone (opd_train.py) and re-raises only when
+    ``permanent`` is set. A plain RuntimeError escapes that handler entirely, so the classification
+    is right by accident while the sample-level transient path is skipped. The
+    strand test above cannot see this: it asserts the classification, which both error types produce.
+    """
+    from flash.engine.worker.teacher import TeacherError
+
+    batcher = _TextTeacherBatcher(object(), max_batch_size=4, flush_wait_s=0.01)
+    batcher.close(timeout_s=0.1)
+
+    with pytest.raises(TeacherError) as error:
+        batcher.score("prompt", "completion")
+
+    assert error.value.permanent
+
+
+def test_text_teacher_batcher_preserves_teacher_error_permanence_through_the_batch():
+    """A scorer failure must reach the waiter as a ``TeacherError`` with its permanence intact.
+
+    ``_score_sample`` treats a non-permanent TeacherError as a recoverable per-sample failure and
+    anything else as fatal, so a transient provider error that arrives re-wrapped as permanent (or as
+    a bare RuntimeError) aborts a run that should have dropped one sample and continued.
+    """
+    from flash.engine.worker.teacher import TeacherError
+
+    class FailingTeacher:
+        def __init__(self, error):
+            self.error = error
+
+        def score_many(self, items):
+            raise self.error
+
+    transient = _TextTeacherBatcher(
+        FailingTeacher(TeacherError("rate limited", permanent=False)),
+        max_batch_size=1,
+        flush_wait_s=0.01,
+    )
+    try:
+        with pytest.raises(TeacherError) as error:
+            transient.score("prompt", "completion")
+        assert not error.value.permanent
+        assert "rate limited" in str(error.value)
+    finally:
+        transient.close(timeout_s=0.1)
+
+    # a non-TeacherError from the scorer is normalized rather than leaked verbatim.
+    opaque = _TextTeacherBatcher(
+        FailingTeacher(ValueError("provider internals")),
+        max_batch_size=1,
+        flush_wait_s=0.01,
+    )
+    try:
+        with pytest.raises(RuntimeError) as raw:
+            opaque.score("prompt", "completion")
+        assert not isinstance(raw.value, TeacherError)
+    finally:
+        opaque.close(timeout_s=0.1)
 
 
 def test_transient_teacher_sample_returns_no_signal_while_following_peer_trains():
