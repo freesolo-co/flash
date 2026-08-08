@@ -119,6 +119,30 @@ def test_base_image_declares_the_entrypoint():
     assert "COPY deploy/infisical/entrypoint.sh" in text
 
 
+def test_publish_rebuilds_on_every_file_the_image_copies_in():
+    """A file baked into the image must also trigger the build that publishes it.
+
+    The path filter and the Dockerfile's COPY list are two statements of the same fact, kept in
+    step by hand. When they drift, a change to the copied file merges without rebuilding, and the
+    published tags keep serving the old copy until some unrelated watched file happens to change
+    -- so a security fix to the secrets wrapper would look shipped while every deployment still
+    ran the previous script. Deriving the requirement from the COPY lines keeps the next file
+    added to the image from inheriting the same gap silently.
+    """
+    copied = re.findall(r"^COPY\s+(?!--)(\S+)", BASE_DOCKERFILE.read_text(), re.MULTILINE)
+    # `COPY . .` already covers the whole tree; only specific paths need their own filter entry.
+    specific = [src for src in copied if src not in {".", "./"}]
+    assert specific, "expected the base image to COPY at least one specific path"
+
+    workflow = (REPO_ROOT / ".github" / "workflows" / "publish-image.yml").read_text()
+    paths_block = workflow.split("paths:", 1)[1].split("workflow_dispatch", 1)[0]
+    for src in specific:
+        assert f'"{src}"' in paths_block, (
+            f"Dockerfile copies {src} into the image, but publish-image.yml would not rebuild "
+            f"when it changes -- add it to on.push.paths"
+        )
+
+
 def test_overlay_restates_the_base_cmd_verbatim():
     """Setting ENTRYPOINT in a DERIVED image resets the inherited CMD to null.
 

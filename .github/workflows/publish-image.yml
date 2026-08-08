@@ -8,6 +8,11 @@ on:
     paths:
       - "flash/**"
       - "Dockerfile"
+      # The base image COPYs the entrypoint out of this directory, so a change here changes the
+      # published image. Without this filter entry an entrypoint-only fix -- including a security
+      # fix to the secrets wrapper -- merges without rebuilding, and the tags keep serving the old
+      # script until some unrelated watched file happens to change.
+      - "deploy/infisical/entrypoint.sh"
       - "pyproject.toml"
       - "scripts/build_dev_dist.py"
       - ".github/workflows/publish-image.yml"
