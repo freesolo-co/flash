@@ -49,50 +49,126 @@ def _installer_files() -> tuple[Path, ...]:
 INSTALLER_FILES = _installer_files()
 
 # `curl … | bash`, `wget … | sh`, and friends: a fetch whose output is piped into a shell.
-# Applied to joined logical lines, so a continued command is one string here.
 #
-# The shell may be reached by an absolute path (`| /bin/bash`) and may sit behind wrapper
-# commands (`| sudo -E bash`, `| env bash`, `| xargs sh`), so match any run of wrapper words and
-# flags before it, and allow a leading path on the shell itself. Anchoring the shell to a bare
-# word left `| /bin/bash` -- the same command, spelled the way a hardened script writes it --
-# passing a guard whose entire purpose is to reject it.
-#
-# The wrapper run is `-`-prefixed flags and known exec wrappers only, never arbitrary words:
-# allowing any word made `curl … | grep bash` match, where the shell name is an ARGUMENT being
-# searched for rather than the command being run.
-#
-# What may sit between the pipe and the command word is a CLOSED grammatical set: assignments
-# (`MODE=install bash`), redirections (`2>/dev/null bash`), and wrapper commands that exec what
-# follows. The first two are matched as categories rather than as spellings -- omitting
-# assignments left both `env MODE=install bash` and the wrapper-less `MODE=install bash` running
-# a downloaded script past a green guard. The wrapper NAMES stay an explicit list because that
-# set is open-ended, which is the one part of this pattern that can still be outgrown.
-#
-# A flag may take an OPERAND (`sudo -u root bash`, `env -C /tmp bash`): consuming the flag but
-# not its value left the operand as an unmatched word and the guard went green. Flags are matched
-# with an optional following operand, which is why the operand slot is deliberately narrow --
-# `[\w./=:-]+` accepts a user, path, or signal but not an arbitrary word, so `grep bash` cannot
-# reach the shell name by pretending `grep` is an operand.
-#
-# `[^\n]*?` rather than `[^|]*` between the fetch and the pipe: a pipeline may pass through
-# intermediate stages first (`curl … | tee /tmp/i.sh | bash`), and stopping at the first `|`
-# made the guard blind to every such spelling. Lazy, so it still prefers the nearest match.
-#
-# But `[^\n]*?` also let the separator itself be the SECOND bar of a `||`, so a legitimate
-# fallback (`curl … || bash recover.sh`) matched -- an over-match, the opposite failure from
-# every other bug here, and one this guard's own earlier fix introduced. The separator is now a
-# single `|` that is not part of `||`: not preceded by one, and not followed by one.
-PIPE_TO_SHELL = re.compile(
-    r"(?:curl|wget)\b[^\n]*?(?<!\|)\|(?!\|)\s*"  # a fetch piped on, possibly via other stages
-    r"(?:(?:"
-    r"(?:sudo|env|xargs|nohup|exec|command)"  # exec wrappers: they run what follows
-    r"|-\S+(?:\s+[\w./=:-]+)?"  # their flags, and a flag's operand
-    r"|[A-Za-z_]\w*=\S*"  # VAR=VALUE assignments preceding the command
-    r"|[0-9]*[<>]{1,2}\s*\S+"  # redirections preceding the command
-    r")\s+)*"
-    r"(?:[\w./-]*/)?"  # optional path on the shell: /bin/, /usr/bin/
-    r"(?:ba|z|k|da)?sh(?![\w.-])"  # sh, bash, zsh, ksh, dash -- as the COMMAND
-)
+# This was a single regex through eleven rounds of review, and each fix created the next hole:
+# widening the gap before the pipe made `||` fallbacks match, and adding flag operands made
+# `env -u bash cat` match at the OPERAND. That is not bad luck. Deciding which token is the
+# command requires knowing how many operands each flag consumes, and a regex cannot carry that
+# state -- so its optional groups backtrack and re-read an operand as the command. Walking the
+# tokens models the actual grammar and makes both failure directions expressible.
+_SHELL_NAME = re.compile(r"(?:[\w./-]*/)?(?:ba|z|k|da)?sh$")
+
+# Wrappers that EXEC what follows them, so the real command is further right. Open-ended by
+# nature; this is the part of the guard most likely to need extending, and the only part where
+# a miss is a silent under-match rather than a parse error.
+_EXEC_WRAPPERS = {"sudo", "env", "xargs", "nohup", "exec", "command", "timeout", "stdbuf"}
+
+# Flags that take a SEPARATE operand, per wrapper. Keyed by wrapper because the same spelling
+# means different things: `env -u NAME` unsets a variable, `sudo -u USER` picks a user. Knowing
+# the arity is what stops the operand from being mistaken for the command -- `env -u bash cat`
+# runs `cat`, not `bash`, and flagging it would fail CI on a legitimate pipeline.
+_FLAGS_WITH_OPERAND = {
+    "sudo": {"-u", "-g", "-h", "-p", "-C", "-U", "-r", "-t", "--user", "--group", "--prompt"},
+    "env": {"-u", "-C", "-S", "--unset", "--chdir", "--split-string"},
+    "timeout": {"-k", "-s", "--kill-after", "--signal"},
+    "xargs": {"-a", "-E", "-I", "-L", "-n", "-P", "-s", "-d", "--delimiter", "--max-args"},
+    "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
+}
+
+# A bare numeric operand sitting between a wrapper and its command: `timeout 30 sh` requires one,
+# and an unrecognized flag may introduce one (`nohup -n 5 bash`). Skipped after ANY wrapper rather
+# than special-cased to `timeout`, because nothing is ever *named* `30` -- so treating a bare
+# numeral as an operand cannot swallow a real command, while guessing its arity wrong the other
+# way silently drops the guard.
+_NUMERIC_OPERAND = re.compile(r"\d+(?:\.\d+)?[smhd]?")
+
+
+def _piped_into_a_shell(line: str) -> bool:
+    """True when a `curl`/`wget` fetch has its output piped into a shell.
+
+    The rule is "do not execute a download", not "do not use a pipe": `curl … | jq`,
+    `curl … | tar -xz`, and `curl … | grep bash` are all fine, and `curl … || bash recover.sh`
+    is a fallback on FAILURE with nothing piped into it.
+    """
+    return any(_stage_runs_a_shell(s) for s in _pipeline_stages_after_a_fetch(line))
+
+
+# Words and shell operators. Quotes are STRIPPED rather than honoured, so `sh -c "curl … | bash"`
+# is still seen as a pipe into a shell: the quoting is the outer command's, and the inner text is
+# a real pipeline that really runs. A `>&`-style redirection is matched first so its `&` is not
+# taken for a separator.
+_TOKEN = re.compile(r"\d*[<>]{1,2}&\d*|\|\||&&|\||;|&|[^\s;|&]+")
+_FETCH = re.compile(r"(?:[\w./-]*/)?(?:curl|wget)")
+
+
+def _tokenize(line: str) -> list[str]:
+    return _TOKEN.findall(line.replace('"', " ").replace("'", " "))
+
+
+def _pipeline_stages_after_a_fetch(line: str) -> list[list[str]]:
+    """Every stage that a curl/wget's output flows into, as token lists.
+
+    All later stages are returned, not just the next one: a pipeline may pass through
+    intermediate stages first (`curl … | tee /tmp/i.sh | bash`), and looking only at the stage
+    directly after the fetch was blind to every such spelling.
+
+    `||` is NOT a stage separator, and neither are `&&`, `;`, or `&`. They end the pipeline: what
+    follows is a separate command with nothing piped into it. Reading the second bar of a `||` as
+    a pipe made legitimate `curl … || bash recover.sh` fallbacks match.
+    """
+    pipelines: list[list[list[str]]] = [[[]]]
+    for tok in _tokenize(line):
+        if tok in ("||", "&&", ";", "&"):
+            pipelines.append([[]])
+        elif tok == "|":
+            pipelines[-1].append([])
+        else:
+            pipelines[-1][-1].append(tok)
+
+    downstream: list[list[str]] = []
+    for stages in pipelines:
+        fetched = next((i for i, s in enumerate(stages) if any(_FETCH.fullmatch(t) for t in s)), -1)
+        if fetched >= 0:
+            downstream.extend(stages[fetched + 1 :])
+    return downstream
+
+
+def _stage_runs_a_shell(tokens: list[str]) -> bool:
+    """Walk one pipeline stage's tokens to the command word, and say whether it is a shell.
+
+    Assignments and redirections may PRECEDE the command (`MODE=install bash`, `2>/dev/null sh`)
+    -- both spellings run the downloaded stream, and the second needs no wrapper at all. Exec
+    wrappers move the command further right, and their flags may consume an operand, which is the
+    part a regex could not track.
+    """
+    i = 0
+    wrapper = ""
+    while i < len(tokens):
+        tok = tokens[i]
+        if re.fullmatch(r"[A-Za-z_]\w*=.*", tok) or re.fullmatch(r"\d*[<>]{1,2}.*", tok):
+            i += 1
+            continue
+        if tok.startswith("-"):
+            # A flag's operand is skipped only when THIS wrapper's flag actually takes one, so a
+            # shell-named operand (`env -u bash cat`) is never mistaken for the command.
+            if "=" not in tok and tok in _FLAGS_WITH_OPERAND.get(wrapper, frozenset()):
+                i += 1
+            i += 1
+            continue
+        if wrapper and _NUMERIC_OPERAND.fullmatch(tok):
+            i += 1
+            continue
+        if _SHELL_NAME.fullmatch(tok):
+            return True
+        if tok in _EXEC_WRAPPERS or (tok.rsplit("/", 1)[-1] in _EXEC_WRAPPERS):
+            wrapper = tok.rsplit("/", 1)[-1]
+            i += 1
+            continue
+        # Any other word IS the command, and it is not a shell. `grep bash` stops here, so the
+        # shell name that follows is an argument being searched for, not the command being run.
+        return False
+    return False
+
 
 # A line ending in any of these does not end the command -- the next line continues it. `\` is
 # the explicit continuation; a trailing `|`, `&&`, or `||` is an incomplete construct the shell
@@ -193,7 +269,7 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
     execute. This is a repo-wide rule, not an Infisical one; the parametrization is what keeps
     it that way when the next installer is added.
     """
-    offenders = [ln for ln in _logical_lines(path.read_text()) if PIPE_TO_SHELL.search(ln)]
+    offenders = [ln for ln in _logical_lines(path.read_text()) if _piped_into_a_shell(ln)]
     assert not offenders, f"{path.name} pipes a downloaded script into a shell: {offenders}"
 
 
@@ -253,6 +329,24 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
         ),
         pytest.param(
             "RUN curl -sSL https://x.example/i.sh | env -C /tmp sh\n", id="env-flag-with-operand"
+        ),
+        # `timeout` takes a bare duration before the command, so recognizing the wrapper name
+        # alone is not enough -- the duration read as the command and the guard went green.
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | timeout 30 sh\n", id="timeout-wrapper"
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | timeout -k 5 30 bash\n", id="timeout-with-flag"
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | nohup -n 5 bash\n", id="numeric-flag-operand"
+        ),
+        # Arity is PER-WRAPPER, not global. `-s` takes an operand for `timeout` (a signal) but
+        # not for `sudo`, so a wrapper-blind flag list skips the word after it and walks straight
+        # past the shell -- a silent under-match. This pairing is what distinguishes the two
+        # designs; the `env -u bash` cases below cannot, since `-u` takes an operand either way.
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | sudo -s bash\n", id="flag-arity-is-per-wrapper"
         ),
     ],
 )
@@ -335,6 +429,18 @@ def test_the_guard_catches_a_yaml_line_that_both_folds_back_and_continues_on(tmp
             "curl -fsSL https://x.example/f || bash recover.sh", id="or-fallback-to-a-shell"
         ),
         pytest.param("wget -q https://x.example/f || sh -c 'exit 1'", id="or-fallback-to-sh"),
+        # A flag's OPERAND that happens to be named like a shell. `env -u bash cat` unsets the
+        # variable `bash` and runs `cat`; flagging it would fail CI on a legitimate pipeline.
+        # Knowing each flag's arity is what tells the operand apart from the command.
+        pytest.param("curl -s https://x.example/f | env -u bash cat", id="shell-named-operand"),
+        pytest.param("curl -s https://x.example/f | sudo -u bash whoami", id="shell-named-user"),
+        # `&&` and `;` end the pipeline: the shell that follows gets nothing piped into it.
+        pytest.param("curl -s https://x.example/f > /tmp/f && bash /tmp/o.sh", id="and-then-shell"),
+        pytest.param("curl -s https://x.example/f ; bash unrelated.sh", id="semicolon-then-shell"),
+        # A wrapper in front of something that is not a shell is still not a shell.
+        pytest.param("curl -s https://x.example/f | timeout 30 jq .", id="timeout-into-jq"),
+        # The command name merely STARTS with the shell name.
+        pytest.param("curl -s https://x.example/f | sudo -u shane cat", id="operand-shell-prefix"),
     ],
 )
 def test_the_pipe_to_shell_guard_does_not_flag_ordinary_pipelines(line: str, tmp_path: Path):
