@@ -254,31 +254,31 @@ def test_revision_sizing_fails_closed_when_pinned_commit_lacks_param_metadata(
         vram.model_required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", model_revision="f" * 40)
 
 
-def test_check_fit_pinned_metadata_failure_is_unknown_but_sizing_stays_strict(monkeypatch):
+def test_pinned_metadata_failure_keeps_sizing_strict(monkeypatch):
+    """A pin whose metadata cannot be read must raise, never size the run on a guess.
+
+    (This also covered `check_fit`, which returned an "unknown" verdict for the same failure. That
+    advisory estimator was reachable only from the deleted open-model path and is gone; the strict
+    sizing half below is what actually gates a paid allocation.)
+    """
     import flash.engine.vram as vram
 
-    failure = RuntimeError("metadata unavailable")
-
+    # the pinned path reads full geometry, not just the parameter count -- patch what it actually
+    # calls, or the "failure" is really an offline network call and the test proves nothing.
     def fail(*args, **kwargs):
-        raise failure
+        raise RuntimeError("metadata unavailable")
 
-    monkeypatch.setattr(vram, "fetch_hf_params_b", fail)
-
-    estimate = vram.check_fit(
-        "owner/model",
-        "sft",
-        "RTX 4090",
-        model_revision="a" * 40,
-    )
-    assert estimate.verdict == "unknown"
-    assert estimate.params_b is None
+    monkeypatch.setattr(vram, "fetch_hf_model_geometry", fail)
 
     with pytest.raises(RuntimeError, match="metadata unavailable"):
         vram.model_required_vram_gb(
-            "owner/model",
+            "Qwen/Qwen3.5-0.8B",
             "sft",
             model_revision="a" * 40,
         )
+    # the same model WITHOUT a pin sizes fine from the catalog, so the raise above is the pinned
+    # path failing closed rather than sizing being broken for this model.
+    assert vram.model_required_vram_gb("Qwen/Qwen3.5-0.8B", "sft") > 0
 
 
 def test_prefetch_error_classification():

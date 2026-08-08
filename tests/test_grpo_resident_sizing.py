@@ -189,7 +189,7 @@ def test_pinned_revision_is_sized_on_the_revisions_own_geometry(monkeypatch):
 
 
 def test_fits_resident_is_conservative_when_unknown():
-    # Unknown card VRAM (0) or an unlisted/open model (no catalog params) -> keep the safe
+    # Unknown card VRAM (0) or an id the catalog does not list (no params) -> keep the safe
     # sleep default (return False), never disable sleep on a guess.
     assert grpo_fits_resident("Qwen/Qwen3.5-4B", card_vram_gb=0) is False
     assert grpo_fits_resident("some/unlisted-model", card_vram_gb=80) is False

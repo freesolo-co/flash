@@ -241,14 +241,14 @@ def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
     )
 
 
-# reject unknown tables and user-authored platform fields instead of silently dropping them.
-# model_policy is authorable but not self-authorizing: the server-side control plane calls
-# authorize_model_policy because only it can see FLASH_STANDALONE.
+# unknown tables are rejected LOUDLY: a stray [grpo] table silently dropped grpo knobs and trained
+# at 16x-cost defaults. platform-managed fields (run_id; per-section hf_repo, gpu disk/volume,
+# environment resolved_sha) are assigned by the control plane, so to_dict() omits them and this
+# parser rejects a user who sets them.
 _TOP_LEVEL_KEYS = frozenset(
     {
         "model",
         "model_revision",
-        "model_policy",
         "algorithm",
         "thinking",
         "seed",
@@ -294,25 +294,6 @@ def validate_train_keys(keys: Collection[str]) -> None:
             f"[train] unknown key(s): {', '.join(unknown)} "
             f"(allowed: {', '.join(sorted(TRAIN_SCHEMA_KEYS))})"
         )
-
-
-MODEL_POLICIES = ("catalog", "allow")
-
-
-def _model_policy(raw: dict[str, Any]) -> str:
-    """parse authored ``model_policy``, defaulting to the curated catalog.
-
-    authorization is separate because the client cannot see server-side ``FLASH_STANDALONE``. the
-    control plane calls ``authorize_model_policy`` after parsing.
-    """
-    value = raw.get("model_policy", "catalog")
-    if not isinstance(value, str) or value.strip().lower() not in MODEL_POLICIES:
-        raise ConfigError(
-            f"model_policy must be one of: {', '.join(MODEL_POLICIES)} "
-            '("catalog" trains only curated models; "allow" accepts any HuggingFace model that '
-            "fits the GPU, and is available on self-hosted control planes only)"
-        )
-    return value.strip().lower()
 
 
 def spec_from_dict(
@@ -362,7 +343,6 @@ def spec_from_dict(
         algorithm = normalize_algorithm(raw.get("algorithm"))
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
-    model_policy = _model_policy(raw)
     thinking = raw.get("thinking", False)
     if not isinstance(thinking, bool):
         raise ConfigError("thinking must be a boolean")
@@ -440,8 +420,10 @@ def spec_from_dict(
         model, gpu_count or 1, model_revision=model_revision
     )
     try:
-        # offline sizing/display only; allocator re-resolves auto runs at submit time.
-        provisional_type = provisional_gpu(
+        # called for its rejection, not its return: it raises when no validated class can hold the
+        # run, which is the parse-time "this is unplaceable" gate. The class it picks is offline
+        # sizing/display only -- the allocator re-resolves auto runs at submit time.
+        provisional_gpu(
             model,
             algorithm=algorithm,
             train=train_raw,
@@ -474,16 +456,7 @@ def spec_from_dict(
     except (UnsupportedGpuError, ValueError) as exc:
         raise ConfigError(str(exc)) from exc
     try:
-        info = resolve_model(
-            model,
-            algorithm,
-            policy=model_policy,
-            gpu=gpu_type or provisional_type,
-            # the provisional class above was already picked for this ceiling; resolving it as a
-            # single card would reject a shardable run on the per-card class chosen BECAUSE it
-            # shards.
-            gpu_count=preflight_gpu_count,
-        )
+        info = resolve_model(model, algorithm)
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
     if thinking and info.thinking == "none":
@@ -496,13 +469,6 @@ def spec_from_dict(
         raise ConfigError(
             f"{model} always emits <think> reasoning and cannot run with thinking "
             f"disabled; set thinking = true"
-        )
-    if thinking and info.thinking == "unknown":
-        # stderr keeps stdout clean for machine-readable callers
-        print(
-            f"warning: open-model policy: cannot verify that {model}'s chat template "
-            f"supports thinking mode; the run proceeds with enable_thinking=true",
-            file=sys.stderr,
         )
     init_from_adapter = _init_from_adapter_ref(train_raw)
     if algorithm == "sft" and init_from_adapter:
@@ -578,7 +544,6 @@ def spec_from_dict(
         run_id=run_id or "local",  # server-assigned at create_run; never user-set
         seed=_job_seed(raw),
         worker_env=worker_env,
-        model_policy=model_policy,
         thinking=thinking,
         wandb=wandb_spec,
         project=project,

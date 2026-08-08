@@ -553,14 +553,19 @@ def _smoke_provenance(result: dict, adapter_revision: str, checkpoint: str) -> t
 def _thinking_tag_is_guaranteed(spec) -> bool:
     """Whether the catalog vouches that this model's chat template opens a thinking block.
 
-    Query the catalog directly: ``resolve_model`` also applies unrelated default-GPU sizing.
-    Uncataloged models remain the open-model, unknown-capability case.
+    A curated entry states its ``thinking`` capability, so the tag is required. Only a stale caller
+    can present an uncataloged model -- submit rejects those -- and nothing vouches for its
+    template, so the tag is not demanded of it.
+
+    Asks the catalog DIRECTLY rather than through ``resolve_model``, which validates against an
+    algorithm and raises for an uncataloged id. Whether a chat template opens a ``<think>`` block
+    has nothing to do with either, and treating that raise as "guaranteed" would demand the tag
+    from precisely the models that cannot promise it.
     """
     from flash.catalog import MODELS
 
     model = getattr(spec, "model", None)
-    info = MODELS.get(model.strip()) if isinstance(model, str) else None
-    return info is not None and info.thinking != "unknown"
+    return isinstance(model, str) and model.strip() in MODELS
 
 
 def _thinking_answer(content: str, *, require_tag: bool = True) -> str:

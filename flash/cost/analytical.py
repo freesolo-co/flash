@@ -8,12 +8,12 @@ from __future__ import annotations
 
 import math
 
-from flash.catalog import MODELS
 from flash.opd_limits import OPD_TEACHER_SCORING_CONCURRENCY, opd_teacher_request_multiplier
 from flash.providers.allocator import geometry_safe_gpu_cap, required_vram_gb, vram_headroom
 
 from .facts import (
     GPU_COMPUTE_TFLOPS,
+    _catalog_model_info,
     active_params_b,
     download_weight_gb,
     effective_train_tflops,
@@ -216,12 +216,16 @@ def required_save_overhead_seconds(config: RunConfig) -> float:
     return len(n.save_at_steps) * per_save
 
 
-def _is_moe(model_id: str, revision: str = "") -> bool:
-    """True when the model routes each token through a subset of experts (active < total params)."""
-    info = MODELS.get(model_id)
-    if info is not None:
-        return bool(info.active_params_b and info.active_params_b < info.params_b)
-    return active_params_b(model_id, revision) < total_params_b(model_id, revision)
+def _is_moe(model_id: str) -> bool:
+    """True when the model routes each token through a subset of experts (active < total params).
+
+    Routing is curated architecture metadata, so this is a catalog read and takes no revision: a
+    pinned commit of an entry does not change whether it is an MoE. (The uncataloged branch that
+    compared active against total params is gone -- both of those raise for an unknown id now, so it
+    could only ever have raised rather than answered.)
+    """
+    info = _catalog_model_info(model_id)
+    return bool(info.active_params_b and info.active_params_b < info.params_b)
 
 
 def compile_seconds(config: RunConfig, gpu: str) -> float:
@@ -229,7 +233,7 @@ def compile_seconds(config: RunConfig, gpu: str) -> float:
     (whose original timing did not model it). Larger for rollout methods (add vLLM cudagraph
     capture)."""
     _ = gpu
-    if not _is_moe(config.model_id, config.model_revision):
+    if not _is_moe(config.model_id):
         return 0.0
     return COMPILE_MOE_SFT_S if config.method == "sft" else COMPILE_MOE_ROLLOUT_S
 
@@ -318,7 +322,7 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
     peak = effective_train_tflops(gpu) * 1e12  # FLOP/s (realized training throughput; see facts)
     # An MoE's per-step wall scales with TOTAL params (routing + all-expert coordination + grouped
     # GEMM under-utilization), not the tiny active-param FLOPs; dense models keep active (== total).
-    moe = _is_moe(n.model_id, n.model_revision)
+    moe = _is_moe(n.model_id)
     params = (
         total_params_b(n.model_id, n.model_revision)
         if moe
@@ -416,7 +420,7 @@ def sft_seconds_for_tokens(config: RunConfig, gpu: str, train_tokens: float) -> 
     """SFT steady-state wall time for an actual token count on ``gpu``."""
     n = config.normalized()
     # MoE prices on total params at a reduced MFU (see seconds_per_step); dense keeps active.
-    moe = _is_moe(n.model_id, n.model_revision)
+    moe = _is_moe(n.model_id)
     params = (
         total_params_b(n.model_id, n.model_revision)
         if moe
@@ -437,7 +441,8 @@ def _offline_gpu_shape(
     offline, then replace the quote with the selected live candidate before provisioning.
     """
     # Fail closed on a model that cannot be sized at all. Curated entries answer from the catalog
-    # with no network call; an open-policy model resolves via HF (self-hosted planes only).
+    # with no network call; a PINNED revision still resolves that commit's real geometry, so the
+    # revision has to be passed or the check sizes a different set of weights than the worker loads.
     total_params_b(config.model_id, config.model_revision)
     need = required_vram_gb(
         config.model_id,
@@ -675,7 +680,7 @@ def _notes(
             f"{len(n.save_at_steps)} synchronous required save(s) add "
             f"~{_fmt_duration(required_save_s)}"
         )
-    if _is_moe(n.model_id, n.model_revision):
+    if _is_moe(n.model_id):
         notes.append(
             "MoE model: per-step time priced on total params (routing + all-expert coordination), "
             "not just active-param FLOPs, plus a one-time kernel compile"

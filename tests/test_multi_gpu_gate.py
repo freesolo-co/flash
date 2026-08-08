@@ -851,120 +851,51 @@ def test_public_max_gpu_count_is_rentable_not_silently_clamped():
     assert combined_vram_gb(get_gpu_info(chosen).vram_gb, 8) >= need
 
 
-def test_eight_cards_require_catalog_head_geometry():
-    """Open models must not newly rent 8 cards before their attention-head count is validated.
+def test_eight_cards_require_validated_head_geometry():
+    """A run must not rent 8 cards before its attention-head count is known to divide.
 
-    verl requires ``num_attention_heads % sp_size == 0``. Catalog rows are curated and every head
-    count divides by 8; open-model resolution currently fetches parameter/vocabulary geometry only,
-    so an 8-card run could pay for a box and abort during sequence-parallel initialization.
+    verl requires ``num_attention_heads % sp_size == 0``. Curated default revisions have hand-checked
+    geometry and every row divides by 8. A PINNED revision does not: the pin's own config is fetched
+    for parameter/vocabulary size but its head count is never validated, so an 8-card pinned run
+    could pay for a box and abort during sequence-parallel initialization. Those stay at four.
     """
     from flash.providers.allocator import geometry_safe_gpu_cap
 
     assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8) == 8
     assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision="a" * 40) == 4
-    assert geometry_safe_gpu_cap("acme/open-12-head-model", 8) == 4
     # odd ceilings still normalize through the shared rentable-count helper.
-    assert geometry_safe_gpu_cap("acme/open-12-head-model", 3) == 2
+    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 3, model_revision="a" * 40) == 2
 
 
-def test_schema_preflight_applies_the_open_model_geometry_cap():
-    """Schema preview and resolution must judge an unknown model on four cards, not authored eight."""
-    from flash.catalog import MODELS
+def test_schema_preflight_applies_the_geometry_cap_to_provisional_sizing():
+    """Schema preview must size a pinned run on four cards, not the authored eight.
+
+    Sizing against a count the allocator will never rent picks the wrong per-card class: the
+    provisional class is chosen FOR the ceiling, so an eight-card preview of a run the cap holds to
+    four quotes a class the run never gets.
+    """
     from flash.schema import spec_from_dict
 
-    seen: list[tuple[str, int]] = []
+    seen: list[int] = []
 
     def _preview(_model, *args, gpu_count=1, **kwargs):
-        seen.append(("preview", gpu_count))
+        seen.append(gpu_count)
         return "H100"
-
-    def _resolve(_model, *args, gpu_count=1, **kwargs):
-        seen.append(("resolve", gpu_count))
-        return MODELS["Qwen/Qwen3.5-0.8B"]
 
     monkey = pytest.MonkeyPatch()
     try:
         monkey.setattr("flash.schema.provisional_gpu", _preview)
-        monkey.setattr("flash.schema.resolve_model", _resolve)
         spec_from_dict(
             {
-                "model": "acme/open-12-head-model",
+                "model": "Qwen/Qwen3.5-0.8B",
+                "model_revision": "a" * 40,
                 "algorithm": "sft",
                 "environment": {"id": "owner/env"},
                 "train": {"max_examples": 1},
                 "gpu": {"count": 8},
             }
         )
-        assert seen == [("preview", 4), ("resolve", 4)]
-    finally:
-        monkey.undo()
-
-
-def test_runner_preflight_applies_the_same_open_model_geometry_cap(monkeypatch):
-    """Preparation must pass the capped count to both provisional sizing and model resolution.
-
-    The cap is algorithm-independent, so this runs on grpo: sft would additionally drag in the
-    workload-profile gate (pinned env sha, profile record), none of which is what is under test.
-    """
-    import flash.catalog as catalog
-    import flash.runner as runner
-    from flash.spec import GpuSpec, JobSpec, TrainSpec
-
-    seen: list[tuple[str, int]] = []
-    monkeypatch.setattr(runner, "_resolve_model_revision", lambda spec, **_kwargs: spec)
-    monkeypatch.setattr(
-        "flash.providers.base.provisional_gpu",
-        lambda _model, *args, gpu_count=1, **kwargs: seen.append(("preview", gpu_count)) or "H100",
-    )
-    monkeypatch.setattr(
-        runner,
-        "resolve_model",
-        lambda _model, *args, gpu_count=1, **kwargs: (
-            seen.append(("resolve", gpu_count)) or catalog.MODELS["Qwen/Qwen3.5-0.8B"]
-        ),
-    )
-    monkeypatch.setattr(
-        "flash.cost.spec.estimate_for_spec",
-        lambda _spec: type("Estimate", (), {"total_usd": 1.0})(),
-    )
-
-    runner.prepare_job(
-        JobSpec(
-            model="acme/open-12-head-model",
-            model_policy="allow",
-            algorithm="grpo",
-            train=TrainSpec(max_examples=1),
-            gpu=GpuSpec(count=8),
-        )
-    )
-
-    assert seen == [("preview", 4), ("resolve", 4)]
-
-
-def test_open_model_validation_is_judged_on_the_allocated_shape():
-    """`model_policy = "allow"` must size an open model on its card COUNT, not on one card.
-
-    Threading the count into parse-time sizing deliberately picks a SMALLER per-card class as the
-    ceiling widens (a 32B run resolves to RTX Pro 6000 at 1 card, RTX 5090 at 4). If the open-model
-    fit check still evaluates one card, that smaller class is then rejected as `too_big` -- so
-    `--gpus 4` refuses a model `--gpus 1` accepts, and multi-card stays unusable for exactly the
-    large open models it exists to serve.
-    """
-    from flash.catalog import resolve_model
-    from flash.engine.vram import check_fit
-
-    model, card = "acme/open-32b", "RTX 5090"
-    monkey = pytest.MonkeyPatch()
-    try:
-        # size is stubbed so the assertion is about the COUNT, not about HF reachability.
-        monkey.setattr("flash.engine.vram.fetch_hf_params_b", lambda _m, **_k: 32.0)
-        # one card genuinely cannot hold it -> the count is what makes the wide shape legal.
-        assert check_fit(model, "sft", card, gpu_count=1).verdict == "too_big"
-        assert check_fit(model, "sft", card, gpu_count=4).verdict != "too_big"
-        # the real resolution path must follow: reject on one card, accept on four.
-        with pytest.raises(ValueError, match="does not fit"):
-            resolve_model(model, "sft", policy="allow", gpu=card, gpu_count=1)
-        assert resolve_model(model, "sft", policy="allow", gpu=card, gpu_count=4).params_b == 32.0
+        assert seen == [4]
     finally:
         monkey.undo()
 
@@ -1047,35 +978,6 @@ def test_effective_spec_validation_accepts_an_allocator_narrowed_count():
     # widening past the authored ceiling is NOT an allocator narrowing -> still rejected.
     with pytest.raises(ValueError, match="does not match the public run"):
         _validate_effective_spec(public, _spec_with_gpu(public, _TRI_PROVIDER_GPU, 8))
-
-
-def test_open_model_fit_sizes_on_the_rentable_count_not_the_raw_ceiling():
-    """`check_fit` must judge odd ceilings and the public maximum on rentable shapes.
-
-    A ceiling of 3 buys 2 cards, while 8 is itself rentable. The 48B fixture is too large for four
-    RTX 5090s but fits on eight, so silently restoring the old four-card cap changes the verdict and
-    kills the test rather than comparing the cap to itself.
-    """
-    from flash.engine.vram import check_fit
-
-    model, card = "acme/open-48b", "RTX 5090"
-    monkey = pytest.MonkeyPatch()
-    try:
-        monkey.setattr("flash.engine.vram.fetch_hf_params_b", lambda _m, **_k: 48.0)
-        # a ceiling of 3 must be judged as 2 cards, not 3.
-        assert check_fit(model, "sft", card, gpu_count=3).verdict == (
-            check_fit(model, "sft", card, gpu_count=2).verdict
-        )
-        assert check_fit(model, "sft", card, gpu_count=4).verdict == "too_big"
-        eight = check_fit(model, "sft", card, gpu_count=8)
-        assert eight.verdict != "too_big"
-        assert eight.gpu_count == 8
-        assert "8x" in eight.describe()
-        # odd-ceiling messages still report the shape actually judged.
-        assert check_fit(model, "sft", card, gpu_count=3).gpu_count == 2
-        assert "2x" in check_fit(model, "sft", card, gpu_count=3).describe()
-    finally:
-        monkey.undo()
 
 
 def test_unpinned_quote_bills_the_allocator_selected_count():
@@ -1177,38 +1079,31 @@ def test_lambda_single_card_pricing_survives_a_catalog_outage():
         monkey.undo()
 
 
-def test_structured_opd_validation_is_fit_checked_on_the_allocated_card_count():
-    """The worker's structured-OPD check must judge the model on the shape it was ALLOCATED.
+def test_structured_opd_compiler_vocab_is_card_independent():
+    """The worker's structured-OPD check reads vocabulary size, which no card shape can change.
 
-    Under ``model_policy="allow"`` an open model is fit-checked during ``resolve_model``. This path
-    resolved without ``gpu_count``, so it took the single-card default and re-raised "does not fit"
-    for a shardable run that submit had already placed -- on the worker, after the GPU instance was
-    rented and billed. Every other gate on this branch is count-aware; this one was not.
+    This used to thread the allocated gpu/gpu_count down so an open model's fit check would judge the
+    shape it was actually placed on -- resolving a shardable run as one card re-raised "does not fit"
+    on the worker, after the box was rented. With only curated models trainable there is no fit check
+    inside resolution, so the shape cannot reach it and cannot reject anything: the resolved
+    vocabulary is a function of the model and its revision alone.
     """
     from flash.opd_validation import _resolve_compiler_vocab_size
 
-    seen: list[int] = []
+    seen: list[tuple] = []
 
-    def _fake_resolve(_model, _algo, **kwargs):
-        seen.append(int(kwargs.get("gpu_count", 1)))
+    def _fake_resolve(model, algo, model_revision="", **kwargs):
+        seen.append((model, algo, model_revision, tuple(sorted(kwargs))))
         return SimpleNamespace(vocab_size=151936)
 
     monkey = pytest.MonkeyPatch()
     try:
         monkey.setattr("flash.catalog.resolve_model", _fake_resolve)
-        _resolve_compiler_vocab_size(
-            model_id="acme/open-32b",
-            model_revision="",
-            model_policy="allow",
-            gpu="RTX 5090",
-            gpu_count=4,
+        assert (
+            _resolve_compiler_vocab_size(model_id="Qwen/Qwen3.5-9B", model_revision="a" * 40)
+            == 151936
         )
-        # the allocated count reaches the fit check, rather than silently defaulting to one card.
-        assert seen == [4]
-        # and the default is still one card when nothing is threaded, so the assert above is real.
-        _resolve_compiler_vocab_size(
-            model_id="acme/open-32b", model_revision="", model_policy="allow", gpu="RTX 5090"
-        )
-        assert seen == [4, 1]
+        # the pin reaches resolution, and no card shape is passed along with it.
+        assert seen == [("Qwen/Qwen3.5-9B", "opd", "a" * 40, ())]
     finally:
         monkey.undo()

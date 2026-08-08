@@ -538,8 +538,16 @@ def resolve_gpu_mem_util(
     ``gpu_memory_utilization`` covers the second bf16 weight copy plus kv pool. using
     ``colocate_kv_util`` keeps worker allocation aligned with preflight admission.
 
-    keep the conservative fallback for unknown cards, multi-gpu tensor-parallel runs, or models
-    without a resolvable parameter count; the geometry model cannot safely size those cases.
+    the flat constant is kept where the model does NOT apply, because a wrong number is worse than
+    a conservative one:
+
+    - UNKNOWN CARD (empty/unmanaged ``gpu.type``): the budget is a fraction of the card, so without
+      its size there is nothing to take a fraction of.
+    - MULTI-GPU (``n_gpus > 1``): the rollout is tensor-parallel, so vLLM's weight copy is sharded
+      ACROSS cards while ``colocate_kv_util`` sizes one whole copy against one card. a single-card
+      number would over-reserve per rank on exactly the shapes already tight.
+    - PINNED REVISION with no resolvable parameter count: the weight term dominates, so a guessed
+      size is not worth acting on.
     """
     if n_gpus > 1 or not (gpu_type or "").strip():
         return _DEFAULT_GPU_MEM_UTIL
@@ -558,9 +566,11 @@ def resolve_gpu_mem_util(
         # the commit's real geometry is not validated, so the curated kv/lora shape may not describe
         # it. the parameter count still comes from the pinned config.
         info = None if revision else catalog_info
-        # use catalog params_b first, then the real hf count for open-policy uncataloged or pinned
-        # models. the common catalog path is local; the hf path should already be warm from config
-        # resolution for the same model.
+        # the ONE way the worker, the preflight and the cost estimator agree on a model's size:
+        # curated catalog params_b, else the pinned commit's real HF count. the catalog answers
+        # FIRST and locally, so the common path adds no network call to launch; the HF lookup is
+        # reached only for a pinned revision, already warm in the hub cache from the upstream
+        # config fetch for this same model.
         params_b = float(
             (getattr(catalog_info, "params_b", 0.0) or 0.0)
             if (catalog_info is not None and not revision)

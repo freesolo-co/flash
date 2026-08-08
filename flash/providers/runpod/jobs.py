@@ -462,7 +462,9 @@ def deploy_train_endpoint(
     def _reconciles_a_managed_cache() -> bool:
         """Whether a grow on this call can actually spend budget.
 
-        Mirror `grow_weight_cache_volumes` early returns so cache-free runs reserve nothing.
+        Mirrors ``grow_weight_cache_volumes``'s own early return: a run attaching no managed cache
+        reconciles nothing, so reserving for it would shorten the deadline for a create that was
+        never going to grow anything.
         """
         if cache_volumes is not None:
             return bool(cache_volumes)

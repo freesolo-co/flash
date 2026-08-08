@@ -1497,7 +1497,6 @@ def test_opd_worker_rejects_images_before_gpu_or_teacher_use(monkeypatch):
                 train=train,
                 model="Qwen/Qwen3.5-4B",
                 model_revision="",
-                model_policy="catalog",
                 gpu=SimpleNamespace(type=None),
             ),
             heartbeat=lambda *args, **kwargs: None,

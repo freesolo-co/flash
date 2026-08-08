@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import math
 import os
-from dataclasses import dataclass
 
 
 def _gpu_vram_table() -> dict[str, int]:
@@ -476,38 +475,6 @@ def _rollout_kv_floor_gb(
         preserve_legacy_floor=preserve_legacy_floor,
     )
     return max(fp8_floor, ceiling + 1)
-
-
-@dataclass(frozen=True)
-class VramEstimate:
-    params_b: float | None
-    algorithm: str
-    quant: str
-    est_gb: float | None
-    gpu: str
-    gpu_gb: int
-    verdict: str  # "fits" | "tight" | "too_big" | "unknown"
-    # cards the run was JUDGED on -- already clamped to a rentable power of two by check_fit, so
-    # describe() reports the shape the verdict was computed against rather than the raw ceiling.
-    gpu_count: int = 1
-
-    def describe(self) -> str:
-        if self.est_gb is None:
-            return f"{self.gpu}: VRAM need unknown (could not read model size)"
-        # name the SHAPE, not just the class: "RTX 5090 (32 GB)" reads as a rejection the user
-        # could fix with a bigger card, when the run was actually judged on 4 of them.
-        shape = f"{self.gpu} ({self.gpu_gb} GB)"
-        if self.gpu_count > 1:
-            from flash.providers.base import combined_vram_gb
-
-            shape = (
-                f"{self.gpu_count}x {self.gpu} "
-                f"({combined_vram_gb(self.gpu_gb, self.gpu_count):.0f} GB combined)"
-            )
-        return (
-            f"{shape}: estimated ~{self.est_gb:.0f} GB needed "
-            f"({self.params_b:.1f}B params, {self.quant}, {self.algorithm}) -> {self.verdict}"
-        )
 
 
 def estimate_vram_gb(
@@ -1031,32 +998,10 @@ def model_required_vram_gb(
                 ),
             )
         return need
-    params_b = (
-        fetch_hf_params_b(model_id, revision=model_revision, strict=True)
-        if model_revision
-        else fetch_hf_params_b(model_id)
-    )
-    if params_b is None:
-        return 24
-    # Size the uncataloged (model_policy="allow") fallback with the ACTUAL algorithm, not a hardcoded
-    # "grpo". The cataloged path above already threads `algorithm` through _need; do the same here so
-    # open-model OPD uses its own dense-logit + colocated-vLLM estimator. The grpo-only sequence
-    # escalation stays gated on is_grpo.
-    need = _need(params_b, algorithm, vocab=model_vocab)
-    if is_opd:
-        need = _opd_fp8_adjust(need, params_b, vocab=model_vocab)
-    if is_grpo:
-        need += grpo_seq_escalation_gb(params_b, seq_len)
-    if is_vllm_rollout:
-        floor_gb = 24 if params_b <= 1.0 else int(_VLLM_COLOCATE_FLOOR_GB)
-        if is_opd and params_b >= 2.0:
-            floor_gb = max(floor_gb, int(_OPD_VLLM_COLOCATE_FLOOR_GB))
-        need = max(
-            need,
-            floor_gb,
-            _rollout_kv_floor_gb(params_b, seq_len, vllm_concurrency, model_id=model_id),
-        )
-    return need
+    # Only curated models are trainable, so `info` is never None here in practice. Kept as a
+    # conservative default rather than a raise: this is a sizing helper on the allocation path, and
+    # a caller probing a stale id should get the smallest managed card, not an exception.
+    return 24
 
 
 def fetch_hf_params_b(model_id: str, revision: str = "", *, strict: bool = False) -> float | None:
@@ -1084,60 +1029,18 @@ def fetch_hf_params_b(model_id: str, revision: str = "", *, strict: bool = False
 def resolve_params_b(model_id: str, revision: str = "") -> float | None:
     """Model size in billions, resolved the ONE way the worker and the cost estimator agree on.
 
-    Use catalog `params_b`, else HF safetensor metadata for open-policy models; return None only
-    when uncataloged metadata is unavailable.
+    the curated catalog ``params_b``, or the real HF safetensors count for a PINNED revision (whose
+    true size the catalog states only for the default revision). returns None for an uncataloged id,
+    which only a stale caller can produce since submit rejects those, so callers degrade to the
+    size-unknown path rather than raising on the allocation path. run_sft and run_rl both call this,
+    so they can never drift.
     """
     from flash.catalog import MODELS
 
     info = MODELS.get(model_id)
+    if info is None:
+        return None
     if revision:
-        if info is not None:
-            params_b, _vocab = _validated_revision_geometry(model_id, revision, info)
-            return params_b
-        return fetch_hf_params_b(model_id, revision=revision, strict=True)
-    if info is not None and info.params_b > 0:
-        return info.params_b
-    return fetch_hf_params_b(model_id)
-
-
-def check_fit(
-    model_id: str,
-    algorithm: str,
-    gpu: str,
-    quant: str = "bf16",
-    params_b: float | None = None,
-    model_revision: str = "",
-    gpu_count: int = 1,
-) -> VramEstimate:
-    """Estimate whether ``model_id`` plausibly trains on ``gpu``; never raises.
-
-    Judge sharded runs against `gpu_count` cards because wide allocations deliberately choose a
-    smaller per-card class.
-    """
-    from flash.providers.base import combined_vram_gb, largest_rentable_count
-
-    gpu_gb = GPU_VRAM_GB.get(gpu, 32)
-    # clamp to what the ceiling actually BUYS before sizing: only powers of two up to the
-    # combination cap are ever rented, so a ceiling of 3 provisions 2 cards. sizing on the raw
-    # ceiling would accept a shape submit can never allocate -- the parse/submit divergence this
-    # parameter exists to close, inverted.
-    cards = largest_rentable_count(gpu_count)
-    usable_gb = combined_vram_gb(gpu_gb, cards)
-    if params_b is None:
-        if model_revision:
-            try:
-                params_b = fetch_hf_params_b(model_id, revision=model_revision, strict=True)
-            except Exception:
-                params_b = None
-        else:
-            params_b = fetch_hf_params_b(model_id)
-    if params_b is None:
-        return VramEstimate(None, algorithm, quant, None, gpu, gpu_gb, "unknown")
-    est = estimate_vram_gb(params_b, algorithm, quant)
-    if est > usable_gb * 1.15:
-        verdict = "too_big"
-    elif est > usable_gb * 0.85:
-        verdict = "tight"
-    else:
-        verdict = "fits"
-    return VramEstimate(params_b, algorithm, quant, est, gpu, gpu_gb, verdict, cards)
+        params_b, _vocab = _validated_revision_geometry(model_id, revision, info)
+        return params_b
+    return info.params_b or None

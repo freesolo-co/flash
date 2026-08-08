@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from flash.catalog import MODELS
+from flash.catalog import MODELS, ModelInfo
 from flash.providers.base import GPU_INFO, GpuClass, providers_for
 
 GPU_COMPUTE_TFLOPS: dict[str, float] = {
@@ -204,58 +204,61 @@ def pick_gpu(
     return best.name
 
 
-def total_params_b(model_id: str, revision: str = "") -> float:
-    """Total parameter count (billions), curated entry first and HF safetensors otherwise.
-
-    Pinned revisions use their pinned size. Authorized uncataloged models share `resolve_params_b`
-    with VRAM sizing; if neither source can size the model, fail closed.
-    """
+def _catalog_model_info(model_id: str) -> ModelInfo:
     info = MODELS.get(model_id)
-    if info is not None and info.params_b > 0 and not revision:
-        # The managed path answers here and never touches the network.
-        return info.params_b
-
-    params_b = _sized_from_hf(model_id, revision)
-    if not params_b:
+    if info is None:
         raise ValueError(
-            f"could not size model {model_id!r}: it is not in the catalog "
-            f"({', '.join(MODELS)}) and HuggingFace returned no safetensors parameter metadata "
-            f"for it, so the run cannot be priced"
+            f"unknown model {model_id!r}; cost estimation supports catalog models only "
+            f"({', '.join(MODELS)})"
         )
-    return params_b
+    return info
 
 
-# cache successful open-model size lookups by normalized `(model_id, revision)` to avoid repeated HF
-# calls per quote. misses remain retryable; cache above `fetch_hf_params_b` so test stubs do not
-# leak.
-_SIZE_MEMO: dict[tuple[str, str], float] = {}
+# One quote asks "how big is this model" several times over (setup download, required-save
+# serialization, the MoE check). For an unpinned catalog model those are dict reads; for a PINNED
+# one each is an `HfApi.model_info` round trip, so an ordinary quote repeats the same lookup and
+# becomes hostage to hub latency -- and a transient failure on a later call can reject a run the
+# earlier calls already validated.
+#
+# Memoized per process on the normalized (id, revision) pair: a revision names immutable weights, so
+# a SUCCESSFUL answer cannot change under us. A MISS is deliberately not cached -- a failed lookup is
+# a hub blip, a rate limit, or an HF_TOKEN not yet granted access, not a fact about the model, and
+# caching it would make the first failure permanent for the life of a long-lived plane.
+#
+# Not `functools.cache` on total_params_b: it keys on the literal argument tuple, so a caller that
+# omits `revision` and one that passes "" become two entries. Not on `_validated_revision_geometry`
+# either, which tests monkeypatch -- caching there would leak a stubbed size across tests.
+_PINNED_SIZE_MEMO: dict[tuple[str, str], float] = {}
 
 
-def _sized_from_hf(model_id: str, revision: str) -> float | None:
-    """Resolve an uncataloged model's size, caching only a real answer.
+def total_params_b(model_id: str, revision: str = "") -> float:
+    """Total parameter count (billions) for a catalog model.
 
-    Do not cache misses: hub errors, rate limits, and missing access are transient.
+    a pinned revision sizes that commit (validated against the catalog, fail-closed) so setup/save
+    cost tracks the weights the worker actually loads, not the default-revision count.
     """
+    info = _catalog_model_info(model_id)
+    if not revision:
+        return info.params_b
     key = (model_id, revision)
-    if key not in _SIZE_MEMO:
-        from flash.engine.vram import resolve_params_b
+    if key not in _PINNED_SIZE_MEMO:
+        from flash.engine.vram import _validated_revision_geometry
 
-        params_b = resolve_params_b(model_id, revision=revision)
-        if not params_b:
-            return None
-        _SIZE_MEMO[key] = params_b
-    return _SIZE_MEMO[key]
+        params_b, _vocab = _validated_revision_geometry(model_id, revision, info)
+        _PINNED_SIZE_MEMO[key] = params_b
+    return _PINNED_SIZE_MEMO[key]
 
 
 def active_params_b(model_id: str, revision: str = "") -> float:
     """Active params per token (billions); falls back to total for dense models. Use for FLOPs, not VRAM.
 
-    Price uncataloged models as dense because they lack curated routing metadata; use the pinned
-    total the worker loads.
+    ``revision`` is accepted and IGNORED: an active-parameter count is architecture metadata, which
+    a pinned commit of the same catalog entry does not change. it stays in the signature because
+    callers sizing a pinned run pass it positionally alongside ``total_params_b``, where it does
+    matter. uncataloged models are rejected, so an unknown id raises rather than pricing as dense.
     """
-    info = MODELS.get(model_id)
-    if info is None:
-        return total_params_b(model_id, revision)
+    _ = revision
+    info = _catalog_model_info(model_id)
     return info.active_params_b or info.params_b
 
 
