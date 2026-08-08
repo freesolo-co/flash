@@ -363,6 +363,15 @@ def test_default_lora_rank_defaults_alpha_to_64() -> None:
     assert spec.train.lora_alpha == 64
 
 
+def test_directly_constructed_trainspec_derives_alpha_from_rank() -> None:
+    # A library caller building TrainSpec(...) directly must get the same 2 x rank default as the
+    # parsed path. to_dict() no longer strips alpha, so a stale scalar default would be SUBMITTED
+    # and trained with (rank 8 shipping alpha 64 instead of 16) rather than re-derived server-side.
+    assert TrainSpec(lora_rank=8).lora_alpha == 16
+    assert TrainSpec().lora_alpha == 64  # default rank 32
+    assert TrainSpec(lora_rank=8, lora_alpha=48).lora_alpha == 48  # explicit still wins
+
+
 def test_internal_from_dict_round_trips_stored_lora_alpha() -> None:
     # The internal carrier preserves a stored alpha so an authored value and a warm-start's
     # inherited parent alpha (which need not equal 2 x rank) survive control-plane -> worker

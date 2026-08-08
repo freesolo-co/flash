@@ -267,9 +267,11 @@ REMOVED_PERSISTED_TRAIN_KEYS = frozenset({"advantage_clip"})
 class TrainSpec:
     epochs: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     lora_rank: int = field(default=32, metadata={"introduced_in": "0.2.0"})
-    # Optional user knob: defaults to 2 x lora_rank when unset. Authoring it is rejected alongside
-    # init_from_adapter, where the source adapter's alpha is authoritative (see spec_from_dict).
-    lora_alpha: int = field(default=64, metadata={"introduced_in": "1.1.31"})
+    # Optional user knob. 0 is the "unset" sentinel: __post_init__ derives 2 x lora_rank from it, so
+    # a directly constructed TrainSpec(lora_rank=8) gets alpha 16 like the parsed path rather than a
+    # stale scalar. Authoring it is rejected alongside init_from_adapter, where the source adapter's
+    # alpha is authoritative (see spec_from_dict).
+    lora_alpha: int = field(default=0, metadata={"introduced_in": "1.1.31"})
     # artifact-store adapter ref output by `flash runs status`:
     # ``<hf_repo>:<phase>/<run_id>``.
     init_from_adapter: str = field(default="", metadata={"introduced_in": "0.2.0"})
@@ -308,6 +310,8 @@ class TrainSpec:
     )
 
     def __post_init__(self) -> None:
+        if not self.lora_alpha:
+            object.__setattr__(self, "lora_alpha", 2 * self.lora_rank)
         max_steps = parse_max_steps(self.max_steps)
         save_at_steps = parse_positive_int_tuple(self.save_at_steps, name="train.save_at_steps")
         object.__setattr__(self, "max_steps", max_steps)
