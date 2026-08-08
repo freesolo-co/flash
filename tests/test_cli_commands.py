@@ -15,6 +15,7 @@ import types
 import pytest
 
 import flash.cli as cli
+from flash.cli import traces as cli_traces
 from flash.providers._poll import _format_heartbeat
 
 
@@ -265,8 +266,17 @@ _SELF_HOSTED = ("http://my-plane:8080", "operator-key")
 
 
 def _self_hosted(monkeypatch) -> None:
+    """Point every credential binding these commands read at a self-hosted plane.
+
+    Each consuming module is patched by name because they `from`-import `load_credentials`,
+    binding it at import time -- patching `flash.client.config` alone leaves those bindings on
+    the real function, and the command then reads the developer's ambient `~/.flash` config.
+    That is environment-dependent, not a test: it passes on a machine already pointed at a local
+    plane and fails on a clean checkout, where the default is Freesolo-hosted.
+    """
     monkeypatch.setattr("flash.client.config.load_credentials", lambda: _SELF_HOSTED)
     monkeypatch.setattr(cli.commands, "load_credentials", lambda: _SELF_HOSTED)
+    monkeypatch.setattr(cli_traces, "load_credentials", lambda: _SELF_HOSTED)
 
 
 def test_projects_create_mints_a_local_id_on_a_self_hosted_plane(monkeypatch, capsys) -> None:
@@ -317,12 +327,10 @@ def test_traces_export_refuses_on_a_self_hosted_plane(monkeypatch, capsys) -> No
     """Unlike `projects create` there is nothing local to substitute: traces are written by the
     freesolo SDK into the hosted backend, so a self-hosted plane has no trace store to read."""
     _self_hosted(monkeypatch)
-    monkeypatch.setattr(
-        "flash.client.export_trace_records", lambda *a, **k: pytest.fail("hosted call")
-    )
-    monkeypatch.setattr(
-        "flash.client.list_trace_projects", lambda *a, **k: pytest.fail("hosted call")
-    )
+    # stubbed on `traces`, the binding the command actually calls: patching `flash.client` would
+    # leave the real functions in place there, so these fail-fast guards would never fire.
+    monkeypatch.setattr(cli_traces, "export_trace_records", lambda *a, **k: pytest.fail("hosted"))
+    monkeypatch.setattr(cli_traces, "list_trace_projects", lambda *a, **k: pytest.fail("hosted"))
 
     assert _run(["traces", "export"]) == 1
     err = capsys.readouterr().err.lower()
