@@ -146,7 +146,7 @@ def test_load_evaluation_suites_supports_zero_arg_factory(tmp_path) -> None:
 def test_load_evaluation_suites_supports_positional_only_factory(tmp_path) -> None:
     # a positional-only parameter is recognized by name but cannot be passed by one, so the
     # signature filter accepted `load_evaluations(environment, /)` and python itself then rejected
-    # the call -- a sidecar the documented contract says is supported (codex[bot]).
+    # the call -- a sidecar the documented contract says is supported.
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
@@ -239,7 +239,7 @@ def test_sibling_packages_do_not_leak_between_environments(tmp_path, namespace: 
     Eviction matched only modules whose parent WAS the package directory, but `graders.rules`
     lives one level below it -- so it stayed in sys.modules and the next environment's
     `from graders.rules import ...` silently got the first environment's grader. Both suites then
-    scored with the same code while reporting as independent environments (codex[bot]).
+    scored with the same code while reporting as independent environments.
 
     A namespace package (no __init__.py) has no spec origin at all, so an origin-only test cannot
     see it either.
@@ -312,7 +312,7 @@ def test_normalize_eval_result_accepts_bool_and_float() -> None:
 def test_eval_result_rejects_a_pass_that_also_reports_an_error() -> None:
     # an error means the case was never graded, so three readings of it disagreed: the report
     # excluded it and failed the command, the console printed PASS, and the upload recorded
-    # `success: true` beside the error (codex[bot]). one contract, checked where it is built.
+    # `success: true` beside the error. one contract, checked where it is built.
     with pytest.raises(ValueError, match="passed must be False when an error is reported"):
         EvalResult(case_id="a", passed=True, score=1.0, response="4", error="judge unavailable")
 
@@ -512,7 +512,7 @@ def test_env_eval_pins_bare_run_alias_before_generating_and_uploading(
         # `/v1/deployments` excludes only undeployed/dry_run, so a terminal record is still listed
         # and "has a record" was read as "has a servable one". The chat route has no ready
         # predecessor for these, so every case 409s: a whole suite of generation failures to say
-        # what one target error says here (chatgpt-codex-connector).
+        # what one target error says here.
         ({"state": "failed"}, "deployment is failed"),
         ({"state": "revocation_failed"}, "deployment is revocation_failed"),
     ],
@@ -561,7 +561,7 @@ def test_env_eval_runs_a_pinned_step_whose_latest_deploy_failed(monkeypatch, tmp
     terminal-state arms never run (`flash/server/routes/serving.py`). `mark_deployment_failed`
     leaves that ledger alone -- only undeploy and revocation invalidate it -- so a step verified
     before a LATER deploy failed still answers 200, and refusing it here failed an evaluation the
-    server runs correctly (Cursor).
+    server runs correctly.
     """
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
@@ -601,7 +601,7 @@ def test_env_eval_refuses_a_pinned_step_whose_run_lost_its_verified_ledger(
     `invalidate_verified_adapter_revisions` (`flash/runner/deploy.py`), so under those states there
     is no ledger left for `RUN/step-N` to resolve against and every case 409s -- the wasted suite of
     generation failures this check exists to avoid. Exempting every terminal state for a pinned step
-    let `revocation_failed` through (Cursor).
+    let `revocation_failed` through.
     """
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
@@ -717,8 +717,8 @@ def test_env_eval_settles_the_step_selector_capability_before_the_fan_out(
     # the client caches the step-selector capability only after the check succeeds, so workers
     # starting together all miss the cold cache and each fire their own /v1/health -- one eval's
     # worth of duplicate requests for a fact about the control plane that cannot differ between
-    # them (codex[bot]). settling it once on this thread first is what collapses them, so assert
-    # the ordering: the warm-up happens before any worker runs, not concurrently with them.
+    # them. settling it once on this thread first is what collapses them, so assert the ordering:
+    # the warm-up happens before any worker runs, not concurrently with them.
     #
     # only a surviving `RUN/step-N` reaches this at all. a full revision carries no step, and a
     # shorthand whose live deployment is at that same step is pinned to the revision before
@@ -781,7 +781,7 @@ def test_env_eval_fails_the_target_when_the_capability_prewarm_fails(
     Suppressing it did not soften a transient blip, it multiplied it: the client caches only a
     SUCCESSFUL check, so every worker then missed the same cold cache and re-ran it -- one bad
     /v1/health became one per worker plus a generation error per case, burying the single line
-    that names the real cause (chatgpt-codex-connector). So assert the cascade is gone: nothing
+    that names the real cause. So assert the cascade is gone: nothing
     is generated, and the cause is stated once at target level.
     """
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
@@ -1039,7 +1039,7 @@ def test_env_eval_upload_rejects_a_non_uuid_project_before_paying(
 ) -> None:
     # the preflight only tested for non-blank while `upload_eval_run` requires a canonical UUID, so
     # `proj-9` bought every model request and then failed at upload with nowhere to put the results
-    # -- the waste this guard exists to prevent (cursor, codex[bot]).
+    # -- the waste this guard exists to prevent.
     monkeypatch.setattr(
         "flash.client.client_from_config",
         lambda: (_ for _ in ()).throw(AssertionError("client must not be constructed")),
@@ -1325,7 +1325,7 @@ def test_env_eval_refuses_a_generic_github_reference(monkeypatch, capsys) -> Non
     `_spec_environment_id` returns it verbatim because it denotes no hub page. Nonempty was the only
     guard, so such a run graded and then uploaded a reference the dashboard cannot resolve to
     anything -- the unlinked provenance this command exists to eliminate, reintroduced through the
-    one reference shape nobody thought to exclude (codex[bot]).
+    one reference shape nobody thought to exclude.
     """
 
     class Client(_EvalClient):
@@ -1359,7 +1359,7 @@ def test_env_eval_grades_the_hub_package_over_a_same_named_local_directory(
     the sidecar lookup prefers a local path when `namespace/name` exists in the cwd. A developer
     with a checkout at ./acme/starter therefore graded the published environment with their own
     uncommitted evaluations.py, and the report named the published slug either way -- a wrong
-    measurement filed under a right-looking provenance (cursor[bot]).
+    measurement filed under a right-looking provenance.
 
     Downloading once and grading from the extracted copy is what removes the ambiguity, so this test
     keeps the real resolution running and only fakes the transport.
@@ -1436,7 +1436,7 @@ def test_env_eval_upload_keeps_duplicate_id_cases_distinct(monkeypatch, tmp_path
     # `_case_ids` disambiguates a reused id to `same#2`, but the upload looked its cases back up by
     # the RAW `case.id`. every duplicate after the first missed, uploading a null input and expected
     # while the local report read correctly -- losing exactly the cases the disambiguation exists to
-    # keep apart (cursor).
+    # keep apart.
     env_dir = tmp_path / "local-env"
     env_dir.mkdir()
     (env_dir / "environment.py").write_text("def load_environment():\n    return object()\n")
@@ -1506,9 +1506,9 @@ def test_env_eval_upload_reports_an_errored_case_verbatim(monkeypatch, tmp_path)
     assert cases["dead"]["error"] is not None
     assert "generation failed" in cases["dead"]["error"]
     assert cases["sum"]["error"] is None
-    # and the recorded run agrees with the exit code above. only failures BEFORE case execution
-    # used to be marked failed, so a suite whose cases died mid-run uploaded as a completed run
-    # with no error while the cli printed `overall: FAIL` (codex[bot]).
+    # and the recorded run agrees with the exit code above. only failures BEFORE case execution used
+    # to be marked failed, so a suite whose cases died mid-run uploaded as a completed run with no
+    # error while the cli printed `overall: FAIL`.
     assert uploader.calls[0]["status"] == "failed"
     assert uploader.calls[0]["error"] == "1/2 case(s) failed to generate or score"
 
@@ -1920,7 +1920,7 @@ def test_evaluation_sidecar_load_does_not_grow_sys_path(tmp_path) -> None:
 def test_evaluation_sidecars_do_not_share_a_sibling_module_name(tmp_path) -> None:
     # two packages, each with its own `helper`. the first load left `helper` in sys.modules, so the
     # second sidecar's `from helper import GOLD` found the FIRST package's module already cached and
-    # reused it -- silently running the wrong cases, with no import error to notice (codex[bot]).
+    # reused it -- silently running the wrong cases, with no import error to notice.
     for package, gold in (("alpha", "ALPHA"), ("beta", "BETA")):
         env_dir = tmp_path / package
         env_dir.mkdir()
@@ -2049,7 +2049,7 @@ def test_a_sidecar_namespace_package_wins_over_one_already_cached(tmp_path) -> N
 
     PEP 420 makes a bare `graders/` importable, but the owned-name scan required the marker file,
     so a namespace sibling was never counted -- another environment's cached `graders.rules`
-    survived the sweep and the suite graded with that environment's scoring code (codex[bot]).
+    survived the sweep and the suite graded with that environment's scoring code.
     """
     unrelated = tmp_path / "unrelated"
     (unrelated / "graders").mkdir(parents=True)
@@ -2149,9 +2149,9 @@ def test_a_sidecar_load_leaves_unrelated_cached_modules_alone(tmp_path) -> None:
 
 
 def test_env_eval_forwards_split_and_params_to_the_environment(monkeypatch, tmp_path) -> None:
-    # an env whose load_environment() REQUIRES a setting could not be evaluated at all, and one
-    # that merely defaults built a differently-configured scorer than the run trains on, with no
-    # --param/--split path to correct it (codex[bot]).
+    # an env whose load_environment() REQUIRES a setting could not be evaluated at all, and one that
+    # merely defaults built a differently-configured scorer than the run trains on, with no
+    # --param/--split path to correct it.
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
     loaded: list[dict] = []
 
@@ -2190,8 +2190,8 @@ def test_env_eval_forwards_split_and_params_to_the_environment(monkeypatch, tmp_
 
 def test_env_eval_is_an_org_binding_command(monkeypatch, tmp_path, capsys) -> None:
     # results are recorded under a project resolved from the ambient key, so a shadowing
-    # FREESOLO_API_KEY belonging to another org has to be reported BEFORE the paid requests run,
-    # not discovered at upload time with the whole evaluation already spent (codex[bot]).
+    # FREESOLO_API_KEY belonging to another org has to be reported BEFORE the paid requests run, not
+    # discovered at upload time with the whole evaluation already spent.
     from flash.cli import _ORG_BINDING_COMMANDS
     from flash.cli.env_eval import cmd_env_eval
 
@@ -2212,8 +2212,8 @@ def test_env_eval_is_an_org_binding_command(monkeypatch, tmp_path, capsys) -> No
 def test_env_eval_abort_does_not_join_in_flight_generations(monkeypatch, tmp_path) -> None:
     # Ctrl-C during a concurrent eval must reach the CLI's handler immediately. Under `with
     # ThreadPoolExecutor(...)` the implicit shutdown(wait=True) joined every in-flight request
-    # first, and a chat_stream call may block for up to 30 minutes -- so an aborted eval looked
-    # hung for that long (codex[bot]).
+    # first, and a chat_stream call may block for up to 30 minutes -- so an aborted eval looked hung
+    # for that long.
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
@@ -2268,7 +2268,7 @@ def test_env_eval_abort_does_not_hold_the_process_open(tmp_path) -> None:
     `shutdown(wait=False)` returns immediately but concurrent.futures registers an
     interpreter-exit hook that joins every worker anyway, so the process stayed alive until the
     in-flight chat_stream hit its 30-minute timeout even though the CLI had already reported
-    `aborted` (codex[bot]). The test above measures main()'s return, which the executor already
+    `aborted`. The test above measures main()'s return, which the executor already
     satisfied; only process exit can distinguish the two, so this one runs a real subprocess.
     """
     driver = tmp_path / "abort_driver.py"
@@ -2326,10 +2326,10 @@ def test_case_ids_stay_unique_when_an_id_looks_like_a_disambiguated_one() -> Non
 
 
 def test_env_eval_scores_on_the_calling_thread(monkeypatch, tmp_path, capsys) -> None:
-    # a lock prevents overlap but not thread affinity. a scorer holding a resource created while
-    # the suite was loaded -- a sqlite connection, a tokenizer bound to its creating thread --
-    # failed every case from a worker even though nothing was concurrent (codex[bot]). only
-    # generation is parallel; score() always runs on the thread that ran the command.
+    # a lock prevents overlap but not thread affinity. a scorer holding a resource created while the
+    # suite was loaded -- a sqlite connection, a tokenizer bound to its creating thread -- failed
+    # every case from a worker even though nothing was concurrent. only generation is parallel;
+    # score() always runs on the thread that ran the command.
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     witness = tmp_path / "scoring_threads.txt"
     (env_dir / "evaluations.py").write_text(
@@ -2403,7 +2403,7 @@ def test_env_eval_reports_the_whole_completion_it_graded() -> None:
 def test_env_eval_uploads_a_suite_that_failed_to_load(monkeypatch, tmp_path, capsys) -> None:
     # skipping the upload for a suite that never graded a case left the dashboard showing the
     # earlier suites as a completed run with the failing suite simply absent -- a green-looking
-    # evaluation whose CLI exit code was 1 (codex[bot]).
+    # evaluation whose CLI exit code was 1.
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
@@ -2481,9 +2481,9 @@ def test_env_eval_concurrent_results_stay_in_case_order(monkeypatch, tmp_path) -
 @pytest.mark.parametrize("bad", ["nan", "inf", "Infinity", "1e999"])
 def test_env_eval_rejects_a_non_finite_temperature_before_paying(monkeypatch, tmp_path, bad):
     # `float("nan")` and `float("1e999")` both parse, so argparse took them and every case then
-    # spent a request the serving route rejects for being non-finite -- one bad flag turned into
-    # one doomed paid request per case, the whole evaluation billed and nothing graded
-    # (codex[bot]). the environment loads fine here: reaching generation at all is the defect.
+    # spent a request the serving route rejects for being non-finite -- one bad flag turned into one
+    # doomed paid request per case, the whole evaluation billed and nothing graded. the environment
+    # loads fine here: reaching generation at all is the defect.
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
     class Client(_EvalClient):
@@ -2503,10 +2503,10 @@ def test_env_eval_rejects_a_non_finite_temperature_before_paying(monkeypatch, tm
 
 @pytest.mark.parametrize("bad", ["-1", "-0.5", "-1e-9"])
 def test_env_eval_rejects_a_negative_temperature_before_paying(monkeypatch, tmp_path, bad):
-    # a negative value is finite, so it passed the non-finite guard above and every case then
-    # spent a request the OpenAI sampling contract rejects -- one bad flag recorded as one
-    # generation failure per case rather than one usage error (codex[bot]). training already
-    # enforces this floor on its own temperature (`flash/schema/__init__.py`, `minimum=0.0`).
+    # a negative value is finite, so it passed the non-finite guard above and every case then spent
+    # a request the OpenAI sampling contract rejects -- one bad flag recorded as one generation
+    # failure per case rather than one usage error. training already enforces this floor on its own
+    # temperature (`flash/schema/__init__.py`, `minimum=0.0`).
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
     class Client(_EvalClient):
@@ -2745,7 +2745,7 @@ def test_env_eval_pins_a_step_shorthand_to_its_immutable_revision(
     The chat route resolves a step against the run's whole verified ledger, which can hold several
     revisions at one step, and picks the deployed one (`_resolve_explicit_chat_revision`). Sending
     the shorthand therefore graded weights the report could not name, and a later rebuild of the
-    same step read as the same measurement (codex[bot]).
+    same step read as the same measurement.
     """
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
     shorthand = "flash-1/step-3"
@@ -2842,7 +2842,7 @@ def test_env_eval_refuses_to_upload_a_step_it_cannot_name(monkeypatch, capsys) -
     Evaluating it is right (the test above), but recording it is not: `RUN/step-N` is a shorthand
     the server resolves against a ledger that can hold several revisions at one step, and a later
     rebuild of that step reuses it -- so two different sets of weights file as one measurement
-    (chatgpt-codex-connector). Only the live revision is visible from here, so refuse before buying
+    Only the live revision is visible from here, so refuse before buying
     any generation rather than upload a result nobody can identify afterwards.
     """
 

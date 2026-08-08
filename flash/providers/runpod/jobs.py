@@ -866,7 +866,7 @@ def capacity_escalation_note(on_last_gpu: bool) -> str:
     Promising "the next-best GPU" there contradicted the action line printed directly beneath it,
     which names the reused class. poll_job cannot see the cache-fallback intent -- it holds neither
     the retry budget nor the candidate list -- so it states only the escalation fact and lets the
-    supervisor name the target (codex[bot], cursor).
+    supervisor name the target.
 
     Module-level so a supervisor-level test can assert the two log lines agree without hand-writing
     this string: a stand-in would keep passing after the wording regressed.
@@ -1038,7 +1038,7 @@ def poll_job(
             # `worker_coming_up_at` is only as fresh as the last probe, which is up to 90s old. a
             # worker that began initializing inside that window is invisible here, so abandoning the
             # attempt now discards a gpu runpod has ALREADY granted and pays a fresh cold start to
-            # get back to the same place. one probe at the boundary is cheap next to that (codex[bot]).
+            # get back to the same place. one probe at the boundary is cheap next to that.
             #
             # at most one probe per attempt: if it finds nothing the timer expires immediately below,
             # and if it finds a worker the TTL suppresses `would_expire` for the next 300s. stamping

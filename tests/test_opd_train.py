@@ -6117,7 +6117,7 @@ def test_opd_renders_each_prompt_once_so_a_stateful_environment_is_not_run_twice
     so a stateful or seeded implementation advances its state on a pass whose output is discarded.
     And the two passes can DISAGREE: if the classifying pass is text-only for a record whose second
     rendering carries an image, `multimodal` is already latched false, no processor was built, and
-    the build pass reaches a bare `assert processor is not None` (codex[bot]).
+    the build pass reaches a bare `assert processor is not None`.
 
     Asserted on the source rather than by driving `run_opd_train`, because the build loop sits
     behind a gpu probe, a teacher client and a tokenizer load: a fixture that stubs its way there

@@ -91,7 +91,7 @@ def resolve_smoke_completion_tokens(spec: JobSpec) -> int:
         # (flash/engine/worker/sft.py), so resolving to the recipe unconditionally sized the smoke
         # for a run that was never trained: an 8192-context adapter got 2048 tokens, came back
         # finish_reason="length", and the truncation guard rejected a checkpoint that answered
-        # correctly (codex[bot]). mirror the worker's own resolution instead.
+        # correctly. mirror the worker's own resolution instead.
         #
         # not subtracting a prompt allowance is deliberate. the packed limit spans prompt and
         # completion, so this over-allocates by the length of _SMOKE_PROMPT -- the safe direction,

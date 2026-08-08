@@ -118,11 +118,11 @@ def test_4b_grpo_fits_resident_on_roomy_cards_not_tight_ones():
 
 
 def test_moe_resident_fit_sizes_activations_on_active_params():
-    # Codex P2 (Mrkfb): the 35B-A3B MoE resident-fit estimate must size activations/KV on the ACTIVE
-    # backbone (~3B), not the dense 35B total, so a B200 that genuinely fits the run resident (full
-    # 140 GB of weights + active-sized activations/KV under the margin) is admitted resident instead
-    # of being pinned to the stall-prone sleep/wake path. The weights term stays on the full 35B, so
-    # this never under-counts the two resident weight copies.
+    # the 35B-A3B MoE resident-fit estimate must size activations/KV on the ACTIVE backbone (~3B),
+    # not the dense 35B total, so a B200 that genuinely fits the run resident (full 140 GB of
+    # weights + active-sized activations/KV under the margin) is admitted resident instead of being
+    # pinned to the stall-prone sleep/wake path. The weights term stays on the full 35B, so this
+    # never under-counts the two resident weight copies.
     kw = {"seq_len": 2048, "max_tokens": 384, "group_size": 8, "lora_rank": 32}
     moe = "Qwen/Qwen3.6-35B-A3B"
     # active-sized estimate fits resident on two B200s; the same gate would NOT have, sizing as 35B.
@@ -202,11 +202,11 @@ def test_fits_resident_is_conservative_when_unknown():
 
 
 def test_moe_grpo_fits_resident_sizes_compute_on_active_params():
-    # Cursor High: grpo_fits_resident must size the resident peak's COMPUTE terms (KV pool,
-    # activations, rank-linear LoRA) on the MoE's ~3B ACTIVE backbone — like model_required_vram_gb
-    # does — not the 35B TOTAL. Keying them on the total inflates the resident estimate above the
-    # 180 GB B200 (~186 GB w/ margin) and wrongly forces vLLM sleep mode on a B200 MoE GRPO run,
-    # where the sleep/wake cycle stalls the colocated rollout — the very failure the gate prevents.
+    # grpo_fits_resident must size the resident peak's COMPUTE terms (KV pool, activations,
+    # rank-linear LoRA) on the MoE's ~3B ACTIVE backbone — like model_required_vram_gb does — not
+    # the 35B TOTAL. Keying them on the total inflates the resident estimate above the 180 GB B200
+    # (~186 GB w/ margin) and wrongly forces vLLM sleep mode on a B200 MoE GRPO run, where the
+    # sleep/wake cycle stalls the colocated rollout — the very failure the gate prevents.
     from flash.catalog import MODELS, vocab_size_for
 
     moe = "Qwen/Qwen3.6-35B-A3B"
@@ -246,10 +246,9 @@ def test_moe_grpo_fits_resident_sizes_compute_on_active_params():
 
 
 def test_unset_max_length_still_resolves_the_real_rollout_length():
-    # Cursor High / Codex P2: [train].max_context_tokens UNSET (0) does not mean a 0-length run. the
-    # rollout still generates max_tokens, so the effective sequence length must be derived from it --
-    # sizing a run at 0 would treat a real long rollout as free and admit it onto a card that cannot
-    # hold its KV.
+    # [train].max_context_tokens UNSET (0) does not mean a 0-length run. the rollout still generates
+    # max_tokens, so the effective sequence length must be derived from it -- sizing a run at 0
+    # would treat a real long rollout as free and admit it onto a card that cannot hold its KV.
     assert grpo_rollout_seq_len(0, 64, False) >= 2048
     # and an explicit context wins over the derived floor when it is the larger of the two.
     assert grpo_rollout_seq_len(8192, 64, False) >= 8192
@@ -297,7 +296,7 @@ def test_verl_sft_keeps_the_expandable_allocator():
     """verl.trainer.sft_trainer is a pure FSDP trainer: no rollout, no vLLM engine, no CuMemAllocator.
     so the carve-out must not reach it -- switching SFT to the non-expandable conf would regress the
     large-tensor SFT path onto a fragmentation-prone allocator and OOM jobs that fit today. the
-    predicate is "generates through verl", not "runs on verl" (codex[bot])."""
+    predicate is "generates through verl", not "runs on verl"."""
     assert _worker_env_for("sft", "sft")["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
 
 

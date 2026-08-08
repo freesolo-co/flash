@@ -752,7 +752,7 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
     # resolved OUTSIDE the heartbeat block. an attempt preempted before it published its first ping
     # leaves `last_heartbeat` None while `remote.attempt` has already advanced, and nesting this
     # under the heartbeat printed a bare `running` for the whole cold start -- silent through
-    # exactly the relaunch this line exists to explain (codex[bot]).
+    # exactly the relaunch this line exists to explain.
     #
     # prefer the live attempt from `remote` over the heartbeat's: during the relaunch window
     # `remote.attempt` has already advanced while `last_heartbeat` is still the superseded worker's
@@ -765,7 +765,7 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
     # provider handle lands, so for that whole allocation window flash publishes `remote: null` with
     # the superseded worker's ping still attached. falling back there reintroduced exactly what
     # preferring `remote` was meant to fix: the first retry unlabelled, later ones naming the
-    # previous attempt (codex[bot]).
+    # previous attempt.
     #
     # an explicit null is unambiguous, which is why this can key on it: `on_handle` persists
     # `remote` in the same `_update` that sets `running`, so a running flash record with a heartbeat
@@ -786,13 +786,13 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
         # window those are two different attempts, so printing them side by side reads as progress
         # the replacement worker has not made: `stage=sft_step step=455 attempt=1` attributes the
         # superseded worker's 455 steps to an attempt that just started from zero -- the exact
-        # rewind the attempt counter was added to explain. mark the heartbeat-sourced fields as
-        # the previous attempt's instead of dropping them: the run really did reach that step, and
-        # suppressing it entirely would read as no progress at all (codex[bot]).
-        # a cleared `remote` is the same relaunch window, and the ping is just as superseded there:
-        # the worker that produced it has already been torn down. `heartbeat_is_current_attempt`
-        # answers True because it cannot prove otherwise from the identity alone, so the qualifier
-        # has to come from the clear itself or `step=455` reads as the replacement's progress.
+        # rewind the attempt counter was added to explain. mark the heartbeat-sourced fields as the
+        # previous attempt's instead of dropping them: the run really did reach that step, and
+        # suppressing it entirely would read as no progress at all. a cleared `remote` is the same
+        # relaunch window, and the ping is just as superseded there: the worker that produced it has
+        # already been torn down. `heartbeat_is_current_attempt` answers True because it cannot
+        # prove otherwise from the identity alone, so the qualifier has to come from the clear
+        # itself or `step=455` reads as the replacement's progress.
         stale_heartbeat = remote_cleared or not render.heartbeat_is_current_attempt(
             status, heartbeat
         )
@@ -825,7 +825,7 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
             # covering `hb=` matters as much as covering the step -- that age is the old worker's
             # ping too, so a fresh `hb=<1m` printed outside the marker read as the replacement
             # worker being alive when nothing had been heard from it at all, the opposite of what
-            # the age is there to say (cursor).
+            # the age is there to say.
             parts.append("(prev attempt)")
     if attempt:
         parts.append(f"attempt={attempt}")
@@ -836,8 +836,8 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
     #
     # a settled zero is a real answer and prints: `runs list` and `runs status` both show $0.0000
     # there, and dropping it only here made the same terminal run read as costed in one surface and
-    # uncosted in another. what stays suppressed is the pre-settlement zero -- state carries no
-    # cost yet, and `cost=$0.0000` on a queued run states a charge nobody has computed (cursor).
+    # uncosted in another. what stays suppressed is the pre-settlement zero -- state carries no cost
+    # yet, and `cost=$0.0000` on a queued run states a charge nobody has computed.
     amount, is_estimate = render.run_cost(status)
     settled = str(status.get("state") or "") in render.SETTLED_COST_STATES
     if amount or is_estimate or settled:
@@ -1195,15 +1195,15 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
             # EXCEEDS the reserve meant a remainder at or under it was slept in full and the
             # post-sleep deadline check ended the wait with no further read: `--wait 1` reported a
             # revision that went ready mid-window as still queued and exited 1, and every longer
-            # wait carried the same blind spot through its last second (cursor, codex[bot]).
+            # wait carried the same blind spot through its last second.
             #
             # that window's one read is placed LATE in it, not at its midpoint. Splitting it in half
             # stopped looking with half the budget unspent: `--wait 1` read at t=0 and t=0.5 and
-            # then reported a timeout for a revision that went ready at t=0.75
-            # (chatgpt-codex-connector). The read cannot sit at the deadline itself -- it would
-            # still be in flight past it, which is the overshoot the per-poll bound exists to
-            # prevent (`test_deploy_wait_does_not_start_a_read_after_the_deadline_expires`) -- so
-            # sleep most of the window and leave just enough budget to bound the read inside it.
+            # then reported a timeout for a revision that went ready at t=0.75. The read cannot sit
+            # at the deadline itself -- it would still be in flight past it, which is the overshoot
+            # the per-poll bound exists to prevent
+            # (`test_deploy_wait_does_not_start_a_read_after_the_deadline_expires`) -- so sleep most
+            # of the window and leave just enough budget to bound the read inside it.
             slice_seconds = min(_DEPLOY_POLL_SECONDS, remaining)
             if slice_seconds > _DEPLOY_FINAL_READ_SECONDS:
                 slice_seconds -= _DEPLOY_FINAL_READ_SECONDS
@@ -1244,28 +1244,28 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
                 # the listing drops a run once its deployment is gone, so vanishing mid-wait is
                 # terminal, not slow; continuing here would just burn the whole timeout.
                 #
-                # "absent" and "gone", though, are not the same thing. deployment_for matches on
-                # the checkpoint step too, so a redeploy that FAILED and rolled the run back to a
+                # "absent" and "gone", though, are not the same thing. deployment_for matches on the
+                # checkpoint step too, so a redeploy that FAILED and rolled the run back to a
                 # different revision also reads as absent: `mark_deployment_failed` restores the
                 # predecessor verbatim, and the restored record carries the predecessor's step.
-                # reporting that as "no longer an active deployment" names the wrong event and
-                # drops `last_deploy_error`, the only record of why the requested revision did not
-                # make it (codex[bot]). look for the run's other revision before saying it vanished.
-                # recomputed, not `budget`: that was the remainder BEFORE the read that just
-                # returned, and a poll which consumed nearly all of it would hand this lookup a
-                # second full-length bound -- so `--wait 5` could block for close to ten seconds,
-                # and the pinned one-shot of `--wait 0` for twice its fixed bound (codex[bot],
-                # cursor). the expired case still gets the zero-wait bound rather than being
-                # skipped: classifying rollback against vanished is the difference between
-                # reporting the real failure and naming the wrong event, and it is one read.
+                # reporting that as "no longer an active deployment" names the wrong event and drops
+                # `last_deploy_error`, the only record of why the requested revision did not make
+                # it. look for the run's other revision before saying it vanished. recomputed, not
+                # `budget`: that was the remainder BEFORE the read that just returned, and a poll
+                # which consumed nearly all of it would hand this lookup a second full-length bound
+                # -- so `--wait 5` could block for close to ten seconds, and the pinned one-shot of
+                # `--wait 0` for twice its fixed bound. the expired case still gets the zero-wait
+                # bound rather than being skipped: classifying rollback against vanished is the
+                # difference between reporting the real failure and naming the wrong event, and it
+                # is one read.
                 #
                 # a floor, not just an expired-case fallback: a poll that answered a hair inside the
                 # deadline leaves a remainder that is positive and far too small to read in, so
                 # forwarding it verbatim timed the listing out, `_rollback_record` swallowed the
-                # error, and the run was reported vanished with `last_deploy_error` never printed
-                # (cursor). the same one-read reasoning covers it -- a bound too small to answer in
-                # buys nothing over no lookup at all, and overshoots the deadline by at most the
-                # bound the zero-wait one-shot already spends.
+                # error, and the run was reported vanished with `last_deploy_error` never printed.
+                # the same one-read reasoning covers it -- a bound too small to answer in buys
+                # nothing over no lookup at all, and overshoots the deadline by at most the bound
+                # the zero-wait one-shot already spends.
                 left = deadline - time.monotonic()
                 other = _rollback_record(client, run_id, max(left, _DEPLOY_ZERO_WAIT_READ_SECONDS))
                 if other is not None:
@@ -1305,15 +1305,14 @@ def _rollback_record(client, run_id: str, timeout: float) -> dict | None:
     if parsed is None:
         return None
     base_run_id, _ = parsed
-    # the requested step is not read here, and there is no early return for the final adapter.
-    # a run serving a checkpoint whose FINAL-adapter
-    # redeploy fails is rolled back to that checkpoint by `mark_deployment_failed`, and
-    # `deployment_for` rejects the restored record because its non-null `checkpoint_step` does not
-    # match the requested final adapter. exempting `step is None` therefore hit exactly the case
-    # this lookup exists for: the CLI reported the run as vanished and printed the stale queued
-    # record instead of the persisted error and the still-serving checkpoint (codex[bot], cursor).
-    # the rollback is always to a DIFFERENT revision, so the direction of the step change is not
-    # what makes it one -- `last_deploy_error` below is.
+    # the requested step is not read here, and there is no early return for the final adapter. a run
+    # serving a checkpoint whose FINAL-adapter redeploy fails is rolled back to that checkpoint by
+    # `mark_deployment_failed`, and `deployment_for` rejects the restored record because its
+    # non-null `checkpoint_step` does not match the requested final adapter. exempting `step is
+    # None` therefore hit exactly the case this lookup exists for: the CLI reported the run as
+    # vanished and printed the stale queued record instead of the persisted error and the
+    # still-serving checkpoint. the rollback is always to a DIFFERENT revision, so the direction of
+    # the step change is not what makes it one -- `last_deploy_error` below is.
     try:
         entries = client.deployments(timeout=timeout)
     except (ApiError, ClientError):
@@ -1564,12 +1563,12 @@ def cmd_chat(args) -> int:
     ):
         # nothing reaches stdout until the stream produces non-whitespace. The label waits because
         # printing it up front would leave `assistant` on stdout for an empty stream, so a styled
-        # run (a tty, or FLASH_STYLE=1) would exit 1 with non-empty stdout and break the same
-        # health check this failure exists to make possible -- and a stream of blank chunks does
-        # that too, spaces being just as non-empty as a label (Cursor). So blank chunks are held
-        # rather than printed, and released verbatim once real text arrives, which keeps the
-        # response byte-identical for every stream that has any. `_generate_response` grades
-        # emptiness the same way, for the same reason (flash/cli/env_eval.py).
+        # run (a tty, or FLASH_STYLE=1) would exit 1 with non-empty stdout and break the same health
+        # check this failure exists to make possible -- and a stream of blank chunks does that too,
+        # spaces being just as non-empty as a label. So blank chunks are held rather than printed,
+        # and released verbatim once real text arrives, which keeps the response byte-identical for
+        # every stream that has any. `_generate_response` grades emptiness the same way, for the
+        # same reason (flash/cli/env_eval.py).
         if not wrote:
             pending.append(chunk)
             if not chunk.strip():

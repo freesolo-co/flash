@@ -71,7 +71,7 @@ class EvalResult:
         # an error means the case was never graded, so it cannot also have passed. the report
         # already excludes it from the metrics and fails the command, but the console labelled it
         # PASS and the upload recorded `success: true` beside the error -- three readings of one
-        # case that disagree (codex[bot]). reject the state rather than pick a winner downstream.
+        # case that disagree. reject the state rather than pick a winner downstream.
         if self.error and self.passed:
             raise ValueError(
                 f"EvalResult.passed must be False when an error is reported, "
@@ -254,12 +254,12 @@ def _import_evaluations_module(module_path: Path) -> ModuleType:
     if spec is None or spec.loader is None:
         raise ImportError(f"could not import evaluation module from {module_path}")
     module = importlib.util.module_from_spec(spec)
-    # a sibling a sidecar imports is cached under its plain name, so a second package importing
-    # its own `helper` found the FIRST package's module already in sys.modules and reused it --
-    # silently running the wrong cases and the wrong scoring logic, with no import error to see
-    # (codex[bot]). the scope drops the siblings this load introduced, so the next package imports
-    # its own; anything imported before is left alone, since it is not ours to evict. the same
-    # scope is re-entered around cases() and score(), which is where lazy sibling imports land.
+    # a sibling a sidecar imports is cached under its plain name, so a second package importing its
+    # own `helper` found the FIRST package's module already in sys.modules and reused it -- silently
+    # running the wrong cases and the wrong scoring logic, with no import error to see. the scope
+    # drops the siblings this load introduced, so the next package imports its own; anything
+    # imported before is left alone, since it is not ours to evict. the same scope is re-entered
+    # around cases() and score(), which is where lazy sibling imports land.
     previous_module = sys.modules.get(module_name)
     sys.modules[module_name] = module
     try:
@@ -274,10 +274,10 @@ def _import_evaluations_module(module_path: Path) -> ModuleType:
     return module
 
 
-# Each sidecar directory's own modules, parked here while it is out of scope. They are removed
-# from sys.modules so the next environment's `helper` resolves to its own file, and put back on
-# re-entry so a helper's module-level state -- a counter, a client, a loaded judge model --
-# survives from one case to the next instead of re-executing for every callback (cursor[bot]).
+# Each sidecar directory's own modules, parked here while it is out of scope. They are removed from
+# sys.modules so the next environment's `helper` resolves to its own file, and put back on re-entry
+# so a helper's module-level state -- a counter, a client, a loaded judge model -- survives from one
+# case to the next instead of re-executing for every callback.
 _PARKED_SIDECAR_MODULES: dict[str, dict[str, ModuleType]] = {}
 
 
@@ -292,7 +292,7 @@ def _forget_sidecar_siblings(module_dir: str, before: set[str]) -> dict[str, Mod
     `graders.rules`, and the latter's parent is the package dir's CHILD. Matching only immediate
     children left it in sys.modules, so the next environment's `graders.rules` resolved to the
     first one's -- scoring every later suite with another environment's grader, silently
-    (codex[bot])."""
+    ."""
     directory = Path(module_dir).resolve()
     taken: dict[str, ModuleType] = {}
     for name in set(sys.modules) - before:
@@ -328,7 +328,7 @@ def _sidecar_module_names(directory: Path) -> set[str]:
     path is a namespace package, so `graders/rules.py` with no `__init__.py` is importable as
     `graders.rules`. Requiring the marker file left such a directory out of the owned set, so
     another environment's cached `graders.rules` was never displaced and the suite silently graded
-    with its scoring code (codex[bot]). Verified by probe: the second import returned the first
+    with its scoring code. Verified by probe: the second import returned the first
     package's value.
 
     `isidentifier` is the real condition -- a directory named `my-env` or `.git` cannot be spelled
@@ -356,12 +356,12 @@ def _shadowed_cached_modules(directory: Path) -> dict[str, ModuleType]:
     when the name is already cached: a process holding an unrelated top-level `helper` handed it
     to a sidecar importing its own sibling `helper`, and the suite silently graded with another
     module's cases and scoring constants. `_forget_sidecar_siblings` cannot correct it either --
-    it only examines names absent before the scope, and this one was present (cursor[bot]).
+    it only examines names absent before the scope, and this one was present.
 
     Submodules are displaced with their package. Evicting `graders` alone leaves
     `sys.modules["graders.rules"]` cached, and `from graders.rules import score` resolves the
     submodule entry directly -- so the current environment scored with the other package's rules
-    while its own file sat unread (codex[bot]). Verified by probe: the second import returned the
+    while its own file sat unread. Verified by probe: the second import returned the
     first package's value.
 
     Only names this directory can actually supply are displaced, and only ones resolving
@@ -396,7 +396,7 @@ def _sidecar_scope(module_dir: str) -> Iterator[None]:
     name belongs to whichever package is currently in scope, so leaving it cached would hand it
     to the next one -- but throwing it away re-executed the helper on every callback, resetting a
     counter, reloading a judge model, and reopening a connection between one case and the next
-    (cursor[bot]). Parking keeps both: the name is free while another sidecar runs, and this
+    Parking keeps both: the name is free while another sidecar runs, and this
     sidecar sees the same module objects it had last time."""
     resolved = Path(module_dir).resolve()
     directory = str(resolved)

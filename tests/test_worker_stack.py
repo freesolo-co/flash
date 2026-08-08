@@ -1072,7 +1072,7 @@ def test_hopper_fla_fallback_disables_fla_when_stack_unavailable(monkeypatch):
 def test_hopper_fla_fallback_when_install_fails(monkeypatch):
     """A FAILED pip install (rc!=0) must flip the gate off + disable fla EVEN IF find_spec still
     succeeds on a stale/partial resident copy — a failed install is not silently treated as healthy
-    (Copilot review on perf.py:~487). Without the rc check, find_spec alone would wrongly keep fla.
+    (perf.py:~487). Without the rc check, find_spec alone would wrongly keep fla.
     A wrong tvm-ffi version makes the helper ATTEMPT the pinned reinstall (the conditional-install
     gate), so pip_rc=1 exercises the failed-install path."""
     perf, removed = _patch_hopper_stack(
@@ -1111,7 +1111,7 @@ def test_hopper_fla_kept_when_stack_healthy(monkeypatch):
 
 
 def test_hopper_tilelang_present_but_wrong_version_is_reinstalled(monkeypatch):
-    """Regression (Copilot review on perf.py:~511): a DIFFERENT tilelang already resident (a job or
+    """Regression (perf.py:~511): a DIFFERENT tilelang already resident (a job or
     the base image carries one) must NOT be treated as healthy. The helper gates on the installed
     version, so it (re)installs the exact pin; once the pin lands fla is KEPT."""
     pip_calls: list[str] = []
@@ -1168,7 +1168,7 @@ def test_hopper_tilelang_wrong_version_persists_disables_fla(monkeypatch):
 
 
 def test_hopper_tvm_ffi_pip_skipped_when_pin_already_present(monkeypatch):
-    """Regression (Copilot review on perf.py:~521): when the EXACT apache-tvm-ffi pin is already
+    """Regression (perf.py:~521): when the EXACT apache-tvm-ffi pin is already
     resident AND tilelang was NOT (re)installed this invocation, the helper must SKIP the tvm-ffi
     pip — re-running it unconditionally adds avoidable cold-start latency and could spuriously
     disable fla on a transient network/resolver hiccup. The ok gate still re-verifies the version,
@@ -1193,7 +1193,7 @@ def test_hopper_tvm_ffi_pip_skipped_when_pin_already_present(monkeypatch):
 
 
 def test_hopper_outer_exception_disables_fla(monkeypatch):
-    """Regression (Copilot review on perf.py:~580): an unexpected error mid-setup (AFTER the Hopper
+    """Regression (perf.py:~580): an unexpected error mid-setup (AFTER the Hopper
     check passes) must FAIL-CLOSED — best-effort disable fla so transformers can't engage the broken
     Triton GDN path (#640) on a half-configured fla. The outer handler must call _remove_fla_from_disk
     and never re-raise."""
@@ -1281,7 +1281,7 @@ def test_tilelang_pin_is_consistent_and_pinned():
     """tilelang (the Hopper GDN correctness backend) is PINNED to an exact version (not unversioned)
     and the SAME pin is used in WORKER_DEPS, Dockerfile.worker, and perf.py's runtime reinstall, so
     cold-start installs / image rebuilds / runtime reinstalls all resolve the identical backend
-    (Copilot review on flash/providers/_worker.py)."""
+    (flash/providers/_worker.py)."""
     import pathlib
     import re
 

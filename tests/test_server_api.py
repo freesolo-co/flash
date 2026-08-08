@@ -2250,7 +2250,7 @@ def test_worker_artifacts_surfaces_the_ray_failure_logs(monkeypatch, tmp_path):
     worker to Raylet: ... End of file"). The worker collects ray's own session logs to disambiguate
     that, but they live in a PRIVATE repo -- so if the control plane does not fetch them with the
     operator token, `flash runs log` still shows only the EOF traceback and the artifact is written
-    for nobody (codex[bot]).
+    for nobody.
 
     Attempt-scoped like the traceback beside it: on a retry only the highest attempt reproduced the
     failure, and a stale one would misdirect the diagnosis it exists to give.
@@ -3135,7 +3135,7 @@ def test_public_spec_does_not_publish_a_storage_ref_whose_phase_was_removed():
     A persisted worker/effective spec keeps whatever phase was current when it was written. `opsd`
     was removed from the internal-ref grammar (#784), so its locators stopped parsing as internal
     and the redactor left them alone as though they were user-facing refs -- publishing the private
-    repo verbatim (chatgpt-codex-connector). The phase set is not frozen, so this is the shape of
+    repo verbatim. The phase set is not frozen, so this is the shape of
     every future removal too.
     """
     import flash.runner as runner
@@ -7098,9 +7098,9 @@ def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
 
     monkeypatch.setattr(runner, "_run_job", fake_run_job)
 
-    # Codex MtzrJ: a handle-less run may have left a phantom instance from a non-idempotent create
-    # (Vast PUT /asks) that surfaces via eventual consistency. Recovery must force-reap the run's label
-    # across instance providers RIGHT BEFORE resubmitting, so a phantom isn't left writing the same
+    # a handle-less run may have left a phantom instance from a non-idempotent create (Vast PUT
+    # /asks) that surfaces via eventual consistency. Recovery must force-reap the run's label across
+    # instance providers RIGHT BEFORE resubmitting, so a phantom isn't left writing the same
     # seed-scoped artifacts as the fresh worker. Capture the gc-by-run.
     reaped = []
 

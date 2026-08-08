@@ -211,7 +211,7 @@ def build_worker_env(
     # SFT does NOT qualify: verl.trainer.sft_trainer is a pure FSDP trainer with no rollout, no vLLM
     # engine, and no CuMemAllocator, so it keeps the expandable allocator its large generate/logit
     # tensors need against fragmentation. The predicate is "generates through verl", not "runs on
-    # verl" (codex[bot]).
+    # verl".
     _alloc_conf = (
         "expandable_segments:True"
         if str(getattr(spec, "algorithm", "")).lower() == "sft"

@@ -368,7 +368,7 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert python_bin.endswith("/verl-venv/bin/python")
     # the interpreter is NAMED, not inherited: FLASH_ATTN_SPEC is a cp312-only wheel and flash
     # supports 3.11, so a bare `uv venv` on a 3.11 host builds an interpreter that required install
-    # cannot enter -- killing the run during provisioning (codex[bot]).
+    # cannot enter -- killing the run during provisioning.
     assert calls[0][:4] == ["uv", "venv", "--python", "3.12"]
     assert "cp312" in vc.FLASH_ATTN_SPEC
     install = calls[1]
@@ -485,8 +485,7 @@ def test_the_fallback_install_overrides_the_three_ceilings_it_violates(monkeypat
     A bare `vllm==0.19.1` on the command line is a CONSTRAINT, not an override: the resolver must
     still satisfy verl[vllm]'s declared `vllm<=0.12.0` alongside it, so the pair is unsatisfiable
     and the install fails outright rather than picking the pin. Only `--override` makes uv ignore
-    the declaration. Dockerfile.worker:253-258 records the same three violations and the same fix
-    (codex[bot]).
+    the declaration. Dockerfile.worker:253-258 records the same three violations and the same fix.
     """
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
@@ -1285,7 +1284,7 @@ def test_the_stamp_identifies_flash_attn_so_a_prefix_venv_is_not_reused(monkeypa
     The stamp is the whole reuse gate, and flash-attn is installed separately from verl. A stamp
     naming only the verl pin is byte-identical before and after this fix, so a retry landing on a
     pod whose venv predates it would skip the install entirely and hand back an interpreter with no
-    flash-attn -- the exact failure this path exists to prevent (codex[bot]).
+    flash-attn -- the exact failure this path exists to prevent.
     """
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
@@ -1866,8 +1865,8 @@ def test_stall_tail_fields_narrows_to_the_most_recent_lines():
 # these tests drive real processes through the real escalation, which needs three kernel features
 # this repo only ever runs teardown on: fork, /proc for group membership, and libc for the subreaper
 # probe. the rest of the suite is os-independent, so guard rather than fail on a platform that
-# cannot answer (codex[bot]). checked at runtime like the /proc/self/maps test in test_worker_stack,
-# instead of on the platform name, so the condition is the capability actually required.
+# cannot answer. checked at runtime like the /proc/self/maps test in test_worker_stack, instead of
+# on the platform name, so the condition is the capability actually required.
 def _has_libc() -> bool:
     """whether `libc.so.6` loads here, for the subreaper probe the adoption tests need."""
     try:
@@ -1904,7 +1903,7 @@ def _child_subreaper_enabled():
     pid 1 in `Dockerfile.worker` adopts them for free; a shared pytest process does not, so these
     tests ask for the same behaviour explicitly. Leaving it set would change subprocess semantics for
     every LATER test in the process -- they would adopt orphans they never reap, accumulating
-    zombies and making failures order-dependent (codex[bot]).
+    zombies and making failures order-dependent.
     """
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
     previous = _child_subreaper_setting()
@@ -1929,7 +1928,7 @@ def quick_teardown_grace(monkeypatch):
 
     every child below refuses the term on purpose, so each one waits out the full production grace
     before escalating -- 30s of a 30.6s file for three tests. the constant is read from the module
-    at call time, so patching it needs no production seam (codex[bot]).
+    at call time, so patching it needs no production seam.
 
     it is only ever shortened. what these tests assert is that SIGKILL is what performs the
     termination and that nothing is left unreaped, and neither depends on how long the grace was.
@@ -2299,7 +2298,7 @@ def test_child_exit_watchdog_does_not_kill_a_reader_inside_one_long_callback(mon
     real shape is ONE SLOW callback -- an `on_step` checkpoint upload runs for minutes, and while it
     does, a counter bumped only on entry cannot move. That reader is indistinguishable from one
     blocked on a pipe nobody will close, so the group is torn down mid-upload and a run that
-    succeeded is reported as failed (cursor).
+    succeeded is reported as failed.
     """
     monkeypatch.setattr(vc, "_ORPHANED_PIPE_GRACE_S", 0.2)
     # the child exits immediately, so the callback below runs with the watchdog already armed.
@@ -2348,8 +2347,8 @@ def test_a_group_whose_only_member_is_a_zombie_is_not_read_as_alive():
     # never reaped and sits as a zombie indefinitely. killpg(pgid, 0) succeeds for that group, so
     # driving the escalation off addressability alone burned the whole drain deadline on every
     # teardown even though the cuda context was already released -- and sigkill cannot clear a
-    # zombie, only reaping can (codex[bot]). fork rather than Popen: subprocess reaps for you, which
-    # is the very behaviour the worker image lacks.
+    # zombie, only reaping can. fork rather than Popen: subprocess reaps for you, which is the very
+    # behaviour the worker image lacks.
     pid = os.fork()
     if pid == 0:  # pragma: no cover - child never returns to pytest
         os.setsid()
@@ -2421,7 +2420,7 @@ def test_an_unreadable_process_status_does_not_read_as_exited(monkeypatch):
     # teardown can run with the worker out of file descriptors, where opening /proc/<pid>/stat
     # raises EMFILE for every live member at once. reading that as a zombie made the whole group
     # report drained, so SIGKILL was never sent and an EngineCore kept its cuda context precisely on
-    # a resource-failure path (codex[bot]). only disappearance proves an exit.
+    # a resource-failure path. only disappearance proves an exit.
     child = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
     )
@@ -2459,7 +2458,7 @@ def test_an_empty_group_snapshot_is_rechecked_against_the_kernel(monkeypatch):
     # /proc can be listed just before a fork publishes a new child while the member that WAS there
     # exits inside the same window, so one snapshot can show nobody in a group that still holds the
     # gpu. teardown then returned before SIGKILL and the newly forked child -- which inherited the
-    # group and never received the earlier signal -- kept its cuda context (codex[bot]).
+    # group and never received the earlier signal -- kept its cuda context.
     child = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
     )
@@ -2479,7 +2478,7 @@ def test_a_zombie_only_snapshot_taken_before_a_fork_is_not_a_drain(subreaper):
     """The same race the empty snapshot has, one member later: /proc is listed with the leader
     present, and the leader forks and exits before its status is inspected. The walk is then
     nonempty and zombie-only while the child that inherited the group is alive and unlisted, so a
-    verdict taken from it skips SIGKILL and leaves the gpu held (codex[bot])."""
+    verdict taken from it skips SIGKILL and leaves the gpu held."""
     leader = os.fork()
     if leader == 0:  # pragma: no cover - runs only in the forked child
         os.setpgid(0, 0)
@@ -2573,7 +2572,7 @@ def test_a_production_entry_point_does_not_leave_this_process_adopting_orphans()
     Any test reaching `run_verl_training` flips this shared pytest process from 0 to 1 for the rest
     of the session, after which every later test adopts orphaned grandchildren it never waits on --
     accumulating zombies and making results order-dependent. The `subreaper` fixture restores only
-    the tests that ask for it, which is not where this flag is now set (codex[bot]).
+    the tests that ask for it, which is not where this flag is now set.
 
     The autouse conftest fixture is what restores it. This asserts the guarantee the fixture makes,
     from a 0 setting -- what the suite actually runs -- and would fail on a plain `finally`-less
@@ -2655,8 +2654,8 @@ def test_teardown_reaps_an_adopted_grandchild_rather_than_leaving_a_zombie(
 ):
     # pid 1 has no init in Dockerfile.worker, so an EngineCore orphaned when the trainer exits is
     # reparented onto the worker. SIGKILL turns it into a zombie that no signal can clear -- only a
-    # wait can -- so leaving it costs one permanent process-table entry per failed or cancelled run
-    # (codex[bot]). the `subreaper` fixture reproduces that adoption inside this test process.
+    # wait can -- so leaving it costs one permanent process-table entry per failed or cancelled run.
+    # the `subreaper` fixture reproduces that adoption inside this test process.
     leader_src = (
         "import subprocess, sys, time\n"
         "g = subprocess.Popen([sys.executable, '-c',\n"
@@ -2706,7 +2705,7 @@ def test_a_straggler_that_dies_after_the_deadline_is_reaped_by_the_next_teardown
     # SIGKILL cannot be refused, but it also cannot be DELIVERED to a process in uninterruptible
     # sleep. such a member can outlast the drain deadline and turn into a zombie afterwards -- past
     # the last wait its own teardown performs -- so with no record no future wait is ever scheduled
-    # and the entry is permanent on a pid-1 worker (codex[bot]).
+    # and the entry is permanent on a pid-1 worker.
     monkeypatch.setattr(vc, "_UNREAPED_STRAGGLERS", set())
 
     pid = os.fork()
@@ -2780,8 +2779,8 @@ def test_a_straggler_that_was_never_ours_is_not_tracked_forever(monkeypatch):
 def test_a_job_that_succeeds_still_drains_the_stragglers_an_earlier_one_left(monkeypatch):
     # `kill_process_group` is the only OTHER caller of the sweep, and both of its call sites sit in
     # `except BaseException` blocks. a worker whose later jobs all SUCCEED therefore never schedules
-    # the future wait a straggler needs, holding that zombie for the process's whole life -- as pid 1
-    # there is nothing else to reap it. the drain has to happen at every job boundary (codex[bot]).
+    # the future wait a straggler needs, holding that zombie for the process's whole life -- as pid
+    # 1 there is nothing else to reap it. the drain has to happen at every job boundary.
     monkeypatch.setattr(vc, "_UNREAPED_STRAGGLERS", set())
 
     pid = os.fork()
@@ -2844,7 +2843,7 @@ def test_a_worker_that_exits_after_one_phase_still_collects_its_straggler():
 
     Remembering a pid arranges a future wait, and on a long-lived process the next teardown is that
     wait. The runpod worker is not long-lived -- one process per phase -- so the set dies with the
-    phase and the straggler reparents to the persistent handler as a permanent zombie (codex[bot]).
+    phase and the straggler reparents to the persistent handler as a permanent zombie.
     """
     done = subprocess.run(
         [sys.executable, "-c", _SHORT_LIVED_WORKER.format(repo=_REPO_ROOT)],
@@ -2906,7 +2905,7 @@ def test_every_test_touching_a_linux_only_api_carries_the_platform_guard():
 
     A skipif on some of them still fails the run on a platform without `fork` or `/proc`, so this
     reads THIS file and requires the marker wherever such an api appears -- the whole block, not a
-    remembered list (codex[bot]). Source inspection is exempt: asserting that a string is absent
+    remembered list. Source inspection is exempt: asserting that a string is absent
     from `rl_train` runs anywhere.
     """
     linux_only = ("os.fork", "os.getpgid", "os.killpg", "os.waitpid", "libc.so.6", "/proc/")
@@ -2997,8 +2996,8 @@ result = os.read(r_res, 64).decode()
 os.waitpid(worker, 0)
 # the negative control leaves the EngineCore a zombie ON PURPOSE -- that is the result it reports.
 # but this handler is its subreaper (line 1173), so the entry is OURS, and exiting here would
-# reparent it to whatever runs pytest and leak one process-table slot per run of that test
-# (codex[bot]). the state above was already recorded, so collecting it now costs the test nothing.
+# reparent it to whatever runs pytest and leak one process-table slot per run of that test. the
+# state above was already recorded, so collecting it now costs the test nothing.
 #
 # reported rather than done silently: whether the leak is VISIBLE depends on the pid 1 the suite
 # happens to run under -- systemd reaps orphans, a container's `python rp_handler.py` does not -- so
@@ -3036,7 +3035,7 @@ def test_an_orphan_is_actually_reaped_in_the_container_process_topology():
     a subprocess (`flash/providers/runpod/train/endpoints.py:539`). So an EngineCore orphaned when
     the trainer exits reparents past the worker to the HANDLER, `waitpid` raises `ChildProcessError`
     here, and `_reap` records the zombie as handled while it keeps its pid for the worker's whole
-    life -- the handler waits only on the worker, so nothing else collects it either (codex[bot]).
+    life -- the handler waits only on the worker, so nothing else collects it either.
 
     Driven in a subprocess because the pytest process cannot show this: the `subreaper` fixture that
     the teardown tests use manufactures the adoption production does not have, so the defect is
@@ -3065,11 +3064,11 @@ def test_without_the_claim_the_orphan_reparents_past_this_process():
     assert claimed == "True", (
         "`_reap` reported the zombie as handled, which is what makes this silent"
     )
-    # the zombie this control deliberately produces is the probe's to clear before it exits. it is
-    # a subreaper, so the entry is its own; exiting would hand it to whatever runs pytest and leak
-    # one process-table slot per run (codex[bot]). asserted on what the probe COLLECTED rather than
-    # on the pid disappearing: under systemd the orphan is reaped either way, so the disappearance
-    # is not evidence and a test built on it could never fail here.
+    # the zombie this control deliberately produces is the probe's to clear before it exits. it is a
+    # subreaper, so the entry is its own; exiting would hand it to whatever runs pytest and leak one
+    # process-table slot per run. asserted on what the probe COLLECTED rather than on the pid
+    # disappearing: under systemd the orphan is reaped either way, so the disappearance is not
+    # evidence and a test built on it could never fail here.
     assert engine in collected, (
         f"the probe exited without reaping orphan {engine}, leaking a process-table entry to "
         "whatever inherits it -- invisible under an init that reaps, permanent under one that does not"
@@ -3126,7 +3125,7 @@ def test_a_missing_libc_does_not_fail_the_run():
 
 def test_the_grpo_success_path_drains_stragglers_too():
     """`kill_process_group` runs on exceptions alone in the grpo loop, so without a drain on the
-    ordinary exit a worker whose later jobs all SUCCEED keeps a straggler zombie for life (cursor).
+    ordinary exit a worker whose later jobs all SUCCEED keeps a straggler zombie for life.
     """
     src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
     finally_block = src[src.rindex("finally:") :]
@@ -3437,7 +3436,7 @@ def test_a_session_predating_this_run_is_rejected_not_reported_as_its_evidence(t
     /tmp survives a retry on a reused pod, so a failure during dependency provisioning or model
     download still finds an earlier run's session under /tmp/ray. Uploading it under this attempt's
     artifact prefix is worse than uploading nothing: it reads as a raylet death that never happened
-    and sends the next diagnosis after a cause belonging to a different run (codex[bot], cursor).
+    and sends the next diagnosis after a cause belonging to a different run.
     """
     root = tmp_path / "ray"
     _ray_session(root, "session_prev", files={"raylet.err": "PREVIOUS RUN"}, mtime=1_000_000)
@@ -3466,7 +3465,7 @@ def test_a_secret_split_by_the_tail_boundary_is_not_uploaded_in_part(tmp_path):
     sanitize_diagnostic matches a secret by its ``key=`` prefix or by full value. A tail boundary
     landing inside a token strips the prefix and the value's head, so no pattern matches and the
     remainder uploads in clear. Dropping the partial first line makes that impossible, because a
-    secret cannot span a newline (codex[bot]).
+    secret cannot span a newline.
     """
     root = tmp_path / "ray"
     secret = "ghp_" + "z" * 60
@@ -3491,7 +3490,7 @@ def test_a_multiline_secret_cut_by_the_boundary_is_redacted_past_the_first_line(
     When the tail begins inside such a value's first line, that line is dropped -- but every
     LATER line of the same secret is whole, lands after the cut, and no longer matches the
     whole-value replace, so it uploads verbatim. Redaction must therefore know a secret's
-    individual lines (codex[bot]).
+    individual lines.
     """
     root = tmp_path / "ray"
     body_lines = ["MIIEowIBAAKCAQEAx" + "Q" * 40, "kJ9vTinRUME7Fw3n" + "R" * 40]

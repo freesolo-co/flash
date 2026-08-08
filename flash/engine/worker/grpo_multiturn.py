@@ -72,7 +72,7 @@ def post_json(url: str, path: str, payload: dict) -> dict:
     fails healthy episodes for arriving Nth, which is a property of the batch size and not of the
     environment. a genuinely wedged env is caught by the stall watchdog instead
     (``flash/providers/_poll.py`` STALL_AFTER_S), which measures training progress rather than one
-    request (codex[bot]).
+    request.
     """
     request = urllib.request.Request(
         url.rstrip("/") + path,

@@ -1314,8 +1314,8 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
                     reasoning_open = True
                     # the text belongs to the block that is opening, not to every block so far.
                     # accumulating across blocks made the duplicate checks below compare a later
-                    # block's retained close against both blocks' text, so they stopped
-                    # recognising it and streamed the delimiter a second time (cursor).
+                    # block's retained close against both blocks' text, so they stopped recognising
+                    # it and streamed the delimiter a second time.
                     reasoning_text = ""
                     yield _TAG_OPEN
                 if raw_reasoning:

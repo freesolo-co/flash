@@ -715,14 +715,14 @@ _QUIET_HEARTBEAT_HINT = (
     "heartbeat uploads are throttled; quiet is not dead - check flash runs log <run-id> -f"
 )
 # a throttled training step is never guaranteed current: the worker holds mid-training commits for
-# up to _HB_MIN_INTERVAL_S (900s), so from upload until the next commit the displayed step lags by an
-# unknown amount. gate on the same age at which the panel already flags the quiet (300s) rather than
-# on 900s -- the incident that motivated this reported 559s and 687s, squarely inside that window,
-# where a 900s gate would stay silent and leave only the dead-end quiet hint (codex[bot]).
+# up to _HB_MIN_INTERVAL_S (900s), so from upload until the next commit the displayed step lags by
+# an unknown amount. gate on the same age at which the panel already flags the quiet (300s) rather
+# than on 900s -- the incident that motivated this reported 559s and 687s, squarely inside that
+# window, where a 900s gate would stay silent and leave only the dead-end quiet hint.
 _STALE_STEP_AFTER_S = _HB_QUIET_HINT_AFTER_S
 # only the stages the worker actually holds on the 900s upload throttle. opd_step is excluded: its
-# post-update ping is force=True, so it re-commits at the 60s forced floor and an opd_step older than
-# 900s means a long step, failed uploads, or a real stall -- not reporting lag (codex[bot]).
+# post-update ping is force=True, so it re-commits at the 60s forced floor and an opd_step older
+# than 900s means a long step, failed uploads, or a real stall -- not reporting lag.
 _TRAINING_STEP_STAGES = frozenset({"rl_step", "sft_step"})
 
 
@@ -746,7 +746,7 @@ def _stale_step_hint(
     if not running or heartbeat_age_seconds is None:
         return None
     # a heartbeat from a superseded attempt describes a dead worker's step; calling that ordinary
-    # throttled progress hides that the replacement has published nothing (codex[bot]).
+    # throttled progress hides that the replacement has published nothing.
     if not current_attempt:
         return None
     if heartbeat_age_seconds <= _STALE_STEP_AFTER_S:
@@ -754,8 +754,8 @@ def _stale_step_hint(
     if str(heartbeat.get("stage") or "") not in _TRAINING_STEP_STAGES:
         return None
     # step 0 is the cold, still-running first step: no optimizer update has landed, so there is no
-    # later hidden step for the reassurance to point at. reuse the shared step-gated predicate rather
-    # than a bare presence check (codex[bot]).
+    # later hidden step for the reassurance to point at. reuse the shared step-gated predicate
+    # rather than a bare presence check.
     from flash.providers._poll import is_training_heartbeat
 
     if not is_training_heartbeat(heartbeat.get("stage"), heartbeat.get("step")):
@@ -765,8 +765,7 @@ def _stale_step_hint(
     # print comes from _print_worker_output AFTER the run reaches a terminal state
     # (flash/cli/commands.py cmd_log) -- so it cannot answer this question while the run is live.
     # even reaching for that artifact mid-follow would not help: the worker uploads it on a 3600s
-    # interval (_CONSOLE_UPLOAD_INTERVAL_S), an hour of staleness against a hint that fires at 300s
-    # (codex[bot]).
+    # interval (_CONSOLE_UPLOAD_INTERVAL_S), an hour of staleness against a hint that fires at 300s.
     #
     # the always-available signal is the `age` row this hint hangs off, which is rendered from the
     # same payload and therefore cannot be missing: below the 900s upload throttle the quiet is
@@ -964,8 +963,8 @@ def cost_panel(est) -> str:
         ("wall clock", f"{est.wall_clock_hours:.2f} h"),
         ("billable", f"{est.billable_hours:.2f} h  {_dim('(training only)')}"),
     ]
-    # opd teacher spend is itemized but not part of total_usd (billed by parasail on the managed key).
-    # Mirror CostEstimate.breakdown() so the styled panel doesn't silently drop it (cursor[bot]).
+    # opd teacher spend is itemized but not part of total_usd (billed by parasail on the managed
+    # key). Mirror CostEstimate.breakdown() so the styled panel doesn't silently drop it.
     if getattr(est, "teacher_api_usd", 0) > 0:
         pairs.append(
             (

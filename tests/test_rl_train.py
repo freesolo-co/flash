@@ -174,7 +174,7 @@ def test_grpo_consumer_inside_one_long_step_is_not_read_as_a_stuck_reader(monkey
     A grpo step -- generation, reward, an optimizer pass -- easily outlasts the orphaned-pipe grace.
     Progress counted at the arrival of a line cannot advance during it, so the consumer looks
     exactly like a reader blocked on a pipe nobody will close, and the group is torn down under a
-    run that is working (cursor). The child polls as exited here, which is the state that arms the
+    run that is working. The child polls as exited here, which is the state that arms the
     watchdog at all, so the only thing keeping the group alive is the in-flight line.
     """
     monkeypatch.setattr(rl_train, "_ORPHANED_PIPE_GRACE_S", 0.1)
@@ -1799,7 +1799,7 @@ def test_an_unscorable_reward_is_masked_before_it_reaches_verl(env):
     with no nan-aware variant on its path, so one nan row makes the mean, the std, and all
     `group_size` advantages nan -- the whole group, not just the unscorable row. The retired trl
     path could forward it because it masked nan rows out of the baseline and zeroed their
-    advantage (grpo_trainer.py:2171, :2222); nothing downstream of here does that now (codex[bot]).
+    advantage (grpo_trainer.py:2171,:2222); nothing downstream of here does that now.
     """
     breakdowns: list[dict[str, float] | None] = []
     s = rl_train.score_single_turn(
@@ -1874,7 +1874,7 @@ def test_a_capability_probe_that_raises_scores_zero_and_counts_as_a_failed_gradi
     """The probe is env code too, so it has to sit inside the guard that turns env faults into 0.0.
 
     Outside it, the exception escapes into the reward http handler, the verl child reads a bridge
-    failure and aborts the whole run -- over one env's attribute access (codex[bot]).
+    failure and aborts the whole run -- over one env's attribute access.
 
     The `None` matters just as much as the 0.0: a raising probe is a completion that FAILED to
     score, and the mean counts None as a zero for every name the other completions reported.
@@ -4595,7 +4595,7 @@ def test_the_recorded_transcript_excludes_the_prompt_it_was_seeded_from():
 
     Publishing the whole list repeats the prompt inside `completion` when it already rides the
     sample as `prompt_tail`: the reader sees it twice, and the doubled text eats the payload budget
-    a long episode needs for its actual turns (codex[bot]).
+    a long episode needs for its actual turns.
     """
     recorded: list[tuple] = []
     prompt = [
@@ -4710,7 +4710,7 @@ def test_a_first_turn_abort_is_still_shown_in_the_sample(abort):
     `step` keeps an unusable turn out of `messages` so the env never scores it. Building the sample
     from that state alone therefore publishes an empty completion for a first-turn truncation --
     a model that generated right up to its token limit reads as a model that generated nothing
-    (codex[bot])."""
+    ."""
     recorded: list[tuple] = []
     env = _BridgeEnv(done_after=99)
     bridge = _bridge(
@@ -4974,7 +4974,7 @@ def test_bridge_reaps_a_session_whose_actor_died_before_it_could_close(capsys):
     # a ray rollout actor that dies between /multiturn/start and its `finally` /multiturn/close
     # leaves an entry nobody will ever remove. verl restarts the actor, the replacement starts a
     # fresh session, and the dead one's env state and transcript are retained for the rest of the
-    # worker's life -- so the leak grows with every actor death, unbounded (codex[bot]).
+    # worker's life -- so the leak grows with every actor death, unbounded.
     env = _BridgeEnv()
     bridge = _bridge(env, session_lease_s=60.0)
     bridge.start({"index": 0, "session_id": "dead"})
@@ -5494,7 +5494,7 @@ def test_every_completion_counts_toward_the_mean_however_large_the_generation():
     """A generation is ``batch_size * group_size`` completions, both unbounded, so no retention cap
     can hold one. Dropping the overflow biases the published mean toward whichever completions were
     graded last -- here, a run that succeeded early and failed late would report a flat 0
-    (codex[bot])."""
+    ."""
     score, buffer = _score_buffer(
         _CountingBreakdownEnv(),
         prompts=["prompt-0"],
@@ -5615,7 +5615,7 @@ def test_a_heartbeat_landing_mid_generation_republishes_the_last_complete_one():
     The completions that finish first are the fast ones -- short outputs, cache hits, envs that
     grade without i/o. A drain on the heartbeat cadence therefore reports THAT subset's mean as the
     step's reward, systematically over-representing whatever is cheap to produce. The reading has to
-    stay pinned to the last whole generation until the next boundary seals a new one (codex[bot]).
+    stay pinned to the last whole generation until the next boundary seals a new one.
     """
     score, buffer = _score_buffer(
         _NamedBreakdownEnv(),
@@ -5643,7 +5643,7 @@ def test_a_heartbeat_landing_mid_generation_republishes_the_last_complete_one():
 def test_the_next_generation_cannot_be_sealed_into_the_step_line_that_is_still_in_flight():
     """The child's stdout is delivered asynchronously, so `step:N` can reach the parent AFTER
     generation N+1 has started scoring. A boundary taken at that moment seals both generations
-    under step N and leaves N+1 with nothing of its own to publish (codex[bot]).
+    under step N and leaves N+1 with nothing of its own to publish.
 
     Counting closes the generation on the scoring thread that finishes it, so the in-flight line
     only names what was already sealed."""
@@ -5671,7 +5671,7 @@ def test_a_generation_that_completes_before_the_previous_step_line_is_not_lost()
 
     A single "already sealed" flag only remembers one unacknowledged generation, so the second seal
     overwrites the first: generation 1 is dropped and generation 2 publishes under step 1, leaving
-    every later step misaligned. Small generations make that window ordinary (cursor, codex[bot])."""
+    every later step misaligned. Small generations make that window ordinary."""
     score, buffer = _score_buffer(_NamedBreakdownEnv(), generation_size=2)
     score(0, "7")
     score(0, "7")  # generation 1 complete: success 1.0
@@ -5710,8 +5710,7 @@ def test_an_eviction_does_not_shift_every_later_step_onto_the_wrong_generation()
 
     Handing that line to the oldest SURVIVOR consumes a generation whose own line is still coming,
     so the offset never closes -- every step for the rest of the run publishes the next generation's
-    output under the previous step's number. One eviction, permanently wrong diagnostics (cursor,
-    codex[bot]).
+    output under the previous step's number. One eviction, permanently wrong diagnostics.
     """
     limit = RewardObservabilityBuffer._SEALED_QUEUE_LIMIT
     buffer = RewardObservabilityBuffer(generation_size=1)
@@ -5739,7 +5738,7 @@ def test_the_step_preview_reads_the_generation_that_step_published():
     A late `step:N` line arrives with generation N+1 already scoring, so the newest recorded sample
     belongs to N+1. Previewing that labels N+1's completion as step N -- the mislabelling the queue
     exists to prevent, reintroduced one line later, and disagreeing with the heartbeat about the
-    very same step (codex[bot]).
+    very same step.
     """
     buffer = RewardObservabilityBuffer(generation_size=2)
     buffer.record("p", "gen1-a", 1.0)
@@ -5767,7 +5766,7 @@ def test_a_preview_before_the_first_boundary_still_shows_a_rollout():
 def test_a_component_too_large_to_be_a_float_does_not_fail_the_reward_request():
     """`record` runs OUTSIDE `score_single_turn`'s error guard, so anything it raises 400s the
     reward request and aborts the run. An int larger than a float can hold raises OverflowError,
-    which is neither TypeError nor ValueError (codex[bot])."""
+    which is neither TypeError nor ValueError."""
     score, buffer = _score_buffer(_OverflowingBreakdownEnv())
 
     assert score(0, "7") == 1.0  # the total graded fine; only the diagnostic component is unusable
@@ -5959,7 +5958,7 @@ def test_samples_carry_the_step_they_were_generated_at_not_the_current_one():
 
     The buffer is rolling, so a drain that stamps everything in it with the current step
     re-publishes older rollouts as if the model had just produced them -- a reader watching for
-    behaviour change sees old text under a new step number (codex[bot]).
+    behaviour change sees old text under a new step number.
     """
     score, buffer = _score_buffer(_NamedBreakdownEnv())
     score(0, "7")
@@ -6090,7 +6089,7 @@ def test_the_generation_boundary_is_the_step_line_and_the_heartbeat_never_drains
         "samp = observability.latest_for_step(step_box[0])"
     )
     # and the preview asks for THIS step's rows. the unchecked accessor answers with whatever was
-    # published last, which on the drop-spend path belongs to an earlier step (cursor).
+    # published last, which on the drop-spend path belongs to an earlier step.
     assert "observability.latest()" not in stdout_loop, (
         "the preview would print older rows under this step number"
     )
@@ -6102,7 +6101,7 @@ def test_a_step_whose_generation_was_dropped_previews_nothing_rather_than_older_
     `close_generation` spends this step's line on a generation the queue already dropped and
     publishes nothing. `latest` keeps answering with the previous generation's rows, and the caller
     -- which cannot see that no publish happened -- prints them under the new step number, so the
-    log claims this step generated text that a different step produced (cursor).
+    log claims this step generated text that a different step produced.
     """
     buffer = RewardObservabilityBuffer(generation_size=2)
     buffer.record("pA", "gen-A-a", 1.0)
@@ -6606,7 +6605,7 @@ def test_a_truncated_final_turn_still_earns_per_turn_credit_for_the_turns_before
     # the bridge does not record an aborted turn into env state (MultiTurnBridge.step returns before
     # record_model_turn), so the env returns no reward for it. the loop must not span it either, or
     # the vector is one short of the spans, score_rollouts rejects the count, and the row -- and via
-    # the shim its whole group -- silently drops to episode credit (cursor).
+    # the shim its whole group -- silently drops to episode credit.
     env = _SpanEnv()
     out = _drive_multi_turn_episode(
         stop_reasons=[("ab", "completed"), ("cd", "aborted")], env=env, monkeypatch=monkeypatch
@@ -6739,7 +6738,7 @@ def test_the_rl_trainer_stores_the_frozen_base_in_bf16():
 
 
 def test_grpo_builds_its_verl_child_env_from_the_allowlist():
-    """Regression (codex[bot], rl_train.py): the grpo driver built the child env with
+    """Regression (rl_train.py): the grpo driver built the child env with
     `dict(os.environ)`, so the platform HF_TOKEN, the GITHUB_TOKEN and every user-declared
     environment secret reached the verl subprocess -- and verl fans that env out to each ray actor.
     scoring never happens there: it stays in this process behind the localhost reward bridge, so the
@@ -6782,7 +6781,7 @@ def test_the_verl_child_allowlist_keeps_the_kernel_choice_but_drops_credentials(
 
 
 def test_grpo_finalization_carries_the_completed_step():
-    """Regression (codex[bot], rl_train.py): write_train_meta emits `<phase>_train_done` and then the
+    """Regression (rl_train.py): write_train_meta emits `<phase>_train_done` and then the
     terminal `done`. Called without `step`, both land stepless and overwrite the stepped `rl_trained`
     heartbeat above them, and actual_steps_run() deliberately returns 0 for a non-training stage with
     no step -- so a cancel arriving between finalization and DONE reprices a fully trained run at

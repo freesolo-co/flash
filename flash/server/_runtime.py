@@ -213,13 +213,13 @@ def _confirm_run_clear(spec) -> bool:
                 clear = False  # an instance for this run is still present
         except Exception:
             clear = False  # couldn't list -> can't prove clear -> don't race
-    # An instance provider that WAS available at submit (so it could have taken the lost create) but is
-    # NOT configurable now and owns the standing-instance capability can't be enumerated -> can't prove
-    # clear -> fail closed. Already-configured providers were handled above. CRITICAL: do NOT wrap this in
-    # a broad ``suppress(Exception)`` — an
-    # error loading the status, resolving a recorded provider, or reading the capability would otherwise
-    # be swallowed and leave ``clear`` True, defeating the fail-closed intent (cursor). Every failure
-    # inspecting the recorded set must instead make the guard CONSERVATIVE (block/defer the resubmit).
+    # An instance provider that WAS available at submit (so it could have taken the lost create) but
+    # is NOT configurable now and owns the standing-instance capability can't be enumerated -> can't
+    # prove clear -> fail closed. Already-configured providers were handled above. CRITICAL: do NOT
+    # wrap this in a broad ``suppress(Exception)`` — an error loading the status, resolving a
+    # recorded provider, or reading the capability would otherwise be swallowed and leave ``clear``
+    # True, defeating the fail-closed intent. Every failure inspecting the recorded set must instead
+    # make the guard CONSERVATIVE (block/defer the resubmit).
     for name in recorded or []:
         if name in configured or name not in INSTANCE_PROVIDERS:
             continue
@@ -509,7 +509,7 @@ def _ray_log_name_for_attempt(phase: str, error_name: str) -> str | None:
     run they can belong to an earlier attempt than the traceback: attempt 0 dies to a raylet, attempt
     1 fails for an unrelated reason and uploads none, and resolving the two independently surfaces
     attempt 0's raylet death beside attempt 1's traceback -- misattributing a non-ray failure to a
-    raylet that died an attempt ago (codex[bot]). Pinning to the traceback's attempt means the pair
+    raylet that died an attempt ago. Pinning to the traceback's attempt means the pair
     always describes one attempt, and the fetch simply misses when this attempt produced no ray logs.
 
     Returns None for an unscoped traceback: there is no attempt to pin to, and guessing would
@@ -547,9 +547,9 @@ def _worker_artifacts(spec) -> dict[str, str]:
     # ray's own session logs. the traceback beside them records only the downstream symptom of a
     # raylet death ("Failed to register worker to Raylet: ... End of file"), so without this the
     # collector that exists to disambiguate it uploads a diagnosis nothing ever reads back
-    # (VERL-115, codex[bot]). pinned to the TRACEBACK's attempt rather than resolved independently:
-    # they are uploaded only when ray failed, so the newest pair can straddle two attempts. absent
-    # for every non-ray failure, and the loop below skips it.
+    # (VERL-115). pinned to the TRACEBACK's attempt rather than resolved independently: they are
+    # uploaded only when ray failed, so the newest pair can straddle two attempts. absent for every
+    # non-ray failure, and the loop below skips it.
     ray_name = _ray_log_name_for_attempt(spec.phase, error_name)
     for name in (
         _latest_worker_artifact_name(repo, prefix, spec.phase, "console"),
@@ -657,7 +657,7 @@ def recover_runs() -> None:
             # that can only crash. Same disposition as the handle-less branch below: fail it
             # visibly, then tear the worker down. `_strict_teardown_handle` needs only the persisted
             # handle and the run id, never a parsed spec, so removal does not depend on the parse
-            # that just failed (chatgpt-codex-connector).
+            # that just failed.
             try:
                 JobSpec.from_dict(status.spec)
             except Exception as exc:
@@ -674,11 +674,11 @@ def recover_runs() -> None:
                 _teardown_unrecoverable_remote(status)
                 # If that teardown could not confirm deletion it records the handle for the cleanup
                 # drain -- but this run's drain was dispatched above and has already taken its
-                # snapshot, of a list that did not yet contain this record (cursor). `_drain_cleanup_
+                # snapshot, of a list that did not yet contain this record. `_drain_cleanup_
                 # remotes` returns early on an empty snapshot, so nothing would retry it before the
-                # next restart. Dispatch a second drain now that the record exists. A double teardown
-                # of one handle is safe: `_strict_teardown_handle` is idempotent and the record is
-                # removed by compare-and-remove only on a confirmed delete.
+                # next restart. Dispatch a second drain now that the record exists. A double
+                # teardown of one handle is safe: `_strict_teardown_handle` is idempotent and the
+                # record is removed by compare-and-remove only on a confirmed delete.
                 threading.Thread(
                     target=_drain_cleanup_remotes_bg, args=(status.run_id,), daemon=True
                 ).start()

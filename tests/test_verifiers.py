@@ -197,7 +197,7 @@ def test_single_turn_reward_many_batches_by_example_value_identical(monkeypatch)
 
 
 def test_single_turn_reward_many_serial_when_not_thread_safe(monkeypatch):
-    """Codex MtMlT: an env that opts out with reward_thread_safe = False must NOT have a group's
+    """An env that opts out with reward_thread_safe = False must NOT have a group's
     completions batched into one env-concurrent score_responses call (a scorer with mutable/thread-
     bound state would be raced). reward_many must score each rollout with its OWN single-item call,
     byte-identical and in input order — the pre-batching serial behavior."""

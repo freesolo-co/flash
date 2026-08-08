@@ -511,8 +511,7 @@ def render_reentrant_checkpointing_shim(reentrant: bool, *, multimodal: bool = F
     as requiring grad the visual modules silently receive nothing while the language side trains
     normally (``tests/test_multimodal_input_grads.py``). the retired trl path installed that hook
     via a trainer callback; verl has no callback surface, so it rides this shim instead -- and only
-    here, because non-reentrant recompute does not have the behaviour that makes it necessary
-    (codex[bot]).
+    here, because non-reentrant recompute does not have the behaviour that makes it necessary.
     """
     if not reentrant:
         return ""

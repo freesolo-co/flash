@@ -659,7 +659,7 @@ def test_a_worker_arriving_inside_the_probe_gap_is_not_abandoned(monkeypatch):
 
     Here health reports nothing until the boundary is in sight, then a worker appears. Without a
     probe AT the boundary the run is failed no_capacity on a reading taken before the worker
-    existed (codex[bot]).
+    existed.
     """
 
     probes = {"n": 0}
@@ -4068,7 +4068,7 @@ def test_attach_unparseable_spec_fails_closed_and_tears_down(monkeypatch):
     It is dispatched on a daemon thread by `recover_runs`, so nothing surfaces the exception: the
     run stays nonterminal holding a live handle and its worker bills until someone notices. A spec
     stops parsing when the plane drops a surface a still-in-flight run was accepted under -- here a
-    local `environment.path`, which `JobSpec.from_dict` rejects (codex[bot]).
+    local `environment.path`, which `JobSpec.from_dict` rejects.
     """
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
@@ -6008,7 +6008,7 @@ def test_reattach_keeps_the_stall_grace_but_not_the_capacity_wording(monkeypatch
     reallocation_spec_from_status -- restoring the run's original unpinned gpu type -- and re-enters
     _run_training with empty failed_providers and tried_classes, so the replacement really can pick
     another class or provider. Forwarding the snapshot to poll_job would state "no further GPU-class
-    escalation follows" about a picker that has its whole candidate list back (codex[bot]).
+    escalation follows" about a picker that has its whole candidate list back.
 
     The stall grace is a different question -- how long to wait on hardware that was scarce -- which
     the snapshot still answers correctly, so it must keep flowing through."""

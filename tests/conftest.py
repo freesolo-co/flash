@@ -152,7 +152,7 @@ def _child_subreaper_does_not_leak_between_tests():
     pytest process from 0 to 1 for the rest of the session. From then on every later test adopts
     orphaned grandchildren it never waits on, so it accumulates zombies and its result depends on
     what ran before it. The ``subreaper`` fixture in ``test_backend_common`` restores only the tests
-    that ask for it, which is not where the flag is now set (codex[bot]).
+    that ask for it, which is not where the flag is now set.
 
     Autouse and here rather than in that module: five test files reach those entry points, and the
     tests harmed are any that follow -- so the guarantee has to cover the whole suite. The module's

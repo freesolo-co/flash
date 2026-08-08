@@ -155,9 +155,9 @@ class RunpodProvider:
             # unpinned gpu type, and re-enters _run_training with empty failed_providers and
             # tried_classes -- so the replacement really can pick another class or provider.
             # forwarding the snapshot here would state "no further GPU-class escalation follows"
-            # about a picker that has its whole candidate list back (codex[bot]). the grace is a
-            # different question: how long to wait on hardware that was scarce, which the snapshot
-            # still answers correctly.
+            # about a picker that has its whole candidate list back. the grace is a different
+            # question: how long to wait on hardware that was scarce, which the snapshot still
+            # answers correctly.
             **stall_kwargs(on_last_gpu=on_last_gpu),
         )
 

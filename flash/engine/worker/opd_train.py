@@ -2271,9 +2271,9 @@ def run_opd_train(spec=None) -> None:
     # shuffle the RENDERED rows, not the examples, so the pass below reuses this rendering instead
     # of calling back into the environment. prompt_messages is user code: a stateful or seeded
     # implementation returns something different the second time, and a second-pass image the scan
-    # never saw would reach `assert processor is not None` with multimodal already latched false
-    # (codex[bot]). same seed over the same length is the same permutation, so data order is
-    # unchanged and a resume fingerprint still matches.
+    # never saw would reach `assert processor is not None` with multimodal already latched false.
+    # same seed over the same length is the same permutation, so data order is unchanged and a
+    # resume fingerprint still matches.
     random.Random(_w.SEED).shuffle(prompt_rows)
 
     started_at = time.time()

@@ -484,7 +484,7 @@ def method_card_speedup(config: RunConfig, gpu_count: int, gpu: str, provider: s
     scaling. It is a parameter rather than only a ``config`` field because the two paths that
     matter -- allocator ranking and the re-quote from a live allocation -- both build the config
     WITHOUT a provider and learn the real one only from the candidate they are pricing. Reading it
-    off ``config`` alone left `auto` there and silently kept the nvlink curve (Cursor Bugbot).
+    off ``config`` alone left `auto` there and silently kept the nvlink curve.
     ``config.provider`` remains the fallback for a run that pinned one explicitly.
     """
     n = config.normalized()

@@ -298,8 +298,7 @@ def test_env_test_rejects_an_evaluation_case_whose_image_cannot_be_resolved(
     # `prompt_messages()` is only half of the prompt: env eval and every training worker then run
     # `normalize_prompt_images`. checking only the message envelope approved a case whose
     # package-relative image does not exist, and the online command then recorded a
-    # prompt-construction failure for a suite this gate had reported `overall: PASS`
-    # (chatgpt-codex-connector).
+    # prompt-construction failure for a suite this gate had reported `overall: PASS`.
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
@@ -474,8 +473,8 @@ def test_env_test_does_not_blame_the_grader_for_a_reference_it_cannot_replay(
     # a gold answer written in reasoning markup is graded on what survives the `<think>` strip in a
     # thinking run, but this command has no run config to read `thinking` from and replays the
     # tagged reference verbatim. against a strict answer-only grader every reference then scores
-    # zero, and the gate reported a working environment as unable to recognize its own gold answers
-    # (codex[bot]). the evidence for that conclusion cannot be produced from here.
+    # zero, and the gate reported a working environment as unable to recognize its own gold answers.
+    # the evidence for that conclusion cannot be produced from here.
     env_dir = _environment_dir(tmp_path)
     env = _SingleTurnEnv(
         rows=[
@@ -503,7 +502,7 @@ def test_env_test_control_answer_differs_from_a_gold_answer_that_is_the_control_
     The control was the fixed string `test`, so a reference answer of `test` collided with it and
     the probe graded the CORRECT answer -- reading back the gold reward and concluding the grader
     pays junk as much as gold. A centered scorer awarding 0 to the reference and less to anything
-    else separates perfectly, and this failed it (Cursor).
+    else separates perfectly, and this failed it.
     """
     env_dir = _environment_dir(tmp_path)
     env = _SingleTurnEnv(rows=[{"input": "echo the word", "output": "test"}])
@@ -532,7 +531,7 @@ def test_env_test_does_not_blame_the_grader_for_a_replay_shorter_than_the_episod
 
     The driver pads the remaining turns with the junk control so the rollout still terminates, but
     the scored trajectory is then part reference and part junk. Counting it as a gold replay let
-    the blocking gate fail on a trajectory it never fully exercised (Cursor).
+    the blocking gate fail on a trajectory it never fully exercised.
     """
     env_dir = _environment_dir(tmp_path)
     env = _MultiTurnEnv()
@@ -586,7 +585,7 @@ def test_env_test_does_not_apply_the_reward_gate_to_an_sft_environment(
     """SFT trains on a supervised loss and never calls the environment reward.
 
     A no-op scorer is legitimate for it, so blocking on one failed the recommended pre-push check
-    for an environment that trains perfectly well (Cursor). Same for OPD, which trains on a teacher
+    for an environment that trains perfectly well. Same for OPD, which trains on a teacher
     token loss.
     """
     env_dir = _environment_dir(tmp_path)
@@ -625,7 +624,7 @@ def test_env_test_reads_per_turn_rewards_before_calling_the_grader_flat(
     `credit_assignment = "per_turn"` learns from `per_turn_rewards`, which reaches the trainer
     through `rollout_rewards_many` and never through `env.reward` (flash/envs/adapter.py). Reading
     only the flat scalar reported an environment whose turns separate as unable to recognize its
-    references (Cursor).
+    references.
     """
     env_dir = _environment_dir(tmp_path)
     env = _MultiTurnEnv()
@@ -693,7 +692,7 @@ def test_env_test_still_blames_the_grader_for_plain_gold_answers(monkeypatch, tm
 def test_env_test_negative_reward_scale_is_not_a_zero_reward_grader(monkeypatch, tmp_path, capsys):
     # a grader scaled -1 for a correct reference and -2 for an incorrect completion still separates
     # them, which is all GRPO's relative advantage needs. counting every non-positive reward as a
-    # zero made the gate reject those environments outright (codex[bot]).
+    # zero made the gate reject those environments outright.
     env_dir = _environment_dir(tmp_path)
     env = _SingleTurnEnv(
         rows=[{"input": "what is 2 + 2?", "output": "4"}, {"input": "2 + 3?", "output": "5"}],
@@ -1079,10 +1078,9 @@ def test_a_case_variant_of_a_non_finite_float_is_not_forwarded_as_text(
     monkeypatch, tmp_path, capsys, value
 ):
     # TOML spells the non-finite floats lowercase only, so a case variant fails the parse and used
-    # to fall through the bare-word test as the literal STRING "NaN" -- never reaching the
-    # JSON check that turns the lowercase spelling away. the gate then validated a str where the
-    # config holds a float, or an env coercing it back got the very value that check exists to
-    # reject (codex[bot]).
+    # to fall through the bare-word test as the literal STRING "NaN" -- never reaching the JSON
+    # check that turns the lowercase spelling away. the gate then validated a str where the config
+    # holds a float, or an env coercing it back got the very value that check exists to reject.
     env_dir = _environment_dir(tmp_path)
     seen = _patch_loader(monkeypatch, _SingleTurnEnv())
 
@@ -1106,7 +1104,7 @@ def test_a_full_length_infinity_is_not_forwarded_as_text(monkeypatch, tmp_path, 
     # reaches the bare-word test rather than the parse. matching only the `inf` abbreviation let it
     # through as the string "Infinity", which an env normalizing with float() turns straight back
     # into inf: the value the abbreviation is rejected for, reached by a spelling
-    # [environment.params] cannot parse at all (codex[bot]).
+    # [environment.params] cannot parse at all.
     env_dir = _environment_dir(tmp_path)
     seen = _patch_loader(monkeypatch, _SingleTurnEnv())
 
@@ -1128,7 +1126,7 @@ def test_a_surrogate_param_value_is_rejected_like_a_surrogate_name(
     # a lone surrogate reaches argv when the command line carries a byte that is not valid UTF-8. it
     # is no more expressible on the RIGHT of an assignment than on the left, but only the name was
     # guarded -- so the loader could open the path and the gate PASS, while no UTF-8 training TOML
-    # could submit the run that was validated (codex[bot]).
+    # could submit the run that was validated.
     env_dir = _environment_dir(tmp_path)
     seen = _patch_loader(monkeypatch, _SingleTurnEnv())
 
@@ -1175,9 +1173,9 @@ def test_env_test_param_keys_that_denote_toml_structure_are_rejected(
 )
 def test_a_quoted_param_key_names_itself_rather_than_nesting(monkeypatch, tmp_path, value, name):
     # a dot only nests when it is BARE: `"release.channel" = 3` is a quoted key and produces the
-    # flat {"release.channel": 3}. classifying dots and quotes as structure outright left that
-    # valid config with no --param spelling at all, so the command could not mirror it (codex[bot]).
-    # quoting is also exactly the text the config needs, so the flag and the config stay in step.
+    # flat {"release.channel": 3}. classifying dots and quotes as structure outright left that valid
+    # config with no --param spelling at all, so the command could not mirror it. quoting is also
+    # exactly the text the config needs, so the flag and the config stay in step.
     env_dir = _environment_dir(tmp_path)
     seen = _patch_loader(monkeypatch, _SingleTurnEnv())
 
@@ -1198,7 +1196,7 @@ def test_a_quoted_param_key_may_contain_an_equals_sign(
 ):
     # `[environment.params] "a=b" = 1` loads as the flat key `a=b`, so the run really can receive
     # this name. splitting at the first `=` made the key `"a` and rejected the argument, leaving
-    # that config with no --param spelling able to validate it (codex[bot]).
+    # that config with no --param spelling able to validate it.
     env_dir = _environment_dir(tmp_path)
     seen = _patch_loader(monkeypatch, _SingleTurnEnv())
 
@@ -1209,7 +1207,7 @@ def test_a_quoted_param_key_may_contain_an_equals_sign(
 def test_a_null_spelling_is_not_forwarded_as_text(monkeypatch, tmp_path, capsys):
     # TOML has no null, so these bare words fail the parse, carry no structural character, and
     # forward as their own literal string -- truthy, where the spelling asked for absent. no
-    # [environment.params] entry could produce that value either (codex[bot]).
+    # [environment.params] entry could produce that value either.
     env_dir = _environment_dir(tmp_path)
 
     for spelling in ("null", "NULL", "None", "none", "nil"):
@@ -1235,8 +1233,8 @@ def test_a_malformed_param_key_spelling_is_rejected(monkeypatch, tmp_path, capsy
 def test_env_test_param_keys_a_quoted_config_key_can_carry_still_load(monkeypatch, tmp_path, value):
     # these are not BARE keys, but that is not the question -- a QUOTED key carries every one of
     # them and the schema loader reads it, so `"bad key" = 1` and `"café" = 1` are configs a run
-    # really can receive. rejecting them blocked validating a working config while the error
-    # claimed [environment.params] could not hold the name (cursor).
+    # really can receive. rejecting them blocked validating a working config while the error claimed
+    # [environment.params] could not hold the name.
     env_dir = _environment_dir(tmp_path)
     seen = _patch_loader(monkeypatch, _SingleTurnEnv())
     key = value.split("=")[0]
@@ -1330,11 +1328,11 @@ def test_env_test_malformed_param_without_a_delimiter_is_rejected(
     # [environment.params] entry fails to load -- the gate approving a config that cannot be
     # written. the tell is a leading digit or sign: every TOML scalar except the bare
     # true/false/inf/nan words starts with one, so a token that starts that way and does not parse
-    # is a malformed number or date rather than text (codex[bot]).
+    # is a malformed number or date rather than text.
     #
     # a leading `.` is the same tell: TOML requires a digit before the point, so `.5` is exactly as
     # malformed as the `+.5` the signs already caught -- accepting one and rejecting the other left
-    # the same number admitted or refused on whether it carried a sign (cursor).
+    # the same number admitted or refused on whether it carried a sign.
     env_dir = _environment_dir(tmp_path)
     seen = _patch_loader(monkeypatch, _SingleTurnEnv())
 
@@ -1346,7 +1344,7 @@ def test_env_test_malformed_param_without_a_delimiter_is_rejected(
     assert "quote it" in err, err
     # and it has to survive a shell. suggesting `--param k="v"` is a remedy that fails when pasted:
     # the shell strips those quotes, argv sees `k=v` again, and the user hits the same error. the
-    # quoting has to be spelled so the quotes reach argv (cursor).
+    # quoting has to be spelled so the quotes reach argv.
     key = value.partition("=")[0]
     assert f"--param '{key}=" in err, err
 
@@ -1360,7 +1358,7 @@ def test_env_test_a_python_spelled_boolean_is_rejected_rather_than_sent_as_text(
     # python-style `strict=False` parse-fail and fall through as the STRING "False" -- and a
     # non-empty string is truthy, so an env branching on `if strict` reads it as ENABLED while the
     # config spelling `false` disables it. the gate would pass on the opposite of what the run
-    # trains with (codex[bot]).
+    # trains with.
     env_dir = _environment_dir(tmp_path)
     seen = _patch_loader(monkeypatch, _SingleTurnEnv())
 

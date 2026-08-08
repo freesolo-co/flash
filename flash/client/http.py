@@ -508,9 +508,9 @@ class ApiClient:
 
     def _require_chat_step_selector(self) -> None:
         # cached after it first succeeds: this is a property of the control plane, not of the
-        # request. `env eval` sends one chat per case, so re-checking each time doubled the
-        # request count and let a single transient /v1/health blip fail an arbitrary case while
-        # the chat endpoint was healthy (codex[bot]).
+        # request. `env eval` sends one chat per case, so re-checking each time doubled the request
+        # count and let a single transient /v1/health blip fail an arbitrary case while the chat
+        # endpoint was healthy.
         if self._chat_step_selector_available:
             return
         capabilities = self.health().get("capabilities")
@@ -530,7 +530,7 @@ class ApiClient:
         """Settle the step-selector capability now, so concurrent callers inherit the cached answer.
 
         A caller about to run many chats in parallel would otherwise have every worker miss the cold
-        cache at once and fire its own /v1/health (codex[bot]). Only a `RUN/step-N` target needs the
+        cache at once and fire its own /v1/health. Only a `RUN/step-N` target needs the
         capability, so anything else is a no-op. Raises exactly what the per-request check raises.
         """
         if _parse_chat_target(target)[2] is not None:
@@ -729,7 +729,7 @@ class ApiClient:
         the key owns and loads each one's status before this picks a single record out, so on an
         account with a long run history the poll's cost grows with that history and the wait can
         expire scanning unrelated runs while the requested revision is already ready
-        (chatgpt-codex-connector). `/v1/runs/{run_id}/deploy` resolves the one run directly.
+        `/v1/runs/{run_id}/deploy` resolves the one run directly.
         """
         base_run_id, step = _parse_adapter_target(run_id)
         try:

@@ -1189,8 +1189,7 @@ def _submit_seed_supervised(
             # cold, so the projected class is still untried and reading current_on_last_gpu there
             # printed "retry on H100 again, no untried GPU class fits" -- naming the untried class
             # in the same clause that denies one exists. on_last_gpu is also true when the infra
-            # retry budget runs out with classes still untried, which is not exhaustion either
-            # (codex[bot]).
+            # retry budget runs out with classes still untried, which is not exhaustion either.
             retry_tried = (
                 tried_classes if first_cache_drop else tried_classes | {_shape_key(chosen)}
             )

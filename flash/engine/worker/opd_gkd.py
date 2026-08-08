@@ -20,7 +20,7 @@ def _teacher_prompt_text(prompt_messages: list[dict], thinking_prefill: str = ""
     generation prompt (e.g. Qwen's ``<think>\\n``). The student samples its on-policy completion AFTER
     that prefill, so the teacher must condition on the SAME trailing context; otherwise every
     thinking-mode token is scored against a prompt that never opened the reasoning block, and the gkd
-    logprobs are conditioned on a different prefix than the sampled tokens (codex[bot]). Empty (the
+    logprobs are conditioned on a different prefix than the sampled tokens. Empty (the
     default) when thinking is off or the template ignores it -- the plain ``Assistant: `` already
     matches."""
     parts = []
@@ -40,7 +40,7 @@ def _generation_eos_ids(model, tok) -> frozenset:
     different primary ``tok.eos_token_id``. A completion ending on that secondary id is a NATURAL termination
     even though it != ``tok.eos_token_id``, so ``_rollout_terminated`` must see the whole set; a
     single-id check misreads the rollout as truncated and skips it, which with no stop_sequences burns
-    every sample and fails the run with "no trained step" (codex[bot])."""
+    every sample and fails the run with "no trained step"."""
     ids: set[int] = set()
 
     def _add(v):
@@ -94,7 +94,7 @@ def _rollout_terminated(completion_ids, stop_text, eos_ids, stop_sequences) -> b
     HF ``generate`` halts on four conditions — EOS, a ``stop_strings`` match, the ``max_new_tokens``
     cap, or the ``gen_cfg.max_time`` wall-clock bound — and only the first two are natural completions.
     A cap hit OR a max_time cut leaves the output cut off mid-JSON — INCOMPLETE content we refuse to
-    distil, so the caller skips anything that isn't terminated (codex[bot]). The reverse-KL itself
+    distil, so the caller skips anything that isn't terminated. The reverse-KL itself
     cannot supervise the stop token either (the teacher's and student's EOS differ and are both
     zero-width in the text-span alignment, so EOS is in no group), which is why distillation toward a
     verbose teacher erodes termination. OPD repairs that gap only on verified length-capped defects.
@@ -141,13 +141,13 @@ def student_tokens_with_offsets(tok, completion_ids, completion_text: str):
     while i < len(ids):
         j = i
         # Grow the window over a split multi-byte char, decoding ONLY the window from the current
-        # boundary (ids[i:j+1]) -- never the whole prefix ids[:j+1] -- so total decoding is O(len), not
-        # O(len^2) (reported by codex[bot]; the quadratic bites once max_tokens raises completions to
-        # 1000s of tokens). A byte-level tokenizer renders an INCOMPLETE char as a trailing U+FFFD that
-        # is NOT the real char at completion_text[prev:]; a genuine U+FFFD the model emitted DOES match
-        # there (startswith from prev), so we stop and keep it as its own span, not over-merged.
-        # Decode the window ONCE, then re-decode only when it actually grows over a split char (halves
-        # the decode calls on the common single-token path vs a separate probe decode + a final decode).
+        # boundary (ids[i:j+1]) -- never the whole prefix ids[:j+1] -- so total decoding is O(len),
+        # not O(len^2) (the quadratic bites once max_tokens raises completions to 1000s of tokens).
+        # A byte-level tokenizer renders an INCOMPLETE char as a trailing U+FFFD that is NOT the
+        # real char at completion_text[prev:]; a genuine U+FFFD the model emitted DOES match there
+        # (startswith from prev), so we stop and keep it as its own span, not over-merged. Decode
+        # the window ONCE, then re-decode only when it actually grows over a split char (halves the
+        # decode calls on the common single-token path vs a separate probe decode + a final decode).
         window_text = tok.decode(ids[i : j + 1], skip_special_tokens=True)
         while (
             j + 1 < len(ids)
@@ -157,15 +157,16 @@ def student_tokens_with_offsets(tok, completion_ids, completion_text: str):
             j += 1
             window_text = tok.decode(ids[i : j + 1], skip_special_tokens=True)
         # end = where THIS window's decoded text ends in completion_text. Anchor to completion_text
-        # (the ground-truth full decode) via find() from prev rather than prev + len(decode(window)):
-        # a SentencePiece/LLaMA tokenizer decodes a word token IN ISOLATION without its leading
-        # word-boundary space (decode([▁world]) == "world", not " world"), so prev + len(window) would
-        # undercount the span by one char and drift EVERY following offset -- misaligning teacher spans
-        # onto the wrong sampled ids (codex[bot]). find() locates where the window text actually sits
-        # (skipping any dropped leading whitespace, which is absorbed into this token's start) and the
-        # start stays pinned at prev so the spans remain contiguous. For a byte-level tokenizer (Qwen,
-        # GPT) the window already carries its space, find() returns prev, and end == the old value. An
-        # empty decode (special/eos) -> find() returns prev -> zero-width span, unchanged.
+        # (the ground-truth full decode) via find() from prev rather than prev +
+        # len(decode(window)): a SentencePiece/LLaMA tokenizer decodes a word token IN ISOLATION
+        # without its leading word-boundary space (decode([▁world]) == "world", not " world"), so
+        # prev + len(window) would undercount the span by one char and drift EVERY following offset
+        # -- misaligning teacher spans onto the wrong sampled ids. find() locates where the window
+        # text actually sits (skipping any dropped leading whitespace, which is absorbed into this
+        # token's start) and the start stays pinned at prev so the spans remain contiguous. For a
+        # byte-level tokenizer (Qwen, GPT) the window already carries its space, find() returns
+        # prev, and end == the old value. An empty decode (special/eos) -> find() returns prev ->
+        # zero-width span, unchanged.
         hit = completion_text.find(window_text, prev)
         end = (hit + len(window_text)) if hit != -1 else prev + len(window_text)
         end = min(n, max(prev, end))

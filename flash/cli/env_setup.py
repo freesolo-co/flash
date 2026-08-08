@@ -412,8 +412,7 @@ def _existing_reasoning(configs: tuple[Path, ...]) -> bool | None:
     Reads EVERY config rather than anchoring on the first one found. Stopping at the first accepts a
     project whose configs contradict each other -- exactly what a scaffold from before #824 looks
     like, since that release wrote `thinking` into rl and sft but never into opd. rl is visited
-    first, reports reasoning, and the stale opd config is neither reported nor rewritten
-    (codex[bot]).
+    first, reports reasoning, and the stale opd config is neither reported nor rewritten.
 
     A config that is absent is not a disagreement: it is about to be written from whatever this
     returns.
@@ -594,9 +593,9 @@ def cmd_env_setup(args) -> int:
         # the starter sidecar only matches the starter environment written in this run. rerun in a
         # directory holding a custom environment.py, this used to drop in the arithmetic suite
         # anyway, which then called that env's reward with an unrelated `7 + 5` example -- a
-        # published check measuring nothing (codex[bot]). the multi-turn scaffold gets its own
-        # suite: a single-shot eval cannot grade a finished episode, so it checks the first
-        # action's format instead.
+        # published check measuring nothing. the multi-turn scaffold gets its own suite: a
+        # single-shot eval cannot grade a finished episode, so it checks the first action's format
+        # instead.
         if not starter_evaluations.exists():
             evaluations_py = (
                 _STARTER_EVALUATIONS_MULTITURN_PY if multi_turn else _STARTER_EVALUATIONS_PY

@@ -758,9 +758,9 @@ def test_best_effort_swallows_backend_failure(monkeypatch):
 
 def test_best_effort_skips_silently_when_no_org(monkeypatch):
     # Internal/operator run with no org in either context: skip quietly, do NOT warn, do NOT hit the
-    # backend, and (Copilot Msbm-) do NOT perform the HF checkpoint listing — the org check
-    # short-circuits BEFORE the network call. Regression guard for the noisy "missing org id" log and
-    # the wasted HF listing on an expected-skip run.
+    # backend, and do NOT perform the HF checkpoint listing — the org check short-circuits BEFORE
+    # the network call. Regression guard for the noisy "missing org id" log and the wasted HF
+    # listing on an expected-skip run.
     import io
 
     import flash.server.checkpoints as ck

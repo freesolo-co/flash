@@ -484,12 +484,12 @@ def recover_deployments() -> int:
                 # servable: every serving route parses it before inference, so chat raises there
                 # instead of answering, while `/v1/deployments` keeps listing the record as active.
                 # Only busy states were recovered, so such a record survived every restart as a
-                # deployment that looks live and can never respond (chatgpt-codex-connector). Fail it
-                # HERE, at the same startup pass, so the state the API reports matches what it can do.
+                # deployment that looks live and can never respond. Fail it HERE, at the same
+                # startup pass, so the state the API reports matches what it can do.
                 #
-                # Both readiness spellings, as everywhere else in this module: this pass reads records
-                # persisted by OTHER builds, which is the whole reason it exists, so the one spelling
-                # this build happens to write is not the set it can encounter (cursor).
+                # Both readiness spellings, as everywhere else in this module: this pass reads
+                # records persisted by OTHER builds, which is the whole reason it exists, so the one
+                # spelling this build happens to write is not the set it can encounter.
                 #
                 # no staleness gate here: _deployment_attempt_is_stale answers only for busy states
                 # (it returns False for a ready one), and an unservable spec is not a deploy still in
@@ -571,7 +571,7 @@ def _thinking_tag_is_guaranteed(spec) -> bool:
     call also runs a VRAM fit against the DEFAULT gpu and raises on `too_big`, which has nothing to
     do with the chat template. Treating that as "guaranteed" would demand the tag from the very
     models that cannot promise it, failing a valid tagless smoke over an unrelated sizing check on
-    a gpu the run may not even use (cursor[bot]). A missing entry is the open-model case by
+    a gpu the run may not even use. A missing entry is the open-model case by
     definition, so no exception path is needed to reach the answer.
     """
     from flash.catalog import MODELS

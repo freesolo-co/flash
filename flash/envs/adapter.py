@@ -495,19 +495,18 @@ class FreesoloEnvironment(BaseEnvironment):
             # the env overrode the episode's answer, so it is already the text to grade -- do not
             # strip it. keep the raw view in step with it for any later turn.
             final = str(step.final_response_text)
-            # wrap rather than assign the bare string: a plain str has no .raw/.thinking, so a
+            # wrap rather than assign the bare string: a plain str has no.raw/.thinking, so a
             # thinking-aware score_episode would lose the model's reasoning on exactly the episodes
             # an env terminates by overriding (the scaffolded StarterMultiTurnEnv does this on a
-            # correct guess). the override text is the answer, so .completion is it; .thinking and
-            # .raw stay the model's own from this turn, which the override replaced but did not
-            # produce.
+            # correct guess). the override text is the answer, so.completion is it;.thinking and.raw
+            # stay the model's own from this turn, which the override replaced but did not produce.
             #
             # .raw is documented as the ORIGINAL RAW MODEL OUTPUT (flash/cli/training_doc.py), so
-            # the override does not belong in it: a scorer reaching for .raw wants the text the
-            # model emitted, and is the one scorer that cannot recover it from anywhere else --
-            # .completion and str() are both the override already. assigning it here also left the
-            # object internally inconsistent, pairing an env-authored .raw with the model's own
-            # .thinking, so .raw did not contain the reasoning .thinking was taken from (codex[bot]).
+            # the override does not belong in it: a scorer reaching for.raw wants the text the model
+            # emitted, and is the one scorer that cannot recover it from anywhere else --.completion
+            # and str() are both the override already. assigning it here also left the object
+            # internally inconsistent, pairing an env-authored.raw with the model's own.thinking,
+            # so.raw did not contain the reasoning.thinking was taken from.
             #
             # `raw` is this turn's model emission: the adapter passed it to step_episode above as
             # what the model said. state["raw_response_text"] below is deliberately NOT this -- it

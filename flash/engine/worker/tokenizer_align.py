@@ -69,13 +69,14 @@ def groupwise_alignment(
     edges = [*boundaries, end]
     groups: list[tuple[list[int], float]] = []
     pending: list[int] = []  # student tokens whose span had no teacher token yet
-    # Walk both token lists with monotonic cursors instead of rescanning the WHOLE list per boundary.
-    # Both are sorted by .start (student_tokens_with_offsets emits non-decreasing starts; teacher
-    # offsets arrive in order) and the boundary intervals [edges[k], edges[k+1]) are consecutive and
-    # ascending, so every token falls in exactly one interval and is visited once -- O(S+T+B), not the
-    # O(C^2) a per-boundary rescan costs once max_tokens raises completions to thousands of mostly-
-    # matching tokens (codex[bot]). The cursor position IS the lower bound: everything with start <
-    # edges[k] was consumed by an earlier interval, so `start < hi` alone selects [edges[k], hi).
+    # Walk both token lists with monotonic cursors instead of rescanning the WHOLE list per
+    # boundary. Both are sorted by.start (student_tokens_with_offsets emits non-decreasing starts;
+    # teacher offsets arrive in order) and the boundary intervals [edges[k], edges[k+1]) are
+    # consecutive and ascending, so every token falls in exactly one interval and is visited once --
+    # O(S+T+B), not the O(C^2) a per-boundary rescan costs once max_tokens raises completions to
+    # thousands of mostly- matching tokens. The cursor position IS the lower bound: everything with
+    # start < edges[k] was consumed by an earlier interval, so `start < hi` alone selects [edges[k],
+    # hi).
     si = ti = 0
     for k in range(len(boundaries)):
         hi = edges[k + 1]

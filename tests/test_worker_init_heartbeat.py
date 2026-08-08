@@ -466,7 +466,7 @@ def test_sft_step_liveness_upload_is_throttled(monkeypatch):
 
 
 def test_opd_step_post_update_heartbeat_forces_through_throttle(monkeypatch):
-    """Regression (codex[bot], heartbeat.py/opd.py): a mid-step opd_step progress ping (carrying the
+    """Regression (heartbeat.py/opd.py): a mid-step opd_step progress ping (carrying the
     PREVIOUS opt_steps) can claim the throttle slot immediately before the post-update ping (the
     incremented step). Without force the stepped commit is throttled out, so a cancellation is billed
     from the STALE step even though the update landed. heartbeat(force=True) must upload within the
@@ -590,7 +590,7 @@ def test_initial_rl_step_lock_timeout_is_retriable(monkeypatch):
 
 
 def test_forced_opd_step_commits_each_distinct_step_advance(monkeypatch):
-    """Regression (cursor[bot], heartbeat.py): when optimizer steps land FARTHER apart than the force
+    """Regression (heartbeat.py): when optimizer steps land FARTHER apart than the force
     floor (the normal teacher-round-trip-gated regime), every DISTINCT completed step still commits
     exactly once within the 900s throttle window, so a cancel always bills the true latest step — none
     is dropped. (A sub-floor BURST is instead coalesced to protect the HF commit cap; see the burst test
@@ -611,7 +611,7 @@ def test_forced_opd_step_commits_each_distinct_step_advance(monkeypatch):
 
 
 def test_forced_opd_step_burst_within_floor_coalesces_to_protect_commit_cap(monkeypatch):
-    """Regression (codex[bot], heartbeat.py): a tiny/fast OPD config (batch=1, group=1, small student,
+    """Regression (heartbeat.py): a tiny/fast OPD config (batch=1, group=1, small student,
     cached teacher) can land optimizer updates many times per minute. Unthrottled, force=True would turn
     every post-step ping into an HF commit and blow the per-repo commit cap before the final adapter/DONE
     upload. Forced commits are floored: the FIRST advance in a sub-floor burst commits, the rest within
@@ -637,7 +637,7 @@ def test_forced_opd_step_burst_within_floor_coalesces_to_protect_commit_cap(monk
 
 
 def test_force_commit_via_regular_throttle_arms_the_floor(monkeypatch):
-    """Regression (cursor[bot], heartbeat.py): a force=True heartbeat that commits because the regular
+    """Regression (heartbeat.py): a force=True heartbeat that commits because the regular
     throttle was ALREADY due (not because the force branch bypassed it) must STILL arm the forced-commit
     clock — else the clock stays stale and a following sub-floor forced ping punches through, defeating
     the burst coalescing that protects the HF commit cap."""

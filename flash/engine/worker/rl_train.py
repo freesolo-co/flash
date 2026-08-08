@@ -141,9 +141,9 @@ _MULTI_TURN_SCORE_SHUTDOWN_WAIT_S = 5.0
 # how long a bridge session may go untouched before it is treated as abandoned. a ray rollout actor
 # that dies between `/multiturn/start` and its `finally` `/multiturn/close` leaves an entry nobody
 # will ever remove, so repeated actor restarts retain every dead episode's env state and transcript
-# for the rest of the worker's life (codex[bot]). generously sized against a LIVE session's quietest
-# interval -- one turn is a full generate plus an env reply -- because reaping a live episode would
-# fail a working rollout, while reaping a dead one late merely holds memory a little longer.
+# for the rest of the worker's life. generously sized against a LIVE session's quietest interval --
+# one turn is a full generate plus an env reply -- because reaping a live episode would fail a
+# working rollout, while reaping a dead one late merely holds memory a little longer.
 _MULTI_TURN_SESSION_LEASE_S = 1800.0
 _SINGLE_TURN_SCORE_BATCH_SIZE = 64
 _SINGLE_TURN_SCORE_FLUSH_WAIT_S = 0.1
@@ -1463,13 +1463,13 @@ class MultiTurnBridge:
         self._sessions: dict[str, dict] = {}
         self._session_lease_s = float(session_lease_s)
         # episode scoring still happens under that lock, but ONE call now covers many episodes.
-        # scoring is the one env call that is both batchable and expensive (a judge round-trip),
-        # and score_rollouts hands a whole batch to `score_episodes`, which the env runs at its own
-        # `max_score_concurrency`. holding the lock per episode turned one judge round into
-        # hundreds of serial blocking calls with the gpu idle (codex[bot]). batching shortens the
-        # total time the lock is held rather than dropping it: `reward_thread_safe` licenses racing
-        # the scorer against ITSELF, which is not the same as racing it against `env_reply`, and no
-        # env contract permits the latter.
+        # scoring is the one env call that is both batchable and expensive (a judge round-trip), and
+        # score_rollouts hands a whole batch to `score_episodes`, which the env runs at its own
+        # `max_score_concurrency`. holding the lock per episode turned one judge round into hundreds
+        # of serial blocking calls with the gpu idle. batching shortens the total time the lock is
+        # held rather than dropping it: `reward_thread_safe` licenses racing the scorer against
+        # ITSELF, which is not the same as racing it against `env_reply`, and no env contract
+        # permits the latter.
         self._scorer = _ScoreBatcher(
             self._score_batch,
             max_batch_size=int(score_batch_size),
@@ -1531,12 +1531,12 @@ class MultiTurnBridge:
             if session_id in self._sessions:
                 raise KeyError(f"duplicate multi-turn session {session_id}")
             state = self._env.new_rollout_state(example)
-            # `new_rollout_state` calls `start_episode` a SECOND time -- dataset preparation
-            # already called it to build the prompt the child is generating against. an env that
-            # randomizes per episode returns a different opening here, and the run would then
-            # train a response generated for prompt A on a reward computed for prompt B. adopt
-            # the dataset's prompt so the transcript and the score describe one episode. the rest
-            # of the state (task, env-internal fields) stays as the env built it (codex[bot]).
+            # `new_rollout_state` calls `start_episode` a SECOND time -- dataset preparation already
+            # called it to build the prompt the child is generating against. an env that randomizes
+            # per episode returns a different opening here, and the run would then train a response
+            # generated for prompt A on a reward computed for prompt B. adopt the dataset's prompt
+            # so the transcript and the score describe one episode. the rest of the state (task,
+            # env-internal fields) stays as the env built it.
             env_prompt = [dict(message) for message in self._env_prompts[index]]
             state["prompt"] = env_prompt
             state["messages"] = [dict(message) for message in env_prompt]
@@ -1569,7 +1569,7 @@ class MultiTurnBridge:
                 # it is still the turn the model generated and the child trained on, so it is kept
                 # for the DIAGNOSTIC transcript. dropping it entirely would publish an empty
                 # completion for a first-turn truncation -- the one sample worth reading, since it
-                # is the failure being diagnosed (codex[bot]).
+                # is the failure being diagnosed.
                 session["aborted_turn"] = {
                     "role": "assistant",
                     "content": str(payload.get("completion_text") or ""),
@@ -1700,7 +1700,7 @@ def multi_turn_child_env(inp: dict, *, reward_url: str, thinking: bool) -> dict[
         # `[train].max_completion_tokens` bounds ONE assistant turn, while max_model_len and the
         # response tensor bound the whole transcript. without it the first turn may consume the
         # entire episode budget, which is both a cost and a behaviour change from the retired
-        # driver's `_turn_budget` (per_turn_max_tokens=max_completion) (codex[bot]).
+        # driver's `_turn_budget` (per_turn_max_tokens=max_completion).
         "FLASH_VERL_MAX_COMPLETION_TOKENS": str(int(inp["max_completion"])),
         "FLASH_VERL_STOP_SEQUENCES": json.dumps(list(inp["stop_sequences"])),
         # sorted so the child sees a stable set regardless of frozenset iteration order.
@@ -2347,12 +2347,12 @@ def _resolve_grpo_inputs():
                 prompts.append(
                     {
                         "prompt": messages,
-                        # the messages this row's prompt was BUILT from. `env.prompt_messages`
-                        # calls `start_episode`, and an env is free to randomize there (the
-                        # starter env's own secret is per-example, but nothing stops a per-EPISODE
-                        # one), so the bridge cannot call it a second time and get the same
-                        # episode back. it adopts these instead, keeping the transcript the model
-                        # generated and the state the env scores on the same episode (codex[bot]).
+                        # the messages this row's prompt was BUILT from. `env.prompt_messages` calls
+                        # `start_episode`, and an env is free to randomize there (the starter env's
+                        # own secret is per-example, but nothing stops a per-EPISODE one), so the
+                        # bridge cannot call it a second time and get the same episode back. it
+                        # adopts these instead, keeping the transcript the model generated and the
+                        # state the env scores on the same episode.
                         "env_prompt": messages,
                         "rendered": rendered,
                         "example": ex,
@@ -2503,15 +2503,15 @@ class _GrpoSubprocessStream:
         assert self._proc.stdout is not None
         # the child's exit is watched independently of pipe EOF: verl's vllm EngineCore grandchild
         # inherits this same pipe, so a trainer that dies while it lives leaves a pipe nobody will
-        # close and this loop would run forever on a paid gpu (PR #730 review). the watchdog tears
-        # the group down, which frees the cuda context AND closes the pipe, ending this loop.
+        # close and this loop would run forever on a paid gpu. the watchdog tears the group down,
+        # which frees the cuda context AND closes the pipe, ending this loop.
         with _ChildExitWatchdog(
             self._proc, process_group_id=self._process_group_id, grace_s=_ORPHANED_PIPE_GRACE_S
         ) as watchdog:
             for line in self._proc.stdout:
                 # held ACROSS the yield. this is a generator, so the consumer's work for a line runs
                 # while suspended here -- counting only the arrival would make a consumer inside one
-                # long step look exactly like a reader blocked on a dead pipe (cursor).
+                # long step look exactly like a reader blocked on a dead pipe.
                 with watchdog.handling_line():
                     self._tail.record(line)
                     yield line
@@ -3119,7 +3119,7 @@ def run_rl_train():
         # every job boundary, not just the failing ones. `kill_process_group` runs on exceptions
         # alone here, so a straggler an earlier teardown SIGKILLed but could not drain in time would
         # otherwise be collected only by the next FAILING job: a reusable worker running successful
-        # grpo jobs after one late straggler keeps that zombie for life (cursor).
+        # grpo jobs after one late straggler keeps that zombie for life.
         with contextlib.suppress(Exception):
             reap_stragglers()
 

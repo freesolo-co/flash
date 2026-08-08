@@ -438,10 +438,10 @@ def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(
     # record. every serving route parses the persisted spec before inference, so chat raises there
     # instead of answering -- while `/v1/deployments` still lists the record as active, and only
     # BUSY states were recovered at startup. the record therefore survived every restart as a
-    # deployment that looks live and can never respond (chatgpt-codex-connector).
+    # deployment that looks live and can never respond.
     #
     # both readiness spellings are covered: this pass reads records persisted by OTHER builds, so
-    # the one spelling the current build happens to write is not the set it can encounter (cursor).
+    # the one spelling the current build happens to write is not the set it can encounter.
     rows = [{"run_id": "r-retired"}, {"run_id": "r-legacy-spelling"}, {"run_id": "r-servable"}]
     monkeypatch.setattr(serving.db, "all_runs", lambda: rows)
 
@@ -1146,8 +1146,7 @@ def test_tagless_open_model_smoke_does_not_depend_on_a_vram_fit(monkeypatch):
     Resolving the capability through `resolve_model` also ran an open-model VRAM fit against the
     DEFAULT gpu, which raises for a model too big for it. That exception read as "tag guaranteed",
     so the model least able to promise a `<think>` block was the one the strict requirement was
-    applied to, and a valid tagless smoke failed over the size of a gpu the run need not be using
-    (cursor[bot]).
+    applied to, and a valid tagless smoke failed over the size of a gpu the run need not be using.
 
     The model below really does exceed the default: it is served on multi-gpu hardware the smoke
     never consults. A pass here means the decision no longer reaches the estimator at all.

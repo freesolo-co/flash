@@ -1080,11 +1080,11 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         # This parse is above the try below, so a raise here escapes every handler -- and attach_run
         # is dispatched on a daemon thread, so the failure is silent: the run stays nonterminal with
         # a live handle and its worker keeps billing. A spec stops parsing when the plane upgrades
-        # past an algorithm a still-in-flight run was accepted under (codex[bot]). It cannot be
-        # resumed, so fail it closed and tear the worker down. `_gc_run_endpoints` needs a parsed
-        # spec we do not have; the endpoint name is derived from the run id plus GPU class, both
-        # readable from the raw persisted status, which is the same route recover_runs takes for its
-        # own unparseable-spec branch.
+        # past an algorithm a still-in-flight run was accepted under. It cannot be resumed, so fail
+        # it closed and tear the worker down. `_gc_run_endpoints` needs a parsed spec we do not
+        # have; the endpoint name is derived from the run id plus GPU class, both readable from the
+        # raw persisted status, which is the same route recover_runs takes for its own
+        # unparseable-spec branch.
         from flash.providers.base import JobHandle
         from flash.runner.lifecycle import _strict_teardown_handle
 

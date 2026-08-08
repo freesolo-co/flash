@@ -32,9 +32,9 @@ if TYPE_CHECKING:
 # the set covers cmd.exe AND powershell, because we cannot tell which one the user will paste into:
 # `os.name == "nt"` says nothing about the shell, and powershell is the default terminal on current
 # windows. `foo;calc` passed the cmd-only set and rendered as `--output=foo;calc`, which powershell
-# splits at the semicolon and runs `calc` as its own statement (codex). the extra members --
-# `;{}[]$``,'` and whitespace-adjacent `@#` -- are powershell-only operators, quoting characters,
-# and expansion sigils.
+# splits at the semicolon and runs `calc` as its own statement. the extra members -- `;{}[]$``,'`
+# and whitespace-adjacent `@#` -- are powershell-only operators, quoting characters, and expansion
+# sigils.
 _CMD_METACHARACTERS = frozenset('&|<>^()!"%' + ";{}[]$`,'@#")
 
 
@@ -45,7 +45,7 @@ def _on_windows() -> bool:
     assignment is process-wide, and on python 3.11 -- which CI runs -- ``pathlib`` reads it at
     instantiation, so every later ``Path(...)`` raised ``NotImplementedError: cannot instantiate
     'WindowsPath' on your system`` and the offline job failed before reaching the assertions. It
-    does NOT raise on 3.12, so the pattern looks fine locally and only breaks in CI (codex).
+    does NOT raise on 3.12, so the pattern looks fine locally and only breaks in CI.
     """
     return os.name == "nt"
 
@@ -147,9 +147,9 @@ def cmd_env_pull(args) -> int:
             positional = Path(args.path.replace("\\", "/"))
             default_name = positional.name
             out = Path(args.output) if args.output else Path(default_name)
-            # the common way to land here is `flash env pull ns/env ./somedir`, meaning "put the
-            # env in ./somedir". but the second positional is a path INSIDE the env, not a
-            # destination -- so ./somedir became the file to fetch and its basename the output.
+            # the common way to land here is `flash env pull ns/env./somedir`, meaning "put the env
+            # in./somedir". but the second positional is a path INSIDE the env, not a destination --
+            # so./somedir became the file to fetch and its basename the output.
             #
             # test the ORIGINAL positional, not `out`: an absolute /tmp/into-here is already
             # reduced to the basename `into-here` by the time `out` exists, so comparing against
@@ -161,7 +161,7 @@ def cmd_env_pull(args) -> int:
             # asked for and silently turn this into a whole-environment download.
             #
             # ...and only the POSITIONAL itself. a bare basename collision is not evidence the user
-            # meant a destination: `env pull ns/env assets/config` with a local ./config/ is a real
+            # meant a destination: `env pull ns/env assets/config` with a local./config/ is a real
             # single-file pull, and telling that user to drop `assets/config` would abandon the file
             # they asked for and aim --force at an unrelated directory.
             #
@@ -169,16 +169,16 @@ def cmd_env_pull(args) -> int:
             # names a location inside the environment, and `assets/config` happening to exist
             # locally as a directory does not make it one: on `is_dir()` alone that real single-file
             # pull was refused, and its nonempty branch aimed a whole-env --force replace at the
-            # local ./assets/config the user never mentioned. a destination is written as its own
+            # local./assets/config the user never mentioned. a destination is written as its own
             # name (`into here`, `./-dest`, `.`) or absolute, which is exactly `positional == out`
-            # plus the absolute form that `out` has already reduced to a basename (cursor).
+            # plus the absolute form that `out` has already reduced to a basename.
             #
             # a path that traverses upward is the third form. `..` cannot name anything inside the
             # environment -- `_safe_repo_relative_path` rejects every component of it -- so there is
-            # no in-env reading to protect and no ambiguity to resolve. without this
-            # `env pull ns/env ../into-here` downloaded the package only to fail with an invalid
-            # environment path, instead of explaining `--output` (codex[bot], cursor). tested on the
-            # parts rather than a leading `..` because `assets/../config` is rejected just the same.
+            # no in-env reading to protect and no ambiguity to resolve. without this `env pull
+            # ns/env../into-here` downloaded the package only to fail with an invalid environment
+            # path, instead of explaining `--output`. tested on the parts rather than a leading `..`
+            # because `assets/../config` is rejected just the same.
             traverses_up = ".." in positional.parts
             could_be_destination = positional == out or positional.is_absolute() or traverses_up
             mistaken_dest = (
@@ -493,17 +493,17 @@ def _dynamic_import_callees(tree) -> frozenset[str]:
     identifier, so the call site reads `load("judge")` and matching on the canonical name alone
     skipped it -- leaving `judge.py` out of the archive for a suite that passes locally, its
     directory being importable there, and raises ModuleNotFoundError on its first published case
-    (Cursor). The binding is in the same file as the call, so the alias is statically knowable.
+    The binding is in the same file as the call, so the alias is statically knowable.
 
     An assignment binds it just as well: `load = importlib.import_module` is not an `import ... as`
     and so appears in no import statement at all, which left the same helper unpackaged for the
-    same reason (codex[bot]). Chains are followed too (`a = importlib.import_module` then `b = a`),
+    same reason. Chains are followed too (`a = importlib.import_module` then `b = a`),
     in either declaration order, since nothing requires the alias to appear before its use.
 
     Chains resolve through a work queue rather than repeated sweeps. Re-scanning every assignment
     per pass discovers one link at a time when they are declared in reverse order -- the very order
     this supports -- so a generated 5,000-link sidecar spent ~3.4s here, twice, because `env push`
-    walks again while copying (codex[bot]). Each binding is instead indexed by the name it reads
+    walks again while copying. Each binding is instead indexed by the name it reads
     and visited when that name becomes known, so the walk costs one visit per binding.
 
     Deliberately flow-insensitive: a name rebound to something else later still counts here. The
@@ -575,7 +575,7 @@ def _dynamic_import_name(node, callees: frozenset[str]) -> str | None:
 
     A sidecar importing a sibling dynamically passes local test and eval -- the scope makes the
     directory importable -- and then fails on its first published case, because the helper was
-    never packaged (codex[bot]). A literal argument is statically knowable, so it is followed like
+    never packaged. A literal argument is statically knowable, so it is followed like
     any other import. A computed name is not, and is left to the runtime rather than guessed at."""
     import ast
 
@@ -589,10 +589,10 @@ def _dynamic_import_name(node, callees: frozenset[str]) -> str | None:
         matched = getattr(func, "id", None) in callees
     if not matched:
         return None
-    # both accept the module as the keyword `name`, and that form imports identically. reading
-    # only the positional argument left `import_module(name="judge")` out of the archive, so the
-    # suite that passed locally -- its directory is importable there -- raised ModuleNotFoundError
-    # on its first published case (codex[bot]).
+    # both accept the module as the keyword `name`, and that form imports identically. reading only
+    # the positional argument left `import_module(name="judge")` out of the archive, so the suite
+    # that passed locally -- its directory is importable there -- raised ModuleNotFoundError on its
+    # first published case.
     first = (
         node.args[0]
         if node.args
@@ -612,7 +612,7 @@ def _imported_module_names(tree, *, relative_names_are_siblings: bool = True) ->
     only belongs here when the parsed file sits AT that root. Pass
     `relative_names_are_siblings=False` for a file nested deeper: `from . import config` inside
     `pkg/__init__.py` names `pkg/config.py`, which the package walk already ships, and reading it
-    as a root-level name published an unrelated top-level `config.py` instead (codex[bot]).
+    as a root-level name published an unrelated top-level `config.py` instead.
     """
     import ast
 
@@ -675,13 +675,13 @@ def _iter_import_closure(
     A helper that imports another sibling needs that sibling too: shipping `scorer.py` without
     the `thresholds` it imports published an environment that raised ModuleNotFoundError on its
     first case, having passed every local check because the source directory was importable
-    (cursor[bot]). The queue grows only through siblings actually reached, so it stays a closure
+    The queue grows only through siblings actually reached, so it stays a closure
     over files this push already carries rather than a general dependency resolver -- an
     unimported neighbour stays local.
 
     `yielded` is shared with the caller's other walks so a helper that IS `dataset/` (or lives
     under it) is not emitted twice; `_check_env_push_limits` would otherwise charge those bytes
-    and members twice and reject a tree that is actually under the limit (codex[bot]).
+    and members twice and reject a tree that is actually under the limit.
     """
     import os
 
@@ -696,14 +696,13 @@ def _iter_import_closure(
         # matching only the module spelling published an environment whose sidecar raises
         # ModuleNotFoundError on its first case, having passed every local check.
         #
-        # resolution follows python's own order, which is NOT simply "directories first".
-        # a directory holding __init__.py is a regular package and outranks a same-named
-        # module, so shipping the .py and skipping the package published the file the
-        # sidecar never imports while dropping the one it does (cursor[bot]). but a PEP 420
-        # namespace directory (no __init__.py) is only a fallback portion: `graders.py`
-        # wins over a bare `graders/`. requiring the marker unconditionally sent a
-        # namespace helper to the .py fallback, which did not exist either, and published
-        # an archive missing the helper entirely (codex[bot]). verified by probe: with both
+        # resolution follows python's own order, which is NOT simply "directories first". a
+        # directory holding __init__.py is a regular package and outranks a same-named module, so
+        # shipping the.py and skipping the package published the file the sidecar never imports
+        # while dropping the one it does. but a PEP 420 namespace directory (no __init__.py) is only
+        # a fallback portion: `graders.py` wins over a bare `graders/`. requiring the marker
+        # unconditionally sent a namespace helper to the.py fallback, which did not exist either,
+        # and published an archive missing the helper entirely. verified by probe: with both
         # present, `import graders` binds graders.py.
         package = env_root / module_name
         helper = env_root / f"{module_name}.py"
@@ -756,8 +755,8 @@ def _iter_env_sidecar_files(
     roots = [env_root]
     # shared with the dataset walk below: the import closure can reach a helper package that IS
     # `dataset/` (or lives under it), and yielding it twice makes `_check_env_push_limits` charge
-    # those bytes and members twice -- rejecting a tree that is actually under the limit
-    # (codex[bot]). the copy pass is idempotent, so only the limit check ever saw the double.
+    # those bytes and members twice -- rejecting a tree that is actually under the limit. the copy
+    # pass is idempotent, so only the limit check ever saw the double.
     yielded: set[Path] = set()
     if not include_full_tree:
         import ast
@@ -839,8 +838,8 @@ def _iter_env_sidecar_files(
             # the entrypoint closure above shares `yielded` and runs first, so an entrypoint that
             # imports `evaluations` already shipped it. yielding it a second time made
             # `_check_env_push_limits` charge those bytes and that member twice, rejecting a tree
-            # that is actually under the limit (codex[bot]). only the yield is skipped: the syntax
-            # check and import walk below must still run either way.
+            # that is actually under the limit. only the yield is skipped: the syntax check and
+            # import walk below must still run either way.
             if sidecar not in yielded:
                 yielded.add(sidecar)
                 yield sidecar, sidecar.relative_to(env_root)
@@ -908,7 +907,7 @@ def _write_entrypoint_alias(pkg: Path, *, entrypoint: Path) -> None:
     Packaging writes the entrypoint's contents as environment.py whatever it was called, so a
     sidecar doing `from custom import SCORER` -- which resolves locally, and is the only way to
     reach the entrypoint when it is not named environment.py -- raised ModuleNotFoundError once
-    published (cursor[bot]). The alias rebinds sys.modules rather than re-importing, so the
+    published. The alias rebinds sys.modules rather than re-importing, so the
     sidecar and the runner share ONE module object and one set of module-level state; importing
     the source twice would give the sidecar a second copy of every constant it scores against.
 

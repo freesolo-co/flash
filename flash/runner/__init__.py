@@ -671,7 +671,7 @@ def _redact_internal_adapter_ref(data: dict) -> None:
     A ref is published only when it is PROVEN user-facing, never merely because this build failed
     to parse it as internal. Those are different claims: a persisted locator whose phase this build
     no longer knows (``opsd``, removed in #784) stops parsing as internal, and inferring "public"
-    from that published the private repo verbatim (chatgpt-codex-connector). Unrecognized shapes are
+    from that published the private repo verbatim. Unrecognized shapes are
     dropped, which is what the malformed-prefix branch below has always done.
     """
     train = data.get("train")
@@ -1583,7 +1583,7 @@ def prepare_job(
         # the generic serving preflight above validates the schema's SHAPE, but the constraint can
         # still be one verl OPD deterministically refuses: a guidance-only json feature (format,
         # multipleOf, uniqueItems) or a vllm MistralTokenizer model. that check lived only on the
-        # worker, so the user rented a gpu to receive a permanent validation failure (codex[bot]).
+        # worker, so the user rented a gpu to receive a permanent validation failure.
         #
         # only the allocation-independent half runs here. the vocab-size comparison needs the
         # ALLOCATED card count -- judging a shardable run on one card would reject a shape the

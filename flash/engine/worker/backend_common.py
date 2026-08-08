@@ -957,7 +957,7 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
         # capability probe then reports wandb unavailable, resolve_verl_loggers falls back to
         # console, and the requested W&B run is silently never created. a transient failure of this
         # best-effort install had the same permanent effect, because the stamp is already written by
-        # then (codex[bot]). running it unconditionally re-attempts on the next run instead.
+        # then. running it unconditionally re-attempts on the next run instead.
         #
         # cheap to repeat: `uv pip install` on an already-satisfied wandb is a no-op resolve, which
         # is why this can be unconditional rather than gated on a second probe.
@@ -1773,9 +1773,9 @@ def run_verl_training(
             except subprocess.TimeoutExpired:
                 kill_process_group(proc, process_group_id=process_group_id)
         # every job boundary, not just the failing ones. a straggler an earlier teardown SIGKILLed
-        # but could not drain in time exits shortly after, and `kill_process_group` -- the only other
-        # caller of this -- runs on exceptions alone: a worker whose later jobs all succeed would
-        # hold that zombie for its whole life, as pid 1 with nothing else to reap it (codex[bot]).
+        # but could not drain in time exits shortly after, and `kill_process_group` -- the only
+        # other caller of this -- runs on exceptions alone: a worker whose later jobs all succeed
+        # would hold that zombie for its whole life, as pid 1 with nothing else to reap it.
         reap_stragglers()
     collected = proc.returncode
     if collected is None:
@@ -1855,8 +1855,8 @@ class _ChildExitWatchdog:
         self._lines_read = 0
         # how many lines are being HANDLED right now, not merely taken off the pipe. counting only
         # arrivals makes one long callback look identical to a stuck reader -- the counter cannot
-        # advance while an upload runs, because the next line is not read until it returns (cursor).
-        # so progress is "a line arrived OR one is still in hand", and the two together mean the
+        # advance while an upload runs, because the next line is not read until it returns. so
+        # progress is "a line arrived OR one is still in hand", and the two together mean the
         # watchdog only ever fires on a reader that is neither receiving nor working.
         self._lines_in_flight = 0
         # read by the caller after the loop ends, to distinguish "the child closed its own pipe" from
@@ -1924,7 +1924,7 @@ def _process_is_zombie(pid: int) -> bool:
     there is nothing there, and the two must not collapse: teardown can run with the worker out of
     file descriptors, where opening /proc/<pid>/stat raises EMFILE for every live member at once.
     reading that as a zombie made the whole group report drained, so SIGKILL was never sent and an
-    EngineCore kept its cuda context precisely on a resource-failure path (codex[bot]). so an
+    EngineCore kept its cuda context precisely on a resource-failure path. so an
     unreadable status counts as alive -- over-reporting costs a signal to a group that ignores it,
     under-reporting strands the gpu.
     """
@@ -2007,7 +2007,7 @@ def _reap(pid: int) -> bool:
 
     that answer is only safe because `adopt_orphaned_descendants` runs first: it makes an orphaned
     grandchild reparent to US, so `ChildProcessError` really does mean someone else owns the pid.
-    Without it the same error is returned for a zombie nobody will ever reap (codex[bot]).
+    Without it the same error is returned for a zombie nobody will ever reap.
     """
     try:
         reaped, _ = os.waitpid(pid, os.WNOHANG)
@@ -2026,7 +2026,7 @@ def _reap_group_zombies(pgid: int, skip: int) -> None:
     an EngineCore orphaned when the trainer exits is reparented HERE, because
     `adopt_orphaned_descendants` claimed it. once SIGKILL turns it into a zombie no signal can clear
     it -- only a wait can -- and leaving it costs the reusable worker one permanent pid per failed or
-    cancelled run, walking it toward the pid limit (codex[bot]).
+    cancelled run, walking it toward the pid limit.
 
     `skip` is the direct child, which `subprocess.Popen` reaps itself. waiting on it here would take
     the exit status Popen is owed, leaving `returncode` unset for a caller that asks which signal
@@ -2040,7 +2040,7 @@ def _reap_group_zombies(pgid: int, skip: int) -> None:
     be refused but it also cannot be delivered while a process sits in uninterruptible sleep, so one
     can outlast the drain deadline and only then become a zombie -- after the last wait this
     teardown performs. without a record no future wait is ever scheduled for it and the entry is
-    permanent on a pid-1 worker (codex[bot]).
+    permanent on a pid-1 worker.
     """
     for pid in _process_group_members(pgid) or ():
         if pid == skip:
@@ -2076,7 +2076,7 @@ def _drain_stragglers_before_exit() -> None:
     endpoints.py:538-552` spawns a fresh `flash.engine.worker_entrypoint` per phase and waits for it
     to exit, so the set dies with the phase. the straggler then reparents to the persistent runpod
     handler, which waits only on the worker it spawned, and becomes a zombie for the container's
-    whole life (codex[bot]).
+    whole life.
 
     so the last wait happens here rather than at a job boundary that never comes. registered at
     import because the leak is not specific to one entry point: whichever of them ran, the pids are
@@ -2106,7 +2106,7 @@ def _process_group_alive(pgid: int) -> bool:
     can otherwise sit unreaped indefinitely. driving the escalation off addressability alone
     therefore burned the full drain
     deadline on every teardown -- delaying the reusable worker even though the cuda context was
-    already released -- and nothing stronger than SIGKILL exists to clear it (codex[bot]).
+    already released -- and nothing stronger than SIGKILL exists to clear it.
 
     So the group is alive only while some member is not a zombie. Membership is read from /proc
     rather than tracked, since the survivors are grandchildren this process never spawned.
@@ -2116,7 +2116,7 @@ def _process_group_alive(pgid: int) -> bool:
     leader is still present, and the leader can then fork and exit before its status is inspected:
     the snapshot is nonempty and zombie-only, yet the child that inherited the group is alive,
     unlisted, and never received the earlier signal -- so teardown returns without SIGKILL and it
-    keeps its cuda context (codex[bot]). Rechecking addressability cannot settle it either, since a
+    keeps its cuda context. Rechecking addressability cannot settle it either, since a
     zombie holds the group id: that answers True for a group that really has drained, which is the
     burn-both-deadlines failure this function exists to avoid. A second walk can, because the fork
     it missed is published by then.
