@@ -622,12 +622,17 @@ def test_no_optional_package_is_imported_at_the_probes_top_level():
     )
 
 
-def _run_gdn_probe_branch(monkeypatch, tmp_path, *, forward_src, gdn_present=True):
+def _run_gdn_probe_branch(
+    monkeypatch, tmp_path, *, forward_src, gdn_present=True, module_source=None
+):
     """Execute the probe's gdn branch against a stub transformers module, returning its stdout.
 
     Runs the REAL rendered probe rather than a paraphrase, with both package checks answering True
     so the source check is the only thing that can fail -- which is exactly the case the two
     package flags cannot express.
+
+    ``module_source`` replaces the generated stub outright, for cases where the SHAPE of the class
+    is the thing under test (a decorated forward) rather than its body.
     """
     import importlib.util
     import io as _io
@@ -645,7 +650,9 @@ def _run_gdn_probe_branch(monkeypatch, tmp_path, *, forward_src, gdn_present=Tru
         # the probe reads the forward with inspect.getsource, which needs a real file on disk --
         # an exec'd function raises OSError and would land in the traceback branch instead of the
         # clean-negative one under test. so write the stub module out and import it for real.
-        source = f"class Qwen3GatedDeltaNet:\n    def forward(self):\n        {forward_src}\n"
+        source = module_source or (
+            f"class Qwen3GatedDeltaNet:\n    def forward(self):\n        {forward_src}\n"
+        )
         path = tmp_path / f"{module_name}.py"
         path.write_text(source)
         spec = importlib.util.spec_from_file_location(module_name, path)
@@ -664,9 +671,13 @@ def _run_gdn_probe_branch(monkeypatch, tmp_path, *, forward_src, gdn_present=Tru
     # process has no reason to have, and their absence would drown the line under test.
     start = probe.index(f"if {module_name!r}:")
     captured = _io.StringIO()
-    namespace = {"emit": lambda *_a, **_k: None}
+    # record what the probe ANSWERS, not just what it printed: a positive case prints nothing, so
+    # stdout alone cannot distinguish "answered yes" from "never reached the check".
+    answers: dict = {}
+    namespace = {"emit": lambda key, value: answers.__setitem__(key, value)}
     with contextlib.redirect_stdout(captured):
         exec(probe[start:], namespace)
+    _run_gdn_probe_branch.last_answers = answers
     return captured.getvalue()
 
 
@@ -688,6 +699,61 @@ def test_a_gdn_source_check_failure_does_not_tell_operators_to_install_present_p
     assert "installing packages will not fix it" in out
     assert "cu_seq_lens_q" in out
     assert "seq_idx" in out
+
+
+def test_a_decorated_gdn_forward_is_read_through_to_the_real_body(monkeypatch, tmp_path):
+    """A wrapped forward must not read as "this transformers build cannot reset gdn state".
+
+    The regression, from a real GRPO run on Qwen/Qwen3.5-0.8B. transformers decorates
+    ``Qwen3_5GatedDeltaNet.forward`` with ``@force_accelerate_hooks("conv1d")``, which returns a
+    plain closure and sets no ``__wrapped__``. ``inspect.getsource`` then returns the hook wrapper
+    -- accelerate plumbing mentioning neither name -- so the probe answered "no" and
+    ``require_gdn_boundary_resets`` killed the run on a paid gpu.
+
+    That verdict is unreachable by any fix it suggests: every released transformers 5.x reads the
+    values as ``kwargs.get("cu_seq_lens_q")`` / ``kwargs.get("seq_idx")`` inside the real body, so
+    both packages were already installed and no version bump changes the answer. Verified against a
+    real transformers 5.14.1 install: the old one-liner returns False, reading through returns True.
+
+    The decorator here mirrors the real one's shape -- a closure over the undecorated function, no
+    functools.wraps -- because that shape is precisely what defeats getsource and unwrap alike.
+    """
+    module_source = (
+        "def force_accelerate_hooks(child_module_name):\n"
+        "    def decorator(func):\n"
+        "        def wrapped(self, *args, **kwargs):\n"
+        "            hooked = getattr(self, child_module_name, None)\n"
+        "            return func(self, *args, **kwargs)\n"
+        "        return wrapped\n"
+        "    return decorator\n"
+        "\n"
+        "class Qwen3GatedDeltaNet:\n"
+        "    @force_accelerate_hooks('conv1d')\n"
+        "    def forward(self, hidden_states, cache_params=None, **kwargs):\n"
+        "        return (kwargs.get('cu_seq_lens_q'), kwargs.get('seq_idx'))\n"
+    )
+    # the only POSITIVE case here, so it is the only one that reaches the probe's post-check cuda
+    # smoke. this interpreter has no torch; stub it reporting no gpu, which is the branch a cpu box
+    # takes anyway. without this the assertion below would pass for the wrong reason -- an
+    # ImportError landing in the traceback branch rather than the source check answering yes.
+    import importlib.machinery as _machinery
+    import sys as _sys
+    import types as _types
+
+    torch_stub = _types.ModuleType("torch")
+    torch_stub.__spec__ = _machinery.ModuleSpec("torch", loader=None)
+    torch_stub.cuda = _types.SimpleNamespace(is_available=lambda: False)
+    monkeypatch.setitem(_sys.modules, "torch", torch_stub)
+
+    out = _run_gdn_probe_branch(monkeypatch, tmp_path, forward_src="", module_source=module_source)
+
+    assert "gdn boundary resets unavailable" not in out, (
+        "a decorated forward that DOES thread cu_seq_lens_q and seq_idx was reported as incapable; "
+        "grpo and opd then die on every gdn model with advice that cannot fix it"
+    )
+    # silence is not the answer -- a positive case prints nothing, so assert the affirmative the
+    # caller actually gates on. otherwise this passes just as well when the branch never ran.
+    assert _run_gdn_probe_branch.last_answers.get("gdn_boundary_resets") is True
 
 
 def test_a_gdn_probe_names_the_single_missing_forward_kwarg(monkeypatch, tmp_path):
