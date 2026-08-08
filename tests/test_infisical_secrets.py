@@ -103,43 +103,59 @@ _TOKEN = re.compile(
 )
 _FETCH = re.compile(r"(?:[\w./-]*/)?(?:curl|wget)")
 
-# Does a quoted span read as a COMMAND (so its operators are real) or as a VALUE (so they are
-# data)? The answer differs by operator, and treating them alike broke the guard in both
-# directions on successive commits.
+# A quoted span is a COMMAND when it is the argument to a shell's `-c`, and a VALUE everywhere
+# else. That is a POSITIONAL test, and it replaces three attempts at a content-based one.
 #
-# `&` and `;` are ordinary URL characters: `?a=1&b=2` is a query string, not two commands. So
-# they count only with whitespace around them, the way a command is written. Testing merely for
-# their presence let a live `curl 'https://host/i.sh?a=1&b=2' | bash` through.
+# The content heuristics all failed in both directions, because a URL may legally contain any
+# operator a command can. Requiring whitespace around the operator missed the tight
+# `sh -c "curl …|bash"`; counting a bare `|` anywhere then broke `curl 'http://host/a||b' | bash`
+# (the `||` ended the pipeline early) AND invented a phantom stage from `curl 'https://host/f|bash'
+# | jq .`, flagging a pipeline that feeds `jq`. Each fix traded one failure direction for the
+# other, which is the signature of asking the wrong question: no amount of looking at the
+# characters distinguishes a command from a URL that resembles one.
 #
-# `|` is NOT URL-safe in the same way -- it is rare in a URL and almost always a real pipe -- so
-# it counts wherever it appears. Holding it to the whitespace rule made the fully tight
-# `sh -c "curl …|bash"` one opaque word, and a live installer scanned clean. Both predecessors of
-# that commit caught the spelling, so it was a regression, not a pre-existing gap.
-_EMBEDDED_COMMAND = re.compile(r"\||\s[;&]|[;&]\s")
+# Where the span SITS does distinguish them. `sh -c "…"` is the only construct here that takes a
+# command as a string, so that is the only place the quotes get opened.
+_DASH_C = "-c"
 
 
 def _tokenize(line: str) -> list[str]:
-    """Split a logical line into words and operators, then look INSIDE any quoted word.
+    """Split a logical line into words and operators, opening `sh -c "…"` command strings.
 
-    Both halves matter and they pull in opposite directions. Quoting must not hide an operator
-    from us -- `sh -c "curl … | bash"` is a real pipeline that really runs, and the quotes are
-    just the outer command's -- but it also must not expose the quoted word's OWN characters as
-    operators, which is what stripping quotes outright did to URL query strings.
+    Two requirements pull against each other. Quoting must not HIDE a real pipeline from the
+    scan -- `sh -c "curl … | bash"` runs exactly the command this guard exists to reject -- but
+    it must not EXPOSE a quoted value's own characters as operators either, or a URL containing
+    `&`, `;`, or `|` gets split into phantom commands.
 
-    So: tokenize with quoted spans intact, then look inside a quoted span only when it reads as
-    a COMMAND rather than a value. Containing a metacharacter is not the test -- a URL query
-    string is full of `&` and is still one word. A quoted span is re-read only when it contains
-    whitespace around an operator, which is how a command is written and how a URL is not.
+    Both are satisfied by opening a quoted span only in the one position where the shell itself
+    treats it as code: immediately after a shell name's `-c`.
     """
     tokens: list[str] = []
-    for tok in _TOKEN.findall(line):
+    raw = _TOKEN.findall(line)
+    for index, tok in enumerate(raw):
         quoted = len(tok) > 1 and tok[0] == tok[-1] and tok[0] in "\"'"
         inner = tok[1:-1] if quoted else ""
-        if inner and _EMBEDDED_COMMAND.search(inner):
+        if inner and _is_a_command_string(raw, index):
             tokens.extend(_tokenize(inner))
         else:
             tokens.append(tok[1:-1] if quoted else tok)
     return tokens
+
+
+def _is_a_command_string(tokens: list[str], index: int) -> bool:
+    """Is `tokens[index]` the command string of a `sh -c` (or `bash -c`, `zsh -c`, …)?
+
+    Scans left past the wrapper's other flags to the command word, so `bash -eu -c "…"` and
+    `sudo sh -c "…"` are recognized. Only a shell counts: `jq -c "…"` passes `-c` too, and its
+    argument is a filter, not a command.
+    """
+    if index == 0 or tokens[index - 1] != _DASH_C:
+        return False
+    for tok in reversed(tokens[: index - 1]):
+        if tok.startswith("-"):
+            continue
+        return bool(_SHELL_NAME.fullmatch(tok))
+    return False
 
 
 def _pipeline_stages_after_a_fetch(line: str) -> list[list[str]]:
@@ -402,6 +418,16 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
         pytest.param(
             "RUN sh -c 'curl -fsSL https://x.example/i.sh|sh'\n", id="tight-pipe-single-quoted"
         ),
+        # A `||` inside the URL must stay data. Reading it as an operator ended the pipeline
+        # early, so the real outer `| bash` landed in a pipeline with no fetch in it.
+        pytest.param("RUN curl 'http://x.example/a||b' | bash\n", id="double-pipe-in-a-url"),
+        # The `-c` string may sit behind the shell's own flags, or behind another wrapper.
+        pytest.param(
+            'RUN bash -eu -c "curl -sSL https://x.example/i.sh | sh"\n', id="dash-c-behind-flags"
+        ),
+        pytest.param(
+            'RUN sudo sh -c "curl -sSL https://x.example/i.sh|bash"\n', id="dash-c-behind-sudo"
+        ),
     ],
 )
 def test_the_pipe_to_shell_guard_catches_what_it_claims_to(snippet: str, tmp_path: Path):
@@ -501,6 +527,13 @@ def test_the_guard_catches_a_yaml_line_that_both_folds_back_and_continues_on(tmp
         # A `|` inside a URL value: counting `|` anywhere must not make the surrounding pipeline
         # match when the command it feeds is not a shell.
         pytest.param("curl -s 'https://x.example/f?p=a|b' | jq .", id="pipe-inside-a-url-value"),
+        # A URL segment that IS a shell name. Opening the quotes here invented a pipeline stage
+        # that does not exist -- curl feeds `jq`, and the `bash` is part of the path.
+        pytest.param("curl -s 'https://x.example/f|bash' | jq .", id="shell-named-url-segment"),
+        # `-c` is not exclusive to shells: jq takes one too, and its argument is a filter.
+        pytest.param(
+            'jq -c "curl https://x.example/i.sh | bash" /tmp/f', id="dash-c-on-a-non-shell"
+        ),
     ],
 )
 def test_the_pipe_to_shell_guard_does_not_flag_ordinary_pipelines(line: str, tmp_path: Path):
