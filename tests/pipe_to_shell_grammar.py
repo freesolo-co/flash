@@ -425,20 +425,55 @@ def _arguments_reach_a_command_slot(wrappers: list[str], command: list[str]) -> 
 
 
 def _replacement_placeholders(wrappers: list[str]) -> list[str]:
-    """The `-I`/`--replace` placeholder strings, in every spelling xargs accepts.
+    """The strings xargs will substitute the stream into, or NOTHING if it substitutes at all.
 
-    `-I{}` fuses its operand, `-I {}` separates it, and `--replace`/`-i` default to `{}` when
-    given none. Anything appearing in the command string is substituted with the stream.
+    An empty result is the common case and it matters: with no replace flag, `{}` in the command
+    is ordinary text. `curl … | xargs -0 sh -c 'jq {}'` runs a jq filter, and treating `{}` as a
+    placeholder there fails CI on a legitimate pipeline. So this returns [] rather than defaulting
+    to `{}` -- the default belongs to the FLAG, not to the absence of one.
+
+    The two flags differ in arity, which is the whole subtlety:
+
+      `-I` REQUIRES an operand      -- `-I{}` fused, or `-I {}` separate.
+      `-i` / `--replace` OPTIONAL   -- `-i` alone means `{}`; `-iQQ` / `--replace=QQ` fuse a custom
+                                       one. A SEPARATE word is never its operand, so `xargs -i -0`
+                                       is `-i` (meaning `{}`) plus `-0`, not the placeholder `-0`.
+
+    Confirmed rather than assumed, against GNU findutils:
+        printf 'echo PWNED\\n' | xargs -i -0 sh -c '{}'        -> PWNED   (`-0` was NOT the operand)
+        printf 'echo PWNED\\n' | xargs -iQQ sh -c 'echo got QQ' -> got echo PWNED
+        printf 'X\\n'          | xargs -0 sh -c 'echo {}'       -> {}      (literal, no flag)
     """
     placeholders: list[str] = []
     for flag, following in itertools.zip_longest(wrappers, wrappers[1:], fillvalue=""):
-        if flag in ("-I", "-i", "--replace") and following:
+        if flag == "-I":
+            # Required operand, so the next word IS it even when it looks like an option.
             placeholders.append(following)
-        elif flag.startswith(("-I", "--replace=")) and flag not in ("-I",):
-            placeholders.append(flag.split("=", 1)[1] if "=" in flag else flag[2:])
-        elif flag in ("-i", "--replace"):
+        elif flag == "--replace":
             placeholders.append("{}")
-    return [p for p in placeholders if p] or ["{}"]
+        elif flag.startswith("--replace="):
+            placeholders.append(flag.split("=", 1)[1])
+        elif not flag.startswith("--"):
+            placeholders.append(_fused_replacement(flag))
+    return [p for p in placeholders if p]
+
+
+def _fused_replacement(flag: str) -> str:
+    """The placeholder inside a short-flag cluster, or "" when the cluster has no `-i`/`-I`.
+
+    Short flags cluster, and `-i`/`-I` may sit at the end of one: `xargs -0i` is `-0` plus `-i`.
+    Everything after that letter is the placeholder, not more flags -- `-in1` means the
+    placeholder is literally `n1`, not `-i -n 1`. So the search is for the LAST `i`/`I`, and only
+    when nothing before it could have consumed the rest.
+
+    Confirmed rather than assumed, against GNU findutils:
+        printf 'echo PWNED\\n' | xargs -0i sh -c '{}'        -> PWNED    (clustered, default `{}`)
+        printf 'echo PWNED\\n' | xargs -in1 sh -c '{}'       -> {}: not found  (`n1` is the name)
+    """
+    for position, letter in enumerate(flag):
+        if letter in ("i", "I") and position > 0:
+            return flag[position + 1 :] or "{}"
+    return ""
 
 
 def _dash_c_operand(tokens: list[str]) -> str | None:

