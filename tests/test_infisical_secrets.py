@@ -93,16 +93,45 @@ def _piped_into_a_shell(line: str) -> bool:
     return any(_stage_runs_a_shell(s) for s in _pipeline_stages_after_a_fetch(line))
 
 
-# Words and shell operators. Quotes are STRIPPED rather than honoured, so `sh -c "curl … | bash"`
-# is still seen as a pipe into a shell: the quoting is the outer command's, and the inner text is
-# a real pipeline that really runs. A `>&`-style redirection is matched first so its `&` is not
-# taken for a separator.
-_TOKEN = re.compile(r"\d*[<>]{1,2}&\d*|\|\||&&|\||;|&|[^\s;|&]+")
+# Words and shell operators. A quoted span is ONE token, so shell metacharacters inside it stay
+# data: a query string (`curl 'https://host/i.sh?a=1&b=2' | bash`) must not have its `&` read as
+# a command separator, which would file the fetch and the shell into different pipelines and let
+# a live installer through. A `>&`-style redirection is matched before the bare `&` so its `&` is
+# not taken for a separator either.
+_TOKEN = re.compile(
+    r"""'[^']*'|"[^"]*"|\d*[<>]{1,2}&\d*|\|\||&&|\||;|&|(?:'[^']*'|"[^"]*"|[^\s;|&'"])+"""
+)
 _FETCH = re.compile(r"(?:[\w./-]*/)?(?:curl|wget)")
+
+# Does a quoted span read as a COMMAND (so its operators are real) or as a VALUE (so they are
+# data)? A shell command puts whitespace around its operators -- `sh -c "curl … | bash"` -- while
+# a URL packs them tight: `?a=1&b=2`. Testing merely for the presence of `&` split query strings
+# apart and let a live `curl 'https://host/i.sh?a=1&b=2' | bash` through.
+_EMBEDDED_COMMAND = re.compile(r"\s[;|&]|[;|&]\s")
 
 
 def _tokenize(line: str) -> list[str]:
-    return _TOKEN.findall(line.replace('"', " ").replace("'", " "))
+    """Split a logical line into words and operators, then look INSIDE any quoted word.
+
+    Both halves matter and they pull in opposite directions. Quoting must not hide an operator
+    from us -- `sh -c "curl … | bash"` is a real pipeline that really runs, and the quotes are
+    just the outer command's -- but it also must not expose the quoted word's OWN characters as
+    operators, which is what stripping quotes outright did to URL query strings.
+
+    So: tokenize with quoted spans intact, then look inside a quoted span only when it reads as
+    a COMMAND rather than a value. Containing a metacharacter is not the test -- a URL query
+    string is full of `&` and is still one word. A quoted span is re-read only when it contains
+    whitespace around an operator, which is how a command is written and how a URL is not.
+    """
+    tokens: list[str] = []
+    for tok in _TOKEN.findall(line):
+        quoted = len(tok) > 1 and tok[0] == tok[-1] and tok[0] in "\"'"
+        inner = tok[1:-1] if quoted else ""
+        if inner and _EMBEDDED_COMMAND.search(inner):
+            tokens.extend(_tokenize(inner))
+        else:
+            tokens.append(tok[1:-1] if quoted else tok)
+    return tokens
 
 
 def _pipeline_stages_after_a_fetch(line: str) -> list[list[str]]:
@@ -348,6 +377,14 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
         pytest.param(
             "RUN curl -sSL https://x.example/i.sh | sudo -s bash\n", id="flag-arity-is-per-wrapper"
         ),
+        # A query string's `&` and `;` are DATA. Reading them as command separators filed the
+        # fetch and the shell into different pipelines, so a live installer scanned clean.
+        pytest.param(
+            "RUN curl -fsSL 'https://x.example/i.sh?a=1&b=2' | bash\n", id="quoted-url-ampersand"
+        ),
+        pytest.param(
+            'RUN curl -fsSL "https://x.example/i.sh;v=1" | sh\n', id="quoted-url-semicolon"
+        ),
     ],
 )
 def test_the_pipe_to_shell_guard_catches_what_it_claims_to(snippet: str, tmp_path: Path):
@@ -441,6 +478,9 @@ def test_the_guard_catches_a_yaml_line_that_both_folds_back_and_continues_on(tmp
         pytest.param("curl -s https://x.example/f | timeout 30 jq .", id="timeout-into-jq"),
         # The command name merely STARTS with the shell name.
         pytest.param("curl -s https://x.example/f | sudo -u shane cat", id="operand-shell-prefix"),
+        # The other side of the quoted-URL fix: a query string must not make an ordinary
+        # pipeline match either, so the fix cannot be "treat quoted spans as opaque".
+        pytest.param("curl -s 'https://x.example/f?a=1&b=2' | jq .", id="quoted-url-into-jq"),
     ],
 )
 def test_the_pipe_to_shell_guard_does_not_flag_ordinary_pipelines(line: str, tmp_path: Path):
