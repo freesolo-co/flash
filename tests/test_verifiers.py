@@ -1661,10 +1661,17 @@ def test_multi_turn_reward_groups_are_scored_concurrently(monkeypatch):
 
 
 class _FailingGroupedEnv(_FakeSingleTurnEnv):
-    """Raises on one designated group and counts how many groups actually executed."""
+    """Raises on one designated group and counts how many groups actually executed.
 
-    def __init__(self, fail_on: str):
+    ``slow_head`` makes group ``q0`` an order of magnitude slower than the rest, which is what
+    real scorers look like -- group cost tracks completion length and judge latency, so it is
+    uneven. A pool that waits on results in INPUT order cannot report the failure until that
+    leading group returns, by which time the whole batch has drained.
+    """
+
+    def __init__(self, fail_on: str, slow_head: bool = False):
         self.fail_on = fail_on
+        self.slow_head = slow_head
         self.lock = threading.Lock()
         self.executed = 0
 
@@ -1673,34 +1680,42 @@ class _FailingGroupedEnv(_FakeSingleTurnEnv):
             self.executed += 1
         # hold the worker long enough that the groups queued behind this one are still QUEUED, not
         # started, when the raise surfaces -- that is what cancel_futures can drop.
-        time.sleep(0.05)
+        head = self.slow_head and str(example.input) == "q0"
+        time.sleep(0.5 if head else 0.05)
         if str(example.input) == self.fail_on:
             raise RuntimeError("scorer exploded")
         return [_RewardResult(score=1.0, success=True, metrics=()) for _text in response_texts]
 
 
 @pytest.mark.parametrize(
-    ("fail_on", "ceiling"),
-    [("q1", 16), ("q19", 32)],
+    ("fail_on", "ceiling", "slow_head"),
+    [
+        ("q1", 16, False),
+        ("q19", 32, False),
+        ("q1", 16, True),
+        ("q19", 32, True),
+    ],
 )
-def test_a_failing_scorer_group_wastes_at_most_a_pool_width(monkeypatch, fail_on, ceiling):
+def test_a_failing_scorer_group_wastes_at_most_a_pool_width(
+    monkeypatch, fail_on, ceiling, slow_head
+):
     """A raise must not drag the whole batch through the scorer before it propagates.
 
     The serial loop stopped AT the failing group; the pool also runs whatever is already in flight,
     and rl_train.py's batch-level retry re-scores everything serially afterwards, so those calls are
     billed TWICE. Bounding that waste is what makes the concurrency acceptable.
 
-    Two mechanisms hold the bound independently, which is why this asserts on the OBSERVED count
-    rather than on either one: `map`'s result generator cancels the pending futures when the
-    exception abandons it, and `shutdown(cancel_futures=True)` cancels whatever is still queued.
-    Removing either alone leaves the count at 10 (verified by mutation) -- only submit-then-gather
-    with a plain shutdown runs all 40, which is exactly the regression worth catching.
+    The ``slow_head`` arms are the ones with teeth. Scorer cost is uneven in production, and
+    `pool.map` yields strictly in INPUT order, so a slow leading group defers the raise until every
+    other group has run: measured 40/40 under `map` for both failure points, against 9 and 27 when
+    completions are consumed as they arrive. The uniform-cost arms pass either way, so they cannot
+    catch that regression on their own.
 
     Asserted as a CEILING (one pool width past the failure point, doubled for scheduling slack), not
     an equality: the exact count depends on how many workers have picked up work when the raise
-    lands. Measured at 10 for the early failure and 28 for the late one.
+    lands.
     """
-    sdk_env = _FailingGroupedEnv(fail_on)
+    sdk_env = _FailingGroupedEnv(fail_on, slow_head=slow_head)
     _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
 
     from flash.envs.adapter import FreesoloEnvironment

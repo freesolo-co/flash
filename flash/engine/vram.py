@@ -575,7 +575,11 @@ def estimate_vram_gb(
         completion = opd_completion_len(max_tokens, thinking)
         loss_mb = opd_loss_microbatch(params_b, batch_size, group_size)
         activations = loss_mb * _ACT_COEF * (seq_len / 1024.0) * width
-        ce_rows = min(OPD_CE_CHUNK_SIZE, loss_mb * completion)
+        # rows are bounded by seq_len, NOT completion: the same fused forward that ignores
+        # `logits_to_keep` projects prompt positions too. inert while the cap was 64 (any completion
+        # saturated it), live at 512 -- a serial loss microbatch with a short completion reserved
+        # up to 1.5 GB short of one full chunk.
+        ce_rows = min(OPD_CE_CHUNK_SIZE, loss_mb * seq_len)
         chunked_logits = ce_rows * vocab * _OPD_CE_PEAK_BYTES_PER_LOGIT / 1e9
         dense_image_logits = (seq_len * 4 + completion * 8) * vocab / 1e9
         logits = max(chunked_logits, dense_image_logits)

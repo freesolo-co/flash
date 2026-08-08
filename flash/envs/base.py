@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Protocol, TypeVar
 
@@ -25,22 +25,29 @@ _R = TypeVar("_R")
 def map_bounded(
     items: Sequence[_T], fn: Callable[[_T], _R], *, cap: int, serial: bool = False
 ) -> list[_R]:
-    """Apply ``fn`` to every item, in input order, overlapping at most ``cap`` at a time.
+    """Apply ``fn`` to every item, returning results in input order, at most ``cap`` at a time.
 
     Serial when ``serial`` is set (a scorer that cannot be raced) or when there is nothing to
     overlap -- a pool for a single call is pure overhead.
 
-    ``map`` rather than submit-and-gather because it also BOUNDS a failure: its result generator
-    cancels the still-pending futures when the exception abandons it, so a raising ``fn`` costs at
-    most the work already in flight instead of the whole list. `cancel_futures` on the teardown
-    holds the same bound independently; both are kept since neither is obviously the one a later
-    edit keeps.
+    Failures are bounded to roughly one pool width: the first raise abandons the loop, and the
+    teardown's ``cancel_futures`` drops everything still queued behind it.
+
+    Completions are awaited as they ARRIVE, not in input order, and the results are placed back by
+    index. ``pool.map`` would be shorter but yields strictly in input order, so one slow leading
+    item defers the raise until the whole batch has drained -- measured on a 40-item batch at width
+    8, a slow head runs all 40 whichever item fails, where this runs 9 and 27. Scorer cost is
+    per-group and uneven, so that case is the normal one, not a corner.
     """
     if serial or len(items) <= 1:
         return [fn(item) for item in items]
     pool = ThreadPoolExecutor(max_workers=min(cap, len(items)))
     try:
-        return list(pool.map(fn, items))
+        futures = {pool.submit(fn, item): index for index, item in enumerate(items)}
+        results: list[_R] = [None] * len(items)  # type: ignore[list-item]
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+        return results
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
 
