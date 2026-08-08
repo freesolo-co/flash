@@ -227,23 +227,19 @@ class UnsupportedGpuError(ValueError):
 
 
 class CapacityLookupError(RuntimeError):
-    """A provider's LIVE capacity/offer lookup failed transiently (network / API blip / rate limit) —
-    distinct from ``UnsupportedGpuError`` ("no GPU class fits this job"). A per-provider failure degrades
-    to the other providers; only when it was the SOLE reason NO candidate was found does ``allocate``
-    re-raise it. Because it is NOT an ``UnsupportedGpuError``, the runner treats it as infra-retryable
-    (poll_error) rather than terminal — so a run whose only fitting capacity a transient outage hid is
-    retried on its infra budget instead of being killed."""
+    """A transient live-capacity lookup failure, distinct from no fitting GPU.
+
+    Allocation can degrade to other providers, but re-raises when an outage alone hid all fitting
+    capacity so the runner uses its infrastructure retry budget.
+    """
 
 
 class UnreconciledCreateError(RuntimeError):
-    """A non-idempotent provider create (e.g. Vast's ``PUT /asks``) failed AMBIGUOUSLY and could NOT be
-    reconciled: the possibly-created resource is not visible yet (object-store / API eventual
-    consistency), so we cannot adopt it and we cannot prove it does not exist. Retrying the run would
-    rent a SECOND instance while a phantom from this attempt may still materialize and bill under the
-    still-active run (where ``sweep_orphans`` shields it). The orchestrator must therefore FAIL THE RUN
-    TERMINALLY rather than consume a retry — the run's teardown plus a later sweep (the run is now
-    inactive, so no longer shielded) reclaim any late-materializing instance, preserving the
-    cost-safety invariant that a rented box is always destroyed."""
+    """An ambiguous non-idempotent create could not be reconciled.
+
+    Retrying could double-provision while the first resource materializes later. Fail terminally so
+    teardown and the later unshielded orphan sweep can reclaim it.
+    """
 
 
 def canonical_gpu(name: str) -> str:
@@ -281,11 +277,10 @@ _VRAM_MATCH_TOLERANCE_GB = 3.5
 
 
 def vast_gpu_for_offer(gpu_name: str, gpu_ram_mb: float) -> str | None:
-    """Map a Vast offer (``gpu_name`` + ``gpu_ram`` MB) to a canonical managed GPU class.
+    """Map a Vast name and reported VRAM to a managed GPU class.
 
-    Returns None for anything not in the managed table — the hard Ampere+ floor (T4 / 2080 Ti /
-    Quadro RTX offers never match). Names shared across VRAM variants ("A100 SXM4" = 40/80 GB) resolve
-    to the LARGEST class the board's actual RAM covers.
+    Unmanaged and pre-Ampere offers return None. Shared names resolve to the largest class whose
+    nominal VRAM the board covers.
     """
     fitting = [
         g
@@ -329,12 +324,10 @@ def run_config_for_ranking(
     thinking: bool = False,
     model_revision: str = "",
 ):
-    """Raw train knobs -> a one-step ``RunConfig`` to rank hardware against.
+    """Build the one-step RunConfig shared by every hardware-ranking path.
 
-    The single place spec knobs become a priced run, so every selection path (parse-time
-    provisional, submit-time allocator, cost estimate) ranks on identical inputs. ``steps=1``: the
-    ranking key is per-step, so the run's real length never enters it. Imported lazily because the
-    cost model imports this module.
+    Ranking is per step, so run length is irrelevant. Import lazily because the cost model imports
+    this module.
     """
     from flash.cost.types import RunConfig
 
@@ -411,14 +404,10 @@ MAX_COMBINATION_CARDS = 8
 
 
 def combined_vram_gb(vram_gb: int, gpu_count: int) -> float:
-    """Run-usable VRAM across ``gpu_count`` cards of ``vram_gb`` each.
+    """Return run-usable VRAM for a multi-card shape.
 
-    THE single fit model: parse-time sizing, the submit-time allocator's candidate filter, and its
-    pinned-class check all call this. They used to carry three copies of the arithmetic, which is
-    how parse-time drifted into rejecting shapes submit-time would have accepted.
-
-    Returns 0.0 for a multi-card box whose cards cannot individually clear the replicated floor --
-    such a box has no usable capacity at all, rather than a small amount.
+    All fit gates share this model. Return 0.0 when any card cannot hold the replicated floor; card
+    count cannot compensate for that requirement.
     """
     if gpu_count <= 1:
         return float(vram_gb)
@@ -430,14 +419,10 @@ def combined_vram_gb(vram_gb: int, gpu_count: int) -> float:
 
 
 def cheapest_gpu(min_vram_gb: int, *, gpu_count: int = 1, cost_key=None) -> str:
-    """Cheapest validated GPU class whose ``gpu_count``-card shape holds ``min_vram_gb``.
+    """Return the cheapest fitting validated GPU class for the card ceiling.
 
-    ``gpu_count`` is the run's card ceiling. Sizing a multi-card run against one card is what made
-    ``--gpus 4`` inert: the spec was rejected here before the allocator ever got to shard it.
-
-    ``cost_key`` is ``(gpu_name, hourly_rate) -> comparable``; when given, classes are ranked by
-    what the JOB costs on each rather than by rental rate, matching the submit-time allocator.
-    Omitted, this ranks on $/hr for callers with no run to price.
+    Size against the rentable multi-card shape so ``--gpus`` is not rejected as single-card. A
+    ``cost_key`` ranks job cost; without one, rank hourly rate.
     """
     # the allocator never proposes a wider combination, so sizing against one would admit a spec
     # here only for submit to reject it -- the same defect this parameter exists to fix, inverted.
@@ -557,14 +542,10 @@ class PollResult:
 
 
 def rentable_gpu_counts(max_gpu_count: int) -> tuple[int, ...]:
-    """Card counts worth asking a provider about, largest first, up to ``max_gpu_count``.
+    """Return rentable card counts, largest first, up to ``max_gpu_count``.
 
-    Powers of two only. Every provider sells multi-card boxes in powers of two, and the trainer
-    shards over exactly the cards it rents: verl asserts ``num_attention_heads % sp_size == 0``, so
-    a count that does not divide the head count aborts at step 0 rather than training slowly.
-    Catalog head counts are 8, 16, or 24 -- every one divisible by 1, 2, 4, and 8, and none by an
-    odd count above 1 (24 % 3 == 0 but 8 % 3 != 0). Powers of two are therefore the counts that are
-    safe for every model, so no unrunnable shape is ever allocated.
+    Use powers of two: providers sell those shapes, and verl requires ``num_attention_heads %
+    sp_size == 0``. Catalog head counts are all divisible by 1, 2, 4, and 8.
     """
     cap = max(1, int(max_gpu_count))
     counts, count = [], 1
@@ -575,11 +556,9 @@ def rentable_gpu_counts(max_gpu_count: int) -> tuple[int, ...]:
 
 
 def largest_rentable_count(max_gpu_count: int) -> int:
-    """Widest shape a ``max_gpu_count`` ceiling can actually be provisioned as.
+    """Return the widest shape the card ceiling can actually rent.
 
-    Sizing gates must use this rather than the raw ceiling: only powers of two up to
-    ``MAX_COMBINATION_CARDS`` are ever offered (see ``rentable_gpu_counts``), so a ceiling of 3
-    buys 2 cards. Sizing on 3 would admit a spec that submit can never rent.
+    Only powers of two up to ``MAX_COMBINATION_CARDS`` are offered, so a ceiling of 3 buys 2 cards.
     """
     return rentable_gpu_counts(min(max(1, int(max_gpu_count)), MAX_COMBINATION_CARDS))[0]
 
@@ -714,27 +693,18 @@ class Provider(Protocol):
     # (RunPod). The runner gates its one-shot cache-less retry fallback on it; every other provider
     # defaults False.
 
-    # NOTE: ``run_instances_remaining(run_id) -> list[int]`` is an OPTIONAL capability, intentionally
-    # NOT declared on this ``@runtime_checkable`` Protocol — adding it would make it a REQUIRED member
-    # for ``isinstance(prov, Provider)``, which RunPod (serverless, self-reaping — nothing to enumerate)
-    # and Lambda do not implement. Instance providers that CAN enumerate billable resources by run
-    # label (Vast) implement it so the handle-less recovery resubmit can require a CONFIRMED reap before
-    # launching a second worker (a best-effort ``gc`` returns no error on an unconfirmed teardown).
-    # Callers detect it via ``getattr(prov, "run_instances_remaining", None)`` (see server/_runtime.py).
-    # Contract: ``[]`` == CONFIRMED no resource for the run remains; non-empty == a possibly-live one
-    # survives; RAISES on an incomplete enumeration so a caller can't mistake "couldn't list" for "clear".
+    # ``run_instances_remaining(run_id)`` is optional and must stay off this runtime-checkable
+    # protocol. callers use getattr in server/_runtime.py. ``[]`` confirms clear; non-empty means a
+    # survivor. incomplete enumeration raises so recovery cannot mistake lookup failure for clear.
 
     def sweep_orphans(
         self,
         active_labels: set[str] | Callable[[], set[str]] | None = None,
         known_labels: set[str] | Callable[[], set[str]] | None = None,
     ) -> list[int | str]:
-        """Destroy billable resources this provider owns that no live run claims.
+        """Destroy provider resources unclaimed by live runs.
 
-        ``active_labels``: raw run ids of live runs (may be a callable resolved after listing, to
-        close the launch race). ``known_labels``: universe of run ids this plane may own — reap only
-        resources in this set and not in active_labels (multi-plane safety: two planes sharing one
-        account only reap their own orphans). ``None`` = unscoped single-plane behavior (correct for
-        single-plane prod). Returns destroyed resource ids.
+        Resolve callable ``active_labels`` after listing to close the launch race. ``known_labels``
+        limits cleanup to this plane in shared accounts; None keeps single-plane behavior.
         """
         ...

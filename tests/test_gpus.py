@@ -53,8 +53,8 @@ def test_providers_for():
 
 
 def test_vast_gpu_for_offer_accepts_h100_pcie_alias():
-    # Codex Mslmq: Vast lists PCIe H100s as "H100 PCIE" (distinct from the SXM "H100 SXM"). Both must
-    # map to the canonical H100 class, else a PCIe-only market is dropped as unknown capacity.
+    # Vast lists PCIe H100s as "H100 PCIE" (distinct from the SXM "H100 SXM"). Both must map to the
+    # canonical H100 class, else a PCIe-only market is dropped as unknown capacity.
     from flash.providers.base import vast_gpu_for_offer
 
     h100_ram = 80 * 1024  # MB

@@ -1,19 +1,7 @@
-"""Daily realized-cost reconciliation: pull what the GPU provider actually billed for each
-finished run and report it to the freesolo backend for estimator accuracy tracking.
+"""Daily realized-cost reconciliation for finished runs.
 
-Flash charges customer-facing training usage from the run's ``cost_usd`` (the flash.cost estimate).
-This job is the COGS side: the realized provider invoice (RunPod /v1/billing/endpoints). What it
-REPORTS (via ``/api/billing/training-cost``) is COGS, not a customer charge. The backend's
-training_cost_accuracy view joins the two per run to surface charged-vs-realized error.
-
-Best-effort and entirely off the run hot path: it runs in a background loop (see the server
-lifespan), never blocks request handling, and any failure is swallowed and retried next cycle.
-Realized cost is reported with the operator INTERNAL key (this is COGS, not a customer charge),
-which also gates the whole feature -- with no FREESOLO_INTERNAL_KEY set, reconciliation is off.
-
-Scope note (v1): cost is attributed from the run's last persisted handle (RunStatus.remote).
-This is exact for the common single-attempt run; runs that retried across multiple resources may be
-under-counted until every attempt's resource id is persisted.
+Reports provider COGS with the operator key, best-effort and off-path. Attribution uses the last
+`RunStatus.remote`, so multi-resource retries may be undercounted.
 """
 
 from __future__ import annotations
@@ -37,12 +25,8 @@ _SETTLE_SECONDS = 3600.0  # 1h
 _WINDOW_SECONDS = 7 * 86400.0  # only reconcile runs that finished within the last 7 days
 # States that incur no GPU cost -> never reconciled.
 _FREE_TERMINAL_STATES = frozenset({"dry_run"})
-# States whose training is finished and whose GPU cost is therefore final -> eligible for
-# reconciliation. The terminal billable states plus `deployed`: a deployed run finished
-# training (its training invoice has settled) before serving was stood up on top of it, so
-# its realized training cost is final and must be reconciled like any other finished run.
-# (`deployed` is intentionally NOT in runner.TERMINAL_STATES -- it's a live, undeployable-back
-# state -- so it has to be added explicitly here.) Excludes the free states (e.g. dry_run).
+# reconcile terminal billable states plus `deployed`, whose training invoice is final even though
+# it is intentionally absent from `runner.TERMINAL_STATES`. exclude free states such as `dry_run`.
 _RECONCILABLE_STATES = (runner.TERMINAL_STATES | {"deployed"}) - _FREE_TERMINAL_STATES
 
 
@@ -77,14 +61,11 @@ def _report(body: dict) -> bool:
 
 
 def _terminal_ts(status: runner.RunStatus) -> float:
-    """The run's training-teardown time, used for both billing (``run_end``) and eligibility
-    (settle delay + window). Prefer the frozen ``finished_at`` over the mutable ``updated_at``:
-    deploy / late heartbeat / reconcile all move ``updated_at`` past teardown, which would both
-    DELAY the settle gate (it counts from the bump, not the finish) and let a long-finished run
-    that was merely bumped look "recent" and slip back inside ``_WINDOW_SECONDS``. ``finished_at``
-    is stamped once at the terminal transition and never moved; falls back to ``updated_at`` for
-    pre-feature runs. ``is not None`` (not truthiness) so a legitimate ``finished_at == 0.0`` is
-    honored rather than silently falling back to ``updated_at``."""
+    """The run's training-teardown time, used for both billing and eligibility.
+
+    Prefer immutable `finished_at`; deploys and late updates move `updated_at` and distort settle
+    delay and window. Fall back for pre-feature runs, preserving `finished_at == 0.0`.
+    """
     return float(status.finished_at if status.finished_at is not None else status.updated_at)
 
 
@@ -140,12 +121,8 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
     if not _report(body):
         return False
 
-    # Persist locally so we don't re-pull/re-report, and so `flash runs status` can show realized vs
-    # estimated. COST-FIELDS-ONLY: record_realized_cost re-reads the run under the lock and writes
-    # only the realized-cost columns, never `state`. The `status` here is an earlier snapshot, so
-    # writing its `state` back could REVERT a run that advanced since (e.g. to `deployed`) -- which
-    # the terminal-sticky CAS does NOT protect against, since `deployed` is non-terminal. Updating
-    # only the cost columns keeps the run's current state intact.
+    # persist realized-cost fields only. `status` is stale, and writing its state could revert a run
+    # that advanced to nonterminal `deployed`, which terminal-sticky CAS would not protect.
     with contextlib.suppress(Exception):
         runner.record_realized_cost(
             status.run_id,

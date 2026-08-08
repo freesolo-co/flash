@@ -1,10 +1,7 @@
-"""Pure LoRA-target / VL-checkpoint helpers for the fine-tuning worker.
+"""provide cpu-importable lora-target and vl-checkpoint helpers.
 
-These helpers take the model id as an ARGUMENT and read NONE of the worker's run-scoped
-module globals, so they live here as a leaf module. ``flash.engine.worker`` re-exports
-them; this module must NOT import that package (no cycle). Heavy deps (transformers, peft,
-vllm, the catalog) are imported lazily inside the functions so the module stays
-CPU-importable.
+helpers take model ids explicitly and must not import ``flash.engine.worker``. heavy dependencies remain
+lazy so this leaf module has no package cycle or eager gpu stack import.
 """
 
 from __future__ import annotations
@@ -36,12 +33,8 @@ def is_vl_checkpoint(model_id: str, revision: str = "") -> bool:
 
 
 # --------------------------------------------------------------------------------------------
-# Warm-start (init_from_adapter) SFT-adapter key namespace for VL checkpoints.
-#
-# SFT/GRPO/OPD all train VL checkpoints through the FULL multimodal model, so their adapter module
-# sets match exactly and a warm-start CONTINUES the one LoRA in place (no merge, no rank-stack).
-# ``_LANGUAGE_MODEL_INFIX`` is the signal ``adapter_is_vl_warmstart`` reads to detect a full-VL
-# warm-start adapter from its keys and load the matching multimodal base.
+# warm-start vl adapters use the full multimodal model across sft/grpo/opd. the
+# ``_LANGUAGE_MODEL_INFIX`` key signal selects that base without merging or stacking ranks.
 
 _LANGUAGE_MODEL_INFIX = ".language_model."
 
@@ -62,11 +55,9 @@ _MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024
 
 
 def _read_adapter_tensor_keys(adir: str) -> list[str] | None:
-    """Tensor key names in the downloaded adapter.
+    """return tensor key names from adapter weights without loading tensor data.
 
-    For safetensors, read ONLY the JSON header (pure stdlib, no tensor data). For PEFT
-    ``adapter_model.bin``, use Torch's weights-only loader and inspect the state-dict keys. Returns
-    ``None`` when no adapter weights exist in ``adir``.
+    read only safetensors json headers or torch weights-only state-dict keys. return none if absent.
     """
     import json
     import os
@@ -149,17 +140,12 @@ def _read_adapter_tensor_keys(adir: str) -> list[str] | None:
 
 
 def adapter_is_vl_warmstart(adir: str, model_id: str, revision: str = "") -> bool:
-    """Whether a warm-start adapter must be continued on the FULL multimodal base (VL loader).
+    """detect whether a warm-start adapter requires the full multimodal base.
 
-    Robust to a transient ``is_vl_checkpoint`` config-probe failure (it calls
-    ``AutoConfig.from_pretrained`` and swallows EVERY exception to return False, so an HF
-    rate-limit / network hiccup / uncached config could silently route a genuine VL warm-start onto
-    the language-only loader — whose module names wouldn't match the adapter's ``.language_model.``
-    keys, and whose trainer arch wouldn't match the VL vLLM rollout engine — issue #286). An adapter
-    that actually carries ``.language_model.`` LoRA keys was saved against the full multimodal model and
-    IS a VL warm-start regardless of the probe (the adapter's own keys are the authoritative signal).
-    Falls back to the config probe only when the adapter can't be read or carries no
-    ``.language_model.`` LoRA keys."""
+    ``is_vl_checkpoint`` swallows config-probe failures, so authoritative ``.language_model.`` adapter
+    keys must still select the vl loader during hf/network failures (#286). use the probe only when
+    weights are unreadable or carry no such lora keys.
+    """
     try:
         keys = _read_adapter_tensor_keys(adir)
         if keys and any(_LANGUAGE_MODEL_INFIX in k for k in keys if _is_lora_key(k)):
@@ -177,12 +163,10 @@ def adapter_is_vl_warmstart(adir: str, model_id: str, revision: str = "") -> boo
 
 
 def assert_lora_applied(model, model_id: str) -> int:
-    """After ``PeftModel.from_pretrained``, verify the adapter's LoRA actually loaded (non-empty)
-    so a future key-mismatch regression fails LOUDLY instead of silently training a fresh LoRA.
+    """verify a peft warm-start injected at least one lora module.
 
-    Counts the LoRA A/B submodules present on the PeftModel. Raises for ANY warm-start that ended
-    up with ZERO LoRA modules (a key mismatch from any cause; the VL ``.language_model.`` mismatch
-    this remap fixes is the common one). Returns the count.
+    zero modules means a key mismatch silently started fresh training. return the lora a/b module
+    count after raising on zero.
     """
     count = 0
     for name, _ in model.named_modules():
@@ -201,22 +185,14 @@ def assert_lora_applied(model, model_id: str) -> int:
 
 
 def assert_adapter_load_clean(load_result, model_id: str) -> None:
-    """Assert a peft adapter load matched ALL saved keys — fail closed on a silent discard.
+    """fail closed unless every saved lora key matched the injected adapter.
 
-    ``PeftModel.from_pretrained`` loads adapter weights with ``load_state_dict(strict=False)`` and
-    only WARNS on a key mismatch (it throws the load result away), so an SFT adapter whose keys don't
-    line up with the target base is silently dropped and GRPO restarts from the base model (bug #67).
-    ``assert_lora_applied`` can't catch this: peft INJECTS the LoRA modules from ``target_modules``
-    BEFORE loading any weights, so the module count is non-zero even when zero saved weights matched.
+    peft loads with ``strict=False`` and only warns on mismatches, so grpo can silently restart from
+    base weights (bug #67). module count cannot detect this because peft injects modules before load.
 
-    ``load_result`` is the object returned by ``PeftModel.load_adapter`` (a ``_IncompatibleKeys`` with
-    ``missing_keys`` / ``unexpected_keys``). We only care about LoRA keys: an adapter-only checkpoint
-    loaded with ``strict=False`` legitimately leaves the base-model params out, so they can surface as
-    "missing" without anything being wrong. peft's ``load_adapter`` already filters ``missing_keys`` to
-    the tuner prefix, but we re-filter to keys carrying the LoRA prefix (``lora_``) ourselves so a
-    benign base-weight miss never aborts a correct warm-start even if peft's internal filtering
-    changes. Raises if any injected LoRA module got no saved weight (``missing_keys``) or any saved
-    LoRA key matched no module (``unexpected_keys``) — i.e. matched != saved.
+    inspect ``load_adapter`` missing/unexpected keys, filtering to ``lora_`` because absent base-model
+    weights are legitimate. raise when any injected lora weight is missing or any saved lora key has
+    no module.
     """
 
     def _lora_only(keys):
@@ -241,14 +217,11 @@ def assert_adapter_load_clean(load_result, model_id: str) -> None:
 
 
 def assert_adapter_delta_nonzero(model, model_id: str) -> int:
-    """Assert at least one ``lora_B`` weight is non-zero — the adapter is not an identity no-op.
+    """require at least one nonzero ``lora_B`` weight in a warm-start adapter.
 
-    With standard zero-B init (``init_lora_weights=True``), a freshly-injected-but-unloaded adapter
-    has ``lora_B == 0`` everywhere, so the effective delta ``(B @ A) * scaling`` is identically zero
-    and the warm-started model equals the base. A real SFT adapter that actually loaded has non-zero
-    ``lora_B``. This is an API-independent backstop to ``assert_adapter_load_clean``: it catches a
-    silent discard even if peft's load-result shape changes. Returns the count of non-zero ``lora_B``
-    modules. When no ``lora_B`` modules exist at all, defers to ``assert_lora_applied`` (no raise).
+    zero-b initialization makes an unloaded adapter an identity delta, so this catches silent discards
+    even if peft's load-result API changes. return the nonzero module count; if no b modules exist,
+    defer to ``assert_lora_applied``.
     """
     seen = 0
     nonzero = 0

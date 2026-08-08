@@ -16,21 +16,19 @@ from flash.engine.worker.perf.memory import grad_checkpointing_on
 _MOE = {"active_params_b": 3.0, "hidden": 2048, "num_layers": 40, "batch": 4, "lora_rank": 16}
 
 
-def test_open_model_active_params_resolution_is_null_safe():
+def test_active_params_resolution_is_null_safe():
     # The GC-off gate reads active_params_b from the catalog to size the MoE backbone. It must use
-    # MODELS.get (None for an uncataloged id), NOT get_model (which RAISES), so an open-model SFT run
-    # (model_policy="allow") doesn't abort here. Regression for the Cursor "Open-model SFT crashes on
-    # get_model" finding.
+    # MODELS.get (None for an unknown id), NOT get_model (which RAISES): the gate runs on the
+    # allocation path, where a stale id should degrade to the dense default rather than abort.
     import pytest
 
     from flash.catalog import MODELS, get_model
 
-    open_id = "some/uncataloged-open-model"
+    unknown_id = "some/unknown-model"
     with pytest.raises(ValueError, match="unsupported model"):
-        get_model(open_id)  # the raising path the gate must NOT take
-    # the gate's actual (null-safe) pattern -> dense default, since an open model's MoE active count
-    # is unknown
-    assert (float(getattr(MODELS.get(open_id), "active_params_b", 0.0) or 0.0) or None) is None
+        get_model(unknown_id)  # the raising path the gate must NOT take
+    # the gate's actual (null-safe) pattern -> dense default
+    assert (float(getattr(MODELS.get(unknown_id), "active_params_b", 0.0) or 0.0) or None) is None
     # a cataloged MoE still resolves its active count through the same expression
     assert (
         float(getattr(MODELS.get("Qwen/Qwen3.6-35B-A3B"), "active_params_b", 0.0) or 0.0) or None
@@ -38,9 +36,9 @@ def test_open_model_active_params_resolution_is_null_safe():
 
 
 def test_gc_off_gate_is_lora_rank_aware():
-    # Codex P2 (Mrx13): the GC-off gate must size on the run's REAL LoRA rank, not the default 32.
-    # A higher rank grows the LoRA optimizer/adapter memory, so on a borderline card a high-rank run
-    # that the default-rank estimate would have disabled GC for (then OOM'd) must KEEP GC on.
+    # the GC-off gate must size on the run's REAL LoRA rank, not the default 32. A higher rank grows
+    # the LoRA optimizer/adapter memory, so on a borderline card a high-rank run that the
+    # default-rank estimate would have disabled GC for (then OOM'd) must KEEP GC on.
     p32 = sft_gc_off_peak_gb(35.0, seq_len=2368, **{**_MOE, "lora_rank": 32})
     p512 = sft_gc_off_peak_gb(35.0, seq_len=2368, **{**_MOE, "lora_rank": 512})
     assert p512 > p32  # the peak grows with rank
@@ -261,7 +259,7 @@ def test_grpo_use_reentrant_false_for_non_gdn_dense():
 
     assert grpo_use_reentrant("meta-llama/Llama-3.2-1B") is False
     # an uncataloged open non-qwen model is treated as non-gdn dense (null-safe, no crash).
-    assert grpo_use_reentrant("some/uncataloged-open-model") is False
+    assert grpo_use_reentrant("some/non-qwen-dense-model") is False
 
 
 def test_is_moe_property():

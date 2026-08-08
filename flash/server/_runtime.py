@@ -1,8 +1,6 @@
-"""Background lifecycle helpers for the control plane: realized-cost reconciliation, run
-recovery after a restart, and per-run log / worker-artifact access.
+"""Background lifecycle, restart recovery, and worker-artifact helpers.
 
-No fastapi dependency, so this module is safe to import at ``flash.server.app`` import time
-(it must not pull in the optional server extras).
+This module must remain free of fastapi and optional server extras for app import time.
 """
 
 from __future__ import annotations
@@ -52,17 +50,11 @@ async def _reconcile_cost_loop() -> None:
 
 
 async def _repo_cleanup_loop() -> None:
-    """Background loop: sweep ONCE on startup, then daily, deleting aged undeployed run prefixes
-    (``<phase>/<run_id>``) inside the per-environment HF artifact repos (``<ns>/flashrun-*``)
-    to reclaim the org's private-storage quota. The 7-day age and the daily cadence are hardcoded
-    constants (no env knobs) — see ``flash.server.repo_cleanup``. Sweeping on startup (rather than
-    after a full interval) keeps the GC making progress even on a plane that restarts more often than
-    the 24h cadence.
+    """Sweep aged undeployed HF prefixes on startup, then daily.
 
-    Fails CLOSED: each sweep aborts (deleting nothing) if the live serving set can't be confirmed, so
-    a registry blip never risks deleting a live adapter — it just retries next cycle. The HF +
-    registry calls are blocking, so each sweep is offloaded to a thread. Gated by
-    ``repo_cleanup_enabled`` (needs an operator ``HF_TOKEN``)."""
+    The 7-day age and daily cadence are fixed in ``flash.server.repo_cleanup``. Each threaded sweep
+    fails closed when the live serving set is unconfirmed and requires operator ``HF_TOKEN``.
+    """
     from flash.server.repo_cleanup import CleanupAborted, run_scheduled_cleanup
 
     interval = (
@@ -97,15 +89,11 @@ async def _repo_cleanup_loop() -> None:
 
 
 async def _charge_retry_startup() -> None:
-    """Run ONE completion-charge recovery sweep off the startup critical path.
+    """Run one completion-charge recovery sweep outside the startup critical path.
 
-    The startup sweep must still happen promptly (the periodic loop sleeps a full interval before
-    its first sweep, and recover_runs deliberately excludes terminal `done`, so a crash between the
-    `done` write and the charge would otherwise leak revenue until the first periodic cycle). But it
-    must NOT block the lifespan from `yield`-ing: with a backlog of pending/failed charges and a slow
-    or down billing backend, each charge can wait the full billing timeout, turning a deploy/restart
-    into minutes of unavailability. So the lifespan schedules this as a background task and the sweep
-    runs in a thread (the charge is blocking urllib). Best-effort; cancelled cleanly at shutdown."""
+    It must run promptly because ``recover_runs`` excludes terminal ``done``, but blocking urllib
+    charges must not delay lifespan startup. The background thread is best-effort and cancellable.
+    """
     from flash.server.billing_retry import retry_completion_charges_once
 
     stop = threading.Event()
@@ -125,12 +113,11 @@ async def _charge_retry_startup() -> None:
 
 
 async def _charge_retry_loop() -> None:
-    """Background loop: periodically re-charge completed runs whose customer charge was left
-    pending/charging/failed by a transient backend blip (or a crash between the ``done`` write and
-    the charge), so a finished-but-uncharged run never leaks revenue. The backend charge is
-    idempotent by runId, so every retry is safe. Each sweep is offloaded to a thread (the charge is
-    blocking urllib); failures are swallowed and retried next cycle. The interval IS the bounded
-    backoff. Off entirely when FREESOLO_INTERNAL_KEY is unset (see charge_retry_enabled)."""
+    """Retry incomplete charges for finished runs on a bounded interval.
+
+    Charges are idempotent by runId and run in a thread because urllib blocks. Disabled without
+    ``FREESOLO_INTERNAL_KEY``; failures retry on the next interval.
+    """
     from flash.server.billing_retry import retry_completion_charges_once
 
     interval = 300.0  # retry pending/failed customer charges every 5 min
@@ -164,29 +151,13 @@ _DEFERRED_RECOVERY_RETRY_S = 120.0
 
 
 def _confirm_run_clear(spec) -> bool:
-    """Force-reap this run's instance-provider label and report whether NO instance for it remains.
+    """Force-reap this run's label and confirm no instance remains.
 
-    A best-effort ``gc`` returns no error on an unconfirmed Vast teardown (``destroy_run_instances``
-    yields an empty list, not a raise), so after the reap we ask each instance provider's optional
-    ``run_instances_remaining`` for positive proof: ``[]`` == confirmed clear; a non-empty list (an
-    instance is still present) or a RAISE (the provider can't ENUMERATE, so it can't prove clear) both
-    yield ``False`` — the caller must not resubmit a second worker over a possibly-live box (Codex;
-    mirrors the retry-loop MtzrH guard).
-
-    A provider that does not implement ``run_instances_remaining`` is skipped. Current standing-instance
-    providers expose the strict capability, so Vast and Lambda both require a clean ``[]`` before resubmit;
-    RunPod serverless has no instance label to enumerate here.
-
-    BILLING-SAFETY: a provider that COULD have owned this run's lost create but is now
-    UNCONFIGURABLE must also block the resubmit. A handle-less run's pre-handle non-idempotent create
-    (Vast's ``PUT /asks``) may have left a phantom; if ``VAST_API_KEY`` was dropped before this restart,
-    ``configured_providers()`` omits Vast, so iterating only the configured set returns "clear" and lets
-    a second worker resubmit on another provider while the phantom keeps billing + writing the same HF
-    prefix. We therefore ALSO fail closed for any provider recorded as available when the run was
-    submitted (``submitted_instance_providers``) that owns the standing-instance capability yet can't be
-    enumerated now. Scoping to the recorded set is what keeps this correct on planes that never
-    configure Vast: such a run never recorded Vast, so its handle-less recovery is never blocked (it
-    can't have left a Vast phantom)."""
+    ``gc`` alone cannot prove Vast teardown. Providers with ``run_instances_remaining`` must return
+    ``[]``; a live instance or enumeration failure blocks resubmit. A provider recorded in
+    ``submitted_instance_providers`` also blocks when it is now unconfigurable, because a lost
+    non-idempotent create such as Vast ``PUT /asks`` may still be billing without a handle.
+    """
     from flash.providers import INSTANCE_PROVIDERS, configured_providers, get_provider
 
     try:
@@ -213,13 +184,13 @@ def _confirm_run_clear(spec) -> bool:
                 clear = False  # an instance for this run is still present
         except Exception:
             clear = False  # couldn't list -> can't prove clear -> don't race
-    # An instance provider that WAS available at submit (so it could have taken the lost create) but is
-    # NOT configurable now and owns the standing-instance capability can't be enumerated -> can't prove
-    # clear -> fail closed. Already-configured providers were handled above. CRITICAL: do NOT wrap this in
-    # a broad ``suppress(Exception)`` — an
-    # error loading the status, resolving a recorded provider, or reading the capability would otherwise
-    # be swallowed and leave ``clear`` True, defeating the fail-closed intent (cursor). Every failure
-    # inspecting the recorded set must instead make the guard CONSERVATIVE (block/defer the resubmit).
+    # An instance provider that WAS available at submit (so it could have taken the lost create) but
+    # is NOT configurable now and owns the standing-instance capability can't be enumerated -> can't
+    # prove clear -> fail closed. Already-configured providers were handled above. CRITICAL: do NOT
+    # wrap this in a broad ``suppress(Exception)`` — an error loading the status, resolving a
+    # recorded provider, or reading the capability would otherwise be swallowed and leave ``clear``
+    # True, defeating the fail-closed intent. Every failure inspecting the recorded set must instead
+    # make the guard CONSERVATIVE (block/defer the resubmit).
     for name in recorded or []:
         if name in configured or name not in INSTANCE_PROVIDERS:
             continue
@@ -450,17 +421,11 @@ def _deferred_resubmit_loop(spec) -> None:
 
 
 def _latest_worker_artifact_name(repo: str, prefix: str, phase: str, kind: str) -> str:
-    """Newest worker artifact file under prefix.
+    """Return the newest worker artifact under a prefix.
 
-    ``console`` is uploaded under one stable name that each attempt overwrites; ``error`` and
-    ``raylogs`` are attempt-scoped, so on a retried run only the highest attempt is the real
-    current evidence. Falls back to the default name when the repo can't be listed.
-
-    The attempt-scoped name comes from the writer's own definition rather than being spelled
-    again here: this is the read half of a name the worker chose, and a reader that formats it
-    independently agrees only by coincidence. The failure is silent -- a name that disagrees
-    finds no file, which is indistinguishable from "the worker uploaded nothing", exactly the
-    case these artifacts exist to explain.
+    Console uses one overwritten name; errors and raylogs use the highest attempt. Fall back when
+    listing fails, and derive attempt-scoped names from the writer's definition to prevent silent
+    reader/writer drift.
     """
     import re
 
@@ -503,20 +468,11 @@ def _attempt_of(name: str) -> int | None:
 
 
 def _ray_log_name_for_attempt(phase: str, error_name: str) -> str | None:
-    """The ray session logs belonging to the SAME attempt as ``error_name``, if that is knowable.
+    """Return ray logs for the same attempt as ``error_name`` when knowable.
 
-    Not "the newest raylogs". Ray logs are uploaded only when ray actually failed, so on a retried
-    run they can belong to an earlier attempt than the traceback: attempt 0 dies to a raylet, attempt
-    1 fails for an unrelated reason and uploads none, and resolving the two independently surfaces
-    attempt 0's raylet death beside attempt 1's traceback -- misattributing a non-ray failure to a
-    raylet that died an attempt ago (codex[bot]). Pinning to the traceback's attempt means the pair
-    always describes one attempt, and the fetch simply misses when this attempt produced no ray logs.
-
-    Returns None for an unscoped traceback: there is no attempt to pin to, and guessing would
-    reintroduce exactly the mismatch this exists to prevent.
-
-    Built from the writer's own definition, so the two cannot drift: restating the format here
-    would make worker and reader agree only for as long as nobody edits one of them.
+    Ray logs exist only for ray failures, so choosing the newest independently can pair an old raylet
+    failure with a newer unrelated traceback. Unscoped errors return None. Build the name through
+    the writer's shared definition to prevent format drift.
     """
     attempt = _attempt_of(error_name)
     if attempt is None:
@@ -525,14 +481,10 @@ def _ray_log_name_for_attempt(phase: str, error_name: str) -> str | None:
 
 
 def _worker_artifacts(spec) -> dict[str, str]:
-    """The run's train-subprocess stdout + traceback, fetched from its HF artifact repo.
+    """Fetch train-subprocess stdout and traceback from the private HF artifact repo.
 
-    The control-plane ``.log`` only carries orchestrator lines (and, on a terminal failure, a
-    truncated tail of the worker console). The full ``console_<phase>.txt`` / ``error_<phase>.txt``
-    the worker streams to HF are the real train stdout/traceback — but the repo is PRIVATE, so a
-    user's own HF token 404s. We fetch them here with the OPERATOR ``HF_TOKEN`` (the control plane
-    already holds it) so ``flash runs log`` shows the real worker output regardless of run
-    state and without the user needing repo access. Best-effort: a missing file / no repo yields {}.
+    The control-plane log contains only orchestration and a truncated terminal tail. Use operator
+    ``HF_TOKEN`` so ``flash runs log`` can read private worker artifacts; missing data returns ``{}``.
     """
     repo = getattr(getattr(spec, "train", None), "hf_repo", None)
     if not repo:
@@ -547,9 +499,9 @@ def _worker_artifacts(spec) -> dict[str, str]:
     # ray's own session logs. the traceback beside them records only the downstream symptom of a
     # raylet death ("Failed to register worker to Raylet: ... End of file"), so without this the
     # collector that exists to disambiguate it uploads a diagnosis nothing ever reads back
-    # (VERL-115, codex[bot]). pinned to the TRACEBACK's attempt rather than resolved independently:
-    # they are uploaded only when ray failed, so the newest pair can straddle two attempts. absent
-    # for every non-ray failure, and the loop below skips it.
+    # (VERL-115). pinned to the TRACEBACK's attempt rather than resolved independently: they are
+    # uploaded only when ray failed, so the newest pair can straddle two attempts. absent for every
+    # non-ray failure, and the loop below skips it.
     ray_name = _ray_log_name_for_attempt(spec.phase, error_name)
     for name in (
         _latest_worker_artifact_name(repo, prefix, spec.phase, "console"),
@@ -635,14 +587,9 @@ def recover_runs() -> None:
             status = get_status(row["run_id"])
         except FileNotFoundError:
             continue
-        # Best-effort provider teardown for any remote resources a prior crash left dangling.
-        # Backgrounded (not awaited here, like the attach_run dispatch below): under a provider API
-        # outage, the underlying cancel/destroy calls can each block for their full retry/backoff
-        # window, and this loop runs unconditionally over every known run (not just recoverable
-        # ones). Serialized inline, a handful of stuck cleanup remotes during an outage is enough to
-        # blow past the container's HEALTHCHECK grace period, so the still-starting process gets
-        # killed before it ever accepts a request -- a self-sustaining restart loop. Nothing below
-        # depends on this having finished.
+        # drain cleanup remotes in the background. provider outages can block each teardown through
+        # retry/backoff; serial startup cleanup can exceed HEALTHCHECK grace and create a restart loop.
+        # recovery below does not depend on completion.
         threading.Thread(
             target=_drain_cleanup_remotes_bg, args=(status.run_id,), daemon=True
         ).start()
@@ -657,7 +604,7 @@ def recover_runs() -> None:
             # that can only crash. Same disposition as the handle-less branch below: fail it
             # visibly, then tear the worker down. `_strict_teardown_handle` needs only the persisted
             # handle and the run id, never a parsed spec, so removal does not depend on the parse
-            # that just failed (chatgpt-codex-connector).
+            # that just failed.
             try:
                 JobSpec.from_dict(status.spec)
             except Exception as exc:
@@ -674,11 +621,12 @@ def recover_runs() -> None:
                 _teardown_unrecoverable_remote(status)
                 # If that teardown could not confirm deletion it records the handle for the cleanup
                 # drain -- but this run's drain was dispatched above and has already taken its
-                # snapshot, of a list that did not yet contain this record (cursor). `_drain_cleanup_
-                # remotes` returns early on an empty snapshot, so nothing would retry it before the
-                # next restart. Dispatch a second drain now that the record exists. A double teardown
-                # of one handle is safe: `_strict_teardown_handle` is idempotent and the record is
-                # removed by compare-and-remove only on a confirmed delete.
+                # snapshot, of a list that did not yet contain this record.
+                # `_drain_cleanup_remotes` returns early on an empty snapshot, so nothing would
+                # retry it before the next restart. Dispatch a second drain now that the record
+                # exists. A double teardown of one handle is safe: `_strict_teardown_handle` is
+                # idempotent and the record is removed by compare-and-remove only on a confirmed
+                # delete.
                 threading.Thread(
                     target=_drain_cleanup_remotes_bg, args=(status.run_id,), daemon=True
                 ).start()

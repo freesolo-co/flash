@@ -1457,19 +1457,12 @@ def build_opd_overrides(config: dict) -> list[str]:
         "data.truncation=error",
         "data.shuffle=false",
         f"data.seed={_hydra_val(config.get('seed', 42))}",
-        # rollout engine seed. NOT `rollout.seed`: verl 0.8.0's RolloutConfig declares no such field,
-        # so a bare key fails hydra composition and a `+`/`++` prefix composes but then dies in
-        # omega_conf_to_dataclass with an unexpected-kwarg TypeError. engine_kwargs is a declared
-        # dict on both 0.8.0 and 0.9.x and is spread into the vllm engine args *after* verl's own
-        # "seed" entry, so it wins. `++` because the sub-key is absent from the composed node.
-        # per-request sampling is seeded separately by the plugin's deterministic_rollout_seed.
+        # set the seed through ++actor_rollout_ref.rollout.engine_kwargs.seed: RolloutConfig has no
+        # rollout.seed, and engine_kwargs wins after verl's own seed. requests are seeded
+        # separately.
         f"++actor_rollout_ref.rollout.engine_kwargs.vllm.seed={_hydra_val(config.get('seed', 42))}",
-        # fp8 kv cache, exactly as the deleted trl colocate engine reserved it (it set
-        # kv_cache_dtype="fp8" on cc >= 8.9) and as rl_train.py does for grpo. this is not an
-        # optimization: flash/engine/vram.py sizes an opd run against an fp8 kv pool once the
-        # requirement clears the largest non-fp8 card, so a bf16 cache here would allocate twice the
-        # kv the allocator reserved and OOM at rollout init on a card sizing called sufficient.
-        # the caller resolves the flag (cc probe + gdn exclusion); absent/false means bf16.
+        # use fp8 kv where resolved because vram.py sizes against it; bf16 would double the reserved
+        # cache and OOM. gdn and unsupported devices leave this unset.
         *(
             ["+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8"]
             if config.get("fp8_kv")
@@ -1526,13 +1519,8 @@ def build_opd_overrides(config: dict) -> list[str]:
         *trainer_dtype_overrides(),
         "actor_rollout_ref.rollout.name=vllm",
         "actor_rollout_ref.rollout.mode=async",
-        # safetensors load format is required for lora rollout on vllm, exactly as on the grpo path.
-        # the default is `dummy`, which makes verl set base_sync_done=False and push base weights to
-        # vllm itself. that path routes every name through replace_lora_wrapper, which appends
-        # `.base_layer` to anything matching the all-linear target set, including the vision tower.
-        # plain vllm has no `visual.blocks.N.attn.qkv.base_layer.weight` slot, so the first weight
-        # sync dies with a KeyError before a rollout is ever produced. loading the base from
-        # safetensors keeps vllm authoritative for base weights and transfers only lora deltas.
+        # safetensors is required for lora rollout: the dummy sync appends .base_layer to vision
+        # weights that plain vllm does not expose. keep vllm authoritative for base weights.
         "actor_rollout_ref.rollout.load_format=safetensors",
         # rollout.enforce_eager is a real verl field, so this is a plain override, not a '+' append.
         # the caller resolves it from the device capability; absent/false keeps verl's default.
@@ -1582,13 +1570,8 @@ def build_opd_overrides(config: dict) -> list[str]:
         # whenever that product is not a multiple of 8. size the pool to the batch instead.
         "actor_rollout_ref.rollout.agent.num_workers="
         f"{agent_loop_workers(int(config['train_batch_size']) * int(config['group_size']))}",
-        # verl force-enables TransferQueue on the opd entry point (main_ppo_sync.main sets
-        # transfer_queue.enable = True with no opt-out), and its SimpleStorage default asks for 8
-        # storage units sized for a multi-node cluster. tq.init reserves them through a SPREAD
-        # placement group and blocks in ray.get(pg.ready()) until every 1-cpu bundle is placed,
-        # with no timeout: any ray cluster with fewer free cpus than units hangs the run forever
-        # before a single gpu is touched. one unit is correct for flash's single-node trainer and
-        # keeps the reservation satisfiable regardless of how ray sized the cluster.
+        # verl force-enables TransferQueue and waits forever for every cpu bundle.
+        # one storage unit fits flash's single-node trainer regardless of ray cluster sizing.
         "transfer_queue.backend.SimpleStorage.num_data_storage_units=1",
         # ray autodetects the HOST's cpu count inside a rented pod and eagerly forks one idle worker
         # per core. on a 1x4090 pod that is 48 forks nothing asked for, which oom-killed the actor
@@ -1768,12 +1751,8 @@ def _opd_multimodal_parquet_features():
     )
 
 
-# arrow expands every shared python reference into its own copy, and the opd row list is one
-# reference per prompt repeated across the whole horizon, so converting the rows in a single table
-# costs peak host ram proportional to horizon * prompts_per_step * prompt_bytes. that is the parent
-# worker's ram, not the gpu's, and the allocator sizes vram only -- a host-ram kill surfaces as a
-# generic child exit with oom:false. writing in fixed batches holds the peak flat instead
-# (measured: 24k rows of ~8k-token prompts, 6143 MB in one table vs 189 MB batched).
+# arrow duplicates shared prompt references, so one table scales host ram with the full horizon.
+# fixed batches keep the peak flat; this was empirically measured and will drift with prompt shape.
 _OPD_PARQUET_WRITE_BATCH_ROWS = 2000
 
 
@@ -2137,15 +2116,11 @@ def run_opd_train(spec=None) -> None:
     model_id = spec.model if spec else RECIPE.hf_model_id
     model_revision = getattr(spec, "model_revision", "") if spec else ""
     from flash.opd_validation import validate_opd_structured_outputs
-    from flash.spec import gpu_count_of
 
     structured_validation = validate_opd_structured_outputs(
         knobs.structured_outputs,
         model_id=model_id,
         model_revision=model_revision,
-        model_policy=getattr(spec, "model_policy", "catalog") if spec else "catalog",
-        gpu=spec.gpu.type if spec else None,
-        gpu_count=gpu_count_of(spec) if spec else 1,
     )
     structured_outputs = structured_validation.constraint
     model_vocab_size = structured_validation.model_vocab_size
@@ -2172,12 +2147,9 @@ def run_opd_train(spec=None) -> None:
     multimodal = any(record_has_images(example, messages) for example, messages in prompt_rows)
     if multimodal:
         validate_multimodal_training(model_id, "opd")
-    # shuffle the RENDERED rows, not the examples, so the pass below reuses this rendering instead
-    # of calling back into the environment. prompt_messages is user code: a stateful or seeded
-    # implementation returns something different the second time, and a second-pass image the scan
-    # never saw would reach `assert processor is not None` with multimodal already latched false
-    # (codex[bot]). same seed over the same length is the same permutation, so data order is
-    # unchanged and a resume fingerprint still matches.
+    # shuffle cached rendered rows, not examples: prompt_messages may be stateful and a second
+    # render
+    # could change multimodal classification. the same seeded permutation preserves resume order.
     random.Random(_w.SEED).shuffle(prompt_rows)
 
     started_at = time.time()
@@ -2401,15 +2373,8 @@ def run_opd_train(spec=None) -> None:
     loggers = resolve_verl_loggers(caps)
     project_name = (spec.wandb.project if spec and spec.wandb else None) or "flash"
     experiment_name = _w.wandb_run_name()
-    # fp8 kv cache on ada/hopper+ (cc >= 8.9), matching rl_train's grpo gate -- but NOT for hybrid
-    # linear-attention (gdn) models: vllm's fp8-kv wake path (init_fp8_kv_scales) assumes a plain kv
-    # tensor and crashes on the hybrid cache under verl's sleep/wake, which opd leaves enabled.
-    # the vram estimator applies an fp8 discount to opd above the non-fp8 card ceiling, so this must
-    # stay in lockstep with it: bf16 here against an fp8-sized reservation OOMs at rollout init.
-    # NOT inside gdn_hybrid's resolution above: that reads the checkpoint config and has nothing to
-    # do with device capability. sharing one try would mean a raise from get_device_capability() --
-    # evaluated FIRST -- skips the classification entirely and reports a genuine gdn hybrid as
-    # not-hybrid, which then skips the boundary gate below and packs anyway.
+    # enable fp8 kv on cc >= 8.9 only for non-gdn models; gdn sleep/wake crashes on hybrid caches.
+    # keep this aligned with vram.py, and keep the device probe separate from gdn classification.
     try:
         import torch as _torch_cc
 
@@ -2420,40 +2385,17 @@ def run_opd_train(spec=None) -> None:
         _cc_ok = False
     fp8_kv = _cc_ok and not gdn_hybrid
 
-    # a gdn hybrid may only pack when the CHILD can honor seq_idx + cu_seqlens; the no-fla fallbacks
-    # accept both and discard them, which silently bleeds state across packed example boundaries.
-    # raises when the child cannot -- opd reaches no_padding_2_padding through
-    # trainer/distillation/losses.py exactly as grpo reaches it through ray_trainer, so the padded
-    # fallback that used to handle this cannot complete a step either. see
-    # require_gdn_boundary_resets.
+    # gdn packing requires child support for seq_idx and cu_seqlens; fallbacks discard both and
+    # silently bleed state across examples. see require_gdn_boundary_resets.
     gdn_reset_arch = require_gdn_boundary_resets(caps, gdn_module)
 
-    # sm86's vllm 0.19.1 graph capture degenerates, so only that arch runs the rollout eagerly. grpo
-    # has resolved this since the trl driver; opd never did, and opd is the MORE exposed of the two
-    # because it always runs `rollout.mode=async`, whose server hardcodes
-    # cudagraph_mode=FULL_AND_PIECEWISE (vllm_async_server.py:240).
-    #
-    # an opd run on an rtx 4090 (sm89) captured 102 graphs and was OOM-killed with the node at
-    # 41.51GB/42.84GB of HOST ram, and this gate once excluded sm89 on that basis. the ~29 GB blamed
-    # on the graphs was a RESIDUAL of ray's accounting, not a measurement -- ray cannot see vllm's
-    # EngineCore CHILD process, where the graphs live, so everything unaccounted was attributed to
-    # them. measured across the whole process tree, capture costs ~450 MB on sm89 against ~9.9 GB of
-    # baseline engine footprint that eager pays too. that box was already at 97%; graphs were the
-    # last straw, not the load. see resolve_rollout_enforce_eager for the per-arch evidence.
-    #
-    # one knob is enough and cannot fight verl's: vllm resolves enforce_eager LAST
-    # (config/vllm.py:1024), after the async server has set cudagraph_mode, and forces both
-    # compilation mode and cudagraph_mode to NONE.
-    # one capability probe feeds both rollout decisions, as it does on the grpo path.
+    # run sm86 eagerly because vllm 0.19.1 graph capture degenerates there.
+    # sm89 capture is empirically acceptable; enforce_eager overrides async cudagraph settings last
+    # at config/vllm.py:1024. reuse one capability probe for both rollout decisions.
     verl_cc = verl_device_capability(caps)
     enforce_eager = resolve_rollout_enforce_eager(verl_cc)
-    # the same grpo/opd divergence as enforce_eager above, one knob over: blackwell needs both
-    # rollout attention backends pinned because vllm 0.19.1's defaults are wrong there, and opd
-    # never pinned them. the ViT default routes into a CUTE flash-attn that is unimportable against
-    # every published nvidia-cutlass-dsl, which aborts the engine with
-    # `RuntimeError: Worker failed with error 'module 'cutlass.cute.core' has no attribute
-    # 'ThrMma''` -- and a VL model builds its vision tower even for a text-only rollout, so this
-    # reaches text-only opd too. no-op off blackwell. see resolve_blackwell_attention_backends.
+    # pin both rollout attention backends on blackwell: vllm 0.19.1's ViT CUTE default fails with
+    # missing cutlass.cute.core.ThrMma, including text-only rollouts on VL models.
     attention_backend, mm_encoder_attn_backend = resolve_blackwell_attention_backends(caps, verl_cc)
 
     plugin_path = os.path.join(shim_dir, "flash_opd_plugin.py")
@@ -2476,12 +2418,8 @@ def run_opd_train(spec=None) -> None:
     entry_path = os.path.join(shim_dir, "flash_opd_entry.py")
     with open(entry_path, "w", encoding="utf-8") as file:
         file.write("import verl\nfrom flash_opd_plugin import main\nmain()\n")
-    # opd carries no task reward: use_task_rewards=false makes verl discard the policy loss the
-    # score would feed. the reward loop still runs regardless, and with no custom function it falls
-    # through to the default rule-based scorer, which dispatches on data_source against a builtin
-    # registry that has never heard of "flash_opd" and raises NotImplementedError on every rollout
-    # (reward_loop.py:146-155). supply the zero function so the loop takes the custom branch and
-    # never consults that registry.
+    # use a zero custom reward: verl still runs scoring when use_task_rewards=false, and its default
+    # registry has no flash_opd entry (reward_loop.py:146-155).
     reward_path = os.path.join(shim_dir, "flash_opd_reward.py")
     with open(reward_path, "w", encoding="utf-8") as file:
         file.write(_OPD_ZERO_REWARD_SOURCE)
@@ -2610,12 +2548,8 @@ def run_opd_train(spec=None) -> None:
             step_number = verl_step_number(line)
             if step_number is None:
                 return
-            # parse_verl_metric, not a local float(): verl aggregates this metric with
-            # Metric(SUM) -> np.sum (verl/utils/metric/utils.py), and LocalLogger renders it
-            # through pprint, so under the image's numpy 2.2.6 it prints as
-            # "np.float64(0.64)". a bare float() raises on that spelling, dropping every step
-            # and leaving loss_curve empty -- which the publish guard below turns into a hard
-            # failure on a run that actually trained.
+            # use parse_verl_metric because numpy 2 pprint emits np.float64(...); float() would drop
+            # every step and leave a trained run with an empty loss curve.
             loss = parse_verl_metric(line, "actor/distillation/loss")
             if loss is None:
                 loss = parse_verl_metric(line, "distillation/loss")
@@ -2740,15 +2674,8 @@ def run_opd_train(spec=None) -> None:
                 python_bin=python_bin,
             )
             _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-            # preserve the final checkpoint only when exact save steps are not configured, exactly as
-            # the grpo path does: with save_at_steps set the customer asked for those steps and
-            # nothing else, and the watcher has already published each of them.
-            #
-            # NOT also gated on watcher.processed_steps. the watcher marks every step it processes
-            # but publishes a deployable only for a step in required_steps (== save_at_steps), and
-            # final_save_due is true only when save_at_steps is EMPTY -- so the two publish paths are
-            # disjoint and that guard could never prevent a double-publish, only suppress the last
-            # step's deployable on every default run.
+            # preserve the final checkpoint only when save_at_steps is empty, matching grpo.
+            # watcher and final-save paths are disjoint, so processed_steps must not suppress it.
             if final_save_due(final_step, knobs.save_at_steps):
                 _w.publish_deployable_checkpoint(adapter_dir, final_step, _provenance_ready=True)
 
@@ -2823,14 +2750,8 @@ def run_opd_train(spec=None) -> None:
                 # the engine length actually handed to vllm (prompt + completion), already clamped to
                 # the model's own limit. the prompt filter is carved out of this same number.
                 "vllm_max_model_len": max_model_len,
-                # teacher call shape. only the single-turn TEXT path goes through the batcher, which
-                # holds a fixed cap and one serial scoring thread. the multimodal path scores one
-                # item per call and the multi-turn path batches a whole episode, and both run on the
-                # bridge's own request threads -- neither has a constant, so None records "not
-                # batched by flash" instead of asserting a number nothing enforces.
-                # the cap is bounded by the samples one step can actually produce (trl does the same
-                # in _opd_teacher_batch_size): a step of 1 rollout can never fill a batch of 8, and
-                # reporting the global cap there would describe a shape the run cannot reach.
+                # only single-turn text uses the fixed serial batcher; multimodal and multi-turn use
+                # bridge threads. cap the reported batch by samples the step can produce.
                 "opd_teacher_batch_size": (
                     min(
                         OPD_TEACHER_SCORING_CONCURRENCY, max(1, prompts_per_step * knobs.group_size)
@@ -2843,12 +2764,8 @@ def run_opd_train(spec=None) -> None:
                 "verl_version": "0.8.0",
                 "verl_backend": "fsdp",
                 "ulysses_sequence_parallel_size": gpu_count,
-                # whether the child could reset gdn state at packed example boundaries. resolved per
-                # run by probing the child and announced only by a log line, and a successful run
-                # uploads no console -- so without this key a finished run gives no way to tell
-                # whether it packed with resets or took the padded fallback. for a gate whose failure
-                # mode is silent contamination that is the one thing worth recording. None for a
-                # non-gdn model, where the question does not arise.
+                # record whether the child can reset gdn state at packed boundaries; successful runs
+                # upload no console, and failure here is silent contamination. None means non-gdn.
                 "gdn_boundary_resets": gdn_hybrid or None,
                 "peak_gpu_gb": peak_gpu_gb,
                 "warm_started": bool(warmstart_adapter),

@@ -521,14 +521,8 @@ def test_poll_job_in_queue_capacity_stall(monkeypatch):
 
 
 def test_no_capacity_detail_never_predicts_the_retry_disposition(monkeypatch):
-    # Same never-scheduled stall, polled with the NON-last grace. The detail must be IDENTICAL in
-    # wording regardless of grace: the grace does not determine what happens next.
-    #
-    # on_last_gpu (lifecycle.py:781) is an OR of two unrelated conditions -- "last untried class"
-    # and "infra retry budget exhausted" -- so a 900s grace can mean the walk wraps back to an
-    # already-tried class, OR that can_retry() returns false and the run TERMINATES. Any wording
-    # derived from the grace alone is wrong in at least one of those paths, and "retrying on the
-    # same class" on a max_retries=0 run directly contradicts lifecycle's own "not retrying".
+    # grace length does not determine retry disposition. lifecycle.py:781 combines last-class and
+    # exhausted-budget cases, so poll detail must claim neither a retry nor a class choice.
     import itertools
 
     from flash.providers.runpod import api as runpod_api
@@ -560,11 +554,9 @@ def test_no_capacity_detail_never_predicts_the_retry_disposition(monkeypatch):
 
 
 def _queued_forever(monkeypatch, health, *, step=20.0):
-    """Poll a job that never leaves IN_QUEUE, with ``health`` driving endpoint_health_for_fingerprint.
+    """Poll a permanently queued job with controlled endpoint health.
 
-    ``step`` seconds per mocked ``time.time()`` call. poll_job calls it ~2-3x per iteration, so the
-    loop advances ~40-60s at a time: slow enough that the 90s health-probe cadence and the 300s
-    coming-up TTL are both exercised at their real granularity rather than skipped over in one jump.
+    The clock step preserves the 90-second probe cadence and 300-second worker-coming-up TTL.
     """
     import itertools
 
@@ -586,16 +578,8 @@ def _queued_forever(monkeypatch, health, *, step=20.0):
 
 
 def test_slow_image_pull_is_not_reported_as_missing_capacity(monkeypatch):
-    # A RunPod job stays IN_QUEUE for the WHOLE worker cold start, multi-GB image pull included.
-    # So the queue timer alone cannot tell "RunPod never gave us a GPU" from "the GPU arrived and
-    # the worker is still pulling" -- and a heavy image (flash-worker:cu128-verl) pulls for longer
-    # than the 900s last-GPU capacity grace. Reporting that as no_capacity is self-perpetuating:
-    # the runner tears the endpoint down and re-provisions a FRESH one, which (workersMin=0) pulls
-    # the same image cold again, so every retry re-pays the cost that failed the previous attempt.
-    #
-    # The unhealthy/throttled timers already refuse to fire while a worker is initializing or
-    # usable; the capacity timer must honour the same observation. Once a worker exists the wait is
-    # startup, bounded by the much larger setup_grace_s -- which is what fires here.
+    # IN_QUEUE includes worker cold start. once health shows a worker, the setup grace must govern;
+    # treating a long image pull as no_capacity would tear it down and restart the same cold pull.
     res = _queued_forever(
         monkeypatch, lambda eid, _fp, **_kw: {"workers": {"initializing": 1, "ready": 0}}
     )
@@ -649,17 +633,9 @@ def test_no_worker_at_all_is_still_reported_as_missing_capacity(monkeypatch):
 
 
 def test_a_worker_arriving_inside_the_probe_gap_is_not_abandoned(monkeypatch):
-    """A worker that appears between the last probe and the grace boundary must be seen.
+    """See a worker that appears between the last probe and the grace boundary.
 
-    `worker_coming_up_at` is only as fresh as the last health probe, and those run every 90s. A
-    worker RunPod allocates inside that window is invisible to the capacity check, so the attempt is
-    abandoned and the endpoint torn down -- discarding a GPU already granted and paying a fresh cold
-    start to get back to the same place. Worse, it is self-perpetuating: the replacement endpoint
-    (workersMin=0) pulls the same multi-GB image cold again.
-
-    Here health reports nothing until the boundary is in sight, then a worker appears. Without a
-    probe AT the boundary the run is failed no_capacity on a reading taken before the worker
-    existed (codex[bot]).
+    The boundary must re-probe health or it may abandon an already allocated GPU on a stale reading.
     """
 
     probes = {"n": 0}
@@ -691,13 +667,8 @@ def test_a_worker_arriving_inside_the_probe_gap_is_not_abandoned(monkeypatch):
 
 
 def test_capacity_grace_scales_with_gpu_walk_position():
-    # The two no-capacity backstops — IN_QUEUE with no worker (queue_grace_s) and a worker stuck
-    # THROTTLED (throttled_grace_s) — are tuned to the gpu-walk position. While a next-best class
-    # still exists they wait ~5 min, long enough to ride out a brief blip but short enough to hand
-    # off promptly to the next-best class. On the LAST candidate there is nowhere to walk, so they
-    # wait ~15 min before giving up. A *placed* worker that is still cold-starting is governed by
-    # the much larger setup_grace_s and must NOT be shortened — assert it stays large so we never
-    # abandon a legitimately-initializing worker.
+    # capacity backstops wait 5 minutes while another class exists and 15 on the last candidate.
+    # placed workers remain governed by the larger setup grace.
     import inspect
 
     from flash.providers.runpod import jobs
@@ -1381,12 +1352,8 @@ def test_poll_job_liveness_heartbeat_does_not_reset_progress(monkeypatch):
 
 
 def test_poll_job_stale_late_heartbeat_does_not_reset_progress(monkeypatch):
-    # A newer heartbeat can be skipped (bounded _HB_UPLOAD_LOCK) while an OLDER one lands late,
-    # changing heartbeat.json content but carrying an OLDER ts. That stale heartbeat must NOT buy a
-    # fresh stall window for a genuinely stuck worker — progress is gated on the heartbeat ts
-    # ADVANCING, not on the content merely changing. Proven by ABSOLUTE simulated stall time: a run
-    # whose 2nd heartbeat is STALE stalls at the SAME time as a run with no 2nd heartbeat (stale ==
-    # no-op), while a run whose 2nd heartbeat is FRESH stalls strictly LATER (it reset progress).
+    # an older heartbeat may land after a newer upload was skipped. only an advancing timestamp may
+    # reset the stall window; stale content changes are no-ops.
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs
 
@@ -1497,12 +1464,8 @@ def test_poll_job_malformed_step_does_not_crash(monkeypatch):
 
 
 def test_poll_job_older_attempt_heartbeat_does_not_reset_progress(monkeypatch):
-    # Attempts (retries / preemptions) SHARE this run's HF heartbeat path. A prior attempt's worker,
-    # still shutting down, can upload a heartbeat with an ADVANCING ts but a LOWER attempt number. By
-    # ts alone that looks like progress, but it belongs to a dead attempt and must NOT buy a fresh
-    # stall window for the new attempt's stuck worker. Proven by ABSOLUTE simulated stall time: the
-    # older-attempt second heartbeat stalls at the SAME time as no second heartbeat (it's a no-op),
-    # while a same-attempt heartbeat with a newer ts resets progress (stalls strictly later).
+    # attempts share one heartbeat path. a newer timestamp from an older attempt is still stale and
+    # must not reset the current attempt's stall window.
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs
 
@@ -3307,14 +3270,8 @@ def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
 
 
 def test_supervisor_gpu_walk_exhausts_classes_then_retries_cheapest(monkeypatch):
-    # The candidate walk steps to the next class on each infra retry, then — once every distinct
-    # class on the (single) provider has been tried — falls back to the CHEAPEST one rather than
-    # clamping on the priciest (no point re-rolling the most expensive card when re-trying an
-    # already-tried option). It must never index past the ranked list. Force a VRAM need that only
-    # the 80 GB+ VALIDATED tier satisfies, then trim the ranked candidate list to exactly the two
-    # cheapest 80 GB classes (A100 PCIe, A100 SXM): attempt 0 takes the cheaper (A100 PCIe @ $1.39),
-    # attempt 1 walks to the pricier (A100 SXM @ $1.49), attempt 2 (both now tried) re-rolls the
-    # cheapest (A100 PCIe).
+    # after every distinct candidate is tried, retries wrap to the cheapest candidate rather than
+    # clamping on the priciest or indexing past the list.
     import dataclasses
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -4062,13 +4019,10 @@ def test_attach_requires_handle(monkeypatch):
 
 
 def test_attach_unparseable_spec_fails_closed_and_tears_down(monkeypatch):
-    """A spec that stops parsing must terminate the run, not silently strand a billing worker.
+    """Terminate a run whose persisted spec no longer parses.
 
-    `attach_run` parses the persisted spec ABOVE its try, so a raise there escapes every handler.
-    It is dispatched on a daemon thread by `recover_runs`, so nothing surfaces the exception: the
-    run stays nonterminal holding a live handle and its worker bills until someone notices. A spec
-    stops parsing when the plane drops a surface a still-in-flight run was accepted under -- here a
-    local `environment.path`, which `JobSpec.from_dict` rejects (codex[bot]).
+    Recovery runs on a daemon thread; an uncaught parse error would leave the live handle billing
+    under a nonterminal status.
     """
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
@@ -5227,11 +5181,9 @@ def _make_runpod_flash_mocks(monkeypatch, FakeRM):
 
 
 def _patch_deploy_deps(monkeypatch, jobs, *, set_key: bool = True):
-    """Patch all module-level symbols in jobs that deploy_train_endpoint uses.
+    """Patch ``deploy_train_endpoint`` dependencies.
 
-    ``set_key=False`` for a caller that installed its OWN pool (the multi-account failover tests):
-    overwriting it here would collapse the pool to one account and there would be nothing to fail
-    over to.
+    ``set_key=False`` preserves a caller-installed multi-account pool for failover tests.
     """
     import flash.providers.runpod.auth as auth_mod
     import flash.providers.runpod.keys as keys
@@ -5494,12 +5446,11 @@ def test_deploy_raises_when_all_accounts_exhausted_without_looping(monkeypatch):
 
 
 def test_deploy_failover_from_midpool_tries_every_remaining_account(monkeypatch):
-    """REGRESSION: a deploy whose failover STARTS on a non-first account (a prior run already
-    advanced the active key) must still try EVERY remaining account before giving up. The earlier
-    'advance_key() returns False on wrap-to-index-0' exhaustion heuristic broke this — starting on
-    kB, the wrap kB→kC→kA hit index 0 at kA and stopped one account early, skipping kA. The fix
-    bounds failovers by key_count()-1, so each remaining account is tried exactly once from any
-    start. Here only kA has room; a mid-pool start MUST still reach it."""
+    """Try every remaining account when failover starts mid-pool.
+
+    Bound failovers by ``key_count() - 1``; treating wrap to index zero as exhaustion skips kA when
+    starting from kB in the kA, kB, kC pool.
+    """
     import flash.providers.runpod.jobs as jobs
     import flash.providers.runpod.keys as keys
 
@@ -5972,12 +5923,10 @@ def _poll_in_queue_forever(monkeypatch, **poll_kwargs):
 
 
 def test_capacity_detail_does_not_promise_a_next_best_gpu_on_the_last_class(monkeypatch):
-    """LS-008/AT-013: the capacity failure detail claimed 'retrying on the next-best GPU' even when
-    no further class escalation followed. On the last GPU it must report that instead.
+    """LS-008/AT-013: do not promise a next-best GPU on the last class.
 
-    It must NOT name a class: on_last_gpu says nothing about WHICH class a retry reuses (the picker
-    can clamp back to a cheaper already-tried one), and only the supervisor holds the candidate list
-    needed to know -- so a "same class" promise here would be the same false claim in new words."""
+    ``on_last_gpu`` does not identify a reused class; only the supervisor owns that candidate list.
+    """
     res = _poll_in_queue_forever(monkeypatch, on_last_gpu=True)
     assert res.failure == "no_capacity"
     assert "next-best" not in res.detail, res.detail
@@ -5986,13 +5935,10 @@ def test_capacity_detail_does_not_promise_a_next_best_gpu_on_the_last_class(monk
 
 
 def test_capacity_detail_claims_neither_a_retry_nor_class_exhaustion(monkeypatch):
-    """The supervisor sets on_last_gpu for TWO different reasons: no untried class remains, or the
-    infra retry budget is spent. The second can fire with classes still untried, and it is also the
-    case where ``can_retry()`` returns false and the lifecycle logs ``not retrying``.
+    """Claim neither retry nor class exhaustion from ``on_last_gpu``.
 
-    A detail that asserted either "no untried class" or "retrying" would therefore contradict the
-    real candidate set and the real retry decision on that path. poll_job can see neither, so it
-    states only the escalation fact it does know and leaves both claims to the supervisor."""
+    It can mean no untried class remains or the retry budget is spent; only the supervisor knows.
+    """
     res = _poll_in_queue_forever(monkeypatch, on_last_gpu=True)
     assert res.failure == "no_capacity"
     # not a retry promise: this detail is also emitted on the attempt that ends the run.
@@ -6002,16 +5948,11 @@ def test_capacity_detail_claims_neither_a_retry_nor_class_exhaustion(monkeypatch
 
 
 def test_reattach_keeps_the_stall_grace_but_not_the_capacity_wording(monkeypatch):
-    """The persisted flag answers one of the two questions it is read for, and only one.
+    """Use the persisted last-GPU flag only for the scarcity grace.
 
-    It is a snapshot of a supervisor loop that no longer exists. Recovery calls
-    reallocation_spec_from_status -- restoring the run's original unpinned gpu type -- and re-enters
-    _run_training with empty failed_providers and tried_classes, so the replacement really can pick
-    another class or provider. Forwarding the snapshot to poll_job would state "no further GPU-class
-    escalation follows" about a picker that has its whole candidate list back (codex[bot]).
-
-    The stall grace is a different question -- how long to wait on hardware that was scarce -- which
-    the snapshot still answers correctly, so it must keep flowing through."""
+    Recovery rebuilds an unpinned candidate walk, so the stale flag must not constrain capacity
+    wording even though it still selects the longer wait.
+    """
     from flash.providers.base import JobHandle
     from flash.providers.runpod import PROVIDER
     from flash.providers.runpod import jobs as jobs
@@ -6056,13 +5997,11 @@ def test_reattach_keeps_the_stall_grace_but_not_the_capacity_wording(monkeypatch
 
 
 def test_capacity_detail_promises_no_retry_when_a_next_class_exists(monkeypatch):
-    """The false branch must be exactly as neutral as the true one. It originally read "retrying on
-    the next-best GPU", which asserts BOTH a retry and a class walk -- and a cache-drop retry fires
-    with on_last_gpu false while deliberately reselecting the SAME class, so that wording
-    contradicted the action line printed beneath it (see
-    test_cache_drop_retry_names_the_same_class_it_reselects).
+    """Keep the default capacity detail neutral about retries and class walks.
 
-    Deliberately relies on the default rather than passing on_last_gpu, to guard the normal path."""
+    A cache-drop retry may reselect the same class; see
+    ``test_cache_drop_retry_names_the_same_class_it_reselects``.
+    """
     res = _poll_in_queue_forever(monkeypatch)
     assert res.failure == "no_capacity"
     assert "GPU-class escalation may follow" in res.detail, res.detail

@@ -53,19 +53,14 @@ def test_opd_mamba_block_size_is_catalogued_only_for_hybrid_rollout_model():
 
 def test_thinking_capability_values_are_valid():
     # The config validator branches on these exact values; "unknown" is reserved for
-    # open-model-policy entries and must not appear in the curated catalog.
+    # a synthesized entry's placeholder, and must not appear in the curated catalog.
     for model_id, info in MODELS.items():
         assert info.thinking in ("none", "hybrid", "always"), (model_id, info.thinking)
 
 
 def test_serving_capacity_matches_validated_matrix():
-    # NB: `expected` is a literal in this file, so this asserts the catalog matches a SECOND COPY of
-    # the numbers, not that it matches the serving app. It fails only when someone edits the catalog
-    # and forgets the copy -- it cannot see freesolo `serving/src/model_config.py` drifting away,
-    # which is exactly what happened to the 4B/9B rank between 2026-07-22 and 2026-08-07. The
-    # cross-repo check belongs where both repos are checked out (freesolo-co/tests pins each as a
-    # submodule); flash CI has no freesolo tree to compare against. Keep this as the transcription
-    # guard it is and do not mistake it for a lockstep guarantee.
+    # `expected` is a transcription guard, not a cross-repo lockstep check. flash CI has no
+    # freesolo tree; compare both repos in the pinned freesolo-co/tests checkout.
     expected = {
         "Qwen/Qwen3.5-0.8B": {
             "gpu": "L4",
@@ -183,7 +178,7 @@ def test_default_model_is_a_dense_text_model():
 def test_every_catalog_entry_sets_params_b():
     # params_b is the authoritative numeric model size — the VRAM/disk/cost terms read it DIRECTLY
     # (nothing parses the `params` display string any more). It is a required ModelInfo field, but 0.0
-    # is a legal value only for the open-model policy's "unknown size" path. This guards that every
-    # CURATED entry states a real, positive size, so a new entry can never silently size as 0/unknown.
+    # is the dataclass default. This guards that every entry states a real, positive size, so a new
+    # entry added when forking to extend the catalog can never silently size as 0/unknown.
     for model_id, info in MODELS.items():
         assert info.params_b > 0, f"{model_id} must set params_b > 0 (curated authoritative size)"

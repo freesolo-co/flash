@@ -1580,7 +1580,7 @@ def test_zero_grad_guard_clears_on_a_recovered_step(monkeypatch):
 
 
 def test_a_single_step_run_with_no_gradient_is_rejected(monkeypatch):
-    """Regression (codex[bot], sft_train.py): the consecutive-run guard needs _MAX_ZERO_GRAD_STEPS
+    """Regression (sft_train.py): the consecutive-run guard needs _MAX_ZERO_GRAD_STEPS
     steps to fire, so a horizon SHORTER than that could not trip it at all.
 
     a one-update horizon is ordinary (the retained rows fit a single batch). such a run appended its

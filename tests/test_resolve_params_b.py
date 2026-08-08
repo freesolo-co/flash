@@ -15,41 +15,35 @@ def test_resolve_params_b_uses_catalog_params_b_float():
     assert resolve_params_b("Qwen/Qwen3.6-27B") == 27.0
 
 
-def test_resolve_params_b_zero_falls_through_to_hf_not_string(monkeypatch):
-    """An entry with params_b=0.0 (no curated size) falls through to the HF fetch — the ``params``
-    display string is NOT parsed. params_b_from_str was removed; the string is display-only now, so a
-    "6.5B" display must NOT be mistaken for the size (the HF metadata is the only fallback)."""
-    import types
+def test_resolve_params_b_pinned_revision_reads_the_pinned_size(monkeypatch):
+    """A PIN resolves to the pinned commit's real size, not the catalog's default-revision stat.
 
-    import flash.catalog as catalog
-    from flash.engine import vram
-
-    fake = types.SimpleNamespace(params_b=0.0, params="6.5B (text-only fine-tune)")
-    monkeypatch.setitem(catalog.MODELS, "acme/with-string", fake)
-    calls = []
-    monkeypatch.setattr(vram, "fetch_hf_params_b", lambda mid: calls.append(mid) or 7.0)
-    # 7.0 from the HF fetch, NOT 6.5 from the display string (which is now ignored).
-    assert vram.resolve_params_b("acme/with-string") == 7.0
-    assert calls == [
-        "acme/with-string"
-    ]  # the HF fetch IS consulted (string no longer short-circuits)
-
-
-def test_resolve_params_b_open_model_uses_hf_metadata(monkeypatch):
-    """An uncataloged (open-policy) model has no catalog entry -> fetch the real HF safetensors
-    param count."""
+    The catalog states a size for its default revision only. A run pinned to an older or variant
+    commit can genuinely differ, and sizing it from the catalog would quote the wrong model -- so the
+    pinned path fetches real geometry and the catalog number must NOT win.
+    """
     from flash.engine import vram
 
     monkeypatch.setattr(
-        vram, "fetch_hf_params_b", lambda mid: 7.2 if mid == "acme/open-7b" else None
+        vram, "_validated_revision_geometry", lambda _mid, _rev, _info: (9.1, 151936)
     )
-    assert vram.resolve_params_b("acme/open-7b") == 7.2
+    assert vram.resolve_params_b("Qwen/Qwen3.5-9B", "a" * 40) == 9.1
+    # ...and the unpinned call still reads the catalog, so the assert above is a real difference.
+    assert vram.resolve_params_b("Qwen/Qwen3.5-9B") == 9.7
 
 
-def test_resolve_params_b_none_when_uncataloged_and_no_network(monkeypatch):
-    """Best-effort: an uncataloged model with no HF metadata returns None (callers degrade to the
-    size-unknown path — memory-safe fused-CE gate, loose colocate cap), never an error."""
+def test_resolve_params_b_none_when_uncataloged(monkeypatch):
+    """Best-effort: an uncataloged id returns None, and never reaches the network to guess.
+
+    Submit rejects uncataloged models, so only a stale caller can produce one here. Callers degrade
+    to the size-unknown path (memory-safe fused-CE gate, loose colocate cap) rather than raising on
+    the allocation path -- but a size must never be invented for an id the catalog does not state.
+    """
     from flash.engine import vram
 
-    monkeypatch.setattr(vram, "fetch_hf_params_b", lambda mid: None)
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("an uncataloged id must not be sized over the network")
+
+    monkeypatch.setattr(vram, "fetch_hf_params_b", _boom, raising=False)
     assert vram.resolve_params_b("acme/totally-unknown") is None
+    assert vram.resolve_params_b("acme/totally-unknown", "a" * 40) is None

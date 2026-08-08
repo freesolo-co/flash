@@ -210,15 +210,9 @@ def test_9b_bf16_grpo_needs_an_80gb_class():
 
 
 def test_35b_moe_long_context_grpo_sized_past_the_resident_wall():
-    # The 35B MoE is RESIDENT-ONLY for GRPO (sleep_unsupported: vLLM sleep HANGS its wake), so it's
-    # sized on the RESIDENT peak (two ~70 GB weight copies + KV pool, fp8 KV). What this pins is the
-    # resident WALL: context past ~4-5k tok at group 8 costs materially more, so it is sized past the
-    # allocation a moderate-context run gets rather than admitted-then-HUNG in the broken sleep path
-    # (the old sleep estimate wrongly admitted up to ~16k, then the worker stalled).
-    #
-    # 205 GB is between the moderate-context sizes (200-201) and the long-context ones (211+); it is
-    # deliberately not a card size, because training the routed experts moved every one of these past
-    # a single 180 GB B200 and a 180 bound would no longer separate short context from long.
+    # the 35b moe is resident-only for grpo because vllm sleep hangs its wake. 205 gb separates
+    # moderate from long contexts using the resident peak, preventing admission into the broken sleep
+    # path; it is intentionally not a card size.
     from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
 
     moe = "Qwen/Qwen3.6-35B-A3B"
@@ -367,13 +361,9 @@ def test_opd_teacher_latency_uses_conservative_retry_and_turn_wave_policy(
 
     _gpu_seconds, fixed_seconds = step_seconds_split(config, "RTX 5090")
 
-    # the policy under test is HOW MANY REQUESTS ARE COUNTED -- retries and per-turn scoring are
-    # charged for even when they do not fire. that count is the hand-written fact in the table
-    # above. how many waves it takes is then just arithmetic over the concurrency ceiling, so the
-    # ceiling is read from the constant rather than baked into the expectations: hardcoding wave
-    # counts made this test fail purely because the measured ceiling moved 8 -> 32, which is not a
-    # policy change. recomputing the REQUEST COUNT with the same helper the code uses would instead
-    # make the test unable to fail.
+    # hand-write the policy request count, including retries and per-turn scoring, but derive waves
+    # from the measured concurrency constant. using the production count helper would make this test
+    # self-fulfilling.
     expected_waves = math.ceil(expected_scored_requests / OPD_TEACHER_SCORING_CONCURRENCY)
     assert fixed_seconds == pytest.approx(expected_waves * teacher_seconds_per_completion())
 

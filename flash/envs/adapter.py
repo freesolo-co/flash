@@ -335,25 +335,12 @@ class FreesoloEnvironment(BaseEnvironment):
         ]
 
     def reward_many(self, items: list[tuple[dict, dict]]) -> list[float]:
-        """Reward for many ``(example, state)`` rollouts at once, in input order.
+        """Reward many ``(example, state)`` rollouts in input order.
 
-        Rollouts that share a task go through ONE batched scoring call, which the env scores
-        concurrently (``Environment.max_score_concurrency``) — replacing one blocking scoring call
-        per rollout. For a judge / network-reward env (where scoring dominates) this is the analogue
-        of batched generation: a GRPO group's whole completion set overlaps its judge round-trips
-        instead of N serial GPU-idle calls. Multi-turn groups go through ``score_episodes``,
-        single-turn through ``score_responses`` (an episode's reward is just ``score_response`` on
-        its final text, so the two are equivalent for the one-prompt-one-response case). Equals one
-        :meth:`reward` per item: each path scores every rollout independently — ``score_responses``
-        runs ``score_response`` per completion and ``_reward_to_breakdown(...)['total']`` is exactly
-        ``reward.score`` — so batching changes only concurrency, not values.
-
-        Honors ``reward_thread_safe``: an env whose scorer keeps mutable or thread-bound state opts out
-        with ``reward_thread_safe = False`` and MUST NOT be raced. Batching a group's whole completion
-        set into one ``score_responses`` / ``score_episodes`` call hands them to the env's concurrent
-        scorer (``max_score_concurrency``), so for an opted-out env we fall back to the proven serial
-        path — one single-item :meth:`reward` per rollout, in input order — exactly as the pre-batching
-        code did. Same values; only the concurrency is dropped."""
+        Rollouts sharing a task use one ``score_responses`` or ``score_episodes`` batch, changing
+        concurrency but not values. ``reward_thread_safe = False`` must use serial single-item
+        :meth:`reward` calls because the scorer may hold mutable or thread-bound state.
+        """
         if not self.reward_thread_safe:
             # Single-item scoring per rollout (each reward() makes a ONE-element score_responses /
             # score_episodes call, so the env's concurrent scorer never sees a batch to parallelize).
@@ -495,23 +482,9 @@ class FreesoloEnvironment(BaseEnvironment):
             # the env overrode the episode's answer, so it is already the text to grade -- do not
             # strip it. keep the raw view in step with it for any later turn.
             final = str(step.final_response_text)
-            # wrap rather than assign the bare string: a plain str has no .raw/.thinking, so a
-            # thinking-aware score_episode would lose the model's reasoning on exactly the episodes
-            # an env terminates by overriding (the scaffolded StarterMultiTurnEnv does this on a
-            # correct guess). the override text is the answer, so .completion is it; .thinking and
-            # .raw stay the model's own from this turn, which the override replaced but did not
-            # produce.
-            #
-            # .raw is documented as the ORIGINAL RAW MODEL OUTPUT (flash/cli/training_doc.py), so
-            # the override does not belong in it: a scorer reaching for .raw wants the text the
-            # model emitted, and is the one scorer that cannot recover it from anywhere else --
-            # .completion and str() are both the override already. assigning it here also left the
-            # object internally inconsistent, pairing an env-authored .raw with the model's own
-            # .thinking, so .raw did not contain the reasoning .thinking was taken from (codex[bot]).
-            #
-            # `raw` is this turn's model emission: the adapter passed it to step_episode above as
-            # what the model said. state["raw_response_text"] below is deliberately NOT this -- it
-            # carries the override so a later turn steps the env on the answer it substituted.
+            # wrap the override so `.completion` is env-authored while `.raw` and `.thinking` remain
+            # the model's original turn (flash/cli/training_doc.py). a bare str would discard those
+            # scorer views. `raw_response_text` becomes the override because later turns step on it.
             previous = state.get("response_text")
             state["response_text"] = (
                 _ScoredResponseText(

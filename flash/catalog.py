@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import asdict, dataclass, replace
 from typing import Any
 
@@ -80,13 +79,10 @@ class ModelInfo:
     params: str
     algos: tuple[str, ...]
     min_vram_gb: int
-    # Total parameters in billions — the numeric model size the cost estimator + VRAM equations read
-    # DIRECTLY (no parsing of the ``params`` display string). Drives the memory/size terms (VRAM, disk,
-    # download), which always size the FULL checkpoint. REQUIRED: every ModelInfo must state it — a
-    # curated catalog model sets its true count, and the open-model policy passes the HF/estimated count
-    # (or 0.0 when the size is genuinely "unknown size"). ``test_every_catalog_entry_sets_params_b``
-    # asserts every curated MODELS entry sets it > 0, so a new entry can never silently fall back to a
-    # parsed string again.
+    # numeric total parameters in billions, read DIRECTLY by the cost and VRAM equations rather
+    # than parsed from the ``params`` display string. sizes the FULL checkpoint for vram, disk, and
+    # download. REQUIRED: ``test_every_catalog_entry_sets_params_b`` asserts every entry sets it
+    # > 0, so a new entry can never silently fall back to a parsed string again.
     params_b: float
     quant: str = "bf16"
     recommended_gpu: str = DEFAULT_GPU
@@ -94,14 +90,8 @@ class ModelInfo:
     grpo_min_vram_gb: int = 0
     # 0 => non-grpo sizing uses the param-based estimate; set when a model must not down-route to the cheapest card.
     sft_min_vram_gb: int = 0
-    # vLLM sleep mode (offload the colocate rollout engine between GRPO steps) is NON-FUNCTIONAL for
-    # this model: the wake/reload HANGS the rollout (a ~70 GB weight reallocation can't be placed in
-    # the fragmented non-expandable allocator sleep forces -- live-confirmed on the 35B-A3B, every
-    # attempt stalled). So this model is RESIDENT-ONLY: a config that doesn't fit resident must be
-    # REJECTED (model_required_vram_gb sizes it on the resident peak) rather than routed to the hanging
-    # sleep path. the verl launcher also pins the rollout resident for a flagged model
-    # (free_cache_engine=false) so verl's own per-step offload can't reach the hang. Dense/small
-    # models that sleep cleanly leave this False.
+    # resident-only guard: vllm wake/reload hangs after allocator fragmentation. reject configs that
+    # miss the resident peak and pin free_cache_engine=false in the verl launcher.
     sleep_unsupported: bool = False
     notes: str = ""
     # 0 = platform default (64 GB) suffices. Runner raises gpu.disk_gb to at least this.
@@ -110,7 +100,8 @@ class ModelInfo:
     # Flash's training GPU recommendation above; serving uses Modal/vLLM and sizes hot LoRA buffers
     # by max_loras x max_lora_rank at engine init.
     serving: ServingCapacity | None = None
-    # "none" / "hybrid" (Qwen3-style) / "always" (can't disable) / "unknown" (open-model policy)
+    # "none" / "hybrid" (Qwen3-style) / "always" (can't disable). Every entry is curated, so the
+    # capability is always known -- a new entry must state it rather than leave it to be guessed.
     thinking: str = "none"
     vocab_size: int = _DEFAULT_VOCAB_SIZE
     # Parameters ACTIVE per token in billions — only meaningful for an MoE, where a token routes
@@ -118,12 +109,8 @@ class ModelInfo:
     # this (a token exercises only the active params), while VRAM/disk/download keep using the total
     # ``params_b``. 0.0 (the dense default) means "same as params_b" — every token hits every param.
     active_params_b: float = 0.0
-    # Transformer geometry (decoder layers x hidden width) — the SFT gradient-checkpointing-OFF gate
-    # sizes the no-recompute activation peak from these (engine.vram.sft_gc_off_peak_gb). 0/0 (the
-    # default) means "unknown": the worker falls back to reading the HF config at runtime, and the
-    # GC-off gate stays conservative (keeps GC on) if neither is available. Curated for the MoE whose
-    # SFT runs the gate — a live B200 SFT showed the runtime AutoConfig probe returning (0, 0) on the
-    # multimodal-nested config, so the curated values are what actually engage the gate.
+    # decoder geometry for engine.vram.sft_gc_off_peak_gb. 0/0 means unknown and keeps gradient
+    # checkpointing on if the runtime HF config also lacks usable values.
     num_layers: int = 0
     hidden_size: int = 0
     # vllm cache geometry. zero values mean the catalog has no architecture-aware sizing data.
@@ -143,11 +130,10 @@ class ModelInfo:
 
     @property
     def is_moe(self) -> bool:
-        """True for a mixture-of-experts model — a token routes through only a subset of experts.
+        """Return whether each token routes through only a subset of experts.
 
-        Keyed off ``active_params_b`` (0.0 == dense, "every token hits every param"). Used by the
-        GRPO worker to pick REENTRANT gradient checkpointing for MoE (its router re-dispatches tokens
-        on recompute, which the non-reentrant metadata-equality assert rejects).
+        GRPO uses this to select reentrant checkpointing; MoE routing breaks the non-reentrant
+        metadata-equality assertion on recompute.
         """
         return 0.0 < self.active_params_b < self.params_b
 
@@ -530,9 +516,9 @@ def get_model(model_id: str) -> ModelInfo:
     except KeyError as exc:
         allowed = ", ".join(MODELS)
         raise ValueError(
-            f"unsupported model {model_id!r}; choose one of: {allowed} — or, on a SELF-HOSTED "
-            f'control plane, set model_policy = "allow" in the config to run any HF model that '
-            f"fits the GPU (open-model policy; rejected by the managed service)"
+            f"unsupported model {model_id!r}; choose one of: {allowed} — or, to train another "
+            f"model, fork Flash and add a ModelInfo entry for it to flash/catalog.py "
+            f"(see SELF_HOSTING.md)"
         ) from exc
 
 
@@ -547,7 +533,7 @@ def _model_info_for_serving(model: str | ModelInfo | None) -> ModelInfo | None:
 def serving_lora_rank_cap(model: str | ModelInfo | None) -> int | None:
     """Return the model-specific serving LoRA rank cap.
 
-    Unknown and open-policy models return None.
+    A model with no serving entry returns None.
     """
     info = _model_info_for_serving(model)
     if info is None or info.serving is None:
@@ -556,13 +542,12 @@ def serving_lora_rank_cap(model: str | ModelInfo | None) -> int | None:
 
 
 def serving_context_cap(model: str | ModelInfo | None) -> int | None:
-    """Return the model's serving ``max_model_len`` (the context it is actually served at), or None
-    when Flash has no local serving entry (open-policy / uncataloged).
+    """Return the model's served ``max_model_len``, or None without a local serving entry.
 
-    A LoRA trained at a longer context than it is served wastes compute and learns positions that are
-    never used at inference, so the control plane caps a run's training context to this (see
-    ``flash.lora_rank.preflight_train_context_within_serving``). Resolution mirrors
-    ``serving_lora_rank_cap``: unknown/open-policy models return None rather than a global fallback.
+    A LoRA trained longer than it is served learns positions inference never uses, so the control
+    plane caps training context to this (see
+    ``flash.lora_rank.preflight_train_context_within_serving``). Mirrors ``serving_lora_rank_cap``:
+    no serving entry returns None rather than a global fallback.
     """
     info = _model_info_for_serving(model)
     if info is None or info.serving is None:
@@ -571,7 +556,8 @@ def serving_context_cap(model: str | ModelInfo | None) -> int | None:
 
 
 def vocab_size_for(model_id: str) -> int:
-    """Curated vocab_size for a model, or the safe default for open-model-policy entries."""
+    """Curated vocab_size for a model, or the safe (largest-catalog) default for an id the
+    catalog does not list -- only a stale caller can produce one, since submit rejects them."""
     info = MODELS.get(model_id)
     return info.vocab_size if info is not None else _DEFAULT_VOCAB_SIZE
 
@@ -595,87 +581,30 @@ def resolve_vocab_size(model_id: str, revision: str = "") -> int:
     return vocab_size_for(model_id)
 
 
-def resolve_model(
-    model_id: str,
-    algorithm: str,
-    policy: str = "catalog",
-    gpu: str | None = None,
-    model_revision: str = "",
-    gpu_count: int = 1,
-) -> ModelInfo:
-    """Resolve a model under the configured policy; "allow" accepts any HF model.
+def resolve_model(model_id: str, algorithm: str, model_revision: str = "") -> ModelInfo:
+    """Resolve a curated model, validated for ``algorithm``; anything uncataloged is rejected.
 
-    ``gpu_count`` is the run's card ceiling, forwarded to the open-model fit check so a shardable
-    run is judged on the shape it will be allocated rather than on one card.
+    Resolution is card-independent: a curated entry states its own VRAM/disk requirements, so there
+    is nothing to size against a GPU class or count here. (The uncataloged path used to synthesize a
+    ModelInfo and fit-check it against the allocated shape, which is why this once took ``gpu`` and
+    ``gpu_count``.) Whether the run actually fits the cards it is offered is the allocator's call.
     """
     algo = normalize_algorithm(algorithm)
-    if model_id in MODELS:
-        info = validate_model_for_algorithm(model_id, algo)
-        if model_revision:
-            from flash.engine.vram import _validated_revision_geometry
+    if model_id not in MODELS:
+        return get_model(model_id)  # raises with the fork-a-catalog-entry instruction
+    info = validate_model_for_algorithm(model_id, algo)
+    if model_revision:
+        from flash.engine.vram import _validated_revision_geometry
 
-            params_b, vocab_size = _validated_revision_geometry(model_id, model_revision, info)
-            info = replace(
-                info,
-                params_b=params_b,
-                params=f"{params_b:.1f}B",
-                vocab_size=vocab_size,
-                min_disk_gb=max(info.min_disk_gb, int(params_b * 2) + 64),
-            )
-        return info
-    if policy != "allow":
-        return get_model(model_id)
-    return _resolve_open_model(
-        model_id, algo, gpu, model_revision=model_revision, gpu_count=gpu_count
-    )
-
-
-def _resolve_open_model(
-    model_id: str,
-    algo: str,
-    gpu: str | None,
-    *,
-    model_revision: str = "",
-    gpu_count: int = 1,
-) -> ModelInfo:
-    """Synthesize a ModelInfo for the open-model "allow" policy via a coarse HF VRAM-fit estimate."""
-    from flash.engine.vram import check_fit
-
-    resolved_gpu = gpu or DEFAULT_GPU
-    est = check_fit(
-        model_id,
-        algo,
-        resolved_gpu,
-        model_revision=model_revision,
-        # judge the run on the shape the allocator may rent. the per-card class chosen for a wide
-        # ceiling is deliberately smaller, so evaluating it as one card rejects exactly the large
-        # models the multi-card path exists to serve.
-        gpu_count=gpu_count,
-    )
-    if est.verdict == "too_big":
-        raise ValueError(
-            f"{model_id} does not fit the requested GPU: {est.describe()}. "
-            f"Pick a smaller model or a larger supported GPU."
+        params_b, vocab_size = _validated_revision_geometry(model_id, model_revision, info)
+        info = replace(
+            info,
+            params_b=params_b,
+            params=f"{params_b:.1f}B",
+            vocab_size=vocab_size,
+            min_disk_gb=max(info.min_disk_gb, int(params_b * 2) + 64),
         )
-    if est.verdict in ("tight", "unknown"):
-        print(f"warning: open-model policy: {est.describe()}")
-    params_b = est.params_b or 0.0
-    params = f"{params_b:.1f}B" if params_b else "unknown size"
-    min_disk = int(params_b * 2) + 64 if params_b else 0
-    return ModelInfo(
-        id=model_id,
-        display_name=model_id,
-        params=params,
-        # Carry the estimated/HF param count straight through (0.0 when size is unknown) so downstream
-        # sizing reads ``params_b`` directly — no re-parsing the display string.
-        params_b=params_b,
-        algos=ALGORITHMS,
-        min_vram_gb=math.ceil(est.est_gb) if est.est_gb else 24,
-        min_disk_gb=min_disk,
-        recommended_gpu=resolved_gpu,
-        thinking="unknown",
-        notes="unlisted model accepted via the open-model policy (not curated/validated)",
-    )
+    return info
 
 
 def validate_model_for_algorithm(model_id: str, algorithm: str) -> ModelInfo:

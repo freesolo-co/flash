@@ -1,8 +1,6 @@
-"""Lambda Cloud $/hr: live ``/instance-types`` rate per class, static fallback.
+"""use lambda's live instance-type rate with a lambda-specific static fallback.
 
-NB: the static fallback is a Lambda-specific map, NOT ``GpuClass.hourly_usd`` — that field is the
-RunPod secure-cloud snapshot, which differs from Lambda's list price (e.g. B200 is $5.89 on
-RunPod but $6.99 on Lambda).
+never fall back to ``GpuClass.hourly_usd``; that is a runpod snapshot and prices differ by provider.
 """
 
 from __future__ import annotations
@@ -45,14 +43,9 @@ def hourly_rate(gpu_name: str, *, gpu_count: int = 1, deadline_at: float | None 
             )
             from flash.providers.lambdalabs.gpus import instance_type_for
 
-            # price the type Lambda actually lists: multi-card SKUs can carry a different suffix
-            # than the 1x entry, and a derived-only name would miss the live rate and fall back to
-            # the static list price.
-            #
-            # only the multi-card rewrite needs the catalog -- instance_type_for returns the
-            # registry name unconditionally at count 1. fetching it anyway put a second network
-            # call on the single-card path and made a catalog blip downgrade EVERY lambda quote to
-            # the static list price, even though the per-type lookup below would have succeeded.
+            # query lambda's actual multi-card sku because its suffix can differ from the 1x name.
+            # skip the catalog on single-card quotes: instance_type_for already has the registry name,
+            # and an unnecessary catalog outage would otherwise force a static fallback.
             catalog = list_instance_types(deadline_at=deadline_at) if count > 1 else None
             live = instance_type_price_usd_hr(
                 instance_type_for(name, count, catalog), deadline_at=deadline_at

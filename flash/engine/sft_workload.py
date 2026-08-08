@@ -173,13 +173,9 @@ def _packing_mode(
     if packing_support is not None:
         architecture_mode, supported = packing_support(model_id, revision)
     else:
-        # the RAISING probes, not the swallowing ones. both labels below are frozen into the
-        # profile and compared byte-for-byte by the training worker (sft_train.py), so a probe that
-        # answered False because the hub timed out would freeze "unsupported", and a later
-        # re-derivation that reached the config would produce "gdn-hybrid" and fail the run with
-        # "sft workload changed after the quote was frozen" -- while every token, step and packing
-        # decision was in fact identical. a probe that could not answer must fail the PROFILE, which
-        # is retryable, rather than mint a label that poisons every training run built on it.
+        # use raising probes because these labels are frozen into the profile and compared in
+        # `sft_train.py`. a swallowed timeout can mint `unsupported` and later fail parity against
+        # `gdn-hybrid` despite identical training behavior.
         try:
             if probe_is_pure_attention(model_id, revision=revision):
                 architecture_mode, supported = "pure-attention", True
@@ -228,10 +224,7 @@ def sft_tokens_for_updates(
 def sft_max_length(spec) -> int:
     """The context window the rows are truncated at: the authored cap, else the cap for the mode.
 
-    The one producer of this number. It reaches the trainer and the quote as the profile's
-    ``max_length`` rather than by either of them re-deriving it, because a second derivation would
-    silently disagree while the worker's parity check -- which compares two values this module
-    produced -- still passed.
+    This single profile `max_length` reaches both trainer and quote; neither may re-derive it.
     """
     authored = spec.train.max_context_tokens
     if authored is not None:
@@ -414,20 +407,9 @@ def prepare_sft_workload(
             f"{untruncated_max_length} to keep every row whole.",
             file=sys.stderr,
         )
-    # one example per update is this layer's isolation lever for an architecture it cannot pack.
-    # a micro-batch reaches the model as one (1, total_nnz) row with `attention_mask=None`: softmax
-    # layers recover their boundaries from the per-example `position_ids` restarts, but
-    # GatedDeltaNet layers read theirs out of `seq_idx` (causal conv) and `cu_seq_lens_q`
-    # (recurrence), so on a gdn hybrid every example after the first would train on state carried
-    # over from its predecessor -- silently, with no error and no metric. keeping one example per
-    # batch leaves nothing to carry.
-    #
-    # this decision is made WITHOUT a gpu, so it can only go on the architecture, and it is the one
-    # that binds: `examples_per_update` feeds the quoted step count below, and the worker replays it
-    # verbatim (sft_train reads `profile.examples_per_update` and `profile.authoritative_steps`), so
-    # the horizon the user was quoted is the horizon that runs. the worker's child probe decides
-    # something ELSE -- verl's tensor layout, `use_remove_padding` -- which is why that flag must not
-    # be gated on this mode: it selects a code path, not a batch size.
+    # GDN boundaries require one example per update because this packed layout has no `seq_idx` or
+    # `cu_seq_lens_q`; otherwise recurrent state crosses examples silently. this CPU-side choice
+    # sets quoted and executed steps. the child probe controls verl layout, not batch size.
     examples_per_update = min(effective_batch, len(rows)) if packing_mode == "packed" else 1
     # packed_blocks is already the optimizer batches verl runs per epoch, so the horizon is one
     # update per block per epoch. do not divide by examples_per_update again.
