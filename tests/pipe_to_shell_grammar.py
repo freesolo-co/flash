@@ -58,7 +58,17 @@ INSTALLER_FILES = _installer_files()
 # tokens models the actual grammar and makes both failure directions expressible.
 # `ash` is BusyBox's shell and therefore `/bin/sh` on every Alpine image, which is the base a
 # vendor install script is most likely to run under.
-_SHELL_NAME = re.compile(r"(?:[\w./-]*/)?(?:ba|a|z|k|da)?sh$")
+#
+# `su` is a shell under another name: it starts the target user's login shell with stdin intact,
+# so a piped download is executed exactly as `sh` would. It belongs here rather than in
+# _EXEC_WRAPPERS because there is no command after it to judge -- it IS the command.
+# Confirmed rather than assumed (as root, so no password prompt intervenes):
+#     printf 'echo PWNED\n' | sudo -n su        -> PWNED
+#     printf 'echo PWNED\n' | sudo -n su -      -> PWNED
+#     printf 'echo PWNED\n' | sudo -n su root   -> PWNED
+# It also takes `-c` like a shell (`su -c 'sh'` runs the piped stream, `su -c 'echo hi'` does
+# not), which the `-c` handling below then reads for free.
+_SHELL_NAME = re.compile(r"(?:[\w./-]*/)?(?:(?:ba|a|z|k|da)?sh|su)$")
 
 # Wrappers that EXEC what follows them, so the real command is further right. Open-ended by
 # nature; this is the part of the guard most likely to need extending, and the only part where
@@ -89,12 +99,19 @@ _EXEC_WRAPPERS = {
     "runuser",
 }
 
+# Wrappers that can start a shell through a FLAG instead of a command word: `sudo -s` and
+# `sudo -i` spawn the target user's shell, which then reads the pipe. `runuser` and `su` accept
+# the same two flags. See `_requests_a_shell_by_flag` for why the command word must be absent.
+_SPAWNS_A_SHELL_BY_FLAG = {"sudo", "runuser", "su"}
+
 # Flags that take a SEPARATE operand, per wrapper. Keyed by wrapper because the same spelling
 # means different things: `env -u NAME` unsets a variable, `sudo -u USER` picks a user. Knowing
 # the arity is what stops the operand from being mistaken for the command -- `env -u bash cat`
 # runs `cat`, not `bash`, and flagging it would fail CI on a legitimate pipeline.
 _FLAGS_WITH_OPERAND = {
     "sudo": {"-u", "-g", "-h", "-p", "-C", "-U", "-r", "-t", "--user", "--group", "--prompt"},
+    # `su -s /bin/sh` picks the shell to start; the operand is not the command being run.
+    "su": {"-s", "-g", "-G", "--shell", "--group", "--supp-group"},
     "env": {"-u", "-C", "--unset", "--chdir"},
     "timeout": {"-k", "-s", "--kill-after", "--signal"},
     # Confirmed by running each one bare: `xargs --arg-file` reports "requires an argument",
@@ -332,6 +349,8 @@ def _stage_runs_a_shell(tokens: list[str]) -> bool:
     is an argument being searched for, not the command being run.
     """
     inner = [t for t in tokens if t not in ("(", ")", "{", "}")]
+    if _requests_a_shell_by_flag(inner):
+        return True
     word, at = _command_word(inner)
     if at is not None and _SHELL_NAME.fullmatch(word):
         # `xargs` reads the pipe ITSELF to build an argument list, so the shell it runs gets
@@ -355,9 +374,64 @@ def _stage_runs_a_shell(tokens: list[str]) -> bool:
         if program is None:
             return True
         return any(_stage_runs_a_shell(cmd) for cmd in _commands_in(program))
+    if _starts_a_shell_by_flag(inner, at):
+        return True
     # Checked even when the walk found no command word: `env -S'bash -s'` fuses the operand into
     # the flag, so every token is a flag and the walk runs off the end with the shell still in it.
     return any(_stage_runs_a_shell(_tokenize(cmd)) for cmd in _split_string_operands(inner))
+
+
+def _starts_a_shell_by_flag(tokens: list[str], command_at: int | None) -> bool:
+    """Does a FLAG turn this stage into a shell, with no shell name anywhere in it?
+
+    `sudo -s` and `sudo -i` start a shell instead of running a command, so the pipe is executed
+    even though the only words present are `sudo` and a flag. The walk steps over both and finds
+    nothing, which reads as clean -- an under-match with no shell name to key on.
+
+    Confirmed rather than assumed:
+        printf 'echo PWNED\\n' | sudo -n -s   -> PWNED
+        printf 'echo PWNED\\n' | sudo -n -i   -> PWNED
+        printf 'echo PWNED\\n' | sudo -ns     -> PWNED   (clustered)
+
+    A command word after the flag takes over, so `sudo -s jq .` runs jq and stays clean -- which
+    is why this only fires when the walk found no command.
+    """
+    if command_at is not None or not tokens:
+        return False
+    if tokens[0].rsplit("/", 1)[-1] != "sudo":
+        return False
+    return any(
+        flag.startswith("-") and not flag.startswith("--") and ("s" in flag[1:] or "i" in flag[1:])
+        for flag in tokens[1:]
+    )
+
+
+def _requests_a_shell_by_flag(tokens: list[str]) -> bool:
+    """Does a privilege wrapper start a shell through a FLAG, naming no shell at all?
+
+    `sudo -s` and `sudo -i` spawn the target user's shell, which then reads the pipe -- so the
+    download is executed even though no shell name appears anywhere in the stage. The walk for a
+    command word runs off the end here (every token is a flag) and reported clean.
+
+    Only when no command FOLLOWS the flag: `sudo -s echo hi` runs `echo hi` and the stream stays
+    untouched, so this must not fire on it.
+
+    Confirmed rather than assumed:
+        printf 'echo PWNED\\n' | sudo -n -s              -> PWNED
+        printf 'echo PWNED\\n' | sudo -n -i              -> PWNED
+        printf 'echo PWNED\\n' | sudo -n -ns             -> PWNED   (clustered)
+        printf 'echo X\\n'     | sudo -n -s echo hi      -> hi      (the operand ran, not stdin)
+    """
+    if not tokens or tokens[0].rsplit("/", 1)[-1] not in _SPAWNS_A_SHELL_BY_FLAG:
+        return False
+    word, _ = _command_word(tokens)
+    if word:
+        return False
+    return any(
+        flag in ("--shell", "--login")
+        or (flag.startswith("-") and not flag.startswith("--") and {"s", "i"} & set(flag[1:]))
+        for flag in tokens[1:]
+    )
 
 
 def _takes_a_separate_operand(wrapper: str, flag: str) -> bool:
