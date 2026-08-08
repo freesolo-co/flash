@@ -1969,7 +1969,7 @@ def test_score_single_turn_collects_the_named_breakdown_for_reward_metrics():
 @pytest.mark.usefixtures("_identity_graded")
 def test_a_scalar_reward_env_contributes_no_breakdown_at_all():
     # appending {} for a scores_breakdown-less env would add a denominator under no numerators:
-    # _mean_named_reward_metrics divides by every scored completion, so an env mixing the two
+    # RewardObservabilityBuffer divides by every scored completion, so an env mixing the two
     # shapes -- or a run with none at all -- would publish every name shrunk toward 0.
     breakdowns: list[dict | None] = []
     score = rl_train.score_single_turn(

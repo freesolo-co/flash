@@ -24,11 +24,11 @@ def _write(tmp, name, text):
 
 
 def test_set_overrides_scalar_and_list():
-    from flash.schema import spec_from_file
+    from flash.schema import spec_and_train_keys_from_file
 
     with tempfile.TemporaryDirectory() as tmp:
         cfg = _write(tmp, "c.toml", BASE)
-        spec = spec_from_file(
+        spec = spec_and_train_keys_from_file(
             cfg,
             run_id="x",
             overrides=[
@@ -36,7 +36,7 @@ def test_set_overrides_scalar_and_list():
                 "gpu.type=H100",
                 "train.stop_sequences=[STOP1,STOP2]",
             ],
-        )
+        )[0]
         assert spec.train.epochs == 3
         assert spec.train.stop_sequences == ("STOP1", "STOP2")
         # gpu.type overrides hard-pin the requested active validated class.
@@ -44,7 +44,7 @@ def test_set_overrides_scalar_and_list():
 
 
 def test_composed_config_deep_merge():
-    from flash.schema import spec_from_file
+    from flash.schema import spec_and_train_keys_from_file
 
     with tempfile.TemporaryDirectory() as tmp:
         base = _write(tmp, "base.toml", BASE)
@@ -53,7 +53,7 @@ def test_composed_config_deep_merge():
             "prod.toml",
             '[train]\nmax_examples = 250\n[gpu]\ntype = "H100"\n',
         )
-        spec = spec_from_file(base, run_id="x", extra_configs=[override])
+        spec = spec_and_train_keys_from_file(base, run_id="x", extra_configs=[override])[0]
         assert spec.train.max_examples == 250  # deep-merged override of a scalar
         assert (
             spec.environment.id == "github:freesolo-co/envs@main:gsm8k/environment.py"
@@ -92,9 +92,9 @@ def test_authored_train_keys_follow_composed_config() -> None:
 
 
 def test_set_requires_key_value():
-    from flash.schema import ConfigError, spec_from_file
+    from flash.schema import ConfigError, spec_and_train_keys_from_file
 
     with tempfile.TemporaryDirectory() as tmp:
         cfg = _write(tmp, "c.toml", BASE)
         with pytest.raises(ConfigError):
-            spec_from_file(cfg, run_id="x", overrides=["bogus"])
+            spec_and_train_keys_from_file(cfg, run_id="x", overrides=["bogus"])

@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from flash.catalog import ModelInfo
-from flash.schema import ConfigError, spec_from_dict, spec_from_file
+from flash.schema import ConfigError, spec_and_train_keys_from_file, spec_from_dict
 from flash.spec import JobSpec
 from tests._helpers.specs import raw_spec as _raw
 
@@ -113,5 +113,5 @@ def test_thinking_set_override(tmp_path):
         '[environment]\nid = "github:owner/repo@main:env/environment.py"\n\n'
         "[train]\nepochs = 1\nmax_examples = 8\n"
     )
-    spec = spec_from_file(str(cfg), overrides=["thinking=true"])
+    spec = spec_and_train_keys_from_file(str(cfg), overrides=["thinking=true"])[0]
     assert spec.thinking is True

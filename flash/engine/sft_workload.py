@@ -17,8 +17,8 @@ from flash.engine.worker.packing import probe_is_gdn_hybrid, probe_is_pure_atten
 from flash.engine.worker.sft import (
     _pretokenize_completion_only,
     _reject_image_completion,
-    _select_indexed_sft_examples,
     has_real_target,
+    select_sft_examples,
 )
 from flash.workload_profile import SftWorkloadProfile, sft_sample_policy
 
@@ -262,8 +262,7 @@ def prepare_sft_workload(
     max_steps = int(train_spec.max_steps or 0)
 
     source = list(env.dataset())
-    indexed_train = _select_indexed_sft_examples(source, max_examples, spec.seed)
-    selected = [example for _, example in indexed_train]
+    selected = select_sft_examples(source, max_examples, spec.seed)
     prompt_rows = [
         (example, env.prompt_messages(example), env.sft_completion(example)) for example in selected
     ]
