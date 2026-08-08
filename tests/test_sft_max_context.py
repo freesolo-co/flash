@@ -62,7 +62,6 @@ def test_sft_context_length_resolves_the_authored_window_or_the_mode_cap():
                 model="Qwen/Qwen3.5-4B",
                 algorithm="sft",
                 thinking=thinking,
-                model_policy="catalog",
                 environment=EnvironmentSpec(id="team/example", resolved_sha="b" * 40),
                 model_revision="a" * 40,
                 train=TrainSpec(max_context_tokens=mct, max_examples=2),
@@ -90,7 +89,6 @@ def test_trainer_and_quote_read_the_one_measured_window():
         JobSpec(
             model="Qwen/Qwen3.5-4B",
             algorithm="sft",
-            model_policy="catalog",
             train=TrainSpec(max_context_tokens=3072, max_examples=8),
         )
     )
