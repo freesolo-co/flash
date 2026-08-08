@@ -171,8 +171,7 @@ With it set:
 - **Environment mirror validation is skipped.** The environment package itself is still
   resolved and authorized normally.
 - **Backend reporting is off** - billing precheck and charge, realized-cost
-  reconciliation, checkpoint registration, the shared RunPod slot store, and the hosted
-  artifact GC sweep. Otherwise these would send your operator key to `api.freesolo.co`
+  reconciliation, checkpoint registration, and the hosted artifact GC sweep. Otherwise these would send your operator key to `api.freesolo.co`
   (and, for the GC, `serve.freesolo.co`) and log a warning per run or per startup.
 
 Self-hosting relaxes the billing boundaries, not the catalog. Trainable models are the
