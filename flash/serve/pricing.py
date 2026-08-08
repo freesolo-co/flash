@@ -68,10 +68,3 @@ SERVING_PRICES: dict[str, ServingPrice] = {
         typical_cached_input_usd_per_mtok=0.066,
     ),
 }
-
-
-def serving_price(model_id: str) -> ServingPrice:
-    try:
-        return SERVING_PRICES[model_id]
-    except KeyError as exc:
-        raise ValueError(f"unknown serving model {model_id!r}") from exc

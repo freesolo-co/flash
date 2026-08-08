@@ -92,7 +92,18 @@ def test_sm_capability_and_fp8_kv_support():
     """fp8 KV cache is a cc >= 8.9 feature the OPD/GRPO workers enable off get_device_capability();
     sizing infers it from a class's ``sm`` string. Ada (4090, sm89), Hopper (H100/H200, sm90) and
     Blackwell (B200 sm100, RTX Pro 6000/5090 sm120) qualify; Ampere (A100 sm80, A10 sm86) does not."""
-    from flash.providers.base import _sm_capability, max_non_fp8_kv_vram_gb, supports_fp8_kv
+    from flash.providers.base import (
+        _FP8_KV_MIN_CAPABILITY,
+        _sm_capability,
+        get_gpu_info,
+        max_non_fp8_kv_vram_gb,
+    )
+
+    def fp8_kv(name: str) -> bool:
+        # the sizing path composes these two: parse the class's sm string, compare against the
+        # cc >= 8.9 floor. asserted as that composition rather than through a wrapper, so both
+        # the parse and the threshold stay pinned to what max_non_fp8_kv_vram_gb uses.
+        return _sm_capability(get_gpu_info(name).sm) >= _FP8_KV_MIN_CAPABILITY
 
     assert _sm_capability("sm80") == (8, 0)
     assert _sm_capability("sm89") == (8, 9)
@@ -101,9 +112,9 @@ def test_sm_capability_and_fp8_kv_support():
     assert _sm_capability("sm120") == (12, 0)
     assert _sm_capability("bogus") == (0, 0)  # unparseable -> pre-fp8
     for name in ("RTX 4090", "H100", "H200", "B200", "RTX Pro 6000", "RTX 5090"):
-        assert supports_fp8_kv(name), name
+        assert fp8_kv(name), name
     for name in ("A100 PCIe", "A100 SXM", "A10"):
-        assert not supports_fp8_kv(name), name
+        assert not fp8_kv(name), name
     # the largest validated card WITHOUT fp8 KV is the 80 GB A100 -> a run needing more can only land
     # on a modern (fp8-capable) card.
     assert max_non_fp8_kv_vram_gb() == 80
