@@ -526,7 +526,7 @@ def test_required_vram_policy_floors_and_downrouting():
 
 
 def test_required_vram_sizes_weights_from_curated_params_b_not_display_string():
-    """Cursor Medium: model_required_vram_gb must size the resident WEIGHT term from the curated
+    """model_required_vram_gb must size the resident WEIGHT term from the curated
     ``ModelInfo.params_b`` (the single source of truth resolve_params_b / the cost model read).
     params_b is now a required numeric field and the ``params`` display string is display-only
     (params_b_from_str was removed): re-parsing the string was fragile for an MoE whose string lists
@@ -612,7 +612,7 @@ def test_opd_vram_estimate_reserves_one_dense_image_loss_peak():
 def test_opd_uses_opd_sizing_not_grpo():
     """OPD must size on its own dense-logit estimator, never on the GRPO colocate path.
 
-    Regression (codex[bot], vram.py): a sizing branch hardcoded ``_need(params_b, 'grpo', ...)``, so
+    Regression (vram.py): a sizing branch hardcoded ``_need(params_b, 'grpo', ...)``, so
     an OPD run was sized as a colocated-vLLM GRPO job -- rejecting fitting runs or routing them to
     pricier GPUs. The real algorithm must reach the estimator, so the two diverge.
     """
@@ -644,7 +644,7 @@ def test_opd_applies_the_colocated_vllm_floor():
 
 def test_vram_headroom_consistent_across_sizing_paths():
     """provisional_gpu (parse-time) and required_vram_gb (submit-time) must size with the SAME
-    headroom (a validated constant), so they never disagree (PR #176 review)."""
+    headroom (a validated constant), so they never disagree."""
     from flash.providers import allocator
 
     assert allocator.vram_headroom() == 1.1
@@ -1501,9 +1501,9 @@ def test_sft_estimate_includes_capped_logits_term():
 
 
 def test_vast_candidates_searches_at_effective_disk(monkeypatch):
-    # Codex Mslml: the allocator's Vast capacity search must use the SAME effective disk floor
-    # (max(disk_gb, MIN_DISK_GB)) the submit path provisions with — else a high-disk run is advertised
-    # Vast capacity that only exists at the 60 GB floor and then can't actually rent (an impossible
+    # the allocator's Vast capacity search must use the SAME effective disk floor (max(disk_gb,
+    # MIN_DISK_GB)) the submit path provisions with — else a high-disk run is advertised Vast
+    # capacity that only exists at the 60 GB floor and then can't actually rent (an impossible
     # attempt a max_retries=0 run never escapes).
     from flash.providers import get_provider
     from flash.providers.base import AllocationConstraints
@@ -1528,9 +1528,9 @@ def test_vast_candidates_searches_at_effective_disk(monkeypatch):
 
 
 def test_vast_candidates_threads_max_wall_seconds(monkeypatch):
-    # Codex Msvb0: the allocator's Vast capacity search must thread the run's wall cap so usable_offers
-    # applies the duration floor — else the allocator advertises Vast classes whose only live offers
-    # expire before the run finishes (fatal for a max_retries=0 run).
+    # the allocator's Vast capacity search must thread the run's wall cap so usable_offers applies
+    # the duration floor — else the allocator advertises Vast classes whose only live offers expire
+    # before the run finishes (fatal for a max_retries=0 run).
     from flash.providers import get_provider
     from flash.providers.base import AllocationConstraints
     from flash.providers.vast import jobs as vast_jobs

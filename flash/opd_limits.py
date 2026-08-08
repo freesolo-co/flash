@@ -8,20 +8,9 @@ OPD_DEFAULT_EPISODE_TURNS = 24
 OPD_MIN_EPISODE_TURNS = 8
 OPD_MAX_EPISODE_TURNS = 64
 OPD_NO_SIGNAL_ATTEMPTS = 3
-# measured against the managed teacher endpoint with the supplied-token scoring contract this path
-# actually issues (echo + logprobs, max_tokens=0), 160 requests per level, two interleaved passes:
-#
-#     concurrency   throughput     rejected (HTTP 429)
-#      8 (previous)  ~15 req/s      0
-#     32             ~35-44 req/s   0        <- highest level clean in BOTH passes
-#     40             ~53-55 req/s   0 / 6
-#     48             ~61 req/s      1 / 10
-#     64             ~70-74 req/s   32 / 32
-#
-# 32 is the ceiling that is rejection-free, not the one with the highest raw throughput. above it
-# the provider sheds requests, and a shed request is a LOST TEACHER SCORE -- the OPD path drops
-# training signal rather than going faster. raw requests-per-second keeps climbing past 32 only
-# because rejections return quickly, so throughput alone would pick a value that trains on less data.
+# measured by sweep against supplied-token scoring: 32 is the highest concurrency that was
+# rejection-free in BOTH passes, not the one with the highest raw throughput.
+# higher throughput includes fast HTTP 429 responses that drop teacher scores and training signal.
 OPD_TEACHER_SCORING_CONCURRENCY = 32
 
 

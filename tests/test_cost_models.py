@@ -137,7 +137,7 @@ def test_a_pinned_revision_is_fetched_once_per_quote(monkeypatch):
 
     Setup download and required-save serialization both ask total_params_b with the pin, so an
     uncached lookup turns one quote into repeated HfApi.model_info round trips -- and a transient
-    failure on a later call rejects a run the earlier ones already validated (codex[bot]).
+    failure on a later call rejects a run the earlier ones already validated.
     """
     from flash.cost import facts
 

@@ -302,9 +302,9 @@ def test_vast_live_pricing_duration_mirrors_launch(monkeypatch):
 
 def test_pick_gpu_vast_duration_bound_fetches_market_once(monkeypatch):
     # Copilot: pick_gpu ranks every fitting class by $/hr. A duration-bound Vast query bypasses the
-    # per-call rate cache (Codex MtzrI), so pricing each candidate individually inside min(key=...)
-    # would fire one identical full market fetch PER fitting class. pick_gpu must fetch the live rate
-    # map ONCE and rank from it -> exactly one usable_offers call no matter how many classes fit.
+    # per-call rate cache, so pricing each candidate individually inside min(key=...) would fire one
+    # identical full market fetch PER fitting class. pick_gpu must fetch the live rate map ONCE and
+    # rank from it -> exactly one usable_offers call no matter how many classes fit.
     from flash.cost.facts import pick_gpu
     from flash.providers.vast import jobs as vast
     from flash.providers.vast import pricing

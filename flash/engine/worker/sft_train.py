@@ -1,8 +1,7 @@
 """sft training via verl in a separate interpreter.
 
-flash prepares the exact whole-conversation token ids and completion-only loss mask, writes them to
-parquet, and injects a custom verl dataset that returns those tensors verbatim. the parent streams
-progress and checkpoints without holding a cuda context while torchrun owns the training devices.
+flash writes exact conversation ids and completion-only masks to parquet. the parent streams progress
+and checkpoints without holding cuda while torchrun owns the devices.
 """
 
 from __future__ import annotations
@@ -110,16 +109,9 @@ def _hydra_val(value) -> str:
     return text
 
 
-# the optimizer verl builds for SFT, named rather than imported: verl resolves it on the worker
-# with importlib(optim.optimizer_impl) + getattr(optim.optimizer), so the control path never needs
-# the class object -- and the control path has no torch.
-#
-# fp32 AdamW, NOT the TRL path's 8-bit paged optimizer. verl shards with FSDP2, whose parameters
-# are DTensor; bitsandbytes' optimizer_update_8bit_blockwise is a plain CUDA kernel, not a
-# distributed operator, so it raises "got mixed torch.Tensor and DTensor" on the first step.
-# fsdp1 would sidestep DTensor but flattens parameter names, and PEFT's LoRA+ builder groups by
-# name ("lora_B" in name or param.ndim == 1) -- under a flat_param every parameter is 1-D and
-# would land in the 16x group, corrupting training silently instead of crashing.
+# verl imports this optimizer by name in the torch-bearing worker process.
+# use fp32 adamw: bitsandbytes cannot update fsdp2 dtensors. fsdp1 is not an alternative because flattened
+# names make peft's lora+ grouping treat every parameter as one-dimensional and silently mis-group it.
 _VERL_OPTIMIZER_IMPL = "torch.optim"
 _VERL_OPTIMIZER_NAME = "AdamW"
 
@@ -595,28 +587,13 @@ class _VerlCheckpointWatcher:
         return not self.required_steps or step in self.required_steps
 
     def _staged_source(self, step: int, checkpoint_dir: str) -> str:
-        """Pin a completed checkpoint against verl's retention before the slow work reads it.
+        """hardlink a completed checkpoint before verl retention can prune it.
 
-        This watcher publishes on its own thread, so the merge and the multi-GB upload below both
-        overlap training. verl owns `local_dir` and prunes it from the CHILD process: under
-        `trainer.max_ckpt_to_keep=1`, `register_checkpoint` calls `shutil.rmtree` on global_step_N as
-        soon as N+1 finishes saving. Nothing the parent sets can pin a directory across that, so a
-        required save still exporting or uploading when the next save lands reads a tree being
-        deleted underneath it, and an otherwise successful paid run fails its required save. Close
-        `save_at_steps` (say `[2, 3]`) make that likely rather than theoretical.
+        export and upload overlap training, while verl may delete ``global_step_N`` as soon as the
+        next save completes. hardlinks preserve the data in o(1) without moving the path referenced by
+        ``latest_checkpointed_iteration.txt``. copies can lose the same race; renames break resume.
 
-        HARDLINKS, not a copy and not a rename:
-        - a copy of tens of GB is itself slow enough to lose the same race it is meant to close.
-        - a rename would win the race but break in-pod resume: verl resolves
-          `latest_checkpointed_iteration.txt` to `global_step_N` (`find_latest_ckpt_path`), so moving
-          the directory leaves the tracker pointing at nothing if the pod is preempted afterwards.
-
-        Linking is O(1) per file and leaves the original in place, so verl's retention and resume see
-        exactly what they saw before while the link keeps the DATA alive for as long as this watcher
-        needs it. A pruned original just drops its own reference; the inode survives.
-
-        Best-effort by design: any failure returns the original path, which is the previous
-        (race-exposed) behaviour. Degrading beats failing a run that would otherwise complete.
+        best-effort: on failure, return the original race-exposed path rather than fail the run.
         """
         staged = os.path.join(self.staging_root, f"global_step_{step}")
         try:
@@ -1113,14 +1090,10 @@ def run_sft_train(spec=None) -> None:
         python_bin = resolve_verl_python(
             workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
         )
-        # remove-padding packs the micro-batch into one row, which is correct for softmax attention
-        # (transformers rebuilds its varlen boundaries from the restarting position ids) but NOT for
-        # a gated-deltanet hybrid: its conv and recurrent state only reset if the child can honor
-        # seq_idx and cu_seqlens, and the no-fla fallbacks accept both and discard them. so pack a
-        # gdn model only when the child proves it can reset, and otherwise fall back to verl's
-        # padded path, which carries a real attention_mask and is boundary-correct by construction.
-        # the modeling module is resolved HERE, in the parent, because it needs a hub/cache read the
-        # child must not repeat; "" skips the question for a non-hybrid.
+        # packed gdn hybrids require child support for seq_idx and cu_seqlens resets; no-fla fallbacks
+        # accept and discard them. probe before packing, otherwise use boundary-correct padded input.
+        # resolve the modeling module in the parent to avoid repeating the hub/cache read; empty means
+        # non-hybrid.
         gdn_hybrid = model_is_gdn_hybrid(model_id, model_revision)
         gdn_module = gdn_probe_module(model_id, model_revision) if gdn_hybrid else ""
         # ONE child answers every independent capability question. each used to cost its own
@@ -1141,21 +1114,10 @@ def run_sft_train(spec=None) -> None:
     # `gdn_hybrid`/`gdn_module` and the child's answer are resolved above, inside the configuring
     # liveness wrap, because the probe is part of the setup silence that wrap exists to cover.
     gdn_reset_arch = gdn_reset_arch_from_caps(caps, gdn_module) if gdn_hybrid else None
-    # remove-padding is verl's TENSOR LAYOUT switch, not this run's packing/step contract, so nothing
-    # here may gate it. verl defaults to `pad_mode: no_padding`, whose sft_loss reads
-    # `log_prob.values()` -- valid only on the nested tensor the remove-padding path builds. turning
-    # it off hands that loss a strided tensor and the first optimizer step dies with "values expected
-    # sparse tensor layout but got Strided". flash cannot switch to the padded path instead: its
-    # `pad_mode: right` branch collates with `default_collate` (uniform rows only) and its loss reads
-    # `response_mask`, and FlashTokenizedSFTDataset emits neither -- variable-length rows carrying
-    # input_ids/position_ids/loss_mask. no_padding is the only mode this dataset fits.
-    #
-    # a gdn hybrid without child-side resets is safe here anyway, because it has no packed
-    # neighbours to contaminate: `_packing_mode` answers "exact-unpacked" for every gdn model
-    # (supported=False), that pins `examples_per_update` to 1, and train_batch_size below is exactly
-    # profile.examples_per_update. one example per update leaves nothing to carry -- the same
-    # argument the profile makes in sft_workload._packing_mode. batch=1 is the isolation lever;
-    # this flag never was, and gating it only selected a code path the loss cannot consume.
+    # remove-padding is required by this custom dataset and verl's no_padding loss; disabling it
+    # hands sft_loss a strided tensor and fails on the first step. gdn remains safe because unsupported
+    # packing pins examples_per_update and train_batch_size to 1, leaving no adjacent example state to
+    # contaminate. batch size 1 is the isolation lever, not the tensor-layout flag.
     use_remove_padding = True
 
     config = {
@@ -1186,12 +1148,9 @@ def run_sft_train(spec=None) -> None:
         "experiment_name": experiment_name,
         "loop_epochs": loop_epochs,
         "loggers": loggers,
-        # liger zeroes the lora gradient under this fsdp2 + peft + gradient-checkpointing
-        # composition: a matched a/b on qwen3.5-9b (identical loss to 4 decimals) measured
-        # grad_norm 0.0 with liger on and 7.02 with it off. the grpo path never enables it,
-        # which is why only sft was affected. verl already disables liger's fused linear ce
-        # (it conflicts with verl's forward patching) and flash gets fused ce from
-        # use_fused_kernels + impl_backend=torch, so nothing of value is lost here.
+        # liger produces a 0.0 lora grad norm under fsdp2 + peft + gradient checkpointing, versus
+        # 7.02 off in a matched qwen3.5-9b test. fused linear ce remains provided by
+        # use_fused_kernels with impl_backend=torch.
         "use_liger": False,
         "gradient_checkpointing": gradient_checkpointing and not reentrant_gradient_checkpointing,
         "total_training_steps": update_horizon if max_steps > 0 else None,
@@ -1289,12 +1248,8 @@ def run_sft_train(spec=None) -> None:
             raise RuntimeError(
                 "verl reached an optimizer step before the required lora+ shim succeeded"
             )
-        # these three reach the logger as plain python floats (engine_workers.py returns
-        # loss/grad_norm through .item() and lr through get_last_lr()), so unlike OPD's
-        # Metric(SUM) they do not print in numpy's np.float64(...) spelling today. they share
-        # the parser anyway: one upstream metric-type change would otherwise reintroduce the
-        # same silent drop here, and the shared helper also rejects nan/inf, which would
-        # serialize into the heartbeat as bare NaN and break strict json consumers.
+        # these metrics are currently floats, but use the shared parser to tolerate upstream metric
+        # wrapper changes and reject nan/inf before strict-json heartbeat serialization.
         loss = parse_verl_metric(line, "train/loss")
         grad_norm = parse_verl_metric(line, "train/grad_norm")
         learning_rate_value = parse_verl_metric(line, "train/lr")
@@ -1304,21 +1259,11 @@ def run_sft_train(spec=None) -> None:
         if grad_norm is not None:
             progress["grad_norm"] = grad_norm
             observed_grad_norms.append(grad_norm)
-            # a grad norm of exactly 0.0 means the backward pass produced nothing for every
-            # trainable parameter. that is never legitimate: it is a broken graph, not a small
-            # update. GRAD-001 shipped four runs that reported done and billed while training
-            # nothing, because this number was recorded and never read. fail the run instead of
-            # paying for a zero adapter that then deploys and serves.
+            # a 0.0 grad norm means backward produced nothing for every trainable parameter. fail the
+            # run instead of billing and serving an unchanged adapter (GRAD-001).
             #
-            # VERL-138: this deliberately does NOT condition on the learning rate. verl computes
-            # grad_norm in optimizer_step (transformer_impl.py:683-688) by clipping over p.grad,
-            # strictly BEFORE optimizer.step() and before lr_scheduler_step() advances the
-            # schedule -- so the lr cannot make a gradient zero. the earlier "an lr of 0.0
-            # legitimately produces grad_norm 0.0" reading had the causality backwards, and a
-            # decayed final step was enough to launder a dead run: on a 2-step run the sequence
-            # (grad 0.0, lr 5e-5) then (grad 0.0, lr 0.0) cleared the counter, so the run reported
-            # done and billed while training nothing. every real lr:0.0 line on record comes from
-            # a run that was already broken at every other step too.
+            # VERL-138: do not condition on lr. transformer_impl.py:683-688 computes grad_norm from
+            # p.grad before optimizer.step() and scheduler advance, so lr cannot make the gradient zero.
             if grad_norm == 0.0:
                 zero_grad_steps.append(int(progress["step"] or 0))
                 if len(zero_grad_steps) >= _MAX_ZERO_GRAD_STEPS:
@@ -1352,13 +1297,9 @@ def run_sft_train(spec=None) -> None:
     return_code = 0
     if resume_step < update_horizon:
         watcher.start()
-        # completeness is only a meaningful question when training ran to the end. an on_line
-        # callback that raises (the zero-grad guard above, the lora+ guard) unwinds BEFORE
-        # return_code is assigned, so deriving the flag from return_code alone would leave it at
-        # its initial 0 and demand every required save from a run that stopped at step 2. the
-        # watcher would then raise "required saves were not durably published" from the finally
-        # and REPLACE the diagnosis with a downstream symptom. opd_train tracks the same flag for
-        # the same reason.
+        # check save completeness only after normal training completion. callback failures occur before
+        # return_code assignment; checking anyway would replace the real zero-grad or lora+ diagnosis
+        # with a missing-save error. opd_train uses the same guard.
         training_completed = False
         try:
             with liveness_heartbeat(
@@ -1388,12 +1329,9 @@ def run_sft_train(spec=None) -> None:
         raise RuntimeError(
             f"sft completed {final_step}/{update_horizon} requested optimizer updates"
         )
-    # the consecutive-run guard in on_line needs _MAX_ZERO_GRAD_STEPS steps to fire, so a horizon
-    # shorter than that (one update is ordinary when the retained rows fit a single batch) could
-    # report done having trained nothing. an isolated zero inside a longer run stays tolerated --
-    # this only rejects a session in which EVERY observed update had a dead gradient. a resumed run
-    # abstains: its restored weights carry earlier updates this session never saw, which is the same
-    # abstention _check_grpo_had_a_gradient makes.
+    # short runs may finish before the consecutive zero-grad guard fires, so reject sessions where
+    # every observed update had a dead gradient. tolerate isolated zeros; abstain on resume because
+    # restored weights include unseen earlier updates.
     if not resume_step and observed_grad_norms and not any(observed_grad_norms):
         raise RuntimeError(
             f"verl reported train/grad_norm=0.0 on every one of {len(observed_grad_norms)} "

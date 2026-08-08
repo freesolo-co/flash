@@ -621,7 +621,7 @@ def test_lifecycle_fallback_pin_is_persisted_for_recovery(orch, monkeypatch):
     record and calls that helper with `attempt_started=True`, which deliberately refuses to resolve
     again. A pin held in the lifecycle's local `spec` alone would leave recovery unpinned, so a later
     attempt could resolve a moved ref to different code while resuming the first attempt's
-    checkpoint (codex[bot]).
+    checkpoint.
 
     Exercised on grpo because sft can no longer reach this state at all: its profile gate rejects an
     unpinned environment at submit instead of deferring the pin (the fail-closed test above). grpo
@@ -1724,7 +1724,7 @@ def test_sole_class_cache_drop_does_not_claim_the_class_is_exhausted(orch, monke
     class has been tried at all. A cache-drop retry then deliberately leaves tried_classes untouched
     and reselects the same class cold, so the line read "expecting to retry on H100 @ runpod again,
     no untried GPU class fits this run": naming the untried class in the same clause that denies one
-    exists. Derive the clause from the sets the retry will actually see instead (codex[bot])."""
+    exists. Derive the clause from the sets the retry will actually see instead."""
     from flash.providers import allocator
     from flash.providers.base import Candidate, PollResult
     from flash.providers.runpod import api as runpod_api

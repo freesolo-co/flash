@@ -1,12 +1,7 @@
 """Offline-by-default test harness.
 
-There is no "skip the network" env flag; instead this autouse fixture stubs the network
-boundaries the production code would otherwise reach, so the whole suite stays hermetic (no
-real RunPod / Hugging Face calls) without any env switch. A test that exercises one of
-these boundaries monkeypatches it itself — applied after this fixture, so the test's patch
-wins. (The freesolo auth verify isn't stubbed here because tests that touch it either patch
-``_freesolo_verify`` or ``urllib.request.urlopen`` directly; a global ``urlopen`` stub would
-also break the client tests, which talk to a real loopback server.)
+Autouse fixtures stub production network boundaries; later test patches still win. Freesolo auth
+is not stubbed globally because client tests use a real loopback server.
 """
 
 from __future__ import annotations
@@ -58,26 +53,10 @@ def _offline(monkeypatch):
     with contextlib.suppress(Exception):  # package absent in a client-only checkout
         import runpod_flash  # noqa: F401
 
-    # Secrets flash forwards AUTOMATICALLY (no per-job declaration) are the dangerous ones: a
-    # submit-path test asserting on the outgoing payload picks them up from the operator's ambient
-    # env and fails, and a less careful test would ship a real key into a fixture. Derived from the
-    # production constant so a key added there is scrubbed here without touching this file.
-    #
-    # Lambda and Vast are OPT-IN instance-based complements: leaving their keys set makes the
-    # provider "available" and pulls live capacity/pricing into offline tests (allocation
-    # candidates, registry). A provider test opts back in with ``monkeypatch.setenv(...)``.
-    # FREESOLO_API_KEY is scrubbed for a different reason than the rest: it is not forwarded to a
-    # job, it selects the ORGANIZATION every CLI command runs against. A box with a .env above the
-    # repo (the dotenv walk-up above) gets it refilled mid-suite, and the CLI then prepends its
-    # "this overrides your saved login" warning to stderr -- so tests asserting on exact stderr fail
-    # on a developer machine while passing in CI, which reads as a broken test rather than a leaked
-    # credential. Every test that wants the var sets it itself after this fixture.
-    #
-    # FLASH_STANDALONE and FLASH_HF_NAMESPACE are not credentials but they switch global MODE, and a
-    # developer shell that followed SELF_HOSTING.md exports both. Left set, managed-mode tests take
-    # the standalone auth path, the disabled billing loop, a raising ``serving_base_url``, or a
-    # non-default artifact namespace -- and CI, whose env is clean, still passes. Every test that
-    # wants either one sets it itself (see tests/test_server_standalone.py).
+    # scrub automatically forwarded secrets from the production key set so operator credentials
+    # never enter fixtures. lambda/vast keys enable live providers, FREESOLO_API_KEY changes org
+    # identity, and FLASH_STANDALONE/FLASH_HF_NAMESPACE change global mode. tests opt in after this
+    # fixture; see tests/test_server_standalone.py.
     from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 
     for _key in {
@@ -145,7 +124,7 @@ def _child_subreaper_does_not_leak_between_tests():
     pytest process from 0 to 1 for the rest of the session. From then on every later test adopts
     orphaned grandchildren it never waits on, so it accumulates zombies and its result depends on
     what ran before it. The ``subreaper`` fixture in ``test_backend_common`` restores only the tests
-    that ask for it, which is not where the flag is now set (codex[bot]).
+    that ask for it, which is not where the flag is now set.
 
     Autouse and here rather than in that module: five test files reach those entry points, and the
     tests harmed are any that follow -- so the guarantee has to cover the whole suite. The module's
