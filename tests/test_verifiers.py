@@ -1660,6 +1660,64 @@ def test_multi_turn_reward_groups_are_scored_concurrently(monkeypatch):
     assert [reward.episode for reward in rewards] == [0.5] * 8
 
 
+class _FailingGroupedEnv(_FakeSingleTurnEnv):
+    """Raises on one designated group and counts how many groups actually executed."""
+
+    def __init__(self, fail_on: str):
+        self.fail_on = fail_on
+        self.lock = threading.Lock()
+        self.executed = 0
+
+    def score_responses(self, example, response_texts):
+        with self.lock:
+            self.executed += 1
+        # hold the worker long enough that the groups queued behind this one are still QUEUED, not
+        # started, when the raise surfaces -- that is what cancel_futures can drop.
+        time.sleep(0.05)
+        if str(example.input) == self.fail_on:
+            raise RuntimeError("scorer exploded")
+        return [_RewardResult(score=1.0, success=True, metrics=()) for _text in response_texts]
+
+
+@pytest.mark.parametrize(
+    ("fail_on", "ceiling"),
+    [("q1", 16), ("q19", 32)],
+)
+def test_a_failing_scorer_group_wastes_at_most_a_pool_width(monkeypatch, fail_on, ceiling):
+    """A raise must not drag the whole batch through the scorer before it propagates.
+
+    The serial loop stopped AT the failing group; the pool also runs whatever is already in flight,
+    and rl_train.py's batch-level retry re-scores everything serially afterwards, so those calls are
+    billed TWICE. Bounding that waste is what makes the concurrency acceptable.
+
+    Two mechanisms hold the bound independently, which is why this asserts on the OBSERVED count
+    rather than on either one: `map`'s result generator cancels the pending futures when the
+    exception abandons it, and `shutdown(cancel_futures=True)` cancels whatever is still queued.
+    Removing either alone leaves the count at 10 (verified by mutation) -- only submit-then-gather
+    with a plain shutdown runs all 40, which is exactly the regression worth catching.
+
+    Asserted as a CEILING (one pool width past the failure point, doubled for scheduling slack), not
+    an equality: the exact count depends on how many workers have picked up work when the raise
+    lands. Measured at 10 for the early failure and 28 for the late one.
+    """
+    sdk_env = _FailingGroupedEnv(fail_on)
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    items = [
+        ({"id": f"ex-{prompt}", "input": f"q{prompt}", "output": "4"}, {"response_text": "x"})
+        for prompt in range(40)
+    ]
+
+    with pytest.raises(RuntimeError, match="scorer exploded"):
+        env.reward_many(items)
+
+    assert sdk_env.executed < 40, "the whole batch ran: queued groups were not cancelled"
+    assert sdk_env.executed <= ceiling, sdk_env.executed
+
+
 def test_a_single_task_group_still_scores_inline(monkeypatch):
     """One group must not spawn a pool: a thread for a single call is pure overhead.
 

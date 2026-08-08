@@ -345,6 +345,27 @@ class FreesoloEnvironment(BaseEnvironment):
             try:
                 # `map` propagates the first exception and preserves input order, so a scorer that
                 # raises fails the step exactly as the serial loop did.
+                #
+                # a FAILING scorer costs more work here than it did serially: the serial loop
+                # stopped AT the failing group, this also pays for whatever is already running.
+                # rl_train.py:1001 catches the raise and re-scores the batch serially, so those
+                # calls are billed twice. the excess is bounded at one pool width -- measured on a
+                # 40-group batch at width 8, 10 groups execute when group 2 raises and 28 when
+                # group 20 does. `map` and `cancel_futures=True` hold that bound INDEPENDENTLY:
+                # map's result generator cancels the pending futures when the exception abandons
+                # it, and shutdown cancels whatever is still queued. either alone gives 10; only
+                # submit-then-gather with a plain shutdown runs all 40. both are kept because the
+                # cost is a keyword argument and neither is obviously the one a later edit keeps.
+                #
+                # two ways to shrink the excess further were measured and rejected. an abort flag
+                # checked before each call saves exactly ONE group (10 -> 9, 28 -> 27), because the
+                # waste is work already running when the failure surfaces, not work queued behind
+                # it -- not worth the branch. returning partial results is worse than it looks:
+                # `out` would hold `None` for unscored rows, and both `_grouped_score`
+                # (`float(result.score)`) and multiturn_reward_scoring's `_validated_reward`
+                # (`float(reward.episode)`) dereference every element, so a None row converts a
+                # partial success into an AttributeError that the multi-turn path does not catch.
+                # the honest bound is the pool width, and _REWARD_GROUP_CONCURRENCY sets it.
                 scored = list(pool.map(score_group, order))
             finally:
                 pool.shutdown(wait=True, cancel_futures=True)
