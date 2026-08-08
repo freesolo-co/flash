@@ -22,17 +22,34 @@ BASE_DOCKERFILE = REPO_ROOT / "Dockerfile"
 PUBLISH_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "publish-image.yml"
 ENTRYPOINT = REPO_ROOT / "deploy" / "infisical" / "entrypoint.sh"
 
-# Every file that may install software from the network. A new one must be added here
-# deliberately, which is the point: the checks below then apply to it.
+# Every file that may install software from the network. DISCOVERED, not enumerated: a hand-kept
+# list silently stops covering the next Dockerfile someone adds, and a guard that quietly narrows
+# its own scope reports the same green as one that found nothing. `docker/Dockerfile.kernelcache*`
+# were both missed by an enumerated list that claimed to be repo-wide.
 INSTALLER_FILES = (
-    BASE_DOCKERFILE,
-    REPO_ROOT / "Dockerfile.worker",
+    *sorted(REPO_ROOT.glob("Dockerfile*")),
+    *sorted(REPO_ROOT.glob("docker/Dockerfile*")),
     *sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml")),
 )
 
-# `curl … | bash`, `wget … | sh`, and friends: a fetch whose output is piped into a shell, with
-# or without sudo. Applied to joined logical lines, so a continued command is one string here.
-PIPE_TO_SHELL = re.compile(r"(?:curl|wget)[^|]*\|\s*(?:sudo\s+)?(?:ba|z|k)?sh\b")
+# `curl … | bash`, `wget … | sh`, and friends: a fetch whose output is piped into a shell.
+# Applied to joined logical lines, so a continued command is one string here.
+#
+# The shell may be reached by an absolute path (`| /bin/bash`) and may sit behind wrapper
+# commands (`| sudo -E bash`, `| env bash`, `| xargs sh`), so match any run of wrapper words and
+# flags before it, and allow a leading path on the shell itself. Anchoring the shell to a bare
+# word left `| /bin/bash` -- the same command, spelled the way a hardened script writes it --
+# passing a guard whose entire purpose is to reject it.
+#
+# The wrapper run is `-`-prefixed flags and known exec wrappers only, never arbitrary words:
+# allowing any word made `curl … | grep bash` match, where the shell name is an ARGUMENT being
+# searched for rather than the command being run.
+PIPE_TO_SHELL = re.compile(
+    r"(?:curl|wget)[^|]*\|\s*"  # a network fetch piped onward
+    r"(?:(?:sudo|env|xargs|nohup|exec|command|-\S+)\s+)*"  # exec wrappers and their flags
+    r"(?:[\w./-]*/)?"  # optional path on the shell: /bin/, /usr/bin/
+    r"(?:ba|z|k|da)?sh(?:\s|$)"  # sh, bash, zsh, ksh, dash -- as the COMMAND
+)
 
 # A line ending in any of these does not end the command -- the next line continues it. `\` is
 # the explicit continuation; a trailing `|`, `&&`, or `||` is an incomplete construct the shell
@@ -108,20 +125,64 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
             id="continuation-after-pipe",
         ),
         pytest.param("RUN wget -qO- https://x.example/i.sh | sudo sh\n", id="wget-sudo"),
+        # The shell reached by path, or behind a wrapper command. These are how a script that
+        # thinks of itself as careful spells the same thing.
+        pytest.param("RUN curl -sSL https://x.example/i.sh | /bin/bash\n", id="absolute-path"),
+        pytest.param("RUN curl -sSL https://x.example/i.sh | env bash\n", id="env-wrapper"),
+        pytest.param("RUN curl -sSL https://x.example/i.sh | sudo -E bash\n", id="sudo-with-flag"),
+        pytest.param(
+            "RUN curl -fsSL https://x.example/i.sh | bash -s -- --yes\n", id="bash-with-args"
+        ),
     ],
 )
 def test_the_pipe_to_shell_guard_catches_what_it_claims_to(snippet: str, tmp_path: Path):
     """The guard above is only worth having if it fails on the thing it prohibits.
 
     A scanner that silently matches nothing reports the same green as a clean repository. Every
-    multi-line spelling here evaded an earlier version of this guard, so they are pinned rather
-    than assumed: each one is the same prohibited command, written across two lines a different
-    way.
+    spelling here evaded an earlier version of this guard, so they are pinned rather than
+    assumed: each one is the same prohibited command, written a different way.
     """
     planted = tmp_path / "Dockerfile"
     planted.write_text("FROM scratch\n" + snippet)
+
     with pytest.raises(AssertionError, match="pipes a downloaded script into a shell"):
         test_nothing_pipes_a_downloaded_script_into_a_shell(planted)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        pytest.param('echo "${sha}  ${deb}" | sha256sum -c -', id="verify-a-local-file"),
+        pytest.param("curl -sSL https://x.example/c.tgz | sudo tar -xz -C /usr/bin", id="into-tar"),
+        pytest.param("curl -s https://x.example/api | jq .version", id="into-jq"),
+        pytest.param("curl -s https://x.example/list | grep bash", id="shell-name-as-argument"),
+    ],
+)
+def test_the_pipe_to_shell_guard_does_not_flag_ordinary_pipelines(line: str, tmp_path: Path):
+    """The rule is "do not execute a download", not "do not use a pipe".
+
+    A guard that fires on every pipeline gets suppressed rather than fixed, so the non-shell
+    destinations are pinned too. `grep bash` is the sharp one: the shell name appears as an
+    ARGUMENT being searched for, not as the command being run, and an earlier draft of the
+    wrapper handling matched it.
+    """
+    planted = tmp_path / "Dockerfile"
+    planted.write_text(f"FROM scratch\nRUN {line}\n")
+
+    test_nothing_pipes_a_downloaded_script_into_a_shell(planted)
+
+
+def test_the_installer_scan_covers_every_dockerfile_in_the_repo():
+    """The scan discovers its own inputs, so a new Dockerfile cannot silently escape it.
+
+    An enumerated list looks identical to a complete one right up until someone adds a file:
+    `docker/Dockerfile.kernelcache` and its relayer were both outside a list whose own docstring
+    called the rule repo-wide. Deriving the set from the tree is what makes the claim true.
+    """
+    on_disk = {p.resolve() for p in REPO_ROOT.rglob("Dockerfile*") if ".git" not in p.parts}
+    scanned = {p.resolve() for p in INSTALLER_FILES}
+    missed = on_disk - scanned
+    assert not missed, f"Dockerfiles not covered by the installer scan: {sorted(missed)}"
 
 
 def test_the_infisical_cli_is_pinned_and_checksum_verified():
