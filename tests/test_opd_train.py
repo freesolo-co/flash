@@ -3890,7 +3890,7 @@ def test_deterministic_empty_alignment_exhaustion_remains_permanent():
     assert bridge.empty_alignments == 3
 
 
-def test_multiturn_teacher_scores_are_chunked_and_ordered(monkeypatch):
+def test_multiturn_teacher_scores_are_issued_in_one_wave_and_ordered(monkeypatch):
     class OrderedTeacher:
         def __init__(self):
             self.batch_sizes = []
@@ -3915,10 +3915,12 @@ def test_multiturn_teacher_scores_are_chunked_and_ordered(monkeypatch):
                 )
             return results
 
-    # turn count is derived from the measured concurrency ceiling for the same reason as the batcher
-    # test above: this pins CHUNKING AND ORDER (one full chunk, then the remainder, with scores
-    # still in turn order), and a hardcoded 15 turns would stop chunking at all once the ceiling
-    # rose past it -- leaving an assertion that can no longer observe the behaviour it names.
+    # turn count is derived from the measured concurrency ceiling so the case stays MEANINGFUL if
+    # the ceiling moves: it is deliberately larger than the ceiling, which is exactly the shape the
+    # old chunk-and-drain loop split into two waves. score_many bounds its own pool, so handing it
+    # every item keeps the provider-facing concurrency identical while removing the barrier where
+    # the slowest request in wave 1 held back wave 2. a hardcoded turn count would stop exceeding
+    # the ceiling once it rose, leaving an assertion that no longer observes what it names.
     from flash.opd_limits import OPD_TEACHER_SCORING_CONCURRENCY as bound
 
     turns = bound + bound // 2
@@ -3944,7 +3946,7 @@ def test_multiturn_teacher_scores_are_chunked_and_ordered(monkeypatch):
 
     result = bridge.score_multiturn("session-1")
 
-    assert teacher.batch_sizes == [bound, turns - bound]
+    assert teacher.batch_sizes == [turns]
     assert [_teacher_logsum(turn) for turn in result["turns"]] == [
         -float(index) for index in range(1, turns + 1)
     ]

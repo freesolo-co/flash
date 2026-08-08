@@ -233,3 +233,39 @@ def test_response_contract_rejects_nonfinite_scores(score):
 
 def test_multimodal_scoring_surface_is_removed():
     assert not hasattr(_client(_token_keyed_response()), "score_many_multimodal")
+
+
+def test_score_many_caps_in_flight_requests_at_the_measured_ceiling():
+    # the multi-turn path hands score_many a WHOLE EPISODE (up to OPD_MAX_EPISODE_TURNS = 64) in
+    # one call rather than pre-slicing it, so score_many's own pool is now the only thing standing
+    # between an episode and the provider. OPD_TEACHER_SCORING_CONCURRENCY is a measured
+    # rejection-free ceiling and a shed request is a LOST TEACHER SCORE, so assert the observable
+    # property -- peak simultaneous requests -- rather than the pool's declared max_workers.
+    import threading
+    import time
+
+    from flash.opd_limits import OPD_TEACHER_SCORING_CONCURRENCY
+
+    client = _client(_token_keyed_response())
+    lock = threading.Lock()
+    in_flight = 0
+    peak = 0
+
+    def score_one(_prompt, _completion):
+        nonlocal in_flight, peak
+        with lock:
+            in_flight += 1
+            peak = max(peak, in_flight)
+        # hold each call open so every worker the pool is willing to run overlaps here.
+        time.sleep(0.02)
+        with lock:
+            in_flight -= 1
+        return TeacherScore(tokens=[], input_tokens=3, output_tokens=1)
+
+    client._score_one = score_one
+    items = [(f"prompt-{index}", f"completion-{index}") for index in range(2 * OPD_TEACHER_SCORING_CONCURRENCY)]
+
+    results = client.score_many(items)
+
+    assert len(results) == len(items)
+    assert peak <= OPD_TEACHER_SCORING_CONCURRENCY

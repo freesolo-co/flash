@@ -1145,13 +1145,14 @@ class _TeacherAlignmentBridge:
                     )
                     for position in scorable
                 ]
-                teacher_batches = []
-                for start in range(0, len(items), OPD_TEACHER_SCORING_CONCURRENCY):
-                    teacher_batches.extend(
-                        self.teacher.score_many(
-                            items[start : start + OPD_TEACHER_SCORING_CONCURRENCY]
-                        )
-                    )
+                # ONE call, not a chunk-and-drain loop. score_many already bounds itself to
+                # OPD_TEACHER_SCORING_CONCURRENCY workers, so slicing the items first did not lower
+                # the provider-facing rate -- it only added a BARRIER every 32 items, where the
+                # slowest request in a wave held back the whole next wave and the gpu idled behind
+                # it. handing the full list over keeps the same concurrency ceiling while letting a
+                # finished worker start the next item immediately. `executor.map` preserves input
+                # order, so the zip with `scorable` below is unchanged.
+                teacher_batches = self.teacher.score_many(items)
                 if len(teacher_batches) != len(scorable):
                     raise RuntimeError("teacher returned the wrong number of multi-turn OPD scores")
                 with self._stats_lock:
