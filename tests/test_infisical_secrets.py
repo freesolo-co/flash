@@ -48,6 +48,12 @@ def _logical_lines(text: str) -> list[str]:
     pending = ""
     for raw in text.splitlines():
         code = raw.split("#", 1)[0].rstrip()
+        # A comment BETWEEN a `\` and the rest of the command does not end the command: docker
+        # removes comment lines before joining continuations, so `curl … \` / `# note` / `| bash`
+        # is still one RUN. Treating the stripped-empty line as a terminator would drop the join
+        # and let that spelling past -- verified against a real `docker build`.
+        if pending and not code:
+            continue
         if code.endswith("\\"):
             pending += code[:-1] + " "
             continue
@@ -76,6 +82,11 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
     [
         pytest.param("RUN curl -sSL https://x.example/i.sh | bash\n", id="one-line"),
         pytest.param("RUN curl -fsSL https://x.example/i.sh \\\n    | bash\n", id="continuation"),
+        # Docker strips comments BEFORE joining continuations, so this is still one RUN.
+        pytest.param(
+            "RUN curl -fsSL https://x.example/i.sh \\\n# looks harmless\n    | bash\n",
+            id="continuation-across-comment",
+        ),
         pytest.param("RUN wget -qO- https://x.example/i.sh | sudo sh\n", id="wget-sudo"),
     ],
 )
