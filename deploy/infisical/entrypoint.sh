@@ -96,17 +96,21 @@ for k in ${INFISICAL_KEEP:-}; do
   # so a typo'd or absent KEEP entry would silently WIPE a credential rather than leave the
   # vault's value alone. `${K+set}` distinguishes unset from set-but-empty, so an explicitly
   # empty container value still wins (that is a deliberate choice by whoever wrote it).
-  eval "keep_is_set=\${$k+set}"
-  [ "${keep_is_set:-}" = set ] || continue
-  # Assign through eval rather than `$(...)`: command substitution strips ALL trailing newlines,
+  eval "[ \"\${$k+set}\" = set ]" || continue
+  # Expand straight into the argument list, with no scratch variable in between. Two reasons.
+  #
+  # A scratch name is itself an environment variable, so holding the value in one would clobber
+  # whatever the container set under that name, and unsetting it afterwards would DELETE that
+  # variable from the child -- a variable the caller never mentioned in INFISICAL_KEEP and had
+  # no reason to expect this script to touch.
+  #
+  # And expansion here rather than `$(...)`: command substitution strips ALL trailing newlines,
   # so a kept multiline value (a PEM private key, a certificate chain) would arrive one or more
   # bytes shorter than the container set it -- silently, and only for the values most likely to
   # break something downstream. The expansion sits inside double quotes, so the value's own
   # content is never re-parsed: `$(...)`, backticks, quotes, and backslashes in it stay literal.
-  eval "keep_value=\"\${$k}\""
-  set -- "$k=$keep_value" "$@"
+  eval "set -- \"$k=\${$k}\" \"\$@\""
 done
-unset keep_is_set keep_value
 
 exec infisical run \
   --projectId "$INFISICAL_PROJECT_ID" \

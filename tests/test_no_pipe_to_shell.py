@@ -131,8 +131,8 @@ def _shell_part(line: str) -> str:
 # a live installer through. A `>&`-style redirection is matched before the bare `&` so its `&` is
 # not taken for a separator either.
 _TOKEN = re.compile(
-    r"""'[^']*'|"(?:[^"\\]|\\.)*"|\d*[<>]{1,2}&\d*|\|\||&&|\||;|&"""
-    r"""|(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s;|&'"])+"""
+    r"""'[^']*'|"(?:[^"\\]|\\.)*"|\d*[<>]{1,2}&\d*|\|\||&&|\||;|&|\(|\)"""
+    r"""|(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s;|&()'"])+"""
 )
 _FETCH = re.compile(r"(?:[\w./-]*/)?(?:curl|wget)")
 
@@ -233,6 +233,33 @@ def _command_word(tokens: list[str]) -> tuple[str, int | None]:
     return "", None
 
 
+def _pipelines_in(text: str) -> list[list[list[str]]]:
+    """Split a command list into pipelines, and each pipeline into its stages.
+
+    `||`, `&&`, `;`, and `&` end a pipeline: what follows is a separate command with nothing
+    piped into it. Reading the second bar of a `||` as a pipe made legitimate
+    `curl … || bash recover.sh` fallbacks match.
+
+    Shared by the top-level line and by a shell's `-c` program, because they are the same
+    grammar -- `sh -c 'true; bash'` is a command list exactly as a `RUN` line is. Splitting the
+    two apart is what left the `-c` program resolving only its first command.
+    """
+    pipelines: list[list[list[str]]] = [[[]]]
+    for tok in _tokenize(text):
+        if tok in ("||", "&&", ";", "&"):
+            pipelines.append([[]])
+        elif tok == "|":
+            pipelines[-1].append([])
+        else:
+            pipelines[-1][-1].append(tok)
+    return pipelines
+
+
+def _commands_in(text: str) -> list[list[str]]:
+    """Every command in a command list, flattened across pipelines and pipe stages."""
+    return [stage for pipeline in _pipelines_in(text) for stage in pipeline if stage]
+
+
 def _pipeline_stages_after_a_fetch(line: str) -> list[list[str]]:
     """Every stage that a curl/wget's output flows into, as token lists.
 
@@ -244,17 +271,8 @@ def _pipeline_stages_after_a_fetch(line: str) -> list[list[str]]:
     follows is a separate command with nothing piped into it. Reading the second bar of a `||` as
     a pipe made legitimate `curl … || bash recover.sh` fallbacks match.
     """
-    pipelines: list[list[list[str]]] = [[[]]]
-    for tok in _tokenize(line):
-        if tok in ("||", "&&", ";", "&"):
-            pipelines.append([[]])
-        elif tok == "|":
-            pipelines[-1].append([])
-        else:
-            pipelines[-1][-1].append(tok)
-
     downstream: list[list[str]] = []
-    for stages in pipelines:
+    for stages in _pipelines_in(line):
         fetched = next((i for i, s in enumerate(stages) if any(_FETCH.fullmatch(t) for t in s)), -1)
         if fetched >= 0:
             downstream.extend(stages[fetched + 1 :])
@@ -279,8 +297,15 @@ def _stage_runs_a_shell(tokens: list[str]) -> bool:
         #
         # So the operand replaces the question, it does not answer it: ask whether THAT command
         # is a shell. `sh -c 'bash'` still matches, because the thing reading stdin is a shell.
+        #
+        # The operand is a command LIST, not one command: `sh -c 'true; bash'` runs two, and the
+        # stream is still there for the second. So every command in it is asked, not just the
+        # first -- which is also why this cannot be "does a shell name appear in the program":
+        # `sh -c 'true; jq .'` names no shell that runs, and must stay clean.
         program = _dash_c_operand(inner[at:])
-        return _stage_runs_a_shell(_tokenize(program)) if program is not None else True
+        if program is None:
+            return True
+        return any(_stage_runs_a_shell(cmd) for cmd in _commands_in(program))
     # Checked even when the walk found no command word: `env -S'bash -s'` fuses the operand into
     # the flag, so every token is a flag and the walk runs off the end with the shell still in it.
     return any(_stage_runs_a_shell(_tokenize(cmd)) for cmd in _split_string_operands(inner))
@@ -569,6 +594,23 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
             "RUN curl -sSL https://x.example/i.sh | sh -c 'timeout 30 sh'\n",
             id="dash-c-body-numeric-operand",
         ),
+        # A `-c` program is a command LIST, not one command. Resolving only its first command
+        # stopped at `true` and let the shell behind the separator through.
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | sh -c 'true; bash'\n", id="dash-c-body-list"
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | sh -c 'true && bash'\n",
+            id="dash-c-body-list-and",
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | sh -c 'echo x | bash'\n",
+            id="dash-c-body-inner-pipe",
+        ),
+        # A subshell written TIGHT. `( bash )` was already pinned, but the parentheses were not
+        # tokenizer operators, so `(bash)` stayed one word and the grouping-strip never saw it.
+        pytest.param("RUN curl -sSL https://x.example/i.sh | (bash)\n", id="tight-subshell"),
+        pytest.param("RUN curl -sSL https://x.example/i.sh | (sh)\n", id="tight-subshell-sh"),
         # A shell option that takes its own operand. Scanning LEFT from the `-c` stopped at
         # `pipefail` and concluded the command was not a shell, so the quoted pipeline stayed
         # closed -- and `-o pipefail` is exactly how a careful CI script opens.
@@ -744,6 +786,15 @@ def test_the_guard_catches_a_yaml_line_that_both_folds_back_and_continues_on(tmp
             "curl -s https://x.example/f | sh -c 'bash -c \"jq .\"'", id="nested-dash-c-runs-jq"
         ),
         pytest.param("curl -s https://x.example/f | sh -c 'exec jq .'", id="dash-c-body-exec-jq"),
+        # Asking EVERY command in a `-c` list must not decay into "a shell name appears in the
+        # program". No shell runs here, so the download is still data.
+        pytest.param("curl -s https://x.example/f | sh -c 'true; jq .'", id="dash-c-list-into-jq"),
+        pytest.param(
+            "curl -s https://x.example/f | sh -c 'echo hi; cat'", id="dash-c-list-into-cat"
+        ),
+        # Parentheses became tokenizer operators; inside a quoted value they must stay data.
+        pytest.param("curl -s 'https://x.example/f(1).json' | jq .", id="parens-in-a-quoted-url"),
+        pytest.param("curl -s https://x.example/f | grep '(bash)'", id="parens-in-a-grep-pattern"),
         # A shell OPTION's operand is skipped, so a shell-named one must not read as a command.
         # `bash -o bash script.sh` sets an (invalid) option and runs a script, not a nested shell.
         pytest.param("curl -s https://x.example/f | jq -o bash .", id="option-operand-not-command"),

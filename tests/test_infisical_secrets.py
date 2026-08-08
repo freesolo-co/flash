@@ -266,6 +266,36 @@ class TestEntrypointBehaviour:
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == "container_wins"
 
+    def test_the_wrapper_does_not_delete_variables_it_was_never_asked_about(self, tmp_path):
+        """The wrapper must not consume a name out of the child's environment as scratch space.
+
+        The KEEP loop needs somewhere to hold each name's value while it builds the argument
+        list. Holding it in a shell variable makes that variable's NAME part of the contract:
+        whatever the container set under it is clobbered, and the cleanup `unset` afterwards
+        deletes it from the child entirely -- a variable the caller never mentioned in
+        INFISICAL_KEEP and had no reason to expect this script to touch.
+
+        Worse, the `unset` sat outside the loop, so it fired even when INFISICAL_KEEP was unset
+        and the loop body never ran: a deployment using no KEEP list at all still lost these two
+        names. `keep_value` and `keep_is_set` are ordinary enough that a container could plausibly
+        define them, and the failure is invisible until something downstream reads one.
+        """
+        result = self._run(
+            tmp_path,
+            {
+                "INFISICAL_CLIENT_ID": "cid",
+                "INFISICAL_CLIENT_SECRET": "csec",
+                "INFISICAL_PROJECT_ID": "proj",
+                "INFISICAL_PATH": "/flash",
+                # deliberately NO INFISICAL_KEEP: the loop never runs, and these must survive
+                "keep_value": "container_value",
+                "keep_is_set": "container_flag",
+            },
+            ["sh", "-c", 'echo "${keep_value-<GONE>}/${keep_is_set-<GONE>}"'],
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "container_value/container_flag"
+
     def test_keep_naming_an_unset_variable_leaves_the_vault_value_alone(self, tmp_path):
         """A KEEP entry the container never set must NOT wipe the injected secret.
 
