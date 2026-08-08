@@ -285,9 +285,13 @@ class _ExactTokenizer:
     eos_token = "!"
     all_special_ids = (0,)
 
-    def __call__(self, texts, *, truncation, max_length):
-        assert truncation is True
-        return {"input_ids": [[ord(char) for char in text][:max_length] for text in texts]}
+    def __call__(self, texts, *, truncation=False, max_length=None):
+        ids = [[ord(char) for char in text] for text in texts]
+        # the uncapped encode is how a truncated row reports its real size rather than the cap.
+        if not truncation:
+            return {"input_ids": ids}
+        assert max_length is not None, "truncation=True requires an explicit max_length"
+        return {"input_ids": [row[:max_length] for row in ids]}
 
 
 def test_exact_mask_keeps_prompt_assistant_history_masked_and_full_target_active():

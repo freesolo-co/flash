@@ -41,18 +41,18 @@ class _Tokenizer:
         text = "".join(str(message.get("content") or "") for message in messages)
         return text + (">" if add_generation_prompt else "")
 
-    def __call__(self, texts, *, truncation, max_length):
-        assert truncation
+    def __call__(self, texts, *, truncation=False, max_length=None):
         if isinstance(texts, str):
             texts = [texts]
-        return {
-            "input_ids": [
-                [self.eos_token_id if ch == self.eos_token else 3 + ord(ch) % 89 for ch in text][
-                    :max_length
-                ]
-                for text in texts
-            ]
-        }
+        ids = [
+            [self.eos_token_id if ch == self.eos_token else 3 + ord(ch) % 89 for ch in text]
+            for text in texts
+        ]
+        # the uncapped encode is how a truncated row reports its real size rather than the cap.
+        if not truncation:
+            return {"input_ids": ids}
+        assert max_length is not None, "truncation=True requires an explicit max_length"
+        return {"input_ids": [row[:max_length] for row in ids]}
 
 
 class _Environment:
