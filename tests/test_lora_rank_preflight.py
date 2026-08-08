@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.lora_rank import (
+from flash.adapters.lora_rank import (
     adapter_artifact_identity,
     alpha_from_adapter_config,
     inspect_adapter_config,
@@ -73,7 +73,7 @@ def test_preflight_accepts_child_rank_and_alpha_mismatches():
 
 @pytest.mark.parametrize("model", ["Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-27B"])
 def test_preflight_rejects_adapter_rank_above_serving_cap(model):
-    from flash.catalog import serving_lora_rank_cap
+    from flash.core.catalog import serving_lora_rank_cap
 
     # each tier's own cap, read from the catalog. these were pinned to a shared literal 64, which
     # silently stopped testing the 4B once its cap rose to 128 -- rank 96 then FITS.

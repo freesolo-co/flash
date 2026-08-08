@@ -1121,7 +1121,7 @@ def test_safe_extract_archive_rejects_longname_decompression_bomb(tmp_path):
 
 
 def test_worker_deps():
-    import flash.envs.registry as registry
+    import flash.envs.base as registry
 
     env_id = "github:owner/repo@main:env/environment.py"
     assert registry.worker_pip_for_env(env_id) == ["freesolo>=0.4.0"]
@@ -1276,7 +1276,7 @@ def test_reward_from_messages_strips_thinking_too(monkeypatch):
 def test_worker_marks_the_env_thinking_from_the_job_spec(monkeypatch):
     """The worker is what knows whether the run samples <think>; it must tell the env."""
     import flash.engine.worker as worker
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     class _Env:
         thinking = False
@@ -1333,11 +1333,11 @@ def test_multi_turn_grading_honors_a_prompt_opened_think_block(monkeypatch):
 def test_multi_turn_grading_matches_the_single_turn_path_exactly(monkeypatch):
     """Same completion, same flag, same parsers -- the two modes must not diverge.
 
-    This is the whole point of the shared flash.thinking parsers: pin multi-turn grading against
+    This is the whole point of the shared flash.content.thinking parsers: pin multi-turn grading against
     the single-turn helper rather than against a hand-written expectation, so a future change to
     one path that doesn't reach the other fails here.
     """
-    from flash.thinking import strip_think
+    from flash.content.thinking import strip_think
 
     for opened in (True, False):
         for completion in (_THINK_COMPLETION, _TRUNCATED_THINK_COMPLETION):

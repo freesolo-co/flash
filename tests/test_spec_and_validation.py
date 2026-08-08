@@ -11,6 +11,7 @@ from dataclasses import fields, replace
 
 import pytest
 
+from flash.core.spec import GpuSpec, JobSpec, TrainSpec, load_job_spec_from_env
 from flash.schema import (
     TRAIN_KEY_MIN_VERSIONS,
     TRAIN_SCHEMA_KEYS,
@@ -21,7 +22,6 @@ from flash.schema import (
     train_schema_metadata,
     validate_train_keys,
 )
-from flash.spec import GpuSpec, JobSpec, TrainSpec, load_job_spec_from_env
 
 BASE_RAW = {
     "model": "Qwen/Qwen3.5-0.8B",
@@ -432,7 +432,7 @@ def test_lora_rank_must_fit_small_serving_cap() -> None:
 
 
 def test_lora_rank_must_fit_large_serving_cap() -> None:
-    from flash.catalog import serving_lora_rank_cap
+    from flash.core.catalog import serving_lora_rank_cap
 
     # the 27B is the rank-64 tier. this case used the 4B, which was rank-64 when it was written and
     # is now rank-128 -- leaving it there would have made this a duplicate of the small-cap test
@@ -980,7 +980,7 @@ def test_programmatic_sft_submit_fails_closed_without_a_profilable_environment(
     # sft is quoted from a workload profile that tokenizes the real dataset, so a spec with no
     # environment to profile has no measurable workload. it must fail closed rather than fall back
     # to an assumed row count -- including on the dry-run preview, which previews a real submit.
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     orch = _fresh_orchestrator(tmp_path, monkeypatch)
     monkeypatch.setattr(
@@ -999,7 +999,7 @@ def test_programmatic_sft_submit_fails_closed_without_a_profilable_environment(
 
 
 def test_programmatic_sft_submit_rejects_adapter_continuation(tmp_path, monkeypatch) -> None:
-    from flash.spec import JobSpec, TrainSpec
+    from flash.core.spec import JobSpec, TrainSpec
 
     orch = _fresh_orchestrator(tmp_path, monkeypatch)
     spec = JobSpec(
@@ -1034,7 +1034,7 @@ def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None
 
 
 def test_vram_estimate_scales_with_params_and_algorithm() -> None:
-    from flash.engine import vram
+    from flash.engine.plan import vram
 
     sft_small = vram.estimate_vram_gb(0.6, "sft")
     sft_big = vram.estimate_vram_gb(8.0, "sft")
@@ -1048,7 +1048,7 @@ def test_vram_sft_per_device_bs_is_managed_default(monkeypatch) -> None:
     # fixed value. A control-plane process-env SFT_PER_DEVICE_BS must NOT move the estimate — sizing
     # a card for a micro-batch the worker never uses would under-route an SFT_PER_DEVICE_BS=1 env to
     # a too-small GPU that then OOMs at the default micro-batch 4.
-    from flash.engine import vram
+    from flash.engine.plan import vram
 
     # Use a tiny vocab so this isolates the managed micro-batch cap rather than the dense-logits
     # per-device cap, which can floor both batch sizes to the same per-device value.
@@ -1064,7 +1064,7 @@ def test_vram_sft_per_device_bs_is_managed_default(monkeypatch) -> None:
 
 
 def test_fetch_hf_params_is_offline_safe(monkeypatch) -> None:
-    from flash.engine import vram
+    from flash.engine.plan import vram
 
     assert vram.fetch_hf_params_b("any/model") is None
 
@@ -1075,7 +1075,7 @@ def test_fetch_hf_params_is_offline_safe(monkeypatch) -> None:
 
 
 def test_get_logger_namespacing() -> None:
-    from flash._logging import get_logger
+    from flash._internal.logging import get_logger
 
     assert get_logger().name == "flash"
     assert get_logger("flash").name == "flash"
@@ -1084,7 +1084,7 @@ def test_get_logger_namespacing() -> None:
 
 
 def test_configure_logging_verbosity() -> None:
-    from flash import _logging
+    from flash._internal import logging as _logging
 
     _logging.configure_logging(verbosity=0)
     assert logging.getLogger("flash").level == logging.WARNING
@@ -1175,7 +1175,7 @@ def test_worker_env_rejects_invalid_env_names(name: str) -> None:
     ],
 )
 def test_coerce_bool(value, expected) -> None:
-    from flash.spec import coerce_bool
+    from flash.core.spec import coerce_bool
 
     assert coerce_bool(value) is expected
 
@@ -1219,7 +1219,7 @@ def test_gpu_spec_direct_construction_rejects_bad_count(bad: object, exc: type) 
 
 
 def test_gpu_count_of_reads_spec_and_defaults() -> None:
-    from flash.spec import gpu_count_of
+    from flash.core.spec import gpu_count_of
 
     assert gpu_count_of(None) == 1  # no spec -> single gpu
     assert (

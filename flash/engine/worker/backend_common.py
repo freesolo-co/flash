@@ -30,7 +30,7 @@ from concurrent.futures import thread as _thread_module
 from http.server import ThreadingHTTPServer
 from typing import Self
 
-from flash.diagnostics import sanitize_diagnostic
+from flash._internal.diagnostics import sanitize_diagnostic
 
 # verl 0.8.0 exactly, plus the truncation-mask, 3d position-id, and ulysses fused-label fixes.
 # it must stay on the 0.8.0 base: the opd plugin patches 0.8.0 internals and imports
@@ -184,7 +184,7 @@ def model_max_position_embeddings(model_id: str, revision: str = "") -> int | No
     try:
         from transformers import AutoConfig
 
-        from flash.engine.worker.hf import model_revision_kwargs
+        from flash.engine.worker.io.hf import model_revision_kwargs
 
         cfg = AutoConfig.from_pretrained(
             model_id, trust_remote_code=True, **model_revision_kwargs(revision)
@@ -639,7 +639,7 @@ def gdn_probe_module(model_id: str, revision: str = "") -> str:
     checkpoint config -- a hub/cache read the child should not repeat. pair every call with
     ``gdn_reset_arch_from_caps`` below so the shim is rendered for the SAME arch the child cleared.
     """
-    from flash.engine.worker.packing import gdn_model_type
+    from flash.engine.worker.model.packing import gdn_model_type
 
     model_type = gdn_model_type(model_id, revision=revision)
     return f"transformers.models.{model_type}.modeling_{model_type}"
@@ -882,7 +882,7 @@ def rollout_sleep_unsupported(model_id: str) -> bool:
     verl runs the same ``vllm_async_server`` sleep path for both, so the flag has to mean the same
     thing on both drivers or the one that ignores it wedges on the flagged model.
     """
-    from flash.catalog import MODELS
+    from flash.core.catalog import MODELS
 
     info = MODELS.get(model_id)
     return bool(info is not None and getattr(info, "sleep_unsupported", False))

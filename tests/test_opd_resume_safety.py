@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.opd_retry_contract import (
+from flash.teacher.retry_contract import (
     OPD_RESUME_REVISION_ENV,
     OPD_RESUME_STATE_VERSION,
     OPD_RETRY_CONTRACT_STATUS_KEY,
@@ -25,7 +25,7 @@ _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
 
 @pytest.fixture(autouse=True)
 def _stub_teacher_broker_transport(monkeypatch):
-    import flash.server.teacher_broker as teacher_broker
+    import flash.server.domain.teacher_broker as teacher_broker
 
     monkeypatch.setattr(
         teacher_broker,
@@ -89,7 +89,7 @@ def _remote(*, attempt: int = 0) -> dict:
 
 
 def _opd_spec(run_id: str, *, max_retries: int = 1, seed: int = 42):
-    from flash.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 
     return JobSpec(
         run_id=run_id,
@@ -121,7 +121,7 @@ def _save_status(
 
 def test_status_initialization_stamps_opd_contract_only_when_explicit(monkeypatch, tmp_path):
     import flash.runner as runner
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     contracted = _opd_spec("contract-opd")
@@ -196,7 +196,7 @@ def test_marker_upload_failure_is_retriable_and_attempted_exactly_once(monkeypat
     Retrying in place could double-commit an ambiguous marker. The optimizer wrapper's pre-step
     ordering is covered by ``test_optimizer_step_is_blocked_when_marker_publication_fails``.
     """
-    from flash.engine.worker import hf
+    from flash.engine.worker.io import hf
     from flash.engine.worker.perf import RetriableInfraError
 
     uploads = []
@@ -235,7 +235,7 @@ def test_ambiguous_marker_upload_is_not_retried_and_leaks_no_token(monkeypatch):
     Both guarantees live in `publish_opd_optimizer_start_marker` (single attempt, `sanitize_diagnostic`
     at limit 500), which is why this survives the trl deletion unchanged -- only the caller moved.
     """
-    from flash.engine.worker import hf
+    from flash.engine.worker.io import hf
     from flash.engine.worker.perf import RetriableInfraError
 
     class CommitThenLoseFirstResponse:
@@ -281,7 +281,7 @@ def test_ambiguous_marker_upload_is_not_retried_and_leaks_no_token(monkeypatch):
 
 
 def test_worker_marker_rejects_empty_repo(monkeypatch):
-    from flash.engine.worker import hf
+    from flash.engine.worker.io import hf
 
     monkeypatch.setattr(
         hf,
@@ -293,7 +293,7 @@ def test_worker_marker_rejects_empty_repo(monkeypatch):
 
 
 def test_worker_marker_starts_no_hf_call_at_deadline(monkeypatch):
-    from flash.engine.worker import hf
+    from flash.engine.worker.io import hf
     from flash.engine.worker.perf import RetriableInfraError
 
     calls = []
@@ -317,7 +317,7 @@ def test_worker_marker_starts_no_hf_call_at_deadline(monkeypatch):
 
 
 def test_worker_marker_writes_fsync_and_required_upload(monkeypatch):
-    from flash.engine.worker import hf
+    from flash.engine.worker.io import hf
 
     fsync_calls = []
     uploads = []
@@ -403,7 +403,7 @@ class _FakePrivateHf:
 
 
 def test_strict_reader_pins_one_sha_and_any_present_marker_blocks(monkeypatch, tmp_path):
-    from flash.providers._hf_artifacts import verify_opd_replacement_safe
+    from flash.providers.artifacts.hf import verify_opd_replacement_safe
 
     calls = []
     present_path = opd_optimizer_start_marker_path("run-1", 1)
@@ -447,7 +447,7 @@ def test_strict_reader_pins_one_sha_and_any_present_marker_blocks(monkeypatch, t
 
 
 def test_strict_reader_all_absent_is_safe(monkeypatch):
-    from flash.providers._hf_artifacts import verify_opd_replacement_safe
+    from flash.providers.artifacts.hf import verify_opd_replacement_safe
 
     class Api:
         def repo_info(self, **_kwargs):
@@ -473,7 +473,7 @@ def test_strict_reader_all_absent_is_safe(monkeypatch):
 
 @pytest.mark.parametrize("mode", ["malformed", "timeout", "listing"])
 def test_strict_reader_malformed_or_outage_blocks(monkeypatch, tmp_path, mode):
-    from flash.providers._hf_artifacts import verify_opd_replacement_safe
+    from flash.providers.artifacts.hf import verify_opd_replacement_safe
 
     marker_path = opd_optimizer_start_marker_path("run-1", 0)
 
@@ -510,7 +510,7 @@ def test_strict_reader_malformed_or_outage_blocks(monkeypatch, tmp_path, mode):
     [("", 1), ("private/runs", 2), ("private/runs", True), ("private/runs", "1")],
 )
 def test_strict_reader_missing_repo_or_unsupported_contract_blocks(repo, version):
-    from flash.providers._hf_artifacts import verify_opd_replacement_safe
+    from flash.providers.artifacts.hf import verify_opd_replacement_safe
 
     with pytest.raises(RuntimeError, match="replacement is blocked"):
         verify_opd_replacement_safe(
@@ -544,7 +544,7 @@ def test_initial_contracted_opd_reservation_skips_empty_attempt_query(monkeypatc
 
 def test_retry_gate_uses_authoritative_jobspec_seed(monkeypatch, tmp_path):
     import flash.runner as runner
-    from flash.providers import _hf_artifacts
+    from flash.providers.artifacts import hf as _hf_artifacts
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = _opd_spec("custom-seed-opd", seed=987)
@@ -593,7 +593,7 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
     import flash.providers.allocator as allocator
     import flash.runner as runner
     from flash.providers.base import Allocation, Candidate, PollResult
-    from flash.runner import lifecycle
+    from flash.runner.supervise import lifecycle
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     private_hf = _FakePrivateHf(tmp_path)
@@ -667,7 +667,7 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
     import flash.providers.allocator as allocator
     import flash.runner as runner
     from flash.providers.base import Allocation, Candidate, PollResult
-    from flash.runner import lifecycle
+    from flash.runner.supervise import lifecycle
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     private_hf = _FakePrivateHf(tmp_path)
@@ -696,7 +696,7 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
             self.worker_envs = []
 
         def submit_run(self, _spec, _seed, *, attempt, on_handle, **kwargs):
-            from flash.providers._worker import build_worker_env
+            from flash.providers._lifecycle.worker import build_worker_env
 
             secrets = kwargs.get("runtime_secrets")
             self.runtime_secrets.append(secrets)
@@ -811,7 +811,7 @@ def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkey
 def test_handleless_opd_recovery_blocks_through_recover_runs(monkeypatch, tmp_path):
     import flash.providers as providers
     import flash.runner as runner
-    from flash.server import _runtime
+    from flash.server.platform import runtime as _runtime
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = _opd_spec("handleless-opd-block")
@@ -850,9 +850,9 @@ def test_ambiguous_marker_upload_lands_evidence_and_blocks_replacement(monkeypat
     """
     import flash.providers.allocator as allocator
     import flash.runner as runner
-    from flash.engine.worker import hf
+    from flash.engine.worker.io import hf
     from flash.engine.worker.perf import RetriableInfraError
-    from flash.runner import lifecycle
+    from flash.runner.supervise import lifecycle
 
     private_hf = _FakePrivateHf(tmp_path, raise_after_upload=True)
     monkeypatch.setattr(hf, "_sleep_with_hf_deadline", lambda _delay: True)
@@ -963,7 +963,7 @@ def _install_marker_gate(
 
 
 def _run_gate():
-    from flash.providers._hf_artifacts import verify_opd_replacement_safe
+    from flash.providers.artifacts.hf import verify_opd_replacement_safe
 
     return verify_opd_replacement_safe(
         hf_repo="private/runs",

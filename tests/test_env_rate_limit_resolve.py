@@ -114,7 +114,7 @@ def _fake_loader(captured):
 
 def test_registry_preserves_user_params_and_pins_out_of_band(monkeypatch):
     import flash.envs.adapter as adapter
-    from flash.envs.registry import load_environment
+    from flash.envs.base import load_environment
 
     captured = {}
     monkeypatch.setattr(adapter, "load_freesolo_environment", _fake_loader(captured))
@@ -136,7 +136,7 @@ def test_registry_user_pinned_sha_param_is_forwarded_not_consumed(monkeypatch):
     # Even a user param literally named "pinned_sha" must reach the SDK loader untouched while the
     # control-plane pin stays separate (the whole point of making it positional-only).
     import flash.envs.adapter as adapter
-    from flash.envs.registry import load_environment
+    from flash.envs.base import load_environment
 
     captured = {}
     monkeypatch.setattr(adapter, "load_freesolo_environment", _fake_loader(captured))
@@ -149,7 +149,7 @@ def test_registry_user_pinned_sha_param_is_forwarded_not_consumed(monkeypatch):
 
 def test_registry_omits_pin_when_unset(monkeypatch):
     import flash.envs.adapter as adapter
-    from flash.envs.registry import load_environment
+    from flash.envs.base import load_environment
 
     captured = {}
     monkeypatch.setattr(adapter, "load_freesolo_environment", _fake_loader(captured))
@@ -166,7 +166,7 @@ _GH_ENV = "github:owner/repo@main:env/environment.py"
 def test_assign_resolved_env_sha_pins_when_resolver_succeeds(monkeypatch):
     import flash.envs.loader as adapter
     from flash import runner
-    from flash.spec import EnvironmentSpec, JobSpec
+    from flash.core.spec import EnvironmentSpec, JobSpec
 
     monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, *a, **k: "b" * 40)
     spec = JobSpec(environment=EnvironmentSpec(id=_GH_ENV))
@@ -181,7 +181,7 @@ def test_assign_resolved_env_sha_uses_fast_no_retry_resolver(monkeypatch):
     # short timeout and zero rate-limit retries (the worker keeps the full retry budget).
     import flash.envs.loader as adapter
     from flash import runner
-    from flash.spec import EnvironmentSpec, JobSpec
+    from flash.core.spec import EnvironmentSpec, JobSpec
 
     seen = {}
 
@@ -199,7 +199,7 @@ def test_assign_resolved_env_sha_uses_fast_no_retry_resolver(monkeypatch):
 def test_assign_resolved_env_sha_best_effort_on_failure(monkeypatch):
     import flash.envs.loader as adapter
     from flash import runner
-    from flash.spec import EnvironmentSpec, JobSpec
+    from flash.core.spec import EnvironmentSpec, JobSpec
 
     def boom(*a, **k):
         raise RuntimeError("github down")
@@ -213,7 +213,7 @@ def test_assign_resolved_env_sha_best_effort_on_failure(monkeypatch):
 def test_assign_resolved_env_sha_noop_without_env_or_already_pinned(monkeypatch):
     import flash.envs.loader as adapter
     from flash import runner
-    from flash.spec import EnvironmentSpec, JobSpec
+    from flash.core.spec import EnvironmentSpec, JobSpec
 
     # Must never touch the network when there is nothing to resolve.
     def boom(*a, **k):
@@ -235,7 +235,7 @@ def test_background_submit_defers_env_sha_off_creation_path(monkeypatch, tmp_pat
     import threading
 
     from flash import runner
-    from flash.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
+    from flash.core.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))

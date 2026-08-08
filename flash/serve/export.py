@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 from typing import BinaryIO
 
-from flash._logging import get_logger
+from flash._internal.logging import get_logger
 from flash.serve.deploy import ServingError
 
 logger = get_logger(__name__)

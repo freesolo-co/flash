@@ -22,21 +22,21 @@ try:
 except ImportError:  # pragma: no cover - linux production fails closed below
     fcntl = None
 
-from flash._paths import data_dir
-from flash.adapter_artifacts import MAX_ATTEMPT_ID
-from flash.catalog import ModelInfo, resolve_model
-from flash.opd_retry_contract import (
-    OPD_RETRY_CONTRACT_STATUS_KEY,
-    OPD_RETRY_CONTRACT_VERSION,
-    require_opd_retry_contract_version,
-)
-from flash.providers._poll import _attempt_int
-from flash.spec import (
+from flash._internal.paths import data_dir
+from flash.adapters.artifacts import MAX_ATTEMPT_ID
+from flash.core.catalog import ModelInfo, resolve_model
+from flash.core.spec import (
     _DROPPED_TOP_LEVEL_KEYS,
     MANAGED_GPU_KEYS,
     TRAINER_BACKEND,
     GpuSpec,
     JobSpec,
+)
+from flash.providers._lifecycle.poll import _attempt_int
+from flash.teacher.retry_contract import (
+    OPD_RETRY_CONTRACT_STATUS_KEY,
+    OPD_RETRY_CONTRACT_VERSION,
+    require_opd_retry_contract_version,
 )
 
 _STATE_DIR = str(data_dir())
@@ -468,7 +468,7 @@ def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None]:
         # both the markers and any full-state resume checkpoint the replacement can continue from.
         phase = spec.phase
         seed = spec.seed
-    from flash.providers._hf_artifacts import verify_opd_replacement_safe
+    from flash.providers.artifacts.hf import verify_opd_replacement_safe
 
     resume_revision = verify_opd_replacement_safe(
         hf_repo=hf_repo,
@@ -907,7 +907,7 @@ def weight_cache_catalog_peak_gb() -> float:
     ``params_b``, so it slightly understates a repo that also ships tokenizer/config/ index files;
     the measured-bytes figure for today's catalog is ~5 GB higher.
     """
-    from flash.catalog import MODELS
+    from flash.core.catalog import MODELS
 
     cached = [info for info in MODELS.values() if _fits_weight_cache(info)]
     if not cached:
@@ -988,7 +988,7 @@ def _source_owned_by_key(src_run_id: str, owner_key_id: int | None) -> bool:
     if owner_key_id is None:
         return False
     try:
-        from flash.server import db
+        from flash.server.platform import db
 
         return db.run_owner(src_run_id) == owner_key_id
     except Exception:
@@ -1039,13 +1039,13 @@ def _prepare_init_from_adapter_inner(
     ref = spec.train.init_from_adapter
     if not ref:
         return spec, spec, None
-    from flash.lora_rank import (
+    from flash.adapters.lora_rank import (
         adapter_artifact_identity,
         load_hf_adapter_config,
         preflight_init_adapter_lora_rank,
         resolve_hf_dataset_revision,
     )
-    from flash.runner.checkpoints import CheckpointListingError, adapter_artifact_exists
+    from flash.runner.results.checkpoints import CheckpointListingError, adapter_artifact_exists
     from flash.schema import checkpoint_storage_ref, parse_checkpoint_ref
 
     parsed = parse_checkpoint_ref(ref)
@@ -1336,7 +1336,7 @@ def _prepared_sft_profile_job(spec: JobSpec, *, input_digest: str) -> PreparedJo
     are dropped: they describe where the training run must land, and inheriting them would rent an
     H100 to tokenize on cpu.
     """
-    from flash.workload_profile import SFT_PROFILE_KIND, sft_profile_run_id
+    from flash.engine.profiling.workload_profile import SFT_PROFILE_KIND, sft_profile_run_id
 
     profile_spec = replace(
         spec,
@@ -1368,7 +1368,7 @@ def _prepared_sft_profile_job(spec: JobSpec, *, input_digest: str) -> PreparedJo
 
 def _require_sft_workload_profile(spec: JobSpec) -> JobSpec:
     """Attach the exact sft workload profile for ``spec``, or fail closed until one exists."""
-    from flash.workload_profile import (
+    from flash.engine.profiling.workload_profile import (
         SFT_PROFILE_KIND,
         require_matching_sft_profile,
         sft_profile_input_digest,
@@ -1464,7 +1464,7 @@ def prepare_job(
 
         preflight_serving_path(spec)
     else:
-        from flash.lora_rank import (
+        from flash.adapters.lora_rank import (
             ServingPreflightError,
             preflight_train_context_within_serving,
         )
@@ -1500,7 +1500,7 @@ def prepare_job(
         # run on one card would reject a shape the allocator would have placed -- so it
         # stays on the worker, which also keeps that check as defense in depth for any
         # path that reaches training without passing through here.
-        from flash.opd_validation import preflight_opd_structured_outputs
+        from flash.engine.worker.train.opd.validation import preflight_opd_structured_outputs
 
         preflight_opd_structured_outputs(
             spec.train.structured_outputs,
@@ -1655,7 +1655,7 @@ def submit_job(
     public_spec = prepared.public_spec
     worker_spec = prepared.worker_spec
     estimated_cost_usd = prepared.estimated_cost_usd
-    from flash.multimodal import preflight_validate_image_opd
+    from flash.content.multimodal import preflight_validate_image_opd
 
     preflight_validate_image_opd(worker_spec)
     from flash.providers import INSTANCE_PROVIDERS, available_providers
@@ -1805,7 +1805,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
             raise ValueError("persisted effective preparation failed integrity validation")
     if verify_source and public_spec.train.init_from_adapter:
         try:
-            from flash.lora_rank import (
+            from flash.adapters.lora_rank import (
                 adapter_artifact_identity,
                 inspect_adapter_config,
                 load_hf_adapter_config,
@@ -1983,11 +1983,11 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
     The run id keeps concurrent/sequential runs of the same phase from
     overwriting each other's artifacts. ``metrics["wall_seconds"]`` is the worker's training-loop
     wall time; setup/cold-start is reported separately and is not included here."""
-    from flash.engine.accounting import sanitize_worker_metrics
+    from flash.engine.result.accounting import sanitize_worker_metrics
 
     metrics = sanitize_worker_metrics(metrics)
     if spec.workload_profile_kind:
-        from flash.workload_profile import require_matching_sft_profile
+        from flash.engine.profiling.workload_profile import require_matching_sft_profile
 
         profile = require_matching_sft_profile(
             metrics.get("workload_profile"),
@@ -2033,7 +2033,7 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
     with open(os.path.join(dest, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
     with contextlib.suppress(Exception):
-        from flash.server.run_registry import record_training_checkpoint
+        from flash.server.domain.run_registry import record_training_checkpoint
 
         record_training_checkpoint(spec=spec, metrics=metrics, artifact_path=dest)
     return float(cost)
@@ -2057,7 +2057,7 @@ def _remote_resource_identity(remote: object) -> tuple | None:
                 handle.key_fingerprint,
             )
         if provider == "lambda":
-            from flash.providers.lambdalabs.jobs.builders import LambdaJobHandle
+            from flash.providers.lambda_.jobs.builders import LambdaJobHandle
 
             handle = LambdaJobHandle.from_dict(remote)
             return (
@@ -2223,7 +2223,7 @@ def _canonical_cleanup_remote(remote: object) -> dict | None:
 
             return RunpodJobHandle.from_dict(remote).to_dict()
         if provider == "lambda":
-            from flash.providers.lambdalabs.jobs.builders import LambdaJobHandle
+            from flash.providers.lambda_.jobs.builders import LambdaJobHandle
 
             return LambdaJobHandle.from_dict(remote).to_dict()
         if provider == "vast":
@@ -2288,7 +2288,7 @@ def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
     if not records:
         return attempted
     from flash.providers.base import JobHandle
-    from flash.runner.lifecycle import _strict_teardown_handle
+    from flash.runner.supervise.lifecycle import _strict_teardown_handle
 
     for record in records:
         identity = _remote_resource_identity(record)
@@ -2431,7 +2431,7 @@ def record_billing_state(run_id: str, **fields) -> None:
 
 
 def _send_status_report(status: RunStatus) -> bool:
-    from flash.server.run_registry import record_training_run
+    from flash.server.domain.run_registry import record_training_run
 
     return record_training_run(status=status)
 
@@ -2765,7 +2765,13 @@ def _save_status_unlocked(
             os.unlink(tmp)
 
 
-from flash.runner.deploy import (  # noqa: E402,F401
+from flash.runner.results.verified_revisions import (  # noqa: E402,F401
+    add_verified_adapter_revision,
+    invalidate_verified_adapter_revisions,
+    read_verified_adapter_revisions,
+    verified_adapter_revision_generation,
+)
+from flash.runner.supervise.deploy import (  # noqa: E402,F401
     DeploymentRevocationError,
     DeploymentStatePersistenceError,
     attach_run,
@@ -2778,17 +2784,11 @@ from flash.runner.deploy import (  # noqa: E402,F401
     mark_deployment_undeployed,
     mark_undeployed,
 )
-from flash.runner.lifecycle import (  # noqa: E402,F401
+from flash.runner.supervise.lifecycle import (  # noqa: E402,F401
     _gc_run_endpoints,
     _run_job,
     _run_job_inner,
     _run_training,
     _spec_with_gpu,
     _submit_seed_supervised,
-)
-from flash.runner.verified_revisions import (  # noqa: E402,F401
-    add_verified_adapter_revision,
-    invalidate_verified_adapter_revisions,
-    read_verified_adapter_revisions,
-    verified_adapter_revision_generation,
 )

@@ -15,7 +15,7 @@ import types
 import pytest
 
 import flash.cli as cli
-from flash.providers._poll import _format_heartbeat
+from flash.providers._lifecycle.poll import _format_heartbeat
 
 
 def test_format_heartbeat_appends_named_reward_metrics() -> None:
@@ -271,7 +271,7 @@ def test_train_cost_requires_explicit_project(tmp_path, capsys) -> None:
 def test_env_setup_maps_inaccessible_project_to_client_error(monkeypatch) -> None:
     from argparse import Namespace
 
-    from flash.cli import env_setup
+    from flash.cli.commands.env import setup as env_setup
     from flash.client import ApiError, ClientError
 
     # pinned to a HOSTED url and a key: ownership is only resolved against the backend when the
@@ -301,7 +301,7 @@ def test_env_setup_resolves_the_project_locally_on_a_self_hosted_plane(monkeypat
     """
     from argparse import Namespace
 
-    from flash.cli import env_setup
+    from flash.cli.commands.env import setup as env_setup
 
     monkeypatch.setattr(
         "flash.client.config.load_credentials", lambda: ("http://127.0.0.1:8080", "operator-key")
@@ -323,7 +323,7 @@ def test_env_setup_still_rejects_a_malformed_project_when_self_hosted(monkeypatc
     """Skipping the ownership lookup must not skip the shape check that stands in for it."""
     from argparse import Namespace
 
-    from flash.cli import env_setup
+    from flash.cli.commands.env import setup as env_setup
 
     monkeypatch.setattr(
         "flash.client.config.load_credentials", lambda: ("http://127.0.0.1:8080", "operator-key")
@@ -336,7 +336,7 @@ def test_env_setup_still_rejects_a_malformed_project_when_self_hosted(monkeypatc
 def test_env_setup_self_hosted_interactive_requires_an_explicit_project(monkeypatch) -> None:
     from argparse import Namespace
 
-    from flash.cli import env_setup
+    from flash.cli.commands.env import setup as env_setup
     from flash.client import ClientError
 
     monkeypatch.setattr(
@@ -357,7 +357,7 @@ def test_env_setup_self_hosted_interactive_requires_an_explicit_project(monkeypa
 def test_env_setup_hosted_interactive_still_selects_a_project(monkeypatch) -> None:
     from argparse import Namespace
 
-    from flash.cli import env_setup
+    from flash.cli.commands.env import setup as env_setup
 
     project_id = "11111111-1111-4111-8111-111111111111"
     api_url = "https://flash.freesolo.co"
@@ -428,7 +428,7 @@ def test_login_failure_is_friendly_and_asks_to_retry(monkeypatch, capsys) -> Non
 def test_identity_render_is_ascii_locale_safe(monkeypatch) -> None:
     # Under an ASCII / non-UTF-8 stdout, neither a non-ASCII identity value nor our own
     # punctuation may raise UnicodeEncodeError after a login has already succeeded.
-    from flash.cli import render
+    from flash.cli.ui import render
 
     class _AsciiStdout:
         encoding = "ascii"
@@ -1401,7 +1401,7 @@ def test_env_setup_reasoning_conflict_names_every_stale_config(
 
 
 def test_existing_reasoning_ignores_thinking_text_in_comments(tmp_path) -> None:
-    from flash.cli import env_setup
+    from flash.cli.commands.env import setup as env_setup
 
     sft = tmp_path / "sft.toml"
     rl = tmp_path / "rl.toml"
@@ -1790,8 +1790,8 @@ def test_submit_payload_carries_no_pip_and_the_worker_resolves_it(monkeypatch, t
     would ship a worker with no Freesolo SDK, and the failure would surface only on a real GPU.
     """
     from flash.client.specs import spec_payload
-    from flash.envs.registry import worker_pip_for_env
-    from flash.spec import EnvironmentSpec, JobSpec
+    from flash.core.spec import EnvironmentSpec, JobSpec
+    from flash.envs.base import worker_pip_for_env
 
     spec = JobSpec(
         model="Qwen/Qwen3.5-0.8B",

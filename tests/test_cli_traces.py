@@ -1,6 +1,6 @@
 """`flash traces export` and the trace import offered by `flash env setup`.
 
-Both read the freesolo backend through flash.cli.traces, so these tests stub that module's
+Both read the freesolo backend through flash.cli.commands.traces, so these tests stub that module's
 client calls and drive main() in-process: no server, no stored credentials.
 """
 
@@ -13,7 +13,8 @@ from pathlib import Path
 import pytest
 
 import flash.cli as cli
-from flash.cli import env_setup, traces
+from flash.cli.commands import traces
+from flash.cli.commands.env import setup as env_setup
 from flash.client import ApiError, ClientError
 
 _PROJECTS = [

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 
-from flash.catalog import (
+from flash.core.catalog import (
     DEFAULT_MODEL,
     MODELS,
     SERVING_MODEL_REPOS,
@@ -33,8 +33,8 @@ def test_default_model_is_supported():
 
 
 def test_recipe_and_jobspec_defaults_match_catalog_default():
-    from flash.engine.recipe import RECIPE
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
+    from flash.engine.plan.recipe import RECIPE
 
     # When BENCH_HF_MODEL isn't overriding it, the recipe + JobSpec default to the catalog default.
     if not os.environ.get("BENCH_HF_MODEL"):

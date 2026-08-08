@@ -1,6 +1,6 @@
 """Only curated catalog models are trainable + VRAM estimator unit tests (CPU-only, no network).
 
-Adding a model means forking Flash and adding a ModelInfo entry to flash/catalog.py. There is no
+Adding a model means forking Flash and adding a ModelInfo entry to flash/core/catalog.py. There is no
 config key that accepts an uncataloged model: the rejection is catalog membership itself, so it
 holds identically on a managed and a self-hosted plane.
 """
@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import pytest
 
-from flash.catalog import resolve_model
-from flash.engine.vram import GPU_VRAM_GB, estimate_vram_gb
+from flash.core.catalog import resolve_model
+from flash.engine.plan.vram import GPU_VRAM_GB, estimate_vram_gb
 from flash.schema import ConfigError, spec_from_dict
 from tests._helpers.specs import raw_spec as _raw
 
@@ -22,7 +22,7 @@ def test_an_uncataloged_model_is_rejected_with_the_fork_instruction():
         resolve_model("some-org/some-model", "sft")
     message = str(ei.value)
     assert "fork" in message.lower()
-    assert "flash/catalog.py" in message
+    assert "flash/core/catalog.py" in message
 
 
 def test_catalog_model_resolves_normally():
@@ -61,7 +61,7 @@ def test_a_run_persisted_before_the_upgrade_still_reloads():
     the dropped-key tolerance the first reload after deploy raises and a still-running job loses its
     recovery, deploy, and serving paths.
     """
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     spec = spec_from_dict(_raw(model="Qwen/Qwen3.5-4B"))
     persisted = spec.to_internal_dict()

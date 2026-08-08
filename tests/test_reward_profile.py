@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from flash.engine.reward_profile import gpu_idle_fraction, profile_reward_latency
+from flash.engine.profiling.reward_profile import gpu_idle_fraction, profile_reward_latency
 
 
 def _sleeper(seconds: float, *, record: list[int] | None = None):
@@ -319,7 +319,7 @@ def test_worker_hook_skips_an_env_whose_scorer_is_not_thread_safe(capsys):
 
 
 def test_worker_hook_uses_the_envs_assistant_text_semantics(capsys):
-    """Reference text must come from flash.multimodal.assistant_completion_text.
+    """Reference text must come from flash.content.multimodal.assistant_completion_text.
 
     A hand-rolled ''.join over every message's `content` breaks two ways: openai-style text blocks
     (`[{"type": "text", "text": "4"}]`) stringify into a python repr, and non-assistant turns get

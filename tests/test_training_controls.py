@@ -7,14 +7,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.engine.steps import (
+from flash.core.spec import FIXED_SEED, EnvironmentSpec, JobSpec, TrainSpec
+from flash.engine.plan.steps import (
     final_save_due,
     resolve_update_horizon,
     sft_update_steps,
     validate_save_steps,
 )
 from flash.schema import ConfigError, spec_and_train_keys_from_file
-from flash.spec import FIXED_SEED, EnvironmentSpec, JobSpec, TrainSpec
 
 _BASE_TOML = """
 model = "Qwen/Qwen3.5-0.8B"
@@ -181,7 +181,7 @@ def test_checkpoint_upload_callback_requests_only_exact_save_steps(monkeypatch):
     fake_transformers.TrainerCallback = TrainerCallback
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
-    from flash.engine.worker.hf import make_checkpoint_upload_callback
+    from flash.engine.worker.io.hf import make_checkpoint_upload_callback
 
     callback = make_checkpoint_upload_callback((2, 7))
     for step, expected in ((1, False), (2, True), (3, False), (7, True)):
@@ -223,7 +223,7 @@ def test_transient_required_deployable_failure_retries_before_full_state(monkeyp
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
     import flash.engine.worker as worker
-    from flash.engine.worker import hf as worker_hf
+    from flash.engine.worker.io import hf as worker_hf
 
     checkpoint = tmp_path / "checkpoint-4"
     checkpoint.mkdir()
@@ -261,7 +261,7 @@ def test_transient_required_deployable_failure_retries_before_full_state(monkeyp
 
 def test_resume_first_companion_retries_without_reuploading_full_state(monkeypatch, tmp_path):
     import flash.engine.worker as worker
-    from flash.engine.worker import hf as worker_hf
+    from flash.engine.worker.io import hf as worker_hf
 
     calls = {"resume": 0, "deployable": 0}
 
@@ -299,7 +299,7 @@ def test_permanent_required_save_failure_is_not_retried(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
     import flash.engine.worker as worker
-    from flash.engine.worker import hf as worker_hf
+    from flash.engine.worker.io import hf as worker_hf
 
     checkpoint = tmp_path / "checkpoint-4"
     checkpoint.mkdir()
@@ -345,7 +345,7 @@ def test_resume_upload_failure_requires_full_state_only_at_exact_save(
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
     import flash.engine.worker as worker
-    from flash.engine.worker import hf as worker_hf
+    from flash.engine.worker.io import hf as worker_hf
 
     checkpoint = tmp_path / "checkpoint-4"
     checkpoint.mkdir()
@@ -475,7 +475,7 @@ def test_required_save_fails_when_publication_never_lands(monkeypatch, tmp_path)
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
     import flash.engine.worker as worker
-    from flash.engine.worker import hf as worker_hf
+    from flash.engine.worker.io import hf as worker_hf
 
     checkpoint = tmp_path / "checkpoint-4"
     checkpoint.mkdir()
@@ -501,7 +501,7 @@ def test_required_save_fails_when_publication_never_lands(monkeypatch, tmp_path)
 
 
 def test_seed_training_rngs_initializes_all_supported_generators(monkeypatch):
-    from flash.engine.worker import rng
+    from flash.engine.worker.runtime import rng
 
     calls: list[tuple[str, int]] = []
     fake_numpy = SimpleNamespace(
@@ -539,7 +539,7 @@ def test_seed_host_rngs_reaches_the_dataset_generators_without_importing_torch(m
     training and fail the parity check. torch is the opposite case: seeding it would import the
     model stack into a job that is allocated and billed as cpu-only.
     """
-    from flash.engine.worker import rng
+    from flash.engine.worker.runtime import rng
 
     calls: list[tuple[str, int]] = []
     fake_numpy = SimpleNamespace(
@@ -589,7 +589,7 @@ def test_worker_env_rejects_control_plane_owned_keys(key, tmp_path):
 
 
 def test_provider_worker_env_emits_authoritative_spec_seed():
-    from flash.providers._worker import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
 
     spec = JobSpec(model="model", seed=987)
     assert build_worker_env(spec, 987)["SEED"] == "987"
@@ -598,7 +598,7 @@ def test_provider_worker_env_emits_authoritative_spec_seed():
 
 
 def test_lifecycle_rejects_seed_mismatch_before_provider_work():
-    from flash.runner.lifecycle import _submit_seed_supervised
+    from flash.runner.supervise.lifecycle import _submit_seed_supervised
 
     spec = JobSpec(model="model", seed=987)
     with pytest.raises(ValueError, match=r"does not match JobSpec\.seed"):
@@ -606,7 +606,7 @@ def test_lifecycle_rejects_seed_mismatch_before_provider_work():
 
 
 def test_sft_under_ran_only_fails_a_genuine_under_run():
-    from flash.engine.worker.sft import sft_under_ran
+    from flash.engine.worker.entry.sft import sft_under_ran
 
     # a real under-run (fewer updates than the authoritative horizon) fails loudly.
     assert sft_under_ran(9, 10, 10)
@@ -666,7 +666,7 @@ def test_from_dict_rejects_misspelled_train_key():
 
 
 def test_runtime_secret_cannot_override_control_plane_seed():
-    from flash.providers._worker import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
 
     # a directly-constructed spec can declare a seed env secret (the toml schema rejects it, but
     # json/direct construction does not). the built worker env must still hold the canonical seed.
@@ -676,8 +676,8 @@ def test_runtime_secret_cannot_override_control_plane_seed():
 
 
 def test_provider_worker_env_carries_control_plane_resume_revision():
-    from flash.opd_retry_contract import OPD_RESUME_REVISION_ENV
-    from flash.providers._worker import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
     spec = JobSpec(model="m", algorithm="opd", seed=987)
     env = build_worker_env(

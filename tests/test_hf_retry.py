@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from flash.providers._hf_retry import hf_call
+from flash.providers.artifacts.hf import hf_call
 
 
 def test_hf_call_returns_real_success_after_deadline() -> None:

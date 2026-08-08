@@ -31,7 +31,7 @@ correctness, and the alternatives over-fire the paid GPU bake):
     text change; a future cache-affecting RANGE would reintroduce that gap. (fp_base DOES hash the
     whole Dockerfile.worker, so arbitrary base edits -- apt/ENV/CMD/cache-dir -- still trigger a
     free re-layer; only a cache-affecting change that isn't a parsed pin slips through.)
-  * fp_cache hashes kernel_warmup.py but not its transitive cache-production deps (perf's Hopper
+  * fp_cache hashes runtime/kernel_warmup.py but not its transitive cache-production deps (perf's Hopper
     fla/tilelang setup, docker/bake_pod_entry.py's pod-side install/invoke). The kernel-DETERMINING
     versions (tilelang/tvm-ffi/fla) ARE captured here; that code is otherwise stable or fetched fresh
     at runtime, so a change there only risks a stale (mostly sm90) cache that cold-JITs. Hashing all
@@ -192,7 +192,7 @@ def collect_inputs(
         "tilelang": _need("tilelang"),
         "tvm_ffi": _need("apache-tvm-ffi"),
         "kernel_warmup_sha256": _sha256_file(
-            root / "flash" / "engine" / "worker" / "kernel_warmup.py"
+            root / "flash" / "engine" / "worker" / "runtime" / "kernel_warmup.py"
         ),
     }
 
@@ -225,7 +225,7 @@ def collect_inputs(
         # it lives in fp_base, so such a change triggers only the FREE re-layer, never a paid re-warm.
         "dockerfile_sha256": _sha256_file(root / "Dockerfile.worker"),
         "endpoints_sha256": _sha256_file(
-            root / "flash" / "providers" / "runpod" / "train" / "endpoints.py"
+            root / "flash" / "providers" / "runpod" / "serverless" / "endpoints.py"
         ),
         "make_rp_handler_sha256": _sha256_file(root / "docker" / "make_rp_handler.py"),
     }

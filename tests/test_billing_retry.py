@@ -1,6 +1,6 @@
 """Retry/recovery of completion-time CUSTOMER charges (flash/server/billing_retry.py).
 
-Offline: the only network boundary (flash.server.billing.charge_completed_run) is stubbed, so a
+Offline: the only network boundary (flash.server.billing.charges.charge_completed_run) is stubbed, so a
 transient blip and a successful retry can be simulated without touching the backend. The point of
 the feature is that a finished-but-uncharged run is eventually charged exactly once -- the backend
 route is idempotent by runId, so a retry can never double-charge.
@@ -13,7 +13,7 @@ import io
 
 import pytest
 
-from flash.server import billing_retry
+from flash.server.billing import retry as billing_retry
 
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
@@ -114,7 +114,7 @@ def test_sweep_disabled_without_internal_key(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     _save_run(runner, tmp_path)
     monkeypatch.setattr(
-        "flash.server.billing.charge_completed_run",
+        "flash.server.billing.charges.charge_completed_run",
         lambda **_: (_ for _ in ()).throw(AssertionError("must not charge without internal key")),
     )
     assert billing_retry.retry_completion_charges_once() == 0
@@ -131,7 +131,7 @@ def test_sweep_charges_crashed_pending_run(monkeypatch, tmp_path):
 
     calls = []
     monkeypatch.setattr(
-        "flash.server.billing.charge_completed_run",
+        "flash.server.billing.charges.charge_completed_run",
         lambda *, internal_key, status: (
             calls.append(status.run_id) or {"amountCents": 123, "replay": False}
         ),
@@ -150,7 +150,7 @@ def test_transient_failure_then_retry_charges_exactly_once(monkeypatch, tmp_path
     exactly once. (The backend route is also idempotent by runId, so even a racing duplicate replays
     rather than double-charging.)"""
     import flash.runner as runner
-    from flash.server.billing import BillingError
+    from flash.server.billing.charges import BillingError
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
@@ -164,7 +164,7 @@ def test_transient_failure_then_retry_charges_exactly_once(monkeypatch, tmp_path
             raise BillingError(503, "billing service unavailable: transient")
         return {"amountCents": 123, "replay": False}
 
-    monkeypatch.setattr("flash.server.billing.charge_completed_run", flaky_charge)
+    monkeypatch.setattr("flash.server.billing.charges.charge_completed_run", flaky_charge)
 
     # sweep #1: the transient blip -> run marked failed, nothing charged
     assert billing_retry.retry_completion_charges_once() == 0
@@ -195,7 +195,7 @@ def test_sweep_tolerates_unreadable_status_file(monkeypatch, tmp_path):
 
     calls = []
     monkeypatch.setattr(
-        "flash.server.billing.charge_completed_run",
+        "flash.server.billing.charges.charge_completed_run",
         lambda *, internal_key, status: (
             calls.append(status.run_id) or {"amountCents": 123, "replay": False}
         ),
@@ -217,7 +217,7 @@ def test_sweep_cooperative_stop_halts_between_runs(monkeypatch, tmp_path):
 
     calls = []
     monkeypatch.setattr(
-        "flash.server.billing.charge_completed_run",
+        "flash.server.billing.charges.charge_completed_run",
         lambda *, internal_key, status: (
             calls.append(status.run_id) or {"amountCents": 1, "replay": False}
         ),
@@ -258,7 +258,7 @@ def test_sweep_skips_charged_failed_and_internal_runs(monkeypatch, tmp_path):
     save("internal", state="done", billing_state=None, billing_context=None)
 
     monkeypatch.setattr(
-        "flash.server.billing.charge_completed_run",
+        "flash.server.billing.charges.charge_completed_run",
         lambda **_: (_ for _ in ()).throw(AssertionError("no eligible run should be charged")),
     )
     assert billing_retry.retry_completion_charges_once() == 0
@@ -281,7 +281,7 @@ def test_sweep_charges_completed_then_cancelled_run(monkeypatch, tmp_path):
 
     calls = []
     monkeypatch.setattr(
-        "flash.server.billing.charge_completed_run",
+        "flash.server.billing.charges.charge_completed_run",
         lambda *, internal_key, status: (
             calls.append(status.run_id) or {"amountCents": 123, "replay": False}
         ),
@@ -322,7 +322,7 @@ def test_sweep_charges_cancelled_run_at_its_priced_cost(monkeypatch, tmp_path):
 
     calls = []
     monkeypatch.setattr(
-        "flash.server.billing.charge_completed_run",
+        "flash.server.billing.charges.charge_completed_run",
         lambda *, internal_key, status: (
             calls.append((status.run_id, status.cost_usd)) or {"amountCents": 42, "replay": False}
         ),
@@ -345,7 +345,7 @@ def test_sweep_skips_cancelled_run_with_no_cost(monkeypatch, tmp_path):
     _save_cancelled_run(runner, cost_usd=0.0)
 
     monkeypatch.setattr(
-        "flash.server.billing.charge_completed_run",
+        "flash.server.billing.charges.charge_completed_run",
         lambda **_: (_ for _ in ()).throw(AssertionError("a $0 cancel must not be charged")),
     )
     assert billing_retry.retry_completion_charges_once() == 0
@@ -382,14 +382,14 @@ def test_sweep_charges_run_with_stale_unparseable_spec(monkeypatch, tmp_path):
     )
 
     # belt-and-suspenders: prove this spec really would have aborted the old reparse path
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     with pytest.raises(ValueError, match="local environment paths"):
         JobSpec.from_dict(stale_spec)
 
     calls = []
     monkeypatch.setattr(
-        "flash.server.billing.charge_completed_run",
+        "flash.server.billing.charges.charge_completed_run",
         lambda *, internal_key, status: calls.append(status.run_id) or {"amountCents": 123},
     )
 
@@ -434,7 +434,7 @@ def test_sweep_charge_does_not_downgrade_deployed_state(monkeypatch, tmp_path):
     _save_run(runner, tmp_path, state="deployed", billing_state="failed")
 
     monkeypatch.setattr(
-        "flash.server.billing.charge_completed_run",
+        "flash.server.billing.charges.charge_completed_run",
         lambda *, internal_key, status: {"amountCents": 123},
     )
 
@@ -571,7 +571,7 @@ class _StopLoop(Exception):
 def _run_loop_once(monkeypatch, sweep_impl):
     import asyncio
 
-    from flash.server import _runtime
+    from flash.server.platform import runtime as _runtime
 
     monkeypatch.setattr(billing_retry, "retry_completion_charges_once", sweep_impl)
     calls = {"sleep": 0}
@@ -640,15 +640,15 @@ def test_startup_runs_completion_charge_sweep(monkeypatch, tmp_path):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
-    # runpod.keys caches the parsed pool on first read; reset so the startup preflight reads THIS
+    # runpod.auth caches the parsed pool on first read; reset so the startup preflight reads THIS
     # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make this self-contained).
-    import flash.providers.runpod.keys as runpod_keys
+    import flash.providers.runpod.auth as runpod_keys
 
     runpod_keys.reset()
 
     import flash.runner as runner
-    import flash.server.auth as auth_mod
-    import flash.server.db as db_mod
+    import flash.server.platform.auth as auth_mod
+    import flash.server.platform.db as db_mod
 
     importlib.reload(runner)
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
@@ -661,7 +661,7 @@ def test_startup_runs_completion_charge_sweep(monkeypatch, tmp_path):
 
     charged = []
     monkeypatch.setattr(
-        "flash.server.billing.charge_completed_run",
+        "flash.server.billing.charges.charge_completed_run",
         lambda *, internal_key, status: charged.append(status.run_id) or {"amountCents": 123},
     )
 
@@ -702,15 +702,15 @@ def test_startup_does_not_block_on_slow_charge_backlog(monkeypatch, tmp_path):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
-    # runpod.keys caches the parsed pool on first read; reset so the startup preflight reads THIS
+    # runpod.auth caches the parsed pool on first read; reset so the startup preflight reads THIS
     # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make this self-contained).
-    import flash.providers.runpod.keys as runpod_keys
+    import flash.providers.runpod.auth as runpod_keys
 
     runpod_keys.reset()
 
     import flash.runner as runner
-    import flash.server.auth as auth_mod
-    import flash.server.db as db_mod
+    import flash.server.platform.auth as auth_mod
+    import flash.server.platform.db as db_mod
 
     importlib.reload(runner)
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
@@ -730,7 +730,7 @@ def test_startup_does_not_block_on_slow_charge_backlog(monkeypatch, tmp_path):
             raise AssertionError("slow charge was never released")
         return {"amountCents": 123}
 
-    monkeypatch.setattr("flash.server.billing.charge_completed_run", slow_charge)
+    monkeypatch.setattr("flash.server.billing.charges.charge_completed_run", slow_charge)
 
     import flash.server.app as app_mod
 
@@ -754,8 +754,8 @@ def test_completion_hook_failure_is_recoverable_by_sweep(monkeypatch, tmp_path):
     """End to end across the two paths: the inline hook hits a transient BillingError and marks the
     run failed; the sweep then recovers it. This is the exact silent-revenue-leak scenario."""
     import flash.runner as runner
-    from flash.runner import lifecycle
-    from flash.server.billing import BillingError
+    from flash.runner.supervise import lifecycle
+    from flash.server.billing.charges import BillingError
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
@@ -768,7 +768,7 @@ def test_completion_hook_failure_is_recoverable_by_sweep(monkeypatch, tmp_path):
             raise BillingError(503, "transient")
         return {"amountCents": 123}
 
-    monkeypatch.setattr("flash.server.billing.charge_completed_run", charge)
+    monkeypatch.setattr("flash.server.billing.charges.charge_completed_run", charge)
 
     # inline completion hook (runs right after `done`) hits the blip and records failure
     lifecycle._charge_completed_run_by_id(spec.run_id, io.StringIO())

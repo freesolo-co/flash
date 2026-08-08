@@ -6,9 +6,8 @@ import json
 import math
 from typing import Any
 
-from flash.engine.structured_outputs import CONSTRAINT_KEYS as _SO_CONSTRAINT_KEYS
-from flash.envs.adapter import is_freesolo_environment_id
-from flash.spec import (
+from flash.content.structured_outputs import CONSTRAINT_KEYS as _SO_CONSTRAINT_KEYS
+from flash.core.spec import (
     CREDIT_ASSIGNMENTS,
     DEFAULT_CREDIT_ASSIGNMENT,
     RESERVED_WORKER_ENV_KEYS,
@@ -16,6 +15,7 @@ from flash.spec import (
     WandbSpec,
     validate_worker_env_reserved,
 )
+from flash.envs.adapter import is_freesolo_environment_id
 
 
 def _section_int(
@@ -91,7 +91,7 @@ def _train_teacher(train_raw: dict) -> str:
     if not v.strip():
         return ""
     # Imported lazily: recipe is dependency-free, but keep fields.py's import graph minimal.
-    from flash.engine.recipe import resolve_teacher
+    from flash.engine.plan.recipe import resolve_teacher
 
     # resolve_teacher owns the allow-list + its enumeration; reuse its message so the choices are
     # listed in exactly one place (recipe.py).
@@ -124,7 +124,7 @@ class ConfigError(ValueError):
 
 
 # vLLM StructuredOutputsParams surface: exactly one constraint field (_SO_CONSTRAINT_KEYS, imported
-# above from flash.engine.structured_outputs as the single source of truth) plus these options.
+# above from flash.content.structured_outputs as the single source of truth) plus these options.
 # vLLM also offers grammar/structural_tag, but Flash does not support them; reject explicitly so a
 # `{"grammar": ...}` table isn't silently swallowed by the bare-JSON-schema fallback below.
 _SO_REMOVED_KEYS = frozenset({"grammar", "structural_tag"})

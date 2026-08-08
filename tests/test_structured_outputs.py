@@ -14,14 +14,14 @@ import json
 
 import pytest
 
-from flash.engine.structured_outputs import (
+from flash.content.structured_outputs import (
     THINKING_REASONING_PARSER,
     describe_structured_outputs,
     parse_structured_outputs,
     reasoning_parser_for,
 )
+from flash.core.spec import JobSpec
 from flash.schema import ConfigError, spec_from_dict
-from flash.spec import JobSpec
 
 _SCHEMA = {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}
 

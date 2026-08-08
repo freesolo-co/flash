@@ -18,8 +18,11 @@ artifacts_local/
 hf_cache/
 *.log
 
-# Run artifacts: adapters (large binaries) live on the HF dataset repo, not in git
-results/
+# Run artifacts: adapters (large binaries) live on the HF dataset repo, not in git.
+# Anchored to the repo root: an unanchored `results/` matches at ANY depth, which also swallowed
+# the `flash/runner/results/` source package (and, because hatchling honors gitignore, dropped it
+# from the built wheel).
+/results/
 # ...but the benchmark's committed results ARE the deliverable. Un-ignore that subtree
 # HERE: git won't descend into an ignored dir to read a nested benchmark/results/.gitignore,
 # so the exception must live at the root. benchmark/results/.gitignore then whitelists the

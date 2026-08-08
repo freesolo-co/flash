@@ -29,8 +29,8 @@ _BACKEND_ROOT = Path(__file__).resolve().parents[2] / "backend"
 if _BACKEND_ROOT.is_dir() and str(_BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(_BACKEND_ROOT))
 
+from flash.core.spec import JobSpec
 from flash.schema import ConfigError, spec_from_dict
-from flash.spec import JobSpec
 
 
 def _representative_config() -> dict:

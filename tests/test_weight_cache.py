@@ -14,7 +14,7 @@ import types
 
 import pytest
 
-from flash.spec import GpuSpec, JobSpec, TrainSpec
+from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 from tests._helpers.profile import satisfy_sft_profile
 
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
@@ -27,7 +27,7 @@ def _oversized_model_info():
     catalog now fits entirely, so the size gate needs a stand-in to stay covered.
     """
     from flash import runner
-    from flash.catalog import ModelInfo
+    from flash.core.catalog import ModelInfo
 
     return ModelInfo(
         id="test/oversized",
@@ -249,10 +249,10 @@ def test_deploy_train_endpoint_attaches_volume_kwargs(monkeypatch):
     import runpod_flash
     import runpod_flash.core.resources.resource_manager as rm_mod
 
-    from flash.providers.runpod import auth, jobs, keys
+    from flash.providers.runpod import auth, jobs
 
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
-    keys.reset()
+    auth.reset()
     captured: dict = {}
 
     class RecEndpoint:
@@ -289,10 +289,10 @@ def test_deploy_train_endpoint_no_volume_when_spec_has_none(monkeypatch):
     import runpod_flash
     import runpod_flash.core.resources.resource_manager as rm_mod
 
-    from flash.providers.runpod import auth, jobs, keys
+    from flash.providers.runpod import auth, jobs
 
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
-    keys.reset()
+    auth.reset()
     captured: dict = {}
 
     class RecEndpoint:
@@ -321,7 +321,7 @@ def test_deploy_train_endpoint_no_volume_when_spec_has_none(monkeypatch):
 # worker weight_cache_env / build_worker_env redirect
 # ---------------------------------------------------------------------------
 def test_weight_cache_env_is_base_model_scoped():
-    from flash.providers._worker import weight_cache_env
+    from flash.providers._lifecycle.worker import weight_cache_env
 
     env = weight_cache_env("/runpod-volume")
     # BASE-MODEL-SCOPED: FLASH_WEIGHT_CACHE_DIR points the base-model prefetch at the mount's HF hub
@@ -339,13 +339,13 @@ def test_weight_cache_env_is_base_model_scoped():
 
 
 def test_weight_cache_env_custom_mount():
-    from flash.providers._worker import weight_cache_env
+    from flash.providers._lifecycle.worker import weight_cache_env
 
     assert weight_cache_env("/workspace")["FLASH_WEIGHT_CACHE_DIR"] == "/workspace/hf-cache/hub"
 
 
 def test_build_worker_env_sets_base_model_cache_with_volume():
-    from flash.providers._worker import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
 
     env = build_worker_env(_vol_spec(), 0)
     assert env["FLASH_WEIGHT_CACHE_DIR"] == "/runpod-volume/hf-cache/hub"
@@ -354,7 +354,7 @@ def test_build_worker_env_sets_base_model_cache_with_volume():
 
 
 def test_build_worker_env_no_cache_without_volume():
-    from flash.providers._worker import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
 
     env = build_worker_env(JobSpec(model="m", seed=0), 0)
     # Without a volume the base-model cache var must NOT be set (pointing at a missing mount).
@@ -363,7 +363,7 @@ def test_build_worker_env_no_cache_without_volume():
 
 
 def test_build_worker_env_per_run_override_wins():
-    from flash.providers._worker import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
 
     spec = _vol_spec()
     # network_volume is managed -> carried by the internal dict, so the cache redirect is present
@@ -385,7 +385,7 @@ def _patch_prefetch_io(monkeypatch, ephemeral_hub):
     import huggingface_hub
     import huggingface_hub.constants
 
-    import flash.engine.worker.hf as hf
+    import flash.engine.worker.io.hf as hf
 
     calls = []
 
@@ -484,7 +484,7 @@ def test_prefetch_model_starts_no_download_at_deadline(tmp_path, monkeypatch):
 def test_shared_weight_cache_dir_resolves_mount_for_both_substrates(tmp_path, monkeypatch):
     """_shared_weight_cache_dir derives the mount as two levels up from the cache dir (works for the
     RunPod /runpod-volume and instance /weight-cache mounts alike) and requires it to exist."""
-    import flash.engine.worker.hf as hf
+    import flash.engine.worker.io.hf as hf
 
     monkeypatch.delenv("FLASH_WEIGHT_CACHE_DIR", raising=False)
     assert hf._shared_weight_cache_dir() is None  # unset
@@ -503,7 +503,7 @@ def test_shared_weight_cache_dir_resolves_mount_for_both_substrates(tmp_path, mo
 # instance-provider integration (Lambda reuses RunPod's build_worker_env)
 # ---------------------------------------------------------------------------
 def test_strip_runpod_volume_env_removes_only_mount_rooted_vars():
-    from flash.providers._worker import strip_runpod_volume_env
+    from flash.providers._lifecycle.worker import strip_runpod_volume_env
 
     env = {
         "FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub",
@@ -520,8 +520,8 @@ def test_strip_runpod_volume_env_removes_only_mount_rooted_vars():
 def test_instance_payload_strips_runpod_volume_redirect():
     # The RunPod weight-cache base-model redirect must NOT leak into a Lambda payload —
     # those instances never mount /runpod-volume. (build_worker_env DOES set it; the instance strips.)
-    from flash.providers import _instance
-    from flash.providers._worker import build_worker_env
+    from flash.providers._lifecycle import instance as _instance
+    from flash.providers._lifecycle.worker import build_worker_env
 
     # network_volume is managed -> carried by the internal dict (the leak source that build_worker_env
     # turns into the /runpod-volume redirect).
@@ -633,7 +633,7 @@ def test_assign_weight_cache_keeps_preset_shared_cache_on_fitting_catalog_model(
     # The re-gate only strips when OVERSIZED: a fitting model that already carries the shared cache
     # keeps it (the pin is correct), exercising the honor-existing path for a shared-name spec.
     from flash import runner
-    from flash.catalog import MODELS
+    from flash.core.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.5-9B"]
     spec = JobSpec.from_dict(
@@ -655,7 +655,7 @@ def test_assign_weight_cache_keeps_preset_custom_volume_on_oversized_catalog_mod
     # The re-gate is scoped to the SHARED name only: a custom/per-org volume on an oversized model is
     # left intact (the caller owns its sizing — it may be a 200 GB org cache that DOES fit).
     from flash import runner
-    from flash.catalog import MODELS
+    from flash.core.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.6-35B-A3B"]
     spec = JobSpec.from_dict(
@@ -676,7 +676,7 @@ def test_assign_weight_cache_keeps_preset_custom_volume_on_oversized_catalog_mod
 def test_assign_weight_cache_attaches_fitting_catalog_model():
     # A model whose download fits the cache (with temp headroom) is still attached when info is passed.
     from flash import runner
-    from flash.catalog import MODELS
+    from flash.core.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.5-9B"]  # ~19.4 GB download, peak ~39 GB < 100 GB
     out = runner._assign_weight_cache_volume(JobSpec(model=info.id, run_id="r"), info)
@@ -695,7 +695,7 @@ def test_every_catalog_model_fits_the_weight_cache():
     # must cover. WEIGHT_CACHE_VOLUME_GB must stay >= the peak footprint of the biggest catalog
     # entry; if a larger model is added, grow the volume rather than silently skipping its cache.
     from flash import runner
-    from flash.catalog import MODELS
+    from flash.core.catalog import MODELS
 
     for mid, info in MODELS.items():
         assert runner._fits_weight_cache(info), (
@@ -736,13 +736,13 @@ def test_submit_job_assigns_weight_cache(monkeypatch):
 # lifecycle._drop_weight_cache + the no-capacity fallback
 # ---------------------------------------------------------------------------
 def test_drop_weight_cache_clears_volume():
-    from flash.runner.lifecycle import _drop_weight_cache
+    from flash.runner.supervise.lifecycle import _drop_weight_cache
 
     assert _drop_weight_cache(_vol_spec()).gpu.network_volume is None
 
 
 def test_drop_weight_cache_noop_without_volume():
-    from flash.runner.lifecycle import _drop_weight_cache
+    from flash.runner.supervise.lifecycle import _drop_weight_cache
 
     spec = JobSpec(model="m")
     assert _drop_weight_cache(spec) is spec  # no copy when there's nothing to drop
@@ -753,7 +753,7 @@ def test_drop_weight_cache_preserves_non_shared_escape_hatch_volume():
     # that is the deliberate escape-hatch isolation the run opted into. Only the SHARED
     # platform cache (WEIGHT_CACHE_VOLUME_NAME) is dropped.
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
-    from flash.runner.lifecycle import _drop_weight_cache
+    from flash.runner.supervise.lifecycle import _drop_weight_cache
 
     custom = _vol_spec(name="org-1234-private")
     assert custom.gpu.network_volume != WEIGHT_CACHE_VOLUME_NAME
@@ -847,7 +847,7 @@ def _supervised_walk(monkeypatch, failures):
     with tempfile.TemporaryDirectory() as tmp:
         orch = fresh_runner(tmp, monkeypatch)
         import flash.providers.runpod.jobs as jobs
-        import flash.providers.runpod.train as flash_train
+        import flash.providers.runpod.serverless as flash_train
 
         seen: list = []
 
@@ -859,7 +859,9 @@ def _supervised_walk(monkeypatch, failures):
             return jobs.PollResult(True, metrics={"cost_usd": 0.1})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr("flash.providers._worker.upload_code", lambda repo=None, **_: "repo")
+        monkeypatch.setattr(
+            "flash.providers._lifecycle.worker.upload_code", lambda repo=None, **_: "repo"
+        )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -920,8 +922,8 @@ def test_non_capacity_failure_keeps_weight_cache(monkeypatch):
 # preload: warm the per-region volumes with the catalog models (operator action)
 # ---------------------------------------------------------------------------
 def test_catalog_model_ids_are_the_cache_fitting_catalog():
-    from flash.catalog import MODELS
-    from flash.providers import weight_cache_preload as preload
+    from flash.core.catalog import MODELS
+    from flash.providers.artifacts import weight_cache as preload
     from flash.runner import _fits_weight_cache
 
     ids = set(preload.catalog_model_ids())
@@ -943,7 +945,7 @@ def test_preload_branch_passes_explicit_cache_dir(monkeypatch):
 
     import huggingface_hub
 
-    from flash.providers.runpod.train import endpoints
+    from flash.providers.runpod.serverless import endpoints
 
     monkeypatch.setattr(_os, "environ", dict(_os.environ))  # isolate the branch's os.environ.update
     monkeypatch.setattr(_os.path, "isdir", lambda p: True)  # pretend the volume IS mounted
@@ -990,7 +992,7 @@ def test_preload_rejects_non_volume_hf_home(monkeypatch):
 
     import huggingface_hub
 
-    from flash.providers.runpod.train import endpoints
+    from flash.providers.runpod.serverless import endpoints
 
     monkeypatch.setattr(_os, "environ", dict(_os.environ))
     monkeypatch.setattr(_os.path, "isdir", lambda p: True)  # even with the mount present...
@@ -1014,7 +1016,7 @@ def test_preload_rejects_non_volume_hf_home(monkeypatch):
 
 
 def test_teardown_weight_cache_deletes_only_fleet_volumes(monkeypatch):
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     vols = {
         "v1": "flash-weights-us-ca-2",
@@ -1040,7 +1042,7 @@ def test_teardown_weight_cache_deletes_only_fleet_volumes(monkeypatch):
 
     import runpod_flash.core.api.runpod as rp_api
 
-    from flash.providers.runpod import keys as rp_keys
+    from flash.providers.runpod import auth as rp_keys
 
     monkeypatch.setattr(rp_keys, "keys", lambda: ["k1"])  # single-account pool
     monkeypatch.setattr(rp_api, "RunpodRestClient", FakeRest)
@@ -1059,8 +1061,8 @@ def test_teardown_weight_cache_no_runpod_key_is_noop(monkeypatch):
     """
     import runpod_flash.core.api.runpod as rp_api
 
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.runpod import keys as rp_keys
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.runpod import auth as rp_keys
 
     def _boom(*a, **k):
         raise AssertionError("RunpodRestClient must not be constructed without a key")
@@ -1071,7 +1073,7 @@ def test_teardown_weight_cache_no_runpod_key_is_noop(monkeypatch):
 
 
 def test_teardown_weight_cache_sweeps_all_pool_accounts(monkeypatch):
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     seen_keys = []
 
@@ -1089,7 +1091,7 @@ def test_teardown_weight_cache_sweeps_all_pool_accounts(monkeypatch):
 
     import runpod_flash.core.api.runpod as rp_api
 
-    from flash.providers.runpod import keys as rp_keys
+    from flash.providers.runpod import auth as rp_keys
 
     monkeypatch.setattr(rp_keys, "keys", lambda: ["k1", "k2"])  # two-account pool
     monkeypatch.setattr(rp_api, "RunpodRestClient", FakeRest)
@@ -1104,8 +1106,8 @@ def test_teardown_does_not_report_failed_deletes(monkeypatch):
     # "deleted" result (the re-list is the source of truth), and a warning is logged.
     import runpod_flash.core.api.runpod as rp_api
 
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.runpod import keys as rp_keys
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.runpod import auth as rp_keys
 
     class FakeRest:
         def __init__(self, api_key=None):
@@ -1130,8 +1132,8 @@ def test_teardown_works_inside_running_event_loop(monkeypatch):
 
     import runpod_flash.core.api.runpod as rp_api
 
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.runpod import keys as rp_keys
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.runpod import auth as rp_keys
 
     class FakeRest:
         def __init__(self, api_key=None):
@@ -1155,8 +1157,8 @@ def test_teardown_works_inside_running_event_loop(monkeypatch):
 
 
 def test_teardown_lambda_filesystems_deletes_only_fleet(monkeypatch):
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.lambda_ import api as lambda_api
 
     fses = [
         {"id": "f1", "name": "flash-weights", "region": {"name": "us-east-1"}},
@@ -1173,8 +1175,8 @@ def test_teardown_lambda_filesystems_deletes_only_fleet(monkeypatch):
 
 
 def test_teardown_lambda_filesystems_no_key_is_noop(monkeypatch):
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.lambda_ import api as lambda_api
 
     monkeypatch.setattr(
         lambda_api,
@@ -1188,7 +1190,7 @@ def test_teardown_lambda_filesystems_no_key_is_noop(monkeypatch):
 
 def test_teardown_cli_reclaims_all_providers(monkeypatch):
     """`preload --teardown` sweeps RunPod + Lambda in one shot."""
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     monkeypatch.setattr(preload, "teardown_weight_cache", lambda dcs: ["flash-weights-us-ca-2"])
     monkeypatch.setattr(
@@ -1199,7 +1201,7 @@ def test_teardown_cli_reclaims_all_providers(monkeypatch):
 
 def test_teardown_dry_run_deletes_nothing(monkeypatch):
     """`--teardown --dry-run` only PRINTS the plan — it must never call the destructive helpers."""
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     def _boom(*a, **k):
         raise AssertionError("--teardown --dry-run must not call any teardown helper")
@@ -1211,7 +1213,7 @@ def test_teardown_dry_run_deletes_nothing(monkeypatch):
 
 def test_scoped_teardown_rejects_invalid_datacenter(monkeypatch):
     """`--teardown --datacenters <bad-id>` fails non-zero and deletes NOTHING (no silent success)."""
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     def _boom(*a, **k):
         raise AssertionError("invalid scoped teardown must not delete anything")
@@ -1222,7 +1224,7 @@ def test_scoped_teardown_rejects_invalid_datacenter(monkeypatch):
 
 def test_teardown_continues_when_runpod_unconfigured(monkeypatch):
     """A RunPod teardown raise (auth absent / outage) must NOT abort Lambda cleanup."""
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     def _boom(dcs):
         raise RuntimeError("RUNPOD_API_KEY not configured")
@@ -1241,7 +1243,7 @@ def test_teardown_continues_when_runpod_unconfigured(monkeypatch):
 
 def test_scoped_teardown_is_runpod_only(monkeypatch):
     """`--teardown --datacenters ...` scopes to RunPod; instance-provider caches are left intact."""
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     seen = {}
     monkeypatch.setattr(
@@ -1263,7 +1265,7 @@ def test_teardown_empty_datacenters_scope_is_refused(monkeypatch):
     A present-but-empty scope must abort without touching the fleet; it cannot fall through to the
     all-datacenters default.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     called = {}
     monkeypatch.setattr(
@@ -1282,8 +1284,8 @@ def test_teardown_weight_cache_empty_list_is_noop_not_all(monkeypatch):
     """teardown_weight_cache([]) is a no-op; an EXPLICIT empty scope must not widen to the full fleet."""
     import runpod_flash.core.api.runpod as rp_api
 
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.runpod import keys as rp_keys
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.runpod import auth as rp_keys
 
     def _boom(*a, **k):
         raise AssertionError("an empty scope must not list/delete any volumes")
@@ -1297,8 +1299,8 @@ def test_teardown_weight_cache_empty_list_is_noop_not_all(monkeypatch):
 # eager provision: create lambda weight-cache filesystems in every region without a gpu
 # ---------------------------------------------------------------------------
 def test_provision_lambda_filesystems_covers_every_region(monkeypatch):
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.lambda_ import api as lambda_api
 
     ensured = []
     monkeypatch.setattr(
@@ -1322,8 +1324,8 @@ def test_provision_lambda_filesystems_covers_every_region(monkeypatch):
 
 
 def test_provision_lambda_skips_failed_region(monkeypatch):
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.lambda_ import api as lambda_api
 
     def flaky(name, region, deadline_at=None):
         if region == "bad-1":
@@ -1337,8 +1339,8 @@ def test_provision_lambda_skips_failed_region(monkeypatch):
 
 
 def test_provision_lambda_no_key_is_noop(monkeypatch):
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.lambda_ import api as lambda_api
 
     monkeypatch.setattr(
         lambda_api,
@@ -1350,7 +1352,7 @@ def test_provision_lambda_no_key_is_noop(monkeypatch):
 
 def test_provision_cli_creates_lambda_filesystems(monkeypatch, capsys):
     """`preload --provision` creates Lambda filesystems (GPU-free) and exits 0."""
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     monkeypatch.setattr(preload, "provision_lambda_filesystems", lambda: ["lambda:us-east-1"])
     assert preload.main(["--provision"]) == 0
@@ -1358,7 +1360,7 @@ def test_provision_cli_creates_lambda_filesystems(monkeypatch, capsys):
 
 
 def test_provision_cli_dry_run_provisions_nothing(monkeypatch):
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     called = {"n": 0}
     monkeypatch.setattr(
@@ -1371,7 +1373,7 @@ def test_provision_cli_dry_run_provisions_nothing(monkeypatch):
 
 
 def test_preload_one_dc_deploys_pins_single_dc_and_tears_down(monkeypatch):
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     calls = {}
 
@@ -1447,7 +1449,7 @@ def test_preload_one_dc_deploys_pins_single_dc_and_tears_down(monkeypatch):
 
 
 def test_preload_one_dc_tears_down_on_failure(monkeypatch):
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     deleted = []
     monkeypatch.setattr(
@@ -1475,7 +1477,7 @@ def test_preload_one_dc_tears_down_on_failure(monkeypatch):
 
 
 def _stub_preload_deploy(monkeypatch, job_output):
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     monkeypatch.setattr(
         preload,
@@ -1497,7 +1499,7 @@ def _stub_preload_deploy(monkeypatch, job_output):
 
 def test_preload_one_dc_partial_when_a_model_fails(monkeypatch):
     # A COMPLETED job whose handler reports per-model failures is NOT a fully warmed region.
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     _stub_preload_deploy(
         monkeypatch,
@@ -1516,7 +1518,7 @@ def test_preload_one_dc_partial_when_a_model_fails(monkeypatch):
 
 def test_preload_one_dc_error_when_volume_not_mounted(monkeypatch):
     # The handler's mount-not-mounted hard error must surface as a DC-level error (not silent ok).
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     _stub_preload_deploy(
         monkeypatch,
@@ -1539,7 +1541,7 @@ def test_preload_branch_errors_when_volume_not_mounted(monkeypatch):
     # ephemeral disk — it returns an explicit error and downloads nothing.
     import os as _os
 
-    from flash.providers.runpod.train import endpoints
+    from flash.providers.runpod.serverless import endpoints
 
     monkeypatch.setattr(_os, "environ", dict(_os.environ))
     monkeypatch.setattr(_os.path, "isdir", lambda p: False)  # /runpod-volume not mounted
@@ -1555,7 +1557,7 @@ def test_preload_branch_errors_when_volume_not_mounted(monkeypatch):
 
 
 def test_warm_weight_cache_fans_out_over_datacenters(monkeypatch):
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     seen_dcs = []
 
@@ -1573,7 +1575,7 @@ def test_warm_weight_cache_fans_out_over_datacenters(monkeypatch):
 
 
 def test_warm_weight_cache_defaults_to_full_fleet_and_catalog(monkeypatch):
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     captured = {}
 
@@ -1608,7 +1610,7 @@ def _preload_spec():
 
 
 def test_instance_build_payload_preload_mode():
-    from flash.providers import _instance
+    from flash.providers._lifecycle import instance as _instance
 
     spec = _preload_spec()
     p = _instance.build_payload(
@@ -1631,7 +1633,7 @@ def test_instance_build_payload_preload_mode():
 
 
 def test_instance_build_payload_no_mode_by_default():
-    from flash.providers import _instance
+    from flash.providers._lifecycle import instance as _instance
 
     spec = _preload_spec()
     p = _instance.build_payload(
@@ -1649,7 +1651,7 @@ def test_instance_build_payload_no_mode_by_default():
 def test_instance_build_payload_preserves_worker_env_hf_home(monkeypatch):
     """A per-run [worker_env].HF_HOME override is NOT clobbered by the instance cache path (parity
     with RunPod, where the worker_env override wins), and disables the platform cache redirect."""
-    from flash.providers import _instance
+    from flash.providers._lifecycle import instance as _instance
 
     spec = JobSpec.from_dict(
         {
@@ -1675,7 +1677,7 @@ def test_instance_build_payload_preserves_worker_env_hf_home(monkeypatch):
 
 
 def test_instance_preload_requires_mounted_cache():
-    from flash.providers import _instance_bootstrap as b
+    from flash.providers._lifecycle import bootstrap as b
 
     # FLASH_WEIGHT_CACHE_DIR rooted at an UNMOUNTED cache -> refuse (would warm ephemeral disk), no download
     r = b.run_preload(
@@ -1690,7 +1692,7 @@ def test_instance_preload_downloads_into_cache(tmp_path, monkeypatch):
     import sys
     import types
 
-    from flash.providers import _instance_bootstrap as b
+    from flash.providers._lifecycle import bootstrap as b
 
     calls = []
 
@@ -1726,7 +1728,7 @@ def test_instance_preload_skips_download_when_already_cached(tmp_path, monkeypat
     snapshot already_cached and does NOT re-download it."""
     import sys
 
-    from flash.providers import _instance_bootstrap as b
+    from flash.providers._lifecycle import bootstrap as b
 
     real_downloads = []
 
@@ -1749,7 +1751,7 @@ def test_instance_preload_skips_download_when_already_cached(tmp_path, monkeypat
 def test_nfs_mount_check_verifies_mountpoint_and_writes_sentinel():
     """The NFS (Lambda) preamble drops the sentinel ONLY when the host path is a real mountpoint, so an
     auto-created empty Docker-bind dir (failed/unready NFS) is detectable in-container."""
-    from flash.providers import _instance
+    from flash.providers._lifecycle import instance as _instance
 
     pre = _instance._cache_nfs_mount_check({"cache_host_mount": "/lambda/nfs/flash-weights"})
     assert "mountpoint -q '/lambda/nfs/flash-weights'" in pre  # gates on a REAL mount
@@ -1763,7 +1765,7 @@ def test_instance_preload_nfs_requires_mount_sentinel(tmp_path, monkeypatch):
     auto-creates a missing host dir, so isdir(mount) alone can't prove the NFS actually mounted."""
     import sys
 
-    from flash.providers import _instance_bootstrap as b
+    from flash.providers._lifecycle import bootstrap as b
 
     def _boom(**k):
         raise AssertionError("must not download when the NFS cache isn't really mounted")
@@ -1790,7 +1792,7 @@ def test_instance_preload_nfs_warms_when_sentinel_present(tmp_path, monkeypatch)
     """With the NFS preamble's real-mount sentinel present, a Lambda preload proceeds to download."""
     import sys
 
-    from flash.providers import _instance_bootstrap as b
+    from flash.providers._lifecycle import bootstrap as b
 
     calls = []
 
@@ -1817,7 +1819,7 @@ def test_instance_preload_nfs_warms_when_sentinel_present(tmp_path, monkeypatch)
 def test_build_payload_carries_mount_marker_for_nfs_cache():
     """a cache-attached Lambda preload payload carries cache_mount_marker so the in-container check
     can require the NFS mount sentinel."""
-    from flash.providers import _instance
+    from flash.providers._lifecycle import instance as _instance
 
     spec = _preload_spec()
     p = _instance.build_payload(
@@ -1836,7 +1838,7 @@ def test_build_payload_carries_mount_marker_for_nfs_cache():
 def test_preload_wall_cap_timer_armed_and_cancellable(monkeypatch):
     """run_preload has no worker subprocess, so the preload branch arms an absolute-deadline watchdog
     that hard-exits the box if a download hangs past deadline_at. The timer is cancellable on finish."""
-    from flash.providers import _instance_bootstrap as b
+    from flash.providers._lifecycle import bootstrap as b
 
     now = 1_000.0
     monkeypatch.setattr(b.time, "time", lambda: now)
@@ -1859,8 +1861,8 @@ def test_lambda_launch_threads_preload_mode_into_payload(monkeypatch):
     import base64
     import json as _json
 
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
 
     launched = {}
     monkeypatch.setattr(
@@ -1910,8 +1912,8 @@ def _wire_warm(monkeypatch, marker):
     """Stub the warm path: status repo, the provider's usable_instances/launch/terminate, marker poll."""
     import json as _json
 
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.lambda_ import jobs as lj
 
     launched, terminated = [], []
     monkeypatch.setattr(preload, "_ensure_status_repo", lambda token: None)
@@ -2019,8 +2021,8 @@ def test_warm_poll_budget_matches_worker_wall_cap_below_floor(monkeypatch):
 
 
 def test_warm_instance_terminates_on_launch_failure(monkeypatch):
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.lambda_ import jobs as lj
 
     terminated = []
     monkeypatch.setattr(preload, "_ensure_status_repo", lambda token: None)
@@ -2042,8 +2044,8 @@ def test_warm_instance_stops_early_on_failure_marker(monkeypatch):
     The driver must watch that marker and free the paid box at once instead of polling the full budget."""
     import types as _types
 
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.lambda_ import jobs as lj
 
     terminated = []
     monkeypatch.setattr(preload, "_ensure_status_repo", lambda token: None)
@@ -2077,8 +2079,8 @@ def test_warm_instance_stops_early_on_failure_marker(monkeypatch):
 
 
 def test_warm_instances_no_capacity_returns_empty(monkeypatch):
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.lambda_ import jobs as lj
 
     monkeypatch.setattr(preload, "_ensure_status_repo", lambda token: None)
     monkeypatch.setattr(lj, "usable_instances", lambda gpu: [])
@@ -2089,8 +2091,8 @@ def test_warm_instances_uses_managed_lambda_gpu_ladder(monkeypatch):
     """With no --gpu override, Lambda warming walks the managed ladder cheapest-first."""
     import importlib
 
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.lambda_ import jobs as lj
 
     monkeypatch.setenv("FLASH_PRELOAD_INSTANCE_GPU", "H100")
     importlib.reload(preload)
@@ -2114,8 +2116,8 @@ def test_lambda_ladder_is_ordered_cheapest_first():
 
     Guards against someone appending a class without checking where it lands on price.
     """
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.lambdalabs.pricing import _STATIC_RATES
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.lambda_.pricing import _STATIC_RATES
 
     rates = [_STATIC_RATES[c] for c in preload._LAMBDA_PRELOAD_GPU_LADDER]
     assert rates == sorted(rates), f"ladder must be cheapest-first, got {rates}"
@@ -2143,8 +2145,8 @@ def test_lambda_ladder_reaches_regions_the_cheapest_class_cannot(monkeypatch):
     Regression for the fleet-wide gap where 8 of 10 provisioned filesystems were never warmed because
     A10 -- the only class the warm path ever asked for -- had capacity in just 2 regions.
     """
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.lambda_ import jobs as lj
 
     monkeypatch.setattr(
         lj,
@@ -2170,8 +2172,8 @@ def test_lambda_ladder_reaches_regions_the_cheapest_class_cannot(monkeypatch):
 
 def test_lambda_ladder_skips_a_class_whose_capacity_lookup_fails(monkeypatch):
     """One class's API call failing must not strand the regions a later class could still warm."""
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.lambda_ import jobs as lj
 
     def flaky(gpu):
         if gpu == "A10":
@@ -2188,8 +2190,8 @@ def test_lambda_ladder_skips_a_class_whose_capacity_lookup_fails(monkeypatch):
 
 def test_lambda_explicit_gpu_pins_the_class_and_skips_the_ladder(monkeypatch):
     """An explicit --gpu is an operator decision: never silently widened to other classes."""
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.lambda_ import jobs as lj
 
     asked = []
 
@@ -2326,7 +2328,7 @@ def test_warm_ensures_the_region_filesystem_once_before_the_class_ladder(monkeyp
     Creation is non-idempotent; pre-ensuring makes later class attempts observe the existing mount
     instead of billing duplicate filesystems.
     """
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     preload, lj, _launched, _terminated = _wire_warm(
         monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
@@ -2364,7 +2366,7 @@ def test_warm_skips_a_region_whose_created_filesystem_is_not_yet_listed(monkeypa
     Later `ensure_filesystem` calls are safe only after listing visibility; otherwise launch can
     submit a second non-idempotent create.
     """
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     preload, lj, _launched, _terminated = _wire_warm(
         monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
@@ -2397,7 +2399,7 @@ def test_warm_does_not_launch_while_the_filesystem_is_unconfirmed(monkeypatch):
     Reconciliation failures can lose their sentinel under capacity wrapping. Launching anyway risks
     a second non-idempotent create, so skip the cold region.
     """
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     preload, lj, _launched, _terminated = _wire_warm(
         monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
@@ -2430,8 +2432,8 @@ def test_ladder_planning_shares_one_deadline_across_every_class(monkeypatch):
     Each class performs retrying price and capacity calls; stop the ladder when the shared budget is
     gone rather than stacking four outage windows.
     """
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.lambda_ import jobs as lj
 
     clock = {"t": 0.0}
     monkeypatch.setattr(preload, "time", types.SimpleNamespace(time=lambda: clock["t"]))
@@ -2459,7 +2461,7 @@ def test_warm_still_walks_the_ladder_when_lambda_was_never_reached(monkeypatch):
     Without this distinction the pre-ensure would fail on every host lacking LAMBDA_API_KEY, pin the
     ladder to a single class, and silently disable the class fallback this module exists to provide.
     """
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     preload, lj, _launched, _terminated = _wire_warm(
         monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
@@ -2489,8 +2491,8 @@ def test_warm_raises_when_capacity_could_not_be_measured(monkeypatch):
 
     Empty means healthy no-capacity to callers; an outage is a different fact and cannot exit 0.
     """
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.lambda_ import jobs as lj
 
     monkeypatch.setattr(preload, "_ensure_status_repo", lambda token: None)
     monkeypatch.setattr(preload, "_lambda_provisioned_regions", lambda: set())
@@ -2509,8 +2511,8 @@ def test_warm_reports_a_genuine_zero_capacity_fleet_as_success(monkeypatch):
     The counterpart to the outage case -- without this the fix would turn an ordinary quiet-inventory
     day into a hard failure.
     """
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.lambda_ import jobs as lj
 
     monkeypatch.setattr(preload, "_ensure_status_repo", lambda token: None)
     monkeypatch.setattr(preload, "_lambda_provisioned_regions", lambda: set())
@@ -2551,7 +2553,7 @@ def test_warm_cli_exits_nonzero_when_the_fleet_was_not_fully_measured(monkeypatc
     The launches still print, since they ran and were billed, but the exit code has to say the
     sweep is unfinished -- a green exit here is what let unexamined regions stay cold unnoticed.
     """
-    from flash.providers import weight_cache_preload as _p
+    from flash.providers.artifacts import weight_cache as _p
 
     model = _p.catalog_model_ids()[0]
     preload, lj, _launched, _terminated = _wire_warm(
@@ -2579,7 +2581,7 @@ def test_warm_incomplete_summary_does_not_contradict_the_warmed_count(monkeypatc
 
     One count is successful warms and the other is regions examined; label each accordingly.
     """
-    from flash.providers import weight_cache_preload as _p
+    from flash.providers.artifacts import weight_cache as _p
 
     model = _p.catalog_model_ids()[0]
     preload, lj, _launched, _terminated = _wire_warm(
@@ -2619,8 +2621,8 @@ def test_provisioned_region_snapshot_is_deadline_bounded(monkeypatch):
     It runs after planning budget exhaustion and must not add another retry cycle for a summary
     line.
     """
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.lambda_ import api as lambda_api
 
     seen = {}
 
@@ -2663,7 +2665,7 @@ def test_warm_counts_launch_time_regions_in_the_fleet_total(monkeypatch):
     Launch-time provisioning can add regions absent from the snapshot; include result regions to
     avoid impossible counts such as 2 of 1 incomplete.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     cold, total = preload._cold_lambda_regions(
         {"us-south-2"}, [{"region": "us-west-1", "status": "error"}]
@@ -2679,7 +2681,7 @@ def test_warm_cli_prints_regions_with_no_capacity(monkeypatch, capsys):
     The module entry point may have only a NullHandler, so stdout must carry the no-capacity
     regions.
     """
-    from flash.providers import weight_cache_preload as _p
+    from flash.providers.artifacts import weight_cache as _p
 
     # a real catalog id: --models refuses off-catalog ids before it ever reaches the warm path
     model = _p.catalog_model_ids()[0]
@@ -2703,8 +2705,8 @@ def test_warm_ranks_contested_regions_by_live_price_not_ladder_order(monkeypatch
     ``usable_instances`` already attaches the live ``price_usd_hr``; ignoring it would keep claiming
     regions in a stale snapshot order and launch the more expensive box.
     """
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.lambda_ import jobs as lj
 
     def discounted(gpu):
         # H100 discounted below A10 -- the ladder tuple still lists A10 first.
@@ -2722,8 +2724,8 @@ def test_warm_ties_and_missing_prices_keep_ladder_order(monkeypatch):
 
     An unavailable price is common; it must not randomize which paid class a region gets.
     """
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.lambda_ import jobs as lj
 
     def priceless(gpu):
         return [types.SimpleNamespace(region="us-east-1", gpu=gpu, price_usd_hr=None)]
@@ -2736,7 +2738,7 @@ def test_warm_ties_and_missing_prices_keep_ladder_order(monkeypatch):
 
 def test_warm_cli_prints_the_gpu_class_each_region_used(monkeypatch, capsys):
     """Without --gpu the class is per region, so the printed line is the only cost audit an operator gets."""
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     monkeypatch.setattr(
         preload,
@@ -2752,7 +2754,7 @@ def test_warm_cli_prints_the_gpu_class_each_region_used(monkeypatch, capsys):
 
 def test_warm_cli_help_does_not_promise_the_old_single_class(monkeypatch, capsys):
     """--help must not still advertise A10 for a paid mode that can now launch up to B200."""
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     with pytest.raises(SystemExit):
         preload.main(["--help"])
@@ -2764,8 +2766,8 @@ def test_warm_cli_help_does_not_promise_the_old_single_class(monkeypatch, capsys
 
 
 def test_warm_instances_explicit_gpu_overrides_default(monkeypatch):
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.lambda_ import jobs as lj
 
     seen = {}
 
@@ -2788,7 +2790,7 @@ def test_preload_status_repo_is_managed_across_all_paths(monkeypatch):
 
     import huggingface_hub
 
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     monkeypatch.setenv("FLASH_PRELOAD_STATUS_REPO", "other/repo")
     importlib.reload(preload)
@@ -2847,7 +2849,7 @@ def test_preload_status_repo_follows_self_hosted_namespace(monkeypatch):
     do. Hardcoded, the warm path fails at create_repo and blames the operator's HF_TOKEN."""
     import huggingface_hub
 
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     monkeypatch.setenv("FLASH_HF_NAMESPACE", "self-hoster")
 
@@ -2879,8 +2881,8 @@ def test_warm_instances_requires_status_repo_before_launch(monkeypatch):
 
     import pytest
 
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.lambda_ import jobs as lj
 
     # lambda has capacity -> a real launch target exists.
     monkeypatch.setattr(
@@ -2904,7 +2906,7 @@ def test_warm_instances_cli_reports_planning_outage_without_traceback(monkeypatc
     """A total planning outage / unusable status repo raises bare RuntimeError from warm_instances.
     The CLI must turn that into a message and exit 1, not an unhandled traceback: both conditions are
     operator-actionable (Lambda down, HF_TOKEN missing), and a traceback buries the reason."""
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     monkeypatch.setattr(
         preload,
@@ -2919,7 +2921,7 @@ def test_precheck_cannot_take_time_from_the_launch_deadline(monkeypatch):
 
     Sharing the run deadline can consume create allowance and end polling before a live download.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     # A slow pre-check that returns "listed" but burns two minutes of wall clock getting there.
     def slow_precheck(region, deadline):
@@ -2950,8 +2952,8 @@ def test_precheck_cannot_take_time_from_the_launch_deadline(monkeypatch):
 def test_warm_instances_no_targets_is_noop_without_status_repo(monkeypatch):
     """No provider capacity -> documented no-op: warm returns [] and must NOT require the status repo
     (else an empty warm on an unconfigured / at-capacity host would hard-fail on a missing HF_TOKEN)."""
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.lambda_ import jobs as lj
 
     monkeypatch.setattr(lj, "usable_instances", lambda gpu: [])
     monkeypatch.setattr(
@@ -2965,7 +2967,7 @@ def test_warm_instances_no_targets_is_noop_without_status_repo(monkeypatch):
 
 
 def test_warm_instances_cli_dry_run(monkeypatch):
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     called = {"n": 0}
     monkeypatch.setattr(
@@ -2980,7 +2982,7 @@ def test_cli_gpu_default_is_none_per_mode(monkeypatch):
 
     An explicit RTX 4090 must remain distinguishable from no override.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     # --warm-instances, no --gpu -> warm_instances receives gpu=None and applies the managed lambda a10
     seen = {}
@@ -2996,7 +2998,7 @@ def test_cli_gpu_default_is_none_per_mode(monkeypatch):
 
 def test_cli_runpod_warm_gpu_falls_back_to_preload_default(monkeypatch):
     """RunPod warm path: a None --gpu resolves to _PRELOAD_GPU so None never reaches deploy."""
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     seen = {}
     monkeypatch.setattr(preload, "warm_weight_cache", lambda **k: seen.update(k) or [])
@@ -3011,7 +3013,7 @@ def test_cli_runpod_warm_gpu_falls_back_to_preload_default(monkeypatch):
 
 def _poll_env(monkeypatch, statuses, workers):
     """Wire _poll_until_done's two API calls: job status sequence + a fixed worker-health dict."""
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     seq = list(statuses)
     monkeypatch.setattr(
@@ -3033,7 +3035,7 @@ def test_poll_gives_up_when_datacenter_never_allocates_a_worker(monkeypatch):
     Regression: US-KS-2/US-MO-2/US-NC-2/US-NE-1/US-WA-1 stock no RTX 4090, so preload jobs there sat
     queued with an all-zero worker set until the 5400s timeout and the DC stayed silently cold.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     clock = {"t": 0.0}
     monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
@@ -3058,7 +3060,7 @@ def test_poll_gives_up_when_datacenter_never_allocates_a_worker(monkeypatch):
 
 def test_poll_waits_when_a_worker_is_initializing(monkeypatch):
     """An initializing worker proves capacity exists: a slow download must NOT be cut short."""
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     clock = {"t": 0.0}
     monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
@@ -3091,7 +3093,7 @@ def test_poll_restarts_the_grace_window_after_a_requeue(monkeypatch):
     A later requeue needs a fresh grace window or its first zero-worker reading can delete a proven
     capacity endpoint.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     clock = {"t": 0.0}
     monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
@@ -3126,7 +3128,7 @@ def test_poll_rechecks_health_after_a_requeue_loses_the_worker(monkeypatch):
 
     Clear it after interruption or later health probes remain disabled for the full 5400s timeout.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     clock = {"t": 0.0}
     monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
@@ -3159,7 +3161,7 @@ def test_poll_rechecks_health_when_a_worker_vanishes_without_leaving_the_queue(m
     Clear the latch when the worker vanishes or starvation detection stays disabled without a queue
     transition.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     clock = {"t": 0.0}
     monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
@@ -3192,7 +3194,7 @@ def test_has_worker_treats_health_failure_as_unknown(monkeypatch):
     None, not False -- the caller escalates a sustained False into NoCapacityError and deletes the
     endpoint, so conflating "cannot tell" with "no workers" would kill healthy downloads.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     def _boom(*_a, **_k):
         raise RuntimeError("health api down")
@@ -3217,7 +3219,7 @@ def test_a_broken_worker_image_is_not_reported_as_a_starved_datacenter(monkeypat
     Classify it as an image failure, not no capacity; changing GPU class cannot repair a broken
     image.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     monkeypatch.setattr(
         preload.runpod_api,
@@ -3240,7 +3242,7 @@ def test_a_persistently_unhealthy_worker_is_reported_as_a_broken_image(monkeypat
     Give this state its own timer or it suppresses starvation and holds a paid endpoint for 5400s.
     Match `poll_job`'s 240-second failed-image grace.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     monkeypatch.setattr(
         preload.runpod_api,
@@ -3264,7 +3266,7 @@ def test_an_unhealthy_worker_alongside_a_live_one_is_not_a_broken_image(monkeypa
     Same predicate ``poll_job`` uses: unhealthy only counts when nothing is usable and nothing is
     still coming up. Firing here would throw away a download that is progressing on the good box.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     monkeypatch.setattr(preload, "_UNHEALTHY_GRACE_S", 0.0)  # grace already elapsed
     monkeypatch.setattr(preload.runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
@@ -3284,7 +3286,7 @@ def test_a_throttled_worker_still_counts_as_no_capacity(monkeypatch):
 
     Sustained throttling must follow `jobs.py` into GPU escalation, not wait the full 5400s timeout.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     monkeypatch.setattr(
         preload.runpod_api,
@@ -3304,7 +3306,7 @@ def test_unreadable_health_never_becomes_no_capacity(monkeypatch):
 
     Unreadable health cannot prove zero workers or trigger endpoint deletion.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 0.0)  # grace already elapsed
     monkeypatch.setattr(
@@ -3324,7 +3326,7 @@ def test_unreadable_health_does_not_age_the_grace_timer(monkeypatch):
     Health blackouts cannot age the timer; the first later zero-worker reading must start from prior
     confirmed duration only.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     clock = {"t": 0.0}
     monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
@@ -3350,7 +3352,7 @@ def test_no_capacity_guard_only_runs_while_the_job_is_queued(monkeypatch):
 
     Run starvation checks only while queued or stale health can delete an active download.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     clock = {"t": 0.0}
     monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
@@ -3378,7 +3380,7 @@ def test_no_capacity_guard_only_runs_while_the_job_is_queued(monkeypatch):
 
 def test_no_capacity_is_reported_distinctly_from_error(monkeypatch):
     """A starved DC surfaces as status='no_capacity' so the summary can name it and the GPU class."""
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     monkeypatch.setattr(
         preload,
@@ -3404,10 +3406,10 @@ def test_catalog_is_ordered_largest_first(monkeypatch):
     It is deliberately not the thing that makes the catalog fit -- see
     ``test_volume_holds_whole_catalog_with_largest_model_in_transit`` for that invariant.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     ids = preload.catalog_model_ids()
-    from flash.catalog import MODELS
+    from flash.core.catalog import MODELS
 
     sizes = [MODELS[m].params_b or 0.0 for m in ids]
     assert sizes == sorted(sizes, reverse=True), (
@@ -3436,8 +3438,8 @@ def test_preload_timeout_covers_a_fully_cold_whole_catalog_warm():
     The 250 GB preload pulls about 159 GB cold; size from the measured 35B rate of 70 GB in about
     870 seconds. A timeout discards all progress.
     """
-    from flash.catalog import MODELS
-    from flash.providers.weight_cache_preload import _PRELOAD_TIMEOUT_S
+    from flash.core.catalog import MODELS
+    from flash.providers.artifacts.weight_cache import _PRELOAD_TIMEOUT_S
     from flash.runner import _download_gb, _fits_weight_cache
 
     measured_gb, measured_s = 70.0, 870.0  # observed cold 35B pull
@@ -3461,7 +3463,7 @@ def test_every_preload_timeout_default_reads_the_shared_constant():
     import inspect
     import re
 
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     defaults = {
         name: inspect.signature(fn).parameters["timeout_s"].default
@@ -3489,7 +3491,7 @@ def test_catalog_peak_counts_others_resident_not_just_the_largest():
     The bug was sizing the largest model against an EMPTY volume. Peak must therefore exceed both
     the largest model's own peak and the plain resident total.
     """
-    from flash.catalog import MODELS
+    from flash.core.catalog import MODELS
     from flash.runner import _fits_weight_cache, weight_cache_catalog_peak_gb
 
     sizes = sorted(
@@ -3506,7 +3508,7 @@ def test_catalog_peak_counts_others_resident_not_just_the_largest():
 
 def test_partial_datacenter_names_the_models_that_failed(monkeypatch, caplog):
     """'partial' alone is unactionable: the summary must name each failed model and its reason."""
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     monkeypatch.setattr(preload, "catalog_model_ids", lambda: ["m1", "m2"])
     monkeypatch.setattr(preload, "weight_cache_datacenters", list)
@@ -3533,7 +3535,7 @@ def test_partial_datacenter_names_the_models_that_failed(monkeypatch, caplog):
 
 def test_ok_datacenter_logs_no_per_model_failures(monkeypatch, caplog):
     """A fully warmed DC must not emit failure lines (the summary stays quiet when nothing is wrong)."""
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     monkeypatch.setattr(preload, "catalog_model_ids", lambda: ["m1"])
     monkeypatch.setattr(preload, "weight_cache_datacenters", list)
@@ -3644,7 +3646,7 @@ def test_one_stalling_volume_cannot_starve_the_rest_of_the_fleet(monkeypatch):
     """
     import types
 
-    from flash.providers import _deadline
+    from flash.providers._lifecycle import deadline as _deadline
     from flash.providers.runpod import api
 
     clock = {"t": 10_000.0}
@@ -3715,7 +3717,7 @@ def test_a_bad_account_key_never_blocks_a_warm(monkeypatch):
     A volume that cannot be grown still gets attached, which is no worse than not trying at all --
     but a warm aborted over an expired key warms nothing.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
     from flash.providers.runpod import jobs
 
     monkeypatch.setattr(
@@ -3742,7 +3744,7 @@ def test_assign_refreshes_a_stale_shared_cache_size():
     A correct volume name can still carry the stale 100 GB size and admit models that need 250 GB.
     """
     from flash import runner
-    from flash.catalog import MODELS
+    from flash.core.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.5-9B"]
     spec = JobSpec.from_dict(
@@ -3768,7 +3770,7 @@ def test_assign_leaves_a_custom_volume_size_alone():
     change what they are billed for.
     """
     from flash import runner
-    from flash.catalog import MODELS
+    from flash.core.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.5-9B"]
     spec = JobSpec.from_dict(
@@ -3788,7 +3790,7 @@ def test_an_unknown_job_status_cannot_restart_the_starvation_grace(monkeypatch):
 
     None or unknown status must not restart grace and hide a permanently starved datacenter.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     # alternate IN_QUEUE with junk: under the old rule the junk poll cleared the anchor every time
     statuses = iter(["IN_QUEUE", None, "IN_QUEUE", "SOMETHING_NEW", "IN_QUEUE"] * 50)
@@ -3811,7 +3813,7 @@ def test_a_running_job_still_clears_the_starvation_grace(monkeypatch):
 
     After IN_PROGRESS, a later requeue needs a fresh grace window rather than inherited starvation.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     clock = {"now": 1000.0}
     statuses = iter(["IN_QUEUE", "IN_PROGRESS", "IN_QUEUE", "COMPLETED"])
@@ -3841,7 +3843,7 @@ def test_a_status_blackout_is_not_charged_to_the_starvation_grace(monkeypatch):
     A job may run and requeue during a status blackout. Hold confirmed queued duration, but do not
     charge blind time or fail on the first later reading.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     clock = {"now": 1000.0}
     # 2 confirmed queued polls, a long unreadable gap, then queued again and done
@@ -3873,7 +3875,7 @@ def test_a_blackout_only_pauses_the_grace_and_never_restarts_it(monkeypatch):
     Preserve confirmed queued duration across blackouts so intermittent errors cannot defer failure
     for the full timeout.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     clock = {"now": 1000.0}
     # every confirmed queued poll is separated by an unreadable one, so a reset-on-unknown rule
@@ -3906,7 +3908,7 @@ def test_a_health_blackout_cannot_restart_the_starvation_grace(monkeypatch):
     `_worker_counts` returns None when blind; clearing anchors lets intermittent failures prevent
     starvation, unhealthy, and throttled timers from ever firing.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     clock = {"now": 1000.0}
     polls = {"n": 0}
@@ -3945,7 +3947,7 @@ def test_a_health_blackout_is_not_charged_to_the_grace_either(monkeypatch):
     A worker may appear during a health blackout. Charge only confirmed state time or the next
     reading can tear down a healthy download.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     clock = {"now": 1000.0}
     polls = {"n": 0}
@@ -3983,7 +3985,7 @@ def test_a_throttled_worker_is_not_a_broken_image(monkeypatch):
     Throttling uses a longer grace; the shorter unhealthy timer would misclassify and tear down a
     potentially runnable box.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     assert preload._only_unhealthy_workers({"unhealthy": 1, "throttled": 1}) is False
     # with nothing else alive it IS the broken-image case
@@ -4077,7 +4079,7 @@ def test_the_warm_names_the_volume_the_deploy_must_reconcile(monkeypatch):
     Without cache_volumes the deploy-side grow early-returns on spec=None and nothing reconciles
     the warm's mount at all.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     seen = {}
 
@@ -4097,8 +4099,8 @@ def test_a_short_timeout_still_reconciles(monkeypatch):
     Growth yields the 60-second create allowance, so callers must add headroom or reconciliation
     receives no budget.
     """
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers._deadline import CREATE_ALLOWANCE_S
+    from flash.providers._lifecycle.deadline import CREATE_ALLOWANCE_S
+    from flash.providers.artifacts import weight_cache as preload
     from flash.providers.runpod.jobs import (
         WEIGHT_CACHE_GROW_BUDGET_S,
         weight_cache_grow_headroom_s,
@@ -4130,7 +4132,7 @@ def test_deploy_side_grow_yields_the_create_allowance_it_sits_in_front_of(monkey
     Growth must yield the create allowance before `_deploy_once` rechecks it.
     """
     from flash import runner
-    from flash.providers._deadline import CREATE_ALLOWANCE_S
+    from flash.providers._lifecycle.deadline import CREATE_ALLOWANCE_S
     from flash.providers.runpod import jobs
 
     calls = []
@@ -4173,10 +4175,10 @@ def test_the_account_a_failover_lands_on_still_has_grow_budget(monkeypatch):
     """
     import runpod_flash
 
-    from flash.providers import _deadline
+    from flash.providers._lifecycle import deadline as _deadline
     from flash.providers.runpod import auth as rp_auth
+    from flash.providers.runpod import auth as rp_keys
     from flash.providers.runpod import jobs
-    from flash.providers.runpod import keys as rp_keys
 
     clock = {"t": 10_000.0}
     monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
@@ -4233,11 +4235,11 @@ def test_a_slow_failed_create_cannot_spend_the_failover_grow_budget(monkeypatch)
     """
     import runpod_flash
 
-    from flash.providers import _deadline
-    from flash.providers._deadline import CREATE_ALLOWANCE_S
+    from flash.providers._lifecycle import deadline as _deadline
+    from flash.providers._lifecycle.deadline import CREATE_ALLOWANCE_S
     from flash.providers.runpod import auth as rp_auth
+    from flash.providers.runpod import auth as rp_keys
     from flash.providers.runpod import jobs
-    from flash.providers.runpod import keys as rp_keys
 
     clock = {"t": 10_000.0}
     monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
@@ -4303,10 +4305,10 @@ def test_a_volume_free_run_reserves_no_grow_time(monkeypatch):
     """
     import runpod_flash
 
-    from flash.providers import _deadline
+    from flash.providers._lifecycle import deadline as _deadline
     from flash.providers.runpod import auth as rp_auth
+    from flash.providers.runpod import auth as rp_keys
     from flash.providers.runpod import jobs
-    from flash.providers.runpod import keys as rp_keys
 
     clock = {"t": 10_000.0}
     monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
@@ -4352,8 +4354,8 @@ def test_a_quota_retry_does_not_re_grow_the_same_account(monkeypatch):
     import runpod_flash
 
     from flash.providers.runpod import auth as rp_auth
+    from flash.providers.runpod import auth as rp_keys
     from flash.providers.runpod import jobs
-    from flash.providers.runpod import keys as rp_keys
 
     monkeypatch.setattr(rp_auth, "ensure_auth", lambda: "only-account")
     monkeypatch.setattr(rp_keys, "key_count", lambda: 1)
@@ -4398,10 +4400,10 @@ def test_the_grow_reserve_does_not_reject_a_launchable_deploy(monkeypatch):
     import runpod_flash
 
     from flash import runner
-    from flash.providers import _deadline
+    from flash.providers._lifecycle import deadline as _deadline
     from flash.providers.runpod import auth as rp_auth
+    from flash.providers.runpod import auth as rp_keys
     from flash.providers.runpod import jobs
-    from flash.providers.runpod import keys as rp_keys
 
     clock = {"t": 10_000.0}
     monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
@@ -4444,10 +4446,10 @@ def test_the_grow_reserve_still_caps_what_a_create_may_spend(monkeypatch):
     import runpod_flash
 
     from flash import runner
-    from flash.providers import _deadline
+    from flash.providers._lifecycle import deadline as _deadline
     from flash.providers.runpod import auth as rp_auth
+    from flash.providers.runpod import auth as rp_keys
     from flash.providers.runpod import jobs
-    from flash.providers.runpod import keys as rp_keys
 
     clock = {"t": 10_000.0}
     monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
@@ -4496,11 +4498,11 @@ def test_the_post_grow_recheck_does_not_recharge_a_paid_slice(monkeypatch):
     import runpod_flash
 
     from flash import runner
-    from flash.providers import _deadline
-    from flash.providers._deadline import CREATE_ALLOWANCE_S
+    from flash.providers._lifecycle import deadline as _deadline
+    from flash.providers._lifecycle.deadline import CREATE_ALLOWANCE_S
     from flash.providers.runpod import auth as rp_auth
+    from flash.providers.runpod import auth as rp_keys
     from flash.providers.runpod import jobs
-    from flash.providers.runpod import keys as rp_keys
 
     clock = {"t": 10_000.0}
     monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
@@ -4555,11 +4557,11 @@ def test_admission_is_rejudged_with_the_key_the_attempt_lands_on(monkeypatch):
     import runpod_flash
 
     from flash import runner
-    from flash.providers import _deadline
-    from flash.providers._deadline import CREATE_ALLOWANCE_S
+    from flash.providers._lifecycle import deadline as _deadline
+    from flash.providers._lifecycle.deadline import CREATE_ALLOWANCE_S
     from flash.providers.runpod import auth as rp_auth
+    from flash.providers.runpod import auth as rp_keys
     from flash.providers.runpod import jobs
-    from flash.providers.runpod import keys as rp_keys
 
     clock = {"t": 10_000.0}
     monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
@@ -4629,11 +4631,11 @@ def test_a_large_key_pool_does_not_zero_the_create_timeout(monkeypatch):
     import runpod_flash
 
     from flash import runner
-    from flash.providers import _deadline
-    from flash.providers._deadline import CREATE_ALLOWANCE_S
+    from flash.providers._lifecycle import deadline as _deadline
+    from flash.providers._lifecycle.deadline import CREATE_ALLOWANCE_S
     from flash.providers.runpod import auth as rp_auth
+    from flash.providers.runpod import auth as rp_keys
     from flash.providers.runpod import jobs
-    from flash.providers.runpod import keys as rp_keys
 
     clock = {"t": 10_000.0}
     monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
@@ -4676,8 +4678,8 @@ def test_a_large_key_pool_does_not_zero_the_create_timeout(monkeypatch):
 
 def test_grow_headroom_covers_every_account_in_the_pool(monkeypatch):
     """The caller cannot fund a whole deploy from a single grow budget: failover reconciles again."""
+    from flash.providers.runpod import auth as rp_keys
     from flash.providers.runpod import jobs
-    from flash.providers.runpod import keys as rp_keys
 
     monkeypatch.setattr(rp_keys, "key_count", lambda: 3)
     assert jobs.weight_cache_grow_headroom_s() == jobs.WEIGHT_CACHE_GROW_BUDGET_S * 3
@@ -4729,7 +4731,7 @@ def test_a_mixed_unhealthy_and_throttled_endpoint_still_gives_up(monkeypatch):
     Mixed unhealthy and throttled workers reset both exclusive predicates and otherwise burn the
     full 5400-second paid timeout.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     mixed = {"unhealthy": 1, "throttled": 2}
     assert preload._has_worker(mixed) is True  # starvation timer stays cleared
@@ -4754,7 +4756,7 @@ def test_a_mixed_unhealthy_and_throttled_endpoint_still_gives_up(monkeypatch):
 
 def test_a_usable_worker_keeps_the_throttled_timer_clear():
     """A throttled box next to a running one is contention, not a dead DC -- never give up on it."""
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.artifacts import weight_cache as preload
 
     assert preload._throttled_workers({"throttled": 3, "running": 1}) is False
     assert preload._throttled_workers({"throttled": 1, "initializing": 1}) is False
@@ -4769,8 +4771,8 @@ def test_failover_reconciles_the_account_it_lands_on(monkeypatch):
     Drive through `deploy_train_endpoint` so dropped `cache_volumes` passthrough fails the test.
     """
     from flash.providers.runpod import auth as rp_auth
+    from flash.providers.runpod import auth as rp_keys
     from flash.providers.runpod import jobs
-    from flash.providers.runpod import keys as rp_keys
 
     account = {"key": "first-account"}
     # deploy_train_endpoint imports ensure_auth function-locally, so patch it at the source
@@ -4852,7 +4854,7 @@ def test_the_owning_key_is_read_inside_the_serialized_section():
     """
     import inspect
 
-    from flash.providers.runpod.train import endpoints
+    from flash.providers.runpod.serverless import endpoints
 
     src = inspect.getsource(endpoints.get_train_endpoint)
     assert "grow_weight_cache_volumes(spec, ensure_auth())" in src

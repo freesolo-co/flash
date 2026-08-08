@@ -48,7 +48,7 @@ def test_apply_disk_gb_noops():
 
 def test_oversized_catalog_models_carry_disk_floors():
     """Models whose transient download peak exceeds the shared cache need per-job disk floors."""
-    from flash.catalog import MODELS
+    from flash.core.catalog import MODELS
 
     disk_floor_models = {
         "Qwen/Qwen3.5-9B",
@@ -64,8 +64,8 @@ def test_oversized_catalog_models_carry_disk_floors():
 def test_submit_raises_disk_to_model_min(monkeypatch):
     """submit_job (dry-run) bumps gpu.disk_gb to a catalog model's min_disk_gb."""
     from flash import runner
-    from flash.catalog import MODELS, ModelInfo
-    from flash.spec import JobSpec
+    from flash.core.catalog import MODELS, ModelInfo
+    from flash.core.spec import JobSpec
 
     monkeypatch.setitem(
         MODELS,

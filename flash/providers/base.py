@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
 
 @dataclass(frozen=True)
@@ -461,7 +461,7 @@ def provisional_gpu(
     ``gpu_count`` is the run's card ceiling, so a run allowed to shard is sized against the shape it
     will actually be allocated. The returned class name is per-card either way.
     """
-    from flash.engine.vram import model_required_vram_gb
+    from flash.engine.plan.vram import model_required_vram_gb
     from flash.providers.allocator import vram_headroom
 
     min_vram = model_required_vram_gb(

@@ -23,7 +23,7 @@ def _chained(code: int, text: str) -> Exception:
 
 
 def test_is_not_found_keys_off_status_code_not_bare_404():
-    from flash.providers._http import is_not_found
+    from flash.providers._lifecycle.http import is_not_found
 
     # genuine 404 (chained HTTPError) -> gone
     assert (
@@ -48,7 +48,7 @@ def test_is_not_found_keys_off_status_code_not_bare_404():
 
 def test_lambda_terminate_is_per_id_isolated(monkeypatch):
     """One bad id must NOT abort teardown of the others (the crash-backstop sweep passes many)."""
-    from flash.providers.lambdalabs import api as la_api
+    from flash.providers.lambda_ import api as la_api
 
     calls = []
 
@@ -68,8 +68,8 @@ def test_lambda_terminate_is_per_id_isolated(monkeypatch):
 def test_lambda_sweep_reports_only_truly_reaped(monkeypatch):
     """sweep_orphans must log/return only the instances that ACTUALLY terminated — never a
     still-billing instance."""
-    from flash.providers.lambdalabs import api as la_api
-    from flash.providers.lambdalabs import jobs
+    from flash.providers.lambda_ import api as la_api
+    from flash.providers.lambda_ import jobs
 
     instances = [
         {"id": "i-a", "name": "flash-1700-aaaa-s0-a0"},
@@ -86,7 +86,7 @@ def test_lambda_sweep_reports_only_truly_reaped(monkeypatch):
 def test_label_bounded_and_sweep_matches_for_long_run_id():
     """A run id long enough to overflow the provider name cap is shortened DETERMINISTICALLY, and the
     same bounded prefix is used by launch AND sweep matching (so a live run can't be mis-swept)."""
-    from flash.providers._instance import instance_label, run_label_prefix
+    from flash.providers._lifecycle.instance import instance_label, run_label_prefix
 
     long_id = "flash-" + "x" * 200
     name = instance_label(long_id, 0, 0)
@@ -115,7 +115,7 @@ def test_provider_cost_uses_provider_rate():
 def test_user_data_fails_fast_and_throttles_bootlog():
     """The cloud-init writes a retriable failure marker on docker failure and throttles the host
     boot-log (no 30s-forever loop that would blow HF's commit budget)."""
-    from flash.providers._instance import build_user_data
+    from flash.providers._lifecycle.instance import build_user_data
 
     payload = {
         "hf_repo": "org/repo",

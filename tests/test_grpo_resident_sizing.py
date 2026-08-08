@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from flash.engine.vram import estimate_vram_gb, grpo_fits_resident, grpo_rollout_seq_len
+from flash.engine.plan.vram import estimate_vram_gb, grpo_fits_resident, grpo_rollout_seq_len
 
 
 def test_fp8_kv_unlocks_longer_resident_context():
@@ -68,7 +68,7 @@ def test_sleep_unsupported_model_rejected_at_parse_time_for_long_context():
     # training the routed experts moved both past one 180 GB B200, and a full two-card 360 GB
     # bound would sit above BOTH, so the test would pass no matter how badly the long-context
     # case were sized.
-    from flash.engine.vram import model_required_vram_gb
+    from flash.engine.plan.vram import model_required_vram_gb
 
     mid = "Qwen/Qwen3.6-35B-A3B"
     fits = {
@@ -134,7 +134,7 @@ def test_moe_resident_fit_sizes_activations_on_active_params():
 def test_rollout_seq_len_mirrors_run_rl_defaults():
     # When [train].max_context_tokens is unset, the gate must size to the engine context run_rl() launches
     # (max(1024, prompt+completion)), not a flat 1024 -- the Codex P2 fix.
-    from flash.engine.recipe import RECIPE
+    from flash.engine.plan.recipe import RECIPE
 
     rl = RECIPE.rl
     assert grpo_rollout_seq_len(0) == max(1024, rl.max_prompt_len + rl.max_completion_len)
@@ -170,7 +170,7 @@ def test_pinned_revision_is_sized_on_the_revisions_own_geometry(monkeypatch):
     # catalog's default-revision numbers. otherwise a revision that grew (more params, wider vocab)
     # is admitted onto a card the run cannot fit, and the resident-fit verdict is made against a
     # model that was never loaded.
-    import flash.engine.vram as vram_mod
+    import flash.engine.plan.vram as vram_mod
 
     seen = {}
 
@@ -201,7 +201,7 @@ def test_moe_grpo_fits_resident_sizes_compute_on_active_params():
     # the 35B TOTAL. Keying them on the total inflates the resident estimate above the 180 GB B200
     # (~186 GB w/ margin) and wrongly forces vLLM sleep mode on a B200 MoE GRPO run, where the
     # sleep/wake cycle stalls the colocated rollout — the very failure the gate prevents.
-    from flash.catalog import MODELS, vocab_size_for
+    from flash.core.catalog import MODELS, vocab_size_for
 
     moe = "Qwen/Qwen3.6-35B-A3B"
     info = MODELS[moe]
@@ -265,8 +265,8 @@ def _worker_runtime_for(algorithm: str) -> dict[str, str] | None:
 
 
 def _worker_env_for(algorithm: str, phase: str) -> dict:
-    from flash.providers._worker import build_worker_env
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
+    from flash.providers._lifecycle.worker import build_worker_env
 
     spec = JobSpec.from_dict({"model": "m", "seed": 0, "algorithm": algorithm})
     assert spec.phase == phase, "phase is derived from algorithm; the mapping moved"
@@ -299,8 +299,8 @@ def test_a_stale_backend_key_cannot_change_the_allocator(stale_backend):
     stale key left in a config must therefore be inert -- honoring one would pick an allocator for a
     trainer that cannot run, and "trl" on grpo/opd would hand verl's rollout the expandable conf that
     trips the CuMemAllocator assert before step 1."""
-    from flash.providers._worker import build_worker_env
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
+    from flash.providers._lifecycle.worker import build_worker_env
 
     for algorithm, phase, expect_expandable in (
         ("grpo", "rl", False),

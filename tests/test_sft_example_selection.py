@@ -7,7 +7,7 @@ model to emit nothing. Regression for the shuffle-before-slice ordering in run_s
 
 from __future__ import annotations
 
-from flash.engine.worker.sft import select_sft_examples
+from flash.engine.worker.entry.sft import select_sft_examples
 
 
 def test_max_examples_is_a_prefix_fence_not_a_random_subsample():

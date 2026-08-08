@@ -11,14 +11,14 @@ import pytest
 
 
 def test_catalog_validation():
-    from flash.catalog import get_model, validate_model_for_algorithm
+    from flash.core.catalog import get_model, validate_model_for_algorithm
 
     info = get_model("Qwen/Qwen3.5-4B")
     assert "grpo" in info.algos
     # 9B is the bf16 GRPO tier (needs an 80 GB-class card; QLoRA was dropped).
     assert validate_model_for_algorithm("Qwen/Qwen3.5-9B", "grpo").id == "Qwen/Qwen3.5-9B"
     # An sft-only model still rejects grpo.
-    from flash.catalog import MODELS, ModelInfo
+    from flash.core.catalog import MODELS, ModelInfo
 
     MODELS["test/sft-only"] = ModelInfo(
         id="test/sft-only",
@@ -58,7 +58,7 @@ def test_config_to_job_spec():
 
 
 def test_environment_registry():
-    from flash.envs.registry import load_environment
+    from flash.envs.base import load_environment
 
     # Verifiers-only: there are no builtin envs and no default — an empty id is a hard
     # error (env loading itself is covered in test_envs_coverage).
@@ -73,7 +73,7 @@ def test_orchestrator_dry_run(monkeypatch):
         importlib.reload(runner)
         # fixed constant; redirect to tmp via monkeypatch so it's restored after the test.
         monkeypatch.setattr(runner, "RUNS_DIR", tmp)
-        from flash.spec import JobSpec
+        from flash.core.spec import JobSpec
 
         spec = JobSpec(run_id="dry", model="Qwen/Qwen3.5-4B", algorithm="grpo")
         status = runner.submit_job(spec, dry_run=True)

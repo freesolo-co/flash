@@ -13,7 +13,7 @@ import tarfile
 import pytest
 
 import flash.cli as cli
-from flash.cli.envpush import _human_bytes, _UploadProgress
+from flash.cli.commands.env.push import _human_bytes, _UploadProgress
 
 
 def _fake_client(capture: dict, *, slug: str = "acme/environment"):
@@ -448,7 +448,7 @@ def test_alias_chains_resolve_without_rescanning_every_binding() -> None:
     """
     import ast
 
-    from flash.cli import envpush
+    from flash.cli.commands.env import push as envpush
 
     n = 300
 
@@ -849,7 +849,7 @@ def test_push_entrypoint_importing_evaluations_charges_the_sidecar_once(monkeypa
     membership guard the sidecar was yielded a second time, and `_check_env_push_limits` charged
     those bytes and that member twice -- rejecting a tree that is actually under the limit.
     """
-    from flash.cli import envpush
+    from flash.cli.commands.env import push as envpush
 
     env_file = tmp_path / "environment.py"
     env_file.write_text("import evaluations\n\ndef load_environment(**k):\n    return None\n")
@@ -1076,7 +1076,7 @@ def test_push_rejects_oversized_directory_before_packaging(monkeypatch, tmp_path
     source = "def load_environment(**k):\n    return None\n"
     (env_dir / "environment.py").write_text(source)
     (env_dir / "checkpoint.bin").write_bytes(b"x" * 65)
-    monkeypatch.setattr("flash.cli.envpush._ENV_PUSH_MAX_TOTAL_BYTES", 64)
+    monkeypatch.setattr("flash.cli.commands.env.push._ENV_PUSH_MAX_TOTAL_BYTES", 64)
     monkeypatch.setattr(
         "flash.client.client_from_config",
         lambda: (_ for _ in ()).throw(AssertionError("upload must not start")),
@@ -1303,7 +1303,7 @@ def test_push_rejects_when_member_count_exceeds_limit_including_dirs(monkeypatch
         d = env_dir / f"pkg{i}"
         d.mkdir()
         (d / "mod.py").write_text("X = 1\n")
-    monkeypatch.setattr("flash.cli.envpush._ENV_PUSH_MAX_FILES", 4)
+    monkeypatch.setattr("flash.cli.commands.env.push._ENV_PUSH_MAX_FILES", 4)
     monkeypatch.setattr(
         "flash.client.client_from_config",
         lambda: (_ for _ in ()).throw(AssertionError("upload must not start")),
@@ -1335,7 +1335,7 @@ def test_push_counts_an_imported_dataset_package_once(monkeypatch, tmp_path):
 
     # environment.py + evaluations.py + the two dataset files + the synthesized readme = 5 members,
     # plus the `dataset` directory = 6. counting the package twice charges 8 and trips this cap.
-    monkeypatch.setattr("flash.cli.envpush._ENV_PUSH_MAX_FILES", 6)
+    monkeypatch.setattr("flash.cli.commands.env.push._ENV_PUSH_MAX_FILES", 6)
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 

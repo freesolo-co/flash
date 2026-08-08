@@ -13,9 +13,8 @@ import urllib.request
 from collections.abc import Callable, Iterator
 from typing import Any
 
-from flash.spec import require_project_id
-
-from .config import load_credentials_with_source
+from flash.client.config import load_credentials_with_source
+from flash.core.spec import require_project_id
 
 ProgressCallback = Callable[[int, int], None]
 

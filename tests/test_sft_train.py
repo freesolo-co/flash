@@ -15,9 +15,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.engine.sft_workload import _serialize_multimodal_inputs
+from flash.engine.profiling.sft_workload import _serialize_multimodal_inputs
 from flash.engine.worker.backend_common import parse_verl_metric, verl_step_number
-from flash.engine.worker.sft import _pretokenize_completion_only
+from flash.engine.worker.entry.sft import _pretokenize_completion_only
 from flash.engine.worker.sft_train import (
     _LORAPLUS_READY_MARKER,
     _MAX_ZERO_GRAD_STEPS,
@@ -249,7 +249,7 @@ def test_batch_is_the_isolation_lever_that_replaces_the_removed_flag(support, ex
     is absent, so an override-level assertion reads that default and passes no matter what the
     worker computed.
     """
-    from flash.engine.sft_workload import _packing_mode
+    from flash.engine.profiling.sft_workload import _packing_mode
 
     packing_mode, architecture_mode = _packing_mode(
         "Qwen/Qwen3.5-4B",
@@ -450,7 +450,7 @@ def test_mrope_processor_check_matches_every_image_training_model():
     """
     from transformers.models.auto.image_processing_auto import IMAGE_PROCESSOR_MAPPING_NAMES
 
-    from flash.catalog import _IMAGE_TRAINING_MODELS
+    from flash.core.catalog import _IMAGE_TRAINING_MODELS
 
     # take the literal from the shipped source, so the guard cannot drift from the branch it guards.
     rendered = _render_sft_dataset_module()
@@ -1145,8 +1145,8 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
 
     the caller supplies its own ``run_verl_training`` fake, which is the only remaining seam.
     """
-    import flash.catalog as catalog
-    import flash.engine.vram as vram
+    import flash.core.catalog as catalog
+    import flash.engine.plan.vram as vram
     import flash.engine.worker as worker
     from flash.engine.worker import sft_train
 
@@ -1216,8 +1216,8 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
                 rendered += "<assistant>"
             return rendered
 
-    from flash.engine.sft_workload import prepare_sft_workload
-    from flash.workload_profile import sft_profile_input_digest
+    from flash.engine.profiling.sft_workload import prepare_sft_workload
+    from flash.engine.profiling.workload_profile import sft_profile_input_digest
 
     # deliberately NOT `flash.__version__`: the worker has no flash distribution installed and
     # resolves that to "0+unknown", so building both sides from it would make this fixture agree
@@ -1239,7 +1239,7 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
     # which read the model config off the hub. pin them to the same answer so the parity check under
     # test compares workloads rather than network reachability -- an unresolvable probe now fails
     # closed instead of quietly labelling the model "unsupported".
-    from flash.engine import sft_workload as _sft_workload
+    from flash.engine.profiling import sft_workload as _sft_workload
 
     monkeypatch.setattr(_sft_workload, "probe_is_pure_attention", lambda _m, revision="": False)
     monkeypatch.setattr(_sft_workload, "probe_is_gdn_hybrid", lambda _m, revision="": False)
@@ -1436,7 +1436,7 @@ def test_a_workload_that_moved_under_the_frozen_quote_stops_before_training(monk
     content digest, so an edited one is rejected as corrupt before this guard is reached; only a
     re-derivation that legitimately disagrees can exercise it.
     """
-    from flash.engine import sft_workload
+    from flash.engine.profiling import sft_workload
     from flash.engine.worker import sft_train
 
     spec, _captured = _stub_sft_run(monkeypatch)
@@ -1777,8 +1777,8 @@ def test_drain_join_waits_out_a_slow_upload_until_the_run_deadline(monkeypatch):
     # NB: the worker package rebinds the name `heartbeat` to the re-exported heartbeat
     # FUNCTION, so `import ... as hb` yields that function rather than this module.
     # import_module returns the real module object.
-    hb = importlib.import_module("flash.engine.worker.heartbeat")
-    from flash.engine.worker._pkg import W as _w
+    hb = importlib.import_module("flash.engine.worker.io.heartbeat")
+    from flash.engine.worker.runtime.pkg_proxy import W as _w
 
     # virtual clock: the test must not actually take an hour.
     now = [0.0]

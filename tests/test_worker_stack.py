@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.providers.runpod.train import (
+from flash.providers.runpod.serverless import (
     WORKER_DEPS,
     resolve_worker_deps,
 )
@@ -89,7 +89,7 @@ def test_is_vl_checkpoint_text_model(monkeypatch):
     [("refs/pr/123", {"revision": "refs/pr/123"}), ("", {})],
 )
 def test_model_revision_keyword_is_present_only_when_nonempty(revision, expected):
-    from flash.engine.worker.hf import model_revision_kwargs
+    from flash.engine.worker.io.hf import model_revision_kwargs
 
     assert model_revision_kwargs(revision) == expected
 
@@ -113,7 +113,8 @@ def test_model_revision_threads_through_config_probes(monkeypatch, revision):
     fake_transformers.AutoConfig = _AutoConfig
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
-    from flash.engine.worker import lora, packing, sft
+    from flash.engine.worker.entry import sft
+    from flash.engine.worker.model import lora, packing
     from flash.engine.worker.perf import liger
 
     assert lora.is_vl_checkpoint("org/model", revision=revision)
@@ -149,7 +150,7 @@ def test_arch_dims_revision_zero_probe_falls_back_to_catalog(monkeypatch):
     # revision pin must treat that as "unparseable" and fall back to the curated catalog geometry
     # (exactly like an unpinned run), NOT as a mismatch -- otherwise revision-pinned SFT on that model
     # raises after the GPU is already rented.
-    from flash.engine.worker import sft
+    from flash.engine.worker.entry import sft
 
     _fake_arch_probe(monkeypatch, hidden=0, layers=0)
     # Qwen/Qwen3.6-35B-A3B is the sole catalog entry carrying (hidden, layers) == (2048, 40).
@@ -159,7 +160,7 @@ def test_arch_dims_revision_zero_probe_falls_back_to_catalog(monkeypatch):
 def test_arch_dims_revision_nonzero_mismatch_still_fails_closed(monkeypatch):
     # a NONZERO probe dim that genuinely disagrees with the catalog is a real revision mismatch and must
     # still fail closed, so a revision pin can never silently size VRAM with the wrong geometry.
-    from flash.engine.worker import sft
+    from flash.engine.worker.entry import sft
 
     _fake_arch_probe(monkeypatch, hidden=9999, layers=99)
     with pytest.raises(RuntimeError, match="revision-specific model architecture"):
@@ -182,7 +183,7 @@ def test_model_revision_threads_through_tokenizer_and_prefetch(monkeypatch):
     import huggingface_hub
 
     import flash.engine.worker as worker
-    from flash.engine.worker import hf
+    from flash.engine.worker.io import hf
 
     monkeypatch.setattr(
         huggingface_hub,
@@ -423,7 +424,7 @@ def test_heartbeat_upload_skips_when_lock_is_stuck(monkeypatch):
     import time as _time
 
     # NB: resolve the submodule explicitly (the package re-exports the heartbeat() function).
-    hbmod = importlib.import_module("flash.engine.worker.heartbeat")
+    hbmod = importlib.import_module("flash.engine.worker.io.heartbeat")
 
     monkeypatch.setenv("RUN_MODE", "rl")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
@@ -462,7 +463,7 @@ def test_heartbeat_rolls_back_slot_when_upload_reports_failure(monkeypatch):
     """
     import importlib
 
-    hbmod = importlib.import_module("flash.engine.worker.heartbeat")
+    hbmod = importlib.import_module("flash.engine.worker.io.heartbeat")
 
     monkeypatch.setenv("RUN_MODE", "rl")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
@@ -493,7 +494,7 @@ def test_heartbeat_keeps_slot_when_upload_reports_success(monkeypatch):
     None-returning mock counts as success."""
     import importlib
 
-    hbmod = importlib.import_module("flash.engine.worker.heartbeat")
+    hbmod = importlib.import_module("flash.engine.worker.io.heartbeat")
 
     monkeypatch.setenv("RUN_MODE", "rl")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
@@ -518,7 +519,7 @@ def test_critical_stages_wait_longer_for_upload_lock(monkeypatch):
     import importlib
     import time as _time
 
-    hbmod = importlib.import_module("flash.engine.worker.heartbeat")
+    hbmod = importlib.import_module("flash.engine.worker.io.heartbeat")
 
     monkeypatch.setenv("RUN_MODE", "rl")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
@@ -728,7 +729,7 @@ def test_35b_warmstart_requires_fused_expert_targets(monkeypatch):
 
 def test_prepare_fresh_lora_base_uses_multimodal_loader_for_vl(monkeypatch):
     """Fresh LoRA on a VL checkpoint must wrap the full image-text tree, not TRL's default loader."""
-    import flash.engine.worker.adapter as adapter_mod
+    import flash.engine.worker.model.adapter as adapter_mod
 
     calls = []
 
@@ -760,7 +761,7 @@ def test_prepare_fresh_lora_base_uses_multimodal_loader_for_vl(monkeypatch):
 
 
 def test_prepare_fresh_lora_base_keeps_non_vl_path(monkeypatch):
-    import flash.engine.worker.adapter as adapter_mod
+    import flash.engine.worker.model.adapter as adapter_mod
 
     monkeypatch.setattr(adapter_mod, "is_vl_checkpoint", lambda model_id, revision="": False)
 
@@ -773,7 +774,7 @@ def test_prepare_fresh_lora_base_keeps_non_vl_path(monkeypatch):
 
 
 def test_prepare_fresh_lora_base_forwards_revision_to_probe_and_loader(monkeypatch):
-    import flash.engine.worker.adapter as adapter_mod
+    import flash.engine.worker.model.adapter as adapter_mod
 
     probes = []
     loads = []
@@ -806,7 +807,7 @@ def test_prepare_fresh_lora_base_forwards_revision_to_probe_and_loader(monkeypat
 
 
 def test_prepare_fresh_lora_base_rejects_revision_authority_conflict(monkeypatch):
-    import flash.engine.worker.adapter as adapter_mod
+    import flash.engine.worker.model.adapter as adapter_mod
 
     with pytest.raises(ValueError, match="probe revision must match"):
         adapter_mod.prepare_fresh_lora_base(
@@ -818,7 +819,7 @@ def test_prepare_fresh_lora_base_rejects_revision_authority_conflict(monkeypatch
 
 
 def test_warmstart_base_loader_forwards_model_revision(monkeypatch, tmp_path):
-    import flash.engine.worker.adapter as adapter_mod
+    import flash.engine.worker.model.adapter as adapter_mod
 
     loads = []
 
@@ -885,8 +886,8 @@ def test_warmstart_base_loader_forwards_model_revision(monkeypatch, tmp_path):
 
 def test_train_metadata_keeps_model_revision_in_nested_job_spec(monkeypatch):
     import flash.engine.worker as worker
-    from flash.engine.worker import finalize
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
+    from flash.engine.worker.train import finalize
 
     captured = []
     monkeypatch.setattr(worker, "JOB_SPEC", JobSpec(model_revision="refs/pr/123"))
@@ -917,7 +918,7 @@ def test_train_metadata_keeps_model_revision_in_nested_job_spec(monkeypatch):
 
 def test_train_metadata_preserves_terminal_heartbeat_fields(monkeypatch):
     import flash.engine.worker as worker
-    from flash.engine.worker import finalize
+    from flash.engine.worker.train import finalize
 
     emitted = []
     finalized = []
@@ -958,7 +959,7 @@ def test_finalize_preserves_terminal_heartbeat_fields(monkeypatch):
     from unittest.mock import mock_open
 
     import flash.engine.worker as worker
-    from flash.engine.accounting import RunMetrics
+    from flash.engine.result.accounting import RunMetrics
 
     emitted = []
     metrics_last = [{"step": 4, "reward": 0.75}]

@@ -1,4 +1,4 @@
-"""Tests for flash.engine.vram.resolve_params_b — the single model-size resolver shared by the
+"""Tests for flash.engine.plan.vram.resolve_params_b — the single model-size resolver shared by the
 worker (run_sft / run_rl) and the cost estimator (cost.spec), so they can never drift on how big a
 model is (the >=3B fused-CE gate and the colocate per-device cap both hinge on it)."""
 
@@ -7,7 +7,7 @@ from __future__ import annotations
 
 def test_resolve_params_b_uses_catalog_params_b_float():
     # Curated catalog models return their numeric params_b stat directly (no HF fetch).
-    from flash.engine.vram import resolve_params_b
+    from flash.engine.plan.vram import resolve_params_b
 
     assert resolve_params_b("Qwen/Qwen3.5-0.8B") == 0.9
     assert resolve_params_b("Qwen/Qwen3.5-4B") == 4.7
@@ -22,7 +22,7 @@ def test_resolve_params_b_pinned_revision_reads_the_pinned_size(monkeypatch):
     commit can genuinely differ, and sizing it from the catalog would quote the wrong model -- so the
     pinned path fetches real geometry and the catalog number must NOT win.
     """
-    from flash.engine import vram
+    from flash.engine.plan import vram
 
     monkeypatch.setattr(
         vram, "_validated_revision_geometry", lambda _mid, _rev, _info: (9.1, 151936)
@@ -39,7 +39,7 @@ def test_resolve_params_b_none_when_uncataloged(monkeypatch):
     to the size-unknown path (memory-safe fused-CE gate, loose colocate cap) rather than raising on
     the allocation path -- but a size must never be invented for an id the catalog does not state.
     """
-    from flash.engine import vram
+    from flash.engine.plan import vram
 
     def _boom(*_args, **_kwargs):
         raise AssertionError("an uncataloged id must not be sized over the network")

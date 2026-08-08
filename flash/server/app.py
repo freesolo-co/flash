@@ -15,7 +15,7 @@ import time
 
 from flash import __version__
 from flash.runner import get_status, prepare_job, submit_job
-from flash.runner.checkpoints import list_checkpoints
+from flash.runner.results.checkpoints import list_checkpoints
 from flash.serve.deploy import (
     adapter_alias_target,
     deploy_adapter,
@@ -25,10 +25,9 @@ from flash.serve.deploy import (
 from flash.serve.deploy import chat as serve_chat
 from flash.serve.deploy import chat_stream as serve_chat_stream
 from flash.serve.export import export_adapter
-
-from . import db
-from ._locks import _DEPLOY_LOCKS, _deploy_lock
-from ._runtime import (
+from flash.server.platform import db
+from flash.server.platform.locks import _DEPLOY_LOCKS, _deploy_lock
+from flash.server.platform.runtime import (
     _RECOVERABLE,
     _charge_retry_loop,
     _charge_retry_startup,
@@ -92,7 +91,7 @@ def _train_endpoint_names(*, include_terminal: bool) -> set[str]:
     """
     from flash.providers.base import canonical_gpu
     from flash.providers.runpod.jobs import canonical_endpoint_name
-    from flash.providers.runpod.train import _run_suffix, endpoint_name
+    from flash.providers.runpod.serverless import _run_suffix, endpoint_name
     from flash.runner import TERMINAL_STATES
 
     names: set[str] = set()
@@ -323,8 +322,8 @@ def create_app():
     async def lifespan(app):
         from flash.providers.preflight import check_run_preflight
         from flash.runner import _open_status_reporter
-        from flash.server.billing_retry import charge_retry_enabled
-        from flash.server.reconcile import reconcile_enabled
+        from flash.server.billing.retry import charge_retry_enabled
+        from flash.server.domain.reconcile import reconcile_enabled
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
         db.recover_teacher_request_ledger()
@@ -369,8 +368,8 @@ def create_app():
         # Periodic artifact GC: delete aged (>7d), undeployed run prefixes inside the per-environment
         # HF repos (<artifact namespace>/flashrun-*) so old runs' checkpoints/adapters don't pile up against
         # the org's storage quota. Only on a plane with an operator HF_TOKEN (it deletes operator-owned
-        # repos); fails closed on any live-set uncertainty. See flash.server.repo_cleanup.
-        from flash.server.repo_cleanup import repo_cleanup_enabled
+        # repos); fails closed on any live-set uncertainty. See flash.server.domain.repo_cleanup.
+        from flash.server.domain.repo_cleanup import repo_cleanup_enabled
 
         cleanup_task = asyncio.create_task(_repo_cleanup_loop()) if repo_cleanup_enabled() else None
         try:

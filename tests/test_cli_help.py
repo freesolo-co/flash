@@ -164,7 +164,7 @@ def test_help_plain_when_piped(monkeypatch, capsys) -> None:
 
 def test_help_page_is_ascii_locale_safe(monkeypatch) -> None:
     """Forced-on theme must degrade (not raise UnicodeEncodeError) on an ASCII stdout."""
-    from flash.cli import render
+    from flash.cli.ui import render
 
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.delenv("NO_COLOR", raising=False)
