@@ -67,7 +67,9 @@ def test_authored_train_keys_follow_composed_config() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         base = _write(tmp, "base.toml", BASE)
-        extra = _write(tmp, "extra.toml", '[train]\nteacher_model = "GLM 5.2"\n')
+        # BASE is grpo, so the composed key has to be one grpo accepts: teacher_model is opd-only
+        # and is now rejected by the parser, which would fail before key tracking is exercised.
+        extra = _write(tmp, "extra.toml", "[train]\nentropy_quantile = 0.8\n")
         spec, keys = spec_and_train_keys_from_file(
             base,
             run_id="x",
@@ -79,14 +81,14 @@ def test_authored_train_keys_follow_composed_config() -> None:
         {
             "epochs",
             "max_examples",
-            "teacher_model",
+            "entropy_quantile",
             "temperature",
             "stop_sequences",
         }
     )
     assert spec.train.temperature == 0.0
     assert spec.train.stop_sequences == ()
-    assert spec.train.teacher_model == "glm-5.2"
+    assert spec.train.entropy_quantile == 0.8
 
 
 def test_set_requires_key_value():

@@ -10,7 +10,10 @@ from typing import Any
 
 SFT_PROFILE_KIND = "sft"
 ROLLOUT_PROFILE_KINDS = ("grpo", "opd")
-WORKLOAD_PROFILE_SCHEMA_VERSION = 1
+# 2 adds the sft untruncated length measurement (untruncated_max_length / truncated_examples).
+# a v1 artifact lacks those fields, so __post_init__ rejects it and the run re-profiles rather
+# than reading a censored max length as if it were the real one.
+WORKLOAD_PROFILE_SCHEMA_VERSION = 2
 SFT_PACKING_POLICY_VERSION = 1
 ROLLOUT_SAMPLE_POLICY_VERSION = 1
 _PROFILE_RUN_PREFIX = "profile-sft-"
@@ -214,6 +217,11 @@ class SftWorkloadProfile:
     authoritative_supervised_tokens: int
     authoritative_compute_tokens: int
     realized_max_length: int
+    # measured before truncation, so it reports what the rows need rather than what the cap
+    # allowed. realized_max_length saturates at max_length exactly when the cap binds, which is
+    # the one case where the distribution is censored and the number stops being informative.
+    untruncated_max_length: int
+    truncated_examples: int
     examples_per_update: int
     derived_steps: int
     authoritative_steps: int
@@ -255,6 +263,8 @@ class SftWorkloadProfile:
             "authoritative_supervised_tokens": self.authoritative_supervised_tokens,
             "authoritative_compute_tokens": self.authoritative_compute_tokens,
             "realized_max_length": self.realized_max_length,
+            "untruncated_max_length": self.untruncated_max_length,
+            "truncated_examples": self.truncated_examples,
             "examples_per_update": self.examples_per_update,
             "derived_steps": self.derived_steps,
             "authoritative_steps": self.authoritative_steps,
@@ -288,6 +298,16 @@ class SftWorkloadProfile:
             raise ValueError("authoritative compute tokens cannot be smaller than real tokens")
         if not 1 <= self.realized_max_length <= self.max_length:
             raise ValueError("realized max length must be within the configured maximum")
+        # the untruncated measurement is unbounded above (that is the point), but it can never be
+        # SMALLER than the truncated one it was measured alongside.
+        if self.untruncated_max_length < self.realized_max_length:
+            raise ValueError("untruncated max length cannot be smaller than realized max length")
+        if self.truncated_examples > self.retained_examples:
+            raise ValueError("truncated examples cannot exceed retained examples")
+        # a truncated row is exactly a row longer than the cap, so the two measurements must agree
+        # on whether the cap bound at all.
+        if bool(self.truncated_examples) != (self.untruncated_max_length > self.max_length):
+            raise ValueError("truncated example count disagrees with the untruncated max length")
         if self.examples_per_update < 1:
             raise ValueError("examples per update must be positive")
         if self.derived_steps < 1 or self.authoritative_steps < 1:

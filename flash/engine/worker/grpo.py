@@ -45,7 +45,6 @@ def grpo_overrides() -> dict:
         "temperature": train.temperature,
         "max_tokens": train.max_completion_tokens,
         "kl_penalty_coef": train.kl_penalty_coef,
-        "advantage_clip": train.advantage_clip,
         "entropy_quantile": train.entropy_quantile,
         "thinking_length_penalty_coef": train.thinking_length_penalty_coef,
     }

@@ -59,6 +59,9 @@ def _profile(input_digest: str) -> SftWorkloadProfile:
         authoritative_supervised_tokens=18_000,
         authoritative_compute_tokens=60_000,
         realized_max_length=980,
+        # nothing hit the 1024 cap, so the true max equals the realized max.
+        untruncated_max_length=980,
+        truncated_examples=0,
         examples_per_update=8,
         derived_steps=8,
         authoritative_steps=12,

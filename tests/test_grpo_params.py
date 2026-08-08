@@ -1,6 +1,6 @@
 """Datums-parity GRPO knobs + init-from-adapter wiring (CPU-only, no GPU/network).
 
-The SDK ships the GRPO recipe knobs (group_size/temperature/advantage_clip/
+The SDK ships the GRPO recipe knobs (group_size/temperature/
 kl_penalty_coef/thinking_length_penalty_coef) plus the optimizer/batching knobs
 (learning_rate/batch_size/max_context_tokens/save_every) in the job spec's ``[train]`` table
 (TrainSpec) — NOT ``[environment.params]``, which is forwarded verbatim to the Freesolo
@@ -120,7 +120,6 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
         "group_size": 4,
         "temperature": 0.7,
         "max_completion_tokens": 256,
-        "advantage_clip": 1.5,
         "kl_penalty_coef": 0.02,
         "entropy_quantile": 0.2,
         "thinking_length_penalty_coef": 0.001,
@@ -195,7 +194,6 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
             "temperature": 0.7,
             "max_completion_tokens": 256,
             "kl_penalty_coef": 0.02,
-            "advantage_clip": 1.5,
             "entropy_quantile": 0.2,
             "thinking_length_penalty_coef": 0.001,
         },
@@ -205,7 +203,6 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
     assert spec.train.temperature == 0.7
     assert spec.train.max_completion_tokens == 256
     assert spec.train.kl_penalty_coef == 0.02
-    assert spec.train.advantage_clip == 1.5
     assert spec.train.entropy_quantile == 0.2
     assert spec.train.thinking_length_penalty_coef == 0.001
     # survives the JSON round-trip the worker reconstructs from
