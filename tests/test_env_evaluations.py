@@ -1069,9 +1069,14 @@ def test_env_eval_upload_rejects_an_inaccessible_project_before_paying(
         "flash.client.client_from_config",
         lambda: (_ for _ in ()).throw(AssertionError("client must not be constructed")),
     )
-    monkeypatch.setattr("flash.client.config.load_credentials", lambda: ("url", "key-1"))
+    # a HOSTED url: ownership is resolved against the backend only when the plane is Freesolo's,
+    # so a placeholder that reads as self-hosted would take the shape-only branch and never reach
+    # `get_project` -- disarming the very refusal this test exists to prove.
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("https://flash.freesolo.co", "key-1")
+    )
 
-    def _denied(project_id, api_key):
+    def _denied(project_id, api_key, api_url=None):
         raise ApiError(status, "denied")
 
     monkeypatch.setattr("flash.client.get_project", _denied, raising=False)
