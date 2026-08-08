@@ -1,15 +1,20 @@
 #!/bin/sh
-# OPT-IN: wraps the flash control-plane command with infisical secret injection.
+# Entrypoint for the flash control-plane image: run the server, optionally injecting secrets
+# from Infisical first.
 #
-# The published image does NOT use this. Flash reads secrets from its process environment,
-# so `docker run -e ... / --env-file`, a kubernetes Secret, or any orchestrator's secret
-# store works with no wrapper at all. This file exists for deployments that pull secrets
-# from Infisical at container start; see deploy/infisical/README.md to opt in.
+# Flash reads its secrets from the process environment, and that stays the only contract.
+# This wrapper decides WHERE that environment comes from, using one variable:
 #
-# fallback-safe: if INFISICAL_CLIENT_ID is unset this is a no-op passthrough and the
-# container behaves exactly as it does without the wrapper (reading its env_file / docker
-# env). Once the bootstrap machine-identity creds are present, secrets are pulled from
-# infisical at startup.
+#   INFISICAL_CLIENT_ID unset  -> exec the command unchanged. The container behaves exactly
+#                                 as it would with no entrypoint: `--env-file`, a kubernetes
+#                                 Secret, or any orchestrator's secret store, as before.
+#   INFISICAL_CLIENT_ID set    -> `infisical login` (universal-auth), then `infisical run`
+#                                 injects the vault's secrets before exec'ing the command.
+#
+# Both paths are supported and tested; neither is a fallback for the other. The image is the
+# same either way -- only the environment differs -- so a deployment can move between them
+# without a rebuild. The CLI itself is an opt-in build argument (INSTALL_INFISICAL), so an
+# image built without it supports the first path only and says so rather than failing obscurely.
 #
 # expected env:
 #   INFISICAL_CLIENT_ID / INFISICAL_CLIENT_SECRET  universal-auth machine identity creds
@@ -33,6 +38,19 @@ fi
 
 if [ -z "${INFISICAL_CLIENT_ID:-}" ]; then
   exec "$@"
+fi
+
+# The switch is on but the binary is absent: the image was built without INSTALL_INFISICAL=true
+# (or the wrapper was mounted into an image that has no CLI). Say THAT, because the alternative
+# is `infisical: not found` under `set -e` -- a message that names a missing command without
+# naming the build argument that would have provided it. Refusing here is also the safe outcome:
+# continuing would exec the server with the vault's secrets missing, and a control plane that
+# boots with no credentials fails later and further from the cause.
+if ! command -v infisical >/dev/null 2>&1; then
+  echo "flash infisical entrypoint: INFISICAL_CLIENT_ID is set but the infisical CLI is not" \
+       "installed in this image -- rebuild with --build-arg INSTALL_INFISICAL=true, or unset" \
+       "INFISICAL_CLIENT_ID to take secrets from the container environment instead" >&2
+  exit 2
 fi
 
 INFISICAL_TOKEN="$(infisical login --method=universal-auth \

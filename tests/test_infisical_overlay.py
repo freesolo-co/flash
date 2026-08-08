@@ -1,9 +1,11 @@
-"""The opt-in Infisical overlay under deploy/infisical/.
+"""Infisical secret injection: the entrypoint wrapper and how the CLI reaches the image.
 
-Flash reads secrets from its process environment, so the published image needs no secret-manager
-tooling. The overlay exists for deployments that pull secrets from Infisical at container start.
-These tests pin the two contracts that are easy to break by reading the files and impossible to
-notice until a deployment fails to start.
+Flash reads its secrets from the process environment. This module pins the contract that lets
+ONE image serve both ways of producing that environment -- `--env-file` and an Infisical vault --
+selected at runtime by INFISICAL_CLIENT_ID rather than by which image was pulled.
+
+These are the parts that are easy to break by editing a Dockerfile and impossible to notice
+until a deployment fails to start.
 """
 
 from __future__ import annotations
@@ -16,8 +18,23 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+BASE_DOCKERFILE = REPO_ROOT / "Dockerfile"
 OVERLAY_DIR = REPO_ROOT / "deploy" / "infisical"
+OVERLAY_DOCKERFILE = OVERLAY_DIR / "Dockerfile"
 ENTRYPOINT = OVERLAY_DIR / "entrypoint.sh"
+
+# Every file that may install software from the network. A new one must be added here
+# deliberately, which is the point: the checks below then apply to it.
+INSTALLER_FILES = (
+    BASE_DOCKERFILE,
+    OVERLAY_DOCKERFILE,
+    REPO_ROOT / "Dockerfile.worker",
+    *sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml")),
+)
+
+# `curl … | bash`, `wget … | sh`, and friends. Matches a fetch whose output is piped into a
+# shell, with or without sudo, on one line.
+PIPE_TO_SHELL = re.compile(r"(?:curl|wget)[^|\n]*\|\s*(?:sudo\s+)?(?:ba|z|k)?sh\b")
 
 
 def _cmd_line(dockerfile: Path) -> str:
@@ -26,11 +43,80 @@ def _cmd_line(dockerfile: Path) -> str:
     return lines[0]
 
 
-def test_base_image_bakes_in_no_secret_manager():
-    """The published image stays vendor-free: injection is the overlay's job, not the base's."""
-    base = (REPO_ROOT / "Dockerfile").read_text()
-    assert "infisical" not in base.lower().replace("deploy/infisical", "")
-    assert "ENTRYPOINT" not in base, "the base image must leave ENTRYPOINT free for an overlay"
+@pytest.mark.parametrize("path", INSTALLER_FILES, ids=lambda p: p.name)
+def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
+    """`curl … | bash` executes whatever the vendor serves at request time.
+
+    It cannot be reviewed, cannot be reproduced, and pins nothing -- and in a public repository
+    it teaches the pattern to everyone who reads the file. Fetch to disk, verify a digest, then
+    execute. This is a repo-wide rule, not an Infisical one; the parametrization is what keeps
+    it that way when the next installer is added.
+    """
+    offenders = [
+        ln.strip()
+        for ln in path.read_text().splitlines()
+        # Comments are stripped first: prose ABOUT the pattern (including the comments explaining
+        # why these files avoid it) is not an instance of it. Both Dockerfiles and YAML use `#`.
+        if PIPE_TO_SHELL.search(ln.split("#", 1)[0])
+    ]
+    assert not offenders, f"{path.name} pipes a downloaded script into a shell: {offenders}"
+
+
+@pytest.mark.parametrize(
+    "path", [BASE_DOCKERFILE, OVERLAY_DOCKERFILE], ids=lambda p: str(p.parent.name)
+)
+def test_the_infisical_cli_is_pinned_and_checksum_verified(path: Path):
+    """A version pin alone still trusts whatever that URL serves later.
+
+    The digest is what makes the install reproducible, so both must be present, and the
+    verification has to happen where a mismatch aborts the build.
+    """
+    text = path.read_text()
+    assert re.search(r"^ARG INFISICAL_VERSION=\d+\.\d+\.\d+$", text, re.MULTILINE)
+    for arch in ("AMD64", "ARM64"):
+        assert re.search(rf"^ARG INFISICAL_SHA256_{arch}=[0-9a-f]{{64}}$", text, re.MULTILINE), (
+            f"{path} must pin a full sha256 for {arch}"
+        )
+    assert "sha256sum -c -" in text, f"{path} must verify the download before installing it"
+
+
+def test_both_dockerfiles_pin_the_same_infisical_build():
+    """The overlay re-runs the base's install step; a drifted pin would ship a different CLI."""
+    pins = re.compile(r"^ARG (INFISICAL_(?:VERSION|SHA256_\w+))=(\S+)$", re.MULTILINE)
+    base = dict(pins.findall(BASE_DOCKERFILE.read_text()))
+    overlay = dict(pins.findall(OVERLAY_DOCKERFILE.read_text()))
+    # Non-empty first: two files that both stopped pinning would compare equal and pass.
+    assert base, "the base Dockerfile pins no infisical version or digest"
+    assert base == overlay
+
+
+def test_the_base_image_does_not_install_the_cli_by_default():
+    """An open-source consumer's `docker build .` must produce a vendor-free image.
+
+    The CLI is opt-in, so the build argument has to DEFAULT to false and the install has to be
+    guarded by it. A default of true would ship vendor tooling to everyone who builds from the
+    checkout, which is the thing this design is arranged to avoid.
+    """
+    text = BASE_DOCKERFILE.read_text()
+    assert re.search(r"^ARG INSTALL_INFISICAL=false$", text, re.MULTILINE)
+    assert re.search(r'if \[ "\$\{INSTALL_INFISICAL\}" = "true" \]', text)
+
+
+def test_published_images_are_built_with_the_cli():
+    """The deployments select Infisical by env var, which requires the binary to be present.
+
+    Without this build argument the published image has no CLI, and setting INFISICAL_CLIENT_ID
+    on a deployment would fail at start instead of switching it to vault-backed secrets.
+    """
+    workflow = (REPO_ROOT / ".github" / "workflows" / "publish-image.yml").read_text()
+    assert "INSTALL_INFISICAL=true" in workflow
+
+
+def test_base_image_declares_the_entrypoint():
+    """One image serves both paths, so the wrapper ships in the base and always runs."""
+    text = BASE_DOCKERFILE.read_text()
+    assert 'ENTRYPOINT ["/usr/local/bin/flash-infisical-entrypoint"]' in text
+    assert "COPY deploy/infisical/entrypoint.sh" in text
 
 
 def test_overlay_restates_the_base_cmd_verbatim():
@@ -40,12 +126,12 @@ def test_overlay_restates_the_base_cmd_verbatim():
     overlay that relies on inheriting it hands the wrapper no command, and the container exits
     without ever starting the server. The two CMD lines must therefore stay byte-identical.
     """
-    assert _cmd_line(OVERLAY_DIR / "Dockerfile") == _cmd_line(REPO_ROOT / "Dockerfile")
+    assert _cmd_line(OVERLAY_DOCKERFILE) == _cmd_line(BASE_DOCKERFILE)
 
 
 def test_overlay_builds_on_top_of_the_published_image():
     """The overlay must not rebuild flash: it layers onto an existing image via FLASH_IMAGE."""
-    text = (OVERLAY_DIR / "Dockerfile").read_text()
+    text = OVERLAY_DOCKERFILE.read_text()
     assert re.search(r"^ARG FLASH_IMAGE=", text, re.MULTILINE)
     assert re.search(r"^FROM \$\{FLASH_IMAGE\}", text, re.MULTILINE)
     assert "pip install" not in text
@@ -75,13 +161,51 @@ class TestEntrypointBehaviour:
         stub.chmod(0o755)
         return bin_dir
 
-    def _run(self, tmp_path, env, args):
+    def _run(self, tmp_path, env, args, *, with_cli=True):
+        path = f"{self._stub_dir(tmp_path)}:/usr/bin:/bin" if with_cli else "/usr/bin:/bin"
         return subprocess.run(
             ["sh", str(ENTRYPOINT), *args],
             capture_output=True,
             text=True,
-            env={"PATH": f"{self._stub_dir(tmp_path)}:/usr/bin:/bin", **env},
+            env={"PATH": path, **env},
         )
+
+    def test_env_file_deployment_works_without_the_cli_installed(self, tmp_path):
+        """The vendor-free image must still run: no CLI on PATH, no INFISICAL_* set, no problem.
+
+        This is the default `docker build .` artifact and the `--env-file` deployment. If the
+        wrapper ever required the binary unconditionally, this is the test that fails.
+        """
+        result = self._run(
+            tmp_path,
+            {"HF_TOKEN": "from_container"},
+            ["sh", "-c", 'echo "$HF_TOKEN"'],
+            with_cli=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "from_container"
+
+    def test_switch_on_without_the_cli_names_the_build_argument(self, tmp_path):
+        """Asking for injection from an image built without the CLI must fail loudly, and say why.
+
+        Left to `set -e` this is `infisical: not found` -- a message that names a missing command
+        but not the build argument that provides it. Booting anyway would be worse: the server
+        would start with the vault's secrets absent and fail far from the cause.
+        """
+        result = self._run(
+            tmp_path,
+            {
+                "INFISICAL_CLIENT_ID": "cid",
+                "INFISICAL_CLIENT_SECRET": "csec",
+                "INFISICAL_PROJECT_ID": "proj",
+                "INFISICAL_PATH": "/flash",
+            },
+            ["sh", "-c", "echo should_not_run"],
+            with_cli=False,
+        )
+        assert result.returncode == 2
+        assert "should_not_run" not in result.stdout
+        assert "INSTALL_INFISICAL=true" in result.stderr
 
     def test_no_client_id_is_a_transparent_passthrough(self, tmp_path):
         """Without the switch set the wrapper must be invisible: same env, same command."""

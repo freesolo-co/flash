@@ -74,9 +74,25 @@ file, load it: `set -a && . ./.env && set +a && flash-server`, or
 `docker run --env-file .env ...`. Copy `.env.example` to start from a documented template.
 
 The process environment is the only contract, so a Kubernetes Secret, systemd
-`EnvironmentFile`, or any orchestrator's secret store works as-is. To pull secrets from a
-secret manager at container start instead, wrap the image's entrypoint; `deploy/infisical/`
-is a working example you can copy for another provider.
+`EnvironmentFile`, or any orchestrator's secret store works as-is.
+
+To pull secrets from [Infisical](https://infisical.com) at container start instead, set
+`INFISICAL_CLIENT_ID` (plus its secret, project id, and path). The published images carry the
+CLI, so this is a configuration change rather than a rebuild, and leaving the variable unset
+keeps the `--env-file` behaviour above unchanged:
+
+```bash
+docker run -p 8080:8080 -v flash-state:/root/.flash \
+  -e INFISICAL_CLIENT_ID=... -e INFISICAL_CLIENT_SECRET=... \
+  -e INFISICAL_PROJECT_ID=... -e INFISICAL_PATH=/flash \
+  ghcr.io/freesolo-co/freesolo-flash:main
+```
+
+Building the image yourself omits the CLI unless you ask for it
+(`docker build --build-arg INSTALL_INFISICAL=true .`); with the variable set but the CLI
+absent, the container refuses to start rather than booting without the secrets it was told to
+fetch. See `deploy/infisical/README.md` for the full variable list, and copy its entrypoint if
+you use a different secret manager.
 
 ### The state directory
 
