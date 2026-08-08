@@ -354,7 +354,7 @@ def _require_setup_project(args) -> str:
     from flash.client import ClientError, list_projects, resolve_project_id
     from flash.client.config import load_credentials
 
-    _api_url, api_key = load_credentials()
+    api_url, api_key = load_credentials()
     if not api_key:
         raise ClientError(
             "not logged in. Run `flash login` before `flash env setup` so the project can be validated"
@@ -362,7 +362,7 @@ def _require_setup_project(args) -> str:
 
     supplied = str(getattr(args, "project", "") or "").strip()
     if supplied:
-        return resolve_project_id(supplied, api_key)
+        return resolve_project_id(supplied, api_key, api_url)
     if not _setup_interactive(args):
         raise ClientError(
             "--project PROJECT_UUID is required in noninteractive mode, with redirected stdin, or with --yes"
