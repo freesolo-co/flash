@@ -267,11 +267,9 @@ REMOVED_PERSISTED_TRAIN_KEYS = frozenset({"advantage_clip"})
 class TrainSpec:
     epochs: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     lora_rank: int = field(default=32, metadata={"introduced_in": "0.2.0"})
-    # Derived, not a user knob: always 2 x lora_rank. No ``introduced_in`` so it is absent from
-    # TRAIN_SCHEMA_KEYS and ``[train] lora_alpha`` is rejected; spec_from_dict recomputes it from
-    # lora_rank and to_dict() omits it. The internal from_dict still round-trips the stored value so
-    # a warm-start's inherited parent alpha survives control-plane -> worker serialization.
-    lora_alpha: int = 64
+    # Optional user knob: defaults to 2 x lora_rank when unset. Authoring it is rejected alongside
+    # init_from_adapter, where the source adapter's alpha is authoritative (see spec_from_dict).
+    lora_alpha: int = field(default=64, metadata={"introduced_in": "1.1.31"})
     # artifact-store adapter ref output by `flash runs status`:
     # ``<hf_repo>:<phase>/<run_id>``.
     init_from_adapter: str = field(default="", metadata={"introduced_in": "0.2.0"})
@@ -466,9 +464,13 @@ class JobSpec:
         train = data["train"]
         train.pop("init_from_adapter_revision", None)
         train.pop("hf_repo", None)  # control-plane-assigned artifact repo
-        train.pop("lora_alpha", None)  # derived (2 x lora_rank), recomputed on parse
         if train.get("init_from_adapter"):
+            # the source adapter's topology is authoritative for a warm start, so the parser rejects
+            # both keys alongside init_from_adapter. the runner writes the inherited rank/alpha onto
+            # the public spec, so they must be stripped here or the submit round trip re-validates
+            # a combination the parser refuses.
             train.pop("lora_rank", None)
+            train.pop("lora_alpha", None)
         # runner-assigned disk sizing, shared weight-cache volume, and retry/wall-clock lifecycle.
         gpu = data["gpu"]
         for managed in MANAGED_GPU_KEYS:
@@ -558,8 +560,8 @@ class JobSpec:
             train=TrainSpec(
                 epochs=_opt_int(train.get("epochs")),
                 lora_rank=int(train.get("lora_rank", 32)),
-                # round-trip a stored alpha (internal carrier + warm-start's inherited parent alpha);
-                # derive 2 x rank when absent (a stripped public to_dict() being reconstructed).
+                # round-trip a stored alpha (authored value, internal carrier, or a warm-start's
+                # inherited parent alpha); fall back to 2 x rank when absent.
                 lora_alpha=(
                     int(train["lora_alpha"])
                     if "lora_alpha" in train

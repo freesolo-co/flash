@@ -461,7 +461,14 @@ def spec_from_dict(
             "train.lora_rank cannot be set with train.init_from_adapter because source adapter "
             "rank metadata is authoritative"
         )
+    if init_from_adapter and "lora_alpha" in train_raw:
+        raise ConfigError(
+            "train.lora_alpha cannot be set with train.init_from_adapter because source adapter "
+            "alpha metadata is authoritative"
+        )
     lora_rank = _train_int(train_raw, "lora_rank", minimum=1) or 32
+    # unset -> the tuned 2 x rank default. authored -> the user's value, which need not be 2 x rank.
+    lora_alpha = _train_int(train_raw, "lora_alpha", minimum=1) or 2 * lora_rank
     max_lora_rank = serving_lora_rank_cap(info)
     if not init_from_adapter and max_lora_rank is not None and lora_rank > max_lora_rank:
         raise ConfigError(
@@ -476,7 +483,7 @@ def spec_from_dict(
         train_spec = TrainSpec(
             epochs=_train_int(train_raw, "epochs", minimum=1),
             lora_rank=lora_rank,
-            lora_alpha=2 * lora_rank,  # derived, not a user knob; always 2 x lora_rank
+            lora_alpha=lora_alpha,
             init_from_adapter=init_from_adapter,
             hf_repo="",  # assigned server-side; see submit_job._assign_managed_hf_repo
             learning_rate=_train_float(train_raw, "learning_rate", minimum=0.0, exclusive=True),
