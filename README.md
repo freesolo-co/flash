@@ -82,7 +82,7 @@ id = "your-name/my-env"
 [train]
 epochs = 1
 max_examples = 1000
-lora_rank = 32
+lora_rank = 32              # lora_alpha defaults to 2 x lora_rank; set it to override
 ```
 
 ```bash

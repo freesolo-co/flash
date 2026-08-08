@@ -387,6 +387,16 @@ def test_internal_from_dict_round_trips_stored_lora_alpha() -> None:
     assert JobSpec.from_dict(absent).train.lora_alpha == 32  # absent -> derive 2 x rank
 
 
+def test_internal_dict_emits_an_authored_lora_alpha_to_the_worker() -> None:
+    # the EMISSION direction, not just from_dict: to_internal_dict() is what the worker rehydrates
+    # from, so an authored alpha that never reached the internal carrier would silently train at
+    # the derived 2 x rank scaling instead of the value the user wrote.
+    spec = spec_from_dict(_raw(**{"train.lora_rank": 16, "train.lora_alpha": 48}))
+    assert spec.to_internal_dict()["train"]["lora_alpha"] == 48
+    derived = spec_from_dict(_raw(**{"train.lora_rank": 16}))
+    assert derived.to_internal_dict()["train"]["lora_alpha"] == 32
+
+
 def test_authored_lora_alpha_overrides_the_derived_default() -> None:
     # an authored alpha need not equal 2 x rank, and it survives the public round trip the client
     # submits and the server re-validates.

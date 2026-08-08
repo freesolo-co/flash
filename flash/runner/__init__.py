@@ -610,7 +610,12 @@ def _public_status_spec(raw):
             train.pop("init_from_adapter_revision", None)
             init_ref = train.get("init_from_adapter")
             if init_ref is not None and (not isinstance(init_ref, str) or init_ref.strip()):
+                # mirror to_dict()'s warm-start strip: the parser rejects both keys alongside
+                # init_from_adapter, so leaving either here yields a public status spec that
+                # cannot be re-submitted. alpha only reaches this branch now that it is
+                # authorable and no longer stripped unconditionally.
                 train.pop("lora_rank", None)
+                train.pop("lora_alpha", None)
             data["train"] = train
     _redact_internal_adapter_ref(data)
     return data

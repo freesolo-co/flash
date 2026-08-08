@@ -3134,6 +3134,35 @@ def test_public_spec_does_not_publish_a_storage_ref_whose_phase_was_removed():
     )
 
 
+def test_malformed_legacy_warmstart_spec_drops_both_topology_keys():
+    """The malformed-record fallback must strip alpha as well as rank for a warm start.
+
+    Both keys are rejected alongside `init_from_adapter`, so surfacing either in a public status
+    spec yields a payload that cannot be re-submitted. Alpha only reaches this branch now that it
+    is user-authorable: while it was managed, `to_dict()` stripped it unconditionally.
+    """
+    import flash.runner as runner
+
+    train = runner._public_status_spec(
+        {
+            "train": {
+                "init_from_adapter": "source-run",
+                "lora_rank": 16,
+                "lora_alpha": 32,
+            },
+            "unparseable": object(),
+        }
+    )["train"]
+    assert "lora_rank" not in train
+    assert "lora_alpha" not in train
+
+    # a non-warm-start malformed record keeps an authored alpha: it is submittable there.
+    kept = runner._public_status_spec(
+        {"train": {"lora_rank": 16, "lora_alpha": 48}, "unparseable": object()}
+    )["train"]
+    assert kept["lora_alpha"] == 48
+
+
 def test_deploy_serving_error_is_recorded_as_failed_deployment(api, monkeypatch):
     """A serving-backend failure during deploy is recorded on the deployment status."""
     import flash.runner as runner
