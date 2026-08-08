@@ -75,14 +75,8 @@ from flash.opd_validation import validate_opd_structured_outputs
 def _reference_groupwise_reverse_kl(sp_t, groups, kl_coef=1.0):
     """Straight-line reference for the groupwise reverse-KL used by the equivalence tests below.
 
-    Deliberately written as an INDEPENDENT formulation rather than imported from the worker: the
-    point of the equivalence assertions is to pin verl's vectorized implementation to the objective
-    on paper, and an oracle that shares code with the thing it checks can drift with it and still
-    agree. Per group g over student token indices I_g, the coefficient is
-    ``kl_coef * (sum_{i in I_g} sp_i - teacher_logsum_g) / |I_g|``, applied to each member token and
-    averaged over all grouped tokens. The coefficient uses DETACHED student logprobs, so the
-    gradient flows only through the trailing factor -- that asymmetry is the objective, not an
-    optimization, so a reference that differentiates both factors would disagree by design.
+    Keep this independent of worker code. The coefficient uses detached student logprobs, so only
+    the trailing factor receives gradients.
     """
     import torch
 
@@ -1327,13 +1321,8 @@ def test_text_teacher_batcher_enforces_max_batch_size_across_concurrent_requests
     # batcher's actual guarantees under concurrent posts.
     assert sum(batch_sizes) == total
     assert all(size <= bound for size in batch_sizes)
-    # deliberately NOT asserted: that some batch reaches exactly `bound`. _take_batch waits at most
-    # flush_wait_s (0.1s) for the batch to fill and then ships whatever arrived, so a full batch
-    # depends on posts outrunning that window -- a race, not a contract. the old test asserted
-    # max == 8 and passed only because 8 was small enough that 17 concurrent posts always beat the
-    # flush; at the measured ceiling of 32 the same code produces 16/16/16 and the assertion fails
-    # on scheduling rather than on any defect. more than one batch is still required, which is what
-    # proves chunking happened at all.
+    # do not require a batch to hit the bound: the 0.1s flush window makes that scheduler-dependent.
+    # requiring multiple batches proves chunking without asserting a race.
     assert len(batch_sizes) > 1
 
 
@@ -2253,13 +2242,8 @@ def test_fully_forced_groups_encode_as_no_signal_and_are_filtered():
 def test_dropped_forced_groups_renormalize_over_surviving_tokens_only():
     """A dropped forced span must re-normalize the reverse-KL, not leave a shrunken sum.
 
-    Ported from the TRL OPD suite, where the same invariant was asserted over
-    ``_prepare_gkd_groups`` / ``_gkd_loss_from_logps``. In verl the two halves live in one place:
-    ``group_ids`` of -1 exclude the forced positions, and the ``response_count / selected_count``
-    rescale (opd_plugin.py:135) restores the denominator. The load-bearing claim is that a row
-    whose forced tokens were dropped scores EXACTLY as a row that only ever held the survivors --
-    without that rescale, verl's seq-mean-token-mean aggregation would divide the surviving signal
-    by the full response length and silently shrink the loss in proportion to how much was forced.
+    ``group_ids=-1`` excludes forced tokens and the response/selected rescale at
+    ``opd_plugin.py:135`` must make survivors score exactly like a survivor-only row.
     """
     torch = pytest.importorskip("torch")
 
@@ -2782,18 +2766,8 @@ def test_the_watcher_marks_every_step_processed_but_publishes_only_required_ones
 
 
 def test_the_final_deployable_publish_is_not_suppressed_by_the_processed_marker():
-    # regression: the verl OPD path gated its final publish on `final_step not in
-    # watcher.processed_steps`. that guard reads as "skip if already published", but the two publish
-    # paths are PROVABLY DISJOINT -- final_save_due() is true only when save_at_steps is EMPTY, and
-    # the watcher publishes deployables only for steps that are IN save_at_steps. so the clause can
-    # never prevent a real double-publish; it can only suppress a legitimate one.
-    #
-    # live-confirmed on runpod a100 run flash-1785569991-7ce8c3c1 (4/4 steps, default save_at_steps):
-    # hf carries checkpoint/checkpoint-4/ (the watcher DID process step 4) but no
-    # checkpoints/step-4/adapter/, so `flash runs checkpoint` listed nothing and step-4 deploy was
-    # impossible. the pre-verl path published this unconditionally
-    # (opd.py: publish_checkpoint=final_save_due(opt_steps, knobs.save_at_steps)), and grpo's
-    # rl_train.py still does, so this was a verl-migration regression and a grpo/opd parity break.
+    # final_save_due applies only when save_at_steps is empty, while the watcher publishes only
+    # requested steps. the paths are disjoint, so processed_steps cannot suppress the final publish.
     source = inspect.getsource(opd_train.run_opd_train)
     assert "final_save_due(final_step, knobs.save_at_steps)" in source
     assert "final_step not in watcher.processed_steps" not in source
@@ -4277,12 +4251,8 @@ def test_optimizer_rank_posts_marker_once_across_multiple_steps(monkeypatch):
 
 
 def test_wrapped_optimizer_step_survives_the_lr_scheduler_rebind(monkeypatch):
-    # verl builds a warmup lr scheduler immediately after the optimizer, and torch's
-    # LRScheduler.__init__ patches optimizer.step through step_fn.__func__ followed by
-    # func.__get__(opt, opt.__class__). both only exist on a bound method, so wrapping step with a
-    # plain function crashed every opd run at engine construction, before any gpu work, with
-    # "'function' object has no attribute '__func__'". this replays that exact sequence rather
-    # than importing torch so it gates on machines without the training extras installed.
+    # torch LRScheduler requires optimizer.step to remain bound and accesses __func__ and __get__.
+    # replay that protocol without importing training extras.
     import flash.engine.worker.opd_plugin as plugin
 
     coordination = []
@@ -4462,12 +4432,8 @@ def test_marker_publication_failure_reaches_all_ranks_before_optimizer_step(
 def test_bridge_publishes_the_marker_exactly_once_across_concurrent_ranks():
     """The bridge gate must collapse every rank's first-mutation notice into one marker publish.
 
-    trl drove the marker from a single-process optimizer helper (_apply_opd_optimizer_update), so
-    "exactly once" was trivially true and tested there. verl runs one worker per rank and each wraps
-    its own optimizer, so N ranks race into notify_mutation at the first step -- and a second publish
-    would commit a duplicate marker for the attempt. The _mutation_lock + _mutation_notified gate is
-    what makes that safe, and it had no direct coverage: the tests above drive the plugin-side
-    wrapper, which stops at one notice per rank, not one notice per run.
+    Each verl rank notifies independently, so ``_mutation_lock`` and ``_mutation_notified`` enforce
+    one marker per run rather than one per rank.
     """
     calls = []
     bridge = _text_bridge(_BridgeTeacher(), mutation_callback=lambda: calls.append(True))
@@ -5066,13 +5032,8 @@ def test_overrides_pin_the_rollout_resident_for_sleep_unsupported_models():
     assert not any("free_cache_engine" in value for value in off)
     assert not any("enable_sleep_mode" in value for value in off)
     on = build_opd_overrides(_config(sleep_unsupported=True))
-    # both knobs, not one: free_cache_engine gates the sleep()/wake_up() rpcs
-    # (vllm_async_server.py:626), enable_sleep_mode is what builds the sleep-capable engine (:265).
-    # they need DIFFERENT hydra prefixes -- rollout_resident_overrides' docstring has the why.
-    #
-    # asserted EXACTLY rather than as a substring, because "x=false" is a substring of "+x=false":
-    # the obvious assertion passes against the spelling that kills the run at parse, which is how
-    # this shipped. see ISSUES.md VERL-148.
+    # both sleep knobs are required and use different hydra prefixes; see
+    # rollout_resident_overrides and ISSUES.md VERL-148. assert exact strings because +x contains x.
     assert "actor_rollout_ref.rollout.free_cache_engine=false" in on
     assert "+actor_rollout_ref.rollout.enable_sleep_mode=false" in on
     assert "actor_rollout_ref.rollout.enable_sleep_mode=false" not in on
@@ -5156,15 +5117,9 @@ def test_overrides_bound_transfer_queue_storage_to_one_unit():
 def test_overrides_route_reward_scoring_away_from_verls_data_source_registry():
     """OPD must configure a custom reward function even though it carries no task reward.
 
-    `reward.reward_model.enable=false` disables the reward MODEL, not reward SCORING. verl's
-    RewardLoopWorker (reward_loop.py:146-155) branches on custom_reward_function.path first and
-    only falls through to the default rule-based scorer when it is None -- and that scorer
-    dispatches on data_source against a builtin registry that has no "flash_opd" entry, so it
-    raises NotImplementedError on every rollout and kills the run at step 0 (VERL-153).
-
-    Both key forms are required. The legacy top-level key is migrated onto reward.* in the main
-    process, but the RewardLoopWorker actor reads its own config copy and never sees that
-    migration, so emitting only one leaves the actor on the failing branch.
+    RewardLoopWorker otherwise uses a registry with no ``flash_opd`` entry and fails at step 0
+    (reward_loop.py:146-155, VERL-153). Emit both config keys because actors miss main-process
+    migration.
     """
     overrides = dict(value.split("=", 1) for value in build_opd_overrides(_config()))
 
@@ -5197,12 +5152,7 @@ def test_generated_opd_reward_shim_scores_every_rollout_zero():
 def test_opd_rollout_reserves_the_fp8_kv_cache_its_sizing_assumes():
     """The OPD engine must ask vLLM for fp8 KV, because vram.py already sized the run for it.
 
-    `_opd_fp8_adjust` halves an OPD requirement once it clears the largest non-fp8 card, on the
-    premise that the colocated rollout reserves an fp8 cache. That premise was supplied by the trl
-    engine (opd_vllm.py set kv_cache_dtype="fp8" on cc >= 8.9), which is deleted -- run_opd now
-    delegates to verl unconditionally. Without this override the allocator reserves an fp8-sized
-    pool while vLLM allocates a bf16 one: double the real KV, OOM at rollout init on a card sizing
-    called sufficient. The two must move together or not at all.
+    Otherwise the allocator reserves an fp8-sized pool while vLLM allocates twice as much bf16 KV.
     """
     on = dict(value.split("=", 1) for value in build_opd_overrides(_config(fp8_kv=True)))
     assert on["+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype"] == "fp8"
@@ -5215,16 +5165,8 @@ def test_opd_rollout_reserves_the_fp8_kv_cache_its_sizing_assumes():
 
 
 def test_remote_distillation_config_declares_every_field_post_init_assigns():
-    # verl's BaseConfig.__setattr__ (base_config.py) raises FrozenInstanceError for any assignment to
-    # an already-set field that is not in _mutable_fields. FlashRemoteDistillationConfig's __post_init__
-    # normalizes distillation_loss and clears teacher_models, so BOTH must be declared mutable -- else
-    # hydra's instantiate of distillation._target_ dies at worker startup, i.e. only on GPU, after the
-    # run is already paid for. That is exactly how this shipped: the only other coverage of this class
-    # asserts the _target_ STRING and never constructs it.
-    #
-    # Checked by AST rather than by instantiating: verl is not installed in CI (it lives in a separate
-    # baked venv), so an importorskip test would skip here and prove nothing on the machine that gates
-    # the merge. Reading the source needs no verl at runtime and still fails on a new unlisted field.
+    # verl BaseConfig freezes set fields, so distillation_loss and teacher_models must be mutable
+    # before __post_init__ changes them. inspect ast because verl is absent from ci.
     import ast
     import inspect
 
@@ -5278,16 +5220,8 @@ def test_remote_distillation_config_declares_every_field_post_init_assigns():
 
 
 def test_agent_loops_are_registered_under_an_importable_qualname():
-    # verl's `register` (agent_loop.py) stores f"{cls.__module__}.{cls.__qualname__}" into the agent
-    # loop registry at decoration time, and hydra resolves that string later with a plain dotted-path
-    # import. both flash loops are defined inside a function, so their natural qualname carries
-    # `<locals>` and NOTHING can import it: the run dies at first rollout with
-    # "Error locating target ... <locals>.FlashSingleTurnAgentLoop". the fix is ordering-sensitive --
-    # rewriting __qualname__ after the decorator already ran does not help, because the registry
-    # captured the broken string. so assert both dunders are rewritten BEFORE the register call.
-    #
-    # AST rather than import, for the same reason as the config test above: verl is not installed in
-    # CI, so an importorskip guard would silently skip on the machine that gates the merge.
+    # verl registers module.qualname at decoration time; function-local qualnames are unimportable.
+    # rewrite both dunders before @register. inspect ast because verl is absent from ci.
     import ast
     import inspect
 
@@ -5320,15 +5254,8 @@ def test_agent_loops_are_registered_under_an_importable_qualname():
 
 
 def test_teacher_logprobs_patch_precedes_the_main_ppo_sync_import():
-    # `@ray.remote` copies inherited methods onto the actor class it decorates, so
-    # `AgentLoopWorkerTQ(AgentLoopWorker)` in verl.trainer.main_ppo_sync freezes whatever
-    # `_compute_teacher_logprobs` resolves to at import time. importing that module before flash
-    # patches AgentLoopWorker snapshots verl's original, which calls the teacher manager with
-    # `sequence_ids=` while FlashBridgeTeacherManager takes prompt_ids/response_ids -- the first
-    # rollout then dies with "unexpected keyword argument 'sequence_ids'". patching the parent is
-    # only visible to the actor when it happens BEFORE the import, so assert that order.
-    #
-    # AST rather than import, for the same reason as the test above: verl is not installed in CI.
+    # @ray.remote snapshots inherited methods when AgentLoopWorkerTQ is imported.
+    # patch AgentLoopWorker before that import or the actor keeps the incompatible original method.
     import ast
     import inspect
 
@@ -5617,14 +5544,8 @@ def test_train_meta_records_the_optimizer_steps_that_actually_produced_a_loss():
 def test_worker_filters_over_budget_prompts_before_downloading_the_weights():
     """An all-over-budget dataset must fail before the multi-GB prefetch, not after it.
 
-    The prompt budget comes from `max_context_tokens - max_completion` and the prompt ids come from
-    the tokenizer, so "every prompt is over budget" is decidable from files that weigh kilobytes.
-    Running `prefetch_model` first spends tens of GB of download and minutes of paid worker time to
-    reach a verdict the tokenizer already had. The deleted trl trainer filtered first; this pins the
-    verl path to the same order.
-
-    `generation_eos_from_cached_config` reads the snapshot with local_files_only, so it is allowed
-    to sit after the prefetch -- but the budget check must not.
+    Tokenizer-based prompt budgeting is cheap and must precede ``prefetch_model``; cached EOS config
+    may be read later with ``local_files_only``.
     """
     import inspect
 
@@ -5665,12 +5586,8 @@ def test_train_meta_reports_the_teacher_call_shape_only_where_one_is_enforced():
 
     notes = inspect.getsource(run_opd_train)
     notes = notes[notes.index("_w.write_train_meta(") :]
-    # only the single-turn text path runs through the batcher, and it holds one serial scoring
-    # thread. multimodal scores one item per call and multi-turn batches an episode, both on the
-    # bridge's own request threads -- neither has a constant to report.
-    # the reported cap is bounded by the samples one step can actually produce, matching trl's
-    # _opd_teacher_batch_size: a 1-rollout step can never fill a batch of 8, so publishing the
-    # global cap there would describe a shape the run is structurally unable to reach.
+    # only single-turn text uses the serial batcher; multimodal and multi-turn use bridge threads.
+    # report at most the samples one step can produce.
     assert (
         '"opd_teacher_batch_size": (\n'
         "                    min(\n"
@@ -5796,12 +5713,8 @@ def test_opd_delegates_to_verl_with_no_selector_left(monkeypatch):
 def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch):
     """An OPD spec must build a NON-expandable allocator conf.
 
-    verl leaves rollout.enable_sleep_mode defaulted True, so the engine always builds a
-    CuMemAllocator, which asserts outright on expandable_segments (cumem.py, pytorch#147851) -- the
-    run would die before step 1.
-
-    A [worker_env] selector must not be able to reintroduce it either: run_opd delegates to verl
-    unconditionally, so honoring a stale key would pick an allocator for a backend that cannot run.
+    verl sleep mode uses CuMemAllocator, which rejects expandable_segments
+    (cumem.py, pytorch#147851); worker_env must not reintroduce it.
     """
     from flash.providers._worker import build_worker_env
     from flash.spec import JobSpec
@@ -5867,12 +5780,8 @@ def test_worker_fails_closed_on_tool_env(monkeypatch):
 def test_on_line_parses_the_numpy2_distillation_loss_the_image_actually_prints():
     """the distillation loss must survive numpy 2's np.float64(...) repr.
 
-    verl aggregates actor/distillation/loss with Metric(SUM) -> np.sum
-    (verl/utils/metric/utils.py), and LocalLogger renders it through pprint. verl pins
-    numpy<2, but Dockerfile.worker installs numpy 2.2.6 into the /opt/verl-venv interpreter
-    flash actually launches, where that scalar prints as "np.float64(0.64)". a bare float()
-    raises on that spelling, so every step is skipped, loss_curve ends empty, and the publish
-    guard rejects a run that trained correctly.
+    The worker image uses numpy 2.2.6, whose pprint output makes bare ``float()`` drop every metric
+    and leave the loss curve empty.
     """
     import flash.engine.worker.opd_train as ov
 
@@ -6048,12 +5957,7 @@ def test_stalled_thread_probe_reports_a_thread_that_is_gone_instead_of_raising()
 def test_opd_missing_managed_teacher_broker_fails_before_the_gpu_probe(monkeypatch):
     """A missing managed teacher key must fail before any paid GPU work starts.
 
-    Ported from the TRL OPD suite (`test_opd_missing_teacher_key_raises_platform_managed_error`),
-    where the same guard was asserted against `run_opd`. It is a COST guard, not just a validation
-    one: the key is platform-injected, so its absence is a platform-side failure that can only ever
-    end the run -- reaching `_probe_gpu_in_subprocess` would rent a card for a run guaranteed to
-    fail, and `prefetch_model` would then spend minutes pulling weights before anything noticed.
-    The monkeypatched probe asserts rather than returns, so ordering is proved, not assumed.
+    The platform-injected key is mandatory, so reject before the GPU probe and model prefetch.
     """
     from flash.engine.worker import opd_train as opd_mod
 
@@ -6111,19 +6015,10 @@ def test_opd_missing_managed_teacher_broker_fails_before_the_gpu_probe(monkeypat
 
 
 def test_opd_renders_each_prompt_once_so_a_stateful_environment_is_not_run_twice():
-    """`prompt_messages` is user code, and it was called once to classify and again to build.
+    """`prompt_messages` is user code, and it must be called once per example.
 
-    Two consequences, and the second costs a paid run. The environment observes every prompt twice,
-    so a stateful or seeded implementation advances its state on a pass whose output is discarded.
-    And the two passes can DISAGREE: if the classifying pass is text-only for a record whose second
-    rendering carries an image, `multimodal` is already latched false, no processor was built, and
-    the build pass reaches a bare `assert processor is not None`.
-
-    Asserted on the source rather than by driving `run_opd_train`, because the build loop sits
-    behind a gpu probe, a teacher client and a tokenizer load: a fixture that stubs its way there
-    stops testing this and starts testing the stubs. What makes the mismatch UNCONSTRUCTIBLE is
-    structural -- one call site, and the shuffle applied to the cached rows so the build pass has no
-    reason to re-render -- and that is what this reads.
+    Cache rendered rows before classification and shuffle them directly; repeated stateful renders
+    can disagree on multimodality. This is source-tested because the live path requires a GPU.
     """
     import ast
     import textwrap
@@ -6162,15 +6057,8 @@ def test_opd_renders_each_prompt_once_so_a_stateful_environment_is_not_run_twice
 def test_the_opd_trainer_stores_the_frozen_base_in_bf16():
     """VERL-150: verl's fsdp.yaml default is fp32, which doubles the trainer's resident base.
 
-    an un-overridden run loads the base at 4 bytes/param, because ``model_dtype: fp32``
-    (``trainer/config/engine/fsdp.yaml:33``) is passed straight to ``from_pretrained`` and the
-    ``if torch_dtype is None`` fallback below it never fires. at 27B that is 103 GB instead of 52,
-    which left vLLM 71.9 GB against an 89.2 GB demand and killed g5's OPD leg at engine startup --
-    reported 4 frames above the real error, as a bare ``ValueError`` from a child worker process.
-
-    the sft driver has set an explicit dtype since it was written and the rl/opd drivers did not,
-    which is exactly why g5's sft leg succeeded and its grpo and opd legs failed on the same model
-    and the same card. the rl driver's half of this lives in test_rl_train.
+    Override ``trainer/config/engine/fsdp.yaml:33`` so the frozen base loads in bf16.
+    The GRPO half is pinned in test_rl_train.
     """
     overrides = build_opd_overrides(_config())
     want = "actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16"

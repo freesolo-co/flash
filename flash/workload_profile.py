@@ -24,33 +24,14 @@ _ROLLOUT_PROFILE_RUN_PREFIX = "profile-rollout-"
 # token counts, so the two carry different lifetimes and only one of them is keyed.
 ROLLOUT_LATENCY_MAX_AGE_S = 24 * 60 * 60
 
-# how many completed rollouts a profile needs before its mean may move a quote.
-#
-# MEASURED, not chosen: 16 rollouts of Qwen3.5-9B over 4 grade-school math prompts (2026-08-06,
-# hosted api, temperature 1.0, cap 2048) gave mean 661 tokens with sd 625, so cv = 0.946. the
-# standard error of a mean at that spread is 0.946/sqrt(n) of the mean itself:
-#
-#   n=8 -> +/-33%    n=24 -> +/-19%    n=32 -> +/-17%    n=90 -> +/-10%
-#
-# the sample also showed WHERE the variance lives, which sets the sampling shape rather than just
-# the count: between-prompt variance (304846) was 5x within-prompt (61082), because one word
-# problem ran a median 1642 tokens against ~290 for three arithmetic prompts. a profile that draws
-# many completions from few prompts therefore measures those prompts, not the environment. the
-# worker must spread its draws across DISTINCT prompts first and add repeats second.
-#
-# 32 is the floor: it holds +/-17% at the observed spread while staying cheap enough to run per
-# config (~$0.002 at 9B, ~$0.05 at 27B), and it admits 8 distinct prompts at the group size 4 that
-# grpo itself samples with. chasing +/-10% costs ~3x more rollouts to shave a sixth off an error
-# already far smaller than the cap error it replaces (3.10x on this same sample).
+# chosen floor, not a fit: variance is dominated by prompt mix, so sample distinct prompts before
+# repeats. 32 holds +/-17% at the observed spread, stays cheap enough to run per config, and admits
+# 8 distinct prompts at grpo's group size 4. it will drift with models and workloads.
 MIN_TRUSTWORTHY_ROLLOUTS = 32
 
-# how much of the sample may be censored at the cap before the mean stops meaning anything.
-#
-# a truncated completion contributes the cap instead of its true length, so truncation biases the
-# measured mean DOWNWARD -- the direction that underbills. the same 16-rollout sample above hit
-# the 2048 cap twice (12.5%): real, but light enough that the mean still tracked the distribution.
-# a run where most completions are clipped is a different regime, where the cap IS the workload and
-# quoting it is correct; the profile refuses rather than reporting a censored mean as measurement.
+# conservative censoring policy, not a fit. a truncated completion contributes the cap instead of
+# its true length, biasing the mean DOWNWARD -- the direction that underbills. reject heavily
+# clipped samples rather than report a censored mean as measurement.
 MAX_TRUSTWORTHY_TRUNCATION_RATE = 0.25
 
 # which rows the profile measured. sft is never sampled: it either measures every source row or the
@@ -139,11 +120,9 @@ def sft_profile_input_digest(
 
 
 def _profile_run_id(prefix: str, input_digest: str) -> str:
-    """A profile's run id: its kind prefix and the input digest that keys it.
+    """build a profile run id, validating the digest first.
 
-    The digest is validated rather than trusted because this id becomes a directory name and a
-    lookup key, so a caller that passed a raw path or a truncated hash must fail here rather than
-    silently create a second profile that no reader will find.
+    validation prevents raw paths or truncated hashes from creating unreachable profile directories.
     """
     if len(input_digest) != 64 or any(c not in "0123456789abcdef" for c in input_digest):
         raise ValueError("input_digest must be a lowercase sha256 hex digest")
@@ -155,13 +134,10 @@ def sft_profile_run_id(input_digest: str) -> str:
 
 
 def _profile_from_dict(cls, raw: object):
-    """Rebuild a profile from its serialized form, verifying the digest it arrived with.
+    """rebuild a profile and verify its serialized digest.
 
-    Shared by both profile classes because the check is about the envelope, not the fields: the
-    schema comparison reads ``cls.__dataclass_fields__`` and the digest comparison reads the
-    class's own ``content_digest``, so each class validates against itself. Written once so the
-    two can never drift into accepting different things -- an artifact that survives one reader
-    and is rejected by the other is the failure this prevents.
+    shared envelope validation uses each class's own fields and ``content_digest`` so profile types
+    cannot drift into accepting different identities.
     """
     if not isinstance(raw, dict):
         raise ValueError("workload profile must be an object")
@@ -179,21 +155,12 @@ def _profile_from_dict(cls, raw: object):
 
 @dataclass(frozen=True)
 class SftWorkloadProfile:
-    """Aggregate-only description of the exact sft workload consumed by training.
+    """describe the exact aggregate sft workload consumed by training.
 
-    Two kinds of field live here and they are not interchangeable. Everything down to
-    ``sample_policy`` is *measurement*: derived only from the immutable inputs the input digest
-    keys, so re-running the same preprocessing reproduces it byte for byte. ``created_at`` is
-    *provenance*: it records which profile run emitted this artifact and is deliberately outside
-    ``_content()``, because the training worker re-derives the measurement to check that the
-    workload did not move under the frozen quote, and a timestamp in the digest would fail that
-    check on every run for the one reason that is not a workload change.
+    measurement fields derive from immutable digest-keyed inputs. ``created_at`` is provenance and
+    stays outside ``_content()`` so repeated preprocessing yields the same workload identity.
 
-    There is no trust flag. For sft the measurement is exact or the worker raises, so an artifact
-    that exists is one the quote may use; a profile that could not be produced is a failed profile
-    *run*, and its state and error live on the run record. PR2's sampled rollout evidence is where
-    a trust verdict has content, because a sampled profile can complete and still be too noisy to
-    quote from.
+    sft profiles are exact or fail; unlike sampled rollout profiles, they need no trust verdict.
     """
 
     input_digest: str
@@ -354,11 +321,9 @@ class SftWorkloadProfile:
 
 
 def _measurement_field_names(cls: type | None = None) -> tuple[str, ...]:
-    """Every field except provenance, taken from ``compare`` so the two can never drift apart.
+    """return measurement fields, excluding ``compare=False`` provenance.
 
-    ``compare=False`` is what excludes a field from dataclass equality, which is exactly the
-    training worker's parity check. Deriving the digest from the same flag keeps one definition of
-    "this is measurement" instead of a hand-maintained list that a new field could silently miss.
+    deriving digest content from the equality flag keeps parity checks and identity in sync.
     """
     return tuple(f.name for f in fields(cls or SftWorkloadProfile) if f.compare)
 
@@ -373,13 +338,10 @@ def rollout_profile_input_payload(
     tokenizer_revision: str,
     producer_version: str,
 ) -> dict[str, object]:
-    """Return the non-secret immutable inputs that determine one rollout workload profile.
+    """return immutable non-secret inputs for one rollout profile.
 
-    Deliberately excludes the training horizon (``epochs``, ``max_steps``, ``max_examples``): a
-    short run and a long run over the same environment, model and generation settings draw
-    completions from the same distribution, so they share one profile and one charge. Anything that
-    changes what the model is asked or how much it may say is keyed, because that moves the
-    distribution rather than how many times it is sampled.
+    exclude training horizon because it changes sample count, not the completion distribution. include
+    every setting that changes prompts or generation behavior.
     """
     train = spec.train
     environment = spec.environment
@@ -432,25 +394,14 @@ def rollout_profile_input_digest(
 
 @dataclass(frozen=True)
 class RolloutWorkloadProfile:
-    """Sampled description of what one grpo/opd step actually generates and grades.
+    """describe sampled generation and grading for one grpo/opd step.
 
-    Unlike the sft profile this is a SAMPLE, not a census, and that difference is the whole reason
-    the type carries a trust verdict. An sft profile either measures the exact rows training will
-    consume or the run fails; a rollout profile can finish, report numbers, and still be too thin,
-    too failure-ridden or too stale to move a quote. ``trustworthy`` is what the quote consults, and
-    it is deliberately not a single "did it run" flag.
+    unlike exact sft census data, sampled evidence needs a trust verdict. token distributions are
+    digest-keyed and do not expire; provider/card latency carries ``measured_at`` and ages out after
+    ``ROLLOUT_LATENCY_MAX_AGE_S``.
 
-    Two clocks. The token distribution is structural: the same environment, model and generation
-    settings produce it again, so it is keyed by the input digest and never expires. The measured
-    seconds are not: they belong to one provider on one card at one moment, so they carry
-    ``measured_at`` and age out after ``ROLLOUT_LATENCY_MAX_AGE_S``. Mixing the two lifetimes is how
-    a profile silently starts quoting last week's throughput.
-
-    ``completion_tokens_*`` is the field this type exists for. The quote previously billed
-    ``max_completion_tokens``, a capacity knob, as though it were expected work; measured realized
-    generation runs 0.077-0.392x of it and the resulting bias tracks the knob rather than the
-    workload. Aggregates and provenance only: no prompts, no completions, no token ids, no
-    credentials.
+    completion-token aggregates price realized work instead of the capacity cap. the profile stores no
+    prompts, completions, token ids, or credentials.
     """
 
     input_digest: str
@@ -560,14 +511,10 @@ class RolloutWorkloadProfile:
     def trustworthy(
         self, *, now: float, min_rollouts: int = MIN_TRUSTWORTHY_ROLLOUTS
     ) -> tuple[bool, str]:
-        """Whether this reading may move a quote, and if not, why not.
+        """return whether this evidence may move a quote, or the refusal reason.
 
-        Returns a reason rather than a bare bool because every caller that refuses a profile has to
-        tell a user what to do about it, and re-deriving the reason from the fields at each call
-        site is how two call sites end up disagreeing about what "untrustworthy" meant.
-
-        The bar is deliberately about *evidence*, not success: a profile that ran cleanly on two
-        prompts is not more quotable than one that failed, it is just quieter about it.
+        centralizing the reason keeps callers consistent. success alone is insufficient when samples
+        are too thin, stale, censored, or failure-heavy.
         """
         if self.completed_rollouts < min_rollouts:
             return False, (
@@ -581,12 +528,9 @@ class RolloutWorkloadProfile:
             )
         if self.completion_tokens_max <= 0:
             return False, "every sampled completion was empty, so no generation was measured"
-        # a truncated completion was cut off mid-generation, so it reports the cap rather than the
-        # length the model would have produced. every such sample drags the mean DOWN, and a mean
-        # biased low underbills the quote -- the one direction that costs real money rather than
-        # merely over-reserving it. a light tail is tolerable (the cap is a real limit training
-        # will hit too, so those tokens genuinely are all that gets generated), but once a large
-        # share of the sample is censored the mean stops describing the distribution at all.
+        # truncation reports the cap instead of true completion length and biases means downward.
+        # tolerate a light capped tail, but reject heavily censored samples that no longer describe the
+        # distribution.
         if self.truncation_rate > MAX_TRUSTWORTHY_TRUNCATION_RATE:
             return False, (
                 f"{self.truncated_rollouts} of {self.completed_rollouts} sampled completions were "
@@ -623,11 +567,9 @@ class RolloutWorkloadProfile:
 
 
 class WorkloadProfileMismatch(ValueError):
-    """The attached profile is absent, malformed, or does not describe this exact spec.
+    """report a profile absent, malformed, or mismatched to this exact spec.
 
-    Distinct from the transient failures a quote can also hit (a hub lookup for revision-aware
-    sizing, say): this identity is re-derived from the spec itself, so it resolves the same way
-    every time. Callers that retry infrastructure use the type to fail fast instead.
+    identity is deterministic, unlike transient hub or infrastructure failures, so callers fail fast.
     """
 
 
@@ -659,11 +601,9 @@ def require_matching_rollout_profile(
     tokenizer_revision: str,
     now: float,
 ) -> RolloutWorkloadProfile:
-    """The rollout counterpart of ``require_matching_sft_profile``, plus the trust gate.
+    """require a matching rollout profile and a passing trust verdict.
 
-    Identity and trust are checked in one place on purpose. A caller that verified the digest and
-    then forgot the verdict would quote from a profile that matches this spec exactly and measured
-    almost nothing, which is the failure this type was given a verdict to prevent.
+    checking both together prevents quoters from accepting exact-identity profiles with no evidence.
     """
     try:
         profile = RolloutWorkloadProfile.from_dict(raw)

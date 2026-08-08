@@ -182,25 +182,12 @@ _HB_PROGRESS_UPLOADED_SEQ = 0
 # per-repo commit cap while staying under the provider poller's training stall window
 # (STALL_AFTER_S=1500s in flash/providers/_poll.py).
 _HB_MIN_INTERVAL_S = 900.0
-# Highest optimizer step whose heartbeat has been COMMITTED. A force=True heartbeat (opd's
-# post-optimizer-step ping) bypasses the 900s throttle iff its step exceeds this — i.e. force is gated
-# on STEP ADVANCE, not elapsed time. That lands every distinct completed step exactly once (so a cancel
-# always bills the true latest step, never a stale one a mid-step progress ping left behind) while
-# self-limiting forced commits to the actual optimizer-step rate: redundant same-step/liveness pings
-# stay throttled below, and opd_step advances are teacher-round-trip-gated (minutes apart), so forced
-# commits stay far under the HF per-repo cap without a time floor that would blind-spot fast steps.
+# highest optimizer step committed by a heartbeat.
+# force bypasses the 900s throttle only on step advance so cancel billing stays current.
 _HB_LAST_COMMITTED_STEP = 0
-# A forced (post-optimizer-step) commit bypasses the 900s throttle on STEP ADVANCE so a cancel bills
-# the true latest step. But a tiny/smoke OPD config (batch=1, group=1, small student, fast/cached
-# teacher) can land optimizer steps many times per MINUTE, and forcing every one would blow the HF
-# per-repo commit cap before the final adapter/DONE upload. So forced commits are additionally
-# throttled to at most one per _HB_FORCE_MIN_INTERVAL_S -- but the floor is measured from the last
-# FORCED commit (_HB_LAST_FORCED_UPLOAD), not any upload, so a force still punches through
-# IMMEDIATELY after an unrelated (liveness / mid-step) commit stole the slot carrying a stale step
-# (exactly when force is needed). Net: when steps are farther apart than the floor (the normal
-# teacher-round-trip-gated regime) every distinct step still commits exactly once (exact
-# cancel-billing preserved); only a sub-floor BURST is coalesced, bounding the cancel under-bill to
-# one floor-window of steps while keeping forced commits under the HF cap.
+# forced step commits also obey _HB_FORCE_MIN_INTERVAL_S to protect the hf commit cap.
+# measure from _HB_LAST_FORCED_UPLOAD so unrelated liveness uploads cannot delay a needed force;
+# only sub-floor bursts coalesce, bounding cancel under-billing to one floor window.
 _HB_LAST_FORCED_UPLOAD = 0.0
 _HB_FORCE_MIN_INTERVAL_S = 60.0
 # Setup liveness is the user-visible signal during cold model download/load. Keep it below common
@@ -382,32 +369,11 @@ def main():
             sys.stdout.flush()
             sys.stderr.flush()
             os._exit(0)
-        # Four kernel setups, all running in THIS interpreter. verl trains in a child
-        # (FLASH_VERL_PYTHON), so what each one reaches was audited individually rather than
-        # assumed; the split is not uniform:
-        #
-        #   _force_fla_triton_gdn_on_sm100      -> ENV. Propagates: sft_train's _CHILD_ENV_PREFIXES
-        #                                          carries FLA_, and grpo passes os.environ wholesale.
-        #                                          It has to: FLA_TILELANG=0 is an sm100 correctness
-        #                                          floor, and the child is where the backward runs.
-        #   _ensure_fla_fastpath_on_hopper      -> pip install into sys.executable. Parent-only by
-        #                                          construction. The child gets its own pinned fla +
-        #                                          tilelang at image build (Dockerfile.worker's
-        #                                          verl-venv layer / backend_common.FLA_REQUIREMENT),
-        #                                          which is why that install is not optional.
-        #   _neutralize_tilelang_cudart_stub    -> repoints a symlink under the tilelang package
-        #                                          directory. Per-interpreter: it fixes whichever
-        #                                          site-packages this process imports, not the venv's.
-        #   _restrict_fla_gdn_autotune_on_blackwell -> in-process monkeypatch of an imported fla
-        #                                          module object. Cannot cross a process boundary at
-        #                                          all; a child would have to re-apply it itself.
-        #
-        # Only the first is an env var, so only the first can propagate. The other three are
-        # deliberately NOT forwarded: each mutates parent-process state that the child neither shares
-        # nor inherits, and pretending otherwise would be worse than the gap it papers over.
-        #
-        # BEFORE any model import / fla dispatch: on sm100 the baked tilelang GDN backend
-        # computes wrong gradients — opt out so fla uses its (correct-there) Triton path.
+        # these setups run in the parent; verl trains in FLASH_VERL_PYTHON.
+        # only _force_fla_triton_gdn_on_sm100 propagates through FLA_* env vars. the install,
+        # symlink,
+        # and monkeypatch are interpreter-local and must not be treated as child configuration.
+        # run before model imports: sm100 tilelang GDN computes wrong gradients, so use Triton.
         _force_fla_triton_gdn_on_sm100()
         _ensure_fla_fastpath_on_hopper()
         # Must run AFTER fla fast path (may reinstall tilelang) and BEFORE model/vLLM import.
@@ -436,12 +402,8 @@ def main():
         except Exception as up_err:
             print("error-upload warn:", sanitize_diagnostic(up_err, limit=500))
         try:
-            # when a raylet dies, the traceback uploaded above records only the downstream symptom
-            # ("Failed to register worker to Raylet: ... End of file"); the reason is in ray's
-            # session logs, which live on the pod and vanish with it. that makes a raylet failure
-            # undiagnosable from artifacts and costs a paid gpu run per guess (VERL-115). runs for
-            # every mode: all three backends start ray, and this is empty when the failure had
-            # nothing to do with it.
+            # preserve ray session logs because raylet tracebacks show only the downstream EOF and
+            # pod-local logs vanish after failure (VERL-115). all training modes start ray.
             ray_logs = collect_ray_failure_logs(started_after=WORKER_START_TIME)
             if ray_logs:
                 ray_name = ray_log_artifact_name(RUN_MODE, ATTEMPT)

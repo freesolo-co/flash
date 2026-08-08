@@ -25,40 +25,25 @@ if TYPE_CHECKING:
     from flash.client.http import ProgressCallback
 
 
-# windows shell metacharacters. `list2cmdline` implements MS C-runtime *argv* quoting, which is what
-# a program's argument parser undoes -- it is not command-line escaping, so it leaves these
-# untouched and the shell would act on them before the program ever runs.
-#
-# the set covers cmd.exe AND powershell, because we cannot tell which one the user will paste into:
-# `os.name == "nt"` says nothing about the shell, and powershell is the default terminal on current
-# windows. `foo;calc` passed the cmd-only set and rendered as `--output=foo;calc`, which powershell
-# splits at the semicolon and runs `calc` as its own statement. the extra members -- `;{}[]$``,'`
-# and whitespace-adjacent `@#` -- are powershell-only operators, quoting characters, and expansion
-# sigils.
+# `list2cmdline` quotes argv for the C runtime, not cmd.exe or powershell. reject metacharacters
+# from both shells because pasted suggestions execute them before the program sees the argument.
 _CMD_METACHARACTERS = frozenset('&|<>^()!"%' + ";{}[]$`,'@#")
 
 
 def _on_windows() -> bool:
-    """Whether to quote for a Windows shell.
+    """Return whether shell suggestions need Windows quoting.
 
-    A module-local seam so a test can simulate Windows without assigning to ``os.name``. That
-    assignment is process-wide, and on python 3.11 -- which CI runs -- ``pathlib`` reads it at
-    instantiation, so every later ``Path(...)`` raised ``NotImplementedError: cannot instantiate
-    'WindowsPath' on your system`` and the offline job failed before reaching the assertions. It
-    does NOT raise on 3.12, so the pattern looks fine locally and only breaks in CI.
+    This seam lets tests simulate Windows without mutating process-wide ``os.name``, which breaks
+    ``pathlib.Path`` on Python 3.11 CI.
     """
     return os.name == "nt"
 
 
 def _quote_shell_token(token: str) -> str:
-    """Quote one argv token for the shell the user is most likely to paste it back into.
+    """Quote one token for the platform shell, or return empty when unsafe.
 
-    ``shlex.quote`` is POSIX-only: it wraps in single quotes, which cmd.exe passes through as
-    literal characters rather than grouping, so a suggested command with a space would split
-    there. This package is declared OS-independent, so pick the quoting per platform.
-
-    Returns an empty string when the token cannot be made safely pasteable, so the caller can drop
-    the copy-pasteable form rather than emit a command that would execute something else.
+    POSIX quoting does not group cmd.exe arguments. Unsafe Windows metacharacters suppress the
+    copy-pasteable form rather than risk executing another command.
     """
     if not _on_windows():
         return shlex.quote(token)
@@ -147,38 +132,10 @@ def cmd_env_pull(args) -> int:
             positional = Path(args.path.replace("\\", "/"))
             default_name = positional.name
             out = Path(args.output) if args.output else Path(default_name)
-            # the common way to land here is `flash env pull ns/env./somedir`, meaning "put the env
-            # in./somedir". but the second positional is a path INSIDE the env, not a destination --
-            # so./somedir became the file to fetch and its basename the output.
-            #
-            # test the ORIGINAL positional, not `out`: an absolute /tmp/into-here is already
-            # reduced to the basename `into-here` by the time `out` exists, so comparing against
-            # `out` never matches and the pull runs on to fail with an invalid-env-path error
-            # instead of the hint that would explain it.
-            #
-            # only when -o is ABSENT, though. with an explicit `-o somedir` the user named the
-            # in-env path deliberately, so telling them to drop it would abandon the file they
-            # asked for and silently turn this into a whole-environment download.
-            #
-            # ...and only the POSITIONAL itself. a bare basename collision is not evidence the user
-            # meant a destination: `env pull ns/env assets/config` with a local./config/ is a real
-            # single-file pull, and telling that user to drop `assets/config` would abandon the file
-            # they asked for and aim --force at an unrelated directory.
-            #
-            # ...and only a positional that could BE a destination. a multi-component relative path
-            # names a location inside the environment, and `assets/config` happening to exist
-            # locally as a directory does not make it one: on `is_dir()` alone that real single-file
-            # pull was refused, and its nonempty branch aimed a whole-env --force replace at the
-            # local./assets/config the user never mentioned. a destination is written as its own
-            # name (`into here`, `./-dest`, `.`) or absolute, which is exactly `positional == out`
-            # plus the absolute form that `out` has already reduced to a basename.
-            #
-            # a path that traverses upward is the third form. `..` cannot name anything inside the
-            # environment -- `_safe_repo_relative_path` rejects every component of it -- so there is
-            # no in-env reading to protect and no ambiguity to resolve. without this `env pull
-            # ns/env../into-here` downloaded the package only to fail with an invalid environment
-            # path, instead of explaining `--output`. tested on the parts rather than a leading `..`
-            # because `assets/../config` is rejected just the same.
+            # the second positional names a path inside the env, not the destination. detect only
+            # destination-shaped directories when -o is absent, using the original positional so
+            # absolute paths and `..` survive basename reduction. multi-component relative paths
+            # remain valid in-env paths even when a same-named local directory exists.
             traverses_up = ".." in positional.parts
             could_be_destination = positional == out or positional.is_absolute() or traverses_up
             mistaken_dest = (
@@ -487,34 +444,10 @@ _DYNAMIC_IMPORT_FUNCTIONS = frozenset({"import_module", "__import__"})
 
 
 def _dynamic_import_callees(tree) -> frozenset[str]:
-    """Bare names that call `importlib.import_module` in this module, aliases included.
-
-    `from importlib import import_module as load` binds the same function to a different
-    identifier, so the call site reads `load("judge")` and matching on the canonical name alone
-    skipped it -- leaving `judge.py` out of the archive for a suite that passes locally, its
-    directory being importable there, and raises ModuleNotFoundError on its first published case
-    The binding is in the same file as the call, so the alias is statically knowable.
-
-    An assignment binds it just as well: `load = importlib.import_module` is not an `import ... as`
-    and so appears in no import statement at all, which left the same helper unpackaged for the
-    same reason. Chains are followed too (`a = importlib.import_module` then `b = a`),
-    in either declaration order, since nothing requires the alias to appear before its use.
-
-    Chains resolve through a work queue rather than repeated sweeps. Re-scanning every assignment
-    per pass discovers one link at a time when they are declared in reverse order -- the very order
-    this supports -- so a generated 5,000-link sidecar spent ~3.4s here, twice, because `env push`
-    walks again while copying. Each binding is instead indexed by the name it reads
-    and visited when that name becomes known, so the walk costs one visit per binding.
-
-    Deliberately flow-insensitive: a name rebound to something else later still counts here. The
-    two errors are not symmetric -- an extra name ships a file the archive did not need, while a
-    missed one is a published environment that raises on its first case.
-
-    Covers the two spellings that occur: a plain or annotated assignment. Destructuring
-    (`load, x = importlib.import_module, 1`), walrus, star targets and augmented assignment are
-    not followed, so a helper named only through one of those is still missed. Said plainly rather
-    than left to look like full coverage -- the symptom is the ModuleNotFoundError above, and
-    knowing which spellings are walked is what makes it diagnosable."""
+    """Return aliases that call ``importlib.import_module`` or ``__import__``.
+    Follow plain and annotated assignment chains in either order. Unsupported binding forms remain
+    excluded; missing an alias can omit a sibling and fail after publishing.
+    """
     import ast
     from collections import deque
 
@@ -571,12 +504,11 @@ def _dynamic_import_callees(tree) -> frozenset[str]:
 
 
 def _dynamic_import_name(node, callees: frozenset[str]) -> str | None:
-    """The module a literal `import_module("x")` or `__import__("x")` call names, if any.
+    """Return the module named by a literal dynamic import call, if any.
 
-    A sidecar importing a sibling dynamically passes local test and eval -- the scope makes the
-    directory importable -- and then fails on its first published case, because the helper was
-    never packaged. A literal argument is statically knowable, so it is followed like
-    any other import. A computed name is not, and is left to the runtime rather than guessed at."""
+    Literal siblings must be packaged to avoid post-publish ModuleNotFoundError; computed names are
+    left to runtime rather than guessed.
+    """
     import ast
 
     func = node.func
@@ -606,13 +538,10 @@ def _dynamic_import_name(node, callees: frozenset[str]) -> str | None:
 
 
 def _imported_module_names(tree, *, relative_names_are_siblings: bool = True) -> set[str]:
-    """Top-level sibling names a parsed module imports, by statement or literal call.
+    """Return top-level sibling names imported by statement or literal call.
 
-    Every name returned is resolved against the env root by the caller, so a relative import
-    only belongs here when the parsed file sits AT that root. Pass
-    `relative_names_are_siblings=False` for a file nested deeper: `from . import config` inside
-    `pkg/__init__.py` names `pkg/config.py`, which the package walk already ships, and reading it
-    as a root-level name published an unrelated top-level `config.py` instead.
+    Resolve relative names as root siblings only for files at the env root; nested package relatives
+    are already handled by the package walk.
     """
     import ast
 
@@ -626,12 +555,8 @@ def _imported_module_names(tree, *, relative_names_are_siblings: bool = True) ->
                 if node.module:
                     names.add(node.module.split(".", 1)[0])
             elif node.level == 1 and relative_names_are_siblings:
-                # `from . import config` and `from .utils import load` name siblings of this file
-                # just as the absolute spellings do. an entrypoint written to work both as a
-                # package member and as a loose module puts the relative form first and falls back
-                # to the absolute one, so reading only absolute imports left the helper unpackaged
-                # whenever the relative spelling came first -- and the fallback then had no file to
-                # import. a bare `from . import x` carries the name in `names`, not in `module`.
+                # level-one relative imports name siblings. include both ``module`` and bare
+                # ``from . import x`` names so loose-module fallbacks are packaged.
                 if node.module:
                     names.add(node.module.split(".", 1)[0])
                 else:
@@ -645,15 +570,11 @@ def _imported_module_names(tree, *, relative_names_are_siblings: bool = True) ->
 
 
 def _helper_imports(helper: Path, *, env_root: Path) -> set[str]:
-    """Top-level names a packaged helper imports, for following its own dependencies.
+    """Return imports needed by a packaged helper.
 
-    A helper that fails to parse is still shipped verbatim: refusing the push over a file the
-    sidecar may never execute would be a harsher failure than the ModuleNotFoundError this
-    lookahead exists to avoid, and the sidecar's own syntax is validated separately.
-
-    Only a helper sitting directly at `env_root` has root-level siblings, so a relative import
-    from deeper in a packaged subdirectory is dropped rather than resolved against the wrong
-    directory -- the package walk that reached it already ships its true siblings."""
+    Ship unparseable helpers verbatim. Only root helpers resolve relative names against the env
+    root; the package walk already carries nested siblings.
+    """
     import ast
 
     if helper.suffix != ".py":
@@ -670,18 +591,10 @@ def _helper_imports(helper: Path, *, env_root: Path) -> set[str]:
 def _iter_import_closure(
     seed_modules: set[str], *, env_root: Path, entrypoint: Path, yielded: set[Path]
 ) -> Iterator[tuple[Path, Path]]:
-    """Yield the sibling helpers reachable from `seed_modules`, following their imports too.
+    """Yield imported sibling helpers and their transitive sibling imports.
 
-    A helper that imports another sibling needs that sibling too: shipping `scorer.py` without
-    the `thresholds` it imports published an environment that raised ModuleNotFoundError on its
-    first case, having passed every local check because the source directory was importable
-    The queue grows only through siblings actually reached, so it stays a closure
-    over files this push already carries rather than a general dependency resolver -- an
-    unimported neighbour stays local.
-
-    `yielded` is shared with the caller's other walks so a helper that IS `dataset/` (or lives
-    under it) is not emitted twice; `_check_env_push_limits` would otherwise charge those bytes
-    and members twice and reject a tree that is actually under the limit.
+    This is an import closure, not a general dependency resolver. Sharing ``yielded`` prevents
+    duplicate members from being charged twice by ``_check_env_push_limits``.
     """
     import os
 
@@ -692,18 +605,9 @@ def _iter_import_closure(
         if module_name in visited:
             continue
         visited.add(module_name)
-        # `from graders.rules import score` resolves to a sibling PACKAGE, not graders.py.
-        # matching only the module spelling published an environment whose sidecar raises
-        # ModuleNotFoundError on its first case, having passed every local check.
-        #
-        # resolution follows python's own order, which is NOT simply "directories first". a
-        # directory holding __init__.py is a regular package and outranks a same-named module, so
-        # shipping the.py and skipping the package published the file the sidecar never imports
-        # while dropping the one it does. but a PEP 420 namespace directory (no __init__.py) is only
-        # a fallback portion: `graders.py` wins over a bare `graders/`. requiring the marker
-        # unconditionally sent a namespace helper to the.py fallback, which did not exist either,
-        # and published an archive missing the helper entirely. verified by probe: with both
-        # present, `import graders` binds graders.py.
+        # mirror python import precedence: a regular package beats a same-named module, while a bare
+        # PEP 420 namespace directory is only a fallback. choosing the wrong side omits the imported
+        # helper and fails after publishing.
         package = env_root / module_name
         helper = env_root / f"{module_name}.py"
         ships_package = (
@@ -902,17 +806,10 @@ def _entrypoint_alias_source(module_name: str) -> str:
 
 
 def _write_entrypoint_alias(pkg: Path, *, entrypoint: Path) -> None:
-    """Keep a noncanonical entrypoint importable under the name it had locally.
-
-    Packaging writes the entrypoint's contents as environment.py whatever it was called, so a
-    sidecar doing `from custom import SCORER` -- which resolves locally, and is the only way to
-    reach the entrypoint when it is not named environment.py -- raised ModuleNotFoundError once
-    published. The alias rebinds sys.modules rather than re-importing, so the
-    sidecar and the runner share ONE module object and one set of module-level state; importing
-    the source twice would give the sidecar a second copy of every constant it scores against.
-
-    No sibling can collide with the alias: the entrypoint lives in the package root, and
-    `_ignore_env_push_path` excludes it from the sidecar walk, so its name is unclaimed."""
+    """Keep a renamed entrypoint importable under its local module name.
+    Rebind ``sys.modules`` so sidecars and the runner share state. The entrypoint is excluded from
+    the sidecar walk, so the alias cannot collide with a packaged sibling.
+    """
     if entrypoint.name == _ENV_ENTRYPOINT:
         return
     (pkg / entrypoint.name).write_text(_entrypoint_alias_source(entrypoint.stem))

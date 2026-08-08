@@ -100,21 +100,10 @@ def cmd_version(args) -> int:
 def _verifies_against_freesolo(api_url: str, freesolo_url: str | None) -> bool:
     """Whether ``flash login`` should check this key against the hosted Freesolo backend.
 
-    The two URLs name different services: ``--api-url`` is the control plane that runs training,
-    ``--freesolo-url`` is the backend that issues and verifies user keys. On a SELF-HOSTED plane
-    the second one does not exist -- the plane authenticates FREESOLO_INTERNAL_KEY itself -- so
-    verifying against ``https://api.freesolo.co`` sends the operator's plane-root credential to a
-    service they have no relationship with, which then rejects it. The documented quickstart could
-    not complete, and the key leaked on the way to failing.
-
-    Keyed off the control-plane URL because that is the only standalone signal the CLIENT has:
-    FLASH_STANDALONE is set on the server, and the client cannot see it before it has authenticated.
-    An operator pointing at their own plane is exactly the case that must not phone home. An
-    explicit ``--freesolo-url`` still wins, so a self-hoster running a Freesolo-compatible auth
-    backend of their own keeps verification.
-
-    False routes verification to the plane itself (see ``_verify_key_against_plane``); it never
-    means "accept the key unchecked".
+    A self-hosted plane verifies ``FREESOLO_INTERNAL_KEY`` itself, so sending that credential to
+    the hosted backend would leak it. The client can infer standalone mode only from ``--api-url``;
+    an explicit ``--freesolo-url`` still requests external verification. False routes verification
+    to ``_verify_key_against_plane`` rather than accepting the key unchecked.
     """
     if freesolo_url:
         return True
@@ -171,25 +160,12 @@ _LOGIN_VERIFY_TIMEOUT_S = 30.0
 
 
 def _verify_key_against_plane(api_key: str, api_url: str) -> dict:
-    """Verify a key against a self-hosted plane by calling its authenticated identity endpoint.
+    """Verify a key through the self-hosted plane's authenticated identity endpoint.
 
-    The self-hosted path cannot use `verify_freesolo_key` (that would leak the plane-root
-    credential to a third party), but it must not simply SKIP verification either: the key is
-    saved before the identity card is fetched, and `_identity_or_none` deliberately swallows
-    errors so a control-plane hiccup can't fail an already-verified login. Skipping therefore made
-    `flash login --api-key <typo>` exit 0 and store an unusable key, with the real 401 surfacing
-    later on an unrelated command.
-
-    `/v1/me` is the right probe: it is behind `require_key`, and its response is the identity card
-    login already prints, so one round trip both authenticates and fills the card.
-
-    Reaching the endpoint is NOT by itself proof of acceptance, though. `_request` turns an empty
-    2xx body into `{}`, so a misrouted `--api-url` -- a proxy, a health-check responder, an older
-    service without this route -- returns success having never consulted `require_key`. Trusting
-    that would persist an arbitrary key and print "logged in", which is the same mistake this
-    function exists to correct, one layer down. So require the shape the real endpoint always
-    returns: `kind` and `key_prefix` are unconditional in `flash/server/routes/meta.py`, while
-    `email` is not, making those two the honest contract to assert.
+    Hosted verification would leak the plane-root credential, while skipping verification stores
+    invalid keys. ``/v1/me`` both authenticates and returns identity. Require ``kind`` and
+    ``key_prefix`` because ``_request`` converts an empty 2xx body to ``{}``; those fields are
+    unconditional in ``flash/server/routes/meta.py``.
     """
     identity = ApiClient(api_url, api_key, timeout=_LOGIN_VERIFY_TIMEOUT_S).me()
     if not isinstance(identity, dict) or not identity.get("kind") or not identity.get("key_prefix"):
@@ -742,37 +718,10 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
     state = str(status.get("state") or fallback_state or "unknown")
     parts = [state]
     heartbeat = status.get("last_heartbeat") if isinstance(status, dict) else None
-    # a preemption relaunches the run on fresh hardware from step 0 while `state` stays "running",
-    # so the step counter silently rewinds and the earlier progress is gone. the attempt counter is
-    # the one field that distinguishes that from normal progress, so show it once the run is past
-    # its first attempt rather than leaving a rewind unexplained. attempts are 0-based
-    # (flash/providers/runpod/jobs.py stamps no retry suffix on attempt 0), so any nonzero value is
-    # already a relaunch.
-    #
-    # resolved OUTSIDE the heartbeat block. an attempt preempted before it published its first ping
-    # leaves `last_heartbeat` None while `remote.attempt` has already advanced, and nesting this
-    # under the heartbeat printed a bare `running` for the whole cold start -- silent through
-    # exactly the relaunch this line exists to explain.
-    #
-    # prefer the live attempt from `remote` over the heartbeat's: during the relaunch window
-    # `remote.attempt` has already advanced while `last_heartbeat` is still the superseded worker's
-    # ping, so reading the heartbeat leaves the first preemption unlabelled (stale attempt 0) and
-    # names the *previous* attempt on later ones. `remote` is absent on planes that do not surface
-    # it, hence the heartbeat fallback.
-    #
-    # ...but the fallback is only for an ABSENT `remote`, not a null one. a supervised retry clears
-    # `remote` before reserving the replacement attempt and does not persist the new one until the
-    # provider handle lands, so for that whole allocation window flash publishes `remote: null` with
-    # the superseded worker's ping still attached. falling back there reintroduced exactly what
-    # preferring `remote` was meant to fix: the first retry unlabelled, later ones naming the
-    # previous attempt.
-    #
-    # an explicit null is unambiguous, which is why this can key on it: `on_handle` persists
-    # `remote` in the same `_update` that sets `running`, so a running flash record with a heartbeat
-    # and no remote can only be a worker that has been torn down -- there is no ordinary window
-    # where a live worker is pinging without one. drop the identity rather than guess: the attempt
-    # is genuinely unknown until the replacement is reserved, and a wrong number is worse than none
-    # for a field whose entire job is to explain a step rewind.
+    # retries rewind steps while state remains running, so surface the 0-based attempt identity.
+    # prefer live `remote.attempt`; the heartbeat may belong to the superseded worker. fall back only
+    # when `remote` is absent, not explicitly null: null marks the allocation window after teardown,
+    # when the new attempt is unknown and the attached heartbeat is stale.
     from flash.providers._poll import _attempt_int
 
     remote = status.get("remote")
@@ -1185,25 +1134,10 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
         if not first and (remaining <= 0 or final_read):
             break
         if not first:
-            # hold back a slice of the budget for the read this sleep precedes, so a revision that
-            # becomes ready early in a window no longer than one poll interval is still observed
-            # rather than reported as queued. reserving a fixed slice (rather than sleeping a
-            # fraction of the remainder) is what makes this terminate: a fraction leaves a positive
-            # remainder forever, while this drives the remainder to the slice and then to zero.
-            #
-            # the reservation has to apply to the final window too. subtracting only when the slice
-            # EXCEEDS the reserve meant a remainder at or under it was slept in full and the
-            # post-sleep deadline check ended the wait with no further read: `--wait 1` reported a
-            # revision that went ready mid-window as still queued and exited 1, and every longer
-            # wait carried the same blind spot through its last second.
-            #
-            # that window's one read is placed LATE in it, not at its midpoint. Splitting it in half
-            # stopped looking with half the budget unspent: `--wait 1` read at t=0 and t=0.5 and
-            # then reported a timeout for a revision that went ready at t=0.75. The read cannot sit
-            # at the deadline itself -- it would still be in flight past it, which is the overshoot
-            # the per-poll bound exists to prevent
-            # (`test_deploy_wait_does_not_start_a_read_after_the_deadline_expires`) -- so sleep most
-            # of the window and leave just enough budget to bound the read inside it.
+            # reserve a fixed final-read budget so the loop terminates and observes readiness inside
+            # the last window. place that read late, but before the deadline, to avoid both unused wait
+            # time and an in-flight overshoot; see
+            # `test_deploy_wait_does_not_start_a_read_after_the_deadline_expires`.
             slice_seconds = min(_DEPLOY_POLL_SECONDS, remaining)
             if slice_seconds > _DEPLOY_FINAL_READ_SECONDS:
                 slice_seconds -= _DEPLOY_FINAL_READ_SECONDS
@@ -1241,31 +1175,10 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
             pass
         else:
             if current is None:
-                # the listing drops a run once its deployment is gone, so vanishing mid-wait is
-                # terminal, not slow; continuing here would just burn the whole timeout.
-                #
-                # "absent" and "gone", though, are not the same thing. deployment_for matches on the
-                # checkpoint step too, so a redeploy that FAILED and rolled the run back to a
-                # different revision also reads as absent: `mark_deployment_failed` restores the
-                # predecessor verbatim, and the restored record carries the predecessor's step.
-                # reporting that as "no longer an active deployment" names the wrong event and drops
-                # `last_deploy_error`, the only record of why the requested revision did not make
-                # it. look for the run's other revision before saying it vanished. recomputed, not
-                # `budget`: that was the remainder BEFORE the read that just returned, and a poll
-                # which consumed nearly all of it would hand this lookup a second full-length bound
-                # -- so `--wait 5` could block for close to ten seconds, and the pinned one-shot of
-                # `--wait 0` for twice its fixed bound. the expired case still gets the zero-wait
-                # bound rather than being skipped: classifying rollback against vanished is the
-                # difference between reporting the real failure and naming the wrong event, and it
-                # is one read.
-                #
-                # a floor, not just an expired-case fallback: a poll that answered a hair inside the
-                # deadline leaves a remainder that is positive and far too small to read in, so
-                # forwarding it verbatim timed the listing out, `_rollback_record` swallowed the
-                # error, and the run was reported vanished with `last_deploy_error` never printed.
-                # the same one-read reasoning covers it -- a bound too small to answer in buys
-                # nothing over no lookup at all, and overshoots the deadline by at most the bound
-                # the zero-wait one-shot already spends.
+                # absence may mean rollback, not deletion: `deployment_for` filters by checkpoint
+                # step while `mark_deployment_failed` restores the predecessor. inspect the run's
+                # other revision to preserve `last_deploy_error`. recompute the remaining budget and
+                # floor it at the zero-wait one-read bound so this classification can complete.
                 left = deadline - time.monotonic()
                 other = _rollback_record(client, run_id, max(left, _DEPLOY_ZERO_WAIT_READ_SECONDS))
                 if other is not None:
@@ -1288,16 +1201,10 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
 
 
 def _rollback_record(client, run_id: str, timeout: float) -> dict | None:
-    """The run's currently-listed revision when it is NOT the one that was requested.
+    """Return another listed revision after the requested one disappears.
 
-    Only meaningful once the requested revision is absent from the listing. A failed cross-step
-    redeploy leaves exactly this shape: the run is still deployed, on its previous checkpoint,
-    with `last_deploy_error` explaining why the new one did not take.
-
-    Returned as-is rather than reshaped to look like the requested revision. The caller compares
-    attempt identity (`_deployment_attempt_failed`) and prints the record, so handing back the
-    predecessor's real step and stamp is what makes both report the rollback instead of claiming
-    the requested checkpoint is live.
+    A failed cross-step redeploy restores the predecessor with ``last_deploy_error``. Preserve its
+    real step and attempt stamp so ``_deployment_attempt_failed`` can report rollback accurately.
     """
     from flash.schema import parse_checkpoint_ref
 
@@ -1305,14 +1212,8 @@ def _rollback_record(client, run_id: str, timeout: float) -> dict | None:
     if parsed is None:
         return None
     base_run_id, _ = parsed
-    # the requested step is not read here, and there is no early return for the final adapter. a run
-    # serving a checkpoint whose FINAL-adapter redeploy fails is rolled back to that checkpoint by
-    # `mark_deployment_failed`, and `deployment_for` rejects the restored record because its
-    # non-null `checkpoint_step` does not match the requested final adapter. exempting `step is
-    # None` therefore hit exactly the case this lookup exists for: the CLI reported the run as
-    # vanished and printed the stale queued record instead of the persisted error and the
-    # still-serving checkpoint. the rollback is always to a DIFFERENT revision, so the direction of
-    # the step change is not what makes it one -- `last_deploy_error` below is.
+    # do not exempt final-adapter requests: a failed final redeploy can restore a checkpoint that
+    # `deployment_for` excludes by step. `last_deploy_error`, not step direction, identifies rollback.
     try:
         entries = client.deployments(timeout=timeout)
     except (ApiError, ClientError):
@@ -1338,13 +1239,10 @@ def _rollback_record(client, run_id: str, timeout: float) -> dict | None:
 
 
 def _deployment_attempt_failed(requested: dict, final: dict) -> bool:
-    """True when the revision we asked for is not the one now being served.
+    """True when the requested revision is not the one now served.
 
-    A failed redeploy does not leave a `failed` record. `mark_deployment_failed` restores the
-    previous deployment verbatim and records the failure only in `last_deploy_error`, so the run
-    ends up `ready` on the OLD adapter. Treating that as success is how
-    `deploy --wait && evaluate` silently evaluates the previous checkpoint. Compare the attempt
-    identity instead of trusting the state word.
+    ``mark_deployment_failed`` restores the previous ready record and writes only
+    ``last_deploy_error``. Compare attempt identity or ``deploy --wait`` can accept the old adapter.
     """
     if str(final.get("state") or "") == "failed":
         return True
@@ -1561,14 +1459,9 @@ def cmd_chat(args) -> int:
         temperature=args.temperature,
         max_tokens=args.max_tokens,
     ):
-        # nothing reaches stdout until the stream produces non-whitespace. The label waits because
-        # printing it up front would leave `assistant` on stdout for an empty stream, so a styled
-        # run (a tty, or FLASH_STYLE=1) would exit 1 with non-empty stdout and break the same health
-        # check this failure exists to make possible -- and a stream of blank chunks does that too,
-        # spaces being just as non-empty as a label. So blank chunks are held rather than printed,
-        # and released verbatim once real text arrives, which keeps the response byte-identical for
-        # every stream that has any. `_generate_response` grades emptiness the same way, for the
-        # same reason (flash/cli/env_eval.py).
+        # delay the label and blank chunks until real text arrives. otherwise an empty response has
+        # non-empty stdout and cannot serve as a health check. release buffered blanks verbatim;
+        # flash/cli/env_eval.py grades emptiness the same way.
         if not wrote:
             pending.append(chunk)
             if not chunk.strip():

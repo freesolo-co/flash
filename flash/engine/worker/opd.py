@@ -1,18 +1,7 @@
 """On-policy distillation entry point (algorithm="opd") and the knob/prompt helpers it shares.
 
-``run_opd`` delegates to ``opd_train.run_opd_train``, which owns the whole training path: rollout,
-teacher scoring, and the groupwise reverse-KL backward. What stays here is the part the verl worker
-imports rather than reimplements — ``OpdKnobs`` / ``_resolve_opd_knobs`` (the [train] table's
-resolved view), ``_thinking_prefill_text`` (the reasoning-block opener the teacher prompt must
-match), and ``_drop_fully_forced_groups`` (grammar-forced spans carry no student choice, so they
-carry no signal).
-
-On the distillation objective itself, see ``opd_train`` for the implementation and
-``tokenizer_align`` for the cross-tokenizer bridge: teacher and student tokenize the same completion
-differently, so their distributions are compared over SHARED DECODED-TEXT SPANS using only
-realized-token logprobs, which is exact across arbitrary tokenizer mismatch.
-
-This module holds no heavy imports, so importing it stays CPU/offline-safe.
+Training lives in `opd_train`; this module keeps CPU-safe knobs and prompt helpers. Cross-tokenizer
+scoring compares shared decoded-text spans in `tokenizer_align`.
 """
 
 from __future__ import annotations
@@ -135,20 +124,9 @@ def _thinking_prefill_text(tok) -> str:
             s += 1
         think_mid = think[p : len(think) - s]
         base_mid = base[p : len(base) - s]
-        # CLOSED-BLOCK hybrid recovery, checked BEFORE the think_mid early-return:
-        # enable_thinking=False force-CLOSES the block (base's unique middle is a closing tag
-        # "</think>...") while the shared prefix already opened "<think>", which the student
-        # pre-fills. Recover the OPEN-block opener from the think render so the teacher conditions
-        # on the same open block instead of base's closed one. This MUST run before `if think_mid`
-        # because a base that closes the block right after the opener leaves a non-empty WHITESPACE
-        # remainder in think_mid (base "<think></think>" vs think "<think>\n" -> think_mid "\n"),
-        # which the early-return would otherwise hand back in place of the real "<think>\n" opener.
-        # The base "<think>\n\n</think>" / think "<think>\n" shape (think_mid EMPTY) is the SAME
-        # recovery. lstrip absorbs intra-block whitespace before the closing tag so detection still
-        # fires; we return think[cut:] (the thinking-side opener), so the strip only affects
-        # DETECTION, not the returned opener. If the opener isn't in the shared prefix, fall
-        # through: return the think_mid delta ("" only when the model opens <think> inside the
-        # completion).
+        # recover the open thinking block before the `think_mid` return. non-thinking rendering may
+        # close the shared `<think>` prefix, leaving whitespace in `think_mid`; strip whitespace for
+        # detection but return the exact thinking-side opener.
         base_mid_tag = base_mid.lstrip()
         if base_mid_tag.startswith("</") and ">" in base_mid_tag:
             open_tag = (

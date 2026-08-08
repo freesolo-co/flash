@@ -46,14 +46,8 @@ def styled() -> bool:
 def can_prompt() -> bool:
     """Whether a question can actually be answered by a human right now.
 
-    Stricter than ``styled()``, which only asks whether to draw the themed layout: a prompt that
-    nobody answers blocks the process forever, so CI is refused explicitly. A pseudo-TTY in CI
-    reports ``isatty()`` true, which is exactly the case that hangs, and a closed fd 0 can make
-    ``sys.stdin`` None, so that is guarded before ``.isatty()``.
-
-    One definition, because the two callers had drifted: env setup checked CI and traces export did
-    not, so `flash traces export` with no --project hung on a picker under CI -- and traces export
-    has no --yes to escape with.
+    ``styled()`` is insufficient because CI may expose a pseudo-TTY and hang forever. Require
+    non-CI interactive stdin; ``sys.stdin`` may also be None when fd 0 is closed.
     """
     if os.environ.get("CI", "").strip().lower() not in ("", "0", "false", "no"):
         return False
@@ -760,18 +754,9 @@ def _stale_step_hint(
 
     if not is_training_heartbeat(heartbeat.get("stage"), heartbeat.get("step")):
         return None
-    # do NOT send them to `runs log -f` for worker output. it streams the control-plane log, which
-    # carries orchestration events rather than trainer progress, and the worker console it does
-    # print comes from _print_worker_output AFTER the run reaches a terminal state
-    # (flash/cli/commands.py cmd_log) -- so it cannot answer this question while the run is live.
-    # even reaching for that artifact mid-follow would not help: the worker uploads it on a 3600s
-    # interval (_CONSOLE_UPLOAD_INTERVAL_S), an hour of staleness against a hint that fires at 300s.
-    #
-    # the always-available signal is the `age` row this hint hangs off, which is rendered from the
-    # same payload and therefore cannot be missing: below the 900s upload throttle the quiet is
-    # fully explained by throttling, so the age itself is what tells the user whether they have
-    # waited long enough to conclude anything. w&b stays as the optional live cross-check -- the
-    # trainer writes it directly rather than through the throttled upload -- hence "if configured".
+    # do not suggest `runs log -f`: it shows control-plane logs, and worker output arrives only after
+    # termination (flash/cli/commands.py cmd_log) on a 3600s upload interval. use heartbeat age against
+    # the 900s throttle, with w&b as the optional live signal.
     return (
         "the step above is the last one UPLOADED, not necessarily the one training is on; "
         "a throttled worker can hold it for many minutes while the trainer advances normally. "

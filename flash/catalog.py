@@ -80,13 +80,8 @@ class ModelInfo:
     params: str
     algos: tuple[str, ...]
     min_vram_gb: int
-    # Total parameters in billions — the numeric model size the cost estimator + VRAM equations read
-    # DIRECTLY (no parsing of the ``params`` display string). Drives the memory/size terms (VRAM, disk,
-    # download), which always size the FULL checkpoint. REQUIRED: every ModelInfo must state it — a
-    # curated catalog model sets its true count, and the open-model policy passes the HF/estimated count
-    # (or 0.0 when the size is genuinely "unknown size"). ``test_every_catalog_entry_sets_params_b``
-    # asserts every curated MODELS entry sets it > 0, so a new entry can never silently fall back to a
-    # parsed string again.
+    # numeric total parameters in billions for cost, VRAM, disk, and download sizing. every curated
+    # entry must set this directly; open-policy entries use the HF estimate or 0.0 when unknown.
     params_b: float
     quant: str = "bf16"
     recommended_gpu: str = DEFAULT_GPU
@@ -94,14 +89,8 @@ class ModelInfo:
     grpo_min_vram_gb: int = 0
     # 0 => non-grpo sizing uses the param-based estimate; set when a model must not down-route to the cheapest card.
     sft_min_vram_gb: int = 0
-    # vLLM sleep mode (offload the colocate rollout engine between GRPO steps) is NON-FUNCTIONAL for
-    # this model: the wake/reload HANGS the rollout (a ~70 GB weight reallocation can't be placed in
-    # the fragmented non-expandable allocator sleep forces -- live-confirmed on the 35B-A3B, every
-    # attempt stalled). So this model is RESIDENT-ONLY: a config that doesn't fit resident must be
-    # REJECTED (model_required_vram_gb sizes it on the resident peak) rather than routed to the hanging
-    # sleep path. the verl launcher also pins the rollout resident for a flagged model
-    # (free_cache_engine=false) so verl's own per-step offload can't reach the hang. Dense/small
-    # models that sleep cleanly leave this False.
+    # resident-only guard: vllm wake/reload hangs after allocator fragmentation. reject configs that
+    # miss the resident peak and pin free_cache_engine=false in the verl launcher.
     sleep_unsupported: bool = False
     notes: str = ""
     # 0 = platform default (64 GB) suffices. Runner raises gpu.disk_gb to at least this.
@@ -118,12 +107,8 @@ class ModelInfo:
     # this (a token exercises only the active params), while VRAM/disk/download keep using the total
     # ``params_b``. 0.0 (the dense default) means "same as params_b" — every token hits every param.
     active_params_b: float = 0.0
-    # Transformer geometry (decoder layers x hidden width) — the SFT gradient-checkpointing-OFF gate
-    # sizes the no-recompute activation peak from these (engine.vram.sft_gc_off_peak_gb). 0/0 (the
-    # default) means "unknown": the worker falls back to reading the HF config at runtime, and the
-    # GC-off gate stays conservative (keeps GC on) if neither is available. Curated for the MoE whose
-    # SFT runs the gate — a live B200 SFT showed the runtime AutoConfig probe returning (0, 0) on the
-    # multimodal-nested config, so the curated values are what actually engage the gate.
+    # decoder geometry for engine.vram.sft_gc_off_peak_gb. 0/0 means unknown and keeps gradient
+    # checkpointing on if the runtime HF config also lacks usable values.
     num_layers: int = 0
     hidden_size: int = 0
     # vllm cache geometry. zero values mean the catalog has no architecture-aware sizing data.
@@ -143,11 +128,10 @@ class ModelInfo:
 
     @property
     def is_moe(self) -> bool:
-        """True for a mixture-of-experts model — a token routes through only a subset of experts.
+        """Return whether each token routes through only a subset of experts.
 
-        Keyed off ``active_params_b`` (0.0 == dense, "every token hits every param"). Used by the
-        GRPO worker to pick REENTRANT gradient checkpointing for MoE (its router re-dispatches tokens
-        on recompute, which the non-reentrant metadata-equality assert rejects).
+        GRPO uses this to select reentrant checkpointing; MoE routing breaks the non-reentrant
+        metadata-equality assertion on recompute.
         """
         return 0.0 < self.active_params_b < self.params_b
 
@@ -567,13 +551,10 @@ def serving_lora_rank_cap(model: str | ModelInfo | None) -> int | None:
 
 
 def serving_context_cap(model: str | ModelInfo | None) -> int | None:
-    """Return the model's serving ``max_model_len`` (the context it is actually served at), or None
-    when Flash has no local serving entry (open-policy / uncataloged).
+    """Return the model's served ``max_model_len``, or None without a serving entry.
 
-    A LoRA trained at a longer context than it is served wastes compute and learns positions that are
-    never used at inference, so the control plane caps a run's training context to this (see
-    ``flash.lora_rank.preflight_train_context_within_serving``). Resolution mirrors
-    ``serving_lora_rank_cap``: unknown/open-policy models return None rather than a global fallback.
+    Training beyond this context wastes compute; see
+    ``flash.lora_rank.preflight_train_context_within_serving``. Unknown models have no fallback.
     """
     info = _model_info_for_serving(model)
     if info is None or info.serving is None:

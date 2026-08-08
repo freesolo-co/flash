@@ -1,20 +1,9 @@
 """The init-phase heartbeat must never block on CUDA telemetry.
 
-Regression for the consumer-GPU warm-start "hang": ``run_rl``/``run_sft`` start a daemon thread
-that heartbeats ``rl_initializing``/``sft_initializing`` every 30s while the MAIN thread is blocked
+Regression for the consumer-GPU warm-start "hang": ``run_rl``/``run_sft`` start a daemon thread that
+heartbeats ``rl_initializing``/``sft_initializing`` every 30s while the MAIN thread is blocked
 inside ``GRPOTrainer.__init__`` / ``SFTTrainer.__init__`` (a long, CUDA- and allocator-busy section
-— vLLM colocate engine build + weight load + cold kernel JIT). The old code called
-``gpu_diagnostics()`` (``include_torch=True``) on that side thread, which issues ``torch.cuda``
-queries (``mem_get_info`` / ``memory_allocated`` / ``memory_reserved`` / ``get_device_name``). Those
-serialize on the CUDA driver lock and PyTorch's caching-allocator mutex — both held by the init
-thread — so the heartbeat thread could FREEZE for the whole init. The control plane then saw no
-heartbeat and false-flagged a HANG on a run that was merely doing a slow (but live) cold init. The
-fix: the init heartbeats use ``gpu_diagnostics(include_torch=False)`` (nvidia-smi only, out of
-process, 8s timeout, GIL released during the wait).
-
-These tests reproduce the freeze deterministically on CPU (no GPU needed) by injecting a fake
-``torch`` whose CUDA query blocks, then prove the ``include_torch=False`` path stays responsive.
-A source/AST wiring check pins the call sites so the regression can't silently return.
+-- vLLM colocate engine build + weight load + cold kernel JIT).
 """
 
 from __future__ import annotations
@@ -407,11 +396,8 @@ def test_rl_lifecycle_heartbeats_carry_latest_metrics():
 
 def test_error_heartbeat_fallback_preserves_metric_backlog():
     # regression (#591): the error_{RUN_MODE} heartbeat exists to surface the bounded metric
-    # backlog (metrics_last) for short failing RL runs. main() emits it twice -- a primary call
-    # (with gpu diagnostics) and an except-fallback used if that primary call raises. BOTH must
-    # splat **_err_metrics, or a failure inside the primary call (e.g. gpu_diagnostics() or the
-    # heartbeat upload itself) re-emits an error snapshot that drops the very backlog this path
-    # was added to preserve.
+    # backlog (metrics_last) for short failing RL runs. main() emits it twice -- a primary
+    # call (with gpu diagnostics) and an except-fallback used if that primary call raises.
     import ast
     import textwrap
 
@@ -612,11 +598,11 @@ def test_forced_opd_step_commits_each_distinct_step_advance(monkeypatch):
 
 def test_forced_opd_step_burst_within_floor_coalesces_to_protect_commit_cap(monkeypatch):
     """Regression (heartbeat.py): a tiny/fast OPD config (batch=1, group=1, small student,
-    cached teacher) can land optimizer updates many times per minute. Unthrottled, force=True would turn
-    every post-step ping into an HF commit and blow the per-repo commit cap before the final adapter/DONE
-    upload. Forced commits are floored: the FIRST advance in a sub-floor burst commits, the rest within
-    _HB_FORCE_MIN_INTERVAL_S coalesce (the persisted step then lags by at most one floor window — a
-    bounded, customer-favouring cancel under-bill)."""
+
+    cached teacher) can land optimizer updates many times per minute. Unthrottled, force=True would
+    turn every post-step ping into an HF commit and blow the per-repo commit cap before the final
+    adapter/DONE upload.
+    """
     import flash.engine.worker as ne
 
     uploads: list = []
@@ -687,11 +673,12 @@ def test_forced_opd_step_repeated_same_step_does_not_recommit(monkeypatch):
 
 def test_forced_opd_step_commit_failure_rolls_back_committed_step(monkeypatch):
     """If a forced commit's upload FAILS, the committed-step marker AND the forced-commit clock roll back
-    with the throttle slot — so the retry at the same step still forces through (fstep must again exceed
-    the last committed step, and the floor must not treat the failed attempt as a landed forced commit
-    that delays the retry). Otherwise the failed step would be recorded as committed / the retry would be
-    floored out, and a cancel would bill the stale prior step. (Force floor zeroed so the two forced
-    attempts here aren't coalesced — that path is the burst test.)"""
+
+    with the throttle slot -- so the retry at the same step still forces through (fstep must again
+    exceed the last committed step, and the floor must not treat the failed attempt as a landed
+    forced commit that delays the retry). Otherwise the failed step would be recorded as committed /
+    the retry would be floored out, and a cancel would bill the stale prior step.
+    """
     import flash.engine.worker as ne
 
     attempts: list = []
@@ -998,11 +985,10 @@ def test_provider_surface_heartbeat_records_liveness_without_progress(monkeypatc
 
 
 # --------------------------------------------------------------------------------------------
-# Wiring: each long blocking phase runs under the shared liveness_heartbeat helper (behaviour covered
-# above; these pin the call sites so coverage can't silently regress).
-# rl_initializing is intentionally absent, for the same reason SFT is absent from the warmup test
-# below: verl builds its trainer in a subprocess, so there is no in-process build window to wrap.
-# The setup silence that wrap used to cover is now covered by rl_data_loading.
+# Wiring: each long blocking phase runs under the shared liveness_heartbeat helper (behaviour
+# covered above; these pin the call sites so coverage can't silently regress). rl_initializing is
+# intentionally absent, for the same reason SFT is absent from the warmup test below: verl builds
+# its trainer in a subprocess, so there is no in-process build window to wrap.
 @pytest.mark.parametrize(
     ("modname", "outer", "stage"),
     [
@@ -1078,14 +1064,9 @@ def test_quiet_phases_are_wrapped_in_liveness_heartbeat(modname, outer, stages):
 def test_venv_provisioning_and_the_capability_probe_run_under_one_wrap(modname, outer, stage):
     """All THREE trainers must wrap the verl-interpreter setup, not just sft and opd.
 
-    With no prebuilt worker image `resolve_verl_python` builds a venv and installs the whole
-    training stack, and the batched capability probe that follows pays a cold torch/verl import.
     That is minutes of silence with no training step to report and no liveness thread otherwise
     running -- long enough for the stall watchdog to fail a healthy run on a paid GPU. sft and opd
     have wrapped it since dev #442; grpo called it bare, which is the gap this pins shut.
-
-    Both calls must be INSIDE the same wrap: provisioning the interpreter and then importing torch
-    in it are one silent span, and a wrap that closed in between would leave the probe uncovered.
     """
     mod = importlib.import_module(modname)
     src = inspect.getsource(getattr(mod, outer))

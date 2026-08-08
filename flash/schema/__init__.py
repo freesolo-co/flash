@@ -114,11 +114,10 @@ def parse_adapter_storage_ref(text: str) -> tuple[str, str] | None:
 
 
 def normalize_env_name_segment(value: str) -> str | None:
-    """Normalize one env-name segment to the shared grammar ``[a-z0-9][a-z0-9._-]*``.
+    """normalize one env-name segment to ``[a-z0-9][a-z0-9._-]*``.
 
-    Lowercases, collapses runs of other characters to ``-``, strips edge dashes. Returns None
-    when nothing usable remains (empty, ``.``/``..``, or no alphanumeric). Shared by the CLI's
-    pre-publish name normalization and the server's authoritative publish-slug validation.
+    lowercase, collapse invalid runs to ``-``, strip edge dashes, and return none when no usable
+    alphanumeric content remains. cli and server share this grammar.
     """
     segment = re.sub(r"[^a-z0-9._-]+", "-", str(value or "").lower()).strip("-")
     if segment in {"", ".", ".."} or not re.search(r"[a-z0-9]", segment):
@@ -242,14 +241,9 @@ def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
     )
 
 
-# unknown tables are rejected loudly: a stray [grpo] table silently dropped grpo knobs and trained
-# at 16x-cost defaults. platform-managed fields (run_id; and per-section hf_repo, gpu disk/volume,
-# environment resolved_sha) are NOT accepted here: they are assigned by the control plane / runner,
-# so JobSpec.to_dict() omits them and this parser rejects a user who sets them.
-#
-# `model_policy` is the exception: it is authorable but not self-authorizing. The parser accepts it
-# so a self-hosted config can carry it, and `authorize_model_policy` (called by the control plane,
-# which is the only side that can see FLASH_STANDALONE) decides whether this deployment honours it.
+# reject unknown tables and user-authored platform fields instead of silently dropping them.
+# model_policy is authorable but not self-authorizing: the server-side control plane calls
+# authorize_model_policy because only it can see FLASH_STANDALONE.
 _TOP_LEVEL_KEYS = frozenset(
     {
         "model",
@@ -306,13 +300,10 @@ MODEL_POLICIES = ("catalog", "allow")
 
 
 def _model_policy(raw: dict[str, Any]) -> str:
-    """Parse the authored ``model_policy``, defaulting to the curated catalog.
+    """parse authored ``model_policy``, defaulting to the curated catalog.
 
-    Parsing is deliberately separate from AUTHORIZING it. This parser runs on the client too, and
-    the client cannot see ``FLASH_STANDALONE`` (it is server-side env, and the client would have to
-    authenticate to learn it), so rejecting ``allow`` here would reject it for the self-hosted
-    deployments the policy exists to serve. The control plane calls ``authorize_model_policy``
-    after parsing to decide whether this deployment honours it.
+    authorization is separate because the client cannot see server-side ``FLASH_STANDALONE``. the
+    control plane calls ``authorize_model_policy`` after parsing.
     """
     value = raw.get("model_policy", "catalog")
     if not isinstance(value, str) or value.strip().lower() not in MODEL_POLICIES:
@@ -388,13 +379,9 @@ def spec_from_dict(
             f"[environment] unknown key(s): {', '.join(unknown_env)} "
             f"(allowed: {', '.join(sorted(_ENVIRONMENT_KEYS))})"
         )
-    # Validate the [environment] sub-fields before they reach EnvironmentSpec(...). The
-    # constructor's ``dict(... or {})`` papers over a falsy value (false -> {}) but a
-    # present-but-wrong-typed value otherwise crashes opaquely: ``params = "x"`` -> ``dict("x")``
-    # ValueError, ``params = 1`` -> ``dict(1)`` TypeError (a 500). A MISSING sub-field — absent OR
-    # ``None`` (e.g. JSON ``null``) — keeps its default; any present, NON-None value must be the
-    # right type. A falsy ``params = false`` is still rejected, mirroring the section-level rule
-    # that ``environment = false`` must fail rather than silently coerce.
+    # validate environment sub-fields before EnvironmentSpec coercion. missing or none keeps the
+    # default; every present non-none value, including false, must have the correct type so malformed
+    # input fails clearly instead of becoming {} or an opaque dict conversion error.
     if env_raw.get("params") is not None and not isinstance(env_raw["params"], dict):
         raise ConfigError("[environment] params must be a table")
     environment_secrets = _environment_secrets(env_raw.get("secrets"))
@@ -611,13 +598,8 @@ def spec_from_dict(
     return spec
 
 
-# [train] knobs no algorithm-specific worker reads, mapped to the reason they do nothing there.
-# the flat [train] table is shared by all three algorithms, so without this an sft run silently
-# accepted a rollout knob (group_size, teacher_model, ...) and trained as if it had never been set.
-# sft's own validator already rejected exactly one of these (structured_outputs); this generalizes
-# that precedent to every knob the algorithm's worker cannot consume.
-#
-# keyed by the algorithm that must REJECT the knob, so the consuming algorithms stay silent.
+# map each algorithm to meaningful [train] knobs its worker cannot consume. rejecting them prevents
+# shared-table rollout options from being silently ignored by sft and vice versa.
 _INAPPLICABLE_TRAIN_KNOBS: dict[str, dict[str, str]] = {
     "sft": {
         "structured_outputs": (
@@ -681,12 +663,10 @@ _TRAIN_DEFAULTS = {item.name: item.default for item in dataclass_fields(TrainSpe
 
 
 def _reject_inapplicable_train_knobs(spec: JobSpec) -> None:
-    """reject [train] knobs the run's algorithm cannot consume.
+    """reject [train] knobs the selected algorithm cannot consume.
 
-    Keyed off a MEANINGFUL VALUE rather than key presence: ``JobSpec.to_dict()`` serializes every
-    TrainSpec field (including unset ones), and both the client -> server submit round trip and
-    ``_public_status_spec`` re-parse that full dict through this parser. A presence check would
-    reject those round trips even though the user authored none of the keys.
+    inspect meaningful values, not presence, because serialized JobSpec dictionaries contain every
+    unset field and must survive client/server and public-status re-parsing.
     """
     inapplicable = _INAPPLICABLE_TRAIN_KNOBS.get(spec.algorithm)
     if not inapplicable:

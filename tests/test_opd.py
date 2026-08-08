@@ -1080,13 +1080,8 @@ def test_opd_fp8_kv_gate_does_not_downroute_below_the_fp8_ceiling():
 def test_gdn_fp8_exclusion_survives_a_pinned_revision():
     """The GDN fp8 exclusion must key off the model, not off the sizing struct, which pinning nulls.
 
-    `sizing_info = None if model_revision else info` (vram.py) drops to generic architecture sizing
-    for a pinned commit. That is right for geometry and wrong for attention family: a pinned commit
-    of a GDN hybrid is still a GDN hybrid, and the worker's runtime gate reads the pinned config and
-    refuses fp8 KV regardless. A guard reading only that nulled struct silently stopped excluding
-    every pinned run -- reserving the fp8 half of a cache vLLM allocates in bf16, which is the
-    under-reserving direction: measured, a pinned 35B at ctx1024/g16 was admitted onto a 180 GB B200
-    at 179 GB when its true bf16 need is 192 GB.
+    Pinned GDN models still allocate bf16 KV because runtime rejects hybrid fp8 wake; reading only
+    ``sizing_info`` under-reserves them. This exclusion is empirically validated and may drift.
     """
     import math
     from unittest import mock
@@ -1106,12 +1101,8 @@ def test_gdn_fp8_exclusion_survives_a_pinned_revision():
     assert not _declares_linear_attention(None, "")
     assert not _declares_linear_attention(None, "meta-llama/Llama-3.1-8B")
 
-    # end to end: the pinned reservation must cover the bf16 KV cache vLLM really allocates.
-    #
-    # Deliberately NOT asserted against the unpinned number: generic sizing inflates the pinned
-    # estimate enough that `pinned >= unpinned` holds even with the discount wrongly applied (179 vs
-    # 171 as measured), so that comparison cannot fail and would not be a test. The bf16 estimate is
-    # the quantity the discount actually halves, so it is the one that discriminates.
+    # compare the pinned reservation with the bf16 estimate, not the unpinned total: generic sizing
+    # can inflate both sides enough to hide an incorrectly applied fp8 discount.
     train = {
         "max_context_tokens": 1024,
         "max_completion_tokens": 512,

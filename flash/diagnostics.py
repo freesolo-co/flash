@@ -14,12 +14,8 @@ _SECRET_KEY_RE = re.compile(
 _BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _SECRET_ENV_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
 
-# a secret value may be multiline -- a PEM private key or a JSON service-account blob is a legal
-# `environment.secrets` value. redaction below is a whole-value match, so text holding only PART of
-# such a value (a log tail that began mid-secret, a truncated capture) would match nothing and be
-# emitted verbatim. registering each line as its own needle closes that, but only for lines long
-# enough to be secret-bearing: a PEM `-----BEGIN...-----` or base64 body line is worth redacting,
-# while a JSON `}` is shared with every innocent line in the log and would gut the diagnostic.
+# multiline secrets may appear only partially in truncated logs. register long component lines as
+# needles, but ignore short common fragments such as ``}`` that would erase innocent diagnostics.
 _MIN_SECRET_COMPONENT = 8
 
 

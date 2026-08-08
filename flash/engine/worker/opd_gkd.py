@@ -1,9 +1,8 @@
 """Pure token-alignment + groupwise reverse-KL math for on-policy distillation (algorithm="opd").
 
 Extracted from ``opd.py`` to keep that module under the size bar and make the cross-tokenizer
-alignment helpers independently unit-testable. Every function here is PURE: it takes the tokenizer /
-ids as arguments and touches NO worker (``_w``) globals, recipe, or run state. See ``opd.py`` for the
-orchestration and batched loss path.
+alignment helpers independently unit-testable. See ``opd.py`` for the orchestration and batched loss
+path.
 """
 
 from __future__ import annotations
@@ -16,13 +15,11 @@ from flash.engine.worker.tokenizer_align import StudentToken
 def _teacher_prompt_text(prompt_messages: list[dict], thinking_prefill: str = "") -> str:
     """Render the prompt for the teacher's scoring context (template-agnostic; ends at 'Assistant: ').
 
-    ``thinking_prefill`` is the extra trailing text a thinking-mode student template opens after the
-    generation prompt (e.g. Qwen's ``<think>\\n``). The student samples its on-policy completion AFTER
-    that prefill, so the teacher must condition on the SAME trailing context; otherwise every
-    thinking-mode token is scored against a prompt that never opened the reasoning block, and the gkd
-    logprobs are conditioned on a different prefix than the sampled tokens. Empty (the
-    default) when thinking is off or the template ignores it -- the plain ``Assistant: `` already
-    matches."""
+    Qwen's ``<think>\n``). The student samples its on-policy completion AFTER that prefill, so the
+    teacher must condition on the SAME trailing context; otherwise every thinking-mode token is
+    scored against a prompt that never opened the reasoning block, and the gkd logprobs are
+    conditioned on a different prefix than the sampled tokens.
+    """
     parts = []
     for m in prompt_messages:
         role = str(m.get("role", "user")).capitalize()
@@ -33,14 +30,12 @@ def _teacher_prompt_text(prompt_messages: list[dict], thinking_prefill: str = ""
 
 def _generation_eos_ids(model, tok) -> frozenset:
     """The FULL set of token ids that halt this model's generation — the union of the tokenizer's
-    ``eos_token_id`` and the model's ``generation_config``/``config`` ``eos_token_id``, each of which
-    HF allows to be a single id OR a list.
 
-    A model can stop on a SECONDARY eos from its generation config while its tokenizer exposes a
-    different primary ``tok.eos_token_id``. A completion ending on that secondary id is a NATURAL termination
-    even though it != ``tok.eos_token_id``, so ``_rollout_terminated`` must see the whole set; a
-    single-id check misreads the rollout as truncated and skips it, which with no stop_sequences burns
-    every sample and fails the run with "no trained step"."""
+    A completion ending on that secondary id is a NATURAL termination even though it !=
+    ``tok.eos_token_id``, so ``_rollout_terminated`` must see the whole set; a single-id check
+    misreads the rollout as truncated and skips it, which with no stop_sequences burns every sample
+    and fails the run with "no trained step".
+    """
     ids: set[int] = set()
 
     def _add(v):
@@ -64,8 +59,8 @@ def generation_eos_from_cached_config(
 ) -> frozenset[int]:
     """``_generation_eos_ids`` for a model that is on disk but NOT loaded.
 
-    The verl paths never hold the model in this process -- it is trained in a separate interpreter --
-    so the config and generation_config are read from the local hf cache and presented as the
+    The verl paths never hold the model in this process -- it is trained in a separate interpreter
+    -- so the config and generation_config are read from the local hf cache and presented as the
     attributes ``_generation_eos_ids`` expects. ``local_files_only`` because the caller prefetched
     the model and the child runs with HF_HUB_OFFLINE.
     """
@@ -89,27 +84,13 @@ def generation_eos_from_cached_config(
 
 def _rollout_terminated(completion_ids, stop_text, eos_ids, stop_sequences) -> bool:
     """True iff the rollout ended NATURALLY — the student emitted ANY of the model's EOS ids, or (when
-    stop_sequences are configured) the decoded text ends with a stop delimiter.
 
-    HF ``generate`` halts on four conditions — EOS, a ``stop_strings`` match, the ``max_new_tokens``
-    cap, or the ``gen_cfg.max_time`` wall-clock bound — and only the first two are natural completions.
-    A cap hit OR a max_time cut leaves the output cut off mid-JSON — INCOMPLETE content we refuse to
-    distil, so the caller skips anything that isn't terminated. The reverse-KL itself
-    cannot supervise the stop token either (the teacher's and student's EOS differ and are both
-    zero-width in the text-span alignment, so EOS is in no group), which is why distillation toward a
-    verbose teacher erodes termination. OPD repairs that gap only on verified length-capped defects.
-
-    ``eos_ids`` is the FULL set of generation-halting ids (see ``_generation_eos_ids``), NOT a single
-    id: a model whose ``generation_config.eos_token_id`` is a list stops on any member, so a completion
-    ending in a secondary eos must count as terminated — checked on the IDS. ``stop_text`` is the
-    completion decoded WITH special tokens (skip_special_tokens=False): the stop delimiter (which HF
-    emits before halting) is matched with the same trailing-``endswith`` semantics ``_trim_trailing_stop``
-    uses to remove it, so a stop-terminated rollout is recognised even when the delimiter is a special
-    token (e.g. ``<|im_end|>``) a clean decode would strip, or lands as the final token AT the cap
-    (which a length-only check wrongly discarded). Fail OPEN only when NO termination signal exists at
-    all (empty ``eos_ids`` AND no stop_sequences): we then can't tell a finished answer from a cut-off
-    one, so we distil rather than skip every rollout. Real tokenizers always define an eos, so in
-    production a cap/max_time cut without any EOS or a stop delimiter correctly returns False (skip)."""
+    HF ``generate`` halts on four conditions -- EOS, a ``stop_strings`` match, the
+    ``max_new_tokens`` cap, or the ``gen_cfg.max_time`` wall-clock bound -- and only the first two
+    are natural completions. Fail OPEN only when NO termination signal exists at all (empty
+    ``eos_ids`` AND no stop_sequences): we then can't tell a finished answer from a cut-off one, so
+    we distil rather than skip every rollout.
+    """
     if eos_ids and not eos_ids.isdisjoint(completion_ids):
         return True
     if stop_sequences and any(s and stop_text.endswith(s) for s in stop_sequences):
@@ -119,20 +100,12 @@ def _rollout_terminated(completion_ids, stop_text, eos_ids, stop_sequences) -> b
 
 def student_tokens_with_offsets(tok, completion_ids, completion_text: str):
     """Char spans for the ORIGINAL sampled token ids, indexed into ``completion_text`` (the exact
-    string the teacher echo-scored). Using the sampled ids — not a re-tokenization of the decoded
-    text — keeps the loss on the true on-policy tokens. Offsets are built by incrementally decoding
-    the id prefix and measuring its length (clamped monotonic in ``[0, len]``, so a byte-level token
-    that splits a multi-byte char never yields a negative/backward span); a special token (e.g. eos)
-    decodes to nothing, so it gets a zero-width span and is naturally excluded from the alignment.
 
     Split multi-byte chars (byte-level tokenizers): a char whose bytes span two+ ids decodes to the
-    Unicode replacement char ``U+FFFD`` until its FINAL byte-id arrives. Measuring each half-id's
-    decoded length independently would give one half the whole char and the other a zero-width span —
-    silently dropping a real byte-token from the alignment and undercounting that char's student
-    logprob. Instead we GROW the window while the decoded prefix still ends in ``U+FFFD`` and assign
-    the SHARED completed-char span to every byte-id in it, so both halves share a ``start`` and land in
-    the same alignment group. A normal (already-complete) token is a window of one — identical to the
-    old per-token length measurement."""
+    Unicode replacement char ``U+FFFD`` until its FINAL byte-id arrives. Instead we GROW the window
+    while the decoded prefix still ends in ``U+FFFD`` and assign the SHARED completed-char span to
+    every byte-id in it, so both halves share a ``start`` and land in the same alignment group.
+    """
     ids = [int(t) for t in completion_ids]
     toks: list[StudentToken] = []
     prev = 0
@@ -140,14 +113,10 @@ def student_tokens_with_offsets(tok, completion_ids, completion_text: str):
     i = 0
     while i < len(ids):
         j = i
-        # Grow the window over a split multi-byte char, decoding ONLY the window from the current
-        # boundary (ids[i:j+1]) -- never the whole prefix ids[:j+1] -- so total decoding is O(len),
-        # not O(len^2) (the quadratic bites once max_tokens raises completions to 1000s of tokens).
-        # A byte-level tokenizer renders an INCOMPLETE char as a trailing U+FFFD that is NOT the
-        # real char at completion_text[prev:]; a genuine U+FFFD the model emitted DOES match there
-        # (startswith from prev), so we stop and keep it as its own span, not over-merged. Decode
-        # the window ONCE, then re-decode only when it actually grows over a split char (halves the
-        # decode calls on the common single-token path vs a separate probe decode + a final decode).
+        # Grow the window over a split multi-byte char, decoding ONLY the window from the
+        # current boundary (ids[i:j+1]) -- never the whole prefix ids[:j+1] -- so total
+        # decoding is O(len), not O(len^2) (the quadratic bites once max_tokens raises
+        # completions to 1000s of tokens).
         window_text = tok.decode(ids[i : j + 1], skip_special_tokens=True)
         while (
             j + 1 < len(ids)
@@ -156,17 +125,15 @@ def student_tokens_with_offsets(tok, completion_ids, completion_text: str):
         ):
             j += 1
             window_text = tok.decode(ids[i : j + 1], skip_special_tokens=True)
-        # end = where THIS window's decoded text ends in completion_text. Anchor to completion_text
-        # (the ground-truth full decode) via find() from prev rather than prev +
-        # len(decode(window)): a SentencePiece/LLaMA tokenizer decodes a word token IN ISOLATION
-        # without its leading word-boundary space (decode([▁world]) == "world", not " world"), so
-        # prev + len(window) would undercount the span by one char and drift EVERY following offset
-        # -- misaligning teacher spans onto the wrong sampled ids. find() locates where the window
-        # text actually sits (skipping any dropped leading whitespace, which is absorbed into this
-        # token's start) and the start stays pinned at prev so the spans remain contiguous. For a
-        # byte-level tokenizer (Qwen, GPT) the window already carries its space, find() returns
-        # prev, and end == the old value. An empty decode (special/eos) -> find() returns prev ->
-        # zero-width span, unchanged.
+        # Anchor to completion_text (the ground-truth full decode) via find() from prev
+        # rather than prev + len(decode(window)): a SentencePiece/LLaMA tokenizer decodes
+        # a word token IN ISOLATION without its leading word-boundary space
+        # (decode([▁world]) == "world", not " world"), so prev + len(window) would
+        # undercount the span by one char and drift EVERY following offset -- misaligning
+        # teacher spans onto the wrong sampled ids. find() locates where the window text
+        # actually sits (skipping any dropped leading whitespace, which is absorbed into
+        # this token's start) and the start stays pinned at prev so the spans remain
+        # contiguous.
         hit = completion_text.find(window_text, prev)
         end = (hit + len(window_text)) if hit != -1 else prev + len(window_text)
         end = min(n, max(prev, end))
@@ -179,12 +146,10 @@ def student_tokens_with_offsets(tok, completion_ids, completion_text: str):
 def _trim_trailing_stop(tok, completion_ids, stop_text: str, stops):
     """Drop a trailing stop delimiter from BOTH the sampled ids and the decoded text (token-level).
 
-    HF ``stop_strings`` halts only AFTER the delimiter text is emitted, so a run with e.g.
-    ``[train] stop_sequences=["</answer>"]`` would otherwise score/distil the delimiter the user asked
-    to stop at. ``stop_text`` is the completion decoded WITH special tokens (skip_special_tokens=False)
-    so a special-token delimiter (e.g. ``<|im_end|>``) is visible for the trailing match; the returned
-    text is the KEPT ids decoded WITHOUT special tokens (the teacher/alignment text). Returns
-    ``(ids, clean_text)`` (a list + str)."""
+    HF ``stop_strings`` halts only AFTER the delimiter text is emitted, so a run with e.g. ``[train]
+    stop_sequences=["</answer>"]`` would otherwise score/distil the delimiter the user asked to stop
+    at.
+    """
     ids = [int(t) for t in completion_ids]
     # Pick the LONGEST configured stop that is a trailing match (the earliest stop boundary in the
     # text). Overlapping delimiters like ["\n", "\n\n"] would otherwise trim only the first-listed

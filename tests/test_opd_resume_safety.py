@@ -191,15 +191,10 @@ def test_marker_decode_rejects_malformed_or_noncanonical_evidence(raw):
 
 
 def test_marker_upload_failure_is_retriable_and_attempted_exactly_once(monkeypatch):
-    """A failed marker upload must surface as retriable, with the cause intact and no in-place retry.
+    """A failed marker upload is retriable, preserves its cause, and is attempted once.
 
-    This used to drive trl's `_apply_opd_optimizer_update`, which published the marker itself. verl
-    owns the optimizer step now, so the publish is reached through the plugin's `optimizer.step`
-    wrapper -- the raise below propagates out of that wrapper before the real step, which
-    `test_optimizer_step_is_blocked_when_marker_publication_fails` asserts on the plugin side.
-    What is unique here, and unchanged by the migration, is the publish contract itself: one upload
-    attempt (a retry could double-commit an ambiguous marker) and a retriable classification, so the
-    supervisor reschedules instead of burning the attempt.
+    Retrying in place could double-commit an ambiguous marker. The optimizer wrapper's pre-step
+    ordering is covered by ``test_optimizer_step_is_blocked_when_marker_publication_fails``.
     """
     from flash.engine.worker import hf
     from flash.engine.worker.perf import RetriableInfraError
@@ -848,12 +843,10 @@ def test_handleless_opd_recovery_blocks_through_recover_runs(monkeypatch, tmp_pa
 
 
 def test_ambiguous_marker_upload_lands_evidence_and_blocks_replacement(monkeypatch, tmp_path):
-    """An ambiguous marker upload must still leave evidence that blocks a replacement worker.
+    """An ambiguous marker upload still leaves evidence that blocks replacement.
 
-    This is the end-to-end half of the ambiguity contract: the commit landed but the response was
-    lost, so the run cannot prove it did NOT mutate. The published marker is what a later replacement
-    reads to fail closed before allocating a GPU. Only the publish caller moved to verl -- the
-    evidence and the gate it feeds are unchanged, so this drives the marker publish directly.
+    A lost response cannot prove the commit failed, so the published marker must fail closed before
+    another worker allocates a GPU.
     """
     import flash.providers.allocator as allocator
     import flash.runner as runner

@@ -1,9 +1,8 @@
 """Resident-fit sizing for colocated GRPO (CPU-only, no GPU/network).
 
 A GRPO run holds the policy, the rollout engine and the training peak on one card. These cover the
-pure sizing logic that decides whether a given config fits there -- which is what the parse-time gate
-uses to reject a run before renting a GPU, and what pins a sleep_unsupported model resident. Also
-covers the allocator conf the launcher hands each algorithm, since verl's rollout asserts on it.
+pure sizing logic that decides whether a given config fits there -- which is what the parse-time
+gate uses to reject a run before renting a GPU, and what pins a sleep_unsupported model resident.
 """
 
 from __future__ import annotations
@@ -14,14 +13,11 @@ from flash.engine.vram import estimate_vram_gb, grpo_fits_resident, grpo_rollout
 
 
 def test_fp8_kv_unlocks_longer_resident_context():
-    # fp8 KV halves the resident KV bytes, so the resident-fit gate (which sizes the KV) must admit a
-    # longer context than the bf16 sizing would. At group 8 the 35B-A3B fits ctx 2048 either way, but
-    # ctx 4096 fits ONLY with fp8 KV factored (else it's wrongly routed to the broken sleep path).
-    # Without this awareness the gate over-reserves bf16 KV and rejects a run fp8 KV fits.
-    #
-    # the budget is load-bearing and deliberately NOT a round multiple of a card: training the routed
-    # experts pushed this run past one card, and only ~190-195 GB still separates bf16 from fp8 here.
-    # a full two-card 358 GB budget admits every case above, which would make this test unfailable.
+    # Without this awareness the gate over-reserves bf16 KV and rejects a run fp8 KV fits. the
+    # budget is load-bearing and deliberately NOT a round multiple of a card: training the
+    # routed experts pushed this run past one card, and only ~190-195 GB still separates bf16
+    # from fp8 here. a full two-card 358 GB budget admits every case above, which would make
+    # this test unfailable.
     mid = "Qwen/Qwen3.6-35B-A3B"
 
     def f(ctx, fp8):
@@ -42,13 +38,12 @@ def test_fp8_kv_unlocks_longer_resident_context():
 
 
 def test_sleep_unsupported_model_is_sized_resident_not_slept():
-    # The 35B-A3B is resident-only (vLLM sleep HANGS its wake), so the fit question for it is always
-    # "does it fit RESIDENT" -- there is no sleeping fallback to fall back to. group 8 / ctx 4096 fits
-    # with fp8 KV; doubling the context does not, and the parse-time gate below turns that into a
-    # rejection rather than a run that hangs on its first wake.
-    #
-    # same load-bearing budget as the fp8 test above: a full two-card 358 GB budget fits ctx 8192 too,
-    # which would erase the ceiling this test exists to prove.
+    # The 35B-A3B is resident-only (vLLM sleep HANGS its wake), so the fit question for it is
+    # always "does it fit RESIDENT" -- there is no sleeping fallback to fall back to. group 8
+    # / ctx 4096 fits with fp8 KV; doubling the context does not, and the parse-time gate
+    # below turns that into a rejection rather than a run that hangs on its first wake. same
+    # load-bearing budget as the fp8 test above: a full two-card 358 GB budget fits ctx 8192
+    # too, which would erase the ceiling this test exists to prove.
     mid = "Qwen/Qwen3.6-35B-A3B"
 
     def fits(ctx):
@@ -67,12 +62,12 @@ def test_sleep_unsupported_model_is_sized_resident_not_slept():
 
 
 def test_sleep_unsupported_model_rejected_at_parse_time_for_long_context():
-    # Submit-time: a sleep-broken model is sized on its RESIDENT peak, so a longer context pushes the
-    # requirement past the allocation it would otherwise get -> rejected before launch.
-    #
-    # the 195 GB bound is between the two sized values (190 and 200) on purpose. training the routed
-    # experts moved both past one 180 GB B200, and a full two-card 360 GB bound would sit above BOTH,
-    # so the test would pass no matter how badly the long-context case were sized.
+    # Submit-time: a sleep-broken model is sized on its RESIDENT peak, so a longer context
+    # pushes the requirement past the allocation it would otherwise get -> rejected before
+    # launch. the 195 GB bound is between the two sized values (190 and 200) on purpose.
+    # training the routed experts moved both past one 180 GB B200, and a full two-card 360 GB
+    # bound would sit above BOTH, so the test would pass no matter how badly the long-context
+    # case were sized.
     from flash.engine.vram import model_required_vram_gb
 
     mid = "Qwen/Qwen3.6-35B-A3B"
@@ -162,9 +157,8 @@ def test_resident_estimate_sizes_to_real_default_not_1024():
 
 
 def test_resident_kv_uncapped_for_long_context():
-    # The resident estimate's rollout KV must grow with context (vLLM holds it through the backward);
-    # a 32k run estimates materially higher than a 1k run, so grpo_fits_resident won't admit a
-    # long-context run that the flat-_KV_CAP estimate used to wave through.
+    # vLLM holds rollout KV through backward, so resident sizing must grow with context and reject a
+    # 32k run that does not fit.
     kw = {"max_tokens": 64, "group_size": 8, "sleep_offload": False}
     assert estimate_vram_gb(4.7, "grpo", "bf16", seq_len=32768, **kw) > estimate_vram_gb(
         4.7, "grpo", "bf16", seq_len=1024, **kw
@@ -255,12 +249,11 @@ def test_unset_max_length_still_resolves_the_real_rollout_length():
 
 
 # ---------------------------------------------------------------------------
-# expandable_segments vs verl's rollout allocator.
-#
-# verl's GRPO and OPD trainers both run a vLLM rollout and leave rollout.enable_sleep_mode defaulted
-# True, so the engine ALWAYS builds a CuMemAllocator -- and CuMemAllocator asserts outright on
-# "expandable_segments:True" (vllm/device_allocator/cumem.py:132, pytorch#147851). The launcher's
-# per-algorithm choice is now the only route to that conf, so it carries the whole invariant.
+# expandable_segments vs verl's rollout allocator. verl's GRPO and OPD trainers both run a vLLM
+# rollout and leave rollout.enable_sleep_mode defaulted True, so the engine ALWAYS builds a
+# CuMemAllocator -- and CuMemAllocator asserts outright on "expandable_segments:True"
+# (vllm/device_allocator/cumem.py:132, pytorch#147851). The launcher's per-algorithm choice is now
+# the only route to that conf, so it carries the whole invariant.
 # ---------------------------------------------------------------------------
 def _worker_runtime_for(algorithm: str) -> dict[str, str] | None:
     if algorithm != "opd":

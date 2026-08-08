@@ -684,14 +684,8 @@ def test_build_verl_overrides_batch_shape_is_identical_across_gpu_counts():
 
 
 def test_one_optimizer_step_consumes_exactly_the_requested_unique_prompts():
-    # the invariant the old trl batching helper existed to protect: an optimizer step must optimize
-    # prompts_per_step UNIQUE PROMPTS, not prompts_per_step COMPLETIONS. trl sized batches in
-    # completions, so it needed group_size folded into grad-accum or a step silently optimized
-    # prompts_per_step/group_size prompts. verl sizes in prompts and expands group_size itself via
-    # rollout.n, so the guard here is that flash never pre-divides or pre-multiplies by the group:
-    # train_batch_size (prompts drawn) and ppo_mini_batch_size (prompts per update) both stay the
-    # raw request, and rollout.n carries the group. off-by-a-group here is silent -- the run trains,
-    # just on 1/group_size of the intended data.
+    # train_batch_size and ppo_mini_batch_size count unique prompts; rollout.n carries the group.
+    # folding group_size into either silently trains on 1/group_size of the intended data.
     for prompts, group in ((64, 8), (5, 8), (2, 2), (1, 6)):
         o = rl_train.build_verl_overrides(
             _overrides_cfg(prompts_per_step=prompts, group_size=group)
@@ -1873,12 +1867,7 @@ class _RaisingProbeEnv:
 def test_a_capability_probe_that_raises_scores_zero_and_counts_as_a_failed_grading():
     """The probe is env code too, so it has to sit inside the guard that turns env faults into 0.0.
 
-    Outside it, the exception escapes into the reward http handler, the verl child reads a bridge
-    failure and aborts the whole run -- over one env's attribute access.
-
-    The `None` matters just as much as the 0.0: a raising probe is a completion that FAILED to
-    score, and the mean counts None as a zero for every name the other completions reported.
-    Dropping it instead would shrink the denominator and bias every named metric high.
+    Preserve ``None`` so failed scoring remains in named-metric denominators as zero.
     """
     breakdowns: list[dict[str, float] | None] = []
     s = rl_train.score_single_turn(
@@ -2173,12 +2162,8 @@ def test_the_reentrant_shim_is_wired_for_gdn_and_moe_models_and_not_for_dense_on
 
 
 def test_the_reentrant_shim_installs_vision_input_grads_only_for_multimodal_runs():
-    # reentrant recompute DROPS the backward for a checkpointed block when none of that block's
-    # inputs require grad. the vision tower's patch embeddings are exactly that case -- the pixels
-    # are frozen inputs -- so without a forward hook marking the patch-embed output as requiring
-    # grad the visual modules silently train on nothing while the language side trains normally and
-    # the run reports success. the retired trl path installed the same hook via a trainer callback;
-    # verl has no callback surface, so it rides this shim.
+    # reentrant recompute drops backward when checkpointed inputs require no grad.
+    # mark vision patch embeddings as requiring grad or visual modules silently train on nothing.
     text_only = rl_train.render_reentrant_checkpointing_shim(True)
     assert "_flash_install_vision_input_grads" not in text_only, (
         "a text-only run pays for a vision hook that can never match"
@@ -2564,20 +2549,8 @@ def test_image_pad_ban_and_stop_shims_both_apply_to_the_same_method():
 def test_rollout_shims_survive_verls_real_run_agent_loop_signature():
     """the shims must tolerate the signature verl ACTUALLY calls, not a convenient stub.
 
-    every other shim test writes its own ``_run_agent_loop(self, sampling_params, *args, **kwargs)``
-    stub, so it can only prove the shim works against a signature the test itself chose. verl is a
-    worker-image dependency and is not installed here (``import verl`` -> ModuleNotFoundError), so
-    nothing offline was checking the shim against the real one.
-
-    at the pinned verl commit (backend_common.VERL_REQUIREMENT,
-    freesolo-co/verl@1bea7d68) ``AgentLoopWorker._run_agent_loop`` is::
-
-        async def _run_agent_loop(self, sampling_params, trajectory, *, agent_name, trace=True, **kwargs)
-
-    ``agent_name`` is keyword-only AND required, and ``trajectory`` is a second positional. a wrapper
-    that forgot ``**kwargs`` would raise TypeError on the first rollout of every run; one that
-    swallowed the extra positional would drop the trajectory. this mirrors that signature exactly so
-    the failure shows up here instead of on a paid pod.
+    At freesolo-co/verl@1bea7d68, ``trajectory`` is positional and required ``agent_name`` is
+    keyword-only; the wrapper must also preserve ``**kwargs``.
     """
     import asyncio
     import sys
@@ -2810,12 +2783,8 @@ def test_kl_ref_adapter_shim_is_wired_only_when_warm_start_and_kl_are_both_on():
 
 
 def test_kl_ref_adapter_shim_anchors_the_reference_to_the_warm_start_adapter():
-    # the defect this removes: verl sets ref_in_actor whenever lora is active (always, on flash) and
-    # marks the reference pass no_lora_adapter=True, which engine_workers turns into
-    # engine.disable_adapter() -- the BARE BASE. on a warm-started run the kl term would then pull
-    # the policy away from the sft adapter the run was told to continue. asserting on the rendered
-    # source cannot catch that; only running the patched engine and comparing the three forwards
-    # (sft / base / trained policy) can.
+    # verl disables the adapter for the reference pass, yielding the bare base on warm starts.
+    # execute all three forwards because rendered-source checks cannot catch this semantic mismatch.
     torch = pytest.importorskip("torch")
     peft = pytest.importorskip("peft")
 
@@ -2952,15 +2921,8 @@ def test_model_revision_resolves_pinned_snapshot_for_verl():
 def test_unpinned_model_also_resolves_a_snapshot_dir_for_verl():
     """An EMPTY model_revision must resolve a real snapshot dir too, not pass the bare repo id.
 
-    verl runs with HF_HUB_OFFLINE=1, so a bare repo id resolves only through cache symlinks that
-    are best-effort on this worker. When they do not land, verl raises "does not appear to have a
-    file named pytorch_model.bin or model.safetensors" -- a PERMANENT OSError, thrown after the GPU
-    is already rented, so the user is billed for a pod that never trains. The pinned branch was
-    always resolved; the unpinned one is the path most runs take, and it was the one left bare.
-
-    _cached_model_path raises RetriableInfraError instead, so an unresolvable cache relands the run
-    on a healthy worker. Assert it is called UNCONDITIONALLY -- outside any `if model_revision`
-    branch -- because a resolver reachable on only one branch is exactly the defect.
+    verl runs with ``HF_HUB_OFFLINE=1``; resolve every branch through ``_cached_model_path`` so a
+    missing cache becomes retriable before a paid worker fails permanently.
     """
     import ast
     import inspect
@@ -3200,12 +3162,8 @@ def test_grpo_gradient_check_abstains_for_a_resumed_run():
 
 
 def test_grpo_gradient_check_accepts_a_resume_that_is_already_complete():
-    # a resume whose checkpoint ALREADY sits at the target runs zero steps: verl computes
-    # current_epoch = global_steps // len(dataloader), the epoch range comes out empty, and the child
-    # exits 0 having emitted no metric lines. both histories are therefore empty for a policy that is
-    # fully trained -- which the empty-history branch would report as a reward-bridge wiring
-    # regression, failing a complete run. (trl exempted exactly this via
-    # _grpo_resume_already_complete; the port dropped the exemption.)
+    # a checkpoint already at the target yields no metrics because verl runs zero steps.
+    # empty histories are therefore valid for a fully trained resume.
     rl_train._check_grpo_had_a_gradient([], [], resumed=True, already_complete=True)
 
     # the exemption is ONLY for the zero-step case. a resume that ran steps and produced no metrics
@@ -3739,11 +3697,7 @@ def test_train_notes_report_token_bounded_batching_as_unset_not_fabricated():
 
 
 # ------------------- capability guards: the specs verl grpo refuses -------------------
-# these raises are the ONLY thing standing between a trl-supported job and a verl run that trains
-# on a different contract. they had no regression coverage: every resolver test above drives the
-# happy path, so deleting any guard left the suite green. each test below asserts one rejection by
-# its own message, because a bare pytest.raises(RuntimeError) passes on any of the ~20 other raises
-# in this resolver.
+# each test pins one rejection message so deleting a guard cannot pass via another raise.
 
 
 def _capability_env(*, multi_turn=False, is_tool_env=False, image_uri=None):
@@ -3866,12 +3820,8 @@ def _capability_resolve(
 
     _Tokenizer = _CapabilityTokenizer
 
-    # a multimodal resolve builds a processor rather than a bare tokenizer. AutoProcessor
-    # .from_pretrained would hit the hub, so stub it on the live module: the resolver's
-    # `from transformers import AutoProcessor` runs inside the function and reads the attribute
-    # at call time. imported unconditionally rather than probed out of sys.modules -- a guard that
-    # skips the patch when transformers is not yet imported lets the resolver reach the real loader,
-    # which fails on a missing backend instead of testing anything.
+    # patch AutoProcessor on the live module because the resolver imports it inside the function.
+    # skipping the patch before transformers is imported reaches the real loader.
     monkeypatch.setattr(
         transformers,
         "AutoProcessor",
@@ -4218,14 +4168,8 @@ def test_the_run_body_always_puts_the_shim_dir_on_the_child_path():
     # plain multi-turn job copied three modules the child could never import. source-level because
     # the assignment sits inside run_rl_train, past the subprocess launch.
     src = inspect.getsource(rl_train.run_rl_train)
-    # the assignment is now unconditional (the tf32 fragment means the shim is never empty), which
-    # satisfies this invariant strictly more than any guard could. assert THAT rather than the terms
-    # of a guard: re-introducing one is the regression, since every disjunct it could carry is a
-    # feature that might be off while multi-turn is on -- and the tf32 fragment needs the entry on
-    # EVERY run, so there is no longer a condition under which skipping it is correct.
-    #
-    # walk the ast rather than matching indentation: an earlier `if` block that has already closed
-    # is not a guard on this assignment, and only the tree knows which blocks actually enclose it.
+    # the assignment must remain unconditional because the tf32 fragment applies to every run.
+    # inspect the ast so only enclosing guards count.
     tree = ast.parse(textwrap.dedent(src))
 
     def _assigns_pythonpath(node):
@@ -4293,12 +4237,8 @@ def test_the_child_puts_no_deadline_on_a_bridge_call():
 
 
 def test_the_child_puts_no_deadline_or_retry_on_a_generation_call():
-    # TRAINING.md documents the request policy users are told to reason about, so the two have to
-    # move together. a deadline here cannot be reinstated the way the retired trl driver had it:
-    # that driver held vLLM in-process and aborted by id, while verl's LLMServerClient.generate
-    # mints its OWN uuid4 for the remote call, so the caller cannot name the engine request it
-    # started. retrying without aborting leaves the wedged generation occupying kv cache and
-    # doubles the load on an engine that is already struggling.
+    # keep TRAINING.md aligned: verl mints the request id internally, so callers cannot abort a
+    # timed-out generation; retrying would leave the original request occupying kv cache.
     from flash.engine.worker import grpo_multiturn
 
     source = inspect.getsource(grpo_multiturn)
@@ -4816,16 +4756,8 @@ def test_a_batched_score_reaches_the_env_under_the_same_lock_every_other_call_ta
 
 
 def test_a_failing_batch_fails_every_episode_in_it_rather_than_hanging_them():
-    # the scoring thread scatters results back to waiters. if a raise completed only the waiter
-    # that provoked it, every OTHER episode in that batch would block on its event forever and the
-    # run would wedge with no error -- the worst shape of failure, since the stall watchdog only
-    # fires 25 minutes later.
-    #
-    # the batch has to actually CONTAIN several episodes for this to test anything. an earlier
-    # version just started four threads and hoped; each arrived alone, `_take_batch` returned it by
-    # itself, and `batch[0]` WAS the whole batch -- so it passed against code that completed only
-    # the first waiter (VERL-100). the gate below parks the scorer inside the env call until the
-    # rest have queued, which is the interleave the assertion is actually about.
+    # a scoring raise must complete every waiter or the other episodes block until VERL-100 fires.
+    # park the scorer until several episodes queue so the test exercises one real shared batch.
     entered = threading.Event()
     release = threading.Event()
 
@@ -4864,15 +4796,8 @@ def test_a_failing_batch_fails_every_episode_in_it_rather_than_hanging_them():
     for thread in rest:
         thread.start()
 
-    # wait for all four to be QUEUED before releasing the in-flight call. `_pending` is the wrong
-    # field to watch: the batcher drains it into `_in_flight` the moment it takes a batch, so
-    # sampling it races to zero and the assertion fails against working code. count the waiters
-    # that exist in either place instead.
-    # do NOT gate on `_scorer._pending`: `bridge.score()` takes the bridge lock to look up its
-    # session, and `_score_batch` holds that same lock for the whole parked env call -- so the four
-    # sit inside `score()` and never reach the batcher's queue while s0 is in flight. `_pending`
-    # stays 0 the entire time and any wait on it times out against perfectly good code. they
-    # coalesce the moment the lock is released, which is what `batch_sizes` below actually proves.
+    # count waiters across pending and in-flight; the batcher drains pending immediately.
+    # do not wait on pending while the scorer holds the bridge lock because callers cannot queue.
     time.sleep(0.5)
     release.set()
 
@@ -4898,15 +4823,8 @@ def _score_capturing(bridge, session_id):
 
 
 def test_the_scoring_thread_starts_on_first_use_rather_than_an_explicit_call():
-    # the batcher's consumer thread is what drains the queue. constructed-but-never-started is a
-    # silent wedge: `score` blocks on an event nothing will ever set, and it is invisible until a
-    # multi-turn run hangs on real gpu. binding the start to first use makes that state
-    # unreachable, so no caller can forget.
-    #
-    # the score call is bounded on its own thread rather than made inline: if the start is ever
-    # dropped, an inline call would HANG here, and a hanging test is only marginally better than one
-    # that cannot fail -- it burns the whole ci timeout and reports no assertion. off-thread with a
-    # join deadline turns that same regression into a named failure.
+    # the consumer must start on first use or score waits on an event nobody can set.
+    # keep the call on a bounded thread so this regression fails by assertion instead of hanging ci.
     bridge = _bridge(_BridgeEnv(), examples=[{"index": 0}])
     assert bridge._scorer._thread is None, "the thread was started before any episode needed it"
     bridge.start({"index": 0, "session_id": "a"})
@@ -5067,12 +4985,8 @@ def test_the_bridge_is_built_only_for_multi_turn_jobs():
 
 # ---------------------- multi-turn response tensor width ----------------------
 def test_multi_turn_widens_the_response_tensor_to_hold_a_whole_episode(monkeypatch):
-    # verl right-pads response_ids to data.max_response_length and DROPS the overflow
-    # (_pad_token_ids). on multi-turn the response is the whole transcript -- every assistant turn
-    # plus every glued env reply -- so a max_completion-wide tensor would cut episodes mid-turn and
-    # train on the fragment, silently. the width has to cover the longest episode the engine can
-    # produce: the child stops generating at max_model_len, so engine_len minus the SHORTEST
-    # admitted prompt bounds it.
+    # verl drops response_ids beyond data.max_response_length.
+    # size for the longest transcript: engine length minus the shortest admitted prompt.
     inp = _capability_resolve(monkeypatch, _capability_env(multi_turn=True))
     assert inp["max_response_len"] > inp["max_completion"], "the episode tensor was not widened"
     assert inp["max_response_len"] == inp["engine_len"] - min(
@@ -5408,12 +5322,9 @@ def test_the_reward_profiler_is_skipped_on_multi_turn():
 def _score_buffer(env, *, prompts=None, examples=None, generation_size=0):
     """`_score`'s grade-then-record pair, against a real buffer and fake env.
 
-    `_score` itself is a local of a body that needs a model, a dataset and a verl interpreter to
-    reach, so the two calls it makes are made here directly; the wiring that they ARE what `_score`
-    does is asserted separately below, on its source.
-
-    `generation_size` defaults to 0 -- the boundary stays caller-driven -- so a test that only cares
-    about grading never trips the counted seal.
+    The real local function requires a model, dataset, and verl child, so source tests separately
+    pin
+    this wiring; ``generation_size`` remains caller-driven.
     """
     buffer = RewardObservabilityBuffer(generation_size=generation_size)
     rollout_examples = examples if examples is not None else [{"gt": "7"}]
@@ -6227,12 +6138,8 @@ def test_per_turn_credit_shim_centres_each_turn_against_its_group_sibling():
     pytest.importorskip("torch")
     import torch
 
-    # two rollouts of the same prompt, two turns each, spans [0,2) and [2,4).
-    # turn 0: 1.0 vs 0.0 -> baseline 0.5 -> +0.5 / -0.5
-    # turn 1: 0.0 vs 1.0 -> baseline 0.5 -> -0.5 / +0.5
-    # the second rollout is the WORSE episode overall on turn 0 yet must still earn positive credit
-    # on turn 1; that inversion is the entire point of per-turn credit and episode credit cannot
-    # produce it.
+    # two rollouts and two turns must invert credit on turn 1.
+    # episode-level credit cannot produce that per-turn result.
     rows = [
         (((0, 2), (2, 4)), (1.0, 0.0)),
         (((0, 2), (2, 4)), (0.0, 1.0)),
@@ -6243,18 +6150,8 @@ def test_per_turn_credit_shim_centres_each_turn_against_its_group_sibling():
 
 
 def test_per_turn_credit_shim_reproduces_the_reference_advantages():
-    # the port's defining property: for the same rollouts it must produce the SAME advantages the
-    # original per-turn builder did, which is what makes it a port rather than a second
-    # implementation.
-    #
-    # the reference values below were computed from that builder before it was deleted with the trl
-    # backend. they are pinned as literals deliberately: an oracle that no longer ships cannot be
-    # imported, and re-deriving them from the shim under test would make this assert on itself.
-    #
-    # by hand, for spans [(0,3),(3,5)] / [(0,2),(2,6)] and turn rewards [.25,.75] / [1.0,.5]:
-    # turn 0 group mean is (0.25+1.0)/2 = 0.625, so its centred credits are -0.375 and +0.375;
-    # turn 1 group mean is (0.75+0.5)/2 = 0.625, giving +0.125 and -0.125. each credit is broadcast
-    # across its own token span, and index 5 of row 0 lies past its last span, so it stays 0.
+    # pin literals produced by the removed reference builder; deriving them from this shim would
+    # make the test assert on itself. the spans also verify broadcast and zero outside a span.
     pytest.importorskip("torch")
     import torch
 
@@ -6626,17 +6523,8 @@ def test_a_truncated_final_turn_still_earns_per_turn_credit_for_the_turns_before
 def test_an_unspanned_truncated_turns_tokens_stay_in_the_transcript_but_out_of_the_loss(
     monkeypatch,
 ):
-    # the control for the fix above: dropping the SPAN must not drop the TOKENS. if the fix had
-    # skipped the turn entirely, the child would train on a transcript that never contained it.
-    #
-    # keeping the tokens and keeping them in the LOSS are separate decisions, and they resolve
-    # opposite ways. the transcript must contain the turn -- it is what the model emitted and what a
-    # further turn would condition on. the loss must not: the bridge returns before record_model_turn
-    # for an aborted turn, so the env never saw or scored it, and response_mask is what excludes a
-    # position (the env glue beside it relies on exactly that). leaving it at 1 trains a cut-off
-    # generation on credit earned by the turns before it, which teaches the policy to stop early --
-    # the failure verl's own mask_truncated_completions exists to prevent, and which cannot reach
-    # this custom AgentLoopOutput because it carries no stop reason for that handling to read.
+    # an aborted turn stays in the transcript but out of the loss: later turns condition on its
+    # tokens, while response_mask=0 prevents training on credit the environment never assigned.
     env = _SpanEnv()
     out = _drive_multi_turn_episode(
         stop_reasons=[("ab", "completed"), ("cd", "aborted")], env=env, monkeypatch=monkeypatch
@@ -6710,15 +6598,8 @@ def test_every_turn_is_spanned_when_none_of_them_abort(monkeypatch):
 def test_the_rl_trainer_stores_the_frozen_base_in_bf16():
     """VERL-150: verl's fsdp.yaml default is fp32, which doubles the trainer's resident base.
 
-    the fp32 copy is storage-only -- FSDP already wraps the module MixedPrecision(param_dtype=bf16),
-    so params are cast to bf16 for compute either way -- and the base is FROZEN, since verl's
-    ref_in_actor (lora_rank > 0 or lora_adapter_path is not None) is always true here. what is
-    actually optimized stays fp32: peft's autocast_adapter_dtype casts lora_* weights UP to fp32.
-    so this frees ~51 GB at 27B and changes nothing about the gradient.
-
-    the opd driver's half of this lives in test_opd_train. asserted in both because the sft driver
-    has set a dtype since it was written and these two never did, which is exactly why g5's sft leg
-    succeeded and its grpo and opd legs failed on the same model and the same card.
+    Keep the frozen base in bf16; FSDP computes in bf16 while LoRA weights remain fp32.
+    The OPD half is pinned in test_opd_train.
     """
     overrides = rl_train.build_verl_overrides(_overrides_cfg())
     want = "actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16"
@@ -6738,15 +6619,10 @@ def test_the_rl_trainer_stores_the_frozen_base_in_bf16():
 
 
 def test_grpo_builds_its_verl_child_env_from_the_allowlist():
-    """Regression (rl_train.py): the grpo driver built the child env with
-    `dict(os.environ)`, so the platform HF_TOKEN, the GITHUB_TOKEN and every user-declared
-    environment secret reached the verl subprocess -- and verl fans that env out to each ray actor.
-    scoring never happens there: it stays in this process behind the localhost reward bridge, so the
-    child needs runtime settings and the bridge url, not credentials. sft and opd already build
-    theirs through the shared allowlist.
+    """Regression (rl_train.py): do not pass platform and user secrets to the verl child.
 
-    asserted on the source rather than by running the driver because reaching that line needs a gpu,
-    a prefetched checkpoint and a live verl install.
+    Scoring remains behind the localhost bridge, so the child needs runtime settings and the bridge
+    URL only. This is source-tested because the path requires a GPU and installed verl.
     """
     source = inspect.getsource(rl_train.run_rl_train)
     assert "env_for_verl = _build_verl_child_env(" in source

@@ -296,19 +296,9 @@ def create_run(
                             )
                         _app.submit_job(pending.public_spec, **profile_submit_kwargs)
                     except Exception:
-                        # the claim only means "this key launches it". if the launch does not
-                        # happen the row must go, or the deterministic id stays claimed by a run
-                        # that never ran and every later submitter waits on it forever. this is
-                        # right for a takeover too: the row it replaced was already spent, so
-                        # dropping it returns the id to the plain claim-by-insert path.
-                        #
-                        # but submit_job persists the queued status BEFORE the steps that can still
-                        # raise (_report_status, and starting the background thread), so a failure
-                        # after that point leaves a real run under this id. deleting the claim then
-                        # is the worse wedge of the two: ownership answers 404 for the key that
-                        # launched it, while later submitters read a live queued/running record and
-                        # wait forever on a run nobody can reclaim. keep the claim whenever a run
-                        # record exists -- its lifecycle then ends the normal way.
+                        # delete the deterministic claim when launch creates no run, or the id wedges
+                        # forever. if ``submit_job`` already persisted status, keep the claim so
+                        # ownership and normal lifecycle cleanup remain intact.
                         if not os.path.exists(runs_file_path(profile_run_id, ".json")):
                             db.delete_run(profile_run_id)
                         raise
@@ -316,13 +306,15 @@ def create_run(
                     # charged nothing, so reporting it as launched would name a charge that was
                     # rolled back.
                     launched = True
-                # launched here, lost the claim to a submitter who launched it, or lost a takeover
-                # to one who is relaunching it. in every case the id now belongs to a live attempt,
-                # so the state has to name that attempt: reporting the spent state a takeover loser
-                # read would name a run that no longer exists under this id, and leaving a plain
-                # claim loser on the synthetic "required" tells a user whose profile is queued and
-                # running that it has not started -- `required` is a marker this route invents, not
-                # a state any run is ever in.
+                # launched here, lost the claim to a submitter who launched it, or
+                # lost a takeover to one who is relaunching it. in every case the
+                # id now belongs to a live attempt, so the state has to name that
+                # attempt: reporting the spent state a takeover loser read would
+                # name a run that no longer exists under this id, and leaving a
+                # plain claim loser on the synthetic "required" tells a user whose
+                # profile is queued and running that it has not started --
+                # `required` is a marker this route invents, not a state any run
+                # is ever in.
                 state = "queued"
             raise HTTPException(
                 status_code=409,

@@ -24,13 +24,8 @@ class RunpodProvider:
     supports_weight_cache = True
 
     def is_configured(self) -> bool:
-        # Gated on the operator key, exactly like the instance providers. A plane with no
-        # RUNPOD_API_KEY must not report runpod as available: the allocator would rank RunPod
-        # classes it can never provision and the run would die at submit instead of allocating
-        # on the provider the operator DID configure.
-        #
-        # Read the PARSED pool, not the raw env var: RUNPOD_API_KEY="," is set-but-unusable, and
-        # keys() is what every provisioning call actually draws from.
+        # require a usable parsed key pool, not merely a set env var. otherwise the allocator ranks
+        # RunPod classes the operator cannot provision.
         from flash.providers.runpod import keys
 
         return bool(keys.keys())
@@ -149,15 +144,9 @@ class RunpodProvider:
             failure_detail_reader=failure_reader,
             current_attempt=rh.attempt,
             **deadline_kwargs(poll_job, _deadline_at),
-            # the persisted flag drives the stall grace only, NOT the capacity wording. it is a
-            # snapshot of the supervisor loop that submitted this attempt, and that loop is gone:
-            # recovery calls reallocation_spec_from_status, which restores the run's original
-            # unpinned gpu type, and re-enters _run_training with empty failed_providers and
-            # tried_classes -- so the replacement really can pick another class or provider.
-            # forwarding the snapshot here would state "no further GPU-class escalation follows"
-            # about a picker that has its whole candidate list back. the grace is a different
-            # question: how long to wait on hardware that was scarce, which the snapshot still
-            # answers correctly.
+            # the persisted scarcity flag controls stall grace, not capacity wording. recovery
+            # rebuilds the unpinned allocation with a fresh candidate set, so claiming no escalation
+            # remains would be false.
             **stall_kwargs(on_last_gpu=on_last_gpu),
         )
 

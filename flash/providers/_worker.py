@@ -83,9 +83,8 @@ BAKED_PER_SM_ARCHES = frozenset({"sm80", "sm86", "sm89", "sm90", "sm120", "sm100
 class WorkerImageOverride:
     """A worker-image override and the registry credential needed to pull it.
 
-    The CUDA and disk floors this used to carry were removed with their env vars in #906: the GPU
-    class floor already encodes the driver requirement, and container disk belongs in the run's own
-    ``[gpu] disk_gb``. Only the auth id is left, because it cannot be derived from the image ref.
+    only auth remains here (#906): GPU class encodes the CUDA floor and each run owns
+    ``[gpu] disk_gb``. the credential cannot be derived from the image ref.
     """
 
     image: str
@@ -95,13 +94,10 @@ class WorkerImageOverride:
 def worker_image_override() -> WorkerImageOverride | None:
     """Parse the FLASH_WORKER_IMAGE override and its registry credential.
 
-    FLASH_WORKER_IMAGE holds the image ref; FLASH_WORKER_IMAGE_REGISTRY_AUTH holds the
-    provider-side registry-credential id a private image needs to pull. The credential cannot be
-    derived from the image ref, so it stays configurable.
-
-    The image's CUDA and disk floors are NOT configurable: the GPU class floor (min_cuda_modern)
-    already encodes the real constraint, and a run that needs more container disk sets
-    ``[gpu] disk_gb`` in its own spec, where the requirement is recorded with the run.
+    The credential cannot be derived from the image ref, so it stays configurable. The image's CUDA
+    and disk floors are NOT configurable: the GPU class floor (min_cuda_modern) already encodes the
+    real constraint, and a run that needs more container disk sets ``[gpu] disk_gb`` in its own
+    spec, where the requirement is recorded with the run.
     """
     image = os.environ.get("FLASH_WORKER_IMAGE", "").strip()
     if not image:
@@ -174,8 +170,8 @@ def weight_cache_env(mount: str = _WEIGHT_CACHE_MOUNT) -> dict[str, str]:
     """Env pointing the base-model prefetch at the persistent volume mount.
 
     Sets FLASH_WEIGHT_CACHE_DIR (not HF_HOME) so only the trusted public base model lands on the
-    shared multi-tenant mount; reward/env HF downloads stay in the ephemeral per-worker cache.
-    JIT caches are never redirected — sharing compiled artifacts across tenants is unsafe.
+    shared multi-tenant mount; reward/env HF downloads stay in the ephemeral per-worker cache. JIT
+    caches are never redirected -- sharing compiled artifacts across tenants is unsafe.
     """
     return {"FLASH_WEIGHT_CACHE_DIR": f"{mount}/hf-cache/hub"}
 
@@ -203,15 +199,11 @@ def build_worker_env(
             "environment secrets must not include managed teacher credential names: "
             + ", ".join(declared_managed_credentials)
         )
-    # GRPO and OPD run a verl vLLM rollout (`actor_rollout_ref.rollout.name=vllm`), and verl leaves
-    # rollout.enable_sleep_mode defaulted True, so the engine always builds a CuMemAllocator -- which
-    # asserts outright on "expandable_segments:True" (vllm/device_allocator/cumem.py:132,
-    # pytorch#147851). Both therefore take the non-expandable conf.
-    #
-    # SFT does NOT qualify: verl.trainer.sft_trainer is a pure FSDP trainer with no rollout, no vLLM
-    # engine, and no CuMemAllocator, so it keeps the expandable allocator its large generate/logit
-    # tensors need against fragmentation. The predicate is "generates through verl", not "runs on
-    # verl".
+    # GRPO and OPD run a verl vLLM rollout (`actor_rollout_ref.rollout.name=vllm`), and verl
+    # leaves rollout.enable_sleep_mode defaulted True, so the engine always builds a
+    # CuMemAllocator -- which asserts outright on "expandable_segments:True"
+    # (vllm/device_allocator/cumem.py:132, pytorch#147851). Both therefore take the
+    # non-expandable conf.
     _alloc_conf = (
         "expandable_segments:True"
         if str(getattr(spec, "algorithm", "")).lower() == "sft"
@@ -249,14 +241,14 @@ def build_worker_env(
             )
             continue
         env[str(k)] = str(v)
-    # runtime secrets and declared env secrets may never clobber a control-plane-owned key: the
-    # canonical seed, run id, hf repo, and arm are set above, and a runtime seed override would break
-    # the authoritative-seed invariant regardless of how environment.secrets was populated.
-    # removed keys are filtered here too. the two sets are disjoint and answer different questions --
-    # RESERVED_WORKER_ENV_KEYS is ownership (a caller may not override SEED), _REMOVED_OPTIMIZATION_ENV
-    # is deadness (the key configures nothing now) -- so checking only ownership left
-    # [environment].secrets as a second door that delivered a dead key with none of the warning that
-    # the [worker_env] path emits.
+    # runtime secrets and declared env secrets may never clobber a control-plane-owned key:
+    # the canonical seed, run id, hf repo, and arm are set above, and a runtime seed override
+    # would break the authoritative-seed invariant regardless of how environment.secrets was
+    # populated. removed keys are filtered here too. the two sets are disjoint and answer
+    # different questions -- RESERVED_WORKER_ENV_KEYS is ownership (a caller may not override
+    # SEED), _REMOVED_OPTIMIZATION_ENV is deadness (the key configures nothing now) -- so
+    # checking only ownership left [environment].secrets as a second door that delivered a
+    # dead key with none of the warning that the [worker_env] path emits.
     allowed_runtime_secrets = {
         k
         for k in (set(DEFAULT_RUNTIME_SECRET_KEYS) | set(spec.environment.secrets))

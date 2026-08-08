@@ -33,14 +33,8 @@ _EXPLICIT_TARGET = "flash-1@step-3." + "a" * 40
 class _EvalClient:
     """Base for a double used by an environment evaluation.
 
-    The real client supplies all three methods for every target. Full revisions need no
-    step-selector warm-up, while every evaluation now reads the run spec to find its published
-    environment and project, then downloads that environment's package through the control plane.
-    Keeping those ordinary defaults here lets each double stay focused on the behavior its test
-    owns.
-
-    `download_env_package` packs whatever directory `_patch_published_env` registered, so a test
-    that never registers one inherits an explicit failure rather than a silently empty environment.
+    Defaults cover spec lookup and package download so individual doubles focus on their behavior.
+    Missing package registration fails explicitly.
     """
 
     _env_dir: Path | None = None
@@ -189,12 +183,8 @@ def _lazy_helper_env(root: Path, label: str) -> Path:
 def test_lazily_imported_siblings_stay_bound_to_their_own_environment(tmp_path) -> None:
     """A helper imported inside cases()/score() must be the caller's own, not the last one loaded.
 
-    The sidecar's package directory was left on sys.path so lazy imports would still resolve, and
-    the cleanup ran when the module finished executing -- before cases() or score() had imported
-    anything. So the FIRST package's `helper` stayed cached under its plain name and the second
-    environment silently graded with the first one's cases and the first one's scoring logic. No
-    ImportError, no warning: wrong results that read as legitimate, which is the one failure this
-    module exists to prevent.
+    Plain names cached in ``sys.modules`` can silently make a later environment use earlier grading
+    code, so lazy imports must remain scoped to their package.
     """
     first = _lazy_helper_env(tmp_path, "alpha")
     second = _lazy_helper_env(tmp_path, "beta")
@@ -236,13 +226,7 @@ def _package_helper_env(root: Path, label: str, *, namespace: bool) -> Path:
 def test_sibling_packages_do_not_leak_between_environments(tmp_path, namespace: bool) -> None:
     """A sidecar's sibling package belongs to its own environment, not the first one loaded.
 
-    Eviction matched only modules whose parent WAS the package directory, but `graders.rules`
-    lives one level below it -- so it stayed in sys.modules and the next environment's
-    `from graders.rules import ...` silently got the first environment's grader. Both suites then
-    scored with the same code while reporting as independent environments.
-
-    A namespace package (no __init__.py) has no spec origin at all, so an origin-only test cannot
-    see it either.
+    Evict nested submodules too; namespace packages may have no ``__init__.py`` or spec origin.
     """
     first = _package_helper_env(tmp_path, "alpha", namespace=namespace)
     second = _package_helper_env(tmp_path, "beta", namespace=namespace)
@@ -555,13 +539,8 @@ def test_env_eval_refuses_a_bare_alias_it_cannot_pin(
 def test_env_eval_runs_a_pinned_step_whose_latest_deploy_failed(monkeypatch, tmp_path) -> None:
     """A failed deployment record does not un-verify the steps already in the run's ledger.
 
-    The check above refuses a terminal record because a bare alias has nothing left to serve it.
-    A pinned step does not go through that record at all: the chat route resolves `RUN/step-N`
-    against the verified ledger, and once it resolves, `has_ready_deploy` is true and the
-    terminal-state arms never run (`flash/server/routes/serving.py`). `mark_deployment_failed`
-    leaves that ledger alone -- only undeploy and revocation invalidate it -- so a step verified
-    before a LATER deploy failed still answers 200, and refusing it here failed an evaluation the
-    server runs correctly.
+    Pinned steps resolve through the verified ledger, which only undeploy and revocation invalidate;
+    a later failed deploy must not block an earlier verified revision.
     """
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
@@ -714,16 +693,9 @@ def test_env_eval_concurrency_preserves_case_order(monkeypatch, tmp_path, capsys
 def test_env_eval_settles_the_step_selector_capability_before_the_fan_out(
     monkeypatch, tmp_path
 ) -> None:
-    # the client caches the step-selector capability only after the check succeeds, so workers
-    # starting together all miss the cold cache and each fire their own /v1/health -- one eval's
-    # worth of duplicate requests for a fact about the control plane that cannot differ between
-    # them. settling it once on this thread first is what collapses them, so assert the ordering:
-    # the warm-up happens before any worker runs, not concurrently with them.
-    #
-    # only a surviving `RUN/step-N` reaches this at all. a full revision carries no step, and a
-    # shorthand whose live deployment is at that same step is pinned to the revision before
-    # generation -- so the case under test is the one the CLI deliberately forwards unpinned:
-    # asked for step-3 while step-20 is deployed, the server resolves it against its ledger.
+    # warm the step-selector capability before workers start so a cold cache causes one health call.
+    # only surviving RUN/step-N shorthands need this; full and already-live revisions are pinned
+    # first.
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
@@ -1355,14 +1327,8 @@ def test_env_eval_grades_the_hub_package_over_a_same_named_local_directory(
 ) -> None:
     """A working copy named like the slug must not supply the suites for the published environment.
 
-    Resolution is not uniform across the two loaders: a managed slug goes straight to the hub, while
-    the sidecar lookup prefers a local path when `namespace/name` exists in the cwd. A developer
-    with a checkout at ./acme/starter therefore graded the published environment with their own
-    uncommitted evaluations.py, and the report named the published slug either way -- a wrong
-    measurement filed under a right-looking provenance.
-
-    Downloading once and grading from the extracted copy is what removes the ambiguity, so this test
-    keeps the real resolution running and only fakes the transport.
+    Download once and grade the extracted package so cwd resolution cannot substitute uncommitted
+    local sidecars under a valid published provenance.
     """
     published = tmp_path / "published"
     published.mkdir()
@@ -1993,15 +1959,8 @@ def test_a_sidecar_package_submodule_wins_over_one_already_cached(
 ) -> None:
     """Displacing a package must displace its cached submodules too.
 
-    Evicting only the top-level `graders` left sys.modules["graders.rules"] in place, and
-    `from graders.rules import GOLD` reads that entry directly -- so the suite scored with the
-    other environment's rules while its own file was never read.
-
-    The namespace case is the same defect reached a different way: under PEP 420 a `graders/` with
-    no `__init__.py` is importable all the same, but the owned-name scan required the marker file,
-    so such a directory was never claimed and nothing was displaced at all. This is the
-    already-cached path specifically -- two sidecars in sequence are covered by parking, and only
-    a module the process held BEFORE any sidecar ran survives to be handed to the wrong one.
+    ``from graders.rules`` reads the submodule cache directly. Claim PEP 420 namespace directories
+    too, even without ``__init__.py``.
     """
     unrelated = tmp_path / "unrelated"
     (unrelated / "graders").mkdir(parents=True)
@@ -2970,13 +2929,8 @@ def test_env_eval_prompt_failure_fails_only_its_own_case(monkeypatch, tmp_path, 
 def test_env_eval_sends_the_prompt_images_training_builds(monkeypatch, tmp_path) -> None:
     """A multimodal case must reach the backend as the prompt training built, images included.
 
-    `prompt_messages()` is only half of it: every worker then runs `normalize_prompt_images`
-    (flash/engine/worker/rl.py, sft.py, opd.py). Sending the raw messages dropped a record's
-    top-level `image` entirely, so the suite graded a text-only prompt, and handed an
-    environment's package-relative path to a remote backend that cannot read the evaluator's disk.
-
-    Both halves are asserted because they fail differently: the top-level image is *missing*, and
-    the block-borne path is *present but unusable*.
+    Apply ``normalize_prompt_images`` after ``prompt_messages`` so top-level images and local paths
+    become the same remote-safe blocks used by training.
     """
     image_module = pytest.importorskip("PIL.Image")
 
@@ -3136,15 +3090,8 @@ def test_env_eval_leaves_a_text_only_prompt_exactly_as_the_environment_built_it(
 def test_env_eval_strips_reasoning_only_for_a_thinking_run(monkeypatch, tmp_path, capsys) -> None:
     """Graders must see what training graded, and only when the run actually reasons.
 
-    Training never hands a scorer the raw completion: both rollout paths run it through
-    `flash.thinking` first (`flash/envs/adapter.py`). Evaluating the raw string mis-graded a
-    thinking deployment against its own environment -- the scaffolded scorer in `env setup` reads
-    the first token as an int, which is `<think>` for every reasoning run, so every case errored.
-
-    Stripping unconditionally is the opposite defect, and just as real: `strip_think` also cuts at
-    a bare `<think>` mention, so a non-thinking answer that merely names the tag would be truncated
-    to nothing. The run's own `thinking` decides, never the text, and the two halves below fail in
-    opposite directions to pin that.
+    Strip thinking exactly when the run spec says ``thinking``; raw reasoning breaks scorers, while
+    unconditional stripping corrupts ordinary answers that mention ``<think>``.
     """
 
     def _suite(name: str, expected: str) -> Path:

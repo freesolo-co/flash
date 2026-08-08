@@ -1,11 +1,6 @@
 """Deployable RL checkpoints (CPU-only).
 
-Covers the three control-plane-adjacent pieces of the feature:
-  - the worker publishing each save's LoRA adapter to a stable per-step path,
-  - the lister that enumerates those snapshots from HF,
-  - the backend client that mirrors them to the freesolo run_checkpoints store.
-
-All HF/network boundaries are stubbed; nothing here touches a GPU or the network.
+Covers worker publication, HF listing, and backend mirroring. All network boundaries are stubbed.
 """
 
 from __future__ import annotations
@@ -794,12 +789,8 @@ def test_best_effort_no_checkpoints(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Finalize wiring: the FINAL training step is always published as a deployable
-# checkpoint (not only when it lands on a save_steps boundary). The per-save
-# callback / on_train_end publish at/near save boundaries; an unaligned last
-# step would otherwise have no `RUN_ID/step-N` entry even though it IS the served
-# default `<prefix>/adapter`. run_rl/run_sft must close that gap after saving
-# the final adapter. Source-wiring (a runtime test would need a full trainer).
+# finalization must publish an unaligned last step as `RUN_ID/step-N`; source-wiring tests avoid a
+# full trainer runtime.
 # ---------------------------------------------------------------------------
 def _finalize_src(module_name: str, fn_name: str) -> str:
     import importlib

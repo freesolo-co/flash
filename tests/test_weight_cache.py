@@ -1,17 +1,7 @@
 """Shared, fully-managed, best-effort, multi-region model-weight cache on RunPod network volumes.
 
-The runner attaches ONE platform-wide logical cache name (``flash-weights``) to EVERY run; the RunPod
-provider realizes it as a DISTINCT per-DC physical volume (``flash-weights-<dc>``) in every storage
-datacenter (distinct names avoid the runpod_flash resource-key collision) and allows the endpoint
-across all of them. This gives a cross-run weight cache with NO single-datacenter pin — whichever
-region the run lands in, that region's volume mounts at ``/runpod-volume`` and the worker's
-``HF_HOME`` points there. On a no-capacity failure the lifecycle drops the volume so a run can never
-wedge IN_QUEUE on one full region.
-
-Fully managed: there are NO env knobs (fixed name/size/datacenter set) and NO per-model gating —
-these tests pin that down. Everything is offline (the autouse ``_offline`` conftest stubs the RunPod
-API); the one SDK contract we lock — that our datacenter list is always a superset of the volume DCs
-— is driven through the real ``Endpoint._build_resource_config()`` (a pure, network-free validator).
+Each datacenter gets a managed `/runpod-volume`; failover may drop it to avoid a queue wedge. Tests
+are offline and pin the fixed cache contract plus the SDK datacenter-superset rule.
 """
 
 from __future__ import annotations
@@ -1320,9 +1310,8 @@ def test_scoped_teardown_is_runpod_only(monkeypatch):
 def test_teardown_empty_datacenters_scope_is_refused(monkeypatch):
     """`--teardown --datacenters <empty/whitespace>` must ERROR, never silently full-teardown RunPod.
 
-    Regression for the footgun where a present-but-empty scope (a) widened teardown_weight_cache to
-    the WHOLE RunPod fleet via its `datacenters or <all>` fallback while (b) skipping the instance
-    providers because the flag was present. It must abort (rc != 0) and touch NOTHING.
+    A present-but-empty scope must abort without touching the fleet; it cannot fall through to the
+    all-datacenters default.
     """
     from flash.providers import weight_cache_preload as preload
 
@@ -2303,12 +2292,8 @@ def test_warm_reports_timeouts_and_partials_as_not_warmed(monkeypatch):
     """A timed-out region left its cache incomplete; reporting only errors would read as success."""
     preload, lj, _launched, _terminated = _wire_warm(monkeypatch, None)  # marker never appears
     monkeypatch.setattr(lj, "usable_instances", _stocked(A10=["us-east-1"]))
-    # The poll budget floors at 60s and each loop sleeps >=5s, so a real timeout_s=1 would burn a
-    # minute of wall clock. Expire the deadline instead of waiting for it.
-    #
-    # Swap the module reference rather than setattr on preload.time: that attribute IS the stdlib
-    # time module, so patching through it moves the clock for the whole process (pytest internals,
-    # threads, HF clients) and leaks into later tests.
+    # the poll budget floors at 60s, so expire its deadline instead of waiting. replace the module
+    # reference rather than patching `preload.time`, which is the process-wide stdlib module.
     real_time = preload.time
     # Advance on SLEEP, not on a fixed number of time() reads: a counted tick list silently breaks
     # whenever the code under test adds a clock read (it once left the poll loop spinning forever on
@@ -2388,10 +2373,8 @@ def test_warm_stops_the_ladder_on_an_ambiguous_create(monkeypatch):
 def test_warm_ensures_the_region_filesystem_once_before_the_class_ladder(monkeypatch):
     """The filesystem must be ensured ONCE up front, not once per class inside the ladder.
 
-    create_filesystem is not idempotent, so whoever calls ensure_filesystem first owns the duplicate
-    risk. Ensuring it here means every later per-class call inside launch_and_submit finds the
-    filesystem already listed and returns its mount point without reaching the create path -- so
-    walking the ladder on a capacity rejection can no longer bill a second filesystem.
+    Creation is non-idempotent; pre-ensuring makes later class attempts observe the existing mount
+    instead of billing duplicate filesystems.
     """
     from flash.providers.lambdalabs import api as lambda_api
 
@@ -2428,12 +2411,8 @@ def test_warm_ensures_the_region_filesystem_once_before_the_class_ladder(monkeyp
 def test_warm_skips_a_region_whose_created_filesystem_is_not_yet_listed(monkeypatch):
     """A create that succeeds but has not appeared in the listing must NOT launch.
 
-    Regression for the fix itself: ensure_filesystem returning only proves the create call succeeded.
-    launch_and_submit then does its OWN listing, and a filesystem that exists but is not yet visible
-    makes that listing miss and submit a second non-idempotent create -- the exact duplicate the
-    pre-ensure exists to prevent, just moved one call later. Visibility in the listing, not a
-    successful create, is what makes every later ensure a no-op. One cold region is recoverable; a
-    duplicate filesystem is billed until a human notices it.
+    Later `ensure_filesystem` calls are safe only after listing visibility; otherwise launch can
+    submit a second non-idempotent create.
     """
     from flash.providers.lambdalabs import api as lambda_api
 
@@ -2465,13 +2444,8 @@ def test_warm_skips_a_region_whose_created_filesystem_is_not_yet_listed(monkeypa
 def test_warm_does_not_launch_while_the_filesystem_is_unconfirmed(monkeypatch):
     """When the filesystem cannot be confirmed, the region must not launch at all.
 
-    Regression for the case a sentinel-text check could not see: ensure_filesystem guards its create
-    but NOT the reconciliation listing inside its own except block, so when that listing times out
-    the raw error propagates carrying no sentinel. launch_and_submit then wraps every failure --
-    genuine capacity rejections included -- in the same "no capacity" message, so nothing downstream
-    can tell a starved region from one whose create is in doubt. Launching anyway lets the launcher's
-    own ensure_filesystem submit a SECOND non-idempotent create for the same name and region:
-    duplicate storage, billed forever. Skipping the region costs one cold cycle.
+    Reconciliation failures can lose their sentinel under capacity wrapping. Launching anyway risks
+    a second non-idempotent create, so skip the cold region.
     """
     from flash.providers.lambdalabs import api as lambda_api
 
@@ -2503,10 +2477,8 @@ def test_warm_does_not_launch_while_the_filesystem_is_unconfirmed(monkeypatch):
 def test_ladder_planning_shares_one_deadline_across_every_class(monkeypatch):
     """Four classes must share ONE planning budget, not each get the full retry budget in turn.
 
-    Each usable_instances does a live price lookup and a capacity lookup, both of which retry
-    internally. Against an /instance-types endpoint that accepts connections then hangs, an unbounded
-    per-class call turns a single-class stall into roughly four stacked retry budgets before the warm
-    can even report "no targets". The ladder must stop once the shared budget is gone.
+    Each class performs retrying price and capacity calls; stop the ladder when the shared budget is
+    gone rather than stacking four outage windows.
     """
     from flash.providers import weight_cache_preload as preload
     from flash.providers.lambdalabs import jobs as lj
@@ -2565,10 +2537,7 @@ def test_warm_still_walks_the_ladder_when_lambda_was_never_reached(monkeypatch):
 def test_warm_raises_when_capacity_could_not_be_measured(monkeypatch):
     """A total lookup failure must raise, not return an empty list.
 
-    Empty is indistinguishable from a healthy "nothing to warm" at every call site -- the CLI printed
-    "no Lambda region had capacity" and exited 0 while the whole fleet stayed cold behind a Lambda
-    outage. "No capacity" and "we never got an answer" are different facts and only the first is a
-    success.
+    Empty means healthy no-capacity to callers; an outage is a different fact and cannot exit 0.
     """
     from flash.providers import weight_cache_preload as preload
     from flash.providers.lambdalabs import jobs as lj
@@ -2603,11 +2572,8 @@ def test_warm_reports_a_genuine_zero_capacity_fleet_as_success(monkeypatch):
 def test_warm_does_not_report_a_partial_sweep_as_a_finished_one(monkeypatch):
     """A class going unanswered while ANOTHER still yields targets must not exit 0.
 
-    Regression for the mixed case: the total-outage path already raised, but here A10 fails and
-    H100 still returns a region, so the run warmed 1 of 1 REACHABLE regions and printed
-    "1/1 regions warmed". Any region stocked only by the unanswered class is absent from the
-    numerator AND the denominator, so the ratio looks perfect precisely because the gap is
-    invisible. The launches that did run are kept on the exception -- they are paid work.
+    Reachable-only denominators can report a perfect warm ratio while whole class regions are
+    invisible. Preserve completed paid launches on the exception.
     """
     preload, lj, launched, _terminated = _wire_warm(
         monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
@@ -2661,10 +2627,7 @@ def test_warm_cli_exits_nonzero_when_the_fleet_was_not_fully_measured(monkeypatc
 def test_warm_incomplete_summary_does_not_contradict_the_warmed_count(monkeypatch, capsys):
     """The two closing lines must not disagree about how many caches finished.
 
-    "X/Y regions warmed" counts only ok rows, while the incomplete-plan message counts every
-    launched region whatever its status. Calling the second one "warmed" printed "1/2 regions
-    warmed" immediately followed by "warmed 2 region(s)" -- the summary contradicting the tally one
-    line above it. It reports what the number actually is: regions examined.
+    One count is successful warms and the other is regions examined; label each accordingly.
     """
     from flash.providers import weight_cache_preload as _p
 
@@ -2703,9 +2666,8 @@ def test_warm_incomplete_summary_does_not_contradict_the_warmed_count(monkeypatc
 def test_provisioned_region_snapshot_is_deadline_bounded(monkeypatch):
     """The reporting snapshot must carry its own deadline.
 
-    It runs AFTER the shared planning budget is already spent and list_filesystems retries
-    internally, so an unbounded call would add another retry-and-backoff cycle to the pre-launch
-    phase for what is only a summary line.
+    It runs after planning budget exhaustion and must not add another retry cycle for a summary
+    line.
     """
     from flash.providers import weight_cache_preload as preload
     from flash.providers.lambdalabs import api as lambda_api
@@ -2748,10 +2710,8 @@ def test_warm_names_regions_with_no_capacity_in_any_class(monkeypatch, caplog):
 def test_warm_counts_launch_time_regions_in_the_fleet_total(monkeypatch):
     """The denominator is the union, not the pre-launch snapshot.
 
-    Eager provisioning can succeed in only a subset of regions -- launch-time ensure_filesystem is
-    the documented backstop -- so results may name regions the snapshot never held. Sizing the fleet
-    off the snapshot alone under-counts it, and with one starved pre-provisioned region plus one
-    failed new region it printed the nonsense "2 of 1 region(s) not fully warmed".
+    Launch-time provisioning can add regions absent from the snapshot; include result regions to
+    avoid impossible counts such as 2 of 1 incomplete.
     """
     from flash.providers import weight_cache_preload as preload
 
@@ -2766,10 +2726,8 @@ def test_warm_counts_launch_time_regions_in_the_fleet_total(monkeypatch):
 def test_warm_cli_prints_regions_with_no_capacity(monkeypatch, capsys):
     """The cold-region report must survive to stdout, not die in an unconfigured logger.
 
-    Regression: this module is a library, so the `flash` logger holds only a NullHandler. Running
-    the documented `python -m flash.providers.weight_cache_preload --warm-instances` entry point never
-    called configure_logging, so the one message naming regions with no capacity in any class was
-    discarded -- stdout said "1/1 regions warmed" and exited 0 over a half-cold fleet.
+    The module entry point may have only a NullHandler, so stdout must carry the no-capacity
+    regions.
     """
     from flash.providers import weight_cache_preload as _p
 
@@ -3009,11 +2967,7 @@ def test_warm_instances_cli_reports_planning_outage_without_traceback(monkeypatc
 def test_precheck_cannot_take_time_from_the_launch_deadline(monkeypatch):
     """The pre-check runs on its OWN budget, so a slow one never shortens the launch/poll deadline.
 
-    Regression: it shared the run deadline while the instance wall cap and the reap deadline still
-    got the full effective_s. A slow pre-check therefore (a) ate into the provider's 60s create
-    allowance, so every class in the ladder failed that check inside launch_and_submit and the
-    region reported "no capacity" for classes never actually tested, and (b) ended the driver's poll
-    before the box it was watching, reporting a live download as timed out.
+    Sharing the run deadline can consume create allowance and end polling before a live download.
     """
     from flash.providers import weight_cache_preload as preload
 
@@ -3074,9 +3028,7 @@ def test_warm_instances_cli_dry_run(monkeypatch):
 def test_cli_gpu_default_is_none_per_mode(monkeypatch):
     """--gpu defaults to None; each mode applies its OWN default downstream (no sentinel hack).
 
-    Regression: --gpu used to default to _PRELOAD_GPU ('RTX 4090') and --warm-instances used a
-    `args.gpu != _PRELOAD_GPU` comparison — so a user explicitly asking for RTX 4090 on instance
-    warming was wrongly treated as 'no override'. None must pass through cleanly.
+    An explicit RTX 4090 must remain distinguishable from no override.
     """
     from flash.providers import weight_cache_preload as preload
 
@@ -3186,10 +3138,8 @@ def test_poll_waits_when_a_worker_is_initializing(monkeypatch):
 def test_poll_restarts_the_grace_window_after_a_requeue(monkeypatch):
     """Leaving the queue must reset the starvation anchor, not let it age through the running spell.
 
-    Regression: the grace anchor survived an IN_PROGRESS interval, so a job that queued briefly, ran
-    for longer than the grace window, then got re-queued after an interruption would be declared
-    starved on its FIRST zero-worker reading -- and _preload_one_dc deletes the endpoint on that,
-    killing a DC that has real capacity and had already been allocated a worker.
+    A later requeue needs a fresh grace window or its first zero-worker reading can delete a proven
+    capacity endpoint.
     """
     from flash.providers import weight_cache_preload as preload
 
@@ -3224,10 +3174,7 @@ def test_poll_restarts_the_grace_window_after_a_requeue(monkeypatch):
 def test_poll_rechecks_health_after_a_requeue_loses_the_worker(monkeypatch):
     """The worker latch is per queued interval: a requeue with no worker must still be caught.
 
-    Regression: saw_worker latched true forever on the first healthy reading, so a job that was
-    allocated a worker, started, was interrupted, and returned to IN_QUEUE with the worker gone
-    skipped every later health probe. The starvation window then never ran and the preload sat out
-    the full 5400s timeout instead of reporting the DC as out of capacity.
+    Clear it after interruption or later health probes remain disabled for the full 5400s timeout.
     """
     from flash.providers import weight_cache_preload as preload
 
@@ -3259,11 +3206,8 @@ def test_poll_rechecks_health_after_a_requeue_loses_the_worker(monkeypatch):
 def test_poll_rechecks_health_when_a_worker_vanishes_without_leaving_the_queue(monkeypatch):
     """A worker that appears and then disappears while still IN_QUEUE must not latch the probe off.
 
-    Regression: the latch was only cleared on the transition out of IN_QUEUE, so a worker that was
-    briefly reported ``initializing`` and then reclaimed before the job ever started suppressed every
-    later health probe. The job never left the queue, so nothing reset the latch, the starvation
-    window never ran, and the preload burned the full 5400s timeout on a datacenter that had lost
-    the box -- leaving the region cold and the endpoint billing.
+    Clear the latch when the worker vanishes or starvation detection stays disabled without a queue
+    transition.
     """
     from flash.providers import weight_cache_preload as preload
 
@@ -3320,10 +3264,8 @@ def test_has_worker_treats_health_failure_as_unknown(monkeypatch):
 def test_a_broken_worker_image_is_not_reported_as_a_starved_datacenter(monkeypatch):
     """An unhealthy worker still means the datacenter gave us a box, so it refutes starvation.
 
-    Regression: _has_worker counted only initializing/ready/running/idle. A worker that RunPod
-    allocated and then marked unhealthy (jobs.py reads that as a failed image pull and retries on a
-    fresh endpoint) looked identical to an empty datacenter, so the grace timer fired NoCapacityError
-    and told the operator to pick a different GPU class -- which cannot fix a broken image.
+    Classify it as an image failure, not no capacity; changing GPU class cannot repair a broken
+    image.
     """
     from flash.providers import weight_cache_preload as preload
 
@@ -3345,10 +3287,8 @@ def test_a_broken_worker_image_is_not_reported_as_a_starved_datacenter(monkeypat
 def test_a_persistently_unhealthy_worker_is_reported_as_a_broken_image(monkeypatch):
     """A box allocated and then left unhealthy is a broken image, and nothing but a fix helps.
 
-    It counts as capacity (see above), which is exactly why it needs its own timer: without one it
-    clears the starvation anchor on every poll and the preload holds a PAID endpoint for the whole
-    5400s budget before returning a bare "did not finish" that names nothing. ``poll_job`` already
-    calls this condition a failed image pull on a 240s grace; the preload poller must agree.
+    Give this state its own timer or it suppresses starvation and holds a paid endpoint for 5400s.
+    Match `poll_job`'s 240-second failed-image grace.
     """
     from flash.providers import weight_cache_preload as preload
 
@@ -3392,10 +3332,7 @@ def test_an_unhealthy_worker_alongside_a_live_one_is_not_a_broken_image(monkeypa
 def test_a_throttled_worker_still_counts_as_no_capacity(monkeypatch):
     """Throttled is the no-capacity signal itself, so it must NOT suppress the fail-fast path.
 
-    ``jobs.py`` classifies a sustained throttled worker as ``no_capacity`` and retries on the
-    next-best GPU. Counting it as an allocated box here would make a preload sit the full 5400s
-    timeout on a datacenter RunPod is never going to schedule -- the exact silent-cold-DC failure
-    this PR exists to remove.
+    Sustained throttling must follow `jobs.py` into GPU escalation, not wait the full 5400s timeout.
     """
     from flash.providers import weight_cache_preload as preload
 
@@ -3415,9 +3352,7 @@ def test_a_throttled_worker_still_counts_as_no_capacity(monkeypatch):
 def test_unreadable_health_never_becomes_no_capacity(monkeypatch):
     """A persistently failing health API must not masquerade as a starved datacenter.
 
-    Regression: with health unreadable, the grace timer used to fire NoCapacityError and the caller's
-    finally deleted the endpoint mid-download. The job here stays IN_QUEUE well past the grace window
-    and must simply time out instead.
+    Unreadable health cannot prove zero workers or trigger endpoint deletion.
     """
     from flash.providers import weight_cache_preload as preload
 
@@ -3436,9 +3371,8 @@ def test_unreadable_health_never_becomes_no_capacity(monkeypatch):
 def test_unreadable_health_does_not_age_the_grace_timer(monkeypatch):
     """Grace must count an unbroken run of CONFIRMED zero-worker readings, not wall time since launch.
 
-    Regression: the timer started at launch, so an unreadable health API aged it silently and the very
-    first definite "no workers" after that fired NoCapacityError instantly -- deleting an endpoint whose
-    download may have been progressing the whole time.
+    Health blackouts cannot age the timer; the first later zero-worker reading must start from prior
+    confirmed duration only.
     """
     from flash.providers import weight_cache_preload as preload
 
@@ -3464,9 +3398,7 @@ def test_unreadable_health_does_not_age_the_grace_timer(monkeypatch):
 def test_no_capacity_guard_only_runs_while_the_job_is_queued(monkeypatch):
     """IN_PROGRESS proves a worker was allocated, so zero-worker health there is a reporting artifact.
 
-    Regression: the guard ran on every nonterminal status. A job already downloading on a worker could
-    be declared starved on a stale health reading, and _preload_one_dc would delete the endpoint
-    mid-download.
+    Run starvation checks only while queued or stale health can delete an active download.
     """
     from flash.providers import weight_cache_preload as preload
 
@@ -3536,9 +3468,8 @@ def test_catalog_is_ordered_largest_first(monkeypatch):
 def test_volume_holds_whole_catalog_with_largest_model_in_transit():
     """The volume must fit every model resident PLUS the largest one's download scratch.
 
-    Regression for a real 200 GB failure: the 35B died with "Disk quota exceeded" in every
-    datacenter. Download order does not save it -- the volume is persistent and nothing is
-    evicted, so the largest model always meets a volume already holding the rest.
+    Persistent volumes evict nothing, so download order cannot prevent the observed 200 GB
+    "Disk quota exceeded" failure.
     """
     from flash.runner import WEIGHT_CACHE_VOLUME_GB, weight_cache_catalog_peak_gb
 
@@ -3552,12 +3483,8 @@ def test_volume_holds_whole_catalog_with_largest_model_in_transit():
 def test_preload_timeout_covers_a_fully_cold_whole_catalog_warm():
     """The default budget must outlast downloading the ENTIRE catalog, not just one model.
 
-    Raising the volume to 250 GB is what puts the 27B and 35B into the default preload set, so the
-    worst case this default has to survive changed with it: a cold volume now pulls ~159 GB in one
-    job. Sized off a measured rate rather than a guess -- a real cold 35B pull moved 70 GB in ~870s.
-
-    A too-short budget is not a slow failure, it throws away everything downloaded so far, so this
-    asserts the default clears the measured worst case rather than merely approaching it.
+    The 250 GB preload pulls about 159 GB cold; size from the measured 35B rate of 70 GB in about
+    870 seconds. A timeout discards all progress.
     """
     from flash.catalog import MODELS
     from flash.providers.weight_cache_preload import _PRELOAD_TIMEOUT_S
@@ -3678,10 +3605,8 @@ def test_ok_datacenter_logs_no_per_model_failures(monkeypatch, caplog):
 def test_grow_raises_undersized_volumes_and_leaves_the_rest_alone(monkeypatch):
     """A NetworkVolume is sized on CREATE ONLY, so a size bump is a silent no-op on the live fleet.
 
-    The SDK's _find_existing_volume matches on name+datacenter and hands the volume back untouched,
-    so every volume provisioned before the 100->250 bump stays at 100 forever: the attach succeeds
-    and the download then dies with "Disk quota exceeded", which is the exact failure the bump was
-    meant to fix. Growing over REST is the only way to reconcile what is already provisioned.
+    Existing 100 GB volumes require REST growth to reach 250 GB or larger models still hit
+    "Disk quota exceeded".
     """
     from flash.providers.runpod import api
 
@@ -3764,11 +3689,8 @@ def test_grow_tolerates_a_volume_listing_without_usable_sizes(monkeypatch):
 def test_one_stalling_volume_cannot_starve_the_rest_of_the_fleet(monkeypatch):
     """Regression: a PATCH that burns the shared deadline left every later datacenter unreconciled.
 
-    Skipping a failed volume is not enough on its own. A PATCH that times out or 5xxes spends real
-    time inside its own retries, and when every PATCH is handed the same absolute deadline the first
-    under-sized volume can consume all of it -- every later one then fails its deadline check
-    instantly. That is the same fleet-wide gap as aborting the loop, reached more slowly, and a run
-    placed in one of those datacenters still dies on "Disk quota exceeded".
+    Bound each failed growth attempt so one timeout cannot consume the fleet-wide reconciliation
+    budget and leave later volumes stale.
     """
     import types
 
@@ -3867,10 +3789,7 @@ def test_a_bad_account_key_never_blocks_a_warm(monkeypatch):
 def test_assign_refreshes_a_stale_shared_cache_size():
     """A spec already pinned to the shared cache must still be re-sized to the MANAGED size.
 
-    Regression: _assign_weight_cache_volume returned early whenever the pin was already correct, so
-    a stale or internally round-tripped spec carrying the pre-bump 100 kept it. The 250 GB gate then
-    admitted the 27B/35B onto a 100 GB mount and the download failed with the same disk-quota error
-    the bump exists to prevent.
+    A correct volume name can still carry the stale 100 GB size and admit models that need 250 GB.
     """
     from flash import runner
     from flash.catalog import MODELS
@@ -3919,10 +3838,7 @@ def test_assign_leaves_a_custom_volume_size_alone():
 def test_an_unknown_job_status_cannot_restart_the_starvation_grace(monkeypatch):
     """Only a status that PROVES the job left the queue may reset the no-capacity timer.
 
-    Regression: the check was `status != _QUEUED`, which also matched None and any unrecognized
-    string. One flaky or empty job_status response therefore restarted the grace window, and a DC
-    that never allocates a worker would sit silently cold for the full 5400s instead of failing
-    fast -- the exact failure this poller exists to catch.
+    None or unknown status must not restart grace and hide a permanently starved datacenter.
     """
     from flash.providers import weight_cache_preload as preload
 
@@ -3945,9 +3861,7 @@ def test_an_unknown_job_status_cannot_restart_the_starvation_grace(monkeypatch):
 def test_a_running_job_still_clears_the_starvation_grace(monkeypatch):
     """The reset must still happen for a status that DOES prove allocation.
 
-    A job that reached IN_PROGRESS was given a worker, so a later re-queue must serve a FRESH grace
-    window: carrying the old anchor forward would charge the whole running interval to starvation
-    and delete an endpoint that never actually waited on capacity.
+    After IN_PROGRESS, a later requeue needs a fresh grace window rather than inherited starvation.
     """
     from flash.providers import weight_cache_preload as preload
 
@@ -3976,14 +3890,8 @@ def test_a_running_job_still_clears_the_starvation_grace(monkeypatch):
 def test_a_status_blackout_is_not_charged_to_the_starvation_grace(monkeypatch):
     """Time the poller could not observe must not age an armed timer.
 
-    An unreadable job_status matches neither the left-queue branch nor the queued one, so the anchor
-    used to keep aging on wall time while nothing was being confirmed. If the job ran and was
-    re-queued inside that blackout -- which is exactly the transition the blackout hides -- the next
-    queued reading fired instantly and tore down an endpoint whose current starvation run had only
-    just begun.
-
-    The job here is queued for 60s, dark for 300s, then queued again, against a 100s grace. Only the
-    confirmed 60s+ may be charged, so the run must survive the first reading after the blackout.
+    A job may run and requeue during a status blackout. Hold confirmed queued duration, but do not
+    charge blind time or fail on the first later reading.
     """
     from flash.providers import weight_cache_preload as preload
 
@@ -4014,9 +3922,8 @@ def test_a_status_blackout_is_not_charged_to_the_starvation_grace(monkeypatch):
 def test_a_blackout_only_pauses_the_grace_and_never_restarts_it(monkeypatch):
     """The pause must not become a reset: a genuinely starved DC still has to fail.
 
-    Holding the confirmed duration is the fix; discarding it would be the older bug in a new place,
-    letting one flaky response per grace window keep a dead datacenter alive for the full timeout.
-    Confirmed queued time accumulates across blackouts here and must still expire the timer.
+    Preserve confirmed queued duration across blackouts so intermittent errors cannot defer failure
+    for the full timeout.
     """
     from flash.providers import weight_cache_preload as preload
 
@@ -4048,14 +3955,8 @@ def test_a_blackout_only_pauses_the_grace_and_never_restarts_it(monkeypatch):
 def test_a_health_blackout_cannot_restart_the_starvation_grace(monkeypatch):
     """An unreadable health API must pause the timers, not clear them.
 
-    _worker_counts returns None when health could not be read, and all three predicates read None as
-    inactive -- so running them on a blind reading CLEARED every anchor. One failed health call per
-    grace window then restarted every window, and a datacenter that never allocated a worker held a
-    paid endpoint for the full 5400s timeout before reporting a bare TimeoutError.
-
-    Health here alternates unreadable/confirmed-zero-workers, and only the confirmed polls advance
-    the clock. A reset-on-unknown rule never lets the anchor survive two confirmed polls in a row,
-    so it can never reach the 100s grace; pausing accumulates the confirmed time and must fire.
+    `_worker_counts` returns None when blind; clearing anchors lets intermittent failures prevent
+    starvation, unhealthy, and throttled timers from ever firing.
     """
     from flash.providers import weight_cache_preload as preload
 
@@ -4093,15 +3994,8 @@ def test_a_health_blackout_cannot_restart_the_starvation_grace(monkeypatch):
 def test_a_health_blackout_is_not_charged_to_the_grace_either(monkeypatch):
     """The pause must stay a pause: blind time may not age an armed timer.
 
-    The mirror of the test above, and it guards the OPPOSITE failure. Pausing is the fix for the
-    reset bug, but charging the blind gap would be an over-correction -- the reading that would have
-    cleared the anchor (a worker finally appearing) is exactly what a health blackout hides, so the
-    first confirmed reading after a long dark stretch would tear down an endpoint whose download may
-    be progressing fine.
-
-    Zero workers are confirmed for 60s, health goes dark for 300s, then a confirmed reading returns
-    -- against a 100s grace. Only the confirmed 60s+10s may be charged, so the poll must survive to
-    completion. A rule that charged the dark 300s would raise NoCapacityError here instead.
+    A worker may appear during a health blackout. Charge only confirmed state time or the next
+    reading can tear down a healthy download.
     """
     from flash.providers import weight_cache_preload as preload
 
@@ -4138,9 +4032,8 @@ def test_a_health_blackout_is_not_charged_to_the_grace_either(monkeypatch):
 def test_a_throttled_worker_is_not_a_broken_image(monkeypatch):
     """unhealthy + throttled is capacity contention, NOT a failed image pull.
 
-    A throttled box may still become runnable, and poll_job gives throttling its own longer grace.
-    Classifying the endpoint as exclusively unhealthy would tear it down at the shorter grace and
-    blame a broken image for what is really a busy datacenter.
+    Throttling uses a longer grace; the shorter unhealthy timer would misclassify and tear down a
+    potentially runnable box.
     """
     from flash.providers import weight_cache_preload as preload
 
@@ -4152,9 +4045,8 @@ def test_a_throttled_worker_is_not_a_broken_image(monkeypatch):
 def test_an_ordinary_deploy_grows_the_stale_volume_before_attaching(monkeypatch):
     """Regression: growth used to live only in the preload utility.
 
-    An ordinary training job attaching a pre-bump volume only changed the REQUESTED size, and the
-    SDK returns an existing volume untouched, so the run mounted the old size and a newly admitted
-    model died on "Disk quota exceeded" unless an operator had separately run the preload first.
+    Ordinary training must grow existing volumes before attach or newly admitted models mount the
+    stale size and fail with "Disk quota exceeded".
     """
     from flash import runner
     from flash.providers.runpod import jobs
@@ -4213,9 +4105,7 @@ def test_a_failed_grow_never_blocks_an_ordinary_deploy(monkeypatch):
 def test_deploy_side_grow_takes_a_bounded_budget_not_the_run_deadline(monkeypatch):
     """A bad account must not eat the launch allowance the deploy still needs.
 
-    Passing the run deadline into a retrying listing let an unreachable account burn request
-    timeouts plus backoff against the same clock, leaving under the 60s minimum create allowance so
-    deploy_train_endpoint rejected a launch the healthy owning account could have served.
+    Bound its retrying listing separately so a healthy account retains the 60-second create minimum.
     """
     from flash import runner
     from flash.providers.runpod import jobs
@@ -4256,9 +4146,8 @@ def test_the_warm_names_the_volume_the_deploy_must_reconcile(monkeypatch):
 def test_a_short_timeout_still_reconciles(monkeypatch):
     """Regression: the grow budget is headroom ON TOP of timeout_s, not a slice carved out of it.
 
-    effective timeouts floor at 60s on their own, and the grow yields the 60s create allowance, so
-    a deadline of exactly now+timeout_s left zero budget and skipped reconciliation entirely --
-    reintroducing the under-sized mount.
+    Growth yields the 60-second create allowance, so callers must add headroom or reconciliation
+    receives no budget.
     """
     from flash.providers import weight_cache_preload as preload
     from flash.providers._deadline import CREATE_ALLOWANCE_S
@@ -4290,9 +4179,7 @@ def test_a_short_timeout_still_reconciles(monkeypatch):
 def test_deploy_side_grow_yields_the_create_allowance_it_sits_in_front_of(monkeypatch):
     """Regression: growing must never be the reason a launchable deploy is rejected.
 
-    _deploy_once re-checks require_create_allowance AFTER the grow, so a fixed budget spent out of a
-    deadline that only just clears the 60s minimum drops it under -- turning best-effort
-    reconciliation into a hard deploy failure. The grow must yield the allowance back.
+    Growth must yield the create allowance before `_deploy_once` rechecks it.
     """
     from flash import runner
     from flash.providers._deadline import CREATE_ALLOWANCE_S
@@ -4333,11 +4220,8 @@ def test_deploy_side_grow_is_wired_to_the_run_deadline(monkeypatch):
 def test_the_account_a_failover_lands_on_still_has_grow_budget(monkeypatch):
     """Regression: headroom for ONE grow is spent by the first attempt, starving every later one.
 
-    The grow clamps to `remaining - CREATE_ALLOWANCE_S`. With a single budget of headroom, attempt
-    one's grow consumed it, leaving remaining == the allowance exactly: enough for
-    require_create_allowance to pass, so the deploy proceeded, but a zero grow budget -- so the
-    failover account attached its own stale volume and died on "Disk quota exceeded". That account
-    is the only one whose volume can still be under-sized by then, so starving it defeats the fix.
+    Reserve a grow slice for each unreconciled failover account or it can attach a stale volume with
+    only create allowance remaining.
     """
     import runpod_flash
 
@@ -4396,10 +4280,8 @@ def test_the_account_a_failover_lands_on_still_has_grow_budget(monkeypatch):
 def test_a_slow_failed_create_cannot_spend_the_failover_grow_budget(monkeypatch):
     """Regression: a create that runs long drains the headroom the NEXT account's grow needs.
 
-    Headroom sizing cannot fix this on its own -- a failed create is bounded only by the deadline
-    itself, so there is no amount a caller could have added. The deployer therefore holds each
-    unreconciled account's grow slice back from creates, sweeps and quota back-offs, so an attempt
-    that reaches the create has already been able to reconcile.
+    Hold unreconciled accounts' slices back from creates, sweeps, and backoffs; failed creates have
+    no smaller bound to size headroom against.
     """
     import runpod_flash
 
@@ -4466,11 +4348,8 @@ def test_a_slow_failed_create_cannot_spend_the_failover_grow_budget(monkeypatch)
 def test_a_volume_free_run_reserves_no_grow_time(monkeypatch):
     """Regression: a run that attaches no managed cache must not pay the reconciliation reserve.
 
-    An open-model run, an oversized catalog model, or a spec carrying a custom volume reconciles
-    nothing -- `grow_weight_cache_volumes` early-returns for all three. Reserving for them shortened
-    the deadline for a create that was never going to grow anything, so with two accounts and 90s
-    left the create failed its allowance check against an effective 50s without ever reaching the
-    provider.
+    Open, oversized, or custom-volume runs grow nothing; reserving for them can reject an otherwise
+    launchable create.
     """
     import runpod_flash
 
@@ -4518,9 +4397,7 @@ def test_a_volume_free_run_reserves_no_grow_time(monkeypatch):
 def test_a_quota_retry_does_not_re_grow_the_same_account(monkeypatch):
     """The headroom is scoped to the account pool, so each account may reconcile at most once.
 
-    A quota retry re-selects the account it just reconciled. Paying for that again would spend the
-    budget the account a later failover lands on still needs, reintroducing the starvation this
-    headroom exists to prevent.
+    Quota retries on the same account must not spend the slice reserved for a later failover.
     """
     import runpod_flash
 
@@ -4565,13 +4442,8 @@ def test_a_quota_retry_does_not_re_grow_the_same_account(monkeypatch):
 def test_the_grow_reserve_does_not_reject_a_launchable_deploy(monkeypatch):
     """Regression: the reserve is a spending cap, not an admission test.
 
-    ``submit_run`` hands the deployer the run wall deadline as-is -- it is a submission-to-terminal
-    budget, so unlike the preload it has no headroom to add on top and nothing to add it out of.
-    Charging the whole pool's reserve before the first create then made an attempt that could launch
-    look like one that could not: with 2 accounts and 90s left the allowance check ran against an
-    effective 50s and the deploy was rejected outright, to protect the reconciliation of failovers
-    that were never going to run. The training path attaches the managed cache on every ordinary
-    run, so this is the common case, not an edge one.
+    `submit_run` cannot add headroom to its wall deadline. Admission charges only this attempt's
+    grow; the full pool reserve still limits later spending.
     """
     import runpod_flash
 
@@ -4617,10 +4489,7 @@ def test_the_grow_reserve_does_not_reject_a_launchable_deploy(monkeypatch):
 def test_the_grow_reserve_still_caps_what_a_create_may_spend(monkeypatch):
     """The other direction: admission is judged on the real deadline, spending is not.
 
-    Relaxing the allowance check must not also hand the create the reserved slice to burn. The
-    create still runs under `_create_deadline()`, so the account a failover lands on keeps the
-    budget it needs to reconcile -- without that, this fix would reintroduce the stale under-sized
-    mount that the reserve exists to prevent.
+    Creates still use `_create_deadline()` so they cannot consume a failover account's grow slice.
     """
     import runpod_flash
 
@@ -4672,11 +4541,7 @@ def test_the_grow_reserve_still_caps_what_a_create_may_spend(monkeypatch):
 def test_the_post_grow_recheck_does_not_recharge_a_paid_slice(monkeypatch):
     """Regression: the re-check after the grow still deducted the slice the grow just spent.
 
-    The attempt funds exactly one grow -- its own -- and by the pre-create re-check that grow has
-    already run and burned real time. Releasing the slice only once EVERY account had reconciled
-    kept charging this attempt for a grow it would never run again: on a multi-key pool, a deploy
-    whose remaining time sat between the create allowance and allowance-plus-one-slice was rejected
-    on the deadline after its reconciliation had already succeeded.
+    Once this attempt's account reconciles, release its slice before the pre-create allowance check.
     """
     import runpod_flash
 
@@ -4734,12 +4599,8 @@ def test_the_post_grow_recheck_does_not_recharge_a_paid_slice(monkeypatch):
 def test_admission_is_rejudged_with_the_key_the_attempt_lands_on(monkeypatch):
     """A concurrent deploy's advance_key() between admission and selection must not leak a slice.
 
-    The pre-lock admission check reads the process-global active key. When that key has already
-    reconciled, its slice is released -- but another thread's advance_key() can move selection to
-    an account this call has NOT reconciled before ensure_auth() runs under the lock. Without a
-    re-check against the real key, the attempt proceeds holding only the create allowance, the
-    grow clamps to zero, and the unreconciled account attaches its possibly-stale volume: the
-    exact failure the reserve exists to prevent. The re-check must fail closed instead.
+    Re-check under the lock against the selected account; if it is unreconciled, fail closed rather
+    than attach its stale volume with only create allowance.
     """
     import runpod_flash
 
@@ -4813,10 +4674,7 @@ def test_admission_is_rejudged_with_the_key_the_attempt_lands_on(monkeypatch):
 def test_a_large_key_pool_does_not_zero_the_create_timeout(monkeypatch):
     """Regression: the reserve must yield the create allowance, like the grow it is reserved for.
 
-    Admission passing is not enough on its own. A pool large enough for the reserve to exceed what
-    is left hands `asyncio.wait_for` a zero (or negative) timeout, so the create fails without ever
-    reaching the provider -- rejecting the same launchable deploy one step later than the admission
-    check did. The floor is the allowance the deploy already proved it holds.
+    A reserve larger than remaining time must still leave the allowance already proven at admission.
     """
     import runpod_flash
 
@@ -4918,9 +4776,8 @@ def test_one_bad_volume_never_blocks_the_others(monkeypatch):
 def test_a_mixed_unhealthy_and_throttled_endpoint_still_gives_up(monkeypatch):
     """The gap between the two existing timers: neither fires, so nothing ever did.
 
-    _has_worker counts the unhealthy box as capacity (resets starvation) and _only_unhealthy_workers
-    is blocked by the throttled box (resets broken-image), so a persistently mixed endpoint burned
-    the full 5400s timeout on a paid endpoint before reporting a bare TimeoutError.
+    Mixed unhealthy and throttled workers reset both exclusive predicates and otherwise burn the
+    full 5400-second paid timeout.
     """
     from flash.providers import weight_cache_preload as preload
 
@@ -4958,11 +4815,8 @@ def test_a_usable_worker_keeps_the_throttled_timer_clear():
 def test_failover_reconciles_the_account_it_lands_on(monkeypatch):
     """The account a quota failover moves to must have its OWN volume grown before the attach.
 
-    A sweep in front of the deploy could not do this: it ran once, against whichever accounts it
-    reached, before anyone knew which account the create would succeed on. The one the failover
-    lands on could be exactly the one left holding a stale, under-sized volume. Driven through
-    deploy_train_endpoint on purpose -- the warm passes spec=None, so a dropped cache_volumes
-    passthrough silently turns the whole reconciliation back into a no-op.
+    Reconcile inside each attempt because a pre-sweep cannot know which account will succeed.
+    Drive through `deploy_train_endpoint` so dropped `cache_volumes` passthrough fails the test.
     """
     from flash.providers.runpod import auth as rp_auth
     from flash.providers.runpod import jobs
@@ -5009,10 +4863,8 @@ def test_failover_reconciles_the_account_it_lands_on(monkeypatch):
 def test_datacenter_discovery_failure_never_fails_the_deploy(monkeypatch):
     """Regression: discovery sat OUTSIDE the best-effort boundary and could abort the deploy.
 
-    The helper promises it cannot fail a deploy -- a volume it cannot grow is simply attached as-is.
-    An SDK whose DataCenter.all() raises (say an incompatible runpod-flash update) broke that
-    promise from inside the one function that makes it, while the sibling
-    weight_cache_endpoint_kwargs deliberately catches the same failure and deploys cold.
+    Datacenter discovery failures must be swallowed like growth failures; the helper promises it
+    cannot fail a deploy.
     """
     from flash import runner
     from flash.providers.runpod import jobs

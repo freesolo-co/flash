@@ -367,11 +367,9 @@ def test_env_test_fails_when_a_scorer_reports_an_error(monkeypatch, tmp_path, ca
 def test_env_test_fails_when_a_held_out_case_breaks_prompt_construction(
     monkeypatch, tmp_path, capsys
 ):
-    """The offline gate builds each case's prompt, because `flash env eval` will.
+    """Build each held-out prompt exactly as ``flash env eval`` will.
 
-    prompt_messages() runs against the held-out case, not the dataset row, so an env that raises
-    for a case's input printed `overall: PASS` here while `flash env eval` recorded a
-    prompt-construction error for every case of the same suite.
+    Validating only dataset rows can pass while every held-out case fails prompt construction.
     """
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
@@ -497,12 +495,10 @@ def test_env_test_does_not_blame_the_grader_for_a_reference_it_cannot_replay(
 def test_env_test_control_answer_differs_from_a_gold_answer_that_is_the_control_text(
     monkeypatch, tmp_path, capsys
 ):
-    """The negative control is only evidence while it is actually wrong.
+    """Ensure the negative control differs from the gold answer.
 
-    The control was the fixed string `test`, so a reference answer of `test` collided with it and
-    the probe graded the CORRECT answer -- reading back the gold reward and concluding the grader
-    pays junk as much as gold. A centered scorer awarding 0 to the reference and less to anything
-    else separates perfectly, and this failed it.
+    A fixed ``test`` control can equal the reference and falsely make a separating centered scorer
+    look flat.
     """
     env_dir = _environment_dir(tmp_path)
     env = _SingleTurnEnv(rows=[{"input": "echo the word", "output": "test"}])
@@ -527,11 +523,9 @@ def test_env_test_control_answer_differs_from_a_gold_answer_that_is_the_control_
 def test_env_test_does_not_blame_the_grader_for_a_replay_shorter_than_the_episode(
     monkeypatch, tmp_path, capsys
 ):
-    """A gold answer that runs out mid-rollout never got the reference trajectory graded.
+    """Do not treat a partial multi-turn replay as a graded reference trajectory.
 
-    The driver pads the remaining turns with the junk control so the rollout still terminates, but
-    the scored trajectory is then part reference and part junk. Counting it as a gold replay let
-    the blocking gate fail on a trajectory it never fully exercised.
+    Padding later turns with the junk control makes the episode part reference and part control.
     """
     env_dir = _environment_dir(tmp_path)
     env = _MultiTurnEnv()
@@ -582,11 +576,9 @@ def test_env_test_still_blames_the_grader_for_a_replay_that_covers_the_episode(
 def test_env_test_does_not_apply_the_reward_gate_to_an_sft_environment(
     monkeypatch, tmp_path, capsys
 ):
-    """SFT trains on a supervised loss and never calls the environment reward.
+    """Skip the reward gate for SFT and OPD.
 
-    A no-op scorer is legitimate for it, so blocking on one failed the recommended pre-push check
-    for an environment that trains perfectly well. Same for OPD, which trains on a teacher
-    token loss.
+    SFT uses supervised loss and OPD uses teacher-token loss, so a no-op scorer is valid.
     """
     env_dir = _environment_dir(tmp_path)
     env = _SingleTurnEnv(rows=[{"input": "what is 2 + 2?", "output": "4"}], reward=0.0)
@@ -619,12 +611,10 @@ def test_env_test_keeps_the_reward_gate_when_no_algorithm_is_given(monkeypatch, 
 def test_env_test_reads_per_turn_rewards_before_calling_the_grader_flat(
     monkeypatch, tmp_path, capsys
 ):
-    """A per-turn env trains on a vector the episode scalar cannot express.
+    """Read per-turn rewards before judging a grader by its episode scalar.
 
-    `credit_assignment = "per_turn"` learns from `per_turn_rewards`, which reaches the trainer
-    through `rollout_rewards_many` and never through `env.reward` (flash/envs/adapter.py). Reading
-    only the flat scalar reported an environment whose turns separate as unable to recognize its
-    references.
+    ``credit_assignment = "per_turn"`` trains through ``rollout_rewards_many`` in
+    flash/envs/adapter.py, so a flat ``env.reward`` can still hide separating turn rewards.
     """
     env_dir = _environment_dir(tmp_path)
     env = _MultiTurnEnv()
@@ -711,11 +701,9 @@ def test_env_test_negative_reward_scale_is_not_a_zero_reward_grader(monkeypatch,
 def test_env_test_centered_reward_scale_passes_on_what_the_grader_pays_junk(
     monkeypatch, tmp_path, capsys
 ):
-    """A grader paying 0 for correct and negative for wrong separates them, so it must pass.
+    """Accept a centered grader that pays zero for correct and less for wrong.
 
-    The scale above is cleared by its sign; this one is not. Zero is exactly the value the gate
-    reads as "recognized nothing", so the only thing that distinguishes a centered scale from a
-    broken grader is what the reward pays a wrong answer -- and the gate has to go and ask.
+    Gold zero alone is ambiguous, so the gate must score a deliberately wrong answer.
     """
     env_dir = _environment_dir(tmp_path)
     env = _SingleTurnEnv(
@@ -1323,16 +1311,8 @@ def test_env_test_bare_unquoted_param_still_falls_back_to_a_string(monkeypatch, 
 def test_env_test_malformed_param_without_a_delimiter_is_rejected(
     monkeypatch, tmp_path, capsys, value
 ):
-    # carrying no structural character does not make a token prose. these hold none, so they
-    # forwarded as literal strings ("2026-13-01", "1e", ...) while the equivalent
-    # [environment.params] entry fails to load -- the gate approving a config that cannot be
-    # written. the tell is a leading digit or sign: every TOML scalar except the bare
-    # true/false/inf/nan words starts with one, so a token that starts that way and does not parse
-    # is a malformed number or date rather than text.
-    #
-    # a leading `.` is the same tell: TOML requires a digit before the point, so `.5` is exactly as
-    # malformed as the `+.5` the signs already caught -- accepting one and rejecting the other left
-    # the same number admitted or refused on whether it carried a sign.
+    # a token beginning with a digit, sign, or dot is scalar-shaped, not prose. if TOML cannot parse
+    # it, reject it rather than forward a string that no equivalent config can express.
     env_dir = _environment_dir(tmp_path)
     seen = _patch_loader(monkeypatch, _SingleTurnEnv())
 
@@ -1353,12 +1333,8 @@ def test_env_test_malformed_param_without_a_delimiter_is_rejected(
 def test_env_test_a_python_spelled_boolean_is_rejected_rather_than_sent_as_text(
     monkeypatch, tmp_path, capsys, value
 ):
-    # the booleans are the TOML scalars that do not start with a digit or sign, so the
-    # leading-character test cannot see them. TOML spells them lowercase only, which makes a
-    # python-style `strict=False` parse-fail and fall through as the STRING "False" -- and a
-    # non-empty string is truthy, so an env branching on `if strict` reads it as ENABLED while the
-    # config spelling `false` disables it. the gate would pass on the opposite of what the run
-    # trains with.
+    # TOML booleans are lowercase. rejecting Python-style case prevents ``False`` from becoming a
+    # truthy string and reversing the run's behavior.
     env_dir = _environment_dir(tmp_path)
     seen = _patch_loader(monkeypatch, _SingleTurnEnv())
 

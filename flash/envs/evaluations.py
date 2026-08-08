@@ -1,9 +1,7 @@
-"""Flash-native held-out evaluation suites for Freesolo environment packages.
+"""load flash-native held-out suites from an environment package.
 
-An environment package may define ``evaluations.py`` beside ``environment.py``.
-The sidecar exports ``load_evaluations(...)`` or a module-level ``EVALUATIONS``
-list/tuple of suites. Flash resolves the whole environment package first, so the
-same contract works for local paths, managed hub slugs, and GitHub references.
+packages expose ``load_evaluations(...)`` or ``EVALUATIONS`` beside ``environment.py``. resolving the
+whole package keeps the contract identical for local paths, hub slugs, and github references.
 """
 
 from __future__ import annotations
@@ -254,12 +252,9 @@ def _import_evaluations_module(module_path: Path) -> ModuleType:
     if spec is None or spec.loader is None:
         raise ImportError(f"could not import evaluation module from {module_path}")
     module = importlib.util.module_from_spec(spec)
-    # a sibling a sidecar imports is cached under its plain name, so a second package importing its
-    # own `helper` found the FIRST package's module already in sys.modules and reused it -- silently
-    # running the wrong cases and the wrong scoring logic, with no import error to see. the scope
-    # drops the siblings this load introduced, so the next package imports its own; anything
-    # imported before is left alone, since it is not ours to evict. the same scope is re-entered
-    # around cases() and score(), which is where lazy sibling imports land.
+    # bare sibling imports are global in sys.modules, so another package can silently reuse the first
+    # package's helper. remove only modules introduced from this package, including lazy imports made
+    # during cases() and score(); preserve modules that predated the scope.
     previous_module = sys.modules.get(module_name)
     sys.modules[module_name] = module
     try:
@@ -282,17 +277,11 @@ _PARKED_SIDECAR_MODULES: dict[str, dict[str, ModuleType]] = {}
 
 
 def _forget_sidecar_siblings(module_dir: str, before: set[str]) -> dict[str, ModuleType]:
-    """Take this sidecar's own modules out of sys.modules, and return them.
+    """remove and return modules introduced from this package directory.
 
-    Only modules that (a) were absent before the load and (b) resolve to a file anywhere under
-    this package directory. A stdlib or third-party module the sidecar imported first stays
-    cached: evicting it would re-execute unrelated code for every later load.
-
-    Anywhere under, not directly in: `from graders.rules import score` caches both `graders` and
-    `graders.rules`, and the latter's parent is the package dir's CHILD. Matching only immediate
-    children left it in sys.modules, so the next environment's `graders.rules` resolved to the
-    first one's -- scoring every later suite with another environment's grader, silently
-    ."""
+    include nested descendants such as ``graders.rules``; matching only immediate children leaves
+    stale scoring modules cached. preserve stdlib/third-party modules that existed before the load.
+    """
     directory = Path(module_dir).resolve()
     taken: dict[str, ModuleType] = {}
     for name in set(sys.modules) - before:
@@ -322,18 +311,12 @@ def _is_under(path: str, directory: Path) -> bool:
 
 
 def _sidecar_module_names(directory: Path) -> set[str]:
-    """Top-level import names this package directory can supply.
+    """return top-level import names this package directory can supply.
 
-    A subdirectory counts whether or not it has `__init__.py`: since PEP 420 any directory on the
-    path is a namespace package, so `graders/rules.py` with no `__init__.py` is importable as
-    `graders.rules`. Requiring the marker file left such a directory out of the owned set, so
-    another environment's cached `graders.rules` was never displaced and the suite silently graded
-    with its scoring code. Verified by probe: the second import returned the first
-    package's value.
-
-    `isidentifier` is the real condition -- a directory named `my-env` or `.git` cannot be spelled
-    in an import statement, so claiming it would evict cached modules this directory can never
-    supply. `__pycache__` is a valid identifier but is build output, never a sidecar's helper."""
+    include identifier-named namespace-package directories even without ``__init__.py`` (pep 420),
+    otherwise nested helpers can remain cached across environments. exclude non-identifiers and
+    ``__pycache__`` because this directory cannot intentionally import them as helpers.
+    """
     names: set[str] = set()
     try:
         entries = list(directory.iterdir())
@@ -350,22 +333,12 @@ def _sidecar_module_names(directory: Path) -> set[str]:
 
 
 def _shadowed_cached_modules(directory: Path) -> dict[str, ModuleType]:
-    """Cached modules whose plain name this directory owns while its sidecar runs.
+    """temporarily displace cached modules whose names this directory owns.
 
-    sys.modules is consulted BEFORE sys.path, so prepending the package directory does nothing
-    when the name is already cached: a process holding an unrelated top-level `helper` handed it
-    to a sidecar importing its own sibling `helper`, and the suite silently graded with another
-    module's cases and scoring constants. `_forget_sidecar_siblings` cannot correct it either --
-    it only examines names absent before the scope, and this one was present.
-
-    Submodules are displaced with their package. Evicting `graders` alone leaves
-    `sys.modules["graders.rules"]` cached, and `from graders.rules import score` resolves the
-    submodule entry directly -- so the current environment scored with the other package's rules
-    while its own file sat unread. Verified by probe: the second import returned the
-    first package's value.
-
-    Only names this directory can actually supply are displaced, and only ones resolving
-    elsewhere: a module already loaded FROM this directory is the right one to keep."""
+    sys.modules precedes sys.path, so cached ``helper`` or ``graders.rules`` from another environment
+    would silently win. displace the package and its submodules only when they resolve elsewhere;
+    modules already loaded from this directory are correct.
+    """
     shadowed: dict[str, ModuleType] = {}
     for name in _sidecar_module_names(directory):
         prefix = name + "."
@@ -382,22 +355,12 @@ def _shadowed_cached_modules(directory: Path) -> dict[str, ModuleType]:
 
 @contextmanager
 def _sidecar_scope(module_dir: str) -> Iterator[None]:
-    """Make `module_dir` the first place a bare import resolves, then undo it.
+    """scope bare imports to ``module_dir`` and restore them afterward.
 
-    A sidecar may import its local helpers lazily inside cases() or score(), which run long
-    after the module finished executing. Those imports resolve against whatever sys.path and
-    sys.modules look like at call time, so without this scope the FIRST package's `helper`
-    stayed cached under its plain name and every later package silently reused it -- grading
-    with another environment's cases and another environment's scoring logic, with no import
-    error to reveal it. Wrong results that read as legitimate are the one failure this module
-    exists to prevent, so the binding has to cover the calls, not just the load.
-
-    Modules imported from this directory are PARKED on exit rather than discarded: the plain
-    name belongs to whichever package is currently in scope, so leaving it cached would hand it
-    to the next one -- but throwing it away re-executed the helper on every callback, resetting a
-    counter, reloading a judge model, and reopening a connection between one case and the next
-    Parking keeps both: the name is free while another sidecar runs, and this
-    sidecar sees the same module objects it had last time."""
+    cover lazy imports inside cases() and score(), not only module loading. park this sidecar's modules
+    on exit so another package cannot reuse them, then restore the same objects on re-entry to avoid
+    reinitializing counters, models, or connections.
+    """
     resolved = Path(module_dir).resolve()
     directory = str(resolved)
     before = set(sys.modules)
@@ -476,14 +439,9 @@ def _call_factory(factory, kwargs: dict[str, object]) -> object:
     # failed to load at all. fall through to the positional handling below when both are present.
     if accepts_var_kwargs and not has_positional_only:
         return factory(**kwargs)
-    # a positional-only parameter is in signature.parameters but cannot be passed by name, so
-    # matching on membership alone would raise TypeError for `load_evaluations(environment, /)`.
-    # such a factory declared the argument, so pass it positionally rather than dropping it and
-    # handing the suite environment=None -- which downgrades a real scorer to substring matching.
-    #
-    # a positional-only parameter we have no value for still has to be filled, otherwise every
-    # parameter after it shifts left. use its default; a required one cannot be satisfied at all,
-    # so stop and let the factory raise its own TypeError rather than passing a wrong argument.
+    # positional-only ``environment`` must be passed positionally, not omitted. fill earlier
+    # positional-only parameters from defaults so arguments do not shift; if a required value is
+    # unavailable, let the factory raise its own TypeError.
     positional: list[object] = []
     from_kwargs: list[bool] = []
     for name, parameter in signature.parameters.items():

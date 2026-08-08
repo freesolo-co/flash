@@ -163,19 +163,11 @@ def _spec_with_resolved_env_sha(spec: JobSpec, sha: str) -> JobSpec:
 
 
 def _pin_environment_for_run(spec: JobSpec, log, *, attempt_started: bool) -> JobSpec:
-    """Resolve the environment ref to a SHA once, before any attempt runs, and keep that pin.
+    """Resolve the environment ref once before attempts begin, then keep that pin.
 
-    Submit already tries this, but best-effort: a GitHub outage or rate limit there returns the spec
-    unpinned, and the failure is only visible in a server-side log the user never sees. Retrying then
-    re-resolves the ref, and for a managed slug that ref is ``environment-hub@main`` -- so a push
-    landing between attempt 1 and attempt 2 trains the retry on different environment code, with no
-    error and nothing in the run record distinguishing it.
-
-    ``attempt_started`` is the fail-closed half. Once an attempt has run unpinned it already resolved
-    the symbolic ref on its worker, and that commit is unknowable here. Resolving now would pin a ref
-    that may have advanced since, which reintroduces the same split -- and a retry resumes from the
-    unpinned attempt's checkpoint, so the run would carry both commits. Leave it symbolic instead:
-    unpinned-throughout is one consistent story, and the warning below is what tells the user.
+    A moving ``environment-hub@main`` ref could otherwise change code between retries. After an
+    unpinned attempt starts, its commit is unknowable, so ``attempt_started`` leaves later attempts
+    unpinned rather than mixing commits with a resumed checkpoint.
     """
     if spec.environment.resolved_sha:
         return spec
@@ -562,14 +554,10 @@ def _projected_retry_class(
 
 
 def _candidate_usable_vram_gb(candidate) -> float:
-    """Run-usable VRAM for a candidate, under the same fit model the allocator selected it with.
+    """Run-usable VRAM under the allocator's fit model.
 
-    `combined_vram_gb` is documented as THE single fit model, and every sizing path calls it. The raw
-    `gpu_count * vram_gb` product is NOT interchangeable with it for a sharded shape: it ignores the
-    replicated-per-card floor and the shard efficiency, so it overstates a multi-card box. Comparing
-    the two measures is what let an OOM retry move SIDEWAYS or DOWNWARDS -- 2x80 raw-counts as 160 GB
-    against a 141 GB single card that just OOM'd, but the allocator models that pair as 130.4 GB
-    usable, i.e. smaller than the shape that already failed.
+    Use ``combined_vram_gb`` on both sides of OOM escalation. Raw card-count multiplication ignores
+    replicated floors and shard efficiency, so it can move a retry to a smaller effective shape.
     """
     from flash.providers.base import combined_vram_gb
 

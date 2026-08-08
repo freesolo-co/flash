@@ -1,11 +1,10 @@
 """Coverage for control-plane env publishing helpers (`flash.server.envs`) and the serving
-route helpers (`flash.server.routes.serving`).
 
-These target error / edge branches the existing suite leaves uncovered: git-subprocess
-failure translation, archive-extraction guards, publish/slug input validation, and the pure
-deployment-lifecycle helpers behind the deploy/chat routes. Everything stays hermetic — no
-real git/network/GPU — matching the direct-call + monkeypatch style of tests/test_env_publish.py
-and the offline conftest.
+These target error / edge branches the existing suite leaves uncovered: git-subprocess failure
+translation, archive-extraction guards, publish/slug input validation, and the pure
+deployment-lifecycle helpers behind the deploy/chat routes. Everything stays hermetic -- no real
+git/network/GPU -- matching the direct-call + monkeypatch style of tests/test_env_publish.py and the
+offline conftest.
 """
 
 from __future__ import annotations
@@ -434,14 +433,13 @@ def test_recover_deployments_rechecks_busy_state_under_lock(monkeypatch):
 
 
 def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(monkeypatch):
-    # a run accepted under an algorithm this build has since dropped keeps a `ready` deployment
-    # record. every serving route parses the persisted spec before inference, so chat raises there
-    # instead of answering -- while `/v1/deployments` still lists the record as active, and only
-    # BUSY states were recovered at startup. the record therefore survived every restart as a
-    # deployment that looks live and can never respond.
-    #
-    # both readiness spellings are covered: this pass reads records persisted by OTHER builds, so
-    # the one spelling the current build happens to write is not the set it can encounter.
+    # a run accepted under an algorithm this build has since dropped keeps a `ready`
+    # deployment record. every serving route parses the persisted spec before inference, so
+    # chat raises there instead of answering -- while `/v1/deployments` still lists the record
+    # as active, and only BUSY states were recovered at startup. the record therefore survived
+    # every restart as a deployment that looks live and can never respond. both readiness
+    # spellings are covered: this pass reads records persisted by OTHER builds, so the one
+    # spelling the current build happens to write is not the set it can encounter.
     rows = [{"run_id": "r-retired"}, {"run_id": "r-legacy-spelling"}, {"run_id": "r-servable"}]
     monkeypatch.setattr(serving.db, "all_runs", lambda: rows)
 
@@ -673,7 +671,7 @@ def test_run_deployment_smoke_keeps_non_thinking_paths_at_256(monkeypatch, spec)
 @pytest.mark.parametrize(
     ("spec", "expected"),
     [
-        # opd with an explicit budget, no grammar: previously fell to 256 and could not deploy.
+        # opd without grammar must still use its explicit completion budget.
         (_smoke_spec(algorithm="opd", thinking=True, max_completion_tokens=8192), 8192),
         # grpo thinking with no grammar and no explicit budget -> the thinking recipe default.
         (_smoke_spec(algorithm="grpo", thinking=True), 1536),
@@ -742,11 +740,12 @@ def test_run_deployment_smoke_forwards_configured_stop_sequences(monkeypatch):
 
 def test_run_deployment_smoke_rejects_a_stop_that_fires_while_still_reasoning(monkeypatch):
     """Forwarding stop_sequences opened a hole the truncation guard cannot cover. A run whose
+
     delimiter appears inside its reasoning terminates mid-thought with finish_reason='stop', not
     'length', so the truncation check passes; serving folds the partial reasoning into a balanced
-    <think> block, so the empty-content check passes too. Without a post-</think> answer
-    requirement on every thinking smoke, that checkpoint activates and then answers nothing on
-    real requests."""
+    <think> block, so the empty-content check passes too. Without a post-</think> answer requirement
+    on every thinking smoke, that checkpoint activates and then answers nothing on real requests.
+    """
     monkeypatch.setattr(
         serving._app,
         "serve_chat",
@@ -1026,10 +1025,8 @@ def test_run_deployment_smoke_success_and_empty(monkeypatch):
     assert out["thinking_tag"] is False
     assert out["verify_latency_s"] >= 0.0
 
-    # a thinking adapter that stops mid-reasoning has answered nothing, so it must not activate.
-    # this used to pass because the </think> requirement was gated on structured outputs; a run
-    # using stop_sequences reaches exactly this shape with finish_reason="stop", which slips past
-    # the truncation guard.
+    # a thinking adapter stopped mid-reasoning has no answer. ``finish_reason="stop"`` bypasses the
+    # truncation guard, so the closing-tag requirement must apply without structured outputs.
     monkeypatch.setattr(
         serving._app,
         "serve_chat",
@@ -1061,15 +1058,9 @@ def test_unconstrained_thinking_smoke_rejects_a_reconstructed_empty_answer(monke
 
     `_smoke_provenance` rejects an empty generation, but flash now folds the split-out
     `reasoning_content` back into a balanced block before it gets there
-    (flash/serve/deploy.py::_balanced_thinking_content). Reasoning that exhausts the token budget
-    therefore arrives as a NONEMPTY `<think>...</think>` wrapping an empty answer, which sails past
-    the emptiness check. `_thinking_answer` asserts an answer exists for every thinking smoke;
-    before it did, only the grammar-constrained path checked, so an unconstrained deployment could
-    go live on a smoke that produced no answer at all.
-
-    Both ways of arriving answerless are covered, because they are rejected by different guards: a
-    budget exhaustion carries finish_reason "length" and is caught by the truncation check, while a
-    run whose stop_sequence fires mid-reasoning carries "stop" and reaches `_thinking_answer`.
+    (flash/serve/deploy.py::_balanced_thinking_content). `_thinking_answer` asserts an answer exists
+    for every thinking smoke; before it did, only the grammar-constrained path checked, so an
+    unconstrained deployment could go live on a smoke that produced no answer at all.
     """
     monkeypatch.setattr(
         serving._app,
@@ -1095,12 +1086,8 @@ def test_thinking_smoke_rejects_a_retained_close_tag_as_the_answer(monkeypatch):
 
     A compatibility backend that retains only the sampled `</think>` in `content` gives the fold no
     answer to place behind the block, so `_balanced_thinking_content` emits `<think>why</think>
-    </think>`. Splitting on the first close then left `</think>` as the answer, which is nonempty and
-    sailed through, activating a checkpoint that answered nothing.
-
-    The fold cannot decide this: those bytes are identical to an adapter whose answer genuinely is
-    the tag, and it also backs the public chat route where the text must survive. Rejecting at the
-    deployment gate is the fail-closed direction, and neither shape answers "what is 2+2".
+    </think>`. The fold cannot decide this: those bytes are identical to an adapter whose answer
+    genuinely is the tag, and it also backs the public chat route where the text must survive.
     """
     monkeypatch.setattr(
         serving._app,
@@ -1116,9 +1103,7 @@ def test_thinking_smoke_accepts_a_tagless_answer_only_under_the_open_model_polic
 
     `flash.schema` warns and proceeds when the catalog reports `thinking == "unknown"`, which only
     the open-model policy produces. Such a run may answer with no `<think>` block at all, so the
-    strict requirement would reject a correct answer and strand the trained adapter. Every catalog
-    model keeps the strict path, since for those the missing tag really does mean the reasoning
-    never closed.
+    strict requirement would reject a correct answer and strand the trained adapter.
     """
     monkeypatch.setattr(serving._app, "serve_chat", lambda **_k: _smoke_response("4"))
 
@@ -1147,9 +1132,6 @@ def test_tagless_open_model_smoke_does_not_depend_on_a_vram_fit(monkeypatch):
     DEFAULT gpu, which raises for a model too big for it. That exception read as "tag guaranteed",
     so the model least able to promise a `<think>` block was the one the strict requirement was
     applied to, and a valid tagless smoke failed over the size of a gpu the run need not be using.
-
-    The model below really does exceed the default: it is served on multi-gpu hardware the smoke
-    never consults. A pass here means the decision no longer reaches the estimator at all.
     """
     from flash.catalog import DEFAULT_GPU
     from flash.engine.vram import check_fit

@@ -1,10 +1,7 @@
-"""Deploy / cancel / recover state transitions for a run.
+"""Deploy, cancel, and recover run state transitions.
 
-Store helpers and the lifecycle functions (``_run_training`` / ``_gc_run_endpoints``) are
-pulled in via FUNCTION-LOCAL lazy ``from flash.runner import ...`` imports — never at module
-level — for the same two reasons as ``lifecycle.py``: avoid a partially-initialized-package
-import cycle, and keep the test monkeypatches (e.g. ``flash.runner._gc_run_endpoints``)
-reachable through the package global rather than a statically-bound copy.
+Keep ``flash.runner`` imports function-local to avoid its import cycle and preserve package-level
+monkeypatch seams such as ``flash.runner._gc_run_endpoints``.
 """
 
 from __future__ import annotations
@@ -79,14 +76,10 @@ class DeploymentStatePersistenceError(RuntimeError):
 
 
 def _carry_allocation_stamp(metrics: dict, remote: dict | None) -> None:
-    """Carry the allocation stamp from a persisted remote onto adopted metrics.
+    """Carry the persisted allocation stamp onto adopted metrics.
 
-    `_completed_attempt_metrics` returns the worker's own metrics.json verbatim, and the worker
-    does not know which card, how many of them, or which substrate the allocator picked -- the plane
-    stamps all three at launch. Without this, a multi-card vast/lambda run recovered after a
-    control-plane restart is priced as ONE card on the WRONG provider, because `_persist_metrics`
-    reads each of them from the metrics it is handed.
-    `setdefault`, so a stamp the worker somehow did carry always wins over the persisted copy.
+    Workers do not know the allocator's card, count, or provider. Recovery must restore all three or
+    multi-card Vast/Lambda runs are priced as one RunPod card. ``setdefault`` preserves worker data.
     """
     if not isinstance(metrics, dict) or not isinstance(remote, dict):
         return

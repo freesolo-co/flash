@@ -1,9 +1,6 @@
-"""Vast.ai run lifecycle: container onstart/bootstrap, offer walk, poll state machine (incl. the
-staged setup-vs-training stall grace that fixes the historical ~30-min death), guaranteed destroy,
-and orphan sweep (CPU-only; vast API + HF readers mocked).
+"""Test the Vast container lifecycle, polling, teardown, and orphan sweep.
 
-Vast is opt-in via VAST_API_KEY (the autouse offline fixture deletes it); these tests mock the vast
-API entirely, so no key is needed.
+The Vast API and HF readers are mocked; no API key is needed.
 """
 
 from __future__ import annotations
@@ -947,12 +944,8 @@ def test_poll_dead_host_waits_for_late_terminal_artifact(monkeypatch):
     ],
 )
 def test_poll_malformed_status_read_is_poll_error(monkeypatch, exc):
-    # a transient MALFORMED 200 body from the instance-detail API makes RestClient.request
-    # raise JSONDecodeError/UnicodeDecodeError, or IncompleteRead/http.client.HTTPException on a truncated
-    # body read (NOT a VastApiError — the _http wrapper only catches the OSError-family transients). The
-    # poll loop must treat all of those as a TRANSIENT poll error (count + keep polling, give up only once
-    # the budget is spent), never let it escape and misclassify a recoverable read blip as a terminal/gone
-    # instance.
+    # malformed 200 responses raise decode or HTTP exceptions outside VastApiError. treat them as
+    # transient poll errors so a recoverable status read does not become a terminal host loss.
     from flash.providers import _poll
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast
@@ -973,12 +966,8 @@ def test_poll_malformed_status_read_is_poll_error(monkeypatch, exc):
 
 
 def test_poll_fresh_heartbeat_disarms_load_timeout(monkeypatch):
-    # when Vast's detail API lags in 'loading'/'unknown' and never flips to
-    # 'running', a worker that HAS booted still uploads fresh heartbeats to HF. Those prove it
-    # started, so they disarm the load timeout — else a healthy, heartbeating box is torn down at
-    # LOAD_TIMEOUT_S (15m) on a stale status feed (deadline_s + the finally destroy stay the spend
-    # backstop). Status stays 'loading' the whole run; without the disarm the poller returns
-    # 'stalled' at LOAD_TIMEOUT_S; with it the box survives to see its (late) DONE and completes.
+    # a fresh HF heartbeat proves the worker booted even when Vast status remains loading. it must
+    # disarm LOAD_TIMEOUT_S so a stale provider status cannot tear down a healthy worker.
     clock = {"t": 10_000.0}
     vast = _wire_poll(
         monkeypatch,
@@ -1006,12 +995,8 @@ def test_poll_fresh_heartbeat_disarms_load_timeout(monkeypatch):
 
 
 def test_poll_first_heartbeat_on_timeout_tick_disarms_load_timeout(monkeypatch):
-    # the load-timeout guard must run AFTER the heartbeat read, so the FIRST fresh heartbeat arriving
-    # on the very tick elapsed crosses LOAD_TIMEOUT_S disarms it. if the guard is ordered BEFORE the
-    # read, seen_fresh_hb is still False on that tick
-    # -> a healthy, heartbeating box is torn down as 'stalled'. The heartbeat is ABSENT until the
-    # crossing tick (unlike the sibling test, whose heartbeat is present from iteration 1 and so can't
-    # expose the ordering race).
+    # read the heartbeat before enforcing LOAD_TIMEOUT_S. a first heartbeat on the crossing tick
+    # must disarm the timeout rather than lose an ordering race and report stalled.
     clock = {"t": 10_000.0}
     vast = _wire_poll(
         monkeypatch,

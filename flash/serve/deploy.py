@@ -32,16 +32,8 @@ DEV_FREESOLO_SERVING_URL = "https://serve-dev.freesolo.co"
 def default_serving_url(channel: str = CHANNEL) -> str:
     """Default serving control root for the given release channel.
 
-    The serving plane is per-channel for the same reason the control plane is: each is backed by
-    its own Supabase project, and an org row exists in exactly one of them. `flash-dev` sending a
-    dev org_id to prod serving fails the prod `org_id` foreign key -- a 23503 no amount of retrying
-    or GPU warming can fix, because the row is in the other database.
-
-    This constant was the last hosted endpoint that did not derive from CHANNEL: `client.config`
-    has split prod/dev since the channel was introduced, so `flash-dev` talked to
-    `flash-dev.freesolo.co` for control and `serve.freesolo.co` for serving. freesolo #667 stood up
-    the isolated dev serving plane at `serve-dev.freesolo.co` (Modal env `dev`, dev Supabase,
-    `api-dev.freesolo.co`) and named this fallback as the defect; this is the flash half of it.
+    Serving and control planes use separate per-channel databases; mixing them causes org FK 23503.
+    Dev serving is ``serve-dev.freesolo.co`` per freesolo #667.
     """
     return DEV_FREESOLO_SERVING_URL if channel == "dev" else PROD_FREESOLO_SERVING_URL
 
@@ -245,17 +237,8 @@ def _serving_status_error(url: str, exc: httpx.HTTPStatusError) -> ServingError:
 def serving_base_url() -> str:
     """Env-overridable serving control root.
 
-    A standalone plane must configure this explicitly, and to a backend it OPERATES. Every
-    serving request carries ``FREESOLO_INTERNAL_KEY`` (see ``_internal_key_header``), and on a
-    self-hosted plane that key is the credential granting full control of the plane itself.
-    Sending it to a third party the operator has no relationship with, on an ordinary
-    ``flash deploy`` or ``flash chat``, is the failure this guards.
-
-    Both ways of arriving at the hosted backend are refused, not just the unset one: an operator
-    who copied a managed ``.env`` has ``FREESOLO_SERVING_URL`` already SET to it, so a guard on
-    the fallback alone would miss the more likely case. Raising here covers every caller
-    (including ``serving_openai_base_url``) rather than stripping the header at one call site,
-    and the error names the fix.
+    Standalone planes must target a backend they operate because every request carries the plane's
+    ``FREESOLO_INTERNAL_KEY``. Reject hosted URLs whether supplied explicitly or by fallback.
     """
     # imported lazily: flash.serve is the CLIENT side, and a module-level import would pull
     # flash.server into every CLI invocation.
@@ -280,12 +263,8 @@ def serving_openai_base_url() -> str:
 
 
 def _internal_key_header() -> dict[str, str]:
-    # Stripped for the same reason `authenticate` strips: the two must agree on what the key IS.
-    # A trailing newline (routine in a `.env` file) authenticates fine against the plane but is an
-    # illegal header value, so httpx rejects the request outright; a stray space authenticates and
-    # then presents a DIFFERENT credential to the serving backend. Either way deploy/undeploy/chat
-    # break for a config the plane itself accepts. Blank collapses to no header rather than an
-    # empty one, which is what an unset key already does.
+    # strip exactly as authenticate does: newlines are invalid headers and spaces change the key.
+    # blank values omit the header.
     key = (os.environ.get("FREESOLO_INTERNAL_KEY") or "").strip()
     return {"X-Freesolo-Internal-Key": key} if key else {}
 
@@ -1034,16 +1013,8 @@ def _duplicates_reasoning(content: str, inline: tuple[int, int], reasoning: str)
 def _balanced_thinking_content(message: dict, *, thinking: bool) -> str:
     """Fold a split-out ``reasoning_content`` back into a balanced ``<think>...</think>`` block.
 
-    A thinking chat template renders the OPENING ``<think>`` into the *prompt*, so the model only
-    samples the closing tag; serving's OpenAI surface then returns the reasoning in
-    ``reasoning_content`` with just the answer in ``content``. A caller reading ``content`` alone
-    watches the reasoning vanish, and one reading the raw text sees a stray ``</think>`` with no
-    opener. Re-open the block so every flash-side consumer reads one balanced string.
-    ``reasoning_content`` is left in place for callers that want the split.
-
-    ``thinking`` is the request's own flag, not a guess from the text: this path also backs the
-    public non-streaming chat route, where an ordinary answer quoting ``</think>`` must not be
-    rewritten into a synthetic reasoning block.
+    Thinking templates put the opener in the prompt, so reopen split reasoning for content-only
+    consumers. Only do this when the request's ``thinking`` flag is set.
     """
     content = str(message.get("content") or "")
     if not thinking:
@@ -1186,20 +1157,8 @@ def _delimiter_may_complete(text: str, reasoning: str) -> bool:
 def _strip_retained_close(text: str, reasoning: str, start: int = 0) -> tuple[str | None, int]:
     """Drop a retained sampled ``</think>`` from the head of the post-reasoning content.
 
-    Returns the remaining answer -- or ``None`` while the tag may still be arriving -- paired with
-    the offset a later scan of the same growing buffer may resume from. A compatibility build can
-    emit reasoning on its own field AND keep the sampled close at the head of the first content
-    delta; synthesising another there yields ``<think>reasoned</think></think>answer``.
-
-    The tag need not arrive whole or bare -- the model samples it on its own line as often as not,
-    and a backend may split it across deltas -- so this tolerates the same shapes the non-streaming
-    path does. A delimiter with nothing behind it keeps buffering: the answer may still be coming,
-    or the answer IS the tag, and only the caller's end-of-stream flush can tell them apart.
-
-    ``start`` resumes where a previous call stopped, as the hold path resumes its own scan: the
-    buffer grows a delta at a time and re-reading it whole per delta is quadratic in the repeat's
-    length. The resume point is the tag's own index once one is found, since a tag with nothing
-    behind it keeps buffering and the next call must land on it again.
+    Return ``None`` while a split delimiter may still be arriving. Resume from ``start`` to avoid
+    rescanning the growing buffer; end-of-stream distinguishes a delayed answer from the tag itself.
     """
     close = _find_delimiter(text, start)
     if close >= 0:
@@ -1258,17 +1217,9 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
     # ahead of the retained close, and recognising that repeat is how the block's own delimiter is
     # told from answer text that merely mentions the tag.
     reasoning_text = ""
-    # a legacy backend predating the split streams the whole block inline on `content`, with no
-    # reasoning field to key off. in thinking mode the opener lives in the prompt, so such a stream
-    # begins mid-block and the sampled `</think>` arrives with nothing to close. hold content until
-    # that delimiter proves a reasoning phase, then re-open around it.
-    #
-    # holding is confined to the case that needs it: outside thinking mode there is no block, and a
-    # reasoning delta proves the backend splits, so `held` is dropped the moment either is known.
-    #
-    # the deltas are kept as they arrived AND concatenated as they arrive: releasing replays the
-    # original deltas so a consumer sees the backend's chunk boundaries, while searching needs one
-    # string, and rejoining per delta would copy the whole completion every token.
+    # legacy inline-thinking streams begin mid-block because the opener is in the prompt; hold until
+    # </think> proves the phase, unless non-thinking mode or a reasoning delta proves split output.
+    # preserve original delta boundaries while maintaining a joined string for linear-time search.
     held: list[str] | None = [] if thinking else None
     # `held` joined, kept in step with it. never bound to a second name while being appended to,
     # since that blocks the in-place concatenation and restores the copy this avoids.
