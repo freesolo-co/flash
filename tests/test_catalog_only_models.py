@@ -105,7 +105,9 @@ def test_a_pre_upgrade_snapshot_still_passes_its_integrity_digest(tmp_path, monk
     public, worker = spec.to_dict(), spec.to_internal_dict()
 
     # Recompute the digest exactly as the OLD plane did: its worker payload carried model_policy,
-    # and it dropped empty workload_profile_* keys (the version-1 omission rule) before hashing.
+    # it dropped empty workload_profile_* keys (the version-1 omission rule) before hashing, and its
+    # public spec had no lora_alpha (alpha was managed-and-derived, so to_dict() stripped it).
+    public = {**public, "train": {k: v for k, v in public["train"].items() if k != "lora_alpha"}}
     old_worker = {**worker, "model_policy": "catalog"}
     hashed_worker = {
         k: v

@@ -1192,6 +1192,12 @@ def _preparation_digest(
     for key, value in (legacy_public_keys or {}).items():
         if key in _DROPPED_TOP_LEVEL_KEYS:
             public_payload[key] = value
+    # ``lora_alpha`` became user-authorable, so to_dict() now emits it for non-warm-start runs. Same
+    # reason as the omissions and restorations above: a snapshot prepared before that change hashed a
+    # public spec without alpha, and rehashing it with alpha would fail a still-valid run's integrity
+    # check on recovery. The worker half of this payload carries the authoritative alpha either way,
+    # so dropping it here costs no integrity coverage.
+    public_payload["train"].pop("lora_alpha", None)
     payload = {
         "version": 1,
         "public_spec": public_payload,

@@ -451,3 +451,36 @@ def test_profile_provenance_is_covered_by_preparation_digest(tmp_path, monkeypat
     status.effective_preparation = {**snapshot, "workload_profile": tampered}
     with pytest.raises(ValueError, match="persisted workload profile"):
         runner.effective_spec_from_status(status)
+
+
+def test_preparation_digest_ignores_public_lora_alpha(tmp_path, monkeypatch) -> None:
+    # lora_alpha became user-authorable, so to_dict() emits it for non-warm-start runs. A snapshot
+    # prepared before that change hashed a public spec WITHOUT alpha, so the digest must not see it:
+    # otherwise every in-flight run with a workload profile fails integrity validation on recovery.
+    runner = fresh_runner(tmp_path, monkeypatch)
+    spec = _spec()
+
+    class _PreAlphaPublic:
+        """The public spec as it serialized before lora_alpha was exposed."""
+
+        def __init__(self, inner: JobSpec) -> None:
+            self._inner = inner
+
+        def to_dict(self) -> dict:
+            data = self._inner.to_dict()
+            data["train"].pop("lora_alpha", None)
+            return data
+
+        def to_internal_dict(self) -> dict:
+            return self._inner.to_internal_dict()
+
+    assert "lora_alpha" in spec.to_dict()["train"]  # guard: the public form really does carry it
+    assert runner._preparation_digest(spec, spec, None) == runner._preparation_digest(
+        _PreAlphaPublic(spec), spec, None
+    )
+
+    # the worker half still covers alpha, so a changed alpha must still change the digest.
+    other = replace(spec, train=replace(spec.train, lora_alpha=spec.train.lora_alpha + 8))
+    assert runner._preparation_digest(other, other, None) != runner._preparation_digest(
+        spec, spec, None
+    )
