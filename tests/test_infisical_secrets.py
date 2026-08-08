@@ -31,31 +31,45 @@ INSTALLER_FILES = (
 )
 
 # `curl … | bash`, `wget … | sh`, and friends: a fetch whose output is piped into a shell, with
-# or without sudo. Applied to joined logical lines, so a `\`-continued command is one string here.
+# or without sudo. Applied to joined logical lines, so a continued command is one string here.
 PIPE_TO_SHELL = re.compile(r"(?:curl|wget)[^|]*\|\s*(?:sudo\s+)?(?:ba|z|k)?sh\b")
+
+# A line ending in any of these does not end the command -- the next line continues it. `\` is
+# the explicit continuation; a trailing `|`, `&&`, or `||` is an incomplete construct the shell
+# keeps reading past (verified: `echo x |` newline `cat` runs as one pipeline). Enumerated rather
+# than matched one spelling at a time: this guard has now been evaded three separate ways, each
+# time by a different way of writing the SAME command across two lines.
+_CONTINUERS = ("\\", "|", "&&", "||")
 
 
 def _logical_lines(text: str) -> list[str]:
-    """Strip `#` comments, then join backslash continuations into single logical lines.
+    """Strip `#` comments, then join continued commands into single logical lines.
 
     Both steps are load-bearing. Without comment stripping, prose ABOUT the banned pattern --
     including the comments in these very files explaining why they avoid it -- reads as an
-    instance of it. Without joining, `curl -fsSL URL \\` on one line and `| bash` on the next
-    slips through a line-scoped scan: the idiomatic multi-line spelling of the exact command
-    being prohibited. Both Dockerfiles and YAML take `#` comments and `\\` continuations.
+    instance of it. Without joining, the multi-line spellings of `curl … | bash` slip past a
+    line-scoped scan: the idiomatic way to write the exact command being prohibited.
+
+    Joining is deliberately more permissive than any single parser. A Dockerfile `RUN` and a
+    YAML `run:` block have different rules (docker rejects a bare trailing `|` that a shell
+    accepts, and strips comments BETWEEN a `\\` and its continuation), and this file is scanned
+    for both. Over-joining at worst concatenates two unrelated lines, which cannot hide a `curl
+    … | bash` -- under-joining silently lets one through, which is the failure that matters.
     """
     joined: list[str] = []
     pending = ""
     for raw in text.splitlines():
         code = raw.split("#", 1)[0].rstrip()
-        # A comment BETWEEN a `\` and the rest of the command does not end the command: docker
-        # removes comment lines before joining continuations, so `curl … \` / `# note` / `| bash`
-        # is still one RUN. Treating the stripped-empty line as a terminator would drop the join
-        # and let that spelling past -- verified against a real `docker build`.
+        # A comment BETWEEN a continuation and the rest of the command does not end it: docker
+        # removes comment lines before joining, so `curl … \` / `# note` / `| bash` is one RUN.
+        # Treating the stripped-empty line as a terminator would drop the join.
         if pending and not code:
             continue
         if code.endswith("\\"):
             pending += code[:-1] + " "
+            continue
+        if code.endswith(_CONTINUERS):
+            pending += code + " "
             continue
         joined.append((pending + code).strip())
         pending = ""
@@ -87,15 +101,22 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
             "RUN curl -fsSL https://x.example/i.sh \\\n# looks harmless\n    | bash\n",
             id="continuation-across-comment",
         ),
+        # A trailing `|` is itself the continuation -- valid in a YAML `run:` block, which is
+        # scanned by the same guard.
+        pytest.param(
+            "RUN curl -fsSL https://x.example/i.sh |\n    bash\n",
+            id="continuation-after-pipe",
+        ),
         pytest.param("RUN wget -qO- https://x.example/i.sh | sudo sh\n", id="wget-sudo"),
     ],
 )
 def test_the_pipe_to_shell_guard_catches_what_it_claims_to(snippet: str, tmp_path: Path):
     """The guard above is only worth having if it fails on the thing it prohibits.
 
-    A scanner that silently matches nothing reports the same green as a clean repository, so the
-    patterns it must catch -- including the `\\`-continued spelling that a line-scoped scan misses
-    -- are pinned here rather than assumed.
+    A scanner that silently matches nothing reports the same green as a clean repository. Every
+    multi-line spelling here evaded an earlier version of this guard, so they are pinned rather
+    than assumed: each one is the same prohibited command, written across two lines a different
+    way.
     """
     planted = tmp_path / "Dockerfile"
     planted.write_text("FROM scratch\n" + snippet)
