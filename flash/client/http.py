@@ -69,17 +69,23 @@ def has_freesolo_backend(api_url: str | None) -> bool:
     """Whether the calls in this module have a Freesolo backend to reach.
 
     Lives beside ``freesolo_base_url`` because it answers a question about the same env var: a
-    caller cannot decide whether the hosted API is reachable by looking at the control-plane url
-    alone. Two independent axes settle it, and only both together mean "no backend":
+    caller cannot decide whether the hosted API is reachable from the control-plane url alone.
+    Three independent signals can each supply a backend, and only the absence of all three means
+    there is none:
 
-    - the control-plane url. ``FLASH_STANDALONE`` is server-side, and the callers that need this
+    - the control-plane url names Freesolo. ``FLASH_STANDALONE`` is server-side and these callers
       never reach the plane, so the url is the only standalone signal available.
-    - ``FREESOLO_BASE_URL``. An operator running their own plane can still point it at a
-      Freesolo-compatible backend, which is what these calls resolve through.
-    - ``FREESOLO_API_KEY``. The url is the WEAKEST of the three: these calls never send it (they
-      address ``freesolo_base_url`` with the key), and ``load_credentials`` keeps a saved
-      ``api_url`` while letting the env key win. So a hosted key supplied against a leftover
+    - ``FREESOLO_BASE_URL`` names someone else. An operator running their own plane can point it
+      at a Freesolo-compatible backend, which is what these calls resolve through.
+    - ``FREESOLO_API_KEY`` is set. The control-plane url is the WEAKEST signal: these calls never
+      send it (they address ``freesolo_base_url`` with the key), and ``load_credentials`` keeps a
+      saved ``api_url`` while letting the env key win, so a hosted key supplied against a leftover
       self-hosted login must not be disabled by that stale url.
+
+    Note the deliberate polarity flip between the first two: the plane url qualifies by BEING
+    Freesolo's, the backend url by NOT being. They are different questions -- "is the hosted
+    backend my target" versus "does the operator run their own" -- and honouring a backend url
+    that names Freesolo would send a self-hosted plane's operator key to it.
 
     A false positive is the safe direction: assuming a backend exists yields today's behaviour
     (an authenticated call that may fail) rather than refusing a deployment that works.
