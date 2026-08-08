@@ -310,16 +310,18 @@ def _sized_from_hf(model_id: str, revision: str) -> float | None:
     return _SIZE_MEMO[key]
 
 
-def active_params_b(model_id: str) -> float:
+def active_params_b(model_id: str, revision: str = "") -> float:
     """Active params per token (billions); falls back to total for dense models. Use for FLOPs, not VRAM.
 
     An uncataloged model has no curated MoE routing data, so it is priced as dense (active ==
     total). That is the honest default: over-pricing a sparse model is safe, and inventing an
-    active-param count for an unvalidated architecture is not.
+    active-param count for an unvalidated architecture is not. Its fallback must use the pinned
+    revision because that total is the one the worker loads. Catalog active-parameter counts are
+    revision-independent architecture metadata and continue to answer from the curated catalog.
     """
     info = MODELS.get(model_id)
     if info is None:
-        return total_params_b(model_id)
+        return total_params_b(model_id, revision)
     return info.active_params_b or info.params_b
 
 
