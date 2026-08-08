@@ -34,14 +34,15 @@ def default_output_path(export_format: str) -> Path:
     return RAW_EXPORT_PATH if export_format == RAW_FORMAT else DEFAULT_EXPORT_PATH
 
 
-def _require_api_key(api_key: str | None) -> str:
-    """Validate the key from the caller's credential snapshot.
+def _require_api_key(api_key: str | None = None) -> str:
+    """The key to send, falling back to the stored credential when the caller has none.
 
-    Takes the key rather than re-reading the config so the url the caller decided on and the key
-    sent to the backend come from one snapshot. Re-reading would let a `flash login` landing in
-    between pair a hosted-url decision with a newly stored self-hosted plane credential, sending
-    that credential to the hosted backend.
+    A caller that already read the config passes its key rather than letting this re-read, so the
+    url it decided on and the key sent to the backend come from one snapshot: a `flash login`
+    landing in between would otherwise pair a hosted-url decision with a newly stored self-hosted
+    plane credential and send that credential to the hosted backend.
     """
+    api_key = api_key or load_credentials()[1]
     if not api_key:
         raise ClientError(
             "not logged in. Run `flash login` with your freesolo API key (or set FREESOLO_API_KEY)"
@@ -75,14 +76,12 @@ def fetch_records(
     export_format: str = RECORDS_FORMAT,
 ) -> dict:
     """A project's traces in the requested shape, converted server-side."""
-    return export_trace_records(
-        project_id, _require_api_key(api_key or load_credentials()[1]), export_format=export_format
-    )
+    return export_trace_records(project_id, _require_api_key(api_key), export_format=export_format)
 
 
 def fetch_projects(api_key: str | None = None) -> list[dict]:
     """Projects in the caller's org that traces can be exported from."""
-    return list_trace_projects(_require_api_key(api_key or load_credentials()[1]))
+    return list_trace_projects(_require_api_key(api_key))
 
 
 def _resolve_project_id(args, api_key: str) -> str:

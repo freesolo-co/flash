@@ -13,6 +13,7 @@ import urllib.request
 from collections.abc import Callable, Iterator
 from typing import Any
 
+from flash.serve.urls import is_freesolo_hosted_url
 from flash.spec import require_project_id
 
 from .config import load_credentials_with_source
@@ -62,6 +63,31 @@ def freesolo_base_url(override: str | None = None) -> str:
     return (override or os.environ.get("FREESOLO_BASE_URL") or DEFAULT_FREESOLO_BASE_URL).rstrip(
         "/"
     )
+
+
+def has_freesolo_backend(api_url: str | None) -> bool:
+    """Whether the calls in this module have a Freesolo backend to reach.
+
+    Lives beside ``freesolo_base_url`` because it answers a question about the same env var: a
+    caller cannot decide whether the hosted API is reachable by looking at the control-plane url
+    alone. Two independent axes settle it, and only both together mean "no backend":
+
+    - the control-plane url. ``FLASH_STANDALONE`` is server-side, and the callers that need this
+      never reach the plane, so the url is the only standalone signal available.
+    - ``FREESOLO_BASE_URL``. An operator running their own plane can still point it at a
+      Freesolo-compatible backend, which is what these calls resolve through.
+
+    A false positive is the safe direction: assuming a backend exists yields today's behaviour
+    (an authenticated call that may fail) rather than refusing a deployment that works.
+
+    Two older callers still decide on the url alone -- ``client.resolve_project_id`` and the
+    interactive branch of ``cli.env_setup`` -- so they refuse a configured backend this would
+    accept. Routing them through here is a behaviour change to paths this helper was not added
+    for, so it is deliberately left as follow-up rather than folded in silently.
+    """
+    if api_url is None or is_freesolo_hosted_url(api_url):
+        return True
+    return bool(os.environ.get("FREESOLO_BASE_URL", "").strip())
 
 
 def _detail_from_http_error(exc: urllib.error.HTTPError) -> object:

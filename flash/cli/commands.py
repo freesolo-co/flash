@@ -27,6 +27,7 @@ from flash.client.config import (
     load_credentials_with_source,
     shadowed_login_warning,
 )
+from flash.client.http import has_freesolo_backend
 from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
 from flash.cost.spec import runconfig_from_spec
@@ -101,25 +102,11 @@ def cmd_version(args) -> int:
 def self_hosted_plane(api_url: str | None) -> bool:
     """Whether these commands have no Freesolo backend to reach.
 
-    Two independent axes decide that, and only both together mean "no backend":
-
-    - the control-plane url. The client cannot read ``FLASH_STANDALONE`` (server-side env, and
-      these commands never reach the plane, so no response carries it either), so the url is the
-      only standalone signal available before authenticating.
-    - ``FREESOLO_BASE_URL``. A plane the user runs can still be configured against a reachable
-      Freesolo-compatible backend, which is what these commands actually call
-      (``client.http.freesolo_base_url``) -- that env var is read independently of the plane url.
-
-    Deciding on the url alone would disable a backend the operator has configured and reachable,
-    so an explicit backend wins, exactly as ``_verifies_against_freesolo`` lets ``--freesolo-url``
-    override the same host check.
-
-    A false negative stays the safe direction: a self-hoster who points at Freesolo, or sets a
-    backend url, gets today's hosted behaviour rather than a broken command.
+    The inverse of ``client.http.has_freesolo_backend``, which owns the question because it owns
+    the ``FREESOLO_BASE_URL`` these commands resolve through. Kept as a named helper because the
+    CLI reads better refusing on "self-hosted plane" than on "not has backend".
     """
-    if not api_url or is_freesolo_hosted_url(api_url):
-        return False
-    return not os.environ.get("FREESOLO_BASE_URL", "").strip()
+    return not has_freesolo_backend(api_url)
 
 
 def unavailable_on_self_hosted_plane(what: str, *, because: str, instead: str) -> ClientError:
