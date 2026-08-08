@@ -105,7 +105,6 @@ def api(tmp_path, monkeypatch):
     # provider set to empty: preflight still passes on the keys, but startup stays CPU-only
     # with no network.
     import flash.providers as providers_mod
-    import flash.providers.runpod.train.endpoints as rp_endpoints
     import flash.server.run_registry as run_registry
 
     monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
@@ -114,11 +113,6 @@ def api(tmp_path, monkeypatch):
     # run_registry._post() would urllib-POST the real backend (or wait out its 10s timeout). Stub the
     # single network choke-point so these offline tests stay hermetic (same as the billing fixture).
     monkeypatch.setattr(run_registry, "_post", lambda *a, **k: False, raising=False)
-    # ...and that same key makes create_app() startup run the RunPod slot-store reconcile
-    # (reconcile_endpoint_slots() -> runpod.slots.reconcile() urllib POST). No-op it at the entry.
-    monkeypatch.setattr(
-        rp_endpoints, "reconcile_endpoint_slots", lambda *a, **k: None, raising=False
-    )
     # Offline auth: a token is a valid freesolo USER key iff it has the test prefix. This stub
     # replaces the real network verify.
     auth_mod._verify_cache.clear()
@@ -3839,7 +3833,6 @@ def test_shutdown_flushes_after_status_replay_failure(monkeypatch):
     import flash.server.reconcile as reconcile
     import flash.server.repo_cleanup as repo_cleanup
     from flash.providers import preflight
-    from flash.providers.runpod.train import endpoints
     from flash.server.routes import serving
 
     replay_started = Event()
@@ -3866,7 +3859,6 @@ def test_shutdown_flushes_after_status_replay_failure(monkeypatch):
     monkeypatch.setattr(serving, "replay_status_reports", fail_replay)
     monkeypatch.setattr(billing_retry, "charge_retry_enabled", lambda: False)
     monkeypatch.setattr(reconcile, "reconcile_enabled", lambda: False)
-    monkeypatch.setattr(endpoints, "reconcile_endpoint_slots", lambda: None)
     monkeypatch.setattr(repo_cleanup, "repo_cleanup_enabled", lambda: False)
     monkeypatch.setattr(app_mod, "_instance_providers_configured", lambda: False)
     monkeypatch.setattr(app_mod, "_wait_for_deployment_jobs", wait_for_deployments)
