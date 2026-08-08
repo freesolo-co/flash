@@ -200,7 +200,7 @@ def _score_case(
 _READY_DEPLOYMENT_STATES = frozenset({"ready", "deployed"})
 # a busy redeploy may still serve its predecessor, which the public listing hides.
 # `/v1/deployments` excludes only `undeployed`/`dry_run`, so only `ready` and `busy`
-# may answer; other returned states fail closed (flash/cli/commands.py).
+# may answer; other returned states fail closed (flash/cli/commands/__init__.py).
 _BUSY_DEPLOYMENT_STATES = frozenset({"queued", "smoke_testing", "reconciling"})
 
 
@@ -593,7 +593,7 @@ def cmd_env_eval(args) -> int:
         if want_step is not None:
             # pinned steps resolve through the verified ledger, not the deployment record
             # (`flash/server/routes/serving.py`). allow `failed`, which preserves that ledger;
-            # revocation-failed and undeploy paths invalidate it in `flash/runner/deploy.py`.
+            # revocation-failed and undeploy paths invalidate it in `flash/runner/supervise/deploy.py`.
             servable_states = servable_states | {"failed"}
         if deployment_state not in servable_states:
             # having a record is not having a servable one: the listing keeps terminal states like

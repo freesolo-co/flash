@@ -865,7 +865,7 @@ def test_sft_smoke_budget_follows_an_explicit_context_over_the_recipe_default():
     from flash.serve.preflight import resolve_smoke_completion_tokens
 
     # the worker bounds the packed block by max_context_tokens and only falls back to the recipe
-    # when it is unset (flash/engine/worker/sft.py), so the smoke has to resolve the same way.
+    # when it is unset (flash/engine/worker/entry/sft.py), so the smoke has to resolve the same way.
     # sizing an 8192-context run at the 2048 recipe default truncated the smoke and rejected a
     # checkpoint that answered correctly.
     assert RECIPE.sft.max_seq_len_thinking < 8192

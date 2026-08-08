@@ -176,7 +176,7 @@ _HB_PROGRESS_SEQ = 0
 _HB_PROGRESS_UPLOADED_SEQ = 0
 # Environment-scoped artifact repos are shared by many runs. Keep heartbeat commits below the HF
 # per-repo commit cap while staying under the provider poller's training stall window
-# (STALL_AFTER_S=1500s in flash/providers/_poll.py).
+# (STALL_AFTER_S=1500s in flash/providers/_lifecycle/poll.py).
 _HB_MIN_INTERVAL_S = 900.0
 # highest optimizer step committed by a heartbeat.
 # force bypasses the 900s throttle only on step advance so cancel billing stays current.

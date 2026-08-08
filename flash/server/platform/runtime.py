@@ -515,7 +515,7 @@ def _worker_artifacts(spec) -> dict[str, str]:
                 token=os.environ.get("HF_TOKEN"),
                 # the worker appends to console/error files across the run, so a cached copy goes
                 # stale; force a fresh pull (matches other HF artifact readers, e.g.
-                # flash/providers/_hf_artifacts.py:make_hf_text_reader).
+                # flash/providers/artifacts/hf.py:make_hf_text_reader).
                 force_download=True,
             )
             # errors="replace": worker stdout can carry non-UTF-8 bytes (tracebacks, progress bars);

@@ -1460,7 +1460,7 @@ def cmd_chat(args) -> int:
     ):
         # delay the label and blank chunks until real text arrives. otherwise an empty response has
         # non-empty stdout and cannot serve as a health check. release buffered blanks verbatim;
-        # flash/cli/env_eval.py grades emptiness the same way.
+        # flash/cli/commands/env/eval.py grades emptiness the same way.
         if not wrote:
             pending.append(chunk)
             if not chunk.strip():

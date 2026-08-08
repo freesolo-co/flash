@@ -14,7 +14,7 @@ from flash.cli.ui import render
 _ALLOWED_ROLES = frozenset({"system", "user", "assistant", "tool"})
 _ECHO_RESPONSE = "test"
 # the one algorithm that trains from the environment reward. sft optimizes a supervised loss and opd
-# a teacher token loss; neither reads `env.reward` anywhere (flash/engine/worker/sft.py, opd.py), so
+# a teacher token loss; neither reads `env.reward` anywhere (flash/engine/worker/entry/sft.py, opd.py), so
 # a scorer they never call cannot be evidence of anything for them.
 _REWARD_DRIVEN_ALGORITHM = "grpo"
 _PREVIEW_CHARS = 200
@@ -198,7 +198,7 @@ def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = Fa
     policy = "echo" if force_echo else _resolve_policy(reference_turns)
     record["policy"] = policy
     record["thinking_markup"] = _carries_thinking_markup(reference_turns)
-    # mirror the worker turn loop (flash/engine/worker/grpo_multiturn.py): drive one model
+    # mirror the worker turn loop (flash/engine/worker/train/rl/child/multiturn.py): drive one model
     # turn, then stop at the hard turn ceiling, on the env's own done signal, or when the
     # env yields no reply. the hard cap is fixed at what the trainer passes (env.max_turns)
     # and the turn counter rises every turn until it reaches the cap, so a cooperatively-
@@ -331,7 +331,7 @@ def _normalize_prompt_images(env, example: dict, messages: list[dict]) -> None:
 def _evaluation_response(env, case) -> tuple[str, str]:
     example = _evaluation_example(case)
     # build the prompt even though the replayed response does not need it. `flash env eval` sends
-    # every case through prompt_messages() (flash/cli/env_eval.py `_case_messages`), so a prompt
+    # every case through prompt_messages() (flash/cli/commands/env/eval.py `_case_messages`), so a prompt
     # that raises or returns malformed messages for a held-out case is a suite the online command
     # records a prompt-construction error for. checking only the scorer let this offline gate print
     # `overall: PASS` for exactly that sidecar.

@@ -428,7 +428,7 @@ def test_score_single_turn_can_propagate_errors_for_the_profiler():
 def test_a_single_reference_still_produces_a_reading():
     """One retained prompt is a valid grpo shape and must not profile as unmeasured.
 
-    resolve_grpo_prompts_per_step (flash/engine/worker/grpo.py) explicitly supports a
+    resolve_grpo_prompts_per_step (flash/engine/worker/train/rl/config.py) explicitly supports a
     single-prompt dataset. Slicing the sample list would spend that one reference on the discarded
     warm-up, leaving no timed call and reporting that nothing graded -- false, since grading
     succeeded. Below the warm-up threshold the first call is kept AS the measurement.

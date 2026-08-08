@@ -1,4 +1,4 @@
-"""Retry/recovery of completion-time CUSTOMER charges (flash/server/billing_retry.py).
+"""Retry/recovery of completion-time CUSTOMER charges (flash/server/billing/retry.py).
 
 Offline: the only network boundary (flash.server.billing.charges.charge_completed_run) is stubbed, so a
 transient blip and a successful retry can be simulated without touching the backend. The point of

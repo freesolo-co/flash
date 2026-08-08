@@ -1462,7 +1462,7 @@ def test_a_final_response_override_reaches_both_views(monkeypatch):
 def test_a_final_response_override_keeps_the_models_raw_output_for_scorers(monkeypatch):
     """`.raw` is the model's original output, so an env override must not overwrite it.
 
-    The documented contract (flash/cli/training_doc.py) defines `.raw` as the original raw model
+    The documented contract (flash/cli/scaffold/__init__.py) defines `.raw` as the original raw model
     output, and it is the one view a scorer cannot reconstruct once it is gone: `.completion` and
     `str(response_text)` are both the override already. Assigning the override to `.raw` also left
     the object incoherent -- an env-authored `.raw` paired with the model's own `.thinking`, so

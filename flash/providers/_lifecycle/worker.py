@@ -23,9 +23,11 @@ from flash.providers.artifacts.hf import hf_call, hf_status_code
 from flash.providers.base import get_gpu_info
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
-# pinned literal (not __name__): keeps the logger stream named "flash.providers.runpod.serverless"
+# pinned literal (not __name__): keeps the logger stream named "flash.providers.runpod.train"
 # after this module moved out of flash/providers/runpod/train.py, so operator log filters stay stable.
-logger = get_logger("flash.providers.runpod.serverless")
+# the literal is an OPERATOR-FACING contract, not a module path: it must not track package renames,
+# or the log filters and dashboards it exists to protect break.
+logger = get_logger("flash.providers.runpod.train")
 
 
 # vllm 0.19.1: first vllm compatible with transformers 5.x; vllm>=0.20 pins torch 2.11

@@ -2658,7 +2658,7 @@ def test_a_job_that_succeeds_still_drains_the_stragglers_an_earlier_one_left(mon
 
 # the worker as the runpod handler really runs it: a short-lived process that records a straggler
 # and then EXITS, with no second job to sweep it. `_train_body.run_mode` in
-# `flash/providers/runpod/train/endpoints.py`
+# `flash/providers/runpod/serverless/endpoints.py`
 # spawns one of these per phase and waits for it, so anything the phase leaves behind reparents to
 # the persistent handler -- which waits only on the worker -- and stays a zombie for the container's
 # life. driven as a subprocess because the leak is about process EXIT, which pytest cannot perform.

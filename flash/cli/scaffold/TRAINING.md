@@ -283,7 +283,7 @@ run. Count what the worker will actually get, with the **same params as the subm
 config**:
 
 ```python
-from flash.envs.registry import load_environment
+from flash.envs.base import load_environment
 
 env = load_environment("<your-env-id>", params={...})  # the [environment.params] you submit
 print(len(env.dataset()))

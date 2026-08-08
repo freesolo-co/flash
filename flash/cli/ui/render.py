@@ -750,7 +750,7 @@ def _stale_step_hint(
     if not is_training_heartbeat(heartbeat.get("stage"), heartbeat.get("step")):
         return None
     # do not suggest `runs log -f`: it shows control-plane logs, and worker output arrives only after
-    # termination (flash/cli/commands.py cmd_log) on a 3600s upload interval. use heartbeat age against
+    # termination (flash/cli/commands/__init__.py cmd_log) on a 3600s upload interval. use heartbeat age against
     # the 900s throttle, with w&b as the optional live signal.
     return (
         "the step above is the last one UPLOADED, not necessarily the one training is on; "

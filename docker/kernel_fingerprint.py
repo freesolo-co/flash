@@ -74,7 +74,7 @@ def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def parse_baked_per_sm_arches(text: str, *, source: str = "_worker.py") -> list[str]:
+def parse_baked_per_sm_arches(text: str, *, source: str = "_lifecycle/worker.py") -> list[str]:
     """Parse the canonical baked-architecture frozenset without importing flash."""
     tree = ast.parse(text, filename=source)
     assignments = [
@@ -273,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--print-baked-arches",
         action="store_true",
-        help="print BAKED_PER_SM_ARCHES from _worker.py + exit",
+        help="print BAKED_PER_SM_ARCHES from _lifecycle/worker.py + exit",
     )
     args = ap.parse_args(argv)
 
@@ -285,7 +285,7 @@ def main(argv: list[str] | None = None) -> int:
 
     root = Path(args.root)
     if args.print_baked_arches:
-        worker_source = root / "flash" / "providers" / "_worker.py"
+        worker_source = root / "flash" / "providers" / "_lifecycle" / "worker.py"
         try:
             arches = parse_baked_per_sm_arches(
                 worker_source.read_text(encoding="utf-8"), source=str(worker_source)

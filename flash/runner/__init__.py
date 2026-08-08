@@ -562,7 +562,7 @@ class RunStatus:
     # for runs created outside submit() / pre-feature records.
     submitted_instance_providers: list[str] | None = None
     # Realized provider cost (COGS), pulled from the provider's billing API after the run
-    # finishes by the reconciliation job (flash/server/reconcile.py) and reported to the
+    # finishes by the reconciliation job (flash/server/domain/reconcile.py) and reported to the
     # freesolo backend for estimator accuracy. Distinct from ``cost_usd`` (the flash.cost ESTIMATE
     # we charge the customer); ``reconciled_at`` marks that the realized pull has happened so it
     # isn't re-pulled. Both stay None for un-reconciled / pre-instrumentation runs.

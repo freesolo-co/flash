@@ -1312,7 +1312,7 @@ def test_tilelang_pin_is_consistent_and_pinned():
     """tilelang (the Hopper GDN correctness backend) is PINNED to an exact version (not unversioned)
     and the SAME pin is used in WORKER_DEPS, Dockerfile.worker, and perf.py's runtime reinstall, so
     cold-start installs / image rebuilds / runtime reinstalls all resolve the identical backend
-    (flash/providers/_worker.py)."""
+    (flash/providers/_lifecycle/worker.py)."""
     import pathlib
     import re
 

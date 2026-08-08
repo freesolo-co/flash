@@ -180,9 +180,9 @@ def test_parse_baked_per_sm_arches_contract():
 
 
 def test_print_baked_arches_cli_exits_before_fingerprint_work(tmp_path):
-    worker_dir = tmp_path / "flash" / "providers"
+    worker_dir = tmp_path / "flash" / "providers" / "_lifecycle"
     worker_dir.mkdir(parents=True)
-    (worker_dir / "_worker.py").write_text('BAKED_PER_SM_ARCHES = frozenset({"sm90", "sm80"})\n')
+    (worker_dir / "worker.py").write_text('BAKED_PER_SM_ARCHES = frozenset({"sm90", "sm80"})\n')
     result = subprocess.run(
         [
             sys.executable,

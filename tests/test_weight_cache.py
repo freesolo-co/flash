@@ -2472,7 +2472,7 @@ def test_warm_still_walks_the_ladder_when_lambda_was_never_reached(monkeypatch):
     tried = []
 
     def unconfigured(**k):
-        # the exact text RestClient.missing_key_message builds in flash/providers/_http.py
+        # the exact text RestClient.missing_key_message builds in flash/providers/_lifecycle/http.py
         raise RuntimeError("LAMBDA_API_KEY not configured on the control-plane host")
 
     def rejected(spec, seed, instances, **k):

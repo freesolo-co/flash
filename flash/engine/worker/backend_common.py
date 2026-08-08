@@ -2025,7 +2025,7 @@ def parse_wandb_link(line: str) -> dict | None:
 # its trainer runs out of process. verl's LocalLogger prints exactly one line per optimizer update
 # -- "step:N - key:value - key:value" over every scalar metric -- so the parent reconstructs the
 # same backlog from that line. the payload schema is the CLI's, not verl's: keys below are what
-# flash/cli/commands.py:_FOLLOW_METRIC_FIELDS renders.
+# flash/cli/commands/__init__.py:_FOLLOW_METRIC_FIELDS renders.
 
 # the left edge every verl step pattern shares. "not part of a longer word" rather than start-of-
 # line, because ray tags worker stdout with a "(TaskRunner pid=123) " prefix -- an anchored match

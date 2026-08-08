@@ -296,7 +296,7 @@ def test_env_setup_resolves_the_project_locally_on_a_self_hosted_plane(monkeypat
     Resolving it against ``api.freesolo.co`` sent the operator's plane-root key to a service with
     no relationship to it, which answered 401 -- so `flash env setup`, the first command in the
     SELF_HOSTING.md quickstart, died before writing a file. The plane exposes no project routes at
-    all, so there is nothing else to ask; ``flash/server/projects.py`` performs exactly this
+    all, so there is nothing else to ask; ``flash/server/domain/projects.py`` performs exactly this
     shape-only check under ``standalone()`` when the same run is later submitted.
     """
     from argparse import Namespace
@@ -1543,7 +1543,7 @@ def test_env_setup_reasoning_flag_enables_thinking(monkeypatch, tmp_path) -> Non
     assert "warn_missing_think_tags" in sft
     assert "max_completion_tokens" not in sft
     # nor opd -- not because the knob is inert there (opd honors it, via `_resolve_opd_knobs` ->
-    # `opd_completion_len` at flash/engine/vram.py:97, which feeds verl's max_response_length) but
+    # `opd_completion_len` at flash/engine/plan/vram.py:97, which feeds verl's max_response_length) but
     # because opd ALREADY raises its own budget under thinking: 512 -> 1536. Writing a literal would
     # pin what the recipe should choose, and would go stale the moment that default moves. GRPO needs
     # the line only because its non-thinking default is 320, too tight to leave to a scaffold reader.
@@ -2768,7 +2768,7 @@ def test_log_follow_progress_does_not_trust_a_ping_left_by_a_cleared_remote(
 ) -> None:
     """A supervised retry publishes `remote: null` for its whole allocation window.
 
-    `flash/runner/lifecycle.py` clears `remote` before reserving the replacement attempt and does
+    `flash/runner/supervise/lifecycle.py` clears `remote` before reserving the replacement attempt and does
     not persist the new one until the provider handle lands, so throughout that window flash serves
     a running record whose only attempt identity is the superseded worker's ping. Falling back to it
     there reintroduced exactly what preferring `remote` was meant to fix: the first retry unlabelled

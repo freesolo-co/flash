@@ -6,7 +6,7 @@ The platform backend accepts a training run via RunCreateRequest
 spec the SDK/agent authored (model / algorithm / [environment] id / [train] params).
 That same config shape is what flash parses into a JobSpec
 (flash/schema/__init__.py spec_from_dict, with field validators in
-flash/schema/fields.py, producing the flash/spec.py JobSpec). If the backend accepts
+flash/schema/fields.py, producing the flash/core/spec.py JobSpec). If the backend accepts
 a config flash rejects (or the two drift on field names), a run the backend admits
 never trains. This test pins that seam.
 

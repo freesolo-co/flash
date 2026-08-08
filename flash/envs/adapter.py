@@ -483,7 +483,7 @@ class FreesoloEnvironment(BaseEnvironment):
             # strip it. keep the raw view in step with it for any later turn.
             final = str(step.final_response_text)
             # wrap the override so `.completion` is env-authored while `.raw` and `.thinking` remain
-            # the model's original turn (flash/cli/training_doc.py). a bare str would discard those
+            # the model's original turn (flash/cli/scaffold/__init__.py). a bare str would discard those
             # scorer views. `raw_response_text` becomes the override because later turns step on it.
             previous = state.get("response_text")
             state["response_text"] = (
