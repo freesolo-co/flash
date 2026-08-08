@@ -18,7 +18,9 @@ parametrized fixtures underneath it.
 from __future__ import annotations
 
 import itertools
+import json
 import re
+import shlex
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -182,8 +184,55 @@ def _piped_into_a_shell(line: str) -> bool:
 _FORMAT_KEYWORD = re.compile(r"^\s*(?:RUN|ENTRYPOINT|CMD|-?\s*(?:name:.*)?run:)\s*[|>]?[+-]?\d*\s*")
 
 
+# Dockerfile EXEC form: `RUN ["bash", "-c", "curl … | bash"]`. The shell command is a JSON string
+# INSIDE a JSON array, so after the keyword is stripped the line still starts with `[`. Docker
+# runs the array's members as argv with no shell of its own -- but here argv[0] IS a shell, and
+# argv[2] is the command it runs, so the download is executed exactly as in the shell form.
+_JSON_EXEC_FORM = re.compile(r"^\[\s*(?:\"(?:[^\"\\]|\\.)*\"\s*,?\s*)+\]\s*$")
+
+# A workflow `run:` value may be a QUOTED scalar rather than a bare or block one. The quotes are
+# YAML syntax, not shell syntax, so they have to come off at this boundary -- otherwise the whole
+# command arrives as one quoted token and no pipeline is ever seen inside it.
+_QUOTED_SCALAR = re.compile(r"^(?P<q>[\"'])(?P<body>.*)(?P=q)\s*$")
+
+
 def _shell_part(line: str) -> str:
-    return _FORMAT_KEYWORD.sub("", line, count=1)
+    """The shell command a line runs, with the FILE's own syntax taken off.
+
+    Three spellings reach the same shell command, and the difference between them is the
+    surrounding file's grammar, not the shell's:
+
+        RUN curl … | bash                        <- shell form, the keyword is all there is
+        RUN ["bash", "-c", "curl … | bash"]      <- docker exec form, a JSON array
+        run: "curl … | bash"                     <- a quoted YAML scalar
+
+    Stripping all of it here keeps the knowledge of which file a line came from at this one
+    boundary, so the grammar below only ever sees shell syntax.
+    """
+    stripped = _FORMAT_KEYWORD.sub("", line, count=1).strip()
+    if _JSON_EXEC_FORM.fullmatch(stripped):
+        return _exec_form_command(stripped)
+    scalar = _QUOTED_SCALAR.fullmatch(stripped)
+    # Only unwrap when the quotes enclose the WHOLE value. `curl 'https://h/a|b' | bash` also
+    # starts and ends with a quote, and stripping those would splice a URL onto a shell name.
+    if scalar and not _TOKEN.findall(scalar.group("body"))[0].startswith(("'", '"')):
+        return scalar.group("body")
+    return stripped
+
+
+def _exec_form_command(text: str) -> str:
+    """The shell command inside a Dockerfile exec-form array, or the argv joined back up.
+
+    `["bash", "-c", "curl … | bash"]` is a shell running a command string, so the array is
+    rejoined into exactly the shell form the grammar below already understands. An array that
+    runs no shell (`["python", "-m", "pip", "install", "x"]`) rejoins into a stage whose command
+    word is not a shell, so it stays clean for the same reason its shell-form spelling would.
+    """
+    try:
+        argv = json.loads(text)
+    except ValueError:
+        return text
+    return " ".join(shlex.quote(str(arg)) for arg in argv)
 
 
 # Words and shell operators. A quoted span is ONE token, so shell metacharacters inside it stay
@@ -349,7 +398,7 @@ def _stage_runs_a_shell(tokens: list[str]) -> bool:
     is an argument being searched for, not the command being run.
     """
     inner = [t for t in tokens if t not in ("(", ")", "{", "}")]
-    if _requests_a_shell_by_flag(inner):
+    if _requests_a_shell_by_flag(inner) or _sources_stdin(inner):
         return True
     word, at = _command_word(inner)
     if at is not None and _SHELL_NAME.fullmatch(word):
@@ -377,6 +426,34 @@ def _stage_runs_a_shell(tokens: list[str]) -> bool:
     # Checked even when the walk found no command word: `env -S'bash -s'` fuses the operand into
     # the flag, so every token is a flag and the walk runs off the end with the shell still in it.
     return any(_stage_runs_a_shell(_tokenize(cmd)) for cmd in _split_string_operands(inner))
+
+
+# The paths that name the stage's OWN standard input. Sourcing any of these reads the piped
+# download and runs it in the current shell, so the download is executed with no shell name
+# anywhere in the stage. Verified for each, rather than assumed from /dev/stdin alone:
+#   printf 'echo PWNED\n' | bash -c 'source /dev/fd/0'        -> PWNED
+#   printf 'echo PWNED\n' | bash -c 'source /proc/self/fd/0'  -> PWNED
+_STDIN_PATHS = ("/dev/stdin", "/dev/fd/0", "/proc/self/fd/0")
+
+
+def _sources_stdin(tokens: list[str]) -> bool:
+    """Does this stage `source` its standard input?
+
+    `source` and `.` are shell BUILTINS, not commands, so the recursion above -- which asks
+    whether a stage's command word is a shell -- never sees them. `sh -c 'source /dev/stdin'`
+    therefore read as clean while executing the download outright:
+
+        printf 'echo PWNED\\n' | bash -c 'source /dev/stdin'  ->  PWNED
+        printf 'echo PWNED\\n' | bash -c '. /dev/stdin'       ->  PWNED
+
+    Only the paths that name stdin count. Sourcing an ordinary file runs THAT file and leaves the
+    pipe unread (`source ./setup.sh` prints the file's own output), and a command merely reading
+    stdin as data is not executing it (`cat /dev/stdin`), so neither matches.
+    """
+    word, at = _command_word(tokens)
+    if at is None or word not in ("source", "."):
+        return False
+    return any(operand in _STDIN_PATHS for operand in tokens[at + 1 :])
 
 
 def _requests_a_shell_by_flag(tokens: list[str]) -> bool:
@@ -529,15 +606,44 @@ def _dash_c_operand(tokens: list[str]) -> str | None:
     Returns the operand even when it is empty, so `sh -c ''` is distinguishable from a shell
     invoked with no `-c` at all -- the first runs nothing, the second runs the piped stream.
 
-    `-s` wins over `-c` when both appear: it makes the shell read its program from stdin, which
-    is the piped download, so the operand is no longer the whole story.
+    When BOTH `-s` and `-c` appear the answer is SHELL-DEPENDENT, so it cannot be read off the
+    flags alone. Confirmed by running each:
+
+        printf 'echo FROM_STDIN\\n' | bash       -s -c 'echo FROM_C'  -> FROM_C
+        printf 'echo FROM_STDIN\\n' | busybox ash -s -c 'echo FROM_C' -> FROM_C
+        printf 'echo FROM_STDIN\\n' | dash       -s -c 'echo FROM_C'  -> FROM_C
+                                                                         FROM_STDIN  <-- executed
+
+    bash and busybox ash run the `-c` program and leave the pipe as data. dash runs the program
+    AND THEN reads stdin, so the download is executed. `/bin/sh` IS dash on Debian and Ubuntu --
+    where a Dockerfile `RUN` lands -- so `sh -s -c '…'` is a real evasion, while `bash -s -c '…'`
+    is a legitimate verified-download spelling that must stay clean.
     """
+    if _reads_stdin_despite_dash_c(tokens):
+        return None
     for index, tok in enumerate(tokens):
-        if tok.startswith("-") and "s" in tok[1:] and not tok.startswith("--"):
-            return None
         if _TAKES_A_COMMAND_STRING.fullmatch(tok):
             return tokens[index + 1] if index + 1 < len(tokens) else ""
     return None
+
+
+# Shells confirmed to IGNORE stdin once `-c` supplies the program, even with `-s` also given.
+# dash is deliberately absent: it runs the `-c` program and THEN executes stdin, and it is what
+# `/bin/sh` points at on Debian and Ubuntu.
+_IGNORES_STDIN_GIVEN_DASH_C = ("bash", "ash", "busybox")
+
+
+def _reads_stdin_despite_dash_c(tokens: list[str]) -> bool:
+    """Would this shell still execute the pipe even though `-c` gave it a program?
+
+    Only when `-s` is present AND the shell is not one of the few confirmed to ignore stdin.
+    Unknown shell names are treated as reading stdin, so a miss is a false POSITIVE (a CI failure
+    someone investigates) rather than a silent hole.
+    """
+    if not any(t.startswith("-") and not t.startswith("--") and "s" in t[1:] for t in tokens[1:]):
+        return False
+    name = tokens[0].rsplit("/", 1)[-1] if tokens else ""
+    return name not in _IGNORES_STDIN_GIVEN_DASH_C
 
 
 def _split_string_operands(tokens: list[str]) -> list[str]:

