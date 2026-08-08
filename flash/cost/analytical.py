@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 
+from flash.catalog import MODELS
 from flash.opd_limits import OPD_TEACHER_SCORING_CONCURRENCY, opd_teacher_request_multiplier
 from flash.providers.allocator import geometry_safe_gpu_cap, required_vram_gb, vram_headroom
 
@@ -356,9 +357,12 @@ def required_save_overhead_seconds(config: RunConfig) -> float:
     return len(n.save_at_steps) * per_save
 
 
-def _is_moe(model_id: str) -> bool:
+def _is_moe(model_id: str, revision: str = "") -> bool:
     """True when the model routes each token through a subset of experts (active < total params)."""
-    return active_params_b(model_id) < total_params_b(model_id)
+    info = MODELS.get(model_id)
+    if info is not None:
+        return bool(info.active_params_b and info.active_params_b < info.params_b)
+    return active_params_b(model_id, revision) < total_params_b(model_id, revision)
 
 
 def compile_seconds(config: RunConfig, gpu: str) -> float:
@@ -366,7 +370,7 @@ def compile_seconds(config: RunConfig, gpu: str) -> float:
     (whose original timing did not model it). Larger for rollout methods (add vLLM cudagraph
     capture)."""
     _ = gpu
-    if not _is_moe(config.model_id):
+    if not _is_moe(config.model_id, config.model_revision):
         return 0.0
     return COMPILE_MOE_SFT_S if config.method == "sft" else COMPILE_MOE_ROLLOUT_S
 
@@ -530,8 +534,12 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
     peak = effective_train_tflops(gpu) * 1e12  # FLOP/s (realized training throughput; see facts)
     # An MoE's per-step wall scales with TOTAL params (routing + all-expert coordination + grouped
     # GEMM under-utilization), not the tiny active-param FLOPs; dense models keep active (== total).
-    moe = _is_moe(n.model_id)
-    params = (total_params_b(n.model_id) if moe else active_params_b(n.model_id)) * 1e9
+    moe = _is_moe(n.model_id, n.model_revision)
+    params = (
+        total_params_b(n.model_id, n.model_revision)
+        if moe
+        else active_params_b(n.model_id, n.model_revision)
+    ) * 1e9
     overhead = MOE_STEP_OVERHEAD_S if moe else 0.0
     sft_mfu = MFU_SFT_TRAIN_MOE if moe else MFU_SFT_TRAIN
     update_mfu = MFU_TRAIN_MOE if moe else MFU_TRAIN
@@ -645,8 +653,12 @@ def sft_seconds_for_tokens(config: RunConfig, gpu: str, train_tokens: float) -> 
     """SFT steady-state wall time for an actual token count on ``gpu``."""
     n = config.normalized()
     # MoE prices on total params at a reduced MFU (see seconds_per_step); dense keeps active.
-    moe = _is_moe(n.model_id)
-    params = (total_params_b(n.model_id) if moe else active_params_b(n.model_id)) * 1e9
+    moe = _is_moe(n.model_id, n.model_revision)
+    params = (
+        total_params_b(n.model_id, n.model_revision)
+        if moe
+        else active_params_b(n.model_id, n.model_revision)
+    ) * 1e9
     mfu = MFU_SFT_TRAIN_MOE if moe else MFU_SFT_TRAIN
     peak = effective_train_tflops(gpu) * 1e12
     flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * train_tokens
@@ -666,7 +678,7 @@ def _offline_gpu_shape(
     """
     # Fail closed on a model that cannot be sized at all. Curated entries answer from the catalog
     # with no network call; an open-policy model resolves via HF (self-hosted planes only).
-    total_params_b(config.model_id)
+    total_params_b(config.model_id, config.model_revision)
     need = required_vram_gb(
         config.model_id,
         config.method,
@@ -905,7 +917,7 @@ def _notes(
             f"{len(n.save_at_steps)} synchronous required save(s) add "
             f"~{_fmt_duration(required_save_s)}"
         )
-    if _is_moe(n.model_id):
+    if _is_moe(n.model_id, n.model_revision):
         notes.append(
             "MoE model: per-step time priced on total params (routing + all-expert coordination), "
             "not just active-param FLOPs, plus a one-time kernel compile"

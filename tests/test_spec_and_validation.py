@@ -593,6 +593,30 @@ def test_advantage_clip_is_no_longer_a_config_key() -> None:
         spec_from_dict(raw)
 
 
+def test_jobspec_drops_removed_train_keys_from_persisted_records() -> None:
+    original = _job_from_dict({})
+    persisted = original.to_internal_dict()
+    persisted["train"].update(
+        {
+            "eval_every_steps": 10,
+            "eval_examples": 32,
+            "seeds": [0, 1],
+            "max_length": 2048,
+            "max_tokens": 512,
+            "steps": 100,
+            "opd_entropy_floor": 1.0,
+            "opd_entropy_floor_coef": 0.1,
+            "opd_eos_loss_coef": 0.2,
+            "checkpoint_landmarks": [25, 100],
+            "advantage_clip": 1.5,
+        }
+    )
+
+    restored = JobSpec.from_dict(persisted)
+
+    assert restored.train == original.train
+
+
 def test_environment_pip_is_platform_managed() -> None:
     raw = _raw()
     raw["environment"]["pip"] = ["freesolo==1.2.3"]

@@ -1088,6 +1088,32 @@ def test_env_eval_upload_rejects_an_inaccessible_project_before_paying(
     assert "is not accessible" in captured
 
 
+def test_env_eval_self_hosted_preflight_checks_the_hosted_upload_project(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A self-hosted control plane does not change where evaluation reports are uploaded."""
+    from flash.client import ApiError
+
+    monkeypatch.setattr(
+        "flash.client.client_from_config",
+        lambda: (_ for _ in ()).throw(AssertionError("no generation before project validation")),
+    )
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("http://127.0.0.1:8080", "operator-key")
+    )
+
+    def _denied(project_id, api_key):
+        raise ApiError(403, "denied")
+
+    monkeypatch.setattr("flash.client.get_project", _denied, raising=False)
+    _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
+
+    assert cli.main(["env", "eval", "flash-1", "--project", _PROJECT_ID]) == 1
+    captured = capsys.readouterr().err
+    assert "--project must be a valid PROJECT_ID" in captured
+    assert "is not accessible" in captured
+
+
 def test_env_eval_upload_requires_credentials_before_paying(monkeypatch, tmp_path, capsys) -> None:
     """Uploading without a key cannot be discovered after the suite has already been bought."""
     monkeypatch.setattr(

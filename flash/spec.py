@@ -284,6 +284,27 @@ class EnvironmentSpec:
     resolved_sha: str = ""
 
 
+# drop-on-parse only for internal persisted JobSpec records. these were real TrainSpec fields, so
+# historical status.spec and effective_preparation.worker_spec payloads can still carry them even
+# though stored run records are never rewritten. the public config schema remains derived from the
+# current TrainSpec and rejects every key here.
+REMOVED_PERSISTED_TRAIN_KEYS = frozenset(
+    {
+        "eval_every_steps",  # removed with the original in-training evaluation loop
+        "eval_examples",  # removed with the original in-training evaluation loop
+        "seeds",  # removed when one fixed seed replaced per-run multi-seed training
+        "max_length",  # removed when the context limit became max_context_tokens
+        "max_tokens",  # removed when the completion limit became max_completion_tokens
+        "steps",  # removed when epochs became the duration input
+        "opd_entropy_floor",  # removed with the student-side entropy-floor objective
+        "opd_entropy_floor_coef",  # removed with the student-side entropy-floor objective
+        "opd_eos_loss_coef",  # removed with the destabilizing terminal-eos objective
+        "checkpoint_landmarks",  # removed when exact required saves became save_at_steps
+        "advantage_clip",  # removed because the worker parsed but never applied it
+    }
+)
+
+
 @dataclass(frozen=True)
 class TrainSpec:
     epochs: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
@@ -493,6 +514,9 @@ class JobSpec:
             train = {}
         if not isinstance(train, dict):
             raise TypeError("train must be an object")
+        train = {
+            key: value for key, value in train.items() if key not in REMOVED_PERSISTED_TRAIN_KEYS
+        }
         unknown_train = sorted(set(train) - {item.name for item in fields(TrainSpec)})
         if unknown_train:
             raise ValueError(f"train has unknown key(s): {', '.join(unknown_train)}")

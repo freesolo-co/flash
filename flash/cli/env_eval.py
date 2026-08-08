@@ -494,12 +494,14 @@ def _require_accessible_project(project_id: object) -> str:
     except (TypeError, ValueError) as exc:
         raise ClientError(str(exc)) from exc
 
-    api_url, api_key = load_credentials()
+    _api_url, api_key = load_credentials()
     if not api_key:
         raise ClientError(
             "not logged in — run `flash login` with your freesolo API key (or set FREESOLO_API_KEY)"
         )
-    return resolve_project_id(project_id, api_key, api_url)
+    # eval reports upload to the hosted freesolo api even when generations use a self-hosted plane,
+    # so this preflight deliberately validates against the same hosted destination as upload_eval_run.
+    return resolve_project_id(project_id, api_key)
 
 
 def _upload_report(
