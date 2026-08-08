@@ -34,8 +34,14 @@ def default_output_path(export_format: str) -> Path:
     return RAW_EXPORT_PATH if export_format == RAW_FORMAT else DEFAULT_EXPORT_PATH
 
 
-def _require_api_key() -> str:
-    _api_url, api_key = load_credentials()
+def _require_api_key(api_key: str | None) -> str:
+    """Validate the key from the caller's credential snapshot.
+
+    Takes the key rather than re-reading the config so the url the caller decided on and the key
+    sent to the backend come from one snapshot. Re-reading would let a `flash login` landing in
+    between pair a hosted-url decision with a newly stored self-hosted plane credential, sending
+    that credential to the hosted backend.
+    """
     if not api_key:
         raise ClientError(
             "not logged in. Run `flash login` with your freesolo API key (or set FREESOLO_API_KEY)"
@@ -70,13 +76,13 @@ def fetch_records(
 ) -> dict:
     """A project's traces in the requested shape, converted server-side."""
     return export_trace_records(
-        project_id, api_key or _require_api_key(), export_format=export_format
+        project_id, _require_api_key(api_key or load_credentials()[1]), export_format=export_format
     )
 
 
 def fetch_projects(api_key: str | None = None) -> list[dict]:
     """Projects in the caller's org that traces can be exported from."""
-    return list_trace_projects(api_key or _require_api_key())
+    return list_trace_projects(_require_api_key(api_key or load_credentials()[1]))
 
 
 def _resolve_project_id(args, api_key: str) -> str:
@@ -135,7 +141,9 @@ def _empty_export_error(project_id: str, export_format: str) -> ClientError:
 def cmd_traces_export(args) -> int:
     from .commands import self_hosted_plane, unavailable_on_self_hosted_plane
 
-    api_url, _api_key = load_credentials()
+    # one snapshot for both: the url decides whether to refuse, and the key from that same read is
+    # what gets sent, so a concurrent `flash login` cannot pair this url with a later credential.
+    api_url, snapshot_key = load_credentials()
     if self_hosted_plane(api_url):
         # unlike `projects create`, there is nothing local to substitute: traces are written by the
         # freesolo SDK into the hosted backend, and flash itself never records one. so a
@@ -151,7 +159,7 @@ def cmd_traces_export(args) -> int:
                 f"directly (`{CLI_NAME} env setup` scaffolds the format)"
             ),
         )
-    api_key = _require_api_key()
+    api_key = _require_api_key(snapshot_key)
     project_id = _resolve_project_id(args, api_key)
     export_format = getattr(args, "format", None) or RECORDS_FORMAT
 

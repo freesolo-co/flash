@@ -217,6 +217,34 @@ def test_traces_export_requires_login(monkeypatch, tmp_path, capsys) -> None:
     assert "flash login" in capsys.readouterr().err
 
 
+def test_traces_export_sends_the_key_from_the_url_it_decided_on(monkeypatch, tmp_path) -> None:
+    """The self-hosted guard reads the url, and the key travels to the backend. Both must come
+    from ONE credential read: if the key is re-read afterwards, a `flash login` landing in that
+    window pairs a hosted-url decision with a newly stored self-hosted plane credential, sending
+    that credential to the hosted backend -- the exact leak the guard exists to prevent.
+    """
+    monkeypatch.chdir(tmp_path)
+    reads = iter(
+        [
+            (_HOSTED_URL, "hosted-key"),  # the read the guard decides on
+            ("http://my-plane:8080", "operator-key"),  # a concurrent login lands here
+        ]
+    )
+    monkeypatch.setattr(traces, "load_credentials", lambda: next(reads))
+
+    sent: list[str] = []
+
+    def _record(project_id, api_key, export_format=None):
+        sent.append(api_key)
+        return {"format": "records", "records": [{"input": "a", "output": "b"}]}
+
+    monkeypatch.setattr(traces, "export_trace_records", _record)
+
+    assert cli.main(["traces", "export", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
+    # the plane credential from the second read must never reach the hosted backend
+    assert sent == ["hosted-key"]
+
+
 def test_traces_export_reports_a_project_with_no_usable_traces(
     fake_traces, monkeypatch, tmp_path, capsys
 ) -> None:

@@ -177,7 +177,8 @@ With it set:
   of calling the org directory; `flash projects list` and `flash traces export` have no local
   store to read and refuse with the reason. Traces are recorded by the freesolo SDK into the
   hosted backend, so write the same `{"input", "output"}` JSONL rows yourself and train on
-  them directly.
+  them directly. Setting `FREESOLO_BASE_URL` to a Freesolo-compatible backend you run keeps
+  all three on the normal hosted path, since they then have a directory to call.
 
 Self-hosting relaxes the billing boundaries, not the catalog. Trainable models are the
 curated ones on both deployments; see [adding a model](#adding-a-model).

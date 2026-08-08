@@ -341,6 +341,50 @@ def test_hosted_plane_still_reaches_the_backend(monkeypatch, capsys) -> None:
     assert capsys.readouterr().out == "44444444-4444-4444-8444-444444444444\n"
 
 
+def test_configured_backend_keeps_the_hosted_path_on_a_self_hosted_plane(
+    monkeypatch, capsys
+) -> None:
+    """A plane the operator runs can still be pointed at a reachable Freesolo-compatible backend
+    via FREESOLO_BASE_URL, which is what these commands actually call. Keying on the plane url
+    alone would mint an id that backend's directory never got, turning a clean failure into one
+    deferred to project-access validation, and would disable a listing that does work.
+    """
+    _self_hosted(monkeypatch)
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.internal.example")
+    monkeypatch.setattr(
+        "flash.client.create_project",
+        lambda name, description, api_key: {"id": "55555555-5555-4555-8555-555555555555"},
+    )
+
+    # the backend is reached, so the id is ITS id -- not a locally minted uuid
+    assert _run(["projects", "create", "against a configured backend"]) == 0
+    assert capsys.readouterr().out == "55555555-5555-4555-8555-555555555555\n"
+
+
+def test_configured_backend_keeps_project_listing_available(monkeypatch, capsys) -> None:
+    """The refusal is about having no backend, not about who runs the plane."""
+    _self_hosted(monkeypatch)
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.internal.example")
+    monkeypatch.setattr(
+        "flash.client.list_projects",
+        lambda api_key: [{"id": "66666666-6666-4666-8666-666666666666", "name": "configured"}],
+    )
+
+    assert _run(["projects", "list"]) == 0
+    assert "configured" in capsys.readouterr().out
+
+
+def test_blank_backend_url_does_not_count_as_configured(monkeypatch, capsys) -> None:
+    """An empty or whitespace value is an unset backend, not a reachable one; treating it as
+    configured would restore the 401 this guard exists to prevent."""
+    _self_hosted(monkeypatch)
+    monkeypatch.setenv("FREESOLO_BASE_URL", "   ")
+    monkeypatch.setattr("flash.client.list_projects", lambda *a, **k: pytest.fail("hosted call"))
+
+    assert _run(["projects", "list"]) == 1
+    assert "not available on a self-hosted plane" in capsys.readouterr().err.lower()
+
+
 def test_train_cost_requires_explicit_project(tmp_path, capsys) -> None:
     config = tmp_path / "run.toml"
     config.write_text(

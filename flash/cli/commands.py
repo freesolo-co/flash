@@ -99,17 +99,27 @@ def cmd_version(args) -> int:
 
 
 def self_hosted_plane(api_url: str | None) -> bool:
-    """Whether ``api_url`` names a control plane the user runs rather than Freesolo's.
+    """Whether these commands have no Freesolo backend to reach.
 
-    The client cannot read ``FLASH_STANDALONE`` -- it is server-side env, and these commands never
-    reach the plane at all, so there is no response to learn it from either. The control-plane URL
-    is the only standalone signal available before authenticating, which is the same basis
-    ``_verifies_against_freesolo`` and ``client.resolve_project_id`` already decide on.
+    Two independent axes decide that, and only both together mean "no backend":
 
-    A false negative is the safe direction: a self-hoster who points ``--api-url`` at Freesolo gets
-    today's hosted behaviour, not a broken command.
+    - the control-plane url. The client cannot read ``FLASH_STANDALONE`` (server-side env, and
+      these commands never reach the plane, so no response carries it either), so the url is the
+      only standalone signal available before authenticating.
+    - ``FREESOLO_BASE_URL``. A plane the user runs can still be configured against a reachable
+      Freesolo-compatible backend, which is what these commands actually call
+      (``client.http.freesolo_base_url``) -- that env var is read independently of the plane url.
+
+    Deciding on the url alone would disable a backend the operator has configured and reachable,
+    so an explicit backend wins, exactly as ``_verifies_against_freesolo`` lets ``--freesolo-url``
+    override the same host check.
+
+    A false negative stays the safe direction: a self-hoster who points at Freesolo, or sets a
+    backend url, gets today's hosted behaviour rather than a broken command.
     """
-    return bool(api_url) and not is_freesolo_hosted_url(api_url)
+    if not api_url or is_freesolo_hosted_url(api_url):
+        return False
+    return not os.environ.get("FREESOLO_BASE_URL", "").strip()
 
 
 def unavailable_on_self_hosted_plane(what: str, *, because: str, instead: str) -> ClientError:
