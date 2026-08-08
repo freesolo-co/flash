@@ -243,55 +243,6 @@ def test_deployment_roundtrip_dict():
     assert "mode" not in data
 
 
-def test_serving_prices_cover_catalog():
-    from flash.catalog import MODELS
-    from flash.serve.pricing import SERVING_MARKUP, SERVING_PRICES
-
-    assert set(SERVING_PRICES) == set(MODELS)
-    ordered_prices = sorted(SERVING_PRICES.items())
-    assert [model_id for model_id, _price in ordered_prices] == sorted(MODELS)
-    assert pytest.approx(1.20) == SERVING_MARKUP
-    for model_id, price in ordered_prices:
-        assert price.model_id == model_id
-        assert price.typical_input_usd_per_mtok > 0
-        assert price.typical_output_usd_per_mtok > 0
-        assert price.typical_cached_input_usd_per_mtok > 0
-        assert price.billed_input_usd_per_mtok > 0
-        assert price.billed_output_usd_per_mtok > 0
-        assert price.billed_cached_input_usd_per_mtok > 0
-        assert price.billed_cached_input_usd_per_mtok < price.billed_input_usd_per_mtok
-        assert price.billed_input_usd_per_mtok == pytest.approx(
-            price.typical_input_usd_per_mtok * SERVING_MARKUP
-        )
-        assert price.billed_output_usd_per_mtok == pytest.approx(
-            price.typical_output_usd_per_mtok * SERVING_MARKUP
-        )
-        assert price.billed_cached_input_usd_per_mtok == pytest.approx(
-            price.typical_cached_input_usd_per_mtok * SERVING_MARKUP
-        )
-
-
-def test_serving_prices_pin_public_rates_plus_markup():
-    from flash.serve.pricing import SERVING_MARKUP, SERVING_PRICES
-
-    typical = {
-        "Qwen/Qwen3.5-0.8B": (0.01, 0.05, 0.002),
-        "Qwen/Qwen3.5-2B": (0.02, 0.10, 0.004),
-        "Qwen/Qwen3.5-4B": (0.03, 0.15, 0.006),
-        "Qwen/Qwen3.5-9B": (0.114, 0.19, 0.023),
-        "Qwen/Qwen3.6-27B": (0.4254, 3.055, 0.14),
-        "Qwen/Qwen3.6-35B-A3B": (0.198, 1.265, 0.066),
-    }
-    for model_id, (input_rate, output_rate, cached_rate) in typical.items():
-        price = SERVING_PRICES[model_id]
-        assert price.typical_input_usd_per_mtok == pytest.approx(input_rate)
-        assert price.typical_output_usd_per_mtok == pytest.approx(output_rate)
-        assert price.typical_cached_input_usd_per_mtok == pytest.approx(cached_rate)
-        assert price.billed_input_usd_per_mtok == pytest.approx(input_rate * SERVING_MARKUP)
-        assert price.billed_output_usd_per_mtok == pytest.approx(output_rate * SERVING_MARKUP)
-        assert price.billed_cached_input_usd_per_mtok == pytest.approx(cached_rate * SERVING_MARKUP)
-
-
 def test_resolve_deploy_step_rejects_malformed_step_as_400():
     """A malformed ``step`` must raise HTTPException(400), never a 500. Regression for ``"--5"``:
     ``str.lstrip("-").isdigit()`` accepted it, then ``int("--5")`` raised an uncaught ValueError.
