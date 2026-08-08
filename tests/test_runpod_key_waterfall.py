@@ -319,7 +319,7 @@ def test_list_endpoints_raises_when_any_key_fails(monkeypatch):
 
 def test_list_endpoints_raises_when_no_key_configured(monkeypatch):
     """No RUNPOD_API_KEY -> raise instead of returning [] without any authenticated call. Callers
-    (slot-reconcile/teardown) treat [] as 'fleet confirmed empty' and would act on a false view."""
+    (teardown/idle reaper) treat [] as 'fleet confirmed empty' and would act on a false view."""
     import flash.providers.runpod.api as runpod_api
     import flash.providers.runpod.keys as keys
 
