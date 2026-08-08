@@ -16,10 +16,15 @@ from __future__ import annotations
 import itertools
 import re
 
-# A flag whose operand is the shell's PROGRAM: `sh -c '…'`, `bash -xc '…'`, `su --command '…'`.
-# Shared with `pipe_to_shell_grammar`, which needs the same test to find the program a shell runs;
-# defined here because every other user of it is in this module.
-_TAKES_A_COMMAND_STRING = re.compile(r"-[A-Za-z]*c|--command")
+# a flag whose operand is the shell's program: `sh -c '…'`, `bash -cxe '…'`,
+# `su --command '…'`. `c` may sit anywhere in a short-option cluster; the operand parser below
+# skips values taken by other options before locating the command string.
+_TAKES_A_COMMAND_STRING = re.compile(r"-(?=[A-Za-z]*c)[A-Za-z]+|--command")
+
+# shell invocation options that consume the next argv word before a script or `-c` program. keeping
+# these here prevents an operand such as the `c` in `bash -o c verify.sh` from becoming an option.
+_SHELL_OPTIONS_WITH_OPERAND = {"o", "O"}
+_LONG_SHELL_OPTIONS_WITH_OPERAND = {"--init-file", "--rcfile"}
 
 # `env -S 'bash -s'` splits its operand into words and runs them, so the operand is not a value to
 # skip -- it is the command. The fused spelling puts it in the same token: `-S'bash -s'`.
@@ -130,6 +135,48 @@ def _fused_replacement(flag: str) -> str:
     return ""
 
 
+def _shell_option_state(tokens: list[str]) -> tuple[int, bool, bool]:
+    """Return the first operand index, whether `-c` appeared, and whether `-s` appeared.
+
+    Bash parses a whole short-option cluster before taking operands. Confirmed:
+        bash -cxe 'echo X'                  -> X
+        bash -co pipefail 'echo X'          -> X
+        bash -o c verify.sh                 -> `c` is the option name, not `-c`
+
+    The `-o`/`-O` values therefore move the eventual `-c` program to the right, while a `c` in
+    one of those separate values is data. Parsing the option prefix once keeps both questions in
+    agreement: which string `-c` runs, and whether a script-file operand replaces stdin.
+    """
+    index = 1
+    takes_command = False
+    reads_stdin = False
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            index += 1
+            break
+        if token == "-" or not token.startswith(("-", "+")):
+            break
+        if token in _LONG_SHELL_OPTIONS_WITH_OPERAND:
+            index += 2
+            continue
+        if token.startswith("--"):
+            takes_command |= token == "--command"
+            index += 1
+            continue
+        options = token[1:]
+        takes_command |= "c" in options
+        reads_stdin |= "s" in options
+        index += 1 + sum(option in _SHELL_OPTIONS_WITH_OPERAND for option in options)
+    return index, takes_command, reads_stdin
+
+
+def _command_string_operand_index(tokens: list[str]) -> int | None:
+    """The argv index of a shell's `-c` program, including clustered option operands."""
+    index, takes_command, _ = _shell_option_state(tokens)
+    return index if takes_command else None
+
+
 def _dash_c_operand(tokens: list[str]) -> str | None:
     """The program string a shell's `-c` supplies, or None when the shell has no `-c`.
 
@@ -151,10 +198,26 @@ def _dash_c_operand(tokens: list[str]) -> str | None:
     """
     if _reads_stdin_despite_dash_c(tokens):
         return None
-    for index, tok in enumerate(tokens):
-        if _TAKES_A_COMMAND_STRING.fullmatch(tok):
-            return tokens[index + 1] if index + 1 < len(tokens) else ""
-    return None
+    index = _command_string_operand_index(tokens)
+    if index is None:
+        return None
+    return tokens[index] if index < len(tokens) else ""
+
+
+def _shell_reads_stdin(tokens: list[str]) -> bool:
+    """Does a shell invocation take its program from stdin rather than a script operand?
+
+    A non-option operand is a SCRIPT FILE, so `bash verify.sh` runs that file and leaves the pipe as
+    data. A bare shell, `-s`, and the special `-` operand all still read commands from stdin.
+    """
+    if _reads_stdin_despite_dash_c(tokens):
+        return True
+    index, takes_command, reads_stdin = _shell_option_state(tokens)
+    if takes_command:
+        return False
+    if reads_stdin or index >= len(tokens):
+        return True
+    return tokens[index] == "-"
 
 
 # Shells confirmed to IGNORE stdin once `-c` supplies the program, even with `-s` also given.
@@ -170,7 +233,8 @@ def _reads_stdin_despite_dash_c(tokens: list[str]) -> bool:
     Unknown shell names are treated as reading stdin, so a miss is a false POSITIVE (a CI failure
     someone investigates) rather than a silent hole.
     """
-    if not any(t.startswith("-") and not t.startswith("--") and "s" in t[1:] for t in tokens[1:]):
+    _, takes_command, reads_stdin = _shell_option_state(tokens)
+    if not (takes_command and reads_stdin):
         return False
     name = tokens[0].rsplit("/", 1)[-1] if tokens else ""
     return name not in _IGNORES_STDIN_GIVEN_DASH_C

@@ -32,7 +32,9 @@ import shlex
 from tests.pipe_to_shell_argv import (
     _TAKES_A_COMMAND_STRING,
     _arguments_reach_a_command_slot,
+    _command_string_operand_index,
     _dash_c_operand,
+    _shell_reads_stdin,
     _split_string_operands,
     _stream_becomes_arguments,
 )
@@ -179,7 +181,9 @@ def _piped_into_a_shell(line: str) -> bool:
 # What the file writes BEFORE the shell command: a Dockerfile `RUN`, a workflow `run:` (with the
 # block scalar its value may open on). Stripped once, at the boundary between file syntax and
 # shell syntax, so nothing downstream has to know which kind of file the line came from.
-_FORMAT_KEYWORD = re.compile(r"^\s*(?:RUN|ENTRYPOINT|CMD|-?\s*(?:name:.*)?run:)\s*[|>]?[+-]?\d*\s*")
+_FORMAT_KEYWORD = re.compile(
+    r"^\s*(?:-?\s*(?:name:.*)?run:|(?i:RUN|ENTRYPOINT|CMD))\s*[|>]?[+-]?\d*\s*"
+)
 
 
 # Dockerfile EXEC form: `RUN ["bash", "-c", "curl … | bash"]`. The shell command is a JSON string
@@ -264,10 +268,10 @@ _FETCH = re.compile(r"(?:[\w./-]*/)?(?:curl|wget)")
 # Where the span SITS does distinguish them. `sh -c "…"` is the only construct here that takes a
 # command as a string, so that is the only place the quotes get opened.
 #
-# Short options fuse: `sh -ec`, `bash -lc`, `sh -euc` all end in `c` and all take the next word
-# as the command. Matching the flag exactly as `-c` missed every fused spelling -- including
-# `bash -lc '…'`, which this repo already writes in docker/bake_kernel_cache.py. A long `--command`
-# counts too; `--config` and other `c`-words must not, hence the exact long-form match.
+# short options fuse, and `c` may appear anywhere in a legal cluster: `bash -cxe` and `sh -euc`
+# both take a command string. an `o`/`O` in that cluster consumes its own following operand first,
+# while a separate `-o c` makes `c` data rather than an option. a long `--command` counts too;
+# `--config` and other `c`-words must not, hence the exact long-form match.
 
 
 def _tokenize(line: str) -> list[str]:
@@ -301,10 +305,11 @@ def _is_a_command_string(tokens: list[str], index: int) -> bool:
     `bash -o pipefail -c "…"` stops at `pipefail` and concludes the command is not a shell. Only
     a shell counts -- `jq -c "…"` passes `-c` too, and its argument is a filter, not a command.
     """
-    if index == 0 or not _TAKES_A_COMMAND_STRING.fullmatch(tokens[index - 1]):
+    word, at = _command_word(tokens)
+    if at is None or not _SHELL_NAME.fullmatch(word):
         return False
-    word, at = _command_word(tokens[: index - 1])
-    return at is not None and bool(_SHELL_NAME.fullmatch(word))
+    operand = _command_string_operand_index(tokens[at:])
+    return operand is not None and at + operand == index
 
 
 def _command_word(tokens: list[str]) -> tuple[str, int | None]:
@@ -482,6 +487,8 @@ def _stage_fetches(stage: list[str]) -> bool:
     A substitution is different: `"$(curl URL)"` is not the command word and never will be, so it
     is matched wherever it appears.
     """
+    if any(_stage_fetches(_tokenize(command)) for command in _split_string_operands(stage)):
+        return True
     word, at = _command_word(stage)
     if at is None:
         return _stage_substitutes_a_fetch(stage)
@@ -493,9 +500,9 @@ def _stage_fetches(stage: list[str]) -> bool:
     # this recurses past `-c` rather than re-walking every remaining token.
     #   grep curl commands.txt | bash   ->  runs locally selected text, fetches nothing
     if _SHELL_NAME.fullmatch(word):
-        for index, tok in enumerate(stage[at + 1 :], start=at + 1):
-            if _TAKES_A_COMMAND_STRING.fullmatch(tok):
-                return _stage_fetches(stage[index + 1 :])
+        operand = _command_string_operand_index(stage[at:])
+        if operand is not None:
+            return _stage_fetches(stage[at + operand :])
     return _stage_substitutes_a_fetch(stage)
 
 
@@ -527,6 +534,8 @@ def _stage_runs_a_shell(tokens: list[str]) -> bool:
         # asked below -- not a quieter version of this one.
         if _stream_becomes_arguments(inner[:at]):
             return _arguments_reach_a_command_slot(inner[:at], inner[at:])
+        # a shell without `-c` may still take a script-file operand. `bash verify.sh` runs that
+        # file and leaves the pipe as data, while a bare shell, `-s`, and `-` read commands from it.
         # `sh -c '…'` takes its program from the operand and leaves the pipe on stdin for
         # whatever that program is. `curl checksums.txt | sh -c 'sha256sum -c -'` therefore
         # VERIFIES the download rather than running it -- the stream is data, and flagging it
@@ -541,7 +550,7 @@ def _stage_runs_a_shell(tokens: list[str]) -> bool:
         # `sh -c 'true; jq .'` names no shell that runs, and must stay clean.
         program = _dash_c_operand(inner[at:])
         if program is None:
-            return True
+            return _shell_reads_stdin(inner[at:])
         return any(_stage_runs_a_shell(cmd) for cmd in _commands_in(program))
     # Checked even when the walk found no command word: `env -S'bash -s'` fuses the operand into
     # the flag, so every token is a flag and the walk runs off the end with the shell still in it.
@@ -736,6 +745,20 @@ def _compound_body_text(tokens: list[str]) -> str:
     )
 
 
+def _is_case_keyword(tokens: list[str], index: int) -> bool:
+    """Is this `case` a compound opener rather than a subject, pattern, word-list item, or argument?
+
+    An `in` introduces data in every compound that uses it: branch patterns for `case`, and word
+    lists for `for`/`select`. The first word after it is therefore never a command. A `)` ending a
+    case label does the opposite and opens the branch body, where a nested `case` is a command.
+    """
+    if tokens[index] != "case":
+        return False
+    if index and tokens[index - 1] == "in":
+        return False
+    return _in_command_position(tokens[:index]) or (index > 0 and tokens[index - 1] == ")")
+
+
 def _holds_a_case_keyword(tokens: list[str]) -> bool:
     """Does a `case` KEYWORD appear anywhere in this compound, at any nesting depth?
 
@@ -749,7 +772,7 @@ def _holds_a_case_keyword(tokens: list[str]) -> bool:
     bash ); fi` must not drop patterns, or the `)` closing that group would take `( bash` with it
     and turn a caught line into a miss.
     """
-    return any(tok == "case" and _in_command_position(tokens[:i]) for i, tok in enumerate(tokens))
+    return any(_is_case_keyword(tokens, index) for index in range(len(tokens)))
 
 
 def _drop_case_patterns(tokens: list[str]) -> list[str]:
@@ -771,8 +794,8 @@ def _drop_case_patterns(tokens: list[str]) -> list[str]:
     open_cases = 0
     awaiting = False
     previous = ""
-    for tok in tokens:
-        if tok == "case":
+    for index, tok in enumerate(tokens):
+        if _is_case_keyword(tokens, index):
             open_cases += 1
             awaiting = True
         elif tok == "esac" and open_cases:

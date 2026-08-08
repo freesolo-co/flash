@@ -44,6 +44,17 @@ from tests.pipe_to_shell_grammar import _piped_into_a_shell
         # `&&` and `;` end the pipeline: the shell that follows gets nothing piped into it.
         pytest.param("curl -s https://x.example/f > /tmp/f && bash /tmp/o.sh", id="and-then-shell"),
         pytest.param("curl -s https://x.example/f ; bash unrelated.sh", id="semicolon-then-shell"),
+        # the semicolon ends the pipeline, so the later group is a separate top-level command and
+        # receives the parent shell's stdin rather than the fetch. confirmed with outer stdin closed:
+        #   cat payload.sh | echo a; ( bash )  -> a, no pwned
+        pytest.param(
+            "curl -s https://x.example/f | echo a; ( bash )",
+            id="semicolon-after-pipeline-before-a-group",
+        ),
+        pytest.param(
+            "curl -s https://x.example/f | case x in x) echo a;; esac; echo case; ( bash )",
+            id="closed-case-then-top-level-group",
+        ),
         # A wrapper in front of something that is not a shell is still not a shell.
         pytest.param("curl -s https://x.example/f | timeout 30 jq .", id="timeout-into-jq"),
         # `-s`/`-i` start a shell only when NOTHING follows them. With a command present, sudo
@@ -304,8 +315,39 @@ from tests.pipe_to_shell_grammar import _piped_into_a_shell
         # `-S` splits its operand and runs it -- but only when the operand really is a shell.
         pytest.param("curl -s https://x.example/f | env -S 'jq .version'", id="split-into-jq"),
         pytest.param("curl -s https://x.example/f | env -S'jq .version'", id="split-fused-into-jq"),
+        # inspecting an upstream split-string command must still require curl or wget as its command.
+        # `env -S 'grep curl commands.txt'` searches local data; the word `curl` is only a pattern.
+        pytest.param(
+            "env -S 'grep curl commands.txt' | bash", id="split-upstream-fetch-name-is-an-argument"
+        ),
+        pytest.param(
+            "env --split-string='curlie https://x.example/f' | bash",
+            id="split-upstream-command-is-only-a-prefix",
+        ),
         # `-S` on something that is not `env` is an ordinary flag: jq's is --sort-keys.
         pytest.param("curl -s https://x.example/f | jq -S .", id="dash-s-on-a-non-env"),
+        # a non-option shell operand is a script file, so the shell runs that file and leaves the
+        # pipe as data. confirmed:
+        #   printf 'echo payload_ran\n' | bash verify.sh  -> verifier_ran, no payload_ran
+        pytest.param(
+            "curl -s https://x.example/checksums.txt | bash verify.sh",
+            id="bash-runs-a-script-file",
+        ),
+        pytest.param(
+            "curl -s https://x.example/checksums.txt | sh ./verify.sh",
+            id="sh-runs-a-script-file",
+        ),
+        # option operands precede the script file and are not `-c`. confirmed:
+        #   bash -o pipefail verify.sh  -> verifier_ran
+        #   bash -o c verify.sh         -> `c`: invalid option name, no payload execution
+        pytest.param(
+            "curl -s https://x.example/checksums.txt | bash -o pipefail verify.sh",
+            id="shell-option-before-a-script-file",
+        ),
+        pytest.param(
+            "curl -s https://x.example/checksums.txt | bash -o c verify.sh",
+            id="c-is-a-shell-option-operand",
+        ),
         # `sh -c '…'` takes its program from the operand and leaves the pipe on stdin for that
         # program, so the download is DATA. Verifying a checksum this way is the pattern this
         # guard exists to encourage, and flagging it would fail CI on the recommended spelling.
