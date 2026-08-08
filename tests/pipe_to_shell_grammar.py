@@ -590,13 +590,21 @@ def _privilege_tool_at(tokens: list[str]) -> int | None:
     `env sudo -s` and `nice sudo -s` both execute the pipe.
     """
     wrapper = ""
+    skip_next = False
     for index, tok in enumerate(tokens):
+        if skip_next:
+            skip_next = False
+            continue
         name = tok.rsplit("/", 1)[-1]
         if name in _PRIVILEGE_TOOLS:
             return index
         if tok.startswith(("-", "+")):
+            # A flag may take a SEPARATE operand, and that operand is not a command. Without
+            # this, `env -u LANG sudo -s` stopped at `LANG` and never reached sudo -- while it
+            # executes the download:  printf 'echo PWNED\n' | env -u LANG sudo -n -s  ->  PWNED
+            skip_next = "=" not in tok and _takes_a_separate_operand(wrapper, tok)
             continue
-        # A wrapper's own numeric operand is not a command: `timeout 30 sudo -s` and
+        # A wrapper's own numeric operand is not a command either: `timeout 30 sudo -s` and
         # `nice -n 5 sudo -s` both reach sudo. Same rule the command-word walk applies.
         if wrapper and _NUMERIC_OPERAND.fullmatch(tok):
             continue
