@@ -106,6 +106,10 @@ _EXEC_WRAPPERS = {
     "chrt",
     "taskset",
     "runuser",
+    # `unshare` runs its program with namespaces unshared, stdin untouched. Confirmed:
+    #   sudo -n unshare bash < payload        ->  ran
+    #   sudo -n unshare --fork sh < payload   ->  ran
+    "unshare",
 }
 
 # Flags that take a SEPARATE operand, per wrapper. Keyed by wrapper because the same spelling
@@ -149,6 +153,9 @@ _FLAGS_WITH_OPERAND = {
         "--selinux-label",
     },
     "runuser": {"-u", "-g", "-G", "--user", "--group", "--supp-group"},
+    # `unshare`'s namespace flags take an OPTIONAL fused operand (`--mount=<file>`), so they
+    # consume nothing separate. Only these six take a separate one, per `unshare --help`.
+    "unshare": {"-S", "-G", "--setuid", "--setgid", "--propagation", "--setgroups"},
 }
 
 # `env -S 'bash -s'` splits its operand into words and runs them, so the operand is not a value
@@ -246,7 +253,10 @@ def _exec_form_command(text: str) -> str:
 # a live installer through. A `>&`-style redirection is matched before the bare `&` so its `&` is
 # not taken for a separator either.
 _TOKEN = re.compile(
-    r"""'[^']*'|"(?:[^"\\]|\\.)*"|\d*[<>]{1,2}&\d*|\|\||&&|\||;|&|\(|\)"""
+    # `|&` is ONE operator (bash: pipe stdout AND stderr), so it is matched before `||` and the
+    # bare `&` -- otherwise it splits into `|` then `&`, and the `&` ends the pipeline before the
+    # shell, which read as clean:  cat payload |& bash  ->  ran
+    r"""'[^']*'|"(?:[^"\\]|\\.)*"|\d*[<>]{1,2}&\d*|\|&|\|\||&&|\||;|&|\(|\)"""
     r"""|(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s;|&()'"])+"""
 )
 _FETCH = re.compile(r"(?:[\w./-]*/)?(?:curl|wget)")
@@ -376,7 +386,7 @@ def _pipelines_in(text: str) -> list[list[list[str]]]:
         #   printf 'echo PWNED\n' | (true; bash)      ->  PWNED
         elif tok in ("||", "&&", ";", "&") and depth == 0:
             pipelines.append([[]])
-        elif tok == "|" and depth == 0:
+        elif tok in ("|", "|&") and depth == 0:
             pipelines[-1].append([])
         else:
             pipelines[-1][-1].append(tok)
@@ -418,8 +428,30 @@ _SUBSTITUTED_FETCH = re.compile(r"(?:\$\(|`)[^)`]*\b(?:curl|wget)\b")
 
 
 def _stage_fetches(stage: list[str]) -> bool:
-    """Does this stage download something, as its own command or inside a substitution?"""
-    return any(_FETCH.fullmatch(tok) or _SUBSTITUTED_FETCH.search(tok) for tok in stage)
+    """Does this stage download something, as its own command or inside a substitution?
+
+    The bare name must be the stage's COMMAND. Matching it anywhere made `grep curl commands.txt`
+    a download -- there the word is a search PATTERN, and the shell downstream receives locally
+    selected text:  grep echo commands.txt | bash  ->  runs the local file's line, fetches nothing.
+
+    A substitution is different: `"$(curl URL)"` is not the command word and never will be, so it
+    is matched wherever it appears.
+    """
+    word, at = _command_word(stage)
+    if at is None:
+        return bool(any(_SUBSTITUTED_FETCH.search(tok) for tok in stage))
+    if _FETCH.fullmatch(word):
+        return True
+    # A `sh -c "curl … | bash"` program is spliced INLINE into its stage, so the stage's own
+    # command word is `sh` and the fetch sits further right. Only a shell's `-c` makes what
+    # follows a command: after `grep`, the word is an ARGUMENT (a search pattern), which is why
+    # this recurses past `-c` rather than re-walking every remaining token.
+    #   grep curl commands.txt | bash   ->  runs locally selected text, fetches nothing
+    if _SHELL_NAME.fullmatch(word):
+        for index, tok in enumerate(stage[at + 1 :], start=at + 1):
+            if _TAKES_A_COMMAND_STRING.fullmatch(tok):
+                return _stage_fetches(stage[index + 1 :])
+    return any(_SUBSTITUTED_FETCH.search(tok) for tok in stage)
 
 
 def _stage_runs_a_shell(tokens: list[str]) -> bool:
@@ -436,7 +468,7 @@ def _stage_runs_a_shell(tokens: list[str]) -> bool:
     if _is_a_group(tokens):
         return any(_stage_runs_a_shell(cmd) for cmd in _commands_in(" ".join(tokens[1:-1])))
     inner = [t for t in tokens if t not in ("(", ")", "{", "}")]
-    if _requests_a_shell_by_flag(inner) or _sources_stdin(inner):
+    if _requests_a_shell_by_flag(inner) or _sources_stdin(inner) or _evals_stdin(inner):
         return True
     word, at = _command_word(inner)
     if at is not None and _SHELL_NAME.fullmatch(word):
@@ -492,6 +524,30 @@ def _sources_stdin(tokens: list[str]) -> bool:
     if at is None or word not in ("source", "."):
         return False
     return any(operand in _STDIN_PATHS for operand in tokens[at + 1 :])
+
+
+# Ways a command string SLURPS its own stdin: a bare `cat`, or a redirect-from-stdin
+# substitution. Whatever is captured this way is the piped download.
+_READS_STDIN = re.compile(r"(?:\$\(|`)\s*(?:cat\s*|<\s*/dev/stdin\s*)(?:\)|`)")
+
+
+def _evals_stdin(tokens: list[str]) -> bool:
+    """Does this stage `eval` something it read from stdin?
+
+    `eval` is a builtin, so the `-c` recursion -- which asks whether a command is a shell --
+    stops at it. But `eval "$(cat)"` captures the pipe and executes it:
+
+        printf 'echo PWNED\\n' | bash -c 'eval "$(cat)"'         ->  PWNED
+        printf 'echo PWNED\\n' | bash -c 'eval "$(</dev/stdin)"' ->  PWNED
+        printf 'echo PWNED\\n' | bash -c 'eval "`cat`"'          ->  PWNED
+
+    The capture must actually read stdin. `eval "echo SAFE"` runs a literal and `eval "$FOO"`
+    runs a variable, neither of which touches the pipe, so both stay clean.
+    """
+    word, at = _command_word(tokens)
+    if at is None or word != "eval":
+        return False
+    return any(_READS_STDIN.search(tok) for tok in tokens[at + 1 :])
 
 
 def _requests_a_shell_by_flag(tokens: list[str]) -> bool:

