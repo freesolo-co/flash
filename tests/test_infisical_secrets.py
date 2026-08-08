@@ -10,6 +10,7 @@ until a deployment fails to start.
 
 from __future__ import annotations
 
+import itertools
 import re
 import shutil
 import subprocess
@@ -56,7 +57,9 @@ INSTALLER_FILES = _installer_files()
 # command requires knowing how many operands each flag consumes, and a regex cannot carry that
 # state -- so its optional groups backtrack and re-read an operand as the command. Walking the
 # tokens models the actual grammar and makes both failure directions expressible.
-_SHELL_NAME = re.compile(r"(?:[\w./-]*/)?(?:ba|z|k|da)?sh$")
+# `ash` is BusyBox's shell and therefore `/bin/sh` on every Alpine image, which is the base a
+# vendor install script is most likely to run under.
+_SHELL_NAME = re.compile(r"(?:[\w./-]*/)?(?:ba|a|z|k|da)?sh$")
 
 # Wrappers that EXEC what follows them, so the real command is further right. Open-ended by
 # nature; this is the part of the guard most likely to need extending, and the only part where
@@ -69,11 +72,16 @@ _EXEC_WRAPPERS = {"sudo", "env", "xargs", "nohup", "exec", "command", "timeout",
 # runs `cat`, not `bash`, and flagging it would fail CI on a legitimate pipeline.
 _FLAGS_WITH_OPERAND = {
     "sudo": {"-u", "-g", "-h", "-p", "-C", "-U", "-r", "-t", "--user", "--group", "--prompt"},
-    "env": {"-u", "-C", "-S", "--unset", "--chdir", "--split-string"},
+    "env": {"-u", "-C", "--unset", "--chdir"},
     "timeout": {"-k", "-s", "--kill-after", "--signal"},
     "xargs": {"-a", "-E", "-I", "-L", "-n", "-P", "-s", "-d", "--delimiter", "--max-args"},
     "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
 }
+
+# `env -S 'bash -s'` splits its operand into words and runs them, so the operand is not a value
+# to skip -- it is the command. Kept apart from _FLAGS_WITH_OPERAND because those two treatments
+# are opposites: one steps over the operand, this one steps INTO it.
+_SPLITS_ITS_OPERAND = {"-S", "--split-string"}
 
 # A bare numeric operand sitting between a wrapper and its command: `timeout 30 sh` requires one,
 # and an unrecognized flag may introduce one (`nohup -n 5 bash`). Skipped after ANY wrapper rather
@@ -89,8 +97,21 @@ def _piped_into_a_shell(line: str) -> bool:
     The rule is "do not execute a download", not "do not use a pipe": `curl … | jq`,
     `curl … | tar -xz`, and `curl … | grep bash` are all fine, and `curl … || bash recover.sh`
     is a fallback on FAILURE with nothing piped into it.
+
+    The file's own keyword is dropped first. `RUN`/`run:` introduces a shell command but is not
+    part of one, and a walk that reads it as the command word stops before reaching the shell.
     """
-    return any(_stage_runs_a_shell(s) for s in _pipeline_stages_after_a_fetch(line))
+    return any(_stage_runs_a_shell(s) for s in _pipeline_stages_after_a_fetch(_shell_part(line)))
+
+
+# What the file writes BEFORE the shell command: a Dockerfile `RUN`, a workflow `run:` (with the
+# block scalar its value may open on). Stripped once, at the boundary between file syntax and
+# shell syntax, so nothing downstream has to know which kind of file the line came from.
+_FORMAT_KEYWORD = re.compile(r"^\s*(?:RUN|ENTRYPOINT|CMD|-?\s*(?:name:.*)?run:)\s*[|>]?[+-]?\d*\s*")
+
+
+def _shell_part(line: str) -> str:
+    return _FORMAT_KEYWORD.sub("", line, count=1)
 
 
 # Words and shell operators. A quoted span is ONE token, so shell metacharacters inside it stay
@@ -99,7 +120,8 @@ def _piped_into_a_shell(line: str) -> bool:
 # a live installer through. A `>&`-style redirection is matched before the bare `&` so its `&` is
 # not taken for a separator either.
 _TOKEN = re.compile(
-    r"""'[^']*'|"[^"]*"|\d*[<>]{1,2}&\d*|\|\||&&|\||;|&|(?:'[^']*'|"[^"]*"|[^\s;|&'"])+"""
+    r"""'[^']*'|"(?:[^"\\]|\\.)*"|\d*[<>]{1,2}&\d*|\|\||&&|\||;|&"""
+    r"""|(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s;|&'"])+"""
 )
 _FETCH = re.compile(r"(?:[\w./-]*/)?(?:curl|wget)")
 
@@ -150,17 +172,54 @@ def _tokenize(line: str) -> list[str]:
 def _is_a_command_string(tokens: list[str], index: int) -> bool:
     """Is `tokens[index]` the command string of a `sh -c` (or `bash -lc`, `zsh -euc`, …)?
 
-    Scans left past the wrapper's other flags to the command word, so `bash -eu -c "…"` and
-    `sudo sh -c "…"` are recognized. Only a shell counts: `jq -c "…"` passes `-c` too, and its
-    argument is a filter, not a command.
+    Walks the stage forward to its command word rather than scanning left from the `-c`, so a
+    shell option that takes its own operand cannot hide the flag behind it: a leftward scan over
+    `bash -o pipefail -c "…"` stops at `pipefail` and concludes the command is not a shell. Only
+    a shell counts -- `jq -c "…"` passes `-c` too, and its argument is a filter, not a command.
     """
     if index == 0 or not _TAKES_A_COMMAND_STRING.fullmatch(tokens[index - 1]):
         return False
-    for tok in reversed(tokens[: index - 1]):
-        if tok.startswith("-"):
+    word, at = _command_word(tokens[: index - 1])
+    return at is not None and bool(_SHELL_NAME.fullmatch(word))
+
+
+def _command_word(tokens: list[str]) -> tuple[str, int | None]:
+    """The word a stage actually runs, and its index -- or `("", None)` if there is none.
+
+    Assignments and redirections may PRECEDE the command (`MODE=install bash`, `2>/dev/null sh`)
+    -- both run the downloaded stream, and the second needs no wrapper at all. Exec wrappers move
+    the command further right, and their flags may consume an operand, which is the part a regex
+    could not track.
+
+    One walk serves both callers. Splitting it in two is what let `bash -o pipefail -c` through:
+    each copy has to know the same flag arities, and only one of them was taught this one.
+    """
+    i = 0
+    wrapper = ""
+    while i < len(tokens):
+        tok = tokens[i]
+        if re.fullmatch(r"[A-Za-z_]\w*=.*", tok):
+            i += 1
             continue
-        return bool(_SHELL_NAME.fullmatch(tok))
-    return False
+        # A redirection may be written apart from its target (`2> /dev/null bash`), in which case
+        # the target is a separate token that is not the command.
+        if re.fullmatch(r"\d*[<>]{1,2}.*", tok):
+            i += 2 if tok.rstrip().endswith((">", "<")) else 1
+            continue
+        if tok.startswith(("-", "+")):
+            if "=" not in tok and tok in _FLAGS_WITH_OPERAND.get(wrapper, frozenset()):
+                i += 1
+            i += 1
+            continue
+        if wrapper and _NUMERIC_OPERAND.fullmatch(tok):
+            i += 1
+            continue
+        if tok in _EXEC_WRAPPERS or (tok.rsplit("/", 1)[-1] in _EXEC_WRAPPERS):
+            wrapper = tok.rsplit("/", 1)[-1]
+            i += 1
+            continue
+        return tok, i
+    return "", None
 
 
 def _pipeline_stages_after_a_fetch(line: str) -> list[list[str]]:
@@ -192,40 +251,25 @@ def _pipeline_stages_after_a_fetch(line: str) -> list[list[str]]:
 
 
 def _stage_runs_a_shell(tokens: list[str]) -> bool:
-    """Walk one pipeline stage's tokens to the command word, and say whether it is a shell.
+    """Does one pipeline stage run a shell?
 
-    Assignments and redirections may PRECEDE the command (`MODE=install bash`, `2>/dev/null sh`)
-    -- both spellings run the downloaded stream, and the second needs no wrapper at all. Exec
-    wrappers move the command further right, and their flags may consume an operand, which is the
-    part a regex could not track.
+    A stage may be a subshell (`curl … | ( bash )`), which runs its contents in a shell of its
+    own -- so the grouping tokens are stepped over rather than read as the command. Any other
+    word IS the command, and is not a shell: `grep bash` stops there, so the shell name after it
+    is an argument being searched for, not the command being run.
     """
-    i = 0
-    wrapper = ""
-    while i < len(tokens):
-        tok = tokens[i]
-        if re.fullmatch(r"[A-Za-z_]\w*=.*", tok) or re.fullmatch(r"\d*[<>]{1,2}.*", tok):
-            i += 1
-            continue
-        if tok.startswith("-"):
-            # A flag's operand is skipped only when THIS wrapper's flag actually takes one, so a
-            # shell-named operand (`env -u bash cat`) is never mistaken for the command.
-            if "=" not in tok and tok in _FLAGS_WITH_OPERAND.get(wrapper, frozenset()):
-                i += 1
-            i += 1
-            continue
-        if wrapper and _NUMERIC_OPERAND.fullmatch(tok):
-            i += 1
-            continue
-        if _SHELL_NAME.fullmatch(tok):
-            return True
-        if tok in _EXEC_WRAPPERS or (tok.rsplit("/", 1)[-1] in _EXEC_WRAPPERS):
-            wrapper = tok.rsplit("/", 1)[-1]
-            i += 1
-            continue
-        # Any other word IS the command, and it is not a shell. `grep bash` stops here, so the
-        # shell name that follows is an argument being searched for, not the command being run.
+    inner = [t for t in tokens if t not in ("(", ")", "{", "}")]
+    word, at = _command_word(inner)
+    if at is None:
         return False
-    return False
+    if _SHELL_NAME.fullmatch(word):
+        return True
+    # `env -S 'bash -s'` runs the words of its operand. The operand is the command, not a value,
+    # and the flag introducing it sits to the LEFT of the word the walk stopped on.
+    return any(
+        flag in _SPLITS_ITS_OPERAND and _stage_runs_a_shell(_tokenize(operand))
+        for flag, operand in itertools.pairwise(inner)
+    )
 
 
 # A line ending in any of these does not end the command -- the next line continues it. `\` is
@@ -316,6 +360,35 @@ def _logical_lines(text: str) -> list[str]:
     if pending:
         joined.append(pending.strip())
     return joined
+
+
+def _yaml_block(text: str, key: str) -> list[str]:
+    """Return the entries under the first `key:` block, by indentation.
+
+    Done by hand rather than with a yaml parser: pyyaml reaches this environment only as a
+    transitive dependency of datasets/transformers, so importing it here would make a workflow
+    test quietly contingent on the ML stack staying installed.
+
+    Indentation is what makes this a structural read rather than a substring search. A comment
+    explaining a build argument contains the same text as the argument itself, so a whole-file
+    check for that text passes just as well when the real entry is gone. Entries are collected
+    only while they stay indented past the key, which a comment above the step never is.
+    """
+    entries: list[str] = []
+    depth: int | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if depth is None:
+            if stripped == f"{key}:" or stripped == f"{key}: |":
+                depth = indent
+            continue
+        if indent <= depth:
+            break
+        entries.append(stripped.removeprefix("- ").strip().strip("\"'"))
+    return entries
 
 
 @pytest.mark.parametrize("path", INSTALLER_FILES, ids=lambda p: p.name)
@@ -441,6 +514,38 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
         pytest.param(
             'RUN sh -euc "curl -sSL https://x.example/i.sh | bash"\n', id="fused-flags-euc"
         ),
+        # BusyBox's shell, and therefore `/bin/sh` on every Alpine image -- the base a vendor
+        # install script is most likely to run under.
+        pytest.param("RUN curl -sSL https://x.example/i.sh | ash\n", id="busybox-ash"),
+        # A shell option that takes its own operand. Scanning LEFT from the `-c` stopped at
+        # `pipefail` and concluded the command was not a shell, so the quoted pipeline stayed
+        # closed -- and `-o pipefail` is exactly how a careful CI script opens.
+        pytest.param(
+            'RUN bash -o pipefail -c "curl -sSL https://x.example/i.sh | sh"\n',
+            id="shell-option-with-operand",
+        ),
+        # Nested quotes reach the inner shell unescaped. Left escaped, the inner scan read
+        # `\"https://…\"` as one bare word, and the pipe after it never separated the fetch
+        # from the shell it feeds.
+        pytest.param(
+            'RUN bash -c "curl -sSL \\"https://x.example/i.sh\\" | bash"\n',
+            id="escaped-quotes-inside-a-command-string",
+        ),
+        # `env -S` SPLITS its operand into words and runs them, the opposite of the flags above:
+        # the operand is not a value to step over, it is the command.
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | env -S 'bash -s'\n", id="env-split-string"
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | env --split-string 'sh -e'\n",
+            id="env-split-string-long",
+        ),
+        # A subshell runs its contents in a shell of its own.
+        pytest.param("RUN curl -sSL https://x.example/i.sh | ( bash )\n", id="subshell-stage"),
+        # A redirection may be written apart from its target, which is not the command word.
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | 2> /dev/null bash\n", id="spaced-redirection"
+        ),
     ],
 )
 def test_the_pipe_to_shell_guard_catches_what_it_claims_to(snippet: str, tmp_path: Path):
@@ -552,6 +657,20 @@ def test_the_guard_catches_a_yaml_line_that_both_folds_back_and_continues_on(tmp
         pytest.param(
             'sh --config "curl https://x.example/i.sh | bash"', id="long-flag-is-not-command"
         ),
+        # Accepting `ash` must not turn every word ending in those letters into a shell. `cash`
+        # and `stash` end in `ash`; the name has to match WHOLE, not as a suffix.
+        pytest.param("curl -s https://x.example/f | cash --report", id="ash-is-not-a-suffix"),
+        pytest.param("curl -s https://x.example/f | git stash", id="stash-is-not-a-shell"),
+        # `-S` splits its operand and runs it -- but only when the operand really is a shell.
+        pytest.param("curl -s https://x.example/f | env -S 'jq .version'", id="split-into-jq"),
+        # A shell OPTION's operand is skipped, so a shell-named one must not read as a command.
+        # `bash -o bash script.sh` sets an (invalid) option and runs a script, not a nested shell.
+        pytest.param("curl -s https://x.example/f | jq -o bash .", id="option-operand-not-command"),
+        # The format keyword is stripped, which must not strip a real command that starts with
+        # the same letters. `runner` is not `run:`.
+        pytest.param(
+            "curl -s https://x.example/f | runner --exec bash", id="keyword-is-not-a-prefix"
+        ),
     ],
 )
 def test_the_pipe_to_shell_guard_does_not_flag_ordinary_pipelines(line: str, tmp_path: Path):
@@ -637,8 +756,12 @@ def test_published_images_are_built_with_the_cli():
 
     Without this build argument the published image has no CLI, and setting INFISICAL_CLIENT_ID
     on a deployment would fail at start instead of switching it to vault-backed secrets.
+
+    Read out of the `build-args:` block rather than the whole file: the step is introduced by a
+    comment that names the same argument, so a substring check over the file stays green after
+    the real entry is deleted and the published images silently lose the CLI.
     """
-    assert "INSTALL_INFISICAL=true" in PUBLISH_WORKFLOW.read_text()
+    assert "INSTALL_INFISICAL=true" in _yaml_block(PUBLISH_WORKFLOW.read_text(), "build-args")
 
 
 def test_base_image_declares_the_entrypoint():
@@ -663,22 +786,7 @@ def test_publish_rebuilds_on_every_file_the_image_copies_in():
     specific = [src for src in copied if src not in {".", "./"}]
     assert specific, "expected the base image to COPY at least one specific path"
 
-    # Collect the `- "..."` entries under `paths:` up to the next key at the same indent. Done by
-    # hand rather than with a yaml parser: pyyaml reaches this environment only as a transitive
-    # dependency of datasets/transformers, so importing it here would make a workflow test quietly
-    # contingent on the ML stack staying installed.
-    watched: list[str] = []
-    in_paths = False
-    for line in PUBLISH_WORKFLOW.read_text().splitlines():
-        stripped = line.strip()
-        if stripped == "paths:":
-            in_paths = True
-            continue
-        if in_paths:
-            if stripped.startswith("- "):
-                watched.append(stripped[2:].strip().strip("\"'"))
-            elif stripped and not stripped.startswith("#"):
-                break
+    watched = _yaml_block(PUBLISH_WORKFLOW.read_text(), "paths")
     assert watched, "could not read on.push.paths out of publish-image.yml"
 
     for src in specific:
