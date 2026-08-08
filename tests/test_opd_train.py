@@ -6183,3 +6183,165 @@ def test_the_opd_trainer_stores_the_frozen_base_in_bf16():
     # would free nothing. this asserts the absence so a future reader has to re-derive the above
     # rather than pattern-match it back in.
     assert not [o for o in overrides if "ref.fsdp_config.model_dtype" in o]
+
+
+def _old_flash_groupwise_reverse_kl_values(
+    student_logprobs,
+    teacher_logsums,
+    group_ids,
+    response_mask,
+    kl_penalty_coef: float,
+):
+    """Build response-shaped loss values whose verl aggregation equals flash's sequence mean."""
+    import torch
+
+    if student_logprobs.shape != teacher_logsums.shape or student_logprobs.shape != group_ids.shape:
+        raise ValueError("flash OPD teacher metadata must match student response logprob shape")
+    if response_mask.shape != student_logprobs.shape:
+        raise ValueError("flash OPD response mask must match student response logprob shape")
+    values = torch.zeros_like(student_logprobs)
+    response_mask = response_mask.bool()
+    for row in range(student_logprobs.shape[0]):
+        selected = response_mask[row] & group_ids[row].ge(0)
+        selected_count = int(selected.sum().item())
+        if selected_count == 0:
+            continue
+        response_count = int(response_mask[row].sum().item())
+        row_groups = group_ids[row]
+        for group_id in torch.unique(row_groups[selected], sorted=True):
+            group_mask = selected & row_groups.eq(group_id)
+            group_length = group_mask.sum().to(dtype=student_logprobs.dtype)
+            student_logsum = student_logprobs[row][group_mask].detach().sum()
+            teacher_logsum = teacher_logsums[row][group_mask][0]
+            coefficient = float(kl_penalty_coef) * (student_logsum - teacher_logsum) / group_length
+            values[row][group_mask] = coefficient * student_logprobs[row][group_mask]
+        values[row][selected] *= response_count / selected_count
+    return values
+
+
+@pytest.mark.parametrize("dtype_name", ["float32", "bfloat16"])
+def test_vectorized_groupwise_reverse_kl_is_exactly_equivalent(dtype_name):
+    """The vectorized rewrite must be BIT-identical to the loop it replaced, not merely close.
+
+    This value feeds the training loss, so a reassociated sum silently changes what the model
+    learns. Verified exact (values and gradients) over randomized shapes in an environment that has
+    torch; it SKIPS in CI, which has no torch, so
+    ``test_groupwise_reverse_kl_keeps_the_exact_per_group_reduction`` below carries the structural
+    half of this guarantee on the machine that gates the merge.
+    """
+    torch = pytest.importorskip("torch")
+    dtype = getattr(torch, dtype_name)
+
+    for case_index in range(160):
+        generator = torch.Generator().manual_seed(1000 + case_index)
+        batch_size = 1 + case_index % 8
+        sequence_length = 1 + (case_index * 37) % 128
+        group_count = 1 + case_index % 24
+        student = torch.randn(
+            (batch_size, sequence_length), generator=generator, dtype=dtype
+        )
+        teacher = torch.randn(
+            (batch_size, sequence_length), generator=generator, dtype=dtype
+        )
+        group_ids = torch.randint(
+            -2,
+            group_count,
+            (batch_size, sequence_length),
+            generator=generator,
+        )
+        response_mask = torch.rand(
+            (batch_size, sequence_length), generator=generator
+        ).ge(0.2)
+
+        if case_index % 16 == 0:
+            group_ids.fill_(-1)
+        elif case_index % 16 == 1:
+            response_mask.zero_()
+        elif case_index % 16 == 2:
+            group_ids.zero_()
+            response_mask.fill_(True)
+        elif case_index % 16 == 3:
+            group_ids.copy_(torch.arange(sequence_length).expand(batch_size, -1))
+            response_mask.fill_(True)
+        elif case_index % 16 == 4:
+            group_ids[group_ids.ge(0)] = group_ids[group_ids.ge(0)] * 97 + 11
+        elif case_index % 16 == 5 and batch_size > 1:
+            group_ids[0].fill_(-1)
+            response_mask[1].fill_(True)
+
+        coefficient = (0.37, -0.5, 1.25)[case_index % 3]
+        reference_student = student.clone().requires_grad_()
+        actual_student = student.clone().requires_grad_()
+        expected = _old_flash_groupwise_reverse_kl_values(
+            reference_student,
+            teacher,
+            group_ids,
+            response_mask,
+            coefficient,
+        )
+        actual = _flash_groupwise_reverse_kl_values(
+            actual_student,
+            teacher,
+            group_ids,
+            response_mask,
+            coefficient,
+        )
+
+        assert torch.equal(actual, expected), (
+            f"case {case_index} with dtype {dtype_name} changed the loss values"
+        )
+        if expected.requires_grad:
+            expected.sum().backward()
+            actual.sum().backward()
+            assert torch.equal(actual_student.grad, reference_student.grad), (
+                f"case {case_index} with dtype {dtype_name} changed the gradients"
+            )
+
+
+def test_groupwise_reverse_kl_keeps_the_exact_per_group_reduction():
+    """The exact-equivalence test above SKIPS in CI (no torch), so pin the numerics structurally.
+
+    The vectorized loss must keep each group's reduction as an independent 1-D sum. The obvious
+    vectorizations do not: measured over 3000 random groups, a padded dense row-sum differs from the
+    per-group `torch.sum` in 1026 cases and `scatter_add_` in 2367, because both reassociate the
+    float additions. The differences are ~1e-7 and would never trip a tolerance-based test, but they
+    change the training loss, and nothing downstream would report it.
+
+    `vmap(torch.sum)` over a jagged tensor is what preserves the per-group reduction order. It
+    currently lands on torch's nested batching fallback, which is why it is worth pinning: a future
+    "cleanup" to scatter_add or a padded sum looks equivalent, passes any allclose check, and
+    silently changes the objective.
+
+    Read from source, not by running it: torch is absent in CI (as verl is), so an importorskip
+    guard here would skip on the machine that gates the merge and prove nothing.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from flash.engine.worker import opd_plugin
+
+    source = inspect.getsource(opd_plugin._flash_groupwise_reverse_kl_values)
+    tree = ast.parse(textwrap.dedent(source))
+
+    called = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    # the exact per-group reduction, and the jagged carrier it reduces over.
+    assert "vmap" in called
+    assert "nested_tensor_from_jagged" in called
+    # the reassociating alternatives must not come back.
+    assert "scatter_add" not in called
+    assert "scatter_add_" not in called
+
+    # and the point of the rewrite: no host synchronization and no python-level loop remain, since
+    # each `.item()` stalls the training step waiting on the device.
+    assert "item" not in called
+    assert not [n for n in ast.walk(tree) if isinstance(n, (ast.For, ast.While))]
+
+    # the detach must stay on the student LOGSUM alone: it is what makes the coefficient a constant
+    # rather than a second gradient path, so moving it changes the objective, not just the value.
+    assert "flat_student.detach()" in source
+    assert source.count(".detach()") == 1

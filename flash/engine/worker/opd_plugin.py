@@ -114,24 +114,62 @@ def _flash_groupwise_reverse_kl_values(
         raise ValueError("flash OPD teacher metadata must match student response logprob shape")
     if response_mask.shape != student_logprobs.shape:
         raise ValueError("flash OPD response mask must match student response logprob shape")
-    values = torch.zeros_like(student_logprobs)
     response_mask = response_mask.bool()
-    for row in range(student_logprobs.shape[0]):
-        selected = response_mask[row] & group_ids[row].ge(0)
-        selected_count = int(selected.sum().item())
-        if selected_count == 0:
-            continue
-        response_count = int(response_mask[row].sum().item())
-        row_groups = group_ids[row]
-        for group_id in torch.unique(row_groups[selected], sorted=True):
-            group_mask = selected & row_groups.eq(group_id)
-            group_length = group_mask.sum().to(dtype=student_logprobs.dtype)
-            student_logsum = student_logprobs[row][group_mask].detach().sum()
-            teacher_logsum = teacher_logsums[row][group_mask][0]
-            coefficient = float(kl_penalty_coef) * (student_logsum - teacher_logsum) / group_length
-            values[row][group_mask] = coefficient * student_logprobs[row][group_mask]
-        values[row][selected] *= response_count / selected_count
-    return values
+    selected = response_mask & group_ids.ge(0)
+    order = torch.argsort(group_ids, dim=1, stable=True)
+    sorted_selected = selected.gather(1, order)
+    sorted_groups = group_ids.gather(1, order)
+    sorted_student = student_logprobs.gather(1, order)
+    sorted_teacher = teacher_logsums.gather(1, order)
+    sorted_rows = (
+        torch.arange(group_ids.shape[0], device=group_ids.device)
+        .unsqueeze(1)
+        .expand_as(group_ids)
+    )
+
+    flat_rows = sorted_rows.masked_select(sorted_selected)
+    flat_groups = sorted_groups.masked_select(sorted_selected)
+    flat_student = sorted_student.masked_select(sorted_selected)
+    flat_teacher = sorted_teacher.masked_select(sorted_selected)
+    previous_rows = torch.cat((flat_rows.new_full((1,), -1), flat_rows[:-1]))
+    previous_groups = torch.cat((flat_groups.new_zeros(1), flat_groups[:-1]))
+    group_starts = flat_rows.ne(previous_rows) | flat_groups.ne(previous_groups)
+
+    # the trailing dummy group keeps the jagged reduction valid for an all-empty batch.
+    grouped_starts = torch.cat((group_starts, group_starts.new_ones(1)))
+    grouped_indices = grouped_starts.cumsum(0) - 1
+    group_indices = grouped_indices[:-1]
+    group_lengths = torch.bincount(grouped_indices)
+    grouped_student = torch.cat((flat_student.detach(), flat_student.new_zeros(1)))
+    offsets = torch.cat((group_lengths.new_zeros(1), group_lengths.cumsum(0)))
+    nested_student = torch.nested.nested_tensor_from_jagged(grouped_student, offsets)
+    student_logsums = torch.vmap(torch.sum)(nested_student).values()
+    teacher_logsums_first = torch.cat(
+        (flat_teacher.masked_select(group_starts), flat_teacher.new_zeros(1))
+    )
+    coefficients = (
+        float(kl_penalty_coef)
+        * (student_logsums - teacher_logsums_first)
+        / group_lengths.to(dtype=student_logprobs.dtype)
+    )
+    sorted_values = coefficients.index_select(0, group_indices) * flat_student
+
+    response_counts = response_mask.sum(dim=1)
+    selected_counts = selected.sum(dim=1).clamp_min(1)
+    ratio_dtype = (
+        torch.float32
+        if student_logprobs.dtype in (torch.float16, torch.bfloat16)
+        else student_logprobs.dtype
+    )
+    ratios = response_counts.to(ratio_dtype) / selected_counts.to(ratio_dtype)
+    selected_rows = sorted_rows.masked_select(sorted_selected)
+    sorted_values = (
+        sorted_values.to(ratio_dtype) * ratios.index_select(0, selected_rows)
+    ).to(student_logprobs.dtype)
+    sorted_output = torch.zeros_like(student_logprobs).masked_scatter(
+        sorted_selected, sorted_values
+    )
+    return torch.zeros_like(student_logprobs).scatter(1, order, sorted_output)
 
 
 def _set_current_global_batch_info(config, data) -> None:
