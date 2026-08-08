@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Literal
@@ -359,6 +360,31 @@ MANAGED_GPU_KEYS = frozenset(
 # rejected as unknown by the schema layer's own key check (see schema._TOP_LEVEL_KEYS).
 _DROPPED_TOP_LEVEL_KEYS = frozenset({"model_policy", "worker_env"})
 
+# Tolerating a dropped key keeps a pre-upgrade run's recovery path, but the values behind it stop
+# being applied -- so a run that authored them now trains on managed defaults instead of what was
+# submitted. That is announced rather than silent. Only user-authorable keys qualify: model_policy
+# was platform-managed (to_dict popped it), so its loss cannot change what a submitted config asked
+# for. The values are deliberately NOT forwarded -- doing so would reinstate the override table this
+# removal exists to close, and would deliver it without the validation the deleted parser performed.
+_ANNOUNCED_DROPPED_KEYS = frozenset({"worker_env"})
+
+
+def _announce_dropped_keys(data: dict[str, Any]) -> None:
+    """Log the removed user-authored keys a persisted record still carries and no longer applies."""
+    for key in sorted(_ANNOUNCED_DROPPED_KEYS):
+        value = data.get(key)
+        if not value:
+            continue
+        names = ", ".join(sorted(str(k) for k in value)) if isinstance(value, dict) else str(value)
+        logging.getLogger("flash.spec").warning(
+            "run %s was submitted with [%s] (%s); that table was removed and its values are NOT "
+            "applied -- this run uses managed defaults instead. resubmit without it if the run "
+            "depends on those values.",
+            data.get("run_id") or "<unknown>",
+            key,
+            names,
+        )
+
 
 @dataclass(frozen=True)
 class WandbSpec:
@@ -457,6 +483,7 @@ class JobSpec:
         unknown_top_level = sorted(set(data) - allowed_top_level - _DROPPED_TOP_LEVEL_KEYS)
         if unknown_top_level:
             raise ValueError(f"job spec has unknown key(s): {', '.join(unknown_top_level)}")
+        _announce_dropped_keys(data)
         env = data.get("environment") or {}
         # Reject stale payloads carrying a local `path`; worker only runs published env ids.
         if isinstance(env, dict) and env.get("path"):

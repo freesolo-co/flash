@@ -1144,6 +1144,39 @@ def test_an_unknown_top_level_key_is_still_rejected_on_read() -> None:
         JobSpec.from_dict({**JobSpec().to_internal_dict(), "not_a_real_key": 1})
 
 
+def test_a_pre_upgrade_run_that_authored_overrides_is_told_they_stopped_applying(caplog) -> None:
+    """Tolerating the key must not make the behavior change silent.
+
+    A run submitted with overrides keeps them in its record forever, but nothing forwards them now,
+    so it trains on managed defaults instead of what was authored. Reloading without a word would
+    make that indistinguishable from a run that never set them -- the operator reading logs after an
+    unexpected result would have nothing pointing at the cause.
+    """
+    persisted = {
+        **JobSpec().to_internal_dict(),
+        "run_id": "run-legacy-1",
+        "worker_env": {"FLASH_VERL_PYTHON": "/custom/verl/bin/python"},
+    }
+
+    with caplog.at_level(logging.WARNING, logger="flash.spec"):
+        JobSpec.from_dict(persisted)
+
+    assert "FLASH_VERL_PYTHON" in caplog.text
+    assert "run-legacy-1" in caplog.text
+    assert "NOT" in caplog.text
+
+
+def test_a_record_without_the_dropped_key_says_nothing(caplog) -> None:
+    # every record the pre-upgrade plane wrote names the key, defaulted-empty included. warning on
+    # the empty ones would fire on effectively every reload and train operators to ignore it.
+    persisted = {**JobSpec().to_internal_dict(), "worker_env": {}}
+
+    with caplog.at_level(logging.WARNING, logger="flash.spec"):
+        JobSpec.from_dict(persisted)
+
+    assert caplog.text == ""
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
