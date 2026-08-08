@@ -772,14 +772,8 @@ def test_managed_mode_never_reassigns_a_users_run(monkeypatch, tmp_path) -> None
 
 
 # ---------------------------------------------------------------------------
-# The open-model policy is a standalone capability, authorized server-side
+# Model admission does not vary by deployment
 # ---------------------------------------------------------------------------
-def _open_model_payload() -> dict:
-    from tests._helpers.specs import raw_spec
-
-    return {"spec": raw_spec(model="Qwen/Qwen3.5-0.8B", model_policy="allow")}
-
-
 def _deps_module():
     """``_deps`` imports fastapi (the `server` extra). CI syncs it (`uv sync --extra server --dev`)
     so these tests really run there; a client-only checkout skips instead of failing on an optional
@@ -790,31 +784,36 @@ def _deps_module():
     return _deps
 
 
-def test_a_managed_plane_refuses_an_open_model_run(monkeypatch) -> None:
-    """`allow` accepts ANY HuggingFace model, so on the managed service -- where runs are billed to
-    Freesolo and the curated catalog is the product surface -- asking for it in a config must not
-    grant it. The parser accepts the key (it also runs client-side, which cannot see
-    FLASH_STANDALONE); this is the half that authorizes."""
+def test_the_catalog_binds_on_both_deployments(monkeypatch) -> None:
+    """Self-hosting relaxes billing boundaries, not the catalog -- an uncataloged model is refused
+    on either plane.
+
+    FLASH_STANDALONE used to unlock `model_policy = "allow"`, which synthesized a ModelInfo from an
+    HF size lookup: 4 of ~20 fields set, KV/attention geometry left zeroed, and the result fed into
+    the VRAM equations wearing the same type as a curated entry. An operator on their own GPUs still
+    gets that badly-sized run, so the flag is gone and adding a model means adding a real catalog
+    entry. That makes admission a property of the model, not of the deployment.
+    """
     _deps = _deps_module()
     from fastapi import HTTPException
 
-    monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
-    with pytest.raises(HTTPException) as ei:
-        _deps._parse_spec(_open_model_payload(), run_id="r")
-    assert ei.value.status_code == 403
-    assert "self-hosted" in str(ei.value.detail)
+    from tests._helpers.specs import raw_spec
+
+    payload = {"spec": raw_spec(model="meta-llama/Llama-3.1-8B")}
+    for standalone_value in ("1", None):
+        if standalone_value is None:
+            monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
+        else:
+            monkeypatch.setenv(auth.STANDALONE_ENV, standalone_value)
+        with pytest.raises(HTTPException) as ei:
+            _deps._parse_spec(payload, run_id="r")
+        assert ei.value.status_code == 400
+        assert "fork Flash" in str(ei.value.detail)
 
 
-def test_a_standalone_plane_honours_an_open_model_run(monkeypatch) -> None:
-    """The operator pays for their own GPUs, so the curated catalog is not a billing boundary here."""
-    _deps = _deps_module()
-
-    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
-    assert _deps._parse_spec(_open_model_payload(), run_id="r").model_policy == "allow"
-
-
-def test_the_default_policy_is_untouched_on_both_deployments(monkeypatch) -> None:
-    """The gate must fire on `allow` only -- a curated run is identical on either plane."""
+def test_a_catalog_run_parses_on_both_deployments(monkeypatch) -> None:
+    """The counterpart: a curated run is identical on either plane, so the check above is really
+    about the model and not about the parser refusing everything."""
     _deps = _deps_module()
     from tests._helpers.specs import raw_spec
 
@@ -823,5 +822,4 @@ def test_the_default_policy_is_untouched_on_both_deployments(monkeypatch) -> Non
             monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
         else:
             monkeypatch.setenv(auth.STANDALONE_ENV, standalone_value)
-        spec = _deps._parse_spec({"spec": raw_spec()}, run_id="r")
-        assert spec.model_policy == "catalog"
+        assert _deps._parse_spec({"spec": raw_spec()}, run_id="r").model == raw_spec()["model"]

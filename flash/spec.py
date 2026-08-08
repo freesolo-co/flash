@@ -387,6 +387,16 @@ MANAGED_GPU_KEYS = frozenset(
     {"disk_gb", "network_volume", "network_volume_gb", "max_retries", "max_wall_seconds"}
 )
 
+# Removed top-level fields that a PERSISTED record can still carry. Stored run records are never
+# rewritten, and effective_preparation.worker_spec is written with to_internal_dict() (asdict), which
+# emitted every field including the defaulted ones -- so every record written before a field was
+# dropped still names it. from_dict is strict, so without this the first reload after the upgrade
+# raises and a still-running job loses its recovery, deploy, and serving paths.
+#
+# Ignored on READ only: nothing here is a JobSpec field, so an authored config naming one is still
+# rejected as unknown by the schema layer's own key check (see schema._TOP_LEVEL_KEYS).
+_DROPPED_TOP_LEVEL_KEYS = frozenset({"model_policy"})
+
 
 @dataclass(frozen=True)
 class WandbSpec:
@@ -405,8 +415,6 @@ class JobSpec:
     seed: int = FIXED_SEED
     # per-run env overrides forwarded to the gpu worker; never put secrets here.
     worker_env: dict[str, str] = field(default_factory=dict)
-    # "catalog" (curated models only) or "allow" (any hf model that fits the gpu).
-    model_policy: str = "catalog"
     thinking: bool = False
     wandb: WandbSpec = field(default_factory=WandbSpec)
     model_revision: str = ""
@@ -458,11 +466,6 @@ class JobSpec:
         data = asdict(self)
         # server-assigned identity — never authored in a config.
         data.pop("run_id", None)
-        # `model_policy` IS authorable (a self-hosted plane honours "allow"), so it has to survive
-        # the client -> server round trip or the config could never reach the plane that authorizes
-        # it. Emitted only when it differs from the default, so a managed payload is unchanged.
-        if data.get("model_policy") == "catalog":
-            data.pop("model_policy", None)
         data.pop("workload_profile_kind", None)
         data.pop("workload_profile_input_digest", None)
         data.pop("workload_profile_producer_version", None)
@@ -494,7 +497,7 @@ class JobSpec:
         if not isinstance(data, dict):
             raise TypeError("job spec must be an object")
         allowed_top_level = {item.name for item in fields(cls)}
-        unknown_top_level = sorted(set(data) - allowed_top_level)
+        unknown_top_level = sorted(set(data) - allowed_top_level - _DROPPED_TOP_LEVEL_KEYS)
         if unknown_top_level:
             raise ValueError(f"job spec has unknown key(s): {', '.join(unknown_top_level)}")
         env = data.get("environment") or {}
@@ -604,7 +607,6 @@ class JobSpec:
             ),
             run_id=data.get("run_id", "local"),
             worker_env=_coerce_str_map(data.get("worker_env")),
-            model_policy=data.get("model_policy", "catalog"),
             thinking=coerce_bool(data.get("thinking", False)),
             wandb=_coerce_wandb(data.get("wandb")),
             seed=parse_seed(data.get("seed", FIXED_SEED)),

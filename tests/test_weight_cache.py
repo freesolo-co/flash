@@ -553,69 +553,26 @@ def test_instance_payload_strips_runpod_volume_redirect():
 
 
 # ---------------------------------------------------------------------------
-# runner._assign_weight_cache_volume — fully managed, no knobs; gated to PUBLIC catalog runs only
-# (the shared cross-tenant cache must never hold private/gated weights — confidentiality boundary)
+# runner._assign_weight_cache_volume — fully managed, no knobs. Only curated models are trainable
+# and their weights are public, so the shared cross-tenant cache holds nothing private; size
+# (_fits_weight_cache) is what gates attachment.
 # ---------------------------------------------------------------------------
-def test_assign_weight_cache_attaches_to_catalog_run():
+def test_assign_weight_cache_attaches_to_a_run():
     from flash import runner
 
-    out = runner._assign_weight_cache_volume(JobSpec(model="m", run_id="r", model_policy="catalog"))
+    out = runner._assign_weight_cache_volume(JobSpec(model="m", run_id="r"))
     assert out.gpu.network_volume == runner.WEIGHT_CACHE_VOLUME_NAME == "flash-weights"
     assert out.gpu.network_volume_gb == runner.WEIGHT_CACHE_VOLUME_GB
 
 
-def test_assign_weight_cache_default_policy_attaches():
-    # The JobSpec default policy is "catalog" (managed runs), so a default-policy run is cached.
-    from flash import runner
-
-    out = runner._assign_weight_cache_volume(JobSpec(model="m", run_id="r"))
-    assert out.gpu.network_volume == "flash-weights"
-
-
-def test_assign_weight_cache_skips_open_model_policy():
-    # CONFIDENTIALITY GATE: an open-model ("allow") run may target a PRIVATE/GATED HF repo; its
-    # weights must NOT enter the shared cross-tenant cache. So the cache is NOT attached and HF_HOME
-    # is never redirected onto the shared mount — the weights stay on the worker's ephemeral disk.
-    from flash import runner
-
-    out = runner._assign_weight_cache_volume(
-        JobSpec(model="some-org/private-model", run_id="r", model_policy="allow")
-    )
-    assert (
-        out.gpu.network_volume is None
-    )  # cache-less: no shared-mount redirect for a possibly-private model
-
-
-def test_assign_weight_cache_strips_preset_shared_cache_on_open_model():
-    # The gate takes PRECEDENCE over the "honor an existing volume" no-op: a programmatic open-model
-    # spec that ALREADY pinned the SHARED cache name must be FORCED cache-less, not bypass the gate.
+def test_assign_weight_cache_keeps_a_custom_volume():
+    # A NON-shared (per-org / custom) volume is the intended escape hatch — left intact.
     from flash import runner
 
     spec = JobSpec.from_dict(
         {
-            "model": "some-org/private-model",
+            "model": "Qwen/Qwen3.5-4B",
             "run_id": "r",
-            "model_policy": "allow",
-            "gpu": {
-                "type": "A10",
-                "network_volume": runner.WEIGHT_CACHE_VOLUME_NAME,
-                "network_volume_gb": 100,
-            },
-        }
-    )
-    out = runner._assign_weight_cache_volume(spec)
-    assert out.gpu.network_volume is None  # the pre-set shared cache was stripped
-
-
-def test_assign_weight_cache_keeps_per_org_volume_on_open_model():
-    # A NON-shared (per-org / custom) volume on an open run is the intended escape hatch — left intact.
-    from flash import runner
-
-    spec = JobSpec.from_dict(
-        {
-            "model": "some-org/private-model",
-            "run_id": "r",
-            "model_policy": "allow",
             "gpu": {
                 "type": "A10",
                 "network_volume": "org-123-private-cache",
@@ -641,7 +598,7 @@ def test_assign_weight_cache_does_not_override_existing():
 
     spec = _vol_spec(name="explicit-vol")
     # network_volume is managed -> carried by the internal dict; an already-pinned volume is honored.
-    spec = JobSpec.from_dict({**spec.to_internal_dict(), "model_policy": "catalog", "run_id": "r"})
+    spec = JobSpec.from_dict({**spec.to_internal_dict(), "run_id": "r"})
     out = runner._assign_weight_cache_volume(spec)
     assert out.gpu.network_volume == "explicit-vol"  # an explicit/test value is never clobbered
 
@@ -655,9 +612,7 @@ def test_assign_weight_cache_skips_oversized_catalog_model():
     from flash import runner
 
     info = _oversized_model_info()
-    out = runner._assign_weight_cache_volume(
-        JobSpec(model=info.id, run_id="r", model_policy="catalog"), info
-    )
+    out = runner._assign_weight_cache_volume(JobSpec(model=info.id, run_id="r"), info)
     assert out.gpu.network_volume is None  # too big for the shared cache -> cache-less
 
 
@@ -673,7 +628,6 @@ def test_assign_weight_cache_strips_preset_shared_cache_on_oversized_catalog_mod
         {
             "model": info.id,
             "run_id": "r",
-            "model_policy": "catalog",
             "gpu": {
                 "type": "B200",
                 "network_volume": runner.WEIGHT_CACHE_VOLUME_NAME,
@@ -696,7 +650,6 @@ def test_assign_weight_cache_keeps_preset_shared_cache_on_fitting_catalog_model(
         {
             "model": info.id,
             "run_id": "r",
-            "model_policy": "catalog",
             "gpu": {
                 "type": "H100",
                 "network_volume": runner.WEIGHT_CACHE_VOLUME_NAME,
@@ -719,7 +672,6 @@ def test_assign_weight_cache_keeps_preset_custom_volume_on_oversized_catalog_mod
         {
             "model": info.id,
             "run_id": "r",
-            "model_policy": "catalog",
             "gpu": {
                 "type": "B200",
                 "network_volume": "org-123-big-cache",
@@ -737,9 +689,7 @@ def test_assign_weight_cache_attaches_fitting_catalog_model():
     from flash.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.5-9B"]  # ~19.4 GB download, peak ~39 GB < 100 GB
-    out = runner._assign_weight_cache_volume(
-        JobSpec(model=info.id, run_id="r", model_policy="catalog"), info
-    )
+    out = runner._assign_weight_cache_volume(JobSpec(model=info.id, run_id="r"), info)
     assert out.gpu.network_volume == "flash-weights"
 
 
@@ -810,7 +760,7 @@ def test_drop_weight_cache_noop_without_volume():
 
 def test_drop_weight_cache_preserves_non_shared_escape_hatch_volume():
     # Review (Copilot): the no-capacity cache-drop must NOT strip a non-shared per-org/custom volume —
-    # that is the deliberate escape-hatch isolation an open-model run opted into. Only the SHARED
+    # that is the deliberate escape-hatch isolation the run opted into. Only the SHARED
     # platform cache (WEIGHT_CACHE_VOLUME_NAME) is dropped.
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
     from flash.runner.lifecycle import _drop_weight_cache
@@ -861,7 +811,7 @@ def test_effective_spec_persists_managed_cache_removal(monkeypatch):
 
 
 def test_effective_spec_rejects_custom_volume_removal(monkeypatch):
-    # A per-org escape-hatch volume an open-model run opted into must never be silently removed.
+    # A per-org escape-hatch volume a run opted into must never be silently removed.
     # network_volume is managed and no longer travels in the public spec, so the committed custom
     # volume lives only in the prior preparation snapshot; dropping it there must fail closed.
     import pytest
@@ -3880,7 +3830,6 @@ def test_assign_refreshes_a_stale_shared_cache_size():
         {
             "model": info.id,
             "run_id": "r",
-            "model_policy": "catalog",
             "gpu": {
                 "type": "H100",
                 "network_volume": runner.WEIGHT_CACHE_VOLUME_NAME,
@@ -3907,7 +3856,6 @@ def test_assign_leaves_a_custom_volume_size_alone():
         {
             "model": info.id,
             "run_id": "r",
-            "model_policy": "catalog",
             "gpu": {"type": "H100", "network_volume": "my-org-cache", "network_volume_gb": 100},
         }
     )
@@ -4466,7 +4414,7 @@ def test_a_slow_failed_create_cannot_spend_the_failover_grow_budget(monkeypatch)
 def test_a_volume_free_run_reserves_no_grow_time(monkeypatch):
     """Regression: a run that attaches no managed cache must not pay the reconciliation reserve.
 
-    An open-model run, an oversized catalog model, or a spec carrying a custom volume reconciles
+    An oversized catalog model, or a spec carrying a custom volume, reconciles
     nothing -- `grow_weight_cache_volumes` early-returns for all three. Reserving for them shortened
     the deadline for a create that was never going to grow anything, so with two accounts and 90s
     left the create failed its allowance check against an effective 50s without ever reaching the

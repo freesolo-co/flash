@@ -90,12 +90,10 @@ def _fully_managed_internal_spec() -> JobSpec:
                 "max_wall_seconds": 7200,
             },
             "run_id": "flash-managed-run",
-            "model_policy": "catalog",
         }
     )
     # sanity: the internal carrier really does hold every managed value
     assert spec.run_id == "flash-managed-run"
-    assert spec.model_policy == "catalog"
     assert spec.train.hf_repo == "operator/runs"
     assert spec.train.lora_alpha == 32  # derived: 2 * lora_rank (16)
     assert spec.gpu.disk_gb == 160
@@ -110,7 +108,6 @@ def _fully_managed_internal_spec() -> JobSpec:
 def test_public_spec_omits_all_managed_fields():
     public = _fully_managed_internal_spec().to_dict()
     assert "run_id" not in public
-    assert "model_policy" not in public
     assert "hf_repo" not in public["train"]
     assert "lora_alpha" not in public["train"]
     assert not (
@@ -123,7 +120,6 @@ def test_public_spec_omits_all_managed_fields():
 def test_internal_dict_retains_all_managed_fields():
     internal = _fully_managed_internal_spec().to_internal_dict()
     assert internal["run_id"] == "flash-managed-run"
-    assert internal["model_policy"] == "catalog"
     assert internal["train"]["hf_repo"] == "operator/runs"
     assert internal["train"]["lora_alpha"] == 32  # derived value travels to the worker
     assert internal["gpu"]["disk_gb"] == 160

@@ -65,12 +65,12 @@ def _pretokenize_completion_only(texts, tokenizer, max_length):
 def _model_arch_dims(model_id: str, revision: str = "") -> tuple[int, int]:
     """``(hidden_size, num_hidden_layers)`` used to size the GC-off activation estimate.
 
-    Prefer the CURATED catalog geometry (deterministic, no network/parse risk) for known models — a
-    live B200 SFT showed the runtime ``AutoConfig`` probe returning (0, 0) on the 35B-A3B's
-    multimodal-nested config, which silently kept GC on. For open-model-policy ids (no catalog dims)
-    fall back to the HF config, handling the ``text_config`` nesting (config.json is already cached by
-    the tokenizer load). Best-effort: ``(0, 0)`` if neither is available -> the GC-off gate
-    conservatively keeps gradient checkpointing on."""
+    Prefer the CURATED catalog geometry (deterministic, no network/parse risk) — a live B200 SFT
+    showed the runtime ``AutoConfig`` probe returning (0, 0) on the 35B-A3B's multimodal-nested
+    config, which silently kept GC on. A PINNED revision has no curated dims (the commit's geometry
+    is not validated), so it falls back to the HF config, handling the ``text_config`` nesting
+    (config.json is already cached by the tokenizer load). Best-effort: ``(0, 0)`` if neither is
+    available -> the GC-off gate conservatively keeps gradient checkpointing on."""
     from flash.catalog import MODELS
 
     info = MODELS.get(model_id)
