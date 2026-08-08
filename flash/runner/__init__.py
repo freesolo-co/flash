@@ -23,7 +23,7 @@ except ImportError:  # pragma: no cover - linux production fails closed below
     fcntl = None
 
 from flash._internal.paths import data_dir
-from flash.adapters.artifacts import MAX_ATTEMPT_ID
+from flash.adapters.artifacts import MAX_ATTEMPT_ID as MAX_ATTEMPT_ID
 from flash.core.catalog import ModelInfo, resolve_model
 from flash.core.spec import (
     _DROPPED_TOP_LEVEL_KEYS,
@@ -32,7 +32,7 @@ from flash.core.spec import (
     GpuSpec,
     JobSpec,
 )
-from flash.providers._lifecycle.poll import _attempt_int
+from flash.providers._lifecycle.poll import _attempt_int as _attempt_int
 from flash.teacher.retry_contract import (
     OPD_RETRY_CONTRACT_STATUS_KEY,
     OPD_RETRY_CONTRACT_VERSION,
@@ -162,380 +162,11 @@ def _adapter_ref_for_status(status: RunStatus) -> str | None:
     return status.run_id
 
 
-def _gpu_rate(gpu_type: str, provider: str = "") -> float:
-    """Static representative $/hr for cost projection.
-
-    Falls back to any configured provider that offers the class, so a plane without RunPod still
-    prices its runs. Never raises: this feeds cost ANNOTATION on an already-finished run, so a
-    provider-registry problem must degrade to the flat estimate rather than fail the metrics write.
-    """
-    try:
-        from flash.providers import available_providers, get_provider
-
-        # the billing substrate first when known, then any other configured provider that offers
-        # the class -- so a plane without RunPod still prices its runs.
-        names = [provider.strip().lower()] if provider.strip() else []
-        names += [n for n in available_providers() if n not in names]
-    except Exception:
-        return 0.80
-    for name in names:
-        try:
-            rate = get_provider(name).hourly_rate(gpu_type)
-        except Exception:
-            continue
-        if rate:
-            return float(rate)
-    return 0.80
-
-
-def charge_usd_for_spec(spec, *, steps: int | None = None, fallback: float = 0.0) -> float:
-    """Return the estimated customer charge, prorated by completed steps when requested."""
-    try:
-        from flash.cost.analytical import estimate_cost
-        from flash.cost.spec import estimate_for_spec, runconfig_from_spec
-
-        if getattr(spec, "workload_profile_kind", ""):
-            # a profile job has no optimizer steps to prorate, so its charge is all-or-nothing: the
-            # bounded wall it rented, or zero if it never started. the caller passes steps=0 for the
-            # latter (see profile_steps_run), and honouring it matters because the id is derived
-            # from the workload rather than the account -- a profile cancelled before launch would
-            # otherwise bill the full wall cap to whichever submitter happened to win the claim.
-            if steps is not None and int(steps) <= 0:
-                return 0.0
-            return float(estimate_for_spec(spec).total_usd)
-        if steps is None:
-            return float(estimate_for_spec(spec).total_usd)
-        n = max(0, int(steps))
-        if n == 0:
-            return 0.0
-        cfg = runconfig_from_spec(spec)
-        planned = int(cfg.steps or 0)
-        if planned > 0:
-            n = min(n, planned)
-        # a partial (cancelled) reprice only counts required saves that could already have landed by
-        # the completed step; keeping a save beyond the reduced horizon would also trip the run
-        # config's save_at_steps <= steps guard and drop the whole estimate to the fallback.
-        reached_saves = tuple(s for s in cfg.save_at_steps if s <= n)
-        if not cfg.is_grpo and cfg.train_tokens and planned > 0:
-            scaled_tokens = max(1, int(cfg.train_tokens * n / planned))
-            cfg = replace(cfg, steps=n, train_tokens=scaled_tokens, save_at_steps=reached_saves)
-        else:
-            cfg = replace(cfg, steps=n, save_at_steps=reached_saves)
-        return float(estimate_cost(cfg).total_usd)
-    except Exception:
-        return float(fallback)
-
-
-def _status_estimated_charge(status: RunStatus, spec, *, fallback: float = 0.0) -> float:
-    quote = getattr(status, "estimated_cost_usd", None)
-    if quote is not None:
-        return float(quote)
-    return charge_usd_for_spec(spec, fallback=fallback)
-
-
 # Heartbeat stages that mean the worker has entered training (GPU work underway). The per-step
 # `step` field is 1-indexed and only appears once a step COMPLETES, so the expensive first step (a
 # GRPO rollout can be ~17 min, an opd step waits on the teacher round-trips) streams one of these
 # stages with NO step yet -- still real GPU time.
 _TRAINING_STAGES = frozenset({"rl_step", "sft_step", "opd_step"})
-
-
-def actual_steps_run(status: RunStatus) -> int:
-    """How many optimizer steps to bill a (cancelled) run for.
-
-    Cancelled after N steps -> N. The first step reports no ``step`` until it completes, so a cancel
-    mid-first-step would look like 0 steps despite real GPU time -- we floor to 1 whenever a
-    training-stage heartbeat is present.
-    """
-    hb = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else {}
-    step = hb.get("step")
-    if isinstance(step, (int, float)) and step > 0:
-        return int(step)
-    # Training started (rl_step/sft_step/opd_step) but no completed step yet -> mid-first-step -> 1.
-    if hb.get("stage") in _TRAINING_STAGES:
-        return 1
-    return 0
-
-
-def profile_steps_run(status: RunStatus) -> int:
-    """Whether a cancelled profile job rented anything: 1 if it started, 0 if it never did.
-
-    The signal is that a worker spoke, but a profile's run id is derived from the workload, so a
-    relaunch REUSES it and the stored word may belong to the previous lifecycle. Billing the stored
-    stage there charges a relaunch cancelled in the queue for a machine it never rented. So a
-    relaunch -- and only a relaunch, marked by the attempt floor its takeover records -- is
-    billed on the arm, which is written only for a heartbeat that passed
-    ``_heartbeat_attempt_is_current``. A first lifecycle has no earlier worker to be confused with
-    and bills on the stored word as before.
-    """
-    hb = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else {}
-    if not hb.get("stage"):
-        return 0
-    try:
-        raw = _load_status_json(status.run_id)
-    except (FileNotFoundError, ValueError):
-        return 1
-    if _PROFILE_ATTEMPT_FLOOR_KEY not in raw:
-        return 1
-    return 1 if _profile_wall_armed_at(raw) is not None else 0
-
-
-def _require_valid_deadline(value: object) -> float:
-    """Return a finite positive unix deadline or fail closed."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise RuntimeError("run wall deadline is invalid; no further provisioning is allowed")
-    deadline = float(value)
-    if not math.isfinite(deadline) or deadline <= 0:
-        raise RuntimeError("run wall deadline is invalid; no further provisioning is allowed")
-    return deadline
-
-
-def _profile_wall_armed_at(raw: dict) -> float | None:
-    """Return when this profile's work budget started, or None if it has not started yet.
-
-    Absent means no worker has spoken for this profile yet, which is the normal state while it
-    queues. A stored value is validated like any other deadline input: a corrupt one fails closed
-    rather than silently reverting to the submission basis and shortening the budget."""
-    if _PROFILE_WALL_ARMED_AT_KEY not in raw:
-        return None
-    return _require_valid_deadline(raw[_PROFILE_WALL_ARMED_AT_KEY])
-
-
-def _canonical_run_deadline(raw: dict) -> tuple[RunStatus, float]:
-    status = _runstatus_from_json(raw)
-    # max_wall_seconds is platform-managed and stripped from the public status.spec, so source the
-    # run-global wall budget from the internal worker spec (the same value submit recorded).
-    spec = _internal_spec_from_status(status)
-    created_at = _require_valid_deadline(status.created_at)
-    max_wall_seconds = _require_valid_deadline(spec.gpu.max_wall_seconds)
-    if spec.workload_profile_kind:
-        # a profile's wall budget bounds its WORK. before a worker speaks, the run is still waiting
-        # on capacity, so it holds the queue allowance ON TOP of its untouched work budget; once one
-        # speaks, the work budget runs from that moment and the remaining queue allowance is
-        # dropped. the basis is recomputed from persisted state (never from the wall clock), so this
-        # stays a pure function of the record and _checked_stored_run_deadline still validates it.
-        armed_at = _profile_wall_armed_at(raw)
-        basis = (
-            created_at + _WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS if armed_at is None else armed_at
-        )
-        return status, _require_valid_deadline(basis + max_wall_seconds)
-    return status, _require_valid_deadline(created_at + max_wall_seconds)
-
-
-def _checked_stored_run_deadline(stored: object, canonical: float) -> float:
-    deadline = _require_valid_deadline(stored)
-    if not math.isclose(deadline, canonical, rel_tol=0.0, abs_tol=1e-6):
-        raise RuntimeError(
-            "persisted run wall deadline does not match canonical submission deadline; "
-            "no further provisioning is allowed"
-        )
-    return deadline
-
-
-def _load_run_deadline_at(run_id: str) -> float:
-    """Return the persisted canonical submission-to-terminal deadline."""
-    raw = _load_status_json(run_id)
-    _status, canonical = _canonical_run_deadline(raw)
-    if _RUN_DEADLINE_AT_KEY not in raw:
-        raise RuntimeError(
-            "persisted run wall deadline is missing; no further provisioning is allowed"
-        )
-    return _checked_stored_run_deadline(raw[_RUN_DEADLINE_AT_KEY], canonical)
-
-
-def _remaining_run_wall_seconds(run_id: str, *, now: float | None = None) -> float:
-    """Return non-negative wall allowance remaining on the run-global deadline."""
-    current = time.time() if now is None else now
-    if (
-        isinstance(current, bool)
-        or not isinstance(current, (int, float))
-        or not math.isfinite(current)
-        or current <= 0
-    ):
-        raise ValueError("current clock is invalid")
-    return max(0.0, _load_run_deadline_at(run_id) - float(current))
-
-
-def _worker_deadline_at(run_id: str, spec: JobSpec, *, now: float | None = None) -> float:
-    """Return the absolute deadline the worker may enforce for this launch.
-
-    Unarmed, the work budget from launch is the authority. So an unarmed profile also carries the
-    provisioning allowance -- otherwise docker+gpu waits, the image pull, pip install and the code
-    fetch all come out of the work budget, and a slow-to-boot box self-terminates before it can emit
-    the first heartbeat that would have armed the plane's own clock.
-    """
-    stored = _load_run_deadline_at(run_id)
-    if not spec.workload_profile_kind:
-        return stored
-    current = time.time() if now is None else now
-    work_budget_at = float(current) + float(_WORKLOAD_PROFILE_WALL_SECONDS)
-    if _profile_wall_armed_at(_load_status_json(run_id)) is None:
-        return work_budget_at + float(_WORKLOAD_PROFILE_PROVISION_ALLOWANCE_SECONDS)
-    return min(stored, work_budget_at)
-
-
-def _spec_with_remaining_wall(
-    spec: JobSpec,
-    *,
-    require_provider_minimum: bool,
-    now: float | None = None,
-) -> JobSpec:
-    """Copy a spec with only the run-global wall allowance still available."""
-    remaining = _remaining_run_wall_seconds(spec.run_id, now=now)
-    # exhaustion is judged on the REAL remaining allowance, before any profile substitution below.
-    # a profile's grant replaces `remaining` outright, so deferring this check past that assignment
-    # would make it unreachable for profiles and let a run provision after its own deadline had
-    # passed -- and the first heartbeat would then arm a fresh work window from that moment,
-    # turning the bounded queue allowance into an unbounded one.
-    if remaining <= 0:
-        raise RuntimeError("run wall deadline exhausted; no further provisioning is allowed")
-    if spec.workload_profile_kind:
-        # grant an unarmed profile its full work budget, not remaining submission allowance. the latter
-        # still contains queue time and later truncates work after a long capacity wait; the run-global
-        # deadline remains enforced by ``_worker_deadline_at``.
-        remaining = float(_WORKLOAD_PROFILE_WALL_SECONDS)
-    if require_provider_minimum and remaining < MIN_PROVIDER_WALL_SECONDS:
-        raise RuntimeError(
-            "run wall deadline has less than the 60-second minimum provider allowance remaining; "
-            "no further provisioning is allowed"
-        )
-    allowance = max(1, int(remaining))
-    return replace(spec, gpu=replace(spec.gpu, max_wall_seconds=allowance))
-
-
-def _infer_next_attempt(raw: dict) -> int:
-    if _NEXT_ATTEMPT_KEY not in raw:
-        raise RuntimeError("stored next attempt identity is missing")
-    stored = raw[_NEXT_ATTEMPT_KEY]
-    if _attempt_int(stored) is None:
-        raise RuntimeError("stored next attempt identity is invalid")
-    return stored
-
-
-def _heartbeat_attempt_is_current(hb: object, raw: dict) -> bool:
-    """True when a heartbeat carries the attempt identity this run most recently reserved.
-
-    This is the plane-side counterpart of ``_heartbeat_matches_attempt``, which runs provider-side
-    where the launch timestamp is in hand; here the equivalent identity
-    is the reserved attempt, which the worker stamps on every heartbeat and ``_save_status`` already
-    persists as ``next_attempt`` (the NEXT id to hand out, so the live attempt is one below it --
-    same arithmetic as ``_latest_reserved_attempt``, computed from the caller's already-loaded
-    record because this runs inside the status guard and must not re-read it).
-    """
-    if not isinstance(hb, dict):
-        return False
-    try:
-        next_attempt = _attempt_int(_infer_next_attempt(raw))
-    except RuntimeError:
-        return False
-    if next_attempt is None:
-        return False
-    # `_reserve_attempt` runs before the provider launch (lifecycle.py), so a live worker's
-    # heartbeat always sits one below the stored counter. Zero means nothing has been reserved yet;
-    # accept attempt 0 there rather than rejecting, because the launch path writes the counter and
-    # the worker's first heartbeat can be read back in either order, and refusing to arm would hand
-    # the run a budget measured from a moment before it started working.
-    expected = next_attempt - 1 if next_attempt > 0 else 0
-    if _attempt_int(hb.get("attempt")) != expected:
-        return False
-    # ...and it must belong to THIS lifecycle. a relaunch reuses the run id and carries the counter,
-    # so until it reserves an attempt of its own, `expected` still names the SPENT lifecycle's --
-    # and a prior worker that outlived its record stamps exactly that, recently enough to pass every
-    # other check. the floor is that carried counter, so a heartbeat below it predates this run.
-    floor = _attempt_int(raw.get(_PROFILE_ATTEMPT_FLOOR_KEY))
-    return floor is None or expected >= floor
-
-
-def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None]:
-    """Verify one locked opd retry snapshot and return its attempt plus resume revision."""
-    with _status_guard(run_id):
-        raw = _load_status_json(run_id)
-        status = _runstatus_from_json(raw)
-        # hf_repo is platform-managed and stripped from the public status.spec; the opd replacement
-        # locates its resume checkpoint by hf_repo, so source the complete internal worker spec.
-        spec = _internal_spec_from_status(status)
-        if spec.algorithm != "opd":
-            raise RuntimeError("opd retry verification requires an opd run")
-        try:
-            contract_version = require_opd_retry_contract_version(raw.get(_OPD_RETRY_CONTRACT_KEY))
-        except ValueError as exc:
-            raise RuntimeError(
-                "opd retry contract is missing or invalid; replacement is blocked"
-            ) from exc
-        next_attempt = _infer_next_attempt(raw)
-        hf_repo = spec.train.hf_repo
-        # phase is the hf-prefix component the worker uploads under ({phase}/{run_id}/...), so it locates
-        # both the markers and any full-state resume checkpoint the replacement can continue from.
-        phase = spec.phase
-        seed = spec.seed
-    from flash.providers.artifacts.hf import verify_opd_replacement_safe
-
-    resume_revision = verify_opd_replacement_safe(
-        hf_repo=hf_repo,
-        run_id=run_id,
-        seed=seed,
-        next_attempt=next_attempt,
-        contract_version=contract_version,
-        phase=phase,
-    )
-    return next_attempt, resume_revision
-
-
-def _verified_opd_next_attempt(run_id: str) -> int:
-    """Return just the verified next attempt, discarding the resume revision."""
-    return _verified_opd_retry_state(run_id)[0]
-
-
-def _reserve_attempt(
-    run_id: str,
-    *,
-    minimum_attempt: int = 0,
-    expected_next_attempt: int | None = None,
-) -> int:
-    """Durably consume one run-global attempt identity before provider creation."""
-    minimum = _attempt_int(minimum_attempt)
-    if minimum is None:
-        raise RuntimeError("minimum attempt identity is invalid")
-    expected = None
-    if expected_next_attempt is not None:
-        expected = _attempt_int(expected_next_attempt)
-        if expected is None:
-            raise RuntimeError("expected next attempt identity is invalid")
-    with _status_guard(run_id):
-        raw = _load_status_json(run_id)
-        status = _runstatus_from_json(raw)
-        current = _infer_next_attempt(raw)
-        if expected is not None and current != expected:
-            raise RuntimeError("stored next attempt identity changed after retry verification")
-        spec = JobSpec.from_dict(status.spec)
-        if spec.algorithm == "opd":
-            try:
-                require_opd_retry_contract_version(raw.get(_OPD_RETRY_CONTRACT_KEY))
-            except ValueError as exc:
-                raise RuntimeError(
-                    "opd retry contract is missing or invalid; replacement is blocked"
-                ) from exc
-            if expected is None:
-                raise RuntimeError("opd attempt reservation requires verified retry evidence")
-            if minimum > expected:
-                raise RuntimeError("minimum opd attempt exceeds the verified retry snapshot")
-            attempt = expected
-        else:
-            attempt = max(current, minimum)
-        if attempt >= MAX_ATTEMPT_ID:
-            raise RuntimeError("run attempt identity is exhausted")
-        _save_status_unlocked(status, _next_attempt=attempt + 1)
-        return attempt
-
-
-def _latest_reserved_attempt(run_id: str) -> int | None:
-    """Return the newest durably reserved attempt, or none before any reservation."""
-    try:
-        raw = _load_status_json(run_id)
-        next_attempt = _infer_next_attempt(raw)
-    except Exception:
-        return None
-    return next_attempt - 1 if next_attempt > 0 else None
 
 
 @dataclass
@@ -763,105 +394,6 @@ _ARTIFACT_REPO_PREFIX = "flashrun-"
 _ARTIFACT_REPO_NAME_MAX = 96
 
 
-def artifact_namespace() -> str:
-    """The HuggingFace namespace run artifacts are created under.
-
-    Flash streams code, checkpoints and adapters through HF dataset repos that the control plane
-    CREATES, so the namespace has to be one the operator's ``HF_TOKEN`` can write to. Hardcoding
-    Freesolo's made self-hosting impossible: ``_assign_managed_hf_repo`` runs on every submit, and a
-    self-hoster's token cannot create ``Freesolo-Co/flashrun-*``, so the run failed at upload before
-    any training started.
-    """
-    return (os.environ.get("FLASH_HF_NAMESPACE") or "").strip() or _DEFAULT_ARTIFACT_NAMESPACE
-
-
-def _environment_artifact_repo_name(env_id: str) -> str:
-    """Stable HF dataset repo name for all runs of one environment."""
-    raw = (env_id or "default-environment").strip() or "default-environment"
-    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
-    slug = re.sub(r"[^A-Za-z0-9]+", "-", raw.lower()).strip("-") or "environment"
-    budget = _ARTIFACT_REPO_NAME_MAX - len(_ARTIFACT_REPO_PREFIX) - len(digest) - 1
-    slug = slug[:budget].rstrip("-") or "environment"
-    return f"{_ARTIFACT_REPO_PREFIX}{slug}-{digest}"
-
-
-def managed_hf_repo_for_environment(env_id: str) -> str:
-    """Private HF dataset repo shared by runs that use the same environment id."""
-    return f"{artifact_namespace()}/{_environment_artifact_repo_name(env_id)}"
-
-
-def _file_digest(path: str, digest) -> None:
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            digest.update(chunk)
-
-
-def flash_code_prefix() -> str:
-    """Content-addressed HF path for the current ``flash`` package snapshot."""
-    import flash
-
-    pkg_dir = os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
-    digest = hashlib.sha1()
-    for root, dirs, files in os.walk(pkg_dir):
-        dirs[:] = sorted(d for d in dirs if d != "__pycache__" and not d.startswith("."))
-        for name in sorted(files):
-            if name.endswith((".pyc", ".pyo")):
-                continue
-            path = os.path.join(root, name)
-            if not os.path.isfile(path):
-                continue
-            rel = os.path.relpath(path, pkg_dir).replace(os.sep, "/")
-            digest.update(rel.encode("utf-8"))
-            digest.update(b"\0")
-            _file_digest(path, digest)
-            digest.update(b"\0")
-    return f"code/{digest.hexdigest()[:32]}/flash"
-
-
-def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
-    """Assign the environment-scoped HF artifact repo (platform-managed, never user-set)."""
-    if not spec.run_id or spec.run_id == "local":
-        raise ValueError("run_id must be finalized before assigning the artifact repo")
-    repo = managed_hf_repo_for_environment(spec.environment.id)
-    d = spec.to_internal_dict()
-    d["train"] = {**d["train"], "hf_repo": repo}
-    return JobSpec.from_dict(d)
-
-
-def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
-    """Pin env ref->SHA once so N workers don't fan-out N GitHub API calls (secondary rate-limit). Best-effort."""
-    import logging
-
-    env_id = spec.environment.id
-    if not env_id or spec.environment.resolved_sha:
-        return spec
-    try:
-        from flash.envs.loader import (
-            _parse_github_environment_ref,
-            _resolve_ref_sha,
-            is_managed_environment_slug,
-            managed_slug_to_github_ref,
-        )
-
-        ref_str = (
-            managed_slug_to_github_ref(env_id) if is_managed_environment_slug(env_id) else env_id
-        )
-        parsed = _parse_github_environment_ref(ref_str)
-        if parsed is None:
-            return spec  # local/path or non-GitHub env: nothing to pin
-        sha = _resolve_ref_sha(parsed, timeout=10.0, max_rate_limit_retries=0)
-    except Exception as e:
-        logging.getLogger(__name__).warning(
-            "resolve-once: could not pin env ref->sha for %r (%s); worker will resolve", env_id, e
-        )
-        return spec
-    if not sha:
-        return spec
-    d = spec.to_internal_dict()
-    d["environment"] = {**d["environment"], "resolved_sha": sha}
-    return JobSpec.from_dict(d)
-
-
 WEIGHT_CACHE_VOLUME_NAME = "flash-weights"
 # Must stay >= weight_cache_catalog_peak_gb(), which is what the whole catalog actually needs on one
 # shared volume; test_volume_holds_whole_catalog_with_largest_model_in_transit fails if it does not.
@@ -869,82 +401,6 @@ WEIGHT_CACHE_VOLUME_NAME = "flash-weights"
 WEIGHT_CACHE_VOLUME_GB = 250
 # A download needs the checkpoint plus roughly as much again for Xet reconstruction scratch.
 _WEIGHT_CACHE_PEAK_FACTOR = 2.0
-
-
-def _download_gb(info: ModelInfo) -> float:
-    """Full bf16 checkpoint size in GB, from catalog geometry (2 bytes/param).
-
-    Same rule as ``cost.facts.download_weight_gb``, which cannot be reused here: it resolves a model
-    *id* and fail-closes on anything off-catalog, while cache sizing runs on a ``ModelInfo`` that
-    may legitimately carry no ``params_b``.
-    """
-    return (info.params_b or 0.0) * 2.0
-
-
-def _peak_gb(info: ModelInfo) -> float:
-    """GB the volume must have free for this model to finish downloading."""
-    return _WEIGHT_CACHE_PEAK_FACTOR * _download_gb(info)
-
-
-def _fits_weight_cache(info: ModelInfo) -> bool:
-    """Whether the model's peak download footprint fits the shared weight-cache volume.
-
-    Sizes the model against an EMPTY volume. ``weight_cache_catalog_peak_gb`` answers that
-    cumulative question; keep both in agreement when adding a large model.
-    """
-    if not info.params_b:
-        return (
-            True  # unknown size -> keep the (attach) default; curated catalog models always set it
-        )
-    return _peak_gb(info) <= WEIGHT_CACHE_VOLUME_GB
-
-
-def weight_cache_catalog_peak_gb() -> float:
-    """Peak GB the volume must hold to warm the WHOLE catalog onto one shared volume.
-
-    That is strictly more than any single model's own peak, which is why sizing the volume per-model
-    let the 35B fail with "Disk quota exceeded" on every datacenter at 200 GB. Derived from
-    ``params_b``, so it slightly understates a repo that also ships tokenizer/config/ index files;
-    the measured-bytes figure for today's catalog is ~5 GB higher.
-    """
-    from flash.core.catalog import MODELS
-
-    cached = [info for info in MODELS.values() if _fits_weight_cache(info)]
-    if not cached:
-        return 0.0
-    largest = max(cached, key=_download_gb)
-    resident_others = sum(_download_gb(info) for info in cached if info is not largest)
-    return resident_others + _peak_gb(largest)
-
-
-def _assign_weight_cache_volume(spec: JobSpec, info: ModelInfo | None = None) -> JobSpec:
-    """Attach the shared weight-cache volume, which every run is now eligible for.
-
-    Only curated models are trainable, and their weights are public, so the shared cross-tenant
-    mount holds nothing private. A pre-set non-shared volume is always honored as-is, and an
-    oversized model still fails ``_fits_weight_cache``.
-    """
-    existing = getattr(spec.gpu, "network_volume", None)
-    if existing and existing != WEIGHT_CACHE_VOLUME_NAME:
-        return spec
-    attach = info is None or _fits_weight_cache(info)
-    pinned = existing == WEIGHT_CACHE_VOLUME_NAME
-    # An already-pinned spec is only "correct" if it also carries the CURRENT managed size. A stale
-    # or internally-round-tripped spec can hold the shared name at a previous, smaller size; taking
-    # the no-op return there would deploy an undersized volume for models this size now admits.
-    sized = getattr(spec.gpu, "network_volume_gb", None) == WEIGHT_CACHE_VOLUME_GB
-    if attach == pinned and (sized or not attach):
-        return spec
-    d = spec.to_internal_dict()
-    if attach:
-        d["gpu"] = {
-            **d["gpu"],
-            "network_volume": WEIGHT_CACHE_VOLUME_NAME,
-            "network_volume_gb": WEIGHT_CACHE_VOLUME_GB,
-        }
-    else:
-        d["gpu"] = {**d["gpu"], "network_volume": None}
-    return JobSpec.from_dict(d)
 
 
 def _run_job_background(
@@ -2039,318 +1495,6 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
     return float(cost)
 
 
-def _remote_resource_identity(remote: object) -> tuple | None:
-    """Return the exact strict provider resource identity used for compare-and-clear."""
-    if not isinstance(remote, dict):
-        return None
-    provider = remote.get("provider")
-    try:
-        if provider == "runpod":
-            from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
-
-            handle = RunpodJobHandle.from_dict(remote)
-            return (
-                provider,
-                handle.attempt,
-                handle.endpoint_id,
-                handle.job_id,
-                handle.key_fingerprint,
-            )
-        if provider == "lambda":
-            from flash.providers.lambda_.jobs.builders import LambdaJobHandle
-
-            handle = LambdaJobHandle.from_dict(remote)
-            return (
-                provider,
-                handle.attempt,
-                handle.instance_id,
-                handle.instance_type,
-                handle.region,
-                handle.name,
-            )
-        if provider == "vast":
-            from flash.providers.vast.jobs.builders import VastJobHandle
-
-            handle = VastJobHandle.from_dict(remote)
-            return (
-                provider,
-                handle.attempt,
-                handle.instance_id,
-                handle.offer_id,
-                handle.machine_id,
-                handle.label,
-            )
-    except (TypeError, ValueError):
-        return None
-    return None
-
-
-def _expected_remote_matches(current: object, expected: dict | None) -> bool:
-    if expected is None:
-        return current is None
-    expected_identity = _remote_resource_identity(expected)
-    return expected_identity is not None and _remote_resource_identity(current) == expected_identity
-
-
-def _compare_and_clear_remote(run_id: str, expected_remote: dict) -> bool:
-    """Clear only the nonterminal remote that still names the destroyed resource."""
-    if _remote_resource_identity(expected_remote) is None:
-        return False
-    report_status: RunStatus | None = None
-    with _status_guard(run_id):
-        status = get_status(run_id)
-        if status.state in TERMINAL_STATES:
-            return False
-        if not _expected_remote_matches(status.remote, expected_remote):
-            return False
-        status.remote = None
-        status.updated_at = time.time()
-        _save_status_unlocked(status)
-        report_status = status
-    if report_status is not None:
-        _report_status(report_status)
-    return True
-
-
-def _compare_and_prepare_resubmit(
-    run_id: str,
-    expected_remote: dict | None,
-    *,
-    expected_state: str | None = None,
-) -> bool:
-    """Claim a nonterminal recovery launch only while its expected remote still owns the run."""
-    report_status: RunStatus | None = None
-    with _status_guard(run_id):
-        status = get_status(run_id)
-        if status.state in TERMINAL_STATES:
-            return False
-        if expected_state is not None and status.state != expected_state:
-            return False
-        if not _expected_remote_matches(status.remote, expected_remote):
-            return False
-        status.state = "provisioning"
-        status.updated_at = time.time()
-        _save_status_unlocked(status)
-        report_status = status
-    if report_status is not None:
-        _report_status(report_status)
-    return True
-
-
-def _compare_and_fail_remote(
-    run_id: str,
-    expected_remote: dict | None,
-    error: str,
-) -> bool:
-    """CAS a nonterminal expected remote to failed and confirm the durable write."""
-    report_status: RunStatus | None = None
-    with _status_guard(run_id):
-        status = get_status(run_id)
-        if status.state in TERMINAL_STATES:
-            return False
-        if not _expected_remote_matches(status.remote, expected_remote):
-            return False
-        previous_updated_at = status.updated_at
-        status.state = "failed"
-        status.error = error
-        status.updated_at = time.time()
-        if status.finished_at is None:
-            status.finished_at = status.updated_at or previous_updated_at
-        _save_status_unlocked(status)
-        report_status = status
-    confirmed = get_status(run_id)
-    expected_after = expected_remote
-    if (
-        confirmed.state != "failed"
-        or not _expected_remote_matches(confirmed.remote, expected_after)
-        or confirmed.error != error
-    ):
-        raise RuntimeError("terminal recovery failure was not durably confirmed")
-    if report_status is not None:
-        _report_status(report_status)
-    return True
-
-
-def _compare_and_complete_remote(
-    run_id: str,
-    expected_remote: dict | None,
-    spec: JobSpec,
-    metrics: dict,
-) -> bool:
-    """Adopt strict completed artifacts only while the captured remote still owns the run."""
-    report_status: RunStatus | None = None
-    with _status_guard(run_id):
-        status = get_status(run_id)
-        if status.state in TERMINAL_STATES:
-            return False
-        if not _expected_remote_matches(status.remote, expected_remote):
-            return False
-    if expected_remote is not None and not _record_cleanup_remote(run_id, expected_remote):
-        return False
-    recovered_cost = _persist_metrics(spec, metrics)
-    with _status_guard(run_id):
-        status = get_status(run_id)
-        if status.state in TERMINAL_STATES:
-            return False
-        if not _expected_remote_matches(status.remote, expected_remote):
-            return False
-        measured = float(status.cost_usd or 0.0) + recovered_cost
-        charge_usd = _status_estimated_charge(status, spec, fallback=measured)
-        status.state = "done"
-        status.cost_usd = charge_usd
-        status.artifacts_dir = artifacts_dir(spec)
-        status.updated_at = time.time()
-        if status.finished_at is None:
-            status.finished_at = status.updated_at
-        _save_status_unlocked(status)
-        report_status = status
-    confirmed = get_status(run_id)
-    if confirmed.state != "done" or not _expected_remote_matches(confirmed.remote, expected_remote):
-        raise RuntimeError("terminal recovery completion was not durably confirmed")
-    if report_status is not None:
-        _report_status(report_status)
-    return True
-
-
-def _canonical_cleanup_remote(remote: object) -> dict | None:
-    """Return the complete strict teardown handle for one exact resource."""
-    if not isinstance(remote, dict) or _remote_resource_identity(remote) is None:
-        return None
-    provider = remote.get("provider")
-    try:
-        if provider == "runpod":
-            from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
-
-            return RunpodJobHandle.from_dict(remote).to_dict()
-        if provider == "lambda":
-            from flash.providers.lambda_.jobs.builders import LambdaJobHandle
-
-            return LambdaJobHandle.from_dict(remote).to_dict()
-        if provider == "vast":
-            from flash.providers.vast.jobs.builders import VastJobHandle
-
-            return VastJobHandle.from_dict(remote).to_dict()
-    except (TypeError, ValueError):
-        return None
-    return None
-
-
-def _cleanup_remote_key(remote: object) -> tuple | None:
-    record = _canonical_cleanup_remote(remote)
-    if record is None:
-        return None
-    return _remote_resource_identity(record), record["attempt"]
-
-
-def _cleanup_remotes_from_raw(raw: dict) -> list[dict]:
-    value = raw.get(_CLEANUP_REMOTES_KEY, [])
-    if not isinstance(value, list):
-        raise RuntimeError("stored cleanup remotes are invalid")
-    records = []
-    seen = set()
-    for item in value:
-        record = _canonical_cleanup_remote(item)
-        key = _cleanup_remote_key(record)
-        if record is None or key is None:
-            raise RuntimeError("stored cleanup remote is invalid")
-        if key not in seen:
-            records.append(record)
-            seen.add(key)
-    return records
-
-
-def _snapshot_cleanup_remotes(run_id: str) -> list[dict]:
-    with _status_guard(run_id):
-        return _cleanup_remotes_from_raw(_load_status_json(run_id))
-
-
-def _compare_and_remove_cleanup_remote(run_id: str, expected_remote: dict) -> bool:
-    expected_key = _cleanup_remote_key(expected_remote)
-    if expected_key is None:
-        return False
-    with _status_guard(run_id):
-        raw = _load_status_json(run_id)
-        records = _cleanup_remotes_from_raw(raw)
-        remaining = [record for record in records if _cleanup_remote_key(record) != expected_key]
-        if len(remaining) == len(records):
-            return False
-        _save_status_unlocked(
-            _runstatus_from_json(raw),
-            _cleanup_remotes=remaining or None,
-        )
-    return True
-
-
-def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
-    """Teardown every tracked resource independently, removing only confirmed exact records."""
-    records = _snapshot_cleanup_remotes(run_id)
-    attempted = set()
-    if not records:
-        return attempted
-    from flash.providers.base import JobHandle
-    from flash.runner.supervise.lifecycle import _strict_teardown_handle
-
-    for record in records:
-        identity = _remote_resource_identity(record)
-        if identity is None:
-            continue
-        attempted.add(identity)
-        try:
-            resource_deleted = _strict_teardown_handle(JobHandle.from_dict(record), run_id)
-        except Exception:
-            continue
-        if resource_deleted:
-            with contextlib.suppress(Exception):
-                _compare_and_remove_cleanup_remote(run_id, record)
-    return attempted
-
-
-def _record_cleanup_remote(run_id: str, remote: dict) -> bool:
-    """Persist one exact cleanup identity without changing the active remote."""
-    record = _canonical_cleanup_remote(remote)
-    key = _cleanup_remote_key(record)
-    if record is None or key is None:
-        return False
-    report_status: RunStatus | None = None
-    with _status_guard(run_id):
-        raw = _load_status_json(run_id)
-        status = _runstatus_from_json(raw)
-        records = _cleanup_remotes_from_raw(raw)
-        if all(_cleanup_remote_key(existing) != key for existing in records):
-            records.append(record)
-        status.updated_at = time.time()
-        _save_status_unlocked(status, _cleanup_remotes=records)
-        report_status = status
-    if report_status is not None:
-        _report_status(report_status)
-    return True
-
-
-def _preserve_cleanup_remote(run_id: str, remote: dict) -> bool:
-    """Persist cleanup identity without changing a terminal lifecycle state."""
-    record = _canonical_cleanup_remote(remote)
-    key = _cleanup_remote_key(record)
-    if record is None or key is None:
-        return False
-    report_status: RunStatus | None = None
-    with _status_guard(run_id):
-        raw = _load_status_json(run_id)
-        status = _runstatus_from_json(raw)
-        records = _cleanup_remotes_from_raw(raw)
-        if all(_cleanup_remote_key(existing) != key for existing in records):
-            records.append(record)
-        current_identity = _remote_resource_identity(status.remote)
-        identity = _remote_resource_identity(record)
-        if current_identity is None or current_identity == identity:
-            status.remote = dict(remote)
-        status.updated_at = time.time()
-        _save_status_unlocked(status, _cleanup_remotes=records)
-        report_status = status
-    if report_status is not None:
-        _report_status(report_status)
-    return True
-
-
 def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **updates) -> bool:
     """Atomically transition run state with terminal-stickiness. Returns False if rejected.
 
@@ -2380,54 +1524,9 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
     return True
 
 
-def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at: float) -> None:
-    """Persist reconciliation COGS without touching run state. No-ops if run vanished."""
-    with _status_guard(run_id):
-        try:
-            status = get_status(run_id)
-        except FileNotFoundError:
-            return
-        status.realized_cost_usd = realized_cost_usd
-        status.reconciled_at = reconciled_at
-        status.updated_at = time.time()
-        _save_status_unlocked(status)
-    _report_status(status)
-
-
 _BILLING_FIELDS = frozenset({"billing_state", "billing_error", "billing_charge"})
 # deployed is non-terminal but reconciled; its finished_at must survive billing field-only writes.
 _FINISHED_AT_PRESERVED_STATES = TERMINAL_STATES | {"deployed"}
-
-
-def record_billing_state(run_id: str, **fields) -> None:
-    """Persist billing fields without touching run state. Never downgrades a charged run."""
-    bad = set(fields) - _BILLING_FIELDS
-    if bad:
-        raise ValueError(f"record_billing_state only writes billing fields, got: {sorted(bad)}")
-    with _status_guard(run_id):
-        try:
-            status = get_status(run_id)
-        except FileNotFoundError:
-            return
-        new_billing_state = fields.get("billing_state")
-        if (
-            status.billing_state == "charged"
-            and "billing_state" in fields
-            and new_billing_state != "charged"
-        ):
-            return
-        # Backfill finished_at before bumping updated_at so reconcile._terminal_ts isn't skewed.
-        if (
-            status.state in _FINISHED_AT_PRESERVED_STATES
-            and status.finished_at is None
-            and not status.reconciled_at
-        ):
-            status.finished_at = status.updated_at
-        for key, value in fields.items():
-            setattr(status, key, value)
-        status.updated_at = time.time()
-        _save_status_unlocked(status)
-    _report_status(status)
 
 
 def _send_status_report(status: RunStatus) -> bool:
@@ -2765,6 +1864,58 @@ def _save_status_unlocked(
             os.unlink(tmp)
 
 
+from flash.runner.artifacts import (  # noqa: E402,F401
+    _assign_managed_hf_repo,
+    _assign_resolved_env_sha,
+    _environment_artifact_repo_name,
+    _file_digest,
+    artifact_namespace,
+    flash_code_prefix,
+    managed_hf_repo_for_environment,
+)
+from flash.runner.attempts import (  # noqa: E402,F401
+    _heartbeat_attempt_is_current,
+    _infer_next_attempt,
+    _latest_reserved_attempt,
+    _reserve_attempt,
+    _verified_opd_next_attempt,
+    _verified_opd_retry_state,
+)
+from flash.runner.costs import (  # noqa: E402,F401
+    _gpu_rate,
+    _status_estimated_charge,
+    actual_steps_run,
+    charge_usd_for_spec,
+    profile_steps_run,
+    record_billing_state,
+    record_realized_cost,
+)
+from flash.runner.deadlines import (  # noqa: E402,F401
+    _canonical_run_deadline,
+    _checked_stored_run_deadline,
+    _load_run_deadline_at,
+    _profile_wall_armed_at,
+    _remaining_run_wall_seconds,
+    _require_valid_deadline,
+    _spec_with_remaining_wall,
+    _worker_deadline_at,
+)
+from flash.runner.reconciliation import (  # noqa: E402,F401
+    _canonical_cleanup_remote,
+    _cleanup_remote_key,
+    _cleanup_remotes_from_raw,
+    _compare_and_clear_remote,
+    _compare_and_complete_remote,
+    _compare_and_fail_remote,
+    _compare_and_prepare_resubmit,
+    _compare_and_remove_cleanup_remote,
+    _drain_cleanup_remotes,
+    _expected_remote_matches,
+    _preserve_cleanup_remote,
+    _record_cleanup_remote,
+    _remote_resource_identity,
+    _snapshot_cleanup_remotes,
+)
 from flash.runner.results.verified_revisions import (  # noqa: E402,F401
     add_verified_adapter_revision,
     invalidate_verified_adapter_revisions,
@@ -2791,4 +1942,11 @@ from flash.runner.supervise.lifecycle import (  # noqa: E402,F401
     _run_training,
     _spec_with_gpu,
     _submit_seed_supervised,
+)
+from flash.runner.weight_cache import (  # noqa: E402,F401
+    _assign_weight_cache_volume,
+    _download_gb,
+    _fits_weight_cache,
+    _peak_gb,
+    weight_cache_catalog_peak_gb,
 )
