@@ -91,8 +91,10 @@ docker run -p 8080:8080 -v flash-state:/root/.flash \
 Building the image yourself omits the CLI unless you ask for it
 (`docker build --build-arg INSTALL_INFISICAL=true .`); with the variable set but the CLI
 absent, the container refuses to start rather than booting without the secrets it was told to
-fetch. See `deploy/infisical/README.md` for the full variable list, and copy its entrypoint if
-you use a different secret manager.
+fetch. The switch is unset-vs-set, not truthiness: setting `INFISICAL_CLIENT_ID` to an empty
+string also refuses, since that is what a `${VAR}` with nothing behind it produces rather than
+a deliberate request for the plain-environment path. See `deploy/infisical/README.md` for the
+full variable list, and copy its entrypoint if you use a different secret manager.
 
 ### The state directory
 
