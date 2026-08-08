@@ -111,10 +111,10 @@ def test_search_offers_applies_exact_gpu_names_server_side(monkeypatch):
 
 
 def test_search_offers_applies_duration_filter(monkeypatch):
-    # Codex Msvb0: a run whose wall cap exceeds an offer's remaining availability must not rent a
-    # short-lived offer. When min_duration_seconds is set, the search adds Vast's documented
-    # `duration` filter (seconds, "available at least this long from now") in the same operator-dict
-    # form as the other numeric filters; 0/unset leaves it off.
+    # a run whose wall cap exceeds an offer's remaining availability must not rent a short-lived
+    # offer. When min_duration_seconds is set, the search adds Vast's documented `duration` filter
+    # (seconds, "available at least this long from now") in the same operator-dict form as the other
+    # numeric filters; 0/unset leaves it off.
     from flash.providers.vast import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
@@ -394,11 +394,11 @@ def test_create_instance_is_not_retried(monkeypatch):
 
 
 def test_create_instance_unreadable_response_is_ambiguous(monkeypatch):
-    # Codex Msvbz: a 200 with a truncated / non-JSON body on the NON-IDEMPOTENT create may mean the
-    # host already billed a contract while the RESPONSE leg failed. Such a failure (JSONDecodeError /
+    # a 200 with a truncated / non-JSON body on the NON-IDEMPOTENT create may mean the host already
+    # billed a contract while the RESPONSE leg failed. Such a failure (JSONDecodeError /
     # IncompleteRead — neither an OSError, so the _http retry wrapper doesn't catch/wrap them) must
-    # surface as a VastApiError the walk classifies AMBIGUOUS, NOT escape raw past deploy_and_submit's
-    # `except VastApiError` and leak the contract.
+    # surface as a VastApiError the walk classifies AMBIGUOUS, NOT escape raw past
+    # deploy_and_submit's `except VastApiError` and leak the contract.
     from flash.providers.vast import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
@@ -432,8 +432,9 @@ def test_create_instance_unreadable_response_is_ambiguous(monkeypatch):
             return False
 
     class _InvalidUtf8Resp:  # 200 with invalid UTF-8 -> json.loads(bytes) raises UnicodeDecodeError
-        # Codex MtrgJ: UnicodeDecodeError is a SIBLING of JSONDecodeError under ValueError, so the
-        # JSONDecodeError clause alone would miss it and let it escape raw past the ambiguous reconcile.
+        # UnicodeDecodeError is a SIBLING of JSONDecodeError under ValueError, so the
+        # JSONDecodeError clause alone would miss it and let it escape raw past the ambiguous
+        # reconcile.
         def read(self):
             return b'\xff\xfe{"new_contract": 1}'  # leading invalid-UTF8 bytes
 
@@ -487,7 +488,7 @@ def test_get_instance_none_on_404(monkeypatch):
 
 
 def test_get_instance_reraises_non_404_with_404ish_body(monkeypatch):
-    # Codex Mr4sO: a non-404 4xx whose body embeds an id like "4040" must NOT be misread as a
+    # a non-404 4xx whose body embeds an id like "4040" must NOT be misread as a
     # disappearance/preemption. get_instance keys off the chained HTTPError status (is_not_found),
     # not a bare "404" substring, so this raises instead of returning None.
     from flash.providers.vast import api as vast_api
@@ -685,7 +686,7 @@ def test_destroy_instance_404_is_confirmed_gone(monkeypatch):
 
 
 def test_list_instances_paginates_every_page(monkeypatch):
-    """Codex MsXoI: the v1 instances list is keyset-paginated (limit max 25; pass the prior page's
+    """The v1 instances list is keyset-paginated (limit max 25; pass the prior page's
     `next_token` as `after_token`; `next_token` is null on the last page). list_instances must walk
     EVERY page — a flash orphan on a later page would otherwise never be seen by adoption / destroy /
     sweep and bill forever."""
@@ -707,7 +708,7 @@ def test_list_instances_paginates_every_page(monkeypatch):
 
 
 def test_list_instances_returns_partial_on_later_page_error(monkeypatch):
-    """Cursor MsaAk: a LATER page failing must not discard pages already fetched — adoption/teardown/
+    """A LATER page failing must not discard pages already fetched — adoption/teardown/
     sweep should still act on what we saw (a single-page list would have). A FIRST-page failure has
     nothing useful, so it re-raises and the callers' existing try/except skips, exactly as before."""
     from flash.providers.vast import api as vast_api

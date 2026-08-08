@@ -29,12 +29,9 @@ _TEMP_MERGED_BASE_MODEL_RE = re.compile(
 )
 _MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024
 
-# module-path segments outside the language model; mirrors _VL_EXCLUDE_SEGMENTS in
-# flash/engine/worker/lora.py. managed adapters can contain inert non-lm lora entries when
-# broad target-module names select vision or mtp modules, so key presence alone is not a
-# reason to preserve the mixed namespace. only a nonzero lora_b contribution, or an
-# unrecognized non-lm tensor, proves the adapter genuinely trains those modules and must
-# keep the file unchanged.
+# exclude non-language-model paths like `flash/engine/worker/lora.py` does. preserve mixed
+# namespaces only for a nonzero LoRA-B contribution or an unrecognized non-LM tensor; inert entries
+# alone do not prove those modules were trained.
 _NON_LM_KEY_SEGMENTS = (".visual.", ".vision_tower.", ".multi_modal_projector.", ".mtp.")
 
 

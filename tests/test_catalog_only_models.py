@@ -59,7 +59,7 @@ def test_a_run_persisted_before_the_upgrade_still_reloads():
     the current plane has written names model_policy -- including defaulted ones, which to_dict()
     popped but asdict() kept. Stored records are never rewritten and from_dict is strict, so without
     the dropped-key tolerance the first reload after deploy raises and a still-running job loses its
-    recovery, deploy, and serving paths (cursor[bot]).
+    recovery, deploy, and serving paths.
     """
     from flash.spec import JobSpec
 
@@ -86,8 +86,7 @@ def test_a_pre_upgrade_snapshot_still_passes_its_integrity_digest(tmp_path, monk
     Letting the key through from_dict fixes deserialization, but _preparation_digest rehashes the
     spec, and to_internal_dict no longer emits model_policy. A pre-upgrade snapshot hashed it in, so
     a workload-profile or warm-start run parses and THEN fails "persisted effective preparation
-    failed integrity validation" -- still blocking recovery, deploy and serving (cursor[bot],
-    codex[bot]). The digest must be reproduced from the bytes that were hashed.
+    failed integrity validation" -- still blocking recovery, deploy and serving. The digest must be reproduced from the bytes that were hashed.
     """
     import hashlib
     import json

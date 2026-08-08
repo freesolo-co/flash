@@ -305,12 +305,7 @@ def _push_environment_commit(*, checkout: Path, token: str) -> None:
 def _push_environment_delete(*, checkout: Path, publish_root: str, token: str) -> None:
     """Rebase onto the remote tip, re-apply the slug removal, then push.
 
-    A concurrent publish can add files under the same ``publish_root`` between our clone and this
-    push. ``git pull --rebase`` only replays the removals our delete commit recorded, so a
-    non-conflicting concurrent addition (e.g. a new sidecar while ``environment.py`` is unchanged)
-    survives the rebase: the push would succeed and we'd report ``deleted: true`` while the slug
-    directory still exists partially. Re-run ``git rm -r`` against the freshly rebased tree and fold
-    any newly-tracked paths into the delete commit so the pushed state has the slug fully removed.
+    Re-run ``git rm -r`` after rebasing so concurrent files under the slug are deleted too.
     """
     _run_git(
         checkout, ["pull", "--rebase", "origin", _GITHUB_BRANCH], token=token, operation="delete"
@@ -441,13 +436,9 @@ def _validate_slug(slug: str) -> tuple[str, str]:
     """
     if not isinstance(slug, str):
         raise EnvPublishError("env id must be a string")
-    # Reject — never silently normalize — anything that isn't ALREADY the canonical two-segment id.
-    # Do NOT strip leading/trailing '/' OR surrounding whitespace: requests like
-    # `DELETE /v1/envs/ns/env/` (trailing slash captured by the :path param) or an encoded-padded
-    # `ns/env%20` (FastAPI decodes to `ns/env `) must FAIL, not be trimmed to `ns/env`. Otherwise the
-    # package is deleted under the canonical slug while the response / downstream mirroring carry the
-    # non-canonical id, leaving a stale UI row. Split on the raw value so any empty (stray separator)
-    # or whitespace-padded segment fails the per-segment check below.
+    # reject rather than normalize: whitespace or stray separators must not delete the canonical
+    # slug
+    # while returning a non-canonical id. validate the raw segments.
     parts = slug.split("/")
     if len(parts) != 2 or not all(parts):
         raise EnvPublishError("env id must be 'namespace/name'")
@@ -455,13 +446,9 @@ def _validate_slug(slug: str) -> tuple[str, str]:
         if segment in {".", ".."} or not _SLUG_SEGMENT_RE.match(segment):
             raise EnvPublishError(f"invalid env id segment: {segment!r}")
     namespace, name = parts
-    # The delete path runs `git rm -r -- <namespace>/<name>` directly against the hub checkout, so
-    # the top-level path component (the namespace) must never be a genuine repo-control directory.
-    # An internal-key delete bypasses the namespace-ownership check in delete_package, so this
-    # validator is the only barrier, and a request like `DELETE /v1/envs/.github/workflows` would
-    # otherwise remove tracked repo infrastructure. Reject ONLY `_REPO_CONTROL_TOP_LEVEL_PATHS`, NOT
-    # the wider publish-content blocklist: `source` is a legitimately publishable org slug, so
-    # blocking it here would leave those envs publishable-but-undeletable.
+    # delete runs git rm against the hub checkout, so block repo-control top-level paths here.
+    # use only _REPO_CONTROL_TOP_LEVEL_PATHS because valid namespaces such as source must remain
+    # deletable.
     if namespace in _REPO_CONTROL_TOP_LEVEL_PATHS:
         raise EnvPublishError(f"invalid env id segment: {namespace!r}")
     return namespace, name
@@ -648,18 +635,8 @@ def _github_delete_once(*, repo: str, token: str, publish_root: str, message: st
         )
         target = _checkout_child(checkout, publish_root, operation="delete")
         if not target.exists():
-            # Idempotent: nothing published under this slug, so there is nothing to remove.
-            #
-            # The `git clone --single-branch` above already fetched the branch tip, so `target`
-            # reflects the latest published state as of that fetch and this check runs microseconds
-            # later with no intervening network round-trip. A `git pull` here would not meaningfully
-            # close the publish/delete race: it can only shrink the (sub-second, clone-unpack) window
-            # between a fetch and this check, never eliminate it — a publish landing one instant after
-            # *any* fetch is still unseen. Reporting `deleted: false` for a slug absent in the freshly
-            # cloned tip is the correct answer for the state we observed; a publish racing in
-            # afterwards is a genuinely concurrent, unordered event. We therefore accept this race
-            # rather than pay an extra round-trip on every delete. (The inverse race — a concurrent
-            # publish landing while the slug *does* exist — is handled in `_push_environment_delete`.)
+            # absence in the freshly cloned tip is idempotent. another pull cannot eliminate the
+            # publish/delete race; concurrent additions to an existing slug are handled on push.
             return False
         _run_git(checkout, ["config", "user.name", "freesolo-bot"], token=token, operation="delete")
         _run_git(

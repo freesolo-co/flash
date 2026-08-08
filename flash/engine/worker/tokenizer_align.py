@@ -1,15 +1,10 @@
 """Cross-tokenizer alignment for on-policy distillation (teacher GLM-5.2 -> student Qwen3.5/3.6).
 
-The teacher and student have different tokenizers and vocabularies, so they segment the SAME
-completion string at different byte boundaries and their per-token distributions can't be compared
-directly. ``groupwise_alignment`` bridges this by matching SHARED DECODED-TEXT SPANS: the coarsest
-common refinement of the two tokenizations (a group boundary is any character offset that begins a
-token in BOTH tokenizers). Between consecutive shared boundaries, the student tokens and teacher
-tokens covering that span form one group. This is the collinear-ai *spider* / Tinker-cookbook
-realignment (``_build_alignment_groups`` + ``_compute_groupwise_reverse_kl``), and it uses only the
-REALIZED-token logprobs on each side — no top-k candidates, no vocabulary projection — so it is exact
-across arbitrary tokenizer mismatch and covers every student token. No torch/network imports here, so
-the module is import-safe and unit-testable on a CPU box.
+This is the collinear-ai *spider* / Tinker-cookbook realignment (``_build_alignment_groups`` +
+``_compute_groupwise_reverse_kl``), and it uses only the REALIZED-token logprobs on each side -- no
+top-k candidates, no vocabulary projection -- so it is exact across arbitrary tokenizer mismatch and
+covers every student token. No torch/network imports here, so the module is import-safe and
+unit-testable on a CPU box.
 """
 
 from __future__ import annotations
@@ -45,17 +40,9 @@ def groupwise_alignment(
     """Align student & teacher tokens into matching decoded-text spans, for groupwise reverse-KL.
 
     This is the collinear-ai *spider* / Tinker-cookbook realignment (``_build_alignment_groups`` +
-    ``_compute_groupwise_reverse_kl``): the coarsest common refinement of the two tokenizations —
-    a group boundary is any character position that starts a token in BOTH tokenizers. Between
-    consecutive shared boundaries, the student tokens and teacher tokens covering that span form one
-    group (both sides possibly a different number of tokens). This covers EVERY student token (no
-    masking): where the tokenizers disagree locally, the span just grows until they next agree.
-    Because both offset sets index the same completion string, matching character spans is equivalent
-    to matching decoded text.
-
-    Returns ``[(student_indices, teacher_logprob_sum), ...]`` — for each group the student token
-    indices in it and the summed teacher logprob over that span (``log P_teacher(span)``). OPD's
-    batched loss pairs this with the differentiable ``log P_student(span)`` for reverse-KL.
+    ``_compute_groupwise_reverse_kl``): the coarsest common refinement of the two tokenizations -- a
+    group boundary is any character position that starts a token in BOTH tokenizers. OPD's batched
+    loss pairs this with the differentiable ``log P_student(span)`` for reverse-KL.
     """
     if not student_toks or not teacher_toks:
         return []
@@ -68,14 +55,12 @@ def groupwise_alignment(
     end = max(max(st.end for st in student_toks), max(tt.end for tt in teacher_toks))
     edges = [*boundaries, end]
     groups: list[tuple[list[int], float]] = []
-    pending: list[int] = []  # student tokens whose span had no teacher token yet
-    # Walk both token lists with monotonic cursors instead of rescanning the WHOLE list per boundary.
-    # Both are sorted by .start (student_tokens_with_offsets emits non-decreasing starts; teacher
-    # offsets arrive in order) and the boundary intervals [edges[k], edges[k+1]) are consecutive and
-    # ascending, so every token falls in exactly one interval and is visited once -- O(S+T+B), not the
-    # O(C^2) a per-boundary rescan costs once max_tokens raises completions to thousands of mostly-
-    # matching tokens (codex[bot]). The cursor position IS the lower bound: everything with start <
-    # edges[k] was consumed by an earlier interval, so `start < hi` alone selects [edges[k], hi).
+    pending: list[int] = []  # student tokens awaiting a teacher-bearing span
+    # Both are sorted by.start (student_tokens_with_offsets emits non-decreasing starts;
+    # teacher offsets arrive in order) and the boundary intervals [edges[k], edges[k+1]) are
+    # consecutive and ascending, so every token falls in exactly one interval and is visited
+    # once -- O(S+T+B), not the O(C^2) a per-boundary rescan costs once max_tokens raises
+    # completions to thousands of mostly- matching tokens.
     si = ti = 0
     for k in range(len(boundaries)):
         hi = edges[k + 1]
@@ -107,9 +92,10 @@ def groupwise_coverage(
     """Fraction of ALIGNABLE student tokens that landed in an alignment group.
 
     "Alignable" = non-zero-width (has decoded text). Zero-width tokens (special/eos or partial-byte
-    fragments) carry no text to align; they may still ride along inside a group so the span's student
-    logprob sum stays complete, but they are neither numerator nor denominator here — counting them
-    in the numerator (grouped) but not the denominator is what produced coverage > 100%.
+    fragments) carry no text to align; they may still ride along inside a group so the span's
+    student logprob sum stays complete, but they are neither numerator nor denominator here --
+    counting them in the numerator (grouped) but not the denominator is what produced coverage >
+    100%.
     """
     alignable = {i for i, st in enumerate(student_toks) if st.end > st.start}
     if not alignable:

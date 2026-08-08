@@ -408,9 +408,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="a bare RUN_ID, RUN_ID/step-N, or full immutable adapter revision",
     )
     # the same two knobs `env test` exposes, and for the same reason: an env whose
-    # `load_environment()` requires a difficulty or reads a non-default split cannot be evaluated
-    # at all without them, and a held-out suite scored against a differently-configured
-    # environment than the run trains on is not measuring the run (codex[bot]).
+    # `load_environment()` requires a difficulty or reads a non-default split cannot be evaluated at
+    # all without them, and a held-out suite scored against a differently-configured environment
+    # than the run trains on is not measuring the run.
     env_eval.add_argument(
         "--split",
         default=None,

@@ -198,21 +198,10 @@ def format_gpu_status(gpu: Any) -> str:
 
 
 def _format_child_tail(tail: object, silent_ticks: object = None) -> str:
-    """Render a stalled worker's retained child output, or "" when there is none.
+    """Render a stalled worker's retained child output, or "" when absent.
 
-    ``_format_heartbeat`` renders a fixed whitelist of scalar keys, so ``child_tail`` -- the verl
-    child's last words before it wedged (see ``backend_common.ChildOutputTail``) -- would otherwise be
-    carried all the way to the control plane and then dropped one step short of the log a human
-    reads. It survives in ``heartbeat.json`` and in the run's ``last_heartbeat``, but a stall is
-    diagnosed from the streamed log, so a tail nobody sees costs another paid attempt to learn
-    nothing.
-
-    ``silent_ticks`` rides the header for the same reason: a tail alone cannot tell slow from stuck,
-    and comparing two log lines by eye to find out is exactly the manual step the counter exists to
-    remove. It is rendered here rather than as a scalar because it describes this tail.
-
-    Non-string entries are skipped rather than coerced: this payload crosses a process boundary as
-    JSON, and a malformed one must not make the whole heartbeat line unrenderable.
+    ``child_tail`` and ``silent_ticks`` must reach the streamed log to distinguish slow output from a
+    wedged child. Skip malformed non-string entries rather than breaking the heartbeat line.
     """
     if not isinstance(tail, list):
         return ""
@@ -350,12 +339,8 @@ SETUP_HEARTBEAT_STAGES = frozenset(
         "rl_train_start",
         "sft_initializing",
         "rl_initializing",
-        # OPD cold-start stages (emitted before the first opd_step): prompt-budget filtering,
-        # wait-for-GPU, model load, and LoRA/warm-start init. Without these a slow OPD cold start is
-        # judged by the tight training stall window and retried as "stalled" instead of getting the
-        # setup grace. opd_filtering_prompts emits REAL progress heartbeats while it renders+tokenizes
-        # the split, so it must be listed here or is_training_heartbeat would (stickily) flip the run
-        # into the training window mid-setup.
+        # opd cold-start stages must keep setup grace until the first opd_step. filtering emits real
+        # progress, so omitting it would stickily switch preprocessing to the training stall window.
         "opd_start",
         "opd_configuring",
         "opd_filtering_prompts",

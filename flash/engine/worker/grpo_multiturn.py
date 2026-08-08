@@ -1,21 +1,8 @@
 """standalone child-side multi-turn GRPO rollout support for verl 0.8.0.
 
-runs INSIDE the verl interpreter. stdlib only -- no verl import at module scope and no flash
-import, so the parent copies this file into the child workdir the same way OPD copies its own
-multi-turn helper.
-
-the shape differs from OPD's multi-turn loop in one decisive way. OPD distils each assistant turn
-as its own single-turn sample and returns a LIST of ``AgentLoopOutput``s; only
-``AgentLoopWorkerTQ._agent_loop_postprocess`` (main_ppo_sync.py) tolerates a list, and that class
-belongs to the TransferQueue entrypoint OPD launches. GRPO launches ``verl.trainer.main_ppo``,
-whose stock ``_agent_loop_postprocess`` (agent_loop.py) sets ``output.extra_fields[...]`` on a bare
-object and would raise AttributeError on a list. so this loop returns exactly ONE output per
-EPISODE: the whole interleaved transcript as a single sequence, with ``response_mask`` marking
-model tokens 1 and environment glue 0, and one episode reward on it.
-
-that mask is not an approximation of trl's ``env_mask`` -- verl documents ``response_mask`` as "1s
-for LLM generated token, 0 for tool response token" (agent_loop.py), which is the same quantity
-trl's multi-turn rollout_func builds.
+stdlib only: the parent copies it into the child interpreter. GRPO must return one output per
+episode
+because main_ppo cannot postprocess OPD's list form; response_mask marks model tokens only.
 """
 
 from __future__ import annotations
@@ -61,18 +48,9 @@ _NEXT_TURN_SLACK = 8
 def post_json(url: str, path: str, payload: dict) -> dict:
     """post one json request to the parent's multi-turn bridge and return the decoded reply.
 
-    every failure raises. unlike the single-turn reward bridge -- where a scoring error degrades to
-    0.0 because one bad completion must not kill a run -- a broken turn here has already consumed
-    gpu time and left the parent's episode state half-advanced, and continuing would train on a
-    transcript the environment never agreed to.
-
-    carries NO deadline, for the same reason the single-turn reward client does not: MultiTurnBridge
-    guards every env touch with one lock, so with many rollouts in flight a request spends most of
-    its life queued behind other episodes rather than being served slowly. a client timeout there
-    fails healthy episodes for arriving Nth, which is a property of the batch size and not of the
-    environment. a genuinely wedged env is caught by the stall watchdog instead
-    (``flash/providers/_poll.py`` STALL_AFTER_S), which measures training progress rather than one
-    request (codex[bot]).
+    Every failure raises because continuing would train on environment state that never completed.
+    Use no request deadline: lock queueing is batch-size dependent; the stall watchdog in
+    ``flash/providers/_poll.py`` bounds genuine wedges.
     """
     request = urllib.request.Request(
         url.rstrip("/") + path,
@@ -231,15 +209,10 @@ def build_flash_grpo_multi_turn_agent_loop(
                     turn_start = len(response_ids)
                     unusable_turn = turn_is_unusable(turn)
                     response_ids.extend(turn_ids)
-                    # an unusable turn is NOT recorded into env state by the bridge
-                    # (MultiTurnBridge.step returns before record_model_turn), so the environment
-                    # never saw it and never scored it. its tokens must therefore stay OUT of the
-                    # loss, exactly as the environment glue below does -- the zeroed mask is what
-                    # keeps a position out. leaving them at 1 trains a cut-off turn on credit earned
-                    # by the turns BEFORE it, which teaches the policy to stop early: the same
-                    # failure `mask_truncated_completions` (default True) exists to prevent, and
-                    # which cannot reach here because this custom AgentLoopOutput carries no stop
-                    # reason for verl's single-turn handling to act on.
+                    # the bridge does not record or score an unusable turn, so keep its tokens
+                    # out of the loss with response_mask=0. verl's single-turn truncation handling
+                    # cannot reach
+                    # this custom AgentLoopOutput.
                     response_mask.extend([0 if unusable_turn else 1] * len(turn_ids))
                     # spanning it would also leave one more span than there are rewards, which
                     # score_rollouts rejects as a count mismatch -- dropping the row, and with it its
@@ -347,12 +320,9 @@ def build_flash_grpo_multi_turn_agent_loop(
                 multi_modal_data=multi_modal_data or None,
                 mm_processor_kwargs=mm_processor_kwargs,
                 num_turns=turn_count,
-                # verl reads reward_score BEFORE its reward manager runs: _compute_score skips any
-                # output that already carries one, _postprocess writes it into rm_scores on the
-                # last response token, and both NaiveRewardManager and ray_trainer short-circuit
-                # reward computation when rm_scores is present. so the episode reward set here is
-                # authoritative and the single-turn custom_reward_function is never consulted for
-                # these rows.
+                # reward_score is authoritative: verl copies it to rm_scores and skips
+                # reward-manager
+                # computation, so the single-turn custom reward function is not used for these rows.
                 reward_score=reward_score,
                 # per-turn credit assignment. the bridge returns one reward per emitted turn when
                 # the environment scores turns and the run asked for per-turn credit; it returns

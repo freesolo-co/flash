@@ -4,15 +4,6 @@ Covers BOTH substrates that hold a shared cache -- RunPod network volumes (``war
 and Lambda filesystems (``warm_instances``) -- which is why this sits at the provider-neutral level
 rather than under one provider package. ``main`` is a single CLI over both: ``--gpu`` documents a
 per-mode default for each, and ``--teardown`` reclaims storage on every provider.
-
-Run it::
-
-    python -m flash.providers.weight_cache_preload                 # all catalog models, all DCs
-    python -m flash.providers.weight_cache_preload --datacenters US-CA-2,EU-RO-1 --models Qwen/Qwen3.5-4B
-    python -m flash.providers.weight_cache_preload --dry-run       # print the plan, provision nothing
-    python -m flash.providers.weight_cache_preload --provision     # CREATE lambda filesystems, no GPU
-    python -m flash.providers.weight_cache_preload --warm-instances  # warm the lambda caches
-    python -m flash.providers.weight_cache_preload --teardown      # DELETE the cache volumes (reclaim $)
 """
 
 from __future__ import annotations
@@ -123,21 +114,10 @@ def _any_worker(workers: dict | None, *states: str) -> bool:
 def _has_worker(workers: dict | None) -> bool | None:
     """True once a datacenter has actually given us a box, in any state it can then be in.
 
-    - ``initializing`` / ``ready`` / ``running`` / ``idle`` -- allocated and fine
-    - ``unhealthy`` -- allocated, then the image failed to start. ``jobs.py`` reads this as a failed
-      image pull and retries on a fresh endpoint, so counting it as "no capacity" would blame the
-      datacenter for a broken image and tell the operator to change GPU class, which cannot help.
-      ``_only_unhealthy_workers`` is what separates that case out on its own timer.
-
-    ``throttled`` is deliberately NOT counted. ``jobs.py`` classifies a sustained throttled worker as
-    ``no_capacity`` (a capacity failure on the pinned class), which is exactly the condition this
-    exists to catch: RunPod is not scheduling the pinned class here. Treating it as capacity would
-    make a preload sit the full timeout on a datacenter that will never run it.
-
-    Returns None when health could not be read. That is deliberately NOT False: the caller escalates
-    a sustained False into NoCapacityError and tears the endpoint down, so a health endpoint that is
-    merely unreachable would look identical to a starved datacenter and could kill a download that is
-    running fine. Unknown must stay unknown -- only a positive "no workers" answer is evidence.
+    - ``initializing`` / ``ready`` / ``running`` / ``idle`` -- allocated and fine - ``unhealthy`` --
+    allocated, then the image failed to start. ``jobs.py`` classifies a sustained throttled worker
+    as ``no_capacity`` (a capacity failure on the pinned class), which is exactly the condition this
+    exists to catch: RunPod is not scheduling the pinned class here.
     """
     if workers is None:
         return None
@@ -147,15 +127,10 @@ def _has_worker(workers: dict | None) -> bool | None:
 def _only_unhealthy_workers(workers: dict | None) -> bool:
     """True when every box this datacenter gave us failed to start.
 
-    Same predicate ``poll_job`` runs while IN_QUEUE: unhealthy with nothing usable and nothing still
-    coming up. A box that is initializing may yet come good, and one that is ready/running/idle
-    already has, so neither is a broken image.
-
-    ``throttled`` blocks this too. A throttled box is capacity contention, not a failed image: it may
-    still become runnable, and ``poll_job`` gives it its own longer grace. Calling a mixed
-    unhealthy+throttled endpoint a broken image would tear it down at the shorter grace and blame a
-    failed image pull for what is actually a busy datacenter. ``_throttled_workers`` is the timer
-    that covers that case instead.
+    A throttled box is capacity contention, not a failed image: it may still become runnable, and
+    ``poll_job`` gives it its own longer grace. Calling a mixed unhealthy+throttled endpoint a
+    broken image would tear it down at the shorter grace and blame a failed image pull for what is
+    actually a busy datacenter.
     """
     if not workers:
         return False
@@ -166,15 +141,12 @@ def _only_unhealthy_workers(workers: dict | None) -> bool:
 
 def _throttled_workers(workers: dict | None) -> bool:
     """True while RunPod is holding boxes throttled with nothing usable -- the same call ``poll_job``
-    classifies as ``no_capacity``.
 
-    ``unhealthy`` is deliberately NOT excluded here, and that is the whole point of this predicate.
-    A mixed unhealthy+throttled endpoint sits in the one gap the other two timers leave: ``_has_worker``
-    counts the unhealthy box as allocated capacity so the starvation timer resets, and
-    ``_only_unhealthy_workers`` is blocked by the throttled box so the broken-image timer resets.
-    Nothing would ever fire and the preload would hold a paid endpoint for the whole timeout before
-    reporting a bare TimeoutError. Throttling is what that endpoint is actually suffering from, so
-    it gets its own timer and the honest no-capacity verdict.
+    A mixed unhealthy+throttled endpoint sits in the one gap the other two timers leave:
+    ``_has_worker`` counts the unhealthy box as allocated capacity so the starvation timer resets,
+    and ``_only_unhealthy_workers`` is blocked by the throttled box so the broken-image timer
+    resets. Nothing would ever fire and the preload would hold a paid endpoint for the whole timeout
+    before reporting a bare TimeoutError.
     """
     if not workers:
         return False
@@ -188,13 +160,8 @@ def catalog_model_ids() -> list[str]:
 
     Largest-first only buys fail-fast: the biggest model is the one whose cold download costs the
     most and is the likeliest to run out of room, so trying it before spending 20 minutes on the
-    small ones surfaces the failure early.
-
-    It is NOT what makes the catalog fit, and it must not be mistaken for a capacity fix. The volume
-    is persistent and preload never evicts, so on any DC warmed even once the largest model meets a
-    volume already holding everything else no matter what order this returns. Capacity comes from
-    sizing the volume for the whole resident catalog plus the largest model's in-transit scratch --
-    see ``flash.runner.weight_cache_catalog_peak_gb``.
+    small ones surfaces the failure early. It is NOT what makes the catalog fit, and it must not be
+    mistaken for a capacity fix.
     """
     from flash.catalog import MODELS
     from flash.runner import _fits_weight_cache
@@ -232,13 +199,12 @@ def _preload_one_dc(
     endpoint_id = None
     key_fingerprint = None
     try:
-        # timeout_s is the budget for this DC's job; the best-effort reconciliation in front of it
-        # gets its own bounded budget on top, never a slice carved out of the job's. Without the
-        # headroom a short --timeout-s floors at the 60s create allowance all by itself, the grow
-        # yields to that allowance, and reconciliation is skipped entirely -- reintroducing the
-        # under-sized mount this whole path exists to prevent. The deployer may reconcile once per
-        # account on a quota/balance failover, so ask it how much a whole call can need rather than
-        # funding a single grow.
+        # timeout_s is the budget for this DC's job; the best-effort reconciliation in
+        # front of it gets its own bounded budget on top, never a slice carved out of the
+        # job's. Without the headroom a short --timeout-s floors at the 60s create
+        # allowance all by itself, the grow yields to that allowance, and reconciliation
+        # is skipped entirely -- reintroducing the under-sized mount this whole path
+        # exists to prevent.
         from flash.providers.runpod.jobs import weight_cache_grow_headroom_s
 
         deadline_at = time.time() + timeout_s + weight_cache_grow_headroom_s()
@@ -322,12 +288,11 @@ def _poll_until_done(
             deadline_at=deadline,
         )
         status = (st or {}).get("status")
-        # Only a status that PROVES the job left the queue breaks the run. `!= _QUEUED` would also
-        # match None and any unrecognized string, so one flaky or empty job_status response would
-        # reset the grace window and keep NoCapacityError from ever firing -- the DC would stay
-        # silently cold for the full timeout, which is the failure this poller exists to catch.
-        # An unknown status is unknown: it proves nothing either way, so it neither resets the
-        # anchors nor is charged against them, and the next definite reading decides.
+        # Only a status that PROVES the job left the queue breaks the run. `!= _QUEUED`
+        # would also match None and any unrecognized string, so one flaky or empty
+        # job_status response would reset the grace window and keep NoCapacityError from
+        # ever firing -- the DC would stay silently cold for the full timeout, which is
+        # the failure this poller exists to catch.
         left_queue = status is not None and (
             status in _TERMINAL_OK or status in _TERMINAL_FAIL or status in _RUNNING
         )
@@ -338,25 +303,22 @@ def _poll_until_done(
             # zero-worker reading after the re-queue would delete an endpoint that never actually
             # waited on capacity. Same reasoning as poll_job clearing its in-queue timers.
             starved.since = unhealthy.since = throttled.since = None
-        # Restricted to IN_QUEUE: any other nonterminal status proves a worker was allocated, so
-        # zero-worker health then is a reporting artifact and never evidence of a starved DC.
-        #
-        # Health is re-read on EVERY queued poll rather than latched off after the first worker
-        # sighting. A box that is reported and then reclaimed while the job is still queued would
-        # otherwise suppress all later probes, and because the job never leaves the queue nothing
-        # would ever clear the latch -- the preload would burn the full timeout on a datacenter that
-        # had lost the worker. The grace timers below, not the probe, are what keep a transient
-        # blip from tearing down a healthy endpoint.
+        # Health is re-read on EVERY queued poll rather than latched off after the first
+        # worker sighting. A box that is reported and then reclaimed while the job is
+        # still queued would otherwise suppress all later probes, and because the job
+        # never leaves the queue nothing would ever clear the latch -- the preload would
+        # burn the full timeout on a datacenter that had lost the worker.
         elif status == _QUEUED:
             now = time.time()
             workers = _worker_counts(endpoint_id, key_fingerprint, deadline)
             if workers is None:
-                # Health unreadable. Every predicate below reads None as inactive, so running them
-                # would CLEAR all three anchors -- one failed health call per grace window would
-                # restart every window and a genuinely starved, broken or throttled DC would hold a
-                # paid endpoint for the whole timeout before reporting a bare TimeoutError. The job
-                # being confirmed queued says nothing about which of those it is suffering from;
-                # only health does, and health is what went dark. Pause, do not reset.
+                # Every predicate below reads None as inactive, so running them
+                # would CLEAR all three anchors -- one failed health call per
+                # grace window would restart every window and a genuinely starved,
+                # broken or throttled DC would hold a paid endpoint for the whole
+                # timeout before reporting a bare TimeoutError. The job being
+                # confirmed queued says nothing about which of those it is
+                # suffering from; only health does, and health is what went dark.
                 starved.unknown(now)
                 unhealthy.unknown(now)
                 throttled.unknown(now)
@@ -588,8 +550,7 @@ def _preload_status_repo() -> str:
     Derived from ``artifact_namespace()`` for the same reason run artifacts are: this repo is
     CREATED with the operator's ``HF_TOKEN``, and a hardcoded ``Freesolo-Co`` made the warm path
     unusable for a self-hoster whose token cannot write there -- with an error telling them to fix
-    an ``HF_TOKEN`` that was already correct. Not a separate knob: it follows wherever
-    ``FLASH_HF_NAMESPACE`` already points, so every path here still names one repo.
+    an ``HF_TOKEN`` that was already correct.
     """
     from flash.runner import artifact_namespace
 
@@ -600,8 +561,8 @@ class IncompleteWarmPlanError(RuntimeError):
     """Some regions warmed, but a class went unanswered so the fleet was never fully measured.
 
     Carries the results of the launches that DID run: they are real, paid, completed work, and a
-    bare raise would throw them away along with the record of which regions are now warm. The
-    caller reports them and then treats the run as unfinished rather than as a clean sweep.
+    bare raise would throw them away along with the record of which regions are now warm. The caller
+    reports them and then treats the run as unfinished rather than as a clean sweep.
     """
 
     def __init__(self, message: str, *, results: list[dict]):
@@ -612,26 +573,10 @@ class IncompleteWarmPlanError(RuntimeError):
 def _lambda_warm_targets(lambda_jobs, gpu: str | None) -> tuple[list[list], bool]:
     """``(one cheapest-first candidate list per Lambda region, planning was complete)``.
 
-    An explicit ``gpu`` pins the class and is never second-guessed. Otherwise every ladder class is
-    asked which regions have capacity, and each region keeps ALL the classes that can reach it, so a
-    region with no A10 is still warmed on A100/H100/B200 instead of being silently skipped. Capacity
-    is a live, per-region property, so this is a lookup and not a constant.
-
-    The whole per-region list is kept rather than just its cheapest entry because preload mode
-    deliberately never refreshes candidates: handing the launcher a single candidate means one clean
-    capacity rejection leaves that region cold even though a pricier class from the same inventory
-    snapshot was sitting right there. The alternative to a fallback is not a cheaper box, it is no box.
-
     Ranked by each candidate's own ``price_usd_hr``, which ``usable_instances`` fills from the live
     Lambda rate (falling back to the static table only when the live lookup fails). Ranking on the
     ladder's fixed order instead would keep claiming regions in a stale June price order and could
     launch the more expensive class after a Lambda discount.
-
-    The second element is False when any class went unanswered -- a lookup that failed or was cut off
-    by the planning budget. "No capacity" and "we never got an answer" are different facts, and only
-    the first may be reported as one: a region reachable solely through an unanswered class is not
-    known to be cold. The caller needs the distinction to avoid printing a definitive fleet summary
-    over a Lambda outage.
     """
     classes = [gpu] if gpu else list(_LAMBDA_PRELOAD_GPU_LADDER)
     complete = True
@@ -663,8 +608,7 @@ def _lambda_warm_targets(lambda_jobs, gpu: str | None) -> tuple[list[list], bool
             continue
         for c in candidates:
             by_region.setdefault(c.region, []).append(c)
-    # Ties keep ladder order, which is the static cheapest-first sequence: a stable sort means an
-    # unavailable live price degrades to the old behaviour instead of to an arbitrary one.
+    # stable price ties preserve the static cheapest-first ladder when live pricing is unavailable.
     targets = [
         sorted(cands, key=lambda c: getattr(c, "price_usd_hr", None) or math.inf)
         for _region, cands in sorted(by_region.items())
@@ -675,14 +619,11 @@ def _lambda_warm_targets(lambda_jobs, gpu: str | None) -> tuple[list[list], bool
 def _lambda_provisioned_regions() -> set[str]:
     """Regions where the weight-cache filesystem exists, per the Lambda API. Empty if unreadable.
 
-    The warm summary needs this because a region with no capacity in ANY ladder class never becomes a
-    target and so never produces a result -- it would be invisible in a report built only from
-    results, which is exactly the silent fleet gap this change exists to expose.
-
     Deadline-bounded because this runs AFTER ``_lambda_warm_targets`` has already spent the shared
-    planning budget, and ``list_filesystems`` retries internally: an endpoint that accepts connections
-    then hangs would otherwise add several minutes of attempts and backoff to planning, for what is
-    only a reporting nicety. Losing the snapshot degrades the summary; blocking on it delays warming.
+    planning budget, and ``list_filesystems`` retries internally: an endpoint that accepts
+    connections then hangs would otherwise add several minutes of attempts and backoff to planning,
+    for what is only a reporting nicety. Losing the snapshot degrades the summary; blocking on it
+    delays warming.
     """
     from flash.providers.lambdalabs import api as lambda_api
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
@@ -756,28 +697,20 @@ def _region_filesystem_is_listed(region: str, deadline: float) -> bool:
 def _ensure_region_filesystem(region: str, deadline: float) -> str:
     """Confirm this region's weight-cache filesystem exists before any paid launch.
 
-    ``launch_and_submit`` calls ``ensure_filesystem`` itself on every attempt and
-    ``create_filesystem`` is not idempotent, so the filesystem has to be settled before the ladder
-    runs or a rejection on the cheap class can be followed by a second create for the same name and
-    region on the next -- duplicate storage, billed forever.
-
-    Creating here is not by itself enough, which is the subtle part. ``ensure_filesystem`` returning
-    only proves the create call succeeded; the launcher then does its own listing, and a filesystem
-    that exists but has not yet appeared in ``list_filesystems()`` makes that listing miss and submit
-    the very duplicate this is meant to prevent. So the create is followed by an explicit visibility
-    check, and only a listed filesystem counts as settled.
-
-    Matching on error text instead cannot work. ``ensure_filesystem`` guards its create but not the
-    reconciliation listing inside its own except block (api.py), so when that listing times out the
-    raw error propagates, and ``launch_and_submit`` then wraps *every* failure -- real capacity
-    rejections included -- in the same "all N region(s) rejected ... (no capacity)" message. The two
-    are indistinguishable downstream, so the duplicate has to be prevented upstream.
+    ``launch_and_submit`` calls ``ensure_filesystem`` on every attempt and ``create_filesystem`` is
+    NOT idempotent, so the filesystem must be settled before the ladder runs or a rejection on one
+    class is followed by a second create for the same name and region -- duplicate storage, billed
+    forever. Creating is not enough on its own: a filesystem that exists but has not yet appeared in
+    ``list_filesystems()`` makes the launcher's own listing miss and submit that duplicate, so only
+    a LISTED filesystem counts as settled. Matching on error text cannot substitute, because
+    ``launch_and_submit`` wraps timeouts and real capacity rejections in the same "no capacity"
+    message.
 
     Returns one of:
       ``"listed"``      -- confirmed present, so every later ensure reuses it and cannot create.
       ``"unreachable"`` -- Lambda was never reached, so no create can exist and nothing is at risk.
-      ``"doubtful"``    -- we reached Lambda and cannot confirm the outcome; launching now could pay
-                           for a second filesystem forever, so the caller must skip the region.
+      ``"doubtful"``    -- reached Lambda but cannot confirm; launching could pay for a second
+                           filesystem forever, so the caller must skip the region.
     """
     from flash.providers.lambdalabs import api as lambda_api
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
@@ -831,12 +764,10 @@ def _warm_one_lambda_instance(
     lambda_jobs, candidates: list, models: list, timeout_s: int, poll_interval_s: float
 ) -> dict:
     """Launch a download-only preload instance in one Lambda region, poll its status marker, then
-    ALWAYS terminate. One region failing never aborts the others.
 
-    ``candidates`` is that region's cheapest-first class list. Each is tried until one launches, so a
-    capacity rejection on the cheap class falls through to a pricier one instead of leaving the region
-    cold -- preload mode never refreshes candidates itself. The GPU class is read off the candidate
-    that actually launched, so a mixed-class fleet warm reports what each region really cost.
+    ``candidates`` is that region's cheapest-first class list. The GPU class is read off the
+    candidate that actually launched, so a mixed-class fleet warm reports what each region really
+    cost.
     """
     region = getattr(candidates[0], "region", "?")
     gpu = getattr(candidates[0], "gpu", None) or _LAMBDA_PRELOAD_GPU
@@ -847,15 +778,12 @@ def _warm_one_lambda_instance(
         return {"provider": "lambda", "region": region, "gpu": gpu, "status": status, **extra}
 
     try:
-        # Settle the filesystem before any class runs, so every per-attempt ensure_filesystem inside
-        # the launcher only ever reuses and can never reach the non-idempotent create path.
-        #
-        # On its OWN budget, not the launch/poll one. Charging it to the run deadline while the
-        # instance wall cap and the reap deadline still got the full effective_s made the driver
-        # give up before the box it is watching, so a warm that was still downloading was reported
-        # as timed out. It also silently ate into the provider's 60s create allowance: a pre-check
-        # that left less than that made every class in the ladder fail the allowance check inside
-        # launch_and_submit, and the region reported "no capacity" for classes never actually tried.
+        # Settle the filesystem before any class runs, so every per-attempt
+        # ensure_filesystem inside the launcher only ever reuses and can never reach the
+        # non-idempotent create path. Give it its OWN budget: charging the pre-check to the run
+        # deadline made the driver give up before the box it watches, and it silently ate into the
+        # provider's 60s create allowance, so every class in the ladder failed the allowance check
+        # inside launch_and_submit and the region reported "no capacity" for classes never tried.
         fs_state = _ensure_region_filesystem(region, time.time() + _FS_PRECHECK_BUDGET_S)
         if fs_state == "doubtful":
             # Launching now would let the launcher's own listing miss and create a duplicate that is
@@ -897,13 +825,12 @@ def _warm_one_lambda_instance(
                 )
                 break
             except Exception as exc:
-                # no capacity / launch reject. Walking to the next class is safe here: the doubtful
-                # case already returned above, so the filesystem is either listed (every per-class
-                # ensure_filesystem reuses it and cannot create) or Lambda was never reachable at all
-                # (no create can exist). Deciding this from the error text is impossible --
-                # ensure_filesystem leaves its reconciliation listing unguarded, and launch_and_submit
-                # wraps a filesystem failure and a genuine capacity rejection in the same "no
-                # capacity" message -- which is why it is settled before the ladder instead.
+                # no capacity / launch reject. Deciding this from the error text
+                # is impossible -- ensure_filesystem leaves its reconciliation
+                # listing unguarded, and launch_and_submit wraps a filesystem
+                # failure and a genuine capacity rejection in the same "no
+                # capacity" message -- which is why it is settled before the
+                # ladder instead.
                 launch_err = exc
                 logger.info("warm lambda/%s: %s rejected (%s); trying next class", region, gpu, exc)
         if launch_err is not None or spec is None:
@@ -1033,15 +960,11 @@ def warm_instances(
         results = [f.result() for f in as_completed(futs)]
     _log_unreachable_lambda_regions(provisioned, results, planned=planned)
     if not planned:
-        # The reachable launches above are real work and are kept -- but the fleet was never fully
-        # measured, so this run cannot be reported as a finished one. Without this the mixed case
-        # (one class unanswered, another still yielding targets) printed "N/N regions warmed" and
-        # exited 0, where N counted only the regions we managed to look at. A region reachable
-        # solely through the unanswered class is missing from both the numerator AND the
-        # denominator, so the ratio looks perfect precisely because the gap is invisible.
-        # "examined", not "warmed": results holds every launched region whatever its status, so
-        # counting them as warmed would contradict the ok-only "X/Y regions warmed" line the CLI
-        # prints right above this one.
+        # The reachable launches above are real work and are kept -- but the fleet was
+        # never fully measured, so this run cannot be reported as a finished one. Without
+        # this the mixed case (one class unanswered, another still yielding targets)
+        # printed "N/N regions warmed" and exited 0, where N counted only the regions we
+        # managed to look at.
         raise IncompleteWarmPlanError(
             f"examined {len(results)} region(s), but at least one instance-type lookup failed or "
             "was cut off by the planning budget, so the fleet was not fully measured. Regions "
@@ -1091,11 +1014,8 @@ def _log_unreachable_lambda_regions(
 
     Returned as well as logged because this is a library module: the ``flash`` logger carries only a
     NullHandler until an app calls ``configure_logging``, so a caller that has not opted in would
-    otherwise lose the one message naming regions with no capacity in any class.
-
-    ``planned`` is False when some class went unanswered. A region that never became a target is
-    then not known to be cold, only unexamined, so it is labelled as such: claiming "no capacity"
-    off a lookup that never returned would report an outage as a finished measurement.
+    otherwise lose the one message naming regions with no capacity in any class. ``planned`` is
+    False when some class went unanswered.
     """
     cold, total = _cold_lambda_regions(provisioned, results)
     if not cold:
