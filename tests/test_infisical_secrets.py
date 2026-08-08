@@ -44,7 +44,7 @@ def test_the_infisical_cli_is_pinned_and_checksum_verified():
     assert verify < install, "the checksum must be verified BEFORE the package is installed"
     checked = re.search(r'echo "\$\{sha\}  (\S+)" \| sha256sum -c -', text)
     assert checked, "the checksum line must name the file it verifies"
-    assert checked.group(1) == '${deb}', (
+    assert checked.group(1) == "${deb}", (
         f"the verified file must be the downloaded package, not {checked.group(1)}"
     )
 
