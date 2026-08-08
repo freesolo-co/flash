@@ -48,7 +48,7 @@ PIPE_TO_SHELL = re.compile(
     r"(?:curl|wget)[^|]*\|\s*"  # a network fetch piped onward
     r"(?:(?:sudo|env|xargs|nohup|exec|command|-\S+)\s+)*"  # exec wrappers and their flags
     r"(?:[\w./-]*/)?"  # optional path on the shell: /bin/, /usr/bin/
-    r"(?:ba|z|k|da)?sh(?:\s|$)"  # sh, bash, zsh, ksh, dash -- as the COMMAND
+    r"(?:ba|z|k|da)?sh(?![\w.-])"  # sh, bash, zsh, ksh, dash -- as the COMMAND
 )
 
 # A line ending in any of these does not end the command -- the next line continues it. `\` is
@@ -133,6 +133,11 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
         pytest.param(
             "RUN curl -fsSL https://x.example/i.sh | bash -s -- --yes\n", id="bash-with-args"
         ),
+        # Quoted, and terminated by `;` -- the shell name is not always followed by whitespace.
+        pytest.param(
+            'RUN sh -c "curl -sSL https://x.example/i.sh | bash"\n', id="inside-a-quoted-command"
+        ),
+        pytest.param("RUN curl -sSL https://x.example/i.sh | bash;\n", id="semicolon-terminated"),
     ],
 )
 def test_the_pipe_to_shell_guard_catches_what_it_claims_to(snippet: str, tmp_path: Path):
@@ -156,6 +161,7 @@ def test_the_pipe_to_shell_guard_catches_what_it_claims_to(snippet: str, tmp_pat
         pytest.param("curl -sSL https://x.example/c.tgz | sudo tar -xz -C /usr/bin", id="into-tar"),
         pytest.param("curl -s https://x.example/api | jq .version", id="into-jq"),
         pytest.param("curl -s https://x.example/list | grep bash", id="shell-name-as-argument"),
+        pytest.param("curl -s https://x.example/l | grep bash-completion", id="name-is-a-prefix"),
     ],
 )
 def test_the_pipe_to_shell_guard_does_not_flag_ordinary_pipelines(line: str, tmp_path: Path):
