@@ -34,7 +34,6 @@ from flash.engine.worker.perf.diagnostics import (
     gpu_diagnostics,
 )
 from flash.engine.worker.perf.lifecycle import (
-    RETRIABLE_INFRA_MARKER,
     RetriableInfraError,
     _metric_curve,
     free_gpu,
@@ -42,13 +41,11 @@ from flash.engine.worker.perf.lifecycle import (
     wait_for_gpu,
 )
 from flash.engine.worker.perf.liger import (
-    _LIGER_MIN_PARAMS,
     _estimate_params,
     _liger_default_for_model,
 )
 from flash.engine.worker.perf.loraplus import loraplus_optimizer_cls
 from flash.engine.worker.perf.memory import (
-    _LONG_CONTEXT_TOKENS,
     _memory_mode,
     enable_multimodal_input_require_grads,
     fused_optim_name,
@@ -433,9 +430,6 @@ def _ensure_fla_fastpath_on_hopper() -> None:
 
 
 __all__ = [
-    "RETRIABLE_INFRA_MARKER",
-    "_LIGER_MIN_PARAMS",
-    "_LONG_CONTEXT_TOKENS",
     "RetriableInfraError",
     "_GpuPeakSampler",
     "_attn_impl_for_capability",
