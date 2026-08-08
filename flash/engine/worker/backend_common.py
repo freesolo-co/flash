@@ -519,7 +519,36 @@ if %(gdn_module)r:
                 ),
                 None,
             )
-            src = inspect.getsource(gdn.forward) if gdn is not None else ""
+            # read THROUGH decorators. transformers wraps this forward in
+            # @force_accelerate_hooks("conv1d"), which returns a plain closure and sets no
+            # __wrapped__, so both getsource() and inspect.unwrap() return the hook wrapper --
+            # ~1.1k chars of accelerate plumbing that mentions neither name. That reads as "this
+            # transformers build cannot reset gdn state", which is a FALSE NEGATIVE: every released
+            # 5.x reaches the values as kwargs.get("cu_seq_lens_q") / kwargs.get("seq_idx") in the
+            # real body, so no version bump can fix it and the raise sends operators to reinstall
+            # packages that are already present. The undecorated function is reachable through the
+            # wrapper's closure cells; walk them until the source answers the question.
+            src = ""
+            if gdn is not None:
+                fn = gdn.forward
+                seen = set()
+                while True:
+                    src = inspect.getsource(fn)
+                    if ("cu_seq_lens_q" in src) and ("seq_idx" in src):
+                        break
+                    nxt = None
+                    for cell in getattr(fn, "__closure__", None) or ():
+                        try:
+                            val = cell.cell_contents
+                        except ValueError:
+                            continue
+                        if inspect.isfunction(val) and id(val) not in seen:
+                            seen.add(id(val))
+                            nxt = val
+                            break
+                    if nxt is None:
+                        break
+                    fn = nxt
             ok = ("cu_seq_lens_q" in src) and ("seq_idx" in src)
             if not ok:
                 # both packages are present, so this is the transformers version, not the env.
