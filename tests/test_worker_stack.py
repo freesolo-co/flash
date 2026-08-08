@@ -1242,6 +1242,38 @@ def test_non_hopper_fla_fastpath_is_noop(monkeypatch):
     assert touched == [], "non-Hopper must be a no-op (don't install or disable fla)"
 
 
+def test_causal_conv1d_is_required_not_best_effort_in_the_image():
+    """Both causal_conv1d installs must fail the image build rather than degrade to no kernel.
+
+    It used to be best-effort in both interpreters, on the premise that a failed build meant "gdn
+    trains unpacked". That premise is dead: every catalog model is a gdn hybrid, and
+    ``require_gdn_boundary_resets`` RAISES for grpo/opd when the child cannot reset, because the old
+    padded fallback dies at ``padding.py:144`` against the hardcoded ``use_fused_kernels=True``. A
+    conv-less image therefore does not degrade -- it fails those runs after paying for a gpu.
+
+    Asserts on the ABSENCE of the swallowing ``|| uninstall`` branch, not merely on the presence of
+    the install line: the install was always there, and it was the ``||`` that made it optional.
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    dockerfile = (root / "Dockerfile.worker").read_text()
+
+    assert dockerfile.count("causal-conv1d==1.6.2.post1") == 2, (
+        "both the main interpreter and the verl venv must install causal_conv1d: /opt/verl-venv is "
+        "built without --system-site-packages, so the main interpreter's copy is invisible to the "
+        "child that actually trains"
+    )
+    # the uninstall-on-failure escape hatch must be gone from BOTH steps.
+    assert "pip uninstall -y causal-conv1d" not in dockerfile
+    assert "uv pip uninstall --python /opt/verl-venv/bin/python causal-conv1d" not in dockerfile
+    # and the venv sanity block must assert it, the way it already asserts fla.
+    assert "assert is_causal_conv1d_available()" in dockerfile, (
+        "the verl venv sanity block must assert causal_conv1d the way it asserts fla; a find_spec "
+        "probe printed as an advisory line lets a kernel-less image ship green"
+    )
+
+
 def test_fla_git_pin_is_consistent_and_pinned():
     """The fla git dependency is PINNED to an exact commit (not the moving default branch) and the
     SAME SHA is used in both WORKER_DEPS and Dockerfile.worker (worker venv == baked image)."""

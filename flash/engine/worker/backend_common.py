@@ -118,8 +118,14 @@ def _install_causal_conv1d(py: str) -> bool:
     """Install the causal conv kernel that resets GDN conv state at packed example boundaries.
 
     Best-effort, deliberately: unlike flash-attn this cannot fail the provisioning. Dying here would
-    turn a compiler hiccup into a dead paid run, and SFT still trains correctly without the kernel
-    (``_packing_mode`` pins gdn to one example per update, so there is nothing to contaminate).
+    turn a compiler hiccup into a dead paid run, and returning False is not the end of the story --
+    ``require_gdn_boundary_resets`` raises for grpo/opd on a gdn model whose child cannot reset, so
+    the failure still surfaces, with a message naming the missing kernel. SFT is unaffected either
+    way (``_packing_mode`` pins gdn to one example per update, so there is nothing to contaminate).
+
+    This is the NO-IMAGE provisioning path. ``Dockerfile.worker`` requires the same package outright,
+    because a prebuilt image has no compiler hiccup to forgive: a build that cannot produce the
+    kernel should fail before it ships, not after a run has paid for a gpu.
     """
     completed = subprocess.run(
         ["uv", "pip", "install", "--python", py, "--no-build-isolation", CAUSAL_CONV1D_REQUIREMENT],
