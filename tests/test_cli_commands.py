@@ -382,11 +382,30 @@ def test_configured_backend_keeps_project_listing_available(monkeypatch, capsys)
     assert "configured" in capsys.readouterr().out
 
 
+def test_an_ambient_hosted_key_survives_a_stale_self_hosted_login(monkeypatch, capsys) -> None:
+    """`load_credentials` lets FREESOLO_API_KEY win over the saved key while KEEPING the saved
+    api_url, and these commands never send that url anyway -- they address the backend with the
+    key. So a hosted key supplied against a leftover self-hosted login must keep working rather
+    than be disabled by a url it does not use.
+    """
+    _self_hosted(monkeypatch)
+    monkeypatch.setenv("FREESOLO_API_KEY", "fs-hosted-key")
+    monkeypatch.setattr(
+        "flash.client.list_projects",
+        lambda api_key: [{"id": "77777777-7777-4777-8777-777777777777", "name": "ambient"}],
+    )
+
+    assert _run(["projects", "list"]) == 0
+    assert "ambient" in capsys.readouterr().out
+
+
 def test_blank_backend_url_does_not_count_as_configured(monkeypatch, capsys) -> None:
     """An empty or whitespace value is an unset backend, not a reachable one; treating it as
     configured would restore the 401 this guard exists to prevent."""
     _self_hosted(monkeypatch)
     monkeypatch.setenv("FREESOLO_BASE_URL", "   ")
+    # the other hosted-backend signal must be absent, or this asserts nothing about the blank url
+    monkeypatch.delenv("FREESOLO_API_KEY", raising=False)
     monkeypatch.setattr("flash.client.list_projects", lambda *a, **k: pytest.fail("hosted call"))
 
     assert _run(["projects", "list"]) == 1

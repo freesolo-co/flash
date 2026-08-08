@@ -76,6 +76,10 @@ def has_freesolo_backend(api_url: str | None) -> bool:
       never reach the plane, so the url is the only standalone signal available.
     - ``FREESOLO_BASE_URL``. An operator running their own plane can still point it at a
       Freesolo-compatible backend, which is what these calls resolve through.
+    - ``FREESOLO_API_KEY``. The url is the WEAKEST of the three: these calls never send it (they
+      address ``freesolo_base_url`` with the key), and ``load_credentials`` keeps a saved
+      ``api_url`` while letting the env key win. So a hosted key supplied against a leftover
+      self-hosted login must not be disabled by that stale url.
 
     A false positive is the safe direction: assuming a backend exists yields today's behaviour
     (an authenticated call that may fail) rather than refusing a deployment that works.
@@ -87,7 +91,9 @@ def has_freesolo_backend(api_url: str | None) -> bool:
     """
     if api_url is None or is_freesolo_hosted_url(api_url):
         return True
-    return bool(os.environ.get("FREESOLO_BASE_URL", "").strip())
+    if os.environ.get("FREESOLO_BASE_URL", "").strip():
+        return True
+    return bool(os.environ.get("FREESOLO_API_KEY", "").strip())
 
 
 def _detail_from_http_error(exc: urllib.error.HTTPError) -> object:
