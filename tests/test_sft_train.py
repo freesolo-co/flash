@@ -1829,3 +1829,36 @@ def test_drain_join_waits_out_a_slow_upload_until_the_run_deadline(monkeypatch):
     started = real_time.monotonic()
     hb.join_while_draining(done, "finished uploader")
     assert real_time.monotonic() - started < 5.0
+
+
+def test_sft_ships_no_val_file_so_the_child_cannot_validate():
+    """The child's last-step validation fires on the DATALOADER existing, not on test_freq.
+
+    `verl/trainer/sft_trainer.py` gates it as
+    `is_last_step and self.val_dataloader is not None or (self.test_freq > 0 and is_valid_step)`.
+    Python binds `and` tighter than `or`, so the left disjunct is true on the final step of every
+    run that has a val dataloader at all -- `trainer.test_freq=-1` only suppresses the PERIODIC
+    pass. Flash used to write a one-row `val.parquet` and pass it, buying a full inference forward
+    per run whose `val/loss` nothing in flash reads. A null `data.val_files` makes the child's
+    `val_dataset` (and hence `val_dataloader`) None, so the branch cannot execute.
+
+    Asserted on the worker's own source: the config dict is built inside `run_sft_train`, so a test
+    that drove `build_sft_overrides` through a fixture would assert on the fixture's `val_files`
+    and stay green even if the worker went back to shipping a file.
+    """
+    import inspect
+
+    from flash.engine.worker import sft_train
+
+    # comments are stripped first: the explanation above the config key mentions both val.parquet
+    # and val_file, and matching those words in a comment would pass on a worker that still ships
+    # the file.
+    src = inspect.getsource(sft_train.run_sft_train)
+    code = "\n".join(ln for ln in src.splitlines() if not ln.strip().startswith("#"))
+
+    assert '"val_files": None,' in code
+    # and no val parquet is written or named any more, so the null is not merely cosmetic. the
+    # `val_files` key itself is the one legitimate occurrence, so it is excluded before checking.
+    remainder = code.replace('"val_files": None,', "")
+    assert "val.parquet" not in remainder
+    assert "val_file" not in remainder

@@ -3959,3 +3959,27 @@ def test_grpo_does_not_enable_tf32_in_the_parent():
     assert "setup_perf_backends" not in called, (
         "rl_train calls setup_perf_backends in the parent; the trainer child inherits none of it"
     )
+
+
+def test_agent_loop_workers_warns_when_a_prime_batch_serializes_the_rollout(capsys):
+    """A prime rollout batch silently costs up to 8x rollout throughput, so it must be announced.
+
+    ``agent_loop_workers`` returns the largest divisor of the batch that is <= cap because verl
+    asserts the chunk split is exact. For a prime batch the only such divisor is 1, so the pool
+    collapses to a single worker and the rollout runs fully serialized. Nothing raises and nothing
+    else reports it, so the only symptom is a slower run -- which is indistinguishable from a slow
+    environment unless the worker says so.
+    """
+    assert vc.agent_loop_workers(13) == 1
+    warned = capsys.readouterr().out
+    assert "serialized" in warned
+    assert "13" in warned
+
+    # a composite batch keeps its parallelism and stays quiet: a warning on every run would train
+    # the operator to ignore it.
+    assert vc.agent_loop_workers(16) == 8
+    assert capsys.readouterr().out == ""
+
+    # batch 1 is genuinely one unit of work, not a degraded split, so it is not a warning either.
+    assert vc.agent_loop_workers(1) == 1
+    assert capsys.readouterr().out == ""

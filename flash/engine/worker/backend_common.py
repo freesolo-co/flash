@@ -221,7 +221,19 @@ def agent_loop_workers(rollout_batch: int, *, cap: int = 8) -> int:
     """
     if rollout_batch <= 0:
         raise ValueError("rollout_batch must be positive")
-    return next(n for n in range(min(cap, rollout_batch), 0, -1) if rollout_batch % n == 0)
+    workers = next(n for n in range(min(cap, rollout_batch), 0, -1) if rollout_batch % n == 0)
+    # a PRIME batch has no divisor in (1, cap], so the pool collapses to a single worker and the
+    # rollout runs fully serialized -- a silent cap-fold slowdown, not an error. it needs a prime
+    # group_size (11 or 13 within the plausible range) to happen, since prompts_per_step alone is
+    # multiplied by group_size, so it is rare rather than impossible. say so instead of leaving the
+    # operator to infer it from wall-clock.
+    if workers == 1 and rollout_batch > 1:
+        print(
+            f"[flash-verl][warn] rollout batch {rollout_batch} has no divisor <= {cap}, so the "
+            f"agent-loop pool is 1 worker and the rollout is serialized. a batch with a small "
+            f"factor (adjust prompts_per_step or group_size) restores up to {cap}-way parallelism."
+        )
+    return workers
 
 
 # worker threads each bridge serves requests from. the bridges are pure i/o relays (parse json,

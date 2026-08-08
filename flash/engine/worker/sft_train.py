@@ -198,6 +198,11 @@ def build_sft_overrides(cfg: dict) -> list[str]:
         f"trainer.project_name={_hydra_val(cfg['project_name'])}",
         f"trainer.experiment_name={_hydra_val(cfg['experiment_name'])}",
         f"trainer.total_epochs={_hydra_val(cfg['loop_epochs'])}",
+        # -1 does NOT disable validation on its own. the child's gate is
+        # `is_last_step and self.val_dataloader is not None or (self.test_freq > 0 and is_valid_step)`
+        # (verl/trainer/sft_trainer.py), and `and` binds tighter than `or`, so a val dataloader that
+        # merely EXISTS buys a full inference forward on the last step whatever test_freq says. a
+        # null `data.val_files` is what removes the dataloader; this stays so no periodic pass runs.
         "trainer.test_freq=-1",
         "trainer.resume_mode=auto",
         # retain only the latest full-state checkpoint on the pod: each global_step_N holds model
@@ -1045,9 +1050,7 @@ def run_sft_train(spec=None) -> None:
             f"({masked_tokens / total_tokens_per_epoch:.0%}) prompt tokens"
         )
         train_file = os.path.join(data_dir, "train.parquet")
-        val_file = os.path.join(data_dir, "val.parquet")
         _write_sft_parquet(rows, train_file)
-        _write_sft_parquet([rows[0]], val_file)
 
     download_seconds = _w.prefetch_model(model_id, revision=model_revision)
     setup_seconds = time.time() - started_at
@@ -1160,7 +1163,12 @@ def run_sft_train(spec=None) -> None:
 
     config = {
         "train_files": train_file,
-        "val_files": val_file,
+        # None -> `data.val_files=null`, which is what actually stops the child validating. flash
+        # used to hand it a one-row val.parquet and rely on test_freq=-1, but the child builds a val
+        # dataloader whenever val_files is truthy and its last-step branch fires on the dataloader
+        # EXISTING, not on test_freq -- so every run paid an inference forward whose val/loss flash
+        # never reads. null makes val_dataset (and the dataloader) None, so the branch cannot run.
+        "val_files": None,
         "train_batch_size": train_batch_size,
         "max_length": max_length,
         "micro_batch": micro_batch,
