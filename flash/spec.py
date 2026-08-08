@@ -370,7 +370,17 @@ _ANNOUNCED_DROPPED_KEYS = frozenset({"worker_env"})
 
 
 def _announce_dropped_keys(data: dict[str, Any]) -> None:
-    """Log the removed user-authored keys a persisted record still carries and no longer applies."""
+    """Log the removed user-authored keys a persisted record still carries and no longer applies.
+
+    Only announced when the payload names the run. A public spec is ``to_dict()`` output, which pops
+    the server-assigned run_id, and the same stored run is read through both shapes -- so warning
+    without an id would emit an unactionable "run <unknown>" line and duplicate the identified one
+    the worker-spec read already produced. Every provisioned run records an internal worker spec
+    (asdict, run_id included), and that is the read this fires on.
+    """
+    run_id = str(data.get("run_id") or "").strip()
+    if not run_id:
+        return
     for key in sorted(_ANNOUNCED_DROPPED_KEYS):
         value = data.get(key)
         if not value:
@@ -380,7 +390,7 @@ def _announce_dropped_keys(data: dict[str, Any]) -> None:
             "run %s was submitted with [%s] (%s); that table was removed and its values are NOT "
             "applied -- this run uses managed defaults instead. resubmit without it if the run "
             "depends on those values.",
-            data.get("run_id") or "<unknown>",
+            run_id,
             key,
             names,
         )

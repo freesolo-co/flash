@@ -1166,6 +1166,32 @@ def test_a_pre_upgrade_run_that_authored_overrides_is_told_they_stopped_applying
     assert "NOT" in caplog.text
 
 
+def test_the_warning_names_the_run_or_is_not_emitted_at_all(caplog) -> None:
+    """An unidentified warning is worse than none: it cannot be acted on, and it duplicates.
+
+    The same stored run is read through both shapes -- the internal worker spec (asdict, keeps
+    run_id) and the public spec (to_dict, pops it). Warning on the public read would emit a second
+    line naming no run, which an operator cannot map back to anything, alongside the identified line
+    the worker-spec read already produced.
+    """
+    spec = JobSpec.from_dict(
+        {**JobSpec().to_internal_dict(), "run_id": "run-legacy-1"},
+    )
+    dropped = {"FLASH_VERL_PYTHON": "/custom/verl/bin/python"}
+
+    with caplog.at_level(logging.WARNING, logger="flash.spec"):
+        JobSpec.from_dict({**spec.to_internal_dict(), "worker_env": dropped})
+    assert "run-legacy-1" in caplog.text
+
+    caplog.clear()
+    # the public shape pops run_id, so this read stays quiet rather than saying "run <unknown>".
+    public = spec.to_dict()
+    assert "run_id" not in public
+    with caplog.at_level(logging.WARNING, logger="flash.spec"):
+        JobSpec.from_dict({**public, "worker_env": dropped})
+    assert caplog.text == ""
+
+
 def test_a_record_without_the_dropped_key_says_nothing(caplog) -> None:
     # every record the pre-upgrade plane wrote names the key, defaulted-empty included. warning on
     # the empty ones would fire on effectively every reload and train operators to ignore it.
