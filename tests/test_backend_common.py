@@ -4072,3 +4072,46 @@ def test_every_trainer_asks_for_the_backend_rather_than_hardcoding_one():
         # the caps-taking form is the whole point of the fix; a bare call would be the parent-cuda
         # probe coming back.
         assert "fused_ce_backend()" not in code, module.__name__
+
+
+def test_every_trainer_probes_capabilities_for_every_model_not_just_gdn():
+    """`caps` must be populated unconditionally, or the backend gate silently degrades to torch.
+
+    Only `gdn_module` is architecture-conditional -- it is `""` for a non-hybrid, which the probe
+    accepts as "skip the gdn question" (`probe_verl_capabilities(python_bin, gdn_module="")`). The
+    PROBE ITSELF answers questions that have nothing to do with gdn: the device capability this
+    backend gate reads, the logger set, the vllm field list.
+
+    Binding `caps` under an `if gdn_hybrid:` would leave it empty for every non-gdn checkpoint, so
+    `verl_device_capability` would return None and the gate would yield `torch` on a card where
+    triton measured 2.25x faster. That failure is invisible today -- every catalog model is a gdn
+    hybrid -- which is exactly why it needs a test rather than a reader noticing it later.
+    """
+    import flash.engine.worker.opd_train as opd_train
+    import flash.engine.worker.rl_train as rl_train
+    import flash.engine.worker.sft_train as sft_train
+
+    for module in (sft_train, rl_train, opd_train):
+        lines = pathlib.Path(module.__file__).read_text().splitlines()
+        probes = [
+            (n, line)
+            for n, line in enumerate(lines, 1)
+            if "caps = probe_verl_capabilities(" in line
+        ]
+        assert len(probes) == 1, f"{module.__name__}: expected exactly one probe, got {probes}"
+
+        n, line = probes[0]
+        indent = len(line) - len(line.lstrip())
+        # walk back to the nearest enclosing statement that is less indented; it must not be a
+        # conditional on the architecture. checking the text of the probe line alone would pass
+        # even when the whole block is skipped for a non-hybrid.
+        for prev in reversed(lines[: n - 1]):
+            if not prev.strip() or prev.lstrip().startswith("#"):
+                continue
+            prev_indent = len(prev) - len(prev.lstrip())
+            if prev_indent < indent:
+                assert "gdn" not in prev.lower(), (
+                    f"{module.__name__}:{n} probes capabilities under `{prev.strip()}` -- "
+                    "non-gdn runs would get empty caps and lose the triton backend"
+                )
+                break
