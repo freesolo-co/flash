@@ -53,17 +53,9 @@ _KV_BLOCK_TOKENS = 16
 # floor remains authoritative at short context; longer contexts retain 1.5 gb plus 25% fragmentation.
 _KV_PROFILE_OVERHEAD_GB = 1.5
 _KV_FRAGMENTATION_MARGIN = 1.25
-# adapter bytes per trainable parameter. the 8-bit paged optimizer needs ~10; fp32 AdamW needs 16
-# (4 param + 2 gradient + 8 moments + 2 bf16 shadow). SFT and OPD size on AdamW because verl builds
-# torch.optim.AdamW for both -- OPD inherits verl's own default, and SFT names it explicitly since
-# bitsandbytes' 8-bit blockwise update is not a distributed operator and dies on FSDP2's DTensor
-# parameters. the backend is a [worker_env] property that never reaches this sizing path, so the
-# heavier optimizer is the only safe basis: under-reserving OOMs a paid run.
-#
-# GRPO stays on the paged constant. verl GRPO also runs AdamW, so it is under-sized by the same
-# 6 bytes/param -- but GRPO's estimate is already at the B200 ceiling (the 35B MoE at 4096 ctx sizes
-# to 180 GB exactly), and widening it there REJECTS a configuration that runs today. that gap is real
-# and tracked separately; correcting it needs the resident-peak model retuned, not a constant swap.
+# adapter bytes per trainable parameter: 16 for SFT/OPD AdamW, about 10 for paged GRPO.
+# SFT uses AdamW because bitsandbytes fails on FSDP2 DTensors; OPD inherits it. GRPO's known
+# undercount cannot change alone because its resident-peak model is calibrated at the B200 ceiling.
 _LORA_PAGED_BYTES_PER_PARAM = 10.0
 _LORA_ADAMW_BYTES_PER_PARAM = 16.0
 
@@ -128,9 +120,8 @@ def opd_rollout_concurrency(prompts_per_step: int = 1, group_size: int = 1) -> i
 def opd_loss_microbatch(params_b: float, prompts_per_step: int = 1, group_size: int = 1) -> int:
     """Loss microbatch size used by OPD's GKD backward.
 
-    Keep this in lockstep with worker.opd._opd_loss_microbatch_size without importing the worker from
-    the sizing path. Small/medium catalog models run up to four loss samples per forward; 35B-class
-    models stay serial for VRAM safety.
+    Keep in lockstep with `worker.opd._opd_loss_microbatch_size`; 35B-class models stay serial for
+    VRAM safety.
     """
     total = opd_rollout_concurrency(prompts_per_step, group_size)
     params = float(params_b or 0.0)
@@ -288,46 +279,23 @@ def colocate_kv_util(
 ) -> float:
     """vllm_gpu_memory_utilization for the colocated GRPO rollout engine.
 
-    ``gpu_memory_utilization`` is vLLM's WHOLE model-executor budget — its (2nd) bf16 weight copy PLUS
-    the KV cache — so we budget BOTH (budgeting KV alone would starve the weights and, for big models,
-    under-size the engine). Curated models size attention KV and recurrent-state pages from catalog
-    geometry, then retain a profiled overhead, fragmentation margin, and the measured 8 GB floor.
-    Uncataloged models retain the legacy conservative equation. The old blanket sleep-path 0.45 reserved
-    ~36 GB on an 80 GB A100, measured as the dominant resident allocation that set the GRPO step peak
-    (~46 GB). Both paths budget the weight copy plus cache. At the validated 4B/group8/2k point, 0.25
-    utilization reduced the peak from 46 GB to 26 GB with byte-identical reward and neutral train wall;
-    a tighter 12 GB budget preempts, confirming the retained floor."""
+    Budget vLLM's weight copy plus KV cache. Catalog models use geometry with measured overhead
+    and an 8 GB floor; uncataloged models retain the conservative legacy equation.
+    """
     weights_gb = (
         max(0.5, float(params_b or 1.0)) * 2.0
     )  # vLLM's bf16 weight copy lives in the budget
     # catalog geometry is authoritative. active params remain only for the uncataloged fallback, while
     # the weight copy always uses total parameters.
     kv_params_b = float(active_params_b) if active_params_b else params_b
-    # Utilization ceiling. The blanket 0.45 was tuned on 80 GB cards, where it leaves healthy
-    # headroom. On a BIG card carrying a BIG colocate weight copy (the 35B MoE on a 180 GB B200:
-    # 70 GB vLLM weights + the trainer's 70 GB base both resident during rollout) it instead STARVES
-    # the KV pool: 0.45 x 180 = 81 GB executor budget = 70 GB weights + only ~11 GB KV, with ~29 GB
-    # of the card sitting unused. KV bounds rollout concurrency, so the cheap-active A3B can't fill
-    # the card. Lift the cap to 0.55 ONLY when (a) the weight copy is big (>=60 GB) AND (b) the card
-    # actually has room for it -- the trainer's resident weight copy must still fit alongside the 0.55
-    # executor budget with margin: 0.45*total - weights >= ~10 GB. That holds on the 180 GB B200
-    # (0.45*180 - 70 = 11) -> vLLM budget 99 GB = 70 weights + ~29 KV, resident 70 (trainer) + 99 =
-    # 169 GB (~11 GB margin), but NOT the 141 GB H200 (0.45*141 - 70 = -6.5): there 0.55 x 141 = 78 GB
-    # executor + the trainer's 70 GB copy = 148 GB > 141 GB -> overflow. So the H200 -- and ANY card
-    # where the weight copy wouldn't fit alongside the 0.55 budget -- correctly STAYS at 0.45. Keying
-    # off the real headroom (not a >=140 GB card threshold, which ALSO catches the H200) is what makes
-    # the lift safe. The GRPO step's _GpuPeakSampler verifies the headroom holds. Every other
-    # card/model is byte-for-byte unchanged at 0.45.
+    # 0.45 starves KV for >=60 GB colocated weight copies on cards with residual headroom.
+    # lift to 0.55 only when `0.45 * total_vram_gb - weight_copy_gb >= 10`; this admits B200
+    # but not H200. `_GpuPeakSampler` verifies runtime headroom.
     _util_cap = _colocate_util_cap(weights_gb, total_vram_gb)
     if not sleep_mode:
-        # Resident KV ON TOP of the weight copy: gpu_memory_utilization is the WHOLE executor budget,
-        # so budgeting KV alone (the old _KV_CAP/total) starved the weights and vLLM raised "No
-        # available memory for the cache blocks" on >=3B models whose weights exceed an 8 GB budget.
-        # The KV must ALSO cover the rollout context -- a flat _KV_CAP starves the cache blocks on a
-        # long-context run (vLLM's blocks must span vllm_max_model_length), so scale it with the
-        # context + group (floored at _KV_CAP for the validated short-context lean point, bounded by
-        # the 0.45 util cap below). Matches the resident-fit estimate (estimate_vram_gb sleep_offload
-        # =False) so the resident-fit gate and this budget size the SAME KV.
+        # `gpu_memory_utilization` covers weights plus KV, so budget both. scale KV with
+        # context and group, floor at `_KV_CAP`, and keep the 0.45 cap aligned with
+        # `estimate_vram_gb(..., sleep_offload=False)`.
         kv_gb = max(
             _KV_CAP,
             _resident_kv_gb(
@@ -374,23 +342,10 @@ _SFT_CHUNKED_NLL_TOKENS = 256
 _LIGER_MIN_PARAMS_B = 3.0
 _LIGER_LONG_CTX_TOKENS = 2048
 
-# the fused, dense-logit-free sft loss is validated against these model families. other models keep
-# plain nll until their output-head and backbone traversal are covered by the same parity tests.
-# the implementation moved from trl's chunked_nll to verl's use_fused_kernels (set unconditionally
-# in engine/worker/sft_train.py, with impl_backend=torch); the sizing property -- no dense
-# [b, s, vocab] logits tensor -- is what this set gates, and it holds for both. liger is NOT part
-# of that property: verl disables liger's fused linear ce, and liger zeroed the sft lora gradient
-# (GRAD-001), so sft runs with use_liger=false.
-#
-# membership is decided by the checkpoint's ``model_type``, because that is what verl's
-# patch_forward_with_backends dispatches on: ``qwen3_5`` and ``qwen3_5_moe`` both resolve to
-# verl/models/transformers/qwen3_5.py's forward_with_torch_backend, which computes ce from hidden
-# states via FusedLinearForPPO and never builds the dense tensor. every catalog model reports one of
-# those two types (the 27B is ``qwen3_5``/``Qwen3_5ForConditionalGeneration`` despite its 3.6 name),
-# so the set must list the whole sft-capable catalog -- an omission does not disable the fused
-# kernel, it only makes the allocator reserve logits vram the run never allocates and collapse the
-# micro-batch to 1. contrast kimi_vl, which returns before the fused patch ("Not support fused
-# kernels for KimiVL") and would genuinely keep dense logits.
+# these model types have validated dense-logit-free fused SFT loss; others retain plain NLL.
+# verl dispatches `qwen3_5` and `qwen3_5_moe` through its fused torch backend. liger remains off
+# because it zeroed SFT LoRA gradients (GRAD-001). KimiVL exits before the fused patch, so do not
+# add it without parity coverage.
 _SFT_CHUNKED_NLL_MODELS = frozenset(
     {
         "Qwen/Qwen3.5-0.8B",
@@ -444,17 +399,9 @@ def grpo_kv_floor_gb(
 ) -> int:
     """Smallest card (GB) whose colocated vLLM executor budget still leaves a viable KV pool.
 
-    ``colocate_kv_util`` caps ``gpu_memory_utilization`` at ~0.45 of the card, and that budget
-    must carry vLLM's bf16 weight copy BEFORE any KV cache blocks. On a card sized only for the
-    training peak, a long-context / large-group rollout can leave the pool so small that vLLM
-    init fails with "No available memory for the cache blocks" — an OOM the preflight never
-    caught (e.g. group_size=16 multi-turn rollouts on a 31 GB card). Require the capped budget
-    to hold the weight copy plus at least HALF the concurrent group's working KV (full KV is a
-    throughput target, not an init requirement; half keeps validated lean configs admitted
-    while pushing the observed init-OOM shapes onto a bigger card or a parse-time reject).
-
-    The utilization cap mirrors ``colocate_kv_util`` (0.45, lifted to 0.55 for big weight copies
-    with headroom) so the floor never overestimates the card a large model actually needs."""
+    The 0.45/0.55 cap must hold the weight copy plus half the concurrent group's KV; otherwise
+    vLLM can fail with "No available memory for the cache blocks".
+    """
     kv_params_b = float(active_params_b) if active_params_b else float(params_b)
     weights_gb = max(0.5, float(params_b)) * 2.0
     need = weights_gb + 0.5 * _resident_kv_gb(
@@ -476,17 +423,8 @@ def grpo_kv_floor_gb(
 def _declares_linear_attention(model_info, model_id: str = "") -> bool:
     """True for a GDN hybrid, using the catalog rather than a network config fetch.
 
-    The two vLLM rollout workers refuse an fp8 KV cache for these models (vllm's fp8 wake path
-    init_fp8_kv_scales assumes a plain kv tensor and crashes on the hybrid cache), so sizing must
-    not apply the fp8 discount to them or it reserves half the cache the run allocates. This is the
-    offline half of engine/worker/packing.py:model_is_gdn_hybrid, which probes the HF config; the
-    catalog carries num_linear_attention_layers for every model it routes.
-
-    ``model_id`` is the fallback the pinned-revision path needs. A pinned commit drops to generic
-    architecture sizing (``sizing_info = None``), which is right for geometry but wrong here:
-    attention family is a property of the model, not of the commit, and the worker's runtime gate
-    reads the pinned config and refuses fp8 all the same. Consulting the catalog by id keeps the two
-    in agreement instead of handing pinned GDN runs a discount their cache never takes.
+    GDN workers reject fp8 KV, so sizing must not apply that discount. Fall back to catalog lookup
+    by model id for pinned revisions because attention family is revision-independent.
     """
     if int(getattr(model_info, "num_linear_attention_layers", 0) or 0) > 0:
         return True
@@ -582,14 +520,9 @@ def estimate_vram_gb(
                     fp8_kv=fp8_kv,
                     model_info=model_info,
                 )
-                # the sleep-mode worker (colocate_kv_util) budgets max(_KV_CAP, 1.5 * kv) at the real
-                # group_size. only mirror that lift when kv is backed by real catalog geometry AND
-                # exceeds _KV_CAP -- that is the finding's case (architecture-aware KV above the cap),
-                # where the old min(kv, _KV_CAP) under-counted the pool by 4-11 gb and preflight
-                # admitted a gpu the sleep executor then overran. the generic legacy KV formula
-                # OVER-estimates long context, and its _KV_CAP clamp is what keeps the uncataloged
-                # estimate on its measured train/OOM boundary, so keep min(kv, _KV_CAP) whenever the
-                # geometry is absent (generic) or the arch-aware kv still fits the cap (short context).
+                # mirror the sleep worker's 1.5x KV lift only for catalog geometry above `_KV_CAP`.
+                # keep the capped generic estimate, whose legacy formula overestimates long context
+                # and is calibrated to the measured train/OOM boundary.
                 arch_kv_known = (
                     _architecture_kv_raw_gb(model_info, seq_len, group_size, fp8_kv) is not None
                 )
@@ -701,43 +634,9 @@ def grpo_fits_resident(
     return resident * margin <= card_vram_gb
 
 
-# Activations retained for the backward when gradient checkpointing is OFF. With GC, each layer's
-# intra-block activations are RECOMPUTED in the backward (one extra forward ~= +33% compute); with GC
-# OFF they all stay resident -- so this term is ~num_layers x the per-layer (residual stream + qkv/out
-# + MoE SwiGLU intermediate) activations per token. With FlashAttention / cuDNN-SDPA there is NO s^2
-# attention-score tensor, and the GatedDeltaNet linear layers store only a small recurrent/conv state,
-# so it is LINEAR in seq. K folds the per-layer multiplier (relative to hidden) into one constant.
-# bf16 activations (2 bytes/elem).
-#
-# K is GEOMETRY-SPECIFIC, so there are two. What K multiplies is layers x batch x seq x hidden, i.e.
-# it is the per-layer activation cost measured RELATIVE TO HIDDEN -- and a dense block stores far more
-# of it per unit of hidden than a sparse-MoE block does, because the dense FFN intermediate is
-# 4 x 2048 against the MoE's 8 x 512 active. One constant cannot describe both.
-#
-# DENSE: measured on a live RTX 5090, Qwen3.5-0.8B (hidden 1024, 24 layers), LoRA rank 32
-# all-linear, bs 4, bf16, chunked dense-logit-free CE matching the worker's use_fused_kernels path:
-#   seq 1024 -> 15.09 GB peak,  seq 2048 -> 28.18 GB peak,  seq 4096 -> OOM on 31.37 GB usable
-# Fitting across seq points (the fixed base cancels) gives gc_off = 2.00 + 0.012785 * seq, i.e.
-# K_dense = 65.0. Confirmed linear, not s^2: the gc-on slope is identical across both segments
-# (2.262 GB per 1024 tokens) and the gc-off extra ratio is 1.981 against 2.000 ideal. Out-of-sample
-# check the fit never saw: it predicts 54.4 GB at seq 4096 -> must OOM, and the card OOMed at
-# 30.97 GB. The old shared 18.0 predicted 20.76 GB there, i.e. it would have called that run a FIT.
-#
-# SCOPE of that measurement: fit on ONE dense geometry (1024 hidden x 24 layers) and assumed
-# invariant across dense sizes, which is what K being a per-layer-relative-to-hidden factor asserts.
-# 130 bytes per (token, hidden-unit, layer) is ~3.8x the fused-Megatron figure, which is the expected
-# direction for all-linear LoRA on HF -- every wrapped linear retains its input for the adapter
-# backward, on top of HF's unfused per-block intermediates -- but the SIZE-invariance is untested.
-# Anyone loosening the >= 120 GB card gate should re-measure at the geometry they are enabling rather
-# than trust this extrapolation; at 27B it implies ~410 GB at seq 2048, far outside what was observed.
-#
-# MOE: 18.0 is UNVALIDATED against a live peak -- it is the pre-existing value, kept deliberately.
-# It sits just above the Megatron FlashAttention factor (~34 bytes/(s.b.h) == K 17) so we over-reserve
-# and keep GC ON rather than risk an OOM. The dense 65.0 must NOT be applied here: it would flip the
-# 35B-A3B (the only model whose active_params_b is truthy, hence the only one that reaches this gate
-# today) from GC-off to GC-on at seq >= 2048 and pay the ~+33% recompute tax on every step, on
-# evidence gathered from a model whose FFN geometry it does not share. Calibrate from a live H200
-# peak before changing it.
+# gc-off activation factors are empirical and geometry-specific: dense 65.0 from a live RTX 5090
+# fit, and MoE 18.0 as a conservative unvalidated value. remeasure before widening the >=120 GB
+# dense gate or changing the 35B-A3B MoE factor; the estimate scales with layers*batch*seq*hidden.
 _GC_OFF_ACT_K_DENSE = 65.0
 _GC_OFF_ACT_K_MOE = 18.0
 
@@ -754,14 +653,11 @@ def sft_gc_off_peak_gb(
     quant: str = "bf16",
     model_info=None,
 ) -> float:
-    """Estimated peak VRAM (GB) for a dense-logit-free LoRA SFT step with gradient checkpointing OFF:
-    the resident weights + optimizer/base + the no-recompute activations held across ALL ``num_layers``.
-    Chunked or fused CE is assumed, so there is no ``[B, T, vocab]`` logits term (the thing that made
-    GC-off impossible at a 248k vocab). Unknown architecture dims -> ``inf`` (caller keeps GC on).
+    """Estimated peak VRAM (GB) for a dense-logit-free LoRA SFT step without checkpointing.
 
-    MoE: the activation backbone scales with the model's real ``hidden`` x ``num_layers`` (geometry),
-    NOT params_b -- the ~3B-active expert FFN is already folded into ``_GC_OFF_ACT_K_MOE``. ``weights``
-    still reserves the FULL ``params_b`` (every expert is resident)."""
+    Includes resident weights, optimizer/base, and all-layer activations; unknown geometry returns
+    `inf`. MoE activations use hidden/layer geometry while weights retain full parameter size.
+    """
     if not (hidden and num_layers and seq_len):
         return float("inf")
     bpp = _BYTES_PER_PARAM.get(quant, 2.0)
@@ -790,16 +686,11 @@ def sft_grad_checkpoint_can_disable(
     margin_gb: float = 18.0,
     model_info=None,
 ) -> bool:
-    """True when a dense-logit-free LoRA SFT step fits a ``card_vram_gb`` card WITHOUT gradient checkpointing,
-    so GC -- a ~+33% recompute tax on every step -- can be turned off for the speed win.
+    """True when a dense-logit-free LoRA SFT step fits a card WITHOUT gradient checkpointing.
 
-    Conservative by construction: an unknown card / unknown architecture dims, or a peak that doesn't
-    clear the ``margin_gb`` headroom, returns False (keep GC ON). The MoE estimate over-reserves
-    (``_GC_OFF_ACT_K_MOE`` above the Megatron factor, plus a fixed margin) precisely because the
-    allocator sized the card for the GC-*on* peak -- this is the independent check that the larger
-    GC-off peak still fits the REAL card (mirrors ``grpo_fits_resident``'s resident-fit guard). The
-    dense constant is a live measurement rather than a safety pad, so the ``margin_gb`` headroom is
-    what carries the conservatism there."""
+    Unknown geometry or insufficient `margin_gb` keeps checkpointing on. The MoE factor is padded;
+    the empirical dense factor relies on the explicit margin.
+    """
     if not card_vram_gb or card_vram_gb <= 0 or not (hidden and num_layers and seq_len):
         return False
     peak = sft_gc_off_peak_gb(
@@ -982,18 +873,9 @@ def model_required_vram_gb(
     ) -> int:
         """Re-size an OPD requirement with an fp8 KV cache once the run is provably modern-card-only.
 
-        The colocated OPD vLLM rollout engine reserves an fp8 KV cache on cc >= 8.9 hardware
-        (engine/worker/opd_train.py sends engine_kwargs.vllm.kv_cache_dtype=fp8), but the estimate
-        defaults to a bf16 KV pool. Any OPD run needing
-        more VRAM than the biggest non-fp8 validated card (the 80 GB A100) can ONLY land on a modern
-        (cc >= 8.9) card, so that bf16 pool is a phantom: it doubles the real KV and wrongly rejects
-        full-context / grouped OPD configs on the 35B that actually fit a B200. Halve it — but only
-        while the fp8-sized requirement still clears the non-fp8 ceiling, so the discount can never
-        pull the run back onto a card that would NOT use fp8 (which would then OOM).
-
-        Skipped entirely for GDN hybrids: both workers refuse fp8 KV for them (opd_train.py,
-        rl_train.py), so their cache really is bf16 and the discount would admit a run onto a card
-        that cannot hold it."""
+        OPD uses fp8 KV on cc >= 8.9, so halve the bf16 estimate only while the result still
+        exceeds the 80 GB non-fp8 ceiling. Never apply this to GDN hybrids, which require bf16 KV.
+        """
         from flash.providers.base import max_non_fp8_kv_vram_gb
 
         if _declares_linear_attention(model_info, model_id):
@@ -1062,12 +944,8 @@ def model_required_vram_gb(
         # threshold is below default rollout length); ~3B active gives ~16k headroom.
         if is_grpo and floor:
             if getattr(info, "sleep_unsupported", False):
-                # Sleep is non-functional for this model (it HANGS) -> it MUST fit RESIDENT. Size the
-                # requirement on the RESIDENT peak (engine live through the backward, fp8 KV on the big
-                # floor card which is sm100) instead of the sleep estimate + grpo_seq_escalation_gb, so
-                # a config too long to fit resident is pushed PAST every GPU and REJECTED at parse time
-                # -- rather than admitted-then-HUNG in the broken sleep path between the resident wall
-                # and the old ~16k sleep ceiling.
+                # sleep HANGS for this model, so size the resident peak with fp8 KV on sm100.
+                # push nonresident fits past every GPU and reject them before the broken sleep path.
                 resident_need = math.ceil(
                     estimate_vram_gb(
                         params_b or 4.0,
@@ -1149,13 +1027,14 @@ def fetch_hf_params_b(model_id: str, revision: str = "", *, strict: bool = False
 
 
 def resolve_params_b(model_id: str, revision: str = "") -> float | None:
-    """Model size in billions, resolved the ONE way the worker and the cost estimator agree on:
-    the curated catalog ``params_b``, or the real HF safetensors count for a PINNED revision (the
-    pinned commit's true size, which the catalog states only for the default revision). Returns
-    None for an uncataloged id, which only a stale caller can produce -- submit rejects those --
-    so callers degrade to the size-unknown path rather than raising on the allocation path.
-    The single source of truth for "how big is this model" -- run_sft and run_rl both call this
-    so they can never drift."""
+    """Model size in billions, resolved the ONE way the worker and the cost estimator agree on.
+
+    the curated catalog ``params_b``, or the real HF safetensors count for a PINNED revision (whose
+    true size the catalog states only for the default revision). returns None for an uncataloged id,
+    which only a stale caller can produce since submit rejects those, so callers degrade to the
+    size-unknown path rather than raising on the allocation path. run_sft and run_rl both call this,
+    so they can never drift.
+    """
     from flash.catalog import MODELS
 
     info = MODELS.get(model_id)

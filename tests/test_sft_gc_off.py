@@ -36,9 +36,9 @@ def test_active_params_resolution_is_null_safe():
 
 
 def test_gc_off_gate_is_lora_rank_aware():
-    # Codex P2 (Mrx13): the GC-off gate must size on the run's REAL LoRA rank, not the default 32.
-    # A higher rank grows the LoRA optimizer/adapter memory, so on a borderline card a high-rank run
-    # that the default-rank estimate would have disabled GC for (then OOM'd) must KEEP GC on.
+    # the GC-off gate must size on the run's REAL LoRA rank, not the default 32. A higher rank grows
+    # the LoRA optimizer/adapter memory, so on a borderline card a high-rank run that the
+    # default-rank estimate would have disabled GC for (then OOM'd) must KEEP GC on.
     p32 = sft_gc_off_peak_gb(35.0, seq_len=2368, **{**_MOE, "lora_rank": 32})
     p512 = sft_gc_off_peak_gb(35.0, seq_len=2368, **{**_MOE, "lora_rank": 512})
     assert p512 > p32  # the peak grows with rank

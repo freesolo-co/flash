@@ -54,12 +54,8 @@ class RestClient:
         self.extra_headers = dict(extra_headers or {})
 
     def api_key(self) -> str:
-        # Through load_provider_key, so the key SENT is the key `is_configured()` and the startup
-        # preflight judged. Reading os.environ raw here let a value with a stray newline pass
-        # preflight (which strips) and then go out as `Authorization: Bearer <key>\n`, which the
-        # provider rejects: a Lambda- or Vast-only plane reported healthy while every capacity
-        # lookup and allocation failed. RunPod is unaffected -- its pool strips on parse -- but it
-        # reaches the same value through this method, so normalizing once here covers all three.
+        # read through load_provider_key so preflight and requests use the same stripped value;
+        # raw newlines can pass preflight but break provider authorization headers.
         key = load_provider_key(self.env_var)
         if not key:
             raise self.error_cls(self.missing_key_message)

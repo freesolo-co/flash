@@ -409,14 +409,8 @@ def _validate_existing_config_projects(project_id: str) -> None:
 def _existing_reasoning(configs: tuple[Path, ...]) -> bool | None:
     """The `thinking` state the generated configs already agree on, or None if none exist.
 
-    Reads EVERY config rather than anchoring on the first one found. Stopping at the first accepts a
-    project whose configs contradict each other -- exactly what a scaffold from before #824 looks
-    like, since that release wrote `thinking` into rl and sft but never into opd. rl is visited
-    first, reports reasoning, and the stale opd config is neither reported nor rewritten
-    (codex[bot]).
-
-    A config that is absent is not a disagreement: it is about to be written from whatever this
-    returns.
+    Read every existing config so pre-#824 scaffolds with stale OPD settings are detected. Missing
+    configs are not disagreements because they are about to be written.
     """
     from flash.client import ClientError
 
@@ -591,12 +585,9 @@ def cmd_env_setup(args) -> int:
     )
     if not starter_env_exists:
         starter_env.write_text(env_py)
-        # the starter sidecar only matches the starter environment written in this run. rerun in a
-        # directory holding a custom environment.py, this used to drop in the arithmetic suite
-        # anyway, which then called that env's reward with an unrelated `7 + 5` example -- a
-        # published check measuring nothing (codex[bot]). the multi-turn scaffold gets its own
-        # suite: a single-shot eval cannot grade a finished episode, so it checks the first
-        # action's format instead.
+        # install starter suites only for the starter environment created in this run. multi-turn
+        # uses a first-action format check because single-shot eval cannot grade a completed
+        # episode.
         if not starter_evaluations.exists():
             evaluations_py = (
                 _STARTER_EVALUATIONS_MULTITURN_PY if multi_turn else _STARTER_EVALUATIONS_PY
@@ -612,12 +603,9 @@ def cmd_env_setup(args) -> int:
         'id = ""\n\n'
         '# secrets = ["SERPAPI_API_KEY"]\n\n'
     )
-    # `thinking = true` opts the run into reasoning mode, and is algorithm-agnostic: all three configs
-    # carry it, since all three workers read it. Only GRPO also gets a raised completion budget --
-    # reasoning shares that budget with the answer, and GRPO's non-thinking default is 320 tokens.
-    # OPD needs no such line because it raises its own budget under thinking (512 -> 1536, via
-    # `opd_completion_len`), and SFT does not generate at all. These strings are empty when reasoning
-    # is off, keeping the default scaffold byte-for-byte identical.
+    # `thinking=true` is algorithm-agnostic. only GRPO needs a generated completion increase;
+    # OPD raises its own via `opd_completion_len`, and SFT does not generate. empty strings preserve
+    # the non-reasoning scaffold.
     thinking_line = "thinking = true\n" if reasoning else ""
     rl_reasoning_train = (
         "max_completion_tokens = 2048  # reasoning shares this budget with the answer; raised so it isn't truncated\n"

@@ -634,7 +634,8 @@ def test_liger_default_model_size_gate(monkeypatch):
     Named for liger because that is where the threshold was measured (PR #174, fused-CE's memory win
     only paying off above ~3B), but liger itself is gone from the verl paths: this predicate now
     feeds ``_memory_mode`` -> ``grad_checkpointing_on``, so the threshold is load-bearing for
-    gradient checkpointing rather than for a fused-CE choice."""
+    gradient checkpointing rather than for a fused-CE choice.
+    """
     monkeypatch.setenv("RUN_MODE", "sft")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
     sys.modules.pop("flash.engine.worker", None)
@@ -977,9 +978,10 @@ def test_finalize_preserves_terminal_heartbeat_fields(monkeypatch):
 
 # ---------------------------------------------------------------------------
 # Hopper fla GDN fast-path fallback: when the healthy fla+tilelang stack can't be
-# assembled (probe `ok` false), fla must be DISABLED (physically removed) so transformers'
-# is_fla_available() gate flips off and the model uses the correct pure-PyTorch delta rule
-# instead of fla's broken Triton>=3.4 GDN chunk_bwd (fla #640). A print alone is not enough.
+# Hopper fla GDN fast-path fallback: when the healthy fla+tilelang stack can't be assembled (probe
+# `ok` false), fla must be DISABLED (physically removed) so transformers' is_fla_available() gate
+# flips off and the model uses the correct pure-PyTorch delta rule instead of fla's broken
+# Triton>=3.4 GDN chunk_bwd (fla #640). A print alone is not enough.
 # ---------------------------------------------------------------------------
 def _hopper_torch():
     """A stub ``torch`` that looks like Hopper (sm90) with CUDA available."""
@@ -1008,16 +1010,12 @@ def _patch_hopper_stack(
     record_pip: list[str] | None = None,
 ):
     """Wire the perf helper's external touchpoints for the Hopper fast-path tests and return the
-    list that records _remove_fla_from_disk (fla-disable) calls.
 
-    * ``pip_rc`` -> the return code every mocked ``pip install`` reports (non-zero = failed install).
-    * ``find_spec_ok`` -> whether the post-install import probe finds fla/fla.modules/tilelang.
-    * ``tvm_ffi_version`` -> what importlib.metadata.version('apache-tvm-ffi') reports (None=absent).
-    * ``tilelang_version`` -> what importlib.metadata.version('tilelang') reports (None=absent). The
-      helper gates the tilelang (re)install AND the final ``ok`` on this exact version, so a value
-      != the pin models a present-but-wrong-version stack.
-    * ``record_pip`` -> if given, every mocked ``pip install`` appends its joined spec args here (so
-      a test can assert WHICH packages were reinstalled).
+    list that records _remove_fla_from_disk (fla-disable) calls. * ``pip_rc`` -> the return code
+    every mocked ``pip install`` reports (non-zero = failed install). * ``find_spec_ok`` -> whether
+    the post-install import probe finds fla/fla.modules/tilelang. * ``tvm_ffi_version`` -> what
+    importlib.metadata.version('apache-tvm-ffi') reports (None=absent). * ``tilelang_version`` ->
+    what importlib.metadata.version('tilelang') reports (None=absent).
     """
     import importlib.metadata
     import importlib.util
@@ -1072,7 +1070,7 @@ def test_hopper_fla_fallback_disables_fla_when_stack_unavailable(monkeypatch):
 def test_hopper_fla_fallback_when_install_fails(monkeypatch):
     """A FAILED pip install (rc!=0) must flip the gate off + disable fla EVEN IF find_spec still
     succeeds on a stale/partial resident copy — a failed install is not silently treated as healthy
-    (Copilot review on perf.py:~487). Without the rc check, find_spec alone would wrongly keep fla.
+    (perf.py:~487). Without the rc check, find_spec alone would wrongly keep fla.
     A wrong tvm-ffi version makes the helper ATTEMPT the pinned reinstall (the conditional-install
     gate), so pip_rc=1 exercises the failed-install path."""
     perf, removed = _patch_hopper_stack(
@@ -1111,7 +1109,7 @@ def test_hopper_fla_kept_when_stack_healthy(monkeypatch):
 
 
 def test_hopper_tilelang_present_but_wrong_version_is_reinstalled(monkeypatch):
-    """Regression (Copilot review on perf.py:~511): a DIFFERENT tilelang already resident (a job or
+    """Regression (perf.py:~511): a DIFFERENT tilelang already resident (a job or
     the base image carries one) must NOT be treated as healthy. The helper gates on the installed
     version, so it (re)installs the exact pin; once the pin lands fla is KEPT."""
     pip_calls: list[str] = []
@@ -1168,7 +1166,7 @@ def test_hopper_tilelang_wrong_version_persists_disables_fla(monkeypatch):
 
 
 def test_hopper_tvm_ffi_pip_skipped_when_pin_already_present(monkeypatch):
-    """Regression (Copilot review on perf.py:~521): when the EXACT apache-tvm-ffi pin is already
+    """Regression (perf.py:~521): when the EXACT apache-tvm-ffi pin is already
     resident AND tilelang was NOT (re)installed this invocation, the helper must SKIP the tvm-ffi
     pip — re-running it unconditionally adds avoidable cold-start latency and could spuriously
     disable fla on a transient network/resolver hiccup. The ok gate still re-verifies the version,
@@ -1193,7 +1191,7 @@ def test_hopper_tvm_ffi_pip_skipped_when_pin_already_present(monkeypatch):
 
 
 def test_hopper_outer_exception_disables_fla(monkeypatch):
-    """Regression (Copilot review on perf.py:~580): an unexpected error mid-setup (AFTER the Hopper
+    """Regression (perf.py:~580): an unexpected error mid-setup (AFTER the Hopper
     check passes) must FAIL-CLOSED — best-effort disable fla so transformers can't engage the broken
     Triton GDN path (#640) on a half-configured fla. The outer handler must call _remove_fla_from_disk
     and never re-raise."""
@@ -1281,7 +1279,7 @@ def test_tilelang_pin_is_consistent_and_pinned():
     """tilelang (the Hopper GDN correctness backend) is PINNED to an exact version (not unversioned)
     and the SAME pin is used in WORKER_DEPS, Dockerfile.worker, and perf.py's runtime reinstall, so
     cold-start installs / image rebuilds / runtime reinstalls all resolve the identical backend
-    (Copilot review on flash/providers/_worker.py)."""
+    (flash/providers/_worker.py)."""
     import pathlib
     import re
 
@@ -1695,11 +1693,10 @@ def test_find_real_libcudart_finds_cu13_wheel_layout(tmp_path, monkeypatch):
 
 # ---------------------------------------------------------------------------
 # Blackwell fla GDN autotune restriction (fla #913 / #1000): on sm100/sm120 the
-# unrestricted prepare_wy_repr_bwd autotune space can select grad-miscomputing
-# configs (live B200 Qwen3.6-35B-A3B SFT: grad_norm ~1e8 from the first logged
-# step, loss flat or collapsing at every LR, while H200 trained healthily). The
-# worker restricts the space in-process to the B200-validated config, and fails
-# CLOSED (disables fla -> pure-PyTorch delta) when it cannot.
+# Blackwell fla GDN autotune restriction (fla #913 / #1000): on sm100/sm120 the unrestricted
+# prepare_wy_repr_bwd autotune space can select grad-miscomputing configs (live B200
+# Qwen3.6-35B-A3B SFT: grad_norm ~1e8 from the first logged step, loss flat or collapsing at every
+# LR, while H200 trained healthily).
 # ---------------------------------------------------------------------------
 def _blackwell_torch(cc=(10, 0)):
     """A stub ``torch`` that looks like a Blackwell card with CUDA available."""
@@ -1851,11 +1848,8 @@ def test_non_blackwell_gdn_autotune_untouched(monkeypatch):
 
 # ---------------------------------------------------------------------------
 # sm100 tilelang GDN opt-out: the baked tilelang backend (needed for Hopper, fla
-# #640) computes WRONG GRADIENTS on B200/sm100 (measured: dq/dk ~0.72, dg ~1.28
-# rel-err at the production H==HV call shapes, deterministic, bf16 AND fp32) —
-# the root cause of the B200 35B-A3B SFT incident. The worker must opt fla out
-# via FLA_TILELANG=0 (upstream's own knob; upstream default-gates tilelang to
-# Hopper since fla #975) so fla dispatches to its Triton path, correct on sm100.
+# The worker must opt fla out via FLA_TILELANG=0 (upstream's own knob; upstream default-gates
+# tilelang to Hopper since fla #975) so fla dispatches to its Triton path, correct on sm100.
 # ---------------------------------------------------------------------------
 def _patch_arch(monkeypatch, cc):
     from flash.engine.worker import perf
@@ -1879,9 +1873,9 @@ def test_sm100_fla_tilelang_opted_out(monkeypatch):
 def test_sm100_fla_tilelang_overrides_an_explicit_preset(monkeypatch):
     """A pre-set FLA_TILELANG=1 is overridden on sm100: this is a correctness floor.
 
-    tilelang's chunk_bwd_dqkwg miscomputes GDN gradients on sm100, and the failure is silent —
-    training completes and only the weights are wrong. Honouring an operator's opt-in here would
-    let a run produce quietly garbage weights, so flash owns this value on this arch.
+    tilelang's chunk_bwd_dqkwg miscomputes GDN gradients on sm100, and the failure is silent --
+    training completes and only the weights are wrong. Honouring an operator's opt-in here would let
+    a run produce quietly garbage weights, so flash owns this value on this arch.
     """
     import os
 
@@ -1961,22 +1955,10 @@ def test_gpu_type_pin_still_rejects_underprovisioned_matching_card(monkeypatch):
 def test_no_except_handler_supplies_a_fallback_gdn_hybrid():
     """No `except` may assign `gdn_hybrid`. A swallowed error must not answer the arch question.
 
-    THE regression for a real defect: opd computed `gdn_hybrid` in the SAME try block as its fp8-KV
-    `cuda.get_device_capability()` check, and that block's `except` set `gdn_hybrid = False`. The
-    capability call is evaluated FIRST, so any raise from it (no cuda, driver mismatch, a probe
+    The capability call is evaluated FIRST, so any raise from it (no cuda, driver mismatch, a probe
     failure with nothing to do with the checkpoint) skipped the classification entirely, reported a
     genuine GDN hybrid as not-hybrid, skipped the boundary gate, and left `use_remove_padding` true
     -- packing a GDN model with no boundary resets, exactly the contamination the gate prevents.
-
-    The hazard is specifically an `except` that SUPPLIES a value, because that is what converts an
-    unrelated failure into a confident wrong answer. A bare `try/finally` (grpo wraps its whole
-    training block in one) is fine: an exception propagates and the run dies rather than reaching the
-    packing decision with a fabricated `gdn_hybrid`. So this asserts on handler bodies, not on what
-    else shares the `try`.
-
-    `model_is_gdn_hybrid` already returns False on its own probe failure, so it needs no outer guard.
-    Asserted structurally, across all three algorithms, because the failure is invisible at runtime:
-    it fails toward "pack anyway", which logs nothing and moves no metric.
     """
     import ast
     import inspect as _inspect
@@ -2003,16 +1985,10 @@ def test_no_except_handler_supplies_a_fallback_gdn_hybrid():
 def test_each_path_resolves_the_gdn_arch_question_exactly_once():
     """The gdn arch question may be asked at most once per module. Two calls can disagree.
 
-    THE regression for a real defect: grpo asked the question twice -- once to decide packing, then
-    again inside the fp8-KV try to decide the kv dtype. The helper answers False when its OWN probe
-    raises (a hub blip, a revision fetch failure), so the second call could return False where the
-    first returned True. That turns fp8 kv ON for a GDN hybrid, which the code comment directly above
-    it says crashes vllm's wake path on the hybrid cache ('list' object has no attribute 'zero_').
-
-    Two calls with a swallowed exception between them are not one decision, they are two guesses that
-    happen to agree most of the time. Asserted structurally because the disagreeing case needs a
-    transient failure to reproduce and so will not show up in any deterministic test.
-
+    The helper answers False when its OWN probe raises (a hub blip, a revision fetch failure), so
+    the second call could return False where the first returned True. Asserted structurally because
+    the disagreeing case needs a transient failure to reproduce and so will not show up in any
+    deterministic test.
     """
     import ast
     import inspect as _inspect
@@ -2038,15 +2014,11 @@ def test_each_path_resolves_the_gdn_arch_question_exactly_once():
 def test_every_algorithm_records_whether_gdn_boundary_resets_engaged():
     """All three verl paths must publish `gdn_boundary_resets` in their run metadata.
 
-    The gate is resolved per-run by probing the child, and it announces itself only with a log line.
     A SUCCESSFUL run uploads no console, so without this key a finished GDN run gives no way to tell
     whether it packed with boundary resets or fell back to the padded path. For a gate whose failure
     mode is silent cross-example contamination, "which mode did this run actually train in" is the
     one question the artifacts have to answer -- the same reasoning rl_train already applies to
     `vllm_kv_cache_dtype`.
-
-    Asserted on the source rather than by invoking the builders, because opd's and grpo's metadata
-    dicts are constructed deep inside their run functions, behind a live bridge and a child process.
     """
     import inspect as _inspect
 
@@ -2062,51 +2034,12 @@ def test_every_algorithm_records_whether_gdn_boundary_resets_engaged():
 def test_sft_remove_padding_is_ungated_tensor_layout():
     """sft's `use_remove_padding` must not be gated on ANYTHING.
 
-    An earlier revision of this file asserted the opposite, on the theory that
-    `use_remove_padding = not gdn_hybrid or gdn_boundary_resets` would "pack a run the user was
-    quoted as unpacked" and run `1/effective_batch` of the quoted steps. That premise is false, and
-    verl says so directly:
-
-      sft_trainer.py:240  `global_batch_size = config.data.train_batch_size`
-      sft_trainer.py:181  `total_training_steps = config.trainer.total_training_steps`
-      sft_trainer.py:344  `use_remove_padding` appears ONLY as a logged field
-
-    Examples-per-update and the step horizon come from config the worker copies straight off the
-    profile (`train_batch_size = profile.examples_per_update`, `total_training_steps =
-    profile.authoritative_steps`). `use_remove_padding` selects how that batch is laid out in
-    memory -- nested/concatenated vs padded -- and cannot change how many examples share an
-    optimizer step. With `examples_per_update = 1` there is nothing to co-locate either way.
-
-    Gating it is not merely redundant, it is a crash. verl leaves `pad_mode` at its `no_padding`
-    default, whose `sft_loss` reads `log_prob.values()` -- defined only on the nested tensor the
-    remove-padding branch builds (fsdp/transformer_impl.py:1178). The padded branch (:1186) hands
-    the loss a strided tensor and the first optimizer step dies with "values expected sparse tensor
-    layout but got Strided". Every gdn-hybrid catalog model profiles as `exact-unpacked`, so the
-    AND broke text sft on all of them while `dev` trained fine.
-
-    The `not gdn_hybrid or gdn_boundary_resets` derivation that replaced it fails the same way and
-    for the same reason: a gdn hybrid whose verl child lacks the fla/causal-conv1d kernels answers
-    `gdn_boundary_resets = False`, which turns the flag off and reaches the identical strided-tensor
-    death. So NOTHING may gate this flag in sft -- there is no false case the loss can consume, and
-    verl's padded alternative does not fit `FlashTokenizedSFTDataset` either (`pad_mode: right`
-    collates with `default_collate`, requiring uniform rows, and reads a `response_mask` the dataset
-    never emits).
-
-    The boundary-contamination guard did not go away, it moved one layer earlier and one layer
-    stronger: `sft_workload._packing_mode` answers "exact-unpacked" for every architecture it cannot
-    pack, which pins `examples_per_update` to 1, so a gdn run has no packed NEIGHBOUR to be
-    contaminated by. Batch size is the isolation lever; this flag never was. See
-    `test_batch_is_the_isolation_lever_that_replaces_the_removed_flag` in test_sft_train.py.
-
-    `rl_train` and `opd_train` do NOT get this treatment: they carry no packing profile at all
-    (their batch size is the user's `prompts_per_step`, routinely > 1), so they genuinely pack and
-    a kernel-less child really does contaminate them. Their gate raises instead -- see
-    `test_grpo_and_opd_do_not_launch_into_the_unrunnable_padded_fallback` below.
-
-    Asserted on the source because reaching the real statement needs a live child probe and a
-    checkpoint; the failure is a wrong boolean, not an exception, so nothing else would surface it.
-    The AST walk (rather than a string match) is what catches a SECOND assignment being introduced
-    further down the function, which would silently re-gate the flag after this one set it.
+    That premise is false, and verl says so directly: sft_trainer.py:240 `global_batch_size =
+    config.data.train_batch_size` sft_trainer.py:181 `total_training_steps =
+    config.trainer.total_training_steps` sft_trainer.py:344 `use_remove_padding` appears ONLY as a
+    logged field Examples-per-update and the step horizon come from config the worker copies
+    straight off the profile (`train_batch_size = profile.examples_per_update`,
+    `total_training_steps = profile.authoritative_steps`).
     """
     import ast
     import inspect as _inspect
@@ -2143,23 +2076,8 @@ def test_grpo_and_opd_do_not_launch_into_the_unrunnable_padded_fallback():
     The padded fallback (`use_remove_padding=False`) is boundary-correct but cannot complete a step
     on verl's fsdp engine: flash sets `use_fused_kernels=True` unconditionally, and that pair walks
     into `prepare_model_outputs`' fused padded branch, which returns a dense `[bsz, response_len]`
-    where every sibling path re-nests via `cu_seqlens`. Grpo and opd then assert in
-    `no_padding_2_padding` -- `sequence_offsets[-1] == values.shape[0]` compares total tokens against
-    batch size, so it fails at EVERY batch size. Verl's megatron engine guards this pair explicitly
-    (`megatron/transformer_impl.py:869-874`); its fsdp engine does not.
-
-    Measured on four matched real-gpu arms: all four died at `padding.py:144`, treatment and control
-    alike. Every catalog model is gdn, so a kernel-less child means no grpo or opd run can finish --
-    and the assert names neither gdn nor the gate, so letting it launch spends a full rental on an
-    untraceable shape error.
-
-    SFT is excluded deliberately, not by oversight: it reaches the same branch but is safe without
-    resets, because every gdn model profiles as exact-unpacked and that pins `examples_per_update`
-    to 1, leaving no packed neighbour to contaminate. Raising there would fail runs that train
-    correctly. See `test_sft_remove_padding_is_ungated_tensor_layout` above.
-
-    Asserted on source because these gates sit deep inside the run functions, behind a live bridge
-    and a child process.
+    where every sibling path re-nests via `cu_seqlens`. Raising there would fail runs that train
+    correctly.
     """
     import ast
     import inspect as _inspect

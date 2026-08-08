@@ -153,18 +153,10 @@ def freesolo_base_url() -> str:
 
 
 def standalone() -> bool:
-    """True when this plane runs with NO Freesolo backend behind it (self-hosted deployments).
+    """True when this self-hosted plane has no Freesolo backend.
 
-    Flash's managed deployment keeps org/project/billing records in a Freesolo SaaS backend, and
-    the submit path validates against it on every run. A self-hoster has no such backend: without
-    this flag the plane resolves ``api.freesolo.co``, fails the validation call, and every run is
-    rejected 503 -- so the flag is what makes "self-hosted" a supported configuration rather than
-    an unreachable one.
-
-    Standalone changes AUTHORIZATION SCOPE, not just transport: the plane can no longer distinguish
-    organizations, so it trusts ``FREESOLO_INTERNAL_KEY`` as a single-tenant operator credential
-    and treats every project id the caller sends as theirs. Only run it where that key is the
-    trust boundary (see SELF_HOSTING.md).
+    Standalone mode trusts ``FREESOLO_INTERNAL_KEY`` as the single-tenant authorization boundary and
+    cannot distinguish organizations. Use it only under the trust model in ``SELF_HOSTING.md``.
     """
     return (os.environ.get(STANDALONE_ENV) or "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -228,12 +220,8 @@ def authenticate(authorization: str | None) -> dict | None:
     if not authorization or not authorization.startswith("Bearer "):
         return None
     token = authorization.removeprefix("Bearer ").strip()
-    # Stripped on BOTH sides. The bearer token arrives stripped (above) and the startup preflight
-    # tests the stripped env value, so comparing against the raw one would accept a key at startup
-    # and then reject it on every request -- on a standalone plane that key is the only accepted
-    # credential, so a stray trailing newline in an env file would 401 the entire deployment with a
-    # preflight that reported success. `or ""` keeps a whitespace-only value falsy so it can never
-    # authenticate.
+    # strip both sides to match startup preflight; otherwise a newline can pass startup but 401 every
+    # standalone request. `or ""` keeps whitespace-only credentials invalid.
     internal = (os.environ.get(INTERNAL_KEY_ENV) or "").strip()
     if internal and token == internal:
         # Standalone owns its runs through a key-independent row: rotating the operator secret

@@ -1,10 +1,7 @@
-"""Deploy / cancel / recover state transitions for a run.
+"""Deploy, cancel, and recover run state transitions.
 
-Store helpers and the lifecycle functions (``_run_training`` / ``_gc_run_endpoints``) are
-pulled in via FUNCTION-LOCAL lazy ``from flash.runner import ...`` imports — never at module
-level — for the same two reasons as ``lifecycle.py``: avoid a partially-initialized-package
-import cycle, and keep the test monkeypatches (e.g. ``flash.runner._gc_run_endpoints``)
-reachable through the package global rather than a statically-bound copy.
+Keep ``flash.runner`` imports function-local to avoid its import cycle and preserve package-level
+monkeypatch seams such as ``flash.runner._gc_run_endpoints``.
 """
 
 from __future__ import annotations
@@ -79,14 +76,10 @@ class DeploymentStatePersistenceError(RuntimeError):
 
 
 def _carry_allocation_stamp(metrics: dict, remote: dict | None) -> None:
-    """Carry the allocation stamp from a persisted remote onto adopted metrics.
+    """Carry the persisted allocation stamp onto adopted metrics.
 
-    `_completed_attempt_metrics` returns the worker's own metrics.json verbatim, and the worker
-    does not know which card, how many of them, or which substrate the allocator picked -- the plane
-    stamps all three at launch. Without this, a multi-card vast/lambda run recovered after a
-    control-plane restart is priced as ONE card on the WRONG provider, because `_persist_metrics`
-    reads each of them from the metrics it is handed.
-    `setdefault`, so a stamp the worker somehow did carry always wins over the persisted copy.
+    Workers do not know the allocator's card, count, or provider. Recovery must restore all three or
+    multi-card Vast/Lambda runs are priced as one RunPod card. ``setdefault`` preserves worker data.
     """
     if not isinstance(metrics, dict) or not isinstance(remote, dict):
         return
@@ -1080,11 +1073,11 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         # This parse is above the try below, so a raise here escapes every handler -- and attach_run
         # is dispatched on a daemon thread, so the failure is silent: the run stays nonterminal with
         # a live handle and its worker keeps billing. A spec stops parsing when the plane upgrades
-        # past an algorithm a still-in-flight run was accepted under (codex[bot]). It cannot be
-        # resumed, so fail it closed and tear the worker down. `_gc_run_endpoints` needs a parsed
-        # spec we do not have; the endpoint name is derived from the run id plus GPU class, both
-        # readable from the raw persisted status, which is the same route recover_runs takes for its
-        # own unparseable-spec branch.
+        # past an algorithm a still-in-flight run was accepted under. It cannot be resumed, so fail
+        # it closed and tear the worker down. `_gc_run_endpoints` needs a parsed spec we do not
+        # have; the endpoint name is derived from the run id plus GPU class, both readable from the
+        # raw persisted status, which is the same route recover_runs takes for its own
+        # unparseable-spec branch.
         from flash.providers.base import JobHandle
         from flash.runner.lifecycle import _strict_teardown_handle
 

@@ -1,10 +1,7 @@
-"""Regression test: `flash runs cancel` must reliably stop the REMOTE Flash worker.
+"""verify cancellation stops a remote flash worker across processes.
 
-Bug: ``cancel_run`` called ``stop_endpoint``, which only scales endpoints found in the
-*current process's* in-memory cache. In a fresh ``flash runs cancel`` invocation that cache is empty,
-so the remote RunPod worker kept running (and billing) until the wall-clock cap. Fix:
-``cancel_run`` uses ``terminate_endpoint`` to look the run's uniquely-named endpoint up in
-runpod_flash's persisted registry and delete it via the RunPod API (cross-process).
+``stop_endpoint`` only sees the current process cache. cancellation must use ``terminate_endpoint`` to
+find the persisted runpod resource and delete it through the api before billing continues.
 """
 
 from __future__ import annotations
@@ -465,12 +462,9 @@ def test_cancel_wins_over_racing_undeploy_done(tmp_path, monkeypatch):
 
 
 def test_cancel_loses_to_racing_genuine_completion_done(tmp_path, monkeypatch):
-    # Cancel-race regression (the mirror of test_cancel_wins_over_racing_undeploy_done): while
-    # cancel_run tears down a NON-deployed `running` run, the run's OWN training thread finishes
-    # and writes a GENUINE training-completion `done` (real metrics: cost_usd + artifacts_dir).
-    # The run actually finished, so its result MUST be preserved — cancel must NOT clobber it to
-    # `cancelled`. (A blunt allow_from_terminal=True would discard the real result here; the
-    # override is scoped to runs that were `deployed` at entry, which a `running` run is not.)
+    # if a running job genuinely finishes while cancellation tears it down, preserve its done metrics
+    # and artifacts. only runs deployed at cancellation entry allow the terminal override; a blanket
+    # override would clobber real training results.
     import flash.runner as orch
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
@@ -524,12 +518,10 @@ def test_terminate_endpoint_holds_lock_across_isolation(monkeypatch):
 
 
 def test_terminate_endpoint_from_async_context_does_not_raise(monkeypatch):
-    """Regression: terminate_endpoint must not raise when called from a running event loop.
+    """verify terminate_endpoint works inside an active event loop.
 
-    The original code called asyncio.run(_undeploy_all()) directly, which raises
-    RuntimeError('cannot be called when another event loop is running') from FastAPI/Uvicorn
-    lifespan shutdown or any other async context. The fix detects a running loop and falls
-    back to a ThreadPoolExecutor thread where asyncio.run() always succeeds.
+    it must move ``asyncio.run`` to another thread because calling it directly from fastapi/uvicorn or
+    any async context raises RuntimeError.
     """
     import asyncio
     import sys
@@ -736,25 +728,14 @@ def test_cancel_run_marks_billing_failed_when_pricing_falls_back(tmp_path, monke
 
 
 def test_cancel_run_bills_a_profile_on_started_not_on_optimizer_steps(tmp_path, monkeypatch):
-    """Cancelling a profile charges its bounded wall only if it started, and $0 if it never did.
+    """charge cancelled profiles only when they started, using the persisted quote.
 
-    The wiring is the point here, not the arithmetic (``test_charge_pricing`` covers that): a
-    profile emits no rl_step/sft_step/opd_step heartbeat, so if this path fed it through
-    ``actual_steps_run`` every cancelled profile would price at 0 steps -- free even after it ran
-    its whole wall. Both directions are asserted because a one-sided test passes under exactly
-    that mistake.
+    profiles emit no training-step heartbeat, so ``actual_steps_run`` would incorrectly make all
+    cancellations free. started profiles must use the submitted quote, matching successful settlement;
+    never-started profiles cost zero.
 
-    The started case asserts the PERSISTED quote, not merely a nonzero number: re-deriving the
-    charge here prices against today's offline rate table, so a cancel could bill something other
-    than the figure the user was shown at submit and other than what the same profile bills on
-    success (measured: $23.76 re-derived against a $7.00 quote). ``lifecycle.py`` already settles a
-    completed profile through the persisted quote, so cancel agrees with success rather than
-    introducing a third number.
-
-    ``billing_state`` is asserted alongside every amount because pricing here fails CLOSED: any
-    exception inside ``charge_usd_for_spec`` becomes the nan fallback and lands on cost_usd 0.0
-    with billing_state "failed". Without that assertion a swallowed pricing failure is
-    indistinguishable from a correct $0, and the never-started case expects exactly $0.
+    assert ``billing_state`` because pricing fails closed to cost 0.0 on exceptions, which otherwise
+    looks identical to the expected never-started charge.
     """
     import flash.runner as orch
     from flash.spec import JobSpec
@@ -879,13 +860,11 @@ def _make_poll_provider(monkeypatch, *, on_poll):
 
 
 def test_attach_run_recovery_skips_training_when_raced_terminal(tmp_path, monkeypatch):
-    """Recovery-path TOCTOU regression (the reviewed bug). attach_run checks the terminal state
-    ONCE up front, then runs a long poll. If a concurrent thread/process flips the run terminal
-    (e.g. another attach_run marks it `failed`) DURING that poll, the not-ok recovery path must
-    NOT resume `_run_training` — doing so would submit PAID GPU work for an already-terminal run.
-    The atomic guard: _update(.., "running", ..)'s sticky CAS rejects the write (returns False),
-    so the resume is skipped. Here we flip the run to `failed` from inside the (mocked) poll, then
-    return a not-ok result, and assert training is never resumed."""
+    """verify recovery cannot restart paid work after a concurrent terminal transition.
+
+    flip the run to failed during polling; the sticky ``_update(..., "running", ...)`` cas must reject
+    resume so ``_run_training`` is never called.
+    """
     import flash.runner as orch
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
@@ -1020,13 +999,10 @@ def target_for(run_id):
 
 
 def _install_fake_sdk(monkeypatch, *, resources, undeploy, rest_find, rest_delete=lambda _id: True):
-    """Stub the runpod_flash ResourceManager + the RunPod REST API for terminate_endpoint.
+    """stub runpod resource-manager and rest deletion for terminate_endpoint.
 
-    ``resources`` is the registry dict returned by list_all_resources(); ``undeploy`` is an
-    async fn called per uid; ``rest_find``/``rest_delete`` back the registry-less REST fallback
-    (``rest_find`` may raise to simulate an unreachable API). Also drops the quota semaphore +
-    tracking set to a fresh pair (monkeypatch restores them) so the test owns one acquired slot.
-    Returns ``(ep_mod, target)``.
+    ``resources`` feeds the registry; ``undeploy`` handles uids; ``rest_find``/``rest_delete`` cover
+    registry-less fallback. reset quota tracking so the test owns one slot. return ``(ep_mod, target)``.
     """
     import sys
     import threading

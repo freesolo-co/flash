@@ -124,7 +124,7 @@ def preflight_opd_structured_outputs(
 
     Split out of the full validation below so submission can run it: both of these are decided by
     the constraint and the model id alone, and both reject the run permanently, so leaving them to
-    the worker charged the user for a gpu to learn the job could never have run (codex[bot]).
+    the worker charged the user for a gpu to learn the job could never have run.
 
     Deliberately NOT the whole validation. The vocab-size comparison depends on the allocated card
     count, and applying it here -- before the allocator has placed the run -- would re-raise "does

@@ -54,12 +54,9 @@ class RunConfig:
     sft_packed_blocks: int | None = None
     opd_multi_turn: bool = False
     opd_max_turns: int | None = None
-    # grpo/opd: MEASURED mean tokens one rollout actually generates and consumes, from a sampled
-    # rollout profile. deliberately SEPARATE fields rather than an overwrite of completion_len and
-    # seq_len, because those two size the gpu (see train_knobs) and sizing must cover the worst
-    # case while pricing must reflect the expected one. quoting the cap overbills generation ~3.1x;
-    # SIZING to a measured mean would provision vram for the mean and OOM on the tail. same split
-    # sft already uses with train_tokens, for the same reason.
+    # use measured mean rollout tokens for pricing but retain completion_len/seq_len caps for gpu
+    # sizing. conflating them either overbills expected generation or provisions for the mean and ooms
+    # on the tail; sft uses the same split through train_tokens.
     measured_completion_tokens: float | None = None
     measured_prompt_tokens: float | None = None
 
@@ -190,12 +187,10 @@ class RunConfig:
 
 @dataclass(frozen=True)
 class CostEstimate:
-    """A pre-flight estimate.
+    """report a pre-flight estimate.
 
-    ``total_usd`` = training-only GPU hours * ``gpu_hourly_usd``. Setup/cold-start time is reported
-    as elapsed wall time but is not billed to the user estimate. ``teacher_api_usd`` (opd only) uses
-    the platform-managed teacher key and remains itemized separately from the customer GPU charge,
-    so it is not included in ``total_usd``.
+    ``total_usd`` bills training gpu hours only. setup is elapsed but unbilled; opd teacher api cost is
+    itemized separately because it uses the platform-managed key.
     """
 
     model_id: str

@@ -67,13 +67,8 @@ def test_thinking_capability_values_are_valid():
 
 
 def test_serving_capacity_matches_validated_matrix():
-    # NB: `expected` is a literal in this file, so this asserts the catalog matches a SECOND COPY of
-    # the numbers, not that it matches the serving app. It fails only when someone edits the catalog
-    # and forgets the copy -- it cannot see freesolo `serving/src/model_config.py` drifting away,
-    # which is exactly what happened to the 4B/9B rank between 2026-07-22 and 2026-08-07. The
-    # cross-repo check belongs where both repos are checked out (freesolo-co/tests pins each as a
-    # submodule); flash CI has no freesolo tree to compare against. Keep this as the transcription
-    # guard it is and do not mistake it for a lockstep guarantee.
+    # `expected` is a transcription guard, not a cross-repo lockstep check. flash CI has no
+    # freesolo tree; compare both repos in the pinned freesolo-co/tests checkout.
     expected = {
         "Qwen/Qwen3.5-0.8B": {
             "gpu": "L4",

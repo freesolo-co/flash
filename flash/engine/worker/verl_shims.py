@@ -1,13 +1,7 @@
-"""Source for the sitecustomize shims flash renders into the verl child interpreter.
+"""Source for sitecustomize shims rendered into the verl child interpreter.
 
-Each renderer returns PYTHON SOURCE TEXT, not behaviour: the verl child runs on incompatible
-torch/vllm pins and cannot import flash, so every patch it needs has to arrive as a string that
-python's automatic sitecustomize import executes at child startup. Keeping them together
-separates "text flash generates" from "code flash runs" -- an important distinction, since nothing
-in this module is exercised by importing it.
-
-A shim is rendered only when its feature is active; each prints its marker so the parent can prove
-from the child log that the patch actually took effect.
+Renderers return source text because the pinned child cannot import flash. Active shims print a
+marker so the parent can prove each patch executed.
 """
 
 from __future__ import annotations
@@ -21,36 +15,13 @@ _KL_REF_ADAPTER_MARKER = "[flash-verl] kl reference anchored to the warm-start a
 
 
 def render_kl_ref_adapter_shim(warmstart: bool) -> str:
-    """return the sitecustomize source that anchors verl's kl reference to the warm-start adapter.
+    """return source that anchors verl's kl reference to the warm-start adapter.
 
-    verl computes reference logprobs on the actor whenever lora is active (``ref_in_actor`` in
-    ray_trainer.py is ``lora_rank > 0 or lora_adapter_path is not None``, always true on flash) and
-    marks that call ``no_lora_adapter=True``, which engine_workers.py turns into
-    ``engine.disable_adapter()`` -- the BARE BASE. for a fresh-start run that is correct. for a
-    warm-started run it is not: the kl term would pull the policy back toward the base and undo the
-    sft adapter the run was told to continue, which is why the warm-start + kl combination was
-    refused until now. the retired trl driver instead snapshotted a frozen reference adapter and
-    evaluated the reference under it; this ports that behavior.
-
-    the snapshot is registered as NON-PERSISTENT BUFFERS rather than as a second peft adapter's
-    parameters, which is what keeps it out of every downstream consumer:
-
-    - ``named_parameters()`` never sees it, so fsdp does not flatten it and the optimizer cannot
-      train it (a trainable reference would drift with the policy and anchor nothing).
-    - ``state_dict()`` never sees it, so it stays out of the saved shards. that matters more than
-      it looks: verl's merger does not call ``save_pretrained`` for the adapter, it hand-builds one
-      from every state-dict key containing ``lora_`` and derives ``target_modules`` from
-      ``key.split(".")[-3]`` (base_model_merger.save_lora_adapter). a second adapter's keys do not
-      match its ``.default.weight`` rewrite, so they would resolve to ``lora_A``/``lora_B`` and ship
-      a deliverable adapter with bogus target modules.
-    - a resumed run reloads the same shards with ``strict=True``; absent keys would fail that load.
-      the snapshot is rebuilt from ``lora_adapter_path``, which flash passes on every warm-start
-      run including a resume, so the anchor re-forms identically rather than being restored.
-
-    the swap is ``BaseTunerLayer._active_adapter``, not peft's ``set_adapter``: ``set_adapter``
-    flips ``requires_grad`` on both adapters, and verl wraps fsdp1 with ``use_orig_params=false``
-    where that breaks flat-param uniformity. writing ``_active_adapter`` changes zero flags and
-    restores the policy forward bit-exactly.
+    ``no_lora_adapter=True`` otherwise evaluates the bare base and pulls a warm start backward.
+    Store the frozen reference as non-persistent buffers so FSDP, optimizers, state dicts, and
+    ``base_model_merger.save_lora_adapter`` never treat it as a second trainable adapter. Rebuild it
+    from ``lora_adapter_path`` on resume. Swap ``BaseTunerLayer._active_adapter`` directly because
+    peft's ``set_adapter`` changes ``requires_grad`` and breaks FSDP flat-parameter uniformity.
     """
     if not warmstart:
         return ""
@@ -133,21 +104,11 @@ _flash_ref_impl.FSDPEngine.disable_adapter = _flash_ref_disable_adapter
 
 
 def render_structured_outputs_shim(structured_outputs: dict | None) -> str:
-    """return the sitecustomize source that constrains verl's rollout to a guided grammar.
+    """return source that constrains verl rollout sampling to a guided grammar.
 
-    the sampling half of ``train.structured_outputs``. it rides the same per-sample dict as the stop
-    strings, so the mechanism is identical to render_stop_sequences_shim; only the value differs.
-    the engine half (``reasoning_parser``, applied when thinking is also on) is a plain hydra
-    override and needs no shim -- see _build_verl_overrides.
-
-    the value MUST be wrapped in ``StructuredOutputsParams``. vllm accepts a raw dict here, passes
-    ``_verify_args()``, and then stores a plain dict with no ``.json`` attribute -- constraining
-    nothing, with no error and no log line. the retired trl path got the wrapping for free from its
-    colocate generation layer and so passed the spec as a plain dict; on verl nothing wraps it, so
-    the shim must.
-
-    the object survives the worker -> server hop: that hop is ``server.generate.remote(...)``, a ray
-    actor rpc (cloudpickle), not http/json, so it arrives as the same dataclass it left as.
+    Wrap the value in ``StructuredOutputsParams``: vllm silently accepts a raw dict but applies no
+    constraint. The object survives ``server.generate.remote(...)`` through Ray cloudpickle. The
+    reasoning-parser engine override remains in ``_build_verl_overrides``.
     """
     if not structured_outputs:
         return ""
@@ -189,23 +150,11 @@ if not getattr(
 
 
 def render_exact_save_steps_shim(save_at_steps: tuple[int, ...], total_steps: int) -> str:
-    """return the sitecustomize source that suppresses verl's superset checkpoint writes.
+    """return source that suppresses verl's extra checkpoint writes.
 
-    verl only saves when ``global_steps % save_freq == 0``, so it cannot hit an arbitrary set of
-    steps. the resolver picks the gcd of the required steps, which makes verl save a SUPERSET and
-    the uploader publish deployables at exactly the required ones. correct, but the gcd can be
-    tiny -- save_at_steps=(7, 13) gives gcd 1, a full checkpoint written every single step -- and
-    each write is a full-state dump of a multi-billion-parameter policy.
-
-    this drops the writes flash never asked for, so only the required steps (and the last step,
-    which the run's final publish needs) reach disk. the sft verl backend already does exactly this
-    (sft_train.py); this is the same suppression on the ppo driver.
-
-    ``RayPPOTrainer._save_checkpoint`` takes no step argument -- it reads ``self.global_steps`` --
-    so the filter reads it off the instance rather than a parameter. returning early is safe
-    because the method's only other effect is advancing latest_checkpointed_iteration.txt, and a
-    step with no checkpoint on disk must not be advertised as resumable: the uploader gates on that
-    marker precisely so it never uploads a half-written or absent directory.
+    verl's gcd ``save_freq`` writes a superset of arbitrary ``save_at_steps``. Keep only requested
+    and final steps. Read ``self.global_steps`` because ``RayPPOTrainer._save_checkpoint`` has no
+    step argument; skipped steps must not advance ``latest_checkpointed_iteration.txt``.
     """
     if not save_at_steps:
         return ""
@@ -246,21 +195,11 @@ if not getattr(
 
 
 def render_stop_sequences_shim(stop_sequences: tuple[str, ...]) -> str:
-    """return the sitecustomize source that gives verl's rollout flash's stop-string behavior.
+    """return source that adds flash stop strings to verl rollouts.
 
-    on the retired trl backend flash puts ``stop`` into ``generation_kwargs``, which reaches vllm's
-    ``SamplingParams`` unchanged. verl builds its sampling params as a literal dict in
-    ``AgentLoopWorker.generate_sequences`` (agent_loop.py) with no stop field and no passthrough, so
-    the key has to be inserted there. the value then rides the existing dict all the way into
-    ``SamplingParams(max_tokens=..., **sampling_params)`` in the vllm server, which accepts it.
-
-    the patch lands on ``_run_agent_loop`` rather than the vllm server because the worker owns the
-    dict: patching further down would have to reconstruct which request the params belong to, and
-    the tool/multi-turn loops pass the same dict through untouched.
-
-    token-level semantics match the retired trl path exactly. vllm truncates ``output_text`` at a stop-string match
-    but leaves ``token_ids`` intact, and both backends read ``output.token_ids`` -- so the trained
-    tokens are the same on either backend, including the trailing delimiter tokens.
+    Patch ``_run_agent_loop`` where the per-sample dict is owned and passed into vllm
+    ``SamplingParams``. vllm truncates text but preserves ``token_ids``, so trained tokens retain
+    trailing delimiter tokens.
     """
     if not stop_sequences:
         return ""
@@ -298,19 +237,10 @@ if not getattr(_flash_agent_loop.AgentLoopWorker._run_agent_loop, "_flash_stop_p
 
 
 def render_image_pad_ban_shim(image_pad_token_id: int | None) -> str:
-    """return the sitecustomize source that stops a multimodal rollout emitting the image-pad token.
+    """return source that prevents multimodal rollouts from emitting the image-pad token.
 
-    the vision placeholder token is a real vocabulary entry, so an unconstrained sampler can emit
-    it inside a *completion*. nothing there expands it back into pixels, so the trained sequence
-    then contains a token the model can only have produced by hallucinating an image -- and on the
-    next forward pass the processor's image/text alignment counts a placeholder with no image
-    behind it. the retired trl driver banned it through ``generation_kwargs["logit_bias"]``; verl
-    builds its sampling params as a literal dict, so the key is inserted the same way the
-    stop-strings shim inserts ``stop``.
-
-    unconditional rather than gated on the row: this shim is only written for a multimodal job, and
-    a text-only row in such a job still must not invent a placeholder. -100.0 is a large enough
-    negative bias to make the token unreachable at any temperature this trainer allows.
+    A sampled placeholder has no image and breaks processor alignment on the next forward pass.
+    Apply ``-100.0`` logit bias to every row in a multimodal job, including text-only rows.
     """
     if image_pad_token_id is None:
         return ""
@@ -345,23 +275,11 @@ if not getattr(
 
 
 def render_per_turn_credit_shim(per_turn_credit: bool) -> str:
-    """return the sitecustomize source that gives verl per-turn group-relative credit.
+    """return source that adds per-turn group-relative credit to verl.
 
-    verl credits a whole episode: ``compute_grpo_outcome_advantage`` centres one scalar per rollout
-    against its group and broadcasts it across every response token. per-turn mode instead centres
-    each TURN against the same turn of its group siblings, so a good turn inside a bad episode
-    still gets positive advantage.
-
-    this wraps ``compute_advantage`` rather than registering a custom estimator. a registered
-    estimator would be the tidier hook, but ``compute_advantage`` forwards ``non_tensor_batch`` to
-    exactly one estimator by name (``if adv_estimator in (AdvantageEstimator.GDPO, "gdpo")``), so a
-    custom one could never see the spans it needs. wrapping keeps stock grpo as the baseline and
-    overwrites only the token axis, so the episode-level centring stays exactly as stock grpo
-    computed it and only the per-turn refinement is layered on top.
-
-    the fallback is per GROUP, not per row: grpo centres each rollout against its group, so a group
-    holding a mix of per-turn and episode credit would compare quantities of different scales. one
-    unusable row therefore drops its whole group to episode credit.
+    Wrap ``compute_advantage`` because custom estimators do not receive ``non_tensor_batch`` spans.
+    Keep stock GRPO as the baseline and overwrite token advantages. Fallback must cover the whole
+    group so episode and per-turn scales are never mixed.
     """
     if not per_turn_credit:
         return ""
@@ -475,44 +393,15 @@ _flash_pt_ray_trainer.compute_advantage = _flash_pt_compute_advantage
 
 
 def render_reentrant_checkpointing_shim(reentrant: bool, *, multimodal: bool = False) -> str:
-    """return the sitecustomize source that makes verl's gradient checkpointing REENTRANT.
+    """return source that makes verl gradient checkpointing reentrant.
 
-    verl hardcodes ``use_reentrant=False`` at its single checkpointing site
-    (``workers/engine/fsdp/transformer_impl.py:304``) and exposes no knob for it. non-reentrant
-    recompute asserts that every recomputed activation's metadata matches the forward pass, which
-    the MoE router and the GDN chunk-scan both violate: they save shape-/data-dependent tensors the
-    recompute lays out differently, so the run dies on the FIRST backward, before a single optimizer
-    step. ``grpo_use_reentrant`` documents both live-confirmed cases.
+    verl hardcodes ``use_reentrant=False`` at ``workers/engine/fsdp/transformer_impl.py:304``;
+    MoE and GDN metadata changes make that fail on the first backward. Patch only the kwarg because
+    ``transformer_impl.py:433-434`` also uses the enable flag for activation offloading.
 
-    patches ``_build_module`` and re-enables checkpointing with ``use_reentrant=True`` on the way
-    out, so verl's own call still runs and only the flag differs. the same hook the SFT verl path
-    uses (``sft_train.py``), against the same class: GRPO's actor is ``FSDPEngineWithLMHead``, which
-    inherits ``_build_module`` from ``FSDPEngine``.
-
-    deliberately NOT unified with SFT's version, which instead tells verl
-    ``enable_gradient_checkpointing=False`` and enables checkpointing itself. GRPO cannot do that:
-    verl reads the same flag a SECOND time, to decide activation offloading
-    (``transformer_impl.py:433-434``), so clearing it would silently change the memory profile as
-    well as the recompute flag. leaving it True and correcting only the kwarg keeps this a
-    flag-level change. the guard below exists for the same reason -- ``_build_module`` also builds
-    engines whose config may legitimately have checkpointing off, and enabling it there would turn
-    on a feature verl chose to leave off.
-
-    reentrant recompute drops the backward for a checkpointed block when none of that block's
-    inputs require grad. that hits the LANGUAGE side on every lora run: lora freezes the
-    embeddings, so the hidden states entering the first checkpointed decoder layer have
-    ``requires_grad=False`` and the whole segment -- containing every lora parameter -- receives no
-    gradient, while the run reports success and bills (GRAD-001). ``enable_input_require_grads()``
-    is what prevents it, and it is unconditional here because every flash rl run is lora.
-
-    on a MULTIMODAL run the same hook additionally restores VISION input gradients. the vision
-    tower's patch embeddings are the same failure in a place the language-side call does not
-    reach: the pixels are frozen inputs, so without a forward hook marking the patch-embed output
-    as requiring grad the visual modules silently receive nothing while the language side trains
-    normally (``tests/test_multimodal_input_grads.py``). the retired trl path installed that hook
-    via a trainer callback; verl has no callback surface, so it rides this shim instead -- and only
-    here, because non-reentrant recompute does not have the behaviour that makes it necessary
-    (codex[bot]).
+    Reentrant LoRA needs ``enable_input_require_grads()`` or frozen embeddings drop all adapter
+    gradients (GRAD-001). Multimodal runs also need the vision patch-embed hook in
+    ``tests/test_multimodal_input_grads.py``.
     """
     if not reentrant:
         return ""
@@ -582,19 +471,11 @@ _FlashReentrantEngine._build_module = _flash_reentrant_build_module
 
 
 def render_entropy_quantile_shim(entropy_quantile: float | None) -> str:
-    """return the sitecustomize source that adds top-entropy token masking to verl.
+    """return source that adds top-entropy token masking to verl.
 
-    the objective keeps only the top ``entropy_quantile`` fraction of response tokens in the
-    policy-gradient term; verl has no such knob. the mask is expressible
-    as an extra factor on ``response_mask``, so this patches ``ppo_loss`` rather than registering a
-    custom policy loss: ``ppo_loss`` computes per-token entropy but never forwards it to
-    ``policy_loss_fn``, so a registered loss could not see the entropy it needs to threshold on.
-
-    the mask applies to the policy-gradient term ONLY: it multiplies
-    ``per_token_loss`` by the mask and then adds the kl term, so kl and the entropy bonus stay on the
-    full response mask. equivalence also needs a mask-independent denominator: flash pins
-    ``seq-mean-token-sum-norm``, which divides by ``global_batch_size * loss_scale_factor``, so
-    dropping tokens from the numerator does not rescale the remaining ones.
+    Patch ``ppo_loss`` because registered policy losses cannot see per-token entropy. Mask only the
+    policy-gradient term; KL and entropy bonus keep the full response mask. Flash pins
+    ``seq-mean-token-sum-norm`` so removing numerator tokens does not rescale the rest.
     """
     if entropy_quantile is None or float(entropy_quantile) >= 1.0:
         return ""

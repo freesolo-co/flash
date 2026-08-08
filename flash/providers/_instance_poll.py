@@ -1,21 +1,10 @@
-"""Shared rent-a-box instance poll driver.
+"""shared rent-a-box instance polling and terminal-artifact handling.
 
-RunPod aside, the two "rent a whole box, watch its HF artifacts" providers (Vast and Lambda) ran two
-~80%-duplicate poll loops. This module is the ONE driver they now share: ``poll_instance_job`` plus the
-terminal-artifact detector family (``finish_ok`` / ``done_is_fresh`` / ``finish_from_ok_marker`` /
-``fail_from_marker`` / ``terminal_artifact_result``) and the bounded ``_read_with_retries`` re-reader.
+provider-specific status, markers, costs, and messages live in ``InstancePollAdapter``. every timeout,
+dead-host, stall, or status-outage path performs a bounded artifact reread so hf visibility lag cannot
+turn completed work into a retry.
 
-Everything provider-specific is factored into a small per-call :class:`InstancePollAdapter` (the marker
-filename, the status field/vocabulary, the instance fetcher and the exceptions its transient failures
-raise, the early-liveness probe, the cost/notes stamping, and the failure-detail + stall-message
-builders). The kernel here is baselined on VAST, whose loop is strictly the more robust of the two:
-every give-up path (deadline / dead host / stalled / status-poll outage) does a BOUNDED terminal-artifact
-re-read before concluding loss, so a seed that finished right at the boundary — with its DONE/marker not
-yet visible under HF read-after-write lag — is recognised instead of mis-retried against its own work.
-
-``time`` is referenced as a module attribute (``time.time`` / ``time.sleep``) so a test that patches the
-shared ``time`` module (or a provider jobs module's ``time``, which is the same singleton object) reaches
-this driver too — the fake clocks/sleeps the provider poll tests install still bite.
+reference ``time`` as a module attribute so provider poll tests patch the shared fake clock.
 """
 
 from __future__ import annotations
@@ -199,16 +188,10 @@ def poll_instance_job(
     load_timeout_s: float,
     deadline_at: float | None = None,
 ) -> PollResult:
-    """Poll instance status + HF artifacts to a terminal state (the shared kernel behind poll_vast_job /
-    poll_lambda_job).
+    """poll instance status and hf artifacts to a terminal result.
 
-    COMPLETED     strict ok marker on HF -> metrics.json (cost stamped by the adapter).
-    job_failed    attempt marker with ok=false (a real worker error; fails fast unless flagged retriable).
-    job_preempted instance died without DONE/marker (host loss) -> infra-shaped, retried.
-    stalled       never left loading within ``load_timeout_s``; OR running but emitted NO liveness within
-                  ``first_liveness_s``; OR heartbeat frozen past the setup/stall window; OR deadline passed.
-    poll_error    status endpoint down past budget, OR DONE without a readable/parseable metrics.json —
-                  infra-retryable (bounded by infra_retries), never a fast-fail on a signalled success.
+    completed requires a strict ok marker and metrics. worker markers fail fast; dead hosts, stalls,
+    status outages, and unreadable signalled-success metrics remain infrastructure-retryable.
     """
     say = make_say(log)
     launch_ts = adapter.launch_ts
@@ -450,12 +433,9 @@ def poll_instance_job(
             # budget and keep polling — a read blip must not look like a gone instance.
             if poll_errors.record(e, deadline_at=absolute_deadline):
                 _surface_final_heartbeat()
-                # The status endpoint is down, but the worker may have COMPLETED during the outage and
-                # written its terminal DONE/marker to HF (a different endpoint). Do the BOUNDED terminal
-                # read (same as the deadline / dead-host paths) before giving up: a prolonged outage can
-                # end right as the worker finishes, so a single read can miss the just-written artifact
-                # under HF read-after-write lag. Else poll_error tears the box down and the retry relaunches
-                # a second worker for an attempt that already finished (duplicate work + double-bill).
+                # the status endpoint can fail while the worker finishes through hf. perform the same
+                # bounded terminal-artifact reread used by deadline/dead-host paths so visibility lag
+                # cannot relaunch completed work and double-bill it.
                 terminal = _read_with_retries(
                     terminal_artifact_result,
                     tries=_TERMINAL_REREAD_RETRIES,
@@ -568,14 +548,9 @@ def poll_instance_job(
                     if is_training_heartbeat(stage, new_key[1]):
                         seen_training_hb = True
 
-        # Load timeout: a box that never left loading/unknown within load_timeout_s never started. But a
-        # fresh heartbeat PROVES the worker booted even while the detail API lags in loading/unknown
-        # (never flipping to 'running'), so it disarms this — else a healthy, heartbeating box is torn
-        # down on a lagging status feed. the absolute deadline remains the spend backstop once this is
-        # disarmed. order matters: this runs after the heartbeat read
-        # above, so THIS tick's first fresh heartbeat (which sets seen_fresh_hb) disarms the timeout on the
-        # very iteration it arrives — a heartbeat landing exactly at the timeout mark must not be raced by
-        # a stale seen_fresh_hb from the prior tick.
+        # a fresh heartbeat proves startup even if the detail api still says loading/unknown, so it
+        # disarms load timeout. order matters: this check follows heartbeat processing so a heartbeat
+        # arriving exactly at the boundary wins on the same tick. the absolute deadline still caps spend.
         if not became_running and not seen_fresh_hb and time.time() - start > load_timeout_s:
             return PollResult(
                 False,
@@ -584,12 +559,9 @@ def poll_instance_job(
             )
 
         if became_running:
-            # Fast-failover: a box that reached 'running' but emitted NO heartbeat past first_liveness_s
-            # might be wedged -> 'stalled'. But a healthy slow cold start (pip install / code fetch) also
-            # has no heartbeat yet, so before failing over consult the early-liveness probe: a positive
-            # signal means the bootstrap is alive (latch, let setup_grace_s govern); only a box SILENT
-            # across BOOT_LOG_ABSENT_POLLS is the wedged host. The observed-running floor keeps a reattach
-            # from fast-failing a box that just came up.
+            # after running without a heartbeat, consult early-liveness before declaring a stall: slow
+            # installs and fetches can be healthy. latch positive bootstrap evidence; require silence for
+            # BOOT_LOG_ABSENT_POLLS and respect the observed-running floor on reattach.
             if (
                 not seen_fresh_hb
                 and not liveness_seen

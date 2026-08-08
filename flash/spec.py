@@ -27,11 +27,9 @@ CREDIT_ASSIGNMENTS: tuple[CreditAssignment, ...] = (
 
 
 def _coerce_credit_assignment(value: Any) -> CreditAssignment:
-    """coerce a deserialized credit-assignment value to the typed literal, rejecting unknown modes.
+    """coerce credit assignment to a known mode and reject malformed payloads.
 
-    mirrors the client-side schema validator: missing/blank -> default, a known mode -> that mode,
-    anything else -> ValueError (a valid client cannot submit an unknown value, so this only guards
-    a malformed or tampered internal/persisted payload from silently downgrading to per-episode).
+    missing or blank uses the default; unknown internal/persisted values must not silently downgrade.
     """
     if value is None:
         return DEFAULT_CREDIT_ASSIGNMENT
@@ -179,11 +177,10 @@ def parse_seed(value: Any = FIXED_SEED) -> int:
 
 
 def parse_max_steps(value: Any) -> int | None:
-    """Parse the optional exact optimizer-update horizon without numeric coercion.
+    """parse the optional exact optimizer-update horizon without coercion.
 
-    a positive value is the authoritative update horizon. absent or non-positive (zero or negative)
-    means "use the derived update count", canonicalized to none so a single sentinel represents
-    "not authoritative" everywhere (parse, serialize, resolve_update_horizon, save_at_steps).
+    positive values are authoritative; absent or non-positive values canonicalize to none so every
+    parser, serializer, resolver, and save-step path shares one sentinel.
     """
     if value is None:
         return None
@@ -284,19 +281,9 @@ class EnvironmentSpec:
     resolved_sha: str = ""
 
 
-# dropped on the INTERNAL persisted-record parse only, never by the public config schema.
-#
-# #968 deleted `advantage_clip` from TrainSpec, but runs provisioned before it serialized their spec
-# with asdict() into status.spec and effective_preparation.worker_spec, and stored run records are
-# never rewritten. from_dict is strict, so those records stopped parsing -- and attach_run treats an
-# unparseable spec as unrecoverable: it fails the run and tears the worker down. Dropping the key
-# costs nothing because the worker parsed but never applied it.
-#
-# Deliberately ONLY advantage_clip. Other since-removed train fields are not listed on the theory
-# that they might also appear: `seeds` in particular is REQUIRED to keep raising
-# (test_from_dict_rejects_removed_legacy_train_seeds, #536), so tolerating keys speculatively would
-# silently overturn a decision another change made on purpose. Add a key here when a real persisted
-# record is shown to carry it, not before.
+# internal persisted-record compatibility only, never public config parsing. #968 removed
+# advantage_clip, but already-provisioned strict records still carry the unused key and otherwise fail
+# attach/recovery. do not generalize this allowlist: removed ``seeds`` must still raise (#536).
 REMOVED_PERSISTED_TRAIN_KEYS = frozenset({"advantage_clip"})
 
 
@@ -456,12 +443,10 @@ class JobSpec:
         return "rl" if self.algorithm == "grpo" else self.algorithm
 
     def to_dict(self) -> dict[str, Any]:
-        """Return the public/API representation of this job specification.
+        """return the public user-authorable job specification.
 
-        This is the user-authorable config surface: platform-managed fields are omitted because they
-        are assigned by the control plane / runner, never by the user, and re-validating this dict
-        through the user-facing parser (the client -> server submit round trip) rejects them. The
-        control plane and worker use to_internal_dict(), which retains every field.
+        omit platform-managed fields because the control plane/runner assigns them and the public
+        parser rejects them. internal callers use ``to_internal_dict()``.
         """
         data = asdict(self)
         # server-assigned identity — never authored in a config.

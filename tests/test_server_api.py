@@ -1,10 +1,8 @@
 """Control-plane API: freesolo bearer auth, multi-tenant isolation (CPU-only).
 
-User auth is freesolo API keys only (no native key system). Tests run offline: the `api`
-fixture monkeypatches ``auth._freesolo_verify`` to accept any token shaped like a freesolo
-user key, so each distinct token resolves to its own run-ownership identity via
-``db.ensure_external_key``. All runs are dry-run so nothing touches the network; operator
-env vars are dummies (the startup preflight only checks presence).
+User auth is freesolo API keys only (no native key system). Tests run offline: the `api` fixture
+monkeypatches ``auth._freesolo_verify`` to accept any token shaped like a freesolo user key, so each
+distinct token resolves to its own run-ownership identity via ``db.ensure_external_key``.
 """
 
 from __future__ import annotations
@@ -101,12 +99,11 @@ def api(tmp_path, monkeypatch):
         lambda **_k: {"choices": [{"message": {"content": "4"}, "finish_reason": "stop"}]},
     )
     # The new preflight requires the Lambda key above, which also makes
-    # `configured_providers()` treat it as live — so the startup lifespan's `recover_runs()` and
-    # the orphan-sweep loop would dispatch real `sweep_orphans()` (Lambda list calls) and
-    # break test hermeticity. These API tests don't exercise orphan reaping, so stub the provider set
-    # to empty: preflight still passes on the keys, but startup stays CPU-only with no network. (Both
-    # call sites do a function-local `from flash.providers import configured_providers`, so patching
-    # the package attribute covers them.)
+    # `configured_providers()` treat it as live -- so the startup lifespan's `recover_runs()`
+    # and the orphan-sweep loop would dispatch real `sweep_orphans()` (Lambda list calls) and
+    # break test hermeticity. These API tests don't exercise orphan reaping, so stub the
+    # provider set to empty: preflight still passes on the keys, but startup stays CPU-only
+    # with no network.
     import flash.providers as providers_mod
     import flash.providers.runpod.train.endpoints as rp_endpoints
     import flash.server.run_registry as run_registry
@@ -1110,16 +1107,11 @@ def test_sft_profile_miss_starts_a_separate_profile_run(api, monkeypatch):
 def test_the_route_never_makes_submit_job_launch_the_profile_itself(api, monkeypatch):
     """The server must hand ``submit_job`` a prepared job, never let it re-prepare and self-launch.
 
-    ``submit_job`` has its own ``except WorkloadProfilePending`` branch that recursively launches the
-    profile. That branch bills a run WITHOUT ``claim_profile_run``, so nothing stops two submitters
-    of the same deterministic id from each paying for the same profile. The route is what prevents
-    it: it prepares, claims, and passes ``prepared_job``, which short-circuits ``submit_job`` before
-    the recursion is reachable.
-
-    That makes reachability the real invariant, and a grep proves it only for today. This drives the
-    actual route with the REAL ``submit_job`` and fails if a future refactor drops ``prepared_job``
-    from either call site -- the runner would then re-prepare, raise pending a second time, and take
-    the unclaimed path.
+    The route is what prevents it: it prepares, claims, and passes ``prepared_job``, which
+    short-circuits ``submit_job`` before the recursion is reachable. This drives the actual route
+    with the REAL ``submit_job`` and fails if a future refactor drops ``prepared_job`` from either
+    call site -- the runner would then re-prepare, raise pending a second time, and take the
+    unclaimed path.
     """
     import flash.runner as runner
     import flash.server.app as app_mod
@@ -1185,9 +1177,6 @@ def test_a_second_owner_needing_the_same_profile_is_not_blocked_by_the_first(api
     ``runs.run_id`` is a primary key, so a plain insert raises for the second owner. That must not
     surface as a leaked sqlite error on a submission that is otherwise fine: the profile they need
     already exists and is already running, which is exactly the reuse the deterministic id is for.
-    What they must NOT get is ownership of the first owner's run -- run reads are owner-scoped and
-    404 for everyone else, so the response has to be the same pending 409 that tells them to wait
-    and retry, and the profile must not be launched or charged a second time.
     """
     import flash.runner as runner
     import flash.server.app as app_mod
@@ -1251,12 +1240,11 @@ def test_a_second_owner_needing_the_same_profile_is_not_blocked_by_the_first(api
 def test_an_owner_retrying_its_own_pending_profile_is_not_billed_again(api, monkeypatch):
     """Re-running the same command while your own profile is in flight joins it, it does not relaunch.
 
-    This is the ordinary retry: the first submit answers 409 and tells the user to wait, so they
-    wait and run it again. Only the winning claim launches, so the retry starts nothing and is
-    charged nothing -- but it still owns the run, so ``owned`` alone cannot distinguish it from the
-    submit that did the launching. Without a separate launch signal the client has no choice but to
-    repeat the start-and-bill wording, naming one profile charge per retry against an account that
-    was charged exactly once.
+    Only the winning claim launches, so the retry starts nothing and is charged nothing -- but it
+    still owns the run, so ``owned`` alone cannot distinguish it from the submit that did the
+    launching. Without a separate launch signal the client has no choice but to repeat the
+    start-and-bill wording, naming one profile charge per retry against an account that was charged
+    exactly once.
     """
     import flash.runner as runner
     import flash.server.app as app_mod
@@ -2247,13 +2235,8 @@ def test_worker_artifacts_surfaces_the_ray_failure_logs(monkeypatch, tmp_path):
     """The ray collector's whole purpose is defeated if nothing fetches what it uploads.
 
     A raylet death shows up in the traceback only as its downstream symptom ("Failed to register
-    worker to Raylet: ... End of file"). The worker collects ray's own session logs to disambiguate
-    that, but they live in a PRIVATE repo -- so if the control plane does not fetch them with the
-    operator token, `flash runs log` still shows only the EOF traceback and the artifact is written
-    for nobody (codex[bot]).
-
-    Attempt-scoped like the traceback beside it: on a retry only the highest attempt reproduced the
-    failure, and a stale one would misdirect the diagnosis it exists to give.
+    worker to Raylet: ... Attempt-scoped like the traceback beside it: on a retry only the highest
+    attempt reproduced the failure, and a stale one would misdirect the diagnosis it exists to give.
     """
     import types
 
@@ -2307,9 +2290,7 @@ def test_worker_artifacts_does_not_pair_a_prior_attempts_ray_logs_with_this_trac
 
     They are uploaded only when ray actually failed, so on a retried run the newest raylogs and the
     newest traceback can belong to different attempts: attempt 0 dies to a raylet, attempt 1 fails
-    for an unrelated reason and uploads none. Resolving the two independently then shows attempt 0's
-    raylet death next to attempt 1's ValueError, and the reader diagnoses a raylet that died an
-    attempt ago -- worse than showing nothing, because it looks like corroboration.
+    for an unrelated reason and uploads none.
     """
     import types
 
@@ -3135,8 +3116,7 @@ def test_public_spec_does_not_publish_a_storage_ref_whose_phase_was_removed():
     A persisted worker/effective spec keeps whatever phase was current when it was written. `opsd`
     was removed from the internal-ref grammar (#784), so its locators stopped parsing as internal
     and the redactor left them alone as though they were user-facing refs -- publishing the private
-    repo verbatim (chatgpt-codex-connector). The phase set is not frozen, so this is the shape of
-    every future removal too.
+    repo verbatim.
     """
     import flash.runner as runner
 
@@ -6737,9 +6717,10 @@ def test_chat_rejects_undeployed_record_with_previous_ready_deployment(api, monk
 
 
 def test_chat_rejects_non_finite_sampling_params_with_400(api, monkeypatch):
-    """JSON `1e400`/`Infinity` parses to float('inf'); `int(inf)` raises OverflowError (an
-    ArithmeticError, NOT TypeError/ValueError) which used to escape the guard -> 500. A non-finite
-    max_tokens or temperature must be a clean 400, per the route's own bad-values-are-400 contract."""
+    """Non-finite sampling values must return 400, including OverflowError from ``int(inf)``.
+
+    OverflowError is ArithmeticError, not TypeError or ValueError, so the guard must include it.
+    """
     import flash.runner as runner
     import flash.server.app as app_mod
 
@@ -7098,9 +7079,9 @@ def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
 
     monkeypatch.setattr(runner, "_run_job", fake_run_job)
 
-    # Codex MtzrJ: a handle-less run may have left a phantom instance from a non-idempotent create
-    # (Vast PUT /asks) that surfaces via eventual consistency. Recovery must force-reap the run's label
-    # across instance providers RIGHT BEFORE resubmitting, so a phantom isn't left writing the same
+    # a handle-less run may have left a phantom instance from a non-idempotent create (Vast PUT
+    # /asks) that surfaces via eventual consistency. Recovery must force-reap the run's label across
+    # instance providers RIGHT BEFORE resubmitting, so a phantom isn't left writing the same
     # seed-scoped artifacts as the fresh worker. Capture the gc-by-run.
     reaped = []
 
@@ -7228,11 +7209,8 @@ def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):
 
 
 def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeypatch, tmp_path):
-    # Codex: a handle-less run's force-reap before resubmit is best-effort — Vast's gc
-    # (destroy_run_instances) returns an empty list rather than raising when a DELETE is unconfirmed
-    # (success:false / network). If an instance for this run is STILL present after gc, recovery must
-    # NOT launch a second worker over it (double-write the same seed-scoped HF artifacts); it defers the
-    # run for a later recovery/sweep. run_instances_remaining([...]) reports the survivor.
+    # an unconfirmed Vast delete may leave a live phantom. recovery must defer while
+    # ``run_instances_remaining`` reports it, or a second worker can write the same HF artifacts.
     import flash.runner as runner
     import flash.server.db as db_mod
 
@@ -7292,13 +7270,8 @@ def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeyp
 
 
 def test_recover_runs_defers_when_recorded_provider_unconfigurable(monkeypatch, tmp_path):
-    # Codex: a handle-less run's lost create could have left a Vast phantom on a provider whose creds
-    # were dropped before the restart (VAST_API_KEY removed). configured_providers() then omits Vast, so
-    # iterating only the configured set would silently return "clear" and resubmit a SECOND worker while
-    # the phantom keeps billing + writing the same HF prefix. The guard must FAIL CLOSED for an instance
-    # provider RECORDED as available at submit (submitted_instance_providers) that it can no longer
-    # enumerate. Scoping to the recorded set is what keeps a never-Vast plane recoverable (it never
-    # records Vast); here the run recorded Vast, so its recovery defers.
+    # dropped Vast credentials can hide a live phantom from ``configured_providers``. fail closed for
+    # providers recorded at submit, or recovery can launch a second billed worker on the same HF prefix.
     import flash.runner as runner
     import flash.server.db as db_mod
 
@@ -7352,12 +7325,8 @@ def test_recover_runs_defers_when_recorded_provider_unconfigurable(monkeypatch, 
 
 
 def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypatch, tmp_path):
-    # Codex: a run still `queued` never reached lifecycle's `provisioning` transition, so no provider
-    # create (Vast's non-idempotent PUT /asks) was ever attempted and no phantom can exist. The phantom
-    # guard (_confirm_run_clear) must be SKIPPED for it — otherwise a purely-queued run whose VAST_API_KEY
-    # was dropped after submit fails closed on the unenumerable recorded Vast and defers forever. This is
-    # identical to test_recover_runs_defers_when_recorded_provider_unconfigurable EXCEPT the state is
-    # `queued` (never created) instead of `provisioning` (could have created) -> resubmit, not defer.
+    # queued runs never attempted Vast's non-idempotent create, so skip the phantom guard. otherwise
+    # removed credentials can defer a run forever even though no provider resource can exist.
     import threading
 
     import flash.runner as runner
@@ -7536,10 +7505,8 @@ def test_recover_runs_ignores_newly_configured_unrecorded_provider(monkeypatch, 
 
 
 def test_recover_runs_deferred_resubmit_retries_until_clear(monkeypatch, tmp_path):
-    # Codex: a deferred handle-less resubmit must not be stranded until the next control-plane restart —
-    # a bounded background retry re-confirms the reap and resubmits once it becomes safe (the phantom is
-    # gone / the listing recovers). Here run_instances_remaining reports the box present on the first
-    # check, then clear -> the background loop resubmits on the retry.
+    # bounded background retries must recheck deferred handle-less runs, so a cleared phantom can
+    # resubmit without waiting for the next control-plane restart.
     import threading
 
     import flash.runner as runner
@@ -7840,12 +7807,9 @@ def test_recover_runs_rejects_warmstart_artifact_drift(monkeypatch, tmp_path):
 
 
 def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
-    # Fault isolation: if the FIRST recoverable run's persisted spec is malformed (e.g. a
-    # unsupported `environment.path`, which makes JobSpec.from_dict raise), recovery of that one
-    # run must be skipped — it must NOT abort recover_runs() and thereby skip recovery of
-    # every OTHER in-flight run and the orphan sweep that follows. Here run #1 has a bad spec
-    # and run #2 has a valid no-handle spec: assert run #2 is still resubmitted AND the orphan
-    # sweep still runs (the bad spec didn't take down the whole recovery pass).
+    # Here run #1 has a bad spec and run #2 has a valid no-handle spec: assert run #2 is still
+    # resubmitted AND the orphan sweep still runs (the bad spec didn't take down the whole
+    # recovery pass).
     import threading
 
     import flash.providers as providers_mod
@@ -7900,12 +7864,10 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
 
     # A malformed spec can't be parsed into a JobSpec, so the good-spec branch's
-    # `_gc_run_endpoints(spec)` is unavailable — yet the aborted attempt may still have
+    # `_gc_run_endpoints(spec)` is unavailable -- yet the aborted attempt may still have
     # registered its uniquely-named RunPod endpoint before crashing, which the no-op RunPod
     # `sweep_orphans` won't reap. recover_runs must instead derive the endpoint name from the
     # RAW persisted status (gpu.type + run_id, no spec parse) and `terminate_endpoint` it.
-    # The malformed path imports it via `from flash.providers.runpod.train import
-    # terminate_endpoint`, so patch the attribute on that module and record the call args.
     terminated = []
     monkeypatch.setattr(
         runpod_train,
@@ -7959,11 +7921,9 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     )
 
     # Resource-leak guard: even though the spec couldn't be parsed, the malformed run's RunPod
-    # endpoint must still be torn down — derived from the RAW persisted gpu.type + run_id, not
-    # from a JobSpec — so a crash that registered an endpoint before persisting a handle can't
-    # leak it (RunPod's `sweep_orphans` is a no-op and would never catch it). Best-effort GC
-    # must run for the malformed run AND not have aborted the failed-marking / sweep / resubmit
-    # above (all already asserted), proving it's properly suppressed and ordered.
+    # endpoint must still be torn down -- derived from the RAW persisted gpu.type + run_id,
+    # not from a JobSpec -- so a crash that registered an endpoint before persisting a handle
+    # can't leak it (RunPod's `sweep_orphans` is a no-op and would never catch it).
     assert ("RTX 5090", "bad-1") in terminated, (
         "a malformed-spec run's endpoint must be GC'd by reconstructed name (raw gpu.type + "
         "run_id), since its spec can't be parsed and the RunPod orphan sweep is a no-op"
@@ -9150,11 +9110,11 @@ def test_export_copies_final_adapter_to_user_repo(api, monkeypatch):
 
 def test_export_holds_deploy_lock_across_owned_run(api, monkeypatch):
     """The /export handler must take the per-run deploy lock FROM THE VERY TOP — before even the
-    payload-shape validation — and keep it across owned_run/the artifact read (mirroring /deploy,
-    which locks first). Taking the lock after body validation leaves a window for another deploy,
-    undeploy, or export operation to interleave with the request. Assert the lock is already held during
-    the payload validation (``_validate_hf_repo_id``, which runs first) AND by the time owned_run
-    runs."""
+
+    Taking the lock after body validation leaves a window for another deploy, undeploy, or export
+    operation to interleave with the request. Assert the lock is already held during the payload
+    validation (``_validate_hf_repo_id``, which runs first) AND by the time owned_run runs.
+    """
     import flash.server.app as app_mod
     from flash.server.routes import serving as serving_routes
 
