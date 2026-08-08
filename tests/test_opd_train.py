@@ -6239,21 +6239,15 @@ def test_vectorized_groupwise_reverse_kl_is_exactly_equivalent(dtype_name):
         batch_size = 1 + case_index % 8
         sequence_length = 1 + (case_index * 37) % 128
         group_count = 1 + case_index % 24
-        student = torch.randn(
-            (batch_size, sequence_length), generator=generator, dtype=dtype
-        )
-        teacher = torch.randn(
-            (batch_size, sequence_length), generator=generator, dtype=dtype
-        )
+        student = torch.randn((batch_size, sequence_length), generator=generator, dtype=dtype)
+        teacher = torch.randn((batch_size, sequence_length), generator=generator, dtype=dtype)
         group_ids = torch.randint(
             -2,
             group_count,
             (batch_size, sequence_length),
             generator=generator,
         )
-        response_mask = torch.rand(
-            (batch_size, sequence_length), generator=generator
-        ).ge(0.2)
+        response_mask = torch.rand((batch_size, sequence_length), generator=generator).ge(0.2)
 
         if case_index % 16 == 0:
             group_ids.fill_(-1)

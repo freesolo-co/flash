@@ -4049,8 +4049,6 @@ def test_every_trainer_asks_for_the_backend_rather_than_hardcoding_one():
 
     for module in (sft_train, rl_train, opd_train):
         source = pathlib.Path(module.__file__).read_text()
-        code = "\n".join(
-            line for line in source.splitlines() if not line.lstrip().startswith("#")
-        )
+        code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
         assert "impl_backend=torch" not in code, module.__name__
         assert "fused_ce_backend()" in code, module.__name__

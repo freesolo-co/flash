@@ -1550,16 +1550,14 @@ class _SlowGroupedEnv(_FakeSingleTurnEnv):
 def _grouped_items():
     # four DISTINCT prompts, two rollouts each: four groups, interleaved so a correct scatter
     # cannot be produced by accident from group-ordered output.
-    items = []
-    for rollout in range(2):
-        for prompt in range(4):
-            items.append(
-                (
-                    {"id": f"ex-{prompt}", "input": f"q{prompt}", "output": "4"},
-                    {"response_text": "x" * (prompt * 10 + rollout + 1)},
-                )
-            )
-    return items
+    return [
+        (
+            {"id": f"ex-{prompt}", "input": f"q{prompt}", "output": "4"},
+            {"response_text": "x" * (prompt * 10 + rollout + 1)},
+        )
+        for rollout in range(2)
+        for prompt in range(4)
+    ]
 
 
 def test_reward_task_groups_are_scored_concurrently(monkeypatch):
@@ -1611,16 +1609,14 @@ class _SlowGroupedMultiTurnEnv(_FakeMultiTurnEnv):
 
 
 def _multiturn_grouped_items():
-    items = []
-    for rollout in range(2):
-        for prompt in range(4):
-            items.append(
-                (
-                    {"id": f"ex-{prompt}", "input": f"q{prompt}", "output": "4"},
-                    {"response_text": f"r{rollout}", "episode": {"turns": []}},
-                )
-            )
-    return items
+    return [
+        (
+            {"id": f"ex-{prompt}", "input": f"q{prompt}", "output": "4"},
+            {"response_text": f"r{rollout}", "episode": {"turns": []}},
+        )
+        for rollout in range(2)
+        for prompt in range(4)
+    ]
 
 
 def test_reward_group_concurrency_is_skipped_for_a_non_thread_safe_env(monkeypatch):
@@ -1676,7 +1672,9 @@ def test_a_single_task_group_still_scores_inline(monkeypatch):
 
     env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
     example = {"id": "ex-1", "input": "2+2?", "output": "4"}
-    rewards = env.reward_many([(example, {"response_text": "ab"}), (example, {"response_text": "c"})])
+    rewards = env.reward_many(
+        [(example, {"response_text": "ab"}), (example, {"response_text": "c"})]
+    )
 
     assert sdk_env.calls == 1
     assert sdk_env.peak == 1

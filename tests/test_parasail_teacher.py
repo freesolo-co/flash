@@ -263,7 +263,10 @@ def test_score_many_caps_in_flight_requests_at_the_measured_ceiling():
         return TeacherScore(tokens=[], input_tokens=3, output_tokens=1)
 
     client._score_one = score_one
-    items = [(f"prompt-{index}", f"completion-{index}") for index in range(2 * OPD_TEACHER_SCORING_CONCURRENCY)]
+    items = [
+        (f"prompt-{index}", f"completion-{index}")
+        for index in range(2 * OPD_TEACHER_SCORING_CONCURRENCY)
+    ]
 
     results = client.score_many(items)
 

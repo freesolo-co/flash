@@ -122,9 +122,7 @@ def _flash_groupwise_reverse_kl_values(
     sorted_student = student_logprobs.gather(1, order)
     sorted_teacher = teacher_logsums.gather(1, order)
     sorted_rows = (
-        torch.arange(group_ids.shape[0], device=group_ids.device)
-        .unsqueeze(1)
-        .expand_as(group_ids)
+        torch.arange(group_ids.shape[0], device=group_ids.device).unsqueeze(1).expand_as(group_ids)
     )
 
     flat_rows = sorted_rows.masked_select(sorted_selected)
@@ -163,9 +161,9 @@ def _flash_groupwise_reverse_kl_values(
     )
     ratios = response_counts.to(ratio_dtype) / selected_counts.to(ratio_dtype)
     selected_rows = sorted_rows.masked_select(sorted_selected)
-    sorted_values = (
-        sorted_values.to(ratio_dtype) * ratios.index_select(0, selected_rows)
-    ).to(student_logprobs.dtype)
+    sorted_values = (sorted_values.to(ratio_dtype) * ratios.index_select(0, selected_rows)).to(
+        student_logprobs.dtype
+    )
     sorted_output = torch.zeros_like(student_logprobs).masked_scatter(
         sorted_selected, sorted_values
     )
