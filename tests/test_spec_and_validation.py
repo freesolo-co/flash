@@ -270,21 +270,25 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
     }
     baseline = {"epochs", "hf_repo", "max_examples"}
 
-    # the historical snapshots are immutable and still carry opd_eos_loss_coef, hf_repo, and
-    # lora_alpha because those commits did (hf_repo was a user key then and lora_alpha a user knob;
-    # both are now platform-managed and dropped from the user schema - hf_repo assigned server-side,
-    # lora_alpha derived as 2 x lora_rank). current adds save_at_steps, credit_assignment, and the
-    # entropy-control knobs, and removes the legacy opd eos key.
+    # the historical snapshots are immutable and still carry opd_eos_loss_coef, hf_repo,
+    # lora_alpha, and advantage_clip because those commits did (hf_repo was a user key then and
+    # lora_alpha a user knob; both are now platform-managed and dropped from the user schema -
+    # hf_repo assigned server-side, lora_alpha derived as 2 x lora_rank. advantage_clip was parsed
+    # and shipped but never applied, so it was deleted rather than left as a silent no-op).
+    # current adds save_at_steps, credit_assignment, and the entropy-control knobs, and removes the
+    # legacy opd eos key.
     assert historical_shapes["861571e7"] - {
         "opd_eos_loss_coef",
         "hf_repo",
         "lora_alpha",
+        "advantage_clip",
     } == TRAIN_SCHEMA_KEYS - {
         "credit_assignment",
         "save_at_steps",
         "entropy_quantile",
     }
     assert "opd_eos_loss_coef" not in TRAIN_SCHEMA_KEYS
+    assert "advantage_clip" not in TRAIN_SCHEMA_KEYS
     assert all(baseline <= shape for shape in historical_shapes.values())
     for key in ("structured_outputs", "teacher_model"):
         rejected_by = {commit for commit, shape in historical_shapes.items() if key not in shape}
@@ -509,6 +513,104 @@ def test_env_ref_validator_matches_adapter_acceptor() -> None:
         assert schema_accepts(value) is is_freesolo_environment_id(value), value
 
 
+# the flat [train] table is shared by all three algorithms, so a knob a run's algorithm cannot
+# consume used to parse clean and do nothing. (algorithm, knob, value) pairs that must be rejected.
+_INAPPLICABLE_CASES = [
+    ("sft", "group_size", 8),
+    ("sft", "temperature", 0.7),
+    ("sft", "max_completion_tokens", 512),
+    ("sft", "kl_penalty_coef", 0.5),
+    ("sft", "entropy_quantile", 0.5),
+    ("sft", "thinking_length_penalty_coef", 0.1),
+    ("sft", "teacher_model", "glm-5.2"),
+    ("sft", "credit_assignment", "per_turn"),
+    ("sft", "stop_sequences", ["END"]),
+    ("sft", "structured_outputs", '{"type": "object"}'),
+    ("opd", "entropy_quantile", 0.5),
+    ("opd", "thinking_length_penalty_coef", 0.1),
+    ("opd", "credit_assignment", "per_turn"),
+    ("grpo", "teacher_model", "glm-5.2"),
+]
+
+# the same knobs on an algorithm whose worker DOES read them. without this direction a validator
+# that rejected everything everywhere would pass the rejection tests above.
+_APPLICABLE_CASES = [
+    ("grpo", "group_size", 8),
+    ("opd", "group_size", 2),
+    ("grpo", "temperature", 0.7),
+    ("opd", "temperature", 0.7),
+    ("grpo", "max_completion_tokens", 512),
+    ("opd", "max_completion_tokens", 512),
+    ("grpo", "kl_penalty_coef", 0.5),
+    ("opd", "kl_penalty_coef", 0.5),
+    ("grpo", "stop_sequences", ["END"]),
+    ("opd", "stop_sequences", ["END"]),
+    ("grpo", "structured_outputs", '{"type": "object"}'),
+    ("opd", "structured_outputs", '{"type": "object"}'),
+    ("grpo", "entropy_quantile", 0.5),
+    ("grpo", "thinking_length_penalty_coef", 0.1),
+    ("grpo", "credit_assignment", "per_turn"),
+    ("opd", "teacher_model", "glm-5.2"),
+]
+
+
+@pytest.mark.parametrize(("algorithm", "knob", "value"), _INAPPLICABLE_CASES)
+def test_train_knob_rejected_by_algorithms_that_cannot_consume_it(algorithm, knob, value) -> None:
+    raw = _raw(algorithm=algorithm)
+    raw["train"][knob] = value
+    with pytest.raises(ConfigError, match=rf"train\.{knob}"):
+        spec_from_dict(raw)
+
+
+@pytest.mark.parametrize(("algorithm", "knob", "value"), _APPLICABLE_CASES)
+def test_train_knob_accepted_by_algorithms_that_consume_it(algorithm, knob, value) -> None:
+    raw = _raw(algorithm=algorithm)
+    raw["train"][knob] = value
+    assert spec_from_dict(raw).algorithm == algorithm
+
+
+@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+def test_full_public_dict_round_trips_despite_knob_scoping(algorithm) -> None:
+    """to_dict() serializes EVERY TrainSpec field, including ones the user never authored.
+
+    The client -> server submit round trip re-parses exactly that dict, so scoping keyed on key
+    PRESENCE would reject a config whose owner set none of the scoped knobs. Keying on a
+    meaningful value is what keeps this path working.
+    """
+    spec = spec_from_dict(_raw(algorithm=algorithm))
+
+    restored = spec_from_dict(spec.to_dict())
+
+    assert restored.algorithm == algorithm
+    assert restored.train.epochs == spec.train.epochs
+
+
+def test_advantage_clip_is_no_longer_a_config_key() -> None:
+    # parsed, range-validated, and shipped to the worker, which then explicitly did not apply it.
+    raw = _raw(algorithm="grpo")
+    raw["train"]["advantage_clip"] = 1.5
+    with pytest.raises(ConfigError, match=r"unknown key\(s\): advantage_clip"):
+        spec_from_dict(raw)
+
+
+def test_environment_pip_is_platform_managed() -> None:
+    raw = _raw()
+    raw["environment"]["pip"] = ["freesolo==1.2.3"]
+    with pytest.raises(ConfigError, match=r"\[environment\] unknown key\(s\): pip"):
+        spec_from_dict(raw)
+
+
+def test_submit_payload_round_trips_without_a_pip_key() -> None:
+    """spec_payload is what the CLI actually sends, and the server re-parses it with this parser."""
+    from flash.client.specs import spec_payload
+
+    spec = spec_from_dict(_raw())
+    payload = spec_payload(spec, authored_train_keys=frozenset({"epochs"}))
+
+    assert "pip" not in payload["environment"]
+    assert spec_from_dict(payload).environment.id == spec.environment.id
+
+
 def test_environment_must_be_a_table() -> None:
     raw = _raw()
     raw["environment"] = "gsm8k"
@@ -549,10 +651,9 @@ def test_gpu_retry_and_wall_are_managed_defaults_not_user_authored() -> None:
 
 
 def test_environment_subfields_reject_wrong_types() -> None:
-    # The [environment] sub-fields are consumed by EnvironmentSpec(...) via dict(... or {}) /
-    # tuple(... or ()): a present-but-wrong-typed value would otherwise crash opaquely
-    # (dict("x") / dict(1)) or silently misbehave (pip = "x" char-split into ('x',)). Each
-    # must fail fast with a clear ConfigError instead.
+    # The [environment] sub-fields are consumed by EnvironmentSpec(...) via dict(... or {}):
+    # a present-but-wrong-typed value would otherwise crash opaquely (dict("x") / dict(1)).
+    # Each must fail fast with a clear ConfigError instead.
     # A falsy non-table (params = false) is rejected too, mirroring the section-level rule that
     # `environment = false` must fail rather than silently coerce to {} and bypass intent.
     for bad in ("notatable", 123, False):
@@ -563,21 +664,6 @@ def test_environment_subfields_reject_wrong_types() -> None:
         }
         with pytest.raises(ConfigError, match=r"\[environment\] params must be a table"):
             spec_from_dict(raw)
-    for bad in ("notalist", 123, False):
-        raw = _raw()
-        raw["environment"] = {
-            "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
-            "pip": bad,
-        }
-        with pytest.raises(ConfigError, match=r"\[environment\] pip must be a list of strings"):
-            spec_from_dict(raw)
-    raw = _raw()
-    raw["environment"] = {
-        "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
-        "pip": ["ok", 123],
-    }
-    with pytest.raises(ConfigError, match=r"\[environment\] pip entries must be strings"):
-        spec_from_dict(raw)
     for bad in ("notalist", 123, False):
         raw = _raw()
         raw["environment"] = {
@@ -640,19 +726,18 @@ def test_environment_subfields_accept_valid_and_missing() -> None:
     raw["environment"] = {
         "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
         "params": {"k": "v"},
-        "pip": ["pkg==1.0"],
         "secrets": ["SERPAPI_API_KEY", "OPENAI_API_KEY", "SERPAPI_API_KEY"],
     }
     spec = spec_from_dict(raw)
     assert spec.environment.params == {"k": "v"}
-    assert spec.environment.pip == ("pkg==1.0",)
+    # pip is platform-managed: never authored, so it stays at its default here.
+    assert spec.environment.pip == ()
     assert spec.environment.secrets == ("SERPAPI_API_KEY", "OPENAI_API_KEY")
     # An explicit None (e.g. JSON `null`) is treated as missing -> default, NOT rejected.
     raw = _raw()
     raw["environment"] = {
         "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
         "params": None,
-        "pip": None,
         "secrets": None,
     }
     spec = spec_from_dict(raw)

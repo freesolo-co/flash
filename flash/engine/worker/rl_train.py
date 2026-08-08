@@ -2197,14 +2197,6 @@ def _resolve_grpo_inputs():
     think_penalty = float(gcfg.get("thinking_length_penalty_coef") or 0.0)
     # flash defaults kl_penalty_coef to 0 (dr-grpo, no kl term); honor it rather than forcing a kl.
     kl_coef = float(gcfg.get("kl_penalty_coef") or 0.0)
-    # advantage_clip is recorded but not applied (the retired trl path centered advantages without a value
-    # clip; verl's grpo advantage is likewise group-centered). log it for parity, do not apply.
-    if float(gcfg.get("advantage_clip") or 0.0) > 0:
-        print(
-            f"[rl-verl] advantage_clip={gcfg['advantage_clip']} recorded; verl centers grpo "
-            "advantages (no value clip), matching the retired trl path",
-            flush=True,
-        )
     mask_truncated_completions = _w.grpo_mask_truncated_completions(_t)
     learning_rate = float(
         _t.learning_rate if _t and _t.learning_rate is not None else rl.learning_rate

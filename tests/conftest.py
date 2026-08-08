@@ -40,6 +40,13 @@ def _offline(monkeypatch):
 
     monkeypatch.setattr(vram, "fetch_hf_params_b", lambda model_id: None, raising=False)
 
+    # The cost estimator memoizes open-model sizes for the life of the process (see
+    # cost.facts._SIZE_MEMO). Clear it per test so one test's stubbed size cannot answer another
+    # test's lookup, which would make a size-dependent assertion pass for the wrong reason.
+    import flash.cost.facts as cost_facts
+
+    cost_facts._SIZE_MEMO.clear()
+
     # RunPod endpoint listing -> offline: the idle-endpoint sweep (deploy-time quota reclaim
     # and the startup/post-run orphan sweep) lists account endpoints. Default to "no endpoints"
     # so a sweep never reaches the real API; sweep tests monkeypatch it after this fixture.
