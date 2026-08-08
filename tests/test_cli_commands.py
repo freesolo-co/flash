@@ -175,11 +175,15 @@ class _FakeClient:
 
 @pytest.fixture(autouse=True)
 def project_api(monkeypatch):
+    # A Freesolo-HOSTED api_url, because that is the deployment these tests describe. The value
+    # used to be an arbitrary placeholder, which was harmless only while nothing read it: commands
+    # backed solely by the hosted backend now branch on whether api_url is Freesolo's, so a
+    # placeholder domain silently put every one of them on the self-hosted path.
     monkeypatch.setattr(
-        "flash.client.config.load_credentials", lambda: ("https://flash.test", "fslo-test")
+        "flash.client.config.load_credentials", lambda: ("https://flash.freesolo.co", "fslo-test")
     )
     monkeypatch.setattr(
-        cli.commands, "load_credentials", lambda: ("https://flash.test", "fslo-test")
+        cli.commands, "load_credentials", lambda: ("https://flash.freesolo.co", "fslo-test")
     )
     monkeypatch.setattr(
         "flash.client.get_project", lambda project_id, api_key: {"id": project_id, "name": "Test"}
@@ -212,8 +216,10 @@ def test_whoami_prints_identity(fake_client, capsys) -> None:
 
 def test_project_create_prints_only_returned_id_in_plain_mode(monkeypatch, capsys) -> None:
     seen = {}
+    # a Freesolo-hosted api_url: `projects create` only calls the backend on the HOSTED path
+    # (a self-hosted plane mints the id locally, see the standalone tests below).
     monkeypatch.setattr(
-        cli.commands, "load_credentials", lambda: ("https://flash.test", "fslo-test")
+        cli.commands, "load_credentials", lambda: ("https://flash.freesolo.co", "fslo-test")
     )
 
     def create(name, description, api_key):
@@ -249,6 +255,90 @@ def test_projects_create_uses_plural_group(monkeypatch, capsys) -> None:
 
     assert _run(["projects", "create", "My project"]) == 0
     assert capsys.readouterr().out == "33333333-3333-4333-8333-333333333333\n"
+
+
+# --- self-hosted plane: commands backed only by the hosted backend -----------------------------
+# All three used to call api.freesolo.co with the operator's plane key, which has no relationship
+# with that service -> 401. Same failure `flash env setup` hit on the documented quickstart.
+
+_SELF_HOSTED = ("http://my-plane:8080", "operator-key")
+
+
+def _self_hosted(monkeypatch) -> None:
+    monkeypatch.setattr("flash.client.config.load_credentials", lambda: _SELF_HOSTED)
+    monkeypatch.setattr(cli.commands, "load_credentials", lambda: _SELF_HOSTED)
+
+
+def test_projects_create_mints_a_local_id_on_a_self_hosted_plane(monkeypatch, capsys) -> None:
+    """The plane accepts any well-shaped uuid under standalone(), so minting one locally IS the
+    create. Asserted by CONSUMING the output through the plane's own gate, not by shape alone."""
+    _self_hosted(monkeypatch)
+
+    def _unreachable(*a, **k):  # the hosted backend must not be called at all
+        raise AssertionError("create_project called on a self-hosted plane")
+
+    monkeypatch.setattr("flash.client.create_project", _unreachable)
+
+    assert _run(["projects", "create", "My project"]) == 0
+    minted = capsys.readouterr().out.strip()
+
+    from flash.server.projects import require_project_access
+
+    monkeypatch.setenv("FLASH_STANDALONE", "1")
+    assert (
+        require_project_access(project_id=minted, key={"auth_kind": "internal"}, authorization=None)
+        == minted
+    )
+
+
+def test_projects_create_mints_a_distinct_id_each_time(monkeypatch, capsys) -> None:
+    """A fixed id would collide across every project an operator creates, silently merging runs."""
+    _self_hosted(monkeypatch)
+    monkeypatch.setattr("flash.client.create_project", lambda *a, **k: pytest.fail("hosted call"))
+
+    assert _run(["projects", "create", "one"]) == 0
+    assert _run(["projects", "create", "two"]) == 0
+    first, second = capsys.readouterr().out.split()
+    assert first != second
+
+
+def test_projects_list_refuses_on_a_self_hosted_plane(monkeypatch, capsys) -> None:
+    _self_hosted(monkeypatch)
+    monkeypatch.setattr("flash.client.list_projects", lambda *a, **k: pytest.fail("hosted call"))
+
+    assert _run(["projects", "list"]) == 1
+    err = capsys.readouterr().err.lower()
+    assert "not available on a self-hosted plane" in err
+    # names the way forward, so the refusal is actionable rather than a dead end
+    assert "projects create" in err
+
+
+def test_traces_export_refuses_on_a_self_hosted_plane(monkeypatch, capsys) -> None:
+    """Unlike `projects create` there is nothing local to substitute: traces are written by the
+    freesolo SDK into the hosted backend, so a self-hosted plane has no trace store to read."""
+    _self_hosted(monkeypatch)
+    monkeypatch.setattr(
+        "flash.client.export_trace_records", lambda *a, **k: pytest.fail("hosted call")
+    )
+    monkeypatch.setattr(
+        "flash.client.list_trace_projects", lambda *a, **k: pytest.fail("hosted call")
+    )
+
+    assert _run(["traces", "export"]) == 1
+    err = capsys.readouterr().err.lower()
+    assert "not available on a self-hosted plane" in err
+    assert "freesolo sdk" in err
+
+
+def test_hosted_plane_still_reaches_the_backend(monkeypatch, capsys) -> None:
+    """The guard must key on the URL, not disable these commands everywhere."""
+    monkeypatch.setattr(
+        "flash.client.create_project",
+        lambda name, description, api_key: {"id": "44444444-4444-4444-8444-444444444444"},
+    )
+
+    assert _run(["projects", "create", "hosted"]) == 0
+    assert capsys.readouterr().out == "44444444-4444-4444-8444-444444444444\n"
 
 
 def test_train_cost_requires_explicit_project(tmp_path, capsys) -> None:

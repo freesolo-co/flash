@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from flash._channel import CLI_NAME
 from flash.client import ClientError, export_trace_records, list_trace_projects
 from flash.client.config import load_credentials
 
@@ -145,6 +146,24 @@ def _empty_export_error(project_id: str, export_format: str) -> ClientError:
 
 
 def cmd_traces_export(args) -> int:
+    from .commands import self_hosted_plane, unavailable_on_self_hosted_plane
+
+    api_url, _api_key = load_credentials()
+    if self_hosted_plane(api_url):
+        # unlike `projects create`, there is nothing local to substitute: traces are written by the
+        # freesolo SDK into the hosted backend, and flash itself never records one. so a
+        # self-hosted plane has no trace store to read, not merely no route to it.
+        raise unavailable_on_self_hosted_plane(
+            "exporting traces",
+            because=(
+                "traces are recorded by the freesolo SDK into the hosted backend, which a "
+                "self-hosted plane does not have"
+            ),
+            instead=(
+                'write the same {"input", "output"} JSONL rows yourself and train on them '
+                f"directly (`{CLI_NAME} env setup` scaffolds the format)"
+            ),
+        )
     api_key = _require_api_key()
     project_id = _resolve_project_id(args, api_key)
     export_format = getattr(args, "format", None) or RECORDS_FORMAT

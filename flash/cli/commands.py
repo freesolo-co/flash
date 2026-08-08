@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from flash import __version__
@@ -95,6 +96,32 @@ def cmd_version(args) -> int:
     else:
         print(f"{CLI_NAME} {__version__}")
     return 0
+
+
+def self_hosted_plane(api_url: str | None) -> bool:
+    """Whether ``api_url`` names a control plane the user runs rather than Freesolo's.
+
+    The client cannot read ``FLASH_STANDALONE`` -- it is server-side env, and these commands never
+    reach the plane at all, so there is no response to learn it from either. The control-plane URL
+    is the only standalone signal available before authenticating, which is the same basis
+    ``_verifies_against_freesolo`` and ``client.resolve_project_id`` already decide on.
+
+    A false negative is the safe direction: a self-hoster who points ``--api-url`` at Freesolo gets
+    today's hosted behaviour, not a broken command.
+    """
+    return bool(api_url) and not is_freesolo_hosted_url(api_url)
+
+
+def unavailable_on_self_hosted_plane(what: str, *, because: str, instead: str) -> ClientError:
+    """The refusal for a command backed only by the hosted Freesolo backend.
+
+    These commands are pure client->api.freesolo.co calls that never touch the plane. Left alone
+    they send the operator's plane credential to a service they have no relationship with, which
+    answers 401 -- the same failure `flash env setup` hit on the documented quickstart. Naming the
+    reason and the way forward is what separates "not built for your deployment" from "your key is
+    wrong", which is what a bare 401 says.
+    """
+    return ClientError(f"{what} is not available on a self-hosted plane: {because}. {instead}.")
 
 
 def _verifies_against_freesolo(api_url: str, freesolo_url: str | None) -> bool:
@@ -219,7 +246,16 @@ def cmd_whoami(args) -> int:
 def cmd_projects_create(args) -> int:
     from flash.client import create_project
 
-    _api_url, api_key = load_credentials()
+    api_url, api_key = load_credentials()
+    if self_hosted_plane(api_url):
+        # no directory to create a row in, and none needed: the plane accepts any well-shaped
+        # uuid (server/projects.py under standalone()), so minting one locally IS the create.
+        project_id = str(uuid.uuid4())
+        if render.styled():
+            print(render.project_created(project_id, str(args.name).strip()))
+        else:
+            print(project_id)
+        return 0
     if not api_key:
         raise ClientError("not logged in. Run `flash login` before creating a project")
     result = create_project(args.name, getattr(args, "description", None), api_key)
@@ -234,7 +270,16 @@ def cmd_projects_create(args) -> int:
 def cmd_projects_list(args) -> int:
     from flash.client import list_projects
 
-    _api_url, api_key = load_credentials()
+    api_url, api_key = load_credentials()
+    if self_hosted_plane(api_url):
+        raise unavailable_on_self_hosted_plane(
+            "listing projects",
+            because="a self-hosted plane keeps no project directory to enumerate",
+            instead=(
+                f"`{CLI_NAME} projects create <name>` mints a project id you record yourself; "
+                "any id you already use in a config keeps working"
+            ),
+        )
     if not api_key:
         raise ClientError("not logged in. Run `flash login` before listing projects")
     projects = list_projects(api_key)
