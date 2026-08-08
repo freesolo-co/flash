@@ -130,22 +130,6 @@ def test_standalone_disables_the_artifact_gc_sweep(monkeypatch) -> None:
     assert repo_cleanup_enabled() is False
 
 
-def test_standalone_does_not_reach_for_the_shared_slot_store(monkeypatch) -> None:
-    """The shared RunPod slot store is a backend table, so standalone must not try to lease from it.
-
-    That is all this pins. It does NOT mean concurrency is capped instead: the in-process semaphore
-    behind the store is claimed from `get_train_endpoint`, which the live deploy path replaced, so
-    neither enforces the ceiling (see the note at RUNPOD_ENDPOINT_SLOT_CAP)."""
-    from flash.providers.runpod import slots
-
-    monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key")
-    monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
-    assert slots.internal_key() == "operator-key"
-
-    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
-    assert slots.internal_key() is None
-
-
 def test_standalone_refuses_to_default_the_serving_url(monkeypatch) -> None:
     """Every serving request carries FREESOLO_INTERNAL_KEY, which on a self-hosted plane is the
     credential controlling that plane. Falling back to the hosted default would ship it to a
@@ -663,9 +647,12 @@ def test_a_blank_github_token_is_not_shipped_to_the_worker(monkeypatch) -> None:
 
 
 def test_self_hosting_docs_do_not_promise_an_endpoint_concurrency_cap() -> None:
-    """The slot store and its in-process fallback are both claimed from `get_train_endpoint`, which
-    the live `jobs.py::_deploy_once` path replaced. Telling a self-hoster the semaphore is "the
-    correct cap" invites them to run bursts that RunPod, not Flash, ends up rejecting."""
+    """Flash caps nothing here, so the docs must not imply it does.
+
+    The slot store that was meant to hold the account to 58 endpoints never enforced anything and
+    has been removed; RunPod's own account limit is the only ceiling. Promising a cap invites a
+    self-hoster to run bursts that RunPod, not Flash, ends up rejecting.
+    """
     import pathlib
 
     doc = (pathlib.Path(__file__).resolve().parent.parent / "SELF_HOSTING.md").read_text()
