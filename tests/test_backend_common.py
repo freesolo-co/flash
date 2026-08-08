@@ -1158,6 +1158,48 @@ def test_the_venv_stamp_covers_the_conv_kernel_so_an_older_venv_is_rebuilt():
     assert vc.CAUSAL_CONV1D_REQUIREMENT in vc.VERL_VENV_STAMP
 
 
+def test_the_fallback_pins_transformers_like_the_image_does(monkeypatch, tmp_path):
+    """The fallback venv must carry the same transformers ceiling as /opt/verl-venv.
+
+    is_flash_linear_attention_available() and is_causal_conv1d_available() are find_spec probes
+    whose import path moved in 5.13, so an unpinned resolve lands 5.14.x and both answer False for
+    packages that ARE installed. The child then reports no gdn boundary-reset capability and
+    grpo/opd fail closed -- after the gpu is already rented. verl and vllm both depend on
+    transformers with no upper bound, so the pin has to be in the override file too: a direct pin
+    alone loses to their transitive declarations.
+    """
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+
+    vc.resolve_verl_python(str(tmp_path))
+
+    install = calls[1]
+    override_file = install[install.index("--override") + 1]
+    assert vc.TRANSFORMERS_REQUIREMENT in pathlib.Path(override_file).read_text()
+    assert vc.TRANSFORMERS_REQUIREMENT in install
+
+
+def test_transformers_pin_stays_in_lockstep_with_the_worker_image():
+    # same argument as VERL_SPEC lockstep: the image bakes its own pin, this path resolves its own.
+    # if they drift, the interpreter that TRAINS differs between the image and the no-image path,
+    # and the gdn capability probe silently answers differently on each.
+    dockerfile = pathlib.Path(__file__).resolve().parents[1] / "Dockerfile.worker"
+    text = dockerfile.read_text()
+    quoted = f'"{vc.TRANSFORMERS_REQUIREMENT}"'
+    assert quoted in text, (
+        "Dockerfile.worker's transformers pin drifted from backend_common.TRANSFORMERS_REQUIREMENT"
+    )
+    # and specifically in the verl venv's override file, not only the main interpreter's install.
+    assert f'"{vc.TRANSFORMERS_REQUIREMENT}" > /tmp/verl-overrides.txt' in text
+
+
+def test_the_venv_stamp_covers_the_transformers_pin_so_a_prepin_venv_is_rebuilt():
+    # a venv provisioned before this pin holds the 5.14.x that makes both probes answer False. if
+    # the stamp ignored the range, a retry on the same pod would reuse that venv forever.
+    assert vc.TRANSFORMERS_REQUIREMENT in vc.VERL_VENV_STAMP
+
+
 def test_the_venv_stamp_covers_fla_so_a_prefla_venv_is_rebuilt(monkeypatch, tmp_path):
     # a workdir provisioned by a release that predates the fla install holds no fla. if the stamp
     # ignored fla, a retry would reuse that venv, skip provisioning, and train gdn models on the
