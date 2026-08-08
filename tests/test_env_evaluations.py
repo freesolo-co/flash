@@ -1088,6 +1088,45 @@ def test_env_eval_upload_rejects_an_inaccessible_project_before_paying(
     assert "is not accessible" in captured
 
 
+def test_env_eval_preflight_never_shows_the_plane_key_to_the_hosted_api(monkeypatch) -> None:
+    """A self-hosted preflight shape-checks locally instead of asking api.freesolo.co.
+
+    The stored key on such a plane IS FREESOLO_INTERNAL_KEY, which controls the plane, so an
+    ownership lookup against the hosted backend would leak it (SELF_HOSTING.md) -- and be rejected,
+    breaking `flash env eval` for every self-hosted operator.
+    """
+    from flash.cli.env_eval import _require_accessible_project
+
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("http://127.0.0.1:8080", "operator-key")
+    )
+
+    def _leaked(*_args, **_kwargs):
+        raise AssertionError("the self-hosted plane key must never reach the hosted freesolo api")
+
+    monkeypatch.setattr("flash.client.get_project", _leaked, raising=False)
+
+    assert _require_accessible_project(_PROJECT_ID) == _PROJECT_ID
+
+
+def test_env_eval_preflight_still_resolves_ownership_when_hosted(monkeypatch) -> None:
+    """The hosted path keeps its real accessibility check, so an inaccessible project still refuses."""
+    from flash.cli.env_eval import _require_accessible_project
+    from flash.client import ApiError, ClientError
+
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("https://flash.freesolo.co", "key-1")
+    )
+
+    def _denied(*_args, **_kwargs):
+        raise ApiError(403, "denied")
+
+    monkeypatch.setattr("flash.client.get_project", _denied, raising=False)
+
+    with pytest.raises(ClientError, match="is not accessible"):
+        _require_accessible_project(_PROJECT_ID)
+
+
 def test_env_eval_upload_requires_credentials_before_paying(monkeypatch, tmp_path, capsys) -> None:
     """Uploading without a key cannot be discovered after the suite has already been bought."""
     monkeypatch.setattr(
