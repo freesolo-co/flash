@@ -65,7 +65,7 @@ def freesolo_base_url(override: str | None = None) -> str:
     )
 
 
-def has_freesolo_backend(api_url: str | None) -> bool:
+def has_freesolo_backend(api_url: str) -> bool:
     """Whether the calls in this module have a Freesolo backend to reach.
 
     Lives beside ``freesolo_base_url`` because it answers a question about the same env var: a
@@ -96,8 +96,11 @@ def has_freesolo_backend(api_url: str | None) -> bool:
     interactive branch of ``cli.env_setup`` -- so they refuse a configured backend this would
     accept. Routing them through here is a behaviour change to paths this helper was not added
     for, so it is deliberately left as follow-up rather than folded in silently.
+
+    Takes a plain ``str`` because ``load_credentials`` falls back to ``DEFAULT_API_URL`` and so
+    never yields ``None``; accepting an optional here would invent a state no caller can reach.
     """
-    if api_url is None or is_freesolo_hosted_url(api_url):
+    if is_freesolo_hosted_url(api_url):
         return True
     # an operator-controlled backend is one that is NOT Freesolo's. pointing FREESOLO_BASE_URL at
     # the hosted service (or leaving it at that default) from a self-hosted plane would send the

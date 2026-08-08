@@ -16,6 +16,7 @@ import pytest
 
 import flash.cli as cli
 from flash.cli import traces as cli_traces
+from flash.client.config import DEFAULT_API_URL
 from flash.providers._poll import _format_heartbeat
 
 
@@ -266,17 +267,23 @@ _SELF_HOSTED = ("http://my-plane:8080", "operator-key")
 
 
 def _self_hosted(monkeypatch) -> None:
-    """Point every credential binding these commands read at a self-hosted plane.
+    """Put every input the guard reads on a self-hosted plane with no backend configured.
 
     Each consuming module is patched by name because they `from`-import `load_credentials`,
     binding it at import time -- patching `flash.client.config` alone leaves those bindings on
     the real function, and the command then reads the developer's ambient `~/.flash` config.
     That is environment-dependent, not a test: it passes on a machine already pointed at a local
     plane and fails on a clean checkout, where the default is Freesolo-hosted.
+
+    `FREESOLO_BASE_URL` is cleared for the same reason: the guard reads it as a second input, so
+    an operator shell exporting one silently moves every test below onto the configured-backend
+    path, where the hosted call is CORRECT and these assertions fail. The tests that want that
+    path set the var themselves after calling this.
     """
     monkeypatch.setattr("flash.client.config.load_credentials", lambda: _SELF_HOSTED)
     monkeypatch.setattr(cli.commands, "load_credentials", lambda: _SELF_HOSTED)
     monkeypatch.setattr(cli_traces, "load_credentials", lambda: _SELF_HOSTED)
+    monkeypatch.delenv("FREESOLO_BASE_URL", raising=False)
 
 
 def test_projects_create_mints_a_local_id_on_a_self_hosted_plane(monkeypatch, capsys) -> None:
@@ -354,8 +361,13 @@ def test_hosted_plane_still_refuses_when_logged_out(monkeypatch, capsys) -> None
     A hosted caller with no key must still get the login refusal rather than reaching the backend
     with `None` for a bearer token, so assert the relocation kept it on the hosted path.
     """
-    monkeypatch.setattr("flash.client.config.load_credentials", lambda: (None, None))
-    monkeypatch.setattr(cli.commands, "load_credentials", lambda: (None, None))
+    # the real logged-out shape: `load_credentials` falls back to DEFAULT_API_URL, so the url is a
+    # hosted string and only the key is missing. fabricating a None url would test an unreachable
+    # state and keep an impossible branch alive in the guard.
+    logged_out = (DEFAULT_API_URL, None)
+    monkeypatch.setattr("flash.client.config.load_credentials", lambda: logged_out)
+    monkeypatch.setattr(cli.commands, "load_credentials", lambda: logged_out)
+    monkeypatch.delenv("FREESOLO_BASE_URL", raising=False)
 
     def _unreachable(*a, **k):
         raise AssertionError("called the backend without a key")

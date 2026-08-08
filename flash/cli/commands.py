@@ -99,17 +99,7 @@ def cmd_version(args) -> int:
     return 0
 
 
-def self_hosted_plane(api_url: str | None) -> bool:
-    """Whether these commands have no Freesolo backend to reach.
-
-    The inverse of ``client.http.has_freesolo_backend``, which owns the question because it owns
-    the ``FREESOLO_BASE_URL`` these commands resolve through. Kept as a named helper because the
-    CLI reads better refusing on "self-hosted plane" than on "not has backend".
-    """
-    return not has_freesolo_backend(api_url)
-
-
-def unavailable_on_self_hosted_plane(what: str, *, because: str, instead: str) -> ClientError:
+def unavailable_without_a_freesolo_backend(what: str, *, because: str, instead: str) -> ClientError:
     """The refusal for a command backed only by the hosted Freesolo backend.
 
     These commands are pure client->api.freesolo.co calls that never touch the plane. Left alone
@@ -220,7 +210,7 @@ def cmd_projects_create(args) -> int:
     from flash.client import create_project
 
     api_url, api_key = load_credentials()
-    if self_hosted_plane(api_url):
+    if not has_freesolo_backend(api_url):
         # no directory to create a row in, and none needed: the plane accepts any well-shaped
         # uuid (server/projects.py under standalone()), so minting one locally IS the create.
         project_id = str(uuid.uuid4())
@@ -241,8 +231,8 @@ def cmd_projects_list(args) -> int:
     from flash.client import list_projects
 
     api_url, api_key = load_credentials()
-    if self_hosted_plane(api_url):
-        raise unavailable_on_self_hosted_plane(
+    if not has_freesolo_backend(api_url):
+        raise unavailable_without_a_freesolo_backend(
             "listing projects",
             because="a self-hosted plane keeps no project directory to enumerate",
             instead=(

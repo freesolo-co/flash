@@ -18,7 +18,7 @@ from flash.client import ApiError, ClientError
 
 # Trace export and the hosted project directory exist only on Freesolo's own deployment, so these
 # tests must present a Freesolo-hosted control-plane url. Any other hostname is how the CLI infers
-# a self-hosted plane (`commands.self_hosted_plane`), where these commands refuse by design.
+# a self-hosted plane (`client.http.has_freesolo_backend`), where these commands refuse by design.
 _HOSTED_URL = "https://flash.freesolo.co"
 
 _PROJECTS = [

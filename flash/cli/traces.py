@@ -13,6 +13,7 @@ from pathlib import Path
 from flash._channel import CLI_NAME
 from flash.client import ClientError, export_trace_records, list_trace_projects
 from flash.client.config import load_credentials
+from flash.client.http import has_freesolo_backend
 
 from . import render
 
@@ -143,16 +144,16 @@ def _empty_export_error(project_id: str, export_format: str) -> ClientError:
 
 
 def cmd_traces_export(args) -> int:
-    from .commands import self_hosted_plane, unavailable_on_self_hosted_plane
+    from .commands import unavailable_without_a_freesolo_backend
 
     # one snapshot for both: the url decides whether to refuse, and the key from that same read is
     # what gets sent, so a concurrent `flash login` cannot pair this url with a later credential.
     api_url, snapshot_key = load_credentials()
-    if self_hosted_plane(api_url):
+    if not has_freesolo_backend(api_url):
         # unlike `projects create`, there is nothing local to substitute: traces are written by the
         # freesolo SDK into the hosted backend, and flash itself never records one. so a
         # self-hosted plane has no trace store to read, not merely no route to it.
-        raise unavailable_on_self_hosted_plane(
+        raise unavailable_without_a_freesolo_backend(
             "exporting traces",
             because=(
                 "traces are recorded by the freesolo SDK into the hosted backend, which a "
