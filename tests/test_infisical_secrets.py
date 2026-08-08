@@ -61,12 +61,24 @@ INSTALLER_FILES = _installer_files()
 # allowing any word made `curl … | grep bash` match, where the shell name is an ARGUMENT being
 # searched for rather than the command being run.
 #
+# What may sit between the pipe and the command word is a CLOSED grammatical set: assignments
+# (`MODE=install bash`), redirections (`2>/dev/null bash`), and wrapper commands that exec what
+# follows. The first two are matched as categories rather than as spellings -- omitting
+# assignments left both `env MODE=install bash` and the wrapper-less `MODE=install bash` running
+# a downloaded script past a green guard. The wrapper NAMES stay an explicit list because that
+# set is open-ended, which is the one part of this pattern that can still be outgrown.
+#
 # `[^\n]*?` rather than `[^|]*` between the fetch and the pipe: a pipeline may pass through
 # intermediate stages first (`curl … | tee /tmp/i.sh | bash`), and stopping at the first `|`
 # made the guard blind to every such spelling. Lazy, so it still prefers the nearest match.
 PIPE_TO_SHELL = re.compile(
     r"(?:curl|wget)\b[^\n]*?\|\s*"  # a network fetch piped onward, possibly via other stages
-    r"(?:(?:sudo|env|xargs|nohup|exec|command|-\S+)\s+)*"  # exec wrappers and their flags
+    r"(?:(?:"
+    r"(?:sudo|env|xargs|nohup|exec|command)"  # exec wrappers: they run what follows
+    r"|-\S+"  # their flags
+    r"|[A-Za-z_]\w*=\S*"  # VAR=VALUE assignments preceding the command
+    r"|[0-9]*[<>]{1,2}\s*\S+"  # redirections preceding the command
+    r")\s+)*"
     r"(?:[\w./-]*/)?"  # optional path on the shell: /bin/, /usr/bin/
     r"(?:ba|z|k|da)?sh(?![\w.-])"  # sh, bash, zsh, ksh, dash -- as the COMMAND
 )
@@ -213,6 +225,17 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
         pytest.param(
             "RUN curl 'https://x.example/install.sh#v1' | bash\n", id="hash-in-a-quoted-url"
         ),
+        # Assignments and redirections may precede the command word. Both spellings run the
+        # downloaded stream; the second needs no wrapper command at all.
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | env MODE=install bash\n", id="env-assignment"
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | MODE=install sh\n", id="bare-assignment"
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | 2>/dev/null bash\n", id="redirection-first"
+        ),
     ],
 )
 def test_the_pipe_to_shell_guard_catches_what_it_claims_to(snippet: str, tmp_path: Path):
@@ -284,6 +307,9 @@ def test_the_guard_catches_a_yaml_line_that_both_folds_back_and_continues_on(tmp
         pytest.param("curl -s https://x.example/api | jq .version", id="into-jq"),
         pytest.param("curl -s https://x.example/list | grep bash", id="shell-name-as-argument"),
         pytest.param("curl -s https://x.example/l | grep bash-completion", id="name-is-a-prefix"),
+        # The assignment rule must not turn an assignment-shaped ARGUMENT into a match: here the
+        # shell name is still just text being searched for, not the command being run.
+        pytest.param("curl -s https://x.example/l | grep mode=install bash", id="assignment-arg"),
     ],
 )
 def test_the_pipe_to_shell_guard_does_not_flag_ordinary_pipelines(line: str, tmp_path: Path):
