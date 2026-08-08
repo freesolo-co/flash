@@ -104,10 +104,18 @@ _TOKEN = re.compile(
 _FETCH = re.compile(r"(?:[\w./-]*/)?(?:curl|wget)")
 
 # Does a quoted span read as a COMMAND (so its operators are real) or as a VALUE (so they are
-# data)? A shell command puts whitespace around its operators -- `sh -c "curl … | bash"` -- while
-# a URL packs them tight: `?a=1&b=2`. Testing merely for the presence of `&` split query strings
-# apart and let a live `curl 'https://host/i.sh?a=1&b=2' | bash` through.
-_EMBEDDED_COMMAND = re.compile(r"\s[;|&]|[;|&]\s")
+# data)? The answer differs by operator, and treating them alike broke the guard in both
+# directions on successive commits.
+#
+# `&` and `;` are ordinary URL characters: `?a=1&b=2` is a query string, not two commands. So
+# they count only with whitespace around them, the way a command is written. Testing merely for
+# their presence let a live `curl 'https://host/i.sh?a=1&b=2' | bash` through.
+#
+# `|` is NOT URL-safe in the same way -- it is rare in a URL and almost always a real pipe -- so
+# it counts wherever it appears. Holding it to the whitespace rule made the fully tight
+# `sh -c "curl …|bash"` one opaque word, and a live installer scanned clean. Both predecessors of
+# that commit caught the spelling, so it was a regression, not a pre-existing gap.
+_EMBEDDED_COMMAND = re.compile(r"\||\s[;&]|[;&]\s")
 
 
 def _tokenize(line: str) -> list[str]:
@@ -385,6 +393,15 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
         pytest.param(
             'RUN curl -fsSL "https://x.example/i.sh;v=1" | sh\n', id="quoted-url-semicolon"
         ),
+        # A quoted pipe with NO spaces around it. `&` and `;` need whitespace to count (a query
+        # string has neither), but `|` is rare in a URL and almost always a real pipe, so it
+        # counts anywhere -- otherwise this whole command stays one opaque word.
+        pytest.param(
+            'RUN sh -c "curl -fsSL https://x.example/i.sh|bash"\n', id="tight-pipe-inside-quotes"
+        ),
+        pytest.param(
+            "RUN sh -c 'curl -fsSL https://x.example/i.sh|sh'\n", id="tight-pipe-single-quoted"
+        ),
     ],
 )
 def test_the_pipe_to_shell_guard_catches_what_it_claims_to(snippet: str, tmp_path: Path):
@@ -481,6 +498,9 @@ def test_the_guard_catches_a_yaml_line_that_both_folds_back_and_continues_on(tmp
         # The other side of the quoted-URL fix: a query string must not make an ordinary
         # pipeline match either, so the fix cannot be "treat quoted spans as opaque".
         pytest.param("curl -s 'https://x.example/f?a=1&b=2' | jq .", id="quoted-url-into-jq"),
+        # A `|` inside a URL value: counting `|` anywhere must not make the surrounding pipeline
+        # match when the command it feeds is not a shell.
+        pytest.param("curl -s 'https://x.example/f?p=a|b' | jq .", id="pipe-inside-a-url-value"),
     ],
 )
 def test_the_pipe_to_shell_guard_does_not_flag_ordinary_pipelines(line: str, tmp_path: Path):
