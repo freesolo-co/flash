@@ -374,36 +374,9 @@ def _stage_runs_a_shell(tokens: list[str]) -> bool:
         if program is None:
             return True
         return any(_stage_runs_a_shell(cmd) for cmd in _commands_in(program))
-    if _starts_a_shell_by_flag(inner, at):
-        return True
     # Checked even when the walk found no command word: `env -S'bash -s'` fuses the operand into
     # the flag, so every token is a flag and the walk runs off the end with the shell still in it.
     return any(_stage_runs_a_shell(_tokenize(cmd)) for cmd in _split_string_operands(inner))
-
-
-def _starts_a_shell_by_flag(tokens: list[str], command_at: int | None) -> bool:
-    """Does a FLAG turn this stage into a shell, with no shell name anywhere in it?
-
-    `sudo -s` and `sudo -i` start a shell instead of running a command, so the pipe is executed
-    even though the only words present are `sudo` and a flag. The walk steps over both and finds
-    nothing, which reads as clean -- an under-match with no shell name to key on.
-
-    Confirmed rather than assumed:
-        printf 'echo PWNED\\n' | sudo -n -s   -> PWNED
-        printf 'echo PWNED\\n' | sudo -n -i   -> PWNED
-        printf 'echo PWNED\\n' | sudo -ns     -> PWNED   (clustered)
-
-    A command word after the flag takes over, so `sudo -s jq .` runs jq and stays clean -- which
-    is why this only fires when the walk found no command.
-    """
-    if command_at is not None or not tokens:
-        return False
-    if tokens[0].rsplit("/", 1)[-1] != "sudo":
-        return False
-    return any(
-        flag.startswith("-") and not flag.startswith("--") and ("s" in flag[1:] or "i" in flag[1:])
-        for flag in tokens[1:]
-    )
 
 
 def _requests_a_shell_by_flag(tokens: list[str]) -> bool:
