@@ -35,7 +35,18 @@ def test_the_infisical_cli_is_pinned_and_checksum_verified():
         assert re.search(rf"^ARG INFISICAL_SHA256_{arch}=[0-9a-f]{{64}}$", text, re.MULTILINE), (
             f"the Dockerfile must pin a full sha256 for {arch}"
         )
-    assert "sha256sum -c -" in text, "the download must be verified before it is installed"
+    # Substring presence cannot see ORDER, so it passed just as happily with the check moved
+    # below the install -- where dpkg has already run the package's maintainer scripts by the
+    # time the mismatch is noticed. Assert the actual sequence, and that the file being checked
+    # is the file being installed.
+    verify = text.index("sha256sum -c -")
+    install = text.index('apt-get install -y --no-install-recommends "${deb}"')
+    assert verify < install, "the checksum must be verified BEFORE the package is installed"
+    checked = re.search(r'echo "\$\{sha\}  (\S+)" \| sha256sum -c -', text)
+    assert checked, "the checksum line must name the file it verifies"
+    assert checked.group(1) == '${deb}', (
+        f"the verified file must be the downloaded package, not {checked.group(1)}"
+    )
 
 
 def test_the_base_image_does_not_install_the_cli_by_default():
