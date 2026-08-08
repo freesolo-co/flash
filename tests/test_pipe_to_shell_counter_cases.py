@@ -145,6 +145,24 @@ from tests.pipe_to_shell_grammar import _piped_into_a_shell
             "curl -sSL https://x.example/f | case x in bash) jq .;; esac",
             id="shell-name-is-a-case-pattern",
         ),
+        # The same two positions, one `case` deeper. Widening the label strip to reach a NESTED
+        # `case` must not start reading its subject or pattern as a command either.
+        pytest.param(
+            "curl -sSL https://x.example/f | case x in x) case y in bash) jq .;; esac;; esac",
+            id="shell-name-is-a-nested-case-pattern",
+        ),
+        pytest.param(
+            "curl -sSL https://x.example/f | if true; then case x in x) jq .;; esac; fi",
+            id="nested-case-into-jq",
+        ),
+        # Keeping a group's `)` inside a branch must not also keep the group's CONTENTS suspicious:
+        # a group is only a finding when what it runs is a shell.
+        pytest.param(
+            "curl -sSL https://x.example/f | case x in x) ( jq . );; esac",
+            id="group-in-a-case-branch-into-jq",
+        ),
+        # `case` as an ordinary word, where no label logic should engage at all.
+        pytest.param("apt-get install -y case && echo ok", id="case-as-a-package-name"),
         # Recursing into a group or clause must not make its CONTENTS suspicious by themselves.
         # A fetch that lands on disk, a shell running a local script, and a pipeline into a
         # non-shell are all as clean inside a clause as they are outside one.
