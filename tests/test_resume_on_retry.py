@@ -611,7 +611,7 @@ def test_infra_failure_relaunches_same_run_and_seed(orch, monkeypatch, failure):
 
 
 def test_unconfirmed_instance_teardown_fails_terminal_and_reaps(orch, monkeypatch):
-    """Codex MtzrH: when an instance-provider destroy() RAISES (Vast's unconfirmed DELETE — the old box
+    """When an instance-provider destroy() RAISES (Vast's unconfirmed DELETE — the old box
     may STILL be running and writing this seed's HF artifacts), the retry must NOT launch a second
     worker over it (double-bill + corrupt the shared seed-scoped DONE/metrics). Force-reap the run's
     label (provider.gc, run-scoped / not active-shielded) and FAIL the seed terminally; the handle is
@@ -988,7 +988,7 @@ def test_worker_error_fails_fast_without_relaunch(orch, monkeypatch):
 
 
 def test_unreconciled_create_fails_fast_without_relaunch(orch, monkeypatch):
-    """Codex MtbAD: an ambiguous, unreconciled non-idempotent create (Vast's ``PUT /asks`` 5xx with no
+    """An ambiguous, unreconciled non-idempotent create (Vast's ``PUT /asks`` 5xx with no
     instance adoptable) raises ``UnreconciledCreateError`` from submit. The supervisor must classify it
     TERMINAL (job_failed), NOT as the generic ``poll_error`` flake — retrying would rent a SECOND box
     while the phantom from this attempt may still surface and bill under the still-active run."""

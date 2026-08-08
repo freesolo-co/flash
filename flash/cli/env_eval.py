@@ -39,14 +39,8 @@ def positive_int(value: str) -> int:
 def finite_float(value: str) -> float:
     """A temperature the chat route will accept.
 
-    `float("nan")` and `float("inf")` parse, so argparse took them and every case then spent a
-    request the server rejects for being non-finite (`flash/server/routes/serving.py:1429-1432`),
-    turning one bad flag into one doomed paid request per case (codex[bot]).
-
-    A negative value is finite and so passed that check, but the OpenAI sampling contract the
-    backend implements requires a nonnegative temperature, so it failed once per case rather than
-    once at the flag (codex[bot]). Same floor training already enforces on its own temperature
-    (`flash/schema/__init__.py`, `minimum=0.0`).
+    Reject non-finite or negative values before they become one paid rejection per case.
+    The nonnegative floor matches `flash/schema/__init__.py`.
     """
     parsed = float(value)
     if not math.isfinite(parsed):
@@ -76,11 +70,9 @@ def _generation_error(case_id: str, message: str) -> EvalResult:
 def _case_messages(environment, case: EvalCase) -> list[dict]:
     """The chat messages one case is evaluated on.
 
-    Training never sends the raw input: every path goes through `env.prompt_messages(example)`,
-    which runs the environment's own `start_episode` and injects the training contract as the
-    system prompt (flash/envs/adapter.py). Sending only `case.input` would grade the model on a
-    prompt no run ever trains on, so a suite could fail purely because the system instructions
-    the model was trained under were absent."""
+    Use `env.prompt_messages(example)` so evaluation includes the environment system prompt used
+    by training (`flash/envs/adapter.py`).
+    """
     example = _evaluation_example(case)
     build = getattr(environment, "prompt_messages", None)
     if not callable(build):
@@ -105,16 +97,9 @@ def _case_messages(environment, case: EvalCase) -> list[dict]:
 def _remote_prompt_messages(environment, example: dict, messages: list[dict]) -> list[dict]:
     """The prompt as the serving backend must receive it, matching what training builds.
 
-    `prompt_messages()` is only half of training's prompt: every worker then runs
-    `normalize_prompt_images` (flash/engine/worker/rl.py, sft.py, opd.py), which folds a record's
-    top-level `image`/`images` into the first user message and resolves each source to a
-    descriptor. Sending the raw messages dropped top-level images entirely, so a multimodal suite
-    graded a text-only prompt, and forwarded an environment's package-relative path straight to a
-    remote backend that cannot read the evaluator's disk (codex[bot]).
-
-    Descriptors are then rendered as data URIs, the same conversion the image teacher uses to put
-    local images on a remote request (flash/engine/worker/opd.py). Text-only cases -- the vast
-    majority -- return untouched without importing the multimodal machinery at all."""
+    Apply `normalize_prompt_images` like every worker so top-level images are retained and local
+    paths become remote-safe data URIs. Text-only cases stay untouched.
+    """
     from flash.multimodal import record_has_images
 
     if not record_has_images(example, messages):
@@ -174,14 +159,9 @@ def _generate_case(client, target: str, messages: list[dict], args) -> str | _Ge
 def _scored_response(response: str, *, thinking: bool) -> str:
     """The response as a scorer should see it, matching what training grades.
 
-    Training never hands a grader the raw completion: both the single-turn and multi-turn paths
-    strip the reasoning through `flash.thinking` first (flash/envs/adapter.py). Evaluating the raw
-    string instead mis-grades a thinking deployment against its own environment -- the scaffolded
-    multi-turn scorer reads the first token as an int, which is `<think>` for every reasoning run.
-
-    Gated on the run's own `thinking`, never on the text: `strip_think` also cuts at a bare
-    `<think>` mention, so applying it to a non-thinking answer that merely names the tag would
-    truncate a correct response."""
+    Strip reasoning only for `thinking` runs; raw reasoning mis-grades them, while unconditional
+    stripping can truncate non-thinking answers that mention `<think>`.
+    """
     if not thinking:
         return response
     from flash.envs.adapter import _ScoredResponseText
@@ -200,10 +180,9 @@ def _score_case(
 ) -> EvalResult:
     """Grade one response on the caller's thread.
 
-    Scoring never runs in a worker. A lock would serialize it but still execute it off the
-    main thread, and scorers routinely cannot run there at all: anything installing a
-    signal-based timeout raises `signal only works in main thread`, which would be recorded
-    as the model failing the case rather than as a broken harness."""
+    Scorers may require main-thread resources such as signal-based timeouts; a lock prevents
+    overlap but does not provide thread affinity.
+    """
     try:
         scored = suite.score(case, _scored_response(response, thinking=thinking))
         return normalize_eval_result(case, response, scored, case_id=case_id)
@@ -220,30 +199,18 @@ def _score_case(
 # the server's own names for a record that is serving traffic versus one still coming up
 # (flash/server/routes/serving.py). a busy record's `adapter_revision` is the INCOMING revision.
 _READY_DEPLOYMENT_STATES = frozenset({"ready", "deployed"})
-# a busy record may be a redeploy over a live revision, so it can still serve through the
-# predecessor the public listing hides. ready plus busy is therefore the whole set that might
-# answer; `/v1/deployments` excludes only `undeployed`/`dry_run`, so everything else it returns --
-# `failed`, `revocation_failed`, any state a newer plane adds -- reaches this CLI as a record that
-# is neither. `flash models deploy --wait` already fails closed on exactly that split
-# (flash/cli/commands.py).
+# a busy redeploy may still serve its predecessor, which the public listing hides.
+# `/v1/deployments` excludes only `undeployed`/`dry_run`, so only `ready` and `busy`
+# may answer; other returned states fail closed (flash/cli/commands.py).
 _BUSY_DEPLOYMENT_STATES = frozenset({"queued", "smoke_testing", "reconciling"})
 
 
 def _live_deployment(client, run_id: str) -> dict | None:
     """The run's deployment record, whatever state it is in, or None when it has none.
 
-    `deployment_for` resolves an EXACT revision, so asking it for a bare run id means "the final
-    adapter" (step None) and it rejects a run serving `RUN/step-N`. That would report a deployed
-    run as undeployed and refuse to evaluate a model `flash chat RUN` talks to happily. Match on
-    the run id alone, exactly as `_rollback_record` does for the same reason
-    (flash/cli/commands.py).
-
-    The state is left to the caller because only a READY record names the revision that will
-    answer: a busy one is listed with the revision it is rolling OUT to. Whether a predecessor is
-    still serving underneath it cannot be decided here -- `/v1/deployments` passes every record
-    through `public_deployment()`, which drops `previous_deployment` as private rollback state
-    (flash/serve/urls.py). Both a redeploy over a live revision and a first rollout that has never
-    served therefore arrive as the same bare busy record."""
+    Match by run id because `deployment_for` misses step deployments. Busy records name the rollout
+    target and hide the revision that may still be serving.
+    """
     for entry in client.deployments() or ():
         listed = entry.get("deployment") or {}
         if run_id not in (listed.get("run_id"), entry.get("run_id")):
@@ -258,12 +225,8 @@ def _live_deployment(client, run_id: str) -> dict | None:
 def _case_ids(cases: list[EvalCase]) -> list[str]:
     """Stable per-case ids, disambiguating sidecars that reuse one id across cases.
 
-    Two cases sharing an id would collide in the uploaded payload and in the printed
-    report, silently reporting one graded case where two ran.
-
-    The suffix is retried until it is genuinely free, because the disambiguated form is
-    itself a legal explicit id: cases `a`, `a`, `a#2` resolved to `a`, `a#2`, `a#2` and
-    reintroduced the collision this function exists to remove."""
+    Retry suffixes until free because forms such as `a#2` are also valid explicit ids.
+    """
     ids: list[str] = []
     seen: dict[str, int] = {}
     taken: set[str] = set()
@@ -298,10 +261,8 @@ def _run_cases(
 ) -> tuple[EvalResult, ...]:
     """Generate concurrently, score serially on this thread.
 
-    Only generation is parallel. `suite.score()` always runs here, in case order: a lock
-    prevents overlap but not thread affinity, and a scorer holding a resource created while
-    the suite was loaded -- a sqlite connection, a tokenizer bound to its creating thread --
-    failed every case from a worker even though nothing was concurrent (codex[bot])."""
+    Scorers can hold thread-bound resources, so a lock around worker scoring is insufficient.
+    """
     case_ids = _case_ids(cases)
     prompts = [_build_messages(environment, case) for case in cases]
     if args.concurrency == 1 or len(cases) <= 1:
@@ -347,20 +308,9 @@ def _generate_concurrently(
             pending.put((index, prompt))
     outstanding = pending.qsize()
     if outstanding:
-        # settle the control plane's step-selector capability HERE, on one thread, before any worker
-        # starts. the client caches the answer only after it succeeds, so N workers racing from cold
-        # each fire their own /v1/health -- one eval's worth of duplicate requests for a fact about
-        # the plane that cannot differ between them (codex[bot]). warming it costs one call and needs
-        # no lock in the client, where it would put coordination on every caller for this one race.
-        # a `RUN/step-N` target is what makes the check run at all; anything else skips it.
-        #
-        # A failure propagates rather than being suppressed. Suppressing it did not soften a
-        # transient blip, it multiplied it: only a SUCCESSFUL check is cached, so every worker then
-        # missed the same cold cache, and one timed-out or rate-limited /v1/health became up to 32
-        # more plus one generation error per case -- instead of one target-level failure naming the
-        # real cause (chatgpt-codex-connector). An unsupported plane is not transient at all, and
-        # answering it with a suite of per-case errors buries the one line that says to use a full
-        # revision or upgrade.
+        # warm the step-selector capability once before workers start. only successful
+        # `/v1/health` checks are cached, so cold workers would multiply a transient or
+        # unsupported failure. failures propagate here; only `RUN/step-N` triggers the check.
         client.warm_chat_step_selector(target)
         finished: queue.SimpleQueue = queue.SimpleQueue()
         aborted = threading.Event()
@@ -392,11 +342,11 @@ def _generate_concurrently(
                     return
                 finished.put(index)
 
-        # deliberately NOT a ThreadPoolExecutor. Its shutdown(wait=False) only postpones the
-        # wait: concurrent.futures registers an interpreter-exit hook that joins every worker
-        # thread, so after `main()` reported `aborted` the process still hung until the in-flight
-        # chat_stream hit its 30-minute timeout (codex[bot]). Daemon threads carry no such hook --
-        # Ctrl-C propagates out of the wait below and the interpreter exits without joining them.
+        # deliberately NOT a ThreadPoolExecutor. Its shutdown(wait=False) only postpones the wait:
+        # concurrent.futures registers an interpreter-exit hook that joins every worker thread, so
+        # after `main()` reported `aborted` the process still hung until the in-flight chat_stream
+        # hit its 30-minute timeout. Daemon threads carry no such hook -- Ctrl-C propagates out of
+        # the wait below and the interpreter exits without joining them.
         workers = [
             threading.Thread(target=_run_cases, daemon=True)
             for _ in range(min(args.concurrency, outstanding))
@@ -454,11 +404,9 @@ def _spec_project(spec: object) -> str:
 def _spec_environment_id(spec: object) -> str:
     """The hub environment a run trains against, as the dashboard stores it.
 
-    A managed slug (`namespace/name`) is what the environment pages are keyed by, so a `github:`
-    ref pointing at the managed hub is canonicalized to the slug it denotes -- the same
-    normalization the submit route applies before it records the run's environment
-    (`flash/server/routes/runs.py`). Anything else is a reference this side cannot resolve to a
-    hub page, so it is returned verbatim rather than guessed at."""
+    Canonicalize managed `github:` refs to their slug like the submit route; return other
+    references verbatim rather than guessing.
+    """
     if not isinstance(spec, dict):
         return ""
     environment = spec.get("environment")
@@ -481,10 +429,8 @@ def _spec_environment_id(spec: object) -> str:
 def _require_accessible_project(project_id: object) -> str:
     """The canonical id of a project this caller can actually upload to.
 
-    Shape and reachability are one question here because they have one answer at every call
-    site: a project that cannot be resolved is not a project to record against, whether it is
-    malformed, deleted, or owned by another organization. Raises ClientError in every one of
-    those cases, so the refusal happens before a single generation is bought."""
+    Malformed, missing, or inaccessible projects all raise before generation begins.
+    """
     from flash.client import ClientError, resolve_project_id
     from flash.client.config import load_credentials
     from flash.spec import require_project_id
@@ -499,14 +445,9 @@ def _require_accessible_project(project_id: object) -> str:
         raise ClientError(
             "not logged in — run `flash login` with your freesolo API key (or set FREESOLO_API_KEY)"
         )
-    # ``api_url`` is passed deliberately, so a self-hosted plane gets the shape-only check rather
-    # than an ownership lookup against api.freesolo.co. The stored key on such a plane IS
-    # FREESOLO_INTERNAL_KEY, which controls the plane, and it must not travel to a service the
-    # operator does not run (SELF_HOSTING.md; the same boundary `_verifies_against_freesolo` draws
-    # for `flash login`). That leaves a known gap -- `upload_eval_run` posts to the hosted API, so a
-    # self-hosted `--project` run can still fail at upload after the suite is bought -- but closing
-    # it by resolving against the hosted backend would trade a late failure for a leaked
-    # plane-root credential, which is the worse outcome.
+    # pass `api_url` so self-hosted planes get shape validation without sending
+    # `FREESOLO_INTERNAL_KEY` to api.freesolo.co (SELF_HOSTING.md,
+    # `_verifies_against_freesolo`). upload may still fail later, but credential leakage is worse.
     return resolve_project_id(project_id, api_key, api_url)
 
 
@@ -523,13 +464,9 @@ def _upload_report(
 ) -> int:
     """Record one suite's results against a project, reporting failures without hiding them.
 
-    `environment_reference` is the hub environment the graded run trains against, so the dashboard
-    can open it. It is always a published slug, never a path: an evaluation with no published
-    environment to name is refused before it runs.
-
-    Upload failure is reported but does not change the eval's own exit status: the suite
-    already ran and its verdict is printed above. Returning FAIL here would relabel a
-    passing suite as failing because a network call did not land."""
+    The environment reference must be a published slug. Upload failure is reported without
+    replacing the suite's already-printed verdict.
+    """
     from flash.client import ClientError, upload_eval_run
     from flash.client.config import load_credentials
 
@@ -540,18 +477,15 @@ def _upload_report(
             "API key (or set FREESOLO_API_KEY)"
         )
 
-    # a case that failed before it was graded is still uploaded verbatim; the server
-    # excludes it from the aggregate so a transport failure never reads as a zero score.
-    #
-    # key on the same resolved ids the results carry, not on the raw `case.id`: a sidecar
-    # that reuses one id across cases resolves the second to `id#2`, so a raw-id map both
-    # misses it and hands the first result the *second* case's input and expected value.
+    # upload pre-grading failures verbatim; the server excludes them from aggregates.
+    # key by resolved ids because duplicate sidecar ids become `id#N`; raw ids can attach the
+    # wrong input and expected value.
     by_id = dict(zip(_case_ids(cases), cases, strict=True))
     payload = [_case_payload(by_id.get(result.case_id), result) for result in report.results]
-    # a suite whose cases failed to generate or score is not a completed run. only failures
-    # BEFORE case execution passed status="failed", so a suite where every case errored
-    # uploaded as `completed` with no run-level error while the CLI printed `overall: FAIL`
-    # -- the dashboard and the exit code disagreeing about the same run (codex[bot]).
+    # a suite whose cases failed to generate or score is not a completed run. only failures BEFORE
+    # case execution passed status="failed", so a suite where every case errored uploaded as
+    # `completed` with no run-level error while the CLI printed `overall: FAIL` -- the dashboard and
+    # the exit code disagreeing about the same run.
     if status == "completed" and report.errors:
         status = "failed"
         error = f"{report.errors}/{report.total} case(s) failed to generate or score"
@@ -658,37 +592,24 @@ def cmd_env_eval(args) -> int:
         deployment_state = deployment.get("state")
         servable_states = _READY_DEPLOYMENT_STATES | _BUSY_DEPLOYMENT_STATES
         if want_step is not None:
-            # a pinned step does not go through the deployment record at all: the chat route
-            # resolves `RUN/step-N` against the verified ledger and, once it resolves,
-            # `has_ready_deploy` is already true, so the terminal-state arms below it never run
-            # (`flash/server/routes/serving.py`). `mark_deployment_failed` leaves that ledger
-            # intact, so a step verified before a LATER deploy failed still serves, and refusing it
-            # here failed an evaluation the server answers 200 (Cursor).
-            #
-            # exempt `failed` only. `mark_deployment_revocation_failed` and the undeploy paths call
-            # `invalidate_verified_adapter_revisions` (`flash/runner/deploy.py`), so under those
-            # states the ledger the pin would resolve against is gone and every case 409s -- the
-            # same wasted suite this check exists to avoid (Cursor).
+            # pinned steps resolve through the verified ledger, not the deployment record
+            # (`flash/server/routes/serving.py`). allow `failed`, which preserves that ledger;
+            # revocation-failed and undeploy paths invalidate it in `flash/runner/deploy.py`.
             servable_states = servable_states | {"failed"}
         if deployment_state not in servable_states:
             # having a record is not having a servable one: the listing keeps terminal states like
             # `failed` and `revocation_failed`, and the chat route has no ready predecessor to fall
-            # back to for them, so every case 409s. That spends a whole suite of generation
-            # failures to learn what one target error says now (chatgpt-codex-connector). A step
-            # that genuinely is not in the ledger still gets one 409 naming the deployed steps, not
-            # a suite of them.
+            # back to for them, so every case 409s. That spends a whole suite of generation failures
+            # to learn what one target error says now. A step that genuinely is not in the ledger
+            # still gets one 409 naming the deployed steps, not a suite of them.
             _err(
                 f"env eval failed: run {args.target} deployment is {deployment_state or 'unknown'}"
                 f"; run `{CLI_NAME} models deploy {run_id}` first"
             )
             return _err("overall: FAIL")
-        # a busy record is listed with the revision it is rolling OUT to, so pinning it would file
-        # the scores under weights that were not answering requests (codex[bot]). the predecessor
-        # still serving underneath is stripped from the public listing, so this side cannot name
-        # it either (see `_live_deployment`) -- and refusing outright would fail an evaluation that
-        # `flash chat RUN` serves correctly through that predecessor (codex[bot]). leave the target
-        # as the user wrote it and let the chat route resolve it: it reads the private rollback
-        # state, and answers with a 409 naming the surface to use when nothing is serving at all.
+        # a busy record names the rollout target, not the hidden predecessor still serving.
+        # leave the user's target unpinned so the chat route can resolve private rollback state or
+        # return the correct 409 when nothing serves.
         resolved = None
         if deployment_state in _READY_DEPLOYMENT_STATES:
             candidate = deployment.get("adapter_revision")
@@ -699,38 +620,17 @@ def cmd_env_eval(args) -> int:
                     f"{run_id} has no valid immutable adapter revision"
                 )
                 return _err("overall: FAIL")
-        # `RUN/step-N` is a shorthand, not an identity: the chat route resolves it against the
-        # run's whole verified ledger, which can hold several revisions at one step, and picks the
-        # deployed one. Forwarding the shorthand therefore graded weights the report could not
-        # name, and a later rebuild of the same step would read as the same measurement
-        # (codex[bot]). Pin here so generation and the uploaded report carry the immutable value.
-        # Only when the live deployment IS the requested step can the CLI name the revision that
-        # will answer. Otherwise the shorthand stays: a run keeps its earlier verified revisions
-        # after a newer step is deployed, and the chat route serves them -- asked for step-3 while
-        # step-20 is live, the server resolves the ledger's single step-3 entry and answers 200.
-        # Refusing would fail an evaluation the server runs correctly, so let the server resolve it;
-        # it reads the verified ledger this CLI cannot see, and answers a genuinely ambiguous step
-        # with a 409 naming the surface to use instead.
+        # `RUN/step-N` is not immutable: multiple revisions may share a step. pin only when the
+        # live deployment is that step; otherwise the server-only verified ledger may still resolve
+        # an older step, and the chat route must decide ambiguity.
         if resolved is not None and (want_step is None or resolved[1] == want_step):
             evaluation_target = candidate.strip()
             print(f"resolved evaluation target {args.target} to {evaluation_target}")
         elif args.upload and want_step is not None:
-            # an uploaded report is a permanent record, so it has to name the weights it graded.
-            # `RUN/step-N` names a step but not a revision: the server resolves it against the run's
-            # whole verified ledger, which can hold several revisions at one step
-            # (`_verified_step_index`), and a later rebuild of that step reuses the same shorthand --
-            # so two different sets of weights file as one measurement, and afterwards nothing can
-            # tell them apart (chatgpt-codex-connector).
-            #
-            # This side cannot resolve it: the verified ledger is server-only,
-            # `/v1/runs/{id}/checkpoints` carries no revision, and the chat route never echoes the
-            # revision that answered. So refuse before buying a single generation rather than spend
-            # a whole suite on a result nobody can identify. Both ways out are in the message, and
-            # evaluating with `--no-upload` still prints the verdict.
-            #
-            # Only when a step was asked for. A bare alias means "whatever serves this run now",
-            # which is what it records, and a busy one deliberately stays unpinned so the run still
-            # evaluates through the predecessor `flash chat RUN` uses (codex[bot], test above).
+            # uploaded reports must name immutable weights. the CLI cannot resolve an ambiguous
+            # `RUN/step-N`: the verified ledger is server-only and chat does not echo the revision.
+            # refuse before generation; bare aliases remain valid because they mean the currently
+            # serving revision, including a busy predecessor.
             _err(
                 f"env eval failed: cannot upload results for {args.target}: the immutable "
                 "revision that will answer it is not knowable here. re-run with the full "
@@ -738,28 +638,17 @@ def cmd_env_eval(args) -> int:
             )
             return _err("overall: FAIL")
 
-    # one lookup answers everything this command needs to know ABOUT THE TARGET RUN: which published
-    # environment it trains against, whether its responses carry reasoning, and which project owns
-    # its results. all three are properties of that run, so none is a default or a fallback -- an
-    # evaluation grades the weights against the environment that trained them, and files under the
-    # project that owns them.
-    #
-    # read once here rather than per case: it is the same answer for every case, and a suite of 200
-    # would otherwise buy 200 lookups.
+    # one run lookup supplies its training environment, reasoning mode, and owning project.
+    # these are target-run properties, not fallbacks, and reading once avoids one lookup per case.
     spec = None
     target_run_id = (revision or parsed or (None,))[0]
     if target_run_id:
         try:
             spec = client.get_run(target_run_id).get("spec")
         except ClientError as exc:
-            # one handler, not two: `ApiError` subclasses `ClientError`, so an `except ApiError`
-            # arm would catch 5xx and 429 before the retryable arm ever saw them (cursor[bot]).
-            #
-            # both arms end the command, because the spec is no longer an enrichment: it names the
-            # environment whose suites this evaluation runs. without it there is nothing to grade
-            # against, so neither arm can warn and continue. they stay separate only to say whether
-            # retrying is worth anything -- a 4xx is a settled answer about this run, a 5xx or a
-            # timeout is the plane failing to answer at all.
+            # `ApiError` subclasses `ClientError`, so one handler must preserve retryable 5xx/429.
+            # both arms abort because the run's environment is required; they differ only in
+            # whether retrying can help.
             if getattr(args, "debug", False):
                 raise
             answered_definitively = (
@@ -805,12 +694,8 @@ def cmd_env_eval(args) -> int:
             )
             return _err("overall: FAIL")
 
-    # the published environment the graded weights were trained on: both the suites that score them
-    # and the identity the report is filed under. a local directory cannot serve either role -- it
-    # names no environment anyone else can open, so two developers evaluating one run recorded two
-    # different provenances for the same measurement, and neither could be resolved back to a page.
-    # there is no fallback: an evaluation with nothing published to name is refused rather than
-    # recorded against a path.
+    # grade against the published environment the run trained on and file under that identity.
+    # a local path is neither stable nor resolvable, so there is no fallback.
     environment_reference = _spec_environment_id(spec)
     if not environment_reference:
         _err(
@@ -820,9 +705,9 @@ def cmd_env_eval(args) -> int:
         return _err("overall: FAIL")
     # nonempty is not enough. a run may legitimately train on a generic `github:` ref, which
     # `_spec_environment_id` returns verbatim because it denotes no hub page -- and recording one
-    # would file this report under exactly the unlinkable provenance the command exists to stop
-    # (codex[bot]). the hub is also what makes the package fetchable below, so this is one gate for
-    # both: a slug, or no evaluation.
+    # would file this report under exactly the unlinkable provenance the command exists to stop. the
+    # hub is also what makes the package fetchable below, so this is one gate for both: a slug, or
+    # no evaluation.
     if not is_managed_environment_slug(environment_reference):
         _err(
             f"env eval failed: run {args.target} trains on {environment_reference}, which is not a "
@@ -833,22 +718,10 @@ def cmd_env_eval(args) -> int:
 
     with tempfile.TemporaryDirectory(prefix="flash-env-eval-") as workdir:
         try:
-            # ONE download, through the control plane, and everything is graded from what it wrote.
-            #
-            # through the plane because that is the only credential an ordinary user has: the direct
-            # hub path in `load_freesolo_environment` authenticates with an operator-style
-            # GITHUB_TOKEN, so evaluating a published environment would have demanded a credential
-            # that `env pull` never asks for, and failed without it (codex[bot]).
-            #
-            # once because a managed slug points at environment-hub@main, which moves, and symbolic
-            # refs are deliberately not cached (`_resolve_ref_sha`). resolving per-call let the
-            # environment object come from one revision and its grading code from the next
-            # (codex[bot]). one archive cannot disagree with itself.
-            #
-            # and from the extracted path because slug resolution is not uniform: the sidecar lookup
-            # prefers a local directory when one named `namespace/name` sits in the cwd, so a
-            # matching checkout silently graded the published environment with a working copy's
-            # evaluations.py (cursor[bot]). an absolute path into this temp dir has no such branch.
+            # download once through the control plane, the only credential boundary users have.
+            # one archive pins moving environment-hub@main content for both environment and grader.
+            # load from its absolute extracted path so a matching local `namespace/name` checkout
+            # cannot override the published environment.
             package = client.download_env_package(environment_reference)
             entrypoint = (
                 pull_environment_package_from_archive(package, Path(workdir) / "package")
@@ -875,7 +748,7 @@ def cmd_env_eval(args) -> int:
             # the same kwargs `env test` builds from --split/--param, so a held-out suite grades the
             # environment the run is actually configured with. loading parameterless rejected an env
             # whose load_environment() requires a setting, and silently built a differently-
-            # configured scorer for one that merely defaults (codex[bot]).
+            # configured scorer for one that merely defaults.
             environment = load_freesolo_environment(str(entrypoint), **params)
             suites = load_evaluation_suites(entrypoint, environment=environment)
             # where those suites came from, for the case-validation errors below -- the file
@@ -962,11 +835,10 @@ def cmd_env_eval(args) -> int:
             report = EvalSuiteReport(name=suite.name, results=results)
             _print_report(report)
             reports.append(report)
-            # every report uploads, including the ones that never graded a case. skipping them
-            # left the dashboard showing the earlier suites as a completed run with the failing
-            # suite simply absent -- a green-looking evaluation whose CLI exit code was 1
-            # (codex[bot]). `_case_payload` tolerates a missing case, so a load failure records
-            # its error rather than nothing.
+            # every report uploads, including the ones that never graded a case. skipping them left
+            # the dashboard showing the earlier suites as a completed run with the failing suite
+            # simply absent -- a green-looking evaluation whose CLI exit code was 1. `_case_payload`
+            # tolerates a missing case, so a load failure records its error rather than nothing.
             if args.upload:
                 # the errored-case downgrade lives in `_upload_report`, so it covers this call and the
                 # two load-failure ones above rather than only the path that happens to run cases.

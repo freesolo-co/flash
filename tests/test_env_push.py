@@ -153,7 +153,7 @@ def test_push_single_py_module_carries_an_imported_sibling_package(
 
     `__init__.py` is not what makes it a package: under PEP 420 a bare directory imports the same
     way, so requiring the marker file dropped exactly the helper the sidecar needs while every
-    local check still passed (codex[bot]).
+    local check still passed.
     """
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
@@ -215,7 +215,7 @@ def test_push_ships_a_namespace_package_helper(monkeypatch, tmp_path):
 
     Requiring the marker file sent the helper to the `graders.py` fallback, which does not exist
     either, so the archive carried evaluations.py alone and the published environment raised
-    ModuleNotFoundError on its first case (codex[bot]).
+    ModuleNotFoundError on its first case.
     """
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
@@ -319,7 +319,7 @@ def test_push_ships_helpers_named_through_an_alias_of_import_module(monkeypatch,
 
     Matching the call's identifier against `import_module` alone skipped the aliased call, so
     `judge.py` was left out of the archive for a suite that passes locally -- its directory is
-    importable there -- and raises ModuleNotFoundError on its first published case (Cursor).
+    importable there -- and raises ModuleNotFoundError on its first published case.
     """
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
@@ -398,7 +398,7 @@ def test_push_ships_helpers_named_through_an_assignment_bound_dynamic_import(mon
     """`load = importlib.import_module` binds the importer without any `import ... as`.
 
     The alias walk read import statements, so the from-import spelling was covered and this one --
-    which appears in no import statement at all -- was not (codex[bot]). Same end state either way:
+    which appears in no import statement at all -- was not. Same end state either way:
     the helper stays out of the archive, the suite passes locally because its directory is on
     sys.path, and the published environment raises ModuleNotFoundError on its first case.
 
@@ -439,7 +439,7 @@ def test_alias_chains_resolve_without_rescanning_every_binding() -> None:
     Re-scanning every assignment per pass resolves exactly one new name per pass when the chain is
     declared in reverse -- the ordering this walk explicitly supports -- so the cost is quadratic:
     a generated 5,000-link sidecar spent ~3.4s here, and `env push` walks again while copying, so
-    it paid that twice before any archive limit applied (codex[bot]).
+    it paid that twice before any archive limit applied.
 
     Counts reads of the bound name on the real function rather than timing it. A wall-clock bound
     is flaky on a shared runner and would not say why it got slow, whereas the read count separates
@@ -822,7 +822,7 @@ def test_push_relative_import_inside_a_package_does_not_name_a_root_module(monke
 
     Every name the closure collects is resolved against the env root, so reading a relative import
     from a file nested inside a packaged subdirectory published an unrelated top-level module while
-    the real sibling was already shipped by the package walk (codex[bot]).
+    the real sibling was already shipped by the package walk.
     """
     env_file = tmp_path / "environment.py"
     env_file.write_text("import graders\n\ndef load_environment(**k):\n    return None\n")
@@ -847,8 +847,7 @@ def test_push_entrypoint_importing_evaluations_charges_the_sidecar_once(monkeypa
 
     The entrypoint closure runs first and shares `yielded` with the sidecar block below it. With no
     membership guard the sidecar was yielded a second time, and `_check_env_push_limits` charged
-    those bytes and that member twice -- rejecting a tree that is actually under the limit
-    (codex[bot]).
+    those bytes and that member twice -- rejecting a tree that is actually under the limit.
     """
     from flash.cli import envpush
 
@@ -1322,7 +1321,7 @@ def test_push_counts_an_imported_dataset_package_once(monkeypatch, tmp_path):
     walk. A helper package that IS `dataset/` is reached by both, and the second pass did not
     consult the first's `yielded` set -- so the limit check counted those files and bytes twice and
     rejected a tree that actually fits. The archive was always correct (the copy just overwrites),
-    which is why only the limit saw it (codex[bot]).
+    which is why only the limit saw it.
     """
     # a SINGLE-FILE push: only that path builds the import closure whose `yielded` set the dataset
     # walk has to honour. pushing the directory takes the full-tree branch and never reaches it.
@@ -1422,9 +1421,9 @@ def test_push_drops_underscore_secret_files_but_keeps_secretish_packages(monkeyp
 
 
 def test_push_single_py_ships_its_evaluations_sidecar(monkeypatch, tmp_path):
-    # `env eval TARGET ./environment.py` loads the sibling evaluations.py, so a single-file push
-    # that dropped it published a package whose suite passed locally and was simply gone once
-    # uploaded -- while a directory push of the same files kept it (codex[bot]).
+    # `env eval TARGET./environment.py` loads the sibling evaluations.py, so a single-file push that
+    # dropped it published a package whose suite passed locally and was simply gone once uploaded --
+    # while a directory push of the same files kept it.
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
     (tmp_path / "evaluations.py").write_text(
@@ -1447,9 +1446,9 @@ def test_push_single_py_ships_its_evaluations_sidecar(monkeypatch, tmp_path):
 
 
 def test_push_directory_infers_its_entrypoint_past_an_evaluations_sidecar(monkeypatch, tmp_path):
-    # a directory whose only module is `custom.py` is a supported layout. counting evaluations.py
-    # as a second top-level module made adding one reject the directory outright, so the very
-    # sidecar that enables evaluation disabled the push and the eval alike (codex[bot]).
+    # a directory whose only module is `custom.py` is a supported layout. counting evaluations.py as
+    # a second top-level module made adding one reject the directory outright, so the very sidecar
+    # that enables evaluation disabled the push and the eval alike.
     env_dir = tmp_path / "env"
     env_dir.mkdir()
     (env_dir / "custom.py").write_text("def load_environment(**k):\n    return None\n")

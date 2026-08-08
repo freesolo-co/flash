@@ -72,31 +72,17 @@ def resolve_smoke_completion_tokens(spec: JobSpec) -> int:
     """Resolve the deployment smoke's completion budget for one generation.
 
     This sizes a single smoke request, not the run's training context. sft is the reason the two
-    cannot share a number: an sft run has no completion budget of its own, because the worker
-    trains one packed prompt+completion block bounded by ``max_context_tokens``. Feeding that
-    packed limit back as a completion budget double-counts the prompt, so sft derives its smoke
-    budget from the sft recipe instead and ``max_context_tokens`` stays a context check.
+    cannot share a number: an sft run has no completion budget of its own, because the worker trains
+    one packed prompt+completion block bounded by ``max_context_tokens``.
     """
     explicit = spec.train.max_completion_tokens
     positive_explicit = int(explicit) if explicit is not None and int(explicit) > 0 else None
     if spec.algorithm == "opd":
         return opd_completion_len(positive_explicit, spec.thinking)
     if spec.algorithm == "sft":
-        # sft ignores max_completion_tokens (it is a rollout-only knob), so honouring it here would
-        # cap the smoke below what the run can legitimately generate: a 2048-context sft run with a
-        # leftover max_completion_tokens=320 trains valid long reasoning it could never deploy.
-        #
-        # the recipe value is the DEFAULT, not the budget. the worker bounds its packed block by an
-        # explicit max_context_tokens and only falls back to the recipe when none is set
-        # (flash/engine/worker/sft.py), so resolving to the recipe unconditionally sized the smoke
-        # for a run that was never trained: an 8192-context adapter got 2048 tokens, came back
-        # finish_reason="length", and the truncation guard rejected a checkpoint that answered
-        # correctly (codex[bot]). mirror the worker's own resolution instead.
-        #
-        # not subtracting a prompt allowance is deliberate. the packed limit spans prompt and
-        # completion, so this over-allocates by the length of _SMOKE_PROMPT -- the safe direction,
-        # since only an under-allocation can fail a good checkpoint, and the caller already clamps
-        # to what serving can actually deliver.
+        # SFT ignores max_completion_tokens, so mirror the worker: use explicit max_context_tokens with
+        # the recipe fallback. do not subtract the smoke prompt; slight over-allocation is safe, while
+        # under-allocation can reject a valid checkpoint. serving clamps the final request.
         context = spec.train.max_context_tokens
         if context is not None and int(context) > 0:
             return int(context)

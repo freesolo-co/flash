@@ -153,9 +153,9 @@ def test_usable_offers_exclude_machines(monkeypatch):
 
 
 def test_usable_offers_search_page_spans_all_classes(monkeypatch):
-    # Codex Mr5nO: the price-sorted search page must be wide enough to span EVERY managed class
-    # (callers bucket by class); the old limit=64 let a flood of one cheap class hide a larger fitting
-    # class with usable offers just past the page.
+    # the price-sorted search page must be wide enough to span EVERY managed class (callers bucket
+    # by class); the old limit=64 let a flood of one cheap class hide a larger fitting class with
+    # usable offers just past the page.
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast
 
@@ -249,11 +249,11 @@ def test_usable_offers_threads_duration_floor(monkeypatch):
 
 
 def test_rent_search_outlasts_the_boxs_deadline_not_just_the_wall_grant(monkeypatch):
-    # Cursor Bugbot: an unarmed workload profile's box deadline carries a provisioning allowance on
-    # top of its work budget, but gpu.max_wall_seconds still names the work budget alone. Searching
-    # on the grant accepts a host whose remaining duration outlasts 600s of work yet expires part-way
-    # through the boot the allowance exists to survive -- the box then dies mid-provisioning on a
-    # host that was never rentable for the window it was handed.
+    # an unarmed workload profile's box deadline carries a provisioning allowance on top of its work
+    # budget, but gpu.max_wall_seconds still names the work budget alone. Searching on the grant
+    # accepts a host whose remaining duration outlasts 600s of work yet expires part-way through the
+    # boot the allowance exists to survive -- the box then dies mid-provisioning on a host that was
+    # never rentable for the window it was handed.
     from flash.providers.vast import jobs as vast
 
     captured = {}
@@ -299,8 +299,8 @@ def test_rent_search_never_shortens_below_the_granted_wall(monkeypatch):
 
 
 def test_live_rates_gates_on_min_disk(monkeypatch):
-    # Codex Mr4re: live pricing must gate on MIN_DISK_GB (what create() enforces), not disk_gb=0 —
-    # otherwise it prices off "cheapest" offers that aren't actually provisionable.
+    # live pricing must gate on MIN_DISK_GB (what create() enforces), not disk_gb=0 — otherwise it
+    # prices off "cheapest" offers that aren't actually provisionable.
     from flash.providers.vast import jobs as vast
     from flash.providers.vast import pricing
 
@@ -317,10 +317,10 @@ def test_live_rates_gates_on_min_disk(monkeypatch):
 
 
 def test_live_rates_floors_query_at_smallest_managed_vram(monkeypatch):
-    # Copilot Mtugt: live pricing must floor the market query at the SMALLEST managed Vast class's VRAM,
-    # not 0 — min_vram_gb=0 lets tiny UNMANAGED low-VRAM offers fill the fixed-size price-sorted page and
-    # crowd managed classes off it, so hourly_rate() falls back to static rates even when live offers
-    # exist. The floor keeps it to one market query while making the page relevant.
+    # live pricing must floor the market query at the SMALLEST managed Vast class's VRAM, not 0 —
+    # min_vram_gb=0 lets tiny UNMANAGED low-VRAM offers fill the fixed-size price-sorted page and
+    # crowd managed classes off it, so hourly_rate() falls back to static rates even when live
+    # offers exist. The floor keeps it to one market query while making the page relevant.
     from flash.providers.base import GPU_INFO
     from flash.providers.vast import jobs as vast
     from flash.providers.vast import pricing
@@ -340,7 +340,7 @@ def test_live_rates_floors_query_at_smallest_managed_vram(monkeypatch):
 
 
 def test_live_rates_threads_wall_cap_and_bypasses_cache(monkeypatch):
-    # Codex MtzrI: a duration-bound estimate must price against offers that OUTLAST the run — thread
+    # a duration-bound estimate must price against offers that OUTLAST the run — thread
     # max_wall_seconds into usable_offers (the same duration floor the allocator/submit use), so a
     # cheap short-lived offer that the launch-time filter rejects can't set the rate. Duration-bound
     # queries must also NOT pollute the shared duration-agnostic cache (the `flash gpus` path).
@@ -363,8 +363,8 @@ def test_live_rates_threads_wall_cap_and_bypasses_cache(monkeypatch):
 
 
 def test_live_rates_caches_within_ttl_and_refresh_bypasses(monkeypatch):
-    # Copilot Msbs9: repeated live_rates() within the TTL must share ONE market fetch (the refresh
-    # param was previously ignored); refresh=True forces a fresh query.
+    # repeated live_rates() within the TTL must share ONE market fetch (the refresh param was
+    # previously ignored); refresh=True forces a fresh query.
     from flash.providers.vast import jobs as vast
     from flash.providers.vast import pricing
 

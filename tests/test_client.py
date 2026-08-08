@@ -402,7 +402,7 @@ def test_chat_checkpoint_shorthand_rejects_older_server(stub):
 def test_chat_checkpoint_capability_is_probed_once_per_client(stub):
     # the capability is a property of the control plane, not of the request. `env eval` sends one
     # chat per case, so re-probing each time doubled the request count and let a single transient
-    # /v1/health blip fail an arbitrary case while the chat endpoint was healthy (codex[bot]).
+    # /v1/health blip fail an arbitrary case while the chat endpoint was healthy.
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
 
@@ -417,9 +417,9 @@ def test_chat_checkpoint_capability_is_probed_once_per_client(stub):
 
 
 def test_warming_the_capability_serves_later_chats_from_the_cache(stub):
-    # a caller about to fan out settles the check up front, so its workers inherit the cached
-    # answer instead of every one of them missing the cold cache at once and firing its own
-    # /v1/health (codex[bot]). a target with no step selector needs nothing and must stay silent.
+    # a caller about to fan out settles the check up front, so its workers inherit the cached answer
+    # instead of every one of them missing the cold cache at once and firing its own /v1/health. a
+    # target with no step selector needs nothing and must stay silent.
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
 

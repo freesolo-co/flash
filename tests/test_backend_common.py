@@ -148,12 +148,8 @@ def test_an_uncapped_v2_controller_does_not_fall_through_to_v1(tmp_path):
 
 
 def test_ray_cpu_floor_clears_what_verl_actually_reserves():
-    # the cap must not create the OPPOSITE failure. verl blocks in ray.get(pg.ready()) with no
-    # timeout, so a cluster with fewer cpus than the placement group wants hangs forever before the
-    # gpu is touched -- the same trap the SimpleStorage override upstream of this guards against.
-    # demand on a 1-gpu pod, read off the verl source rather than guessed: 3 for the worker bundle
-    # (RayClassWithInitArgs max_colocate_count=3, seen as CPU_group_0: [30000] in the raylet dump),
-    # 1 for TaskRunner (main_ppo.py ray.remote(num_cpus=1)), 1 for opd's single storage unit.
+    # prevent the opposite hang: verl waits forever for a placement group with too few CPUs.
+    # a 1-GPU OPD pod needs five CPUs: three worker bundles, TaskRunner, and one storage unit.
     verl_peak_cpu_demand = 3 + 1 + 1
     assert vc.verl_cpu_demand(1) == verl_peak_cpu_demand
     with (
@@ -368,7 +364,7 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert python_bin.endswith("/verl-venv/bin/python")
     # the interpreter is NAMED, not inherited: FLASH_ATTN_SPEC is a cp312-only wheel and flash
     # supports 3.11, so a bare `uv venv` on a 3.11 host builds an interpreter that required install
-    # cannot enter -- killing the run during provisioning (codex[bot]).
+    # cannot enter -- killing the run during provisioning.
     assert calls[0][:4] == ["uv", "venv", "--python", "3.12"]
     assert "cp312" in vc.FLASH_ATTN_SPEC
     install = calls[1]
@@ -423,10 +419,8 @@ def _flaky_wheel_install(calls, sleeps, *, failures: int):
 def test_a_transient_wheel_download_failure_is_retried_rather_than_fatal(monkeypatch, tmp_path):
     """uv exits 1 on a download timeout, and one attempt is not evidence the wheel is unreachable.
 
-    Measured: an arm died on `error sending request ... operation timed out` for FLASH_ATTN_SPEC,
-    and the identical url served 200 moments later. uv retries the DOWNLOAD 3x internally, so an
-    exit here means the fault outlived one uv lifetime -- a fresh invocation is the only retry that
-    can outlast it.
+    uv already retries within one invocation; a fresh invocation is the only retry that can outlast
+    a transient failure spanning that process.
     """
     calls, sleeps = [], []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
@@ -451,10 +445,7 @@ def test_a_transient_wheel_download_failure_is_retried_rather_than_fatal(monkeyp
 def test_an_exhausted_wheel_install_hands_the_arm_back_instead_of_burning_it(monkeypatch, tmp_path):
     """The failure must reach the plane as RETRIABLE, which is a claim about _worker_failure_flags.
 
-    Asserting the exception type alone would pass while the arm still died: what actually burns the
-    arm is `retriable: false` in the heartbeat, because _worker_failure_flags treats anything that
-    is not RetriableInfraError/GitHubRateLimitError as permanent and the poller then routes it to
-    job_failed rather than job_preempted. So assert the flag the plane reads, not the type we raise.
+    Assert the heartbeat flag, not only the exception type, because the poller routes on that flag.
     """
     from flash.engine.worker import _worker_failure_flags
     from flash.engine.worker.perf.lifecycle import RetriableInfraError
@@ -482,11 +473,8 @@ def test_an_exhausted_wheel_install_hands_the_arm_back_instead_of_burning_it(mon
 def test_the_fallback_install_overrides_the_three_ceilings_it_violates(monkeypatch, tmp_path):
     """The pin set is deliberately unsatisfiable against declared metadata, so it needs --override.
 
-    A bare `vllm==0.19.1` on the command line is a CONSTRAINT, not an override: the resolver must
-    still satisfy verl[vllm]'s declared `vllm<=0.12.0` alongside it, so the pair is unsatisfiable
-    and the install fails outright rather than picking the pin. Only `--override` makes uv ignore
-    the declaration. Dockerfile.worker:253-258 records the same three violations and the same fix
-    (codex[bot]).
+    A command-line pin remains a constraint; only `--override` ignores verl's incompatible vLLM
+    declaration. See Dockerfile.worker:253-258.
     """
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
@@ -528,14 +516,9 @@ def test_provisioned_venv_can_import_the_entrypoints_flash_launches(monkeypatch,
 
 
 def test_provisioned_venv_gets_flash_attn_for_the_remove_padding_path(monkeypatch, tmp_path):
-    # all three backends hardcode remove-padding ON (a gdn model whose child cannot reset packed
-    # boundaries now raises rather than switching it off, because verl's fsdp engine cannot run the
-    # padded path alongside the fused kernels flash sets) and verl's cuda remove-padding path
-    # imports flash_attn.bert_padding
-    # UNGUARDED (verl/utils/attention_utils.py:30, torch_functional.py:627). there is no sdpa
-    # fallback on that path, so a venv without the wheel dies at the first training batch on a paid
-    # gpu. Dockerfile.worker already treats it as REQUIRED in /opt/verl-venv; this fallback
-    # provisions the same interpreter and must carry the same wheel.
+    # all backends require remove-padding, whose CUDA path imports `flash_attn.bert_padding`
+    # unguarded (verl/utils/attention_utils.py:30, torch_functional.py:627). provision the wheel in
+    # the child interpreter or the first paid training batch fails.
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
     monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
@@ -562,16 +545,9 @@ def test_flash_attn_spec_stays_in_lockstep_with_the_worker_image():
 
 
 def test_the_capability_probe_imports_nothing_from_flash():
-    # THE regression for a bug that shipped silently: the gdn probe ran
-    # `from flash.engine.worker.packing import gdn_packing_available` in the VERL CHILD. flash is
-    # pip-installed into the worker interpreter at runtime and /opt/verl-venv is built without
-    # --system-site-packages, so that import raised ModuleNotFoundError in every child, the gate
-    # answered "cannot reset", and every gdn run pinned itself to the padded fallback forever. it
-    # fails closed, so nothing crashes and no output is wrong -- the boundary fix simply never
-    # engages, and nothing says so. now that every question rides ONE child, an `import flash`
-    # anywhere in the blob would fail-close EVERY capability, not just this one.
-    # assert on the parsed import graph rather than a substring: the probe legitimately mentions
-    # "flash" inside is_flash_linear_attention_available and flashinfer.
+    # the verl child cannot import Flash; doing so made the GDN probe fail closed permanently.
+    # now one child answers every capability, so assert its parsed import graph contains no `flash`
+    # import while allowing names such as flashinfer.
     probe = vc._CAPABILITY_PROBE % {"gdn_module": "transformers.models.qwen3_5.modeling_qwen3_5"}
     roots = set()
     for node in ast.walk(ast.parse(probe)):
@@ -600,13 +576,8 @@ def test_the_capability_probe_imports_nothing_from_flash():
 def test_no_optional_package_is_imported_at_the_probes_top_level():
     """THE structural risk batching introduces: one process now answers every question.
 
-    A module-level ``import flashinfer`` (or verl, torch, transformers, causal_conv1d, wandb) runs
-    BEFORE any try/except and kills the whole child on any interpreter lacking it -- silently
-    fail-closing every OTHER capability too. The old separate subprocesses were isolated by
-    construction; here that isolation is a property of where the imports sit, so pin it.
-
-    Only the stdlib may be imported at the top level; every optional package must sit inside the
-    try/except of the question that needs it.
+    Only stdlib imports may be top-level; optional imports must remain inside each question's
+    try/except or one missing package fail-closes every capability.
     """
     probe = vc._CAPABILITY_PROBE % {"gdn_module": "transformers.models.qwen3_5.modeling_qwen3_5"}
     tree = ast.parse(probe)
@@ -627,12 +598,8 @@ def _run_gdn_probe_branch(
 ):
     """Execute the probe's gdn branch against a stub transformers module, returning its stdout.
 
-    Runs the REAL rendered probe rather than a paraphrase, with both package checks answering True
-    so the source check is the only thing that can fail -- which is exactly the case the two
-    package flags cannot express.
-
-    ``module_source`` replaces the generated stub outright, for cases where the SHAPE of the class
-    is the thing under test (a decorated forward) rather than its body.
+    Run the real rendered probe with package checks true so only source inspection can fail.
+    `module_source` supports class-shape cases such as decorated forwards.
     """
     import importlib.util
     import io as _io
@@ -704,19 +671,8 @@ def test_a_gdn_source_check_failure_does_not_tell_operators_to_install_present_p
 def test_a_decorated_gdn_forward_is_read_through_to_the_real_body(monkeypatch, tmp_path):
     """A wrapped forward must not read as "this transformers build cannot reset gdn state".
 
-    The regression, from a real GRPO run on Qwen/Qwen3.5-0.8B. transformers decorates
-    ``Qwen3_5GatedDeltaNet.forward`` with ``@force_accelerate_hooks("conv1d")``, which returns a
-    plain closure and sets no ``__wrapped__``. ``inspect.getsource`` then returns the hook wrapper
-    -- accelerate plumbing mentioning neither name -- so the probe answered "no" and
-    ``require_gdn_boundary_resets`` killed the run on a paid gpu.
-
-    That verdict is unreachable by any fix it suggests: every released transformers 5.x reads the
-    values as ``kwargs.get("cu_seq_lens_q")`` / ``kwargs.get("seq_idx")`` inside the real body, so
-    both packages were already installed and no version bump changes the answer. Verified against a
-    real transformers 5.14.1 install: the old one-liner returns False, reading through returns True.
-
-    The decorator here mirrors the real one's shape -- a closure over the undecorated function, no
-    functools.wraps -- because that shape is precisely what defeats getsource and unwrap alike.
+    `force_accelerate_hooks` hides the real kwargs-reading body from `inspect.getsource` and sets no
+    `__wrapped__`, so the probe must read through the closure. This fixture preserves that shape.
     """
     module_source = (
         "def force_accelerate_hooks(child_module_name):\n"
@@ -827,12 +783,8 @@ def test_the_probe_skips_the_gdn_question_for_a_non_hybrid():
 
 
 def test_the_shim_patches_the_moe_arch_not_the_dense_one():
-    # THE regression for the second half of the same bug. the shim hardcoded
-    # `transformers.models.qwen3_5` while the gate resolved model_type from the checkpoint, and the
-    # 35B (qwen3_5_moe, whose Qwen3_5MoeGatedDeltaNet reads the same two kwargs off a SEPARATE
-    # Qwen3_5MoeTextModel) would pass the gate, enable remove-padding, and then run an unpatched
-    # forward -- packed, contaminated, and reported as resets-active. the shim must patch whatever
-    # arch it is handed.
+    # patch the architecture supplied by the gate. hardcoding `qwen3_5` leaves the separate
+    # `qwen3_5_moe` forward unpatched and silently contaminates packed GDN boundaries.
     moe = vc.render_gdn_varlen_shim("qwen3_5_moe")
     ast.parse(moe)
     assert "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe" in moe
@@ -848,14 +800,9 @@ def test_the_shim_patches_the_moe_arch_not_the_dense_one():
 
 
 def test_the_gate_hands_the_shim_the_arch_it_verified(monkeypatch):
-    # the gate recovers model_type from the module string the CHILD was asked about, so the caller
-    # physically cannot render the shim for a different architecture than the probe cleared. a
-    # second resolve at the call site would make that agreement a convention; this makes it
-    # structural.
-    # patch the module object, not the dotted path: test_worker_stack pops `flash.engine.worker`
-    # from sys.modules, so by the time this runs the parent package can be a fresh module object
-    # with no `packing` attribute yet, and monkeypatch's dotted lookup fails on the PARENT rather
-    # than on anything this test cares about.
+    # derive model_type from the child module so the gate and shim cannot disagree. patch the module
+    # object because test cleanup may replace the parent package and break dotted monkeypatch
+    # lookup.
     import flash.engine.worker.packing as _packing
 
     monkeypatch.setattr(_packing, "gdn_model_type", lambda *a, **k: "qwen3_5_moe")
@@ -991,17 +938,8 @@ def test_a_child_that_omits_a_key_leaves_it_fail_closed(monkeypatch):
 def test_an_unavailable_gdn_gate_says_why():
     """The gdn probe must print WHY it answered no, in the child, where the cause exists.
 
-    Failing closed silently is what made this expensive to diagnose. `require_gdn_boundary_resets`
-    raises on a negative answer, but the raise happens in the PARENT, which has only a boolean --
-    a missing fla wheel, a built-but-broken causal_conv1d ABI, and a conv kernel compiled without
-    this arch are indistinguishable from there. The exception object only exists inside the child,
-    so the diagnostic has to be emitted there or it does not exist at all.
-
-    Asserted on the probe SOURCE rather than by running it, because the probe is a string executed
-    in a different interpreter: there is nothing importable here to call. The syntax of that string
-    is covered by `test_the_capability_probe_is_valid_python`, so this only has to prove the
-    diagnostic is present on both negative paths -- the clean "checked, unavailable" and the
-    "the probe itself fell over".
+    The parent sees only a boolean, so missing packages and broken ABIs are otherwise identical.
+    Assert both negative-path diagnostics in the rendered source; syntax is tested separately.
     """
     probe = vc._CAPABILITY_PROBE
     # the clean negative: which of the checks failed is the difference between "install fla" and
@@ -1021,18 +959,8 @@ def test_an_unavailable_gdn_gate_says_why():
 def test_child_diagnostics_survive_the_answered_early_return(monkeypatch, capsys):
     """A child `[verl] ...` line must reach the parent log EVEN WHEN the probe answered.
 
-    THE regression for a defect that shipped inside this same change. The gdn question prints why it
-    answered no, but `probe_verl_capabilities` returned as soon as any answer parsed, and the gdn
-    question is asked LAST. So on every real run something earlier answered, the early return fired,
-    and the diagnostic was discarded -- while `require_gdn_boundary_resets` raised telling operators
-    to read a line that was never printed.
-
-    The stdout capture is what makes this invisible without a test: the child's print goes into
-    `subprocess.run(capture_output=True)`, so it exists, it is just never forwarded. Nothing crashes.
-
-    Note the fixture answers `flashinfer` AND emits the diagnostic. A fixture that answered nothing
-    would pass against the broken code too, because the no-answer path already reported stderr --
-    the bug lived exclusively on the answered path, so the test has to take it.
+    The GDN question runs last, so an early return after another answer discarded its diagnostic.
+    The fixture must both answer `flashinfer` and emit the line to exercise that exact path.
     """
     monkeypatch.setattr(
         vc.subprocess,
@@ -1064,16 +992,8 @@ def test_child_diagnostics_survive_the_answered_early_return(monkeypatch, capsys
 def test_the_gdn_gate_has_exactly_three_outcomes():
     """None for non-gdn, an arch for a resettable hybrid, a raise for everything else.
 
-    Both callers (`rl_train`, `opd_train`) treat `arch is not None` as interchangeable with "is this
-    a gdn hybrid" -- rl_train renders the shim on it, and both record it as run metadata. That is
-    only sound because the gate cannot return None for a hybrid: if it ever did, a gdn run would
-    skip the boundary shim while the metadata still said the question did not arise, which is the
-    packed-and-contaminated-but-labelled-fine case the shim exists to prevent.
-
-    The `caps` variants matter as much as the happy path. `_CAPABILITIES_UNAVAILABLE` seeds
-    `gdn_boundary_resets` as None (child died / timed out / printed nothing readable), and a partial
-    read can drop the key entirely. Both are "could not answer", and for THIS question that must
-    fail closed into the raise -- not into None, which the callers would read as "not a hybrid".
+    Callers equate a returned arch with GDN, so a hybrid must not return None and skip the
+    boundary shim. Missing, timed-out, or partial answers fail closed by raising.
     """
     module = "transformers.models.qwen3_5.modeling_qwen3_5"
 
@@ -1178,9 +1098,7 @@ def test_a_missed_conv_build_leaves_the_venv_unstamped_so_the_next_attempt_rebui
 ):
     """A best-effort install may fail; it may not be recorded as a complete provisioning.
 
-    grpo and opd pack, so ``require_gdn_boundary_resets`` raises for a gdn model whose child lacks
-    the kernel. the stamp is what makes a venv reusable, so stamping after a missed build hands
-    every later attempt on this pod the same unrunnable interpreter with no reinstall path.
+    Stamping after a missed GDN kernel build makes the broken venv permanently reusable.
     """
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
@@ -1211,10 +1129,8 @@ def test_a_conv_build_that_installs_but_cannot_import_leaves_the_venv_unstamped(
 ):
     """A zero pip exit is not the kernel landing.
 
-    causal_conv1d is a compiled cuda extension: an ABI or symbol mismatch installs cleanly and then
-    fails at import. transformers' is_causal_conv1d_available() is only a find_spec probe, so a
-    present-but-broken package passes it and the run crashes at model load instead of training
-    unpacked. Dockerfile.worker gates the same package on the same import for the same reason.
+    `causal_conv1d` can install with an ABI mismatch; gate on the real import rather than
+    transformers' `find_spec` check.
     """
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
@@ -1236,10 +1152,8 @@ def test_a_conv_build_that_installs_but_cannot_import_leaves_the_venv_unstamped(
 def test_the_venv_stamp_covers_the_conv_kernel_so_an_older_venv_is_rebuilt():
     """The stricter half of the fla argument.
 
-    Before the install outcome gated stamping, a venv was stamped whether or not the conv kernel
-    landed. Those venvs still exist on reused pod workdirs; if the stamp does not name the conv
-    requirement they keep matching, provisioning is skipped, and require_gdn_boundary_resets goes on
-    raising for grpo/opd with no path to a rebuild.
+    The stamp must name the conv requirement so reused pre-fix venvs rebuild instead of repeatedly
+    failing `require_gdn_boundary_resets`.
     """
     assert vc.CAUSAL_CONV1D_REQUIREMENT in vc.VERL_VENV_STAMP
 
@@ -1282,10 +1196,8 @@ def test_the_venv_stamp_records_the_pin_not_the_install_extras(monkeypatch, tmp_
 def test_the_stamp_identifies_flash_attn_so_a_prefix_venv_is_not_reused(monkeypatch, tmp_path):
     """A workdir provisioned before flash-attn was installed must REBUILD, not be reused.
 
-    The stamp is the whole reuse gate, and flash-attn is installed separately from verl. A stamp
-    naming only the verl pin is byte-identical before and after this fix, so a retry landing on a
-    pod whose venv predates it would skip the install entirely and hand back an interpreter with no
-    flash-attn -- the exact failure this path exists to prevent (codex[bot]).
+    The reuse stamp must include separately installed flash-attn or retries can skip its
+    installation.
     """
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
@@ -1377,12 +1289,8 @@ def test_verl_pin_matches_the_version_opd_requires_exactly():
     from flash.engine.worker import opd_plugin as plugin
 
     assert plugin._STRUCTURED_RUNTIME_EXACT_VERSIONS["verl"] == "0.8.0"
-    # asserting the constant alone would let a newer-base commit land silently, so bind the pinned
-    # commit itself to that version. this is the sha of the truncation-mask and 3d position-id
-    # commits cherry-picked onto the v0.8.0 tag, plus the agent-loop position-id pad, fused-label
-    # shape fix, and qwen3.5 shift-label ownership fix. moving the pin must be deliberate, with the
-    # base re-verified. at 1bea7d68, verl/version/version still reads 0.8.0 and
-    # verl/trainer/main_ppo_sync.py is still present.
+    # bind the pin to its verified base: 1bea7d68 remains verl 0.8.0 with main_ppo_sync.py plus the
+    # truncation, position-id, fused-label, and qwen3.5 shift-label fixes.
     _, _, ref = vc.VERL_REQUIREMENT.partition("git+")
     _, _, commit = ref.rpartition("@")
     assert commit == "1bea7d6825bbb9d2164e86e379b3680e7c53bb8a"
@@ -1413,11 +1321,8 @@ def _wandb_installs(calls, tmp_path):
 def test_resolve_verl_python_installs_wandb_into_a_venv_it_is_reusing(monkeypatch, tmp_path):
     """A reused venv still gets wandb, because the stamp cannot say whether it has it.
 
-    The stamp identifies the verl a venv holds, so a venv built by an earlier run with no
-    WANDB_API_KEY stamps as fully provisioned without wandb. Gating the install on a rebuild skips
-    it for every later run on that pod: the capability probe reports wandb unavailable,
-    resolve_verl_loggers falls back to console, and the requested W&B run is never created --
-    silently, since falling back to console is the designed behavior for a genuinely absent wandb.
+    Earlier no-key runs can stamp a venv without wandb; install it on reuse or later requested W&B
+    runs silently fall back to console.
     """
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
@@ -1728,14 +1633,8 @@ def test_run_verl_training_leaves_an_unclassified_nonzero_exit_terminal():
 def test_run_verl_training_classifies_a_child_cuda_oom_rather_than_returning_it():
     """A child's torch OOM must raise classified, not return a bare status.
 
-    this case used to sit in the parametrize above as a foil for `cudaErrorDevicesUnavailable`,
-    asserting `code == 9`. that was only ever true because a torch-allocator OOM went unrecognized:
-    the two signatures `cuda_oom_message_evidence` knew are both vLLM STARTUP shapes, so the one OOM
-    that happens during training fell through to a status-only return and the lifecycle read it as a
-    permanent job_failed instead of retrying on a larger gpu. the distinction the original test was
-    protecting still holds and is asserted here: an OOM is NOT a RetriableInfraError (that class means
-    the card itself is unusable and the retry is a fresh worker), it is a classified RuntimeError
-    carrying the evidence, which is what routes it to a gpu escalation.
+    Training OOM signatures differ from vLLM startup OOMs. Raise a classified RuntimeError so the
+    lifecycle escalates GPU size; it is not a `RetriableInfraError`.
     """
     with pytest.raises(RuntimeError) as exc_info:
         vc.run_verl_training(
@@ -1863,11 +1762,8 @@ def test_stall_tail_fields_narrows_to_the_most_recent_lines():
 
 
 # ---------------------- child teardown escalates to SIGKILL ----------------------
-# these tests drive real processes through the real escalation, which needs three kernel features
-# this repo only ever runs teardown on: fork, /proc for group membership, and libc for the subreaper
-# probe. the rest of the suite is os-independent, so guard rather than fail on a platform that
-# cannot answer (codex[bot]). checked at runtime like the /proc/self/maps test in test_worker_stack,
-# instead of on the platform name, so the condition is the capability actually required.
+# these real-process tests require fork, /proc group membership, and libc subreaper support.
+# guard on those capabilities rather than platform names.
 def _has_libc() -> bool:
     """whether `libc.so.6` loads here, for the subreaper probe the adoption tests need."""
     try:
@@ -1901,10 +1797,8 @@ def _child_subreaper_setting() -> int:
 def _child_subreaper_enabled():
     """Adopt orphaned grandchildren for the duration, then restore the previous setting.
 
-    pid 1 in `Dockerfile.worker` adopts them for free; a shared pytest process does not, so these
-    tests ask for the same behaviour explicitly. Leaving it set would change subprocess semantics for
-    every LATER test in the process -- they would adopt orphans they never reap, accumulating
-    zombies and making failures order-dependent (codex[bot]).
+    Dockerfile.worker gets adoption from pid 1; pytest must opt in without changing subprocess
+    semantics or accumulating zombies for later tests.
     """
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
     previous = _child_subreaper_setting()
@@ -1927,12 +1821,8 @@ def subreaper():
 def quick_teardown_grace(monkeypatch):
     """shorten the escalation grace so a test that deliberately ignores SIGTERM stays fast.
 
-    every child below refuses the term on purpose, so each one waits out the full production grace
-    before escalating -- 30s of a 30.6s file for three tests. the constant is read from the module
-    at call time, so patching it needs no production seam (codex[bot]).
-
-    it is only ever shortened. what these tests assert is that SIGKILL is what performs the
-    termination and that nothing is left unreaped, and neither depends on how long the grace was.
+    These tests assert SIGKILL and complete reaping, neither of which depends on the production
+    30-second grace.
     """
     monkeypatch.setattr(vc, "_TEARDOWN_GRACE_S", 0.5)
     return 0.5
@@ -2051,10 +1941,7 @@ def _classified_exit_command(marker: pathlib.Path) -> list[str]:
 def _unclassified_exit_command(marker: pathlib.Path) -> list[str]:
     """Same shape as `_classified_exit_command`, but the leader says nothing recognizable.
 
-    the tail carries no oom evidence and no retriable infra signature, so
-    `raise_for_classified_verl_exit` RETURNS instead of raising -- and a teardown that only runs on
-    the exception never fires. everything else is identical, which is what makes the pair a
-    controlled comparison rather than two unrelated scripts.
+    The classifier returns rather than raises, proving teardown cannot depend only on its exception.
     """
     grandchild = (
         "import signal,time\n"
@@ -2078,10 +1965,7 @@ def _unclassified_exit_command(marker: pathlib.Path) -> list[str]:
 def _orphaned_pipe_command(marker: pathlib.Path, *, leader_status: int) -> list[str]:
     """The reviewers' lead case: the leader EXITS while a grandchild holds the merged pipe open.
 
-    This is the reverse of `_outlives_its_stdout_command`. The direct child is gone within a second,
-    but the grandchild inherited the same stdout descriptor and never writes or closes it, so the
-    parent's read loop sees neither a line nor EOF -- it simply blocks, on a paid gpu, having already
-    lost the process it was reading. Only watching the child's exit independently of the pipe ends it.
+    The read loop sees neither data nor EOF, so only independent child-exit monitoring can end it.
     """
     grandchild = (
         "import pathlib,signal,sys,time\n"
@@ -2108,9 +1992,7 @@ def _orphaned_pipe_command(marker: pathlib.Path, *, leader_status: int) -> list[
 def _outlives_its_stdout_command() -> list[str]:
     """A leader that closes its own stdout and then refuses to die.
 
-    the read loop in `run_verl_training` ends on stdout EOF, which is not the child's exit. an
-    unbounded wait after that EOF parks the attempt on a paid gpu indefinitely, so this child closes
-    the pipe, ignores SIGTERM, and sleeps -- only a bounded wait escalating to SIGKILL ends the call.
+    stdout EOF is not process exit; the bounded wait must escalate to SIGKILL.
     """
     leader = (
         "import os,signal,sys,time\n"
@@ -2163,10 +2045,8 @@ def test_unclassified_run_verl_exit_drains_the_group_it_leaves_behind(
 ):
     """The failing path that raises nothing must still tear the group down.
 
-    the classified sibling above is torn down by the except-clause around the classifier. this one
-    is the same leak with the trigger removed: an unrecognized nonzero exit RETURNS from
-    `raise_for_classified_verl_exit`, so before the fix it reached no teardown at all and a
-    reusable worker handed the next attempt a gpu still held by the survivor's cuda context.
+    An unrecognized nonzero exit returns from classification, so teardown must not live only in the
+    classifier exception path.
     """
     marker = tmp_path / "unclassified-grandchild.pid"
     grandchild_pid = None
@@ -2192,10 +2072,7 @@ def test_run_verl_training_bounds_its_wait_on_a_child_that_outlives_its_stdout(
 ):
     """stdout EOF is not the child's exit, so the wait after the read loop has to be bounded.
 
-    verl spawns vllm's EngineCore as a grandchild holding the same merged pipe, and the pipe closing
-    says nothing about the direct child. an unbounded wait here blocks forever on a paid gpu with
-    nothing left to report -- the child below reproduces that by closing its own stdout, ignoring
-    SIGTERM and sleeping for five minutes.
+    A child can close stdout and keep running; an unbounded wait would hold a paid GPU forever.
     """
     started = time.monotonic()
     code = vc.run_verl_training(_outlives_its_stdout_command(), env=dict(os.environ))
@@ -2221,13 +2098,8 @@ def test_run_verl_training_ends_when_a_grandchild_holds_the_pipe_after_the_child
 ):
     """The reviewers' lead case: the read loop never ends, so no teardown below it is reached.
 
-    The direct child exits almost immediately, but vllm's EngineCore grandchild inherited the merged
-    stdout pipe and neither writes to it nor closes it. `for line in proc.stdout` therefore blocks
-    forever -- not on a slow trainer, but on a trainer that is already gone -- and the paid attempt
-    stalls until the provider's own wall-clock limit while the survivor holds the cuda context.
-
-    Without a watchdog on the child's exit this test HANGS rather than failing, which is exactly the
-    production symptom, so it is bounded by a short grace and asserts on elapsed time.
+    The direct child exits while an EngineCore grandchild keeps the pipe open. Bound the test and
+    require the child-exit watchdog to stop the paid-attempt stall.
     """
     monkeypatch.setattr(vc, "_ORPHANED_PIPE_GRACE_S", 1.0)
     marker = tmp_path / "pipe-holder.pid"
@@ -2261,11 +2133,8 @@ def test_run_verl_training_ends_when_a_grandchild_holds_the_pipe_after_the_child
 def test_child_exit_watchdog_does_not_kill_a_reader_still_draining_a_backlog(monkeypatch):
     """The child's exit alone must not arm the teardown -- the reader's progress also counts.
 
-    A child can exit having left a full pipe behind, and the reader then works through that backlog
-    with per-line callbacks: `on_step` uploads a checkpoint, which takes minutes. Arming on the exit
-    alone would kill that mid-upload and report a SUCCESSFUL run as a failure, which is a worse
-    outcome than the leak being fixed. A stuck reader cannot advance the line counter; a busy one
-    does, and that is the whole distinction.
+    A full pipe may still be draining through slow checkpoint callbacks; killing that reader would
+    turn a successful run into a failure.
     """
     # a grace this short fires between consecutive callbacks, so only progress-awareness saves it.
     monkeypatch.setattr(vc, "_ORPHANED_PIPE_GRACE_S", 0.2)
@@ -2294,12 +2163,8 @@ def test_child_exit_watchdog_does_not_kill_a_reader_still_draining_a_backlog(mon
 def test_child_exit_watchdog_does_not_kill_a_reader_inside_one_long_callback(monkeypatch):
     """Progress is counted around the callback, not before it.
 
-    The test above proves MANY FAST callbacks keep the reader alive, which is a weaker claim than it
-    looks: the counter advances between each pair, so no grace window ever spans a single one. The
-    real shape is ONE SLOW callback -- an `on_step` checkpoint upload runs for minutes, and while it
-    does, a counter bumped only on entry cannot move. That reader is indistinguishable from one
-    blocked on a pipe nobody will close, so the group is torn down mid-upload and a run that
-    succeeded is reported as failed (cursor).
+    One checkpoint callback can run for minutes. Counting only entry makes it look stuck and tears
+    down a successful upload; completion must advance progress too.
     """
     monkeypatch.setattr(vc, "_ORPHANED_PIPE_GRACE_S", 0.2)
     # the child exits immediately, so the callback below runs with the watchdog already armed.
@@ -2326,9 +2191,7 @@ def test_child_exit_watchdog_does_not_kill_a_reader_inside_one_long_callback(mon
 def test_child_exit_watchdog_leaves_a_healthy_quiet_child_alone(quick_teardown_grace):
     """The watchdog arms on the child's EXIT, never on silence.
 
-    A trainer loading shards or running a long generation is quiet for minutes with its pipe open,
-    and that is normal. If the watchdog fired on quiet it would kill working runs -- so it must be
-    the child's exit, not the absence of output, that arms it. Silence is `ChildTailStaleness`'s job.
+    Quiet shard loading or generation is valid; silence belongs to `ChildTailStaleness`.
     """
     # a grace of 0 would fire the instant the child exits, so any teardown observed here is
     # attributable to quiet alone.
@@ -2344,12 +2207,8 @@ def test_child_exit_watchdog_leaves_a_healthy_quiet_child_alone(quick_teardown_g
 
 @_needs_process_teardown
 def test_a_group_whose_only_member_is_a_zombie_is_not_read_as_alive():
-    # Dockerfile.worker runs python directly as pid 1 with no init, so an orphaned EngineCore is
-    # never reaped and sits as a zombie indefinitely. killpg(pgid, 0) succeeds for that group, so
-    # driving the escalation off addressability alone burned the whole drain deadline on every
-    # teardown even though the cuda context was already released -- and sigkill cannot clear a
-    # zombie, only reaping can (codex[bot]). fork rather than Popen: subprocess reaps for you, which
-    # is the very behaviour the worker image lacks.
+    # pid 1 in Dockerfile.worker does not reap orphaned EngineCore zombies. `killpg(..., 0)` still
+    # sees them, so teardown must distinguish zombies; fork because Popen would reap automatically.
     pid = os.fork()
     if pid == 0:  # pragma: no cover - child never returns to pytest
         os.setsid()
@@ -2421,7 +2280,7 @@ def test_an_unreadable_process_status_does_not_read_as_exited(monkeypatch):
     # teardown can run with the worker out of file descriptors, where opening /proc/<pid>/stat
     # raises EMFILE for every live member at once. reading that as a zombie made the whole group
     # report drained, so SIGKILL was never sent and an EngineCore kept its cuda context precisely on
-    # a resource-failure path (codex[bot]). only disappearance proves an exit.
+    # a resource-failure path. only disappearance proves an exit.
     child = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
     )
@@ -2459,7 +2318,7 @@ def test_an_empty_group_snapshot_is_rechecked_against_the_kernel(monkeypatch):
     # /proc can be listed just before a fork publishes a new child while the member that WAS there
     # exits inside the same window, so one snapshot can show nobody in a group that still holds the
     # gpu. teardown then returned before SIGKILL and the newly forked child -- which inherited the
-    # group and never received the earlier signal -- kept its cuda context (codex[bot]).
+    # group and never received the earlier signal -- kept its cuda context.
     child = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
     )
@@ -2479,7 +2338,7 @@ def test_a_zombie_only_snapshot_taken_before_a_fork_is_not_a_drain(subreaper):
     """The same race the empty snapshot has, one member later: /proc is listed with the leader
     present, and the leader forks and exits before its status is inspected. The walk is then
     nonempty and zombie-only while the child that inherited the group is alive and unlisted, so a
-    verdict taken from it skips SIGKILL and leaves the gpu held (codex[bot])."""
+    verdict taken from it skips SIGKILL and leaves the gpu held."""
     leader = os.fork()
     if leader == 0:  # pragma: no cover - runs only in the forked child
         os.setpgid(0, 0)
@@ -2542,13 +2401,10 @@ def test_a_group_that_really_is_zombie_only_still_drains(subreaper):
 
 @_needs_process_teardown
 def test_the_subreaper_setting_does_not_outlive_the_test_that_enabled_it():
-    """Both halves in one test rather than across two: a later test asserting the flag is back to 0
-    also passes when it happens to run FIRST, so it would prove nothing under random ordering.
+    """Both halves share one test so ordering cannot make a later restore check pass.
 
-    The restore is exercised from a 0 setting AND from a 1 setting. Only the first is what the suite
-    actually runs, but a `finally` that never fires is indistinguishable from a correct one there --
-    both end at 1 while the block is open and 0 is where the process already was. Entering with the
-    flag set is the case that separates them.
+    Exercise initial subreaper settings 0 and 1 so the test proves restoration, not merely the
+    process default.
     """
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
     entered = _child_subreaper_setting()
@@ -2570,14 +2426,8 @@ def test_the_subreaper_setting_does_not_outlive_the_test_that_enabled_it():
 def test_a_production_entry_point_does_not_leave_this_process_adopting_orphans():
     """The entry points claim adoption unconditionally, and that claim is PROCESS-global.
 
-    Any test reaching `run_verl_training` flips this shared pytest process from 0 to 1 for the rest
-    of the session, after which every later test adopts orphaned grandchildren it never waits on --
-    accumulating zombies and making results order-dependent. The `subreaper` fixture restores only
-    the tests that ask for it, which is not where this flag is now set (codex[bot]).
-
-    The autouse conftest fixture is what restores it. This asserts the guarantee the fixture makes,
-    from a 0 setting -- what the suite actually runs -- and would fail on a plain `finally`-less
-    entry point exactly as the leak does.
+    An autouse fixture must restore the flag after every test or later tests adopt unreaped orphans
+    and become order-dependent.
     """
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
     entered = _child_subreaper_setting()
@@ -2597,13 +2447,8 @@ def test_a_production_entry_point_does_not_leave_this_process_adopting_orphans()
 def test_the_conftest_fixture_restores_the_flag_the_entry_point_set():
     """The half the test above cannot see: the flag is restored AFTER a test, not during it.
 
-    Run as a subprocess so a real pytest teardown happens. Asserting from a later test in this
-    process would pass under random ordering whenever it happened to run first.
-
-    The probe is written UNDER ``tests/`` rather than to a scratch tempdir, because a conftest
-    governs its own directory and below: from anywhere else `tests/conftest.py` is never loaded,
-    the autouse fixture under test never runs, and the probe reports the leak whether or not the
-    fixture works. Placed in a subdirectory of its own so it is never collected by the outer run.
+    Run a subprocess so pytest teardown occurs. Place the probe under `tests/` so the conftest
+    fixture under test is actually loaded.
     """
     probe = (
         "import ctypes\n"
@@ -2655,8 +2500,8 @@ def test_teardown_reaps_an_adopted_grandchild_rather_than_leaving_a_zombie(
 ):
     # pid 1 has no init in Dockerfile.worker, so an EngineCore orphaned when the trainer exits is
     # reparented onto the worker. SIGKILL turns it into a zombie that no signal can clear -- only a
-    # wait can -- so leaving it costs one permanent process-table entry per failed or cancelled run
-    # (codex[bot]). the `subreaper` fixture reproduces that adoption inside this test process.
+    # wait can -- so leaving it costs one permanent process-table entry per failed or cancelled run.
+    # the `subreaper` fixture reproduces that adoption inside this test process.
     leader_src = (
         "import subprocess, sys, time\n"
         "g = subprocess.Popen([sys.executable, '-c',\n"
@@ -2706,7 +2551,7 @@ def test_a_straggler_that_dies_after_the_deadline_is_reaped_by_the_next_teardown
     # SIGKILL cannot be refused, but it also cannot be DELIVERED to a process in uninterruptible
     # sleep. such a member can outlast the drain deadline and turn into a zombie afterwards -- past
     # the last wait its own teardown performs -- so with no record no future wait is ever scheduled
-    # and the entry is permanent on a pid-1 worker (codex[bot]).
+    # and the entry is permanent on a pid-1 worker.
     monkeypatch.setattr(vc, "_UNREAPED_STRAGGLERS", set())
 
     pid = os.fork()
@@ -2780,8 +2625,8 @@ def test_a_straggler_that_was_never_ours_is_not_tracked_forever(monkeypatch):
 def test_a_job_that_succeeds_still_drains_the_stragglers_an_earlier_one_left(monkeypatch):
     # `kill_process_group` is the only OTHER caller of the sweep, and both of its call sites sit in
     # `except BaseException` blocks. a worker whose later jobs all SUCCEED therefore never schedules
-    # the future wait a straggler needs, holding that zombie for the process's whole life -- as pid 1
-    # there is nothing else to reap it. the drain has to happen at every job boundary (codex[bot]).
+    # the future wait a straggler needs, holding that zombie for the process's whole life -- as pid
+    # 1 there is nothing else to reap it. the drain has to happen at every job boundary.
     monkeypatch.setattr(vc, "_UNREAPED_STRAGGLERS", set())
 
     pid = os.fork()
@@ -2842,9 +2687,8 @@ sys.stdout.flush()
 def test_a_worker_that_exits_after_one_phase_still_collects_its_straggler():
     """The deferred reap has to happen before this process exits, because nothing follows it.
 
-    Remembering a pid arranges a future wait, and on a long-lived process the next teardown is that
-    wait. The runpod worker is not long-lived -- one process per phase -- so the set dies with the
-    phase and the straggler reparents to the persistent handler as a permanent zombie (codex[bot]).
+    A per-phase RunPod worker loses remembered pids at exit, leaving stragglers as permanent
+    zombies.
     """
     done = subprocess.run(
         [sys.executable, "-c", _SHORT_LIVED_WORKER.format(repo=_REPO_ROOT)],
@@ -2904,10 +2748,8 @@ def test_grpo_teardown_uses_the_shared_escalating_kill():
 def test_every_test_touching_a_linux_only_api_carries_the_platform_guard():
     """The guard was applied test-by-test and kept being missed on the next one added.
 
-    A skipif on some of them still fails the run on a platform without `fork` or `/proc`, so this
-    reads THIS file and requires the marker wherever such an api appears -- the whole block, not a
-    remembered list (codex[bot]). Source inspection is exempt: asserting that a string is absent
-    from `rl_train` runs anywhere.
+    Inspect this file and require the capability marker beside every real fork/proc use; source-only
+    assertions are exempt.
     """
     linux_only = ("os.fork", "os.getpgid", "os.killpg", "os.waitpid", "libc.so.6", "/proc/")
     exempt = {"test_every_test_touching_a_linux_only_api_carries_the_platform_guard"}
@@ -2997,8 +2839,8 @@ result = os.read(r_res, 64).decode()
 os.waitpid(worker, 0)
 # the negative control leaves the EngineCore a zombie ON PURPOSE -- that is the result it reports.
 # but this handler is its subreaper (line 1173), so the entry is OURS, and exiting here would
-# reparent it to whatever runs pytest and leak one process-table slot per run of that test
-# (codex[bot]). the state above was already recorded, so collecting it now costs the test nothing.
+# reparent it to whatever runs pytest and leak one process-table slot per run of that test. the
+# state above was already recorded, so collecting it now costs the test nothing.
 #
 # reported rather than done silently: whether the leak is VISIBLE depends on the pid 1 the suite
 # happens to run under -- systemd reaps orphans, a container's `python rp_handler.py` does not -- so
@@ -3032,15 +2874,8 @@ def _run_topology_probe(*, claim: bool) -> tuple[str, str, int, list[int]]:
 def test_an_orphan_is_actually_reaped_in_the_container_process_topology():
     """The reaping only works if this process ADOPTS the orphan, and it is not pid 1.
 
-    `Dockerfile.worker` runs `/rp_handler.py` as pid 1, and that handler spawns the flash worker as
-    a subprocess (`flash/providers/runpod/train/endpoints.py:539`). So an EngineCore orphaned when
-    the trainer exits reparents past the worker to the HANDLER, `waitpid` raises `ChildProcessError`
-    here, and `_reap` records the zombie as handled while it keeps its pid for the worker's whole
-    life -- the handler waits only on the worker, so nothing else collects it either (codex[bot]).
-
-    Driven in a subprocess because the pytest process cannot show this: the `subreaper` fixture that
-    the teardown tests use manufactures the adoption production does not have, so the defect is
-    invisible from inside it.
+    Production reparents EngineCore to `/rp_handler.py`, beyond the worker's `waitpid` reach. Run in
+    a subprocess because the test subreaper fixture would otherwise hide this topology.
     """
     claimed, state, _engine, _collected = _run_topology_probe(claim=True)
     assert state == "gone", (
@@ -3054,9 +2889,7 @@ def test_an_orphan_is_actually_reaped_in_the_container_process_topology():
 def test_without_the_claim_the_orphan_reparents_past_this_process():
     """The negative control, and the reason the claim exists: identical topology, no claim.
 
-    Asserting the defect is REACHABLE keeps the test above honest. If this ever reports the orphan
-    gone, the probe is being reaped by something other than the code under test and the pass above
-    means nothing.
+    If the orphan disappears here, something else reaped it and the positive test proves nothing.
     """
     claimed, state, engine, collected = _run_topology_probe(claim=False)
     assert state == "Z", (
@@ -3065,11 +2898,11 @@ def test_without_the_claim_the_orphan_reparents_past_this_process():
     assert claimed == "True", (
         "`_reap` reported the zombie as handled, which is what makes this silent"
     )
-    # the zombie this control deliberately produces is the probe's to clear before it exits. it is
-    # a subreaper, so the entry is its own; exiting would hand it to whatever runs pytest and leak
-    # one process-table slot per run (codex[bot]). asserted on what the probe COLLECTED rather than
-    # on the pid disappearing: under systemd the orphan is reaped either way, so the disappearance
-    # is not evidence and a test built on it could never fail here.
+    # the zombie this control deliberately produces is the probe's to clear before it exits. it is a
+    # subreaper, so the entry is its own; exiting would hand it to whatever runs pytest and leak one
+    # process-table slot per run. asserted on what the probe COLLECTED rather than on the pid
+    # disappearing: under systemd the orphan is reaped either way, so the disappearance is not
+    # evidence and a test built on it could never fail here.
     assert engine in collected, (
         f"the probe exited without reaping orphan {engine}, leaking a process-table entry to "
         "whatever inherits it -- invisible under an init that reaps, permanent under one that does not"
@@ -3126,7 +2959,7 @@ def test_a_missing_libc_does_not_fail_the_run():
 
 def test_the_grpo_success_path_drains_stragglers_too():
     """`kill_process_group` runs on exceptions alone in the grpo loop, so without a drain on the
-    ordinary exit a worker whose later jobs all SUCCEED keeps a straggler zombie for life (cursor).
+    ordinary exit a worker whose later jobs all SUCCEED keeps a straggler zombie for life.
     """
     src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
     finally_block = src[src.rindex("finally:") :]
@@ -3245,17 +3078,9 @@ def test_sm86_forces_the_rollout_eager():
 
 @pytest.mark.parametrize("cc", [(8, 0), (8, 9), (9, 0), (10, 0), (12, 0)])
 def test_arches_without_a_measured_capture_defect_keep_graphs(cc):
-    # a100/h100 shipped with graphs, and blackwell (incl. the b200 rollout work) depends on them.
-    #
-    # sm89 (rtx 4090 / L40S) is here because it was MEASURED, not because it was assumed: judged
-    # against sm90-with-graphs -- the configuration flash already ships -- its graph arm introduced
-    # no non-termination, no repetition loop, and lost no decidable answer, and graph capture costs
-    # it 453 MB of host ram (0.8B) / 426 MB (2B) across the whole process tree, LESS than sm90's
-    # 551 MB. the ~29 GB once blamed on capture in an OPD OOM was a residual of ray's accounting,
-    # which cannot see the EngineCore child where the graphs live.
-    #
-    # sm89 is the catalog's recommended_gpu for Qwen3.5-0.8B and 2B, so forcing it eager cost both
-    # cuda graphs and torch.compile on the default small-model route.
+    # retain graphs on sm89 because matched measurements found no termination or quality regression
+    # and lower host-RAM capture cost than sm90. sm89 is the default 0.8B/2B route, where eager also
+    # disables torch.compile. a100/h100 and blackwell already require graphs.
     assert vc.resolve_rollout_enforce_eager(cc) is False
 
 
@@ -3434,10 +3259,7 @@ def test_ray_log_collection_cannot_mask_the_real_error_it_runs_after(tmp_path):
 def test_a_session_predating_this_run_is_rejected_not_reported_as_its_evidence(tmp_path):
     """A run that dies BEFORE ray starts must report nothing, not the previous attempt's session.
 
-    /tmp survives a retry on a reused pod, so a failure during dependency provisioning or model
-    download still finds an earlier run's session under /tmp/ray. Uploading it under this attempt's
-    artifact prefix is worse than uploading nothing: it reads as a raylet death that never happened
-    and sends the next diagnosis after a cause belonging to a different run (codex[bot], cursor).
+    `/tmp/ray` survives pod reuse, so upload only sessions created by the current attempt.
     """
     root = tmp_path / "ray"
     _ray_session(root, "session_prev", files={"raylet.err": "PREVIOUS RUN"}, mtime=1_000_000)
@@ -3463,10 +3285,8 @@ def test_a_session_live_during_this_run_is_kept_even_if_it_started_earlier(tmp_p
 def test_a_secret_split_by_the_tail_boundary_is_not_uploaded_in_part(tmp_path):
     """Truncating first can leave the REST of a live credential unredacted.
 
-    sanitize_diagnostic matches a secret by its ``key=`` prefix or by full value. A tail boundary
-    landing inside a token strips the prefix and the value's head, so no pattern matches and the
-    remainder uploads in clear. Dropping the partial first line makes that impossible, because a
-    secret cannot span a newline (codex[bot]).
+    A tail cut inside one line removes the matching prefix and value head; drop the partial first
+    line before redaction.
     """
     root = tmp_path / "ray"
     secret = "ghp_" + "z" * 60
@@ -3487,11 +3307,8 @@ def test_a_multiline_secret_cut_by_the_boundary_is_redacted_past_the_first_line(
 ):
     """Dropping the partial first line does NOT contain a multiline secret.
 
-    ``environment.secrets`` values are arbitrary strings, so a PEM key or JSON credential is legal.
-    When the tail begins inside such a value's first line, that line is dropped -- but every
-    LATER line of the same secret is whole, lands after the cut, and no longer matches the
-    whole-value replace, so it uploads verbatim. Redaction must therefore know a secret's
-    individual lines (codex[bot]).
+    Later whole lines of PEM or JSON credentials can remain, so redaction must include safe
+    individual secret lines.
     """
     root = tmp_path / "ray"
     body_lines = ["MIIEowIBAAKCAQEAx" + "Q" * 40, "kJ9vTinRUME7Fw3n" + "R" * 40]
@@ -3517,9 +3334,7 @@ def test_a_multiline_secret_cut_by_the_boundary_is_redacted_past_the_first_line(
 def test_redacting_secret_lines_does_not_strip_ordinary_log_punctuation(monkeypatch, tmp_path):
     """The line-wise needles must not be short enough to gut the diagnostic.
 
-    A JSON credential ends in lines like ``}`` that every innocent log also contains. Registering
-    those as needles would redact unrelated text and destroy the evidence this collector exists to
-    produce, so short components are excluded.
+    Exclude tiny components such as `}` that occur throughout innocent logs.
     """
     root = tmp_path / "ray"
     monkeypatch.setenv("CUSTOMER_API_KEY", '{\n  "private_key": "' + "k" * 40 + '"\n}')
@@ -3546,9 +3361,7 @@ def test_a_read_is_capped_even_when_ray_is_still_writing(monkeypatch, tmp_path):
     class _GrowingFile:
         """a handle that appends 1 MiB the moment the file is OPENED, like a concurrent writer.
 
-        Growing at open (not at seek) is what makes this able to fail: a size-then-read
-        implementation calls os.path.getsize BEFORE opening, so a fixture that grows any later
-        would hand it a stale-but-consistent size and the unbounded read would never show.
+        Growth at open exposes size-before-open readers; later growth would not reproduce the race.
         """
 
         def __init__(self, path):
@@ -3604,14 +3417,8 @@ def test_a_session_without_a_logs_dir_yields_nothing_rather_than_raising(tmp_pat
 def _drive_bridge(server_cls, *, callers: int, hold: threading.Event, await_arrivals: int):
     """fire `callers` concurrent requests at a bridge whose handler blocks until `hold` is set.
 
-    returns ``(peak_threads_over_baseline, errors)`` measured while the handlers are held open.
-    holding them is what makes the measurement meaningful: it forces requests to be resident
-    simultaneously, which is the rollout shape that exhausted the thread table.
-
-    ``await_arrivals`` is how many requests must be inside a handler before the peak is sampled.
-    it cannot be ``callers`` for a bounded server -- only pool-size handlers can ever be resident
-    at once, so waiting for all 64 would hang. that ceiling IS the fix, so the caller passes what
-    it expects to be able to observe and the difference between the arms is the evidence.
+    Holding handlers makes peak concurrency observable. `await_arrivals` cannot exceed the bounded
+    pool size, so callers pass the peak they expect to observe.
     """
     arrived = threading.Semaphore(0)
 
@@ -3675,12 +3482,8 @@ def _drive_bridge(server_cls, *, callers: int, hold: threading.Event, await_arri
 def test_the_bridge_serves_concurrent_requests_from_a_bounded_pool():
     """VERL-139: 64 simultaneous callers must not create 64 handler threads.
 
-    the shipped bridges used ThreadingHTTPServer, which starts a thread per request and never
-    bounds them. on a real rollout (agent.num_workers x rollout.n callers, next to ray/vllm/libgomp
-    pools) that hit the container's thread limit: socketserver.process_request raised
-    "can't start new thread", the connection died mid-request, and verl saw RemoteDisconnected.
-    driving the real server class is the point -- an assertion against a hand-rolled copy of the
-    pool would pass no matter what the worker shipped.
+    `ThreadingHTTPServer` exhausted container threads and caused `RemoteDisconnected`; drive the
+    shipped server class so a copied pool cannot make the test self-fulfilling.
     """
     callers = 64
     assert callers > vc._BRIDGE_WORKER_THREADS * 2, (
@@ -3757,10 +3560,7 @@ def test_both_verl_bridges_use_the_bounded_server():
 def _exit_delay_with_pool(pool_expr: str) -> float:
     """Seconds a fresh interpreter takes to exit while ``pool_expr``'s worker is still running.
 
-    Measured in a SUBPROCESS because the thing under test is interpreter shutdown itself: the
-    stdlib joins pool workers from an exit hook, which cannot be observed from inside a test that
-    is not exiting. The handler sleeps far longer than the measurement, so a delay near the sleep
-    means exit waited for it.
+    Measure in a subprocess because the stdlib joins pool workers only during interpreter shutdown.
     """
     program = textwrap.dedent(f"""
         import sys, time
@@ -3789,15 +3589,8 @@ _EXIT_PROBE_HANDLER_S = 10.0
 def test_a_hung_bridge_handler_cannot_hold_the_worker_process_open():
     """A wedged reward/teacher callback must not delay worker exit.
 
-    The bridge moved from a daemon ``ThreadingHTTPServer`` to a pool, and `daemon_threads = True`
-    does not carry over: it is a ThreadingMixIn flag, unread once `process_request` is overridden.
-    A stock ThreadPoolExecutor registers its workers with an interpreter-exit hook that joins them,
-    and `shutdown(wait=False, cancel_futures=True)` does not release an ALREADY-RUNNING handler --
-    so a hung grader could block the worker from publishing its terminal result and releasing a
-    paid GPU.
-
-    The control arm is the point: a stock executor must FAIL this bound, otherwise the assertion
-    would pass just as well on the defect it exists to catch.
+    `ThreadPoolExecutor` workers are joined at interpreter exit even after `shutdown(wait=False)`; a
+    hung handler can retain a paid GPU. The stock-executor control must fail the bound.
     """
     control = _exit_delay_with_pool("ThreadPoolExecutor(max_workers=2)")
     assert control > _EXIT_PROBE_HANDLER_S * 0.5, (
@@ -3872,12 +3665,10 @@ def test_the_tf32_fragment_never_aborts_a_paid_run():
 
 @pytest.mark.parametrize("backend", ["grpo", "opd", "sft"])
 def test_every_verl_backend_enables_tf32_in_the_child(backend, monkeypatch):
-    """the model runs in the verl CHILD, and torch's tf32 flags are per-process state no subprocess
-    inherits. setting them in the flash parent (which trains nothing) leaves the trainer on the slow
-    path, so each backend must carry the fragment in the sitecustomize its child imports.
+    """the model runs in the verl CHILD, and torch's tf32 flags are per-process state.
 
-    execute the rendered shim rather than grepping it: that is what the child does, and it is the
-    only check that fails when a backend renders the fragment but never reaches it.
+    Execute each rendered sitecustomize fragment; setting flags in the Flash parent or merely
+    rendering unreachable code does not affect training.
     """
     from flash.engine.worker import opd_train, sft_train
 

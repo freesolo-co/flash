@@ -1,10 +1,9 @@
 """Offline tests for the warm-start (init_from_adapter) VL adapter key handling + load guards.
 
-VL SFT trains the FULL multimodal model, so its adapter keys carry the ``.language_model.`` infix
-(``base_model.model.model.language_model.layers.*``). ``adapter_is_vl_warmstart`` gates the #296
-merge-into-base path off the adapter's own keys (not just the config probe); and the three load guards
-(``assert_adapter_load_clean`` / ``assert_lora_applied`` / ``assert_adapter_delta_nonzero``) fail
-closed on a silently-discarded adapter. All exercised without a GPU / transformers / peft / vllm.
+``adapter_is_vl_warmstart`` gates the #296 merge-into-base path off the adapter's own keys (not just
+the config probe); and the three load guards (``assert_adapter_load_clean`` /
+``assert_lora_applied`` / ``assert_adapter_delta_nonzero``) fail closed on a silently-discarded
+adapter. All exercised without a GPU / transformers / peft / vllm.
 """
 
 from __future__ import annotations
@@ -173,13 +172,11 @@ def test_assert_lora_applied_raises_when_zero():
 
 
 # ---------------------------------------------------------------------------
-# Fail-closed key-equality check (matched == saved) on the captured load result.
-#
-# peft injects the LoRA modules from target_modules BEFORE loading weights, so counting injected
-# modules (assert_lora_applied) can't see a silent weight-discard: it passes even when ZERO saved
-# weights matched. assert_adapter_load_clean inspects the load_result peft returns from load_adapter
-# (load_state_dict(strict=False) -> _IncompatibleKeys) and fails closed when matched != saved. These
-# run without torch/peft using a fake load result shaped like peft's namedtuple.
+# Fail-closed key-equality check (matched == saved) on the captured load result. peft injects the
+# LoRA modules from target_modules BEFORE loading weights, so counting injected modules
+# (assert_lora_applied) can't see a silent weight-discard: it passes even when ZERO saved weights
+# matched. assert_adapter_load_clean inspects the load_result peft returns from load_adapter
+# (load_state_dict(strict=False) -> _IncompatibleKeys) and fails closed when matched != saved.
 # ---------------------------------------------------------------------------
 _LoadResult = namedtuple("_LoadResult", ["missing_keys", "unexpected_keys"])
 

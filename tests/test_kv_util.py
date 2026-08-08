@@ -118,7 +118,7 @@ def test_non_sleep_path_budgets_weights_plus_kv():
 
 def test_non_sleep_kv_scales_with_long_context():
     # vLLM's cache blocks must cover vllm_max_model_length, so a long-context resident run needs a
-    # bigger KV budget than a short one -- the old flat _KV_CAP starved the cache blocks (Codex P2).
+    # bigger KV budget than a short one -- the old flat _KV_CAP starved the cache blocks.
     short = colocate_kv_util(4.0, 2048, 80.0, sleep_mode=False)
     long = colocate_kv_util(4.0, 32768, 80.0, sleep_mode=False)
     assert long > short
@@ -159,9 +159,9 @@ def test_big_card_big_weight_colocate_lifts_cap_to_055():
     assert colocate_kv_util(9.0, 8192, 180.0, sleep_mode=True, num_generations=16) == 0.45
     #   big weights on a small card: 0.45*130 - 70 = -11.5 < 10 GB -> no room for the trainer copy -> 0.45
     assert colocate_kv_util(35.0, 8192, 130.0, sleep_mode=True, num_generations=16) == 0.45
-    #   big weights on a 141 GB H200: 0.55*141 = 78 GB executor + the trainer's 70 GB copy = 148 > 141
-    #   -> overflow, so the H200 must STAY at 0.45. The old >=140 GB threshold wrongly lifted it; the
-    #   headroom gate (0.45*141 - 70 = -6.5 < 10) keeps it down. Cursor MrXiS.
+    # big weights on a 141 GB H200: 0.55*141 = 78 GB executor + the trainer's 70 GB copy = 148 > 141
+    # -> overflow, so the H200 must STAY at 0.45. The old >=140 GB threshold wrongly lifted it; the
+    # headroom gate (0.45*141 - 70 = -6.5 < 10) keeps it down.
     assert colocate_kv_util(35.0, 8192, 141.0, sleep_mode=True, num_generations=16) == 0.45
 
 
@@ -179,7 +179,7 @@ def test_robust_to_missing_params_and_zero_context():
 
 
 def test_moe_sizes_kv_on_active_backbone_not_total():
-    """Cursor MsXcx: an MoE's resident KV pool must scale with the ACTIVE backbone (so the runtime
+    """An MoE's resident KV pool must scale with the ACTIVE backbone (so the runtime
     colocate budget matches grpo_fits_resident's sleep-mode gate, which sizes its KV on active), while
     the bf16 weight copy stays on the FULL total. Keying KV off the 35B total would budget a bigger
     pool than the gate counted -> the gate could disable sleep while the engine reserves more KV than
