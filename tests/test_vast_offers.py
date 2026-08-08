@@ -2,6 +2,29 @@
 
 from __future__ import annotations
 
+import pytest
+
+
+def _wall_capped_spec(max_wall_seconds: float):
+    """A rentable vast spec whose gpu carries an explicit wall grant.
+
+    max_wall_seconds is platform-managed and stripped from the public spec, so set it the way the
+    runner does -- by replacing gpu on a built spec rather than passing it through from_dict.
+    """
+    from dataclasses import replace
+
+    from flash.spec import JobSpec
+
+    spec = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "grpo",
+            "gpu": {"type": "H100", "count": 1, "provider": "vast"},
+            "train": {"max_examples": 4},
+        }
+    )
+    return replace(spec, gpu=replace(spec.gpu, max_wall_seconds=max_wall_seconds))
+
 
 def _offer(**kw) -> dict:
     """A fully-passing verified-datacenter RTX 4090 offer; override fields per case."""
@@ -223,6 +246,56 @@ def test_usable_offers_threads_duration_floor(monkeypatch):
     assert captured["min_duration_seconds"] == 60.0
     vast.usable_offers(24, disk_gb=60)  # no wall cap -> filter stays off
     assert captured["min_duration_seconds"] == 0
+
+
+def test_rent_search_outlasts_the_boxs_deadline_not_just_the_wall_grant(monkeypatch):
+    # Cursor Bugbot: an unarmed workload profile's box deadline carries a provisioning allowance on
+    # top of its work budget, but gpu.max_wall_seconds still names the work budget alone. Searching
+    # on the grant accepts a host whose remaining duration outlasts 600s of work yet expires part-way
+    # through the boot the allowance exists to survive -- the box then dies mid-provisioning on a
+    # host that was never rentable for the window it was handed.
+    from flash.providers.vast import jobs as vast
+
+    captured = {}
+
+    def fake_offers(*a, max_wall_seconds=0, **k):
+        captured["max_wall_seconds"] = max_wall_seconds
+        raise vast.vast_api.VastApiError("stop before renting")
+
+    spec = _wall_capped_spec(600.0)
+    monkeypatch.setattr(vast, "usable_offers", fake_offers)
+    # the box holds a 600s work budget plus a 1200s provisioning allowance.
+    now = 1_800_000_000.0
+    monkeypatch.setattr(vast.time, "time", lambda: now)
+    with pytest.raises(vast.vast_api.VastApiError):
+        vast.submit_run_vast(spec, 42, deadline_at=now + 1800.0)
+    assert captured["max_wall_seconds"] == 1800.0, (
+        "offer search must require a host that outlasts the deadline the box enforces"
+    )
+
+
+def test_rent_search_never_shortens_below_the_granted_wall(monkeypatch):
+    # the ordinary case: the deadline sits exactly one wall grant out, so the floor is unchanged.
+    # a deadline already inside the grant (a late retry) must not lower the duration requirement
+    # below the wall the worker is still allowed to use.
+    from flash.providers.vast import jobs as vast
+
+    captured = {}
+
+    def fake_offers(*a, max_wall_seconds=0, **k):
+        captured["max_wall_seconds"] = max_wall_seconds
+        raise vast.vast_api.VastApiError("stop before renting")
+
+    spec = _wall_capped_spec(600.0)
+    monkeypatch.setattr(vast, "usable_offers", fake_offers)
+    now = 1_800_000_000.0
+    monkeypatch.setattr(vast.time, "time", lambda: now)
+    with pytest.raises(vast.vast_api.VastApiError):
+        vast.submit_run_vast(spec, 42, deadline_at=now + 600.0)
+    assert captured["max_wall_seconds"] == 600.0
+    with pytest.raises(vast.vast_api.VastApiError):
+        vast.submit_run_vast(spec, 42, deadline_at=now + 120.0)
+    assert captured["max_wall_seconds"] == 600.0
 
 
 def test_live_rates_gates_on_min_disk(monkeypatch):

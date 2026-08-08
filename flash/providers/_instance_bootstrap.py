@@ -616,6 +616,21 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     console = f"/tmp/console_{mode}.txt"
     upload_deadline_at, reaping_deadline_at = _upload_cleanup_deadlines(deadline_ts)
     worker_deadline_at = _worker_execution_deadline(upload_deadline_at)
+    # the absolute deadline is minted when the box is RENTED, so whatever provisioning did not
+    # spend would otherwise become extra WORK time -- the run's declared wall budget is what bounds
+    # the work itself. this matters for a profile, whose deadline deliberately carries a
+    # provisioning allowance on top of its 10-minute budget: a box that boots fast would keep the
+    # unspent remainder and work ~20 minutes past the wall the job is priced for. Capping here (the
+    # moment work actually starts) makes that allowance strictly a boot grace. A no-op for any job
+    # whose deadline already sits inside its budget.
+    budget = payload.get("run_max_wall_seconds")
+    if isinstance(budget, (int, float)) and not isinstance(budget, bool):
+        budget = float(budget)
+        if math.isfinite(budget) and budget > 0:
+            worker_deadline_at = min(
+                worker_deadline_at,
+                _finite_positive_number(time.time(), "current clock") + budget,
+            )
     timed_out = False
 
     with open(console, "w", buffering=1) as cf:
