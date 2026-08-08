@@ -91,7 +91,11 @@ def has_freesolo_backend(api_url: str | None) -> bool:
     """
     if api_url is None or is_freesolo_hosted_url(api_url):
         return True
-    if os.environ.get("FREESOLO_BASE_URL", "").strip():
+    # an operator-controlled backend is one that is NOT Freesolo's. pointing FREESOLO_BASE_URL at
+    # the hosted service (or leaving it at that default) from a self-hosted plane would send the
+    # plane's operator key to Freesolo as a bearer token -- the leak this guard exists to close.
+    backend = os.environ.get("FREESOLO_BASE_URL", "").strip()
+    if backend and not is_freesolo_hosted_url(backend):
         return True
     return bool(os.environ.get("FREESOLO_API_KEY", "").strip())
 

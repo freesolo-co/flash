@@ -382,6 +382,24 @@ def test_configured_backend_keeps_project_listing_available(monkeypatch, capsys)
     assert "configured" in capsys.readouterr().out
 
 
+def test_a_backend_url_pointing_at_freesolo_does_not_unlock_these_commands(
+    monkeypatch, capsys
+) -> None:
+    """FREESOLO_BASE_URL naming Freesolo's own service is NOT an operator-run backend. Honouring
+    it would send the self-hosted plane's operator key to api.freesolo.co as a bearer token --
+    the credential disclosure this guard exists to prevent, reopened by the escape hatch added
+    for genuinely operator-run backends.
+    """
+    _self_hosted(monkeypatch)
+    monkeypatch.delenv("FREESOLO_API_KEY", raising=False)
+    monkeypatch.setattr("flash.client.list_projects", lambda *a, **k: pytest.fail("leaked key"))
+
+    for hosted in ("https://api.freesolo.co", "https://API.Freesolo.CO/", "api.freesolo.co"):
+        monkeypatch.setenv("FREESOLO_BASE_URL", hosted)
+        assert _run(["projects", "list"]) == 1, hosted
+        assert "not available on a self-hosted plane" in capsys.readouterr().err.lower(), hosted
+
+
 def test_an_ambient_hosted_key_survives_a_stale_self_hosted_login(monkeypatch, capsys) -> None:
     """`load_credentials` lets FREESOLO_API_KEY win over the saved key while KEEPING the saved
     api_url, and these commands never send that url anyway -- they address the backend with the
