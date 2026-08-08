@@ -108,41 +108,20 @@ def _model_arch_dims(model_id: str, revision: str = "") -> tuple[int, int]:
         return c_hidden, c_layers
 
 
-def _select_indexed_sft_examples(train, max_examples, seed):
-    if max_examples > 0:
-        train = train[:max_examples]
-    indexed_train = list(enumerate(train))
-    rng = random.Random(seed)
-    rng.shuffle(indexed_train)
-    return indexed_train
-
-
 def select_sft_examples(train, max_examples, seed):
     """Pick the SFT sample: the first ``max_examples`` rows of the dataset (file order), shuffled.
 
     The slice happens BEFORE the shuffle so ``max_examples`` is a deterministic prefix fence,
     not a random subsample. A train.jsonl that carries fully-labeled SFT rows first and
-    prompt-only (empty-output) GRPO rows after can cap SFT to the labeled head — an empty
+    prompt-only (empty-output) GRPO rows after can cap SFT to the labeled head: an empty
     completion can never be shuffled into the SFT sample and teach the model to emit nothing.
     """
-    return [example for _, example in _select_indexed_sft_examples(train, max_examples, seed)]
-
-
-def sft_completed_train_tokens(
-    tokens_per_epoch: int,
-    epochs: int,
-    derived_steps: int,
-    completed_steps: int,
-) -> int:
-    """Estimate tokens processed from completed updates while preserving epoch accounting at parity."""
-    epoch_tokens = max(0, int(tokens_per_epoch)) * max(0, int(epochs))
-    completed = max(0, int(completed_steps))
-    derived = max(1, int(derived_steps))
-    if completed == derived:
-        return epoch_tokens
-    if completed == 0 or epoch_tokens == 0:
-        return 0
-    return max(1, round(epoch_tokens * completed / derived))
+    if max_examples > 0:
+        train = train[:max_examples]
+    selected = list(train)
+    rng = random.Random(seed)
+    rng.shuffle(selected)
+    return selected
 
 
 def sft_under_ran(final_step: int, update_horizon: int, max_steps: int) -> bool:

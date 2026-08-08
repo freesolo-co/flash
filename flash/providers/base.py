@@ -159,11 +159,6 @@ def _sm_capability(sm: str) -> tuple[int, int]:
     return (n // 10, n % 10)
 
 
-def supports_fp8_kv(gpu_name: str) -> bool:
-    """Whether this GPU class's compute capability supports an fp8 KV cache (cc >= 8.9)."""
-    return _sm_capability(get_gpu_info(gpu_name).sm) >= _FP8_KV_MIN_CAPABILITY
-
-
 def max_non_fp8_kv_vram_gb() -> int:
     """Largest VRAM (GB) among validated GPU classes that do NOT support fp8 KV cache.
 

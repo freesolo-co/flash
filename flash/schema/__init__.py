@@ -147,24 +147,6 @@ def load_toml(path: str) -> dict[str, Any]:
         raise ConfigError(f"cannot read config {path}: {exc.strerror or exc}") from exc
 
 
-def spec_from_file(
-    path: str,
-    run_id: str | None = None,
-    overrides: list[str] | None = None,
-    extra_configs: list[str] | None = None,
-    *,
-    project_required: bool = False,
-) -> JobSpec:
-    spec, _ = spec_and_train_keys_from_file(
-        path,
-        run_id=run_id,
-        overrides=overrides,
-        extra_configs=extra_configs,
-        project_required=project_required,
-    )
-    return spec
-
-
 def spec_and_train_keys_from_file(
     path: str,
     run_id: str | None = None,

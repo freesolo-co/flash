@@ -12,7 +12,7 @@ import os
 
 import pytest
 
-from flash.schema import ConfigError, spec_from_dict, spec_from_file
+from flash.schema import ConfigError, spec_and_train_keys_from_file, spec_from_dict
 from flash.spec import JobSpec, WandbSpec
 
 
@@ -112,9 +112,9 @@ def _toml(tmp_path) -> str:
 
 def test_set_override_reaches_wandb(tmp_path):
     # The CLI surface: `--set wandb.project=… --set wandb.run_name=…`.
-    spec = spec_from_file(
+    spec = spec_and_train_keys_from_file(
         _toml(tmp_path), overrides=["wandb.project=cli-proj", "wandb.run_name=cli-run"]
-    )
+    )[0]
     assert spec.wandb.project == "cli-proj"
     assert spec.wandb.run_name == "cli-run"
 
@@ -123,7 +123,7 @@ def test_set_override_reaches_wandb(tmp_path):
 def test_set_override_preserves_numeric_looking_wandb_label(tmp_path, label):
     # A numeric- or bool-looking --set wandb.* value is the string label the user intends; it must
     # not be coerced to int/float/bool (which the [wandb] validator rejects).
-    spec = spec_from_file(_toml(tmp_path), overrides=[f"wandb.run_name={label}"])
+    spec = spec_and_train_keys_from_file(_toml(tmp_path), overrides=[f"wandb.run_name={label}"])[0]
     assert spec.wandb.run_name == label
 
 

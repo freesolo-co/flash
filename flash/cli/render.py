@@ -654,11 +654,6 @@ def _humanize_age_seconds(seconds: float | None) -> str | None:
     return f"{seconds / 3600:.1f}h ago"
 
 
-def _humanize_age(value) -> str | None:
-    """Format an epoch seconds value as a compact age ("3m ago"), None for non-numbers."""
-    return _humanize_age_seconds(_heartbeat_age_seconds(value))
-
-
 # heartbeat age past which the panel reminds that quiet is normal: worker uploads are throttled
 # (240s quiet phases, up to 900s mid-training), so a frozen ts is usually not a dead worker.
 _HB_QUIET_HINT_AFTER_S = 300.0

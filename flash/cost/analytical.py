@@ -760,14 +760,6 @@ def _offline_gpu_shape(
     return gpu, need, count, provider, hourly
 
 
-def select_gpu(config: RunConfig, *, max_wall_seconds: float = 0.0) -> tuple[str, int]:
-    """(chosen GPU class, required VRAM GB) from the offline structural quote."""
-    gpu, need, _count, _provider, _hourly = _offline_gpu_shape(
-        config, max_wall_seconds=max_wall_seconds
-    )
-    return gpu, need
-
-
 def _offline_profile_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
     """Offline structural quote for a cpu-only profile job: the cheapest rentable single card.
 

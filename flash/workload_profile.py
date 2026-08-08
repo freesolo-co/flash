@@ -17,7 +17,6 @@ WORKLOAD_PROFILE_SCHEMA_VERSION = 2
 SFT_PACKING_POLICY_VERSION = 1
 ROLLOUT_SAMPLE_POLICY_VERSION = 1
 _PROFILE_RUN_PREFIX = "profile-sft-"
-_ROLLOUT_PROFILE_RUN_PREFIX = "profile-rollout-"
 
 # measured generation latency ages out; the shape it was measured from does not. a provider that
 # slows down, or a card whose neighbours change, invalidates the seconds without invalidating the
@@ -361,10 +360,6 @@ def _measurement_field_names(cls: type | None = None) -> tuple[str, ...]:
     "this is measurement" instead of a hand-maintained list that a new field could silently miss.
     """
     return tuple(f.name for f in fields(cls or SftWorkloadProfile) if f.compare)
-
-
-def rollout_profile_run_id(input_digest: str) -> str:
-    return _profile_run_id(_ROLLOUT_PROFILE_RUN_PREFIX, input_digest)
 
 
 def rollout_profile_input_payload(

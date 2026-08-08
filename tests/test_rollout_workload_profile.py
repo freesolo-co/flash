@@ -14,7 +14,7 @@ from flash.workload_profile import (
     require_matching_rollout_profile,
     rollout_profile_input_digest,
     rollout_profile_input_payload,
-    rollout_profile_run_id,
+    sft_profile_run_id,
 )
 
 NOW = 1_700_000_000.0
@@ -318,10 +318,12 @@ def test_two_explicit_temperatures_do_not_share_a_profile():
 
 
 def test_run_id_requires_a_real_digest():
-    assert rollout_profile_run_id(DIGEST) == f"profile-rollout-{DIGEST}"
+    # the shared minter is what every profile kind derives its run id from, so the digest
+    # validation is asserted through the live caller rather than a kind-specific wrapper.
+    assert sft_profile_run_id(DIGEST) == f"profile-sft-{DIGEST}"
     for bad in ("", "z" * 64, "abc", DIGEST.upper()):
         with pytest.raises(ValueError, match="sha256 hex digest"):
-            rollout_profile_run_id(bad)
+            sft_profile_run_id(bad)
 
 
 # --- require_matching_rollout_profile: identity AND trust, in one place ------------------------

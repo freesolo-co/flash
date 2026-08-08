@@ -301,27 +301,6 @@ _REWARD_METRIC_LIMIT = 12
 _REWARD_METRIC_PRIORITY_NAMES = ("success",)
 
 
-def _mean_named_reward_metrics(breakdowns: list[dict[str, float] | None]) -> dict[str, float]:
-    totals: dict[str, float] = {}
-    denominator = len(breakdowns)
-    for breakdown in breakdowns:
-        if not isinstance(breakdown, dict):
-            continue
-        for name, value in breakdown.items():
-            if name == "total":
-                continue
-            totals.setdefault(name, 0.0)
-            try:
-                score = float(value)
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(score):
-                totals[name] += score
-    if denominator == 0:
-        return {}
-    return {name: total / denominator for name, total in totals.items()}
-
-
 class RewardObservabilityBuffer:
     """Rolling rollout samples and per-name reward components for an out-of-process trainer.
 
