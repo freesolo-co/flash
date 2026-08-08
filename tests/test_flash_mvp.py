@@ -36,7 +36,7 @@ def test_catalog_validation():
 
 
 def test_config_to_job_spec():
-    from flash.schema import spec_from_file
+    from flash.schema import spec_and_train_keys_from_file
 
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "run.toml")
@@ -52,7 +52,7 @@ def test_config_to_job_spec():
                 "[gpu]\n"
                 ""
             )
-        spec = spec_from_file(path, run_id="test-run")
+        spec = spec_and_train_keys_from_file(path, run_id="test-run")[0]
         assert spec.run_id == "test-run"
         assert spec.phase == "rl"
 

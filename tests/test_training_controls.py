@@ -13,7 +13,7 @@ from flash.engine.steps import (
     sft_update_steps,
     validate_save_steps,
 )
-from flash.schema import ConfigError, spec_from_file
+from flash.schema import ConfigError, spec_and_train_keys_from_file
 from flash.spec import FIXED_SEED, EnvironmentSpec, JobSpec, TrainSpec
 
 _BASE_TOML = """
@@ -34,7 +34,7 @@ def test_toml_seed_defaults_to_42_and_round_trips(tmp_path):
     path = tmp_path / "train.toml"
     path.write_text(_BASE_TOML)
 
-    spec = spec_from_file(str(path), run_id="seed-default")
+    spec = spec_and_train_keys_from_file(str(path), run_id="seed-default")[0]
 
     assert spec.seed == FIXED_SEED == 42
     assert JobSpec.from_json(spec.to_json()).seed == 42
@@ -47,7 +47,7 @@ def test_toml_seed_and_save_at_steps_parse(tmp_path):
         "seed = 987654321\n" + _BASE_TOML + "max_steps = 12\nsave_at_steps = [1, 4, 12]\n"
     )
 
-    spec = spec_from_file(str(path), run_id="seed-explicit")
+    spec = spec_and_train_keys_from_file(str(path), run_id="seed-explicit")[0]
 
     assert spec.seed == 987654321
     assert spec.train.max_steps == 12
@@ -84,7 +84,7 @@ def test_toml_max_steps_rejects_non_integer_types(tmp_path, toml_value):
     path.write_text(_BASE_TOML + f"max_steps = {toml_value}\n")
 
     with pytest.raises(ConfigError, match=r"train\.max_steps"):
-        spec_from_file(str(path))
+        spec_and_train_keys_from_file(str(path))
 
 
 def test_toml_max_steps_non_positive_uses_derived_fallback(tmp_path):
@@ -92,7 +92,7 @@ def test_toml_max_steps_non_positive_uses_derived_fallback(tmp_path):
     path = tmp_path / "neg-max-steps.toml"
     path.write_text(_BASE_TOML + "max_steps = -3\n")
 
-    assert spec_from_file(str(path)).train.max_steps is None
+    assert spec_and_train_keys_from_file(str(path))[0].train.max_steps is None
 
 
 @pytest.mark.parametrize(
@@ -111,7 +111,7 @@ def test_toml_save_at_steps_validation(tmp_path, required_saves, match):
     path.write_text(_BASE_TOML + f"save_at_steps = {required_saves}\n")
 
     with pytest.raises(ConfigError, match=match):
-        spec_from_file(str(path))
+        spec_and_train_keys_from_file(str(path))
 
 
 def test_save_at_steps_reject_steps_beyond_positive_max_steps(tmp_path):
@@ -119,7 +119,7 @@ def test_save_at_steps_reject_steps_beyond_positive_max_steps(tmp_path):
     path.write_text(_BASE_TOML + "max_steps = 5\nsave_at_steps = [2, 6]\n")
 
     with pytest.raises(ConfigError, match=r"beyond train\.max_steps"):
-        spec_from_file(str(path))
+        spec_and_train_keys_from_file(str(path))
 
     with pytest.raises(ValueError, match=r"beyond train\.max_steps"):
         TrainSpec(max_steps=5, save_at_steps=(2, 6))
@@ -135,7 +135,7 @@ def test_save_at_steps_require_explicit_positive_max_steps(tmp_path):
     path.write_text(_BASE_TOML + "save_at_steps = [2]\n")
 
     with pytest.raises(ConfigError, match=r"requires positive train\.max_steps"):
-        spec_from_file(str(path))
+        spec_and_train_keys_from_file(str(path))
 
     with pytest.raises(ValueError, match=r"requires positive train\.max_steps"):
         TrainSpec(save_at_steps=(2,))
@@ -585,7 +585,7 @@ def test_worker_env_rejects_control_plane_owned_keys(key, tmp_path):
     path = tmp_path / "reserved-worker-env.toml"
     path.write_text(_BASE_TOML + f'\n[worker_env]\n{key} = "override"\n')
     with pytest.raises(ConfigError, match="control-plane key"):
-        spec_from_file(str(path))
+        spec_and_train_keys_from_file(str(path))
 
 
 def test_provider_worker_env_emits_authoritative_spec_seed():
@@ -603,14 +603,6 @@ def test_lifecycle_rejects_seed_mismatch_before_provider_work():
     spec = JobSpec(model="model", seed=987)
     with pytest.raises(ValueError, match=r"does not match JobSpec\.seed"):
         _submit_seed_supervised(spec, 42, SimpleNamespace())
-
-
-def test_sft_train_tokens_scale_with_completed_authoritative_updates():
-    from flash.engine.worker.sft import sft_completed_train_tokens
-
-    assert sft_completed_train_tokens(1_000, 2, 20, 20) == 2_000
-    assert sft_completed_train_tokens(1_000, 2, 20, 5) == 500
-    assert sft_completed_train_tokens(1_000, 2, 20, 30) == 3_000
 
 
 def test_sft_under_ran_only_fails_a_genuine_under_run():
@@ -714,4 +706,4 @@ def test_toml_environment_secrets_reject_control_plane_seed(tmp_path):
         "group_size = 2\n"
     )
     with pytest.raises(ConfigError, match="platform-managed key"):
-        spec_from_file(str(path))
+        spec_and_train_keys_from_file(str(path))

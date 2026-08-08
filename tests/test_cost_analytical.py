@@ -11,8 +11,8 @@ from flash.cost import RunConfig, estimate_cost
 from flash.cost.analytical import (
     DEFAULT_WALL_CAP_S,
     VLLM_INIT_S,
+    _offline_gpu_shape,
     seconds_per_step,
-    select_gpu,
     setup_seconds,
 )
 
@@ -68,8 +68,8 @@ def test_bigger_model_costs_more_per_step():
 
 def test_grpo_requires_at_least_as_much_vram_as_sft():
     for model in (SMALL, MID, BIG):
-        _, sft_need = select_gpu(RunConfig(model, "sft", 100))
-        _, grpo_need = select_gpu(RunConfig(model, "grpo", 100))
+        _, sft_need, *_ = _offline_gpu_shape(RunConfig(model, "sft", 100))
+        _, grpo_need, *_ = _offline_gpu_shape(RunConfig(model, "grpo", 100))
         assert grpo_need >= sft_need
 
 
@@ -78,7 +78,7 @@ def test_omitted_sft_batch_sizes_like_the_real_allocator():
     from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
 
     cfg = RunConfig(MID, "sft", 100)  # batch_size omitted
-    _, need = select_gpu(cfg)
+    _, need, *_ = _offline_gpu_shape(cfg)
     real = alloc_required_vram_gb(MID, "sft", train={}, thinking=False)
     assert need == real
     assert "batch_size" not in cfg.train_knobs()  # omitted batch isn't forwarded (would inflate)
@@ -90,7 +90,7 @@ def test_explicit_sft_batch_is_still_forwarded_for_sizing():
     from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
 
     cfg = RunConfig(MID, "sft", 100, batch_size=32)
-    _, need = select_gpu(cfg)
+    _, need, *_ = _offline_gpu_shape(cfg)
     real = alloc_required_vram_gb(MID, "sft", train={"batch_size": 32}, thinking=False)
     assert cfg.train_knobs()["batch_size"] == 32
     assert need == real
@@ -185,13 +185,13 @@ def test_nonpositive_max_wall_seconds_is_accepted_and_floored():
     assert estimate_cost(capped).wall_clock_seconds == pytest.approx(3600.0)
 
 
-def test_select_gpu_picks_cheapest_including_unvalidated():
-    # No validation gate: select_gpu picks the cheapest fitting class (validated or not) at the
-    # static rate, and nothing fitting is cheaper.
+def test_offline_gpu_shape_picks_cheapest_including_unvalidated():
+    # No validation gate: the offline shape picks the cheapest fitting class (validated or not)
+    # at the static rate, and nothing fitting is cheaper.
     from flash.cost.facts import gpu_hourly_usd, pick_gpu
     from flash.providers.base import GPU_INFO
 
-    gpu, need = select_gpu(RunConfig(MID, "sft", 100))
+    gpu, need, *_ = _offline_gpu_shape(RunConfig(MID, "sft", 100))
     assert gpu == pick_gpu(need)
     cheaper = [
         g
@@ -253,7 +253,7 @@ def test_omitted_grpo_context_sizes_like_the_real_allocator():
     worker_len = max(1024, RECIPE.rl.max_prompt_len + RECIPE.rl.max_completion_len)
     assert cfg.normalized().seq_len == worker_len
     assert cfg.train_knobs()["max_context_tokens"] == worker_len
-    _, need = select_gpu(cfg)
+    _, need, *_ = _offline_gpu_shape(cfg)
     real = alloc_required_vram_gb(MID, "grpo", train={}, thinking=False)
     assert need == real
     # ...and never under-sizes vs the old bare-max_prompt_len default.
@@ -281,7 +281,7 @@ def test_explicit_grpo_context_still_wins():
     cfg = RunConfig(MID, "grpo", 100, seq_len=8192)
     assert cfg.normalized().seq_len == 8192
     assert cfg.train_knobs()["max_context_tokens"] == 8192
-    _, need = select_gpu(cfg)
+    _, need, *_ = _offline_gpu_shape(cfg)
     real = alloc_required_vram_gb(MID, "grpo", train={"max_context_tokens": 8192}, thinking=False)
     assert need == real
 
