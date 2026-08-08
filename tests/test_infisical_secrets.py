@@ -307,6 +307,62 @@ class TestEntrypointBehaviour:
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == "container_value/container_flag"
 
+    def test_the_loop_iterator_does_not_leak_into_the_child(self, tmp_path):
+        """The `for` variable is scratch space too, and a short name collides.
+
+        Removing the scratch variable from the loop BODY left the iterator itself. `for k in
+        ...` assigns to `k` in place, so a container that exported its own `k` hands the loop an
+        already-exported name and the child receives the list's last entry instead. Same defect
+        as the body's scratch name, one line further up, and the same invisibility -- nothing
+        fails until something downstream reads it.
+
+        Distinct from the sibling test above: that one covers KEEP being *unset*, so the loop
+        never runs. This one needs the loop to actually iterate, which is when the iterator is
+        assigned.
+        """
+        result = self._run(
+            tmp_path,
+            {
+                "INFISICAL_CLIENT_ID": "cid",
+                "INFISICAL_CLIENT_SECRET": "csec",
+                "INFISICAL_PROJECT_ID": "proj",
+                "INFISICAL_PATH": "/flash",
+                "INFISICAL_KEEP": "FROM_VAULT",
+                "k": "ORIGINAL",
+            },
+            ["sh", "-c", 'echo "${k-<GONE>}"'],
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "ORIGINAL"
+
+    def test_keeping_the_iterators_own_name_does_not_invent_a_value(self, tmp_path):
+        """A KEEP entry naming the iterator must not materialise out of the loop's own state.
+
+        This is the case that proves the iterator was renamed rather than patched around. With
+        `INFISICAL_KEEP=k` and NO container `k`, the loop's `${$name}` indirection resolves
+        through the iterator: while processing entry `k`, the iterator's value *is* the string
+        `k`, so the buggy version emitted `k=k` and the child received a variable nobody set,
+        holding a value that is just its own name.
+
+        Asserting `<GONE>` rather than a value is deliberate. Every other KEEP test supplies a
+        container value, so all of them stay green while this hole is open -- the wrapper is
+        only correct here if it emits nothing at all.
+        """
+        result = self._run(
+            tmp_path,
+            {
+                "INFISICAL_CLIENT_ID": "cid",
+                "INFISICAL_CLIENT_SECRET": "csec",
+                "INFISICAL_PROJECT_ID": "proj",
+                "INFISICAL_PATH": "/flash",
+                "INFISICAL_KEEP": "k",
+                # deliberately NO container `k`: there is nothing legitimate to re-apply
+            },
+            ["sh", "-c", 'echo "${k-<GONE>}"'],
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "<GONE>"
+
     def test_keep_naming_an_unset_variable_leaves_the_vault_value_alone(self, tmp_path):
         """A KEEP entry the container never set must NOT wipe the injected secret.
 

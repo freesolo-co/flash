@@ -81,13 +81,20 @@ export INFISICAL_TOKEN
 # an unquoted string and word-splitting it would corrupt such values, and a leading space
 # would make `env` choke.) INFISICAL_KEEP itself is a whitespace-separated list of variable
 # NAMES, so splitting *it* is intentional.
+# The iterator is scratch space, and `for` assigns to an existing name in place -- so if the
+# container exported a variable by that name, the loop inherits its export mark and the child
+# receives the loop's value instead of the container's. The name is therefore part of this
+# script's contract with the image, exactly like the scratch variable removed from the loop
+# body. `_infisical_keep_name` is namespaced to this script so no container plausibly sets it;
+# a short name like `k` collides, and there is no shell-level way to make an iterator local in
+# POSIX sh.
 # shellcheck disable=SC2086
-for k in ${INFISICAL_KEEP:-}; do
+for _infisical_keep_name in ${INFISICAL_KEEP:-}; do
   # These names are expanded inside `eval` below, so refuse anything that is not a shell
   # identifier instead of executing it.
-  case $k in
+  case $_infisical_keep_name in
     [!A-Za-z_]* | *[!A-Za-z0-9_]*)
-      echo "flash infisical entrypoint: INFISICAL_KEEP entry is not a variable name: $k" >&2
+      echo "flash infisical entrypoint: INFISICAL_KEEP entry is not a variable name: $_infisical_keep_name" >&2
       exit 2
       ;;
   esac
@@ -96,7 +103,7 @@ for k in ${INFISICAL_KEEP:-}; do
   # so a typo'd or absent KEEP entry would silently WIPE a credential rather than leave the
   # vault's value alone. `${K+set}` distinguishes unset from set-but-empty, so an explicitly
   # empty container value still wins (that is a deliberate choice by whoever wrote it).
-  eval "[ \"\${$k+set}\" = set ]" || continue
+  eval "[ \"\${$_infisical_keep_name+set}\" = set ]" || continue
   # Expand straight into the argument list, with no scratch variable in between. Two reasons.
   #
   # A scratch name is itself an environment variable, so holding the value in one would clobber
@@ -109,7 +116,7 @@ for k in ${INFISICAL_KEEP:-}; do
   # bytes shorter than the container set it -- silently, and only for the values most likely to
   # break something downstream. The expansion sits inside double quotes, so the value's own
   # content is never re-parsed: `$(...)`, backticks, quotes, and backslashes in it stay literal.
-  eval "set -- \"$k=\${$k}\" \"\$@\""
+  eval "set -- \"$_infisical_keep_name=\${$_infisical_keep_name}\" \"\$@\""
 done
 
 exec infisical run \
