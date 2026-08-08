@@ -357,7 +357,7 @@ MANAGED_GPU_KEYS = frozenset(
 #
 # Ignored on READ only: nothing here is a JobSpec field, so an authored config naming one is still
 # rejected as unknown by the schema layer's own key check (see schema._TOP_LEVEL_KEYS).
-_DROPPED_TOP_LEVEL_KEYS = frozenset({"model_policy"})
+_DROPPED_TOP_LEVEL_KEYS = frozenset({"model_policy", "worker_env"})
 
 
 @dataclass(frozen=True)

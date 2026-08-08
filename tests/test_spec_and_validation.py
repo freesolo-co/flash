@@ -1110,6 +1110,40 @@ def test_removed_worker_environment_table_is_rejected(tmp_path) -> None:
     assert "(allowed tables: environment, train, gpu, wandb)" in message
 
 
+@pytest.mark.parametrize("stored", [{}, {"CUSTOM_FLAG": "value"}])
+def test_a_run_persisted_before_the_worker_env_removal_still_reloads(stored) -> None:
+    """A record written by the OLD plane must survive the upgrade that drops the field.
+
+    Specs were persisted with asdict, so EVERY record the pre-upgrade plane wrote names worker_env,
+    including the defaulted empty one. Stored records are never rewritten and from_dict is strict, so
+    without the dropped-key tolerance the first reload after deploy raises and a still-running job
+    loses its recovery, deploy, and serving paths.
+    """
+    persisted = {**JobSpec().to_internal_dict(), "worker_env": stored}
+
+    spec = JobSpec.from_dict(persisted)
+
+    # tolerated on read, but genuinely gone: the value must not come back as an attribute.
+    assert not hasattr(spec, "worker_env")
+
+
+def test_the_dropped_worker_env_key_is_tolerated_on_read_only_never_authored() -> None:
+    """Tolerance must not quietly re-open the table as an authorable one.
+
+    from_dict ignores it so old RECORDS load; the schema layer still rejects it so a CONFIG naming it
+    fails loudly rather than training with its overrides silently discarded.
+    """
+    with pytest.raises(ConfigError, match="unknown config section"):
+        spec_from_dict(_raw(worker_env={"CUSTOM_FLAG": "value"}))
+
+
+def test_an_unknown_top_level_key_is_still_rejected_on_read() -> None:
+    # the tolerance is scoped to keys the spec itself dropped, so it cannot become a general
+    # accept-anything hole in the persisted-spec reader.
+    with pytest.raises(ValueError, match="unknown key"):
+        JobSpec.from_dict({**JobSpec().to_internal_dict(), "not_a_real_key": 1})
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
