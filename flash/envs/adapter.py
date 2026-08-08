@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,12 @@ from flash.opd_limits import (
 
 _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
+
+# how many TASK GROUPS may be scored at once. this bounds in-flight scorer CALLS, not the requests
+# they make: each call fans out inside the env's own per-instance pool, whose max_score_concurrency
+# is enforced globally across overlapping calls, so this cannot raise the provider-facing rate. it
+# exists only to keep a large rollout batch from creating one thread per prompt.
+_REWARD_GROUP_CONCURRENCY = 8
 
 
 def _json_safe(value: Any) -> Any:
@@ -312,12 +319,38 @@ class FreesoloEnvironment(BaseEnvironment):
             grp["idxs"].append(i)
             grp["payloads"].append(payload_of(st))
         out: list = [None] * len(items)
-        for key in order:
+
+        def score_group(key: str) -> tuple[str, list]:
             grp = groups[key]
             rewards = scorer(grp["task"], grp["payloads"])
             if len(rewards) != len(grp["payloads"]):
                 raise RuntimeError(f"Freesolo environment {method} returned the wrong length")
-            for idx, reward in zip(grp["idxs"], rewards, strict=True):
+            return key, rewards
+
+        # groups are scored CONCURRENTLY, not one after another. each call already scores its own
+        # completions concurrently, but a serial loop over groups still serializes the round trips
+        # ACROSS prompts, so a step with N prompts pays N judge latencies end to end while the gpu
+        # idles. the env's own pool is per-instance and sized once (freesolo Environment
+        # `_score_concurrently` / `max_score_concurrency`), so overlapping calls SHARE those workers
+        # and the provider-facing rate stays capped where it already was -- this removes a barrier
+        # rather than raising concurrency.
+        #
+        # a non-thread-safe env never reaches here: reward_many/rollout_rewards_many route it to a
+        # serial scorer above. one group still runs inline, since a pool for a single call is pure
+        # overhead and keeps the common single-prompt path exactly as it was.
+        if not self.reward_thread_safe or len(order) <= 1:
+            scored = [score_group(key) for key in order]
+        else:
+            pool = ThreadPoolExecutor(max_workers=min(_REWARD_GROUP_CONCURRENCY, len(order)))
+            try:
+                # `map` propagates the first exception and preserves input order, so a scorer that
+                # raises fails the step exactly as the serial loop did.
+                scored = list(pool.map(score_group, order))
+            finally:
+                pool.shutdown(wait=True, cancel_futures=True)
+
+        for key, rewards in scored:
+            for idx, reward in zip(groups[key]["idxs"], rewards, strict=True):
                 out[idx] = reward
         return out
 

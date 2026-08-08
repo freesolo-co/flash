@@ -8,6 +8,8 @@ import json
 import os
 import sys
 import tarfile
+import threading
+import time
 import tracemalloc
 import types
 from dataclasses import dataclass, field
@@ -1518,3 +1520,164 @@ def test_rl_hands_the_derived_opener_flag_to_the_env():
     src = inspect.getsource(_resolve_grpo_inputs)
     assert 'hasattr(env, "prompt_opens_thinking")' in src
     assert "env.prompt_opens_thinking = prompt_opened_thinking" in src
+
+
+class _SlowGroupedEnv(_FakeSingleTurnEnv):
+    """Records how many score_responses calls are in flight at once."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.live = 0
+        self.peak = 0
+        self.calls = 0
+
+    def score_responses(self, example, response_texts):
+        with self.lock:
+            self.live += 1
+            self.peak = max(self.peak, self.live)
+            self.calls += 1
+        try:
+            time.sleep(0.05)
+            return [
+                _RewardResult(score=float(len(text)), success=True, metrics=())
+                for text in response_texts
+            ]
+        finally:
+            with self.lock:
+                self.live -= 1
+
+
+def _grouped_items():
+    # four DISTINCT prompts, two rollouts each: four groups, interleaved so a correct scatter
+    # cannot be produced by accident from group-ordered output.
+    items = []
+    for rollout in range(2):
+        for prompt in range(4):
+            items.append(
+                (
+                    {"id": f"ex-{prompt}", "input": f"q{prompt}", "output": "4"},
+                    {"response_text": "x" * (prompt * 10 + rollout + 1)},
+                )
+            )
+    return items
+
+
+def test_reward_task_groups_are_scored_concurrently(monkeypatch):
+    """Distinct prompts must overlap their scoring instead of waiting on each other.
+
+    Each score_responses call already scores its own completions concurrently, but the adapter used
+    to loop over task groups SERIALLY, so a step with N prompts paid N judge latencies end to end
+    while the gpu sat idle. For a remote-judge env that is the dominant cost of the step. Asserted
+    on observed OVERLAP (peak in-flight calls > 1), not on wall-clock, so it cannot pass on a loaded
+    machine by luck.
+    """
+    sdk_env = _SlowGroupedEnv()
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    rewards = env.reward_many(_grouped_items())
+
+    assert sdk_env.calls == 4, sdk_env.calls
+    assert sdk_env.peak > 1, f"groups did not overlap (peak={sdk_env.peak})"
+    # and the values still land in INPUT order, not group order: each score is the response length.
+    assert rewards == [float(len(state["response_text"])) for _, state in _grouped_items()]
+
+
+class _SlowGroupedMultiTurnEnv(_FakeMultiTurnEnv):
+    """Multi-turn env that records concurrent score_episodes calls."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.live = 0
+        self.peak = 0
+        self.calls = 0
+
+    def score_episodes(self, example, episodes):
+        with self.lock:
+            self.live += 1
+            self.peak = max(self.peak, self.live)
+            self.calls += 1
+        try:
+            time.sleep(0.05)
+            return [
+                _RewardResult(score=0.5, success=True, metrics=(_RewardMetric("episode", 0.5),))
+                for _episode in episodes
+            ]
+        finally:
+            with self.lock:
+                self.live -= 1
+
+
+def _multiturn_grouped_items():
+    items = []
+    for rollout in range(2):
+        for prompt in range(4):
+            items.append(
+                (
+                    {"id": f"ex-{prompt}", "input": f"q{prompt}", "output": "4"},
+                    {"response_text": f"r{rollout}", "episode": {"turns": []}},
+                )
+            )
+    return items
+
+
+def test_reward_group_concurrency_is_skipped_for_a_non_thread_safe_env(monkeypatch):
+    """`reward_thread_safe = False` means the scorer must never be raced, batching win or not.
+
+    Such an env keeps thread-bound state (sqlite handles, browser sessions). Driven through
+    rollout_rewards_many DELIBERATELY: reward_many diverts a non-thread-safe env to a serial path
+    before _grouped_results is ever reached, so a reward_many-based test passes with the guard
+    deleted and proves nothing. rollout_rewards_many is the door that actually reaches the grouped
+    scorer, so it is the one that can fail.
+    """
+    sdk_env = _SlowGroupedMultiTurnEnv()
+    sdk_env.reward_thread_safe = False
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    rewards = env.rollout_rewards_many(_multiturn_grouped_items())
+
+    assert sdk_env.peak == 1, f"a non-thread-safe scorer was raced (peak={sdk_env.peak})"
+    assert [reward.episode for reward in rewards] == [0.5] * 8
+
+
+def test_multi_turn_reward_groups_are_scored_concurrently(monkeypatch):
+    """The same overlap win must reach the multi-turn path, which scores whole episodes.
+
+    Pairs with the guard test above: together they show the concurrency is real on this path AND
+    that reward_thread_safe is what turns it off, rather than the path being serial anyway.
+    """
+    sdk_env = _SlowGroupedMultiTurnEnv()
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    rewards = env.rollout_rewards_many(_multiturn_grouped_items())
+
+    assert sdk_env.calls == 4, sdk_env.calls
+    assert sdk_env.peak > 1, f"multi-turn groups did not overlap (peak={sdk_env.peak})"
+    assert [reward.episode for reward in rewards] == [0.5] * 8
+
+
+def test_a_single_task_group_still_scores_inline(monkeypatch):
+    """One group must not spawn a pool: a thread for a single call is pure overhead.
+
+    This is the common single-prompt path, so it stays exactly as it was.
+    """
+    sdk_env = _SlowGroupedEnv()
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    example = {"id": "ex-1", "input": "2+2?", "output": "4"}
+    rewards = env.reward_many([(example, {"response_text": "ab"}), (example, {"response_text": "c"})])
+
+    assert sdk_env.calls == 1
+    assert sdk_env.peak == 1
+    assert rewards == [2.0, 1.0]
