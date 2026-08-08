@@ -13,7 +13,6 @@ def _spec(
     max_context_tokens: int | None = None,
     max_completion_tokens: int | None = None,
     thinking: bool = False,
-    model_policy: str = "catalog",
 ) -> JobSpec:
     # Built directly (not via spec_from_dict) so the unit under test is the context preflight alone,
     # not the allocator VRAM sizing spec_from_dict also runs.
@@ -21,7 +20,6 @@ def _spec(
         model=model,
         algorithm=algorithm,
         thinking=thinking,
-        model_policy=model_policy,
         train=TrainSpec(
             max_context_tokens=max_context_tokens,
             max_completion_tokens=max_completion_tokens,
@@ -120,12 +118,16 @@ def test_opd_rollout_context_within_serving_cap_allowed():
     )
 
 
-def test_open_policy_uncataloged_model_skipped():
-    # No serving entry -> serving_context_cap is None -> preflight is a no-op even for a huge context.
-    spec = _spec(
-        model="mistralai/Mistral-7B-v0.1",
-        algorithm="sft",
-        max_context_tokens=32768,
-        model_policy="allow",
+def test_a_model_without_a_serving_entry_is_skipped(monkeypatch):
+    # serving_context_cap is None -> the preflight is a no-op even for a huge context. Every
+    # current catalog entry declares `serving`, so the None branch is reached by clearing it on a
+    # curated model rather than by naming an uncataloged one (submit rejects those outright).
+    from dataclasses import replace
+
+    import flash.catalog as catalog
+
+    model = "Qwen/Qwen3.5-4B"
+    monkeypatch.setitem(catalog.MODELS, model, replace(catalog.MODELS[model], serving=None))
+    preflight_train_context_within_serving(
+        _spec(model=model, algorithm="sft", max_context_tokens=32768)
     )
-    preflight_train_context_within_serving(spec)

@@ -34,18 +34,11 @@ def _reset_status_reporter_before_test():
 
 @pytest.fixture(autouse=True)
 def _offline(monkeypatch):
-    # HF param probe -> offline: sizing for an unlisted model falls back to the heuristic
-    # (24 GB tier) instead of hitting the Hugging Face API.
+    # HF param probe -> offline: pinned-revision sizing reads safetensors metadata over the
+    # network, so stub it rather than hitting the Hugging Face API from a unit test.
     import flash.engine.vram as vram
 
     monkeypatch.setattr(vram, "fetch_hf_params_b", lambda model_id: None, raising=False)
-
-    # The cost estimator memoizes open-model sizes for the life of the process (see
-    # cost.facts._SIZE_MEMO). Clear it per test so one test's stubbed size cannot answer another
-    # test's lookup, which would make a size-dependent assertion pass for the wrong reason.
-    import flash.cost.facts as cost_facts
-
-    cost_facts._SIZE_MEMO.clear()
 
     # RunPod endpoint listing -> offline: the idle-endpoint sweep (deploy-time quota reclaim
     # and the startup/post-run orphan sweep) lists account endpoints. Default to "no endpoints"

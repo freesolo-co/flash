@@ -1,102 +1,22 @@
 """regression tests for the single-field gpu.type merge (PR #670).
 
 collapsing gpu.exact_type into a pinning gpu.type dropped the old non-empty gpu.type
-default that used to seed sizing. two consumers regressed on the now-empty auto value:
+default that used to seed sizing, which regressed recovery re-allocation: it reloaded
+the persisted effective worker_spec whose gpu.type had been overwritten with the
+concrete allocated class, hard-pinning an originally auto run to the prior attempt's
+class after a control-plane restart/attach.
 
-- prepare_job's open-model preflight fed the empty public gpu.type straight to
-  resolve_model, whose _resolve_open_model falls back to DEFAULT_GPU. an uncataloged
-  model larger than DEFAULT_GPU but fitting a managed class then passed schema
-  validation (which sizes against provisional_gpu) yet was rejected at prepare_job.
-- recovery re-allocation reloaded the persisted effective worker_spec whose gpu.type
-  had been overwritten with the concrete allocated class, hard-pinning an originally
-  auto run to the prior attempt's class after a control-plane restart/attach.
+(the other consumer this file covered was prepare_job's open-model fit preflight, which
+sized an uncataloged model against the empty public gpu.type. the open-model path is
+gone -- only curated models are trainable, and a curated entry states its own
+requirements rather than estimating them from a card -- so that half went with it.)
 """
 
 from __future__ import annotations
 
 import tempfile
 
-import pytest
-
-from flash.catalog import DEFAULT_GPU
-from flash.providers.base import provisional_gpu
 from flash.spec import GpuSpec, JobSpec, TrainSpec
-
-
-def _auto_open_spec(run_id: str, *, gpu_type: str = "") -> JobSpec:
-    return JobSpec(
-        run_id=run_id,
-        model="acme/mid-14b",
-        algorithm="grpo",
-        train=TrainSpec(epochs=1, max_examples=1),
-        gpu=GpuSpec(type=gpu_type, max_retries=2),
-        model_policy="allow",
-    )
-
-
-def test_prepare_job_open_model_auto_sizes_against_provisional(monkeypatch):
-    # a 14b open model exceeds DEFAULT_GPU (RTX 5090, 32gb) but fits a larger managed class.
-    monkeypatch.setattr(
-        "flash.engine.vram.fetch_hf_params_b", lambda model_id, **k: 14.0, raising=True
-    )
-    import flash.runner as runner
-
-    spec = _auto_open_spec("open-auto-preflight")
-    expected = provisional_gpu(
-        spec.model,
-        spec.algorithm,
-        train=spec.train,
-        thinking=spec.thinking,
-        model_revision=spec.model_revision,
-    )
-    # precondition: the provisional class the schema validated against is a real, larger
-    # class -- not the empty public value and not the DEFAULT_GPU fallback -- otherwise the
-    # regression would be invisible (empty resolves to DEFAULT_GPU internally anyway).
-    assert expected not in ("", DEFAULT_GPU)
-
-    class ReachedModelResolution(Exception):
-        pass
-
-    captured: dict[str, object] = {}
-
-    def capture(*_args, **kwargs):
-        captured["gpu"] = kwargs.get("gpu")
-        raise ReachedModelResolution
-
-    monkeypatch.setattr(runner, "resolve_model", capture)
-
-    with pytest.raises(ReachedModelResolution):
-        runner.prepare_job(spec)
-
-    # prepare_job must size the fit preflight against the provisional managed class, not
-    # the empty public gpu.type that would fall back to DEFAULT_GPU and wrongly reject.
-    assert captured["gpu"] == expected
-
-
-def test_prepare_job_pinned_open_model_uses_pinned_type(monkeypatch):
-    # a pinned run keeps passing its exact class through to resolve_model unchanged.
-    monkeypatch.setattr(
-        "flash.engine.vram.fetch_hf_params_b", lambda model_id, **k: 14.0, raising=True
-    )
-    import flash.runner as runner
-
-    spec = _auto_open_spec("open-pinned-preflight", gpu_type="H200")
-
-    class ReachedModelResolution(Exception):
-        pass
-
-    captured: dict[str, object] = {}
-
-    def capture(*_args, **kwargs):
-        captured["gpu"] = kwargs.get("gpu")
-        raise ReachedModelResolution
-
-    monkeypatch.setattr(runner, "resolve_model", capture)
-
-    with pytest.raises(ReachedModelResolution):
-        runner.prepare_job(spec)
-
-    assert captured["gpu"] == "H200"
 
 
 def _persist_effective(runner, public: JobSpec, effective_type: str, effective_count: int = 0):

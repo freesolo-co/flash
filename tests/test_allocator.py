@@ -16,7 +16,7 @@ def test_required_vram_catalog_and_open(monkeypatch):
     assert (
         required_vram_gb("Qwen/Qwen3.5-4B", "sft") == 19
     )  # chunked nll bounds the vocab projection to 256 tokens
-    # open model: sized for GRPO (the heavier phase of the usual SFT+GRPO run) + headroom
+    # sized for GRPO (the heavier phase of the usual SFT+GRPO run) + headroom
     monkeypatch.setattr(vram, "fetch_hf_params_b", lambda m, **k: 4.0)
     est = vram.estimate_vram_gb(4.0, "grpo")
 
@@ -609,49 +609,37 @@ def test_opd_vram_estimate_reserves_one_dense_image_loss_peak():
     assert long > short
 
 
-def test_open_model_opd_uses_opd_sizing_not_grpo(monkeypatch):
-    """Regression (codex[bot], vram.py): for an uncataloged (model_policy='allow') model the open-model
-    fallback hardcoded ``_need(params_b, 'grpo', ...)``, so an OPD run was sized as a colocated-vLLM GRPO
-    job and never used the OPD dense-logit estimator — rejecting fitting runs or routing them to pricier
-    GPUs. The fallback must thread the REAL algorithm through, so open-model OPD sizing diverges from the
-    GRPO sizing it was previously (wrongly) identical to."""
-    from flash.catalog import MODELS
-    from flash.engine import vram
+def test_opd_uses_opd_sizing_not_grpo():
+    """OPD must size on its own dense-logit estimator, never on the GRPO colocate path.
+
+    Regression (codex[bot], vram.py): a sizing branch hardcoded ``_need(params_b, 'grpo', ...)``, so
+    an OPD run was sized as a colocated-vLLM GRPO job -- rejecting fitting runs or routing them to
+    pricier GPUs. The real algorithm must reach the estimator, so the two diverge.
+    """
     from flash.engine.vram import model_required_vram_gb
 
-    fake_id = "test-org/uncataloged-7b"
-    assert fake_id not in MODELS  # ensure it takes the open-model (info is None) fallback
-    monkeypatch.setattr(vram, "fetch_hf_params_b", lambda m, **k: 7.0)
     train = {"max_context_tokens": 8192, "max_completion_tokens": 8192, "lora_rank": 16}
-    opd_need = model_required_vram_gb(fake_id, "opd", train=train)
-    grpo_need = model_required_vram_gb(fake_id, "grpo", train=train)
-    # Before the fix these were IDENTICAL (opd fell through to the hardcoded grpo sizing); now opd uses
-    # its own dense-logit / no-colocated-vLLM estimator, so the two diverge.
-    assert opd_need != grpo_need, "open-model OPD must use OPD sizing, not the GRPO colocate path"
-    assert opd_need > 0
+    for model_id in ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B"):
+        opd_need = model_required_vram_gb(model_id, "opd", train=train)
+        grpo_need = model_required_vram_gb(model_id, "grpo", train=train)
+        assert opd_need != grpo_need, f"{model_id} OPD must not size as the GRPO colocate path"
+        assert opd_need > 0
 
 
-def test_open_model_opd_applies_colocated_vllm_floor(monkeypatch):
-    """Uncataloged OPD still starts a resident colocated vLLM engine, so it must keep the same minimum
-    GPU floor the curated path uses instead of admitting a tiny training estimate."""
-    from flash.catalog import MODELS
-    from flash.engine import vram
+def test_opd_applies_the_colocated_vllm_floor():
+    """OPD starts a resident colocated vLLM engine, so a tiny model cannot be admitted on its tiny
+    training estimate -- the engine's own footprint sets a floor the training term never reaches."""
     from flash.engine.vram import model_required_vram_gb
 
-    fake_id = "test-org/uncataloged-small-opd"
-    assert fake_id not in MODELS
     train = {
         "max_context_tokens": 1536,
         "max_completion_tokens": 128,
         "batch_size": 1,
         "group_size": 1,
     }
-
-    monkeypatch.setattr(vram, "fetch_hf_params_b", lambda _model_id, **_kwargs: 0.8)
-    assert model_required_vram_gb(fake_id, "opd", train=train, headroom=1.0) >= 24
-
-    monkeypatch.setattr(vram, "fetch_hf_params_b", lambda _model_id, **_kwargs: 1.1)
-    assert model_required_vram_gb(fake_id, "opd", train=train, headroom=1.0) >= 28
+    # the smallest catalog model: its training estimate is far under the floor, so the 24 GB it
+    # reports IS the floor rather than a coincidence of the sizing equations.
+    assert model_required_vram_gb("Qwen/Qwen3.5-0.8B", "opd", train=train, headroom=1.0) == 24
 
 
 def test_vram_headroom_consistent_across_sizing_paths():

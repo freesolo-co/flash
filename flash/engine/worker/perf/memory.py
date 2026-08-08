@@ -76,9 +76,11 @@ def grad_checkpointing_on(
 def _is_gdn_hybrid_family(model_id: str) -> bool:
     """Offline family check for a Qwen3.5/3.6 GatedDeltaNet hybrid (no network/config probe).
 
-    Every curated model is a Qwen3.5/3.6 GDN hybrid; uncataloged non-Qwen open models are not. Kept
-    as a string check so ``grpo_use_reentrant``
-    stays pure and hermetic (callable at config-build time, unit-testable without HF access).
+    Every catalog model is a Qwen3.5/3.6 GDN hybrid today, so this currently answers True for all of
+    them -- but the False branch is deliberately kept for the first non-Qwen entry someone adds when
+    forking to extend the catalog, which is the supported way to add a model. Kept as a string check
+    so ``grpo_use_reentrant`` stays pure and hermetic (callable at config-build time, unit-testable
+    without HF access).
     """
     mid = (model_id or "").lower()
     return any(token in mid for token in ("qwen3.5", "qwen3_5", "qwen3.6", "qwen3_6"))
@@ -106,7 +108,8 @@ def grpo_use_reentrant(model_id: str) -> bool:
     Reentrant checkpointing re-runs the forward inside the same autograd context over the same
     closed-over inputs (mask/position_ids threaded via the ``partial``; ``use_cache=False``) and does
     NOT assert metadata equality, so it tolerates these recomputes and produces correct gradients.
-    Uncataloged non-GDN dense open models keep the faster, lower-overhead non-reentrant path.
+    A non-MoE, non-GDN dense model keeps the faster, lower-overhead non-reentrant path (no catalog
+    entry is one today; see ``_is_gdn_hybrid_family``).
     """
     from flash.catalog import MODELS
 
