@@ -25,6 +25,7 @@ from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.backend_common import (
     completed_checkpoint_step,
     export_peft_adapter,
+    fused_ce_backend,
     gdn_probe_module,
     gdn_reset_arch_from_caps,
     latest_global_step_dir,
@@ -173,9 +174,10 @@ def build_sft_overrides(cfg: dict) -> list[str]:
         f"model.use_remove_padding={_hydra_val(cfg.get('use_remove_padding', True))}",
         # 32k contexts: the fused linear-CE forward never materializes the [tokens, vocab] logits
         # tensor (~130 GB at 32k on a 248k vocab), computing loss from hidden states + lm_head in
-        # chunks instead. torch backend = numerically exact CE, no extra deps.
+        # chunks instead. the backend is chosen per card -- see fused_ce_backend for the measured
+        # table; triton wins on sm90+ and loses below it.
         "model.use_fused_kernels=true",
-        "model.fused_kernel_options.impl_backend=torch",
+        f"model.fused_kernel_options.impl_backend={fused_ce_backend()}",
         f"model.use_liger={_hydra_val(cfg.get('use_liger', False))}",
         f"model.enable_gradient_checkpointing={_hydra_val(cfg.get('gradient_checkpointing', True))}",
         f"engine.strategy={_hydra_val(cfg.get('strategy', 'fsdp2'))}",

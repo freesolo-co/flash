@@ -36,6 +36,7 @@ from flash.engine.worker.backend_common import (
     ChildOutputTail,
     ChildTailStaleness,
     agent_loop_workers,
+    fused_ce_backend,
     clamp_engine_len,
     gdn_probe_module,
     latest_global_step_dir,
@@ -1591,9 +1592,10 @@ def build_opd_overrides(config: dict) -> list[str]:
         # 32k contexts: the fused linear-CE forward computes per-token log_probs from hidden states
         # + lm_head in chunks (FusedLinearForPPO), never materializing the [tokens, vocab] logits
         # tensor (~130 GB at 32k on a 248k vocab). the distillation loss consumes exactly
-        # model_output["log_probs"], so the fused path is loss-equivalent. torch backend = exact.
+        # model_output["log_probs"], so the fused path is loss-equivalent. the backend is chosen
+        # per card; see fused_ce_backend for the measured table.
         "actor_rollout_ref.model.use_fused_kernels=true",
-        "actor_rollout_ref.model.fused_kernel_options.impl_backend=torch",
+        f"actor_rollout_ref.model.fused_kernel_options.impl_backend={fused_ce_backend()}",
         "actor_rollout_ref.model.enable_gradient_checkpointing=true",
         f"actor_rollout_ref.model.lora_rank={_hydra_val(config['lora_rank'])}",
         f"actor_rollout_ref.model.lora_alpha={_hydra_val(config['lora_alpha'])}",

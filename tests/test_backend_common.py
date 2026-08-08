@@ -3983,3 +3983,74 @@ def test_agent_loop_workers_warns_when_a_prime_batch_serializes_the_rollout(caps
     # batch 1 is genuinely one unit of work, not a degraded split, so it is not a warning either.
     assert vc.agent_loop_workers(1) == 1
     assert capsys.readouterr().out == ""
+
+
+def _fake_torch(*, available=True, capability=(9, 0), raises=False):
+    class _Cuda:
+        @staticmethod
+        def is_available():
+            if raises:
+                raise RuntimeError("driver died")
+            return available
+
+        @staticmethod
+        def get_device_capability(_index=0):
+            if raises:
+                raise RuntimeError("driver died")
+            return capability
+
+    return SimpleNamespace(cuda=_Cuda())
+
+
+def test_fused_ce_backend_picks_triton_only_where_it_measured_faster():
+    """The triton fused-CE backend wins on sm90+ and LOSES below it, so the choice is per card.
+
+    Measured fwd+bwd at 4096x2560 into a 248320 vocab, paired and alternating: triton is 2.25x
+    faster on H100 (sm90) but 3.28x SLOWER on A100 (sm80) and 1.43x slower on A40 (sm86). A blanket
+    flip to triton -- which reads as the obvious "use the fused kernel" change -- would therefore
+    slow down every run on the two oldest fleet classes. Pin the boundary so a later edit cannot
+    quietly widen it.
+    """
+    for capability in ((9, 0), (10, 0), (12, 0)):
+        with mock.patch.dict(sys.modules, {"torch": _fake_torch(capability=capability)}):
+            assert vc.fused_ce_backend() == "triton", capability
+
+    # sm80 (A100) and sm86 (A10/A40) are real fleet classes, not hypotheticals, and sm89 is the
+    # RTX 4090 -- the cheapest class the allocator reaches first.
+    for capability in ((8, 0), (8, 6), (8, 9)):
+        with mock.patch.dict(sys.modules, {"torch": _fake_torch(capability=capability)}):
+            assert vc.fused_ce_backend() == "torch", capability
+
+
+def test_fused_ce_backend_falls_back_to_the_current_behaviour_when_it_cannot_probe():
+    """No device, or a device that will not answer, must yield `torch` -- today's behaviour.
+
+    The fallback matters more than it looks: `torch` is what all three trainers pinned before this
+    gate existed, so an unreadable capability degrades to the previously shipping configuration
+    rather than to an untested one.
+    """
+    with mock.patch.dict(sys.modules, {"torch": _fake_torch(available=False)}):
+        assert vc.fused_ce_backend() == "torch"
+
+    with mock.patch.dict(sys.modules, {"torch": _fake_torch(raises=True)}):
+        assert vc.fused_ce_backend() == "torch"
+
+
+def test_every_trainer_asks_for_the_backend_rather_than_hardcoding_one():
+    """All three algos must route through the gate; a leftover literal would silently opt out.
+
+    Asserted on the source because the alternative -- building each trainer's full hydra override
+    list -- needs a model download and a GPU. The literal `impl_backend=torch` is exactly what this
+    change removes, so its absence is the property worth pinning.
+    """
+    import flash.engine.worker.opd_train as opd_train
+    import flash.engine.worker.rl_train as rl_train
+    import flash.engine.worker.sft_train as sft_train
+
+    for module in (sft_train, rl_train, opd_train):
+        source = pathlib.Path(module.__file__).read_text()
+        code = "\n".join(
+            line for line in source.splitlines() if not line.lstrip().startswith("#")
+        )
+        assert "impl_backend=torch" not in code, module.__name__
+        assert "fused_ce_backend()" in code, module.__name__

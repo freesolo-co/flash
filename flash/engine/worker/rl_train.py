@@ -63,6 +63,7 @@ from flash.engine.worker.backend_common import (
     _ChildExitWatchdog,
     adopt_orphaned_descendants,
     agent_loop_workers,
+    fused_ce_backend,
     append_step_metrics,
     clamp_engine_len,
     completed_checkpoint_step,
@@ -415,7 +416,8 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # always true by the time we get here; there is no longer a configuration that turns it off.
         "actor_rollout_ref.model.use_remove_padding=True",
         "actor_rollout_ref.model.use_fused_kernels=True",
-        "actor_rollout_ref.model.fused_kernel_options.impl_backend=torch",
+        # backend chosen per card; see fused_ce_backend for the measured table.
+        f"actor_rollout_ref.model.fused_kernel_options.impl_backend={fused_ce_backend()}",
         *(
             [f"actor_rollout_ref.model.lora_adapter_path={cfg['warmstart_adapter']}"]
             if cfg.get("warmstart_adapter")
