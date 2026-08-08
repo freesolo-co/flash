@@ -5,12 +5,10 @@ from __future__ import annotations
 from flash.engine.vram import _LIGER_LONG_CTX_TOKENS
 from flash.engine.worker.perf.liger import _liger_default_for_model
 
-_LONG_CONTEXT_TOKENS = _LIGER_LONG_CTX_TOKENS
-
 
 def _memory_mode(model_id: str, max_length: int = 0, *, revision: str = "") -> bool:
     """True for large models or long contexts; False for small+short (optimize for speed)."""
-    if max_length and max_length >= _LONG_CONTEXT_TOKENS:
+    if max_length and max_length >= _LIGER_LONG_CTX_TOKENS:
         return True
     return _liger_default_for_model(model_id, revision=revision)
 
