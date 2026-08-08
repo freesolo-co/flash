@@ -349,6 +349,26 @@ def test_hosted_plane_still_reaches_the_backend(monkeypatch, capsys) -> None:
     assert capsys.readouterr().out == "44444444-4444-4444-8444-444444444444\n"
 
 
+def test_hosted_plane_still_refuses_when_logged_out(monkeypatch, capsys) -> None:
+    """The logged-out guard moved inside the hosted branch when the self-hosted branch was added.
+    A hosted caller with no key must still get the login refusal rather than reaching the backend
+    with `None` for a bearer token, so assert the relocation kept it on the hosted path.
+    """
+    monkeypatch.setattr("flash.client.config.load_credentials", lambda: (None, None))
+    monkeypatch.setattr(cli.commands, "load_credentials", lambda: (None, None))
+
+    def _unreachable(*a, **k):
+        raise AssertionError("called the backend without a key")
+
+    monkeypatch.setattr("flash.client.create_project", _unreachable)
+    monkeypatch.setattr("flash.client.list_projects", _unreachable)
+
+    assert _run(["projects", "create", "no key"]) == 1
+    assert "flash login" in capsys.readouterr().err
+    assert _run(["projects", "list"]) == 1
+    assert "flash login" in capsys.readouterr().err
+
+
 def test_configured_backend_keeps_the_hosted_path_on_a_self_hosted_plane(
     monkeypatch, capsys
 ) -> None:

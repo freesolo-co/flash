@@ -34,23 +34,15 @@ def default_output_path(export_format: str) -> Path:
     return RAW_EXPORT_PATH if export_format == RAW_FORMAT else DEFAULT_EXPORT_PATH
 
 
-_NO_SNAPSHOT = object()
+def _require_api_key(api_key: str | None) -> str:
+    """The key from a credential snapshot the caller already read, or the logged-out refusal.
 
-
-def _require_api_key(api_key: str | None | object = _NO_SNAPSHOT) -> str:
-    """The key to send, reading the stored credential only when the caller has no snapshot.
-
-    A caller that already read the config passes its key rather than letting this re-read, so the
-    url it decided on and the key sent to the backend come from one snapshot: a `flash login`
-    landing in between would otherwise pair a hosted-url decision with a newly stored self-hosted
-    plane credential and send that credential to the hosted backend.
-
-    ``None`` therefore has to mean "my snapshot held no key" -- a logged-out caller -- and NOT
-    "no snapshot": treating both as absent would send the logged-out path back to the config and
-    reopen that race for exactly the caller whose snapshot said there was nothing to send.
+    Takes the key instead of reading the config itself so that a caller which decided something
+    from a snapshot -- `cmd_traces_export` deciding on the url -- sends the key from that SAME
+    read. Re-reading here would let a `flash login` landing in between pair a hosted-url decision
+    with a newly stored self-hosted plane credential and send that credential to the hosted
+    backend, including for a caller whose snapshot had already established there was no key.
     """
-    if api_key is _NO_SNAPSHOT:
-        api_key = load_credentials()[1]
     if not api_key:
         raise ClientError(
             "not logged in. Run `flash login` with your freesolo API key (or set FREESOLO_API_KEY)"
@@ -83,16 +75,18 @@ def fetch_records(
     api_key: str | None = None,
     export_format: str = RECORDS_FORMAT,
 ) -> dict:
-    """A project's traces in the requested shape, converted server-side."""
-    # `None` here is this signature's "caller passed nothing", not a snapshot that held no key,
-    # so it forwards as no-snapshot and `_require_api_key` may read the config itself.
-    key = _require_api_key(api_key if api_key is not None else _NO_SNAPSHOT)
+    """A project's traces in the requested shape, converted server-side.
+
+    Omitting `api_key` reads the stored credential, which is right for `env_setup`'s call: it holds
+    no snapshot this key has to agree with.
+    """
+    key = _require_api_key(api_key or load_credentials()[1])
     return export_trace_records(project_id, key, export_format=export_format)
 
 
-def fetch_projects(api_key: str | None = None) -> list[dict]:
+def fetch_projects(api_key: str) -> list[dict]:
     """Projects in the caller's org that traces can be exported from."""
-    return list_trace_projects(_require_api_key(api_key if api_key is not None else _NO_SNAPSHOT))
+    return list_trace_projects(api_key)
 
 
 def _resolve_project_id(args, api_key: str) -> str:

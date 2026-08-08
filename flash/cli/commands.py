@@ -224,15 +224,12 @@ def cmd_projects_create(args) -> int:
         # no directory to create a row in, and none needed: the plane accepts any well-shaped
         # uuid (server/projects.py under standalone()), so minting one locally IS the create.
         project_id = str(uuid.uuid4())
-        if render.styled():
-            print(render.project_created(project_id, str(args.name).strip()))
-        else:
-            print(project_id)
-        return 0
-    if not api_key:
-        raise ClientError("not logged in. Run `flash login` before creating a project")
-    result = create_project(args.name, getattr(args, "description", None), api_key)
-    project_id = result["id"]
+    else:
+        if not api_key:
+            raise ClientError("not logged in. Run `flash login` before creating a project")
+        project_id = create_project(args.name, getattr(args, "description", None), api_key)["id"]
+
+    # both ids are reported the same way: where it came from is the only difference above.
     if render.styled():
         print(render.project_created(project_id, str(args.name).strip()))
     else:
