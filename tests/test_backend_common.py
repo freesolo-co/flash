@@ -4012,14 +4012,12 @@ def test_fused_ce_backend_picks_triton_only_where_it_measured_faster():
     quietly widen it.
     """
     for capability in ((9, 0), (10, 0), (12, 0)):
-        with mock.patch.dict(sys.modules, {"torch": _fake_torch(capability=capability)}):
-            assert vc.fused_ce_backend() == "triton", capability
+        assert vc.fused_ce_backend({"capability": list(capability)}) == "triton", capability
 
     # sm80 (A100) and sm86 (A10/A40) are real fleet classes, not hypotheticals, and sm89 is the
     # RTX 4090 -- the cheapest class the allocator reaches first.
     for capability in ((8, 0), (8, 6), (8, 9)):
-        with mock.patch.dict(sys.modules, {"torch": _fake_torch(capability=capability)}):
-            assert vc.fused_ce_backend() == "torch", capability
+        assert vc.fused_ce_backend({"capability": list(capability)}) == "torch", capability
 
 
 def test_fused_ce_backend_falls_back_to_the_current_behaviour_when_it_cannot_probe():
@@ -4027,13 +4025,29 @@ def test_fused_ce_backend_falls_back_to_the_current_behaviour_when_it_cannot_pro
 
     The fallback matters more than it looks: `torch` is what all three trainers pinned before this
     gate existed, so an unreadable capability degrades to the previously shipping configuration
-    rather than to an untested one.
+    rather than to an untested one. The probe reports every one of these as a missing or unusable
+    `capability` entry (`probe_verl_capabilities` emits None when cuda is absent or the import
+    raises), so they all funnel through `verl_device_capability` returning None.
     """
-    with mock.patch.dict(sys.modules, {"torch": _fake_torch(available=False)}):
-        assert vc.fused_ce_backend() == "torch"
+    for caps in ({}, {"capability": None}, {"capability": []}, {"capability": ["x", "y"]}):
+        assert vc.fused_ce_backend(caps) == "torch", caps
 
-    with mock.patch.dict(sys.modules, {"torch": _fake_torch(raises=True)}):
-        assert vc.fused_ce_backend() == "torch"
+
+def test_fused_ce_backend_does_not_open_a_cuda_context_in_the_parent():
+    """The gate must read the child's probe, never `torch.cuda` in this long-lived process.
+
+    Initializing cuda here to answer one question retains a context for the process lifetime on the
+    devices `torchrun` is about to own -- unbudgeted VRAM against a reserve sized without it. It is
+    also the wrong interpreter: verl pins its own torch, and the question is about verl's kernels.
+
+    A stub torch whose `get_device_capability` raises stands in for "somebody reintroduced the live
+    probe": if the gate touches it at all, this fails instead of silently regressing.
+    """
+    exploding = _fake_torch(raises=True)
+
+    with mock.patch.dict(sys.modules, {"torch": exploding}):
+        assert vc.fused_ce_backend({"capability": [9, 0]}) == "triton"
+        assert vc.fused_ce_backend({"capability": [8, 0]}) == "torch"
 
 
 def test_every_trainer_asks_for_the_backend_rather_than_hardcoding_one():
@@ -4042,6 +4056,9 @@ def test_every_trainer_asks_for_the_backend_rather_than_hardcoding_one():
     Asserted on the source because the alternative -- building each trainer's full hydra override
     list -- needs a model download and a GPU. The literal `impl_backend=torch` is exactly what this
     change removes, so its absence is the property worth pinning.
+
+    Each trainer resolves the backend once from `caps` and threads the ANSWER through its config
+    dict, so the override builders read `cfg[...]` and only the call sites name the helper.
     """
     import flash.engine.worker.opd_train as opd_train
     import flash.engine.worker.rl_train as rl_train
@@ -4051,4 +4068,7 @@ def test_every_trainer_asks_for_the_backend_rather_than_hardcoding_one():
         source = pathlib.Path(module.__file__).read_text()
         code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
         assert "impl_backend=torch" not in code, module.__name__
-        assert "fused_ce_backend()" in code, module.__name__
+        assert "fused_ce_backend(caps)" in code, module.__name__
+        # the caps-taking form is the whole point of the fix; a bare call would be the parent-cuda
+        # probe coming back.
+        assert "fused_ce_backend()" not in code, module.__name__

@@ -236,26 +236,26 @@ def model_max_position_embeddings(model_id: str, revision: str = "") -> int | No
 _TRITON_FUSED_CE_MIN_CAPABILITY = (9, 0)
 
 
-def fused_ce_backend() -> str:
+def fused_ce_backend(caps: dict) -> str:
     """`triton` where it is measurably faster (sm90+), `torch` everywhere else.
 
-    Probed live rather than derived from the allocator's GpuClass: the trainers already read
-    `torch.cuda.get_device_capability()` for the fp8-KV gate, and the card a run lands on is the
-    only authority on what the kernel will compile for. an unavailable or unreadable device falls
-    back to `torch`, which is the current behaviour on every card.
-    """
-    try:
-        import torch
+    Takes the capability from the out-of-process probe (`verl_device_capability`) rather than
+    calling `torch.cuda.get_device_capability` here, for two reasons:
 
-        if not torch.cuda.is_available():
-            return "torch"
-        return (
-            "triton"
-            if torch.cuda.get_device_capability(0) >= _TRITON_FUSED_CE_MIN_CAPABILITY
-            else "torch"
-        )
-    except Exception:
+    * this runs in the long-lived PARENT, which does not otherwise touch cuda. initializing a
+      context here to answer one question retains it for the process lifetime, on the same devices
+      `torchrun` is about to own -- unbudgeted VRAM against a reserve sized without it, which is
+      exactly the kind of overhead that OOMs a job sized near a card's limit.
+    * the question is about verl's kernels, and verl pins its own torch. the parent's torch is the
+      wrong interpreter to ask.
+
+    An unanswerable probe (no cuda, no torch, hung import) yields None and falls back to `torch`,
+    which is the current behaviour on every card.
+    """
+    cc = verl_device_capability(caps)
+    if cc is None:
         return "torch"
+    return "triton" if cc >= _TRITON_FUSED_CE_MIN_CAPABILITY else "torch"
 
 
 def agent_loop_workers(rollout_batch: int, *, cap: int = 8) -> int:

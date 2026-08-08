@@ -177,7 +177,7 @@ def build_sft_overrides(cfg: dict) -> list[str]:
         # chunks instead. the backend is chosen per card -- see fused_ce_backend for the measured
         # table; triton wins on sm90+ and loses below it.
         "model.use_fused_kernels=true",
-        f"model.fused_kernel_options.impl_backend={fused_ce_backend()}",
+        f"model.fused_kernel_options.impl_backend={cfg.get('fused_ce_backend', 'torch')}",
         f"model.use_liger={_hydra_val(cfg.get('use_liger', False))}",
         f"model.enable_gradient_checkpointing={_hydra_val(cfg.get('gradient_checkpointing', True))}",
         f"engine.strategy={_hydra_val(cfg.get('strategy', 'fsdp2'))}",
@@ -1201,12 +1201,14 @@ def run_sft_train(spec=None) -> None:
         # grad_norm 0.0 with liger on and 7.02 with it off. the grpo path never enables it,
         # which is why only sft was affected. verl already disables liger's fused linear ce
         # (it conflicts with verl's forward patching) and flash gets fused ce from
-        # use_fused_kernels + impl_backend=torch, so nothing of value is lost here.
+        # use_fused_kernels + the impl_backend resolved below, so nothing of value is lost here.
         "use_liger": False,
         "gradient_checkpointing": gradient_checkpointing and not reentrant_gradient_checkpointing,
         "total_training_steps": update_horizon if max_steps > 0 else None,
         "total_epochs": epochs if max_steps <= 0 else None,
         "use_remove_padding": use_remove_padding,
+        # resolved from the out-of-process capability probe, never by opening cuda in this parent.
+        "fused_ce_backend": fused_ce_backend(caps),
     }
     overrides = build_sft_overrides(config)
 

@@ -1595,7 +1595,7 @@ def build_opd_overrides(config: dict) -> list[str]:
         # model_output["log_probs"], so the fused path is loss-equivalent. the backend is chosen
         # per card; see fused_ce_backend for the measured table.
         "actor_rollout_ref.model.use_fused_kernels=true",
-        f"actor_rollout_ref.model.fused_kernel_options.impl_backend={fused_ce_backend()}",
+        f"actor_rollout_ref.model.fused_kernel_options.impl_backend={config.get('fused_ce_backend', 'torch')}",
         "actor_rollout_ref.model.enable_gradient_checkpointing=true",
         f"actor_rollout_ref.model.lora_rank={_hydra_val(config['lora_rank'])}",
         f"actor_rollout_ref.model.lora_alpha={_hydra_val(config['lora_alpha'])}",
@@ -2656,6 +2656,9 @@ def run_opd_train(spec=None) -> None:
             "mm_encoder_attn_backend": mm_encoder_attn_backend,
             "sleep_unsupported": rollout_sleep_unsupported(model_id),
             "loggers": loggers,
+            # resolved from the out-of-process capability probe, never by opening cuda in this
+            # parent -- see fused_ce_backend.
+            "fused_ce_backend": fused_ce_backend(caps),
         }
         overrides = build_opd_overrides(config)
         progress_state = _OpdProgressState(resume_state)
