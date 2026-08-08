@@ -59,7 +59,20 @@ _SHELL_NAME = re.compile(r"(?:[\w./-]*/)?(?:ba|a|z|k|da)?sh$")
 # Wrappers that EXEC what follows them, so the real command is further right. Open-ended by
 # nature; this is the part of the guard most likely to need extending, and the only part where
 # a miss is a silent under-match rather than a parse error.
-_EXEC_WRAPPERS = {"sudo", "env", "xargs", "nohup", "exec", "command", "timeout", "stdbuf"}
+_EXEC_WRAPPERS = {
+    "sudo",
+    "env",
+    "xargs",
+    "nohup",
+    "exec",
+    "command",
+    "timeout",
+    "stdbuf",
+    # `busybox ash` runs ash through BusyBox's applet dispatch. Unlike the others this one also
+    # dispatches non-shells (`busybox wget`), so it only matters that the walk keeps GOING -- the
+    # applet after it is judged on its own name, exactly as any other command word would be.
+    "busybox",
+}
 
 # Flags that take a SEPARATE operand, per wrapper. Keyed by wrapper because the same spelling
 # means different things: `env -u NAME` unsets a variable, `sudo -u USER` picks a user. Knowing
@@ -259,10 +272,35 @@ def _stage_runs_a_shell(tokens: list[str]) -> bool:
     inner = [t for t in tokens if t not in ("(", ")", "{", "}")]
     word, at = _command_word(inner)
     if at is not None and _SHELL_NAME.fullmatch(word):
-        return True
+        # `sh -c '…'` takes its program from the operand and leaves the pipe on stdin for
+        # whatever that program is. `curl checksums.txt | sh -c 'sha256sum -c -'` therefore
+        # VERIFIES the download rather than running it -- the stream is data, and flagging it
+        # would fail CI on the exact pattern this guard is meant to encourage.
+        #
+        # So the operand replaces the question, it does not answer it: ask whether THAT command
+        # is a shell. `sh -c 'bash'` still matches, because the thing reading stdin is a shell.
+        program = _dash_c_operand(inner[at:])
+        return _stage_runs_a_shell(_tokenize(program)) if program is not None else True
     # Checked even when the walk found no command word: `env -S'bash -s'` fuses the operand into
     # the flag, so every token is a flag and the walk runs off the end with the shell still in it.
     return any(_stage_runs_a_shell(_tokenize(cmd)) for cmd in _split_string_operands(inner))
+
+
+def _dash_c_operand(tokens: list[str]) -> str | None:
+    """The program string a shell's `-c` supplies, or None when the shell has no `-c`.
+
+    Returns the operand even when it is empty, so `sh -c ''` is distinguishable from a shell
+    invoked with no `-c` at all -- the first runs nothing, the second runs the piped stream.
+
+    `-s` wins over `-c` when both appear: it makes the shell read its program from stdin, which
+    is the piped download, so the operand is no longer the whole story.
+    """
+    for index, tok in enumerate(tokens):
+        if tok.startswith("-") and "s" in tok[1:] and not tok.startswith("--"):
+            return None
+        if _TAKES_A_COMMAND_STRING.fullmatch(tok):
+            return tokens[index + 1] if index + 1 < len(tokens) else ""
+    return None
 
 
 def _split_string_operands(tokens: list[str]) -> list[str]:
@@ -499,6 +537,22 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
         # BusyBox's shell, and therefore `/bin/sh` on every Alpine image -- the base a vendor
         # install script is most likely to run under.
         pytest.param("RUN curl -sSL https://x.example/i.sh | ash\n", id="busybox-ash"),
+        # The same shell reached through BusyBox's applet dispatch. `busybox` is a wrapper the
+        # walk must step over, not the command word.
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | busybox ash\n", id="busybox-applet-dispatch"
+        ),
+        pytest.param("RUN curl -sSL https://x.example/i.sh | busybox sh\n", id="busybox-applet-sh"),
+        # A shell whose `-c` operand is ITSELF a shell: the thing reading stdin is still a shell,
+        # so exempting every `-c` would let this through.
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | sh -c 'bash'\n", id="dash-c-runs-a-shell"
+        ),
+        # `-s` makes the shell read its program from stdin -- the piped download -- so it wins
+        # over the `-c` operand rather than deferring to it.
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | bash -s -c 'jq .'\n", id="dash-s-beats-dash-c"
+        ),
         # A shell option that takes its own operand. Scanning LEFT from the `-c` stopped at
         # `pipefail` and concluded the command was not a shell, so the quoted pipeline stayed
         # closed -- and `-o pipefail` is exactly how a careful CI script opens.
@@ -657,6 +711,17 @@ def test_the_guard_catches_a_yaml_line_that_both_folds_back_and_continues_on(tmp
         pytest.param("curl -s https://x.example/f | env -S'jq .version'", id="split-fused-into-jq"),
         # `-S` on something that is not `env` is an ordinary flag: jq's is --sort-keys.
         pytest.param("curl -s https://x.example/f | jq -S .", id="dash-s-on-a-non-env"),
+        # `sh -c '…'` takes its program from the operand and leaves the pipe on stdin for that
+        # program, so the download is DATA. Verifying a checksum this way is the pattern this
+        # guard exists to encourage, and flagging it would fail CI on the recommended spelling.
+        pytest.param(
+            "curl -s https://x.example/checksums.txt | sh -c 'sha256sum -c -'",
+            id="dash-c-verifies-the-download",
+        ),
+        pytest.param("curl -s https://x.example/f | bash -c 'jq .'", id="dash-c-runs-a-non-shell"),
+        # BusyBox dispatches non-shell applets too; stepping over the wrapper must not make the
+        # applet after it match.
+        pytest.param("curl -s https://x.example/f | busybox cat", id="busybox-non-shell-applet"),
         # A shell OPTION's operand is skipped, so a shell-named one must not read as a command.
         # `bash -o bash script.sh` sets an (invalid) option and runs a script, not a nested shell.
         pytest.param("curl -s https://x.example/f | jq -o bash .", id="option-operand-not-command"),
