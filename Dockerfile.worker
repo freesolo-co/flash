@@ -277,9 +277,24 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # the resolve_verl_python path where that hardening lives -- letting the two lists drift means the
 # fallback protects nobody and a vllm respin breaks launch on the default image alone. Keep them in
 # lockstep with backend_common.py's install list.
+#
+# freesolo-co/verl is a PRIVATE repo, so this clone needs a credential. It arrives as a BuildKit
+# secret (--mount=type=secret) rather than an ARG/ENV: an ARG is recorded in the image history and
+# an ENV persists into the running container, either of which would ship a GitHub token to every
+# training pod. The secret is mounted only for the lifetime of this RUN and leaves no layer.
+# The token is injected via GIT_CONFIG_* insteadOf rather than being written into VERL_SPEC, so the
+# URL stays credential-free everywhere it is echoed (uv logs the spec it resolves) and stays
+# byte-identical to backend_common.VERL_REQUIREMENT_URL, which tests assert lockstep on.
+# Absent secret = unauthenticated clone, which fails on the private repo instead of silently
+# building an image without verl.
 ARG VERL_SPEC=verl[vllm]@git+https://github.com/freesolo-co/verl@1bea7d6825bbb9d2164e86e379b3680e7c53bb8a
 ENV FLASH_VERL_PYTHON=/opt/verl-venv/bin/python
-RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" > /tmp/verl-overrides.txt \
+RUN --mount=type=secret,id=verl_token,required=true \
+    export GIT_CONFIG_COUNT=1 \
+    && export GIT_CONFIG_KEY_0="url.https://x-access-token:$(cat /run/secrets/verl_token)@github.com/.insteadOf" \
+    && export GIT_CONFIG_VALUE_0="https://github.com/" \
+    && export GIT_TERMINAL_PROMPT=0 \
+    && printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" > /tmp/verl-overrides.txt \
     && uv venv --seed /opt/verl-venv \
     && VIRTUAL_ENV=/opt/verl-venv uv pip install --python /opt/verl-venv/bin/python \
         --override /tmp/verl-overrides.txt \

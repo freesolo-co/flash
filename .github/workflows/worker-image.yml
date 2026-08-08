@@ -117,6 +117,13 @@ jobs:
           build-args: |
             FLASH_ATTN_SPEC=${{ env.FA2_SPEC }}
             FLASH_ATTN_3_SPEC=${{ env.FA3_SPEC }}
+          # freesolo-co/verl is PRIVATE, and Dockerfile.worker clones it to build /opt/verl-venv.
+          # The default GITHUB_TOKEN is scoped to THIS repo only, so it cannot read verl -- this
+          # needs a token with read access to it (VERL_READ_TOKEN, a fine-grained PAT with
+          # contents:read on freesolo-co/verl). Passed as a BuildKit secret, never a build-arg:
+          # build-args land in `docker history`, which would publish the token with the image.
+          secrets: |
+            verl_token=${{ secrets.VERL_READ_TOKEN }}
 
       # When :cu128 is republished the per-arch cu128-sm* tags go stale. auto-rebake.yml now handles
       # that automatically on this workflow's completion: a free re-layer when only the base moved, or

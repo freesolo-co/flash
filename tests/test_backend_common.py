@@ -1261,6 +1261,61 @@ def test_verl_spec_stays_in_lockstep_with_the_worker_image():
     )
 
 
+def test_the_verl_install_can_authenticate_to_the_private_fork(monkeypatch, tmp_path):
+    # freesolo-co/verl is private. GITHUB_TOKEN reaches the worker, but git will not USE it without
+    # a rule binding it to github.com, so inheriting os.environ leaves the clone prompting for a
+    # username and the run dies during provisioning on a paid pod.
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_sentinel")
+    envs = []
+
+    def fake_run(command, check, env=None, capture_output=False):
+        envs.append((command, env))
+        if command[:2] == ["uv", "venv"]:
+            os.makedirs(os.path.join(command[-1], "bin"), exist_ok=True)
+
+    monkeypatch.setattr(vc.subprocess, "run", fake_run)
+    vc.resolve_verl_python(str(tmp_path))
+
+    env = next(e for cmd, e in envs if "pip" in cmd and e is not None)
+    assert env["GIT_CONFIG_COUNT"] == "1"
+    assert env["GIT_CONFIG_KEY_0"] == (
+        "url.https://x-access-token:ghp_sentinel@github.com/.insteadOf"
+    )
+    assert env["GIT_CONFIG_VALUE_0"] == "https://github.com/"
+    # a missing credential must fail fast, not block forever on a username prompt.
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_the_verl_requirement_url_never_carries_the_token(monkeypatch, tmp_path):
+    # uv echoes the requirement it resolves, so a token spliced into the URL would be printed into
+    # the pod's training log. the credential must travel only through git's config env.
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_sentinel")
+    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+
+    vc.resolve_verl_python(str(tmp_path))
+
+    install = next(c for c in calls if "pip" in c)
+    assert not any("ghp_sentinel" in str(a) for a in install), (
+        "the github token leaked into the uv command line, which is logged"
+    )
+    assert "ghp_sentinel" not in vc.VERL_REQUIREMENT_URL
+
+
+def test_the_worker_image_takes_the_verl_token_as_a_secret_not_a_build_arg():
+    # a build-arg is recorded in `docker history`, so passing the token that way would publish a
+    # credential for freesolo-co/verl inside every worker image on ghcr.
+    root = pathlib.Path(__file__).resolve().parents[1]
+    dockerfile = (root / "Dockerfile.worker").read_text()
+    workflow = (root / ".github" / "workflows" / "worker-image.yml").read_text()
+    assert "--mount=type=secret,id=verl_token" in dockerfile
+    assert "verl_token=${{ secrets.VERL_READ_TOKEN }}" in workflow
+    assert "ARG VERL_TOKEN" not in dockerfile
+    assert "VERL_TOKEN=${{" not in workflow
+
+
 def test_the_venv_stamp_records_the_pin_not_the_install_extras(monkeypatch, tmp_path):
     # the stamp gates rebuilds. if it recorded the extra-bearing spec while the pin stayed bare,
     # every later call would see a mismatch and rebuild the venv from scratch on a paid pod.

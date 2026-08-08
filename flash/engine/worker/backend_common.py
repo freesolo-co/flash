@@ -826,6 +826,31 @@ def require_gdn_boundary_resets(caps: dict, gdn_module: str) -> str | None:
     return arch
 
 
+def _verl_clone_env() -> dict[str, str]:
+    """os.environ plus the credential git needs to clone the PRIVATE freesolo-co/verl.
+
+    VERL_REQUIREMENT_URL points at a private repo, so an anonymous clone fails outright. The token
+    is injected through git's ``insteadOf`` rewrite via GIT_CONFIG_* env vars rather than being
+    substituted into the URL: uv echoes the requirement it resolves, and a token spliced into the
+    URL would land in the pod's training log.
+
+    GIT_CONFIG_COUNT is read by git itself, so no file is written and nothing outlives this
+    subprocess -- unlike the GIT_ASKPASS temp-file helper the extra-pip path uses.
+
+    A run WITHOUT a token still tries: the clone then fails with git's own auth error, which names
+    the missing credential far better than a preflight guess. GIT_TERMINAL_PROMPT=0 keeps that a
+    fast failure rather than a subprocess blocked forever on a username prompt.
+    """
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    token = (env.get("GITHUB_TOKEN") or "").strip()
+    if token:
+        env["GIT_CONFIG_COUNT"] = "1"
+        env["GIT_CONFIG_KEY_0"] = f"url.https://x-access-token:{token}@github.com/.insteadOf"
+        env["GIT_CONFIG_VALUE_0"] = "https://github.com/"
+    return env
+
+
 def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
     """return an interpreter that can import verl.
 
@@ -921,6 +946,10 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
                 "apache-tvm-ffi==0.1.11",
             ],
             check=True,
+            # verl is a PRIVATE repo: without this the clone dies on an auth prompt. Inheriting
+            # os.environ is not enough -- GITHUB_TOKEN is forwarded to the worker, but git has no
+            # rule telling it to USE that value for github.com.
+            env=_verl_clone_env(),
         )
         # a SEPARATE install, exactly as Dockerfile.worker runs it: the wheel is prebuilt against
         # torch 2.10, so it needs --no-build-isolation, and that flag must not apply to the resolve
