@@ -1574,11 +1574,21 @@ def _persist_effective_worker_spec(
         adapter_identity = None
     _reject_managed_volume_removal(snapshot, worker_spec)
     _validate_effective_spec(public_spec, worker_spec)
+    # status.spec is never rewritten, so a pre-upgrade run keeps its dropped keys for life and every
+    # later read rehashes with them restored. re-persisting (quote refresh, realloc) has to hash the
+    # same way or the digest it writes now is one the next integrity check cannot reproduce.
+    raw_public = status.spec if isinstance(status.spec, dict) else {}
+    legacy_public_keys = {k: raw_public[k] for k in _DROPPED_TOP_LEVEL_KEYS if k in raw_public}
     effective_preparation = {
         "worker_spec": worker_spec.to_internal_dict(),
         "workload_profile": worker_spec.workload_profile or None,
         "adapter_identity": adapter_identity,
-        "preparation_digest": _preparation_digest(public_spec, worker_spec, adapter_identity),
+        "preparation_digest": _preparation_digest(
+            public_spec,
+            worker_spec,
+            adapter_identity,
+            legacy_public_keys=legacy_public_keys,
+        ),
         "backend": TRAINER_BACKEND,
     }
     fields = {"effective_preparation": effective_preparation}

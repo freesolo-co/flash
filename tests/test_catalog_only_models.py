@@ -209,6 +209,14 @@ def test_a_pre_upgrade_worker_env_snapshot_still_passes_its_integrity_digest(tmp
     loaded = runner.effective_spec_from_status(runner.get_status(spec.run_id))
     assert loaded.model == "Qwen/Qwen3.5-4B"
 
+    # a quote refresh or realloc REWRITES the digest, but never status.spec -- so the write path has
+    # to hash the legacy public keys exactly as the read path restores them. otherwise the run
+    # survives the upgrade, gets re-persisted, and only then becomes permanently unrecoverable.
+    runner._persist_effective_worker_spec(spec, estimated_cost_usd=1.23)
+
+    reloaded = runner.effective_spec_from_status(runner.get_status(spec.run_id))
+    assert reloaded.model == "Qwen/Qwen3.5-4B"
+
 
 # ---------------------------------------------------------------------------
 # Estimator sanity: calibrated against catalog anchors
