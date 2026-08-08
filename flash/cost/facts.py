@@ -256,6 +256,23 @@ def _catalog_model_info(model_id: str) -> ModelInfo:
     return info
 
 
+# One quote asks "how big is this model" several times over (setup download, required-save
+# serialization, the MoE check). For an unpinned catalog model those are dict reads; for a PINNED one
+# each is an `HfApi.model_info` round trip, so an ordinary quote repeats the same lookup and becomes
+# hostage to hub latency -- and a transient failure on a later call can reject a run the earlier
+# calls already validated (codex[bot]).
+#
+# Memoized per process on the normalized (id, revision) pair: a revision names immutable weights, so
+# a SUCCESSFUL answer cannot change under us. A MISS is deliberately not cached -- a failed lookup is
+# a hub blip, a rate limit, or an HF_TOKEN not yet granted access, not a fact about the model, and
+# caching it would make the first failure permanent for the life of a long-lived plane.
+#
+# Not `functools.cache` on total_params_b: it keys on the literal argument tuple, so a caller that
+# omits `revision` and one that passes "" become two entries. Not on `_validated_revision_geometry`
+# either, which tests monkeypatch -- caching there would leak a stubbed size across tests.
+_PINNED_SIZE_MEMO: dict[tuple[str, str], float] = {}
+
+
 def total_params_b(model_id: str, revision: str = "") -> float:
     """Total parameter count (billions) for a catalog model.
 
@@ -263,12 +280,15 @@ def total_params_b(model_id: str, revision: str = "") -> float:
     so setup/save cost tracks the weights the worker actually loads, not the default-revision count.
     """
     info = _catalog_model_info(model_id)
-    if revision:
+    if not revision:
+        return info.params_b
+    key = (model_id, revision)
+    if key not in _PINNED_SIZE_MEMO:
         from flash.engine.vram import _validated_revision_geometry
 
         params_b, _vocab = _validated_revision_geometry(model_id, revision, info)
-        return params_b
-    return info.params_b
+        _PINNED_SIZE_MEMO[key] = params_b
+    return _PINNED_SIZE_MEMO[key]
 
 
 def active_params_b(model_id: str) -> float:

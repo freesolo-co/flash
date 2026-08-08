@@ -76,3 +76,63 @@ def test_a_catalog_model_is_never_sized_over_the_network(monkeypatch):
 
     monkeypatch.setattr(vram, "fetch_hf_params_b", _boom, raising=False)
     assert total_params_b("Qwen/Qwen3.5-9B") == pytest.approx(MODELS["Qwen/Qwen3.5-9B"].params_b)
+
+
+def _stub_geometry(monkeypatch, model_id: str, calls: list):
+    """Answer the pinned-geometry fetch with the catalog's own numbers, counting each call."""
+    import flash.engine.vram as vram
+
+    info = MODELS[model_id]
+
+    def _counting(_mid, revision="", strict=False):
+        calls.append(revision)
+        return (info.params_b, info.vocab_size, info.hidden_size, info.num_layers)
+
+    monkeypatch.setattr(vram, "fetch_hf_model_geometry", _counting)
+
+
+def test_a_pinned_revision_is_fetched_once_per_quote(monkeypatch):
+    """One quote sizes a pinned model several times; only the FIRST may reach the hub.
+
+    Setup download and required-save serialization both ask total_params_b with the pin, so an
+    uncached lookup turns one quote into repeated HfApi.model_info round trips -- and a transient
+    failure on a later call rejects a run the earlier ones already validated (codex[bot]).
+    """
+    from flash.cost import facts
+
+    calls: list = []
+    _stub_geometry(monkeypatch, "Qwen/Qwen3.5-9B", calls)
+    monkeypatch.setattr(facts, "_PINNED_SIZE_MEMO", {})
+
+    rev = "a" * 40
+    first = facts.total_params_b("Qwen/Qwen3.5-9B", rev)
+    assert facts.total_params_b("Qwen/Qwen3.5-9B", rev) == first
+    assert facts.download_weight_gb("Qwen/Qwen3.5-9B", rev) == pytest.approx(first * 2.0)
+    assert len(calls) == 1, f"pinned sizing hit the hub {len(calls)} times in one quote"
+
+
+def test_a_failed_pinned_lookup_is_not_cached(monkeypatch):
+    """A hub blip must not become permanent for the life of the process.
+
+    A failure is a rate limit or an ungranted token, not a fact about the model -- caching it would
+    keep rejecting a valid pin until the plane restarted, indistinguishable from a real defect.
+    """
+    import flash.engine.vram as vram
+    from flash.cost import facts
+
+    monkeypatch.setattr(facts, "_PINNED_SIZE_MEMO", {})
+    rev = "b" * 40
+
+    def _blip(*_a, **_k):
+        raise RuntimeError("transient hub error")
+
+    monkeypatch.setattr(vram, "fetch_hf_model_geometry", _blip)
+    with pytest.raises(RuntimeError):
+        facts.total_params_b("Qwen/Qwen3.5-9B", rev)
+    assert facts._PINNED_SIZE_MEMO == {}
+
+    calls: list = []
+    _stub_geometry(monkeypatch, "Qwen/Qwen3.5-9B", calls)
+    assert facts.total_params_b("Qwen/Qwen3.5-9B", rev) == pytest.approx(
+        MODELS["Qwen/Qwen3.5-9B"].params_b
+    )

@@ -52,6 +52,34 @@ def test_a_catalog_spec_round_trips_without_a_policy_field():
     assert spec_from_dict(payload).model == "Qwen/Qwen3.5-4B"
 
 
+def test_a_run_persisted_before_the_upgrade_still_reloads():
+    """A record written by the OLD plane must survive the upgrade that drops the field.
+
+    effective_preparation.worker_spec is written with to_internal_dict() (asdict), so EVERY record
+    the current plane has written names model_policy -- including defaulted ones, which to_dict()
+    popped but asdict() kept. Stored records are never rewritten and from_dict is strict, so without
+    the dropped-key tolerance the first reload after deploy raises and a still-running job loses its
+    recovery, deploy, and serving paths (cursor[bot]).
+    """
+    from flash.spec import JobSpec
+
+    spec = spec_from_dict(_raw(model="Qwen/Qwen3.5-4B"))
+    persisted = spec.to_internal_dict()
+    persisted["model_policy"] = "catalog"  # what the pre-upgrade plane wrote
+
+    assert JobSpec.from_dict(persisted).model == "Qwen/Qwen3.5-4B"
+
+
+def test_the_dropped_key_is_tolerated_on_read_only_never_authored():
+    """Tolerance must not quietly re-open the flag as an authorable key.
+
+    from_dict ignores it so old RECORDS load; the schema layer still rejects it so a CONFIG naming
+    it fails loudly rather than silently training under a policy that no longer exists.
+    """
+    with pytest.raises(ConfigError, match="unknown config key"):
+        spec_from_dict(_raw(model="Qwen/Qwen3.5-4B", model_policy="allow"))
+
+
 # ---------------------------------------------------------------------------
 # Estimator sanity: calibrated against catalog anchors
 # ---------------------------------------------------------------------------

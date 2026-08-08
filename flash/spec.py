@@ -371,6 +371,16 @@ MANAGED_GPU_KEYS = frozenset(
     {"disk_gb", "network_volume", "network_volume_gb", "max_retries", "max_wall_seconds"}
 )
 
+# Removed top-level fields that a PERSISTED record can still carry. Stored run records are never
+# rewritten, and effective_preparation.worker_spec is written with to_internal_dict() (asdict), which
+# emitted every field including the defaulted ones -- so every record written before a field was
+# dropped still names it. from_dict is strict, so without this the first reload after the upgrade
+# raises and a still-running job loses its recovery, deploy, and serving paths.
+#
+# Ignored on READ only: nothing here is a JobSpec field, so an authored config naming one is still
+# rejected as unknown by the schema layer's own key check (see schema._TOP_LEVEL_KEYS).
+_DROPPED_TOP_LEVEL_KEYS = frozenset({"model_policy"})
+
 
 @dataclass(frozen=True)
 class WandbSpec:
@@ -471,7 +481,7 @@ class JobSpec:
         if not isinstance(data, dict):
             raise TypeError("job spec must be an object")
         allowed_top_level = {item.name for item in fields(cls)}
-        unknown_top_level = sorted(set(data) - allowed_top_level)
+        unknown_top_level = sorted(set(data) - allowed_top_level - _DROPPED_TOP_LEVEL_KEYS)
         if unknown_top_level:
             raise ValueError(f"job spec has unknown key(s): {', '.join(unknown_top_level)}")
         env = data.get("environment") or {}
