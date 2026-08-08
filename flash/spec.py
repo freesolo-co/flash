@@ -284,6 +284,22 @@ class EnvironmentSpec:
     resolved_sha: str = ""
 
 
+# dropped on the INTERNAL persisted-record parse only, never by the public config schema.
+#
+# #968 deleted `advantage_clip` from TrainSpec, but runs provisioned before it serialized their spec
+# with asdict() into status.spec and effective_preparation.worker_spec, and stored run records are
+# never rewritten. from_dict is strict, so those records stopped parsing -- and attach_run treats an
+# unparseable spec as unrecoverable: it fails the run and tears the worker down. Dropping the key
+# costs nothing because the worker parsed but never applied it.
+#
+# Deliberately ONLY advantage_clip. Other since-removed train fields are not listed on the theory
+# that they might also appear: `seeds` in particular is REQUIRED to keep raising
+# (test_from_dict_rejects_removed_legacy_train_seeds, #536), so tolerating keys speculatively would
+# silently overturn a decision another change made on purpose. Add a key here when a real persisted
+# record is shown to carry it, not before.
+REMOVED_PERSISTED_TRAIN_KEYS = frozenset({"advantage_clip"})
+
+
 @dataclass(frozen=True)
 class TrainSpec:
     epochs: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
@@ -493,6 +509,9 @@ class JobSpec:
             train = {}
         if not isinstance(train, dict):
             raise TypeError("train must be an object")
+        train = {
+            key: value for key, value in train.items() if key not in REMOVED_PERSISTED_TRAIN_KEYS
+        }
         unknown_train = sorted(set(train) - {item.name for item in fields(TrainSpec)})
         if unknown_train:
             raise ValueError(f"train has unknown key(s): {', '.join(unknown_train)}")
