@@ -18,6 +18,7 @@ from flash.engine.worker.packing import (
     gdn_packing_available,
     model_is_gdn_hybrid,
     tokenize_for_packing,
+    untruncated_lengths_for_packing,
 )
 
 
@@ -27,12 +28,15 @@ class _FakeTok:
     def __init__(self, eos="<e>"):
         self.eos_token = eos
 
-    def __call__(self, rows, truncation, max_length, add_special_tokens=True):
+    def __call__(self, rows, truncation=False, max_length=None, add_special_tokens=True):
         # mirror TRL: default add_special_tokens (no override); prepend a BOS marker (id 1) when on,
         # so the test can assert parity with TRL's text-field tokenization. Truncate the TOTAL.
-        assert truncation is True
         bos = [1] if add_special_tokens else []
-        return {"input_ids": [(bos + [ord(c) for c in r])[:max_length] for r in rows]}
+        ids = [bos + [ord(c) for c in r] for r in rows]
+        if not truncation:
+            return {"input_ids": ids}
+        assert max_length is not None, "truncation=True requires an explicit max_length"
+        return {"input_ids": [row[:max_length] for row in ids]}
 
 
 def test_tokenize_for_packing_eos_and_bos_parity():
@@ -53,6 +57,29 @@ def test_tokenize_for_packing_truncates_and_handles_no_eos():
     assert tokenize_for_packing(["ab"], _FakeTok(eos=None), max_length=100) == [
         [1, ord("a"), ord("b")]
     ]
+
+
+def test_untruncated_lengths_ignore_the_cap_under_the_same_eos_rule():
+    """The uncapped measurement must count the SAME tokens the capped encode would produce.
+
+    Both encodes share ``_eos_terminated``. Measuring the raw text instead would omit the appended
+    EOS, so any row not already ending in one would report a length SHORT of its own truncated
+    length -- and "untruncated < realized" is the contradiction that makes a truncation count
+    untrustworthy.
+    """
+    tok = _FakeTok(eos="!")
+    rows = ["abcdef", "cd!"]
+
+    lengths = untruncated_lengths_for_packing(rows, tok)
+
+    # BOS + 6 chars + appended EOS; BOS + 3 chars, EOS already present so not doubled.
+    assert lengths == [8, 4]
+    # the cap is what separates the two: capped saturates, uncapped keeps running.
+    assert [len(ids) for ids in tokenize_for_packing(rows, tok, max_length=3)] == [3, 3]
+    assert all(
+        length >= len(ids)
+        for length, ids in zip(lengths, tokenize_for_packing(rows, tok, max_length=3), strict=True)
+    )
 
 
 # --------------------------------------------------------------------------- arch gate
