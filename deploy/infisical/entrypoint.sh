@@ -98,9 +98,15 @@ for k in ${INFISICAL_KEEP:-}; do
   # empty container value still wins (that is a deliberate choice by whoever wrote it).
   eval "keep_is_set=\${$k+set}"
   [ "${keep_is_set:-}" = set ] || continue
-  set -- "$k=$(eval "printf '%s' \"\${$k}\"")" "$@"
+  # Assign through eval rather than `$(...)`: command substitution strips ALL trailing newlines,
+  # so a kept multiline value (a PEM private key, a certificate chain) would arrive one or more
+  # bytes shorter than the container set it -- silently, and only for the values most likely to
+  # break something downstream. The expansion sits inside double quotes, so the value's own
+  # content is never re-parsed: `$(...)`, backticks, quotes, and backslashes in it stay literal.
+  eval "keep_value=\"\${$k}\""
+  set -- "$k=$keep_value" "$@"
 done
-unset keep_is_set
+unset keep_is_set keep_value
 
 exec infisical run \
   --projectId "$INFISICAL_PROJECT_ID" \

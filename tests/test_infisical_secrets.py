@@ -68,14 +68,25 @@ INSTALLER_FILES = _installer_files()
 # a downloaded script past a green guard. The wrapper NAMES stay an explicit list because that
 # set is open-ended, which is the one part of this pattern that can still be outgrown.
 #
+# A flag may take an OPERAND (`sudo -u root bash`, `env -C /tmp bash`): consuming the flag but
+# not its value left the operand as an unmatched word and the guard went green. Flags are matched
+# with an optional following operand, which is why the operand slot is deliberately narrow --
+# `[\w./=:-]+` accepts a user, path, or signal but not an arbitrary word, so `grep bash` cannot
+# reach the shell name by pretending `grep` is an operand.
+#
 # `[^\n]*?` rather than `[^|]*` between the fetch and the pipe: a pipeline may pass through
 # intermediate stages first (`curl … | tee /tmp/i.sh | bash`), and stopping at the first `|`
 # made the guard blind to every such spelling. Lazy, so it still prefers the nearest match.
+#
+# But `[^\n]*?` also let the separator itself be the SECOND bar of a `||`, so a legitimate
+# fallback (`curl … || bash recover.sh`) matched -- an over-match, the opposite failure from
+# every other bug here, and one this guard's own earlier fix introduced. The separator is now a
+# single `|` that is not part of `||`: not preceded by one, and not followed by one.
 PIPE_TO_SHELL = re.compile(
-    r"(?:curl|wget)\b[^\n]*?\|\s*"  # a network fetch piped onward, possibly via other stages
+    r"(?:curl|wget)\b[^\n]*?(?<!\|)\|(?!\|)\s*"  # a fetch piped on, possibly via other stages
     r"(?:(?:"
     r"(?:sudo|env|xargs|nohup|exec|command)"  # exec wrappers: they run what follows
-    r"|-\S+"  # their flags
+    r"|-\S+(?:\s+[\w./=:-]+)?"  # their flags, and a flag's operand
     r"|[A-Za-z_]\w*=\S*"  # VAR=VALUE assignments preceding the command
     r"|[0-9]*[<>]{1,2}\s*\S+"  # redirections preceding the command
     r")\s+)*"
@@ -236,6 +247,13 @@ def test_nothing_pipes_a_downloaded_script_into_a_shell(path: Path):
         pytest.param(
             "RUN curl -sSL https://x.example/i.sh | 2>/dev/null bash\n", id="redirection-first"
         ),
+        # A flag with an operand: consuming `-u` but not `root` left an unmatched word.
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | sudo -u root bash\n", id="flag-with-operand"
+        ),
+        pytest.param(
+            "RUN curl -sSL https://x.example/i.sh | env -C /tmp sh\n", id="env-flag-with-operand"
+        ),
     ],
 )
 def test_the_pipe_to_shell_guard_catches_what_it_claims_to(snippet: str, tmp_path: Path):
@@ -310,6 +328,13 @@ def test_the_guard_catches_a_yaml_line_that_both_folds_back_and_continues_on(tmp
         # The assignment rule must not turn an assignment-shaped ARGUMENT into a match: here the
         # shell name is still just text being searched for, not the command being run.
         pytest.param("curl -s https://x.example/l | grep mode=install bash", id="assignment-arg"),
+        # `||` is a fallback, not a pipe: the shell runs on FAILURE of the fetch and nothing is
+        # piped into it. Reading the second bar of a `||` as the pipe made this legitimate
+        # recovery branch match -- an over-match introduced by the multi-stage-pipe fix.
+        pytest.param(
+            "curl -fsSL https://x.example/f || bash recover.sh", id="or-fallback-to-a-shell"
+        ),
+        pytest.param("wget -q https://x.example/f || sh -c 'exit 1'", id="or-fallback-to-sh"),
     ],
 )
 def test_the_pipe_to_shell_guard_does_not_flag_ordinary_pipelines(line: str, tmp_path: Path):
@@ -671,6 +696,30 @@ class TestEntrypointBehaviour:
         )
         assert result.returncode == 0, result.stderr
         assert result.stdout == tricky
+
+    def test_keep_preserves_a_multiline_value_byte_for_byte(self, tmp_path):
+        """A kept PEM key must arrive exactly as the container set it, trailing newline included.
+
+        Command substitution strips ALL trailing newlines, so re-applying the value through
+        `$(...)` shortened precisely the values most likely to break something downstream: a
+        private key, a certificate chain, anything a parser reads line-wise. It failed silently
+        and only for multiline values, so the single-line tests above stayed green.
+        """
+        pem = "-----BEGIN KEY-----\nabc\ndef\n-----END KEY-----\n"
+        result = self._run(
+            tmp_path,
+            {
+                "INFISICAL_CLIENT_ID": "cid",
+                "INFISICAL_CLIENT_SECRET": "csec",
+                "INFISICAL_PROJECT_ID": "proj",
+                "INFISICAL_PATH": "/flash",
+                "INFISICAL_KEEP": "PEM",
+                "PEM": pem,
+            },
+            ["sh", "-c", 'printf "%s" "$PEM"'],
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == pem, "the kept value lost bytes on its way through the wrapper"
 
     def test_empty_cmd_reports_the_missing_command_not_a_credential(self, tmp_path):
         """`exec "$@"` with no arguments is a no-op that falls THROUGH to the injection path.
