@@ -4845,7 +4845,7 @@ def test_spec_none_without_named_volumes_stays_a_no_op(monkeypatch):
 
 
 def test_the_owning_key_is_read_inside_the_serialized_section():
-    """Another thread can advance_key() while this one waits for the endpoint slot.
+    """Another thread can advance_key() while this one waits for FLASH_SDK_LOCK.
 
     A key captured before the wait would grow one account's volume while Endpoint attaches the
     account the env var now names -- leaving the attached volume stale.
