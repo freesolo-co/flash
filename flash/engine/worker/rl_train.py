@@ -365,7 +365,7 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         "actor_rollout_ref.model.use_remove_padding=True",
         "actor_rollout_ref.model.use_fused_kernels=True",
         # backend chosen per card; see fused_ce_backend for the measured table.
-        f"actor_rollout_ref.model.fused_kernel_options.impl_backend={cfg.get('fused_ce_backend', 'torch')}",
+        f"actor_rollout_ref.model.fused_kernel_options.impl_backend={cfg['fused_ce_backend']}",
         *(
             [f"actor_rollout_ref.model.lora_adapter_path={cfg['warmstart_adapter']}"]
             if cfg.get("warmstart_adapter")
@@ -620,12 +620,15 @@ def _build_verl_training_cfg(
     experiment_name: str,
     gpu_type: str = "",
     n_gpus: int = 1,
-    fused_ce_backend: str = "torch",
+    # NOT named fused_ce_backend: that is the imported resolver, and a parameter of the same name
+    # would shadow it inside this function so a later `fused_ce_backend(caps)` call silently
+    # returned a string. required, since every caller resolves it from the capability probe.
+    ce_backend: str,
 ) -> dict:
     engine_len = int(inp["engine_len"])
     sleep_unsupported = rollout_sleep_unsupported(inp["model_id"])
     return {
-        "fused_ce_backend": fused_ce_backend,
+        "fused_ce_backend": ce_backend,
         "train_files": train_files,
         "val_files": val_files,
         "model_id": model_id,
@@ -2530,7 +2533,7 @@ def run_rl_train():
             n_gpus=gpu_count_of(_w.JOB_SPEC),
             # resolved from the out-of-process capability probe, never by opening cuda in this
             # parent -- see fused_ce_backend.
-            fused_ce_backend=fused_ce_backend(caps),
+            ce_backend=fused_ce_backend(caps),
         )
         overrides = build_verl_overrides(cfg)
         # the executor budget is sized per run now, so print what this one actually asked for --

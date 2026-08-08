@@ -1492,7 +1492,7 @@ def build_opd_overrides(config: dict) -> list[str]:
         # model_output["log_probs"], so the fused path is loss-equivalent. the backend is chosen
         # per card; see fused_ce_backend for the measured table.
         "actor_rollout_ref.model.use_fused_kernels=true",
-        f"actor_rollout_ref.model.fused_kernel_options.impl_backend={config.get('fused_ce_backend', 'torch')}",
+        f"actor_rollout_ref.model.fused_kernel_options.impl_backend={config['fused_ce_backend']}",
         "actor_rollout_ref.model.enable_gradient_checkpointing=true",
         f"actor_rollout_ref.model.lora_rank={_hydra_val(config['lora_rank'])}",
         f"actor_rollout_ref.model.lora_alpha={_hydra_val(config['lora_alpha'])}",

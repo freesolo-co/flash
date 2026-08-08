@@ -134,6 +134,12 @@ def _flash_groupwise_reverse_kl_values(
     group_starts = flat_rows.ne(previous_rows) | flat_groups.ne(previous_groups)
 
     # the trailing dummy group keeps the jagged reduction valid for an all-empty batch.
+    #
+    # `vmap(torch.sum)` over a jagged tensor, NOT scatter_add_ or a padded row-sum: those
+    # reassociate the float additions and so change the per-group value. measured on this machine,
+    # scatter_add_ differs BITWISE from `torch.sum` in 1056 of 3000 random fp32 groups. the
+    # differences are ~1e-7 and pass any allclose check, but they move the training loss silently.
+    # test_groupwise_reverse_kl_keeps_the_exact_per_group_reduction pins this by reading the source.
     grouped_starts = torch.cat((group_starts, group_starts.new_ones(1)))
     grouped_indices = grouped_starts.cumsum(0) - 1
     group_indices = grouped_indices[:-1]
@@ -152,6 +158,9 @@ def _flash_groupwise_reverse_kl_values(
     )
     sorted_values = coefficients.index_select(0, group_indices) * flat_student
 
+    # verl aggregates over RESPONSE positions while this loss is defined over the SELECTED subset,
+    # so rescale each row by response/selected to keep the two denominators equal. clamp guards a
+    # row with nothing selected, which is reachable and must contribute zeros rather than nan.
     response_counts = response_mask.sum(dim=1)
     selected_counts = selected.sum(dim=1).clamp_min(1)
     ratio_dtype = (
@@ -160,12 +169,11 @@ def _flash_groupwise_reverse_kl_values(
         else student_logprobs.dtype
     )
     ratios = response_counts.to(ratio_dtype) / selected_counts.to(ratio_dtype)
-    selected_rows = sorted_rows.masked_select(sorted_selected)
-    sorted_values = (sorted_values.to(ratio_dtype) * ratios.index_select(0, selected_rows)).to(
+    scaled_values = (sorted_values.to(ratio_dtype) * ratios.index_select(0, flat_rows)).to(
         student_logprobs.dtype
     )
     sorted_output = torch.zeros_like(student_logprobs).masked_scatter(
-        sorted_selected, sorted_values
+        sorted_selected, scaled_values
     )
     return torch.zeros_like(student_logprobs).scatter(1, order, sorted_output)
 

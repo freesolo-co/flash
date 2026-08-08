@@ -40,8 +40,9 @@ _PROFILE_PRODUCER_VERSION = "9.9.9"
 
 def _cfg(**over):
     base = {
+        # required: run_sft_train always resolves this from the capability probe.
+        "fused_ce_backend": "torch",
         "train_files": "/w/train.parquet",
-        "val_files": "/w/val.parquet",
         "train_batch_size": 32,
         "max_length": 32768,
         "micro_batch": 1,
@@ -78,7 +79,8 @@ def test_overrides_match_verl_0_8_sft_and_fsdp_config_surface():
     overrides = _as_map(build_sft_overrides(_cfg()))
     assert overrides == {
         "data.train_files": "/w/train.parquet",
-        "data.val_files": "/w/val.parquet",
+        # hardcoded null, not a cfg value: see test_sft_ships_no_val_file_so_the_child_cannot_validate
+        "data.val_files": "null",
         "data.train_batch_size": "32",
         "data.max_length": "32768",
         "data.micro_batch_size_per_gpu": "1",
@@ -1714,8 +1716,8 @@ def test_sft_never_enables_liger_because_it_zeroes_the_lora_gradient():
     from flash.engine.worker.sft_train import build_sft_overrides
 
     base = {
+        "fused_ce_backend": "torch",
         "train_files": "/w/train.parquet",
-        "val_files": "/w/val.parquet",
         "train_batch_size": 8,
         "max_length": 1024,
         "micro_batch": 1,
@@ -1842,23 +1844,24 @@ def test_sft_ships_no_val_file_so_the_child_cannot_validate():
     per run whose `val/loss` nothing in flash reads. A null `data.val_files` makes the child's
     `val_dataset` (and hence `val_dataloader`) None, so the branch cannot execute.
 
-    Asserted on the worker's own source: the config dict is built inside `run_sft_train`, so a test
-    that drove `build_sft_overrides` through a fixture would assert on the fixture's `val_files`
-    and stay green even if the worker went back to shipping a file.
+    `data.val_files=null` is HARDCODED in `build_sft_overrides` rather than threaded through a cfg
+    key, because null is the only supported value -- accepting one would let a caller recreate the
+    inference forward this removes. So the override is asserted directly, and the worker source is
+    asserted to name no val parquet at all.
     """
     import inspect
 
     from flash.engine.worker import sft_train
 
-    # comments are stripped first: the explanation above the config key mentions both val.parquet
-    # and val_file, and matching those words in a comment would pass on a worker that still ships
-    # the file.
-    src = inspect.getsource(sft_train.run_sft_train)
-    code = "\n".join(ln for ln in src.splitlines() if not ln.strip().startswith("#"))
+    # the override is unconditional: no fixture value can change it.
+    assert "data.val_files=null" in build_sft_overrides(_cfg())
+    src = inspect.getsource(build_sft_overrides)
+    assert "cfg['val_files']" not in src
+    assert 'cfg["val_files"]' not in src
 
-    assert '"val_files": None,' in code
-    # and no val parquet is written or named any more, so the null is not merely cosmetic. the
-    # `val_files` key itself is the one legitimate occurrence, so it is excluded before checking.
-    remainder = code.replace('"val_files": None,', "")
-    assert "val.parquet" not in remainder
-    assert "val_file" not in remainder
+    # comments are stripped first: the explanation mentions both val.parquet and val_file, and
+    # matching those words in a comment would pass on a worker that still ships the file.
+    worker = inspect.getsource(sft_train.run_sft_train)
+    code = "\n".join(ln for ln in worker.splitlines() if not ln.strip().startswith("#"))
+    assert "val.parquet" not in code
+    assert "val_file" not in code

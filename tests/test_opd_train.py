@@ -4871,6 +4871,8 @@ def test_parent_maps_teacher_failures_to_fatal_or_retriable_run_errors():
 
 def _config(**overrides):
     config = {
+        # required: run_opd_train always resolves this from the capability probe.
+        "fused_ce_backend": "torch",
         "train_files": ["/w/train.parquet"],
         "val_files": ["/w/val.parquet"],
         "train_batch_size": 8,

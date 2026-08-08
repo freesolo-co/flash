@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from flash.envs.base import BaseEnvironment, RolloutReward
+from flash.envs.base import (
+    REWARD_GROUP_CONCURRENCY,
+    BaseEnvironment,
+    RolloutReward,
+    map_bounded,
+)
 from flash.envs.loader import (
     GitHubEnvironmentRef,
     GitHubRateLimitError,
@@ -32,12 +36,6 @@ from flash.opd_limits import (
 
 _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
-
-# how many TASK GROUPS may be scored at once. this bounds in-flight scorer CALLS, not the requests
-# they make: each call fans out inside the env's own per-instance pool, whose max_score_concurrency
-# is enforced globally across overlapping calls, so this cannot raise the provider-facing rate. it
-# exists only to keep a large rollout batch from creating one thread per prompt.
-_REWARD_GROUP_CONCURRENCY = 8
 
 
 def _json_safe(value: Any) -> Any:
@@ -335,40 +333,15 @@ class FreesoloEnvironment(BaseEnvironment):
         # and the provider-facing rate stays capped where it already was -- this removes a barrier
         # rather than raising concurrency.
         #
-        # a non-thread-safe env never reaches here: reward_many/rollout_rewards_many route it to a
-        # serial scorer above. one group still runs inline, since a pool for a single call is pure
-        # overhead and keeps the common single-prompt path exactly as it was.
-        if not self.reward_thread_safe or len(order) <= 1:
-            scored = [score_group(key) for key in order]
-        else:
-            pool = ThreadPoolExecutor(max_workers=min(_REWARD_GROUP_CONCURRENCY, len(order)))
-            try:
-                # `map` propagates the first exception and preserves input order, so a scorer that
-                # raises fails the step exactly as the serial loop did.
-                #
-                # a FAILING scorer costs more work here than it did serially: the serial loop
-                # stopped AT the failing group, this also pays for whatever is already running.
-                # rl_train.py:1001 catches the raise and re-scores the batch serially, so those
-                # calls are billed twice. the excess is bounded at one pool width -- measured on a
-                # 40-group batch at width 8, 10 groups execute when group 2 raises and 28 when
-                # group 20 does. `map` and `cancel_futures=True` hold that bound INDEPENDENTLY:
-                # map's result generator cancels the pending futures when the exception abandons
-                # it, and shutdown cancels whatever is still queued. either alone gives 10; only
-                # submit-then-gather with a plain shutdown runs all 40. both are kept because the
-                # cost is a keyword argument and neither is obviously the one a later edit keeps.
-                #
-                # two ways to shrink the excess further were measured and rejected. an abort flag
-                # checked before each call saves exactly ONE group (10 -> 9, 28 -> 27), because the
-                # waste is work already running when the failure surfaces, not work queued behind
-                # it -- not worth the branch. returning partial results is worse than it looks:
-                # `out` would hold `None` for unscored rows, and both `_grouped_score`
-                # (`float(result.score)`) and multiturn_reward_scoring's `_validated_reward`
-                # (`float(reward.episode)`) dereference every element, so a None row converts a
-                # partial success into an AttributeError that the multi-turn path does not catch.
-                # the honest bound is the pool width, and _REWARD_GROUP_CONCURRENCY sets it.
-                scored = list(pool.map(score_group, order))
-            finally:
-                pool.shutdown(wait=True, cancel_futures=True)
+        # on a raise, map_bounded pays for the groups already in flight where the serial loop
+        # stopped at the failing one, and rl_train.py:1001 re-scores the batch serially, so those
+        # calls are billed twice. bounded at one pool width; REWARD_GROUP_CONCURRENCY sets it.
+        scored = map_bounded(
+            order,
+            score_group,
+            cap=REWARD_GROUP_CONCURRENCY,
+            serial=not self.reward_thread_safe,
+        )
 
         for key, rewards in scored:
             for idx, reward in zip(groups[key]["idxs"], rewards, strict=True):
