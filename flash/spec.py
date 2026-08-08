@@ -59,13 +59,6 @@ def coerce_bool(value: Any) -> bool:
     return bool(value)
 
 
-def _coerce_str_map(value: Any) -> dict[str, str]:
-    """Coerce to dict[str, str]; non-dict input returns empty dict."""
-    if not isinstance(value, dict):
-        return {}
-    return {str(k): str(v) for k, v in value.items()}
-
-
 def require_project_id(value: Any) -> str:
     """Return one explicit canonical Freesolo project UUID or reject it."""
     if value is None:
@@ -192,7 +185,7 @@ def parse_max_steps(value: Any) -> int | None:
 CONTROL_PANEL_URL_ENV = "FLASH_CONTROL_PANEL_URL"
 TEACHER_CAPABILITY_ENV = "FLASH_TEACHER_CAPABILITY"
 MANAGED_TEACHER_CREDENTIAL_ENV_KEYS = frozenset({"PARASAIL_API_KEY"})
-RESERVED_WORKER_ENV_KEYS = frozenset(
+CONTROL_PLANE_OWNED_ENV_KEYS = frozenset(
     {
         "RUN_ID",
         "HF_REPO",
@@ -206,27 +199,9 @@ RESERVED_WORKER_ENV_KEYS = frozenset(
 )
 
 
-def validate_worker_env_reserved(worker_env: Any) -> None:
-    """Reject worker env overrides for control-plane-owned fields."""
-    if not isinstance(worker_env, dict):
-        return
-    conflicts = sorted(
-        str(key) for key in worker_env if str(key).upper() in RESERVED_WORKER_ENV_KEYS
-    )
-    if conflicts:
-        detail = (
-            "; set top-level seed instead"
-            if any(key.upper() == "SEED" for key in conflicts)
-            else ""
-        )
-        raise ValueError(
-            f"[worker_env] must not override control-plane key(s): {', '.join(conflicts)}{detail}"
-        )
-
-
 # the trainer every run reports. run_sft, run_opd and run_rl all delegate straight to verl, so this
-# is a constant rather than a resolution: nothing in [worker_env] or the spec can select anything
-# else. recorded on effective_preparation so a stored run says which trainer produced it.
+# is a constant rather than a resolution: no job-spec field can select anything else. recorded on
+# effective_preparation so a stored run says which trainer produced it.
 TRAINER_BACKEND = "verl"
 
 
@@ -400,8 +375,6 @@ class JobSpec:
     gpu: GpuSpec = field(default_factory=GpuSpec)
     run_id: str = "local"
     seed: int = FIXED_SEED
-    # per-run env overrides forwarded to the gpu worker; never put secrets here.
-    worker_env: dict[str, str] = field(default_factory=dict)
     thinking: bool = False
     wandb: WandbSpec = field(default_factory=WandbSpec)
     model_revision: str = ""
@@ -434,7 +407,6 @@ class JobSpec:
             raise TypeError("workload_profile must be an object")
         if profile_digest and not str(self.workload_profile_producer_version or ""):
             raise ValueError("workload profile digest requires its producer version")
-        validate_worker_env_reserved(self.worker_env)
 
     @property
     def phase(self) -> str:
@@ -591,7 +563,6 @@ class JobSpec:
                 count=gpu.get("count", 1),
             ),
             run_id=data.get("run_id", "local"),
-            worker_env=_coerce_str_map(data.get("worker_env")),
             thinking=coerce_bool(data.get("thinking", False)),
             wandb=_coerce_wandb(data.get("wandb")),
             seed=parse_seed(data.get("seed", FIXED_SEED)),
