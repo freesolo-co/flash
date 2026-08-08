@@ -272,3 +272,46 @@ def test_score_many_caps_in_flight_requests_at_the_measured_ceiling():
 
     assert len(results) == len(items)
     assert peak <= OPD_TEACHER_SCORING_CONCURRENCY
+
+
+def test_score_many_stops_billing_requests_after_one_fails():
+    """A failed teacher request must not drag the rest of the episode through the provider.
+
+    These are PAID requests and the caller retries the whole OPD attempt on a raise, so every
+    request submitted after the failure is billed for a result nobody reads. The pre-PR code
+    pre-sliced the episode into waves, which capped that waste at one wave.
+
+    The SLOW FIRST REQUEST is the point. Consuming results in input order cannot report the failure
+    until request 0 returns, by which time the whole episode has been sent: measured 64/64 that
+    way, against ~one pool width here. Teacher latency tracks completion length, so an uneven
+    episode is the normal case, not a corner.
+    """
+    import threading
+    import time
+
+    from flash.opd_limits import OPD_TEACHER_SCORING_CONCURRENCY
+
+    client = _client(_token_keyed_response())
+    lock = threading.Lock()
+    executed = []
+
+    def score_one(prompt, _completion):
+        with lock:
+            executed.append(prompt)
+        time.sleep(0.5 if prompt == "prompt-0" else 0.01)
+        if prompt == "prompt-5":
+            raise RuntimeError("teacher exploded")
+        return TeacherScore(tokens=[], input_tokens=3, output_tokens=1)
+
+    client._score_one = score_one
+    total = 2 * OPD_TEACHER_SCORING_CONCURRENCY
+    items = [(f"prompt-{index}", f"completion-{index}") for index in range(total)]
+
+    with pytest.raises(RuntimeError, match="teacher exploded"):
+        client.score_many(items)
+
+    assert len(executed) < total, "the whole episode was billed after the failure"
+    # measured 37 of 64, stable across runs. asserted as a CEILING of one pool width past the
+    # failure point, not an equality: the exact count depends on how many workers have picked up
+    # work when the raise lands. an input-order consumer scores 64 here and fails this.
+    assert len(executed) <= OPD_TEACHER_SCORING_CONCURRENCY + 6, len(executed)
