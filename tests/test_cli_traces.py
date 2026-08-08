@@ -245,6 +245,27 @@ def test_traces_export_sends_the_key_from_the_url_it_decided_on(monkeypatch, tmp
     assert sent == ["hosted-key"]
 
 
+def test_a_logged_out_snapshot_does_not_reread_the_config(monkeypatch, tmp_path, capsys) -> None:
+    """A snapshot that legitimately held no key must refuse, not fall back to a fresh read. The
+    logged-out caller is exactly the one whose re-read could pick up a credential stored by a
+    concurrent `flash login` and pair it with the url this command already decided on.
+    """
+    monkeypatch.chdir(tmp_path)
+    reads = iter(
+        [
+            (_HOSTED_URL, None),  # the snapshot the guard decides on: logged out
+            (_HOSTED_URL, "key-stored-by-a-concurrent-login"),  # must never be reached
+        ]
+    )
+    monkeypatch.setattr(traces, "load_credentials", lambda: next(reads))
+    monkeypatch.setattr(
+        traces, "export_trace_records", lambda *a, **k: pytest.fail("re-read the config")
+    )
+
+    assert cli.main(["traces", "export", "--project", "11111111-1111-4111-8111-111111111111"]) == 1
+    assert "flash login" in capsys.readouterr().err
+
+
 def test_traces_export_reports_a_project_with_no_usable_traces(
     fake_traces, monkeypatch, tmp_path, capsys
 ) -> None:

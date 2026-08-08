@@ -34,15 +34,23 @@ def default_output_path(export_format: str) -> Path:
     return RAW_EXPORT_PATH if export_format == RAW_FORMAT else DEFAULT_EXPORT_PATH
 
 
-def _require_api_key(api_key: str | None = None) -> str:
-    """The key to send, falling back to the stored credential when the caller has none.
+_NO_SNAPSHOT = object()
+
+
+def _require_api_key(api_key: str | None | object = _NO_SNAPSHOT) -> str:
+    """The key to send, reading the stored credential only when the caller has no snapshot.
 
     A caller that already read the config passes its key rather than letting this re-read, so the
     url it decided on and the key sent to the backend come from one snapshot: a `flash login`
     landing in between would otherwise pair a hosted-url decision with a newly stored self-hosted
     plane credential and send that credential to the hosted backend.
+
+    ``None`` therefore has to mean "my snapshot held no key" -- a logged-out caller -- and NOT
+    "no snapshot": treating both as absent would send the logged-out path back to the config and
+    reopen that race for exactly the caller whose snapshot said there was nothing to send.
     """
-    api_key = api_key or load_credentials()[1]
+    if api_key is _NO_SNAPSHOT:
+        api_key = load_credentials()[1]
     if not api_key:
         raise ClientError(
             "not logged in. Run `flash login` with your freesolo API key (or set FREESOLO_API_KEY)"
@@ -76,12 +84,15 @@ def fetch_records(
     export_format: str = RECORDS_FORMAT,
 ) -> dict:
     """A project's traces in the requested shape, converted server-side."""
-    return export_trace_records(project_id, _require_api_key(api_key), export_format=export_format)
+    # `None` here is this signature's "caller passed nothing", not a snapshot that held no key,
+    # so it forwards as no-snapshot and `_require_api_key` may read the config itself.
+    key = _require_api_key(api_key if api_key is not None else _NO_SNAPSHOT)
+    return export_trace_records(project_id, key, export_format=export_format)
 
 
 def fetch_projects(api_key: str | None = None) -> list[dict]:
     """Projects in the caller's org that traces can be exported from."""
-    return list_trace_projects(_require_api_key(api_key))
+    return list_trace_projects(_require_api_key(api_key if api_key is not None else _NO_SNAPSHOT))
 
 
 def _resolve_project_id(args, api_key: str) -> str:

@@ -373,13 +373,19 @@ def test_configured_backend_keeps_project_listing_available(monkeypatch, capsys)
     """The refusal is about having no backend, not about who runs the plane."""
     _self_hosted(monkeypatch)
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.internal.example")
-    monkeypatch.setattr(
-        "flash.client.list_projects",
-        lambda api_key: [{"id": "66666666-6666-4666-8666-666666666666", "name": "configured"}],
-    )
+    sent: list[str] = []
+
+    def _list(api_key):
+        sent.append(api_key)
+        return [{"id": "66666666-6666-4666-8666-666666666666", "name": "configured"}]
+
+    monkeypatch.setattr("flash.client.list_projects", _list)
 
     assert _run(["projects", "list"]) == 0
     assert "configured" in capsys.readouterr().out
+    # assert WHICH credential travelled: reaching the backend is only correct if the key sent is
+    # the one the operator configured. a test that ignores the argument passes a leak too.
+    assert sent == ["operator-key"]
 
 
 def test_a_backend_url_pointing_at_freesolo_does_not_unlock_these_commands(
@@ -400,21 +406,18 @@ def test_a_backend_url_pointing_at_freesolo_does_not_unlock_these_commands(
         assert "not available on a self-hosted plane" in capsys.readouterr().err.lower(), hosted
 
 
-def test_an_ambient_hosted_key_survives_a_stale_self_hosted_login(monkeypatch, capsys) -> None:
-    """`load_credentials` lets FREESOLO_API_KEY win over the saved key while KEEPING the saved
-    api_url, and these commands never send that url anyway -- they address the backend with the
-    key. So a hosted key supplied against a leftover self-hosted login must keep working rather
-    than be disabled by a url it does not use.
+def test_an_ambient_api_key_does_not_unlock_these_commands(monkeypatch, capsys) -> None:
+    """FREESOLO_API_KEY cannot prove a hosted account. SELF_HOSTING.md has self-hosters log in
+    with the plane-controlling FREESOLO_INTERNAL_KEY, and `cmd_login` reads this same env var as
+    the login key, so its value is as likely to be the operator key. Treating its presence as a
+    hosted signal ships that credential to api.freesolo.co.
     """
     _self_hosted(monkeypatch)
-    monkeypatch.setenv("FREESOLO_API_KEY", "fs-hosted-key")
-    monkeypatch.setattr(
-        "flash.client.list_projects",
-        lambda api_key: [{"id": "77777777-7777-4777-8777-777777777777", "name": "ambient"}],
-    )
+    monkeypatch.setenv("FREESOLO_API_KEY", "the-plane-operator-key")
+    monkeypatch.setattr("flash.client.list_projects", lambda *a, **k: pytest.fail("leaked key"))
 
-    assert _run(["projects", "list"]) == 0
-    assert "ambient" in capsys.readouterr().out
+    assert _run(["projects", "list"]) == 1
+    assert "not available on a self-hosted plane" in capsys.readouterr().err.lower()
 
 
 def test_blank_backend_url_does_not_count_as_configured(monkeypatch, capsys) -> None:

@@ -70,22 +70,24 @@ def has_freesolo_backend(api_url: str | None) -> bool:
 
     Lives beside ``freesolo_base_url`` because it answers a question about the same env var: a
     caller cannot decide whether the hosted API is reachable from the control-plane url alone.
-    Three independent signals can each supply a backend, and only the absence of all three means
-    there is none:
+    Two signals can supply a backend, and the absence of both means there is none:
 
     - the control-plane url names Freesolo. ``FLASH_STANDALONE`` is server-side and these callers
       never reach the plane, so the url is the only standalone signal available.
     - ``FREESOLO_BASE_URL`` names someone else. An operator running their own plane can point it
       at a Freesolo-compatible backend, which is what these calls resolve through.
-    - ``FREESOLO_API_KEY`` is set. The control-plane url is the WEAKEST signal: these calls never
-      send it (they address ``freesolo_base_url`` with the key), and ``load_credentials`` keeps a
-      saved ``api_url`` while letting the env key win, so a hosted key supplied against a leftover
-      self-hosted login must not be disabled by that stale url.
 
-    Note the deliberate polarity flip between the first two: the plane url qualifies by BEING
-    Freesolo's, the backend url by NOT being. They are different questions -- "is the hosted
-    backend my target" versus "does the operator run their own" -- and honouring a backend url
-    that names Freesolo would send a self-hosted plane's operator key to it.
+    Note the deliberate polarity flip: the plane url qualifies by BEING Freesolo's, the backend
+    url by NOT being. They are different questions -- "is the hosted backend my target" versus
+    "does the operator run their own" -- and honouring a backend url that names Freesolo would
+    send a self-hosted plane's operator key to it.
+
+    The presence of ``FREESOLO_API_KEY`` deliberately does NOT count. It looks like a hosted
+    signal but cannot be one: ``SELF_HOSTING.md`` has self-hosters log in with the
+    plane-controlling ``FREESOLO_INTERNAL_KEY``, and ``cmd_login`` reads that env var as the login
+    key, so its value is as likely to be the operator key as a hosted account key. Nothing marks
+    which, and guessing wrong ships the plane credential to Freesolo. A hosted account reached
+    from a self-hosted plane needs ``FREESOLO_BASE_URL`` set explicitly.
 
     A false positive is the safe direction: assuming a backend exists yields today's behaviour
     (an authenticated call that may fail) rather than refusing a deployment that works.
@@ -101,9 +103,7 @@ def has_freesolo_backend(api_url: str | None) -> bool:
     # the hosted service (or leaving it at that default) from a self-hosted plane would send the
     # plane's operator key to Freesolo as a bearer token -- the leak this guard exists to close.
     backend = os.environ.get("FREESOLO_BASE_URL", "").strip()
-    if backend and not is_freesolo_hosted_url(backend):
-        return True
-    return bool(os.environ.get("FREESOLO_API_KEY", "").strip())
+    return bool(backend) and not is_freesolo_hosted_url(backend)
 
 
 def _detail_from_http_error(exc: urllib.error.HTTPError) -> object:
