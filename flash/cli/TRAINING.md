@@ -780,10 +780,10 @@ Pick SFT when you already have good answers and want the model to imitate them.
   the same LoRA (VL and text-only alike), so the run trains and serves at the SFT
   adapter's rank-`r` and just has to fit the selected model's serving `max_lora_rank` (some
   serving models allow rank 128, larger serving paths cap at 64). Do **NOT** set `lora_rank`
-  for a warm-start: the source adapter's rank/alpha metadata is authoritative. Flash reads the
-  rank from the source adapter and uses it for cost, GPU allocation, and GRPO-sleep sizing, so
-  setting `lora_rank` alongside `init_from_adapter` is rejected at submit; it also rejects a
-  source adapter whose rank exceeds the serving cap.
+  or `lora_alpha` for a warm-start: the source adapter's rank/alpha metadata is authoritative.
+  Flash reads the rank from the source adapter and uses it for cost, GPU allocation, and
+  GRPO-sleep sizing, so setting either alongside `init_from_adapter` is rejected at submit; it
+  also rejects a source adapter whose rank exceeds the serving cap.
 
 ```toml
 # configs/rl.toml — warm-start GRPO from the SFT run's adapter

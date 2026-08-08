@@ -1314,7 +1314,7 @@ def test_warmstart_dry_run_persists_source_adapter_alpha(api, monkeypatch):
     )
 
     assert resp.status_code == 200, resp.text
-    # lora_alpha is platform-derived (2x rank) and stripped from the public spec; the resolved
+    # a warm start cannot author alpha, so it is stripped from the public spec; the resolved
     # warm-start source alpha is persisted in the internal worker-spec carrier.
     assert "lora_alpha" not in resp.json()["spec"]["train"]
     status = runner.get_status(resp.json()["run_id"])
@@ -1343,7 +1343,7 @@ def test_warmstart_accepts_normalized_default_alpha_without_authored_metadata(ap
             "train": {**SPEC["train"], "init_from_adapter": "source-run"},
         }
     ).to_dict()
-    # lora_alpha is platform-derived and stripped from the public spec; a normalized spec omits it.
+    # a warm start cannot author alpha, so a normalized warm-start spec omits it.
     assert "lora_alpha" not in normalized["train"]
 
     resp = api.post(
@@ -1397,9 +1397,9 @@ def test_warmstart_rejects_explicit_conflicting_alpha(api, monkeypatch):
     )
 
     assert resp.status_code == 400
-    # lora_alpha is a platform-managed field (always 2x rank); the user parser rejects it outright,
-    # so an explicit value is refused before any warm-start alpha-conflict check runs.
-    assert "[train] unknown key(s): lora_alpha" in resp.json()["detail"]
+    # lora_alpha is authorable again, but not alongside init_from_adapter: the source adapter's
+    # alpha is authoritative, so the parser refuses the pair rather than silently overriding it.
+    assert "train.lora_alpha cannot be set with train.init_from_adapter" in resp.json()["detail"]
     assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
 
 

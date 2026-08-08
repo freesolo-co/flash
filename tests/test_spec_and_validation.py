@@ -363,6 +363,21 @@ def test_default_lora_rank_defaults_alpha_to_64() -> None:
     assert spec.train.lora_alpha == 64
 
 
+def test_internal_from_dict_round_trips_stored_lora_alpha() -> None:
+    # The internal carrier preserves a stored alpha so an authored value and a warm-start's
+    # inherited parent alpha (which need not equal 2 x rank) survive control-plane -> worker
+    # serialization; alpha falls back to 2 x rank only when the payload omits it.
+    base = {
+        "model": "Qwen/Qwen3.5-0.8B",
+        "algorithm": "grpo",
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
+        "train": {"epochs": 1, "max_examples": 8, "lora_rank": 16, "lora_alpha": 48},
+    }
+    assert JobSpec.from_dict(base).train.lora_alpha == 48  # present -> round-trip
+    absent = {**base, "train": {"epochs": 1, "max_examples": 8, "lora_rank": 16}}
+    assert JobSpec.from_dict(absent).train.lora_alpha == 32  # absent -> derive 2 x rank
+
+
 def test_authored_lora_alpha_overrides_the_derived_default() -> None:
     # an authored alpha need not equal 2 x rank, and it survives the public round trip the client
     # submits and the server re-validates.
