@@ -16,8 +16,8 @@ from flash.schema import (
     TRAIN_SCHEMA_KEYS,
     ConfigError,
     parse_adapter_revision,
+    spec_and_train_keys_from_file,
     spec_from_dict,
-    spec_from_file,
     train_schema_metadata,
     validate_train_keys,
 )
@@ -174,7 +174,7 @@ def test_toml_config_requires_project(tmp_path) -> None:
     )
 
     with pytest.raises(ConfigError, match="project is required and must be nonblank"):
-        spec_from_file(str(config), project_required=True)
+        spec_and_train_keys_from_file(str(config), project_required=True)
 
 
 def test_project_id_is_required_canonicalized_and_roundtrips() -> None:

@@ -1,7 +1,24 @@
 import inspect
 
-from flash.engine.worker.heartbeat import _mean_named_reward_metrics
+from flash.engine.worker.heartbeat import RewardObservabilityBuffer
 from flash.engine.worker.rl_train import run_rl_train, score_single_turn
+
+
+def _published_reward_metrics(breakdowns: list[dict[str, float] | None]) -> dict[str, float]:
+    """Average named reward components the way production does: through the live buffer.
+
+    ``RewardObservabilityBuffer`` is the only thing that averages these on the verl path, so the
+    semantics below (a missing name counts as zero, a failed grading still occupies a denominator
+    slot, a non-finite value is masked to zero) are asserted through it rather than through a
+    standalone helper no caller reaches. One ``record`` per completion mirrors ``score_single_turn``,
+    which appends a 0-or-1 element accumulator per completion; ``close_generation`` then seals the
+    generation and ``heartbeat_fields`` reads back what a heartbeat would actually ship.
+    """
+    buffer = RewardObservabilityBuffer()
+    for index, breakdown in enumerate(breakdowns):
+        buffer.record(f"prompt-{index}", f"completion-{index}", 0.0, [breakdown])
+    buffer.close_generation(1)
+    return buffer.heartbeat_fields().get("reward_metrics", {})
 
 
 def test_named_reward_metrics_are_averaged_across_completions() -> None:
@@ -11,7 +28,7 @@ def test_named_reward_metrics_are_averaged_across_completions() -> None:
         {"success": 1.0, "quality": 1.0, "total": 0.9},
     ]
 
-    assert _mean_named_reward_metrics(breakdowns) == {
+    assert _published_reward_metrics(breakdowns) == {
         "success": 2.0 / 3.0,
         "quality": 2.2 / 3.0,
     }
@@ -20,13 +37,13 @@ def test_named_reward_metrics_are_averaged_across_completions() -> None:
 def test_missing_named_metric_counts_as_zero_across_scored_completions() -> None:
     breakdowns = [{"success": 1.0, "total": 1.0}, {"total": 0.0}]
 
-    assert _mean_named_reward_metrics(breakdowns) == {"success": 0.5}
+    assert _published_reward_metrics(breakdowns) == {"success": 0.5}
 
 
 def test_failed_scoring_attempt_counts_as_zero() -> None:
     breakdowns = [{"success": 1.0, "total": 1.0}, None]
 
-    assert _mean_named_reward_metrics(breakdowns) == {"success": 0.5}
+    assert _published_reward_metrics(breakdowns) == {"success": 0.5}
 
 
 def test_non_finite_named_metric_counts_as_zero() -> None:
@@ -36,12 +53,12 @@ def test_non_finite_named_metric_counts_as_zero() -> None:
         {"m": 0.0, "total": 1.0},
     ]
 
-    assert _mean_named_reward_metrics(breakdowns) == {"m": 1.0 / 3.0}
+    assert _published_reward_metrics(breakdowns) == {"m": 1.0 / 3.0}
 
 
 def test_plain_scalar_rewards_produce_no_named_metrics() -> None:
-    assert _mean_named_reward_metrics([None, None]) == {}
-    assert _mean_named_reward_metrics([{"total": 0.4}, {"total": 0.8}]) == {}
+    assert _published_reward_metrics([None, None]) == {}
+    assert _published_reward_metrics([{"total": 0.4}, {"total": 0.8}]) == {}
 
 
 def test_scoring_validates_total_before_aggregating_breakdown() -> None:

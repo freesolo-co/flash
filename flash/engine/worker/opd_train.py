@@ -14,7 +14,7 @@ import re
 import shutil
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
@@ -80,6 +80,7 @@ from flash.engine.worker.opd_gkd import (
     student_tokens_with_offsets,
 )
 from flash.engine.worker.rng import seed_training_rngs
+from flash.engine.worker.score_batcher import ScoreBatcher
 from flash.engine.worker.sft_train import (
     _build_verl_child_env,
     _cached_model_path,
@@ -139,37 +140,6 @@ def _align_granularity(groups, student_tokens) -> float:
 
 class _TeacherBridgeHTTPServer(BoundedThreadingHTTPServer):
     request_queue_size = _TEXT_TEACHER_REQUEST_BACKLOG
-
-
-@dataclass
-class _TextTeacherWaiter:
-    item: tuple[str, str]
-    enqueued_at: float
-    done: threading.Event = field(default_factory=threading.Event)
-    result: TeacherScore | None = None
-    error: Exception | None = None
-    _lock: threading.Lock = field(default_factory=threading.Lock)
-
-    def complete(
-        self,
-        *,
-        result: TeacherScore | None = None,
-        error: Exception | None = None,
-    ) -> None:
-        with self._lock:
-            if self.done.is_set():
-                return
-            self.result = result
-            self.error = error
-            self.done.set()
-
-    def wait(self) -> TeacherScore:
-        self.done.wait()
-        if self.error is not None:
-            raise self.error
-        if self.result is None:
-            raise RuntimeError("text teacher batch waiter completed without a result")
-        return self.result
 
 
 def _teacher_batch_error(error: Exception) -> Exception:
@@ -245,7 +215,22 @@ def _validate_text_teacher_batch(
     return scored
 
 
-class _TextTeacherBatcher:
+def _permanent_teacher_error(message: str) -> Exception:
+    return TeacherError(message, permanent=True)
+
+
+class _TextTeacherBatcher(ScoreBatcher):
+    """Batch supplied-token teacher scoring, billing each unique item exactly once.
+
+    Deduplication is the OPD-specific part and stays here: a generation can ask for the same
+    (prompt, completion) pair more than once (identical completions off one prompt are common at low
+    temperature), and the teacher charges per scored item. Sending the pair once and marking the
+    repeats unbilled keeps the answer identical while paying for it once.
+
+    ``recheck_closed_after_wait`` is on: a batch assembled during the flush window after ``close``
+    must NOT be sent, because a teacher call bills real money and the run is already shutting down.
+    """
+
     def __init__(
         self,
         teacher,
@@ -253,130 +238,49 @@ class _TextTeacherBatcher:
         max_batch_size: int = OPD_TEACHER_SCORING_CONCURRENCY,
         flush_wait_s: float = _TEXT_TEACHER_FLUSH_WAIT_S,
     ) -> None:
-        if max_batch_size <= 0:
-            raise ValueError("text teacher batch size must be positive")
-        if flush_wait_s <= 0:
-            raise ValueError("text teacher flush wait must be positive")
+        super().__init__(
+            self._score_items,
+            max_batch_size=max_batch_size,
+            flush_wait_s=flush_wait_s,
+            label="text teacher batcher",
+            thread_name="flash-opd-text-teacher-batcher",
+            make_error=_permanent_teacher_error,
+            wrap_batch_error=_teacher_batch_error,
+            recheck_closed_after_wait=True,
+        )
         self.teacher = teacher
-        self.max_batch_size = int(max_batch_size)
-        self.flush_wait_s = float(flush_wait_s)
-        self._condition = threading.Condition()
-        self._pending: list[_TextTeacherWaiter] = []
-        self._in_flight: list[_TextTeacherWaiter] = []
-        self._closed = False
-        self._thread: threading.Thread | None = None
 
-    def start(self) -> None:
-        with self._condition:
-            if self._closed:
-                raise RuntimeError("text teacher batcher is closed")
-            if self._thread is not None:
-                return
-            self._thread = threading.Thread(
-                target=self._run,
-                name="flash-opd-text-teacher-batcher",
-                daemon=True,
-            )
-            thread = self._thread
-        thread.start()
-
-    def score(self, prompt_text: str, completion_text: str) -> TeacherScore:
-        with self._condition:
-            if self._closed:
-                raise TeacherError("text teacher batcher shut down", permanent=True)
-            waiter = _TextTeacherWaiter(
-                (prompt_text, completion_text),
-                enqueued_at=time.monotonic(),
-            )
-            self._pending.append(waiter)
-            self._condition.notify_all()
-        return waiter.wait()
-
-    def _take_batch(self) -> list[_TextTeacherWaiter] | None:
-        with self._condition:
-            while not self._pending:
-                if self._closed:
-                    return None
-                self._condition.wait()
-            deadline = self._pending[0].enqueued_at + self.flush_wait_s
-            while len(self._pending) < self.max_batch_size and not self._closed:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                self._condition.wait(remaining)
-            if self._closed:
-                return None
-            batch = self._pending[: self.max_batch_size]
-            del self._pending[: len(batch)]
-            self._in_flight = batch
-            return batch
-
-    def _score_batch(self, batch: list[_TextTeacherWaiter]) -> None:
+    def _score_items(self, items: list[tuple[str, str]]) -> list[TeacherScore]:
         unique_items: list[tuple[str, str]] = []
         item_indexes: dict[tuple[str, str], int] = {}
         scatter_indexes: list[int] = []
-        for waiter in batch:
-            index = item_indexes.get(waiter.item)
+        for item in items:
+            index = item_indexes.get(item)
             if index is None:
                 index = len(unique_items)
-                item_indexes[waiter.item] = index
-                unique_items.append(waiter.item)
+                item_indexes[item] = index
+                unique_items.append(item)
             scatter_indexes.append(index)
         scored = _validate_text_teacher_batch(
             self.teacher.score_many(unique_items),
             unique_items,
         )
         billed_indexes: set[int] = set()
-        for waiter, index in zip(batch, scatter_indexes, strict=True):
+        results: list[TeacherScore] = []
+        for index in scatter_indexes:
             result = scored[index]
             if index in billed_indexes:
                 result = result.without_billing()
             else:
                 billed_indexes.add(index)
-            waiter.complete(result=result)
+            results.append(result)
+        return results
 
-    def _run(self) -> None:
-        try:
-            while True:
-                batch = self._take_batch()
-                if batch is None:
-                    return
-                try:
-                    self._score_batch(batch)
-                except Exception as error:
-                    for waiter in batch:
-                        waiter.complete(error=_teacher_batch_error(error))
-                finally:
-                    with self._condition:
-                        self._in_flight = []
-                        self._condition.notify_all()
-        finally:
-            error = TeacherError("text teacher batcher stopped", permanent=True)
-            with self._condition:
-                stranded = [*self._pending, *self._in_flight]
-                self._pending.clear()
-                self._in_flight = []
-                self._closed = True
-                self._condition.notify_all()
-            for waiter in stranded:
-                waiter.complete(error=_teacher_batch_error(error))
+    def score(self, prompt_text: str, completion_text: str) -> TeacherScore:
+        return self.submit((prompt_text, completion_text))
 
     def close(self, timeout_s: float = _TEXT_TEACHER_SHUTDOWN_WAIT_S) -> None:
-        error = TeacherError("text teacher batcher shut down", permanent=True)
-        with self._condition:
-            self._closed = True
-            pending = list(self._pending)
-            self._pending.clear()
-            self._condition.notify_all()
-            thread = self._thread
-        for waiter in pending:
-            waiter.complete(error=_teacher_batch_error(error))
-        if thread is not None:
-            thread.join(timeout=max(0.0, timeout_s))
-        with self._condition:
-            in_flight = list(self._in_flight)
-        for waiter in in_flight:
-            waiter.complete(error=_teacher_batch_error(error))
+        super().close(timeout_s)
 
 
 class _RecordedMutationCallbackFailure(RuntimeError):

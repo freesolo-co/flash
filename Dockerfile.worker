@@ -127,24 +127,23 @@ RUN if [ -n "${FLASH_ATTN_3_SPEC}" ]; then \
 # lets the GatedDeltaNet hybrids (Qwen3.5/3.6) PACK boundary-correctly — a 4D block-diagonal mask
 # alone only fixes the full-attention layers (engine.worker.packing.gdn_packing_available gates the
 # SFT packing path on this import). GPU-validated (RTX 5090, Qwen3.5-0.8B): a packed example's output
-# is byte-identical regardless of its neighbors' content (zero cross-example leakage). Best-effort
-# source build (small + fast vs flash-attn); on failure GDN packing simply stays off and Qwen3.5/3.6
-# train UNPACKED as before — no correctness risk. Arch-bounded to the catalog GPUs to cap build time.
-# PINNED (compiled CUDA extension) for reproducible image builds — an unpinned upstream release could
-# silently change behavior or break the build. On a build that compiles but then fails to IMPORT
-# (ABI/symbol mismatch), UNINSTALL it: transformers' is_causal_conv1d_available() is a find_spec probe,
-# so a present-but-broken package would pass it and then crash at Qwen3.5 model load instead of safely
-# training unpacked. (engine.worker.packing.gdn_packing_available also re-imports it as defense.)
-# 1.6.2.post1 builds Blackwell/sm120 kernels (RTX 5090, flash's default GPU); older lines (e.g. 1.5.2)
-# import fine but raise "no kernel image is available for execution on the device" at the first conv
-# forward on sm120 — GPU-verified. engine.worker.packing.gdn_packing_available runs a conv smoke too,
-# so even a wrong-arch build can't crash a run (it just keeps GDN packing off).
+# is byte-identical regardless of its neighbors' content (zero cross-example leakage).
+# Arch-bounded to the catalog GPUs to cap build time. PINNED (compiled CUDA extension) for
+# reproducible image builds — an unpinned upstream release could silently change behavior or break
+# the build. 1.6.2.post1 builds Blackwell/sm120 kernels (RTX 5090, flash's default GPU); older lines
+# (e.g. 1.5.2) import fine but raise "no kernel image is available for execution on the device" at
+# the first conv forward on sm120 — GPU-verified.
+#
+# REQUIRED here for the same reason as the verl venv copy below, and kept in the same && chain so an
+# ABI-broken build fails the image: transformers' is_causal_conv1d_available() is only a find_spec
+# probe, so a present-but-broken package would pass it and then crash at Qwen3.5 model load. This
+# interpreter is not where training runs (that is /opt/verl-venv), but it is where the parent-side
+# probes in engine.worker.packing execute, and a parent that cannot import the kernel cannot answer
+# the packing question the same way the child would.
 RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=4 \
     pip install --no-cache-dir "causal-conv1d==1.6.2.post1" --no-build-isolation \
     && python -c "import causal_conv1d" \
-    && echo "causal_conv1d: installed (GDN packing enabled)" \
-    || { echo "causal_conv1d: build/import failed -> removing + GDN packing stays off (Qwen3.5/3.6 train unpacked)"; \
-         pip uninstall -y causal-conv1d 2>/dev/null || true; }
+    && echo "causal_conv1d: installed (GDN packing enabled)"
 
 # weight cache (runtime, not baked): when the shared weight-cache network volume is attached,
 # flash/providers/_worker.py:weight_cache_env redirects only base-model prefetching through
@@ -316,15 +315,20 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" MAX_JOBS=4 \
 # the GDN layer cu_seq_lens_q + seq_idx, but transformers' pure-torch fallbacks take **kwargs and
 # silently DISCARD both, so a child missing these kernels trains across example boundaries while
 # looking patched. verl_child_can_reset_gdn_boundaries probes this venv for exactly that reason.
-# Best-effort with the same uninstall-on-broken-import guard as the main interpreter: a present but
-# ABI-broken package passes transformers' find_spec probe and then crashes at model load, and a
-# failed build must degrade to unpacked training (the gate returns False) rather than fail the image.
+#
+# REQUIRED, not best-effort. This was best-effort on the premise that a failed build degrades to
+# unpacked training, and that premise no longer holds: every catalog model is a GDN hybrid, and
+# backend_common.require_gdn_boundary_resets now RAISES for grpo/opd when the child cannot reset,
+# because the old padded fallback (use_remove_padding=False) is incompatible with the
+# use_fused_kernels=True these recipes hardcode and dies at padding.py:144 on every batch size.
+# So a conv-less image does not train unpacked here -- it fails grpo and opd after paying for the
+# gpu. Failing the BUILD is strictly cheaper than failing the run. No `|| uninstall` branch: the
+# import check below is part of the same && chain, so an ABI-broken build (which passes
+# transformers' find_spec probe) fails the image rather than shipping as present-but-broken.
 RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=4 \
     uv pip install --python /opt/verl-venv/bin/python "causal-conv1d==1.6.2.post1" --no-build-isolation \
     && /opt/verl-venv/bin/python -c "import causal_conv1d" \
-    && echo "causal_conv1d (verl venv): installed (GDN boundary resets enabled)" \
-    || { echo "causal_conv1d (verl venv): build/import failed -> GDN trains unpacked (padded fallback)"; \
-         uv pip uninstall --python /opt/verl-venv/bin/python causal-conv1d 2>/dev/null || true; }
+    && echo "causal_conv1d (verl venv): installed (GDN boundary resets enabled)"
 
 # Sanity: the verl venv must be able to LAUNCH, not merely install. This is the assert that would
 # have caught the shipped-but-unrunnable venv. Import the three entrypoints flash actually invokes
@@ -334,10 +338,14 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=T
 # hydra override. Also assert the Qwen3.5 archs are registered, since that is the entire reason this
 # venv carries 0.19.1 instead of 0.11.2.
 #
-# fla is asserted HARD here (causal_conv1d is not, matching its best-effort install above): without
-# it transformers binds chunk_gated_delta_rule to the pure-torch fallback, which accepts cu_seqlens
-# and discards it, so packed GDN runs would train across example boundaries. A silently fla-less
-# child is exactly the failure this assert exists to make loud at build time rather than on a paid GPU.
+# fla and causal_conv1d are both asserted HARD here, matching their required installs above: without
+# fla transformers binds chunk_gated_delta_rule to the pure-torch fallback, which accepts cu_seqlens
+# and discards it, and without causal_conv1d the conv falls back to F.silu(self.conv1d(...)), which
+# takes no seq_idx at all -- so packed GDN runs would train across example boundaries. The conv is
+# the DOMINANT channel of the two: on a real Qwen3_5TextModel, honoring seq_idx alone cuts
+# cross-example contamination from 9.47e-02 to 1.63e-05, while segmenting only the recurrence barely
+# moves it. A silently kernel-less child is exactly the failure these asserts exist to make loud at
+# build time rather than on a paid GPU.
 RUN /opt/verl-venv/bin/python -c "import importlib.metadata as M; \
 import importlib; \
 [importlib.import_module(m) for m in ('verl.trainer.main_ppo','verl.trainer.main_ppo_sync','verl.trainer.sft_trainer')]; \
@@ -347,6 +355,9 @@ assert 'mask_truncated_completions' in RolloutConfig.__dataclass_fields__, 'verl
 importlib.import_module('flash_attn.bert_padding'); \
 from transformers.utils.import_utils import is_flash_linear_attention_available; \
 assert is_flash_linear_attention_available(), 'flash-linear-attention missing from the verl venv: packed GDN boundary resets would be silently discarded'; \
+from transformers.utils.import_utils import is_causal_conv1d_available; \
+assert is_causal_conv1d_available(), 'causal_conv1d missing from the verl venv: the gdn causal conv would silently discard seq_idx, and grpo/opd fail closed on a gdn model whose child cannot reset boundaries'; \
+importlib.import_module('causal_conv1d'); \
 assert M.version('verl') == '0.8.0', 'opd structured gate requires verl exactly 0.8.0, got ' + M.version('verl'); \
 assert M.version('xgrammar') == '0.1.25', 'opd structured gate requires xgrammar exactly 0.1.25, got ' + M.version('xgrammar'); \
 from vllm import ModelRegistry; \
@@ -356,8 +367,7 @@ assert not missing, 'vllm cannot serve the default-model archs: ' + repr(sorted(
 print('verl venv OK | verl', M.version('verl'), '| vllm', M.version('vllm'), '| torch', M.version('torch'), '| numpy', M.version('numpy'), '| xgrammar', M.version('xgrammar')); \
 print('  entrypoints: main_ppo (grpo), main_ppo_sync (opd), sft_trainer (sft)'); \
 print('  qwen3.5 archs registered; mask_truncated_completions present'); \
-from transformers.utils.import_utils import is_causal_conv1d_available; \
-print('  gdn boundary resets: fla yes, causal_conv1d ' + ('yes' if is_causal_conv1d_available() else 'NO -> gdn trains padded'))"
+print('  gdn boundary resets: fla yes, causal_conv1d yes (both asserted)')"
 
 # RunPod Serverless worker entrypoint (Pattern D — Flash custom image). Generate /rp_handler.py
 # from the real _train_body source in providers/runpod/train/endpoints.py (single source of truth;

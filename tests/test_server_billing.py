@@ -279,7 +279,6 @@ def api(tmp_path, monkeypatch):
     # configured provider keys would trigger orphan sweeps and status reporting. stub both because
     # these billing tests assert only on the API response and must remain network-free.
     import flash.providers as providers_mod
-    import flash.providers.runpod.train.endpoints as rp_endpoints
     import flash.server.projects as projects_mod
     import flash.server.run_registry as run_registry
 
@@ -290,11 +289,6 @@ def api(tmp_path, monkeypatch):
         lambda *, project_id, **_kwargs: project_id,
     )
     monkeypatch.setattr(run_registry, "_post", lambda *a, **k: False, raising=False)
-    # FREESOLO_INTERNAL_KEY also makes create_app() startup run the RunPod slot-store reconcile
-    # (reconcile_endpoint_slots() -> runpod.slots.reconcile() urllib POST). No-op it at the entry.
-    monkeypatch.setattr(
-        rp_endpoints, "reconcile_endpoint_slots", lambda *a, **k: None, raising=False
-    )
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
     monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
