@@ -81,13 +81,26 @@ export INFISICAL_TOKEN
 # an unquoted string and word-splitting it would corrupt such values, and a leading space
 # would make `env` choke.) INFISICAL_KEEP itself is a whitespace-separated list of variable
 # NAMES, so splitting *it* is intentional.
-# The iterator is scratch space, and `for` assigns to an existing name in place -- so if the
-# container exported a variable by that name, the loop inherits its export mark and the child
-# receives the loop's value instead of the container's. The name is therefore part of this
-# script's contract with the image, exactly like the scratch variable removed from the loop
-# body. `_infisical_keep_name` is namespaced to this script so no container plausibly sets it;
-# a short name like `k` collides, and there is no shell-level way to make an iterator local in
-# POSIX sh.
+# The loop below iterates with `_infisical_keep_name`, and POSIX `for` assigns to an existing
+# name IN PLACE -- inheriting that name's export mark. That gives the iterator's own name two
+# failures, and renaming it only moves both to the new name, because any name can appear in
+# INFISICAL_KEEP. There is no safe choice and no way to make an iterator local in POSIX sh, so
+# the name is handled explicitly instead:
+#
+#   a container that set it has its value overwritten in the child, even without asking for it
+#   in INFISICAL_KEEP -- so capture that value HERE, before the loop exists, and hand it to
+#   `env` as an operand. `env` applies operands over the environment it inherits, so the
+#   container's value is restored whatever the loop did to the live variable.
+#
+#   a KEEP entry naming it would make the presence check below resolve THROUGH the iterator,
+#   which is always set by then -- emitting an invented `NAME=NAME` -- so the loop skips it.
+#   The operand captured here is the honest answer for that name, and it is already emitted.
+#
+# When the container never set it, nothing is captured and nothing is emitted: the loop's
+# assignment is then an ordinary unexported shell variable that no child ever sees.
+if [ -n "${_infisical_keep_name+set}" ]; then
+  set -- "_infisical_keep_name=$_infisical_keep_name" "$@"
+fi
 # shellcheck disable=SC2086
 for _infisical_keep_name in ${INFISICAL_KEEP:-}; do
   # These names are expanded inside `eval` below, so refuse anything that is not a shell
@@ -98,6 +111,11 @@ for _infisical_keep_name in ${INFISICAL_KEEP:-}; do
       exit 2
       ;;
   esac
+  # Handled above, from the value captured before this loop clobbered the variable. Evaluating
+  # it here would read the iterator itself rather than the container's variable.
+  if [ "$_infisical_keep_name" = _infisical_keep_name ]; then
+    continue
+  fi
   # Only re-apply names the container actually SET. An unset name expands to nothing, and
   # handing `env` a bare `K=` would overwrite the injected secret with an empty string --
   # so a typo'd or absent KEEP entry would silently WIPE a credential rather than leave the
