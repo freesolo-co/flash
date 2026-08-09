@@ -14,20 +14,25 @@ credentials:
 
 ```bash
 uv sync --extra server --dev
-uv run pytest -q
 uv run ruff check .
+uv run ruff format --check .
+uv run pytest -q
 ```
 
 That is the same set of checks CI runs (`.github/workflows/ci.yml`), so a green local run
-usually means a green CI run.
+usually means a green CI run. CI runs them on both supported interpreters (3.11 and 3.12);
+locally, whichever one `uv` picks is normally enough.
+
+CI also runs `uv run mypy flash`, but that job is advisory: it reports the existing type
+errors without failing the build, so you do not need a clean mypy run to contribute.
 
 To run the CLI from a dev checkout, use `uv run python -m flash.cli --help`. The `--dev`
 group installs `runpod-flash`, which also declares a `flash` console script, so plain
 `uv run flash` may resolve to RunPod's CLI instead of this one.
 
-Formatting is not yet enforced across the whole tree: `ruff format .` would rewrite a large
-number of files unrelated to your change. Format only the files you touched
-(`uv run ruff format path/to/file.py`) so your diff stays reviewable.
+Formatting is enforced: CI runs `ruff format --check .` and fails on any drift, so run
+`uv run ruff format .` before you push. The whole tree is already formatted, so this
+touches only the files you changed.
 
 Running the control plane (`flash-server`) additionally requires operator credentials for
 GPU providers and the Freesolo backend — see `.env.example` and the self-hosting notes in
