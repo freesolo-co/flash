@@ -44,6 +44,7 @@ class _FakeClient:
         runtime_secrets=None,
         dry_run: bool = False,
         client_train_schema=None,
+        rollout_evidence=None,
     ) -> dict:
         self.calls.append(("create_run", spec, runtime_secrets, dry_run, client_train_schema))
         response = {"run_id": "flash-dry", "state": "dry_run", "spec": spec}

@@ -873,6 +873,33 @@ def _prepared_sft_profile_job(spec: JobSpec, *, input_digest: str) -> PreparedJo
     )
 
 
+def _attach_rollout_workload_profile(spec: JobSpec, evidence: object) -> JobSpec:
+    """Attach client-measured rollout evidence to ``spec``, or return it unchanged.
+
+    Fails OPEN, unlike ``_require_sft_workload_profile``, and the asymmetry is the point. An sft
+    profile is a census of the exact rows training consumes, so a missing one means the quote would
+    describe different work and refusing is correct. A rollout profile is a SAMPLE of a stochastic
+    process, and one cannot be taken for every model -- three of the six catalog models are too small
+    for any provider to host. Raising here would make those models unquotable in order to buy
+    accuracy on the others.
+
+    So an absent, malformed, thin, or mismatched measurement silently leaves the declared cap in
+    place, which is exactly the pricing this path had before any of it existed.
+    """
+    if not evidence or spec.algorithm not in ("grpo", "opd"):
+        return spec
+    from flash.server.domain.rollout_evidence import rollout_profile_from_evidence
+
+    profile = rollout_profile_from_evidence(
+        spec,
+        evidence,
+        producer_version=_profile_producer_version(),
+    )
+    if not profile:
+        return spec
+    return replace(spec, workload_profile=profile)
+
+
 def _require_sft_workload_profile(spec: JobSpec) -> JobSpec:
     """Attach the exact sft workload profile for ``spec``, or fail closed until one exists."""
     from flash.engine.profiling.workload_profile import (
@@ -959,6 +986,7 @@ def prepare_job(
     billing_context: dict | None = None,
     platform_context: dict | None = None,
     owner_key_id: int | None = None,
+    rollout_evidence: object = None,
 ) -> PreparedJob:
     """Prepare all read-only submission inputs before persistence or allocation."""
     spec = _resolve_model_revision(spec, required=spec.algorithm == "sft")
@@ -966,6 +994,8 @@ def prepare_job(
     if spec.algorithm == "sft":
         spec = _require_pinned_profile_environment(spec)
         spec = _require_sft_workload_profile(spec)
+    else:
+        spec = _attach_rollout_workload_profile(spec, rollout_evidence)
     if spec.train.structured_outputs:
         from flash.serve.preflight import preflight_serving_path
 

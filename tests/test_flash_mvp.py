@@ -107,7 +107,12 @@ def test_cli_train_dry_run(monkeypatch, capsys):
 
         class _FakeClient:
             def create_run(
-                self, spec, runtime_secrets=None, dry_run=False, client_train_schema=None
+                self,
+                spec,
+                runtime_secrets=None,
+                dry_run=False,
+                client_train_schema=None,
+                rollout_evidence=None,
             ):
                 seen["dry_run"] = dry_run
                 seen["client_train_schema"] = client_train_schema

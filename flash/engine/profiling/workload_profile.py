@@ -445,9 +445,15 @@ class RolloutWorkloadProfile:
             c not in "0123456789abcdef" for c in self.input_digest
         ):
             raise ValueError("input_digest must be a lowercase sha256 hex digest")
-        for name in ("producer_version", "tokenizer_revision", "environment_id"):
+        for name in ("producer_version", "environment_id"):
             if not getattr(self, name):
                 raise ValueError(f"{name} is required")
+        # tokenizer_revision is deliberately NOT required. It is compared for equality against
+        # ``spec.model_revision``, and an unpinned spec -- the normal case -- has "" there. Requiring
+        # a non-empty value made every ordinary run unmatchable: no profile could be built carrying
+        # the "" it would have to equal, so the measured path was unreachable rather than merely
+        # unused. "" is a real revision value here, meaning "whatever the model's default branch
+        # resolves to", and it keys distinctly from any pinned sha in the digest.
         if not self.environment_revision:
             raise ValueError("environment_revision is required")
         if not self.sample_policy:

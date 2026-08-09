@@ -39,6 +39,17 @@ _MAX_SCHEMA_FIELDS = 256
 _MAX_SCHEMA_TEXT = 128
 
 
+def _rollout_evidence(payload: dict) -> dict | None:
+    """The client's rollout measurement, if it sent one.
+
+    Passed through as-is: every field is re-derived or bounds-checked by
+    ``rollout_profile_from_evidence``, which is the only place that decides whether any of it may
+    affect a price. Extracting it here only keeps the untrusted payload out of the spec parser.
+    """
+    raw = payload.get("rollout_evidence")
+    return raw if isinstance(raw, dict) else None
+
+
 def _client_train_schema(payload: dict) -> dict | None:
     raw = payload.get("client_train_schema")
     if not isinstance(raw, dict) or set(raw) != {"version", "fields", "authored_keys"}:
@@ -230,6 +241,7 @@ def create_run(
                 billing_context=billing_context,
                 platform_context=platform_context or None,
                 owner_key_id=key["id"],
+                rollout_evidence=_rollout_evidence(payload),
             )
         except ServingPreflightError:
             raise
