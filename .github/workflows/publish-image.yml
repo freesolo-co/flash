@@ -8,6 +8,11 @@ on:
     paths:
       - "flash/**"
       - "Dockerfile"
+      # The base image COPYs the entrypoint out of this directory, so a change here changes the
+      # published image. Without this filter entry an entrypoint-only fix -- including a security
+      # fix to the secrets wrapper -- merges without rebuilding, and the tags keep serving the old
+      # script until some unrelated watched file happens to change.
+      - "deploy/infisical/entrypoint.sh"
       - "pyproject.toml"
       - "scripts/build_dev_dist.py"
       - ".github/workflows/publish-image.yml"
@@ -83,12 +88,20 @@ jobs:
         if: github.ref_name == 'dev'
         run: python3 scripts/build_dev_dist.py --no-build
 
+      # INSTALL_INFISICAL=true bakes the pinned Infisical CLI into the PUBLISHED images (:main,
+      # :latest, :dev) so a deployment can switch to vault-backed secrets by setting
+      # INFISICAL_CLIENT_ID, with no rebuild. It does NOT change how these images behave by
+      # default: the entrypoint stays a passthrough until that variable is set, so an image
+      # published here still runs on a plain --env-file. The Dockerfile defaults the argument
+      # to false, so `docker build .` from a checkout stays vendor-free.
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           push: true
+          build-args: |
+            INSTALL_INFISICAL=true
           tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=min
