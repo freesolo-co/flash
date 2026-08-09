@@ -261,9 +261,9 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # ensurepip is not available"). --seed puts pip in the venv anyway. uv itself is already in the base
 # image at /usr/local/bin/uv.
 #
-# Three pins are non-obvious and load-bearing: datasets>=4.7 (older raises AttributeError on PyArrow
+# Four pins are non-obvious and load-bearing: datasets>=4.7 (older raises AttributeError on PyArrow
 # PyExtensionType), TransferQueue (absent from verl's setup.py, but OPD calls tq.init()/tq.close()),
-# and wandb (also absent from verl's setup.py). verl calls wandb.init from THIS interpreter, not
+# transformers<5.13 (see below), and wandb (also absent from verl's setup.py). verl calls wandb.init from THIS interpreter, not
 # flash's, so a job that sets WANDB_API_KEY loses its curves and run link unless wandb is importable
 # in here; resolve_verl_loggers() degrades to console when it is not, which is the right behaviour
 # for a foreign FLASH_VERL_PYTHON but silently drops W&B on the default image (codex[bot]).
@@ -276,9 +276,19 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # the resolve_verl_python path where that hardening lives -- letting the two lists drift means the
 # fallback protects nobody and a vllm respin breaks launch on the default image alone. Keep them in
 # lockstep with backend_common.py's install list.
+#
+# transformers is pinned to the SAME range as the main interpreter (>=5.6,<5.13) and in the override
+# file, not just the direct list -- verl and vllm both depend on transformers, so without the
+# override a transitive requirement re-widens it. Left unpinned, this venv resolved 5.14.1, where
+# `is_flash_linear_attention_available()` returns False for the fla build installed two lines below,
+# and the sanity assert further down fails the image with "flash-linear-attention missing" while fla
+# is demonstrably installed. The venv is the interpreter that TRAINS, so its transformers must be the
+# one the gdn probes were validated against; the main interpreter carrying the pin protects nothing
+# in here (/opt/verl-venv is built without --system-site-packages). Raising this ceiling means
+# re-validating the fla and causal_conv1d probes against the new line, not just bumping the number.
 ARG VERL_SPEC=verl[vllm]@git+https://github.com/freesolo-co/verl@1bea7d6825bbb9d2164e86e379b3680e7c53bb8a
 ENV FLASH_VERL_PYTHON=/opt/verl-venv/bin/python
-RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" > /tmp/verl-overrides.txt \
+RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers>=5.6,<5.13" > /tmp/verl-overrides.txt \
     && uv venv --seed /opt/verl-venv \
     && VIRTUAL_ENV=/opt/verl-venv uv pip install --python /opt/verl-venv/bin/python \
         --override /tmp/verl-overrides.txt \
@@ -286,6 +296,7 @@ RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" > /tmp/verl-o
         "vllm==0.19.1" \
         "xgrammar==0.1.25" \
         "numpy==2.2.6" \
+        "transformers>=5.6,<5.13" \
         "datasets>=4.7,<6" \
         "TransferQueue==0.1.7" \
         liger-kernel "bitsandbytes>=0.49" qwen-vl-utils \
