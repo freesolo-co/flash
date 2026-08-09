@@ -271,7 +271,7 @@ class TrainSpec:
     # a directly constructed TrainSpec(lora_rank=8) gets alpha 16 like the parsed path rather than a
     # stale scalar. Authoring it is rejected alongside init_from_adapter, where the source adapter's
     # alpha is authoritative (see spec_from_dict).
-    lora_alpha: int = field(default=0, metadata={"introduced_in": "1.1.31"})
+    lora_alpha: int = field(default=0, metadata={"introduced_in": "1.1.32"})
     # artifact-store adapter ref output by `flash runs status`:
     # ``<hf_repo>:<phase>/<run_id>``.
     init_from_adapter: str = field(default="", metadata={"introduced_in": "0.2.0"})

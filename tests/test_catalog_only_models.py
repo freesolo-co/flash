@@ -171,9 +171,15 @@ def test_a_pre_upgrade_worker_env_snapshot_still_passes_its_integrity_digest(tmp
     )
     public, worker = spec.to_dict(), spec.to_internal_dict()
 
-    # what the OLD plane wrote and hashed: asdict emitted worker_env into both payloads.
+    # what the OLD plane wrote and hashed: asdict emitted worker_env into both payloads. its public
+    # spec also had no lora_alpha (alpha was managed-and-derived, so to_dict() stripped it), so drop
+    # it here too -- today's to_dict() emits it and would hash bytes that snapshot never carried.
     old_worker = {**worker, "worker_env": {}}
-    old_public = {**public, "worker_env": {}}
+    old_public = {
+        **public,
+        "worker_env": {},
+        "train": {k: v for k, v in public["train"].items() if k != "lora_alpha"},
+    }
     hashed_worker = {
         k: v
         for k, v in old_worker.items()

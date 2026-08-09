@@ -136,7 +136,7 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
     assert TRAIN_KEY_MIN_VERSIONS["entropy_quantile"] == "1.0.15"
     # re-introduced as a user knob after being managed-and-derived; gated on the release that
     # restored it, not on lora_rank's original 0.2.0.
-    assert TRAIN_KEY_MIN_VERSIONS["lora_alpha"] == "1.1.31"
+    assert TRAIN_KEY_MIN_VERSIONS["lora_alpha"] == "1.1.32"
     # opd has no auxiliary eos loss or user-facing eos-loss key.
     assert "opd_eos_loss_coef" not in TRAIN_KEY_MIN_VERSIONS
     assert {
