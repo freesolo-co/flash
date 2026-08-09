@@ -16,6 +16,11 @@ import flash.cli as cli
 from flash.cli import env_setup, traces
 from flash.client import ApiError, ClientError
 
+# Trace export and the hosted project directory exist only on Freesolo's own deployment, so these
+# tests must present a Freesolo-hosted control-plane url. Any other hostname is how the CLI infers
+# a self-hosted plane (`client.http.has_freesolo_backend`), where these commands refuse by design.
+_HOSTED_URL = "https://flash.freesolo.co"
+
 _PROJECTS = [
     {
         "id": "11111111-1111-4111-8111-111111111111",
@@ -63,8 +68,11 @@ def fake_traces(monkeypatch):
 
     monkeypatch.setattr(traces, "list_trace_projects", list_projects)
     monkeypatch.setattr(traces, "export_trace_records", export_records)
-    monkeypatch.setattr(traces, "load_credentials", lambda: ("https://flash", "fs-key"))
-    monkeypatch.setattr("flash.client.config.load_credentials", lambda: ("https://flash", "fs-key"))
+    # A Freesolo-HOSTED url: trace export only exists on that deployment (traces are recorded by
+    # the freesolo SDK into its backend), so every behaviour below is the hosted path. A
+    # placeholder hostname reads as self-hosted and would short-circuit all of it at the guard.
+    monkeypatch.setattr(traces, "load_credentials", lambda: (_HOSTED_URL, "fs-key"))
+    monkeypatch.setattr("flash.client.config.load_credentials", lambda: (_HOSTED_URL, "fs-key"))
     monkeypatch.setattr("flash.client.list_projects", lambda api_key: _PROJECTS)
     monkeypatch.setattr(
         "flash.client.get_project",
@@ -199,8 +207,60 @@ def test_traces_export_under_ci_never_prompts(fake_traces, monkeypatch, tmp_path
 
 
 def test_traces_export_requires_login(monkeypatch, tmp_path, capsys) -> None:
+    """Logged out against the HOSTED plane, where a login is what's missing. On a self-hosted
+    plane the command is unavailable outright, so pointing this at one would assert the wrong
+    refusal (see test_traces_export_refuses_on_a_self_hosted_plane)."""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(traces, "load_credentials", lambda: ("https://flash", None))
+    monkeypatch.setattr(traces, "load_credentials", lambda: (_HOSTED_URL, None))
+
+    assert cli.main(["traces", "export", "--project", "11111111-1111-4111-8111-111111111111"]) == 1
+    assert "flash login" in capsys.readouterr().err
+
+
+def test_traces_export_sends_the_key_from_the_url_it_decided_on(monkeypatch, tmp_path) -> None:
+    """The self-hosted guard reads the url, and the key travels to the backend. Both must come
+    from ONE credential read: if the key is re-read afterwards, a `flash login` landing in that
+    window pairs a hosted-url decision with a newly stored self-hosted plane credential, sending
+    that credential to the hosted backend -- the exact leak the guard exists to prevent.
+    """
+    monkeypatch.chdir(tmp_path)
+    reads = iter(
+        [
+            (_HOSTED_URL, "hosted-key"),  # the read the guard decides on
+            ("http://my-plane:8080", "operator-key"),  # a concurrent login lands here
+        ]
+    )
+    monkeypatch.setattr(traces, "load_credentials", lambda: next(reads))
+
+    sent: list[str] = []
+
+    def _record(project_id, api_key, export_format=None):
+        sent.append(api_key)
+        return {"format": "records", "records": [{"input": "a", "output": "b"}]}
+
+    monkeypatch.setattr(traces, "export_trace_records", _record)
+
+    assert cli.main(["traces", "export", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
+    # the plane credential from the second read must never reach the hosted backend
+    assert sent == ["hosted-key"]
+
+
+def test_a_logged_out_snapshot_does_not_reread_the_config(monkeypatch, tmp_path, capsys) -> None:
+    """A snapshot that legitimately held no key must refuse, not fall back to a fresh read. The
+    logged-out caller is exactly the one whose re-read could pick up a credential stored by a
+    concurrent `flash login` and pair it with the url this command already decided on.
+    """
+    monkeypatch.chdir(tmp_path)
+    reads = iter(
+        [
+            (_HOSTED_URL, None),  # the snapshot the guard decides on: logged out
+            (_HOSTED_URL, "key-stored-by-a-concurrent-login"),  # must never be reached
+        ]
+    )
+    monkeypatch.setattr(traces, "load_credentials", lambda: next(reads))
+    monkeypatch.setattr(
+        traces, "export_trace_records", lambda *a, **k: pytest.fail("re-read the config")
+    )
 
     assert cli.main(["traces", "export", "--project", "11111111-1111-4111-8111-111111111111"]) == 1
     assert "flash login" in capsys.readouterr().err
@@ -491,7 +551,7 @@ def test_traces_export_skip_note_names_the_right_missing_half(
     """A prompts skip means no usable request; blaming a missing response would
     contradict the reason the prompts shape exists."""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(traces, "load_credentials", lambda: ("https://flash", "fs-key"))
+    monkeypatch.setattr(traces, "load_credentials", lambda: (_HOSTED_URL, "fs-key"))
     monkeypatch.setattr(
         traces,
         "export_trace_records",
@@ -530,7 +590,7 @@ def test_traces_export_refuses_a_format_the_backend_ignored(monkeypatch, tmp_pat
     complete trace dump -- an incomplete backup reported as success.
     """
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(traces, "load_credentials", lambda: ("https://flash", "fs-key"))
+    monkeypatch.setattr(traces, "load_credentials", lambda: (_HOSTED_URL, "fs-key"))
     monkeypatch.setattr(
         traces,
         "export_trace_records",
@@ -562,7 +622,7 @@ def test_traces_export_default_records_works_against_a_format_blind_backend(
 ) -> None:
     """The default request cannot be mislabelled: records is what such a backend returns."""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(traces, "load_credentials", lambda: ("https://flash", "fs-key"))
+    monkeypatch.setattr(traces, "load_credentials", lambda: (_HOSTED_URL, "fs-key"))
     monkeypatch.setattr(
         traces,
         "export_trace_records",
@@ -587,7 +647,7 @@ def test_traces_export_refuses_an_explicit_mismatch_on_the_default_format(
     and any value other than the one asked for must be refused whichever format was requested.
     """
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(traces, "load_credentials", lambda: ("https://flash", "fs-key"))
+    monkeypatch.setattr(traces, "load_credentials", lambda: (_HOSTED_URL, "fs-key"))
     monkeypatch.setattr(
         traces,
         "export_trace_records",
