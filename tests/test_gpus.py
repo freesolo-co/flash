@@ -361,9 +361,15 @@ def test_35b_expert_lora_shapes_and_multicard_sizing():
     assert 32 * target_dims == 1_906_356_480
     assert 64 * target_dims == 3_812_712_960
 
+    # sft moved +2 / +1 off the pre-correction numbers (117 / 151) because _SFT_CHUNKED_NLL_TOKENS
+    # now tracks verl's real FusedLinearForPPO chunk_size of 512 rather than the old 256. one extra
+    # 256-row vocab projection at 248320 x 16 B is 1.017 GB, which crosses a ceil boundary at rank
+    # 32 and not at 64. that is under-reservation being removed, not growth -- the child always
+    # projected 512 rows. the selected card is unchanged on both ranks (H200 at 32, B200 at 64), so
+    # this corrects the reserve without rerouting any run.
     expected_need = {
-        32: {"sft": 117, "grpo": 200, "opd": 204},
-        64: {"sft": 151, "grpo": 222, "opd": 238},
+        32: {"sft": 119, "grpo": 200, "opd": 204},
+        64: {"sft": 152, "grpo": 222, "opd": 238},
     }
     for rank, by_algorithm in expected_need.items():
         for algorithm, need in by_algorithm.items():

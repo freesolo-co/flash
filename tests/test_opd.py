@@ -1214,8 +1214,16 @@ def test_opd_vram_keeps_chunked_text_peak_when_it_exceeds_dense_image_peak():
         estimate_vram_gb,
     )
 
+    # seq_len must be >= the completion budget: it is prompt PLUS completion, so the old
+    # `seq_len: 1` alongside `max_tokens: 512` described a sequence shorter than its own
+    # completion. That was only inert because the chunk row count used to be taken from the
+    # completion and ignored seq_len; now that it is bounded by seq_len (the fused forward
+    # projects prompt positions too) the incoherent value reserves one row instead of a chunk.
+    #
+    # 768 keeps the chunk saturated while the dense image term stays smaller, which is the
+    # comparison under test. That window is 512..1023 -- at 1024 the dense term takes over.
     kw = {
-        "seq_len": 1,
+        "seq_len": 768,
         "max_tokens": OPD_CE_CHUNK_SIZE,
         "lora_rank": 16,
         "batch_size": 1,

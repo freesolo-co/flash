@@ -1247,10 +1247,13 @@ def test_verl_venv_pins_transformers_to_the_main_interpreters_range():
     """The verl venv must carry the SAME transformers ceiling as the main interpreter.
 
     /opt/verl-venv is built without --system-site-packages, so the main interpreter's pin does not
-    reach it. Left unpinned it resolved 5.14.1, where `is_flash_linear_attention_available()` returns
-    False for the pinned fla build and the venv sanity block fails the image with
-    "flash-linear-attention missing" while fla is installed. The venv is the interpreter that trains,
-    so it is the one whose transformers has to match what the gdn probes were validated against.
+    reach it. The venv is the interpreter that TRAINS, and transformers owns the gdn modelling code
+    the boundary-reset shim patches, so an unbounded resolve there silently moves training onto a
+    transformers line nothing validated.
+
+    This pin does NOT fix the cuda-gated probes -- they are byte-identical in 5.12.1 and 5.14.1 and
+    answer False on any gpu-less builder at every version. See
+    ``test_venv_sanity_block_uses_no_cuda_gated_probe``.
 
     The pin must also be in the OVERRIDE file: verl and vllm both require transformers, so a direct
     pin alone can be re-widened by a transitive requirement.
@@ -1304,11 +1307,44 @@ def test_causal_conv1d_is_required_not_best_effort_in_the_image():
     # the uninstall-on-failure escape hatch must be gone from BOTH steps.
     assert "pip uninstall -y causal-conv1d" not in dockerfile
     assert "uv pip uninstall --python /opt/verl-venv/bin/python causal-conv1d" not in dockerfile
-    # and the venv sanity block must assert it, the way it already asserts fla.
-    assert "assert is_causal_conv1d_available()" in dockerfile, (
-        "the verl venv sanity block must assert causal_conv1d the way it asserts fla; a find_spec "
-        "probe printed as an advisory line lets a kernel-less image ship green"
+    # and the venv sanity block must import it, the way it imports fla. NOT via transformers'
+    # is_causal_conv1d_available(): that begins with is_torch_cuda_available(), and the image builds
+    # on a cpu runner, so it answers False with the kernel installed and fails every build. The
+    # import is what a cpu can prove; the cuda-gated capability is asserted on the worker.
+    venv_sanity = dockerfile[dockerfile.index("# Sanity: the verl venv must be able to LAUNCH") :]
+    assert "importlib.import_module('causal_conv1d')" in venv_sanity, (
+        "the verl venv sanity block must import causal_conv1d the way it imports fla; an install "
+        "line whose result is never imported lets an ABI-broken build ship green"
     )
+
+
+def test_venv_sanity_block_uses_no_cuda_gated_probe():
+    """The build-time sanity block must not call a probe that needs a gpu to answer True.
+
+    ``is_flash_linear_attention_available()`` and ``is_causal_conv1d_available()`` both open with
+    ``is_torch_cuda_available()`` -> ``torch.cuda.is_available()``. worker-image.yml builds on
+    ``ubuntu-24.04-8core``, which has no device, so both return False with the kernels correctly
+    installed and the asserts are unsatisfiable BY CONSTRUCTION -- they fail every build regardless
+    of image contents. Run 31291646212 died exactly this way with fla 0.5.2 present and
+    transformers 5.12.1 resolved.
+
+    The build asserts what a cpu can prove (importable, and fla >= the 0.2.2 the probe demands). The
+    cuda-gated capability is asserted where a device exists: the child probe feeding
+    ``require_gdn_boundary_resets``, which raises for grpo/opd before a step runs.
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    dockerfile = (root / "Dockerfile.worker").read_text()
+    venv_sanity = dockerfile[dockerfile.index("# Sanity: the verl venv must be able to LAUNCH") :]
+    venv_sanity = venv_sanity[: venv_sanity.index("# RunPod Serverless worker entrypoint")]
+
+    for probe in ("is_flash_linear_attention_available", "is_causal_conv1d_available"):
+        assert f"assert {probe}()" not in venv_sanity, (
+            f"{probe}() is cuda-gated and the image builds on a cpu runner, so asserting it fails "
+            "every build with the kernel installed. assert the import instead, and leave the "
+            "capability to the worker-side probe."
+        )
 
 
 def test_fla_git_pin_is_consistent_and_pinned():

@@ -27,7 +27,11 @@ _BASE_OVERHEAD_GB = 4.0
 _ACT_COEF = 0.12
 _SFT_PER_DEVICE_BS_DEFAULT = 4
 _VOCAB_DEFAULT = 248_320
-OPD_CE_CHUNK_SIZE = 64
+# must track verl's `FusedLinearForPPO(chunk_size=...)` default
+# (verl/utils/experimental/torch_functional.py). the child projects the vocab in chunks of this
+# many token rows, so a smaller value here under-reserves and admits a job that then OOMs.
+VERL_FUSED_CE_CHUNK_TOKENS = 512
+OPD_CE_CHUNK_SIZE = VERL_FUSED_CE_CHUNK_TOKENS
 _OPD_CE_PEAK_BYTES_PER_LOGIT = 16
 
 
@@ -337,7 +341,7 @@ _OPD_VLLM_COLOCATE_FLOOR_GB = 41.0
 _LOGITS_BUDGET_GB = 6.0
 # 16 B/elem: fp32 logits+grad + bf16 logits+grad + CE temp. 8 B/elem under-counts (live OOM confirmed).
 _SFT_LOGITS_BYTES_PER_ELEM = 16.0
-_SFT_CHUNKED_NLL_TOKENS = 256
+_SFT_CHUNKED_NLL_TOKENS = VERL_FUSED_CE_CHUNK_TOKENS
 # shared thresholds for the independent liger and worker memory gates.
 _LIGER_MIN_PARAMS_B = 3.0
 _LIGER_LONG_CTX_TOKENS = 2048
@@ -562,14 +566,20 @@ def estimate_vram_gb(
                 preserve_legacy_floor=True,
             ),
         )
-        # text opd projects only completion-prediction hidden states and computes exact full-vocabulary
-        # ce in checkpointed chunks. image samples still use the dense full-sequence logits path and are
-        # processed one at a time. allocation does not know the dataset modality, so reserve the larger
-        # of one text ce chunk and one dense image loss forward/backward peak.
+        # text opd computes exact full-vocabulary ce in chunks of VERL_FUSED_CE_CHUNK_TOKENS rows.
+        # the child projects prompt AND completion positions (verl's fused qwen forward takes no
+        # `logits_to_keep` and does not slice hidden states), so the chunk cap, not the completion
+        # length, is what bounds the projection. image samples still use the dense full-sequence
+        # logits path and are processed one at a time. allocation does not know the dataset modality,
+        # so reserve the larger of one text ce chunk and one dense image loss forward/backward peak.
         completion = opd_completion_len(max_tokens, thinking)
         loss_mb = opd_loss_microbatch(params_b, batch_size, group_size)
         activations = loss_mb * _ACT_COEF * (seq_len / 1024.0) * width
-        ce_rows = min(OPD_CE_CHUNK_SIZE, loss_mb * completion)
+        # rows are bounded by seq_len, NOT completion: the same fused forward that ignores
+        # `logits_to_keep` projects prompt positions too. inert while the cap was 64 (any completion
+        # saturated it), live at 512 -- a serial loss microbatch with a short completion reserved
+        # up to 1.5 GB short of one full chunk.
+        ce_rows = min(OPD_CE_CHUNK_SIZE, loss_mb * seq_len)
         chunked_logits = ce_rows * vocab * _OPD_CE_PEAK_BYTES_PER_LOGIT / 1e9
         dense_image_logits = (seq_len * 4 + completion * 8) * vocab / 1e9
         logits = max(chunked_logits, dense_image_logits)
@@ -579,8 +589,9 @@ def estimate_vram_gb(
     fused = False if sft_fused_ce is None else bool(sft_fused_ce)
     pd = sft_per_device(batch_size, seq_len=seq_len, vocab=vocab, fused=fused)
     activations = _ACT_COEF * pd * (seq_len / 1024.0) * width
-    # plain nll retains every sequence position. chunked nll retains at most one 256-token vocab
-    # projection at a time, independent of micro-batch and context once the chunk is full.
+    # plain nll retains every sequence position. chunked nll retains at most one
+    # VERL_FUSED_CE_CHUNK_TOKENS-token vocab projection at a time, independent of micro-batch and
+    # context once the chunk is full.
     projected_tokens = min(pd * seq_len, _SFT_CHUNKED_NLL_TOKENS) if fused else pd * seq_len
     logits = projected_tokens * vocab * _SFT_LOGITS_BYTES_PER_ELEM / 1e9
     return base + activations + logits
@@ -817,7 +828,12 @@ def model_required_vram_gb(
         # opd sizes prompt plus completion for the resident rollout path.
         _default_len = opd_rollout_seq_len(0, max_tokens, thinking)
     else:
-        _default_len = 1024
+        # sft trims rows to RECIPE.sft.max_seq_len_thinking when thinking is on (sft_max_length).
+        # defaulting to the non-thinking cap here sizes activations for half the sequence the worker
+        # actually trains on.
+        from flash.engine.plan.recipe import RECIPE
+
+        _default_len = int(RECIPE.sft.max_seq_len_thinking if thinking else RECIPE.sft.max_seq_len)
     seq_len = _pos_int(_get(train, "max_context_tokens"), _default_len)
     lora_rank = _pos_int(_get(train, "lora_rank"), 32)
     if _algo == "opd":

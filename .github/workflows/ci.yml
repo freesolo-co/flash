@@ -60,6 +60,16 @@ jobs:
           HF_HUB_DISABLE_TELEMETRY: "1"
         run: uv run pytest -q
 
+      # The offline suite can only compare the pin against a hardcoded copy of itself, so a
+      # mis-transcribed sha passes every pin test while naming a commit that was never pushed --
+      # which then fails EVERY worker install at provisioning time. This is the one pin check that
+      # asks the fork instead of asking the repo about itself, so it needs the network.
+      #
+      # Deliberately NOT covered by the offline env above: those vars are scoped to the pytest step,
+      # so this step still reaches github as it must.
+      - name: verl pin exists on the fork
+        run: uv run python scripts/check_verl_pin_exists.py
+
   # `lint + offline tests` is the required status check, and the matrix above turned that one
   # check into two per-version checks. This aggregate keeps a single stable name for branch
   # protection to require, and fails if either matrix leg failed or was cancelled.

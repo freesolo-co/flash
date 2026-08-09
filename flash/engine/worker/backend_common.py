@@ -38,7 +38,7 @@ from flash._internal.diagnostics import sanitize_diagnostic
 # version file this branch pins to the release value.
 VERL_REQUIREMENT_NAME = "verl"
 VERL_REQUIREMENT_URL = (
-    "git+https://github.com/freesolo-co/verl@1bea7d6825bbb9d2164e86e379b3680e7c53bb8a"
+    "git+https://github.com/freesolo-co/verl@32d6200de81dc484893baf8b9cf30297ebe7fa49"
 )
 # the pin, as the venv stamp records it. the provisioning install asks for the [vllm] extra of this
 # same commit; the stamp stays extra-free so it identifies the verl a venv holds, not how it was
@@ -72,18 +72,24 @@ FLA_REQUIREMENT = (
 CAUSAL_CONV1D_REQUIREMENT = "causal-conv1d==1.6.2.post1"
 
 # the SAME transformers range the main interpreter and Dockerfile.worker's verl-venv layer use.
-# is_flash_linear_attention_available() and is_causal_conv1d_available() are find_spec probes whose
-# import path moved in 5.13: an unpinned resolve lands 5.14.x, which answers False for BOTH even
-# though the packages are installed, so the child reports no gdn boundary-reset capability and
-# grpo/opd fail closed on every catalog model. verl and vllm both depend on transformers, so this
-# has to be in the OVERRIDE file as well as the direct list -- a direct pin alone loses to their
-# transitive declarations.
+# this venv is the interpreter that TRAINS, and transformers owns the gdn modelling code the
+# boundary-reset shim patches (chunk_gated_delta_rule, the causal conv, and the kwargs they read),
+# so an unbounded resolve here means the training path silently rides a transformers line nothing
+# validated. bounding it to the range flash tests against is the whole reason. verl and vllm both
+# depend on transformers, so this has to be in the OVERRIDE file as well as the direct list -- a
+# direct pin alone loses to their transitive declarations.
+#
+# NOT the reason: this pin does not affect is_flash_linear_attention_available() or
+# is_causal_conv1d_available(). Those are byte-identical in 5.12.1 and 5.14.1 and both open with
+# is_torch_cuda_available(), so they answer False on any machine without a gpu regardless of the
+# installed version. An earlier revision of this comment claimed a 5.13 import-path move made them
+# answer False; that mechanism does not exist. See Dockerfile.worker's sanity block.
 TRANSFORMERS_REQUIREMENT = "transformers>=5.6,<5.13"
 
 # the stamp must identify every separately installed package the venv holds. omitting flash-attn,
 # fla, causal_conv1d, or the transformers range lets an older partial venv match forever; conv1d
 # leaves GRPO/OPD failing ``require_gdn_boundary_resets`` with no rebuild path, and a stale venv
-# resolved before the transformers pin holds the 5.14.x that makes both probes answer False.
+# resolved before the transformers pin keeps training on an out-of-range transformers indefinitely.
 VERL_VENV_STAMP = (
     f"{VERL_REQUIREMENT}\n{FLASH_ATTN_SPEC}\n{FLA_REQUIREMENT}\n{CAUSAL_CONV1D_REQUIREMENT}\n"
     f"{TRANSFORMERS_REQUIREMENT}"
@@ -210,6 +216,54 @@ def model_max_position_embeddings(model_id: str, revision: str = "") -> int | No
         return None
 
 
+# verl ships two fused linear-CE backends and dispatches on `fused_kernel_options.impl_backend`
+# (models/transformers/monkey_patch.py). all three flash trainers used to pin `torch`, which is
+# verl's own default (config/model/hf_model.yaml:67) -- a restated default rather than a choice.
+#
+# MEASURED, 4096x2560 hidden into a 248320 vocab, bf16, fwd+bwd, paired and alternating, 10 reps
+# after warmup, verl's own entry points on both arms:
+#
+#     card               sm    triton vs torch   peak VRAM        triton err vs fp32
+#     A100 SXM4 80GB     80    3.28x SLOWER      2.75x lower      lower on all 4 quantities
+#     A40                86    1.43x SLOWER      2.75x lower      lower on all 4 quantities
+#     H100 80GB HBM3     90    2.25x FASTER      2.72x lower      lower on all 4 quantities
+#
+# so the choice is card-dependent and a blanket flip would slow every sm80/sm86 run. the split is
+# sm90: the triton kernel's TMA path is gated on `get_device_capability()[0] >= 9`
+# (verl/utils/kernel/kernels.py:48), and below that it takes a general mainloop that loses to the
+# torch chunked loop. the H100 win is stable across shapes (1.9x at 1024 tokens, 2.15x at 2048,
+# 2.25x at 4096 and 8192).
+#
+# ACCURACY is not the deciding axis but is worth recording, because "faster" would not be worth a
+# worse gradient: measured against an fp32 log-softmax arbiter, triton is closer on EVERY card and
+# every quantity -- log_probs 3e-6 vs 7e-4, grad_hidden 6.5e-3 vs 1.8e-2, grad_weight 2.8e-3 vs
+# 1.8e-2. the two backends differ from each other by ~1.9e-2 on gradients, and that gap is mostly
+# the torch backend's own error, not triton's.
+_TRITON_FUSED_CE_MIN_CAPABILITY = (9, 0)
+
+
+def fused_ce_backend(caps: dict) -> str:
+    """`triton` where it is measurably faster (sm90+), `torch` everywhere else.
+
+    Takes the capability from the out-of-process probe (`verl_device_capability`) rather than
+    calling `torch.cuda.get_device_capability` here, for two reasons:
+
+    * this runs in the long-lived PARENT, which does not otherwise touch cuda. initializing a
+      context here to answer one question retains it for the process lifetime, on the same devices
+      `torchrun` is about to own -- unbudgeted VRAM against a reserve sized without it, which is
+      exactly the kind of overhead that OOMs a job sized near a card's limit.
+    * the question is about verl's kernels, and verl pins its own torch. the parent's torch is the
+      wrong interpreter to ask.
+
+    An unanswerable probe (no cuda, no torch, hung import) yields None and falls back to `torch`,
+    which is the current behaviour on every card.
+    """
+    cc = verl_device_capability(caps)
+    if cc is None:
+        return "torch"
+    return "triton" if cc >= _TRITON_FUSED_CE_MIN_CAPABILITY else "torch"
+
+
 def agent_loop_workers(rollout_batch: int, *, cap: int = 8) -> int:
     """largest divisor of ``rollout_batch`` that is <= ``cap`` (verl's default worker count).
 
@@ -221,7 +275,19 @@ def agent_loop_workers(rollout_batch: int, *, cap: int = 8) -> int:
     """
     if rollout_batch <= 0:
         raise ValueError("rollout_batch must be positive")
-    return next(n for n in range(min(cap, rollout_batch), 0, -1) if rollout_batch % n == 0)
+    workers = next(n for n in range(min(cap, rollout_batch), 0, -1) if rollout_batch % n == 0)
+    # a PRIME batch has no divisor in (1, cap], so the pool collapses to a single worker and the
+    # rollout runs fully serialized -- a silent cap-fold slowdown, not an error. it needs a prime
+    # group_size (11 or 13 within the plausible range) to happen, since prompts_per_step alone is
+    # multiplied by group_size, so it is rare rather than impossible. say so instead of leaving the
+    # operator to infer it from wall-clock.
+    if workers == 1 and rollout_batch > 1:
+        print(
+            f"[flash-verl][warn] rollout batch {rollout_batch} has no divisor <= {cap}, so the "
+            f"agent-loop pool is 1 worker and the rollout is serialized. a batch with a small "
+            f"factor (adjust prompts_per_step or group_size) restores up to {cap}-way parallelism."
+        )
+    return workers
 
 
 # worker threads each bridge serves requests from. the bridges are pure i/o relays (parse json,
@@ -740,9 +806,8 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
         # declares vllm>=0.8.5,<=0.12.0 -> flash needs 0.19.1 for the Qwen3.5 archs vllm
         # declares xgrammar>=0.1.32 -> structured opd gates on EXACTLY 0.1.25 verl and
         # vllm both depend on transformers with no upper bound -> an unpinned resolve
-        # lands 5.14.x, whose moved import path makes the fla and causal_conv1d find_spec
-        # probes answer False for packages that ARE installed, so the child reports no
-        # gdn boundary-reset capability and grpo/opd fail closed after the gpu is rented.
+        # drifts the interpreter that TRAINS onto a transformers line nothing validated,
+        # and transformers owns the gdn modelling code the boundary-reset shim patches.
         overrides = os.path.join(workdir, "verl-overrides.txt")
         with open(overrides, "w") as f:
             f.write(f"numpy==2.2.6\nxgrammar==0.1.25\nvllm==0.19.1\n{TRANSFORMERS_REQUIREMENT}\n")

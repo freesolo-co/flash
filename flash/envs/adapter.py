@@ -11,7 +11,12 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
-from flash.envs.base import BaseEnvironment, RolloutReward
+from flash.envs.base import (
+    REWARD_GROUP_CONCURRENCY,
+    BaseEnvironment,
+    RolloutReward,
+    map_bounded,
+)
 from flash.envs.loader import (
     GitHubEnvironmentRef,
     GitHubRateLimitError,
@@ -312,12 +317,34 @@ class FreesoloEnvironment(BaseEnvironment):
             grp["idxs"].append(i)
             grp["payloads"].append(payload_of(st))
         out: list = [None] * len(items)
-        for key in order:
+
+        def score_group(key: str) -> tuple[str, list]:
             grp = groups[key]
             rewards = scorer(grp["task"], grp["payloads"])
             if len(rewards) != len(grp["payloads"]):
                 raise RuntimeError(f"Freesolo environment {method} returned the wrong length")
-            for idx, reward in zip(grp["idxs"], rewards, strict=True):
+            return key, rewards
+
+        # groups are scored CONCURRENTLY, not one after another. each call already scores its own
+        # completions concurrently, but a serial loop over groups still serializes the round trips
+        # ACROSS prompts, so a step with N prompts pays N judge latencies end to end while the gpu
+        # idles. the env's own pool is per-instance and sized once (freesolo Environment
+        # `_score_concurrently` / `max_score_concurrency`), so overlapping calls SHARE those workers
+        # and the provider-facing rate stays capped where it already was -- this removes a barrier
+        # rather than raising concurrency.
+        #
+        # on a raise, map_bounded pays for the groups already in flight where the serial loop
+        # stopped at the failing one, and rl_train.py:1001 re-scores the batch serially, so those
+        # calls are billed twice. bounded at one pool width; REWARD_GROUP_CONCURRENCY sets it.
+        scored = map_bounded(
+            order,
+            score_group,
+            cap=REWARD_GROUP_CONCURRENCY,
+            serial=not self.reward_thread_safe,
+        )
+
+        for key, rewards in scored:
+            for idx, reward in zip(groups[key]["idxs"], rewards, strict=True):
                 out[idx] = reward
         return out
 
