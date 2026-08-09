@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+from dataclasses import dataclass
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -145,6 +146,185 @@ def _precheck_budget_or_block(*, run_id: str, estimate_usd: float, org_id: str) 
     return True
 
 
+@dataclass(frozen=True)
+class _SubmissionContext:
+    """Billing and platform attribution derived from the key and the requested mode."""
+
+    affordability_org_id: str
+    billable_key: bool
+    bill_on_completion: bool
+    billing_context: dict | None
+    profile_billing_context: dict | None
+    platform_context: dict
+
+
+def _submission_context(
+    *, key: dict, dry_run: bool, project_id: str, org_id_header: str | None
+) -> _SubmissionContext:
+    affordability_org_id = str(key.get("org_id") or "").strip()
+    billable_key = key.get("auth_kind") != "internal"
+    bill_on_completion = not dry_run and billable_key
+    billing_context = None
+    # the org requirement is a property of the KEY, not of the mode: a dry run whose org cannot be
+    # resolved would otherwise skip the affordability check and answer 200, while submitting the very
+    # same spec for real is rejected 400 here -- the preview contradicting the launch it previews.
+    if billable_key and not affordability_org_id:
+        raise HTTPException(
+            status_code=400,
+            detail="org id is required to bill a completed training run",
+        )
+    # a workload profile is a separate job that really runs, so it bills on its own completion
+    # whenever the key is billable -- including under `--dry-run`. dry-run previews the TRAINING
+    # run; it does not make work that actually executed free.
+    profile_billing_context = {"org_id": affordability_org_id} if billable_key else None
+    if bill_on_completion:
+        billing_context = profile_billing_context
+    platform_context = {
+        field: value
+        for field, value in {
+            "org_id": key.get("org_id") or org_id_header,
+            "user_id": key.get("user_id"),
+            "api_key_id": key.get("api_key_id"),
+            "project_id": project_id,
+        }.items()
+        if value
+    }
+    return _SubmissionContext(
+        affordability_org_id=affordability_org_id,
+        billable_key=billable_key,
+        bill_on_completion=bill_on_completion,
+        billing_context=billing_context,
+        profile_billing_context=profile_billing_context,
+        platform_context=platform_context,
+    )
+
+
+def _resolve_managed_environment(spec, *, project_id: str, reporting_key: dict) -> str | None:
+    """Return the canonical managed environment slug for ``spec``, or ``None`` when unmanaged."""
+    from flash.envs.adapter import canonical_managed_environment_slug
+
+    try:
+        environment_slug = canonical_managed_environment_slug(spec.environment.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if environment_slug is None:
+        return None
+    from flash.server.domain import envs as managed_envs
+    from flash.server.domain.environment_registry import require_environment_project
+
+    try:
+        environment_slug = managed_envs.canonical_env_id(environment_slug)
+    except managed_envs.EnvPublishError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    require_environment_project(
+        slug=environment_slug,
+        project_id=project_id,
+        key=reporting_key,
+        repair_missing=True,
+    )
+    return environment_slug
+
+
+def _launch_pending_workload_profile(
+    exc,
+    *,
+    key: dict,
+    runtime_secrets,
+    profile_billing_context: dict | None,
+    platform_context: dict,
+    billable_key: bool,
+    affordability_org_id: str,
+) -> tuple[bool, str]:
+    """Claim and launch the pending workload profile.
+
+    Returns ``(launched, state)`` where ``launched`` says whether THIS request started and billed the
+    profile, as opposed to joining one another submitter already owns.
+    """
+    pending = exc.prepared_job
+    state = exc.state
+    # whether THIS request launched and billed the profile, as opposed to joining one that
+    # was already running. only a winning claim launches, so anything else must not be told
+    # it was charged. defaults false: a path that never reaches the claim launched nothing.
+    launched = False
+    if not isinstance(pending, _runner.PreparedJob):
+        return launched, state
+    profile_run_id = pending.public_spec.run_id
+    # claim before spending anything on it. the id is deterministic in the workload, so
+    # another key may already own this exact profile -- in which case it is already
+    # running and this submitter neither launches it again nor pays for it a second
+    # time. losing the claim is ordinary reuse, not an error; it just means waiting.
+    spent_at = getattr(exc, "spent_at", None)
+    if spent_at is None:
+        claimed = db.claim_profile_run(profile_run_id, key["id"])
+    else:
+        # the id is already claimed by a run that is spent, so a fresh claim cannot be
+        # inserted. take the existing one over against the spent run's own timestamp,
+        # so of several submitters watching the same dead profile exactly one relaunches
+        # it and the rest are told to wait on the one that is now running.
+        claimed = db.reclaim_spent_profile_run(profile_run_id, key["id"], spent_at=spent_at)
+    if claimed:
+        profile_submit_kwargs = {
+            "background": True,
+            "owner_key_id": key["id"],
+            "prepared_job": pending,
+        }
+        if runtime_secrets:
+            profile_submit_kwargs["runtime_secrets"] = runtime_secrets
+        if profile_billing_context:
+            profile_submit_kwargs["billing_context"] = profile_billing_context
+        if platform_context:
+            profile_submit_kwargs["platform_context"] = platform_context
+        try:
+            if billable_key:
+                _precheck_budget_or_block(
+                    run_id=profile_run_id,
+                    estimate_usd=pending.estimated_cost_usd,
+                    org_id=affordability_org_id,
+                )
+            _app.submit_job(pending.public_spec, **profile_submit_kwargs)
+        except Exception:
+            # delete the deterministic claim when launch creates no run, or the id wedges
+            # forever. if ``submit_job`` already persisted status, keep the claim so
+            # ownership and normal lifecycle cleanup remain intact.
+            if not os.path.exists(runs_file_path(profile_run_id, ".json")):
+                db.delete_run(profile_run_id)
+            raise
+        # set only after submit_job returns: a launch that raised deleted the row and
+        # charged nothing, so reporting it as launched would name a charge that was
+        # rolled back.
+        launched = True
+    # launched here, lost the claim to a submitter who launched it, or
+    # lost a takeover to one who is relaunching it. in every case the
+    # id now belongs to a live attempt, so the state has to name that
+    # attempt: reporting the spent state a takeover loser read would
+    # name a run that no longer exists under this id, and leaving a
+    # plain claim loser on the synthetic "required" tells a user whose
+    # profile is queued and running that it has not started --
+    # `required` is a marker this route invents, not a state any run
+    # is ever in.
+    return launched, "queued"
+
+
+def _record_environment_use(
+    environment_slug: str | None, *, project_id: str, run_id: str, reporting_key: dict
+) -> None:
+    """Report the environment use for an already-submitted run; never fails the request."""
+    try:
+        from flash.server.domain.environment_registry import record_environment_use
+
+        if environment_slug is not None:
+            record_environment_use(
+                slug=environment_slug,
+                project_id=project_id,
+                run_id=run_id,
+                key=reporting_key,
+            )
+    except Exception:
+        _LOG.warning(
+            "platform reporting failed for %s (run already submitted)", run_id, exc_info=True
+        )
+
+
 @router.post("/v1/runs")
 def create_run(
     payload: dict,
@@ -172,55 +352,19 @@ def create_run(
         org_id=x_freesolo_org_id,
     )
     reporting_key = {**key, "org_id": key.get("org_id") or x_freesolo_org_id}
-    from flash.envs.adapter import canonical_managed_environment_slug
-
-    try:
-        environment_slug = canonical_managed_environment_slug(spec.environment.id)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if environment_slug is not None:
-        from flash.server.domain import envs as managed_envs
-        from flash.server.domain.environment_registry import require_environment_project
-
-        try:
-            environment_slug = managed_envs.canonical_env_id(environment_slug)
-        except managed_envs.EnvPublishError as exc:
-            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
-        require_environment_project(
-            slug=environment_slug,
-            project_id=project_id,
-            key=reporting_key,
-            repair_missing=True,
-        )
+    environment_slug = _resolve_managed_environment(
+        spec, project_id=project_id, reporting_key=reporting_key
+    )
     runtime_secrets = _runtime_secrets(payload, spec)
-    affordability_org_id = str(key.get("org_id") or "").strip()
-    billable_key = key.get("auth_kind") != "internal"
-    bill_on_completion = not dry_run and billable_key
-    billing_context = None
-    # the org requirement is a property of the KEY, not of the mode: a dry run whose org cannot be
-    # resolved would otherwise skip the affordability check and answer 200, while submitting the very
-    # same spec for real is rejected 400 here -- the preview contradicting the launch it previews.
-    if billable_key and not affordability_org_id:
-        raise HTTPException(
-            status_code=400,
-            detail="org id is required to bill a completed training run",
-        )
-    # a workload profile is a separate job that really runs, so it bills on its own completion
-    # whenever the key is billable -- including under `--dry-run`. dry-run previews the TRAINING
-    # run; it does not make work that actually executed free.
-    profile_billing_context = {"org_id": affordability_org_id} if billable_key else None
-    if bill_on_completion:
-        billing_context = profile_billing_context
-    platform_context = {
-        field: value
-        for field, value in {
-            "org_id": key.get("org_id") or x_freesolo_org_id,
-            "user_id": key.get("user_id"),
-            "api_key_id": key.get("api_key_id"),
-            "project_id": project_id,
-        }.items()
-        if value
-    }
+    ctx = _submission_context(
+        key=key, dry_run=dry_run, project_id=project_id, org_id_header=x_freesolo_org_id
+    )
+    affordability_org_id = ctx.affordability_org_id
+    billable_key = ctx.billable_key
+    bill_on_completion = ctx.bill_on_completion
+    billing_context = ctx.billing_context
+    profile_billing_context = ctx.profile_billing_context
+    platform_context = ctx.platform_context
     run_id = spec.run_id
     affordability_verified = False
     try:
@@ -252,70 +396,15 @@ def create_run(
                 ),
             ) from exc
         except _runner.WorkloadProfilePending as exc:
-            pending = exc.prepared_job
-            state = exc.state
-            # whether THIS request launched and billed the profile, as opposed to joining one that
-            # was already running. only a winning claim launches, so anything else must not be told
-            # it was charged. defaults false: a path that never reaches the claim launched nothing.
-            launched = False
-            if isinstance(pending, _runner.PreparedJob):
-                profile_run_id = pending.public_spec.run_id
-                # claim before spending anything on it. the id is deterministic in the workload, so
-                # another key may already own this exact profile -- in which case it is already
-                # running and this submitter neither launches it again nor pays for it a second
-                # time. losing the claim is ordinary reuse, not an error; it just means waiting.
-                spent_at = getattr(exc, "spent_at", None)
-                if spent_at is None:
-                    claimed = db.claim_profile_run(profile_run_id, key["id"])
-                else:
-                    # the id is already claimed by a run that is spent, so a fresh claim cannot be
-                    # inserted. take the existing one over against the spent run's own timestamp,
-                    # so of several submitters watching the same dead profile exactly one relaunches
-                    # it and the rest are told to wait on the one that is now running.
-                    claimed = db.reclaim_spent_profile_run(
-                        profile_run_id, key["id"], spent_at=spent_at
-                    )
-                if claimed:
-                    profile_submit_kwargs = {
-                        "background": True,
-                        "owner_key_id": key["id"],
-                        "prepared_job": pending,
-                    }
-                    if runtime_secrets:
-                        profile_submit_kwargs["runtime_secrets"] = runtime_secrets
-                    if profile_billing_context:
-                        profile_submit_kwargs["billing_context"] = profile_billing_context
-                    if platform_context:
-                        profile_submit_kwargs["platform_context"] = platform_context
-                    try:
-                        if billable_key:
-                            _precheck_budget_or_block(
-                                run_id=profile_run_id,
-                                estimate_usd=pending.estimated_cost_usd,
-                                org_id=affordability_org_id,
-                            )
-                        _app.submit_job(pending.public_spec, **profile_submit_kwargs)
-                    except Exception:
-                        # delete the deterministic claim when launch creates no run, or the id wedges
-                        # forever. if ``submit_job`` already persisted status, keep the claim so
-                        # ownership and normal lifecycle cleanup remain intact.
-                        if not os.path.exists(runs_file_path(profile_run_id, ".json")):
-                            db.delete_run(profile_run_id)
-                        raise
-                    # set only after submit_job returns: a launch that raised deleted the row and
-                    # charged nothing, so reporting it as launched would name a charge that was
-                    # rolled back.
-                    launched = True
-                # launched here, lost the claim to a submitter who launched it, or
-                # lost a takeover to one who is relaunching it. in every case the
-                # id now belongs to a live attempt, so the state has to name that
-                # attempt: reporting the spent state a takeover loser read would
-                # name a run that no longer exists under this id, and leaving a
-                # plain claim loser on the synthetic "required" tells a user whose
-                # profile is queued and running that it has not started --
-                # `required` is a marker this route invents, not a state any run
-                # is ever in.
-                state = "queued"
+            launched, state = _launch_pending_workload_profile(
+                exc,
+                key=key,
+                runtime_secrets=runtime_secrets,
+                profile_billing_context=profile_billing_context,
+                platform_context=platform_context,
+                billable_key=billable_key,
+                affordability_org_id=affordability_org_id,
+            )
             raise HTTPException(
                 status_code=409,
                 detail={
@@ -367,20 +456,9 @@ def create_run(
         if isinstance(exc, HTTPException):
             raise
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    try:
-        from flash.server.domain.environment_registry import record_environment_use
-
-        if environment_slug is not None:
-            record_environment_use(
-                slug=environment_slug,
-                project_id=project_id,
-                run_id=run_id,
-                key=reporting_key,
-            )
-    except Exception:
-        _LOG.warning(
-            "platform reporting failed for %s (run already submitted)", run_id, exc_info=True
-        )
+    _record_environment_use(
+        environment_slug, project_id=project_id, run_id=run_id, reporting_key=reporting_key
+    )
     response = status.to_dict()
     if dry_run and schema is not None:
         response["train_schema_compatibility"] = schema["compatibility"]
