@@ -383,12 +383,48 @@ def test_the_measured_rows_match_opd_which_shuffles_after_it_renders():
     assert measured != list(range(_PROMPT_ROWS))
 
 
-def test_an_oversized_prompt_is_declined_before_the_request_is_built(monkeypatch):
+def test_a_row_whose_render_raises_declines_instead_of_shrinking_the_offer():
+    """A raising prompt_messages() must decline, exactly as an unrepresentable return value does.
+
+    Dropping the row instead shrinks `offered_prompts`, and coverage is measured against that -- so
+    draws over the survivors report FULL coverage and pass the trust gate while the worker renders
+    and trains on the omitted row. A partial population that looks complete is worse than no
+    measurement, which merely returns the quote to the cap.
+
+    A transient i/o error during client-side profiling also says nothing about whether the worker's
+    own render will fail, so treating it as "this row does not exist" is not a safe inference.
+    """
+    from flash.cli.commands.rollout_profile import _PROMPT_ROWS, _prompts_from
+
+    rows = [{"i": i} for i in range(_PROMPT_ROWS)]
+
+    class _Env:
+        def __init__(self, bad):
+            self.bad = bad
+
+        def prompt_messages(self, example):
+            if example["i"] == self.bad:
+                raise OSError("transient i/o during profiling")
+            return [{"role": "user", "content": f"row {example['i']}"}]
+
+    assert _prompts_from(_Env(bad=3), rows) is None
+
+    # and the decline must be caused by the raise, not by the path being broken for every dataset.
+    healthy = _prompts_from(_Env(bad=-1), rows)
+    assert healthy is not None
+    assert len(healthy) == _PROMPT_ROWS
+
+
+def test_an_oversized_prompt_is_declined_before_the_request_is_sent(monkeypatch):
     """The prompt comes from the user's own prompt_messages(), so its size is not ours to trust.
 
-    A corpus-sized or malformed row would otherwise be serialized and sent in full on every draw.
-    The existing prompt-budget filter cannot help here: it reads the endpoint's reported
-    `prompt_tokens`, which only exists once the request has already been built and sent.
+    A corpus-sized or malformed row would otherwise be sent in full on every draw. The prompt-budget
+    filter cannot help: it reads the endpoint's reported `prompt_tokens`, which does not exist until
+    the request has already been built and sent.
+
+    The ceiling has to be measured on the ENCODED body. A character count is not the same quantity
+    -- json escaping expands non-ascii text by up to 12x, so a character ceiling admits a body far
+    over the limit -- and it silently excludes roles, stop sequences and every other payload field.
 
     Declining rather than truncating, because a shortened prompt would measure a completion
     distribution belonging to no run at all.
@@ -403,7 +439,10 @@ def test_an_oversized_prompt_is_declined_before_the_request_is_built(monkeypatch
         lambda request, timeout=None: opened.append(1),
     )
 
-    huge = "x" * (rollout_sampler.MAX_REQUEST_BYTES + 1024)
+    # NON-ASCII, deliberately. json escaping is not length-preserving -- an emoji is one character
+    # and twelve serialized bytes -- so a character-count ceiling passes this while the encoded body
+    # is an order of magnitude over the limit. an ascii prompt cannot tell the two checks apart.
+    huge = "\U0001f600" * (rollout_sampler.MAX_REQUEST_BYTES // 4)
     sample = rollout_sampler._one_completion(
         model="Qwen/Qwen3.5-4B",
         messages=[{"role": "user", "content": huge}],

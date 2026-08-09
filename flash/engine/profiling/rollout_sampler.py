@@ -52,11 +52,11 @@ MAX_CONSECUTIVE_FAILURES = 5
 # one completion at the 2048-token cap plus usage accounting, a few tens of kilobytes.
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
-# ceiling on one REQUEST body, measured on the rendered prompt before it is serialized. the prompt
-# comes from the user's own prompt_messages(), so a corpus-sized or malformed row would otherwise be
-# encoded and sent in full -- once per draw. the same limit as the response for the same reason: a
-# prompt this large is far past any run's context budget, so the worker would drop the row anyway
-# and the draw could never have priced real work.
+# ceiling on one REQUEST body, measured on the serialized bytes. the prompt comes from the user's
+# own prompt_messages(), so a corpus-sized or malformed row would otherwise be sent in full -- once
+# per draw. the same limit as the response for the same reason: a prompt this large is far past any
+# run's context budget, so the worker would drop the row anyway and the draw could never have priced
+# real work.
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
 
 # prompt-mix dominates the variance (measured: between-prompt 304846 vs within-prompt 61082, a word
@@ -267,12 +267,6 @@ def _one_completion(
     ``timeout_s`` is the caller's REMAINING overall budget when that is tighter than the per-request
     ceiling, so no single draw can carry the pass past its deadline.
     """
-    # measured on the rendered prompt, before it is encoded into a request body. the content comes
-    # from the user's own prompt_messages(), so a corpus-sized row would otherwise be serialized and
-    # sent in full on every draw. declining is the right answer rather than truncating: a shortened
-    # prompt would measure a completion distribution that belongs to no run at all.
-    if sum(len(str(m.get("content", ""))) for m in messages) > MAX_REQUEST_BYTES:
-        return None
     payload: dict[str, object] = {
         "model": model,
         # the env's own prompt_messages() output, roles intact. flattening a system turn into a
@@ -304,9 +298,21 @@ def _one_completion(
         # checked below instead of this being trusted.
         payload["chat_template_kwargs"] = {"enable_thinking": bool(thinking)}
         payload["reasoning"] = {"enabled": bool(thinking)}
+    # the ceiling is enforced on the ENCODED body, not on the prompt's character count. the content
+    # comes from the user's own prompt_messages(), and json escaping is not length-preserving: a
+    # non-ascii character can serialize to twelve bytes, so a character count passes a body an order
+    # of magnitude over the limit. encoding once and measuring the result is also what makes roles,
+    # stop sequences and every other field count toward the same bound.
+    #
+    # nothing is sent when it is exceeded. declining beats truncating: a shortened prompt would
+    # measure a completion distribution belonging to no run at all, and a prompt this large is far
+    # past any run's context budget, so the worker would drop the row anyway.
+    body = json.dumps(payload).encode()
+    if len(body) > MAX_REQUEST_BYTES:
+        return None
     request = urllib.request.Request(
         f"{base_url.rstrip('/')}/chat/completions",
-        data=json.dumps(payload).encode(),
+        data=body,
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",

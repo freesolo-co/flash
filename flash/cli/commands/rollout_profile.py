@@ -464,7 +464,12 @@ def _prompts_from(environment, dataset) -> list[list[dict]] | None:
         try:
             messages = environment.prompt_messages(example)
         except Exception:
-            continue
+            # a raising row declines the whole measurement, exactly as an unrepresentable one does
+            # below. dropping it instead shrinks `offered_prompts`, so draws over the survivors
+            # report FULL coverage and pass the trust gate while the worker renders and trains on
+            # the omitted row -- and a transient i/o error here says nothing about whether the
+            # worker's own render will fail.
+            return None
         if record_has_images(example if isinstance(example, dict) else {}, messages):
             return None
         usable = _chat_messages(messages)
