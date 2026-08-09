@@ -12,8 +12,8 @@ import types
 
 import pytest
 
-import flash.providers.runpod.train as ftrain
-from flash.providers.runpod.train import _run_suffix, _select_endpoint_resources, endpoint_name
+import flash.providers.runpod.serverless as ftrain
+from flash.providers.runpod.serverless import _run_suffix, _select_endpoint_resources, endpoint_name
 from tests._helpers.runner import provisioned_status
 
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
@@ -36,7 +36,7 @@ def _res(name):
 
 
 def test_isolate_flash_state_resets_runpod_flash_manager_on_scope_change(tmp_path, monkeypatch):
-    import flash.providers.runpod.train.endpoints as ep_mod
+    import flash.providers.runpod.serverless.endpoints as ep_mod
 
     for mod_name in (
         "runpod_flash",
@@ -97,7 +97,7 @@ def test_isolate_flash_state_resets_runpod_flash_manager_on_scope_change(tmp_pat
 def test_get_train_endpoint_locks_sdk_state_and_does_not_cache_run_scoped_handlers(monkeypatch):
     import flash.providers.runpod.auth as auth
     import flash.providers.runpod.jobs as jobs
-    import flash.providers.runpod.train.endpoints as ep_mod
+    import flash.providers.runpod.serverless.endpoints as ep_mod
 
     locked_events = []
 
@@ -181,9 +181,9 @@ def test_cancel_run_revocation_failure_defers_until_after_fence_and_teardown(
     tmp_path, monkeypatch, failed_revocation_call
 ):
     import flash.runner as orch
-    from flash.runner import lifecycle
-    from flash.server import db as server_db
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
+    from flash.runner.supervise import lifecycle
+    from flash.server.platform import db as server_db
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     spec = JobSpec.from_dict(
@@ -234,7 +234,7 @@ def test_cancel_run_calls_terminate_and_marks_cancelled(tmp_path, monkeypatch):
     import flash.runner as orch
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     spec = JobSpec.from_dict(
         {
@@ -271,7 +271,7 @@ def test_cancel_deployed_run_marks_deployment_inactive(tmp_path, monkeypatch):
     import flash.serve.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-dep-1"})
     st = orch.RunStatus(
@@ -299,7 +299,7 @@ def test_cancel_undeploys_deployment_that_raced_in_after_entry_snapshot(tmp_path
     import flash.serve.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-dep-racein"})
     orch._save_status(orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
@@ -341,7 +341,7 @@ def test_cancel_deployed_run_undeploy_goes_through_lock_guarded_path(tmp_path, m
     import flash.serve.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-dep-lock"})
     st = orch.RunStatus(
@@ -384,7 +384,7 @@ def test_cancel_deployed_run_undeployed_even_when_raced_to_terminal(tmp_path, mo
     import flash.serve.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-dep-race"})
     st = orch.RunStatus(
@@ -427,7 +427,7 @@ def test_cancel_wins_over_racing_undeploy_done(tmp_path, monkeypatch):
     import flash.serve.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancel-wins"})
     st = orch.RunStatus(
@@ -462,7 +462,7 @@ def test_cancel_loses_to_racing_genuine_completion_done(tmp_path, monkeypatch):
     import flash.runner as orch
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-finish-race"})
     # A `running` run (NOT deployed): no deployment, an in-flight training thread.
@@ -522,7 +522,7 @@ def test_terminate_endpoint_from_async_context_does_not_raise(monkeypatch):
     import types as _types
 
     import flash.providers.runpod.auth as auth
-    import flash.providers.runpod.train.endpoints as ep_mod
+    import flash.providers.runpod.serverless.endpoints as ep_mod
     from flash.providers.base import canonical_gpu
 
     run_id = "flash-1-abcd1234"
@@ -576,7 +576,7 @@ def test_cancel_run_noop_when_terminal(tmp_path, monkeypatch):
     import flash.runner as orch
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-done-1"})
     orch._save_status(orch.RunStatus(run_id=spec.run_id, state="done", spec=spec.to_dict()))
@@ -591,7 +591,7 @@ def test_cancel_run_noop_when_terminal(tmp_path, monkeypatch):
 def test_cancel_run_retries_durable_cleanup_for_cancelled_run(tmp_path, monkeypatch):
     import flash.providers as providers
     import flash.runner as orch
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancelled-1"})
@@ -621,7 +621,7 @@ def test_cancel_run_accepts_confirmed_endpoint_delete_after_cancel_ack_failure(
 ):
     import flash.providers as providers
     import flash.runner as orch
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancel-retry"})
@@ -659,7 +659,7 @@ def test_cancel_run_accepts_confirmed_endpoint_delete_after_cancel_ack_failure(
 def test_cancel_run_failed_teardown_does_not_replace_racing_public_remote(tmp_path, monkeypatch):
     import flash.providers as providers
     import flash.runner as orch
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancel-race"})
@@ -697,7 +697,7 @@ def test_cancel_run_failed_teardown_does_not_replace_racing_public_remote(tmp_pa
 
 def test_cancel_run_marks_billing_failed_when_pricing_falls_back(tmp_path, monkeypatch):
     import flash.runner as orch
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancel-price"})
@@ -732,8 +732,8 @@ def test_cancel_run_bills_a_profile_on_started_not_on_optimizer_steps(tmp_path, 
     looks identical to the expected never-started charge.
     """
     import flash.runner as orch
-    from flash.spec import JobSpec
-    from flash.workload_profile import SFT_PROFILE_KIND
+    from flash.core.spec import JobSpec
+    from flash.engine.profiling.workload_profile import SFT_PROFILE_KIND
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
@@ -795,7 +795,7 @@ def test_cancel_run_bills_a_profile_on_started_not_on_optimizer_steps(tmp_path, 
 def test_cancel_run_successful_exact_teardown_leaves_no_cleanup_remote(tmp_path, monkeypatch):
     import flash.providers as providers
     import flash.runner as orch
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancel-clean"})
@@ -862,7 +862,7 @@ def test_attach_run_recovery_skips_training_when_raced_terminal(tmp_path, monkey
     import flash.runner as orch
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-race-terminal"})
     st = orch.RunStatus(
@@ -906,7 +906,7 @@ def test_attach_run_recovery_resumes_training_when_still_active(tmp_path, monkey
     import flash.runner as orch
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-recover-active"})
     st = provisioned_status(orch, spec, state="running", remote=_remote("ep-1", "job-1", 0))
@@ -918,7 +918,9 @@ def test_attach_run_recovery_resumes_training_when_still_active(tmp_path, monkey
         "_run_training",
         lambda *a, **k: training_calls.__setitem__("n", training_calls["n"] + 1),
     )
-    monkeypatch.setattr("flash.providers._worker.upload_code", lambda repo, *, code_prefix: repo)
+    monkeypatch.setattr(
+        "flash.providers._lifecycle.worker.upload_code", lambda repo, *, code_prefix: repo
+    )
 
     from flash.providers.base import PollResult
 
@@ -940,7 +942,7 @@ def test_run_training_bails_on_terminal_before_paid_work(tmp_path, monkeypatch):
     import flash.runner as orch
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-loop-terminal"})
     # The run is already terminal (failed) before training runs.
@@ -969,7 +971,7 @@ def test_update_returns_false_when_terminal_sticky(tmp_path, monkeypatch):
     import flash.runner as orch
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-update-ret"})
     orch._save_status(orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
@@ -981,7 +983,7 @@ def test_update_returns_false_when_terminal_sticky(tmp_path, monkeypatch):
 
 
 def _run_spec(run_id: str):
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     return JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": run_id})
 
@@ -1017,7 +1019,7 @@ def _ready_checkpoint(orch, run_id: str, step: int, *, remote: dict | None = Non
 def test_cancel_tears_down_training_before_checkpoint_serving_decision(tmp_path, monkeypatch):
     import flash.providers as providers
     import flash.runner as orch
-    import flash.runner.verified_revisions as verified_revisions
+    import flash.runner.results.verified_revisions as verified_revisions
     import flash.serve.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
@@ -1132,7 +1134,7 @@ def test_cancel_preserves_busy_attempt_previous_checkpoint_without_alias_lookup(
 def test_cancel_contended_deploy_fences_previous_checkpoint_before_wait(tmp_path, monkeypatch):
     import flash.runner as orch
     import flash.serve.deploy as deploy
-    import flash.server._locks as locks
+    import flash.server.platform.locks as locks
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = "flash-checkpoint-contended-fence"
@@ -1211,7 +1213,7 @@ def test_cancel_contended_deploy_fences_previous_checkpoint_before_wait(tmp_path
 def test_cancel_contended_unknown_activation_is_fenced_before_wait(tmp_path, monkeypatch):
     import flash.runner as orch
     import flash.serve.deploy as deploy
-    import flash.server._locks as locks
+    import flash.server.platform.locks as locks
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = "flash-checkpoint-contended-unknown"
@@ -1269,7 +1271,7 @@ def test_cancel_contended_predecessor_recommit_failure_stays_fenced_and_revokes(
 ):
     import flash.runner as orch
     import flash.serve.deploy as deploy
-    import flash.server._locks as locks
+    import flash.server.platform.locks as locks
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = "flash-checkpoint-contended-restore-miss"
@@ -1335,7 +1337,7 @@ def test_cancel_contended_fence_revokes_when_alias_changes_before_lock_release(
 ):
     import flash.runner as orch
     import flash.serve.deploy as deploy
-    import flash.server._locks as locks
+    import flash.server.platform.locks as locks
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = f"flash-checkpoint-contended-alias-race-{attempted_step}"
@@ -1787,7 +1789,7 @@ def test_cancel_unknown_outcome_never_preserves_verified_final_alias(tmp_path, m
 
 def test_activation_unknown_final_predecessor_is_not_preservable_checkpoint(tmp_path, monkeypatch):
     import flash.runner as orch
-    from flash.runner.deploy import _preservable_checkpoint_deployment
+    from flash.runner.supervise.deploy import _preservable_checkpoint_deployment
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = "flash-final-predecessor"
@@ -1881,7 +1883,7 @@ def test_cancel_revokes_inflight_checkpoint_deployment(tmp_path, monkeypatch):
 def test_cancel_active_deployment_with_malformed_spec_still_revokes(tmp_path, monkeypatch):
     import flash.runner as orch
     import flash.serve.deploy as deploy
-    import flash.server._locks as locks
+    import flash.server.platform.locks as locks
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = "flash-malformed-spec-revoke"
@@ -1931,7 +1933,7 @@ def test_cancel_backend_success_local_commit_failure_is_not_backend_uncertainty(
 ):
     import flash.runner as orch
     import flash.serve.deploy as deploy
-    from flash.runner.deploy import DeploymentStatePersistenceError
+    from flash.runner.supervise.deploy import DeploymentStatePersistenceError
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = "flash-local-persistence-failure"
@@ -2031,9 +2033,9 @@ def test_cancel_preserved_checkpoint_prunes_other_verified_revisions(tmp_path, m
 
 def test_cancel_checkpoint_prune_failure_is_retryable_without_revocation(tmp_path, monkeypatch):
     import flash.runner as orch
-    import flash.runner.verified_revisions as verified_revisions
+    import flash.runner.results.verified_revisions as verified_revisions
     import flash.serve.deploy as deploy
-    from flash.runner.deploy import DeploymentStatePersistenceError
+    from flash.runner.supervise.deploy import DeploymentStatePersistenceError
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = "flash-checkpoint-prune-retry"
@@ -2085,7 +2087,7 @@ def test_cancel_double_undeploy_failure_revokes_authority_and_is_retryable(tmp_p
     import flash.serve.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     run_id = "flash-dep-revoke"
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": run_id})
@@ -2146,7 +2148,7 @@ def _fake_sdk_with_orphan(monkeypatch, *, rest_find, rest_delete, resources=None
 
     import flash.providers.runpod.api as runpod_api
     import flash.providers.runpod.auth as auth
-    import flash.providers.runpod.train.endpoints as ep_mod
+    import flash.providers.runpod.serverless.endpoints as ep_mod
     from flash.providers.base import canonical_gpu
 
     monkeypatch.setattr(auth, "ensure_auth", lambda: None)

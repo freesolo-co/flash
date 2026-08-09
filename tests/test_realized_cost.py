@@ -8,7 +8,7 @@ from __future__ import annotations
 from flash import runner
 from flash.providers import realized
 from flash.providers.runpod.cost import shape_endpoint_cost
-from flash.server import reconcile
+from flash.server.domain import reconcile
 
 
 # --------------------------------------------------------------------------- RunPod shaping
@@ -396,7 +396,7 @@ def _run_reconcile_loop_once(monkeypatch, reconcile_once_impl):
     from flash.server import app as server_app
 
     # reconcile_once is imported function-locally inside the loop
-    # (`from flash.server.reconcile import reconcile_once`), so patch it at the source module.
+    # (`from flash.server.domain.reconcile import reconcile_once`), so patch it at the source module.
     monkeypatch.setattr(reconcile, "reconcile_once", reconcile_once_impl)
 
     calls = {"sleep": 0}

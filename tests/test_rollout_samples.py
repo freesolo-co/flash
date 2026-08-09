@@ -8,8 +8,8 @@ import sys
 
 import pytest
 
-from flash.engine.rollout_samples import build_rollout_sample, select_rollout_samples
-from flash.providers._poll import _format_heartbeat
+from flash.engine.result.rollout_samples import build_rollout_sample, select_rollout_samples
+from flash.providers._lifecycle.poll import _format_heartbeat
 
 
 def test_build_rollout_sample_shows_full_text_and_sanitizes_without_redacting_placeholder(
@@ -198,7 +198,7 @@ def test_throttled_heartbeat_omits_samples_from_console(monkeypatch, capsys) -> 
     monkeypatch.setattr(worker, "_HB_LAST_PROGRESS_TS", 0.0)
     monkeypatch.setattr(worker, "_HB_PROGRESS_SEQ", 0)
     monkeypatch.setattr(worker, "_HB_PROGRESS_UPLOADED_SEQ", 0)
-    heartbeat_module = importlib.import_module("flash.engine.worker.heartbeat")
+    heartbeat_module = importlib.import_module("flash.engine.worker.io.heartbeat")
     monkeypatch.setattr(heartbeat_module.time, "time", lambda: 1001.0)
 
     committed = worker.heartbeat(
@@ -316,7 +316,7 @@ def test_format_heartbeat_caps_rendered_samples_at_three() -> None:
 def test_bounded_sampled_completions_resanitizes_and_neutralizes_without_truncating(
     monkeypatch,
 ) -> None:
-    heartbeat_module = importlib.import_module("flash.engine.worker.heartbeat")
+    heartbeat_module = importlib.import_module("flash.engine.worker.io.heartbeat")
     secret = "heartbeat-secret-boundary-xyz"
     monkeypatch.setenv("HEARTBEAT_API_KEY", secret)
 
@@ -348,7 +348,7 @@ def test_bounded_sampled_completions_resanitizes_and_neutralizes_without_truncat
 
 
 def test_bounded_sampled_completions_accepts_opd_loss_samples() -> None:
-    heartbeat_module = importlib.import_module("flash.engine.worker.heartbeat")
+    heartbeat_module = importlib.import_module("flash.engine.worker.io.heartbeat")
 
     bounded = heartbeat_module._bounded_sampled_completions(
         [
@@ -367,7 +367,7 @@ def test_bounded_sampled_completions_accepts_opd_loss_samples() -> None:
 
 
 def test_bounded_sampled_completions_caps_at_three() -> None:
-    heartbeat_module = importlib.import_module("flash.engine.worker.heartbeat")
+    heartbeat_module = importlib.import_module("flash.engine.worker.io.heartbeat")
 
     bounded = heartbeat_module._bounded_sampled_completions(
         [
@@ -408,7 +408,7 @@ def test_format_heartbeat_defensively_neutralizes_control_characters() -> None:
 
 @pytest.mark.parametrize(
     "module",
-    ["flash.providers._poll", "flash.runner", "flash.cli.commands"],
+    ["flash.providers._lifecycle.poll", "flash.runner", "flash.cli.commands"],
 )
 def test_control_plane_modules_import_without_running_worker_init(module: str) -> None:
     """The control plane must not execute worker startup just by being imported.

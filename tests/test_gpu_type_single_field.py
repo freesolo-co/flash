@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import tempfile
 
-from flash.spec import GpuSpec, JobSpec, TrainSpec
+from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 
 
 def _persist_effective(runner, public: JobSpec, effective_type: str, effective_count: int = 0):

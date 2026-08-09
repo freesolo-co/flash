@@ -12,7 +12,7 @@ import os
 import re
 import tempfile
 
-from flash.spec import JobSpec
+from flash.core.spec import JobSpec
 from tests._helpers.profile import satisfy_sft_profile
 
 
@@ -66,7 +66,7 @@ def test_managed_hf_repo_finalizes_local_run_id(monkeypatch):
     # The JobSpec default run_id "local" is treated as unset: submit_job assigns a real run_id and
     # still assigns the environment-scoped managed repo instead of trusting a user value.
     from flash import runner
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     base = JobSpec.from_dict(
         {

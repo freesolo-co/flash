@@ -39,6 +39,7 @@ def _import_agent(modpath: str):
 
 # --- flash side (always importable in the flash venv) ---------------------
 from flash.cli import main
+from flash.core.spec import JobSpec
 from flash.runner import (
     TERMINAL_STATES,
     RunStatus,
@@ -46,7 +47,6 @@ from flash.runner import (
     new_run_id,
     require_safe_run_id,
 )
-from flash.spec import JobSpec
 
 
 @pytest.mark.parametrize(

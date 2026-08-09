@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from flash.providers._deadline import deadline_kwargs
+from flash.providers._lifecycle.deadline import deadline_kwargs
 from flash.providers.base import (
     AllocationConstraints,
     Candidate,
@@ -26,9 +26,9 @@ class RunpodProvider:
     def is_configured(self) -> bool:
         # require a usable parsed key pool, not merely a set env var. otherwise the allocator ranks
         # RunPod classes the operator cannot provision.
-        from flash.providers.runpod import keys
+        from flash.providers.runpod import auth
 
-        return bool(keys.keys())
+        return bool(auth.keys())
 
     def preflight(self, require_hf: bool = True) -> list[str]:
         from flash.providers.runpod.preflight import missing_credentials
@@ -73,8 +73,8 @@ class RunpodProvider:
         code_prefix: str | None = None,
         _deadline_at: float | None = None,
     ) -> PollResult:
+        from flash.core.spec import require_matching_seed
         from flash.providers.runpod.jobs import submit_run
-        from flash.spec import require_matching_seed
 
         seed = require_matching_seed(spec, seed)
         kwargs = {
@@ -98,6 +98,7 @@ class RunpodProvider:
         log: Any = None,
         _deadline_at: float | None = None,
     ) -> PollResult:
+        from flash.core.spec import require_matching_seed
         from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
         from flash.providers.runpod.jobs import (
             make_hf_failure_detail_reader,
@@ -105,7 +106,6 @@ class RunpodProvider:
             poll_job,
             stall_kwargs,
         )
-        from flash.spec import require_matching_seed
 
         seed = require_matching_seed(spec, seed)
         hf_repo = spec.train.hf_repo
@@ -182,7 +182,7 @@ class RunpodProvider:
             )
 
     def gc(self, spec) -> None:
-        from flash.providers.runpod.train import terminate_endpoint
+        from flash.providers.runpod.serverless import terminate_endpoint
 
         terminate_endpoint(spec.gpu.type, spec.run_id)
 

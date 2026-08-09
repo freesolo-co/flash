@@ -2,7 +2,7 @@
 
 The normalized dataclasses (``VastOffer``, ``VastJobHandle``), the image accessor, and the container
 ``onstart`` script. Cross-provider pieces (the sweep label, the bootstrap payload) come from the
-shared ``flash.providers._instance`` so Vast stays byte-identical to Lambda on substrate-neutral
+shared ``flash.providers._lifecycle.instance`` so Vast stays byte-identical to Lambda on substrate-neutral
 parts. Vast rents a CONTAINER directly (image + args), not a VM you cloud-init, so there is no
 ``build_user_data``/``docker run`` — ``build_onstart`` runs the shared bootstrap as the container command.
 
@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
-from flash.providers._instance import (
+from flash.providers._lifecycle.instance import (
     InstanceJobHandle,
     _spill_large_spec_to_hf,
     instance_label,
@@ -26,7 +26,7 @@ from flash.providers._instance import (
 )
 
 # Shared instance-provider helpers (single source of truth; Vast binds arm="vast" + its own onstart).
-from flash.providers._instance import (
+from flash.providers._lifecycle.instance import (
     build_payload as _shared_build_payload,
 )
 
@@ -116,7 +116,7 @@ def vast_image(gpu: str | None = None) -> str:
     (``FLASH_WORKER_IMAGE`` and the per-SM kernel-cache image). Vast runs the worker via its own onstart,
     so the image's CMD is irrelevant — only the baked deps/cache matter. The Blackwell driver floor lives
     in the ``cuda_max_good`` offer filter, not the image."""
-    from flash.providers._worker import WORKER_IMAGE, worker_image_for_gpu
+    from flash.providers._lifecycle.worker import WORKER_IMAGE, worker_image_for_gpu
 
     return worker_image_for_gpu(gpu) or WORKER_IMAGE
 
@@ -161,8 +161,10 @@ def build_onstart(payload: dict) -> str:
     # base64 payload and can blow Vast's onstart length limit, failing the rent. Idempotent.
     payload = _spill_large_spec_to_hf(payload)
     payload_b64 = base64.encodebytes(json.dumps(payload).encode()).decode()
-    # Ship the SHARED instance bootstrap (sibling of the vast package's parent: providers/_instance_bootstrap.py).
-    bootstrap_src = (Path(__file__).parent.parent.parent / "_instance_bootstrap.py").read_text()
+    # Ship the SHARED instance bootstrap (providers/_lifecycle/bootstrap.py).
+    bootstrap_src = (
+        Path(__file__).parent.parent.parent / "_lifecycle" / "bootstrap.py"
+    ).read_text()
     # Vast's args-mode wrapper resets PATH, so `python3` can resolve to the OS python (PEP 668
     # externally-managed), not the image's stack python. Prefer the image's baked interpreter
     # (conda / /usr/local) where torch + huggingface_hub live; fall back to python3.

@@ -9,7 +9,7 @@ logging off, which is only discoverable after the GPU spend, when the curve is g
 from __future__ import annotations
 
 from flash.cli.commands import _warn_if_wandb_requested_without_key
-from flash.spec import JobSpec, WandbSpec
+from flash.core.spec import JobSpec, WandbSpec
 
 
 def _spec(**wandb_fields) -> JobSpec:
@@ -69,7 +69,7 @@ def test_dry_run_does_not_claim_the_run_will_train(capsys):
 
 def test_supported_algorithms_still_get_the_export_remedy(capsys):
     """Every shipped algorithm reaches W&B through its trainer, so a key genuinely fixes its case."""
-    from flash.catalog import ALGORITHMS
+    from flash.core.catalog import ALGORITHMS
 
     for algorithm in ALGORITHMS:
         spec = JobSpec(algorithm=algorithm, wandb=WandbSpec(project="my-project"))
@@ -97,7 +97,7 @@ def test_every_shipped_worker_actually_reaches_wandb():
     import inspect
     from pathlib import Path
 
-    from flash.catalog import ALGORITHMS
+    from flash.core.catalog import ALGORITHMS
     from flash.engine import worker as worker_pkg
 
     worker_dir = Path(inspect.getfile(worker_pkg)).parent

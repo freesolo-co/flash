@@ -7,11 +7,11 @@ from __future__ import annotations
 
 import time
 
-from flash.catalog import samples_on_policy
+from flash.core.catalog import samples_on_policy
 from flash.cost.analytical import estimate_cost, estimate_profile_cost
 from flash.cost.types import CostEstimate, RunConfig
-from flash.engine.steps import on_policy_steps, resolve_update_horizon
-from flash.workload_profile import (
+from flash.engine.plan.steps import on_policy_steps, resolve_update_horizon
+from flash.engine.profiling.workload_profile import (
     WorkloadProfileMismatch,
     require_matching_rollout_profile,
     require_matching_sft_profile,
@@ -21,7 +21,7 @@ from flash.workload_profile import (
 
 
 def _on_policy_epochs(spec) -> int:
-    from flash.engine.recipe import RECIPE
+    from flash.engine.plan.recipe import RECIPE
 
     t = spec.train
     default = RECIPE.rl.num_epochs if spec.algorithm == "grpo" else RECIPE.opd.num_epochs
@@ -112,7 +112,7 @@ def _env_max_examples(spec) -> int:
 
 
 def _on_policy_requested_prompts_per_step(spec) -> int:
-    from flash.engine.recipe import RECIPE
+    from flash.engine.plan.recipe import RECIPE
 
     t = spec.train
     default = (
@@ -193,8 +193,8 @@ def runconfig_from_spec(spec) -> RunConfig:
     opd_multi_turn = False
     opd_max_turns = None
     if spec.algorithm == "opd":
-        from flash.engine.recipe import RECIPE
-        from flash.opd_limits import configured_opd_turn_limit
+        from flash.engine.plan.recipe import RECIPE
+        from flash.teacher.limits import configured_opd_turn_limit
 
         teacher_model = t.teacher_model or RECIPE.opd.teacher_model
         opd_multi_turn, opd_max_turns = configured_opd_turn_limit(spec.environment)

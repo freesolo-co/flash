@@ -11,7 +11,7 @@ import tempfile
 
 def test_run_job_persists_flash_metrics(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        import flash.providers.runpod.train as flash_train
+        import flash.providers.runpod.serverless as flash_train
         import flash.runner as runner
 
         importlib.reload(flash_train)
@@ -21,9 +21,9 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         monkeypatch.setattr(runner, "RESULTS_DIR", os.path.join(tmp, "results"))
         # _run_job_inner uploads the run code before training; stub it (no HF).
         monkeypatch.setattr(
-            "flash.providers._worker.upload_code", lambda repo=None, **_: "mock/repo"
+            "flash.providers._lifecycle.worker.upload_code", lambda repo=None, **_: "mock/repo"
         )
-        from flash.spec import GpuSpec, JobSpec, TrainSpec
+        from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 
         captured = {}
 
@@ -110,7 +110,7 @@ def test_upload_code_forces_private_on_reused_repo(monkeypatch):
     fake_hub.HfApi = _FakeApi
     monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
 
-    import flash.providers.runpod.train as flash_train
+    import flash.providers.runpod.serverless as flash_train
 
     assert flash_train.upload_code("owner/run-artifacts") == "owner/run-artifacts"
 
@@ -161,7 +161,7 @@ def test_upload_code_creates_repo_only_when_missing(monkeypatch):
     fake_hub.HfApi = _FakeApi
     monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
 
-    import flash.providers.runpod.train as flash_train
+    import flash.providers.runpod.serverless as flash_train
 
     flash_train.upload_code("owner/new-env-artifacts")
     flash_train.upload_code("owner/new-env-artifacts")
@@ -207,7 +207,7 @@ def test_upload_code_rechecks_privacy_on_each_submit(monkeypatch):
     fake_hub.HfApi = _FakeApi
     monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
 
-    import flash.providers.runpod.train as flash_train
+    import flash.providers.runpod.serverless as flash_train
 
     flash_train.upload_code("owner/rechecked-env-artifacts")
     flash_train.upload_code("owner/rechecked-env-artifacts")
@@ -258,9 +258,9 @@ def test_upload_code_retries_transient_repo_settings(monkeypatch):
     fake_hub.HfApi = _FakeApi
     monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
 
-    import flash.providers.runpod.train as flash_train
+    import flash.providers.runpod.serverless as flash_train
 
-    monkeypatch.setattr("flash.providers._worker.time.sleep", lambda _delay: None)
+    monkeypatch.setattr("flash.providers._lifecycle.worker.time.sleep", lambda _delay: None)
 
     flash_train.upload_code("owner/transient-settings")
 
@@ -270,7 +270,7 @@ def test_upload_code_retries_transient_repo_settings(monkeypatch):
 
 
 def test_hf_call_honors_retry_after(monkeypatch):
-    import flash.providers.runpod.train as flash_train
+    import flash.providers.runpod.serverless as flash_train
 
     sleeps: list[float] = []
     logs: list[tuple[str, tuple]] = []
@@ -292,7 +292,7 @@ def test_hf_call_honors_retry_after(monkeypatch):
             raise _RateLimited("slow down")
         return "ok"
 
-    monkeypatch.setattr("flash.providers._worker.time.sleep", sleeps.append)
+    monkeypatch.setattr("flash.providers._lifecycle.worker.time.sleep", sleeps.append)
     monkeypatch.setattr(flash_train.logger, "warning", lambda msg, *args: logs.append((msg, args)))
 
     assert flash_train._hf_call(flaky, "upload") == "ok"
@@ -301,7 +301,7 @@ def test_hf_call_honors_retry_after(monkeypatch):
 
 
 def test_hf_call_caps_http_date_retry_after(monkeypatch):
-    import flash.providers.runpod.train as flash_train
+    import flash.providers.runpod.serverless as flash_train
 
     sleeps: list[float] = []
 
@@ -322,7 +322,7 @@ def test_hf_call_caps_http_date_retry_after(monkeypatch):
             raise _RateLimited("slow down")
         return "ok"
 
-    monkeypatch.setattr("flash.providers._worker.time.sleep", sleeps.append)
+    monkeypatch.setattr("flash.providers._lifecycle.worker.time.sleep", sleeps.append)
     monkeypatch.setattr(flash_train.logger, "warning", lambda *_args: None)
 
     assert flash_train._hf_call(flaky, "upload") == "ok"
@@ -367,7 +367,7 @@ def test_upload_code_uses_content_addressed_prefix(monkeypatch):
     fake_hub.HfApi = _FakeApi
     monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
 
-    import flash.providers.runpod.train as flash_train
+    import flash.providers.runpod.serverless as flash_train
 
     flash_train.upload_code("owner/run-artifacts")
     assert calls["upload"], "upload_folder was not called"
@@ -413,7 +413,7 @@ def test_upload_code_skips_existing_content_prefix(monkeypatch):
     fake_hub.HfApi = _FakeApi
     monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
 
-    import flash.providers.runpod.train as flash_train
+    import flash.providers.runpod.serverless as flash_train
 
     prefix = "code/0123456789abcdef0123456789abcdef/flash"
     flash_train.upload_code("owner/run-artifacts", code_prefix=prefix)
@@ -461,7 +461,7 @@ def test_upload_code_reuploads_when_completion_marker_missing(monkeypatch):
     fake_hub.HfApi = _FakeApi
     monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
 
-    import flash.providers.runpod.train as flash_train
+    import flash.providers.runpod.serverless as flash_train
 
     prefix = "code/0123456789abcdef0123456789abcdef/flash"
     flash_train.upload_code("owner/run-artifacts", code_prefix=prefix)

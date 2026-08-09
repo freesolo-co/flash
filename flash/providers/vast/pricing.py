@@ -13,7 +13,7 @@ import os
 import time
 from typing import Any
 
-from flash._logging import get_logger
+from flash._internal.logging import get_logger
 
 logger = get_logger(__name__)
 

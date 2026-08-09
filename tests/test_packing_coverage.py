@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import flash.engine.worker.packing as packing
+import flash.engine.worker.model.packing as packing
 
 
 def test_gdn_hybrid_probe_failure_is_a_safe_false(monkeypatch, capsys) -> None:

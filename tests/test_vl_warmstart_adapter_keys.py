@@ -15,7 +15,7 @@ from collections import namedtuple
 
 import pytest
 
-from flash.engine.worker.lora import (
+from flash.engine.worker.model.lora import (
     assert_adapter_delta_nonzero,
     assert_adapter_load_clean,
     assert_lora_applied,
@@ -67,7 +67,7 @@ def _write_torch_bin(path: str, names: list[str]) -> None:
 def test_read_adapter_keys_rejects_oversized_header(tmp_path):
     # A corrupt / hostile safetensors file can declare a huge header length; we must reject it from
     # the declared length vs the real file size BEFORE allocating/reading the header payload.
-    import flash.engine.worker.lora as lora
+    import flash.engine.worker.model.lora as lora
 
     adir = tmp_path / "adapter"
     adir.mkdir()
@@ -83,7 +83,7 @@ def test_read_adapter_keys_rejects_non_object_header(tmp_path):
     # otherwise raise a confusing TypeError later in _is_lora_key (substring search on a non-str);
     # fail with a clear ValueError here instead. (JSON object keys are always str, so only the
     # container type is checked.)
-    import flash.engine.worker.lora as lora
+    import flash.engine.worker.model.lora as lora
 
     adir = tmp_path / "adapter"
     adir.mkdir()
@@ -98,7 +98,7 @@ def test_read_adapter_keys_rejects_non_object_header(tmp_path):
 def test_read_adapter_keys_corrupt_json_reraises_with_path(tmp_path):
     # A header that isn't valid JSON at all must re-raise with the FILE PATH (a bare JSONDecodeError
     # names no file), so a bad adapter download is diagnosable (#198).
-    import flash.engine.worker.lora as lora
+    import flash.engine.worker.model.lora as lora
 
     adir = tmp_path / "adapter"
     adir.mkdir()
@@ -112,7 +112,7 @@ def test_read_adapter_keys_corrupt_json_reraises_with_path(tmp_path):
 
 
 def test_read_adapter_keys_reads_bin_state_dict(tmp_path):
-    import flash.engine.worker.lora as lora
+    import flash.engine.worker.model.lora as lora
 
     adir = tmp_path / "adapter"
     adir.mkdir()
@@ -123,7 +123,7 @@ def test_read_adapter_keys_reads_bin_state_dict(tmp_path):
 
 def test_read_adapter_keys_rejects_malformed_bin_state_dict(tmp_path):
     torch = pytest.importorskip("torch")
-    import flash.engine.worker.lora as lora
+    import flash.engine.worker.model.lora as lora
 
     adir = tmp_path / "adapter"
     adir.mkdir()
@@ -271,7 +271,7 @@ def test_assert_adapter_delta_nonzero_raises_when_all_b_zero():
 # (Copilot MsAoq / Cursor MsATq — the #286 fragility applied to the #296 merge decision).
 # ---------------------------------------------------------------------------
 def test_adapter_is_vl_warmstart_trusts_adapter_evidence_over_failed_probe(monkeypatch, tmp_path):
-    from flash.engine.worker import lora
+    from flash.engine.worker.model import lora
 
     adir = tmp_path / "adapter"
     adir.mkdir()
@@ -284,7 +284,7 @@ def test_adapter_is_vl_warmstart_trusts_adapter_evidence_over_failed_probe(monke
 def test_adapter_is_vl_warmstart_trusts_bin_adapter_evidence_over_failed_probe(
     monkeypatch, tmp_path
 ):
-    from flash.engine.worker import lora
+    from flash.engine.worker.model import lora
 
     adir = tmp_path / "adapter"
     adir.mkdir()
@@ -294,7 +294,7 @@ def test_adapter_is_vl_warmstart_trusts_bin_adapter_evidence_over_failed_probe(
 
 
 def test_adapter_is_vl_warmstart_falls_back_to_probe_when_keys_are_not_vl(monkeypatch, tmp_path):
-    from flash.engine.worker import lora
+    from flash.engine.worker.model import lora
 
     adir = tmp_path / "adapter"
     adir.mkdir()
@@ -308,7 +308,7 @@ def test_adapter_is_vl_warmstart_falls_back_to_probe_when_keys_are_not_vl(monkey
 
 
 def test_adapter_is_vl_warmstart_missing_file_defers_to_probe(monkeypatch, tmp_path):
-    from flash.engine.worker import lora
+    from flash.engine.worker.model import lora
 
     adir = tmp_path / "empty"
     adir.mkdir()

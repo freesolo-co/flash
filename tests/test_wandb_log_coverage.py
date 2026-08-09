@@ -6,7 +6,7 @@ import importlib.util
 import sys
 import types
 
-import flash.engine.worker.wandb_log as wandb_log
+import flash.engine.worker.io.wandb_log as wandb_log
 
 
 def test_wandb_report_to_skips_without_an_api_key(monkeypatch) -> None:

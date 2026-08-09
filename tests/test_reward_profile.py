@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from flash.engine.reward_profile import gpu_idle_fraction, profile_reward_latency
+from flash.engine.profiling.reward_profile import gpu_idle_fraction, profile_reward_latency
 
 
 def _sleeper(seconds: float, *, record: list[int] | None = None):
@@ -319,7 +319,7 @@ def test_worker_hook_skips_an_env_whose_scorer_is_not_thread_safe(capsys):
 
 
 def test_worker_hook_uses_the_envs_assistant_text_semantics(capsys):
-    """Reference text must come from flash.multimodal.assistant_completion_text.
+    """Reference text must come from flash.content.multimodal.assistant_completion_text.
 
     A hand-rolled ''.join over every message's `content` breaks two ways: openai-style text blocks
     (`[{"type": "text", "text": "4"}]`) stringify into a python repr, and non-assistant turns get
@@ -428,7 +428,7 @@ def test_score_single_turn_can_propagate_errors_for_the_profiler():
 def test_a_single_reference_still_produces_a_reading():
     """One retained prompt is a valid grpo shape and must not profile as unmeasured.
 
-    resolve_grpo_prompts_per_step (flash/engine/worker/grpo.py) explicitly supports a
+    resolve_grpo_prompts_per_step (flash/engine/worker/train/rl/config.py) explicitly supports a
     single-prompt dataset. Slicing the sample list would spend that one reference on the discarded
     warm-up, leaving no timed call and reporting that nothing graded -- false, since grading
     succeeded. Below the warm-up threshold the first call is kept AS the measurement.

@@ -15,13 +15,13 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-from flash._logging import get_logger
-from flash.providers._deadline import (
+from flash._internal.logging import get_logger
+from flash.providers._lifecycle.deadline import (
     remaining_seconds,
     require_create_allowance,
     require_deadline_at,
 )
-from flash.providers._http import RestClient, is_not_found
+from flash.providers._lifecycle.http import RestClient, is_not_found
 
 logger = get_logger(__name__)
 

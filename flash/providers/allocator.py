@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 
-from flash._logging import get_logger
+from flash._internal.logging import get_logger
 from flash.providers import PROVIDER_NAMES, available_providers, get_provider
 from flash.providers.base import (
     GPU_INFO,
@@ -40,7 +40,7 @@ def required_vram_gb(
     model_revision: str = "",
 ) -> int:
     """VRAM required for the full run, sized to actual knobs via model_required_vram_gb."""
-    from flash.engine.vram import model_required_vram_gb
+    from flash.engine.plan.vram import model_required_vram_gb
 
     return model_required_vram_gb(
         model_id,
@@ -149,7 +149,7 @@ def geometry_safe_gpu_cap(model_id: str, max_gpu_count: int, *, model_revision: 
     pinned head geometry at every width.
     """
     cap = largest_rentable_count(max_gpu_count)
-    from flash.catalog import MODELS
+    from flash.core.catalog import MODELS
 
     default_catalog_revision = model_id in MODELS and not model_revision
     return cap if default_catalog_revision else min(cap, 4)

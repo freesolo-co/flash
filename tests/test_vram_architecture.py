@@ -4,8 +4,8 @@ import math
 
 import pytest
 
-from flash.catalog import MODELS, serving_lora_rank_cap
-from flash.engine.vram import (
+from flash.core.catalog import MODELS, serving_lora_rank_cap
+from flash.engine.plan.vram import (
     _KV_BLOCK_TOKENS,
     _LORA_ADAMW_BYTES_PER_PARAM,
     _architecture_kv_raw_gb,
@@ -127,7 +127,7 @@ def test_gdn_state_page_and_attention_kv_use_real_geometry():
 
 
 def test_pinned_grpo_resident_check_uses_generic_geometry(monkeypatch):
-    import flash.engine.vram as vram_mod
+    import flash.engine.plan.vram as vram_mod
 
     captured = {}
 

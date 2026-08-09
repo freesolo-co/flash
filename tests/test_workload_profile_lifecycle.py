@@ -4,8 +4,8 @@ from dataclasses import replace
 
 import pytest
 
-from flash.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
-from flash.workload_profile import (
+from flash.core.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
+from flash.engine.profiling.workload_profile import (
     SFT_PROFILE_KIND,
     SftWorkloadProfile,
     sft_profile_input_digest,
@@ -558,7 +558,9 @@ def test_public_lora_alpha_is_bound_into_new_preparation_digests(tmp_path, monke
         **intact,
         "train": {**intact["train"], "lora_alpha": intact["train"]["lora_alpha"] + 8},
     }
-    with pytest.raises(ValueError):
+    # the structural comparison sees this one first now that rank/alpha are compared on a
+    # profile-free run; either rejection is correct, so match both messages.
+    with pytest.raises(ValueError, match=r"does not match the public run|failed integrity"):
         runner.effective_spec_from_status(status)
 
     # deleting alpha must not forge a legacy snapshot out of a current one. the structural check
@@ -620,7 +622,8 @@ def test_profile_free_run_compares_lora_topology_structurally(tmp_path, monkeypa
         },
     )
     # guard: this run really does bypass both digest branches.
-    assert not worker.workload_profile_kind and not worker.train.init_from_adapter
+    assert not worker.workload_profile_kind
+    assert not worker.train.init_from_adapter
     assert runner.effective_spec_from_status(status) == worker
 
     for field, tampered in (("lora_alpha", 48), ("lora_rank", 99)):

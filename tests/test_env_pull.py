@@ -14,9 +14,9 @@ from pathlib import Path
 
 import pytest
 
-from flash._channel import CLI_NAME
-from flash.cli import envpush
-from flash.cli.envpush import cmd_env_pull
+from flash._internal.channel import CLI_NAME
+from flash.cli.commands.env import push as envpush
+from flash.cli.commands.env.push import cmd_env_pull
 from flash.envs import loader as adapter
 from flash.envs.pull import environment_local_dirname
 

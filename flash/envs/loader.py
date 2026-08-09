@@ -26,13 +26,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
-from flash.envs.archive import extract_validated_archive_members
-from flash.envs.archive_policy import (
+from flash.envs.package.limits import (
     ARCHIVE_MEMBER_LIMIT,
     ARCHIVE_SCAN_MEMBER_LIMIT,
     LimitedArchiveReader,
     archive_stream_limit,
 )
+from flash.envs.package.unpack import extract_validated_archive_members
 
 _DEFAULT_GITHUB_REF = "main"
 _DEFAULT_ENVIRONMENT_PATH = "environment.py"

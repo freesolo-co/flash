@@ -1,0 +1,1475 @@
+"""Run-execution machinery: the submit -> supervised training job -> GC flow.
+
+Sibling helpers are imported function-locally to avoid the flash.runner.__init__ import cycle
+and to keep monkeypatches reachable (``monkeypatch.setattr(runner, ...)`` vs a static copy).
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+
+from flash.core.spec import JobSpec, gpu_count_of, require_matching_seed
+from flash.providers._lifecycle.deadline import deadline_kwargs
+from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
+
+# Floor so a streak of broken/busy GPUs doesn't kill a run that left retries enabled.
+# max_retries==0 (single-shot) is always respected; floor only applies when retries are on.
+INFRA_RETRY_FLOOR = 5
+INFRA_RETRY_FAILURES = frozenset({"stalled", "no_capacity", "poll_error", "job_preempted"})
+RETRY_FAILURES = INFRA_RETRY_FAILURES | {"oom"}
+_RECOVERY_MARKER_GRACE_S = 120.0
+_RECOVERY_METRICS_POLL_S = 5.0
+_RUNPOD_STATUS_PROBE_TIMEOUT_S = 10.0
+
+
+class _CompletedAttemptPending(RuntimeError):
+    """A strict success marker exists, but its metrics are not readable yet."""
+
+
+class _SelectedQuoteUnaffordable(RuntimeError):
+    """The selected live candidate costs more than the owning organization can afford."""
+
+
+def _recheck_selected_quote_affordability(status, selected_quote: float, log) -> None:
+    """Recheck only a live quote that increases the amount accepted before allocation."""
+    accepted_quote = float(getattr(status, "estimated_cost_usd", 0.0) or 0.0)
+    if selected_quote <= accepted_quote:
+        return
+    context = getattr(status, "billing_context", None)
+    if not isinstance(context, dict):
+        return
+    org_id = str(context.get("org_id") or "").strip()
+    if not org_id:
+        return
+
+    from flash.server.platform.internal_client import internal_key
+
+    key = internal_key()
+    if not key:
+        return
+    try:
+        from flash.server.billing.charges import precheck_training_run
+
+        precheck_training_run(internal_key=key, org_id=org_id, estimate_usd=selected_quote)
+    except Exception as exc:
+        from flash.server.billing.charges import BillingError
+
+        if isinstance(exc, BillingError) and exc.status_code == 402:
+            raise _SelectedQuoteUnaffordable(
+                "selected live GPU quote exceeds the organization's available training balance"
+            ) from exc
+        print(
+            f"budget recheck skipped for selected quote (billing service error: {type(exc).__name__})",
+            file=log,
+            flush=True,
+        )
+
+
+@dataclass
+class _RetryBudget:
+    infra_retries: int
+    oom_retries: int
+    cache_fallbacks: int
+    infra_used: int = 0
+    oom_used: int = 0
+    cache_used: int = 0
+
+    @property
+    def max_attempts(self) -> int:
+        return 1 + self.infra_retries + self.oom_retries + self.cache_fallbacks
+
+    def infra_exhausted(self, *, cache_fallback_available: bool) -> bool:
+        return self.infra_used >= self.infra_retries and not cache_fallback_available
+
+    def can_retry(self, failure: str | None, *, cache_drop: bool) -> bool:
+        if failure not in RETRY_FAILURES:
+            return False
+        if cache_drop:
+            return self.cache_used < self.cache_fallbacks
+        if failure == "oom":
+            return self.oom_used < self.oom_retries
+        return self.infra_used < self.infra_retries
+
+    def record_retry(self, failure: str | None, *, cache_drop: bool) -> None:
+        if cache_drop:
+            self.cache_used += 1
+            return
+        if failure == "oom":
+            self.oom_used += 1
+        elif failure in INFRA_RETRY_FAILURES:
+            self.infra_used += 1
+
+
+def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
+    from flash.content.multimodal import preflight_validate_image_opd
+
+    preflight_validate_image_opd(spec)
+
+    # Lazy import: dry-run / unit tests never construct a Flash endpoint.
+    from flash.providers._lifecycle.worker import upload_code
+    from flash.runner import (
+        RUNS_DIR,
+        TERMINAL_STATES,
+        _gc_run_endpoints,
+        _run_job_inner,
+        _update,
+        get_status,
+    )
+
+    # Cancel can land before this thread starts; don't overwrite a terminal state with provisioning.
+    if get_status(spec.run_id).state in TERMINAL_STATES:
+        return
+    _update(spec.run_id, "provisioning")
+    log_path = os.path.join(RUNS_DIR, f"{spec.run_id}.log")
+    try:
+        _run_job_inner(spec, log_path, upload_code, runtime_secrets=runtime_secrets)
+    finally:
+        # GC registered endpoints — undeleted endpoints count against the account-wide worker quota.
+        # Skip when the run is still non-terminal: that means another live supervisor already owns the
+        # durable handle (see _submit_seed_supervised's "already has a durable provider handle" bail),
+        # and reaping here would tear down its still-active provider resources.
+        if get_status(spec.run_id).state in TERMINAL_STATES:
+            _gc_run_endpoints(spec)
+
+
+def _spec_with_gpu(spec: JobSpec, gpu_type: str, gpu_count: int = 0) -> JobSpec:
+    """The spec the workers/loggers see for THIS attempt's allocated class and card count.
+
+    The allocator may satisfy the run with a multi-card combination of a smaller class than the spec
+    named, so the count it CHOSE has to land on the spec too: the worker sizes its rank count from
+    gpu.count, and the provider payload rents gpu.count cards. Letting those diverge would either
+    strand rented cards or launch more ranks than were rented.
+    """
+    count = gpu_count if gpu_count >= 1 else gpu_count_of(spec)
+    if spec.gpu.type == gpu_type and gpu_count_of(spec) == count:
+        return spec
+    d = spec.to_internal_dict()
+    d["gpu"] = {**d["gpu"], "type": gpu_type, "count": count}
+    return JobSpec.from_dict(d)
+
+
+def _spec_with_resolved_env_sha(spec: JobSpec, sha: str) -> JobSpec:
+    """The spec carrying an already-resolved environment SHA, or the spec unchanged."""
+    if not sha or spec.environment.resolved_sha == sha:
+        return spec
+    d = spec.to_internal_dict()
+    d["environment"] = {**d["environment"], "resolved_sha": sha}
+    return JobSpec.from_dict(d)
+
+
+def _pin_environment_for_run(spec: JobSpec, log, *, attempt_started: bool) -> JobSpec:
+    """Resolve the environment ref once before attempts begin, then keep that pin.
+
+    A moving ``environment-hub@main`` ref could otherwise change code between retries. After an
+    unpinned attempt starts, its commit is unknowable, so ``attempt_started`` leaves later attempts
+    unpinned rather than mixing commits with a resumed checkpoint.
+    """
+    if spec.environment.resolved_sha:
+        return spec
+    if attempt_started:
+        # no pin is recoverable from here; see the docstring. warn once more so the condition is
+        # visible in the log at the point the retry is launched, not only at the start of the run.
+        print(
+            f"warning: environment {spec.environment.id!r} ran unpinned on an earlier attempt; "
+            "leaving it unpinned so this retry cannot resolve a different commit",
+            file=log,
+            flush=True,
+        )
+        return spec
+    from flash.runner import _assign_resolved_env_sha
+
+    pinned = _assign_resolved_env_sha(spec)
+    sha = pinned.environment.resolved_sha
+    if not sha:
+        # still unpinned: the ref stays symbolic and every attempt resolves it on its own worker. say
+        # so in the run log, which is the one place the user actually reads.
+        print(
+            f"warning: could not pin environment {spec.environment.id!r} to a commit; "
+            "a retry may resolve it to a newer push",
+            file=log,
+            flush=True,
+        )
+        return spec
+    print(f"environment {spec.environment.id!r} pinned to {sha}", file=log, flush=True)
+    return pinned
+
+
+def _drop_weight_cache(spec: JobSpec) -> JobSpec:
+    """Spec with the SHARED weight-cache volume removed for an unrestricted cross-region retry.
+
+    Only drops the platform-managed shared cache (WEIGHT_CACHE_VOLUME_NAME); a custom per-org
+    network_volume is the user's own choice and is preserved across retries.
+    """
+    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
+    if getattr(spec.gpu, "network_volume", None) != WEIGHT_CACHE_VOLUME_NAME:
+        return spec
+    d = spec.to_internal_dict()
+    d["gpu"] = {**d["gpu"], "network_volume": None}
+    return JobSpec.from_dict(d)
+
+
+def _canonical_provider_handle(handle):
+    """Validate and canonicalize one complete provider-specific persisted handle."""
+    from flash.providers.base import JobHandle
+
+    data = handle.to_dict() if hasattr(handle, "to_dict") else dict(handle)
+    provider = data.get("provider")
+    if provider == "runpod":
+        from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
+
+        return JobHandle.from_dict(RunpodJobHandle.from_dict(data).to_dict())
+    if provider == "lambda":
+        from flash.providers.lambda_.jobs.builders import LambdaJobHandle
+
+        return JobHandle.from_dict(LambdaJobHandle.from_dict(data).to_dict())
+    if provider == "vast":
+        from flash.providers.vast.jobs.builders import VastJobHandle
+
+        return JobHandle.from_dict(VastJobHandle.from_dict(data).to_dict())
+    raise ValueError("persisted provider identity is missing or unsupported")
+
+
+def _runpod_completed_metrics(handle, *, deadline_at: float | None = None) -> dict | None:
+    """Return decoded metrics only when the exact RunPod job completed successfully."""
+    try:
+        original = handle.to_dict() if hasattr(handle, "to_dict") else dict(handle)
+        canonical = _canonical_provider_handle(original)
+        data = canonical.to_dict()
+        if canonical.provider != "runpod" or not data.get("job_id"):
+            return None
+        from flash.providers.runpod import api as runpod_api
+        from flash.providers.runpod.jobs import TERMINAL_OK, decode_output
+
+        # a status probe must fail fast: cap it at a short fresh timeout regardless of how far
+        # the run wall deadline is. handing job_status the wall+grace deadline (which can be
+        # hours out for a run that just started) lets a runpod api outage burn the full
+        # per-request retry budget before returning None, stalling the reconciler each pass.
+        # the wall+grace value governs only the pending-output decision below, never the probe.
+        probe_deadline_at = (
+            time.time() + _RUNPOD_STATUS_PROBE_TIMEOUT_S if deadline_at is not None else None
+        )
+        job = runpod_api.job_status(
+            data["endpoint_id"],
+            data["job_id"],
+            key_fingerprint=data["key_fingerprint"],
+            deadline_at=probe_deadline_at,
+        )
+        if not isinstance(job, dict) or job.get("status") not in TERMINAL_OK:
+            return None
+        try:
+            metrics = decode_output(job.get("output"))
+            output_readable = isinstance(metrics, dict)
+        except Exception:
+            raw_output = job.get("output")
+            if isinstance(raw_output, str):
+                # a string-form envelope (json text) is still a READABLE failure if it decodes to one;
+                # parse it before falling through to the pending path so a completed-with-failure job
+                # is not kept reconciling as if its output were merely lagging.
+                try:
+                    decoded = json.loads(raw_output)
+                except (ValueError, TypeError):
+                    decoded = None
+                if isinstance(decoded, dict):
+                    raw_output = decoded
+            if isinstance(raw_output, dict) and (
+                raw_output.get("error")
+                or ("success" in raw_output and not raw_output.get("success"))
+            ):
+                # the terminal-ok job's output is a READABLE worker-failure envelope, not
+                # lagging success metrics: the attempt definitively completed with a failure.
+                # do not raise _CompletedAttemptPending (which would keep reconciling a job
+                # that already failed); return None so the caller takes the completed-without-
+                # metrics (failed) path.
+                return None
+            # otherwise the output is present but not yet decodable (unparseable/non-dict):
+            # treat it like a missing output below (pending within grace) so a job that
+            # already completed is not torn down over a transient output lag.
+            metrics = None
+            output_readable = False
+        if not output_readable:
+            # the queue job is terminal-ok but its output metrics are not readable yet
+            # (missing, non-dict, or not yet decodable); treat this lag like instance
+            # recovery (raise pending) so callers keep reconciling instead of tearing down
+            # a job that already completed.
+            grace_expired = (
+                deadline_at is None or time.time() >= deadline_at + _RECOVERY_MARKER_GRACE_S
+            )
+            if grace_expired:
+                return None
+            raise _CompletedAttemptPending(
+                "runpod job completed but its output metrics are not readable yet"
+            )
+        allocated_gpu = original.get("allocated_gpu")
+        if allocated_gpu:
+            metrics.setdefault("allocated_gpu", allocated_gpu)
+        allocated_count = original.get("allocated_gpu_count")
+        if allocated_count:
+            metrics.setdefault("allocated_gpu_count", int(allocated_count))
+        return metrics
+    except _CompletedAttemptPending:
+        raise
+    except Exception:
+        return None
+
+
+def _worker_provably_gone(run_id: str, handle) -> bool:
+    """Return true only when the captured attempt cannot still have a live worker."""
+    from flash.providers import INSTANCE_PROVIDERS, get_provider
+
+    try:
+        handle = _canonical_provider_handle(handle)
+        data = handle.to_dict()
+    except Exception:
+        return False
+    if handle.provider == "runpod":
+        job_id = data.get("job_id")
+        if not job_id:
+            return False
+        try:
+            from flash.providers.runpod import api as runpod_api
+            from flash.providers.runpod.jobs import TERMINAL_FAIL, TERMINAL_OK
+
+            job = runpod_api.job_status(
+                data["endpoint_id"],
+                job_id,
+                key_fingerprint=data["key_fingerprint"],
+            )
+            return isinstance(job, dict) and job.get("status") in TERMINAL_OK | TERMINAL_FAIL
+        except Exception:
+            return False
+    if handle.provider in INSTANCE_PROVIDERS:
+        try:
+            check = getattr(get_provider(handle.provider), "run_instances_remaining", None)
+            return check is not None and check(run_id) == []
+        except Exception:
+            return False
+    return False
+
+
+def _strict_teardown_handle(handle, run_id: str) -> bool:
+    """Request exact teardown, then prove the captured attempt's worker is gone.
+
+    Returns true when the billable resource deletion itself was confirmed. Returns false only for a
+    RunPod job proven terminal while its endpoint deletion remains unconfirmed; callers must persist
+    that exact endpoint in cleanup_remotes before clearing the active remote.
+    """
+    from flash.providers import INSTANCE_PROVIDERS, get_provider
+
+    handle = _canonical_provider_handle(handle)
+    provider = get_provider(handle.provider)
+    data = handle.to_dict()
+    if handle.provider == "runpod":
+        if data.get("job_id"):
+            with contextlib.suppress(Exception):
+                provider.cancel(handle)
+        try:
+            provider.destroy(handle)
+        except Exception as exc:
+            if _worker_provably_gone(run_id, handle):
+                return False
+            raise RuntimeError(
+                "runpod endpoint deletion could not be confirmed and its worker may still be live"
+            ) from exc
+        return True
+    if handle.provider in INSTANCE_PROVIDERS:
+        destroy_error: Exception | None = None
+        try:
+            provider.destroy(handle)
+        except Exception as exc:
+            destroy_error = exc
+        if _worker_provably_gone(run_id, handle):
+            return True
+        raise RuntimeError(
+            "instance teardown could not be confirmed absent; its worker may still be live"
+        ) from destroy_error
+    provider.cancel(handle)
+    provider.destroy(handle)
+    return True
+
+
+def _completed_attempt_metrics(
+    spec: JobSpec,
+    *,
+    provider: str,
+    attempt: int,
+    launch_floor: float,
+    deadline_at: float,
+    log=None,
+) -> dict | None:
+    """Read a strict successful instance marker plus its run-scoped metrics."""
+    if provider not in {"vast", "lambda"} or not spec.train.hf_repo:
+        return None
+    from flash.providers._lifecycle.poll import make_say
+    from flash.providers._lifecycle.poll_instance import (
+        _METRICS_AFTER_SUCCESS_RETRIES,
+        _METRICS_AFTER_SUCCESS_WAIT_S,
+        _TERMINAL_REREAD_RETRIES,
+        _TERMINAL_REREAD_WAIT_S,
+        _read_with_retries,
+        decode_terminal_marker,
+    )
+    from flash.providers.artifacts.hf import make_hf_text_reader
+
+    prefix = f"{spec.phase}/{spec.run_id}"
+    marker_reader = make_hf_text_reader(
+        spec.train.hf_repo,
+        f"{prefix}/{provider}_attempt{attempt}.json",
+    )
+    metrics_reader = make_hf_text_reader(spec.train.hf_repo, f"{prefix}/metrics.json")
+    say = make_say(log)
+    observation_deadline = time.time() + (_TERMINAL_REREAD_RETRIES * _TERMINAL_REREAD_WAIT_S)
+    marker_raw = _read_with_retries(
+        lambda: marker_reader(force=True),
+        tries=_TERMINAL_REREAD_RETRIES,
+        wait_s=_TERMINAL_REREAD_WAIT_S,
+        say=say,
+        message="recovery deadline reached; waiting for the terminal attempt marker",
+        deadline_at=observation_deadline,
+    )
+    if marker_raw is None:
+        return None
+    try:
+        marker = decode_terminal_marker(
+            marker_raw,
+            run_id=spec.run_id,
+            attempt=attempt,
+            launch_floor=launch_floor,
+            deadline_at=deadline_at + _RECOVERY_MARKER_GRACE_S,
+        )
+    except (TypeError, ValueError):
+        return None
+    if not marker["ok"]:
+        return None
+    metrics_observation_deadline = time.time() + (
+        _METRICS_AFTER_SUCCESS_RETRIES * _METRICS_AFTER_SUCCESS_WAIT_S
+    )
+    metrics_raw = _read_with_retries(
+        lambda: metrics_reader(force=True),
+        tries=_METRICS_AFTER_SUCCESS_RETRIES,
+        wait_s=_METRICS_AFTER_SUCCESS_WAIT_S,
+        say=say,
+        message="successful recovery marker seen; waiting for metrics.json",
+        deadline_at=metrics_observation_deadline,
+    )
+    metrics_grace_expired = time.time() >= deadline_at + _RECOVERY_MARKER_GRACE_S
+    if metrics_raw is None:
+        if metrics_grace_expired:
+            return None
+        raise _CompletedAttemptPending(
+            "successful recovery marker is present but metrics.json is not readable yet"
+        )
+    try:
+        metrics = json.loads(metrics_raw)
+    except (TypeError, ValueError) as exc:
+        if metrics_grace_expired:
+            return None
+        raise _CompletedAttemptPending(
+            "successful recovery marker is present but metrics.json is not parseable yet"
+        ) from exc
+    if not isinstance(metrics, dict):
+        if metrics_grace_expired:
+            return None
+        raise _CompletedAttemptPending(
+            "successful recovery marker is present but metrics.json is not an object yet"
+        )
+    return metrics
+
+
+def _adopt_completed_attempt(
+    run_id: str,
+    spec: JobSpec,
+    expected_remote: dict | None,
+    metrics: dict,
+    *,
+    log,
+) -> bool:
+    """Finalize a phantom-completed attempt through the expected-remote CAS."""
+    from flash.runner import _compare_and_complete_remote
+
+    applied = _compare_and_complete_remote(run_id, expected_remote, spec, metrics)
+    if applied:
+        _charge_completed_run_by_id(spec.run_id, log)
+        _register_checkpoints_best_effort(spec, log)
+    return applied
+
+
+def _shape_key(candidate) -> tuple[str, str, int]:
+    """Retry-bookkeeping identity: a class at a CARD COUNT, not a class.
+
+    Providers report several counts for the same class (2x and 4x H100 are distinct rentable
+    shapes), so keying on (provider, gpu) alone would mark every count tried the moment one fails
+    and skip a wider shape that fits.
+    """
+    return (candidate.provider, candidate.gpu, int(getattr(candidate, "gpu_count", 1) or 1))
+
+
+def _select_candidate(
+    candidates, failed_providers: set[str], tried_classes: set[tuple[str, str, int]]
+):
+    """Pick the next (provider, class) from the cross-provider ranked candidate list.
+
+    Escapes a congested/sick provider cross-provider before walking classes within it.
+    Falls back to cheapest untried class when every provider has already burned a retry.
+    """
+    return min(
+        candidates,
+        key=lambda c: (
+            c.provider in failed_providers,  # 1) escape providers that already failed this run
+            _shape_key(c) in tried_classes,  # 2) then prefer a shape not yet tried
+            getattr(c, "gpu_count", 1) * c.hourly_usd,  # 3) then cheapest TOTAL cost
+            getattr(c, "gpu_count", 1),  # 4) fewer cards on ties (less inter-card overhead)
+            c.vram_gb,  # 5) then the smaller card (don't burn a big GPU on a small job)
+        ),
+    )
+
+
+def _projected_retry_class(
+    candidates, failed_providers, tried_classes, chosen, *, cache_drop: bool
+):
+    """The class the NEXT attempt is expected to select, given the failure this one records.
+
+    Mirrors the bookkeeping at the bottom of the retry loop: a cache-drop retry leaves both sets
+    untouched (same class, cold), any other retry marks this class tried and its provider failed.
+    Only valid off the OOM path, where the escalation floor rewrites the candidate list first.
+
+    Expected, not guaranteed: the next attempt calls ``allocate()`` again, and providers that build
+    candidates from live capacity can drop this class or surface a cheaper one. Callers must word it
+    as a projection.
+    """
+    if not candidates:
+        return None
+    if cache_drop:
+        return _select_candidate(candidates, failed_providers, tried_classes)
+    return _select_candidate(
+        candidates,
+        failed_providers | {chosen.provider},
+        tried_classes | {_shape_key(chosen)},
+    )
+
+
+def _candidate_usable_vram_gb(candidate) -> float:
+    """Run-usable VRAM under the allocator's fit model.
+
+    Use ``combined_vram_gb`` on both sides of OOM escalation. Raw card-count multiplication ignores
+    replicated floors and shard efficiency, so it can move a retry to a smaller effective shape.
+    """
+    from flash.providers.base import combined_vram_gb
+
+    return combined_vram_gb(candidate.vram_gb, int(getattr(candidate, "gpu_count", 1) or 1))
+
+
+def _oom_escalated(candidates, oom_vram_floor: float):
+    """Candidates strictly LARGER than the VRAM that just OOM'd. ``oom_vram_floor == 0`` (no prior OOM)
+    leaves the list unchanged; otherwise an 80GB OOM leaves only the >80GB classes (a same-size retry
+    would just OOM again). EMPTY means the run already OOM'd the largest available class.
+
+    Both sides are measured with `_candidate_usable_vram_gb`, and the floor recorded on OOM uses it
+    too -- the filter is only meaningful if the floor and the candidates are on one scale."""
+    if not oom_vram_floor:
+        return list(candidates)
+    return [c for c in candidates if _candidate_usable_vram_gb(c) > oom_vram_floor]
+
+
+def _await_runpod_completed_metrics(
+    last_handle,
+    deadline_at,
+    *,
+    check_cancelled: Callable[[], None] | None = None,
+) -> dict | None:
+    # a terminal-ok runpod job whose output metrics are not decodable yet raises
+    # _CompletedAttemptPending within the grace window; keep reconciling (like attach_run
+    # and background reconciliation) instead of letting it escape the supervisor and fail
+    # a job that already completed.
+    #
+    # bound the wait to a short observation window measured from first observation (never past the
+    # run wall), not the full run wall deadline. callers pass the run wall deadline, up to
+    # max_wall_seconds (default 24h); passing it straight through let a terminal-ok job whose output
+    # never became readable pin the supervisor for the remainder of the run instead of failing over
+    # to a retry. _runpod_completed_metrics returns None once time >= observation_floor +
+    # _RECOVERY_MARKER_GRACE_S, so this synchronous poll is bounded to ~the grace window.
+    observation_floor = time.time()
+    if deadline_at is not None:
+        observation_floor = min(observation_floor, deadline_at)
+    while True:
+        try:
+            return _runpod_completed_metrics(last_handle, deadline_at=observation_floor)
+        except _CompletedAttemptPending:
+            if check_cancelled is not None:
+                check_cancelled()
+            time.sleep(_RECOVERY_METRICS_POLL_S)
+
+
+def _submit_seed_supervised(
+    spec: JobSpec,
+    seed: int,
+    log,
+    runtime_secrets: dict[str, str] | None = None,
+    code_prefix: str | None = None,
+    attempt_start: int = 0,
+) -> dict:
+    """Run one seed with bounded auto-retry on infra-shaped failures.
+
+    Retries resume from the latest HF checkpoint on a fresh host. Genuine worker errors fail fast.
+    ``attempt_start`` offsets persisted identities without expanding this invocation's retry budget.
+    """
+    seed = require_matching_seed(spec, seed)
+    from flash.providers import get_provider
+    from flash.providers.allocator import allocate, allocation_summary
+    from flash.providers.base import PollResult
+    from flash.runner import (
+        TERMINAL_STATES,
+        _compare_and_clear_remote,
+        _load_run_deadline_at,
+        _persist_effective_worker_spec,
+        _preserve_cleanup_remote,
+        _record_cleanup_remote,
+        _reserve_attempt,
+        _RunCancelled,
+        _spec_with_gpu,
+        _spec_with_remaining_wall,
+        _TerminalHandleRace,
+        _update,
+        _verified_opd_retry_state,
+        _worker_deadline_at,
+        flash_code_prefix,
+        get_status,
+    )
+    from flash.server.platform.locks import _deploy_lock
+
+    code_prefix = code_prefix or flash_code_prefix()
+    last_handle: dict = {}
+    current_gpu: dict = {}
+    # Persisted into the run handle so attach_run recovery polls with the same stall tuning.
+    current_on_last_gpu: dict = {"value": False}
+    attempt_start = max(0, int(attempt_start))
+    current_attempt: dict = {"value": attempt_start}
+    # tracks complete rN-suffixed retry handles that registry-less gc cannot reconstruct by name.
+    seen_endpoints: dict[str, dict] = {}
+    submission_lock = None
+
+    def on_handle(handle: dict):
+        nonlocal submission_lock
+
+        try:
+            selected_provider = current_gpu.get("provider")
+            if not isinstance(selected_provider, str) or not selected_provider:
+                raise RuntimeError("selected provider identity is unavailable")
+            canonical = _canonical_provider_handle(handle)
+            canonical_handle = canonical.to_dict()
+            if canonical.provider != selected_provider:
+                raise RuntimeError("provider handle identity does not match the selected provider")
+            expected_attempt = int(current_attempt["value"])
+            if canonical_handle["attempt"] != expected_attempt:
+                raise RuntimeError("provider handle attempt does not match the reserved attempt")
+            last_handle.clear()
+            last_handle.update(canonical_handle)
+            if canonical_handle.get("endpoint_id"):
+                seen_endpoints[canonical_handle["endpoint_id"]] = dict(canonical_handle)
+            persisted_handle = {
+                **canonical_handle,
+                "seed": int(seed),
+                "allocated_gpu": current_gpu.get("name"),
+                # carried beside the gpu name for the same reason and by the same route: the
+                # canonical provider handle drops unknown keys, so a recovering process can only
+                # learn the shape from what was persisted here. without the count a run adopted
+                # after a control-plane restart prices its wall as a single card.
+                "allocated_gpu_count": current_gpu.get("count"),
+                "on_last_gpu": bool(current_on_last_gpu["value"]),
+                "code_prefix": code_prefix,
+            }
+            if _update(spec.run_id, "running", remote=persisted_handle):
+                return
+            resource_deleted = False
+            with contextlib.suppress(Exception):
+                resource_deleted = _strict_teardown_handle(canonical_handle, spec.run_id)
+            if resource_deleted:
+                last_handle.clear()
+            else:
+                _preserve_cleanup_remote(spec.run_id, persisted_handle)
+            raise _TerminalHandleRace(
+                f"run {spec.run_id} became terminal while its provider handle was being persisted"
+            )
+        finally:
+            lock = submission_lock
+            submission_lock = None
+            if lock is not None:
+                lock.release()
+
+    def _gc_seen_endpoints() -> None:
+        # only RunPod handles carry an endpoint_id, so this set is empty on a plane without it.
+        if not seen_endpoints:
+            return
+        from flash.providers import get_provider
+        from flash.providers.base import JobHandle
+
+        rp = get_provider("runpod")
+        for remote in seen_endpoints.values():
+            with contextlib.suppress(Exception):
+                rp.destroy(JobHandle.from_dict(remote))
+
+    def _cancel() -> _RunCancelled:
+        """Reap this seed's tracked endpoints before unwinding on cancel — a handle whose `running`
+        write loses the terminal-stickiness race never lands in status.remote, so only seen_endpoints
+        (rN walk endpoints _gc_run_endpoints can't name) can free it."""
+        _gc_seen_endpoints()
+        return _RunCancelled(f"run {spec.run_id} was cancelled")
+
+    def _raise_if_cancelled() -> None:
+        try:
+            if get_status(spec.run_id).state == "cancelled":
+                raise _cancel()
+        except FileNotFoundError:
+            pass
+
+    def _return_completed_runpod_metrics(metrics: dict) -> dict:
+        try:
+            if get_status(spec.run_id).state == "cancelled":
+                raise _cancel()
+        except FileNotFoundError:
+            pass
+        _gc_seen_endpoints()
+        if current_gpu.get("name"):
+            metrics.setdefault("allocated_gpu", current_gpu["name"])
+        if current_gpu.get("provider"):
+            metrics.setdefault("allocated_provider", current_gpu["provider"])
+        # the runpod serverless route returns here rather than through the `res.ok` stamp below, so
+        # the card count has to be recorded on both or a sharded serverless run is still priced as
+        # one card. same source either way: the candidate allocation actually chose.
+        if current_gpu.get("count"):
+            metrics.setdefault("allocated_gpu_count", int(current_gpu["count"]))
+        return metrics
+
+    max_retries = int(spec.gpu.max_retries)
+    infra_budget = max(max_retries, INFRA_RETRY_FLOOR) if max_retries else 0
+    last_detail = None
+    # Sticky: once dropped stays dropped so all remaining attempts run on the unrestricted all-DC pool.
+    drop_weight_cache = False
+    # one cache-less fallback is available only when the user enabled retries; max_retries=0 is
+    # exactly one provider submission. a non-shared per-org volume earns no bonus.
+    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
+    started_with_shared_cache = (
+        getattr(spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME
+    )
+    cache_fallback_attempts = 1 if started_with_shared_cache and max_retries > 0 else 0
+    retry_budget = _RetryBudget(infra_budget, max_retries, cache_fallback_attempts)
+    # Grow only when an attempt actually provisioned a class and lost it to infra.
+    failed_providers: set[str] = set()
+    tried_classes: set[tuple[str, str, int]] = set()
+    oom_vram_floor = 0.0
+    # Pin the environment ref ONCE, here, before any attempt runs -- not per attempt. Submit's pin
+    # is best-effort, so a GitHub blip there leaves resolved_sha empty, and a managed slug points at
+    # environment-hub@main, which moves. attempt_start > 0 means a previous invocation already ran an
+    # attempt (post-restart recovery), so resolving now could pin a commit different from the one
+    # that attempt used; _pin_environment_for_run fails closed on that.
+    spec = _pin_environment_for_run(spec, log, attempt_started=attempt_start > 0)
+    if spec.algorithm == "opd":
+        from flash.server.domain.teacher_broker import require_teacher_broker_configuration
+
+        # configuration and absolute policy fail before allocation can create a paid worker.
+        require_teacher_broker_configuration(spec)
+        require_teacher_broker_configuration(
+            spec,
+            deadline_at=_load_run_deadline_at(spec.run_id),
+        )
+    for local_attempt in range(retry_budget.max_attempts):
+        attempt = attempt_start + local_attempt
+        try:
+            if get_status(spec.run_id).state == "cancelled":
+                raise _cancel()
+        except FileNotFoundError:
+            pass
+        if local_attempt > 0 and last_handle:
+            from flash.providers import get_provider
+            from flash.providers.base import JobHandle
+
+            completed_metrics = _await_runpod_completed_metrics(
+                last_handle,
+                _load_run_deadline_at(spec.run_id),
+                check_cancelled=_raise_if_cancelled,
+            )
+            if completed_metrics is not None:
+                return _return_completed_runpod_metrics(completed_metrics)
+            resource_deleted = False
+            teardown_error: Exception | None = None
+            try:
+                resource_deleted = _strict_teardown_handle(
+                    JobHandle.from_dict(last_handle), spec.run_id
+                )
+            except Exception as exc:
+                teardown_error = exc
+            resource_kind = "endpoint" if last_handle.get("endpoint_id") else "instance"
+            resource_id = last_handle.get("endpoint_id") or last_handle.get("instance_id")
+            worker_gone = teardown_error is None or _worker_provably_gone(spec.run_id, last_handle)
+            if (
+                worker_gone
+                and last_handle.get("provider") == "runpod"
+                and not resource_deleted
+                and not _record_cleanup_remote(spec.run_id, last_handle)
+            ):
+                raise RuntimeError(
+                    f"seed {seed}: terminal worker's leaked endpoint cleanup target "
+                    "could not be persisted"
+                )
+            if worker_gone:
+                if not _compare_and_clear_remote(spec.run_id, last_handle):
+                    raise RuntimeError(
+                        f"seed {seed}: previous attempt's persisted remote changed before clear; "
+                        "aborting replacement to avoid double-provisioning"
+                    )
+                if resource_deleted:
+                    message = "terminated"
+                else:
+                    message = (
+                        "teardown unconfirmed but worker terminal; proceeding, leaked resource "
+                        "persisted for cleanup"
+                    )
+                print(
+                    f"retry {attempt}: {last_handle.get('provider')} {resource_kind} "
+                    f"{resource_id} {message}",
+                    file=log,
+                    flush=True,
+                )
+                last_handle.clear()
+            else:
+                with contextlib.suppress(Exception):
+                    get_provider(last_handle["provider"]).gc(spec)
+                _gc_seen_endpoints()
+                print(
+                    f"retry {attempt}: {last_handle.get('provider')} {resource_kind} {resource_id} "
+                    f"teardown unconfirmed ({type(teardown_error).__name__}); "
+                    "keeping the handle so the "
+                    "possibly-billing resource stays reachable for cleanup",
+                    file=log,
+                    flush=True,
+                )
+                raise RuntimeError(
+                    f"seed {seed}: previous attempt's {last_handle.get('provider')} {resource_kind} "
+                    f"{resource_id} teardown could not be confirmed; failing to avoid "
+                    "double-provisioning a second worker over a possibly-live resource"
+                )
+        try:
+            attempt_spec = _spec_with_remaining_wall(spec, require_provider_minimum=True)
+        except RuntimeError:
+            _gc_seen_endpoints()
+            raise
+        if spec.algorithm == "opd":
+            expected_next_attempt, opd_resume_revision = _verified_opd_retry_state(spec.run_id)
+        else:
+            expected_next_attempt, opd_resume_revision = None, None
+        attempt = _reserve_attempt(
+            spec.run_id,
+            minimum_attempt=attempt_start if local_attempt == 0 else 0,
+            expected_next_attempt=expected_next_attempt,
+        )
+        current_attempt["value"] = attempt
+        attempt_runtime_secrets = dict(runtime_secrets or {})
+        attempt_runtime_secrets.pop(OPD_RESUME_REVISION_ENV, None)
+        if opd_resume_revision is not None:
+            attempt_runtime_secrets[OPD_RESUME_REVISION_ENV] = opd_resume_revision
+        res = None
+        alloc = None
+        chosen = None
+        quote_refresh_failed = False
+        # A cancel can land after _run_training's pre-submit check but while
+        # allocation/pricing runs, when no handle exists yet for cancel_run() to
+        # delete. Re-read state right before paid provisioning so a cancelled run
+        # never launches a worker (the later checks only stop the final-state
+        # overwrite, after the GPU has already run and billed).
+        with contextlib.suppress(FileNotFoundError):
+            if get_status(spec.run_id).state == "cancelled":
+                raise _cancel()
+        try:
+            alloc = allocate(
+                attempt_spec.model,
+                attempt_spec.algorithm,
+                train=attempt_spec.train,
+                thinking=attempt_spec.thinking,
+                # The run's requested disk, so the Vast capacity check searches at the SAME effective
+                # floor submit provisions with — else a high-disk run is advertised Vast capacity that
+                # only exists at 60 GB and then can't rent.
+                disk_gb=float(getattr(attempt_spec.gpu, "disk_gb", 0.0) or 0.0),
+                # the remaining run-global wall cap, so retries cannot reset the duration budget.
+                max_wall_seconds=float(getattr(attempt_spec.gpu, "max_wall_seconds", 0.0) or 0.0),
+                provider=getattr(attempt_spec.gpu, "provider", ""),
+                gpu_type=getattr(attempt_spec.gpu, "type", ""),
+                model_revision=attempt_spec.model_revision,
+                # the run's own gpu.count is the ceiling on cards the allocator may combine. at the
+                # default 1 this is exactly the historical cheapest-single-class search; above 1 the
+                # gate has already confirmed a sharding backend on a provider that rents n cards, so
+                # combinations of smaller classes become fair game when they price below one big card.
+                max_gpu_count=gpu_count_of(attempt_spec),
+                # a profile job tokenizes on cpu and exits before weights load, so it allocates the
+                # cheapest rentable card rather than the training shape it is measuring.
+                workload_profile=bool(attempt_spec.workload_profile_kind),
+            )
+        except Exception as exc:
+            from flash.providers.base import UnsupportedGpuError
+
+            if isinstance(exc, UnsupportedGpuError):
+                raise  # config-shaped: no GPU anywhere can run this job
+            res = PollResult(
+                False,
+                failure="poll_error",
+                detail=f"allocation failed ({type(exc).__name__})",
+            )
+        if alloc is not None:
+            with contextlib.suppress(FileNotFoundError):
+                if get_status(spec.run_id).state == "cancelled":
+                    raise _cancel()
+            cands = _oom_escalated(alloc.candidates, oom_vram_floor)
+            if not cands:
+                last_detail = f"oom: exceeded the largest available GPU ({oom_vram_floor:g} GB)"
+                print(
+                    f"seed={seed} OOM on the largest GPU class ({oom_vram_floor:g} GB); not retrying",
+                    file=log,
+                    flush=True,
+                )
+                break
+            chosen = _select_candidate(cands, failed_providers, tried_classes)
+            untried = [c for c in cands if _shape_key(c) not in tried_classes]
+            cache_fallback_available = (
+                retry_budget.cache_used < retry_budget.cache_fallbacks
+                and started_with_shared_cache
+                and not drop_weight_cache
+                and chosen is not None
+                and getattr(get_provider(chosen.provider), "supports_weight_cache", False)
+            )
+            on_last_gpu = len(untried) <= 1 or (
+                retry_budget.infra_exhausted(cache_fallback_available=cache_fallback_available)
+            )
+            current_on_last_gpu["value"] = on_last_gpu
+            print(allocation_summary(alloc), file=log, flush=True)
+            if (chosen.provider, chosen.gpu) != (alloc.provider, alloc.gpu):
+                print(
+                    f"retry {attempt}: walking past the cheapest class to {chosen.gpu} "
+                    f"@ {chosen.provider} ${chosen.hourly_usd:.2f}/hr",
+                    file=log,
+                    flush=True,
+                )
+            elif attempt and not untried:
+                # every fitting class has been tried, so the picker re-selects the one that just
+                # failed -- correct (never strand a run with no candidates), but silent: a
+                # no_capacity retry then spends another full LAST_GPU_CAPACITY_GRACE_S waiting on
+                # the same unavailable class. say so, because the operator's fix is to unpin
+                # gpu.type rather than to keep waiting.
+                print(
+                    f"retry {attempt}: no untried class left; re-selecting {chosen.gpu} "
+                    f"@ {chosen.provider}"
+                    + (" (gpu.type is pinned)" if getattr(spec.gpu, "type", None) else ""),
+                    file=log,
+                    flush=True,
+                )
+            effective_spec = _spec_with_gpu(spec, chosen.gpu, getattr(chosen, "gpu_count", 1))
+            if drop_weight_cache:
+                effective_spec = _drop_weight_cache(effective_spec)
+            # carry the run's one pin (resolved above the loop) onto this attempt's spec. _spec_with_gpu
+            # and _drop_weight_cache rebuild the spec, so the pin has to be re-applied, but it is never
+            # re-resolved: every attempt is handed the same commit.
+            effective_spec = _spec_with_resolved_env_sha(
+                effective_spec, spec.environment.resolved_sha
+            )
+            try:
+                run_spec = _spec_with_remaining_wall(
+                    effective_spec,
+                    require_provider_minimum=True,
+                )
+            except RuntimeError:
+                _gc_seen_endpoints()
+                raise
+            current_gpu["name"] = chosen.gpu
+            current_gpu["provider"] = chosen.provider
+            current_gpu["count"] = int(getattr(chosen, "gpu_count", 1) or 1)
+            current_attempt["value"] = attempt
+            retry_delay = 0
+            submission_lock = _deploy_lock(spec.run_id)
+            submission_lock.acquire()
+            try:
+                latest = get_status(spec.run_id)
+                if latest.state in TERMINAL_STATES:
+                    raise _cancel()
+                if latest.remote:
+                    raise _RunCancelled(
+                        f"run {spec.run_id} already has a durable provider handle; not resubmitting"
+                    )
+                # Preparation stays offline so a market outage cannot consume the lifecycle's first
+                # retry before the run exists. Now that allocation selected an exact live shape,
+                # replace the provisional quote atomically with the effective worker spec, before
+                # provisioning starts and before any billable work can occur.
+                from flash.cost.spec import estimate_for_spec
+                from flash.engine.profiling.workload_profile import WorkloadProfileMismatch
+                from flash.providers.base import Allocation as QuoteAllocation
+
+                quote_allocation = QuoteAllocation(
+                    provider=chosen.provider,
+                    gpu=chosen.gpu,
+                    hourly_usd=chosen.hourly_usd,
+                    min_vram_gb=alloc.min_vram_gb,
+                    candidates=(chosen,),
+                    gpu_count=getattr(chosen, "gpu_count", 1),
+                )
+                try:
+                    selected_quote = estimate_for_spec(
+                        effective_spec, allocation=quote_allocation
+                    ).total_usd
+                    _recheck_selected_quote_affordability(latest, selected_quote, log)
+                except _SelectedQuoteUnaffordable:
+                    raise
+                except WorkloadProfileMismatch:
+                    # the quote is backed by a workload profile whose identity is derived from this
+                    # spec, so a mismatch here is a defect in the run's own inputs, not a market or
+                    # metadata blip. retrying re-derives the same identity and fails the same way,
+                    # spending the run's remaining deadline in backoff sleeps to get there.
+                    raise
+                except Exception as exc:
+                    # revision-aware quote inputs can depend on remote metadata. a transient refresh
+                    # failure after allocation is infrastructure-shaped, not a terminal run defect.
+                    quote_refresh_failed = True
+                    res = PollResult(
+                        False,
+                        failure="poll_error",
+                        detail=f"selected quote refresh failed ({type(exc).__name__})",
+                    )
+                    if local_attempt < infra_budget:
+                        remaining = _load_run_deadline_at(spec.run_id) - time.time()
+                        if remaining > 0:
+                            retry_delay = min(10 * (local_attempt + 1), remaining)
+                else:
+                    if not _persist_effective_worker_spec(
+                        effective_spec, estimated_cost_usd=selected_quote
+                    ):
+                        raise _cancel()
+                    if get_status(spec.run_id).state in TERMINAL_STATES:
+                        raise _cancel()
+                    provider = get_provider(chosen.provider)
+                    try:
+                        from flash.server.domain.teacher_broker import teacher_attempt_transport
+
+                        with teacher_attempt_transport(
+                            run_spec,
+                            attempt=attempt,
+                            deadline_at=_load_run_deadline_at(spec.run_id),
+                        ) as teacher_secrets:
+                            attempt_runtime_secrets.update(teacher_secrets)
+                            submit_kwargs = {
+                                "log": log,
+                                "on_handle": on_handle,
+                                "attempt": attempt,
+                                "on_last_gpu": on_last_gpu,
+                                "code_prefix": code_prefix,
+                                # bounded, not the raw run deadline: while a profile is unarmed the
+                                # persisted one still carries the queue allowance, and the bootstrap
+                                # enforces whatever absolute deadline it is handed regardless of
+                                # max_wall_seconds. see _worker_deadline_at.
+                                "_deadline_at": _worker_deadline_at(spec.run_id, run_spec),
+                            }
+                            if attempt_runtime_secrets:
+                                submit_kwargs["runtime_secrets"] = attempt_runtime_secrets
+                            res = provider.submit_run(run_spec, seed, **submit_kwargs)
+                    except _TerminalHandleRace:
+                        raise
+                    except Exception as exc:
+                        from flash.providers.base import UnreconciledCreateError
+
+                        if isinstance(exc, UnreconciledCreateError):
+                            res = PollResult(
+                                False,
+                                failure="job_failed",
+                                detail=(
+                                    f"provider create could not be reconciled ({type(exc).__name__})"
+                                ),
+                            )
+                        else:
+                            res = PollResult(
+                                False,
+                                failure="poll_error",
+                                detail=f"provider submit failed ({type(exc).__name__})",
+                            )
+                            if local_attempt < infra_budget:
+                                remaining = _load_run_deadline_at(spec.run_id) - time.time()
+                                if remaining > 0:
+                                    retry_delay = min(10 * (local_attempt + 1), remaining)
+            finally:
+                lock = submission_lock
+                submission_lock = None
+                if lock is not None:
+                    lock.release()
+            if retry_delay:
+                time.sleep(retry_delay)  # let the transient clear
+        if res.ok:
+            # A late worker success must not resurrect a cancelled run.
+            try:
+                if get_status(spec.run_id).state == "cancelled":
+                    raise _cancel()
+            except FileNotFoundError:
+                pass
+            _gc_seen_endpoints()
+            if chosen is not None and isinstance(res.metrics, dict):
+                res.metrics.setdefault("allocated_gpu", chosen.gpu)
+                # the provider that actually billed this run, so cost attribution prices the
+                # class on ITS substrate rather than assuming RunPod's table.
+                res.metrics.setdefault("allocated_provider", chosen.provider)
+                # and how many cards of it. `hourly_rate(gpu_type)` is per CARD, so a fallback that
+                # prices the wall once records a 2x/4x run at half or a quarter of its real spend.
+                # the spec's own gpu.count cannot stand in: it is a ceiling, and allocation
+                # routinely picks fewer (see TRAINING.md, "a ceiling, not an exact count").
+                res.metrics.setdefault("allocated_gpu_count", int(getattr(chosen, "gpu_count", 1)))
+            return res.metrics
+        # cancel wins over any retry-shaped failure.
+        try:
+            if get_status(spec.run_id).state == "cancelled":
+                raise _cancel()
+        except FileNotFoundError:
+            pass
+        completed_metrics = _await_runpod_completed_metrics(
+            last_handle,
+            _load_run_deadline_at(spec.run_id),
+            check_cancelled=_raise_if_cancelled,
+        )
+        if completed_metrics is not None:
+            return _return_completed_runpod_metrics(completed_metrics)
+        last_detail = f"{res.failure}: {res.detail}"
+        oom_shaped = res.failure == "oom"
+        if oom_shaped and chosen is not None:
+            # same measure the filter compares against, see _candidate_usable_vram_gb
+            oom_vram_floor = max(oom_vram_floor, _candidate_usable_vram_gb(chosen))
+        run_had_cache = bool(
+            chosen is not None
+            and getattr(get_provider(chosen.provider), "supports_weight_cache", False)
+            and getattr(run_spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME
+        )
+        first_cache_drop = (
+            not quote_refresh_failed
+            and run_had_cache
+            and not drop_weight_cache
+            and res.failure in ("no_capacity", "poll_error")
+        )
+        oom_mode = oom_vram_floor > 0
+        will_retry = retry_budget.can_retry(
+            res.failure,
+            cache_drop=first_cache_drop,
+        )
+        # name the class the retry will ACTUALLY land on. on_last_gpu only says no further class
+        # escalation follows -- it does NOT mean this class is reused: with several fitting classes
+        # the picker clamps back to the cheapest already-tried one (A100 PCIe, A100 SXM, then A100
+        # PCIe again). so re-run the picker against the sets this failure is about to update.
+        #
+        # projected off the CURRENT candidate list, which the next attempt rebuilds by calling
+        # allocate() again. lambda/vast rebuild from live capacity and pricing, so the named class
+        # can disappear or lose to a newly available one -- word it as the expected target, not a
+        # guarantee. a cache-drop retry projects too: it leaves both sets untouched and so reuses
+        # this class cold, which is exactly the escalation the generic line failed to describe.
+        projected = None
+        if will_retry and not oom_mode and chosen is not None and not quote_refresh_failed:
+            projected = _projected_retry_class(
+                cands, failed_providers, tried_classes, chosen, cache_drop=first_cache_drop
+            )
+        if projected is not None:
+            same = (projected.provider, projected.gpu) == (chosen.provider, chosen.gpu)
+            # derived from the sets AFTER this failure's bookkeeping, not from the flag. a
+            # cache-drop retry deliberately leaves tried_classes untouched and reuses this class
+            # cold, so the projected class is still untried and reading current_on_last_gpu there
+            # printed "retry on H100 again, no untried GPU class fits" -- naming the untried class
+            # in the same clause that denies one exists. on_last_gpu is also true when the infra
+            # retry budget runs out with classes still untried, which is not exhaustion either.
+            retry_tried = (
+                tried_classes if first_cache_drop else tried_classes | {_shape_key(chosen)}
+            )
+            exhausted = all(_shape_key(c) in retry_tried for c in cands)
+            no_escalation = ", no untried GPU class fits this run" if exhausted else ""
+            retry_target = (
+                f"expecting to retry on {projected.gpu} @ {projected.provider}"
+                f"{' again' if same else ''}{no_escalation} (resume from last checkpoint; "
+                "reallocated against live capacity, so the class may change)"
+            )
+        else:
+            retry_target = "retrying (resume from last checkpoint)"
+        action = (
+            f"retrying on a larger GPU (> {oom_vram_floor:g} GB)"
+            if (will_retry and oom_mode)
+            else retry_target
+            if will_retry
+            else "not retrying"
+        )
+        print(
+            f"seed={seed} attempt={attempt} failed ({res.failure}); {action}"
+            f"\n--- failure detail ---\n{(res.detail or '')[:2000]}\n---",
+            file=log,
+            flush=True,
+        )
+        if not will_retry:
+            break
+        if first_cache_drop:
+            drop_weight_cache = True
+            retry_budget.record_retry(res.failure, cache_drop=True)
+        else:
+            retry_budget.record_retry(res.failure, cache_drop=False)
+            if chosen is not None and not quote_refresh_failed:
+                if not oom_shaped:
+                    failed_providers.add(chosen.provider)
+                tried_classes.add(_shape_key(chosen))
+    _gc_seen_endpoints()
+    raise RuntimeError(f"seed {seed} failed after retries: {last_detail}")
+
+
+def _run_job_inner(
+    spec: JobSpec,
+    log_path: str,
+    upload_code,
+    runtime_secrets: dict[str, str] | None = None,
+) -> None:
+    from flash.runner import (
+        _load_run_deadline_at,
+        _run_training,
+        _RunCancelled,
+        _update,
+        flash_code_prefix,
+        get_status,
+    )
+
+    try:
+        code_prefix = flash_code_prefix()
+        upload_code(
+            spec.train.hf_repo,
+            code_prefix=code_prefix,
+            **deadline_kwargs(upload_code, _load_run_deadline_at(spec.run_id)),
+        )
+        with open(log_path, "a") as log:
+            _run_training(
+                spec,
+                log,
+                prior_cost=0.0,
+                runtime_secrets=runtime_secrets,
+                code_prefix=code_prefix,
+            )
+    except _RunCancelled:
+        return  # cancel_run already set the terminal state
+    except Exception as exc:
+        if get_status(spec.run_id).state != "cancelled":
+            _update(spec.run_id, "failed", error=f"{type(exc).__name__}: run failed")
+        raise
+
+
+def _run_training(
+    spec: JobSpec,
+    log,
+    *,
+    prior_cost: float,
+    runtime_secrets: dict[str, str] | None = None,
+    code_prefix: str | None = None,
+    attempt_start: int = 0,
+) -> None:
+    """Train the run's single adapter under supervision; finalize the run.
+
+    Shared by a fresh submit and post-restart recovery (the worker resumes from its last HF
+    checkpoint on a fresh allocation). ``prior_cost`` carries spend already booked before a
+    recovery so the total isn't under-reported. ``attempt_start`` preserves globally monotonic
+    worker identities while each invocation keeps its own bounded retry budget."""
+    from flash.runner import (
+        TERMINAL_STATES,
+        _persist_metrics,
+        _RunCancelled,
+        _status_estimated_charge,
+        _submit_seed_supervised,
+        _update,
+        artifacts_dir,
+        get_status,
+    )
+
+    # Defense in depth against the recovery TOCTOU (see attach_run): a run can be flipped into ANY
+    # terminal state — not just `cancelled` — by a concurrent thread/process between the resume
+    # decision and here. Bail before _update + the supervised submit so we never submit PAID GPU
+    # work for an already-terminal run. _RunCancelled is the terminal signal; callers swallow it.
+    if get_status(spec.run_id).state in TERMINAL_STATES:
+        raise _RunCancelled(f"run {spec.run_id} is already terminal; not submitting")
+    # The pre-check above closes most of the window, but a concurrent flip can still land between
+    # it and this transition. _update is a compare-and-set: it returns False when the run is already
+    # terminal and leaves the state untouched. Gate the PAID supervised submit on that result so a
+    # run cancelled in this last instant is never resumed onto a GPU.
+    if not _update(spec.run_id, "running"):
+        raise _RunCancelled(f"run {spec.run_id} went terminal before submit; not submitting")
+    print(
+        f"starting phase={spec.phase} model={spec.model} gpu={spec.gpu.type}",
+        file=log,
+        flush=True,
+    )
+    metrics = _submit_seed_supervised(
+        spec,
+        spec.seed,
+        log,
+        runtime_secrets=runtime_secrets,
+        code_prefix=code_prefix,
+        attempt_start=attempt_start,
+    )
+    # measured wall x $/hr is recorded in metrics.json for analytics, but is NOT what we charge.
+    measured_cost = prior_cost + _persist_metrics(spec, metrics)
+    # The customer is charged the submit-time QUOTE, not measured wall. Legacy runs without a
+    # persisted quote are re-priced from the spec, falling back only for old/unpriceable records.
+    charge_usd = _status_estimated_charge(get_status(spec.run_id), spec, fallback=measured_cost)
+    # A cancel can land while this thread writes metrics — after the supervised late-cancel check.
+    # Re-read before the terminal "done" so a late worker success doesn't resurrect a cancelled run.
+    with contextlib.suppress(FileNotFoundError):
+        if get_status(spec.run_id).state == "cancelled":
+            raise _RunCancelled(f"run {spec.run_id} was cancelled")
+    # Gate side effects on the CAS succeeding — a concurrent cancel rejects the `done` write.
+    applied = _update(
+        spec.run_id,
+        "done",
+        cost_usd=charge_usd,
+        artifacts_dir=artifacts_dir(spec),
+    )
+    print(
+        f"done: train_wall={metrics.get('wall_seconds')} measured={measured_cost:.4f} "
+        f"charge_usd={charge_usd:.4f}",
+        file=log,
+        flush=True,
+    )
+    if applied:
+        _charge_completed_run_by_id(spec.run_id, log)
+        _register_checkpoints_best_effort(spec, log)
+
+
+def _register_checkpoints_best_effort(spec: JobSpec, log) -> None:
+    """Mirror a finished run's per-step checkpoints to the backend store (best-effort)."""
+    from flash.runner import get_status
+
+    try:
+        from flash.server.domain.checkpoints import register_checkpoints_best_effort
+
+        register_checkpoints_best_effort(get_status(spec.run_id), log=log)
+    except Exception as exc:  # never let checkpoint bookkeeping disturb a run
+        print(
+            f"[ckpt] register warn ({spec.run_id}): {type(exc).__name__}",
+            file=log,
+            flush=True,
+        )
+
+
+def _charge_completed_run_by_id(run_id: str, log) -> None:
+    """Bill a completed external run by run id, without changing its training result.
+
+    The charge reads everything it needs from the persisted ``RunStatus`` (``billing_context`` +
+    ``cost_usd`` + the raw ``spec`` dict), so a run id is the only input. The retry sweep calls this
+    directly so a legacy/stale persisted spec that ``JobSpec.from_dict`` would reject does NOT block
+    recovery of a real pending/failed charge."""
+    from flash.server.billing.charges import charge_completed_run
+
+    _apply_charge_with_state(
+        run_id,
+        log,
+        # "terminal" not "completed": the retry sweep bills cancelled-mid-training runs through here
+        # too, so the not-billed log/error text must read accurately for both.
+        noun="terminal",
+        charge_call=lambda internal_key, status: charge_completed_run(
+            internal_key=internal_key, status=status
+        ),
+    )
+
+
+def _apply_charge_with_state(run_id: str, log, *, charge_call, noun: str) -> None:
+    """Drive the billing state machine around one charge attempt (charging -> charged/failed).
+
+    ``charge_call(internal_key, status)`` performs the actual backend charge and returns its response
+    dict. Reading org/cost from the
+    persisted ``RunStatus`` (never a reparsed spec) is what lets a legacy/stale spec still be charged.
+    """
+    from flash.runner import get_status, record_billing_state
+    from flash.server.billing.charges import BillingError
+    from flash.server.platform.auth import INTERNAL_KEY_ENV, standalone
+    from flash.server.platform.internal_client import internal_key as operator_internal_key
+
+    status = get_status(run_id)
+    if not status.billing_context or status.billing_state == "charged":
+        return
+
+    # The shared gate, not a raw env read: it also returns None in standalone mode. A standalone
+    # plane started against an existing state directory can hold a run that still carries a
+    # managed-mode `billing_context`; charging it would send the operator's key to
+    # FREESOLO_BASE_URL (the hosted default when unset) and bill an organization this plane has no
+    # relationship with. Every other backend reporter is gated the same way, so billing turns off
+    # as a whole rather than one caller at a time.
+    internal_key = operator_internal_key()
+    if not internal_key:
+        # Name both causes: in standalone the key IS set, and reporting it as missing would send
+        # an operator looking for configuration that is already correct.
+        cause = (
+            "standalone mode has no billing backend"
+            if standalone()
+            else f"{INTERNAL_KEY_ENV} is not configured"
+        )
+        detail = f"{cause}; {noun} run was not billed"
+        # Field-only billing write that re-reads state under the lock: never overwrite a `deployed`
+        # that a concurrent /deploy may have written since we last read the run.
+        record_billing_state(run_id, billing_state="failed", billing_error=detail)
+        print(f"billing failed: {detail}", file=log, flush=True)
+        return
+
+    record_billing_state(run_id, billing_state="charging", billing_error=None)
+    status = get_status(run_id)
+    try:
+        charge = charge_call(internal_key, status)
+    except BillingError as exc:
+        record_billing_state(run_id, billing_state="failed", billing_error=exc.detail)
+        print(f"billing failed: {exc.detail}", file=log, flush=True)
+        return
+
+    record_billing_state(
+        run_id,
+        billing_state="charged",
+        billing_error=None,
+        billing_charge=charge,
+    )
+    print(
+        f"billing charged: amount_cents={charge.get('amountCents')} "
+        f"replay={bool(charge.get('replay'))}",
+        file=log,
+        flush=True,
+    )
+
+
+def _gc_run_endpoints(spec: JobSpec) -> None:
+    """Best-effort teardown of every endpoint a run may have registered."""
+    from flash.runner import (
+        _drain_cleanup_remotes,
+        _remote_resource_identity,
+        effective_spec_from_status,
+        get_status,
+    )
+
+    attempted_cleanup = set()
+    with contextlib.suppress(Exception):
+        attempted_cleanup = _drain_cleanup_remotes(spec.run_id)
+    status = None
+    with contextlib.suppress(Exception):
+        status = get_status(spec.run_id)
+    if status is not None:
+        with contextlib.suppress(Exception):
+            spec = effective_spec_from_status(status)
+    if (
+        status is not None
+        and status.remote
+        and _remote_resource_identity(status.remote) not in attempted_cleanup
+    ):
+        try:
+            resource_deleted = _strict_teardown_handle(status.remote, spec.run_id)
+            if status.remote.get("provider") == "runpod" and not resource_deleted:
+                from flash.runner import _record_cleanup_remote
+
+                _record_cleanup_remote(spec.run_id, status.remote)
+        except Exception:
+            pass
+    from flash.providers import available_providers, get_provider
+
+    # Sweep every CONFIGURED provider, including RunPod (whose gc also reaps the rN-suffixed
+    # endpoints the persisted handle cannot name). Gating on available_providers() is what makes
+    # this work on a self-hosted plane: an unconfigured provider holds nothing of ours, and
+    # calling it would only raise against a credential the operator never set.
+    for _prov in available_providers():
+        with contextlib.suppress(Exception):
+            get_provider(_prov).gc(spec)

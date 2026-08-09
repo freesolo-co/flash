@@ -11,7 +11,7 @@ import time
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from flash.server.teacher_broker import (
+from flash.server.domain.teacher_broker import (
     MAX_REQUEST_BODY_BYTES,
     TeacherBrokerError,
     authenticate_teacher_capability,

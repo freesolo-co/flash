@@ -335,7 +335,7 @@ def test_read_json_or_empty_returns_dict_for_non_object(tmp_path):
     """read_json_or_empty honors its ``-> dict`` contract: valid-but-non-object JSON (list,
     scalar, null) and unreadable/empty content all yield ``{}`` so config/credential callers
     can ``.get(...)`` / item-assign without an AttributeError/TypeError bricking every command."""
-    from flash._fileio import read_json_or_empty
+    from flash._internal.fileio import read_json_or_empty
 
     p = tmp_path / "config.json"
     for content in ("[]", "5", '"x"', "null", "[1,2,3]", "not json at all", ""):

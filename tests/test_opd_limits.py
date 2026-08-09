@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from flash.opd_limits import configured_opd_turn_limit, opd_teacher_request_multiplier
-from flash.spec import EnvironmentSpec
+from flash.core.spec import EnvironmentSpec
+from flash.teacher.limits import configured_opd_turn_limit, opd_teacher_request_multiplier
 
 
 @pytest.mark.parametrize(
