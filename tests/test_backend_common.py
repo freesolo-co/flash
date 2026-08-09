@@ -342,7 +342,7 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert "cp312" in vc.FLASH_ATTN_SPEC
     install = calls[1]
     assert vc.VERL_REQUIREMENT == (
-        "verl @ git+https://github.com/freesolo-co/verl@32d6200de81dcc9e97e3aa2ae4a2b3ba30d33e93"
+        "verl @ git+https://github.com/freesolo-co/verl@32d6200de81dc484893baf8b9cf30297ebe7fa49"
     )
     assert any(vc.VERL_REQUIREMENT_URL in arg for arg in install)
     assert "liger-kernel" in install
@@ -1309,7 +1309,7 @@ def test_verl_pin_matches_the_version_opd_requires_exactly():
     # skip on top of them.
     _, _, ref = vc.VERL_REQUIREMENT.partition("git+")
     _, _, commit = ref.rpartition("@")
-    assert commit == "32d6200de81dcc9e97e3aa2ae4a2b3ba30d33e93"
+    assert commit == "32d6200de81dc484893baf8b9cf30297ebe7fa49"
 
 
 def test_resolve_verl_python_installs_wandb_best_effort_when_requested(monkeypatch, tmp_path):
