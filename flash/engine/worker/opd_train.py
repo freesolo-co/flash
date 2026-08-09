@@ -2082,8 +2082,70 @@ def _processed_resume_steps(required_steps: tuple[int, ...], resume_step: int) -
     return processed
 
 
-def run_opd_train(spec=None) -> None:
-    """Run flash OPD through verl's native rollout and weight-sync path."""
+@dataclass(frozen=True)
+class _PreparedOpdTrain:
+    spec: object
+    env: object
+    multi_turn: bool
+    max_turns: int
+    knobs: object
+    model_id: str
+    model_revision: str
+    structured_outputs: object
+    model_vocab_size: object
+    started_at: float
+    teacher: object
+    tokenizer: object
+    thinking_prefill: str
+    max_model_len: int
+    prompt_budget: int
+    prompts: list[_BridgePrompt]
+    dropped_long: int
+    download_seconds: float
+    eos_token_ids: object
+    prompts_per_step: int
+    update_horizon: int
+    prompt_pool_fingerprint: str
+    multimodal: bool
+
+
+@dataclass(frozen=True)
+class _PreparedOpdVerl:
+    workdir: str
+    shim_dir: str
+    local_dir: str
+    export_root: str
+    mutation_failure_path: str
+    score_delivery_failure_path: str
+    abandonment_failure_path: str
+    resample_failure_path: str
+    cycle_commit_failure_path: str
+    train_file: str
+    val_file: str
+    lora_rank: int
+    lora_alpha: int
+    target_modules: object
+    warmstart_adapter: object
+    python_bin: str
+    model_path: str
+    gpu_count: int
+    save_freq: int
+    loggers: object
+    project_name: str
+    experiment_name: str
+    caps: object
+    gdn_hybrid: bool
+    fp8_kv: bool
+    enforce_eager: bool
+    attention_backend: object
+    mm_encoder_attn_backend: object
+    entry_path: str
+    reward_path: str
+    resume_step: int
+    resume_state: dict | None
+
+
+def _prepare_opd_train(spec=None) -> _PreparedOpdTrain:
     from flash.content.multimodal import (
         image_teacher_prompt_messages,
         normalize_prompt_images,
@@ -2292,7 +2354,43 @@ def run_opd_train(spec=None) -> None:
     update_horizon = resolve_update_horizon(derived_steps, knobs.max_steps)
     validate_save_steps(knobs.save_at_steps, update_horizon)
     prompt_pool_fingerprint = _prompt_pool_fingerprint(prompts)
+    return _PreparedOpdTrain(
+        spec=spec,
+        env=env,
+        multi_turn=multi_turn,
+        max_turns=max_turns,
+        knobs=knobs,
+        model_id=model_id,
+        model_revision=model_revision,
+        structured_outputs=structured_outputs,
+        model_vocab_size=model_vocab_size,
+        started_at=started_at,
+        teacher=teacher,
+        tokenizer=tokenizer,
+        thinking_prefill=thinking_prefill,
+        max_model_len=max_model_len,
+        prompt_budget=prompt_budget,
+        prompts=prompts,
+        dropped_long=dropped_long,
+        download_seconds=download_seconds,
+        eos_token_ids=eos_token_ids,
+        prompts_per_step=prompts_per_step,
+        update_horizon=update_horizon,
+        prompt_pool_fingerprint=prompt_pool_fingerprint,
+        multimodal=multimodal,
+    )
 
+
+def _prepare_opd_verl(prepared: _PreparedOpdTrain) -> _PreparedOpdVerl:
+    knobs = prepared.knobs
+    model_id = prepared.model_id
+    model_revision = prepared.model_revision
+    multimodal = prepared.multimodal
+    prompt_pool_fingerprint = prepared.prompt_pool_fingerprint
+    prompts = prepared.prompts
+    prompts_per_step = prepared.prompts_per_step
+    spec = prepared.spec
+    update_horizon = prepared.update_horizon
     workdir = os.path.join("/tmp", "flash-opd-verl", _w.RUN_ID, f"seed-{_w.SEED}")
     shutil.rmtree(workdir, ignore_errors=True)
     data_dir = os.path.join(workdir, "data")
@@ -2447,6 +2545,98 @@ def run_opd_train(spec=None) -> None:
         prompt_pool_fingerprint=prompt_pool_fingerprint,
         update_horizon=update_horizon,
     )
+    return _PreparedOpdVerl(
+        workdir=workdir,
+        shim_dir=shim_dir,
+        local_dir=local_dir,
+        export_root=export_root,
+        mutation_failure_path=mutation_failure_path,
+        score_delivery_failure_path=score_delivery_failure_path,
+        abandonment_failure_path=abandonment_failure_path,
+        resample_failure_path=resample_failure_path,
+        cycle_commit_failure_path=cycle_commit_failure_path,
+        train_file=train_file,
+        val_file=val_file,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        target_modules=target_modules,
+        warmstart_adapter=warmstart_adapter,
+        python_bin=python_bin,
+        model_path=model_path,
+        gpu_count=gpu_count,
+        save_freq=save_freq,
+        loggers=loggers,
+        project_name=project_name,
+        experiment_name=experiment_name,
+        caps=caps,
+        gdn_hybrid=gdn_hybrid,
+        fp8_kv=fp8_kv,
+        enforce_eager=enforce_eager,
+        attention_backend=attention_backend,
+        mm_encoder_attn_backend=mm_encoder_attn_backend,
+        entry_path=entry_path,
+        reward_path=reward_path,
+        resume_step=resume_step,
+        resume_state=resume_state,
+    )
+
+
+def _execute_opd_train(prepared: _PreparedOpdTrain, verl: _PreparedOpdVerl) -> None:
+    spec = prepared.spec
+    env = prepared.env
+    multi_turn = prepared.multi_turn
+    max_turns = prepared.max_turns
+    knobs = prepared.knobs
+    model_id = prepared.model_id
+    model_revision = prepared.model_revision
+    structured_outputs = prepared.structured_outputs
+    model_vocab_size = prepared.model_vocab_size
+    started_at = prepared.started_at
+    teacher = prepared.teacher
+    tokenizer = prepared.tokenizer
+    thinking_prefill = prepared.thinking_prefill
+    max_model_len = prepared.max_model_len
+    prompt_budget = prepared.prompt_budget
+    prompts = prepared.prompts
+    dropped_long = prepared.dropped_long
+    download_seconds = prepared.download_seconds
+    eos_token_ids = prepared.eos_token_ids
+    prompts_per_step = prepared.prompts_per_step
+    update_horizon = prepared.update_horizon
+    prompt_pool_fingerprint = prepared.prompt_pool_fingerprint
+    multimodal = prepared.multimodal
+    workdir = verl.workdir
+    shim_dir = verl.shim_dir
+    local_dir = verl.local_dir
+    export_root = verl.export_root
+    mutation_failure_path = verl.mutation_failure_path
+    score_delivery_failure_path = verl.score_delivery_failure_path
+    abandonment_failure_path = verl.abandonment_failure_path
+    resample_failure_path = verl.resample_failure_path
+    cycle_commit_failure_path = verl.cycle_commit_failure_path
+    train_file = verl.train_file
+    val_file = verl.val_file
+    lora_rank = verl.lora_rank
+    lora_alpha = verl.lora_alpha
+    target_modules = verl.target_modules
+    warmstart_adapter = verl.warmstart_adapter
+    python_bin = verl.python_bin
+    model_path = verl.model_path
+    gpu_count = verl.gpu_count
+    save_freq = verl.save_freq
+    loggers = verl.loggers
+    project_name = verl.project_name
+    experiment_name = verl.experiment_name
+    caps = verl.caps
+    gdn_hybrid = verl.gdn_hybrid
+    fp8_kv = verl.fp8_kv
+    enforce_eager = verl.enforce_eager
+    attention_backend = verl.attention_backend
+    mm_encoder_attn_backend = verl.mm_encoder_attn_backend
+    entry_path = verl.entry_path
+    reward_path = verl.reward_path
+    resume_step = verl.resume_step
+    resume_state = verl.resume_state
     bridge = _TeacherAlignmentBridge(
         prompts=prompts,
         tokenizer=tokenizer,
@@ -2791,3 +2981,10 @@ def run_opd_train(spec=None) -> None:
         )
     finally:
         bridge.close()
+
+
+def run_opd_train(spec=None) -> None:
+    """Run flash OPD through verl's native rollout and weight-sync path."""
+    prepared = _prepare_opd_train(spec)
+    verl = _prepare_opd_verl(prepared)
+    _execute_opd_train(prepared, verl)

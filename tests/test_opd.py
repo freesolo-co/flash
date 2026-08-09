@@ -582,9 +582,9 @@ def test_opd_validates_dynamic_image_compatibility_before_gpu_wait():
     # an incompatible model must fail before any paid GPU work starts.
     import inspect
 
-    from flash.engine.worker.opd_train import run_opd_train
+    from flash.engine.worker.opd_train import _prepare_opd_train
 
-    source = inspect.getsource(run_opd_train)
+    source = inspect.getsource(_prepare_opd_train)
     validation = 'validate_multimodal_training(model_id, "opd")'
 
     assert source.index(validation) < source.index("_probe_gpu_in_subprocess(")
@@ -1162,7 +1162,7 @@ def test_opd_worker_fp8_kv_flag_matches_the_sizing_assumption():
 
     from flash.engine.worker import opd_train
 
-    src = inspect.getsource(opd_train.run_opd_train)
+    src = inspect.getsource(opd_train._prepare_opd_verl)
     assert "model_is_gdn_hybrid(model_id, revision=model_revision)" in src
     assert "fp8_kv = _cc_ok and not gdn_hybrid" in src
     assert "get_device_capability() >= (8, 9)" in src

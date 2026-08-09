@@ -967,9 +967,9 @@ def test_failure_accounting_metadata_uses_trl_skip_reason_names():
 def test_write_train_meta_integrates_canonical_failure_accounting_metadata():
     import inspect
 
-    from flash.engine.worker.opd_train import run_opd_train
+    from flash.engine.worker.opd_train import _execute_opd_train
 
-    source = inspect.getsource(run_opd_train)
+    source = inspect.getsource(_execute_opd_train)
     write_train_meta_source = source[source.index("_w.write_train_meta(") :]
 
     assert "**_failure_accounting_metadata(final_accounting)" in write_train_meta_source
@@ -2832,7 +2832,7 @@ def test_the_watcher_marks_every_step_processed_but_publishes_only_required_ones
 def test_the_final_deployable_publish_is_not_suppressed_by_the_processed_marker():
     # final_save_due applies only when save_at_steps is empty, while the watcher publishes only
     # requested steps. the paths are disjoint, so processed_steps cannot suppress the final publish.
-    source = inspect.getsource(opd_train.run_opd_train)
+    source = inspect.getsource(opd_train._execute_opd_train)
     assert "final_save_due(final_step, knobs.save_at_steps)" in source
     assert "final_step not in watcher.processed_steps" not in source
 
@@ -5026,7 +5026,9 @@ def test_overrides_gate_rollout_enforce_eager_on_hardware():
 def test_the_resolved_eager_flag_reaches_the_opd_verl_config():
     # the string assertions above pass against a resolver whose answer is never carried into the
     # config, which is exactly the shape of the bug this fixes. pin the wiring.
-    built = inspect.getsource(opd_train.run_opd_train)
+    built = inspect.getsource(opd_train._prepare_opd_verl) + inspect.getsource(
+        opd_train._execute_opd_train
+    )
     # one probe now feeds both eager and the attention pins, so the call is bound to a name rather
     # than nested inline. assert the resolver still consumes THAT probe, not a second one.
     assert "verl_cc = verl_device_capability(caps)" in built
@@ -5065,7 +5067,11 @@ def test_both_ray_rollouts_pin_blackwell_attention_from_the_same_resolver():
     # way rather than trusting opd alone.
     for module, source in (
         ("rl_train", inspect.getsource(rl_train.run_rl_train)),
-        ("opd_train", inspect.getsource(opd_train.run_opd_train)),
+        (
+            "opd_train",
+            inspect.getsource(opd_train._prepare_opd_verl)
+            + inspect.getsource(opd_train._execute_opd_train),
+        ),
     ):
         # the resolver must be CALLED and its second return value must be carried onward. the two
         # trainers spell the handoff differently (rl_train passes it as a kwarg into
@@ -5086,7 +5092,11 @@ def test_both_ray_rollouts_resolve_eager_from_the_same_hardware_probe():
     # only one trainer is how this reached production in the first place.
     for module, source in (
         ("rl_train", inspect.getsource(rl_train.run_rl_train)),
-        ("opd_train", inspect.getsource(opd_train.run_opd_train)),
+        (
+            "opd_train",
+            inspect.getsource(opd_train._prepare_opd_verl)
+            + inspect.getsource(opd_train._execute_opd_train),
+        ),
     ):
         assert "resolve_rollout_enforce_eager(" in source, module
         # every capability question rides ONE child probe per run; the eager decision reads that
@@ -5110,7 +5120,7 @@ def test_overrides_pin_the_rollout_resident_for_sleep_unsupported_models():
 def test_the_resolved_sleep_flag_reaches_the_opd_verl_config():
     # the assertions above pass against a resolver whose answer never reaches the config, which is
     # the exact shape of the bug this fixes. pin the wiring, not just the string.
-    built = inspect.getsource(opd_train.run_opd_train)
+    built = inspect.getsource(opd_train._execute_opd_train)
     assert '"sleep_unsupported": rollout_sleep_unsupported(model_id),' in built
 
 
@@ -5599,9 +5609,9 @@ def test_deterministic_seed_uses_every_rollout_identity_component():
 def test_train_meta_records_the_optimizer_steps_that_actually_produced_a_loss():
     import inspect
 
-    from flash.engine.worker.opd_train import run_opd_train
+    from flash.engine.worker.opd_train import _execute_opd_train
 
-    notes = inspect.getsource(run_opd_train)
+    notes = inspect.getsource(_execute_opd_train)
     notes = notes[notes.index("_w.write_train_meta(") :]
     # `steps` is the REQUESTED horizon. a step whose batch carried no teacher signal never applies
     # an update, so reporting the horizon as the work done would overstate a partly-starved run.
@@ -5617,9 +5627,9 @@ def test_worker_filters_over_budget_prompts_before_downloading_the_weights():
     """
     import inspect
 
-    from flash.engine.worker.opd_train import run_opd_train
+    from flash.engine.worker.opd_train import _prepare_opd_train
 
-    source = inspect.getsource(run_opd_train)
+    source = inspect.getsource(_prepare_opd_train)
     budget_raise = source.index('raise RuntimeError("every OPD prompt exceeds the configured')
     prefetch = source.index("_w.prefetch_model(")
     assert budget_raise < prefetch
@@ -5630,9 +5640,9 @@ def test_worker_filters_over_budget_prompts_before_downloading_the_weights():
 def test_worker_refuses_to_publish_a_loss_curve_shorter_than_the_final_checkpoint():
     import inspect
 
-    from flash.engine.worker.opd_train import run_opd_train
+    from flash.engine.worker.opd_train import _execute_opd_train
 
-    source = inspect.getsource(run_opd_train)
+    source = inspect.getsource(_execute_opd_train)
     # record_step only checks that each metric line FOLLOWS the previous one, so it cannot notice a
     # MISSING TRAILING metric: on_line silently skips any step-tagged line whose loss it cannot
     # parse, and no later step ever arrives to trip the sequence check. that leaves a curve of
@@ -5650,9 +5660,9 @@ def test_worker_refuses_to_publish_a_loss_curve_shorter_than_the_final_checkpoin
 def test_train_meta_reports_the_teacher_call_shape_only_where_one_is_enforced():
     import inspect
 
-    from flash.engine.worker.opd_train import run_opd_train
+    from flash.engine.worker.opd_train import _execute_opd_train
 
-    notes = inspect.getsource(run_opd_train)
+    notes = inspect.getsource(_execute_opd_train)
     notes = notes[notes.index("_w.write_train_meta(") :]
     # only single-turn text uses the serial batcher; multimodal and multi-turn use bridge threads.
     # report at most the samples one step can produce.
@@ -5718,9 +5728,9 @@ def test_text_teacher_batcher_scores_one_batch_at_a_time():
 def test_worker_structured_validator_runs_before_model_download():
     import inspect
 
-    from flash.engine.worker.opd_train import run_opd_train
+    from flash.engine.worker.opd_train import _prepare_opd_train
 
-    source = inspect.getsource(run_opd_train)
+    source = inspect.getsource(_prepare_opd_train)
     assert source.index("validate_opd_structured_outputs(") < source.index("_w.prefetch_model(")
     assert "resolve_vocab_size" not in source
 
@@ -5870,7 +5880,7 @@ def test_opd_line_handler_reads_the_loss_through_the_shared_parser():
 
     import flash.engine.worker.opd_train as ov
 
-    source = textwrap.dedent(inspect.getsource(ov.run_opd_train))
+    source = textwrap.dedent(inspect.getsource(ov._execute_opd_train))
     handler = next(
         node
         for node in ast.walk(ast.parse(source))
@@ -6087,7 +6097,7 @@ def test_opd_renders_each_prompt_once_so_a_stateful_environment_is_not_run_twice
 
     from flash.engine.worker import opd_train as opd_mod
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(opd_mod.run_opd_train)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(opd_mod._prepare_opd_train)))
     renders = [
         node
         for node in ast.walk(tree)
