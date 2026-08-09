@@ -28,6 +28,9 @@ from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
 _MAX_LOGPROB_ROUNDING_ERROR = 1e-6
 _BROKER_PROVIDER_TIMEOUT_CEILING_S = 90.0
 _DEFAULT_TEACHER_TIMEOUT_S = 105.0
+# the token every managed vision teacher's chat template uses to close a turn. it bounds the text
+# we supplied: the provider's own generation header comes after it.
+_TURN_END_TOKEN = "<|im_end|>"
 # imported rather than redeclared: the renderer rejects both markers from source text, and the
 # drop guard below counts pad runs. if the two ever named different strings, text-origin runs
 # would silently re-enter the count the guard depends on.
@@ -414,14 +417,17 @@ def _chat_messages(
     return output
 
 
-def _contiguous_run_starts(values: list[int], target: list[int]) -> list[int]:
-    if not target or len(target) > len(values):
-        return []
-    return [
-        start
-        for start in range(len(values) - len(target) + 1)
-        if values[start : start + len(target)] == target
-    ]
+def _supplied_turn_end(values: list[int], turn_end_token_id: int) -> int | None:
+    """Locate the terminator closing the assistant turn that carries the completion.
+
+    the completion is the last thing inside the LAST supplied message, so its turn terminator is
+    the last one in the rendered prompt. anything after it is template the provider appended for
+    its own generation turn, never content we supplied.
+    """
+    for index in range(len(values) - 1, -1, -1):
+        if values[index] == turn_end_token_id:
+            return index
+    return None
 
 
 def _image_pad_runs(values: list[int], image_pad_token_id: int) -> int:
@@ -448,6 +454,7 @@ def _normalize_multimodal_response(
     completion_text: str,
     image_count: int,
     image_pad_token_id: int,
+    turn_end_token_id: int,
 ) -> TeacherScore:
     choices = response.get("choices")
     if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
@@ -462,21 +469,33 @@ def _normalize_multimodal_response(
             "silently dropped an image"
         )
     local_completion_ids = [token.token_id for token in encoded_completion]
-    matches = _contiguous_run_starts(remote_ids, local_completion_ids)
-    if not matches:
+    # anchor to the terminator of the supplied assistant turn, NOT to the last matching run. the
+    # chat route renders its own "<|im_start|>assistant\n" generation header after our final
+    # message, and those template ids collide with ordinary completions: a completion of
+    # "assistant" is a single id that occurs both where the student actually answered and inside
+    # that trailing header, so picking the last run scores fixed template tokens as the model's
+    # answer -- silently, since every structural check still passes. confirmed live: the provider
+    # returns [..., 77091, 151645, 198, 151644, 77091, 198] for that completion.
+    turn_end = _supplied_turn_end(remote_ids, turn_end_token_id)
+    if turn_end is None:
         raise _permanent(
-            "teacher response must contain the completion token ids as a contiguous run; "
-            "found no match"
+            "teacher response does not terminate the supplied assistant turn; "
+            "cannot locate the completion token ids"
+        )
+    start = turn_end - len(local_completion_ids)
+    if start < 0 or remote_ids[start:turn_end] != local_completion_ids:
+        # fail closed rather than score a guess. the completion ends its turn by construction, so
+        # a mismatch means the rendered ids are not what we encoded -- a boundary merge with the
+        # template's own "assistant\n" (a completion starting with "\n" merges into it), or a
+        # provider-side template change. scoring the wrong span is worse than retrying.
+        raise _permanent(
+            "teacher response does not end the supplied assistant turn with the completion "
+            "token ids; cannot attribute prompt logprobs to the sampled tokens"
         )
     input_tokens, output_tokens = _validated_usage(response, len(remote_ids))
     scores = _token_keyed_scores(response.get("prompt_logprobs"), remote_ids)
     if scores is None:
         raise _permanent("teacher response is missing top-level prompt_logprobs")
-    # the LAST occurrence, not the only one. _chat_messages always appends the completion to the
-    # trailing assistant turn, so it is the final run by construction. requiring global uniqueness
-    # instead would permanently fail valid rollouts whose prompt happens to quote the answer -- a
-    # list-style prompt ("The options are:\nsquare\ncircle") answered with "square" matches twice.
-    start = matches[-1]
     completion_scores = scores[start : start + len(encoded_completion)]
     tokens = _completion_tokens(
         encoded_completion,
@@ -713,6 +732,11 @@ class TeacherClient:
             raise _permanent(
                 "managed vision teacher tokenizer must encode the image-pad marker as one token"
             )
+        turn_end_tokens = self.tokenizer.encode(_TURN_END_TOKEN)
+        if len(turn_end_tokens) != 1:
+            raise _permanent(
+                "managed vision teacher tokenizer must encode the turn terminator as one token"
+            )
         messages = _chat_messages(
             prompt_messages,
             completion_text,
@@ -737,6 +761,7 @@ class TeacherClient:
             completion_text=completion_text,
             image_count=len(image_data_uris),
             image_pad_token_id=image_pad_tokens[0].token_id,
+            turn_end_token_id=turn_end_tokens[0].token_id,
         )
 
     def score_many(self, items: list[tuple[str, str]]) -> list[TeacherScore]:

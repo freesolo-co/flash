@@ -32,6 +32,8 @@ class _MultimodalTokenizer:
     def encode(self, text):
         if text == "<|image_pad|>":
             return [EncodedTeacherToken(151655, 0, len(text))]
+        if text == "<|im_end|>":
+            return [EncodedTeacherToken(151645, 0, len(text))]
         if text == "red":
             return [
                 EncodedTeacherToken(201, 0, 1),
@@ -83,7 +85,10 @@ def _positional_response():
 
 
 def _multimodal_response(prompt_ids=None):
-    prompt_ids = prompt_ids or [10, 151655, 11, 201, 202]
+    # the completion sits at the END of the supplied assistant turn, closed by <|im_end|> (151645)
+    # and followed by the chat template's own generation header. that trailing header is what the
+    # live route really returns, and scoring must not mistake it for the completion.
+    prompt_ids = prompt_ids or [10, 151655, 11, 201, 202, 151645, 198]
     return {
         "choices": [{"index": 0, "token_ids": [999], "message": {"role": "assistant"}}],
         "prompt_token_ids": prompt_ids,
@@ -348,11 +353,11 @@ def test_multimodal_scoring_builds_chat_body_and_reads_top_level_prompt_scores()
         ("r", 0, 1, -0.30000000000000004),
         ("ed", 1, 3, -0.4),
     ]
-    assert (scored.input_tokens, scored.output_tokens) == (5, 1)
+    assert (scored.input_tokens, scored.output_tokens) == (7, 1)
 
 
 def test_multimodal_scoring_rejects_prompt_ids_unchanged_by_image():
-    response = _multimodal_response([10, 11, 201, 202])
+    response = _multimodal_response([10, 11, 201, 202, 151645, 198])
 
     with pytest.raises(TeacherError, match="silently dropped") as error:
         _multimodal_client(response).score_many_multimodal(
@@ -369,9 +374,9 @@ def test_multimodal_scoring_rejects_prompt_ids_unchanged_by_image():
 
 
 def test_multimodal_completion_ids_must_be_present():
-    response = _multimodal_response([10, 151655, 11, 203, 204])
+    response = _multimodal_response([10, 151655, 11, 203, 204, 151645, 198])
 
-    with pytest.raises(TeacherError, match="found no match") as error:
+    with pytest.raises(TeacherError, match="does not end the supplied assistant turn") as error:
         _multimodal_client(response).score_many_multimodal(
             [
                 (
@@ -385,11 +390,11 @@ def test_multimodal_completion_ids_must_be_present():
     assert error.value.permanent is True
 
 
-def test_multimodal_scoring_anchors_to_the_trailing_completion_run():
+def test_multimodal_scoring_anchors_to_the_supplied_turn_not_a_quoting_prompt():
     # a valid rollout whose PROMPT quotes the answer: the completion ids appear twice. requiring
-    # global uniqueness would permanently fail it, so anchor to the trailing run -- the one
-    # _chat_messages appends. the scored logprobs must come from that occurrence, not the first.
-    prompt_ids = [10, 151655, 201, 202, 11, 201, 202]
+    # global uniqueness would permanently fail it, so anchor to the turn the completion closes.
+    # the scored logprobs must come from that occurrence, not the earlier quote.
+    prompt_ids = [10, 151655, 201, 202, 11, 201, 202, 151645, 198]
     scored = _multimodal_client(_multimodal_response(prompt_ids)).score_many_multimodal(
         [
             (
@@ -405,11 +410,55 @@ def test_multimodal_scoring_anchors_to_the_trailing_completion_run():
     assert [round(token.logprob, 4) for token in scored.tokens] == [-0.5, -0.6]
 
 
+def test_multimodal_scoring_ignores_the_trailing_generation_header():
+    # the defect this anchoring exists for. the chat route appends its own
+    # "<|im_start|>assistant\n" after our supplied turn, and a completion can collide with those
+    # template ids -- confirmed live, where a completion of "assistant" returned
+    # [..., 77091, 151645, 198, 151644, 77091, 198]. picking the LAST matching run scores fixed
+    # template tokens as the model's answer, and every structural check still passes, so the
+    # corruption is silent. the completion here is a single id (77091) that appears both where the
+    # student answered (index 3) and inside the trailing header (index 6).
+    class _CollidingTokenizer:
+        def encode(self, text):
+            table = {
+                "<|image_pad|>": [EncodedTeacherToken(151655, 0, len(text))],
+                "<|im_end|>": [EncodedTeacherToken(151645, 0, len(text))],
+                "assistant": [EncodedTeacherToken(77091, 0, len("assistant"))],
+            }
+            if text in table:
+                return list(table[text])
+            raise AssertionError(f"unexpected tokenizer input: {text!r}")
+
+    prompt_ids = [10, 151655, 11, 77091, 151645, 198, 151644, 77091, 198]
+    client = TeacherClient(
+        "capability",
+        "https://broker.example",
+        "parasail-qwen3vl-8b-instruct",
+        tokenizer=_CollidingTokenizer(),
+    )
+    client._post = lambda path, body: _multimodal_response(prompt_ids)
+
+    scored = client.score_many_multimodal(
+        [
+            (
+                [{"role": "user", "content": "<|media_pad|>"}],
+                "assistant",
+                ["data:image/png;base64,aW1hZ2U="],
+                False,
+            )
+        ]
+    )[0]
+
+    # logprob is -0.1 * index: the real answer sits at index 3 (-0.3), the header's copy at
+    # index 7 (-0.7). asserting the VALUE is what distinguishes the two.
+    assert [round(token.logprob, 4) for token in scored.tokens] == [-0.3]
+
+
 def test_multimodal_scoring_rejects_a_partially_dropped_image():
     # two images supplied, one expanded. a raw pad COUNT cannot catch this -- the surviving image
     # alone contributes more pads than the image count -- so this is the case that proves the
     # guard counts per-image runs.
-    prompt_ids = [10, 151655, 151655, 151655, 11, 201, 202]
+    prompt_ids = [10, 151655, 151655, 151655, 11, 201, 202, 151645, 198]
     response = _multimodal_response(prompt_ids)
 
     with pytest.raises(TeacherError, match="fewer images") as error:
@@ -429,7 +478,7 @@ def test_multimodal_scoring_rejects_a_partially_dropped_image():
 def test_multimodal_scoring_admits_two_genuinely_expanded_images():
     # the paired control: the same two-image request, both expanded, must be ADMITTED. a guard
     # that rejects valid traffic is as broken as one that never fires.
-    prompt_ids = [10, 151655, 151655, 11, 151655, 151655, 12, 201, 202]
+    prompt_ids = [10, 151655, 151655, 11, 151655, 151655, 12, 201, 202, 151645, 198]
     scored = _multimodal_client(_multimodal_response(prompt_ids)).score_many_multimodal(
         [
             (
@@ -488,6 +537,8 @@ def test_multimodal_completion_is_encoded_after_its_assistant_prefix():
         def encode(self, text):
             if text == "<|image_pad|>":
                 return [EncodedTeacherToken(151655, 0, len(text))]
+            if text == "<|im_end|>":
+                return [EncodedTeacherToken(151645, 0, len(text))]
             table = {
                 "<think>\n": [EncodedTeacherToken(151667, 0, 7), EncodedTeacherToken(198, 7, 8)],
                 "\nred": [EncodedTeacherToken(198, 0, 1), EncodedTeacherToken(1151, 1, 4)],
@@ -511,7 +562,7 @@ def test_multimodal_completion_is_encoded_after_its_assistant_prefix():
     # the provider's rendered prompt contains the MERGED ids [271, 1151]; the standalone encoding
     # [198, 1151] does not occur anywhere in it. scoring must still find the completion, so this
     # only passes if the request path encodes in context rather than in isolation.
-    prompt_ids = [10, 151655, 11, 271, 1151]
+    prompt_ids = [10, 151655, 11, 271, 1151, 151645, 198]
     client._post = lambda path, body: _multimodal_response(prompt_ids)
 
     scored = client.score_many_multimodal(
