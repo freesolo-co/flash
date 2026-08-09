@@ -18,7 +18,7 @@ from __future__ import annotations
 import os
 import random
 import tempfile
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -41,6 +41,7 @@ def collect_for_submit(
     *,
     runtime_secrets: Mapping[str, str] | None = None,
     debug: bool = False,
+    on_environment_loaded: Callable[[], None] | None = None,
 ) -> dict[str, Any] | None:
     """measured rollout aggregates for ``spec``, or None when nothing could be measured.
 
@@ -49,6 +50,11 @@ def collect_for_submit(
     the env code run here is the same code the worker runs: an env whose reward() reads a declared
     key would otherwise raise locally, and the broad except below would quietly return the quote to
     the cap. they are never persisted and never travel in the evidence, which is aggregates only.
+
+    ``on_environment_loaded`` fires once the user's module has been imported, before any of it is
+    called. returning None does NOT mean nothing ran: a multi-turn env, a dataset with no samplable
+    prompts, or a dead sampler all execute the user's code first. the caller reports what ran from
+    this hook rather than inferring it from the payload.
     """
     if spec.algorithm not in ("grpo", "opd"):
         return None
@@ -65,7 +71,7 @@ def collect_for_submit(
 
     try:
         with _runtime_secret_env(spec, runtime_secrets), _restored_host_rng():
-            return _collect(client, spec)
+            return _collect(client, spec, on_environment_loaded=on_environment_loaded)
     except Exception:
         if debug:
             raise
@@ -132,7 +138,9 @@ def unsamplable_reason(spec) -> str:
     return ""
 
 
-def _collect(client, spec) -> dict[str, Any] | None:
+def _collect(
+    client, spec, *, on_environment_loaded: Callable[[], None] | None = None
+) -> dict[str, Any] | None:
     from flash.engine.profiling.rollout_evidence import collect_rollout_evidence
     from flash.envs.loader import load_freesolo_environment
     from flash.envs.pull import pull_environment_package_from_archive
@@ -144,6 +152,10 @@ def _collect(client, spec) -> dict[str, Any] | None:
         # absolute, so the loader takes its local-file branch. a relative dir matches the managed-slug
         # pattern and would resolve remotely, re-downloading what was just extracted.
         environment = load_freesolo_environment(str(entrypoint), **(spec.environment.params or {}))
+        # the user's module has executed by now. every return below this point is a decline, and
+        # each one still ran their code -- so the caller is told here, not from the return value.
+        if on_environment_loaded is not None:
+            on_environment_loaded()
         if getattr(environment, "multi_turn", False):
             # the worker generates an assistant turn per step_episode call and trains on the whole
             # transcript. one hosted completion is the FIRST turn only, so its token mean
@@ -197,6 +209,9 @@ def _restored_host_rng() -> Iterator[None]:
     this is a cli process that keeps running after the measurement -- it goes on to submit the run.
     seeding for the env's benefit and leaving the seed in place would make every later random draw
     in this process deterministic as a side effect of asking for a quote.
+
+    every generator _seed_environment_rngs seeds is restored here, torch included. restoring only
+    some of them would leave the process half-seeded, which is the same defect in a subset.
     """
     python_state = random.getstate()
     numpy_state = None
@@ -206,6 +221,8 @@ def _restored_host_rng() -> Iterator[None]:
         numpy_state = np.random.get_state()
     except ImportError:
         pass
+    torch = _optional_torch()
+    torch_state = torch.get_rng_state() if torch is not None else None
     try:
         yield
     finally:
@@ -214,13 +231,43 @@ def _restored_host_rng() -> Iterator[None]:
             import numpy as np
 
             np.random.set_state(numpy_state)
+        if torch_state is not None:
+            torch.set_rng_state(torch_state)
 
 
 def _seed_environment_rngs(spec) -> None:
-    """seed the generators the workers seed, so this samples the rows training will see."""
+    """seed the generators the workers seed, so this samples the rows training will see.
+
+    the workers call seed_training_rngs, which also seeds torch. env code that draws its dataset
+    through torch would otherwise select rows from this process's incidental torch state: measured,
+    two cli processes quoting the same spec.seed picked different rows ([44, 19, 93, 90, 71] vs
+    [52, 74, 73, 81, 76]) where the worker was stable -- a profile describing work the run never does.
+
+    cpu generators only. the worker also seeds cuda because model init consumes it, and this
+    deliberately never reaches model init -- the client host generally has no gpu at all.
+    """
     from flash.engine.worker.runtime.rng import seed_host_rngs
 
-    seed_host_rngs(int(getattr(spec, "seed", 0) or 0))
+    seed = int(getattr(spec, "seed", 0) or 0)
+    seed_host_rngs(seed)
+    torch = _optional_torch()
+    if torch is not None:
+        torch.manual_seed(seed)
+
+
+def _optional_torch():
+    """the torch module, or None where it is not installed.
+
+    torch is not a cli dependency, so this stays optional in the same shape ``seed_host_rngs`` uses
+    for numpy. the import cost is irrelevant on this path: by the time it runs, the caller has
+    already pulled the environment package over the network and is about to spend up to
+    SAMPLING_DEADLINE_S on hosted draws.
+    """
+    try:
+        import torch
+    except ImportError:
+        return None
+    return torch
 
 
 def _training_population(spec, dataset):

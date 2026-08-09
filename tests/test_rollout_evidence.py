@@ -740,35 +740,37 @@ def test_no_stop_field_is_sent_when_the_run_configures_none(monkeypatch):
     assert "stop" not in captured["body"]
 
 
-@pytest.mark.parametrize(
-    ("reward_samples", "must_say", "must_not_say"),
-    [
-        (3, "reward() were run", "was NOT called"),
-        (0, "was NOT called", "external scorer was really called"),
-    ],
-)
-def test_the_dry_run_claims_reward_ran_only_when_it_did(
-    reward_samples, must_say, must_not_say, capsys
-):
-    """Grading is skipped for a multi-turn or thread-unsafe env, and for one whose gold completions
-    cannot be read -- evidence still arrives from generation sampling alone. Telling a user a paid
-    external scorer was called when it was not is the one claim here they could act on wrongly."""
+def test_the_dry_run_never_claims_a_paid_scorer_was_called():
+    """reward() is no longer run on the client for any algorithm, so the notice must not imply it.
+
+    Telling a user a paid external scorer was called when it was not is the one claim in this line
+    they could act on wrongly -- and it also tells them grading cost is absent from the quote.
+    """
     from flash.cli.commands import _dry_run_preview_line
 
     line = _dry_run_preview_line(
         algorithm="grpo",
         affordability_verified=True,
-        rollout_evidence=_evidence(reward_samples=reward_samples),
+        rollout_evidence=_evidence(),
+        environment_was_executed=True,
     )
-    assert must_say in line
-    assert must_not_say not in line
+    assert "reward() was NOT called" in line
+    assert "external scorer was really called" not in line
 
 
-def test_the_dry_run_says_nothing_ran_when_there_was_no_measurement():
+def test_the_dry_run_says_nothing_ran_when_profiling_never_started():
+    """The genuinely-untouched path: no sampler key, or a config profiling declines before loading.
+
+    Stated explicitly rather than relying on the parameter's default, so this keeps asserting about
+    the case where the user's module really was never imported.
+    """
     from flash.cli.commands import _dry_run_preview_line
 
     line = _dry_run_preview_line(
-        algorithm="grpo", affordability_verified=True, rollout_evidence=None
+        algorithm="grpo",
+        affordability_verified=True,
+        rollout_evidence=None,
+        environment_was_executed=False,
     )
     assert "did NOT import or run your environment.py" in line
 
@@ -1506,3 +1508,149 @@ def test_generation_pricing_stays_bounded_by_the_cap_when_the_actor_drifts():
         completion_tokens_max=cap,
     )
     assert rollout_profile_from_evidence(spec, incoherent, producer_version=VERSION) is None
+
+
+def test_a_draw_starting_near_the_deadline_cannot_overrun_the_sampling_budget(monkeypatch):
+    """The overall deadline must bound the WALL TIME of a pass, not merely when a draw may start.
+
+    Checking the deadline only at the top of the loop let a draw begun just inside it stall for the
+    full per-request timeout, so a "bounded" pass ran for deadline + REQUEST_TIMEOUT_S in front of a
+    submit the user is waiting on. Asserting on the timeout handed to the request rather than on
+    elapsed time keeps this failable without making the suite sleep.
+    """
+    monkeypatch.setattr(rollout_sampler, "SAMPLING_DEADLINE_S", 4.0)
+    monkeypatch.setattr(rollout_sampler, "REQUEST_TIMEOUT_S", 180.0)
+
+    timeouts: list[float] = []
+    clock = {"now": 0.0}
+
+    def _fake_completion(**kwargs) -> RolloutSample | None:
+        timeouts.append(kwargs["timeout_s"])
+        # each draw consumes most of the budget, so the second one starts just inside the deadline.
+        clock["now"] += 3.9
+        # a failed draw, which is what keeps the loop going to the next attempt.
+        return None
+
+    monkeypatch.setattr(rollout_sampler.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(rollout_sampler, "_one_completion", _fake_completion)
+
+    rollout_sampler.sample_rollouts(
+        model="m",
+        prompts=[[{"role": "user", "content": "hi"}]],
+        rollouts=32,
+        max_completion_tokens=128,
+        temperature=None,
+        base_url="https://example.invalid/v1",
+        api_key="k",
+    )
+
+    assert timeouts, "the pass made no request at all"
+    # no single draw may be allowed to run past the moment the whole pass was due to stop.
+    assert timeouts[-1] == pytest.approx(0.1)
+    assert max(timeouts) <= rollout_sampler.SAMPLING_DEADLINE_S
+
+
+def test_the_measurement_seeds_the_generators_the_worker_seeds(monkeypatch):
+    """Env code may build its dataset through torch, which the workers seed and this did not.
+
+    Measured before the fix: two CLI processes quoting the same spec.seed selected different rows
+    ([44, 19, 93, 90, 71] vs [52, 74, 73, 81, 76]) because the profile inherited whatever torch
+    state the process happened to carry, while the worker was stable. The profile then describes
+    rows the run never trains on -- and still passes the trust gate.
+    """
+    torch = pytest.importorskip("torch")
+    from flash.cli.commands.rollout_profile import _seed_environment_rngs
+    from flash.engine.worker.runtime.rng import seed_training_rngs
+
+    def rows():
+        return torch.randperm(100)[:5].tolist()
+
+    drawn = []
+    for ambient in (0, 999):
+        torch.manual_seed(ambient)
+        _seed_environment_rngs(_spec(seed=7))
+        drawn.append(rows())
+
+    torch.manual_seed(12345)
+    seed_training_rngs(7)
+    from_worker = rows()
+
+    assert drawn[0] == drawn[1], "the profile still depends on incidental process rng state"
+    assert drawn[0] == from_worker, "the profile samples rows the worker would not"
+
+
+def test_measuring_does_not_leave_the_process_torch_seeded(monkeypatch):
+    """Seeding torch for the env's benefit must not make the rest of the CLI deterministic.
+
+    The process goes on to submit the run. Restoring python and numpy but not torch would leave the
+    same defect in a subset of the generators.
+    """
+    torch = pytest.importorskip("torch")
+    from flash.cli.commands.rollout_profile import _restored_host_rng, _seed_environment_rngs
+
+    def rows():
+        return torch.randperm(100)[:5].tolist()
+
+    torch.manual_seed(4242)
+    undisturbed = rows()
+
+    torch.manual_seed(4242)
+    with _restored_host_rng():
+        _seed_environment_rngs(_spec(seed=7))
+        rows()
+    after_measuring = rows()
+
+    assert after_measuring == undisturbed
+
+
+@pytest.mark.parametrize(
+    ("executed", "evidence", "must_say", "must_not_say"),
+    [
+        (True, {"completed_rollouts": 32}, "WAS imported locally", "did NOT import"),
+        (True, None, "no usable measurement came back", "did NOT import"),
+        (False, None, "did NOT import or run your environment.py", "WAS imported locally"),
+    ],
+)
+def test_the_dry_run_reports_whether_the_environment_ran_not_whether_it_measured(
+    executed, evidence, must_say, must_not_say
+):
+    """Profiling imports and runs the user's module BEFORE it can find the config unmeasurable.
+
+    A multi-turn env, a dataset with no samplable prompts, and a dead sampler all execute
+    environment.py and then return no evidence. Inferring execution from the payload told those
+    users their code had not been imported at all, which is the opposite of what happened.
+    """
+    from flash.cli.commands import _dry_run_preview_line
+
+    line = _dry_run_preview_line(
+        algorithm="grpo",
+        affordability_verified=True,
+        rollout_evidence=evidence,
+        environment_was_executed=executed,
+    )
+    assert must_say in line
+    assert must_not_say not in line
+
+
+def test_the_submit_path_learns_the_environment_ran_even_with_no_evidence(monkeypatch, tmp_path):
+    """The seam between profiling and the notice.
+
+    _collect returns None for a multi-turn env, so only the load hook can tell the caller the user's
+    code executed. Testing the notice alone leaves this uncovered: the hook never firing is silent,
+    and the dry run goes back to claiming nothing was imported.
+    """
+    from flash.cli.commands import _rollout_evidence_for
+
+    class _MultiTurn:
+        multi_turn = True
+
+        def dataset(self):  # pragma: no cover - declined before this is reached
+            raise AssertionError("a multi-turn env must not be measured")
+
+    client, _seen = _profiling_stubs(monkeypatch, tmp_path, _MultiTurn())
+    monkeypatch.setattr("flash.cli.commands.client_from_config", lambda: client, raising=False)
+
+    evidence, executed = _rollout_evidence_for(client, _spec())
+
+    assert evidence is None
+    assert executed is True

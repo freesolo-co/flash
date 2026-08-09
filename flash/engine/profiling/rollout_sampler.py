@@ -181,7 +181,13 @@ def sample_rollouts(
     # changed, so a dead endpoint still gives up after MAX_CONSECUTIVE_FAILURES draws.
     attempts = 0
     while len(collected) < rollouts:
-        if time.monotonic() >= deadline:
+        # the deadline bounds when a draw may START; this bounds how long it may RUN. checking only
+        # at the top lets a draw begun one second inside the deadline stall for the full request
+        # timeout, so the "bounded" pass takes deadline + REQUEST_TIMEOUT_S. measured against a
+        # stalling endpoint: 6.00s wall on a 4.0s deadline, which at production values is ~480s in
+        # front of a submit the user is waiting on.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             break
         # round-robin over ATTEMPTS: keeps one prompt from being redrawn just because an earlier
         # draw of it failed, which would concentrate the sample on whichever prompt is flakiest.
@@ -196,6 +202,7 @@ def sample_rollouts(
             base_url=base_url,
             api_key=api_key,
             stop_sequences=stop_sequences,
+            timeout_s=min(REQUEST_TIMEOUT_S, remaining),
         )
         if sample is None:
             failures += 1
@@ -221,8 +228,13 @@ def _one_completion(
     base_url: str,
     api_key: str,
     stop_sequences: Sequence[str] = (),
+    timeout_s: float = REQUEST_TIMEOUT_S,
 ) -> RolloutSample | None:
-    """one generation's token counts, or None when the draw failed for any reason."""
+    """one generation's token counts, or None when the draw failed for any reason.
+
+    ``timeout_s`` is the caller's REMAINING overall budget when that is tighter than the per-request
+    ceiling, so no single draw can carry the pass past its deadline.
+    """
     payload: dict[str, object] = {
         "model": model,
         # the env's own prompt_messages() output, roles intact. flattening a system turn into a
@@ -249,7 +261,7 @@ def _one_completion(
         },
     )
     try:
-        with _NO_REDIRECT_OPENER.open(request, timeout=REQUEST_TIMEOUT_S) as response:
+        with _NO_REDIRECT_OPENER.open(request, timeout=timeout_s) as response:
             body = json.load(response)
     except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
         return None

@@ -440,14 +440,24 @@ def _client_train_schema(authored_train_keys: frozenset[str]) -> dict:
 
 
 def _dry_run_preview_line(
-    *, algorithm: str, affordability_verified: bool, rollout_evidence: dict | None
+    *,
+    algorithm: str,
+    affordability_verified: bool,
+    rollout_evidence: dict | None,
+    environment_was_executed: bool = False,
 ) -> str:
     """What a dry run actually checked, and what it actually executed on this machine.
 
     Three-way, because what ran locally differs per path. sft required a matching workload profile
     to get this far, and that profile run already imported environment.py and tokenized the dataset,
-    so claiming otherwise would understate what has been checked and already billed. A measured
-    grpo/opd quote imported environment.py too. Only the unmeasured path ran nothing.
+    so claiming otherwise would understate what has been checked and already billed. A grpo/opd
+    quote that reached profiling imported environment.py too. Only the path that never ran it
+    locally ran nothing.
+
+    ``environment_was_executed`` is tracked separately from ``rollout_evidence`` because profiling
+    can execute the user's module and still return nothing -- a multi-turn env, no samplable
+    prompts, or an unreachable sampler. Both facts are things a user could act on: whether their
+    code ran here, and whether this price came from a measurement.
     """
     # the server fails open on a billing-infra problem, so "cost" is only in the validated list
     # when it was actually checked. absent key = a server that predates the signal, which is
@@ -459,24 +469,22 @@ def _dry_run_preview_line(
             "the workload profile this quote is built on; model load and gpu/training are "
             "first exercised on the worker after cold-start."
         )
-    elif rollout_evidence:
-        # whether reward() ALSO ran is a separate question from whether the env was imported.
-        # grading is skipped for a multi-turn or thread-unsafe env, and for one whose gold
-        # completions cannot be read, in which case the evidence still arrives from generation
-        # sampling alone. telling a user a paid external scorer was called when it was not is the
-        # one claim here they could act on wrongly, so it is read off what was actually measured.
-        graded = bool(rollout_evidence.get("reward_samples"))
-        ran = (
-            "dataset(), prompt_messages() and reward() were run on a small sample, so a "
-            "reward that calls an external scorer was really called"
-            if graded
-            else "dataset() and prompt_messages() were run on a small sample; reward() was "
-            "NOT called, so its grading cost is not in this quote"
+    elif environment_was_executed:
+        # what ran is reported from whether profiling EXECUTED, not from whether it produced a
+        # usable measurement. a multi-turn env, a dataset with no samplable prompts, or a dead
+        # sampler all import environment.py and run dataset() and then return no evidence -- and
+        # inferring execution from the payload told those users nothing had been imported at all.
+        priced = (
+            "and this quote is priced from the rollouts it measured"
+            if rollout_evidence
+            else "but no usable measurement came back, so this quote still uses the declared "
+            "completion cap"
         )
         environment = (
-            f"your environment.py WAS imported locally to measure this quote: {ran}. "
-            "worker imports, model load, and gpu/training are first exercised on the worker "
-            "after cold-start."
+            f"your environment.py WAS imported locally: dataset() and prompt_messages() were "
+            f"run on a small sample, {priced}. reward() was NOT called, so its grading cost is "
+            "not in this quote. worker imports, model load, and gpu/training are first "
+            "exercised on the worker after cold-start."
         )
     else:
         environment = (
@@ -493,7 +501,7 @@ def _dry_run_preview_line(
 
 def _rollout_evidence_for(
     client: ApiClient, spec, runtime_secrets: dict | None = None
-) -> dict | None:
+) -> tuple[dict | None, bool]:
     """Measured rollout aggregates for a grpo/opd submit, or None when nothing was measured.
 
     Advisory, and silent on every failure. The server re-derives the digest and re-applies the same
@@ -505,10 +513,22 @@ def _rollout_evidence_for(
     ``runtime_secrets`` are forwarded so the env code executed locally sees the same declared
     secrets the worker will; without them an external-judge reward() raises and the measurement is
     silently lost.
+
+    Returns the evidence and whether the user's environment.py was executed here. They are separate
+    facts: profiling imports and runs the module before it can discover that a config is not
+    measurable, so a None payload does not mean nothing ran.
     """
     from flash.cli.commands.rollout_profile import collect_for_submit
 
-    evidence = collect_for_submit(client, spec, runtime_secrets=runtime_secrets)
+    executed = False
+
+    def _executed() -> None:
+        nonlocal executed
+        executed = True
+
+    evidence = collect_for_submit(
+        client, spec, runtime_secrets=runtime_secrets, on_environment_loaded=_executed
+    )
     if evidence:
         logger.info(
             "measured %s rollouts for the quote: mean %.0f completion tokens (cap %s)",
@@ -516,7 +536,7 @@ def _rollout_evidence_for(
             evidence.get("completion_tokens_mean") or 0.0,
             spec.train.max_completion_tokens or "recipe default",
         )
-    return evidence
+    return evidence, executed
 
 
 def _raise_if_workload_profile_pending(client: ApiClient, exc: ApiError) -> None:
@@ -756,7 +776,9 @@ def cmd_train(args) -> int:
         runtime_secrets_from_local_env(args.config, keys=spec.environment.secrets) or None
     )
     _warn_if_wandb_requested_without_key(spec, runtime_secrets, dry_run=bool(args.dry_run))
-    rollout_evidence = _rollout_evidence_for(client, spec, runtime_secrets)
+    rollout_evidence, environment_was_executed = _rollout_evidence_for(
+        client, spec, runtime_secrets
+    )
     if args.dry_run:
         # dry-run runs submit-time server preflights without allocating a training gpu or charging
         # for training. a rejection surfaces as the server's error with exit status 1. for sft it
@@ -787,6 +809,7 @@ def cmd_train(args) -> int:
                 algorithm=spec.algorithm,
                 affordability_verified=affordability_verified,
                 rollout_evidence=rollout_evidence,
+                environment_was_executed=environment_was_executed,
             ),
             file=sys.stderr,
         )
