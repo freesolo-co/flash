@@ -286,7 +286,7 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # one the gdn probes were validated against; the main interpreter carrying the pin protects nothing
 # in here (/opt/verl-venv is built without --system-site-packages). Raising this ceiling means
 # re-validating the fla and causal_conv1d probes against the new line, not just bumping the number.
-ARG VERL_SPEC=verl[vllm]@git+https://github.com/freesolo-co/verl@1bea7d6825bbb9d2164e86e379b3680e7c53bb8a
+ARG VERL_SPEC=verl[vllm]@git+https://github.com/freesolo-co/verl@32d6200de81dcc9e97e3aa2ae4a2b3ba30d33e93
 ENV FLASH_VERL_PYTHON=/opt/verl-venv/bin/python
 RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers>=5.6,<5.13" > /tmp/verl-overrides.txt \
     && uv venv --seed /opt/verl-venv \
