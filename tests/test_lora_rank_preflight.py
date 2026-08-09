@@ -22,9 +22,9 @@ _ADAPTER_REF = "owner/runs:sft/sft-run"
 
 
 def _spec(*, rank: int = 16, model: str = "Qwen/Qwen3.5-4B"):
-    # lora_alpha is platform-derived (always 2 x lora_rank) and not a user key, so the child
-    # spec only carries lora_rank; the adapter-side alpha the preflight inspects comes from the
-    # loaded adapter_config.json, independent of the child spec.
+    # a warm-start child cannot author rank or alpha, so the child spec only carries the rank
+    # default; the adapter-side alpha the preflight inspects comes from the loaded
+    # adapter_config.json, independent of the child spec.
     spec = spec_from_dict(
         {
             "model": model,

@@ -224,7 +224,7 @@ epochs = 1                  # one pass over the retained train rows
 max_examples = 2            # rows to train on (the starter dataset has 2)
 # max_steps = 100           # positive values set the exact optimizer-update horizon
 # save_at_steps = [10, 50, 100]  # requires max_steps; overrides save_every
-lora_rank = 32              # lora_alpha is managed: always derived as 2 x lora_rank
+lora_rank = 32              # lora_alpha defaults to 2 x lora_rank; set it to override
 # All knobs live under [train]. Do not add [sft], [grpo], or [opd] tables.
 
 [wandb]
@@ -235,7 +235,7 @@ lora_rank = 32              # lora_alpha is managed: always derived as 2 x lora_
 **Knobs are scoped by algorithm.** `[train]` is one flat table shared by all three algorithms,
 but a knob the run's algorithm cannot consume is REJECTED at parse time rather than silently
 ignored. Everything in the block above (`epochs`, `max_examples`, `max_steps`, `save_every`,
-`save_at_steps`, `lora_rank`, `learning_rate`, `batch_size`, `max_context_tokens`,
+`save_at_steps`, `lora_rank`, `lora_alpha`, `learning_rate`, `batch_size`, `max_context_tokens`,
 `init_from_adapter`) applies everywhere. These do not:
 
 | knob                                                                                                            | sft      | grpo     | opd      |
@@ -251,14 +251,14 @@ see below) belongs on a `grpo` run, and setting it on `sft` or `opd` is a submit
 **Key placement that is easy to get wrong.** Every one of these is a real submit-time
 error or a wrong-config-that-still-runs; `--dry-run` catches the loud ones for free.
 
-| You might write              | The schema wants                               | What happens                                                             |
-| ---------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------ |
-| `[environment] args = {...}` | `[environment] params = {...}`                 | rejected as an unknown `[environment]` key                               |
-| `[wandb] name = "..."`       | `[wandb] run_name = "..."`                     | `[wandb] unknown key(s): name`                                           |
-| `[train] thinking = true`    | top-level `thinking = true`                    | rejected under `[train]`; misplacing it trains the wrong mode            |
-| `[train] lora_alpha = 64`    | omit it                                        | rejected — alpha is managed as `2 x lora_rank`                           |
-| `[train] max_tokens = 512`   | `max_completion_tokens` / `max_context_tokens` | rejected as an unknown `[train]` key                                     |
-| `[sft]` / `[grpo]` tables    | `[train]`                                      | rejected — allowed tables are `environment`, `train`, `gpu`, and `wandb` |
+| You might write                               | The schema wants                               | What happens                                                             |
+| --------------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------ |
+| `[environment] args = {...}`                  | `[environment] params = {...}`                 | rejected as an unknown `[environment]` key                               |
+| `[wandb] name = "..."`                        | `[wandb] run_name = "..."`                     | `[wandb] unknown key(s): name`                                           |
+| `[train] thinking = true`                     | top-level `thinking = true`                    | rejected under `[train]`; misplacing it trains the wrong mode            |
+| `[train] lora_alpha` with `init_from_adapter` | omit it for a warm start only                  | rejected — the source adapter's alpha is authoritative                   |
+| `[train] max_tokens = 512`                    | `max_completion_tokens` / `max_context_tokens` | rejected as an unknown `[train]` key                                     |
+| `[sft]` / `[grpo]` tables                     | `[train]`                                      | rejected — allowed tables are `environment`, `train`, `gpu`, and `wandb` |
 
 `WANDB_API_KEY` is a default runtime secret, but it is only read from the process
 environment or a `.env` **next to your CWD or the config** — not from a `.env` one
@@ -780,10 +780,10 @@ Pick SFT when you already have good answers and want the model to imitate them.
   the same LoRA (VL and text-only alike), so the run trains and serves at the SFT
   adapter's rank-`r` and just has to fit the selected model's serving `max_lora_rank` (some
   serving models allow rank 128, larger serving paths cap at 64). Do **NOT** set `lora_rank`
-  for a warm-start: the source adapter's rank/alpha metadata is authoritative. Flash reads the
-  rank from the source adapter and uses it for cost, GPU allocation, and GRPO-sleep sizing, so
-  setting `lora_rank` alongside `init_from_adapter` is rejected at submit; it also rejects a
-  source adapter whose rank exceeds the serving cap.
+  or `lora_alpha` for a warm-start: the source adapter's rank/alpha metadata is authoritative.
+  Flash reads the rank from the source adapter and uses it for cost, GPU allocation, and
+  GRPO-sleep sizing, so setting either alongside `init_from_adapter` is rejected at submit; it
+  also rejects a source adapter whose rank exceeds the serving cap.
 
 ```toml
 # configs/rl.toml — warm-start GRPO from the SFT run's adapter
@@ -793,9 +793,8 @@ algorithm = "grpo"
 # the sft run id (as printed by `flash runs status`); add /step-n to warm-start from a
 # specific checkpoint listed by `flash runs checkpoint <run-id>`
 init_from_adapter = "<sft-run-id>"
-# do NOT set lora_rank for a warm-start: the source adapter's rank and alpha metadata are
-# authoritative (lora_alpha is always managed as 2 x rank), and setting lora_rank alongside
-# init_from_adapter is rejected
+# do NOT set lora_rank or lora_alpha for a warm-start: the source adapter's rank and alpha
+# metadata are authoritative, and setting either alongside init_from_adapter is rejected
 ```
 
 SFT, GRPO, and OPD all accept **epoch-driven** configs (`epochs`). For GRPO/OPD,

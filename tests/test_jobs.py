@@ -2086,8 +2086,8 @@ def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch
 
         st = orch.get_status("warm-run")
         assert st.spec["train"]["init_from_adapter"] == "source-run/step-40"
-        # lora_rank and lora_alpha are platform-managed for warm-start: the child inherits the
-        # source adapter's rank and derived alpha, so both are stripped from the public spec. the
+        # lora_rank and lora_alpha are not authorable for warm-start: the child inherits the
+        # source adapter's rank and alpha, so both are stripped from the public spec. the
         # authoritative resolved values live in the worker spec — what the worker actually trains
         # with, and what the launch captures below.
         assert "lora_rank" not in st.spec["train"]
@@ -2258,9 +2258,9 @@ def test_submit_dry_run_omits_public_warmstart_rank_and_resolves_alpha(monkeypat
         assert "lora_rank" not in status.spec["train"]
         assert "lora_alpha" not in status.spec["train"]
         assert "init_from_adapter_revision" not in status.spec["train"]
-        # lora_rank/lora_alpha are platform-managed and stripped from the public spec; the dry-run
-        # still resolves the source adapter's authoritative rank and derived alpha into the worker
-        # spec, so preflight and execution report the same effective spec.
+        # lora_rank/lora_alpha are not authorable for a warm start and are stripped from the public
+        # spec; the dry-run still resolves the source adapter's authoritative rank and alpha into
+        # the worker spec, so preflight and execution report the same effective spec.
         worker_train = status.effective_preparation["worker_spec"]["train"]
         assert (worker_train["lora_rank"], worker_train["lora_alpha"]) == (64, 128)
         assert status.to_dict()["spec"] == status.spec
