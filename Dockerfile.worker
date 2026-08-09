@@ -349,25 +349,31 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=T
 # hydra override. Also assert the Qwen3.5 archs are registered, since that is the entire reason this
 # venv carries 0.19.1 instead of 0.11.2.
 #
-# fla and causal_conv1d are both asserted HARD here, matching their required installs above: without
-# fla transformers binds chunk_gated_delta_rule to the pure-torch fallback, which accepts cu_seqlens
-# and discards it, and without causal_conv1d the conv falls back to F.silu(self.conv1d(...)), which
-# takes no seq_idx at all -- so packed GDN runs would train across example boundaries. The conv is
-# the DOMINANT channel of the two: on a real Qwen3_5TextModel, honoring seq_idx alone cuts
-# cross-example contamination from 9.47e-02 to 1.63e-05, while segmenting only the recurrence barely
-# moves it. A silently kernel-less child is exactly the failure these asserts exist to make loud at
-# build time rather than on a paid GPU.
+# fla and causal_conv1d are asserted here as INSTALLED AND IMPORTABLE, not via transformers'
+# is_flash_linear_attention_available() / is_causal_conv1d_available(). Both of those begin with
+# is_torch_cuda_available(), and this image is built on a cpu runner (ubuntu-24.04-8core), so both
+# answer False no matter what is installed -- an unsatisfiable assert that fails every build. What a
+# cpu CAN prove is what this checks: the packages import, and fla is at least the 0.2.2 the probe
+# demands, so a device-bearing worker will get True. The capability itself is asserted where a gpu
+# exists: verl_child_can_reset_gdn_boundaries runs the real probes in the child, and
+# backend_common.require_gdn_boundary_resets RAISES for grpo/opd before a step runs.
+#
+# The stakes, unchanged: without fla transformers binds chunk_gated_delta_rule to the pure-torch
+# fallback, which accepts cu_seqlens and discards it, and without causal_conv1d the conv falls back
+# to F.silu(self.conv1d(...)), which takes no seq_idx at all -- so packed GDN runs would train across
+# example boundaries. The conv is the DOMINANT channel of the two: on a real Qwen3_5TextModel,
+# honoring seq_idx alone cuts cross-example contamination from 9.47e-02 to 1.63e-05, while segmenting
+# only the recurrence barely moves it.
 RUN /opt/verl-venv/bin/python -c "import importlib.metadata as M; \
 import importlib; \
+from packaging import version; \
 [importlib.import_module(m) for m in ('verl.trainer.main_ppo','verl.trainer.main_ppo_sync','verl.trainer.sft_trainer')]; \
 [importlib.import_module(m) for m in ('verl.workers.rollout.vllm_rollout.vllm_rollout','verl.workers.rollout.vllm_rollout.vllm_async_server')]; \
 from verl.workers.config.rollout import RolloutConfig; \
 assert 'mask_truncated_completions' in RolloutConfig.__dataclass_fields__, 'verl is not the freesolo fork (no mask_truncated_completions)'; \
 importlib.import_module('flash_attn.bert_padding'); \
-from transformers.utils.import_utils import is_flash_linear_attention_available; \
-assert is_flash_linear_attention_available(), 'flash-linear-attention missing from the verl venv: packed GDN boundary resets would be silently discarded'; \
-from transformers.utils.import_utils import is_causal_conv1d_available; \
-assert is_causal_conv1d_available(), 'causal_conv1d missing from the verl venv: the gdn causal conv would silently discard seq_idx, and grpo/opd fail closed on a gdn model whose child cannot reset boundaries'; \
+importlib.import_module('fla'); \
+assert version.parse(M.version('flash-linear-attention')) >= version.parse('0.2.2'), 'flash-linear-attention older than the 0.2.2 transformers requires: packed GDN boundary resets would be silently discarded'; \
 importlib.import_module('causal_conv1d'); \
 assert M.version('verl') == '0.8.0', 'opd structured gate requires verl exactly 0.8.0, got ' + M.version('verl'); \
 assert M.version('xgrammar') == '0.1.25', 'opd structured gate requires xgrammar exactly 0.1.25, got ' + M.version('xgrammar'); \
@@ -378,7 +384,7 @@ assert not missing, 'vllm cannot serve the default-model archs: ' + repr(sorted(
 print('verl venv OK | verl', M.version('verl'), '| vllm', M.version('vllm'), '| torch', M.version('torch'), '| numpy', M.version('numpy'), '| xgrammar', M.version('xgrammar')); \
 print('  entrypoints: main_ppo (grpo), main_ppo_sync (opd), sft_trainer (sft)'); \
 print('  qwen3.5 archs registered; mask_truncated_completions present'); \
-print('  gdn boundary resets: fla yes, causal_conv1d yes (both asserted)')"
+print('  gdn boundary resets: fla', M.version('flash-linear-attention'), 'and causal_conv1d installed and importable (capability itself is cuda-gated, asserted on the worker)')"
 
 # RunPod Serverless worker entrypoint (Pattern D — Flash custom image). Generate /rp_handler.py
 # from the real _train_body source in providers/runpod/serverless/endpoints.py (single source of truth;
