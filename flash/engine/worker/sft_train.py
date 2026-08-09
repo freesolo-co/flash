@@ -40,6 +40,7 @@ from flash.engine.worker.backend_common import (
     run_verl_training,
     stage_verl_resume,
     stamp_adapter_dir_provenance,
+    strict_gdn_probe_module,
     unprocessed_checkpoint_dirs,
     verl_step_number,
 )
@@ -1112,7 +1113,19 @@ def run_sft_train(spec=None) -> None:
         gdn_hybrid = profile.architecture_mode == "gdn-hybrid" or model_is_gdn_hybrid(
             model_id, model_revision
         )
-        gdn_module = gdn_probe_module(model_id, model_revision) if gdn_hybrid else ""
+        # and the MODULE has to fail closed for the same reason one layer down: `gdn_model_type`
+        # swallows a failed config read and defaults to "qwen3_5". on a packed `qwen3_5_moe` model
+        # (Qwen/Qwen3.6-35B-A3B is in the catalog) that default names the DENSE module, so the child
+        # would clear it, the shim would patch it, and the real MoE layers would stay unpatched --
+        # state crossing packed boundaries while the log says resets are active. resolve it strictly
+        # for a packed run and let the failure surface instead.
+        # keyed on the REALIZED batch, matching the reset gate below: a packed profile whose
+        # examples_per_update is 1 has no neighbours, so it needs neither the strict resolve nor
+        # the hard gate.
+        if gdn_hybrid and profile.packing_mode == "packed" and profile.examples_per_update > 1:
+            gdn_module = strict_gdn_probe_module(model_id, model_revision)
+        else:
+            gdn_module = gdn_probe_module(model_id, model_revision) if gdn_hybrid else ""
         # ONE child answers every independent capability question. each used to cost its own
         # interpreter, and the torch/verl import -- not the question -- was the price.
         caps = probe_verl_capabilities(python_bin, gdn_module)
@@ -1137,7 +1150,12 @@ def run_sft_train(spec=None) -> None:
     # only place that question can be answered, and continuing without resets would train across
     # packed example boundaries while looking patched. an exact-unpacked run keeps the soft form:
     # examples_per_update is 1, so there are no packed neighbours to contaminate.
-    if gdn_hybrid and profile.packing_mode == "packed":
+    # `packed` with examples_per_update == 1 is still boundary-safe: min(batch_size, len(rows)) can
+    # land on 1, and one example per update has no neighbour to contaminate. requiring resets there
+    # would reject a run the unpacked path executes happily, so key the demand on the REALIZED
+    # batch rather than the label.
+    packed_neighbours = profile.packing_mode == "packed" and profile.examples_per_update > 1
+    if gdn_hybrid and packed_neighbours:
         gdn_reset_arch = require_gdn_boundary_resets(caps, gdn_module)
     else:
         gdn_reset_arch = gdn_reset_arch_from_caps(caps, gdn_module) if gdn_hybrid else None

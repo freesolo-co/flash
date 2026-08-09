@@ -2186,6 +2186,7 @@ def test_grpo_and_opd_do_not_launch_into_the_unrunnable_padded_fallback():
     """
     import ast
     import inspect as _inspect
+    import textwrap as _textwrap
 
     from flash.engine.worker import backend_common, opd_train, rl_train, sft_train
 
@@ -2246,4 +2247,71 @@ def test_grpo_and_opd_do_not_launch_into_the_unrunnable_padded_fallback():
         "the sft gdn decision no longer consults the frozen profile.architecture_mode. it must, "
         "because model_is_gdn_hybrid returns False on a transient config-read failure: that would "
         "silently skip the packed-boundary reset requirement instead of failing closed."
+    )
+    # the module the shim patches must fail closed too. gdn_model_type answers "qwen3_5" both for a
+    # dense model and for a config it could not read, and Qwen/Qwen3.6-35B-A3B is qwen3_5_moe -- so
+    # the guess patches the WRONG module and reports resets active over unpatched MoE layers.
+    #
+    # assert on the GUARD, not on the call: `strict_gdn_probe_module(` survives inside `if False:`,
+    # so a substring check passes with the fix disabled (observed while mutation-testing this).
+    sft_tree = ast.parse(_textwrap.dedent(sft_src))
+    strict_guards = [
+        node
+        for node in ast.walk(sft_tree)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(c, ast.Call)
+            and isinstance(c.func, ast.Name)
+            and c.func.id == "strict_gdn_probe_module"
+            for c in ast.walk(node)
+        )
+    ]
+    assert strict_guards, (
+        "packed sft no longer resolves its modeling module strictly, so a transient config-read "
+        "failure would fall back to the dense qwen3_5 module and patch the wrong arch on a "
+        "qwen3_5_moe model while logging boundary resets as active."
+    )
+    guard_src = " ".join(ast.unparse(node.test) for node in strict_guards)
+    assert "packing_mode" in guard_src, (
+        "the strict module resolve is no longer guarded by the packed profile (guard is "
+        f"{guard_src!r}). an exact-unpacked run has no boundaries and must not be forced to "
+        "resolve its arch strictly."
+    )
+    assert "examples_per_update" in guard_src, (
+        "the strict module resolve is no longer guarded by the realized batch (guard is "
+        f"{guard_src!r}). it must be reached exactly when the reset gate below fires, or the two "
+        "disagree about which runs need a proven arch."
+    )
+
+    # and the demand must key on the REALIZED batch: min(batch_size, len(rows)) can be 1 under a
+    # `packed` label, and one example per update has no neighbour to contaminate. assert on the
+    # expression that actually feeds `require_gdn_boundary_resets`, since the same literal also
+    # appears at the strict-resolve guard above and would satisfy a substring check on its own.
+    require_guards = [
+        node
+        for node in ast.walk(sft_tree)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(c, ast.Call)
+            and isinstance(c.func, ast.Name)
+            and c.func.id == "require_gdn_boundary_resets"
+            for c in ast.walk(node)
+        )
+    ]
+    assert require_guards, "packed sft no longer calls require_gdn_boundary_resets under any guard."
+    # the guard may name a local (packed_neighbours); resolve any plain assignments to it so the
+    # test reads the CONDITION, not the variable name.
+    assigns = {
+        t.id: ast.unparse(n.value)
+        for n in ast.walk(sft_tree)
+        if isinstance(n, ast.Assign)
+        for t in n.targets
+        if isinstance(t, ast.Name)
+    }
+    require_src = " ".join(ast.unparse(node.test) for node in require_guards)
+    resolved = require_src + " " + " ".join(assigns.get(n, "") for n in assigns if n in require_src)
+    assert "examples_per_update" in resolved, (
+        "the packed sft gate no longer checks examples_per_update (condition resolves to "
+        f"{resolved.strip()!r}), so a packed profile that realized a single-example update would "
+        "hard-fail on a missing child capability despite having no packed neighbours to protect."
     )

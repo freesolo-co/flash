@@ -722,6 +722,40 @@ def gdn_probe_module(model_id: str, revision: str = "") -> str:
     return f"transformers.models.{model_type}.modeling_{model_type}"
 
 
+def strict_gdn_probe_module(model_id: str, revision: str = "") -> str:
+    """``gdn_probe_module`` that RAISES rather than guessing the arch, for a packed run.
+
+    ``gdn_model_type`` answers ``qwen3_5`` both when the config says so and when the config could
+    not be read at all. Those are the same string and a different meaning. For a packed run the
+    difference is silent corruption: ``Qwen/Qwen3.6-35B-A3B`` is ``qwen3_5_moe``, so the fallback
+    names the DENSE module -- the child clears it, the shim patches it, the MoE layers it was
+    supposed to protect stay unpatched, and packed examples bleed state while the log reports
+    ``gdn packed-boundary resets active``. A failed read must stop the run instead.
+    """
+    from transformers import AutoConfig
+
+    from flash.engine.worker.io.hf import model_revision_kwargs
+
+    try:
+        cfg = AutoConfig.from_pretrained(
+            model_id, trust_remote_code=True, **model_revision_kwargs(revision)
+        )
+        model_type = getattr(cfg, "model_type", None)
+    except Exception as e:
+        raise RuntimeError(
+            f"packed gdn run could not read the model config for {model_id!r}, so the modeling "
+            "module to patch is unknown. refusing to guess: the fallback arch would patch a "
+            "different module than the model uses and train across packed example boundaries "
+            "while reporting resets as active."
+        ) from e
+    if not model_type:
+        raise RuntimeError(
+            f"packed gdn run read the config for {model_id!r} but it declares no model_type, so "
+            "the modeling module to patch is unknown. refusing to guess."
+        )
+    return f"transformers.models.{model_type}.modeling_{model_type}"
+
+
 def gdn_reset_arch_from_caps(caps: dict, gdn_module: str) -> str | None:
     """the architecture to patch when the VERL CHILD can honor packed GDN boundary resets, else None.
 

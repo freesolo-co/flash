@@ -178,3 +178,45 @@ def test_gdn_packing_catches_unexpected_probe_failures(monkeypatch) -> None:
     )
 
     assert packing.gdn_packing_available() is False
+
+
+def test_the_strict_module_resolver_refuses_to_guess_the_arch(monkeypatch) -> None:
+    """A packed run must abort on an unreadable config, not fall back to the dense module.
+
+    `gdn_model_type` returns "qwen3_5" for a dense model AND for a config it could not read. Same
+    string, different meaning. `Qwen/Qwen3.6-35B-A3B` is `qwen3_5_moe`, so on that model the
+    fallback names a module the model does not use: the child clears it, the shim patches it, the
+    real MoE layers stay unpatched, and packed examples bleed state while the log prints
+    "gdn packed-boundary resets active".
+    """
+    import transformers
+
+    from flash.engine.worker.backend_common import strict_gdn_probe_module
+
+    monkeypatch.setattr(
+        transformers.AutoConfig,
+        "from_pretrained",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("hub read failed")),
+    )
+    with pytest.raises(RuntimeError, match="refusing to guess"):
+        strict_gdn_probe_module("Qwen/Qwen3.6-35B-A3B")
+
+    # a config that loads but declares no model_type is the same ambiguity, not a usable answer.
+    monkeypatch.setattr(
+        transformers.AutoConfig,
+        "from_pretrained",
+        lambda *a, **k: SimpleNamespace(model_type=None),
+    )
+    with pytest.raises(RuntimeError, match="no model_type"):
+        strict_gdn_probe_module("Qwen/Qwen3.6-35B-A3B")
+
+    # and it must return the arch the config actually declares, not the dense default.
+    monkeypatch.setattr(
+        transformers.AutoConfig,
+        "from_pretrained",
+        lambda *a, **k: SimpleNamespace(model_type="qwen3_5_moe"),
+    )
+    assert (
+        strict_gdn_probe_module("Qwen/Qwen3.6-35B-A3B")
+        == "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe"
+    )
