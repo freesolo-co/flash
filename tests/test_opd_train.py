@@ -6267,7 +6267,7 @@ def test_groupwise_reverse_kl_keeps_the_exact_per_group_reduction():
     import inspect
     import textwrap
 
-    from flash.engine.worker import opd_plugin
+    from flash.engine.worker.train.opd.child import plugin as opd_plugin
 
     source = inspect.getsource(opd_plugin._flash_groupwise_reverse_kl_values)
     tree = ast.parse(textwrap.dedent(source))

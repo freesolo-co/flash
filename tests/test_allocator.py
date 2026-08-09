@@ -1691,7 +1691,7 @@ def test_fused_ce_chunk_matches_verl_default():
     on a paid gpu -- the failure this pins. the literal 512 is deliberate: deriving it from
     ``VERL_FUSED_CE_CHUNK_TOKENS`` would move with the constant and never fail.
     """
-    from flash.engine import vram
+    from flash.engine.plan import vram
 
     assert vram.VERL_FUSED_CE_CHUNK_TOKENS == 512
     assert vram._SFT_CHUNKED_NLL_TOKENS == 512
@@ -1704,7 +1704,7 @@ def test_sft_default_context_tracks_thinking_mode():
     ``sft_max_length`` trims rows to ``RECIPE.sft.max_seq_len_thinking`` when thinking is on, so a
     flat non-thinking default sized activations for half the real sequence.
     """
-    from flash.engine.recipe import RECIPE
+    from flash.engine.plan.recipe import RECIPE
     from flash.engine.plan.vram import model_required_vram_gb
 
     assert RECIPE.sft.max_seq_len_thinking > RECIPE.sft.max_seq_len

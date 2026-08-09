@@ -831,7 +831,7 @@ def model_required_vram_gb(
         # sft trims rows to RECIPE.sft.max_seq_len_thinking when thinking is on (sft_max_length).
         # defaulting to the non-thinking cap here sizes activations for half the sequence the worker
         # actually trains on.
-        from flash.engine.recipe import RECIPE
+        from flash.engine.plan.recipe import RECIPE
 
         _default_len = int(RECIPE.sft.max_seq_len_thinking if thinking else RECIPE.sft.max_seq_len)
     seq_len = _pos_int(_get(train, "max_context_tokens"), _default_len)
