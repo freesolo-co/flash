@@ -1840,7 +1840,7 @@ def _read_failure_fallback_records(base_path: str) -> list[tuple[str, str]]:
             if len(encoded) > 8192:
                 continue
             record = json.loads(encoded)
-        except (OSError, TypeError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        except (OSError, TypeError, ValueError):
             continue
         if not isinstance(record, dict):
             continue

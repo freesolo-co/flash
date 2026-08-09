@@ -226,7 +226,7 @@ def _strict_json_loads(value: str):
 
     try:
         return json.loads(value, parse_constant=reject_constant)
-    except (json.JSONDecodeError, ValueError) as exc:
+    except ValueError as exc:
         raise ServingError(f"structured smoke output is not valid JSON: {exc}") from exc
 
 

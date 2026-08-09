@@ -1078,7 +1078,7 @@ def completed_checkpoint_step(local_dir: str) -> int:
     try:
         with open(tracker) as file:
             return int(file.read().strip())
-    except (FileNotFoundError, OSError, ValueError):
+    except (OSError, ValueError):
         return 0
 
 
@@ -1740,7 +1740,7 @@ def _reap(pid: int) -> bool:
         reaped, _ = os.waitpid(pid, os.WNOHANG)
     except ChildProcessError:
         return True  # not ours, so no status is owed to this process
-    except (PermissionError, OSError):
+    except OSError:
         # cannot wait on it, and retrying later would not change that. dropped rather than tracked
         # so the straggler set cannot grow without bound on a path that can never clear it.
         return True
@@ -1848,7 +1848,7 @@ def _process_group_members(pgid: int) -> list[int] | None:
         try:
             if os.getpgid(pid) == pgid:
                 members.append(pid)
-        except (ProcessLookupError, PermissionError, OSError):
+        except OSError:
             # exited between listdir and here, or not ours to inspect. a process this cannot see is
             # one it also could not have signalled.
             continue
