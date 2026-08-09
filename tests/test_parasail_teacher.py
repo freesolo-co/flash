@@ -509,6 +509,58 @@ def test_multimodal_scoring_admits_two_genuinely_expanded_images():
     assert len(scored.tokens) == 2
 
 
+def test_multimodal_drop_guard_ignores_pads_inside_the_completion():
+    # the completion is SAMPLED by the student, and a vision student can emit the literal
+    # image-pad token. counting pads over the whole prompt lets that token stand in for an image
+    # the provider actually dropped: two supplied, one expanded, and the completion's own pad
+    # supplies the second run. the guard passes and the OPD target is image-unconditioned.
+    # rejecting the marker in prompt text does not cover it -- the completion is appended after
+    # that check. so pads are counted over the prompt region only.
+    class _PadInCompletionTokenizer:
+        def encode(self, text):
+            table = {
+                "<|image_pad|>": [EncodedTeacherToken(151655, 0, len("<|image_pad|>"))],
+                "<|im_end|>": [EncodedTeacherToken(151645, 0, len("<|im_end|>"))],
+                "\n": [EncodedTeacherToken(198, 0, 1)],
+                "\n<|image_pad|>x": [
+                    EncodedTeacherToken(198, 0, 1),
+                    EncodedTeacherToken(151655, 1, 14),
+                    EncodedTeacherToken(120, 14, 15),
+                ],
+            }
+            if text in table:
+                return list(table[text])
+            raise AssertionError(f"unexpected tokenizer input: {text!r}")
+
+    client = TeacherClient(
+        "capability",
+        "https://broker.example",
+        "parasail-qwen3vl-8b-instruct",
+        tokenizer=_PadInCompletionTokenizer(),
+    )
+    # one real image expanded (index 1-2), then the completion's own pad at index 4. counting the
+    # whole list yields 2 runs and admits a request that dropped an image.
+    prompt_ids = [10, 151655, 151655, 11, 151655, 120, 151645, 198]
+    client._post = lambda path, body: _multimodal_response(prompt_ids)
+
+    with pytest.raises(TeacherError, match="fewer images") as error:
+        client.score_many_multimodal(
+            [
+                (
+                    [{"role": "user", "content": "<|media_pad|><|media_pad|>"}],
+                    "<|image_pad|>x",
+                    [
+                        "data:image/png;base64,aW1hZ2U=",
+                        "data:image/png;base64,aW1hZ2Uy",
+                    ],
+                    False,
+                )
+            ]
+        )
+
+    assert error.value.permanent is True
+
+
 def test_multimodal_completion_opens_a_new_assistant_turn():
     # the student froze its prompt with add_generation_prompt=True, so the sampled tokens follow a
     # NEW assistant boundary. gluing them onto an assistant turn from the environment's own history

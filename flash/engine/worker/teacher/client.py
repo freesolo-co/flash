@@ -466,11 +466,6 @@ def _normalize_multimodal_response(
     if len(generated_ids) != 1:
         raise _permanent("teacher response must contain exactly one generated token id")
     remote_ids = _integer_list(response.get("prompt_token_ids"), field="prompt_token_ids")
-    if _image_pad_runs(remote_ids, image_pad_token_id) < image_count:
-        raise _permanent(
-            "teacher response expanded fewer images than were supplied; the provider may have "
-            "silently dropped an image"
-        )
     local_completion_ids = [token.token_id for token in encoded_completion]
     # anchor to the terminator of the supplied assistant turn, NOT to the last matching run. the
     # chat route renders its own "<|im_start|>assistant\n" generation header after our final
@@ -494,6 +489,17 @@ def _normalize_multimodal_response(
         raise _permanent(
             "teacher response does not end the supplied assistant turn with the completion "
             "token ids; cannot attribute prompt logprobs to the sampled tokens"
+        )
+    # count pads over the PROMPT only, which is everything before the completion. the completion is
+    # sampled by the student, and a vision student can emit the literal image-pad token: that token
+    # lands in remote_ids as its own run and would satisfy the count for an image the provider
+    # actually dropped, handing back image-unconditioned targets. rejecting the marker in prompt
+    # text does not cover this -- the completion is appended after that check, straight from the
+    # sampled ids.
+    if _image_pad_runs(remote_ids[:start], image_pad_token_id) < image_count:
+        raise _permanent(
+            "teacher response expanded fewer images than were supplied; the provider may have "
+            "silently dropped an image"
         )
     input_tokens, output_tokens = _validated_usage(response, len(remote_ids))
     scores = _token_keyed_scores(response.get("prompt_logprobs"), remote_ids)
