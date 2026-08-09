@@ -431,6 +431,155 @@ def _sweep_idle_flash_endpoints(
     return deleted
 
 
+_QUOTA_MAX_RETRIES = 3
+
+
+class _GrowBudget:
+    """Reserves one weight-cache grow slice per not-yet-reconciled account out of the run deadline.
+
+    Creates, sweeps, and backoffs cannot spend that reserve, so a launch always retains enough budget
+    to grow its own cache volume before attaching it. Without the reserve an admission judged against
+    the raw deadline can yield zero growth and then mount a stale, undersized volume, which fails much
+    later as "Disk quota exceeded".
+    """
+
+    def __init__(self, *, deadline_at: float | None, spec, cache_volumes: dict[str, int] | None):
+        self._deadline_at = deadline_at
+        self._spec = spec
+        self._cache_volumes = cache_volumes
+        self.reconciled: set[str] = set()
+
+    def _reconciles_a_managed_cache(self) -> bool:
+        """Whether a grow on this call can actually spend budget.
+
+        Mirrors ``grow_weight_cache_volumes``'s own early return: a run attaching no managed cache
+        reconciles nothing, so reserving for it would shorten the deadline for a create that was
+        never going to grow anything.
+        """
+        if self._cache_volumes is not None:
+            return bool(self._cache_volumes)
+        from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
+        base = getattr(self._spec.gpu, "network_volume", None) if self._spec is not None else None
+        return str(base or "") == WEIGHT_CACHE_VOLUME_NAME
+
+    def create_deadline(self) -> float | None:
+        """``deadline_at`` less the grow budget still owed to unreconciled accounts.
+
+        Creates, sweeps, and backoffs cannot spend this reserve. Any attempt reaching create has
+        reconciled; cache-free runs reserve nothing. See `require_launchable` for admission.
+        """
+        from flash.providers.runpod import auth as rp_keys
+
+        if self._deadline_at is None or not self._reconciles_a_managed_cache():
+            return self._deadline_at
+        owed = max(0, rp_keys.key_count() - len(self.reconciled))
+        return self._deadline_at - WEIGHT_CACHE_GROW_BUDGET_S * owed
+
+    def attempt_deadline(self, owning_key: str | None = None) -> float | None:
+        """``deadline_at`` less the ONE grow slice this attempt's own reconciliation can need.
+
+        Admission funds only this attempt's grow. Once its account reconciles, do not charge the
+        slice again; before selection, reserve conservatively.
+        """
+        from flash.providers.runpod import auth as rp_keys
+
+        if self._deadline_at is None or not self._reconciles_a_managed_cache():
+            return self._deadline_at
+        key = owning_key if owning_key is not None else rp_keys.active_key()
+        if key is not None and key in self.reconciled:
+            return self._deadline_at
+        if rp_keys.key_count() <= len(self.reconciled):
+            return self._deadline_at
+        return self._deadline_at - WEIGHT_CACHE_GROW_BUDGET_S
+
+    def require_launchable(self, owning_key: str | None = None) -> None:
+        """Fail closed unless this attempt can still reconcile itself and then create."""
+        if self._deadline_at is not None:
+            require_create_allowance(self.attempt_deadline(owning_key))
+
+
+def _deploy_with_quota_failover(
+    deploy_once,
+    *,
+    name: str,
+    deadline_at: float | None,
+    require_launchable,
+    create_deadline,
+) -> tuple[object, str]:
+    """Run ``deploy_once`` against each configured account until one deploys.
+
+    Sweeps scaled-to-zero orphans under quota pressure, then fails over to the next RUNPOD_API_KEY
+    account on a quota or balance error. Returns ``(resource, owning_fingerprint)``.
+    """
+    from flash.providers.runpod import auth as rp_keys
+
+    resource = None
+    owning_fingerprint = None
+    # Bound by count, not advance_key() return value — advance_key() always wraps so can't signal exhaustion.
+    failovers_left = max(0, rp_keys.key_count() - 1)
+    while resource is None:
+        deploy_failover_exc: Exception | None = None
+        for quota_attempt in range(_QUOTA_MAX_RETRIES):
+            if quota_attempt > 0:
+                # under quota pressure, reap only scaled-to-zero orphans on this account.
+                # `reap_warm=False` protects live runs' between-job workers; reserve failover growth
+                # from this sweep and backoff.
+                require_launchable()
+                quota_deadline = create_deadline()
+                swept = _sweep_idle_flash_endpoints(
+                    protected={canonical_endpoint_name(name)},
+                    min_idle_s=0.0,
+                    reap_warm=False,
+                    **deadline_kwargs(_sweep_idle_flash_endpoints, quota_deadline),
+                )
+                wait_s = 30 * quota_attempt
+                if deadline_at is not None:
+                    wait_s = min(wait_s, remaining_seconds(quota_deadline))
+                logger.warning(
+                    "RunPod worker quota hit (attempt %d/%d): swept %d idle flash-* endpoint(s); "
+                    "retrying in %ds",
+                    quota_attempt + 1,
+                    _QUOTA_MAX_RETRIES,
+                    swept,
+                    wait_s,
+                )
+                if wait_s > 0:
+                    time.sleep(wait_s)
+            try:
+                resource, owning_fingerprint = deploy_once()
+                break  # success
+            except Exception as exc:
+                if _is_balance_error(exc):
+                    # a broke account can't be helped by sweeping idle endpoints — fail over now
+                    deploy_failover_exc = exc
+                    break
+                if not _is_workers_quota_error(exc):
+                    raise
+                deploy_failover_exc = exc
+        if resource is not None:
+            break
+        if failovers_left > 0:
+            with FLASH_SDK_LOCK:
+                rp_keys.advance_key()
+            failovers_left -= 1
+            reason = (
+                "has insufficient balance"
+                if deploy_failover_exc is not None and _is_balance_error(deploy_failover_exc)
+                else "worker quota exhausted after sweeping"
+            )
+            logger.warning(
+                "RunPod account %s; failing over to the next RUNPOD_API_KEY account (%d configured)",
+                reason,
+                rp_keys.key_count(),
+            )
+            continue
+        raise deploy_failover_exc or RuntimeError(
+            "deploy_train_endpoint: deploy failover exhausted"
+        )
+    return resource, owning_fingerprint
+
+
 def deploy_train_endpoint(
     friendly_gpu: str,
     execution_timeout_ms: int | None = None,
@@ -449,7 +598,6 @@ def deploy_train_endpoint(
     from runpod_flash import Endpoint
     from runpod_flash.core.resources.resource_manager import ResourceManager
 
-    from flash.providers.runpod import auth as rp_keys
     from flash.providers.runpod.auth import ensure_auth
 
     _patch_runpod_backoff()
@@ -457,56 +605,10 @@ def deploy_train_endpoint(
     name = endpoint_name(friendly, name_suffix)
     image = worker_image_for_gpu(friendly, allow_default=True)
 
-    reconciled: set[str] = set()
-
-    def _reconciles_a_managed_cache() -> bool:
-        """Whether a grow on this call can actually spend budget.
-
-        Mirrors ``grow_weight_cache_volumes``'s own early return: a run attaching no managed cache
-        reconciles nothing, so reserving for it would shorten the deadline for a create that was
-        never going to grow anything.
-        """
-        if cache_volumes is not None:
-            return bool(cache_volumes)
-        from flash.runner import WEIGHT_CACHE_VOLUME_NAME
-
-        base = getattr(spec.gpu, "network_volume", None) if spec is not None else None
-        return str(base or "") == WEIGHT_CACHE_VOLUME_NAME
-
-    def _create_deadline() -> float | None:
-        """``deadline_at`` less the grow budget still owed to unreconciled accounts.
-
-        Creates, sweeps, and backoffs cannot spend this reserve. Any attempt reaching create has
-        reconciled; cache-free runs reserve nothing. See `_require_launchable` for admission.
-        """
-        if deadline_at is None or not _reconciles_a_managed_cache():
-            return deadline_at
-        owed = max(0, rp_keys.key_count() - len(reconciled))
-        return deadline_at - WEIGHT_CACHE_GROW_BUDGET_S * owed
-
-    def _attempt_deadline(owning_key: str | None = None) -> float | None:
-        """``deadline_at`` less the ONE grow slice this attempt's own reconciliation can need.
-
-        Admission funds only this attempt's grow. Once its account reconciles, do not charge the
-        slice again; before selection, reserve conservatively.
-        """
-        if deadline_at is None or not _reconciles_a_managed_cache():
-            return deadline_at
-        key = owning_key if owning_key is not None else rp_keys.active_key()
-        if key is not None and key in reconciled:
-            return deadline_at
-        if rp_keys.key_count() <= len(reconciled):
-            return deadline_at
-        return deadline_at - WEIGHT_CACHE_GROW_BUDGET_S
-
-    def _require_launchable(owning_key: str | None = None) -> None:
-        """Fail closed unless this attempt can still reconcile itself and then create.
-
-        Raw-deadline admission can yield zero growth and mount a stale volume. Reserving one slice
-        prevents the later "Disk quota exceeded" failure.
-        """
-        if deadline_at is not None:
-            require_create_allowance(_attempt_deadline(owning_key))
+    budget = _GrowBudget(deadline_at=deadline_at, spec=spec, cache_volumes=cache_volumes)
+    reconciled = budget.reconciled
+    _require_launchable = budget.require_launchable
+    _create_deadline = budget.create_deadline
 
     def _deploy_once() -> tuple[object, str]:
         """Create under one serialized account selection and return its owning fingerprint."""
@@ -571,70 +673,13 @@ def deploy_train_endpoint(
                 )
             return resource, owning_fingerprint
 
-    _QUOTA_MAX_RETRIES = 3
-    resource = None
-    owning_fingerprint = None
-    # Bound by count, not advance_key() return value — advance_key() always wraps so can't signal exhaustion.
-    failovers_left = max(0, rp_keys.key_count() - 1)
-    while resource is None:
-        deploy_failover_exc: Exception | None = None
-        for quota_attempt in range(_QUOTA_MAX_RETRIES):
-            if quota_attempt > 0:
-                # under quota pressure, reap only scaled-to-zero orphans on this account.
-                # `reap_warm=False` protects live runs' between-job workers; reserve failover growth
-                # from this sweep and backoff.
-                _require_launchable()
-                quota_deadline = _create_deadline()
-                swept = _sweep_idle_flash_endpoints(
-                    protected={canonical_endpoint_name(name)},
-                    min_idle_s=0.0,
-                    reap_warm=False,
-                    **deadline_kwargs(_sweep_idle_flash_endpoints, quota_deadline),
-                )
-                wait_s = 30 * quota_attempt
-                if deadline_at is not None:
-                    wait_s = min(wait_s, remaining_seconds(quota_deadline))
-                logger.warning(
-                    "RunPod worker quota hit (attempt %d/%d): swept %d idle flash-* endpoint(s); "
-                    "retrying in %ds",
-                    quota_attempt + 1,
-                    _QUOTA_MAX_RETRIES,
-                    swept,
-                    wait_s,
-                )
-                if wait_s > 0:
-                    time.sleep(wait_s)
-            try:
-                resource, owning_fingerprint = _deploy_once()
-                break  # success
-            except Exception as exc:
-                if _is_balance_error(exc):
-                    # a broke account can't be helped by sweeping idle endpoints — fail over now
-                    deploy_failover_exc = exc
-                    break
-                if not _is_workers_quota_error(exc):
-                    raise
-                deploy_failover_exc = exc
-        if resource is not None:
-            break
-        if failovers_left > 0:
-            with FLASH_SDK_LOCK:
-                rp_keys.advance_key()
-            failovers_left -= 1
-            reason = (
-                "has insufficient balance"
-                if deploy_failover_exc is not None and _is_balance_error(deploy_failover_exc)
-                else "worker quota exhausted after sweeping"
-            )
-            logger.warning(
-                "RunPod account %s; failing over to the next RUNPOD_API_KEY account (%d configured)",
-                reason,
-                rp_keys.key_count(),
-            )
-            continue
-        raise deploy_failover_exc or RuntimeError(
-            "deploy_train_endpoint: deploy failover exhausted"
-        )
+    resource, owning_fingerprint = _deploy_with_quota_failover(
+        _deploy_once,
+        name=name,
+        deadline_at=deadline_at,
+        require_launchable=_require_launchable,
+        create_deadline=_create_deadline,
+    )
 
     endpoint_id = getattr(resource, "id", None)
     if not endpoint_id:
@@ -748,6 +793,335 @@ def capacity_escalation_note(on_last_gpu: bool) -> str:
     )
 
 
+def _queue_capacity_result(
+    handle: JobHandle,
+    status: str,
+    *,
+    now: float,
+    queued_timer: GraceTimer,
+    queue_grace_s: float,
+    worker_coming_up_at: float | None,
+    last_health_probe: float,
+    absolute_deadline: float | None,
+    next_gpu_note: str,
+) -> tuple[PollResult | None, float | None, float]:
+    """Advance the IN_QUEUE capacity timer, probing once at the boundary before giving up.
+
+    Returns ``(result_or_none, worker_coming_up_at, last_health_probe)``.
+    """
+    coming_up = _worker_is_coming_up(worker_coming_up_at, now)
+    would_expire = (
+        status == "IN_QUEUE"
+        and not coming_up
+        and queued_timer.since is not None
+        and now - queued_timer.since > queue_grace_s
+    )
+    if would_expire:
+        # the last worker reading may be 90s stale, so probe once before abandoning a GPU RunPod
+        # may already have granted. the existing TTL prevents repeated boundary probes.
+        last_health_probe = now
+        coming_up = _worker_is_coming_up(
+            _probe_worker_coming_up_at(handle, now, absolute_deadline), now
+        )
+        if coming_up:
+            worker_coming_up_at = now
+    if queued_timer.expired(status == "IN_QUEUE" and not coming_up, now, queue_grace_s):
+        return (
+            PollResult(
+                False,
+                failure="no_capacity",
+                detail=f"never scheduled: job stuck IN_QUEUE for {int(now - queued_timer.since)}s "
+                f"(no RunPod capacity for the pinned GPU class); {next_gpu_note}",
+            ),
+            worker_coming_up_at,
+            last_health_probe,
+        )
+    return None, worker_coming_up_at, last_health_probe
+
+
+def _worker_is_coming_up(at: float | None, now: float) -> bool:
+    """Whether a worker sighting at ``at`` is recent enough to still suppress the capacity timer."""
+    return at is not None and (now - at) <= WORKER_COMING_UP_TTL_S
+
+
+def _probe_worker_coming_up_at(
+    handle: JobHandle, now: float, absolute_deadline: float | None
+) -> float | None:
+    """One health read answering only "has runpod granted a worker yet".
+
+    Do not update continuous unhealthy/throttled timers here. A failed read returns None and
+    leaves existing evidence unchanged.
+    """
+    try:
+        h = runpod_api.endpoint_health_for_fingerprint(
+            handle.endpoint_id,
+            handle.key_fingerprint,
+            **deadline_kwargs(runpod_api.endpoint_health_for_fingerprint, absolute_deadline),
+        )
+    except Exception:
+        return None
+    workers = h.get("workers") or {}
+    usable = workers.get("running") or workers.get("ready") or workers.get("idle")
+    return now if (usable or workers.get("initializing")) else None
+
+
+def _advance_heartbeat_progress(
+    new_key,
+    stage,
+    *,
+    current_attempt: int,
+    last_hb_attempt: int,
+    last_hb_ts: float,
+    last_progress: float,
+    seen_training_hb: bool,
+) -> tuple[int, float, float, bool]:
+    """Fold one fresh heartbeat into the stall clocks.
+
+    Returns ``(last_hb_attempt, last_hb_ts, last_progress, seen_training_hb)``. A heartbeat from
+    another attempt, or one whose ts has not advanced, returns the inputs unchanged so stale progress
+    never tightens the stall window.
+    """
+    if stage is None:
+        return last_hb_attempt, last_hb_ts, last_progress, seen_training_hb
+    hb_ts = new_key[2]
+    hb_step = new_key[1]
+    hb_attempt = _attempt_int(new_key[3])
+    is_training_hb = is_training_heartbeat(stage, hb_step)
+    if hb_attempt != current_attempt:
+        # Non-current heartbeat: ignore so stale progress never tightens the stall window.
+        pass
+    elif hb_attempt > last_hb_attempt:
+        # fresh attempt: reset ts baseline and re-derive seen_training_hb so cold-start grace rearms.
+        return hb_attempt, hb_ts or 0.0, time.time(), is_training_hb
+    elif hb_attempt == last_hb_attempt and (hb_ts is None or hb_ts > last_hb_ts):
+        # Gate progress on ts advancing — a stale late upload must not buy a fresh stall window.
+        if hb_ts is not None:
+            last_hb_ts = hb_ts
+        return (
+            last_hb_attempt,
+            last_hb_ts,
+            time.time(),
+            True if is_training_hb else seen_training_hb,
+        )
+    return last_hb_attempt, last_hb_ts, last_progress, seen_training_hb
+
+
+def _queued_worker_health_result(
+    handle: JobHandle,
+    *,
+    now: float,
+    say,
+    absolute_deadline: float | None,
+    unhealthy_timer: GraceTimer,
+    throttled_timer: GraceTimer,
+    unhealthy_grace_s: float,
+    throttled_grace_s: float,
+    next_gpu_note: str,
+    worker_coming_up_at: float | None,
+) -> tuple[PollResult | None, float | None]:
+    """Probe endpoint health while IN_QUEUE and advance the unhealthy/throttled grace timers.
+
+    Returns ``(result_or_none, worker_coming_up_at)``. A probe that raises returns the sighting as it
+    stood when the exception hit, matching the inline ``except Exception: pass`` this replaced: a read
+    that fails before the assignment must leave the prior sighting intact rather than clear it.
+    """
+    try:
+        h = runpod_api.endpoint_health_for_fingerprint(
+            handle.endpoint_id,
+            handle.key_fingerprint,
+            **deadline_kwargs(runpod_api.endpoint_health_for_fingerprint, absolute_deadline),
+        )
+        workers = h.get("workers") or {}
+        usable = workers.get("running") or workers.get("ready") or workers.get("idle")
+        recovering = workers.get("initializing")
+        # runpod granted the gpu the moment a worker is initializing or usable, so from
+        # here on the wait is startup, not capacity starvation. stamped rather than a bare
+        # flag: a probe that starts failing must not leave a stale True suppressing the
+        # capacity timer forever, so it expires after WORKER_COMING_UP_TTL_S.
+        worker_coming_up_at = now if (usable or recovering) else None
+        if any(workers.get(k) for k in ("throttled", "unhealthy", "initializing")) or not usable:
+            say(f"queued; workers: {workers}")
+        if unhealthy_timer.expired(
+            workers.get("unhealthy") and not usable and not recovering,
+            now,
+            unhealthy_grace_s,
+        ):
+            return (
+                PollResult(
+                    False,
+                    failure="stalled",
+                    detail=f"worker stuck unhealthy for "
+                    f"{int(now - unhealthy_timer.since)}s while IN_QUEUE (likely a failed "
+                    f"image pull); retrying on a fresh endpoint",
+                ),
+                worker_coming_up_at,
+            )
+        if throttled_timer.expired(
+            workers.get("throttled") and not usable and not recovering,
+            now,
+            throttled_grace_s,
+        ):
+            return (
+                PollResult(
+                    False,
+                    failure="no_capacity",
+                    detail=f"never scheduled: worker stuck THROTTLED for "
+                    f"{int(now - throttled_timer.since)}s while IN_QUEUE (no RunPod "
+                    f"capacity for the pinned GPU class); {next_gpu_note}",
+                ),
+                worker_coming_up_at,
+            )
+    except Exception:
+        return None, worker_coming_up_at
+    return None, worker_coming_up_at
+
+
+def _validated_poll_identity(handle: JobHandle, current_attempt: int | None) -> tuple[float, int]:
+    """Return ``(launch_ts, attempt)`` for a pollable handle, or raise if either is untrustworthy.
+
+    Both values gate heartbeat freshness, so a bad launch stamp or a caller/handle attempt mismatch
+    has to fail here rather than silently accept a prior attempt's artifacts as this attempt's.
+    """
+    launch_ts = handle.started_ts
+    if not math.isfinite(launch_ts) or launch_ts <= 0:
+        raise ValueError("persisted RunPod launch timestamp is invalid")
+    attempt_id = handle.attempt if current_attempt is None else _attempt_int(current_attempt)
+    if attempt_id is None or attempt_id != handle.attempt:
+        raise ValueError("RunPod poll attempt identity does not match the persisted handle")
+    return launch_ts, attempt_id
+
+
+def _queue_phase_result(
+    handle: JobHandle,
+    status,
+    *,
+    now: float,
+    say,
+    queued_timer: GraceTimer,
+    unhealthy_timer: GraceTimer,
+    throttled_timer: GraceTimer,
+    queue_grace_s: float,
+    unhealthy_grace_s: float,
+    throttled_grace_s: float,
+    worker_coming_up_at: float | None,
+    last_health_probe: float,
+    absolute_deadline: float | None,
+    next_gpu_note: str,
+) -> tuple[PollResult | None, float | None, float]:
+    """Run the queue-state timers for one iteration.
+
+    Returns ``(result, worker_coming_up_at, last_health_probe)``; a non-None result is terminal.
+    """
+    capacity_result, worker_coming_up_at, last_health_probe = _queue_capacity_result(
+        handle,
+        status,
+        now=now,
+        queued_timer=queued_timer,
+        queue_grace_s=queue_grace_s,
+        worker_coming_up_at=worker_coming_up_at,
+        last_health_probe=last_health_probe,
+        absolute_deadline=absolute_deadline,
+        next_gpu_note=next_gpu_note,
+    )
+    if capacity_result is not None:
+        return capacity_result, worker_coming_up_at, last_health_probe
+    if status != "IN_QUEUE":
+        # The in-queue grace timers measure CONTINUOUS throttle/unhealthy while queued (like
+        # queued_timer, driven every iteration above); reset them whenever the job leaves the
+        # queue so a re-queue after an IN_PROGRESS spell doesn't fire on a stale arm time.
+        unhealthy_timer.since = None
+        throttled_timer.since = None
+        return None, worker_coming_up_at, last_health_probe
+    if now - last_health_probe <= 90:
+        return None, worker_coming_up_at, last_health_probe
+    last_health_probe = now
+    health_result, worker_coming_up_at = _queued_worker_health_result(
+        handle,
+        now=now,
+        say=say,
+        absolute_deadline=absolute_deadline,
+        unhealthy_timer=unhealthy_timer,
+        throttled_timer=throttled_timer,
+        unhealthy_grace_s=unhealthy_grace_s,
+        throttled_grace_s=throttled_grace_s,
+        next_gpu_note=next_gpu_note,
+        worker_coming_up_at=worker_coming_up_at,
+    )
+    return health_result, worker_coming_up_at, last_health_probe
+
+
+def _terminal_ok_result(
+    st: dict,
+    *,
+    heartbeat_reader,
+    failure_detail_reader,
+    last_hb_key,
+    say,
+    current_attempt: int,
+    launch_ts: float,
+) -> tuple[PollResult, object]:
+    """Decode a TERMINAL_OK job. Returns ``(result, last_hb_key)``."""
+    # read heartbeats already committed at the wall deadline (deadline_at=None) so a job that
+    # completes right at the boundary still surfaces its final per-step metrics for `flash runs log -f`
+    forced_reader = (
+        (lambda: heartbeat_reader(force=True, deadline_at=None))
+        if heartbeat_reader is not None
+        else None
+    )
+    last_hb_key, _ = surface_heartbeat(forced_reader, last_hb_key, say)
+    try:
+        return PollResult(True, metrics=decode_output(st.get("output"))), last_hb_key
+    except RuntimeError as e:
+        last_hb_key, retriable, oom = surfaced_worker_flags(
+            heartbeat_reader, last_hb_key, say, current_attempt, launch_ts=launch_ts
+        )
+        detail = _append_failure_artifacts(str(e), failure_detail_reader)
+        return (
+            PollResult(
+                False,
+                failure="oom" if oom else ("job_preempted" if retriable else "job_failed"),
+                detail=detail,
+            ),
+            last_hb_key,
+        )
+
+
+def _terminal_fail_result(
+    st: dict,
+    status: str,
+    *,
+    heartbeat_reader,
+    failure_detail_reader,
+    last_hb_key,
+    say,
+    current_attempt: int,
+    launch_ts: float,
+) -> tuple[PollResult, object]:
+    """Classify a TERMINAL_FAIL job. Returns ``(result, last_hb_key)``."""
+    detail = str(st.get("error") or "")[-1500:]
+    out = st.get("output")
+    if isinstance(out, dict) and out.get("stdout"):
+        detail += "\n--- worker stdout tail ---\n" + str(out["stdout"])
+    elif not detail:
+        detail = str(out)[-1500:]
+    if status in PLATFORM_TERMINATIONS:
+        return PollResult(
+            False, failure="job_preempted", detail=f"[{status}] {detail}"
+        ), last_hb_key
+    last_hb_key, retriable, oom = surfaced_worker_flags(
+        heartbeat_reader, last_hb_key, say, current_attempt, launch_ts=launch_ts
+    )
+    detail = _append_failure_artifacts(detail, failure_detail_reader)
+    return (
+        PollResult(
+            False,
+            failure="oom" if oom else ("job_preempted" if retriable else "job_failed"),
+            detail=f"[{status}] {detail}",
+        ),
+        last_hb_key,
+    )
+
+
 def poll_job(
     handle: JobHandle,
     log=None,
@@ -777,13 +1151,7 @@ def poll_job(
     poll_errors = PollErrorTracker(say, interval_s)
 
     absolute_deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
-    launch_ts = handle.started_ts
-    if not math.isfinite(launch_ts) or launch_ts <= 0:
-        raise ValueError("persisted RunPod launch timestamp is invalid")
-    attempt_id = handle.attempt if current_attempt is None else _attempt_int(current_attempt)
-    if attempt_id is None or attempt_id != handle.attempt:
-        raise ValueError("RunPod poll attempt identity does not match the persisted handle")
-    current_attempt = attempt_id
+    launch_ts, current_attempt = _validated_poll_identity(handle, current_attempt)
     last_status = None
     last_hb_key = None
     last_hb_ts = 0.0
@@ -802,28 +1170,6 @@ def poll_job(
     # fire while a worker is initializing or usable; carry that same observation forward so the
     # capacity timer gets it too, and a heavy image can never self-report as no_capacity.
     worker_coming_up_at: float | None = None
-
-    def _worker_is_coming_up(at: float | None, now: float) -> bool:
-        """Whether a worker sighting at ``at`` is recent enough to still suppress the capacity timer."""
-        return at is not None and (now - at) <= WORKER_COMING_UP_TTL_S
-
-    def _probe_worker_coming_up_at(now: float) -> float | None:
-        """One health read answering only "has runpod granted a worker yet".
-
-        Do not update continuous unhealthy/throttled timers here. A failed read returns None and
-        leaves existing evidence unchanged.
-        """
-        try:
-            h = runpod_api.endpoint_health_for_fingerprint(
-                handle.endpoint_id,
-                handle.key_fingerprint,
-                **deadline_kwargs(runpod_api.endpoint_health_for_fingerprint, absolute_deadline),
-            )
-        except Exception:
-            return None
-        workers = h.get("workers") or {}
-        usable = workers.get("running") or workers.get("ready") or workers.get("idle")
-        return now if (usable or workers.get("initializing")) else None
 
     while True:
         if absolute_deadline is not None and time.time() >= absolute_deadline:
@@ -848,146 +1194,62 @@ def poll_job(
             last_status = status
             last_progress = time.time()
         if status in TERMINAL_OK:
-            # read heartbeats already committed at the wall deadline (deadline_at=None) so a job that
-            # completes right at the boundary still surfaces its final per-step metrics for `flash runs log -f`
-            forced_reader = (
-                (lambda: heartbeat_reader(force=True, deadline_at=None))
-                if heartbeat_reader is not None
-                else None
+            result, last_hb_key = _terminal_ok_result(
+                st,
+                heartbeat_reader=heartbeat_reader,
+                failure_detail_reader=failure_detail_reader,
+                last_hb_key=last_hb_key,
+                say=say,
+                current_attempt=current_attempt,
+                launch_ts=launch_ts,
             )
-            last_hb_key, _ = surface_heartbeat(forced_reader, last_hb_key, say)
-            try:
-                return PollResult(True, metrics=decode_output(st.get("output")))
-            except RuntimeError as e:
-                last_hb_key, retriable, oom = surfaced_worker_flags(
-                    heartbeat_reader, last_hb_key, say, current_attempt, launch_ts=launch_ts
-                )
-                detail = _append_failure_artifacts(str(e), failure_detail_reader)
-                return PollResult(
-                    False,
-                    failure="oom" if oom else ("job_preempted" if retriable else "job_failed"),
-                    detail=detail,
-                )
+            return result
         if status in TERMINAL_FAIL:
-            detail = str(st.get("error") or "")[-1500:]
-            out = st.get("output")
-            if isinstance(out, dict) and out.get("stdout"):
-                detail += "\n--- worker stdout tail ---\n" + str(out["stdout"])
-            elif not detail:
-                detail = str(out)[-1500:]
-            if status in PLATFORM_TERMINATIONS:
-                return PollResult(False, failure="job_preempted", detail=f"[{status}] {detail}")
-            last_hb_key, retriable, oom = surfaced_worker_flags(
-                heartbeat_reader, last_hb_key, say, current_attempt, launch_ts=launch_ts
+            result, last_hb_key = _terminal_fail_result(
+                st,
+                status,
+                heartbeat_reader=heartbeat_reader,
+                failure_detail_reader=failure_detail_reader,
+                last_hb_key=last_hb_key,
+                say=say,
+                current_attempt=current_attempt,
+                launch_ts=launch_ts,
             )
-            detail = _append_failure_artifacts(detail, failure_detail_reader)
-            return PollResult(
-                False,
-                failure="oom" if oom else ("job_preempted" if retriable else "job_failed"),
-                detail=f"[{status}] {detail}",
-            )
+            return result
         now = time.time()
 
-        coming_up = _worker_is_coming_up(worker_coming_up_at, now)
-        would_expire = (
-            status == "IN_QUEUE"
-            and not coming_up
-            and queued_timer.since is not None
-            and now - queued_timer.since > queue_grace_s
+        queue_result, worker_coming_up_at, last_health_probe = _queue_phase_result(
+            handle,
+            status,
+            now=now,
+            say=say,
+            queued_timer=queued_timer,
+            unhealthy_timer=unhealthy_timer,
+            throttled_timer=throttled_timer,
+            queue_grace_s=queue_grace_s,
+            unhealthy_grace_s=unhealthy_grace_s,
+            throttled_grace_s=throttled_grace_s,
+            worker_coming_up_at=worker_coming_up_at,
+            last_health_probe=last_health_probe,
+            absolute_deadline=absolute_deadline,
+            next_gpu_note=next_gpu_note,
         )
-        if would_expire:
-            # the last worker reading may be 90s stale, so probe once before abandoning a GPU RunPod
-            # may already have granted. the existing TTL prevents repeated boundary probes.
-            last_health_probe = now
-            coming_up = _worker_is_coming_up(_probe_worker_coming_up_at(now), now)
-            if coming_up:
-                worker_coming_up_at = now
-        if queued_timer.expired(status == "IN_QUEUE" and not coming_up, now, queue_grace_s):
-            return PollResult(
-                False,
-                failure="no_capacity",
-                detail=f"never scheduled: job stuck IN_QUEUE for {int(now - queued_timer.since)}s "
-                f"(no RunPod capacity for the pinned GPU class); {next_gpu_note}",
-            )
-        if status != "IN_QUEUE":
-            # The in-queue grace timers measure CONTINUOUS throttle/unhealthy while queued (like
-            # queued_timer, driven every iteration above); reset them whenever the job leaves the
-            # queue so a re-queue after an IN_PROGRESS spell doesn't fire on a stale arm time.
-            unhealthy_timer.since = None
-            throttled_timer.since = None
-        elif now - last_health_probe > 90:
-            last_health_probe = now
-            try:
-                h = runpod_api.endpoint_health_for_fingerprint(
-                    handle.endpoint_id,
-                    handle.key_fingerprint,
-                    **deadline_kwargs(
-                        runpod_api.endpoint_health_for_fingerprint, absolute_deadline
-                    ),
-                )
-                workers = h.get("workers") or {}
-                usable = workers.get("running") or workers.get("ready") or workers.get("idle")
-                recovering = workers.get("initializing")
-                # runpod granted the gpu the moment a worker is initializing or usable, so from
-                # here on the wait is startup, not capacity starvation. stamped rather than a bare
-                # flag: a probe that starts failing must not leave a stale True suppressing the
-                # capacity timer forever, so it expires after WORKER_COMING_UP_TTL_S.
-                worker_coming_up_at = now if (usable or recovering) else None
-                if (
-                    any(workers.get(k) for k in ("throttled", "unhealthy", "initializing"))
-                    or not usable
-                ):
-                    say(f"queued; workers: {workers}")
-                if unhealthy_timer.expired(
-                    workers.get("unhealthy") and not usable and not recovering,
-                    now,
-                    unhealthy_grace_s,
-                ):
-                    return PollResult(
-                        False,
-                        failure="stalled",
-                        detail=f"worker stuck unhealthy for "
-                        f"{int(now - unhealthy_timer.since)}s while IN_QUEUE (likely a failed "
-                        f"image pull); retrying on a fresh endpoint",
-                    )
-                if throttled_timer.expired(
-                    workers.get("throttled") and not usable and not recovering,
-                    now,
-                    throttled_grace_s,
-                ):
-                    return PollResult(
-                        False,
-                        failure="no_capacity",
-                        detail=f"never scheduled: worker stuck THROTTLED for "
-                        f"{int(now - throttled_timer.since)}s while IN_QUEUE (no RunPod "
-                        f"capacity for the pinned GPU class); {next_gpu_note}",
-                    )
-            except Exception:
-                pass
+        if queue_result is not None:
+            return queue_result
         new_key, stage = surface_heartbeat(heartbeat_reader, last_hb_key, say)
         if new_key != last_hb_key:
             last_hb_key = new_key
-            if stage is not None:
-                hb_ts = new_key[2]
-                hb_step = new_key[1]
-                hb_attempt = _attempt_int(new_key[3])
-                is_training_hb = is_training_heartbeat(stage, hb_step)
-                if hb_attempt != current_attempt:
-                    # Non-current heartbeat: ignore so stale progress never tightens the stall window.
-                    pass
-                elif hb_attempt > last_hb_attempt:
-                    # fresh attempt: reset ts baseline and re-derive seen_training_hb so cold-start grace rearms.
-                    last_hb_attempt = hb_attempt
-                    last_hb_ts = hb_ts or 0.0
-                    last_progress = time.time()
-                    seen_training_hb = is_training_hb
-                elif hb_attempt == last_hb_attempt and (hb_ts is None or hb_ts > last_hb_ts):
-                    # Gate progress on ts advancing — a stale late upload must not buy a fresh stall window.
-                    if hb_ts is not None:
-                        last_hb_ts = hb_ts
-                    last_progress = time.time()
-                    if is_training_hb:
-                        seen_training_hb = True
+            last_hb_attempt, last_hb_ts, last_progress, seen_training_hb = (
+                _advance_heartbeat_progress(
+                    new_key,
+                    stage,
+                    current_attempt=current_attempt,
+                    last_hb_attempt=last_hb_attempt,
+                    last_hb_ts=last_hb_ts,
+                    last_progress=last_progress,
+                    seen_training_hb=seen_training_hb,
+                )
+            )
         in_setup = heartbeat_reader is not None and not seen_training_hb
         stall_limit = setup_grace_s if in_setup else stall_after_s
         if time.time() - last_progress > stall_limit:

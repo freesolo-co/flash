@@ -40,13 +40,13 @@ from flash.providers.base import PollResult
 _METRICS_AFTER_SUCCESS_RETRIES = 6
 _METRICS_AFTER_SUCCESS_WAIT_S = 5.0
 
-# any boundary exit can race terminal-artifact visibility under hf read-after-write lag. re-read
-# terminal artifacts before classifying the exit so a completed seed is not retried against its work.
 # distinguishes "caller passed no read deadline" from an explicit ``None`` (unbounded read). the
 # closures this replaced bound ``absolute_deadline`` as a default at definition time; a method cannot,
 # so the sentinel restores that exact behavior.
 _UNSET_DEADLINE = object()
 
+# any boundary exit can race terminal-artifact visibility under hf read-after-write lag. re-read
+# terminal artifacts before classifying the exit so a completed seed is not retried against its work.
 _TERMINAL_REREAD_RETRIES = 6
 _TERMINAL_REREAD_WAIT_S = 5.0
 
@@ -408,6 +408,164 @@ class _TerminalArtifacts:
         return PollResult(False, failure="stalled", detail=detail)
 
 
+def _dead_host_result(
+    adapter, artifacts: _TerminalArtifacts, *, heartbeat_reader, launch_ts: float
+) -> PollResult:
+    """Classify a vanished box once no terminal artifact could be found for it."""
+    artifacts.surface_final_heartbeat()
+    # The worker may have finished just before the box self-destroyed, with its DONE/marker not
+    # yet visible on HF (read-after-write lag). Re-read terminal artifacts a bounded number of
+    # times before concluding loss.
+    terminal = artifacts.reread_before_giving_up(
+        "instance gone; waiting for HF to expose any terminal DONE/marker before failover"
+    )
+    if terminal is not None:
+        return terminal
+    # Dead host, no ok-marker/DONE. Distinguish genuine host LOSS (retry on a fresh host) from a
+    # worker that RAN and CRASHED early leaving error_{phase}_attempt<N>.txt (bad env/config/OOM):
+    # that is DETERMINISTIC -> fail FAST. A crash the worker flagged retriable still retries.
+    err = adapter.read_current_error()
+    # error files are attempt-scoped, so a present file already belongs to this exact handle.
+    worker_crashed = bool(err and err.strip()) and not worker_flagged_retriable(
+        heartbeat_reader,
+        launch_ts=launch_ts,
+        current_attempt=adapter.current_attempt,
+    )
+    return PollResult(
+        False,
+        failure="job_failed" if worker_crashed else "job_preempted",
+        detail=adapter.failure_detail(None),
+    )
+
+
+@dataclass
+class _WorkerProgress:
+    """Stall / liveness clocks for one polled instance.
+
+    Seeded from LAUNCH, not from this poll's start: a delayed reattach has been billing since launch,
+    so a still-loading box that already blew ``load_timeout_s`` fails over now.
+    """
+
+    last_progress: float
+    # Anchored to launch so a reattach already-running measures first-liveness from the original launch.
+    running_since: float
+    became_running: bool = False
+    # Wall-clock THIS session first saw it running (set once) — "how long WE have watched it", so a
+    # reattach doesn't fast-fail a box that just came up.
+    observed_running_since: float | None = None
+    seen_training_hb: bool = False
+    # Any FRESH heartbeat from this attempt proves the worker started -> clears the first-liveness
+    # deadline (distinct from seen_training_hb, which gates the tighter training window).
+    seen_fresh_hb: bool = False
+    # A positive early-liveness signal (non-empty container log / present boot.log) proves the bootstrap
+    # is alive on a slow cold start (pip/code fetch can outlast first_liveness_s before the first
+    # heartbeat), so we don't fast-fail a healthy box. Require silence across BOOT_LOG_ABSENT_POLLS so a
+    # log-API blip can't burn a retry.
+    liveness_seen: bool = False
+    liveness_absent_polls: int = 0
+
+    def observe_running(self) -> None:
+        self.became_running = True
+        if self.observed_running_since is None:
+            self.observed_running_since = time.time()
+
+    def record_heartbeat(self, new_key, stage, *, launch_ts: float, current_attempt) -> None:
+        # Credit the heartbeat's OWN ts (clamped to [launch, now]) so a pre-restart-stale heartbeat
+        # buys no fresh window. ``fresh`` is False for a leftover prior-attempt heartbeat.
+        hb_ts, fresh = heartbeat_progress_ts(new_key, launch_ts, current_attempt)
+        if not fresh:
+            return
+        self.seen_fresh_hb = True
+        # Advance the stall clock ONLY on a STAGED heartbeat (stage is not None): a bare liveness
+        # ping must not let a wedged worker keep resetting the setup/training stall window.
+        # MONOTONIC: never regress on an out-of-order upload.
+        if stage is None:
+            return
+        self.last_progress = max(self.last_progress, hb_ts)
+        # Tighten setup_grace -> stall only once training genuinely begins (the shared helper
+        # keeps cold-start pings, incl. the silent step=0 first rollout, under setup grace).
+        if is_training_heartbeat(stage, new_key[1]):
+            self.seen_training_hb = True
+
+    def stall_detail(
+        self,
+        adapter,
+        *,
+        status: str,
+        first_liveness_s: float,
+        stall_after_s: float,
+        setup_grace_s: float,
+    ) -> str | None:
+        """Detail for a stall exit, or ``None`` to keep polling."""
+        # after running without a heartbeat, consult early-liveness before declaring a stall: slow
+        # installs and fetches can be healthy. latch positive bootstrap evidence; require silence for
+        # BOOT_LOG_ABSENT_POLLS and respect the observed-running floor on reattach.
+        if (
+            not self.seen_fresh_hb
+            and not self.liveness_seen
+            and time.time() - self.running_since > first_liveness_s
+            and self.observed_running_since is not None
+            and time.time() - self.observed_running_since > FIRST_LIVENESS_OBSERVED_FLOOR_S
+        ):
+            if not adapter.early_liveness_alive():
+                # A lone absent read can be a transient log-API error -> require BOOT_LOG_ABSENT_POLLS.
+                self.liveness_absent_polls += 1
+                if self.liveness_absent_polls >= BOOT_LOG_ABSENT_POLLS:
+                    return adapter.first_liveness_detail(
+                        time.time() - self.running_since, first_liveness_s
+                    )
+            else:
+                # Bootstrap is producing output -> healthy slow cold start; setup/stall below backstop.
+                self.liveness_seen = True
+        limit = stall_after_s if self.seen_training_hb else setup_grace_s
+        if time.time() - self.last_progress > limit:
+            phase = "training" if self.seen_training_hb else "setup (pre-training)"
+            return (
+                f"no worker progress for {int(time.time() - self.last_progress)}s during "
+                f"{phase} (instance status {status}, limit {int(limit)}s)"
+            )
+        return None
+
+
+def _validated_launch_ts(adapter: InstancePollAdapter) -> float:
+    """Return the adapter's launch stamp, or raise if it cannot anchor the stall clocks.
+
+    Every grace window below is measured from launch, so a bool, a non-number, a nan/inf, or a
+    non-positive stamp has to fail here rather than silently hand the box an unbounded window.
+    """
+    launch_ts = adapter.launch_ts
+    if (
+        isinstance(launch_ts, bool)
+        or not isinstance(launch_ts, (int, float))
+        or not math.isfinite(launch_ts)
+        or launch_ts <= 0
+    ):
+        raise ValueError("persisted instance launch timestamp is invalid")
+    return launch_ts
+
+
+def _observe_status_change(
+    adapter: InstancePollAdapter,
+    status,
+    last_status,
+    progress: _WorkerProgress,
+    say,
+) -> None:
+    """Fold one status read into the progress clocks."""
+    if status != last_status:
+        say(f"instance {adapter.instance_id}: {status}")
+        # Count a status TRANSITION as progress, but NOT the first observation (last_status starts
+        # None, so the first read always "changes" — crediting it would hand a silent-since-launch
+        # worker a fresh setup grace after every restart).
+        if last_status is not None:
+            progress.last_progress = time.time()
+            if status == adapter.running_status:
+                # genuine ->running: start the liveness clock
+                progress.running_since = time.time()
+    if status == adapter.running_status:
+        progress.observe_running()
+
+
 def poll_instance_job(
     adapter: InstancePollAdapter,
     *,
@@ -426,14 +584,7 @@ def poll_instance_job(
     status outages, and unreadable signalled-success metrics remain infrastructure-retryable.
     """
     say = make_say(log)
-    launch_ts = adapter.launch_ts
-    if (
-        isinstance(launch_ts, bool)
-        or not isinstance(launch_ts, (int, float))
-        or not math.isfinite(launch_ts)
-        or launch_ts <= 0
-    ):
-        raise ValueError("persisted instance launch timestamp is invalid")
+    launch_ts = _validated_launch_ts(adapter)
     absolute_deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
     artifacts = _TerminalArtifacts(
         adapter,
@@ -448,27 +599,9 @@ def poll_instance_job(
     _surface_final_heartbeat = artifacts.surface_final_heartbeat
 
     poll_errors = PollErrorTracker(say, interval_s)
-    # Seed the load/stall clocks from LAUNCH, not this poll's start: a delayed reattach has been billing
-    # since launch, so a still-loading box that already blew load_timeout_s fails over now.
     start = launch_ts
     last_status = None
-    last_progress = start
-    became_running = False
-    # Anchored to launch so a reattach already-running measures first-liveness from the original launch.
-    running_since = start
-    # Wall-clock THIS session first saw it running (set once) — "how long WE have watched it", so a
-    # reattach doesn't fast-fail a box that just came up.
-    observed_running_since = None
-    seen_training_hb = False
-    # Any FRESH heartbeat from this attempt proves the worker started -> clears the first-liveness
-    # deadline (distinct from seen_training_hb, which gates the tighter training window).
-    seen_fresh_hb = False
-    # A positive early-liveness signal (non-empty container log / present boot.log) proves the bootstrap
-    # is alive on a slow cold start (pip/code fetch can outlast first_liveness_s before the first
-    # heartbeat), so we don't fast-fail a healthy box. Require silence across BOOT_LOG_ABSENT_POLLS so a
-    # log-API blip can't burn a retry.
-    liveness_seen = False
-    liveness_absent_polls = 0
+    progress = _WorkerProgress(last_progress=start, running_since=start)
     missing_streak = 0
     while True:
         if absolute_deadline is not None and time.time() >= absolute_deadline:
@@ -506,20 +639,8 @@ def poll_instance_job(
         status = (inst or {}).get(adapter.status_field) or (
             "missing" if inst is None else "unknown"
         )
-        if status != last_status:
-            say(f"instance {adapter.instance_id}: {status}")
-            # Count a status TRANSITION as progress, but NOT the first observation (last_status starts
-            # None, so the first read always "changes" — crediting it would hand a silent-since-launch
-            # worker a fresh setup grace after every restart).
-            if last_status is not None:
-                last_progress = time.time()
-                if status == adapter.running_status:
-                    running_since = time.time()  # genuine ->running: start the liveness clock
-            last_status = status
-        if status == adapter.running_status:
-            became_running = True
-            if observed_running_since is None:
-                observed_running_since = time.time()
+        _observe_status_change(adapter, status, last_status, progress, say)
+        last_status = status
 
         # Per-iteration terminal check: the SAME detector every give-up path uses (force=False — the loop
         # paces its own reads). Folds the DONE and ok/err-marker checks into one call.
@@ -534,92 +655,44 @@ def poll_instance_job(
         dead = (
             missing_streak >= adapter.missing_dead_threshold
             or status in adapter.dead_states
-            or (became_running and status == "unknown")
+            or (progress.became_running and status == "unknown")
         )
         if dead:
-            _surface_final_heartbeat()
-            # The worker may have finished just before the box self-destroyed, with its DONE/marker not
-            # yet visible on HF (read-after-write lag). Re-read terminal artifacts a bounded number of
-            # times before concluding loss.
-            terminal = artifacts.reread_before_giving_up(
-                "instance gone; waiting for HF to expose any terminal DONE/marker before failover"
-            )
-            if terminal is not None:
-                return terminal
-            # Dead host, no ok-marker/DONE. Distinguish genuine host LOSS (retry on a fresh host) from a
-            # worker that RAN and CRASHED early leaving error_{phase}_attempt<N>.txt (bad env/config/OOM):
-            # that is DETERMINISTIC -> fail FAST. A crash the worker flagged retriable still retries.
-            err = adapter.read_current_error()
-            # error files are attempt-scoped, so a present file already belongs to this exact handle.
-            worker_crashed = bool(err and err.strip()) and not worker_flagged_retriable(
-                heartbeat_reader,
-                launch_ts=launch_ts,
-                current_attempt=adapter.current_attempt,
-            )
-            return PollResult(
-                False,
-                failure="job_failed" if worker_crashed else "job_preempted",
-                detail=adapter.failure_detail(None),
+            return _dead_host_result(
+                adapter, artifacts, heartbeat_reader=heartbeat_reader, launch_ts=launch_ts
             )
 
         new_key, stage = surface_heartbeat(heartbeat_reader, artifacts.last_hb_key, say)
         if new_key != artifacts.last_hb_key:
             artifacts.last_hb_key = new_key
-            # Credit the heartbeat's OWN ts (clamped to [launch, now]) so a pre-restart-stale heartbeat
-            # buys no fresh window. ``fresh`` is False for a leftover prior-attempt heartbeat.
-            hb_ts, fresh = heartbeat_progress_ts(new_key, launch_ts, adapter.current_attempt)
-            if fresh:
-                seen_fresh_hb = True
-                # Advance the stall clock ONLY on a STAGED heartbeat (stage is not None): a bare liveness
-                # ping must not let a wedged worker keep resetting the setup/training stall window.
-                # MONOTONIC: never regress on an out-of-order upload.
-                if stage is not None:
-                    last_progress = max(last_progress, hb_ts)
-                    # Tighten setup_grace -> stall only once training genuinely begins (the shared helper
-                    # keeps cold-start pings, incl. the silent step=0 first rollout, under setup grace).
-                    if is_training_heartbeat(stage, new_key[1]):
-                        seen_training_hb = True
+            progress.record_heartbeat(
+                new_key, stage, launch_ts=launch_ts, current_attempt=adapter.current_attempt
+            )
 
         # a fresh heartbeat proves startup even if the detail api still says loading/unknown, so it
         # disarms load timeout. order matters: this check follows heartbeat processing so a heartbeat
         # arriving exactly at the boundary wins on the same tick. the absolute deadline still caps spend.
-        if not became_running and not seen_fresh_hb and time.time() - start > load_timeout_s:
+        if (
+            not progress.became_running
+            and not progress.seen_fresh_hb
+            and time.time() - start > load_timeout_s
+        ):
             return PollResult(
                 False,
                 failure="stalled",
                 detail=adapter.load_timeout_detail(status, time.time() - start),
             )
 
-        if became_running:
-            # after running without a heartbeat, consult early-liveness before declaring a stall: slow
-            # installs and fetches can be healthy. latch positive bootstrap evidence; require silence for
-            # BOOT_LOG_ABSENT_POLLS and respect the observed-running floor on reattach.
-            if (
-                not seen_fresh_hb
-                and not liveness_seen
-                and time.time() - running_since > first_liveness_s
-                and observed_running_since is not None
-                and time.time() - observed_running_since > FIRST_LIVENESS_OBSERVED_FLOOR_S
-            ):
-                if not adapter.early_liveness_alive():
-                    # A lone absent read can be a transient log-API error -> require BOOT_LOG_ABSENT_POLLS.
-                    liveness_absent_polls += 1
-                    if liveness_absent_polls >= BOOT_LOG_ABSENT_POLLS:
-                        return stalled_unless_terminal(
-                            adapter.first_liveness_detail(
-                                time.time() - running_since, first_liveness_s
-                            )
-                        )
-                else:
-                    # Bootstrap is producing output -> healthy slow cold start; setup/stall below backstop.
-                    liveness_seen = True
-            limit = stall_after_s if seen_training_hb else setup_grace_s
-            if time.time() - last_progress > limit:
-                phase = "training" if seen_training_hb else "setup (pre-training)"
-                return stalled_unless_terminal(
-                    f"no worker progress for {int(time.time() - last_progress)}s during "
-                    f"{phase} (instance status {status}, limit {int(limit)}s)"
-                )
+        if progress.became_running:
+            stall_detail = progress.stall_detail(
+                adapter,
+                status=status,
+                first_liveness_s=first_liveness_s,
+                stall_after_s=stall_after_s,
+                setup_grace_s=setup_grace_s,
+            )
+            if stall_detail is not None:
+                return stalled_unless_terminal(stall_detail)
         delay = interval_s
         if absolute_deadline is not None:
             remaining = remaining_seconds(absolute_deadline)

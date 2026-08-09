@@ -3421,7 +3421,6 @@ def test_every_preload_timeout_default_reads_the_shared_constant():
     leaves that path timing out exactly as before, and it is the CLI default that operators hit.
     """
     import inspect
-    import re
 
     from flash.providers.artifacts import weight_cache as preload
 
@@ -3435,13 +3434,17 @@ def test_every_preload_timeout_default_reads_the_shared_constant():
     stale = {k: v for k, v in defaults.items() if v != preload._PRELOAD_TIMEOUT_S}
     assert not stale, f"these carry a literal instead of _PRELOAD_TIMEOUT_S: {stale}"
 
-    # The CLI parser is built inline in main(), so there is no parser object to query without
-    # running it. Read the source instead -- a numeric literal here is the operator-facing default
-    # and would keep timing out at the old budget however high the constant is raised.
-    cli = re.search(r'"--timeout-s".*?default=([^,)\s]+)', inspect.getsource(preload.main), re.S)
-    assert cli, "--timeout-s no longer declares a default; this test must be updated"
-    assert cli.group(1) == "_PRELOAD_TIMEOUT_S", (
-        f"--timeout-s defaults to {cli.group(1)} instead of _PRELOAD_TIMEOUT_S"
+    # Query the real parser: a numeric literal here is the operator-facing default and would keep
+    # timing out at the old budget however high the constant is raised. Reading the resolved default
+    # off the action also catches a literal that merely HAPPENS to equal the constant today.
+    timeout_action = next(
+        (a for a in preload._build_preload_parser()._actions if "--timeout-s" in a.option_strings),
+        None,
+    )
+    assert timeout_action is not None, "--timeout-s no longer exists; this test must be updated"
+    assert timeout_action.default == preload._PRELOAD_TIMEOUT_S, (
+        f"--timeout-s defaults to {timeout_action.default} instead of "
+        f"_PRELOAD_TIMEOUT_S ({preload._PRELOAD_TIMEOUT_S})"
     )
 
 
