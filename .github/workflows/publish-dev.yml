@@ -35,7 +35,8 @@ jobs:
     if: github.repository == 'freesolo-co/flash'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # `write` (not `read`) because the tag step at the end of this job pushes a git tag.
+      contents: write
     env:
       UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
 
@@ -123,3 +124,29 @@ jobs:
             exit 1
           fi
           uv publish
+
+      # Tag only -- no GitHub release. The dev channel ships several times a day, so a release per
+      # version would bury the prod releases it is meant to sit alongside. The tag is the part that
+      # carries the information: it is the only record of WHICH commit is inside a given
+      # `freesolo-flash-dev` version. Without it, two commits claiming the same version (which is a
+      # thing that happens here -- concurrent PRs bump to the same number, merge without conflict,
+      # and the second silently no-publishes) are indistinguishable after the fact.
+      #
+      # Named `dev-v<version>` so the dev channel shares no namespace with prod's `v<version>`:
+      # both channels use the SAME version number by design (version-parity.yml enforces it), so a
+      # shared prefix would collide on every single release.
+      - name: Tag the released dev version
+        if: steps.decide.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="dev-v${VERSION}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "::notice::Tag ${tag} already exists on origin; leaving it as-is."
+            exit 0
+          fi
+          git config user.name "David Shan"
+          git config user.email "78061174+DavidBShan@users.noreply.github.com"
+          git tag -a "${tag}" -m "freesolo-flash-dev ${VERSION}"
+          git push origin "${tag}"

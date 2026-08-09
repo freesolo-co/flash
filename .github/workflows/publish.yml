@@ -31,7 +31,9 @@ jobs:
     if: github.repository == 'freesolo-co/flash'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # `write` (not `read`) because the release steps at the end of this job push a git tag and
+      # create a GitHub release through the default GITHUB_TOKEN.
+      contents: write
     env:
       UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
 
@@ -174,6 +176,66 @@ jobs:
             exit 1
           fi
           uv publish
+
+      # Tag + GitHub release come AFTER a successful `uv publish`, deliberately. A tag that exists
+      # for a version PyPI never accepted is worse than no tag: it reads as "this shipped" forever,
+      # and the next run has to reason about which of the two sources is lying. Publishing first
+      # means the tag is only ever created for a version that is genuinely on the index.
+      - name: Tag the released version
+        id: tag
+        if: github.event_name == 'workflow_dispatch' || steps.changes.outputs.package_changed == 'true'
+        env:
+          PACKAGE_VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v${PACKAGE_VERSION}"
+          # A re-run of this workflow over the same commit would otherwise die on a duplicate tag.
+          # The publish step above already guarantees this version was not previously on PyPI, so an
+          # existing tag here means a partial earlier run, not a double release -- skip, don't fail.
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "::notice::Tag ${tag} already exists on origin; leaving it as-is."
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          else
+            git config user.name "David Shan"
+            git config user.email "78061174+DavidBShan@users.noreply.github.com"
+            # Annotated (not lightweight) so the tag carries its own date and author.
+            git tag -a "${tag}" -m "freesolo-flash ${PACKAGE_VERSION}"
+            git push origin "${tag}"
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        # Gated on the tag EXISTING, not on this run having created it. If an earlier run pushed the
+        # tag and then died before the release, that state is only repairable if this step still
+        # runs -- `created == 'true'` would skip it forever.
+        if: steps.tag.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PACKAGE_NAME: ${{ steps.metadata.outputs.name }}
+          PACKAGE_VERSION: ${{ steps.metadata.outputs.version }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "::notice::Release ${TAG} already exists; nothing to do."
+            exit 0
+          fi
+          # Built with printf into a file rather than an inline multi-line --notes string: the body
+          # spans blank lines, and a continuation line at column 0 inside a `run: |` block ends the
+          # YAML block scalar and parses as a new mapping key.
+          notes="${RUNNER_TEMP}/release-notes.md"
+          printf 'Install: `pip install %s==%s`\n\nPyPI: https://pypi.org/project/%s/%s/\n' \
+            "$PACKAGE_NAME" "$PACKAGE_VERSION" "$PACKAGE_NAME" "$PACKAGE_VERSION" > "$notes"
+          # --generate-notes fills in the commit/PR list; --notes-file content is PREPENDED to it
+          # (per the REST API contract for generate_release_notes), so the install line leads and
+          # the changelog follows. --verify-tag guards against racing the tag push above.
+          gh release create "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${TAG}" \
+            --verify-tag \
+            --generate-notes \
+            --notes-file "$notes"
 
       - name: No package changes
         if: github.event_name == 'push' && steps.changes.outputs.package_changed == 'false'
