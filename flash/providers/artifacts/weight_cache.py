@@ -1053,6 +1053,138 @@ def provision_lambda_filesystems(name: str | None = None) -> list[str]:
     return done
 
 
+def _default_weight_cache_datacenters() -> list[str]:
+    # Lazy: weight_cache_datacenters() imports runpod_flash; avoid importing it on instance-only hosts.
+    return [dc.value for dc in weight_cache_datacenters()]
+
+
+def _run_weight_cache_provision(args) -> int:
+    if args.dry_run:
+        print("would provision Lambda filesystems in every region")
+        return 0
+    provisioned = provision_lambda_filesystems()
+    print(
+        f"provisioned {len(provisioned)} Lambda filesystem(s): "
+        f"{', '.join(provisioned) or '(none: no Lambda key or no regions)'}"
+    )
+    return 0
+
+
+def _run_lambda_weight_cache_warm(args, models: list[str]) -> int:
+    if args.dry_run:
+        print("would warm Lambda caches (one download-only launch per region with capacity)")
+        return 0
+    incomplete = ""
+    try:
+        results = warm_instances(
+            models=models, gpu=args.gpu, timeout_s=args.timeout_s, max_workers=args.max_workers
+        )
+    except IncompleteWarmPlanError as exc:
+        # Still print the per-region lines below: those launches ran and were paid for, and a
+        # bare traceback would hide which regions are now warm. The run is reported as
+        # unfinished at the end instead of as a clean sweep.
+        results, incomplete = exc.results, str(exc)
+    except RuntimeError as exc:
+        # A total planning outage or an unusable status repo aborts before any launch, so there
+        # is nothing paid to report. Exit non-zero with the message instead of a traceback: this
+        # is an operator-actionable condition (Lambda down, HF_TOKEN missing), not a crash.
+        print(f"0 regions warmed — {exc}")
+        return 1
+    if not results:
+        if incomplete:
+            print(f"0 regions warmed — {incomplete}")
+            return 1
+        print(
+            "0 regions warmed — no Lambda region had capacity to warm right now "
+            "(weights download cold on first run). Nothing launched."
+        )
+        return 0
+    failed = [r for r in results if r.get("status") not in ("ok",)]
+    for r in results:
+        # Name the GPU: without --gpu the ladder picks per region, so this is the only place the
+        # operator can see which paid class each region actually billed.
+        gpu_note = f" on {r['gpu']}" if r.get("gpu") else ""
+        print(
+            f"  {r['provider']}/{r['region']}: {r['status']}{gpu_note}"
+            + (f" ({r.get('error')})" if r.get("error") else "")
+        )
+    print(f"{len(results) - len(failed)}/{len(results)} regions warmed")
+    if incomplete:
+        # NOT "N/N regions warmed ... exit 0": the denominator counts only the regions we could
+        # see, so a perfect ratio here means the gap is invisible, not absent.
+        print(f"WARNING: {incomplete}")
+        return 1
+    return 1 if failed else 0
+
+
+def _run_weight_cache_teardown(args, parsed_dcs: list[str], scoped: bool) -> int:
+    if scoped:
+        from runpod_flash.core.resources.datacenter import DataCenter
+
+        bad = []
+        for d in parsed_dcs:
+            try:
+                DataCenter.from_string(d)
+            except Exception:
+                bad.append(d)
+        if bad:
+            print(
+                f"--teardown --datacenters: invalid datacenter id(s): {', '.join(bad)} "
+                "— refusing to run (nothing deleted)"
+            )
+            return 2
+    if args.dry_run:
+        scope_desc = (
+            f"{len(parsed_dcs)} datacenter(s): {', '.join(parsed_dcs)}"
+            if scoped
+            else "every RunPod storage datacenter"
+        )
+        print(
+            f"would delete the RunPod weight-cache volumes in {scope_desc}"
+            + ("" if scoped else " + every Lambda filesystem named flash-weights")
+        )
+        return 0
+    deleted: list[str] = []
+    try:
+        deleted += teardown_weight_cache(parsed_dcs or None)
+    except Exception as exc:
+        logger.warning("teardown: RunPod cache teardown failed (continuing): %s", exc)
+    # Scoped (--datacenters) teardown is RunPod-only; Lambda regions are a different namespace.
+    if not scoped:
+        try:
+            deleted += teardown_lambda_filesystems()
+        except Exception as exc:
+            logger.warning("teardown: Lambda cache teardown failed (continuing): %s", exc)
+    else:
+        print("scoped teardown (--datacenters): RunPod-only; Lambda caches left intact")
+    print(f"deleted {len(deleted)} weight-cache volume(s): {', '.join(deleted) or '(none)'}")
+    return 0
+
+
+def _run_runpod_weight_cache_warm(args, models: list[str], parsed_dcs: list[str]) -> int:
+    dcs = parsed_dcs or _default_weight_cache_datacenters()
+    if args.dry_run:
+        print(f"would warm {len(dcs)} datacenter(s): {', '.join(dcs)}")
+        print(f"with {len(models)} model(s): {', '.join(models)}")
+        return 0
+
+    results = warm_weight_cache(
+        models=models,
+        datacenters=dcs,
+        gpu=args.gpu or _PRELOAD_GPU,
+        timeout_s=args.timeout_s,
+        max_workers=args.max_workers,
+    )
+    failed = [r for r in results if r.get("status") != "ok"]
+    for r in results:
+        print(
+            f"  {r['datacenter']}: {r['status']}"
+            + (f" ({r.get('error')})" if r.get("error") else "")
+        )
+    print(f"{len(results) - len(failed)}/{len(results)} datacenters warmed")
+    return 1 if failed else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     # This module is a library: the `flash` logger carries only a NullHandler until an app opts in,
     # so every logger.warning here -- including the one naming regions with no capacity in any class,
@@ -1147,128 +1279,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     scoped = bool(parsed_dcs)
 
-    # Lazy: weight_cache_datacenters() imports runpod_flash; avoid importing it on instance-only hosts.
-    def _default_dcs() -> list[str]:
-        return [dc.value for dc in weight_cache_datacenters()]
-
     if args.provision:
-        if args.dry_run:
-            print("would provision Lambda filesystems in every region")
-            return 0
-        provisioned = provision_lambda_filesystems()
-        print(
-            f"provisioned {len(provisioned)} Lambda filesystem(s): "
-            f"{', '.join(provisioned) or '(none: no Lambda key or no regions)'}"
-        )
-        return 0
+        return _run_weight_cache_provision(args)
     if args.warm_instances:
-        if args.dry_run:
-            print("would warm Lambda caches (one download-only launch per region with capacity)")
-            return 0
-        incomplete = ""
-        try:
-            results = warm_instances(
-                models=models, gpu=args.gpu, timeout_s=args.timeout_s, max_workers=args.max_workers
-            )
-        except IncompleteWarmPlanError as exc:
-            # Still print the per-region lines below: those launches ran and were paid for, and a
-            # bare traceback would hide which regions are now warm. The run is reported as
-            # unfinished at the end instead of as a clean sweep.
-            results, incomplete = exc.results, str(exc)
-        except RuntimeError as exc:
-            # A total planning outage or an unusable status repo aborts before any launch, so there
-            # is nothing paid to report. Exit non-zero with the message instead of a traceback: this
-            # is an operator-actionable condition (Lambda down, HF_TOKEN missing), not a crash.
-            print(f"0 regions warmed — {exc}")
-            return 1
-        if not results:
-            if incomplete:
-                print(f"0 regions warmed — {incomplete}")
-                return 1
-            print(
-                "0 regions warmed — no Lambda region had capacity to warm right now "
-                "(weights download cold on first run). Nothing launched."
-            )
-            return 0
-        failed = [r for r in results if r.get("status") not in ("ok",)]
-        for r in results:
-            # Name the GPU: without --gpu the ladder picks per region, so this is the only place the
-            # operator can see which paid class each region actually billed.
-            gpu_note = f" on {r['gpu']}" if r.get("gpu") else ""
-            print(
-                f"  {r['provider']}/{r['region']}: {r['status']}{gpu_note}"
-                + (f" ({r.get('error')})" if r.get("error") else "")
-            )
-        print(f"{len(results) - len(failed)}/{len(results)} regions warmed")
-        if incomplete:
-            # NOT "N/N regions warmed ... exit 0": the denominator counts only the regions we could
-            # see, so a perfect ratio here means the gap is invisible, not absent.
-            print(f"WARNING: {incomplete}")
-            return 1
-        return 1 if failed else 0
+        return _run_lambda_weight_cache_warm(args, models)
     if args.teardown:
-        if scoped:
-            from runpod_flash.core.resources.datacenter import DataCenter
-
-            bad = []
-            for d in parsed_dcs:
-                try:
-                    DataCenter.from_string(d)
-                except Exception:
-                    bad.append(d)
-            if bad:
-                print(
-                    f"--teardown --datacenters: invalid datacenter id(s): {', '.join(bad)} "
-                    "— refusing to run (nothing deleted)"
-                )
-                return 2
-        if args.dry_run:
-            scope_desc = (
-                f"{len(parsed_dcs)} datacenter(s): {', '.join(parsed_dcs)}"
-                if scoped
-                else "every RunPod storage datacenter"
-            )
-            print(
-                f"would delete the RunPod weight-cache volumes in {scope_desc}"
-                + ("" if scoped else " + every Lambda filesystem named flash-weights")
-            )
-            return 0
-        deleted: list[str] = []
-        try:
-            deleted += teardown_weight_cache(parsed_dcs or None)
-        except Exception as exc:
-            logger.warning("teardown: RunPod cache teardown failed (continuing): %s", exc)
-        # Scoped (--datacenters) teardown is RunPod-only; Lambda regions are a different namespace.
-        if not scoped:
-            try:
-                deleted += teardown_lambda_filesystems()
-            except Exception as exc:
-                logger.warning("teardown: Lambda cache teardown failed (continuing): %s", exc)
-        else:
-            print("scoped teardown (--datacenters): RunPod-only; Lambda caches left intact")
-        print(f"deleted {len(deleted)} weight-cache volume(s): {', '.join(deleted) or '(none)'}")
-        return 0
-    dcs = parsed_dcs or _default_dcs()
-    if args.dry_run:
-        print(f"would warm {len(dcs)} datacenter(s): {', '.join(dcs)}")
-        print(f"with {len(models)} model(s): {', '.join(models)}")
-        return 0
-
-    results = warm_weight_cache(
-        models=models,
-        datacenters=dcs,
-        gpu=args.gpu or _PRELOAD_GPU,
-        timeout_s=args.timeout_s,
-        max_workers=args.max_workers,
-    )
-    failed = [r for r in results if r.get("status") != "ok"]
-    for r in results:
-        print(
-            f"  {r['datacenter']}: {r['status']}"
-            + (f" ({r.get('error')})" if r.get("error") else "")
-        )
-    print(f"{len(results) - len(failed)}/{len(results)} datacenters warmed")
-    return 1 if failed else 0
+        return _run_weight_cache_teardown(args, parsed_dcs, scoped)
+    return _run_runpod_weight_cache_warm(args, models, parsed_dcs)
 
 
 if __name__ == "__main__":
