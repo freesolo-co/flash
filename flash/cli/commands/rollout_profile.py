@@ -1,9 +1,13 @@
 """gather rollout evidence for a grpo/opd submit, from the client.
 
-this runs here rather than on the control plane because of where the two halves can be measured.
-generation length needs a hosted inference endpoint, which either side could call; grading latency
-needs the environment's own scorer, and the control plane never executes user environment code.
-doing both here keeps one download and one place that can fail.
+what is measured here is realized generation LENGTH, and nothing else. length is a property of
+(model, prompt, sampling params), so a hosted endpoint measures the same quantity the rented gpu
+would -- it transfers between hosts. seconds do not: they depend on the machine, its cpu and its
+network path. that is why no grading latency is timed here even though the env's scorer is loadable
+in this process; the worker times its own scorer on the machine that will run it.
+
+the env is loaded locally because prompt length is half the measurement and only the env's own
+prompt_messages() produces the real prompts.
 
 entirely best-effort. every failure returns None and the submit proceeds on the declared cap, which
 is the pricing this path had before any of this existed.
@@ -14,7 +18,6 @@ from __future__ import annotations
 import os
 import random
 import tempfile
-import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -25,14 +28,6 @@ _DEFAULT_ENVIRONMENT_PATH = "environment.py"
 # how many dataset rows to draw prompts from. prompt difficulty dominates length variance, so a
 # handful of distinct prompts beats many draws from one.
 _PROMPT_ROWS = 8
-
-# references handed to the grading timer. three real completions is what `profile_reward_latency`
-# uses by default, plus its discarded warm-up call.
-_REWARD_REFERENCES = 4
-
-# shared deadline for gathering those references. matches the worker profiler's own budget
-# (rl_train.py `_PROFILE_BUDGET_S`), because both bound the same user-supplied hook.
-_REFERENCE_BUDGET_S = 30.0
 
 # the only message keys this path can reproduce faithfully. the workers pass the original message
 # dicts into the chat template, so anything else (`name`, tool-call fields) can change what the
@@ -138,7 +133,6 @@ def unsamplable_reason(spec) -> str:
 
 
 def _collect(client, spec) -> dict[str, Any] | None:
-    from flash.content.multimodal import assistant_completion_text
     from flash.engine.profiling.rollout_evidence import collect_rollout_evidence
     from flash.envs.loader import load_freesolo_environment
     from flash.envs.pull import pull_environment_package_from_archive
@@ -177,22 +171,19 @@ def _collect(client, spec) -> dict[str, Any] | None:
         if not prompts:
             return None
 
-        # only grpo prices reward latency (analytical.py adds `completions x latency` in the grpo
-        # branch alone); opd supervises from the teacher distribution and uses zero task reward. so
-        # timing an opd env's reward() would call a possibly paid external judge locally to produce
-        # a number nothing reads. completion-length sampling still runs for both.
-        score_one, references = (
-            _reward_inputs(environment, dataset, assistant_completion_text)
-            if spec.algorithm == "grpo"
-            else (None, None)
-        )
+        # NO grading latency is measured here, for either algorithm. seconds measured on this
+        # machine do not describe the worker: reward() is either cpu-bound (a different cpu) or an
+        # external judge call (a different network path and geography), and the number would then be
+        # multiplied by every completion of every step. this is the same rule the generation half
+        # already follows -- token COUNTS transfer between hosts, SECONDS do not -- and the worker
+        # already times its own scorer on the machine that will run it (rl_train.py
+        # `_log_reward_profile`). timing it here would also call a possibly paid judge locally to
+        # produce a number the run should not be priced from.
         return collect_rollout_evidence(
             model=spec.model,
             prompts=prompts,
             max_completion_tokens=_completion_cap(spec),
             temperature=_sampling_temperature(spec),
-            score_one=score_one,
-            reward_samples=references,
             # a run configured with stop strings ends generation at the first one, so a sample
             # drawn without them measures a longer completion than training will ever produce.
             stop_sequences=tuple(getattr(spec.train, "stop_sequences", ()) or ()),
@@ -303,53 +294,6 @@ def _chat_messages(messages) -> list[dict]:
             return []
         out.append({"role": role, "content": content})
     return out
-
-
-def _reward_inputs(environment, dataset, assistant_completion_text):
-    """(scorer, references) for grading-latency timing, or (None, None) when unavailable.
-
-    grades the env's own gold completions: they are the closest available stand-in for what training
-    will grade, and going through the env's accessor keeps block-structured outputs from being
-    stringified into a python repr.
-    """
-    reward = getattr(environment, "reward", None)
-    if not callable(reward) or not getattr(environment, "reward_thread_safe", True):
-        # an env that declares itself thread-unsafe must not be graded off-thread here: the timer
-        # runs the scorer on another thread, which could mutate scorer state before training does.
-        return None, None
-    if getattr(environment, "multi_turn", False):
-        # a multi-turn episode is graded per episode, not per completion, so timing one completion
-        # would measure a different operation than the one being priced.
-        return None, None
-
-    # sft_completion reaches user code and can block on i/o exactly like a grader can. unbounded, a
-    # hung reference source stalls `flash train` forever: the outer best-effort handler never regains
-    # control, because nothing raises. the worker's equivalent profiler bounds this the same way, and
-    # for the same reason (rl_train.py, _PROFILE_BUDGET_S).
-    from flash.engine.profiling.reward_profile import call_bounded
-
-    references: list[tuple[int, str]] = []
-    deadline = time.perf_counter() + _REFERENCE_BUDGET_S
-    for index, example in enumerate(dataset[:_REWARD_REFERENCES]):
-        remaining = deadline - time.perf_counter()
-        if remaining <= 0:
-            break
-        # bind the loop var: the call runs on another thread, so a late-binding closure could read
-        # the next iteration's example.
-        ok, _elapsed, text = call_bounded(
-            lambda ex=example: assistant_completion_text(environment.sft_completion(ex)), remaining
-        )
-        if ok is None:
-            # a reference source that did not return within the budget will not return within it on
-            # the next row either. give up on grading latency; the token measurement still stands.
-            return None, None
-        if not ok:
-            continue
-        if isinstance(text, str) and text.strip():
-            references.append((index, text))
-    if not references:
-        return None, None
-    return (lambda index, completion: float(reward(completion, dataset[index]))), references
 
 
 def _completion_cap(spec) -> int:

@@ -253,10 +253,10 @@ def _one_completion(
             body = json.load(response)
     except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
         return None
-    return _sample_from_response(body)
+    return _sample_from_response(body, max_completion_tokens=int(max_completion_tokens))
 
 
-def _sample_from_response(body: object) -> RolloutSample | None:
+def _sample_from_response(body: object, *, max_completion_tokens: int) -> RolloutSample | None:
     """token counts for one draw, or None when the response cannot stand as a measurement."""
     usage = body.get("usage") if isinstance(body, dict) else None
     choices = body.get("choices") if isinstance(body, dict) else None
@@ -281,8 +281,15 @@ def _sample_from_response(body: object) -> RolloutSample | None:
     # trust gate with zero reported truncations and quote a length no rollout produces, so they are
     # dropped as failed draws instead.
     if finish == "length":
+        # a truncated draw is a censored observation: the true length is at least the cap, and the
+        # count reported here is only where generation was cut off. when a provider stops BELOW the
+        # requested cap -- its own output ceiling, or an exhausted context -- keeping that smaller
+        # number would pull the mean down, and up to MAX_TRUSTWORTHY_TRUNCATION_RATE of such draws
+        # are accepted, so they would underquote. record the cap the run will actually generate to.
         return RolloutSample(
-            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, truncated=True
+            prompt_tokens=prompt_tokens,
+            completion_tokens=max(completion_tokens, int(max_completion_tokens)),
+            truncated=True,
         )
     if finish != "stop":
         return None

@@ -239,7 +239,7 @@ def test_a_draw_that_did_not_end_naturally_is_not_an_eos_sample(finish, monkeypa
         "usage": {"completion_tokens": 12, "prompt_tokens": 20},
         "choices": [{"finish_reason": finish}],
     }
-    assert rollout_sampler._sample_from_response(payload) is None
+    assert rollout_sampler._sample_from_response(payload, max_completion_tokens=512) is None
 
 
 @pytest.mark.parametrize(
@@ -251,7 +251,7 @@ def test_natural_and_truncated_draws_are_both_kept(finish, truncated):
         "usage": {"completion_tokens": 12, "prompt_tokens": 20},
         "choices": [{"finish_reason": finish}],
     }
-    sample = rollout_sampler._sample_from_response(payload)
+    sample = rollout_sampler._sample_from_response(payload, max_completion_tokens=512)
     assert sample is not None
     assert sample.truncated is truncated
 
@@ -912,11 +912,15 @@ def test_a_multi_turn_environment_is_not_priced_from_one_turn(monkeypatch, tmp_p
     assert rp.collect_for_submit(_Client(), _spec(), debug=True) is None
 
 
-def test_opd_measures_length_but_does_not_run_the_task_reward(monkeypatch, tmp_path):
-    """Only the grpo cost branch prices reward latency; opd supervises from the teacher.
+@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
+def test_no_algorithm_times_the_task_reward_on_the_client_host(algorithm, monkeypatch, tmp_path):
+    """Seconds measured on this machine do not describe the worker.
 
-    So timing an opd env's reward() calls a possibly paid external judge to produce a number nothing
-    reads. Length sampling must still happen -- opd is quoted on completion tokens too.
+    reward() is either cpu-bound (a different cpu) or an external judge call (a different network
+    path and geography), and the figure would then be multiplied by every completion of every step.
+    This is the same rule generation already follows: token COUNTS transfer between hosts, SECONDS
+    do not. The worker times its own scorer on the machine that will run it. Length sampling must
+    still happen for both algorithms -- both are quoted on completion tokens.
     """
     from flash.cli.commands import rollout_profile as rp
 
@@ -932,7 +936,7 @@ def test_opd_measures_length_but_does_not_run_the_task_reward(monkeypatch, tmp_p
             return [{"role": "user", "content": example["q"]}]
 
         def reward(self, *_a, **_k):
-            raise AssertionError("opd must not call the task reward while profiling")
+            raise AssertionError("profiling must not call the task reward on this host")
 
         def sft_completion(self, _example):
             return "4"
@@ -953,9 +957,10 @@ def test_opd_measures_length_but_does_not_run_the_task_reward(monkeypatch, tmp_p
         def download_env_package(self, _env_id):
             return b""
 
-    rp.collect_for_submit(_Client(), _spec(algorithm="opd"), debug=True)
-    assert seen.get("prompts"), "opd must still sample completion length"
-    assert seen.get("score_one") is None, "opd must not hand a scorer to the timer"
+    rp.collect_for_submit(_Client(), _spec(algorithm=algorithm), debug=True)
+    assert seen.get("prompts"), "completion length must still be sampled"
+    assert seen.get("score_one") is None, "no scorer may be handed to a client-side timer"
+    assert seen.get("reward_samples") is None
 
 
 @pytest.mark.parametrize(
@@ -982,31 +987,352 @@ def test_a_run_whose_generation_the_endpoint_cannot_match_is_not_measured(
     assert rp.collect_for_submit(object(), _spec(**{field: value}), debug=True) is None
 
 
-def test_a_broken_grader_does_not_discard_the_token_measurement():
-    """The two readings are independent, and only one of them failed.
+def _profiling_stubs(monkeypatch, tmp_path, env):
+    """Wire collect_for_submit's in-body imports to a fake env and capture what it would measure."""
+    entry = tmp_path / "package" / "environment.py"
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    entry.write_text("")
 
-    `reward_failures > reward_samples` violates a RolloutWorkloadProfile invariant, so reporting the
-    failure count alongside `reward_samples: 0` made the whole payload unconstructable -- a scorer
-    that raised threw away an otherwise good 32-rollout token measurement and returned the quote to
-    the cap.
+    seen: dict = {}
+
+    class _Client:
+        def download_env_package(self, _env_id):
+            return b""
+
+    monkeypatch.setattr(
+        "flash.envs.pull.pull_environment_package_from_archive", lambda *_a: tmp_path / "package"
+    )
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda *_a, **_k: env)
+    monkeypatch.setattr(
+        "flash.engine.profiling.rollout_evidence.collect_rollout_evidence",
+        lambda **kw: seen.update(kw) or {"measured": True},
+    )
+    monkeypatch.setenv(rollout_sampler.ROLLOUT_SAMPLER_API_KEY_ENV, "k")
+    return _Client(), seen
+
+
+def test_the_evidence_carries_no_grading_measurement(monkeypatch):
+    """Grading is no longer timed on the client, so no reward field may appear in the payload.
+
+    A stray zero would be read by the cost model as "grading is free" rather than "grading was not
+    measured here" -- the same conflation the reward-default work removed.
     """
-    from flash.engine.profiling.rollout_evidence import _reward_evidence
+    monkeypatch.setattr(
+        "flash.engine.profiling.rollout_evidence.sampler_credentials",
+        lambda: ("https://example.invalid/v1", "k"),
+    )
+    monkeypatch.setattr(
+        "flash.engine.profiling.rollout_evidence.sample_rollouts",
+        lambda **_kw: RolloutSampling(
+            samples=tuple(
+                RolloutSample(prompt_tokens=10, completion_tokens=40, truncated=False)
+                for _ in range(MIN_TRUSTWORTHY_ROLLOUTS)
+            ),
+            failures=0,
+            sampled_prompts=8,
+        ),
+    )
+    from flash.engine.profiling.rollout_evidence import collect_rollout_evidence
 
-    def _raises(_index, _completion):
-        raise RuntimeError("grader down")
+    evidence = collect_rollout_evidence(
+        model="m",
+        prompts=[[{"role": "user", "content": "p"}]],
+        max_completion_tokens=512,
+        temperature=None,
+    )
+    assert not [key for key in evidence if key.startswith("reward")]
+    # and the token half still stands on its own.
+    assert evidence["completed_rollouts"] == MIN_TRUSTWORTHY_ROLLOUTS
 
-    evidence = _reward_evidence(_raises, [(0, "a"), (1, "b")])
-    assert evidence["reward_samples"] == 0, "a failed grading is not a measurement"
-    assert evidence["reward_seconds_per_completion"] == 0.0
-    assert evidence["reward_failures"] <= evidence["reward_samples"], (
-        "the profile invariant must hold, or the token aggregates are discarded with it"
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"q": "what is in this picture?", "image": "data:image/png;base64,AAAA"},
+        {"q": "what is in these?", "images": ["a.png", "b.png"]},
+    ],
+)
+def test_a_multimodal_row_is_not_priced_from_its_text_alone(row, monkeypatch, tmp_path):
+    """The workers add image blocks and the processor's expanded image tokens before generating.
+
+    A text-only draw of the same row measures a fraction of the real prompt work. Skipping such rows
+    would be worse than declining: a mixed dataset would still return a full set of text-only draws,
+    pass the trust gate, and underprice every multimodal step.
+    """
+    from flash.cli.commands import rollout_profile as rp
+
+    class _Env:
+        multi_turn = False
+
+        def dataset(self):
+            return [row, {"q": "plain text row"}]
+
+        def prompt_messages(self, example):
+            return [{"role": "user", "content": example["q"]}]
+
+    client, seen = _profiling_stubs(monkeypatch, tmp_path, _Env())
+    assert rp.collect_for_submit(client, _spec(), debug=True) is None
+    assert not seen, "a multimodal dataset must not reach the sampler at all"
+
+
+def test_a_text_only_dataset_is_still_measured(monkeypatch, tmp_path):
+    """The control: the multimodal check must not decline ordinary text runs."""
+    from flash.cli.commands import rollout_profile as rp
+
+    class _Env:
+        multi_turn = False
+
+        def dataset(self):
+            return [{"q": "2+2?"}, {"q": "3+3?"}]
+
+        def prompt_messages(self, example):
+            return [{"role": "user", "content": example["q"]}]
+
+    client, seen = _profiling_stubs(monkeypatch, tmp_path, _Env())
+    assert rp.collect_for_submit(client, _spec(), debug=True) == {"measured": True}
+    assert len(seen["prompts"]) == 2
+
+
+def test_the_measurement_samples_the_rows_the_run_will_train_on(monkeypatch, tmp_path):
+    """The workers seed before their first environment call; this path did not.
+
+    Env code may consume python/numpy randomness while building its dataset, so unseeded the measured
+    rows depend on this process's incidental RNG state -- while the server binds the profile to
+    spec.seed. Two runs with different seeds could then share a measurement of a different sample.
+    """
+    from flash.cli.commands import rollout_profile as rp
+
+    class _Env:
+        multi_turn = False
+
+        def dataset(self):
+            # a dataset built with randomness, exactly what the worker's seeding exists to pin.
+            return [{"q": f"row-{random.random():.12f}"}]
+
+        def prompt_messages(self, example):
+            return [{"role": "user", "content": example["q"]}]
+
+    def _measured_row(spec):
+        client, seen = _profiling_stubs(monkeypatch, tmp_path, _Env())
+        rp.collect_for_submit(client, spec, debug=True)
+        return seen["prompts"][0][0]["content"]
+
+    # the same seed must select the same row every time, whatever this process did beforehand.
+    random.seed(999)
+    first = _measured_row(_spec(seed=7))
+    random.seed(12345)
+    second = _measured_row(_spec(seed=7))
+    assert first == second, "the measured rows must follow spec.seed, not ambient RNG state"
+
+    # and a different seed is a different sample, which is why the digest keys it.
+    assert _measured_row(_spec(seed=8)) != first
+
+
+def test_measuring_does_not_leave_the_process_rng_seeded(monkeypatch, tmp_path):
+    """This CLI keeps running after the measurement -- it goes on to submit the run.
+
+    Leaving the seed in place would make every later random draw in the process deterministic as a
+    side effect of asking for a quote.
+    """
+    from flash.cli.commands import rollout_profile as rp
+
+    class _Env:
+        multi_turn = False
+
+        def dataset(self):
+            return [{"q": "2+2?"}]
+
+        def prompt_messages(self, example):
+            return [{"role": "user", "content": example["q"]}]
+
+    client, _seen = _profiling_stubs(monkeypatch, tmp_path, _Env())
+    random.seed(4242)
+    expected = [random.random() for _ in range(3)]
+
+    random.seed(4242)
+    rp.collect_for_submit(client, _spec(seed=7), debug=True)
+    assert [random.random() for _ in range(3)] == expected, (
+        "the caller's RNG stream must survive the measurement"
     )
 
-    # and the full payload must actually build, which is the property that was broken.
+
+def test_the_api_key_is_not_disclosed_to_a_redirect_target():
+    """urllib copies request headers onto a redirected request, Authorization included.
+
+    So a 30x from the configured endpoint hands the user's PAID inference key to whatever host the
+    Location names. The same hop also rewrites POST to GET and its response was still parsed as a
+    sample, letting a foreign host dictate the measurement it was paid to leak.
+
+    Two real local servers rather than a mocked opener: the leak lives in urllib's redirect handler,
+    so a test that stubs the transport asserts on its own stub.
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    seen: dict = {}
+
+    class _Attacker(BaseHTTPRequestHandler):
+        def do_POST(self):
+            seen["authorization"] = self.headers.get("Authorization")
+            body = json.dumps(
+                {
+                    "usage": {"completion_tokens": 10, "prompt_tokens": 5},
+                    "choices": [{"finish_reason": "stop"}],
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        # a 302 turns the POST into a GET, so the credential arrives on the GET.
+        do_GET = do_POST
+
+        def log_message(self, *_args):
+            pass
+
+    class _Redirector(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{attacker_port}/steal")
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    attacker = HTTPServer(("127.0.0.1", 0), _Attacker)
+    attacker_port = attacker.server_address[1]
+    redirector = HTTPServer(("127.0.0.1", 0), _Redirector)
+    threading.Thread(target=attacker.serve_forever, daemon=True).start()
+    threading.Thread(target=redirector.serve_forever, daemon=True).start()
+    try:
+        sample = rollout_sampler._one_completion(
+            model="m",
+            messages=[{"role": "user", "content": "p"}],
+            max_completion_tokens=64,
+            temperature=None,
+            base_url=f"http://127.0.0.1:{redirector.server_address[1]}/v1",
+            api_key="sk-USER-PAID-INFERENCE-KEY",
+        )
+    finally:
+        attacker.shutdown()
+        redirector.shutdown()
+
+    assert seen.get("authorization") is None, "the api key must never reach another origin"
+    assert sample is None, "a redirected response must not stand as a measurement"
+
+
+def test_evidence_from_a_different_sampling_policy_is_rejected():
+    """The server stamps the profile with ITS version, not the client's.
+
+    So without a policy version in the payload, a client from before a sampling-policy change could
+    submit aggregates that are recorded under the newer identity and later reused as matching.
+    """
     spec = _spec()
-    profile = rollout_profile_from_evidence(spec, _evidence(**evidence), producer_version=VERSION)
-    assert profile is not None
-    assert profile["completion_tokens_mean"] == pytest.approx(53.6875)
+    assert rollout_profile_from_evidence(spec, _evidence(), producer_version=VERSION) is not None
+
+    stale = _evidence(sample_policy_version=ROLLOUT_SAMPLE_POLICY_VERSION + 1)
+    assert rollout_profile_from_evidence(spec, stale, producer_version=VERSION) is None
+
+    missing = _evidence()
+    del missing["sample_policy_version"]
+    assert rollout_profile_from_evidence(spec, missing, producer_version=VERSION) is None
+
+    for junk in ("one", None, [1]):
+        payload = _evidence(sample_policy_version=junk)
+        assert rollout_profile_from_evidence(spec, payload, producer_version=VERSION) is None
+
+
+def test_the_sampler_stamps_the_policy_version_it_produced(monkeypatch):
+    """The seam: the server requires the field, so the client has to emit it or measure nothing."""
+    # rollout_evidence imports both names at module scope, so ITS module is the binding a patch has
+    # to reach -- patching the defining module would leave the real calls untouched.
+    monkeypatch.setattr(
+        "flash.engine.profiling.rollout_evidence.sampler_credentials",
+        lambda: ("https://example.invalid/v1", "k"),
+    )
+    monkeypatch.setattr(
+        "flash.engine.profiling.rollout_evidence.sample_rollouts",
+        lambda **_kw: RolloutSampling(
+            samples=tuple(
+                RolloutSample(prompt_tokens=10, completion_tokens=40, truncated=False)
+                for _ in range(MIN_TRUSTWORTHY_ROLLOUTS)
+            ),
+            failures=0,
+            sampled_prompts=8,
+        ),
+    )
+    from flash.engine.profiling.rollout_evidence import collect_rollout_evidence
+
+    evidence = collect_rollout_evidence(
+        model="m",
+        prompts=[[{"role": "user", "content": "p"}]],
+        max_completion_tokens=512,
+        temperature=None,
+    )
+    assert evidence["sample_policy_version"] == ROLLOUT_SAMPLE_POLICY_VERSION
+    # and it survives the server's gate, which is the point of emitting it.
+    assert rollout_profile_from_evidence(_spec(), evidence, producer_version=VERSION) is not None
+
+
+def test_a_message_the_sampler_cannot_reproduce_is_not_measured():
+    """The workers pass the ORIGINAL message dicts to `apply_chat_template`.
+
+    A template that reads `name` renders a different prompt than a role/content reconstruction, so
+    silently dropping the field would report a confident measurement of a prompt the run never
+    sends. Rejecting returns the quote to the cap, which costs nothing.
+    """
+    from flash.cli.commands.rollout_profile import _chat_messages
+
+    plain = [{"role": "user", "content": "hi"}]
+    assert _chat_messages(plain) == plain
+
+    assert _chat_messages([{"role": "user", "content": "hi", "name": "alice"}]) == []
+    assert _chat_messages([{"role": "assistant", "content": "hi", "tool_calls": []}]) == []
+
+
+def test_a_truncated_draw_is_recorded_at_the_cap_it_will_generate_to():
+    """A truncated draw is a CENSORED observation: the true length is at least the cap.
+
+    A provider can stop below the requested cap for its own reasons -- an output ceiling, an
+    exhausted context -- and keeping that smaller count would pull the mean down. Up to
+    MAX_TRUSTWORTHY_TRUNCATION_RATE of such draws are accepted, so they would underquote the run.
+    """
+    short_truncation = {
+        "usage": {"completion_tokens": 120, "prompt_tokens": 20},
+        "choices": [{"finish_reason": "length"}],
+    }
+    sample = rollout_sampler._sample_from_response(short_truncation, max_completion_tokens=512)
+    assert sample.truncated is True
+    assert sample.completion_tokens == 512, (
+        "a truncated draw contributes the cap, not where the provider happened to stop"
+    )
+
+    # a natural end is reported as measured -- the cap must not overwrite a real observation.
+    natural = {
+        "usage": {"completion_tokens": 120, "prompt_tokens": 20},
+        "choices": [{"finish_reason": "stop"}],
+    }
+    eos = rollout_sampler._sample_from_response(natural, max_completion_tokens=512)
+    assert (eos.truncated, eos.completion_tokens) == (False, 120)
+
+
+def test_client_measured_grading_latency_never_reaches_the_quote():
+    """The evidence must carry no reward latency at all, whatever an env's scorer does here.
+
+    Reward seconds are multiplied by every completion of every step, so a client-host figure moves
+    the quote a long way: a 5s/completion reading takes the default grpo spec from $4.14 to $10.94.
+    That number describes this laptop, not the rented worker.
+    """
+    import inspect
+
+    from flash.engine.profiling.rollout_evidence import collect_rollout_evidence
+
+    # the collector must not even accept a scorer any more -- the parameter is the seam.
+    parameters = inspect.signature(collect_rollout_evidence).parameters
+    assert "score_one" not in parameters
+    assert "reward_samples" not in parameters
 
 
 def test_a_declared_secret_reaches_the_locally_run_environment(monkeypatch, tmp_path):
@@ -1180,302 +1506,3 @@ def test_generation_pricing_stays_bounded_by_the_cap_when_the_actor_drifts():
         completion_tokens_max=cap,
     )
     assert rollout_profile_from_evidence(spec, incoherent, producer_version=VERSION) is None
-
-
-def _profiling_stubs(monkeypatch, tmp_path, env):
-    """Wire collect_for_submit's in-body imports to a fake env and capture what it would measure."""
-    entry = tmp_path / "package" / "environment.py"
-    entry.parent.mkdir(parents=True, exist_ok=True)
-    entry.write_text("")
-
-    seen: dict = {}
-
-    class _Client:
-        def download_env_package(self, _env_id):
-            return b""
-
-    monkeypatch.setattr(
-        "flash.envs.pull.pull_environment_package_from_archive", lambda *_a: tmp_path / "package"
-    )
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda *_a, **_k: env)
-    monkeypatch.setattr(
-        "flash.engine.profiling.rollout_evidence.collect_rollout_evidence",
-        lambda **kw: seen.update(kw) or {"measured": True},
-    )
-    monkeypatch.setenv(rollout_sampler.ROLLOUT_SAMPLER_API_KEY_ENV, "k")
-    return _Client(), seen
-
-
-@pytest.mark.parametrize(
-    "row",
-    [
-        {"q": "what is in this picture?", "image": "data:image/png;base64,AAAA"},
-        {"q": "what is in these?", "images": ["a.png", "b.png"]},
-    ],
-)
-def test_a_multimodal_row_is_not_priced_from_its_text_alone(row, monkeypatch, tmp_path):
-    """The workers add image blocks and the processor's expanded image tokens before generating.
-
-    A text-only draw of the same row measures a fraction of the real prompt work. Skipping such rows
-    would be worse than declining: a mixed dataset would still return a full set of text-only draws,
-    pass the trust gate, and underprice every multimodal step.
-    """
-    from flash.cli.commands import rollout_profile as rp
-
-    class _Env:
-        multi_turn = False
-
-        def dataset(self):
-            return [row, {"q": "plain text row"}]
-
-        def prompt_messages(self, example):
-            return [{"role": "user", "content": example["q"]}]
-
-    client, seen = _profiling_stubs(monkeypatch, tmp_path, _Env())
-    assert rp.collect_for_submit(client, _spec(), debug=True) is None
-    assert not seen, "a multimodal dataset must not reach the sampler at all"
-
-
-def test_a_text_only_dataset_is_still_measured(monkeypatch, tmp_path):
-    """The control: the multimodal check must not decline ordinary text runs."""
-    from flash.cli.commands import rollout_profile as rp
-
-    class _Env:
-        multi_turn = False
-
-        def dataset(self):
-            return [{"q": "2+2?"}, {"q": "3+3?"}]
-
-        def prompt_messages(self, example):
-            return [{"role": "user", "content": example["q"]}]
-
-    client, seen = _profiling_stubs(monkeypatch, tmp_path, _Env())
-    assert rp.collect_for_submit(client, _spec(), debug=True) == {"measured": True}
-    assert len(seen["prompts"]) == 2
-
-
-def test_the_measurement_samples_the_rows_the_run_will_train_on(monkeypatch, tmp_path):
-    """The workers seed before their first environment call; this path did not.
-
-    Env code may consume python/numpy randomness while building its dataset, so unseeded the measured
-    rows depend on this process's incidental RNG state -- while the server binds the profile to
-    spec.seed. Two runs with different seeds could then share a measurement of a different sample.
-    """
-    from flash.cli.commands import rollout_profile as rp
-
-    class _Env:
-        multi_turn = False
-
-        def dataset(self):
-            # a dataset built with randomness, exactly what the worker's seeding exists to pin.
-            return [{"q": f"row-{random.random():.12f}"}]
-
-        def prompt_messages(self, example):
-            return [{"role": "user", "content": example["q"]}]
-
-    def _measured_row(spec):
-        client, seen = _profiling_stubs(monkeypatch, tmp_path, _Env())
-        rp.collect_for_submit(client, spec, debug=True)
-        return seen["prompts"][0][0]["content"]
-
-    # the same seed must select the same row every time, whatever this process did beforehand.
-    random.seed(999)
-    first = _measured_row(_spec(seed=7))
-    random.seed(12345)
-    second = _measured_row(_spec(seed=7))
-    assert first == second, "the measured rows must follow spec.seed, not ambient RNG state"
-
-    # and a different seed is a different sample, which is why the digest keys it.
-    assert _measured_row(_spec(seed=8)) != first
-
-
-def test_measuring_does_not_leave_the_process_rng_seeded(monkeypatch, tmp_path):
-    """This CLI keeps running after the measurement -- it goes on to submit the run.
-
-    Leaving the seed in place would make every later random draw in the process deterministic as a
-    side effect of asking for a quote.
-    """
-    from flash.cli.commands import rollout_profile as rp
-
-    class _Env:
-        multi_turn = False
-
-        def dataset(self):
-            return [{"q": "2+2?"}]
-
-        def prompt_messages(self, example):
-            return [{"role": "user", "content": example["q"]}]
-
-    client, _seen = _profiling_stubs(monkeypatch, tmp_path, _Env())
-    random.seed(4242)
-    expected = [random.random() for _ in range(3)]
-
-    random.seed(4242)
-    rp.collect_for_submit(client, _spec(seed=7), debug=True)
-    assert [random.random() for _ in range(3)] == expected, (
-        "the caller's RNG stream must survive the measurement"
-    )
-
-
-def test_a_hanging_reference_source_cannot_stall_the_submit(monkeypatch):
-    """`sft_completion` is user code and can block on i/o exactly like a grader can.
-
-    Unbounded, a hung reference source stalls `flash train` forever: nothing raises, so the outer
-    best-effort handler never regains control. The worker's profiler bounds the same hook.
-    """
-    from flash.cli.commands import rollout_profile as rp
-
-    monkeypatch.setattr(rp, "_REFERENCE_BUDGET_S", 0.25)
-    started = time.perf_counter()
-
-    class _Env:
-        multi_turn = False
-        reward_thread_safe = True
-
-        def reward(self, _completion, _example):
-            return 1.0
-
-        def sft_completion(self, _example):
-            time.sleep(30)
-            return "never"
-
-    score_one, references = rp._reward_inputs(_Env(), [{"q": "a"}, {"q": "b"}], lambda value: value)
-    elapsed = time.perf_counter() - started
-    assert (score_one, references) == (None, None), "a hung source yields no grading measurement"
-    assert elapsed < 5.0, f"reference gathering must be bounded, took {elapsed:.1f}s"
-
-
-def test_the_api_key_is_not_disclosed_to_a_redirect_target():
-    """urllib copies request headers onto a redirected request, Authorization included.
-
-    So a 30x from the configured endpoint hands the user's PAID inference key to whatever host the
-    Location names. The same hop also rewrites POST to GET and its response was still parsed as a
-    sample, letting a foreign host dictate the measurement it was paid to leak.
-
-    Two real local servers rather than a mocked opener: the leak lives in urllib's redirect handler,
-    so a test that stubs the transport asserts on its own stub.
-    """
-    import threading
-    from http.server import BaseHTTPRequestHandler, HTTPServer
-
-    seen: dict = {}
-
-    class _Attacker(BaseHTTPRequestHandler):
-        def do_POST(self):
-            seen["authorization"] = self.headers.get("Authorization")
-            body = json.dumps(
-                {
-                    "usage": {"completion_tokens": 10, "prompt_tokens": 5},
-                    "choices": [{"finish_reason": "stop"}],
-                }
-            ).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        # a 302 turns the POST into a GET, so the credential arrives on the GET.
-        do_GET = do_POST
-
-        def log_message(self, *_args):
-            pass
-
-    class _Redirector(BaseHTTPRequestHandler):
-        def do_POST(self):
-            self.send_response(302)
-            self.send_header("Location", f"http://127.0.0.1:{attacker_port}/steal")
-            self.end_headers()
-
-        def log_message(self, *_args):
-            pass
-
-    attacker = HTTPServer(("127.0.0.1", 0), _Attacker)
-    attacker_port = attacker.server_address[1]
-    redirector = HTTPServer(("127.0.0.1", 0), _Redirector)
-    threading.Thread(target=attacker.serve_forever, daemon=True).start()
-    threading.Thread(target=redirector.serve_forever, daemon=True).start()
-    try:
-        sample = rollout_sampler._one_completion(
-            model="m",
-            messages=[{"role": "user", "content": "p"}],
-            max_completion_tokens=64,
-            temperature=None,
-            base_url=f"http://127.0.0.1:{redirector.server_address[1]}/v1",
-            api_key="sk-USER-PAID-INFERENCE-KEY",
-        )
-    finally:
-        attacker.shutdown()
-        redirector.shutdown()
-
-    assert seen.get("authorization") is None, "the api key must never reach another origin"
-    assert sample is None, "a redirected response must not stand as a measurement"
-
-
-def test_evidence_from_a_different_sampling_policy_is_rejected():
-    """The server stamps the profile with ITS version, not the client's.
-
-    So without a policy version in the payload, a client from before a sampling-policy change could
-    submit aggregates that are recorded under the newer identity and later reused as matching.
-    """
-    spec = _spec()
-    assert rollout_profile_from_evidence(spec, _evidence(), producer_version=VERSION) is not None
-
-    stale = _evidence(sample_policy_version=ROLLOUT_SAMPLE_POLICY_VERSION + 1)
-    assert rollout_profile_from_evidence(spec, stale, producer_version=VERSION) is None
-
-    missing = _evidence()
-    del missing["sample_policy_version"]
-    assert rollout_profile_from_evidence(spec, missing, producer_version=VERSION) is None
-
-    for junk in ("one", None, [1]):
-        payload = _evidence(sample_policy_version=junk)
-        assert rollout_profile_from_evidence(spec, payload, producer_version=VERSION) is None
-
-
-def test_the_sampler_stamps_the_policy_version_it_produced(monkeypatch):
-    """The seam: the server requires the field, so the client has to emit it or measure nothing."""
-    # rollout_evidence imports both names at module scope, so ITS module is the binding a patch has
-    # to reach -- patching the defining module would leave the real calls untouched.
-    monkeypatch.setattr(
-        "flash.engine.profiling.rollout_evidence.sampler_credentials",
-        lambda: ("https://example.invalid/v1", "k"),
-    )
-    monkeypatch.setattr(
-        "flash.engine.profiling.rollout_evidence.sample_rollouts",
-        lambda **_kw: RolloutSampling(
-            samples=tuple(
-                RolloutSample(prompt_tokens=10, completion_tokens=40, truncated=False)
-                for _ in range(MIN_TRUSTWORTHY_ROLLOUTS)
-            ),
-            failures=0,
-            sampled_prompts=8,
-        ),
-    )
-    from flash.engine.profiling.rollout_evidence import collect_rollout_evidence
-
-    evidence = collect_rollout_evidence(
-        model="m",
-        prompts=[[{"role": "user", "content": "p"}]],
-        max_completion_tokens=512,
-        temperature=None,
-    )
-    assert evidence["sample_policy_version"] == ROLLOUT_SAMPLE_POLICY_VERSION
-    # and it survives the server's gate, which is the point of emitting it.
-    assert rollout_profile_from_evidence(_spec(), evidence, producer_version=VERSION) is not None
-
-
-def test_a_message_the_sampler_cannot_reproduce_is_not_measured():
-    """The workers pass the ORIGINAL message dicts to `apply_chat_template`.
-
-    A template that reads `name` renders a different prompt than a role/content reconstruction, so
-    silently dropping the field would report a confident measurement of a prompt the run never
-    sends. Rejecting returns the quote to the cap, which costs nothing.
-    """
-    from flash.cli.commands.rollout_profile import _chat_messages
-
-    plain = [{"role": "user", "content": "hi"}]
-    assert _chat_messages(plain) == plain
-
-    assert _chat_messages([{"role": "user", "content": "hi", "name": "alice"}]) == []
-    assert _chat_messages([{"role": "assistant", "content": "hi", "tool_calls": []}]) == []
