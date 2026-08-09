@@ -538,6 +538,48 @@ def test_multimodal_completion_is_encoded_after_its_assistant_prefix():
     assert [token.token_id for token in plain] == [198, 1151]
 
 
+def test_multimodal_encoding_rejects_a_boundary_that_eats_multiple_prefix_tokens():
+    # real BPE only merges the token straddling the seam, so the tail starts at most one token
+    # inside the prefix. a tokenizer that rewrote MORE would return tokens whose text is largely
+    # prefill, and scoring those as the completion would attribute the prefill's logprobs to
+    # sampled tokens -- wrong in the silent direction, so fail closed instead.
+    class _OvermergingTokenizer:
+        def encode(self, text):
+            table = {
+                "AB": [
+                    EncodedTeacherToken(1, 0, 1),
+                    EncodedTeacherToken(2, 1, 2),
+                    EncodedTeacherToken(3, 2, 3),
+                ],
+                # one shared token, then a single token swallowing the rest of the prefix plus C
+                "ABC": [
+                    EncodedTeacherToken(1, 0, 1),
+                    EncodedTeacherToken(9, 1, 3),
+                    EncodedTeacherToken(4, 3, 4),
+                ],
+            }
+            if text in table:
+                return list(table[text])
+            raise AssertionError(f"unexpected tokenizer input: {text!r}")
+
+    client = TeacherClient(
+        "capability",
+        "https://broker.example",
+        "parasail-qwen3vl-8b-instruct",
+        tokenizer=_OvermergingTokenizer(),
+    )
+
+    with pytest.raises(TeacherError, match="rewrote more than one prefix token"):
+        client._encode_completion_in_context(
+            [
+                {"role": "user", "content": "<|media_pad|>"},
+                {"role": "assistant", "content": "AB"},
+            ],
+            "C",
+            continue_final_assistant=True,
+        )
+
+
 def test_score_many_caps_in_flight_requests_at_the_measured_ceiling():
     # the multi-turn path hands score_many a WHOLE EPISODE (up to OPD_MAX_EPISODE_TURNS = 64) in
     # one call rather than pre-slicing it, so score_many's own pool is now the only thing standing

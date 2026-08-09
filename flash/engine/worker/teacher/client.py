@@ -673,6 +673,15 @@ class TeacherClient:
                 "teacher completion contributed no tokens after its assistant prefix; "
                 "cannot attribute prompt logprobs to the sampled tokens"
             )
+        # the tail must start no earlier than the boundary token. real BPE merges only the token
+        # straddling the seam, so the tail begins at most one token inside the prefix; a tokenizer
+        # that rewrote MORE than that would hand back tokens whose text is largely prefill, and
+        # scoring them as the completion would attribute the prefill's logprobs to sampled tokens.
+        if tail[0].start < len(prefix) and shared + 1 < len(encoded_prefix):
+            raise _permanent(
+                "teacher completion boundary rewrote more than one prefix token; "
+                "cannot attribute prompt logprobs to the sampled tokens"
+            )
         # rebase the character spans onto completion_text. they currently index into
         # prefix + completion, and the caller slices the COMPLETION with them. a merged boundary
         # token starts inside the prefix, so its rebased start clamps to 0 -- it covers the
