@@ -1090,6 +1090,12 @@ def test_programmatic_sft_submit_rejects_adapter_continuation(tmp_path, monkeypa
     from flash.core.spec import JobSpec, TrainSpec
 
     orch = _fresh_orchestrator(tmp_path, monkeypatch)
+    # offline: sft requires a resolved model_revision, which calls HfApi().model_info(). Stub it
+    # the same way the sibling test above does, so the adapter-continuation rejection this test is
+    # about is what fails -- not an unrelated network lookup on a disconnected runner.
+    monkeypatch.setattr(
+        orch, "_resolve_model_revision", lambda s, **_kw: replace(s, model_revision="a" * 40)
+    )
     spec = JobSpec(
         run_id="sft-warmstart",
         model="Qwen/Qwen3.5-0.8B",

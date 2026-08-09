@@ -743,11 +743,24 @@ def test_dry_run_accepts_valid_regex_and_local_ref_constraints(api, structured_o
 def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
     api, monkeypatch, tmp_path, max_completion_tokens, status_code
 ) -> None:
+    import flash.engine.worker.train.opd.validation as opd_validation
     import flash.envs.loader as envs_loader
     import flash.schema as schema
     import flash.server.routes.runs as runs_route
 
     monkeypatch.setattr(schema, "provisional_gpu", lambda *_a, **_k: "B200")
+    # offline: the structured-OPD preflight resolves model metadata over the network -- geometry
+    # (model_info + a config.json download) and list_repo_files, to detect a mistral tokenizer.
+    # Without this the dry run reached hf.co and passed only on a connected runner. The values are
+    # not what this test asserts on (it checks that an invalid context is rejected BEFORE
+    # allocation), so stub the resolver itself rather than pin geometry numbers that read as
+    # meaningful; vocab comes from the catalog entry for this model.
+    monkeypatch.setattr(
+        opd_validation,
+        "_resolve_structured_model_metadata",
+        lambda *_a, **_k: (151936, ("config.json", "tokenizer.json")),
+        raising=False,
+    )
     # offline: the valid-context path pins the github env ref to a sha; stub it so the
     # test never makes a real github request (the api fixture only sets a fake token)
     monkeypatch.setattr(envs_loader, "_resolve_ref_sha", lambda *_a, **_k: "0" * 40)
