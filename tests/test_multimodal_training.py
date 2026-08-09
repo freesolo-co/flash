@@ -561,6 +561,30 @@ def test_image_opd_preflight_rejects_multi_turn_with_a_vision_teacher():
         mm.preflight_validate_image_opd(spec)
 
 
+def test_image_opd_preflight_allows_max_turns_on_a_single_turn_env():
+    # max_turns is a turn CAP, not a multi-turn declaration: the worker derives multi_turn from the
+    # env CLASS, never from params. rejecting on max_turns here would fail a job the worker runs.
+    spec = SimpleNamespace(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        environment=SimpleNamespace(
+            id="local",
+            params={
+                "max_turns": 4,
+                "records": [
+                    {
+                        "input": [{"role": "user", "content": [{"type": "image"}]}],
+                        "image": _data_uri(_png_bytes()),
+                    }
+                ],
+            },
+        ),
+        train=SimpleNamespace(teacher_model="qwen3-vl-8b"),
+    )
+
+    mm.preflight_validate_image_opd(spec)
+
+
 @pytest.mark.parametrize("record_source", ["inline", "packaged"])
 def test_image_opd_preflight_limits_scan_to_max_examples(tmp_path, record_source):
     records = [
