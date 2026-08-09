@@ -23,6 +23,7 @@ from flash.engine.profiling.sft_workload import prepare_sft_workload, sft_tokens
 from flash.engine.worker.backend_common import (
     completed_checkpoint_step,
     export_peft_adapter,
+    fused_ce_backend,
     gdn_probe_module,
     gdn_reset_arch_from_caps,
     latest_global_step_dir,
@@ -58,7 +59,7 @@ _MAX_ZERO_GRAD_STEPS = 2
 
 _REQUIRED_OVERRIDE_KEYS = (
     "train_files",
-    "val_files",
+    "fused_ce_backend",
     "train_batch_size",
     "max_length",
     "micro_batch",
@@ -135,7 +136,10 @@ def build_sft_overrides(cfg: dict) -> list[str]:
 
     overrides = [
         f"data.train_files={_hydra_val(cfg['train_files'])}",
-        f"data.val_files={_hydra_val(cfg['val_files'])}",
+        # HARDCODED null, not a cfg key. flash never reads verl's val/loss, and a val dataloader
+        # that merely EXISTS buys a full inference forward on the last step (see trainer.test_freq
+        # below). there is no supported value other than null, so do not accept one.
+        "data.val_files=null",
         f"data.train_batch_size={_hydra_val(cfg['train_batch_size'])}",
         f"data.max_length={_hydra_val(cfg['max_length'])}",
         f"data.micro_batch_size_per_gpu={_hydra_val(cfg['micro_batch'])}",
@@ -165,9 +169,10 @@ def build_sft_overrides(cfg: dict) -> list[str]:
         f"model.use_remove_padding={_hydra_val(cfg.get('use_remove_padding', True))}",
         # 32k contexts: the fused linear-CE forward never materializes the [tokens, vocab] logits
         # tensor (~130 GB at 32k on a 248k vocab), computing loss from hidden states + lm_head in
-        # chunks instead. torch backend = numerically exact CE, no extra deps.
+        # chunks instead. the backend is chosen per card -- see fused_ce_backend for the measured
+        # table; triton wins on sm90+ and loses below it.
         "model.use_fused_kernels=true",
-        "model.fused_kernel_options.impl_backend=torch",
+        f"model.fused_kernel_options.impl_backend={cfg['fused_ce_backend']}",
         f"model.use_liger={_hydra_val(cfg.get('use_liger', False))}",
         f"model.enable_gradient_checkpointing={_hydra_val(cfg.get('gradient_checkpointing', True))}",
         f"engine.strategy={_hydra_val(cfg.get('strategy', 'fsdp2'))}",
@@ -190,6 +195,11 @@ def build_sft_overrides(cfg: dict) -> list[str]:
         f"trainer.project_name={_hydra_val(cfg['project_name'])}",
         f"trainer.experiment_name={_hydra_val(cfg['experiment_name'])}",
         f"trainer.total_epochs={_hydra_val(cfg['loop_epochs'])}",
+        # -1 does NOT disable validation on its own. the child's gate is
+        # `is_last_step and self.val_dataloader is not None or (self.test_freq > 0 and is_valid_step)`
+        # (verl/trainer/sft_trainer.py), and `and` binds tighter than `or`, so a val dataloader that
+        # merely EXISTS buys a full inference forward on the last step whatever test_freq says. a
+        # null `data.val_files` is what removes the dataloader; this stays so no periodic pass runs.
         "trainer.test_freq=-1",
         "trainer.resume_mode=auto",
         # retain only the latest full-state checkpoint on the pod: each global_step_N holds model
@@ -1022,9 +1032,7 @@ def run_sft_train(spec=None) -> None:
             f"({masked_tokens / total_tokens_per_epoch:.0%}) prompt tokens"
         )
         train_file = os.path.join(data_dir, "train.parquet")
-        val_file = os.path.join(data_dir, "val.parquet")
         _write_sft_parquet(rows, train_file)
-        _write_sft_parquet([rows[0]], val_file)
 
     download_seconds = _w.prefetch_model(model_id, revision=model_revision)
     setup_seconds = time.time() - started_at
@@ -1122,7 +1130,6 @@ def run_sft_train(spec=None) -> None:
 
     config = {
         "train_files": train_file,
-        "val_files": val_file,
         "train_batch_size": train_batch_size,
         "max_length": max_length,
         "micro_batch": micro_batch,
@@ -1150,12 +1157,14 @@ def run_sft_train(spec=None) -> None:
         "loggers": loggers,
         # liger produces a 0.0 lora grad norm under fsdp2 + peft + gradient checkpointing, versus
         # 7.02 off in a matched qwen3.5-9b test. fused linear ce remains provided by
-        # use_fused_kernels with impl_backend=torch.
+        # use_fused_kernels with the impl_backend resolved below.
         "use_liger": False,
         "gradient_checkpointing": gradient_checkpointing and not reentrant_gradient_checkpointing,
         "total_training_steps": update_horizon if max_steps > 0 else None,
         "total_epochs": epochs if max_steps <= 0 else None,
         "use_remove_padding": use_remove_padding,
+        # resolved from the out-of-process capability probe, never by opening cuda in this parent.
+        "fused_ce_backend": fused_ce_backend(caps),
     }
     overrides = build_sft_overrides(config)
 

@@ -186,11 +186,15 @@ def test_sizing_accuracy_matrix_preserves_safe_boundaries_and_removes_overroutin
         ),
         # the two moe ceilings sit above the pre-expert numbers (103 and 180) on purpose: the routed
         # experts are real trainable parameters, so an estimate that excluded them under-reserved.
+        # the sft ceiling is 155 rather than 154 for the same reason one level down:
+        # _SFT_CHUNKED_NLL_TOKENS now tracks verl's real FusedLinearForPPO chunk_size of 512, and
+        # the extra 256 rows of vocab projection are 1.017 GB the child was always spending. the
+        # card is unchanged (B200 before and after), so nothing reroutes.
         "moe_sft": (
             "Qwen/Qwen3.6-35B-A3B",
             "sft",
             {"max_context_tokens": 4096, "batch_size": 4, "lora_rank": 64},
-            154,
+            155,
         ),
         "moe_grpo": (
             "Qwen/Qwen3.6-35B-A3B",
