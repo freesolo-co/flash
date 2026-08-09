@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash._internal.logging import get_logger
@@ -171,6 +172,193 @@ def _abort_ambiguous_launch(run_id: str, detail: str) -> None:
     )
 
 
+def _build_lambda_cache_user_data(
+    spec,
+    seed: int,
+    attempt: int,
+    runtime_secrets: dict | None,
+    mount_point: str,
+    mode: str | None,
+    models: list | None,
+    code_prefix: str | None,
+    absolute_deadline: float,
+) -> str:
+    """Build user_data with this region's actual NFS mount point."""
+    return build_user_data(
+        build_payload(
+            spec,
+            seed,
+            attempt,
+            runtime_secrets=runtime_secrets,
+            cache_host_mount=mount_point,
+            mode=mode,
+            models=models,
+            code_prefix=code_prefix,
+            **deadline_kwargs(build_payload, absolute_deadline),
+        ),
+        gpu=spec.gpu.type,
+    )
+
+
+@dataclass(frozen=True)
+class _LambdaLaunchContext:
+    spec: object
+    seed: int
+    attempt: int
+    say: Callable
+    mode: str | None
+    cache_name: str | None
+    cold_user_data: str
+    cache_user_data_for: Callable[[str], str]
+    default_cache_mount: str
+    cache_user_data: str | None
+    name: str
+    ssh_keys: list[str]
+    absolute_deadline: float
+
+
+def _launch_lambda_candidates(
+    ctx: _LambdaLaunchContext,
+    instances: list[LambdaInstance],
+) -> LambdaJobHandle:
+    tried_regions: set[str] = set()
+    candidates = list(instances)
+    refreshed = False
+    last_err: Exception | None = None
+    while candidates:
+        inst = candidates.pop(0)
+        if inst.region in tried_regions:
+            continue
+        tried_regions.add(inst.region)
+        user_data, fs_names = ctx.cold_user_data, None
+        if ctx.cache_name:
+            try:
+                mount_point = lambda_api.ensure_filesystem(
+                    ctx.cache_name,
+                    inst.region,
+                    **deadline_kwargs(lambda_api.ensure_filesystem, ctx.absolute_deadline),
+                )
+                # Rebuild user_data when the actual mount_point differs from the default (rare).
+                region_user_data = (
+                    ctx.cache_user_data
+                    if mount_point == ctx.default_cache_mount
+                    else ctx.cache_user_data_for(mount_point)
+                )
+                user_data, fs_names = region_user_data, [ctx.cache_name]
+            except Exception as e:
+                last_err = e
+                detail = sanitize_diagnostic(e, limit=1000)
+                # preload must not fall back cold because it would train instead of warming the cache.
+                if ctx.mode == "preload":
+                    ctx.say(
+                        f"weight cache unavailable in {inst.region} ({detail}); skipping (preload needs it)"
+                    )
+                    continue
+                ctx.say(f"weight cache unavailable in {inst.region} ({detail}); launching cold")
+        try:
+            require_create_allowance(ctx.absolute_deadline)
+            instance_id = lambda_api.launch_instance(
+                region_name=inst.region,
+                instance_type_name=inst.instance_type,
+                ssh_key_names=ctx.ssh_keys,
+                name=ctx.name,
+                user_data=user_data,
+                file_system_names=fs_names,
+                **deadline_kwargs(lambda_api.launch_instance, ctx.absolute_deadline),
+            )
+        except lambda_api.LambdaApiError as e:
+            last_err = e
+            detail = sanitize_diagnostic(e, limit=1000)
+            if not _launch_rejection_is_clean(e):
+                # ambiguous creates may have billed an instance, so reconcile before any retry.
+                ctx.say(
+                    f"ambiguous launch failure in {inst.region} ({type(e).__name__}); "
+                    "attempting cleanup and failing closed"
+                )
+                _abort_ambiguous_launch(ctx.spec.run_id, type(e).__name__)
+            ctx.say(f"region {inst.region} ({inst.gpu} {inst.instance_type}) rejected: {detail}")
+            # Filesystem-attach errors: retry once without the cache before walking (clean reject = safe).
+            fs_attach_reject = fs_names and any(
+                tok in str(e).lower() for tok in ("file_system", "filesystem", "file-system")
+            )
+            if ctx.mode != "preload" and fs_attach_reject:
+                ctx.say(
+                    f"retrying {inst.region} WITHOUT the weight cache (attach may have caused the reject)"
+                )
+                try:
+                    require_create_allowance(ctx.absolute_deadline)
+                    instance_id = lambda_api.launch_instance(
+                        region_name=inst.region,
+                        instance_type_name=inst.instance_type,
+                        ssh_key_names=ctx.ssh_keys,
+                        name=ctx.name,
+                        user_data=ctx.cold_user_data,
+                        file_system_names=None,
+                        **deadline_kwargs(lambda_api.launch_instance, ctx.absolute_deadline),
+                    )
+                except lambda_api.LambdaApiError as e2:
+                    last_err = e2
+                    cold_detail = sanitize_diagnostic(e2, limit=1000)
+                    if not _launch_rejection_is_clean(e2):
+                        _abort_ambiguous_launch(ctx.spec.run_id, type(e2).__name__)
+                    ctx.say(f"region {inst.region} also rejected cold: {cold_detail}")
+                else:
+                    ctx.say(
+                        f"launched lambda instance {instance_id} (cold, cache-less): {inst.gpu} "
+                        f"{inst.instance_type} in {inst.region} attempt={ctx.attempt} seed={ctx.seed}"
+                    )
+                    return LambdaJobHandle(
+                        instance_id=instance_id,
+                        instance_type=inst.instance_type,
+                        region=inst.region,
+                        name=ctx.name,
+                        gpu=inst.gpu,
+                        hourly_usd=inst.price_usd_hr * inst.gpu_count,
+                        attempt=ctx.attempt,
+                        started_ts=time.time(),
+                    )
+            # Preload must not refresh to a different region (would warm the wrong one).
+            if ctx.mode != "preload" and not candidates and not refreshed:
+                refreshed = True
+                candidates = [
+                    c
+                    for c in usable_instances(
+                        inst.gpu,
+                        force=True,
+                        # refresh the SHAPE already being launched: dropping the count here would
+                        # fall back to a 1-card type while the worker still starts n ranks.
+                        gpu_count=inst.gpu_count,
+                        **deadline_kwargs(usable_instances, ctx.absolute_deadline),
+                    )
+                    if c.region not in tried_regions
+                ]
+            continue
+        ctx.say(
+            f"launched lambda instance {instance_id}: {inst.gpu} {inst.instance_type} "
+            f"${inst.price_usd_hr:.2f}/hr in {inst.region} attempt={ctx.attempt} seed={ctx.seed}"
+        )
+        return LambdaJobHandle(
+            instance_id=instance_id,
+            instance_type=inst.instance_type,
+            region=inst.region,
+            name=ctx.name,
+            gpu=inst.gpu,
+            # ``price_usd_hr`` is PER CARD (the allocator's contract); the handle's rate is billed
+            # against wall-clock once by both the cost stamp and realized COGS, so it must price the
+            # WHOLE instance or an n-card box under-reports by exactly n.
+            hourly_usd=inst.price_usd_hr * inst.gpu_count,
+            attempt=ctx.attempt,
+            started_ts=time.time(),
+        )
+    # Reap any phantom instance (accepted but no id returned) before giving up.
+    with contextlib.suppress(Exception):
+        terminate_run_instances(ctx.spec.run_id)
+    raise lambda_api.LambdaApiError(
+        f"all {len(tried_regions)} Lambda region(s) rejected the {ctx.spec.gpu.type} launch "
+        f"(no capacity): {sanitize_diagnostic(last_err, limit=1000)}"
+    )
+
+
 def launch_and_submit(
     spec,
     seed: int,
@@ -203,166 +391,41 @@ def launch_and_submit(
         gpu=spec.gpu.type,
     )
 
-    def _cache_user_data_for(mount_point: str) -> str:
-        """Build user_data with this region's actual NFS mount point."""
-        return build_user_data(
-            build_payload(
-                spec,
-                seed,
-                attempt,
-                runtime_secrets=runtime_secrets,
-                cache_host_mount=mount_point,
-                mode=mode,
-                models=models,
-                code_prefix=code_prefix,
-                **deadline_kwargs(build_payload, absolute_deadline),
-            ),
-            gpu=spec.gpu.type,
+    def cache_user_data_for(mount_point: str) -> str:
+        return _build_lambda_cache_user_data(
+            spec,
+            seed,
+            attempt,
+            runtime_secrets,
+            mount_point,
+            mode,
+            models,
+            code_prefix,
+            absolute_deadline,
         )
 
     default_cache_mount = f"/lambda/nfs/{cache_name}" if cache_name else ""
-    cache_user_data = _cache_user_data_for(default_cache_mount) if cache_name else None
+    cache_user_data = cache_user_data_for(default_cache_mount) if cache_name else None
     name = instance_label(spec.run_id, seed, attempt)
     ssh_keys = resolve_ssh_key_names(
         **deadline_kwargs(resolve_ssh_key_names, absolute_deadline),
     )
-
-    tried_regions: set[str] = set()
-    candidates = list(instances)
-    refreshed = False
-    last_err: Exception | None = None
-    while candidates:
-        inst = candidates.pop(0)
-        if inst.region in tried_regions:
-            continue
-        tried_regions.add(inst.region)
-        user_data, fs_names = cold_user_data, None
-        if cache_name:
-            try:
-                mount_point = lambda_api.ensure_filesystem(
-                    cache_name,
-                    inst.region,
-                    **deadline_kwargs(lambda_api.ensure_filesystem, absolute_deadline),
-                )
-                # Rebuild user_data when the actual mount_point differs from the default (rare).
-                region_user_data = (
-                    cache_user_data
-                    if mount_point == default_cache_mount
-                    else _cache_user_data_for(mount_point)
-                )
-                user_data, fs_names = region_user_data, [cache_name]
-            except Exception as e:
-                last_err = e
-                detail = sanitize_diagnostic(e, limit=1000)
-                # preload must not fall back cold because it would train instead of warming the cache.
-                if mode == "preload":
-                    say(
-                        f"weight cache unavailable in {inst.region} ({detail}); skipping (preload needs it)"
-                    )
-                    continue
-                say(f"weight cache unavailable in {inst.region} ({detail}); launching cold")
-        try:
-            require_create_allowance(absolute_deadline)
-            instance_id = lambda_api.launch_instance(
-                region_name=inst.region,
-                instance_type_name=inst.instance_type,
-                ssh_key_names=ssh_keys,
-                name=name,
-                user_data=user_data,
-                file_system_names=fs_names,
-                **deadline_kwargs(lambda_api.launch_instance, absolute_deadline),
-            )
-        except lambda_api.LambdaApiError as e:
-            last_err = e
-            detail = sanitize_diagnostic(e, limit=1000)
-            if not _launch_rejection_is_clean(e):
-                # ambiguous creates may have billed an instance, so reconcile before any retry.
-                say(
-                    f"ambiguous launch failure in {inst.region} ({type(e).__name__}); "
-                    "attempting cleanup and failing closed"
-                )
-                _abort_ambiguous_launch(spec.run_id, type(e).__name__)
-            say(f"region {inst.region} ({inst.gpu} {inst.instance_type}) rejected: {detail}")
-            # Filesystem-attach errors: retry once without the cache before walking (clean reject = safe).
-            fs_attach_reject = fs_names and any(
-                tok in str(e).lower() for tok in ("file_system", "filesystem", "file-system")
-            )
-            if mode != "preload" and fs_attach_reject:
-                say(
-                    f"retrying {inst.region} WITHOUT the weight cache (attach may have caused the reject)"
-                )
-                try:
-                    require_create_allowance(absolute_deadline)
-                    instance_id = lambda_api.launch_instance(
-                        region_name=inst.region,
-                        instance_type_name=inst.instance_type,
-                        ssh_key_names=ssh_keys,
-                        name=name,
-                        user_data=cold_user_data,
-                        file_system_names=None,
-                        **deadline_kwargs(lambda_api.launch_instance, absolute_deadline),
-                    )
-                except lambda_api.LambdaApiError as e2:
-                    last_err = e2
-                    cold_detail = sanitize_diagnostic(e2, limit=1000)
-                    if not _launch_rejection_is_clean(e2):
-                        _abort_ambiguous_launch(spec.run_id, type(e2).__name__)
-                    say(f"region {inst.region} also rejected cold: {cold_detail}")
-                else:
-                    say(
-                        f"launched lambda instance {instance_id} (cold, cache-less): {inst.gpu} "
-                        f"{inst.instance_type} in {inst.region} attempt={attempt} seed={seed}"
-                    )
-                    return LambdaJobHandle(
-                        instance_id=instance_id,
-                        instance_type=inst.instance_type,
-                        region=inst.region,
-                        name=name,
-                        gpu=inst.gpu,
-                        hourly_usd=inst.price_usd_hr * inst.gpu_count,
-                        attempt=attempt,
-                        started_ts=time.time(),
-                    )
-            # Preload must not refresh to a different region (would warm the wrong one).
-            if mode != "preload" and not candidates and not refreshed:
-                refreshed = True
-                candidates = [
-                    c
-                    for c in usable_instances(
-                        inst.gpu,
-                        force=True,
-                        # refresh the SHAPE already being launched: dropping the count here would
-                        # fall back to a 1-card type while the worker still starts n ranks.
-                        gpu_count=inst.gpu_count,
-                        **deadline_kwargs(usable_instances, absolute_deadline),
-                    )
-                    if c.region not in tried_regions
-                ]
-            continue
-        say(
-            f"launched lambda instance {instance_id}: {inst.gpu} {inst.instance_type} "
-            f"${inst.price_usd_hr:.2f}/hr in {inst.region} attempt={attempt} seed={seed}"
-        )
-        return LambdaJobHandle(
-            instance_id=instance_id,
-            instance_type=inst.instance_type,
-            region=inst.region,
-            name=name,
-            gpu=inst.gpu,
-            # ``price_usd_hr`` is PER CARD (the allocator's contract); the handle's rate is billed
-            # against wall-clock once by both the cost stamp and realized COGS, so it must price the
-            # WHOLE instance or an n-card box under-reports by exactly n.
-            hourly_usd=inst.price_usd_hr * inst.gpu_count,
-            attempt=attempt,
-            started_ts=time.time(),
-        )
-    # Reap any phantom instance (accepted but no id returned) before giving up.
-    with contextlib.suppress(Exception):
-        terminate_run_instances(spec.run_id)
-    raise lambda_api.LambdaApiError(
-        f"all {len(tried_regions)} Lambda region(s) rejected the {spec.gpu.type} launch "
-        f"(no capacity): {sanitize_diagnostic(last_err, limit=1000)}"
+    ctx = _LambdaLaunchContext(
+        spec=spec,
+        seed=seed,
+        attempt=attempt,
+        say=say,
+        mode=mode,
+        cache_name=cache_name,
+        cold_user_data=cold_user_data,
+        cache_user_data_for=cache_user_data_for,
+        default_cache_mount=default_cache_mount,
+        cache_user_data=cache_user_data,
+        name=name,
+        ssh_keys=ssh_keys,
+        absolute_deadline=absolute_deadline,
     )
+    return _launch_lambda_candidates(ctx, instances)
 
 
 # Tests monkeypatch this name so keep it as a module-level alias.
