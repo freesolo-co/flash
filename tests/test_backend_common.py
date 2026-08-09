@@ -342,7 +342,7 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert "cp312" in vc.FLASH_ATTN_SPEC
     install = calls[1]
     assert vc.VERL_REQUIREMENT == (
-        "verl @ git+https://github.com/freesolo-co/verl@32d6200de81dcc9e97e3aa2ae4a2b3ba30d33e93"
+        "verl @ git+https://github.com/freesolo-co/verl@32d6200de81dc484893baf8b9cf30297ebe7fa49"
     )
     assert any(vc.VERL_REQUIREMENT_URL in arg for arg in install)
     assert "liger-kernel" in install
@@ -1134,12 +1134,14 @@ def test_the_venv_stamp_covers_the_conv_kernel_so_an_older_venv_is_rebuilt():
 def test_the_fallback_pins_transformers_like_the_image_does(monkeypatch, tmp_path):
     """The fallback venv must carry the same transformers ceiling as /opt/verl-venv.
 
-    is_flash_linear_attention_available() and is_causal_conv1d_available() are find_spec probes
-    whose import path moved in 5.13, so an unpinned resolve lands 5.14.x and both answer False for
-    packages that ARE installed. The child then reports no gdn boundary-reset capability and
-    grpo/opd fail closed -- after the gpu is already rented. verl and vllm both depend on
-    transformers with no upper bound, so the pin has to be in the override file too: a direct pin
-    alone loses to their transitive declarations.
+    This path provisions the interpreter that TRAINS when no image supplies one, and transformers
+    owns the gdn modelling code the boundary-reset shim patches. An unbounded resolve there puts
+    training on a transformers line nothing validated. verl and vllm both depend on transformers
+    with no upper bound, so the pin has to be in the override file too: a direct pin alone loses to
+    their transitive declarations.
+
+    The pin is NOT what makes the cuda-gated probes answer True -- those are identical across
+    5.12.1 and 5.14.1 and depend on a gpu being present, not on the transformers version.
     """
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
@@ -1155,8 +1157,8 @@ def test_the_fallback_pins_transformers_like_the_image_does(monkeypatch, tmp_pat
 
 def test_transformers_pin_stays_in_lockstep_with_the_worker_image():
     # same argument as VERL_SPEC lockstep: the image bakes its own pin, this path resolves its own.
-    # if they drift, the interpreter that TRAINS differs between the image and the no-image path,
-    # and the gdn capability probe silently answers differently on each.
+    # if they drift, the interpreter that TRAINS runs a different transformers depending on whether
+    # an image supplied it -- and transformers owns the gdn modelling code the shim patches.
     dockerfile = pathlib.Path(__file__).resolve().parents[1] / "Dockerfile.worker"
     text = dockerfile.read_text()
     quoted = f'"{vc.TRANSFORMERS_REQUIREMENT}"'
@@ -1168,8 +1170,8 @@ def test_transformers_pin_stays_in_lockstep_with_the_worker_image():
 
 
 def test_the_venv_stamp_covers_the_transformers_pin_so_a_prepin_venv_is_rebuilt():
-    # a venv provisioned before this pin holds the 5.14.x that makes both probes answer False. if
-    # the stamp ignored the range, a retry on the same pod would reuse that venv forever.
+    # a venv provisioned before this pin holds an out-of-range transformers. if the stamp ignored
+    # the range, a retry on the same pod would reuse that venv forever with no rebuild path.
     assert vc.TRANSFORMERS_REQUIREMENT in vc.VERL_VENV_STAMP
 
 
@@ -1309,7 +1311,7 @@ def test_verl_pin_matches_the_version_opd_requires_exactly():
     # skip on top of them.
     _, _, ref = vc.VERL_REQUIREMENT.partition("git+")
     _, _, commit = ref.rpartition("@")
-    assert commit == "32d6200de81dcc9e97e3aa2ae4a2b3ba30d33e93"
+    assert commit == "32d6200de81dc484893baf8b9cf30297ebe7fa49"
 
 
 def test_resolve_verl_python_installs_wandb_best_effort_when_requested(monkeypatch, tmp_path):

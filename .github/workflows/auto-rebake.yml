@@ -58,18 +58,28 @@ jobs:
       base_ref: ${{ steps.base.outputs.base_ref }}
       base_revision: ${{ steps.base.outputs.revision }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
 
+      # Downloaded to disk and checksum-verified before extraction, rather than piped straight
+      # into tar: a piped stream is extracted as it arrives, so a corrupted or substituted
+      # artifact is already on PATH by the time anything could notice. Bump the version and the
+      # digest together (the vendor publishes checksums.txt alongside each release).
       - name: Install crane
         run: |
-          curl -sSL https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz \
-            | sudo tar -xz -C /usr/local/bin crane
+          set -euo pipefail
+          ver=v0.20.2
+          sha=c14340087103ba9dadf61d45acd20675490fd0ccbd56ac7901fc1b502137f44b
+          curl -fsSL -o /tmp/crane.tar.gz \
+            "https://github.com/google/go-containerregistry/releases/download/${ver}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${sha}  /tmp/crane.tar.gz" | sha256sum -c -
+          sudo tar -xz -C /usr/local/bin -f /tmp/crane.tar.gz crane
+          rm -f /tmp/crane.tar.gz
           crane version
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -188,7 +198,7 @@ jobs:
       FP_BASE: ${{ needs.gate.outputs.fp_base }}
       BASE_REVISION: ${{ needs.gate.outputs.base_revision }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
 
@@ -203,10 +213,10 @@ jobs:
           sudo docker image prune -af || true
           df -h /
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -222,7 +232,7 @@ jobs:
           echo "ref=${img%:*}@$digest" >> "$GITHUB_OUTPUT"
 
       - name: Re-layer cache onto the fresh base (no GPU)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: docker/Dockerfile.kernelcache.relayer

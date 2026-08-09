@@ -8,6 +8,11 @@ on:
     paths:
       - "flash/**"
       - "Dockerfile"
+      # The base image COPYs the entrypoint out of this directory, so a change here changes the
+      # published image. Without this filter entry an entrypoint-only fix -- including a security
+      # fix to the secrets wrapper -- merges without rebuilding, and the tags keep serving the old
+      # script until some unrelated watched file happens to change.
+      - "deploy/infisical/entrypoint.sh"
       - "pyproject.toml"
       - "scripts/build_dev_dist.py"
       - ".github/workflows/publish-image.yml"
@@ -32,13 +37,13 @@ jobs:
       IMAGE: ghcr.io/freesolo-co/freesolo-flash
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -75,7 +80,7 @@ jobs:
       # doesn't need.
       - name: Set up Python
         if: github.ref_name == 'dev'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
 
@@ -83,12 +88,20 @@ jobs:
         if: github.ref_name == 'dev'
         run: python3 scripts/build_dev_dist.py --no-build
 
+      # INSTALL_INFISICAL=true bakes the pinned Infisical CLI into the PUBLISHED images (:main,
+      # :latest, :dev) so a deployment can switch to vault-backed secrets by setting
+      # INFISICAL_CLIENT_ID, with no rebuild. It does NOT change how these images behave by
+      # default: the entrypoint stays a passthrough until that variable is set, so an image
+      # published here still runs on a plain --env-file. The Dockerfile defaults the argument
+      # to false, so `docker build .` from a checkout stays vendor-free.
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: ./Dockerfile
           push: true
+          build-args: |
+            INSTALL_INFISICAL=true
           tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=min
