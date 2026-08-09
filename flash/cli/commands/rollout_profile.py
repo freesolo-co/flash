@@ -11,7 +11,10 @@ is the pricing this path had before any of this existed.
 
 from __future__ import annotations
 
+import os
 import tempfile
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -26,8 +29,21 @@ _PROMPT_ROWS = 8
 _REWARD_REFERENCES = 4
 
 
-def collect_for_submit(client, spec, *, debug: bool = False) -> dict[str, Any] | None:
-    """measured rollout aggregates for ``spec``, or None when nothing could be measured."""
+def collect_for_submit(
+    client,
+    spec,
+    *,
+    runtime_secrets: Mapping[str, str] | None = None,
+    debug: bool = False,
+) -> dict[str, Any] | None:
+    """measured rollout aggregates for ``spec``, or None when nothing could be measured.
+
+    ``runtime_secrets`` are the run's declared secrets as the worker will receive them. they are
+    exported for the duration of the local measurement only (see ``_runtime_secret_env``), because
+    the env code run here is the same code the worker runs: an env whose reward() reads a declared
+    key would otherwise raise locally, and the broad except below would quietly return the quote to
+    the cap. they are never persisted and never travel in the evidence, which is aggregates only.
+    """
     if spec.algorithm not in ("grpo", "opd"):
         return None
     from flash.engine.profiling.rollout_sampler import sampler_credentials
@@ -36,20 +52,50 @@ def collect_for_submit(client, spec, *, debug: bool = False) -> dict[str, Any] |
     if not api_key:
         # no sampler configured. the common case, and not a problem: the quote falls back to the cap.
         return None
-    if _unsamplable_reason(spec):
+    if unsamplable_reason(spec):
         # the hosted draw would not reproduce this run's generation, and a measurement that
         # describes different work must not set a price. declining returns the quote to the cap.
         return None
 
     try:
-        return _collect(client, spec)
+        with _runtime_secret_env(spec, runtime_secrets):
+            return _collect(client, spec)
     except Exception:
         if debug:
             raise
         return None
 
 
-def _unsamplable_reason(spec) -> str:
+@contextmanager
+def _runtime_secret_env(spec, runtime_secrets: Mapping[str, str] | None) -> Iterator[None]:
+    """export this run's DECLARED secrets for the measurement, then restore os.environ.
+
+    a declared secret that lives only in a local .env file is collected for submission but never
+    reaches ``os.environ``, so a reward() that reads one -- an external judge, typically -- raises
+    here and the measurement is lost. the worker runs that same reward() with the secret present, so
+    the local failure is an artifact of this process, not of the env.
+
+    scoped three ways. only keys the spec DECLARES are exported, so an unrelated secret that
+    happened to be collected (WANDB_API_KEY is always collected) is not handed to env code. a key
+    already set in the process is left alone, since the user's own shell value is what the rest of
+    this command already used. and every key set here is removed on exit, including on the exception
+    path, so nothing outlives the measurement.
+    """
+    declared = {str(key) for key in (getattr(spec.environment, "secrets", ()) or ())}
+    exported = {
+        key: value
+        for key, value in (runtime_secrets or {}).items()
+        if key in declared and key not in os.environ and value
+    }
+    os.environ.update(exported)
+    try:
+        yield
+    finally:
+        for key in exported:
+            os.environ.pop(key, None)
+
+
+def unsamplable_reason(spec) -> str:
     """why a hosted draw cannot stand for this run's generation, or "" when it can.
 
     the sampler draws ONE unconstrained completion from the base model. a config that changes what

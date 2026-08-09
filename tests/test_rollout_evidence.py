@@ -9,6 +9,7 @@ leave the quote on the declared cap rather than fail the submit.
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import replace
 
@@ -969,3 +970,176 @@ def test_a_broken_grader_does_not_discard_the_token_measurement():
     profile = rollout_profile_from_evidence(spec, _evidence(**evidence), producer_version=VERSION)
     assert profile is not None
     assert profile["completion_tokens_mean"] == pytest.approx(53.6875)
+
+
+def test_a_declared_secret_reaches_the_locally_run_environment(monkeypatch, tmp_path):
+    """An external-judge reward() must see the same declared secret the worker gets.
+
+    `runtime_secrets_from_local_env` returns a .env-only secret for SUBMISSION but never exports it,
+    so env code executed here raised KeyError, the fail-open guard swallowed it, and the quote
+    silently returned to the cap -- for exactly the envs whose grading cost matters most.
+    """
+    from flash.cli.commands import rollout_profile as rp
+
+    entry = tmp_path / "package" / "environment.py"
+    entry.parent.mkdir(parents=True)
+    entry.write_text("")
+
+    seen: dict = {}
+
+    class _Env:
+        multi_turn = False
+
+        def dataset(self):
+            # env code reads its declared secret exactly where the worker's would.
+            seen["visible"] = os.environ.get("JUDGE_API_KEY")
+            return [{"q": "2+2?"}]
+
+        def prompt_messages(self, example):
+            return [{"role": "user", "content": example["q"]}]
+
+    class _Client:
+        def download_env_package(self, _env_id):
+            return b""
+
+    monkeypatch.setattr(
+        "flash.envs.pull.pull_environment_package_from_archive", lambda *_a: tmp_path / "package"
+    )
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda *_a, **_k: _Env())
+    monkeypatch.setattr(
+        "flash.engine.profiling.rollout_evidence.collect_rollout_evidence", lambda **kw: None
+    )
+    monkeypatch.setenv(rollout_sampler.ROLLOUT_SAMPLER_API_KEY_ENV, "k")
+    monkeypatch.delenv("JUDGE_API_KEY", raising=False)
+
+    spec = _spec(
+        environment=EnvironmentSpec(
+            id="acme/math", resolved_sha="a" * 40, secrets=("JUDGE_API_KEY",)
+        )
+    )
+    rp.collect_for_submit(
+        _Client(), spec, runtime_secrets={"JUDGE_API_KEY": "sk-local"}, debug=True
+    )
+
+    assert seen["visible"] == "sk-local", (
+        "env code run for the quote must see the declared secret the worker will receive"
+    )
+    assert "JUDGE_API_KEY" not in os.environ, "the secret must not outlive the measurement"
+
+
+def test_an_undeclared_secret_is_not_handed_to_environment_code(monkeypatch, tmp_path):
+    """Scope: only what the spec DECLARES. WANDB_API_KEY is always collected, and user env code has
+    no business reading it."""
+    from flash.cli.commands import rollout_profile as rp
+
+    entry = tmp_path / "package" / "environment.py"
+    entry.parent.mkdir(parents=True)
+    entry.write_text("")
+
+    seen: dict = {}
+
+    class _Env:
+        multi_turn = False
+
+        def dataset(self):
+            seen["wandb"] = os.environ.get("WANDB_API_KEY")
+            return [{"q": "2+2?"}]
+
+        def prompt_messages(self, example):
+            return [{"role": "user", "content": example["q"]}]
+
+    class _Client:
+        def download_env_package(self, _env_id):
+            return b""
+
+    monkeypatch.setattr(
+        "flash.envs.pull.pull_environment_package_from_archive", lambda *_a: tmp_path / "package"
+    )
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda *_a, **_k: _Env())
+    monkeypatch.setattr(
+        "flash.engine.profiling.rollout_evidence.collect_rollout_evidence", lambda **kw: None
+    )
+    monkeypatch.setenv(rollout_sampler.ROLLOUT_SAMPLER_API_KEY_ENV, "k")
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+
+    # declares nothing, so nothing may be exported even though a secret was collected.
+    rp.collect_for_submit(
+        _Client(), _spec(), runtime_secrets={"WANDB_API_KEY": "sk-wandb"}, debug=True
+    )
+    assert seen["wandb"] is None, "an undeclared secret must not reach environment code"
+
+
+def test_the_cost_preview_says_when_a_dry_run_would_quote_differently(monkeypatch, capsys):
+    """`flash train --cost` prices rollouts at the cap; a dry-run on the SAME config measures them.
+
+    The two deliberately disagree, and --cost is the command meant for pre-spend decisions -- so the
+    difference has to be stated rather than surfacing as an unexplained change at submit.
+    """
+    from flash.cli.commands import _cmd_train_cost_offline
+
+    monkeypatch.setenv(rollout_sampler.ROLLOUT_SAMPLER_API_KEY_ENV, "k")
+    assert _cmd_train_cost_offline(_spec()) == 0
+    assert "declared completion cap" in capsys.readouterr().err
+
+
+def test_the_cost_preview_stays_quiet_when_no_measurement_could_happen(monkeypatch, capsys):
+    """No sampler key, or a config the draw cannot reproduce, means BOTH paths quote from the cap.
+    Warning there would describe a disagreement that does not exist."""
+    from flash.cli.commands import _cmd_train_cost_offline
+
+    monkeypatch.delenv(rollout_sampler.ROLLOUT_SAMPLER_API_KEY_ENV, raising=False)
+    assert _cmd_train_cost_offline(_spec()) == 0
+    assert "declared completion cap" not in capsys.readouterr().err
+
+    # key present, but the config is declined -- still no disagreement.
+    monkeypatch.setenv(rollout_sampler.ROLLOUT_SAMPLER_API_KEY_ENV, "k")
+    assert _cmd_train_cost_offline(_spec(thinking=True)) == 0
+    assert "declared completion cap" not in capsys.readouterr().err
+
+
+def test_generation_pricing_stays_bounded_by_the_cap_when_the_actor_drifts():
+    """RL changes generation length, and the profile only ever sees the PRE-TRAINING actor.
+
+    That exposure is real but bounded, and the bound is what makes pricing the whole horizon from an
+    initial sample defensible. `_completion_tokens` clamps to the declared cap, so an actor that
+    drifts LONGER converges to the cap-based quote this path used before any measurement existed --
+    it never prices generation above it. An actor that drifts SHORTER is over-quoted, which is the
+    safe direction.
+
+    Asserted on the generation term itself, not on a total: a measured quote CAN exceed the
+    cap-based one, because measured grading latency is real cost the cap-based quote simply omits.
+    Conflating the two would let a grading regression pass as a generation bound.
+    """
+    from flash.cost.analytical import _completion_tokens, _sequence_tokens
+    from flash.cost.spec import runconfig_from_spec
+
+    spec = _spec()
+    cap = spec.train.max_completion_tokens
+    cap_cfg = runconfig_from_spec(spec).normalized()
+
+    def _measured(mean: float):
+        evidence = _evidence(
+            completion_tokens_mean=mean,
+            completion_tokens_p50=int(mean),
+            completion_tokens_p90=min(cap, int(mean * 1.2)),
+            completion_tokens_max=min(cap, int(mean * 1.3)),
+        )
+        profile = rollout_profile_from_evidence(spec, evidence, producer_version=VERSION)
+        assert profile is not None
+        return runconfig_from_spec(_with_profile(spec, profile)).normalized()
+
+    # an actor that drifted all the way to the cap is priced at the cap, never above it.
+    assert _completion_tokens(_measured(float(cap))) == pytest.approx(float(cap))
+    assert _sequence_tokens(_measured(float(cap))) <= _sequence_tokens(cap_cfg)
+    # the pre-training sample only ever discounts generation off the cap.
+    assert _completion_tokens(_measured(53.6875)) < float(cap)
+
+    # a mean above the sample's own max is incoherent, so the server refuses it outright rather
+    # than clamping -- the ceiling is enforced before pricing, not inside it.
+    incoherent = _evidence(
+        completion_tokens_mean=2000.0,
+        completion_tokens_p50=2000,
+        completion_tokens_p90=cap,
+        completion_tokens_max=cap,
+    )
+    assert rollout_profile_from_evidence(spec, incoherent, producer_version=VERSION) is None

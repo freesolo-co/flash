@@ -351,6 +351,19 @@ def _cmd_train_cost_offline(spec) -> int:
     """Catalog-only quote for the algorithms that do not need workload evidence yet (grpo, opd)."""
     from flash.cost import estimate_cost
 
+    if _measured_quote_would_differ(spec):
+        # this command prices rollouts at the declared completion cap, but a dry-run or submit on
+        # the same config measures them and quotes the measured length instead -- so the two
+        # deliberately disagree, and this is the one meant for pre-spend decisions. it stays
+        # cap-based rather than measuring: measuring imports and runs the user's environment.py and
+        # can call a paid external scorer, which is not what `--cost` promises. say which number
+        # this is instead of letting the difference surface as an unexplained change at submit.
+        print(
+            "note: this quote prices generation at the declared completion cap. A sampler key is "
+            "configured, so `flash train --dry-run` measures real rollout length and can quote a "
+            "different (usually lower) amount for this same config.",
+            file=sys.stderr,
+        )
     if spec.train.init_from_adapter:
         # --cost is offline/catalog-only and cannot read the source adapter, so the rank stays at the
         # local default. Warm starts train and are priced at the SOURCE adapter's authoritative rank
@@ -368,6 +381,25 @@ def _cmd_train_cost_offline(spec) -> int:
     else:
         print(estimate.breakdown())
     return 0
+
+
+def _measured_quote_would_differ(spec) -> bool:
+    """whether a dry-run on this same config would quote from measured rollouts instead.
+
+    only true when a measurement could actually happen: the algorithm samples rollouts, a sampler
+    key is configured, and nothing about the config makes a hosted draw unrepresentative. a config
+    that would be declined is quoted from the cap on BOTH paths, so warning about it would describe
+    a disagreement that does not exist.
+    """
+    from flash.core.catalog import samples_on_policy
+
+    if not samples_on_policy(spec.algorithm):
+        return False
+    from flash.cli.commands.rollout_profile import unsamplable_reason
+    from flash.engine.profiling.rollout_sampler import sampler_credentials
+
+    _base_url, api_key = sampler_credentials()
+    return bool(api_key) and not unsamplable_reason(spec)
 
 
 def _cmd_train_cost_sft(args, spec, authored_train_keys: frozenset[str]) -> int:
@@ -459,7 +491,9 @@ def _dry_run_preview_line(
     )
 
 
-def _rollout_evidence_for(client: ApiClient, spec) -> dict | None:
+def _rollout_evidence_for(
+    client: ApiClient, spec, runtime_secrets: dict | None = None
+) -> dict | None:
     """Measured rollout aggregates for a grpo/opd submit, or None when nothing was measured.
 
     Advisory, and silent on every failure. The server re-derives the digest and re-applies the same
@@ -467,10 +501,14 @@ def _rollout_evidence_for(client: ApiClient, spec) -> dict | None:
     rejected or evidence that survives those checks. Returning None leaves the quote on the declared
     completion cap, which is the pricing this path had before any of it existed -- so a submit must
     never fail because a sampler was unreachable, slow, or unconfigured.
+
+    ``runtime_secrets`` are forwarded so the env code executed locally sees the same declared
+    secrets the worker will; without them an external-judge reward() raises and the measurement is
+    silently lost.
     """
     from flash.cli.commands.rollout_profile import collect_for_submit
 
-    evidence = collect_for_submit(client, spec)
+    evidence = collect_for_submit(client, spec, runtime_secrets=runtime_secrets)
     if evidence:
         logger.info(
             "measured %s rollouts for the quote: mean %.0f completion tokens (cap %s)",
@@ -718,7 +756,7 @@ def cmd_train(args) -> int:
         runtime_secrets_from_local_env(args.config, keys=spec.environment.secrets) or None
     )
     _warn_if_wandb_requested_without_key(spec, runtime_secrets, dry_run=bool(args.dry_run))
-    rollout_evidence = _rollout_evidence_for(client, spec)
+    rollout_evidence = _rollout_evidence_for(client, spec, runtime_secrets)
     if args.dry_run:
         # dry-run runs submit-time server preflights without allocating a training gpu or charging
         # for training. a rejection surfaces as the server's error with exit status 1. for sft it
