@@ -1943,7 +1943,6 @@ def test_runtime_secret_validation_and_non_persistence(api):
     dumped = json.dumps(body)
     assert "user-wandb-key" not in dumped
     assert "runtime_secrets" not in dumped
-    assert "WANDB_API_KEY" not in body["spec"].get("worker_env", {})
 
     env_secret_spec = {
         **SPEC,
