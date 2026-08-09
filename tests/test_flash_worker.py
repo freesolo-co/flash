@@ -260,109 +260,13 @@ def test_worker_console_always_uploaded_and_no_flag(monkeypatch):
         assert "_force_console" not in src
 
 
-def _spec_worker_env(worker_env: dict):
-    """A grpo JobSpec carrying a per-run [worker_env] block (the TOML override map)."""
-    from flash.spec import JobSpec, TrainSpec
-
-    return JobSpec(
-        model="Qwen/Qwen3.5-4B",
-        algorithm="grpo",
-        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
-        seed=0,
-        worker_env=dict(worker_env),
-    )
-
-
-def test_build_worker_env_filters_removed_optimization_toggles(monkeypatch):
-    """A per-run [worker_env] block can NOT re-inject the optimization toggles removed in PR #175
-    (flash is deterministic + fully managed). The dangerous case: a recipe pinning
-    PYTORCH_ALLOC_CONF=expandable_segments:True would crash GRPO vLLM sleep mode — it must be
-    dropped, and flash's computed sleep-safe RL conf must survive. Non-removed keys still merge."""
-    from flash.providers.runpod.train import build_worker_env
-
-    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
-    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
-    spec = _spec_worker_env(
-        {
-            # Removed optimization toggles — must all be stripped.
-            "PYTORCH_ALLOC_CONF": "expandable_segments:True",
-            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-            "VLLM_ATTENTION_BACKEND": "FLASHINFER",
-            "VLLM_FLASH_ATTN_VERSION": "2",
-            "VLLM_USE_V1": "0",
-            "SFT_PER_DEVICE_BS": "1",
-            "TORCHDYNAMO_DISABLE": "1",
-            "FLASH_DISABLE_FA2": "1",
-            "RL_VLLM_SLEEP": "0",
-            "FLASH_ROPE_KERNEL": "0",
-            "FLASH_WORKER_DEPS": "evil==9",
-            # Case-insensitive match: a lower-cased re-injection is also stripped.
-            "pytorch_alloc_conf": "expandable_segments:True",
-            # A legitimate, non-removed per-run override still wins.
-            "MY_ENV_FLAG": "keep-me",
-        }
-    )
-    env = build_worker_env(spec, 0)  # grpo -> sleep-safe non-expandable alloc conf
-    # The unsafe alloc conf was NOT injected; flash's computed RL conf stands.
-    assert "expandable_segments" not in env["PYTORCH_ALLOC_CONF"]
-    assert "expandable_segments" not in env["PYTORCH_CUDA_ALLOC_CONF"]
-    for stripped in (
-        "VLLM_ATTENTION_BACKEND",
-        "VLLM_FLASH_ATTN_VERSION",
-        "VLLM_USE_V1",
-        "SFT_PER_DEVICE_BS",
-        "TORCHDYNAMO_DISABLE",
-        "FLASH_DISABLE_FA2",
-        "RL_VLLM_SLEEP",
-        "FLASH_ROPE_KERNEL",
-        "FLASH_WORKER_DEPS",
-    ):
-        assert stripped not in env, f"{stripped} should have been filtered from worker_env"
-    # A non-removed per-run key is honored — the filter is targeted, not a blanket block.
-    assert env["MY_ENV_FLAG"] == "keep-me"
-
-
-def test_build_worker_env_strips_the_deleted_chalk_spec_override(monkeypatch, caplog):
-    """FLASH_CHALK_SPEC selected a chalk install source. Chalk installed against an in-process
-    trainer.model, which the verl child does not have, so the surface was deleted — and a deleted
-    key must be FILTERED, not merely unimplemented. Left unfiltered it still reaches the worker and
-    configures nothing, so a run that sets it gets silence rather than a warning that it stopped
-    mattering. Asserts through build_worker_env (not set membership) so the filter loop must
-    actually run, and asserts the operator-visible warning names the key."""
-    import logging
-
-    from flash.providers.runpod.train import build_worker_env
-
-    monkeypatch.delenv("FLASH_CHALK_SPEC", raising=False)
-    spec = _spec_worker_env(
-        {
-            "FLASH_CHALK_SPEC": "freesolo-chalk==0.5.7",
-            # lower-cased too: the filter upper-cases before matching.
-            "flash_chalk_spec": "git+https://github.com/freesolo-co/chalk@main",
-            "MY_ENV_FLAG": "keep-me",
-        }
-    )
-    with caplog.at_level(logging.WARNING):
-        env = build_worker_env(spec, 0)
-    assert "FLASH_CHALK_SPEC" not in env
-    assert "flash_chalk_spec" not in env
-    # getMessage() renders lazy %-args; r.message alone is the unformatted template.
-    assert any("FLASH_CHALK_SPEC" in r.getMessage() for r in caplog.records), (
-        "setting a deleted key must warn, otherwise it fails silently"
-    )
-    assert env["MY_ENV_FLAG"] == "keep-me"
-
-
 def test_removed_keys_cannot_reach_the_worker_through_environment_secrets():
-    """[environment].secrets is a second door into the worker env, and it must honor the same
-    removal filter as [worker_env].
+    """declared runtime secrets must not deliver removed optimization keys to the worker.
 
     the two filters answer different questions and are deliberately disjoint:
-    RESERVED_WORKER_ENV_KEYS is control-plane ownership (a caller may not override SEED), while
-    _REMOVED_OPTIMIZATION_ENV is deadness (the key configures nothing now). the runtime-secret merge
-    only consulted the ownership set, so declaring a removed key under [environment].secrets
-    delivered it to the worker with no warning -- exactly the silence the worker_env filter exists
-    to prevent."""
+    CONTROL_PLANE_OWNED_ENV_KEYS prevents overrides such as SEED, while
+    _REMOVED_OPTIMIZATION_ENV blocks dead keys that configure nothing.
+    """
     from flash.providers._worker import _REMOVED_OPTIMIZATION_ENV
     from flash.providers.runpod.train import build_worker_env
     from flash.spec import EnvironmentSpec, JobSpec, TrainSpec

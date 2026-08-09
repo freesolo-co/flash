@@ -294,10 +294,7 @@ def test_resolve_verl_python_prefers_preset(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("blank", ["", "   "])
 def test_resolve_verl_python_treats_an_empty_preset_as_unset(monkeypatch, tmp_path, blank):
-    # a worker IMAGE can export FLASH_VERL_PYTHON itself, and [worker_env] can only SET a key, never
-    # delete one -- so omitting it from a spec leaves the image's interpreter in place. an empty
-    # value is the only way a run can say "ignore the image's verl and provision the pinned fork",
-    # and the error at rl_train.py's mask_truncated_completions gate names exactly this remedy.
+    # a missing or blank image preset takes the isolated pinned-fork provisioning path.
     calls = []
     monkeypatch.setenv("FLASH_VERL_PYTHON", blank)
     monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
@@ -306,30 +303,6 @@ def test_resolve_verl_python_treats_an_empty_preset_as_unset(monkeypatch, tmp_pa
 
     assert python_bin.endswith("/verl-venv/bin/python")
     assert any(vc.VERL_REQUIREMENT_URL in arg for arg in calls[1])
-
-
-def test_worker_env_remedies_are_copy_pasteable_toml():
-    # a [worker_env] snippet in an error gets pasted into a config verbatim, so it has to survive the
-    # real parser: '[worker_env] KEY = "..."' reads fine in prose but is invalid TOML, because a
-    # table header must end its line. a blocked run would just hit a second, more confusing error.
-    import re
-    import tomllib
-
-    from flash.engine.worker import rl_train
-
-    # only assignment forms -- '[worker_env] can set a key but never delete one' is prose, not a
-    # snippet, and carries no '=' to paste.
-    pattern = re.compile(r"\[worker_env\][^\n]*?[A-Z_]+\s*=\s*(\"[^\"]*\"|'[^']*')")
-    snippets = [m.group(0) for m in pattern.finditer(inspect.getsource(rl_train))]
-    assert snippets, "expected rl_train to advertise at least one [worker_env] remedy"
-
-    for snippet in snippets:
-        # a valid snippet is the header, a newline, then the assignment -- exactly what we tell users.
-        header, _, assignment = snippet.partition("]")
-        parsed = tomllib.loads(f"{header}]\n{assignment.split('as ')[-1].strip()}")
-        assert parsed == {"worker_env": {"FLASH_VERL_PYTHON": ""}}
-        # and the prose must not run the header into the assignment on one line.
-        assert not re.match(r"\[worker_env\]\s+[A-Z_]+\s*=", snippet), snippet
 
 
 def _fake_verl_venv(tmp_path, *, stamp: str | None):

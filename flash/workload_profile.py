@@ -10,10 +10,9 @@ from typing import Any
 
 SFT_PROFILE_KIND = "sft"
 ROLLOUT_PROFILE_KINDS = ("grpo", "opd")
-# 2 adds the sft untruncated length measurement (untruncated_max_length / truncated_examples).
-# a v1 artifact lacks those fields, so __post_init__ rejects it and the run re-profiles rather
-# than reading a censored max length as if it were the real one.
-WORKLOAD_PROFILE_SCHEMA_VERSION = 2
+# 3 removes the deleted per-run worker environment map from both profile identity payloads. old
+# cached profiles use a different identity shape, so reject them and re-profile.
+WORKLOAD_PROFILE_SCHEMA_VERSION = 3
 SFT_PACKING_POLICY_VERSION = 1
 ROLLOUT_SAMPLE_POLICY_VERSION = 1
 _PROFILE_RUN_PREFIX = "profile-sft-"
@@ -92,7 +91,6 @@ def sft_profile_input_payload(
         },
         "seed": int(spec.seed),
         "thinking": bool(spec.thinking),
-        "worker_env_sha256": _digest_mapping(spec.worker_env),
         "train": {
             "epochs": train.epochs,
             "batch_size": train.batch_size,
@@ -357,7 +355,6 @@ def rollout_profile_input_payload(
         },
         "seed": int(spec.seed),
         "thinking": bool(spec.thinking),
-        "worker_env_sha256": _digest_mapping(spec.worker_env),
         "generation": {
             "max_completion_tokens": train.max_completion_tokens,
             "max_context_tokens": train.max_context_tokens,

@@ -708,10 +708,8 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
     """return an interpreter that can import verl.
 
     prefer ``FLASH_VERL_PYTHON`` unchanged; otherwise provision an isolated venv with the pinned verl
-    stack and optional wandb. rebuild owned venvs when their stamp differs.
-
-    an explicit empty value means ignore an image-provided interpreter, because worker env can set a
-    key but cannot delete one.
+    stack and optional wandb. rebuild owned venvs when their stamp differs. a missing or blank preset
+    takes the provisioning path.
     """
     preset = os.environ.get("FLASH_VERL_PYTHON", "").strip()
     if preset:
