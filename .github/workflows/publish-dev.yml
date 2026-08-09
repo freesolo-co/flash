@@ -135,6 +135,17 @@ jobs:
       # Named `dev-v<version>` so the dev channel shares no namespace with prod's `v<version>`:
       # both channels use the SAME version number by design (version-parity.yml enforces it), so a
       # shared prefix would collide on every single release.
+      #
+      # KNOWN LIMITATION -- same non-self-healing shape as publish.yml. If PyPI accepts the upload
+      # and the tag push then fails, re-running does NOT repair it: `Decide whether to publish`
+      # finds the version already on the index and sets publish=false, so this step is skipped
+      # from then on. Repair by hand against the commit that actually shipped:
+      #
+      #   git tag -a dev-v<version> <sha> -m "freesolo-flash-dev <version>" && git push origin dev-v<version>
+      #
+      # Auto-tagging every already-published dev commit would be worse than the gap it closes:
+      # ordinary dev pushes deliberately reuse the current version, so it would tag whichever later
+      # commit happened to run, recording a commit that was never in that version.
       - name: Tag the released dev version
         if: steps.decide.outputs.publish == 'true'
         env:
@@ -142,8 +153,20 @@ jobs:
         run: |
           set -euo pipefail
           tag="dev-v${VERSION}"
-          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
-            echo "::notice::Tag ${tag} already exists on origin; leaving it as-is."
+          # See publish.yml for the peel/verify rationale. It matters more here: this tag is the ONLY
+          # record of which commit went into a given dev version, so a tag left pointing at the wrong
+          # commit is not a cosmetic problem -- it is a false provenance record, and silently
+          # accepting it would defeat the reason this step exists.
+          existing="$(git ls-remote --tags origin "refs/tags/${tag}" "refs/tags/${tag}^{}" || true)"
+          if [ -n "$existing" ]; then
+            peeled="$(printf '%s\n' "$existing" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')"
+            plain="$(printf '%s\n' "$existing" | awk '$2 !~ /\^\{\}$/ {print $1; exit}')"
+            target="${peeled:-$plain}"
+            if [ "$target" != "$GITHUB_SHA" ]; then
+              echo "::error::Tag ${tag} already exists on origin but points at ${target}, not this commit (${GITHUB_SHA}). The dev tag is the only record of which commit shipped in a given version; refusing to leave a false one. Resolve the tag by hand."
+              exit 1
+            fi
+            echo "::notice::Tag ${tag} already exists and points at this commit; nothing to do."
             exit 0
           fi
           git config user.name "David Shan"
