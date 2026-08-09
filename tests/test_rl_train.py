@@ -493,6 +493,8 @@ def test_text_only_parquet_does_not_pin_the_multimodal_schema(tmp_path):
 # ------------------------------- override generation -------------------------------
 def _overrides_cfg(**over):
     cfg = {
+        # required: run_rl_train always resolves this from the capability probe.
+        "fused_ce_backend": "torch",
         "train_files": "/w/train.parquet",
         "val_files": "/w/val.parquet",
         "model_id": "Qwen/Qwen3-4B",
@@ -888,6 +890,7 @@ def test_gpu_mem_util_sizing_reaches_the_launch_config():
         enforce_eager=False,
         attention_backend=None,
         mm_encoder_attn_backend=None,
+        ce_backend="torch",
         reward_path="/w/r.py",
         local_dir="/w/ckpt",
         project_name="flash",
@@ -1027,6 +1030,7 @@ def test_sleep_unsupported_models_keep_the_rollout_engine_resident():
             enforce_eager=False,
             attention_backend=None,
             mm_encoder_attn_backend=None,
+            ce_backend="torch",
             reward_path="/w/r.py",
             local_dir="/w/ckpt",
             project_name="flash",
@@ -1080,6 +1084,7 @@ def test_build_verl_training_cfg_derives_engine_len_and_budget():
         "ckpt_to_keep": 1,
     }
     common = {
+        "ce_backend": "torch",
         "train_files": "/w/t.parquet",
         "val_files": "/w/v.parquet",
         "model_id": "Qwen/Qwen3-4B",
@@ -1180,6 +1185,7 @@ def test_resolver_clamps_prompt_budget_with_the_engine(monkeypatch):
     # and every length the overrides emit agrees with it.
     cfg = rl_train._build_verl_training_cfg(
         inp,
+        ce_backend="torch",
         train_files="/w/train.parquet",
         val_files="/w/val.parquet",
         model_id=inp["model_id"],
@@ -1388,6 +1394,7 @@ def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeyp
     inp = rl_train._resolve_grpo_inputs()
     cfg = rl_train._build_verl_training_cfg(
         inp,
+        ce_backend="torch",
         train_files="/w/train.parquet",
         val_files="/w/val.parquet",
         model_id=inp["model_id"],
@@ -2551,7 +2558,7 @@ def test_image_pad_ban_and_stop_shims_both_apply_to_the_same_method():
 def test_rollout_shims_survive_verls_real_run_agent_loop_signature():
     """the shims must tolerate the signature verl ACTUALLY calls, not a convenient stub.
 
-    At freesolo-co/verl@1bea7d68, ``trajectory`` is positional and required ``agent_name`` is
+    At freesolo-co/verl@32d6200d, ``trajectory`` is positional and required ``agent_name`` is
     keyword-only; the wrapper must also preserve ``**kwargs``.
     """
     import asyncio
@@ -3868,6 +3875,7 @@ def test_multi_turn_env_resolves_and_selects_the_flash_agent_loop(monkeypatch):
     assert inp["max_turns"] == 3
     cfg = rl_train._build_verl_training_cfg(
         inp,
+        ce_backend="torch",
         train_files="/w/train.parquet",
         val_files="/w/val.parquet",
         model_id=inp["model_id"],
@@ -5013,6 +5021,7 @@ def test_the_response_width_reaches_verls_config_rather_than_max_completion(monk
     inp = _capability_resolve(monkeypatch, _capability_env(multi_turn=True))
     cfg = rl_train._build_verl_training_cfg(
         inp,
+        ce_backend="torch",
         train_files="/w/train.parquet",
         val_files="/w/val.parquet",
         model_id=inp["model_id"],

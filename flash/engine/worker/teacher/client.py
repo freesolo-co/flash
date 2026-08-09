@@ -13,7 +13,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
@@ -23,6 +22,7 @@ from flash.engine.worker.teacher.encoding import (
     load_teacher_tokenizer,
 )
 from flash.engine.worker.teacher.tokenizer_align import TeacherToken
+from flash.envs.base import map_bounded
 from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
 
 _MAX_LOGPROB_ROUNDING_ERROR = 1e-6
@@ -462,15 +462,23 @@ class TeacherClient:
         )
 
     def score_many(self, items: list[tuple[str, str]]) -> list[TeacherScore]:
-        """Score each unique prompt and completion through one idempotent broker request."""
+        """Score each unique prompt and completion through one idempotent broker request.
+
+        Bounded by `map_bounded`, which consumes completions as they arrive rather than in input
+        order. That matters here because these are PAID requests: on a failure the caller retries
+        the whole OPD attempt, so anything submitted after the first raise is billed for a result
+        nobody reads. `executor.map` bounds that to about one pool width only when requests finish
+        roughly in order -- with one slow leading request it bills the ENTIRE list (measured 64,
+        128, 256 of 256 at width 32, against 37 here). Teacher latency varies with completion
+        length, so that is the normal case.
+        """
         if not items:
             return []
-        if len(items) == 1:
-            return [self._score_one(*items[0])]
-        with ThreadPoolExecutor(
-            max_workers=min(OPD_TEACHER_SCORING_CONCURRENCY, len(items))
-        ) as executor:
-            return list(executor.map(lambda item: self._score_one(*item), items))
+        return map_bounded(
+            items,
+            lambda item: self._score_one(*item),
+            cap=OPD_TEACHER_SCORING_CONCURRENCY,
+        )
 
     def score(self, prompt_text: str, completion_text: str) -> TeacherScore:
         return self._score_one(prompt_text, completion_text)
