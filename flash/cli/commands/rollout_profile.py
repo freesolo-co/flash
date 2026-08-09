@@ -36,6 +36,10 @@ def collect_for_submit(client, spec, *, debug: bool = False) -> dict[str, Any] |
     if not api_key:
         # no sampler configured. the common case, and not a problem: the quote falls back to the cap.
         return None
+    if _unsamplable_reason(spec):
+        # the hosted draw would not reproduce this run's generation, and a measurement that
+        # describes different work must not set a price. declining returns the quote to the cap.
+        return None
 
     try:
         return _collect(client, spec)
@@ -43,6 +47,27 @@ def collect_for_submit(client, spec, *, debug: bool = False) -> dict[str, Any] |
         if debug:
             raise
         return None
+
+
+def _unsamplable_reason(spec) -> str:
+    """why a hosted draw cannot stand for this run's generation, or "" when it can.
+
+    the sampler draws ONE unconstrained completion from the base model. a config that changes what
+    generation is -- different weights, a decoding grammar, or many turns per episode -- produces a
+    length distribution the draw does not describe, and a measurement of different work must never
+    replace the cap. these are declined rather than approximated: fail-open costs nothing (the quote
+    is the cap-based one this path always used), while a confident wrong number sets a price.
+    """
+    train = getattr(spec, "train", None)
+    if getattr(train, "init_from_adapter", ""):
+        # the worker loads the warm-start adapter before its first rollout. an adapter changes
+        # stopping behaviour and length, and the hosted endpoint serves the base weights.
+        return "warm-start adapter"
+    if getattr(train, "structured_outputs", ""):
+        # grammar-constrained decoding has its own length distribution, and the hosted request
+        # carries no schema. forwarding one is a larger contract than this path has.
+        return "structured outputs"
+    return ""
 
 
 def _collect(client, spec) -> dict[str, Any] | None:
@@ -58,6 +83,11 @@ def _collect(client, spec) -> dict[str, Any] | None:
         # absolute, so the loader takes its local-file branch. a relative dir matches the managed-slug
         # pattern and would resolve remotely, re-downloading what was just extracted.
         environment = load_freesolo_environment(str(entrypoint), **(spec.environment.params or {}))
+        if getattr(environment, "multi_turn", False):
+            # the worker generates an assistant turn per step_episode call and trains on the whole
+            # transcript. one hosted completion is the FIRST turn only, so its token mean
+            # undercounts an episode -- and would still pass the trust gate. decline instead.
+            return None
         dataset = environment.dataset()
         if not dataset:
             return None
@@ -73,7 +103,15 @@ def _collect(client, spec) -> dict[str, Any] | None:
         if not prompts:
             return None
 
-        score_one, references = _reward_inputs(environment, dataset, assistant_completion_text)
+        # only grpo prices reward latency (analytical.py adds `completions x latency` in the grpo
+        # branch alone); opd supervises from the teacher distribution and uses zero task reward. so
+        # timing an opd env's reward() would call a possibly paid external judge locally to produce
+        # a number nothing reads. completion-length sampling still runs for both.
+        score_one, references = (
+            _reward_inputs(environment, dataset, assistant_completion_text)
+            if spec.algorithm == "grpo"
+            else (None, None)
+        )
         return collect_rollout_evidence(
             model=spec.model,
             prompts=prompts,

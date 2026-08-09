@@ -814,3 +814,107 @@ def test_stop_sequences_are_part_of_the_measurements_identity():
     )
     # different stop strings stop at different points, so they are different distributions too.
     assert _digest(stop_sequences=("</answer>",)) != _digest(stop_sequences=("</s>",))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("init_from_adapter", "acme/run-1"), ("structured_outputs", '{"type":"object"}')],
+)
+def test_a_config_the_sampler_cannot_reproduce_is_not_measured(field, value, monkeypatch):
+    """A hosted draw is one unconstrained completion from the BASE model.
+
+    A warm-start adapter changes the weights that generate, and structured outputs impose a decoding
+    grammar; both move the length distribution, and the hosted request carries neither. Measuring
+    anyway would put a confident number describing different work into a persisted quote, so these
+    fall back to the cap instead.
+    """
+    from flash.cli.commands import rollout_profile as rp
+
+    monkeypatch.setenv(rollout_sampler.ROLLOUT_SAMPLER_API_KEY_ENV, "k")
+
+    def _must_not_run(*_a, **_k):
+        raise AssertionError("an unsamplable config must not reach the sampler")
+
+    monkeypatch.setattr(rp, "_collect", _must_not_run)
+    spec = _spec(train=TrainSpec(max_steps=50, batch_size=8, group_size=4, **{field: value}))
+    assert rp.collect_for_submit(object(), spec, debug=True) is None
+
+
+def test_a_multi_turn_environment_is_not_priced_from_one_turn(monkeypatch, tmp_path):
+    """The worker generates an assistant turn per step_episode and trains on the transcript.
+
+    One hosted completion is the first turn only, so its mean undercounts an episode -- and would
+    still clear the trust gate, replacing the cap with a number that is too low.
+    """
+    from flash.cli.commands import rollout_profile as rp
+
+    entry = tmp_path / "package" / "environment.py"
+    entry.parent.mkdir(parents=True)
+    entry.write_text("")
+
+    class _MultiTurn:
+        multi_turn = True
+
+        def dataset(self):
+            raise AssertionError("a multi-turn env must be declined before its dataset is read")
+
+    monkeypatch.setenv(rollout_sampler.ROLLOUT_SAMPLER_API_KEY_ENV, "k")
+    monkeypatch.setattr(
+        "flash.envs.pull.pull_environment_package_from_archive",
+        lambda *_a: tmp_path / "package",
+    )
+    monkeypatch.setattr(
+        "flash.envs.loader.load_freesolo_environment", lambda *_a, **_k: _MultiTurn()
+    )
+
+    class _Client:
+        def download_env_package(self, _env_id):
+            return b""
+
+    assert rp.collect_for_submit(_Client(), _spec(), debug=True) is None
+
+
+def test_opd_measures_length_but_does_not_run_the_task_reward(monkeypatch, tmp_path):
+    """Only the grpo cost branch prices reward latency; opd supervises from the teacher.
+
+    So timing an opd env's reward() calls a possibly paid external judge to produce a number nothing
+    reads. Length sampling must still happen -- opd is quoted on completion tokens too.
+    """
+    from flash.cli.commands import rollout_profile as rp
+
+    entry = tmp_path / "package" / "environment.py"
+    entry.parent.mkdir(parents=True)
+    entry.write_text("")
+
+    class _Env:
+        def dataset(self):
+            return [{"q": "2+2?"}]
+
+        def prompt_messages(self, example):
+            return [{"role": "user", "content": example["q"]}]
+
+        def reward(self, *_a, **_k):
+            raise AssertionError("opd must not call the task reward while profiling")
+
+        def sft_completion(self, _example):
+            return "4"
+
+    seen: dict = {}
+    monkeypatch.setenv(rollout_sampler.ROLLOUT_SAMPLER_API_KEY_ENV, "k")
+    monkeypatch.setattr(
+        "flash.envs.pull.pull_environment_package_from_archive",
+        lambda *_a: tmp_path / "package",
+    )
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda *_a, **_k: _Env())
+    monkeypatch.setattr(
+        "flash.engine.profiling.rollout_evidence.collect_rollout_evidence",
+        lambda **kw: seen.update(kw),
+    )
+
+    class _Client:
+        def download_env_package(self, _env_id):
+            return b""
+
+    rp.collect_for_submit(_Client(), _spec(algorithm="opd"), debug=True)
+    assert seen.get("prompts"), "opd must still sample completion length"
+    assert seen.get("score_one") is None, "opd must not hand a scorer to the timer"
