@@ -42,6 +42,11 @@ _METRICS_AFTER_SUCCESS_WAIT_S = 5.0
 
 # any boundary exit can race terminal-artifact visibility under hf read-after-write lag. re-read
 # terminal artifacts before classifying the exit so a completed seed is not retried against its work.
+# distinguishes "caller passed no read deadline" from an explicit ``None`` (unbounded read). the
+# closures this replaced bound ``absolute_deadline`` as a default at definition time; a method cannot,
+# so the sentinel restores that exact behavior.
+_UNSET_DEADLINE = object()
+
 _TERMINAL_REREAD_RETRIES = 6
 _TERMINAL_REREAD_WAIT_S = 5.0
 
@@ -180,60 +185,48 @@ def _decode_terminal_marker(
     )
 
 
-def poll_instance_job(
-    adapter: InstancePollAdapter,
-    *,
-    log=None,
-    interval_s: float = 15.0,
-    heartbeat_reader=None,
-    setup_grace_s: float,
-    stall_after_s: float,
-    first_liveness_s: float,
-    load_timeout_s: float,
-    deadline_at: float | None = None,
-) -> PollResult:
-    """poll instance status and hf artifacts to a terminal result.
+class _TerminalArtifacts:
+    """Reads HF terminal artifacts (marker, done, metrics) and classifies them into a ``PollResult``.
 
-    completed requires a strict ok marker and metrics. worker markers fail fast; dead hosts, stalls,
-    status outages, and unreadable signalled-success metrics remain infrastructure-retryable.
+    Groups the reads that every give-up path shares. ``last_hb_key`` and ``deferred_deadline_failure``
+    live here because the give-up paths mutate them across calls, exactly as the closures they replace
+    did through ``nonlocal``.
     """
-    say = make_say(log)
-    launch_ts = adapter.launch_ts
-    if (
-        isinstance(launch_ts, bool)
-        or not isinstance(launch_ts, (int, float))
-        or not math.isfinite(launch_ts)
-        or launch_ts <= 0
-    ):
-        raise ValueError("persisted instance launch timestamp is invalid")
-    absolute_deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
-    done_reader = adapter.done_reader
-    marker_reader = adapter.marker_reader
-    metrics_reader = adapter.metrics_reader
-    deferred_deadline_failure: PollResult | None = None
 
-    def read_artifact(reader, *, force: bool, read_deadline_at: float | None):
+    def __init__(self, adapter, *, say, heartbeat_reader, launch_ts, absolute_deadline):
+        self._adapter = adapter
+        self._say = say
+        self._heartbeat_reader = heartbeat_reader
+        self._launch_ts = launch_ts
+        self._absolute_deadline = absolute_deadline
+        self.last_hb_key = None
+        self.deferred_deadline_failure: PollResult | None = None
+
+    def _read_artifact(self, reader, *, force: bool, read_deadline_at: float | None):
         return reader(
             force=force,
             **deadline_kwargs(reader, read_deadline_at),
         )
 
     def finish_ok(
+        self,
         end_ts_hint: float | str | None = None,
         *,
-        read_deadline_at: float | None = absolute_deadline,
+        read_deadline_at: float | None = _UNSET_DEADLINE,
     ) -> PollResult:
+        if read_deadline_at is _UNSET_DEADLINE:
+            read_deadline_at = self._absolute_deadline
         # the strict success marker authorizes completion, but metrics.json visibility can lag it on hf.
         # re-read before falling back to the poll_error retry used for a success without metrics.
         raw = _read_with_retries(
-            lambda: read_artifact(
-                metrics_reader,
+            lambda: self._read_artifact(
+                self._adapter.metrics_reader,
                 force=True,
                 read_deadline_at=read_deadline_at,
             ),
             tries=_METRICS_AFTER_SUCCESS_RETRIES,
             wait_s=_METRICS_AFTER_SUCCESS_WAIT_S,
-            say=say,
+            say=self._say,
             message="DONE seen but metrics.json not visible yet; waiting for HF read-after-write",
             deadline_at=read_deadline_at,
         )
@@ -261,12 +254,12 @@ def poll_instance_job(
         if end_ts_hint is not None:
             with contextlib.suppress(TypeError, ValueError):
                 ts = float(end_ts_hint)
-                if launch_ts <= ts <= end_ts:
+                if self._launch_ts <= ts <= end_ts:
                     end_ts = ts
-        adapter.stamp_cost_and_notes(metrics, end_ts=end_ts, launch_ts=launch_ts)
+        self._adapter.stamp_cost_and_notes(metrics, end_ts=end_ts, launch_ts=self._launch_ts)
         return PollResult(True, metrics=metrics)
 
-    def done_is_fresh(content: str) -> bool:
+    def _done_is_fresh(self, content: str) -> bool:
         # done carries only a finite completion timestamp bound to this attempt and deadline.
         try:
             ts = float(content.strip())
@@ -276,57 +269,64 @@ def poll_instance_job(
         return bool(
             math.isfinite(ts)
             and math.isfinite(now)
-            and ts > launch_ts - 120.0
+            and ts > self._launch_ts - 120.0
             and ts <= now + 120.0
-            and (absolute_deadline is None or ts <= absolute_deadline)
+            and (self._absolute_deadline is None or ts <= self._absolute_deadline)
         )
 
-    def finish_from_ok_marker(
+    def _finish_from_ok_marker(
+        self,
         marker: dict,
         *,
-        read_deadline_at: float | None = absolute_deadline,
+        read_deadline_at: float | None = _UNSET_DEADLINE,
     ) -> PollResult:
+        if read_deadline_at is _UNSET_DEADLINE:
+            read_deadline_at = self._absolute_deadline
         # a strict ok marker authorizes completion even if done is stale or absent. prefer a fresh done
         # timestamp when available; otherwise use the marker's completion timestamp for the wall note.
-        d = read_artifact(
-            done_reader,
+        d = self._read_artifact(
+            self._adapter.done_reader,
             force=True,
             read_deadline_at=read_deadline_at,
         )
-        fresh = d is not None and done_is_fresh(d)
+        fresh = d is not None and self._done_is_fresh(d)
         marker_ts = marker["ts"]
-        return finish_ok(d if fresh else marker_ts, read_deadline_at=read_deadline_at)
+        return self.finish_ok(d if fresh else marker_ts, read_deadline_at=read_deadline_at)
 
-    def fail_from_marker(marker: dict) -> PollResult:
+    def _fail_from_marker(self, marker: dict) -> PollResult:
         # a real worker error fails fast unless flagged retriable in the marker or the worker heartbeat.
         # gate the heartbeat flag to this attempt so a stale prior-attempt flag cannot trigger a retry.
         retriable = marker["retriable"] or worker_flagged_retriable(
-            heartbeat_reader, launch_ts=launch_ts, current_attempt=adapter.current_attempt
+            self._heartbeat_reader,
+            launch_ts=self._launch_ts,
+            current_attempt=self._adapter.current_attempt,
         )
         return PollResult(
             False,
             failure="job_preempted" if retriable else "job_failed",
-            detail=adapter.failure_detail(marker),
+            detail=self._adapter.failure_detail(marker),
         )
 
-    def terminal_artifact_result(
+    def result(
+        self,
         force: bool = True,
         *,
-        read_deadline_at: float | None = absolute_deadline,
+        read_deadline_at: float | None = _UNSET_DEADLINE,
         defer_deadline_failure: bool = False,
     ) -> PollResult | None:
-        nonlocal deferred_deadline_failure
         # the strict attempt marker is the sole terminal authority. done may help timestamp a
         # marker-authorized success, but it cannot complete a run by itself.
-        raw = read_artifact(
-            marker_reader,
+        if read_deadline_at is _UNSET_DEADLINE:
+            read_deadline_at = self._absolute_deadline
+        raw = self._read_artifact(
+            self._adapter.marker_reader,
             force=force,
             read_deadline_at=read_deadline_at,
         )
         if raw is None:
             return None
         try:
-            marker = _decode_terminal_marker(raw, adapter)
+            marker = _decode_terminal_marker(raw, self._adapter)
         except (TypeError, ValueError):
             return PollResult(
                 False,
@@ -334,79 +334,124 @@ def poll_instance_job(
                 detail="terminal marker is invalid or unverifiable",
             )
         if marker["ok"]:
-            return finish_from_ok_marker(marker, read_deadline_at=read_deadline_at)
-        failure = fail_from_marker(marker)
+            return self._finish_from_ok_marker(marker, read_deadline_at=read_deadline_at)
+        failure = self._fail_from_marker(marker)
         # the watchdog marker can race a successful final marker or lagging done upload. only the
         # deadline exit defers it; every other failure marker still terminates immediately.
         if defer_deadline_failure and marker["error"].startswith("run wall deadline exceeded"):
-            deferred_deadline_failure = failure
+            self.deferred_deadline_failure = failure
             return None
         return failure
 
-    def _surface_final_heartbeat() -> None:
+    def surface_final_heartbeat(self) -> None:
         # persist the latest metrics before any terminal give-up so `flash runs log -f` still shows the final
         # per-step metrics for runs that end via deadline / dead-host / poll-outage / stall, not only the
         # per-iteration terminal path below. deadline_at=None reads heartbeats already committed at the
         # boundary even though this runs past the compute deadline; capturing the returned key stops a
         # repeat (pre- vs post-reread) call from surfacing the same heartbeat twice.
-        nonlocal last_hb_key
-        forced_reader = (
-            (lambda: heartbeat_reader(force=True, deadline_at=None))
-            if heartbeat_reader is not None
-            else None
-        )
-        last_hb_key, _ = surface_heartbeat(forced_reader, last_hb_key, say)
+        self.last_hb_key, _ = surface_heartbeat(self._forced_reader(), self.last_hb_key, self._say)
 
-    def deadline_unless_terminal() -> PollResult:
-        nonlocal deferred_deadline_failure
+    def _forced_reader(self):
+        if self._heartbeat_reader is None:
+            return None
+        return lambda: self._heartbeat_reader(force=True, deadline_at=None)
+
+    def reread_before_giving_up(self, message: str) -> PollResult | None:
+        """Bounded terminal reread shared by the dead-host, poll-outage, and stall give-up paths."""
+        terminal = _read_with_retries(
+            self.result,
+            tries=_TERMINAL_REREAD_RETRIES,
+            wait_s=_TERMINAL_REREAD_WAIT_S,
+            say=self._say,
+            message=message,
+            deadline_at=self._absolute_deadline,
+        )
+        if terminal is not None:
+            self.surface_final_heartbeat()
+        return terminal
+
+    def deadline_unless_terminal(self) -> PollResult:
         # the run deadline stops worker compute, not bounded observation of artifacts already committed
         # at the boundary. share one fixed reread budget across terminal and metrics visibility lag.
-        deferred_deadline_failure = None
-        _surface_final_heartbeat()
+        self.deferred_deadline_failure = None
+        self.surface_final_heartbeat()
         read_deadline = time.time() + (_TERMINAL_REREAD_RETRIES * _TERMINAL_REREAD_WAIT_S)
         terminal = _read_with_retries(
-            lambda: terminal_artifact_result(
+            lambda: self.result(
                 read_deadline_at=read_deadline,
                 defer_deadline_failure=True,
             ),
             tries=_TERMINAL_REREAD_RETRIES,
             wait_s=_TERMINAL_REREAD_WAIT_S,
-            say=say,
+            say=self._say,
             message="deadline reached; waiting for HF to expose any terminal DONE/marker before stalled",
             deadline_at=read_deadline,
         )
         if terminal is not None:
-            _surface_final_heartbeat()
+            self.surface_final_heartbeat()
             return terminal
-        if deferred_deadline_failure is not None:
-            return deferred_deadline_failure
+        if self.deferred_deadline_failure is not None:
+            return self.deferred_deadline_failure
         return PollResult(False, failure="stalled", detail="client-side deadline exceeded")
 
-    def stalled_unless_terminal(detail: str) -> PollResult:
+    def stalled_unless_terminal(self, detail: str) -> PollResult:
         # A stall exit still checks for terminal artifacts — the worker may have finished right at the
         # boundary. Use the BOUNDED read (like the deadline / dead-host / poll-error paths) so a fresh
         # DONE/marker not yet visible under HF read-after-write lag isn't missed and mis-classified stalled
         # (which would fail a max_retries=0 run that actually completed, or rent a second box for the seed).
-        _surface_final_heartbeat()
-        terminal = _read_with_retries(
-            terminal_artifact_result,
-            tries=_TERMINAL_REREAD_RETRIES,
-            wait_s=_TERMINAL_REREAD_WAIT_S,
-            say=say,
-            message="stall boundary; waiting for HF to expose any terminal DONE/marker before stalled",
-            deadline_at=absolute_deadline,
+        self.surface_final_heartbeat()
+        terminal = self.reread_before_giving_up(
+            "stall boundary; waiting for HF to expose any terminal DONE/marker before stalled"
         )
         if terminal is not None:
-            _surface_final_heartbeat()
             return terminal
         return PollResult(False, failure="stalled", detail=detail)
+
+
+def poll_instance_job(
+    adapter: InstancePollAdapter,
+    *,
+    log=None,
+    interval_s: float = 15.0,
+    heartbeat_reader=None,
+    setup_grace_s: float,
+    stall_after_s: float,
+    first_liveness_s: float,
+    load_timeout_s: float,
+    deadline_at: float | None = None,
+) -> PollResult:
+    """poll instance status and hf artifacts to a terminal result.
+
+    completed requires a strict ok marker and metrics. worker markers fail fast; dead hosts, stalls,
+    status outages, and unreadable signalled-success metrics remain infrastructure-retryable.
+    """
+    say = make_say(log)
+    launch_ts = adapter.launch_ts
+    if (
+        isinstance(launch_ts, bool)
+        or not isinstance(launch_ts, (int, float))
+        or not math.isfinite(launch_ts)
+        or launch_ts <= 0
+    ):
+        raise ValueError("persisted instance launch timestamp is invalid")
+    absolute_deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
+    artifacts = _TerminalArtifacts(
+        adapter,
+        say=say,
+        heartbeat_reader=heartbeat_reader,
+        launch_ts=launch_ts,
+        absolute_deadline=absolute_deadline,
+    )
+    terminal_artifact_result = artifacts.result
+    deadline_unless_terminal = artifacts.deadline_unless_terminal
+    stalled_unless_terminal = artifacts.stalled_unless_terminal
+    _surface_final_heartbeat = artifacts.surface_final_heartbeat
 
     poll_errors = PollErrorTracker(say, interval_s)
     # Seed the load/stall clocks from LAUNCH, not this poll's start: a delayed reattach has been billing
     # since launch, so a still-loading box that already blew load_timeout_s fails over now.
     start = launch_ts
     last_status = None
-    last_hb_key = None
     last_progress = start
     became_running = False
     # Anchored to launch so a reattach already-running measures first-liveness from the original launch.
@@ -440,16 +485,10 @@ def poll_instance_job(
                 # the status endpoint can fail while the worker finishes through hf. perform the same
                 # bounded terminal-artifact reread used by deadline/dead-host paths so visibility lag
                 # cannot relaunch completed work and double-bill it.
-                terminal = _read_with_retries(
-                    terminal_artifact_result,
-                    tries=_TERMINAL_REREAD_RETRIES,
-                    wait_s=_TERMINAL_REREAD_WAIT_S,
-                    say=say,
-                    message="status-poll outage; waiting for HF to expose any terminal DONE/marker before poll_error",
-                    deadline_at=absolute_deadline,
+                terminal = artifacts.reread_before_giving_up(
+                    "status-poll outage; waiting for HF to expose any terminal DONE/marker before poll_error"
                 )
                 if terminal is not None:
-                    _surface_final_heartbeat()
                     return terminal
                 return PollResult(
                     False,
@@ -486,12 +525,7 @@ def poll_instance_job(
         # paces its own reads). Folds the DONE and ok/err-marker checks into one call.
         terminal = terminal_artifact_result(force=False)
         if terminal is not None:
-            forced_reader = (
-                (lambda: heartbeat_reader(force=True, deadline_at=None))
-                if heartbeat_reader is not None
-                else None
-            )
-            last_hb_key, _ = surface_heartbeat(forced_reader, last_hb_key, say)
+            _surface_final_heartbeat()
             return terminal
 
         # ``unknown`` = "host has no recent heartbeat and won't progress" (host loss) -> dead for fast
@@ -507,16 +541,10 @@ def poll_instance_job(
             # The worker may have finished just before the box self-destroyed, with its DONE/marker not
             # yet visible on HF (read-after-write lag). Re-read terminal artifacts a bounded number of
             # times before concluding loss.
-            terminal = _read_with_retries(
-                terminal_artifact_result,
-                tries=_TERMINAL_REREAD_RETRIES,
-                wait_s=_TERMINAL_REREAD_WAIT_S,
-                say=say,
-                message="instance gone; waiting for HF to expose any terminal DONE/marker before failover",
-                deadline_at=absolute_deadline,
+            terminal = artifacts.reread_before_giving_up(
+                "instance gone; waiting for HF to expose any terminal DONE/marker before failover"
             )
             if terminal is not None:
-                _surface_final_heartbeat()
                 return terminal
             # Dead host, no ok-marker/DONE. Distinguish genuine host LOSS (retry on a fresh host) from a
             # worker that RAN and CRASHED early leaving error_{phase}_attempt<N>.txt (bad env/config/OOM):
@@ -534,9 +562,9 @@ def poll_instance_job(
                 detail=adapter.failure_detail(None),
             )
 
-        new_key, stage = surface_heartbeat(heartbeat_reader, last_hb_key, say)
-        if new_key != last_hb_key:
-            last_hb_key = new_key
+        new_key, stage = surface_heartbeat(heartbeat_reader, artifacts.last_hb_key, say)
+        if new_key != artifacts.last_hb_key:
+            artifacts.last_hb_key = new_key
             # Credit the heartbeat's OWN ts (clamped to [launch, now]) so a pre-restart-stale heartbeat
             # buys no fresh window. ``fresh`` is False for a leftover prior-attempt heartbeat.
             hb_ts, fresh = heartbeat_progress_ts(new_key, launch_ts, adapter.current_attempt)
