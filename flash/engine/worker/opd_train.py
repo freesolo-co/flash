@@ -2561,7 +2561,7 @@ def _write_opd_shims(
     return entry_path, reward_path
 
 
-def _prepare_opd_verl(prepared: _PreparedOpdTrain) -> _PreparedOpdVerl:
+def _prepare_opd_verl(prepared: _PreparedOpdTrain, probe_verl_child) -> _PreparedOpdVerl:
     knobs = prepared.knobs
     model_id = prepared.model_id
     model_revision = prepared.model_revision
@@ -2588,24 +2588,8 @@ def _prepare_opd_verl(prepared: _PreparedOpdTrain) -> _PreparedOpdVerl:
     if isinstance(target_modules, set | frozenset):
         target_modules = sorted(target_modules)
     warmstart_adapter = _warmstart_adapter_path(model_id, model_revision, lora_rank)
-    # same silent boundary the sft path guards: with no prebuilt worker image this builds a venv and
-    # installs the training stack, minutes long with nothing to report and no liveness thread running.
-    with liveness_heartbeat("opd_configuring"):
-        python_bin = resolve_verl_python(
-            workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
-        )
-        # the architecture question is asked on its OWN, before the batched probe, because it reads
-        # the checkpoint config and has nothing to do with the child's capabilities.
-        # model_is_gdn_hybrid already returns False on its own probe failure, so it needs no guard.
-        # the modeling module is resolved HERE, in the parent, because it needs a hub/cache read the
-        # child must not repeat; "" skips the gdn question for a non-hybrid.
-        from flash.engine.worker.model.packing import model_is_gdn_hybrid
-
-        gdn_hybrid = model_is_gdn_hybrid(model_id, revision=model_revision)
-        gdn_module = gdn_probe_module(model_id, model_revision) if gdn_hybrid else ""
-        # ONE child answers every independent capability question. each used to cost its own
-        # interpreter, and the torch/verl import -- not the question -- was the price.
-        caps = probe_verl_capabilities(python_bin, gdn_module)
+    # the caller owns the probe and its liveness wrap so the stage stays visible in run_opd_train.
+    python_bin, gdn_hybrid, gdn_module, caps = probe_verl_child(workdir, model_id, model_revision)
     model_path = _cached_model_path(model_id, model_revision)
     gpu_count = int(getattr(spec.gpu, "count", 1) or 1)
     save_freq = math.gcd(*knobs.save_at_steps) if knobs.save_at_steps else knobs.save_every
@@ -3179,6 +3163,29 @@ def _execute_opd_train(prepared: _PreparedOpdTrain, verl: _PreparedOpdVerl) -> N
 
 def run_opd_train(spec=None) -> None:
     """Run flash OPD through verl's native rollout and weight-sync path."""
+
+    def probe_verl_child(workdir, model_id, model_revision):
+        # same silent boundary the sft path guards: with no prebuilt worker image this builds a venv
+        # and installs the training stack, minutes long with nothing to report and no liveness
+        # thread running. wrapped here so this function keeps naming every phase the watchdog reads.
+        with liveness_heartbeat("opd_configuring"):
+            python_bin = resolve_verl_python(
+                workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
+            )
+            # the architecture question is asked on its OWN, before the batched probe, because it
+            # reads the checkpoint config and has nothing to do with the child's capabilities.
+            # model_is_gdn_hybrid already returns False on its own probe failure, so it needs no
+            # guard. the modeling module is resolved HERE, in the parent, because it needs a
+            # hub/cache read the child must not repeat; "" skips the gdn question for a non-hybrid.
+            from flash.engine.worker.model.packing import model_is_gdn_hybrid
+
+            gdn_hybrid = model_is_gdn_hybrid(model_id, revision=model_revision)
+            gdn_module = gdn_probe_module(model_id, model_revision) if gdn_hybrid else ""
+            # ONE child answers every independent capability question. each used to cost its own
+            # interpreter, and the torch/verl import -- not the question -- was the price.
+            caps = probe_verl_capabilities(python_bin, gdn_module)
+        return python_bin, gdn_hybrid, gdn_module, caps
+
     prepared = _prepare_opd_train(spec)
-    verl = _prepare_opd_verl(prepared)
+    verl = _prepare_opd_verl(prepared, probe_verl_child)
     _execute_opd_train(prepared, verl)

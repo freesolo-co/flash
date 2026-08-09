@@ -5096,7 +5096,10 @@ def test_both_ray_rollouts_resolve_eager_from_the_same_hardware_probe():
         ("rl_train", inspect.getsource(rl_train.run_rl_train)),
         (
             "opd_train",
-            inspect.getsource(opd_train._prepare_opd_verl)
+            # the one child probe runs under run_opd_train's configuring wrap; the eager decision
+            # reads its answers downstream, so the pair spans all three functions.
+            inspect.getsource(opd_train.run_opd_train)
+            + inspect.getsource(opd_train._prepare_opd_verl)
             + inspect.getsource(opd_train._prepare_opd_execution),
         ),
     ):

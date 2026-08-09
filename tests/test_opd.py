@@ -1162,7 +1162,11 @@ def test_opd_worker_fp8_kv_flag_matches_the_sizing_assumption():
 
     from flash.engine.worker import opd_train
 
-    src = inspect.getsource(opd_train._prepare_opd_verl)
+    # the probe runs under run_opd_train's configuring wrap and hands its answers to the resolver,
+    # so the gdn question and the flag it feeds sit in different functions of the same path.
+    src = inspect.getsource(opd_train.run_opd_train) + inspect.getsource(
+        opd_train._prepare_opd_verl
+    )
     assert "model_is_gdn_hybrid(model_id, revision=model_revision)" in src
     assert "fp8_kv = _cc_ok and not gdn_hybrid" in src
     assert "get_device_capability() >= (8, 9)" in src

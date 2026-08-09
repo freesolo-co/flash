@@ -982,6 +982,18 @@ class _SftVerlProbe:
         return iter((self.python_bin, self.gdn_hybrid, self.gdn_module, self.caps))
 
 
+def _emit_sft_step_heartbeat(runtime, step: int) -> None:
+    """latch the step and report it with whatever metrics the child has emitted so far."""
+    runtime.progress["step"] = step
+    payload = {
+        "step": step,
+        "loss": runtime.progress["loss"],
+        "grad_norm": runtime.progress["grad_norm"],
+        "learning_rate": runtime.progress["lr"],
+    }
+    _w.heartbeat("sft_step", **{key: value for key, value in payload.items() if value is not None})
+
+
 def _record_sft_grad_norm(runtime, grad_norm: float) -> None:
     """latch one observed grad norm and fail the run once too many consecutive ones are dead."""
     runtime.progress["grad_norm"] = grad_norm
@@ -1525,25 +1537,8 @@ def _run_sft_child(
         field="input_ids",
     )
 
-    def publish() -> str:
-        adapter_dir = os.path.join(inputs.workdir, "adapter")
-        _export_checkpoint_adapter(
-            actor_dir,
-            adapter_dir,
-            model_id=inputs.model_id,
-            model_revision=inputs.model_revision,
-            python_bin=inputs.python_bin,
-        )
-        _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-        if (
-            final_save_due(final_step, inputs.save_at_steps)
-            and final_step not in child.watcher.processed_steps
-        ):
-            _w.publish_deployable_checkpoint(adapter_dir, final_step)
-        return adapter_dir
-
-    # the caller owns the liveness wrap so the stage stays visible in run_sft_train.
-    adapter_dir = finalize_under_wrap(publish, final_step)
+    # the caller owns the export and its liveness wrap so both stay visible in run_sft_train.
+    adapter_dir = finalize_under_wrap(actor_dir, final_step)
 
     _w.heartbeat(
         "sft_trained",
@@ -1713,16 +1708,7 @@ def run_sft_train(spec=None) -> None:
             runtime.progress["lr"] = learning_rate_value
 
     def on_step(step: int) -> None:
-        runtime.progress["step"] = step
-        payload = {
-            "step": step,
-            "loss": runtime.progress["loss"],
-            "grad_norm": runtime.progress["grad_norm"],
-            "learning_rate": runtime.progress["lr"],
-        }
-        _w.heartbeat(
-            "sft_step", **{key: value for key, value in payload.items() if value is not None}
-        )
+        _emit_sft_step_heartbeat(runtime, step)
 
     def child_heartbeat() -> None:
         _w.heartbeat("sft_step", liveness=True, step=int(runtime.progress["step"] or 0))
@@ -1737,7 +1723,7 @@ def run_sft_train(spec=None) -> None:
         ):
             return run_child()
 
-    def finalize_under_wrap(publish, final_step):
+    def finalize_under_wrap(actor_dir, final_step):
         # the save/merge/upload runs for minutes with no step line of its own; keepalive holds the
         # provider's stall clock open while it drains.
         with liveness_heartbeat(
@@ -1746,7 +1732,21 @@ def run_sft_train(spec=None) -> None:
             progress_step=True,
             keepalive=True,
         ):
-            return publish()
+            adapter_dir = os.path.join(inputs.workdir, "adapter")
+            _export_checkpoint_adapter(
+                actor_dir,
+                adapter_dir,
+                model_id=inputs.model_id,
+                model_revision=inputs.model_revision,
+                python_bin=inputs.python_bin,
+            )
+            _w.hf_upload_folder(adapter_dir, "adapter", required=True)
+            if (
+                final_save_due(final_step, inputs.save_at_steps)
+                and final_step not in child.watcher.processed_steps
+            ):
+                _w.publish_deployable_checkpoint(adapter_dir, final_step)
+            return adapter_dir
 
     result = _run_sft_child(
         inputs,
