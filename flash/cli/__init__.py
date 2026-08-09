@@ -234,8 +234,40 @@ class _FlashParser(_ThemedParser):
 
 def _build_parser() -> argparse.ArgumentParser:
     """Build the fully-configured root parser. Extracted from main() so tests can introspect the
-    registered subcommands and keep the themed help catalog (_HELP_GROUPS) in lockstep."""
+    registered subcommands and keep the themed help catalog (_HELP_GROUPS) in lockstep.
+
+    Registration is split into one ``_add_*_commands`` helper per command family. The call order
+    below is the order subcommands appear in help, so it is part of the CLI's surface, not an
+    implementation detail. ``models_sub`` is threaded from the models family into the deployment
+    family because `deploy`/`chat`/`export` are `flash models` subcommands registered after the
+    top-level `runs` group.
+    """
     parser = _FlashParser(prog=CLI_NAME, description="Managed LoRA post-training")
+    _add_root_flags(parser)
+    # subparsers theme their usage errors (parser_class=_ThemedParser) but not their help, so
+    # `flash <cmd> --help` keeps the standard layout; only the root parser themes its help (see
+    # _FlashParser). Nested `env` subcommands inherit _ThemedParser automatically (the env parser
+    # is itself a _ThemedParser, so its add_subparsers defaults to the same class).
+    sub = parser.add_subparsers(
+        dest="cmd", required=True, parser_class=_ThemedParser, metavar="<command>"
+    )
+
+    _add_auth_commands(sub)
+    _add_project_commands(sub)
+    models_sub = _add_model_commands(sub)
+    _add_env_commands(sub)
+    _add_traces_commands(sub)
+    _add_train_commands(sub)
+    _add_runs_commands(sub)
+    _add_deployment_commands(models_sub)
+    # The control plane is operator-only and run as a separate one-off service via the
+    # `flash-server` console script (flash.server.__main__:main), not a `flash` subcommand.
+
+    return parser
+
+
+def _add_root_flags(parser: argparse.ArgumentParser) -> None:
+    """Flags on the root parser itself, ahead of any subcommand."""
     parser.add_argument("-V", "--version", action="version", version=f"{CLI_NAME} {__version__}")
     parser.add_argument(
         "--debug",
@@ -249,14 +281,10 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0,
         help="increase log verbosity (-v for info, -vv for debug)",
     )
-    # subparsers theme their usage errors (parser_class=_ThemedParser) but not their help, so
-    # `flash <cmd> --help` keeps the standard layout; only the root parser themes its help (see
-    # _FlashParser). Nested `env` subcommands inherit _ThemedParser automatically (the env parser
-    # is itself a _ThemedParser, so its add_subparsers defaults to the same class).
-    sub = parser.add_subparsers(
-        dest="cmd", required=True, parser_class=_ThemedParser, metavar="<command>"
-    )
 
+
+def _add_auth_commands(sub: argparse._SubParsersAction) -> None:
+    """`version`, `login`, `whoami`: identity and build introspection."""
     version = sub.add_parser("version", help="print the Flash version")
     version.set_defaults(func=cmd_version)
 
@@ -282,6 +310,9 @@ def _build_parser() -> argparse.ArgumentParser:
     whoami = sub.add_parser("whoami", help="show the identity behind your stored key")
     whoami.set_defaults(func=cmd_whoami)
 
+
+def _add_project_commands(sub: argparse._SubParsersAction) -> None:
+    """`projects create` / `projects list`."""
     projects = sub.add_parser("projects", help="manage Freesolo projects")
     projects_sub = projects.add_subparsers(dest="projects_cmd", required=True)
     projects_create = projects_sub.add_parser("create", help="create a Freesolo project")
@@ -291,6 +322,13 @@ def _build_parser() -> argparse.ArgumentParser:
     projects_list = projects_sub.add_parser("list", help="list Freesolo projects and UUIDs")
     projects_list.set_defaults(func=cmd_projects_list)
 
+
+def _add_model_commands(sub: argparse._SubParsersAction) -> argparse._SubParsersAction:
+    """`models list` and `gpus`, returning the `models` subparser action.
+
+    The returned action is what `_add_deployment_commands` hangs `deploy`/`undeploy`/`export`/
+    `deployments`/`chat` off, further down the registration order.
+    """
     models = sub.add_parser("models", help="work with models and deployments")
     models.set_defaults(func=cmd_models)  # hidden bare `flash models` shim, mirrors `flash runs`
     models_sub = models.add_subparsers(dest="models_cmd", required=False)
@@ -299,9 +337,25 @@ def _build_parser() -> argparse.ArgumentParser:
 
     gpus = sub.add_parser("gpus", help="list managed GPU classes with estimated $/hr")
     gpus.set_defaults(func=cmd_gpus)
+    return models_sub
 
+
+def _add_env_commands(sub: argparse._SubParsersAction) -> None:
+    """`env setup/list/test/eval/push/pull/delete`.
+
+    Split one level further than the other families because `env` carries seven subcommands; the
+    call order here is the order they appear in `flash env --help`.
+    """
     env = sub.add_parser("env", help="manage Freesolo environments")
     env_sub = env.add_subparsers(dest="env_cmd", required=True)
+    _add_env_setup_command(env_sub)
+    _add_env_test_commands(env_sub)
+    _add_env_eval_command(env_sub)
+    _add_env_publish_commands(env_sub)
+
+
+def _add_env_setup_command(env_sub: argparse._SubParsersAction) -> None:
+    """`env setup`: the scaffold generator and its turn-mode / reasoning switches."""
     setup = env_sub.add_parser("setup", help="create a starter Freesolo environment scaffold")
     setup_mode = setup.add_mutually_exclusive_group()
     setup_mode.add_argument(
@@ -349,6 +403,9 @@ def _build_parser() -> argparse.ArgumentParser:
     # apart from "not chosen yet" and, on an interactive terminal, ask instead of assuming.
     setup.set_defaults(func=cmd_env_setup, turn_mode=None, reasoning=None, yes=False)
 
+
+def _add_env_test_commands(env_sub: argparse._SubParsersAction) -> None:
+    """`env list` and `env test`: local inspection before anything is published."""
     env_list = env_sub.add_parser("list", help="list local environment sources")
     env_list.set_defaults(func=cmd_env_list)
 
@@ -394,6 +451,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     env_test.set_defaults(func=cmd_env_test)
 
+
+def _add_env_eval_command(env_sub: argparse._SubParsersAction) -> None:
+    """`env eval`: score a deployed model against its environment's held-out suites."""
     env_eval = env_sub.add_parser(
         "eval",
         help="score a deployed model against its own environment's held-out suites",
@@ -460,6 +520,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     env_eval.set_defaults(func=cmd_env_eval)
 
+
+def _add_env_publish_commands(env_sub: argparse._SubParsersAction) -> None:
+    """`env push/pull/delete`: the hub round trip."""
     env_push = env_sub.add_parser("push", help="upload a local Freesolo environment")
     env_push.add_argument(
         "--name",
@@ -513,6 +576,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     env_delete.set_defaults(func=cmd_env_delete)
 
+
+def _add_traces_commands(sub: argparse._SubParsersAction) -> None:
+    """`traces export`."""
     traces = sub.add_parser("traces", help="work with traces recorded by the freesolo SDK")
     traces_sub = traces.add_subparsers(dest="traces_cmd", required=True)
     traces_export = traces_sub.add_parser(
@@ -550,6 +616,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     traces_export.set_defaults(func=cmd_traces_export)
 
+
+def _add_train_commands(sub: argparse._SubParsersAction) -> None:
+    """`train`: config composition, overrides, cost preflight."""
     train = sub.add_parser("train", help="submit a managed training run from a TOML config")
     train.add_argument("config")
     train.add_argument(
@@ -592,6 +661,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     train.set_defaults(func=cmd_train)
 
+
+def _add_runs_commands(sub: argparse._SubParsersAction) -> None:
+    """`runs list/status/log/cancel/checkpoint`."""
     runs = sub.add_parser("runs", help="manage training runs")
     runs.set_defaults(func=cmd_runs)  # hidden bare `flash runs` shim for deployed agents
     runs_sub = runs.add_subparsers(dest="runs_cmd", required=False)
@@ -632,6 +704,9 @@ def _build_parser() -> argparse.ArgumentParser:
     runs_checkpoint.add_argument("run_id")
     runs_checkpoint.set_defaults(func=cmd_checkpoints)
 
+
+def _add_deployment_commands(models_sub: argparse._SubParsersAction) -> None:
+    """`models deploy/undeploy/export/deployments/chat`, hung off the `models` subparser."""
     deploy = models_sub.add_parser("deploy", help="deploy a run's adapter to a serving endpoint")
     deploy.add_argument(
         "run_id",
@@ -709,11 +784,6 @@ def _build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--max-tokens", type=int, default=512)
     chat.add_argument("--temperature", type=float, default=0.0)
     chat.set_defaults(func=cmd_chat)
-
-    # The control plane is operator-only and run as a separate one-off service via the
-    # `flash-server` console script (flash.server.__main__:main), not a `flash` subcommand.
-
-    return parser
 
 
 # commands that bind work to an organization: either they write to it, or they resolve a project
