@@ -291,9 +291,24 @@ def build_verl_overrides(cfg: dict) -> list[str]:
 
     preserves flash's dr-grpo objective, kl coefficient, constant lr, seed, top_p, and one ppo epoch.
     verl samples a fresh rollout per optimizer update.
+
+    assembled from one section builder per hydra key family, then the hardware- and
+    feature-conditional appends. hydra applies overrides in order, so both the order of the calls
+    below and the conditional block coming last are part of the contract.
     """
     kl_on = float(cfg["kl_coef"]) > 0
-    o = [
+    return [
+        *_grpo_algorithm_and_data_overrides(cfg),
+        *_grpo_model_and_actor_overrides(cfg, kl_on),
+        *_grpo_rollout_overrides(cfg),
+        *_grpo_reward_and_trainer_overrides(cfg),
+        *_grpo_conditional_overrides(cfg, kl_on),
+    ]
+
+
+def _grpo_algorithm_and_data_overrides(cfg: dict) -> list[str]:
+    """`algorithm.*` and `data.*`, including the multimodal parquet keys."""
+    return [
         "algorithm.adv_estimator=grpo",
         # dr-grpo recipe: group-mean-centered advantages with NO std normalization, and a
         # constant-length loss aggregation (no per-response length bias). matches the retired trl path's
@@ -348,6 +363,12 @@ def build_verl_overrides(cfg: dict) -> list[str]:
             if cfg.get("multimodal")
             else []
         ),
+    ]
+
+
+def _grpo_model_and_actor_overrides(cfg: dict, kl_on: bool) -> list[str]:
+    """`actor_rollout_ref.model.*` and `actor_rollout_ref.actor.*`: lora, fused CE, optimizer."""
+    return [
         f"actor_rollout_ref.model.path={cfg['model_id']}",
         f"actor_rollout_ref.model.lora_rank={cfg['lora_rank']}",
         f"actor_rollout_ref.model.lora_alpha={cfg['lora_alpha']}",
@@ -391,6 +412,12 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         f"actor_rollout_ref.actor.ulysses_sequence_parallel_size={cfg['n_gpus']}",
         # store the frozen base in bf16, not verl's fp32 yaml default. shared with the opd driver.
         *trainer_dtype_overrides(),
+    ]
+
+
+def _grpo_rollout_overrides(cfg: dict) -> list[str]:
+    """`actor_rollout_ref.rollout.*`: vllm engine, agent loop, sampling and kv sizing."""
+    return [
         "actor_rollout_ref.rollout.name=vllm",
         f"actor_rollout_ref.rollout.n={cfg['group_size']}",
         # verl 0.8.0 chunks the rollout batch across agent workers with exact divisibility
@@ -436,6 +463,12 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # log-prob pass switches to token budgeting with the actor, never independently.
         "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=true",
         f"actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu={cfg['max_token_len_per_gpu']}",
+    ]
+
+
+def _grpo_reward_and_trainer_overrides(cfg: dict) -> list[str]:
+    """Reward-function wiring, `ray_kwargs.*` sizing, and `trainer.*` (horizon, checkpoints, wandb)."""
+    return [
         f"custom_reward_function.path={cfg['reward_path']}",
         f"custom_reward_function.name={cfg['reward_name']}",
         # verl trainer-v1 reward loop reads reward.custom_reward_function (the legacy top-level key
@@ -469,6 +502,15 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         f"trainer.experiment_name={_hydra_val(cfg['experiment_name'])}",
         f"trainer.default_local_dir={cfg['local_dir']}",
     ]
+
+
+def _grpo_conditional_overrides(cfg: dict, kl_on: bool) -> list[str]:
+    """The kl term plus the hardware- and feature-gated engine keys.
+
+    Kept last and in this order because hydra applies overrides in sequence: these are the keys
+    that must win over anything the sections above emitted for the same path.
+    """
+    o: list[str] = []
     if kl_on:
         # a reference policy is active -> add the token-level kl loss. the ref worker needs no
         # batching keys of its own: ref.yaml defaults log_prob_use_dynamic_bsz and
