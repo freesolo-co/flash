@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from flash.engine.worker import hf
+from flash.engine.worker.io import hf
 
 
 def test_is_commit_sha_accepts_only_full_hex():

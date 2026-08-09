@@ -15,9 +15,9 @@ import types
 import pytest
 
 import flash.cli as cli
-from flash.cli import traces as cli_traces
+from flash.cli.commands import traces as cli_traces
 from flash.client.config import DEFAULT_API_URL
-from flash.providers._poll import _format_heartbeat
+from flash.providers._lifecycle.poll import _format_heartbeat
 
 
 def test_format_heartbeat_appends_named_reward_metrics() -> None:
@@ -299,7 +299,7 @@ def test_projects_create_mints_a_local_id_on_a_self_hosted_plane(monkeypatch, ca
     assert _run(["projects", "create", "My project"]) == 0
     minted = capsys.readouterr().out.strip()
 
-    from flash.server.projects import require_project_access
+    from flash.server.domain.projects import require_project_access
 
     monkeypatch.setenv("FLASH_STANDALONE", "1")
     assert (
@@ -485,7 +485,7 @@ def test_train_cost_requires_explicit_project(tmp_path, capsys) -> None:
 def test_env_setup_maps_inaccessible_project_to_client_error(monkeypatch) -> None:
     from argparse import Namespace
 
-    from flash.cli import env_setup
+    from flash.cli.commands.env import setup as env_setup
     from flash.client import ApiError, ClientError
 
     # pinned to a HOSTED url and a key: ownership is only resolved against the backend when the
@@ -510,12 +510,12 @@ def test_env_setup_resolves_the_project_locally_on_a_self_hosted_plane(monkeypat
     Resolving it against ``api.freesolo.co`` sent the operator's plane-root key to a service with
     no relationship to it, which answered 401 -- so `flash env setup`, the first command in the
     SELF_HOSTING.md quickstart, died before writing a file. The plane exposes no project routes at
-    all, so there is nothing else to ask; ``flash/server/projects.py`` performs exactly this
+    all, so there is nothing else to ask; ``flash/server/domain/projects.py`` performs exactly this
     shape-only check under ``standalone()`` when the same run is later submitted.
     """
     from argparse import Namespace
 
-    from flash.cli import env_setup
+    from flash.cli.commands.env import setup as env_setup
 
     monkeypatch.setattr(
         "flash.client.config.load_credentials", lambda: ("http://127.0.0.1:8080", "operator-key")
@@ -537,7 +537,7 @@ def test_env_setup_still_rejects_a_malformed_project_when_self_hosted(monkeypatc
     """Skipping the ownership lookup must not skip the shape check that stands in for it."""
     from argparse import Namespace
 
-    from flash.cli import env_setup
+    from flash.cli.commands.env import setup as env_setup
 
     monkeypatch.setattr(
         "flash.client.config.load_credentials", lambda: ("http://127.0.0.1:8080", "operator-key")
@@ -550,7 +550,7 @@ def test_env_setup_still_rejects_a_malformed_project_when_self_hosted(monkeypatc
 def test_env_setup_self_hosted_interactive_requires_an_explicit_project(monkeypatch) -> None:
     from argparse import Namespace
 
-    from flash.cli import env_setup
+    from flash.cli.commands.env import setup as env_setup
     from flash.client import ClientError
 
     monkeypatch.setattr(
@@ -571,7 +571,7 @@ def test_env_setup_self_hosted_interactive_requires_an_explicit_project(monkeypa
 def test_env_setup_hosted_interactive_still_selects_a_project(monkeypatch) -> None:
     from argparse import Namespace
 
-    from flash.cli import env_setup
+    from flash.cli.commands.env import setup as env_setup
 
     project_id = "11111111-1111-4111-8111-111111111111"
     api_url = "https://flash.freesolo.co"
@@ -642,7 +642,7 @@ def test_login_failure_is_friendly_and_asks_to_retry(monkeypatch, capsys) -> Non
 def test_identity_render_is_ascii_locale_safe(monkeypatch) -> None:
     # Under an ASCII / non-UTF-8 stdout, neither a non-ASCII identity value nor our own
     # punctuation may raise UnicodeEncodeError after a login has already succeeded.
-    from flash.cli import render
+    from flash.cli.ui import render
 
     class _AsciiStdout:
         encoding = "ascii"
@@ -1615,7 +1615,7 @@ def test_env_setup_reasoning_conflict_names_every_stale_config(
 
 
 def test_existing_reasoning_ignores_thinking_text_in_comments(tmp_path) -> None:
-    from flash.cli import env_setup
+    from flash.cli.commands.env import setup as env_setup
 
     sft = tmp_path / "sft.toml"
     rl = tmp_path / "rl.toml"
@@ -1757,7 +1757,7 @@ def test_env_setup_reasoning_flag_enables_thinking(monkeypatch, tmp_path) -> Non
     assert "warn_missing_think_tags" in sft
     assert "max_completion_tokens" not in sft
     # nor opd -- not because the knob is inert there (opd honors it, via `_resolve_opd_knobs` ->
-    # `opd_completion_len` at flash/engine/vram.py:97, which feeds verl's max_response_length) but
+    # `opd_completion_len` at flash/engine/plan/vram.py:97, which feeds verl's max_response_length) but
     # because opd ALREADY raises its own budget under thinking: 512 -> 1536. Writing a literal would
     # pin what the recipe should choose, and would go stale the moment that default moves. GRPO needs
     # the line only because its non-thinking default is 320, too tight to leave to a scaffold reader.
@@ -2004,8 +2004,8 @@ def test_submit_payload_carries_no_pip_and_the_worker_resolves_it(monkeypatch, t
     would ship a worker with no Freesolo SDK, and the failure would surface only on a real GPU.
     """
     from flash.client.specs import spec_payload
-    from flash.envs.registry import worker_pip_for_env
-    from flash.spec import EnvironmentSpec, JobSpec
+    from flash.core.spec import EnvironmentSpec, JobSpec
+    from flash.envs.base import worker_pip_for_env
 
     spec = JobSpec(
         model="Qwen/Qwen3.5-0.8B",
@@ -2982,7 +2982,7 @@ def test_log_follow_progress_does_not_trust_a_ping_left_by_a_cleared_remote(
 ) -> None:
     """A supervised retry publishes `remote: null` for its whole allocation window.
 
-    `flash/runner/lifecycle.py` clears `remote` before reserving the replacement attempt and does
+    `flash/runner/supervise/lifecycle.py` clears `remote` before reserving the replacement attempt and does
     not persist the new one until the provider handle lands, so throughout that window flash serves
     a running record whose only attempt identity is the superseded worker's ping. Falling back to it
     there reintroduced exactly what preferring `remote` was meant to fix: the first retry unlabelled

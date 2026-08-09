@@ -28,8 +28,10 @@ import numpy as np
 import pytest
 
 import flash.engine.worker as W
-from flash.engine.worker import backend_common, rl, rl_train, sft_train, verl_shims
-from flash.engine.worker.heartbeat import RewardObservabilityBuffer
+from flash.engine.worker import backend_common, rl_train, sft_train
+from flash.engine.worker.entry import rl
+from flash.engine.worker.io.heartbeat import RewardObservabilityBuffer
+from flash.engine.worker.train.rl import shims as verl_shims
 
 
 # ------------------------------- dispatch -------------------------------
@@ -628,7 +630,7 @@ def test_run_rl_train_sizes_the_run_from_the_spec_gpu_count(count, expected):
     # the wiring, not just the builder: a spec that rents N cards must configure verl for N.
     # gpu_count_of is the same reader the runpod rental path uses, so the rented shape and the
     # trained shape cannot drift apart.
-    from flash.spec import GpuSpec, JobSpec, gpu_count_of
+    from flash.core.spec import GpuSpec, JobSpec, gpu_count_of
 
     project = "11111111-1111-4111-8111-111111111111"
     spec = (
@@ -825,8 +827,8 @@ def test_gpu_mem_util_is_the_sized_budget_not_a_constant():
     OWN output rather than a copied literal: pinning the number here is exactly what let the previous
     constant look intended, and it would have to be hand-edited (i.e. re-decided) on any retune.
     """
-    from flash.catalog import MODELS
-    from flash.engine.vram import colocate_kv_util
+    from flash.core.catalog import MODELS
+    from flash.engine.plan.vram import colocate_kv_util
     from flash.providers.base import get_gpu_info
 
     info = MODELS["Qwen/Qwen3.5-4B"]
@@ -980,7 +982,7 @@ def test_sleep_unsupported_models_keep_the_rollout_engine_resident():
     wedges on the first wake instead of failing fast. The flag comes from the catalog, so assert
     against a real flagged entry rather than a fabricated one.
     """
-    from flash.catalog import MODELS
+    from flash.core.catalog import MODELS
 
     flagged = [m for m, i in MODELS.items() if getattr(i, "sleep_unsupported", False)]
     assert flagged, "no catalog model is sleep_unsupported; this guard now has no subject"
@@ -1237,7 +1239,7 @@ def test_final_publish_is_suppressed_when_exact_save_steps_are_set():
     # parity with the retired trl path: with save_at_steps set the customer
     # asked for those steps and nothing else, so the final step must not add an unrequested
     # deployable. without them the final checkpoint is still preserved.
-    from flash.engine.steps import final_save_due
+    from flash.engine.plan.steps import final_save_due
 
     assert not final_save_due(100, (10, 25))
     assert final_save_due(100, ())
@@ -1342,8 +1344,8 @@ def test_checkpoint_retention_outlives_the_export_when_exact_saves_are_set(monke
 
 
 def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeypatch):
-    from flash.engine.worker._pkg import W
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
+    from flash.engine.worker.runtime.pkg_proxy import W
 
     class _Env:
         multi_turn = False
@@ -1481,8 +1483,8 @@ def test_build_verl_overrides_kl_on_when_requested():
 
 
 def test_verl_uses_canonical_heartbeat_stage_contracts():
-    from flash.engine.worker.heartbeat import _HB_THROTTLED_STAGES
-    from flash.providers._poll import STEP_GATED_STAGES
+    from flash.engine.worker.io.heartbeat import _HB_THROTTLED_STAGES
+    from flash.providers._lifecycle.poll import STEP_GATED_STAGES
     from flash.runner import _TRAINING_STAGES
 
     src = inspect.getsource(rl_train.run_rl_train)
@@ -3815,8 +3817,8 @@ def _capability_resolve(
     """run the resolver against one env, with everything else on the supported path."""
     import transformers
 
-    from flash.engine.worker._pkg import W as _PkgW
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
+    from flash.engine.worker.runtime.pkg_proxy import W as _PkgW
 
     _Tokenizer = _CapabilityTokenizer
 
@@ -3977,7 +3979,7 @@ def test_kl_anchored_warm_start_is_accepted(monkeypatch, tmp_path):
     # continue. render_kl_ref_adapter_shim anchors the reference to that adapter instead, so the
     # combination now resolves. the kl coefficient arrives through grpo_overrides, so it must go
     # through the helper rather than being patched separately.
-    import flash.engine.worker.adapter as _adapter_mod
+    import flash.engine.worker.model.adapter as _adapter_mod
 
     adapter_dir = tmp_path / "warmstart"
     adapter_dir.mkdir()
@@ -3995,7 +3997,7 @@ def test_kl_anchored_warm_start_is_accepted(monkeypatch, tmp_path):
 
 
 def test_35b_grpo_warm_start_requires_fused_expert_targets(monkeypatch, tmp_path):
-    import flash.engine.worker.adapter as adapter_mod
+    import flash.engine.worker.model.adapter as adapter_mod
 
     adapter_dir = tmp_path / "warmstart"
     adapter_dir.mkdir()
@@ -4070,7 +4072,7 @@ def test_multi_turn_child_env_carries_every_variable_the_loop_reads():
     # missing FLASH_VERL_MULTITURN_URL/MAX_TURNS/MAX_MODEL_LEN raises KeyError inside the rollout.
     # asserted against the loop's OWN source rather than a hardcoded list, so renaming a key on one
     # side and not the other fails here instead of on the first episode.
-    from flash.engine.worker import grpo_multiturn
+    from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
 
     emitted = rl_train.multi_turn_child_env(
         _multi_turn_inp(), reward_url="http://127.0.0.1:9/", thinking=False
@@ -4096,7 +4098,9 @@ def test_multi_turn_child_env_registers_the_plugin_with_verl():
     )
     assert emitted["VERL_USE_EXTERNAL_MODULES"] == "flash_grpo_plugin"
     # the module name must match the file actually copied in, or the import fails at child startup.
-    assert ("grpo_plugin.py", "flash_grpo_plugin.py") in rl_train.MULTI_TURN_CHILD_MODULES
+    # assert on the FLAT name the child imports, not the source path: the source moves with the
+    # package layout, the flat name is the contract with VERL_USE_EXTERNAL_MODULES.
+    assert "flash_grpo_plugin.py" in {flat for _, flat in rl_train.MULTI_TURN_CHILD_MODULES}
 
 
 def test_multi_turn_child_env_serializes_values_the_child_can_parse_back():
@@ -4211,7 +4215,7 @@ def test_the_child_caps_each_turn_at_max_completion_tokens_not_the_whole_episode
     # two bounds are transcript-wide, so a 4096-token engine window lets turn one generate 4096
     # tokens and leaves nothing for the rest of the episode. asserted on the child's own source
     # because the alternative is a full engine rollout to observe one min().
-    from flash.engine.worker import grpo_multiturn
+    from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
 
     body = " ".join(inspect.getsource(grpo_multiturn).split())
     assert 'max_completion_tokens = int(os.environ["FLASH_VERL_MAX_COMPLETION_TOKENS"])' in body
@@ -4227,7 +4231,7 @@ def test_the_child_puts_no_deadline_on_a_bridge_call():
     # timeout there fails healthy episodes for arriving Nth -- a function of batch size, not of
     # the environment. a genuinely wedged env is caught by the stall watchdog instead, which
     # measures training progress rather than one request.
-    from flash.engine.worker import grpo_multiturn
+    from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
 
     body = " ".join(inspect.getsource(grpo_multiturn.post_json).split())
     assert "urllib.request.urlopen(request) as response" in body
@@ -4239,7 +4243,7 @@ def test_the_child_puts_no_deadline_on_a_bridge_call():
 def test_the_child_puts_no_deadline_or_retry_on_a_generation_call():
     # keep TRAINING.md aligned: verl mints the request id internally, so callers cannot abort a
     # timed-out generation; retrying would leave the original request occupying kv cache.
-    from flash.engine.worker import grpo_multiturn
+    from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
 
     source = inspect.getsource(grpo_multiturn)
     # checked before the anchor below, because the usual way to add a deadline is to wrap the call
@@ -4345,7 +4349,7 @@ def test_bridge_exposes_exactly_the_routes_the_child_posts_to():
     # the child posts to four literal paths and the server 404s anything else, with the failure
     # surfacing as a transport error mid-episode. pinned against the child's own source so a rename
     # on either side fails here.
-    from flash.engine.worker import grpo_multiturn
+    from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
 
     routes = set(_bridge(_BridgeEnv()).routes())
     posted = set(re.findall(r"\"(/multiturn/[a-z]+)\"", inspect.getsource(grpo_multiturn)))
@@ -5035,8 +5039,8 @@ def _resolved_inputs_for_notes(monkeypatch):
     Mirrors the resolver fixture above: _resolve_grpo_inputs needs a loaded env, a spec and
     a tokenizer, none of which exist in a unit test.
     """
-    from flash.engine.worker._pkg import W
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
+    from flash.engine.worker.runtime.pkg_proxy import W
 
     class _Env:
         multi_turn = False
@@ -5079,7 +5083,7 @@ def _resolved_inputs_for_notes(monkeypatch):
 
 def _profile(seconds: float, *, trustworthy: bool = True):
     """A RewardProfile shaped like the profiler's real output."""
-    from flash.engine.reward_profile import RewardProfile
+    from flash.engine.profiling.reward_profile import RewardProfile
 
     return RewardProfile(
         seconds_per_completion=seconds,
@@ -5690,7 +5694,7 @@ def test_a_component_too_large_to_be_a_float_does_not_fail_the_reward_request():
 def test_the_published_metric_bound_survives_a_value_too_large_to_be_a_float():
     # the same coercion runs again on the publish side, on the heartbeat thread, over a dict the
     # trl callback takes from its caller. escaping there kills liveness reporting for the whole run.
-    from flash.engine.worker.heartbeat import _bounded_reward_metrics
+    from flash.engine.worker.io.heartbeat import _bounded_reward_metrics
 
     assert _bounded_reward_metrics({"huge": 10**400, "fine": 0.25}) == {"fine": 0.25}
 
@@ -6370,7 +6374,7 @@ def _drive_multi_turn_episode(
     how many turns to score. a hand-built bridge conversation would restate that bookkeeping
     instead of exercising it.
     """
-    from flash.engine.worker import grpo_multiturn
+    from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
 
     monkeypatch.setenv("FLASH_VERL_MULTITURN_URL", "http://bridge.invalid")
     monkeypatch.setenv("FLASH_VERL_MAX_TURNS", str(max_turns))
@@ -6680,7 +6684,7 @@ def test_grpo_finalization_carries_the_completed_step():
     assert step_arg.id == "steps_run"
 
     # finalize only forwards a positive int, so a stepless spelling would silently no-op.
-    from flash.engine.worker import finalize
+    from flash.engine.worker.train import finalize
 
     forwarding = inspect.getsource(finalize.write_train_meta)
     assert '"step": int(step)' in forwarding

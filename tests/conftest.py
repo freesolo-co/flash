@@ -31,7 +31,7 @@ def _reset_status_reporter_before_test():
 def _offline(monkeypatch):
     # HF param probe -> offline: pinned-revision sizing reads safetensors metadata over the
     # network, so stub it rather than hitting the Hugging Face API from a unit test.
-    import flash.engine.vram as vram
+    import flash.engine.plan.vram as vram
 
     monkeypatch.setattr(vram, "fetch_hf_params_b", lambda model_id: None, raising=False)
 
@@ -92,7 +92,7 @@ def _offline(monkeypatch):
     # The RunPod key pool caches the parsed RUNPOD_API_KEY at module level (so collapsing
     # it to a single active key never loses the rest of the pool). Reset it around every
     # test so a key set/collapsed by one test can't leak into the next.
-    import flash.providers.runpod.keys as rp_keys
+    import flash.providers.runpod.auth as rp_keys
 
     rp_keys.reset()
 
@@ -106,7 +106,7 @@ def _offline(monkeypatch):
     # Always-on artifact GC: the control-plane lifespan sweeps ONCE on startup (when an operator
     # HF_TOKEN is set). Stub it to a no-op so offline TestClient startups never reach HF/serving;
     # tests/test_repo_cleanup.py restores the real function to exercise the genuine sweep.
-    import flash.server.repo_cleanup as _rc
+    import flash.server.domain.repo_cleanup as _rc
 
     monkeypatch.setattr(_rc, "run_scheduled_cleanup", lambda *a, **k: 0, raising=False)
 

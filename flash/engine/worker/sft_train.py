@@ -17,10 +17,9 @@ import time
 from functools import reduce
 from math import gcd
 
-from flash.engine.recipe import RECIPE
-from flash.engine.sft_workload import prepare_sft_workload, sft_tokens_for_updates
-from flash.engine.steps import final_save_due, validate_save_steps
-from flash.engine.worker._pkg import W as _w
+from flash.engine.plan.recipe import RECIPE
+from flash.engine.plan.steps import final_save_due, validate_save_steps
+from flash.engine.profiling.sft_workload import prepare_sft_workload, sft_tokens_for_updates
 from flash.engine.worker.backend_common import (
     completed_checkpoint_step,
     export_peft_adapter,
@@ -42,10 +41,11 @@ from flash.engine.worker.backend_common import (
     unprocessed_checkpoint_dirs,
     verl_step_number,
 )
-from flash.engine.worker.heartbeat import join_while_draining, liveness_heartbeat
-from flash.engine.worker.packing import model_is_gdn_hybrid
-from flash.engine.worker.rng import seed_training_rngs
-from flash.engine.worker.sft import _model_arch_dims, sft_under_ran
+from flash.engine.worker.entry.sft import _model_arch_dims, sft_under_ran
+from flash.engine.worker.io.heartbeat import join_while_draining, liveness_heartbeat
+from flash.engine.worker.model.packing import model_is_gdn_hybrid
+from flash.engine.worker.runtime.pkg_proxy import W as _w
+from flash.engine.worker.runtime.rng import seed_training_rngs
 
 # todo: run the two-gpu sft smoke on the exact runpod image and command assembled below.
 _SFT_LORAPLUS_RATIO = 16.0
@@ -667,7 +667,7 @@ class _VerlCheckpointWatcher:
 def _cached_model_path(model_id: str, model_revision: str) -> str:
     from huggingface_hub import snapshot_download
 
-    from flash.engine.worker.hf import _shared_weight_cache_dir
+    from flash.engine.worker.io.hf import _shared_weight_cache_dir
     from flash.engine.worker.perf import RetriableInfraError
 
     # prefetch lands weights on the shared volume when attached; resolve from the same cache first.
@@ -911,8 +911,8 @@ class _NvidiaSmiPeakSampler:
 
 def run_sft_train(spec=None) -> None:
     """run flash sft through verl's out-of-process fsdp trainer."""
-    from flash.catalog import MODELS, resolve_vocab_size
-    from flash.engine.vram import sft_chunked_nll_enabled, sft_grad_accum
+    from flash.core.catalog import MODELS, resolve_vocab_size
+    from flash.engine.plan.vram import sft_chunked_nll_enabled, sft_grad_accum
 
     spec = spec or _w.JOB_SPEC
     env = _w.require_active_env()
@@ -954,7 +954,7 @@ def run_sft_train(spec=None) -> None:
     os.makedirs(local_dir, exist_ok=True)
 
     with liveness_heartbeat("sft_data_loading"):
-        from flash.workload_profile import require_matching_sft_profile
+        from flash.engine.profiling.workload_profile import require_matching_sft_profile
 
         # carried on the spec, not read from `flash.__version__` here: the worker runs the plane's
         # source snapshot off PYTHONPATH with no flash distribution installed, so a locally derived

@@ -13,23 +13,18 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from flash._logging import get_logger
+from flash._internal.logging import get_logger
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-from flash.providers._deadline import (
+from flash.providers._lifecycle.deadline import (
     CREATE_ALLOWANCE_S,
     deadline_kwargs,
     remaining_seconds,
     require_create_allowance,
     require_deadline_at,
 )
-from flash.providers._hf_artifacts import (
-    make_hf_failure_detail_reader,
-    make_hf_heartbeat_reader,
-    worker_flagged_retriable,
-)
-from flash.providers._poll import (
+from flash.providers._lifecycle.poll import (
     PollErrorTracker,
     _attempt_int,
     heartbeat_oom_for_attempt,
@@ -37,10 +32,15 @@ from flash.providers._poll import (
     make_say,
     surface_heartbeat,
 )
+from flash.providers.artifacts.hf import (
+    make_hf_failure_detail_reader,
+    make_hf_heartbeat_reader,
+    worker_flagged_retriable,
+)
 from flash.providers.base import PollResult, UnreconciledCreateError, canonical_gpu
 from flash.providers.runpod import api as runpod_api
 from flash.providers.runpod.gpus import flash_gpu
-from flash.providers.runpod.train import (
+from flash.providers.runpod.serverless import (
     DEFAULT_EXECUTION_TIMEOUT_MS,
     FLASH_SDK_LOCK,
     WORKER_IMAGE,
@@ -92,7 +92,7 @@ def weight_cache_grow_headroom_s() -> float:
     Reserve one grow per account because retries on an already-reconciled account skip it. The
     deployer separately protects this headroom from creates and backoffs.
     """
-    from flash.providers.runpod import keys as rp_keys
+    from flash.providers.runpod import auth as rp_keys
 
     return WEIGHT_CACHE_GROW_BUDGET_S * max(1, rp_keys.key_count())
 
@@ -156,8 +156,8 @@ def weight_cache_volumes(spec) -> list:
         return []
     from runpod_flash import NetworkVolume
 
+    from flash.core.spec import _volume_gb
     from flash.runner import WEIGHT_CACHE_VOLUME_GB, WEIGHT_CACHE_VOLUME_NAME
-    from flash.spec import _volume_gb
 
     # The shared cache is platform-managed, so its size comes from the managed constant rather than
     # whatever the spec happens to carry: a stale/round-tripped spec can still hold a pre-bump size,
@@ -226,7 +226,7 @@ def apply_image_override_constraints(config) -> None:
 
     Private override images otherwise fail before Flash code starts.
     """
-    from flash.providers._worker import worker_image_override
+    from flash.providers._lifecycle.worker import worker_image_override
 
     override = worker_image_override()
     if not (override and override.registry_auth_id):
@@ -449,7 +449,7 @@ def deploy_train_endpoint(
     from runpod_flash import Endpoint
     from runpod_flash.core.resources.resource_manager import ResourceManager
 
-    from flash.providers.runpod import keys as rp_keys
+    from flash.providers.runpod import auth as rp_keys
     from flash.providers.runpod.auth import ensure_auth
 
     _patch_runpod_backoff()
@@ -510,7 +510,7 @@ def deploy_train_endpoint(
 
     def _deploy_once() -> tuple[object, str]:
         """Create under one serialized account selection and return its owning fingerprint."""
-        from flash.spec import gpu_count_of
+        from flash.core.spec import gpu_count_of
 
         _require_launchable()
         with FLASH_SDK_LOCK:
@@ -1020,8 +1020,8 @@ def submit_run(
     deadline_at: float | None = None,
 ) -> PollResult:
     """Deploy, submit, persist handle via ``on_handle``, and poll to completion."""
-    from flash.envs.registry import worker_pip_for_env
-    from flash.providers.runpod.train import _run_suffix, build_worker_env
+    from flash.envs.base import worker_pip_for_env
+    from flash.providers.runpod.serverless import _run_suffix, build_worker_env
     from flash.runner import flash_code_prefix
 
     deadline_at = require_deadline_at(deadline_at)
@@ -1143,7 +1143,7 @@ def submit_run(
 
 
 # make_hf_heartbeat_reader / make_hf_failure_detail_reader and the heartbeat-provenance predicate
-# worker_flagged_retriable are provider-neutral and live in flash.providers._hf_artifacts; they are
+# worker_flagged_retriable are provider-neutral and live in flash.providers.artifacts.hf; they are
 # re-exported here so the runpod package and tests reference them as runpod.jobs.<name>.
 
 

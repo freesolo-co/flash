@@ -5,9 +5,9 @@ from typing import ClassVar
 
 import pytest
 
-from flash.engine.sft_workload import prepare_sft_workload, sft_tokens_for_updates
-from flash.spec import EnvironmentSpec, JobSpec, TrainSpec
-from flash.workload_profile import sft_profile_input_digest
+from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
+from flash.engine.profiling.sft_workload import prepare_sft_workload, sft_tokens_for_updates
+from flash.engine.profiling.workload_profile import sft_profile_input_digest
 
 
 class FakeTokenizer:
@@ -253,7 +253,7 @@ def test_probe_failure_fails_the_profile_instead_of_freezing_a_wrong_label(monke
     "sft workload changed after the quote was frozen" -- with no takeover path, because the profile
     itself stays ``done``.
     """
-    from flash.engine import sft_workload
+    from flash.engine.profiling import sft_workload
 
     def _boom(model_id, revision=""):
         raise OSError("hub read timed out")
@@ -271,7 +271,7 @@ def test_probe_failure_fails_the_profile_instead_of_freezing_a_wrong_label(monke
 
 def test_gdn_probe_failure_also_fails_closed(monkeypatch) -> None:
     """The second probe carries the same risk: False-on-error would freeze ``unsupported``."""
-    from flash.engine import sft_workload
+    from flash.engine.profiling import sft_workload
 
     monkeypatch.setattr(
         sft_workload, "probe_is_pure_attention", lambda model_id, revision="": False

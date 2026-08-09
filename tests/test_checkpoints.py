@@ -9,13 +9,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.runner.checkpoints import (
+from flash.core.spec import JobSpec
+from flash.runner.results.checkpoints import (
     CheckpointListingError,
     adapter_artifact_exists,
     checkpoint_adapter_prefix,
     list_checkpoints,
 )
-from flash.spec import JobSpec
 
 _PROJECT_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -97,7 +97,7 @@ def test_publish_deployable_checkpoint_writes_base_model_provenance(tmp_path, mo
     import json
 
     import flash.engine.worker as worker
-    import flash.engine.worker.hf as hf
+    import flash.engine.worker.io.hf as hf
 
     rec = _RecordingHfApi()
     _prime_worker(monkeypatch, rec)
@@ -387,7 +387,7 @@ def test_consecutive_saves_each_upload_when_uploader_keeps_up(
 def test_on_save_retries_transient_upload_error(tmp_path, monkeypatch, fake_trainer_callback):
     """A transient HF error must not cost the step: the synchronous upload retries until it lands,
     so `save_every` is a guarantee, not best-effort."""
-    from flash.engine.worker import hf as worker_hf
+    from flash.engine.worker.io import hf as worker_hf
 
     rec = _RecordingHfApi()
     worker = _prime_worker(monkeypatch, rec)
@@ -420,7 +420,7 @@ def test_on_save_retries_transient_upload_error(tmp_path, monkeypatch, fake_trai
 
 def test_prune_stale_resume_checkpoints_deletes_only_older_steps(monkeypatch):
     """Pruning removes older steps without deleting a newer concurrently published checkpoint."""
-    import flash.engine.worker.hf as worker_hf
+    import flash.engine.worker.io.hf as worker_hf
 
     prefix = "rl/flash-ckpt-1"
     files = [
@@ -447,7 +447,7 @@ def test_prune_stale_resume_checkpoints_deletes_only_older_steps(monkeypatch):
 
 
 def test_prune_stale_resume_checkpoints_no_repo_is_noop(monkeypatch):
-    import flash.engine.worker.hf as worker_hf
+    import flash.engine.worker.io.hf as worker_hf
 
     rec = _RecordingHfApi(["rl/r/checkpoint/checkpoint-1/optimizer.pt"])
     _prime_worker(monkeypatch, rec, repo="")  # local run, no HF repo
@@ -638,7 +638,7 @@ _CKPTS = [
 
 
 def test_register_run_checkpoints_body_shape(monkeypatch):
-    import flash.server.checkpoints as ck
+    import flash.server.domain.checkpoints as ck
 
     captured = {}
     monkeypatch.setattr(
@@ -666,7 +666,7 @@ def test_register_run_checkpoints_body_shape(monkeypatch):
 def test_register_run_checkpoints_requires_a_project(monkeypatch):
     # a run whose spec carries no project must fail loudly here rather than posting a body the
     # backend rejects as a 422 that the best-effort wrapper would swallow.
-    import flash.server.checkpoints as ck
+    import flash.server.domain.checkpoints as ck
 
     posted = []
     monkeypatch.setattr(ck, "_post_checkpoints", lambda **kw: posted.append(kw) or {})
@@ -681,7 +681,7 @@ def test_register_run_checkpoints_requires_a_project(monkeypatch):
 
 
 def test_register_run_checkpoints_requires_org():
-    import flash.server.checkpoints as ck
+    import flash.server.domain.checkpoints as ck
 
     with pytest.raises(ValueError, match="org id"):
         ck.register_run_checkpoints(
@@ -695,7 +695,7 @@ def test_register_run_checkpoints_falls_back_to_platform_context(monkeypatch):
     # Internal/operator runs carry org only in platform_context (billing_context is None):
     # registration must still scope rows to that org. _run_org_id falls back to billing-then-platform
     # (same order as routes/serving.py::_run_org; NOT run_registry, which is platform-first).
-    import flash.server.checkpoints as ck
+    import flash.server.domain.checkpoints as ck
 
     captured = {}
     monkeypatch.setattr(
@@ -710,7 +710,7 @@ def test_register_run_checkpoints_falls_back_to_platform_context(monkeypatch):
 
 
 def test_best_effort_noop_without_internal_key(monkeypatch):
-    import flash.server.checkpoints as ck
+    import flash.server.domain.checkpoints as ck
 
     monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
     # Even if HF had checkpoints, no internal key => skip persistence (HF stays source of truth).
@@ -719,7 +719,7 @@ def test_best_effort_noop_without_internal_key(monkeypatch):
 
 
 def test_best_effort_registers(monkeypatch):
-    import flash.server.checkpoints as ck
+    import flash.server.domain.checkpoints as ck
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "int-key")
     monkeypatch.setattr(ck, "list_checkpoints", lambda spec: _CKPTS)
@@ -736,7 +736,7 @@ def test_best_effort_swallows_backend_failure(monkeypatch):
     import io
     import urllib.error
 
-    import flash.server.checkpoints as ck
+    import flash.server.domain.checkpoints as ck
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "int-key")
     monkeypatch.setattr(ck, "list_checkpoints", lambda spec: _CKPTS)
@@ -758,7 +758,7 @@ def test_best_effort_skips_silently_when_no_org(monkeypatch):
     # listing on an expected-skip run.
     import io
 
-    import flash.server.checkpoints as ck
+    import flash.server.domain.checkpoints as ck
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "int-key")
     listed = {"called": False}
@@ -781,7 +781,7 @@ def test_best_effort_skips_silently_when_no_org(monkeypatch):
 
 
 def test_best_effort_no_checkpoints(monkeypatch):
-    import flash.server.checkpoints as ck
+    import flash.server.domain.checkpoints as ck
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "int-key")
     monkeypatch.setattr(ck, "list_checkpoints", lambda spec: [])

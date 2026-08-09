@@ -9,7 +9,17 @@ from collections.abc import Collection
 from dataclasses import fields as dataclass_fields
 from typing import Any
 
-from flash.catalog import normalize_algorithm, resolve_model, serving_lora_rank_cap
+from flash.core.catalog import normalize_algorithm, resolve_model, serving_lora_rank_cap
+from flash.core.spec import (
+    FIXED_SEED,
+    MANAGED_GPU_KEYS,
+    EnvironmentSpec,
+    GpuSpec,
+    JobSpec,
+    TrainSpec,
+    parse_seed,
+    require_project_id,
+)
 from flash.providers import PROVIDER_NAMES
 from flash.providers.base import (
     GPU_INFO,
@@ -32,16 +42,6 @@ from flash.schema.fields import (
     _train_structured_outputs,
     _train_teacher,
     _wandb_spec,
-)
-from flash.spec import (
-    FIXED_SEED,
-    MANAGED_GPU_KEYS,
-    EnvironmentSpec,
-    GpuSpec,
-    JobSpec,
-    TrainSpec,
-    parse_seed,
-    require_project_id,
 )
 
 _OWNER_REPO_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*"
@@ -240,7 +240,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "project",
     }
 )
-# runner-assigned [gpu] fields (MANAGED_GPU_KEYS, single-sourced in flash.spec) are excluded from the
+# runner-assigned [gpu] fields (MANAGED_GPU_KEYS, single-sourced in flash.core.spec) are excluded from the
 # user-facing surface. GpuSpec still carries them so the internal JobSpec.from_dict round trip
 # preserves the runner's disk sizing, weight-cache volume, and platform retry/wall-clock policy.
 _GPU_KEYS = frozenset(item.name for item in dataclass_fields(GpuSpec)) - MANAGED_GPU_KEYS
@@ -636,7 +636,7 @@ def _validate_grpo(spec: JobSpec) -> None:
 def _validate_on_policy_prompt_budget(spec: JobSpec, algorithm: str) -> None:
     if not spec.train.max_context_tokens:
         return
-    from flash.engine.vram import opd_completion_len
+    from flash.engine.plan.vram import opd_completion_len
 
     max_completion = opd_completion_len(spec.train.max_completion_tokens, spec.thinking)
     if spec.train.max_context_tokens - max_completion < 1:

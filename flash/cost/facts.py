@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from flash.catalog import MODELS, ModelInfo
+from flash.core.catalog import MODELS, ModelInfo
 from flash.providers.base import GPU_INFO, GpuClass, providers_for
 
 GPU_COMPUTE_TFLOPS: dict[str, float] = {
@@ -242,7 +242,7 @@ def total_params_b(model_id: str, revision: str = "") -> float:
         return info.params_b
     key = (model_id, revision)
     if key not in _PINNED_SIZE_MEMO:
-        from flash.engine.vram import _validated_revision_geometry
+        from flash.engine.plan.vram import _validated_revision_geometry
 
         params_b, _vocab = _validated_revision_geometry(model_id, revision, info)
         _PINNED_SIZE_MEMO[key] = params_b
@@ -293,7 +293,7 @@ def teacher_price_per_1m(teacher_model: str) -> tuple[float, float]:
 
     Routes through the closed managed-teacher catalog. Parasail bills every supplied-token score as
     all prompt tokens plus the one generated output token required by its completions endpoint."""
-    from flash.engine.recipe import resolve_teacher
+    from flash.engine.plan.recipe import resolve_teacher
 
     return resolve_teacher(teacher_model).usd_per_1m
 

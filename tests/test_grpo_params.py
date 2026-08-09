@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import pytest
 
+from flash.core.spec import JobSpec
 from flash.schema import ConfigError, spec_from_dict
-from flash.spec import JobSpec
 
 
 class _Tok:
@@ -250,7 +250,7 @@ def test_opt_int_float_reject_bools() -> None:
     _opt_int/_opt_float) rejects it, matching schema._opt_num."""
     import pytest
 
-    from flash.spec import _opt_float, _opt_int
+    from flash.core.spec import _opt_float, _opt_int
 
     for bad in (True, False):
         with pytest.raises(TypeError):

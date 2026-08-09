@@ -1,7 +1,7 @@
 # Flash prebuilt WORKER image — the full training stack baked in for RunPod workers.
 # The worker still fetches the flash `code/**` from HF at runtime, so only DEPS live here.
 #
-# this image name is defined in flash/providers/_worker.py. it must be
+# this image name is defined in flash/providers/_lifecycle/worker.py. it must be
 # published to GHCR and the package set PUBLIC (no registry login is configured) so RunPod can
 # pull it. Normally built by
 # .github/workflows/worker-image.yml (manual dispatch); to build/push by hand:
@@ -12,7 +12,7 @@
 #
 # Base is torch 2.10 / cu12.8 / cudnn9 (-devel = has nvcc for any source builds); it ships the
 # CUDA 12.8 runtime libs the PyPI wheels link against. The pinned stack mirrors
-# flash/providers/_worker.py:WORKER_DEPS.
+# flash/providers/_lifecycle/worker.py:WORKER_DEPS.
 FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -67,7 +67,7 @@ RUN pip install --no-cache-dir \
 # (Ampere/Ada/Blackwell) the Triton path is correct. On Hopper (sm90) fla's GDN chunk_bwd is
 # miscomputed with Triton>=3.4 (fla #640) — the fix is fla's TILELANG backend (correct there), so
 # we bake the pinned tilelang==0.1.11 + apache-tvm-ffi==0.1.11 (0.1.12 double-registers TVM-FFI ->
-# `import tilelang` aborts) and KEEP fla on every arch; flash.engine.worker._ensure_fla_fastpath_on_hopper
+# `import tilelang` aborts) and KEEP fla on every arch; flash.engine.worker.perf._ensure_fla_fastpath_on_hopper
 # ensures the tilelang backend is live on sm90 before any model import. The INVERSE holds on
 # B200/sm100: THERE the tilelang chunk_bwd_dqkwg miscomputes gradients while the Triton path is
 # correct — and the pinned fla default-enables tilelang wherever it imports (i.e. everywhere,
@@ -77,7 +77,7 @@ RUN pip install --no-cache-dir \
 # pure-PyTorch fallback (H100 SXM, Qwen3.5 hidden-2560 LoRA): seq4096 4.2x faster / 1.6x less mem,
 # seq16384 12.6x / 1.9x, loss matches to 1.8e-4. fla is from git: the PyPI wheel is a broken stub
 # (no fla.modules). The git URL is PINNED to a commit (not the moving default branch) for
-# reproducible image builds; keep this sha in lockstep with the worker dependencies in flash/providers/_worker.py.
+# reproducible image builds; keep this sha in lockstep with the worker dependencies in flash/providers/_lifecycle/worker.py.
 
 # FlashAttention: PREFER a prebuilt wheel. There is no OFFICIAL Dao-AILab wheel for torch 2.10 yet,
 # but community CI publishes matching wheels (cu128/torch2.10/cp312); CI passes one as FLASH_ATTN_SPEC
@@ -146,7 +146,7 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=T
     && echo "causal_conv1d: installed (GDN packing enabled)"
 
 # weight cache (runtime, not baked): when the shared weight-cache network volume is attached,
-# flash/providers/_worker.py:weight_cache_env redirects only base-model prefetching through
+# flash/providers/_lifecycle/worker.py:weight_cache_env redirects only base-model prefetching through
 # FLASH_WEIGHT_CACHE_DIR to the persistent volume for reuse across runs. HF_HOME remains ephemeral,
 # so environment and reward downloads are not shared. executable kernel-jit caches are deliberately
 # not shared because the volume is multi-tenant; a poisoned compiled artifact could affect another
@@ -161,7 +161,7 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=T
 # first-use JIT as a per-run RUNTIME cost on a cold worker.
 #
 # OPT-IN PATH: build on a real GPU runner with --build-arg BUILD_KERNEL_CACHE=true after running
-# flash/engine/worker/kernel_warmup.py there to produce a portable mega-cache under build/kernel_cache/
+# flash/engine/worker/runtime/kernel_warmup.py there to produce a portable mega-cache under build/kernel_cache/
 # (torch.compiler.save_cache_artifacts). The conditional COPY below then bakes it into
 # /opt/flash/kernelcache, and engine.worker._load_kernel_cache_if_present loads it at boot
 # (torch.compiler.load_cache_artifacts) — measured cold compile ~124s -> warm load ~0.2s (537x).
@@ -381,10 +381,10 @@ print('  qwen3.5 archs registered; mask_truncated_completions present'); \
 print('  gdn boundary resets: fla yes, causal_conv1d yes (both asserted)')"
 
 # RunPod Serverless worker entrypoint (Pattern D — Flash custom image). Generate /rp_handler.py
-# from the real _train_body source in providers/runpod/train/endpoints.py (single source of truth;
+# from the real _train_body source in providers/runpod/serverless/endpoints.py (single source of truth;
 # _train_body is self-contained — every name is imported inside its body) and run it as the CMD so the
 # image is a self-contained RunPod Serverless worker. Build context is the repo root.
-COPY flash/providers/runpod/train/endpoints.py docker/make_rp_handler.py /tmp/rpgen/
+COPY flash/providers/runpod/serverless/endpoints.py docker/make_rp_handler.py /tmp/rpgen/
 RUN python /tmp/rpgen/make_rp_handler.py /tmp/rpgen/endpoints.py /rp_handler.py \
     && python -c "import ast; ast.parse(open('/rp_handler.py').read()); print('rp_handler OK')"
 CMD ["python", "-u", "/rp_handler.py"]

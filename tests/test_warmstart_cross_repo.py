@@ -160,10 +160,10 @@ def test_mark_warmstart_source_noops_without_a_real_dependency(monkeypatch):
 
 
 def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeypatch):
-    import flash.lora_rank as rank_mod
+    import flash.adapters.lora_rank as rank_mod
     import flash.runner as R
-    import flash.runner.checkpoints as checkpoints
-    from flash.spec import JobSpec
+    import flash.runner.results.checkpoints as checkpoints
+    from flash.core.spec import JobSpec
 
     source = JobSpec.from_dict(
         {
@@ -232,7 +232,7 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
 
 def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
     import flash.runner as R
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     source = JobSpec.from_dict(
         {
@@ -262,11 +262,11 @@ def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
 def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
     import types
 
+    import flash.adapters.lora_rank as rank_mod
     import flash.cost.spec as cost_spec
-    import flash.lora_rank as rank_mod
     import flash.runner as R
-    import flash.runner.checkpoints as checkpoints
-    from flash.spec import JobSpec
+    import flash.runner.results.checkpoints as checkpoints
+    from flash.core.spec import JobSpec
 
     source = JobSpec.from_dict(
         {
@@ -338,7 +338,7 @@ def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
 
 def test_effective_preparation_persists_but_is_not_public(monkeypatch, tmp_path):
     import flash.runner as R
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(R, "RUNS_DIR", str(tmp_path / "runs"))
     public = JobSpec.from_dict(
@@ -469,7 +469,7 @@ def test_public_status_redacts_internal_storage_ref_on_valid_spec(stored_ref, ex
 @pytest.mark.parametrize("snapshot", [None, []])
 def test_persist_effective_warmstart_requires_valid_snapshot(monkeypatch, tmp_path, snapshot):
     import flash.runner as R
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(R, "RUNS_DIR", str(tmp_path / "runs"))
     public = JobSpec.from_dict(
@@ -496,7 +496,7 @@ def test_persist_effective_warmstart_requires_valid_snapshot(monkeypatch, tmp_pa
 def test_selected_gpu_is_persisted_for_handleless_cleanup(monkeypatch, tmp_path):
     import flash.providers as providers
     import flash.runner as R
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(R, "RUNS_DIR", str(tmp_path / "runs"))
     public = JobSpec.from_dict(
@@ -555,9 +555,9 @@ def test_selected_gpu_is_persisted_for_handleless_cleanup(monkeypatch, tmp_path)
 
 
 def test_recovery_revalidates_pinned_revision_after_default_branch_moves(monkeypatch):
-    import flash.lora_rank as rank_mod
+    import flash.adapters.lora_rank as rank_mod
     import flash.runner as R
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     public = JobSpec.from_dict(
         {
@@ -627,7 +627,7 @@ def test_effective_snapshot_rejects_tampering(field, value):
     import copy
 
     import flash.runner as R
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     public = JobSpec.from_dict(
         {
@@ -680,7 +680,7 @@ def test_effective_snapshot_rejects_tampering(field, value):
 
 
 def test_worker_metrics_sanitizer_redacts_nested_and_direct_private_refs():
-    from flash.engine.accounting import RunMetrics, sanitize_worker_metrics
+    from flash.engine.result.accounting import RunMetrics, sanitize_worker_metrics
 
     private_ref = "private-owner/private-repo:rl/source-run/checkpoints/step-20"
     payload = {
@@ -707,8 +707,8 @@ def test_worker_metrics_sanitizer_redacts_nested_and_direct_private_refs():
 
 def test_persist_metrics_reports_only_sanitized_worker_metrics(monkeypatch, tmp_path):
     import flash.runner as R
-    import flash.server.run_registry as registry
-    from flash.spec import JobSpec
+    import flash.server.domain.run_registry as registry
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(R, "RESULTS_DIR", str(tmp_path / "results"))
     private_ref = "private-owner/private-repo:rl/source-run"
@@ -747,7 +747,7 @@ def test_persist_metrics_reports_only_sanitized_worker_metrics(monkeypatch, tmp_
 
 def test_legacy_warmstart_status_fails_closed_without_private_snapshot():
     import flash.runner as R
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     public = JobSpec.from_dict(
         {

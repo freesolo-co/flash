@@ -37,7 +37,7 @@ def _fake_lambda_types() -> dict:
     drift from the real naming (the class is ``gpu_1x_h100_pcie``, not the ``_sxm5`` one might
     guess) and quietly stock a catalog nothing ever looks up.
     """
-    from flash.providers.lambdalabs.gpus import instance_type_for
+    from flash.providers.lambda_.gpus import instance_type_for
 
     return {
         instance_type_for(_TRI_PROVIDER_GPU, n): {
@@ -78,7 +78,7 @@ def all_providers_configured(monkeypatch):
     calls are stubbed at their single entry points -- ``list_instance_types`` and ``search_offers``
     -- leaving every line of the count-aware provider code under test and only the transport faked.
     """
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
     from flash.providers.vast import api as vast_api
 
     monkeypatch.setenv("LAMBDA_API_KEY", "test-key-not-used")
@@ -92,7 +92,7 @@ def all_providers_configured(monkeypatch):
 
 
 def _spec(count: int, algorithm: str = "grpo", provider: str = "runpod"):
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     gpu: dict = {"type": "RTX 5090", "count": count}
     if provider:
@@ -195,7 +195,7 @@ def test_single_card_constraint_yields_only_single_card_offers(all_providers_con
 
 def test_lambda_names_the_card_count_in_the_instance_type():
     """Lambda reaches an n-card box only by rewriting the count segment of the type name."""
-    from flash.providers.lambdalabs.gpus import instance_type_for
+    from flash.providers.lambda_.gpus import instance_type_for
 
     one = instance_type_for("H100")
     assert one.startswith("gpu_1x_")
@@ -211,7 +211,7 @@ def test_lambda_resolves_a_multi_card_sku_that_renames_its_suffix():
     derived ``gpu_8x_h100_pcie`` does not exist. ``regions_with_capacity`` answers [] for an unknown
     type, which reads as "sold out" rather than "wrong name" -- real capacity disappears silently.
     """
-    from flash.providers.lambdalabs.gpus import instance_type_for
+    from flash.providers.lambda_.gpus import instance_type_for
 
     derived = instance_type_for("H100", 4)
     real = derived.replace("_pcie", "_sxm5")
@@ -233,7 +233,7 @@ def test_lambda_catalog_suffix_fallback_preserves_the_managed_memory_class():
     arbitrarily; in the live catalog that selected the 80 GB box at $22.32/hr instead of the fitting
     40 GB box at $15.92/hr while still labelling the candidate ``A100 SXM 40GB``.
     """
-    from flash.providers.lambdalabs.gpus import instance_type_for
+    from flash.providers.lambda_.gpus import instance_type_for
 
     forty = "gpu_8x_a100"
     eighty = "gpu_8x_a100_80gb_sxm4"
@@ -267,9 +267,9 @@ def test_lambda_missing_required_count_sku_is_terminal(monkeypatch):
     capacity failures. A shape Lambda does not sell can never recover by retrying.
     """
     from flash.providers.base import AllocationConstraints, UnsupportedGpuError
-    from flash.providers.lambdalabs import LambdaProvider
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs.gpus import instance_type_for
+    from flash.providers.lambda_ import LambdaProvider
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.gpus import instance_type_for
 
     gpu = "A100 SXM 40GB"
 
@@ -339,8 +339,8 @@ def test_lambda_instance_type_never_reaches_the_network():
     An in-function catalog fetch turns a pure name lookup into live I/O on every sizing call and
     deadlocks the offline test path. Callers holding a catalog pass it; nobody else pays.
     """
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs.gpus import instance_type_for
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.gpus import instance_type_for
 
     def explode(*_a, **_k):
         raise AssertionError("instance_type_for fetched the catalog")
@@ -360,7 +360,7 @@ def test_lambda_price_is_per_card_not_per_instance():
     Without the division an n-card box prices n^2 (the allocator re-multiplies by gpu_count via
     total_hourly_usd) and would never be chosen -- a silent, permanent multi-gpu outage.
     """
-    import flash.providers.lambdalabs.jobs as lj
+    import flash.providers.lambda_.jobs as lj
 
     seen: dict = {}
 
@@ -373,7 +373,7 @@ def test_lambda_price_is_per_card_not_per_instance():
 
     monkey = pytest.MonkeyPatch()
     try:
-        monkey.setattr("flash.providers.lambdalabs.pricing.hourly_rate", fake_rate)
+        monkey.setattr("flash.providers.lambda_.pricing.hourly_rate", fake_rate)
         monkey.setattr(lj.lambda_api, "regions_with_capacity", fake_regions)
         four = lj.usable_instances("H100", gpu_count=4)
     finally:
@@ -456,7 +456,7 @@ def test_lambda_submit_requests_the_allocated_card_count():
     This is the expensive half of the contract: the worker spawns gpu.count ranks regardless, so a
     single-card rental oversubscribes one card while the run bills for the full wall time.
     """
-    import flash.providers.lambdalabs.jobs as lj
+    import flash.providers.lambda_.jobs as lj
 
     seen: dict = {}
 
@@ -509,9 +509,9 @@ def test_lambda_capacity_refresh_keeps_the_allocated_card_count():
     1-card box while the worker still starts n ranks -- the exact billing exposure the submit-path
     test guards, reached through the other door.
     """
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs as lj
-    from flash.providers.lambdalabs.jobs.builders import LambdaInstance
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs as lj
+    from flash.providers.lambda_.jobs.builders import LambdaInstance
 
     def _inst(region: str) -> LambdaInstance:
         return LambdaInstance(
@@ -616,9 +616,9 @@ def test_handle_rate_prices_the_whole_instance_not_one_card(provider):
     cards = 4
 
     if provider == "lambda":
-        from flash.providers.lambdalabs import api as lambda_api
-        from flash.providers.lambdalabs import jobs as lj
-        from flash.providers.lambdalabs.jobs.builders import LambdaInstance
+        from flash.providers.lambda_ import api as lambda_api
+        from flash.providers.lambda_ import jobs as lj
+        from flash.providers.lambda_.jobs.builders import LambdaInstance
 
         inst = LambdaInstance(
             gpu=_TRI_PROVIDER_GPU,
@@ -700,7 +700,7 @@ def test_retry_bookkeeping_distinguishes_card_counts_of_one_class():
     walk skips a wider shape that would have fit.
     """
     from flash.providers.base import Candidate
-    from flash.runner.lifecycle import _select_candidate, _shape_key
+    from flash.runner.supervise.lifecycle import _select_candidate, _shape_key
 
     two = Candidate(
         provider="runpod", gpu=_TRI_PROVIDER_GPU, hourly_usd=3.0, vram_gb=80, gpu_count=2
@@ -725,7 +725,7 @@ def _submittable(
     gpu: str = _TRI_PROVIDER_GPU,
 ):
     """a spec that survives a full submit, unlike a bare gate fixture."""
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     train: dict = {"max_examples": 4}
     if algorithm == "opd":
@@ -911,9 +911,9 @@ def test_effective_spec_validation_accepts_an_allocator_narrowed_count():
     unpinned `count > 1` outright. Narrowing only: claiming MORE cards than authorized is still an
     integrity failure.
     """
+    from flash.core.spec import JobSpec, gpu_count_of
     from flash.runner import _validate_effective_spec
-    from flash.runner.lifecycle import _spec_with_gpu
-    from flash.spec import JobSpec, gpu_count_of
+    from flash.runner.supervise.lifecycle import _spec_with_gpu
 
     public = JobSpec.from_dict(
         {
@@ -1011,8 +1011,8 @@ def test_lambda_single_card_pricing_survives_a_catalog_outage():
     for EVERY Lambda quote -- even though the per-type price lookup underneath would have answered
     fine. Live pricing that silently reverts to a stale snapshot misprices allocation and billing.
     """
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs.pricing import _STATIC_RATES, hourly_rate
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.pricing import _STATIC_RATES, hourly_rate
 
     live_rate, calls = 2.49, []
 
@@ -1044,7 +1044,7 @@ def test_structured_opd_compiler_vocab_is_card_independent():
     inside resolution, so the shape cannot reach it and cannot reject anything: the resolved
     vocabulary is a function of the model and its revision alone.
     """
-    from flash.opd_validation import _resolve_compiler_vocab_size
+    from flash.engine.worker.train.opd.validation import _resolve_compiler_vocab_size
 
     seen: list[tuple] = []
 
@@ -1054,7 +1054,7 @@ def test_structured_opd_compiler_vocab_is_card_independent():
 
     monkey = pytest.MonkeyPatch()
     try:
-        monkey.setattr("flash.catalog.resolve_model", _fake_resolve)
+        monkey.setattr("flash.core.catalog.resolve_model", _fake_resolve)
         assert (
             _resolve_compiler_vocab_size(model_id="Qwen/Qwen3.5-9B", model_revision="a" * 40)
             == 151936

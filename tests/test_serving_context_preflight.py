@@ -1,8 +1,8 @@
 import pytest
 
-from flash.catalog import serving_context_cap
-from flash.lora_rank import preflight_train_context_within_serving
-from flash.spec import JobSpec
+from flash.adapters.lora_rank import preflight_train_context_within_serving
+from flash.core.catalog import serving_context_cap
+from flash.core.spec import JobSpec
 
 
 @pytest.mark.parametrize(

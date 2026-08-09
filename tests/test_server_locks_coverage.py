@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-import flash.server._locks as locks
+import flash.server.platform.locks as locks
 
 
 def test_nonblocking_file_lock_failure_closes_descriptor_and_releases_thread_lock(

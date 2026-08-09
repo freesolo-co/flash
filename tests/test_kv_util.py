@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import pytest
 
-from flash.catalog import MODELS
-from flash.engine.vram import (
+from flash.core.catalog import MODELS
+from flash.engine.plan.vram import (
     _BASE_OVERHEAD_GB,
     _KV_CAP,
     _lora_memory_gb,
@@ -166,7 +166,7 @@ def test_big_card_big_weight_colocate_lifts_cap_to_055():
 
 
 def test_grpo_kv_floor_searches_lifted_cap_transition():
-    from flash.engine.vram import grpo_kv_floor_gb
+    from flash.engine.plan.vram import grpo_kv_floor_gb
 
     # The 0.55 cap is gated by total card size. The floor must not only test need/0.55 and
     # otherwise jump all the way to need/0.45; the first valid lifted-cap card is smaller.

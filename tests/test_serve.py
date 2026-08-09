@@ -251,7 +251,7 @@ def test_deploy_27b_rejects_lora_rank_above_serving_cap():
 
 
 def test_deploy_rejects_lora_rank_above_serving_cap():
-    from flash.catalog import serving_lora_rank_cap
+    from flash.core.catalog import serving_lora_rank_cap
     from flash.serve.deploy import deploy_adapter
 
     # derive the over-cap rank from the catalog rather than hardcoding it: the 4B cap has moved
@@ -271,7 +271,7 @@ def test_deploy_rejects_lora_rank_above_serving_cap():
 
 def test_deploy_rejects_recombined_artifact_rank_above_serving_cap(monkeypatch, tmp_path):
     """Deploy validates the effective artifact rank, not only spec.train.lora_rank."""
-    from flash.catalog import serving_lora_rank_cap
+    from flash.core.catalog import serving_lora_rank_cap
     from flash.serve.deploy import deploy_adapter
 
     # the artifact's effective rank exceeds the cap even though the spec lora_rank (32) fits, so

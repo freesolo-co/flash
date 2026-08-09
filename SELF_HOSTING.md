@@ -190,10 +190,10 @@ at config parse time, before a GPU is rented:
 
 ```
 unsupported model 'meta-llama/Llama-3.1-8B'; choose one of: ... - or, to train another
-model, fork Flash and add a ModelInfo entry for it to flash/catalog.py
+model, fork Flash and add a ModelInfo entry for it to flash/core/catalog.py
 ```
 
-That is the whole workflow: fork, add an entry to `MODELS` in `flash/catalog.py`, and the
+That is the whole workflow: fork, add an entry to `MODELS` in `flash/core/catalog.py`, and the
 model is trainable. There is no config key that accepts an uncataloged id.
 
 An entry is a `ModelInfo`. Copy the nearest existing one and correct it against the model's
@@ -254,7 +254,7 @@ tell whose runs those were, and it will treat all of them as the operator's.
 Do not expose a standalone plane to untrusted callers. Put it on a private network, behind
 a VPN, or behind an authenticating reverse proxy. If you need real multi-tenancy - separate
 organizations, per-user keys, project ownership enforcement - you need an identity backend
-serving the `/api/auth/verify` contract in `flash/server/auth.py`, and you should run
+serving the `/api/auth/verify` contract in `flash/server/platform/auth.py`, and you should run
 without `FLASH_STANDALONE` and set `FREESOLO_BASE_URL` to point at it.
 
 ## Optional pieces

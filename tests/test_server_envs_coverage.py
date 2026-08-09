@@ -1,4 +1,4 @@
-"""Coverage for control-plane env publishing helpers (`flash.server.envs`) and the serving
+"""Coverage for control-plane env publishing helpers (`flash.server.domain.envs`) and the serving
 
 These target error / edge branches the existing suite leaves uncovered: git-subprocess failure
 translation, archive-extraction guards, publish/slug input validation, and the pure
@@ -20,13 +20,13 @@ from typing import ClassVar
 
 import pytest
 
-from flash.server import envs
+from flash.server.domain import envs
 
 pytest.importorskip("fastapi")
 from fastapi import HTTPException
 
 import flash.server.routes.serving as serving
-from flash.engine.recipe import RECIPE
+from flash.engine.plan.recipe import RECIPE
 from flash.serve.deploy import ServingError
 
 
@@ -43,7 +43,7 @@ def _targz(members: list[tuple[tarfile.TarInfo, bytes | None]]) -> bytes:
 
 
 # ===========================================================================
-# flash.server.envs
+# flash.server.domain.envs
 # ===========================================================================
 
 
@@ -396,7 +396,7 @@ def test_recover_deployments_fails_busy_and_skips_missing(monkeypatch):
     monkeypatch.setattr(serving, "mark_deployment_failed", mark_failed)
     monkeypatch.setattr(runner, "_report_status", reported.append)
 
-    from flash.server._locks import _RunLock
+    from flash.server.platform.locks import _RunLock
 
     held_lock = _RunLock("r-held")
     assert held_lock.acquire(blocking=False) is True
@@ -865,7 +865,7 @@ def test_sft_smoke_budget_follows_an_explicit_context_over_the_recipe_default():
     from flash.serve.preflight import resolve_smoke_completion_tokens
 
     # the worker bounds the packed block by max_context_tokens and only falls back to the recipe
-    # when it is unset (flash/engine/worker/sft.py), so the smoke has to resolve the same way.
+    # when it is unset (flash/engine/worker/entry/sft.py), so the smoke has to resolve the same way.
     # sizing an 8192-context run at the 2048 recipe default truncated the smoke and rejected a
     # checkpoint that answered correctly.
     assert RECIPE.sft.max_seq_len_thinking < 8192
@@ -926,7 +926,7 @@ def test_sft_contributes_no_completion_budget_to_the_serving_context_guard():
 
 
 def test_rollout_budget_ignores_context_tokens():
-    from flash.engine.recipe import RECIPE
+    from flash.engine.plan.recipe import RECIPE
     from flash.serve.preflight import resolve_effective_completion_tokens
 
     # grpo budgets the completion, not the whole rollout, so max_context_tokens must not become

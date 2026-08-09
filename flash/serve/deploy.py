@@ -15,11 +15,11 @@ from urllib.parse import quote
 
 import httpx
 
-from flash._channel import CHANNEL
-from flash._logging import get_logger
-from flash.adapter_artifacts import ADAPTER_WEIGHT_FILES
-from flash.engine.structured_outputs import parse_structured_outputs
-from flash.lora_rank import rank_from_adapter_config
+from flash._internal.channel import CHANNEL
+from flash._internal.logging import get_logger
+from flash.adapters.artifacts import ADAPTER_WEIGHT_FILES
+from flash.adapters.lora_rank import rank_from_adapter_config
+from flash.content.structured_outputs import parse_structured_outputs
 from flash.schema import format_adapter_revision
 from flash.serve.urls import is_freesolo_hosted_url, openai_base_url, serving_control_url
 
@@ -242,7 +242,7 @@ def serving_base_url() -> str:
     """
     # imported lazily: flash.serve is the CLIENT side, and a module-level import would pull
     # flash.server into every CLI invocation.
-    from flash.server.auth import standalone
+    from flash.server.platform.auth import standalone
 
     configured = (os.environ.get("FREESOLO_SERVING_URL") or "").strip()
     if standalone() and (not configured or is_freesolo_hosted_url(configured)):
@@ -339,7 +339,7 @@ def deployment_record(
 
 def validate_serving_lora_rank(model: str, lora_rank: int, *, rank_source: str = "adapter") -> None:
     """Fail before registration when a trained adapter rank exceeds serving capacity."""
-    from flash.catalog import serving_lora_rank_cap
+    from flash.core.catalog import serving_lora_rank_cap
 
     max_lora_rank = serving_lora_rank_cap(model)
     if max_lora_rank is None:

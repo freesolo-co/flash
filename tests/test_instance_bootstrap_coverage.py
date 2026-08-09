@@ -1,6 +1,6 @@
 """Focused hermetic coverage for the shared instance bootstrap (Vast/Lambda worker container).
 
-These target under-covered helpers in ``flash.providers._instance_bootstrap``: payload loading,
+These target under-covered helpers in ``flash.providers._lifecycle.bootstrap``: payload loading,
 code-prefix validation, the Hugging Face transient-retry machinery (status/Retry-After parsing +
 backoff), the HF upload/exists/fetch wrappers, ``run_mode``'s subprocess tee (success + wall-clock
 timeout), the attempt-marker writer, the preload wall-cap watchdog ``_fire`` path, and ``main()``'s
@@ -23,8 +23,8 @@ import types
 
 import pytest
 
-from flash.providers import _instance_bootstrap as b
-from flash.providers._deadline import deadline_kwargs
+from flash.providers._lifecycle import bootstrap as b
+from flash.providers._lifecycle.deadline import deadline_kwargs
 
 CODE_PREFIX = "code/0123456789abcdef0123456789abcdef/flash"
 

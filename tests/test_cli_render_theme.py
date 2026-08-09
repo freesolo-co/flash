@@ -12,7 +12,7 @@ import pytest
 
 import flash.cli as cli
 from flash import __version__
-from flash.cli import render
+from flash.cli.ui import render
 
 
 class _Client:
@@ -668,7 +668,7 @@ def test_stale_training_step_is_labelled_as_reporting_lag(monkeypatch):
     """
     import time as _time
 
-    from flash.cli import render
+    from flash.cli.ui import render
 
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")

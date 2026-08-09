@@ -12,8 +12,8 @@ import types
 
 import pytest
 
-from flash.engine.worker import packing
-from flash.engine.worker.packing import (
+from flash.engine.worker.model import packing
+from flash.engine.worker.model.packing import (
     completion_mask_from_ids,
     gdn_packing_available,
     model_is_gdn_hybrid,
@@ -116,7 +116,7 @@ def test_gdn_forward_probe_resolves_actual_arch():
     # installed forward threads both reset kwargs -> True; a bogus arch -> safe-False.
     pytest.importorskip("transformers")
     pytest.importorskip("torch")
-    from flash.engine.worker.packing import _gdn_forward_threads_reset_kwargs
+    from flash.engine.worker.model.packing import _gdn_forward_threads_reset_kwargs
 
     assert _gdn_forward_threads_reset_kwargs(None) is True
 
@@ -184,7 +184,7 @@ def test_completion_mask_from_ids_empty_full():
 def test_pretokenize_completion_only_drops_empty_and_keeps_lockstep():
     # The SFT pre-tokenizer batches both tokenizations, builds the masks, and drops rows with no
     # completion target — keeping texts and pretok in lockstep so downstream token accounting matches.
-    from flash.engine.worker.sft import _pretokenize_completion_only
+    from flash.engine.worker.entry.sft import _pretokenize_completion_only
 
     tok = _FakeTok(eos="!")
     texts = [
@@ -204,7 +204,7 @@ def test_pretokenize_drops_content_free_completion():
     # A completion whose only masked token is special (an empty assistant turn -> just EOS/turn-closer)
     # has no REAL target and must be dropped — not train the model to emit EOS immediately. "Special" is
     # the tokenizer's own all_special_ids, so the check is template-agnostic.
-    from flash.engine.worker.sft import _pretokenize_completion_only
+    from flash.engine.worker.entry.sft import _pretokenize_completion_only
 
     class _TokWithSpecials(_FakeTok):
         all_special_ids = (1, ord("!"))  # BOS + EOS marked special

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from flash.server import _internal_client as ic
-from flash.server.auth import INTERNAL_KEY_ENV
+from flash.server.platform import internal_client as ic
+from flash.server.platform.auth import INTERNAL_KEY_ENV
 
 
 def test_internal_key_strips_whitespace(monkeypatch):
