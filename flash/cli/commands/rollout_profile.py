@@ -12,7 +12,9 @@ is the pricing this path had before any of this existed.
 from __future__ import annotations
 
 import os
+import random
 import tempfile
+import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -27,6 +29,10 @@ _PROMPT_ROWS = 8
 # references handed to the grading timer. three real completions is what `profile_reward_latency`
 # uses by default, plus its discarded warm-up call.
 _REWARD_REFERENCES = 4
+
+# shared deadline for gathering those references. matches the worker profiler's own budget
+# (rl_train.py `_PROFILE_BUDGET_S`), because both bound the same user-supplied hook.
+_REFERENCE_BUDGET_S = 30.0
 
 
 def collect_for_submit(
@@ -58,7 +64,7 @@ def collect_for_submit(
         return None
 
     try:
-        with _runtime_secret_env(spec, runtime_secrets):
+        with _runtime_secret_env(spec, runtime_secrets), _restored_host_rng():
             return _collect(client, spec)
     except Exception:
         if debug:
@@ -144,6 +150,13 @@ def _collect(client, spec) -> dict[str, Any] | None:
             # transcript. one hosted completion is the FIRST turn only, so its token mean
             # undercounts an episode -- and would still pass the trust gate. decline instead.
             return None
+        # the workers seed before their first environment call, and env code may consume python or
+        # numpy randomness while building its dataset. without this the rows measured here depend on
+        # this process's incidental rng state, while the server binds the profile to spec.seed -- so
+        # two runs with different seeds could share a measurement drawn from a different sample.
+        # seed_host_rngs rather than seed_training_rngs: the same split the sft workload profile
+        # uses, because it must not import torch into the cli.
+        _seed_environment_rngs(spec)
         dataset = environment.dataset()
         if not dataset:
             return None
@@ -181,6 +194,39 @@ def _collect(client, spec) -> dict[str, Any] | None:
         )
 
 
+@contextmanager
+def _restored_host_rng() -> Iterator[None]:
+    """run with the caller's python/numpy rng state restored afterward.
+
+    this is a cli process that keeps running after the measurement -- it goes on to submit the run.
+    seeding for the env's benefit and leaving the seed in place would make every later random draw
+    in this process deterministic as a side effect of asking for a quote.
+    """
+    python_state = random.getstate()
+    numpy_state = None
+    try:
+        import numpy as np
+
+        numpy_state = np.random.get_state()
+    except ImportError:
+        pass
+    try:
+        yield
+    finally:
+        random.setstate(python_state)
+        if numpy_state is not None:
+            import numpy as np
+
+            np.random.set_state(numpy_state)
+
+
+def _seed_environment_rngs(spec) -> None:
+    """seed the generators the workers seed, so this samples the rows training will see."""
+    from flash.engine.worker.runtime.rng import seed_host_rngs
+
+    seed_host_rngs(int(getattr(spec, "seed", 0) or 0))
+
+
 def _training_population(spec, dataset):
     """the dataset prefix training will actually consume, mirroring the workers' own fence."""
     max_examples = int(getattr(spec.train, "max_examples", 0) or 0)
@@ -189,8 +235,8 @@ def _training_population(spec, dataset):
     return dataset
 
 
-def _prompts_from(environment, dataset) -> list[list[dict]]:
-    """chat prompts of the first distinct rows, as the env's own prompt builder returns them.
+def _prompts_from(environment, dataset) -> list[list[dict]] | None:
+    """chat prompts of the first distinct rows, or None when this dataset must not be measured.
 
     uses ``prompt_messages`` rather than the raw ``input`` field so the sampled prompt carries the
     system turn and any templating the env applies. that is what sets prompt length, and prompt
@@ -200,13 +246,24 @@ def _prompts_from(environment, dataset) -> list[list[dict]]:
     turn: the worker sends what prompt_messages returns, and collapsing a system turn changes both
     chat-template tokenization and how the model answers, so a flattened sample would describe a
     different distribution than the run being quoted.
+
+    a multimodal row aborts the whole measurement rather than being skipped. the workers detect
+    ``record_has_images`` and run ``normalize_prompt_images``, so the real request carries image
+    blocks and the processor's expanded image tokens -- far more prompt tokens than the text alone,
+    and a different completion distribution. skipping such rows is worse than declining: a mixed
+    dataset would still yield a full set of text-only draws, pass the trust gate, and underprice
+    every multimodal step.
     """
+    from flash.content.multimodal import record_has_images
+
     prompts: list[list[dict]] = []
     for example in dataset[:_PROMPT_ROWS]:
         try:
             messages = environment.prompt_messages(example)
         except Exception:
             continue
+        if record_has_images(example if isinstance(example, dict) else {}, messages):
+            return None
         usable = _chat_messages(messages)
         if usable:
             prompts.append(usable)
@@ -252,11 +309,28 @@ def _reward_inputs(environment, dataset, assistant_completion_text):
         # would measure a different operation than the one being priced.
         return None, None
 
+    # sft_completion reaches user code and can block on i/o exactly like a grader can. unbounded, a
+    # hung reference source stalls `flash train` forever: the outer best-effort handler never regains
+    # control, because nothing raises. the worker's equivalent profiler bounds this the same way, and
+    # for the same reason (rl_train.py, _PROFILE_BUDGET_S).
+    from flash.engine.profiling.reward_profile import call_bounded
+
     references: list[tuple[int, str]] = []
+    deadline = time.perf_counter() + _REFERENCE_BUDGET_S
     for index, example in enumerate(dataset[:_REWARD_REFERENCES]):
-        try:
-            text = assistant_completion_text(environment.sft_completion(example))
-        except Exception:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            break
+        # bind the loop var: the call runs on another thread, so a late-binding closure could read
+        # the next iteration's example.
+        ok, _elapsed, text = call_bounded(
+            lambda ex=example: assistant_completion_text(environment.sft_completion(ex)), remaining
+        )
+        if ok is None:
+            # a reference source that did not return within the budget will not return within it on
+            # the next row either. give up on grading latency; the token measurement still stands.
+            return None, None
+        if not ok:
             continue
         if isinstance(text, str) and text.strip():
             references.append((index, text))

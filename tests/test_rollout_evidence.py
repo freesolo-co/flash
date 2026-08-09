@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import time
 from dataclasses import replace
 
@@ -1143,3 +1144,166 @@ def test_generation_pricing_stays_bounded_by_the_cap_when_the_actor_drifts():
         completion_tokens_max=cap,
     )
     assert rollout_profile_from_evidence(spec, incoherent, producer_version=VERSION) is None
+
+
+def _profiling_stubs(monkeypatch, tmp_path, env):
+    """Wire collect_for_submit's in-body imports to a fake env and capture what it would measure."""
+    entry = tmp_path / "package" / "environment.py"
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    entry.write_text("")
+
+    seen: dict = {}
+
+    class _Client:
+        def download_env_package(self, _env_id):
+            return b""
+
+    monkeypatch.setattr(
+        "flash.envs.pull.pull_environment_package_from_archive", lambda *_a: tmp_path / "package"
+    )
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda *_a, **_k: env)
+    monkeypatch.setattr(
+        "flash.engine.profiling.rollout_evidence.collect_rollout_evidence",
+        lambda **kw: seen.update(kw) or {"measured": True},
+    )
+    monkeypatch.setenv(rollout_sampler.ROLLOUT_SAMPLER_API_KEY_ENV, "k")
+    return _Client(), seen
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"q": "what is in this picture?", "image": "data:image/png;base64,AAAA"},
+        {"q": "what is in these?", "images": ["a.png", "b.png"]},
+    ],
+)
+def test_a_multimodal_row_is_not_priced_from_its_text_alone(row, monkeypatch, tmp_path):
+    """The workers add image blocks and the processor's expanded image tokens before generating.
+
+    A text-only draw of the same row measures a fraction of the real prompt work. Skipping such rows
+    would be worse than declining: a mixed dataset would still return a full set of text-only draws,
+    pass the trust gate, and underprice every multimodal step.
+    """
+    from flash.cli.commands import rollout_profile as rp
+
+    class _Env:
+        multi_turn = False
+
+        def dataset(self):
+            return [row, {"q": "plain text row"}]
+
+        def prompt_messages(self, example):
+            return [{"role": "user", "content": example["q"]}]
+
+    client, seen = _profiling_stubs(monkeypatch, tmp_path, _Env())
+    assert rp.collect_for_submit(client, _spec(), debug=True) is None
+    assert not seen, "a multimodal dataset must not reach the sampler at all"
+
+
+def test_a_text_only_dataset_is_still_measured(monkeypatch, tmp_path):
+    """The control: the multimodal check must not decline ordinary text runs."""
+    from flash.cli.commands import rollout_profile as rp
+
+    class _Env:
+        multi_turn = False
+
+        def dataset(self):
+            return [{"q": "2+2?"}, {"q": "3+3?"}]
+
+        def prompt_messages(self, example):
+            return [{"role": "user", "content": example["q"]}]
+
+    client, seen = _profiling_stubs(monkeypatch, tmp_path, _Env())
+    assert rp.collect_for_submit(client, _spec(), debug=True) == {"measured": True}
+    assert len(seen["prompts"]) == 2
+
+
+def test_the_measurement_samples_the_rows_the_run_will_train_on(monkeypatch, tmp_path):
+    """The workers seed before their first environment call; this path did not.
+
+    Env code may consume python/numpy randomness while building its dataset, so unseeded the measured
+    rows depend on this process's incidental RNG state -- while the server binds the profile to
+    spec.seed. Two runs with different seeds could then share a measurement of a different sample.
+    """
+    from flash.cli.commands import rollout_profile as rp
+
+    class _Env:
+        multi_turn = False
+
+        def dataset(self):
+            # a dataset built with randomness, exactly what the worker's seeding exists to pin.
+            return [{"q": f"row-{random.random():.12f}"}]
+
+        def prompt_messages(self, example):
+            return [{"role": "user", "content": example["q"]}]
+
+    def _measured_row(spec):
+        client, seen = _profiling_stubs(monkeypatch, tmp_path, _Env())
+        rp.collect_for_submit(client, spec, debug=True)
+        return seen["prompts"][0][0]["content"]
+
+    # the same seed must select the same row every time, whatever this process did beforehand.
+    random.seed(999)
+    first = _measured_row(_spec(seed=7))
+    random.seed(12345)
+    second = _measured_row(_spec(seed=7))
+    assert first == second, "the measured rows must follow spec.seed, not ambient RNG state"
+
+    # and a different seed is a different sample, which is why the digest keys it.
+    assert _measured_row(_spec(seed=8)) != first
+
+
+def test_measuring_does_not_leave_the_process_rng_seeded(monkeypatch, tmp_path):
+    """This CLI keeps running after the measurement -- it goes on to submit the run.
+
+    Leaving the seed in place would make every later random draw in the process deterministic as a
+    side effect of asking for a quote.
+    """
+    from flash.cli.commands import rollout_profile as rp
+
+    class _Env:
+        multi_turn = False
+
+        def dataset(self):
+            return [{"q": "2+2?"}]
+
+        def prompt_messages(self, example):
+            return [{"role": "user", "content": example["q"]}]
+
+    client, _seen = _profiling_stubs(monkeypatch, tmp_path, _Env())
+    random.seed(4242)
+    expected = [random.random() for _ in range(3)]
+
+    random.seed(4242)
+    rp.collect_for_submit(client, _spec(seed=7), debug=True)
+    assert [random.random() for _ in range(3)] == expected, (
+        "the caller's RNG stream must survive the measurement"
+    )
+
+
+def test_a_hanging_reference_source_cannot_stall_the_submit(monkeypatch):
+    """`sft_completion` is user code and can block on i/o exactly like a grader can.
+
+    Unbounded, a hung reference source stalls `flash train` forever: nothing raises, so the outer
+    best-effort handler never regains control. The worker's profiler bounds the same hook.
+    """
+    from flash.cli.commands import rollout_profile as rp
+
+    monkeypatch.setattr(rp, "_REFERENCE_BUDGET_S", 0.25)
+    started = time.perf_counter()
+
+    class _Env:
+        multi_turn = False
+        reward_thread_safe = True
+
+        def reward(self, _completion, _example):
+            return 1.0
+
+        def sft_completion(self, _example):
+            time.sleep(30)
+            return "never"
+
+    score_one, references = rp._reward_inputs(_Env(), [{"q": "a"}, {"q": "b"}], lambda value: value)
+    elapsed = time.perf_counter() - started
+    assert (score_one, references) == (None, None), "a hung source yields no grading measurement"
+    assert elapsed < 5.0, f"reference gathering must be bounded, took {elapsed:.1f}s"
