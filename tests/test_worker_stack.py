@@ -2129,8 +2129,17 @@ def test_every_algorithm_records_whether_gdn_boundary_resets_engaged():
 
     from flash.engine.worker import opd_train, rl_train, sft_train
 
+    # grpo renders its run metadata in train.rl.verl_config and opd in train.opd.overrides, so
+    # each trainer's source is its module plus wherever its notes are built.
+    from flash.engine.worker.train.opd import overrides as opd_overrides
+    from flash.engine.worker.train.rl import verl_config as rl_verl_config
+
+    extra = {"rl_train": rl_verl_config, "opd_train": opd_overrides}
     for module in (sft_train, opd_train, rl_train):
-        assert '"gdn_boundary_resets"' in _inspect.getsource(module), (
+        source = _inspect.getsource(module)
+        if module.__name__.rsplit(".", 1)[-1] in extra:
+            source += _inspect.getsource(extra[module.__name__.rsplit(".", 1)[-1]])
+        assert '"gdn_boundary_resets"' in source, (
             f"{module.__name__} computes the gdn boundary-reset decision but never records it, so a "
             "finished run cannot be checked for whether it trained packed-with-resets or padded."
         )
