@@ -81,61 +81,54 @@ export INFISICAL_TOKEN
 # an unquoted string and word-splitting it would corrupt such values, and a leading space
 # would make `env` choke.) INFISICAL_KEEP itself is a whitespace-separated list of variable
 # NAMES, so splitting *it* is intentional.
-# The loop below iterates with `_infisical_keep_name`, and POSIX `for` assigns to an existing
-# name IN PLACE -- inheriting that name's export mark. That gives the iterator's own name two
-# failures, and renaming it only moves both to the new name, because any name can appear in
-# INFISICAL_KEEP. There is no safe choice and no way to make an iterator local in POSIX sh, so
-# the name is handled explicitly instead:
 #
-#   a container that set it has its value overwritten in the child, even without asking for it
-#   in INFISICAL_KEEP -- so capture that value HERE, before the loop exists, and hand it to
-#   `env` as an operand. `env` applies operands over the environment it inherits, so the
-#   container's value is restored whatever the loop did to the live variable.
+# The loop runs in a SUBSHELL that prints shell code, instead of iterating here. A `for` in
+# this shell has to iterate with a variable NAME, and POSIX `for` assigns to an existing name
+# IN PLACE -- inheriting its export mark -- so a container that exported a variable of that
+# name has its value replaced in the child. Any name can appear in INFISICAL_KEEP, so no
+# choice of iterator is safe, and there is no way to make one local in POSIX sh. Patching the
+# damage afterwards is what the previous revision did, by re-applying the captured value as an
+# `env` operand: that restored the value but also made it beat the vault, which only names
+# listed in INFISICAL_KEEP are allowed to do. A subshell removes the damage instead of
+# compensating for it -- the assignment cannot outlive the loop, so the environment `exec`
+# hands to the child is never touched, and a name nobody asked to keep is simply left alone
+# for infisical to override.
 #
-#   a KEEP entry naming it would make the presence check below resolve THROUGH the iterator,
-#   which is always set by then -- emitting an invented `NAME=NAME` -- so the loop skips it.
-#   The operand captured here is the honest answer for that name, and it is already emitted.
-#
-# When the container never set it, nothing is captured and nothing is emitted: the loop's
-# assignment is then an ordinary unexported shell variable that no child ever sees.
-if [ -n "${_infisical_keep_name+set}" ]; then
-  set -- "_infisical_keep_name=$_infisical_keep_name" "$@"
-fi
-# shellcheck disable=SC2086
-for _infisical_keep_name in ${INFISICAL_KEEP:-}; do
-  # These names are expanded inside `eval` below, so refuse anything that is not a shell
-  # identifier instead of executing it.
-  case $_infisical_keep_name in
-    [!A-Za-z_]* | *[!A-Za-z0-9_]*)
-      echo "flash infisical entrypoint: INFISICAL_KEEP entry is not a variable name: $_infisical_keep_name" >&2
-      exit 2
-      ;;
-  esac
-  # Handled above, from the value captured before this loop clobbered the variable. Evaluating
-  # it here would read the iterator itself rather than the container's variable.
-  if [ "$_infisical_keep_name" = _infisical_keep_name ]; then
-    continue
-  fi
-  # Only re-apply names the container actually SET. An unset name expands to nothing, and
-  # handing `env` a bare `K=` would overwrite the injected secret with an empty string --
-  # so a typo'd or absent KEEP entry would silently WIPE a credential rather than leave the
-  # vault's value alone. `${K+set}` distinguishes unset from set-but-empty, so an explicitly
-  # empty container value still wins (that is a deliberate choice by whoever wrote it).
-  eval "[ \"\${$_infisical_keep_name+set}\" = set ]" || continue
-  # Expand straight into the argument list, with no scratch variable in between. Two reasons.
-  #
-  # A scratch name is itself an environment variable, so holding the value in one would clobber
-  # whatever the container set under that name, and unsetting it afterwards would DELETE that
-  # variable from the child -- a variable the caller never mentioned in INFISICAL_KEEP and had
-  # no reason to expect this script to touch.
-  #
-  # And expansion here rather than `$(...)`: command substitution strips ALL trailing newlines,
-  # so a kept multiline value (a PEM private key, a certificate chain) would arrive one or more
-  # bytes shorter than the container set it -- silently, and only for the values most likely to
-  # break something downstream. The expansion sits inside double quotes, so the value's own
-  # content is never re-parsed: `$(...)`, backticks, quotes, and backslashes in it stay literal.
-  eval "set -- \"$_infisical_keep_name=\${$_infisical_keep_name}\" \"\$@\""
-done
+# The emitted code carries only NAMES and lets this shell expand the values, so no value ever
+# passes through the generated text: nothing to quote wrongly, and a multiline value (a PEM
+# key, a certificate chain) arrives byte for byte. Names reaching that text are checked to be
+# shell identifiers first.
+eval "$(
+  # Positional parameters, not a scratch variable, hold the one fact the loop destroys. Any
+  # name used here would be an environment variable, and a container that set THAT name would
+  # be read wrongly -- the same defect one rename further along. `$@` inside this subshell is
+  # the command, which the loop does not need, and no child is exec'd from here.
+  set -- "${_infisical_keep_name+set}"
+  # shellcheck disable=SC2086
+  for _infisical_keep_name in ${INFISICAL_KEEP:-}; do
+    case $_infisical_keep_name in
+      [!A-Za-z_]* | *[!A-Za-z0-9_]*)
+        echo "flash infisical entrypoint: INFISICAL_KEEP entry is not a variable name: $_infisical_keep_name" >&2
+        # The parent evaluates what this prints, so its exit status is what stops the startup.
+        echo 'exit 2'
+        exit 0
+        ;;
+    esac
+    # Only re-apply names the container actually SET. An unset name expands to nothing, and
+    # handing `env` a bare `K=` would overwrite the injected secret with an empty string --
+    # so a typo'd or absent KEEP entry would silently WIPE a credential rather than leave the
+    # vault's value alone. `${K+set}` distinguishes unset from set-but-empty, so an explicitly
+    # empty container value still wins (that is a deliberate choice by whoever wrote it).
+    if [ "$_infisical_keep_name" = _infisical_keep_name ]; then
+      # Asking to keep the loop's own name: the check below would resolve THROUGH the iterator,
+      # which by now holds that very name, and report a variable nobody set as present.
+      [ "$1" = set ] || continue
+    else
+      eval "[ \"\${$_infisical_keep_name+set}\" = set ]" || continue
+    fi
+    echo "set -- \"$_infisical_keep_name=\${$_infisical_keep_name}\" \"\$@\""
+  done
+)"
 
 exec infisical run \
   --projectId "$INFISICAL_PROJECT_ID" \

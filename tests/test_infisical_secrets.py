@@ -436,6 +436,59 @@ class TestEntrypointBehaviour:
         assert result.returncode == 0, result.stderr
         assert result.stdout == ""
 
+    def test_the_vault_still_wins_for_the_iterator_name_nobody_kept(self, tmp_path):
+        """Fixing the iterator leak must not promote that name to a permanent KEEP entry.
+
+        The previous fix restored the container's value by handing it to `env` as an operand.
+        Operands are applied AFTER injection, which is exactly how a KEEP entry beats the vault
+        -- so the iterator's name won over the vault unconditionally, including when the keep
+        list was empty and there was nothing to protect it from. Only names listed in
+        INFISICAL_KEEP are allowed to do that.
+
+        The default stub cannot see this: it injects `FROM_VAULT` alone, so the vault never
+        defines the iterator's name and container-wins is indistinguishable from vault-wins.
+        This one injects that name, which is what makes the two outcomes differ.
+        """
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        stub = bin_dir / "infisical"
+        stub.write_text(
+            "#!/bin/sh\n"
+            'case "$1" in\n'
+            "  login) echo stub-token ;;\n"
+            '  run) shift; while [ "$1" != "--" ]; do shift; done; shift;\n'
+            '       exec env _infisical_keep_name=vault_value "$@" ;;\n'
+            "esac\n"
+        )
+        stub.chmod(0o755)
+
+        def run(keep: str | None) -> str:
+            env = {
+                "PATH": f"{bin_dir}:/usr/bin:/bin",
+                "INFISICAL_CLIENT_ID": "cid",
+                "INFISICAL_CLIENT_SECRET": "csec",
+                "INFISICAL_PROJECT_ID": "proj",
+                "INFISICAL_PATH": "/flash",
+                "_infisical_keep_name": "CONTAINER_VAL",
+            }
+            if keep is not None:
+                env["INFISICAL_KEEP"] = keep
+            result = subprocess.run(
+                ["sh", str(ENTRYPOINT), "sh", "-c", 'echo "${_infisical_keep_name-<GONE>}"'],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            assert result.returncode == 0, result.stderr
+            return result.stdout.strip()
+
+        # Not kept -- by the list being absent, or by naming something else entirely. Both are
+        # the ordinary case for a container that happens to export this name for its own reasons.
+        assert run(None) == "vault_value"
+        assert run("SOMETHING_ELSE") == "vault_value"
+        # Kept explicitly: now, and only now, the container's value is the right answer.
+        assert run("_infisical_keep_name") == "CONTAINER_VAL"
+
     def test_keep_rejects_a_name_that_is_not_an_identifier(self, tmp_path):
         """KEEP names reach `eval`, so a non-identifier is refused rather than executed."""
         marker = tmp_path / "executed"

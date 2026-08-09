@@ -72,7 +72,7 @@ when the switch is on but unusable, and the `INFISICAL_KEEP` handling described 
 
 | Variable                  | Required | Default | Purpose                                                                                                                                                                                                                                                                                                                            |
 | ------------------------- | -------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `INFISICAL_CLIENT_ID`     | yes      | unset   | Universal-auth machine identity. **Unset makes the wrapper a no-op passthrough**, so the container behaves exactly like the base image. Set but _empty_ aborts startup: that is a broken `${VAR}` interpolation, not a request for the passthrough.                                                                               |
+| `INFISICAL_CLIENT_ID`     | yes      | unset   | Universal-auth machine identity. **Unset makes the wrapper a no-op passthrough**, so the container behaves exactly like the base image. Set but _empty_ aborts startup: that is a broken `${VAR}` interpolation, not a request for the passthrough.                                                                                |
 | `INFISICAL_CLIENT_SECRET` | yes      | unset   | Machine identity secret.                                                                                                                                                                                                                                                                                                           |
 | `INFISICAL_PROJECT_ID`    | yes      | unset   | Infisical project (workspace) id.                                                                                                                                                                                                                                                                                                  |
 | `INFISICAL_PATH`          | yes      | unset   | Secret folder path for this service, e.g. `/flash`.                                                                                                                                                                                                                                                                                |
@@ -84,7 +84,9 @@ when the switch is on but unusable, and the `INFISICAL_KEEP` handling described 
 A name listed in `INFISICAL_KEEP` that the container has **not** set is skipped, so the vault's
 value survives — a typo there costs you an override, not a credential. Setting a name to an empty
 string is treated as a deliberate choice and still wins over the vault. Entries must be shell
-identifiers; anything else aborts startup rather than being evaluated.
+identifiers; anything else aborts startup rather than being evaluated. The list is the _only_
+thing that grants an override: a name the container exports but does not list takes the vault's
+value like any other, whatever that name happens to be.
 
 ## Failure behaviour
 
