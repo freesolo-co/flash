@@ -2551,7 +2551,7 @@ def test_image_pad_ban_and_stop_shims_both_apply_to_the_same_method():
 def test_rollout_shims_survive_verls_real_run_agent_loop_signature():
     """the shims must tolerate the signature verl ACTUALLY calls, not a convenient stub.
 
-    At freesolo-co/verl@1bea7d68, ``trajectory`` is positional and required ``agent_name`` is
+    At freesolo-co/verl@32d6200d, ``trajectory`` is positional and required ``agent_name`` is
     keyword-only; the wrapper must also preserve ``**kwargs``.
     """
     import asyncio
