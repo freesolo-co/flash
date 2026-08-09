@@ -383,6 +383,44 @@ def test_the_measured_rows_match_opd_which_shuffles_after_it_renders():
     assert measured != list(range(_PROMPT_ROWS))
 
 
+def test_an_oversized_prompt_is_declined_before_the_request_is_built(monkeypatch):
+    """The prompt comes from the user's own prompt_messages(), so its size is not ours to trust.
+
+    A corpus-sized or malformed row would otherwise be serialized and sent in full on every draw.
+    The existing prompt-budget filter cannot help here: it reads the endpoint's reported
+    `prompt_tokens`, which only exists once the request has already been built and sent.
+
+    Declining rather than truncating, because a shortened prompt would measure a completion
+    distribution belonging to no run at all.
+    """
+    from flash.engine.profiling import rollout_sampler
+
+    opened: list = []
+
+    monkeypatch.setattr(
+        rollout_sampler._NO_REDIRECT_OPENER,
+        "open",
+        lambda request, timeout=None: opened.append(1),
+    )
+
+    huge = "x" * (rollout_sampler.MAX_REQUEST_BYTES + 1024)
+    sample = rollout_sampler._one_completion(
+        model="Qwen/Qwen3.5-4B",
+        messages=[{"role": "user", "content": huge}],
+        max_completion_tokens=512,
+        temperature=None,
+        top_p=1.0,
+        base_url="https://example.invalid/v1",
+        api_key="k",
+        thinking=False,
+    )
+
+    assert sample is None
+    # the point is that nothing was SENT: a guard that rejected the response instead would already
+    # have paid the serialization and the request this exists to avoid.
+    assert opened == []
+
+
 def test_an_oversized_response_body_is_declined_rather_than_read(monkeypatch):
     """The endpoint is user-configured and this reads whatever it sends.
 

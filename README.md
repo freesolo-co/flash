@@ -141,9 +141,9 @@ the work a rollout does. A run that caps at 512 tokens but generates 54 is quote
 times the generation it performs.
 
 If you point `flash train` at an OpenAI-compatible inference endpoint, it samples a handful of real
-completions for your model and prompts before submitting, and times your environment's own reward
-function. This is **off unless you set the key** — no measurement happens, and the quote uses the
-cap, until you opt in:
+completions for your model and prompts before submitting, and quotes from their measured length.
+This is **off unless you set the key** — no measurement happens, and the quote uses the cap, until
+you opt in:
 
 ```bash
 export FLASH_ROLLOUT_SAMPLER_API_KEY=...          # unset = no measurement, quote uses the cap

@@ -52,6 +52,13 @@ MAX_CONSECUTIVE_FAILURES = 5
 # one completion at the 2048-token cap plus usage accounting, a few tens of kilobytes.
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
+# ceiling on one REQUEST body, measured on the rendered prompt before it is serialized. the prompt
+# comes from the user's own prompt_messages(), so a corpus-sized or malformed row would otherwise be
+# encoded and sent in full -- once per draw. the same limit as the response for the same reason: a
+# prompt this large is far past any run's context budget, so the worker would drop the row anyway
+# and the draw could never have priced real work.
+MAX_REQUEST_BYTES = 8 * 1024 * 1024
+
 # prompt-mix dominates the variance (measured: between-prompt 304846 vs within-prompt 61082, a word
 # problem running a median 1642 tokens against ~290 for arithmetic), so spread draws across DISTINCT
 # prompts before repeating any one of them.
@@ -260,6 +267,12 @@ def _one_completion(
     ``timeout_s`` is the caller's REMAINING overall budget when that is tighter than the per-request
     ceiling, so no single draw can carry the pass past its deadline.
     """
+    # measured on the rendered prompt, before it is encoded into a request body. the content comes
+    # from the user's own prompt_messages(), so a corpus-sized row would otherwise be serialized and
+    # sent in full on every draw. declining is the right answer rather than truncating: a shortened
+    # prompt would measure a completion distribution that belongs to no run at all.
+    if sum(len(str(m.get("content", ""))) for m in messages) > MAX_REQUEST_BYTES:
+        return None
     payload: dict[str, object] = {
         "model": model,
         # the env's own prompt_messages() output, roles intact. flattening a system turn into a
