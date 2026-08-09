@@ -157,7 +157,7 @@ def test_capability_is_bound_to_attempt_and_new_attempt_revokes_old(broker_db):
 
 
 def test_exact_24_hour_capability_deadline_is_accepted(broker_db, monkeypatch):
-    monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
+    monkeypatch.setenv("FLASH_API_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
     issued_at = 1_000.0
     deadline_at = issued_at + teacher_broker.MAX_CAPABILITY_LIFETIME_S
@@ -182,7 +182,7 @@ def test_48_hour_opd_wall_is_rejected_before_allocation(monkeypatch):
     import flash.providers.allocator as allocator
     from flash.runner.supervise import lifecycle
 
-    monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
+    monkeypatch.setenv("FLASH_API_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
     monkeypatch.setattr(
         lifecycle,
@@ -211,7 +211,7 @@ def test_broker_accepts_every_catalog_teacher(monkeypatch):
     # would be rejected at submit despite resolving fine.
     from flash.engine.plan.recipe import TEACHER_MODELS
 
-    monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
+    monkeypatch.setenv("FLASH_API_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
     for alias in TEACHER_MODELS:
         spec = JobSpec(
@@ -224,7 +224,7 @@ def test_broker_accepts_every_catalog_teacher(monkeypatch):
 
 
 def test_deadline_contract_over_24_hours_is_rejected(monkeypatch):
-    monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
+    monkeypatch.setenv("FLASH_API_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
     spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
@@ -1086,7 +1086,7 @@ def test_only_predispatch_failure_can_retry_same_logical_request(broker_db, monk
     ],
 )
 def test_control_panel_url_requires_a_canonical_worker_reachable_https_origin(url):
-    with pytest.raises(RuntimeError, match="FLASH_CONTROL_PANEL_URL"):
+    with pytest.raises(RuntimeError, match="FLASH_API_URL"):
         teacher_broker.validate_control_panel_url(url)
 
     assert teacher_broker.validate_control_panel_url("https://flash.example.com/") == (
@@ -1094,44 +1094,35 @@ def test_control_panel_url_requires_a_canonical_worker_reachable_https_origin(ur
     )
 
 
-def test_control_panel_url_falls_back_to_the_client_api_url(monkeypatch):
-    monkeypatch.delenv("FLASH_CONTROL_PANEL_URL", raising=False)
+def test_control_panel_url_resolves_from_the_api_url(monkeypatch):
     monkeypatch.setenv("FLASH_API_URL", "https://flash.example.com/")
 
     assert teacher_broker.resolve_control_panel_url() == "https://flash.example.com"
 
 
-def test_control_panel_url_wins_over_the_client_api_url(monkeypatch):
-    monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://worker-reachable.example")
-    monkeypatch.setenv("FLASH_API_URL", "https://localhost:8000")
+def test_control_panel_url_unset_fails_without_reaching_the_channel_default(monkeypatch):
+    """resolution must not fall through to flash.client.config's hosted default.
 
-    assert teacher_broker.resolve_control_panel_url() == "https://worker-reachable.example"
-
-
-def test_control_panel_url_unset_everywhere_still_fails(monkeypatch):
-    """the fallback must not reach flash.client.config's channel default.
-
-    resolving to the hosted plane when the operator set nothing would issue capabilities against
-    a plane that never minted them, and only after the gpu is allocated.
+    a plane that set nothing would otherwise issue capabilities against the hosted plane, which
+    never minted them, and only after the gpu is allocated.
     """
-    monkeypatch.delenv("FLASH_CONTROL_PANEL_URL", raising=False)
     monkeypatch.delenv("FLASH_API_URL", raising=False)
 
-    with pytest.raises(RuntimeError, match="FLASH_CONTROL_PANEL_URL"):
+    with pytest.raises(RuntimeError, match="FLASH_API_URL"):
         teacher_broker.resolve_control_panel_url()
 
 
-def test_unusable_client_api_url_names_both_variables(monkeypatch):
-    monkeypatch.delenv("FLASH_CONTROL_PANEL_URL", raising=False)
-    monkeypatch.setenv("FLASH_API_URL", "http://flash.example.com")
+def test_legacy_control_panel_url_does_not_configure_the_plane(monkeypatch):
+    """the removed FLASH_CONTROL_PANEL_URL must not keep working as an alias."""
+    monkeypatch.delenv("FLASH_API_URL", raising=False)
+    monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://stale.example")
 
-    with pytest.raises(RuntimeError, match="FLASH_API_URL") as error:
+    with pytest.raises(RuntimeError, match="FLASH_API_URL"):
         teacher_broker.resolve_control_panel_url()
-    assert "FLASH_CONTROL_PANEL_URL" in str(error.value)
 
 
 def test_legacy_teacher_broker_url_does_not_configure_the_control_panel(monkeypatch):
-    monkeypatch.delenv("FLASH_CONTROL_PANEL_URL", raising=False)
+    monkeypatch.delenv("FLASH_API_URL", raising=False)
     monkeypatch.setenv("FLASH_TEACHER_BROKER_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
     spec = JobSpec(
@@ -1141,16 +1132,16 @@ def test_legacy_teacher_broker_url_does_not_configure_the_control_panel(monkeypa
         run_id="run-legacy-control-panel-url",
     )
 
-    with pytest.raises(RuntimeError, match="FLASH_CONTROL_PANEL_URL"):
+    with pytest.raises(RuntimeError, match="FLASH_API_URL"):
         teacher_broker.require_teacher_broker_configuration(spec)
 
 
-@pytest.mark.parametrize("missing", ["FLASH_CONTROL_PANEL_URL", "PARASAIL_API_KEY"])
+@pytest.mark.parametrize("missing", ["FLASH_API_URL", "PARASAIL_API_KEY"])
 def test_missing_broker_configuration_fails_before_allocation(monkeypatch, missing):
     import flash.providers.allocator as allocator
     from flash.runner.supervise import lifecycle
 
-    monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
+    monkeypatch.setenv("FLASH_API_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
     monkeypatch.delenv(missing, raising=False)
     monkeypatch.setattr(
@@ -1175,7 +1166,7 @@ def test_missing_broker_configuration_fails_before_allocation(monkeypatch, missi
 
 
 def test_failed_submission_scope_revokes_attempt_capability(broker_db, monkeypatch):
-    monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
+    monkeypatch.setenv("FLASH_API_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
     spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
@@ -1200,7 +1191,7 @@ def test_failed_submission_scope_revokes_attempt_capability(broker_db, monkeypat
 
 
 def test_old_attempt_context_exit_does_not_revoke_new_attempt_token(broker_db, monkeypatch):
-    monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
+    monkeypatch.setenv("FLASH_API_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
     spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
@@ -1286,7 +1277,7 @@ def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monke
     )
     runtime = {
         "PARASAIL_API_KEY": "parasail-worker-canary",
-        "FLASH_CONTROL_PANEL_URL": "https://broker.example",
+        "FLASH_API_URL": "https://broker.example",
         "FLASH_TEACHER_CAPABILITY": "capability-worker-canary",
     }
     monkeypatch.setenv("PARASAIL_API_KEY", "parasail-control-plane-canary")

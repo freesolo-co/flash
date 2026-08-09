@@ -36,7 +36,7 @@ def _stub_teacher_broker_transport(monkeypatch):
     @contextlib.contextmanager
     def teacher_transport(_spec, **_kwargs):
         yield {
-            "FLASH_CONTROL_PANEL_URL": "https://broker.example",
+            "FLASH_API_URL": "https://broker.example",
             "FLASH_TEACHER_CAPABILITY": "capability-test-value",
         }
 
@@ -745,7 +745,7 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
         "allocated_gpu_count": 1,
     }
     broker_transport = {
-        "FLASH_CONTROL_PANEL_URL": "https://broker.example",
+        "FLASH_API_URL": "https://broker.example",
         "FLASH_TEACHER_CAPABILITY": "capability-test-value",
     }
     assert provider.runtime_secrets == [

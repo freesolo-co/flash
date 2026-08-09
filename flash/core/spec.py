@@ -183,11 +183,10 @@ def parse_max_steps(value: Any) -> int | None:
     return value if value > 0 else None
 
 
-CONTROL_PANEL_URL_ENV = "FLASH_CONTROL_PANEL_URL"
-# the cli's own control-plane url. the broker falls back to it when CONTROL_PANEL_URL_ENV is unset,
-# since both name the same origin on the managed plane. it stays out of CONTROL_PLANE_OWNED_ENV_KEYS
-# on purpose: it is operator/client configuration, never transport injected into a worker.
-CLIENT_API_URL_ENV = "FLASH_API_URL"
+# one name for this plane's origin: the url the cli dials in on is the url a gpu worker dials back
+# on. it is control-plane-owned as worker transport (the plane injects it for opd), so a caller
+# cannot declare it as a worker env override or an [environment] secret.
+CONTROL_PANEL_URL_ENV = "FLASH_API_URL"
 TEACHER_CAPABILITY_ENV = "FLASH_TEACHER_CAPABILITY"
 MANAGED_TEACHER_CREDENTIAL_ENV_KEYS = frozenset({"PARASAIL_API_KEY"})
 CONTROL_PLANE_OWNED_ENV_KEYS = frozenset(
