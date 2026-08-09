@@ -10,11 +10,11 @@ from jsonschema.validators import validator_for
 from referencing.exceptions import NoSuchResource
 from referencing.jsonschema import specification_with
 
-from flash.engine.recipe import RECIPE
-from flash.engine.structured_outputs import parse_structured_outputs
-from flash.engine.vram import opd_completion_len
-from flash.lora_rank import ServingPreflightError, preflight_train_context_within_serving
-from flash.spec import JobSpec
+from flash.adapters.lora_rank import ServingPreflightError, preflight_train_context_within_serving
+from flash.content.structured_outputs import parse_structured_outputs
+from flash.core.spec import JobSpec
+from flash.engine.plan.recipe import RECIPE
+from flash.engine.plan.vram import opd_completion_len
 
 SERVING_PROMPT_TOKEN_ALLOWANCE = 256
 

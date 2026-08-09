@@ -9,9 +9,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from .._channel import CHANNEL, CLI_NAME
-from .._fileio import read_json_or_empty, secure_json_write
-from .._paths import data_dir
+from flash._internal.channel import CHANNEL, CLI_NAME
+from flash._internal.fileio import read_json_or_empty, secure_json_write
+from flash._internal.paths import data_dir
 
 PROD_API_URL = "https://flash.freesolo.co"
 DEV_API_URL = "https://flash-dev.freesolo.co"

@@ -15,7 +15,7 @@ import urllib.error
 
 import pytest
 
-from flash.spec import JobSpec
+from flash.core.spec import JobSpec
 
 
 def _spec(gpu_type="RTX 4090", **gpu_kw) -> JobSpec:
@@ -129,7 +129,7 @@ def test_onstart_ships_payload_and_runs_shared_bootstrap(monkeypatch):
     # it is genuinely the shared module (a distinctive line only that file has)
     from pathlib import Path
 
-    import flash.providers._instance_bootstrap as ib
+    import flash.providers._lifecycle.bootstrap as ib
 
     shared_src = Path(ib.__file__).read_text()
     assert "RetriableBootstrapError" in shared_src  # sanity: distinctive marker exists
@@ -208,7 +208,7 @@ def test_onstart_spills_large_spec_to_hf(monkeypatch):
 def test_build_payload_sets_vast_arm():
     """build_payload stamps flash_arm='vast' so the metrics record attributes the substrate, and the
     shared bootstrap turns it into FLASH_ARM."""
-    from flash.providers import _instance_bootstrap as ib
+    from flash.providers._lifecycle import bootstrap as ib
     from flash.providers.vast.jobs.builders import build_payload
 
     assert build_payload(_spec(), 0, 0, deadline_at=_deadline_at())["flash_arm"] == "vast"
@@ -946,7 +946,7 @@ def test_poll_dead_host_waits_for_late_terminal_artifact(monkeypatch):
 def test_poll_malformed_status_read_is_poll_error(monkeypatch, exc):
     # malformed 200 responses raise decode or HTTP exceptions outside VastApiError. treat them as
     # transient poll errors so a recoverable status read does not become a terminal host loss.
-    from flash.providers import _poll
+    from flash.providers._lifecycle import poll as _poll
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast
 
@@ -1031,7 +1031,7 @@ def test_poll_status_outage_reads_terminal_done_before_poll_error(monkeypatch):
     returning poll_error. A worker that COMPLETED during a prolonged outage — DONE on HF, a separate
     endpoint, but lagged on the first read — is finished rather than abandoned to a duplicate retry that
     re-rents a GPU for an attempt that already succeeded. A single read would miss the lagged DONE here."""
-    from flash.providers import _poll
+    from flash.providers._lifecycle import poll as _poll
     from flash.providers.vast import api as vast_api
 
     done_seq = {"n": 0}
@@ -1343,7 +1343,7 @@ def test_poll_interval_and_terminal_reread_sleeps_are_bounded(monkeypatch):
 
 
 def test_poll_error_backoff_stops_at_absolute_deadline(monkeypatch):
-    from flash.providers import _poll
+    from flash.providers._lifecycle import poll as _poll
 
     clock = {"now": 100.0}
     sleeps = []
@@ -2217,7 +2217,7 @@ def test_provider_poll_recovery_unconfirmed_teardown_escalates_to_run_scoped_rea
     instance destroy to a run-scoped reap (mirroring the submit_run_vast finally). Otherwise a successful
     multi-seed ATTACH that clears ``remote`` and resumes the next seed leaves the box shielded by the
     active-run label and billing, with no persisted handle."""
-    from flash.providers import _hf_artifacts
+    from flash.providers.artifacts import hf as _hf_artifacts
     from flash.providers.base import JobHandle, PollResult
     from flash.providers.vast import PROVIDER
     from flash.providers.vast import api as vast_api
@@ -2241,7 +2241,7 @@ def test_provider_poll_recovery_unconfirmed_teardown_escalates_to_run_scoped_rea
 
 def test_provider_poll_recovery_confirmed_teardown_skips_run_scoped_reap(monkeypatch):
     """A confirmed recovery teardown needs no extra run-scoped reap (no redundant list+destroy)."""
-    from flash.providers import _hf_artifacts
+    from flash.providers.artifacts import hf as _hf_artifacts
     from flash.providers.base import JobHandle, PollResult
     from flash.providers.vast import PROVIDER
     from flash.providers.vast import api as vast_api

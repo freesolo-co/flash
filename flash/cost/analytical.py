@@ -8,10 +8,7 @@ from __future__ import annotations
 
 import math
 
-from flash.opd_limits import OPD_TEACHER_SCORING_CONCURRENCY, opd_teacher_request_multiplier
-from flash.providers.allocator import geometry_safe_gpu_cap, required_vram_gb, vram_headroom
-
-from .facts import (
+from flash.cost.facts import (
     GPU_COMPUTE_TFLOPS,
     _catalog_model_info,
     active_params_b,
@@ -25,7 +22,9 @@ from .facts import (
     teacher_token_cost_usd,
     total_params_b,
 )
-from .types import CostEstimate, RunConfig
+from flash.cost.types import CostEstimate, RunConfig
+from flash.providers.allocator import geometry_safe_gpu_cap, required_vram_gb, vram_headroom
+from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY, opd_teacher_request_multiplier
 
 # FLOPs per token per active-parameter.
 SFT_FLOPS_PER_TOKEN_PER_PARAM = 6.0  # forward (2) + backward (4)
@@ -492,7 +491,7 @@ def _offline_gpu_shape(
             # provider's offline static rate here; the lifecycle replaces it from the selected candidate
             # before provisioning, so the persisted/charged quote still carries the exact live rate.
             if provider == "lambda":
-                from flash.providers.lambdalabs.pricing import static_hourly_rate
+                from flash.providers.lambda_.pricing import static_hourly_rate
 
                 hourly = static_hourly_rate(gpu)
             else:
@@ -547,7 +546,7 @@ def _offline_profile_shape(config: RunConfig) -> tuple[str, int, int, str, float
         if provider != "auto" and provider not in providers_for(gpu):
             continue
         if provider == "lambda":
-            from flash.providers.lambdalabs.pricing import static_hourly_rate
+            from flash.providers.lambda_.pricing import static_hourly_rate
 
             hourly = static_hourly_rate(gpu)
         else:
@@ -635,7 +634,7 @@ def _notes(
     if n.is_opd:
         comps, _ = _opd_step_shape(n)
         tsec = teacher_seconds_per_completion()
-        from flash.engine.recipe import resolve_teacher
+        from flash.engine.plan.recipe import resolve_teacher
 
         teacher_name = resolve_teacher(n.teacher_model).display_name
         notes.append(

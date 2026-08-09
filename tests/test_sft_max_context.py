@@ -23,11 +23,11 @@ from __future__ import annotations
 import pathlib
 from dataclasses import fields
 
-import flash.engine.sft_workload as sft_workload_mod
+import flash.engine.profiling.sft_workload as sft_workload_mod
 import flash.engine.worker.sft_train as sft_train_mod
-from flash.engine.recipe import RECIPE
-from flash.engine.sft_workload import sft_max_length as _measured_max_length
-from flash.spec import EnvironmentSpec, JobSpec, TrainSpec
+from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
+from flash.engine.plan.recipe import RECIPE
+from flash.engine.profiling.sft_workload import sft_max_length as _measured_max_length
 
 
 def test_trainspec_exposes_max_context_tokens_and_not_the_stale_max_length():

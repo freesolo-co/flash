@@ -7,13 +7,13 @@ distinct, side-by-side-installable package that defaults to the staging control 
   * pyproject `[project].name`    : freesolo-flash  -> freesolo-flash-dev
   * pyproject `[project].version` : [project].version -> [tool.flash-dev].version
   * pyproject `[project.scripts]` : flash -> flash-dev, flash-server -> flash-dev-server
-  * flash/_channel.py             : CHANNEL = "prod" -> CHANNEL = "dev"
+  * flash/_internal/channel.py    : CHANNEL = "prod" -> CHANNEL = "dev"
                                     (from which CLI_NAME=flash-dev, DIST_NAME=freesolo-flash-dev,
                                      and the flash-dev.freesolo.co default URL all derive)
 
 It then runs `uv build` to produce sdist + wheel in ./dist.
 
-This MUTATES the working tree in place (pyproject.toml + flash/_channel.py), so run it in a
+This MUTATES the working tree in place (pyproject.toml + flash/_internal/channel.py), so run it in a
 disposable checkout — which is exactly the CI case (.github/workflows/publish-dev.yml and
 publish-image.yml, the latter via `--no-build` since the Docker image needs the source rewrites
 but has no PyPI dist step). The prod build path (uv build with no transform) is unaffected: the
@@ -89,7 +89,7 @@ def rewrite_channel(text: str) -> str:
     )
     if count != 1:
         raise SystemExit(
-            f'expected exactly one `CHANNEL = "prod"` line in flash/_channel.py; found {count}.'
+            f'expected exactly one `CHANNEL = "prod"` line in flash/_internal/channel.py; found {count}.'
         )
     return new_text
 
@@ -97,7 +97,7 @@ def rewrite_channel(text: str) -> str:
 def transform_tree(root: Path) -> str:
     """Apply the dev-channel rewrites in place under ``root``; return the dev version."""
     pyproject = root / "pyproject.toml"
-    channel = root / "flash" / "_channel.py"
+    channel = root / "flash" / "_internal" / "channel.py"
     pyproject_text = pyproject.read_text()
     dev_version = read_dev_version(pyproject_text)
     pyproject.write_text(rewrite_pyproject(pyproject_text, dev_version))

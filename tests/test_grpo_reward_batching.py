@@ -8,7 +8,7 @@ import time
 import pytest
 
 from flash.engine.worker import rl_train
-from flash.engine.worker._pkg import W
+from flash.engine.worker.runtime.pkg_proxy import W
 
 
 @pytest.fixture

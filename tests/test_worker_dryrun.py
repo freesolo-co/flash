@@ -18,7 +18,7 @@ os.environ["SEED"] = "0"
 
 
 def test_on_policy_epochs_resolve_to_prompt_pool_passes():
-    from flash.engine.steps import on_policy_steps
+    from flash.engine.plan.steps import on_policy_steps
 
     assert (
         on_policy_steps(

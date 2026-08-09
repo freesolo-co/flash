@@ -25,28 +25,27 @@ from functools import reduce
 from http.server import BaseHTTPRequestHandler
 from math import gcd
 
-from flash.engine.multiturn_reward_scoring import RolloutScoreRequest, score_rollouts
-from flash.engine.recipe import RECIPE
-from flash.engine.rollout_samples import (
-    sample_completion_text,
-    sanitize_rollout_text,
+from flash.content.structured_outputs import (
+    describe_structured_outputs,
+    parse_structured_outputs,
+    reasoning_parser_for,
 )
-from flash.engine.sft_workload import (
-    _materialize_verl_images,
-    _multimodal_messages_with_images,
-)
-from flash.engine.steps import (
+from flash.core.spec import DEFAULT_CREDIT_ASSIGNMENT, gpu_count_of
+from flash.engine.plan.recipe import RECIPE
+from flash.engine.plan.steps import (
     final_save_due,
     on_policy_steps,
     resolve_update_horizon,
     validate_save_steps,
 )
-from flash.engine.structured_outputs import (
-    describe_structured_outputs,
-    parse_structured_outputs,
-    reasoning_parser_for,
+from flash.engine.profiling.sft_workload import (
+    _materialize_verl_images,
+    _multimodal_messages_with_images,
 )
-from flash.engine.worker._pkg import W as _w
+from flash.engine.result.rollout_samples import (
+    sample_completion_text,
+    sanitize_rollout_text,
+)
 from flash.engine.worker.backend_common import (
     _ORPHANED_PIPE_GRACE_S,
     _TEARDOWN_GRACE_S,
@@ -88,19 +87,18 @@ from flash.engine.worker.backend_common import (
     verl_declares_rollout_field,
     verl_device_capability,
 )
-from flash.engine.worker.heartbeat import (
+from flash.engine.worker.io.heartbeat import (
     GRPO_METRIC_HISTORY_LIMIT,
     LATEST_GRPO_METRICS_LAST,
     RewardObservabilityBuffer,
     join_while_draining,
     liveness_heartbeat,
 )
-from flash.engine.worker.hf import _deployable_adapter_on_hf
-from flash.engine.worker.multiturn_glue import validate_glue_template
-from flash.engine.worker.opd_gkd import generation_eos_from_cached_config
-from flash.engine.worker.packing import model_is_gdn_hybrid
+from flash.engine.worker.io.hf import _deployable_adapter_on_hf
+from flash.engine.worker.model.packing import model_is_gdn_hybrid
 from flash.engine.worker.perf import gpu_diagnostics, wait_for_gpu
-from flash.engine.worker.rng import backend_seed, seed_training_rngs
+from flash.engine.worker.runtime.pkg_proxy import W as _w
+from flash.engine.worker.runtime.rng import backend_seed, seed_training_rngs
 from flash.engine.worker.score_batcher import ScoreBatcher
 from flash.engine.worker.sft_train import (
     _build_verl_child_env,
@@ -109,7 +107,10 @@ from flash.engine.worker.sft_train import (
     _NvidiaSmiPeakSampler,
     _verl_image_message_content,
 )
-from flash.engine.worker.verl_shims import (
+from flash.engine.worker.train.core.child.glue import validate_glue_template
+from flash.engine.worker.train.opd.gkd import generation_eos_from_cached_config
+from flash.engine.worker.train.rl.scoring import RolloutScoreRequest, score_rollouts
+from flash.engine.worker.train.rl.shims import (
     render_entropy_quantile_shim,
     render_exact_save_steps_shim,
     render_image_pad_ban_shim,
@@ -120,7 +121,6 @@ from flash.engine.worker.verl_shims import (
     render_stop_sequences_shim,
     render_structured_outputs_shim,
 )
-from flash.spec import DEFAULT_CREDIT_ASSIGNMENT, gpu_count_of
 
 DATA_SOURCE = "flash_env"
 
@@ -238,7 +238,7 @@ def _processor_expanded_prompt(
     a bare tokenizer undercounts image rows and can admit prompts the engine rejects. returns the
     expanded ids and rendered text so the caller can also inspect the chat template's think span.
     """
-    from flash.multimodal import decode_image_descriptors
+    from flash.content.multimodal import decode_image_descriptors
 
     images = decode_image_descriptors(list(image_descriptors), package_root)
     prepared = _multimodal_messages_with_images(messages, images)
@@ -553,8 +553,8 @@ def resolve_gpu_mem_util(
     if n_gpus > 1 or not (gpu_type or "").strip():
         return _DEFAULT_GPU_MEM_UTIL
     try:
-        from flash.catalog import MODELS
-        from flash.engine.vram import colocate_kv_util, resolve_params_b
+        from flash.core.catalog import MODELS
+        from flash.engine.plan.vram import colocate_kv_util, resolve_params_b
         from flash.providers.base import get_gpu_info
 
         total_vram_gb = float(get_gpu_info(gpu_type).vram_gb)
@@ -719,7 +719,7 @@ def _measured_idle_fraction(
     gpu_seconds = step_wall - reward_s
     if gpu_seconds <= 0:
         return None
-    from flash.engine.reward_profile import gpu_idle_fraction
+    from flash.engine.profiling.reward_profile import gpu_idle_fraction
 
     return gpu_idle_fraction(reward_profile.seconds_per_completion, completions, gpu_seconds)
 
@@ -1079,8 +1079,8 @@ def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_
     advisory only and never fatal.
     """
     try:
-        from flash.engine.reward_profile import call_bounded, profile_reward_latency
-        from flash.multimodal import assistant_completion_text
+        from flash.content.multimodal import assistant_completion_text
+        from flash.engine.profiling.reward_profile import call_bounded, profile_reward_latency
 
         if not getattr(env, "reward_thread_safe", True):
             print(
@@ -1401,10 +1401,12 @@ class MultiTurnBridge:
 # modules, not as a package: flash itself is NOT importable in the verl interpreter (incompatible
 # torch/vllm pins), which is why they are copied rather than imported. same mechanism the opd verl
 # path uses for its own loop.
+# (path relative to flash/engine/worker/, flat name the child imports it under). the child code
+# lives under train/, so these are package-relative paths rather than bare siblings.
 MULTI_TURN_CHILD_MODULES = (
-    ("multiturn_glue.py", "flash_multiturn_glue.py"),
-    ("grpo_multiturn.py", "flash_grpo_multiturn.py"),
-    ("grpo_plugin.py", "flash_grpo_plugin.py"),
+    (os.path.join("train", "core", "child", "glue.py"), "flash_multiturn_glue.py"),
+    (os.path.join("train", "rl", "child", "multiturn.py"), "flash_grpo_multiturn.py"),
+    (os.path.join("train", "rl", "child", "plugin.py"), "flash_grpo_plugin.py"),
 )
 
 
@@ -1894,7 +1896,7 @@ def _resolve_grpo_inputs():
     # adapter's rank/alpha (flash forbids a child lora_rank on warm-start).
     warmstart_adapter = ""
     if _t and getattr(_t, "init_from_adapter", ""):
-        from flash.engine.worker.adapter import _download_adapter
+        from flash.engine.worker.model.adapter import _download_adapter
 
         # a multi-GB adapter pull emits nothing of its own, so it must run under a liveness wrap or
         # the provider judges the silence as a stall.
@@ -1929,7 +1931,7 @@ def _resolve_grpo_inputs():
     rng.shuffle(train)
     message_prompts = [env.prompt_messages(ex) for ex in train]
 
-    from flash.multimodal import (
+    from flash.content.multimodal import (
         normalize_prompt_images,
         record_has_images,
         resolve_image_pad_token_id,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from flash.engine.vram import _LIGER_LONG_CTX_TOKENS
+from flash.engine.plan.vram import _LIGER_LONG_CTX_TOKENS
 from flash.engine.worker.perf.liger import _liger_default_for_model
 
 
@@ -43,13 +43,13 @@ def grad_checkpointing_on(
     )
     if not can_consider_gc_off:
         return True
-    from flash.catalog import MODELS
+    from flash.core.catalog import MODELS
 
     info = MODELS.get(model_id)
     params_b = float(getattr(info, "params_b", 0.0) or 0.0) if info else 0.0
     if params_b <= 0:
         return True
-    from flash.engine.vram import sft_grad_checkpoint_can_disable
+    from flash.engine.plan.vram import sft_grad_checkpoint_can_disable
 
     if sft_grad_checkpoint_can_disable(
         params_b,
@@ -109,7 +109,7 @@ def grpo_use_reentrant(model_id: str) -> bool:
     A non-MoE, non-GDN dense model keeps the faster, lower-overhead non-reentrant path (no catalog
     entry is one today; see ``_is_gdn_hybrid_family``).
     """
-    from flash.catalog import MODELS
+    from flash.core.catalog import MODELS
 
     info = MODELS.get(model_id)
     if info is not None and info.is_moe:

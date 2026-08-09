@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from flash.catalog import MODELS
+from flash.core.catalog import MODELS
 from flash.cost.facts import active_params_b, download_weight_gb, model_quant, total_params_b
 
 
@@ -29,7 +29,7 @@ def test_active_params_defaults_to_total_for_dense(model_id):
 
 
 def test_catalog_dense_active_params_ignore_revision_without_hf_lookup(monkeypatch):
-    import flash.engine.vram as vram
+    import flash.engine.plan.vram as vram
 
     model_id = "Qwen/Qwen3.5-4B"
 
@@ -57,7 +57,7 @@ def test_catalog_moe_classification_never_queries_huggingface(monkeypatch, model
     params over HF is unreachable, so "ignores the revision" is now enforced by the signature rather
     than by a test. What still needs guarding is that classification stays offline.
     """
-    import flash.engine.vram as vram
+    import flash.engine.plan.vram as vram
     from flash.cost.analytical import _is_moe
 
     def _boom(*_args, **_kwargs):
@@ -99,7 +99,7 @@ def test_download_weight_gb_is_total_params_bf16():
 def test_an_uncataloged_model_is_rejected(monkeypatch):
     # Fail closed: an id with no catalog entry raises rather than being priced as free. Even with
     # HF reachable it must not be sized over the network -- a quote is a catalog read, full stop.
-    import flash.engine.vram as vram
+    import flash.engine.plan.vram as vram
 
     monkeypatch.setattr(vram, "fetch_hf_params_b", lambda *_a, **_k: 8.03, raising=False)
     with pytest.raises(ValueError, match="cost estimation supports catalog models only"):
@@ -110,7 +110,7 @@ def test_an_uncataloged_model_is_rejected(monkeypatch):
 
 def test_a_catalog_model_is_never_sized_over_the_network(monkeypatch):
     """Pricing reads the curated entry and nothing else: no quote may depend on hub reachability."""
-    import flash.engine.vram as vram
+    import flash.engine.plan.vram as vram
 
     def _boom(*_args, **_kwargs):
         raise AssertionError("a catalog model must be sized from the catalog, with no HF call")
@@ -121,7 +121,7 @@ def test_a_catalog_model_is_never_sized_over_the_network(monkeypatch):
 
 def _stub_geometry(monkeypatch, model_id: str, calls: list):
     """Answer the pinned-geometry fetch with the catalog's own numbers, counting each call."""
-    import flash.engine.vram as vram
+    import flash.engine.plan.vram as vram
 
     info = MODELS[model_id]
 
@@ -158,7 +158,7 @@ def test_a_failed_pinned_lookup_is_not_cached(monkeypatch):
     A failure is a rate limit or an ungranted token, not a fact about the model -- caching it would
     keep rejecting a valid pin until the plane restarted, indistinguishable from a real defect.
     """
-    import flash.engine.vram as vram
+    import flash.engine.plan.vram as vram
     from flash.cost import facts
 
     monkeypatch.setattr(facts, "_PINNED_SIZE_MEMO", {})

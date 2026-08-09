@@ -13,11 +13,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from flash.server import db
+from flash.server.platform import db
 
 
 def _initialize_fresh_database_process(path: str, barrier, results) -> None:
-    from flash.server import db as process_db
+    from flash.server.platform import db as process_db
 
     real_connect = sqlite3.connect
     synchronized = False
@@ -532,15 +532,15 @@ def test_me_surfaces_verify_identity_fields_through_api(tmp_path, monkeypatch) -
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
-    # runpod.keys caches the parsed pool on first read; reset so the startup preflight reads THIS
+    # runpod.auth caches the parsed pool on first read; reset so the startup preflight reads THIS
     # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make the fixture self-contained).
-    import flash.providers.runpod.keys as runpod_keys
+    import flash.providers.runpod.auth as runpod_keys
 
     runpod_keys.reset()
 
     import flash.runner as runner
-    import flash.server.auth as auth_mod
-    import flash.server.db as db_mod
+    import flash.server.platform.auth as auth_mod
+    import flash.server.platform.db as db_mod
 
     importlib.reload(runner)
     importlib.reload(auth_mod)

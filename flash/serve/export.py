@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 from typing import BinaryIO
 
-from flash._logging import get_logger
+from flash._internal.logging import get_logger
 from flash.serve.deploy import ServingError
 
 logger = get_logger(__name__)
@@ -29,7 +29,7 @@ _TEMP_MERGED_BASE_MODEL_RE = re.compile(
 )
 _MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024
 
-# exclude non-language-model paths like `flash/engine/worker/lora.py` does. preserve mixed
+# exclude non-language-model paths like `flash/engine/worker/model/lora.py` does. preserve mixed
 # namespaces only for a nonzero LoRA-B contribution or an unrecognized non-LM tensor; inert entries
 # alone do not prove those modules were trained.
 _NON_LM_KEY_SEGMENTS = (".visual.", ".vision_tower.", ".multi_modal_projector.", ".mtp.")
@@ -76,7 +76,7 @@ def _non_lm_tensor_is_live(
 
 
 def _strip_language_model_infix(key: str) -> str:
-    # mirrors _LANGUAGE_MODEL_INFIX namespace semantics in flash/engine/worker/lora.py
+    # mirrors _LANGUAGE_MODEL_INFIX namespace semantics in flash/engine/worker/model/lora.py
     infix = ".language_model."
     index = key.find(infix)
     if index == -1:

@@ -12,7 +12,7 @@ from typing import ClassVar
 
 import pytest
 
-from flash.server import auth
+from flash.server.platform import auth
 
 
 @pytest.fixture(autouse=True)
@@ -65,7 +65,7 @@ def test_standalone_rejects_an_external_token_instead_of_trusting_it(monkeypatch
 
 def test_standalone_accepts_the_operator_key_as_internal(monkeypatch, tmp_path) -> None:
     """The operator key is the whole trust boundary of a standalone plane, so it must still work."""
-    from flash.server import db
+    from flash.server.platform import db
 
     monkeypatch.setenv(auth.STANDALONE_ENV, "1")
     monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key")
@@ -89,7 +89,7 @@ def test_standalone_disables_backend_reporting_at_the_shared_gate(monkeypatch) -
     that key, so without this they would all POST the operator's key to api.freesolo.co and log a
     warning per run. One gate, so the reporters cannot drift apart.
     """
-    from flash.server._internal_client import internal_key
+    from flash.server.platform.internal_client import internal_key
 
     monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key")
     monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
@@ -101,8 +101,8 @@ def test_standalone_disables_backend_reporting_at_the_shared_gate(monkeypatch) -
 
 def test_standalone_disables_the_backend_polling_loops(monkeypatch) -> None:
     """Cost reconciliation and charge retry poll on a timer against a backend that isn't there."""
-    from flash.server.billing_retry import charge_retry_enabled
-    from flash.server.reconcile import reconcile_enabled
+    from flash.server.billing.retry import charge_retry_enabled
+    from flash.server.domain.reconcile import reconcile_enabled
 
     monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key")
     monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
@@ -120,7 +120,7 @@ def test_standalone_disables_the_artifact_gc_sweep(monkeypatch) -> None:
     it confirms the live set against the hosted serving registry before deleting. It can only ever
     delete inside the hardcoded Freesolo-Co/flashrun-* allowlist, which a self-hoster's token does
     not own, so standalone loses nothing by skipping it."""
-    from flash.server.repo_cleanup import repo_cleanup_enabled
+    from flash.server.domain.repo_cleanup import repo_cleanup_enabled
 
     monkeypatch.setenv("HF_TOKEN", "hf-operator-token")
     monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
@@ -238,7 +238,7 @@ def test_standalone_operator_key_survives_surrounding_whitespace(monkeypatch, tm
     """The preflight tests the STRIPPED value, so an env file with a trailing newline starts a plane
     that then rejects the only credential it accepts -- every request 401 behind a preflight that
     reported success. Both sides strip, so startup and authentication agree."""
-    from flash.server import db
+    from flash.server.platform import db
 
     monkeypatch.setenv(auth.STANDALONE_ENV, "1")
     monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key\n")
@@ -263,7 +263,7 @@ def test_artifact_namespace_is_operator_configurable(monkeypatch) -> None:
     the assignment runs on every submit, and a self-hoster cannot create Freesolo-Co/flashrun-*, so
     the run died at upload before training started."""
     from flash import runner
-    from flash.server import repo_cleanup
+    from flash.server.domain import repo_cleanup
 
     monkeypatch.delenv("FLASH_HF_NAMESPACE", raising=False)
     assert runner.artifact_namespace() == runner._DEFAULT_ARTIFACT_NAMESPACE
@@ -286,7 +286,7 @@ def test_a_whitespace_only_provider_key_reads_as_unconfigured(monkeypatch) -> No
     """`is_configured()` decides whether a provider is advertised to the allocator and whether the
     startup preflight passes. A whitespace-only key (a stray newline in an env file) must not make
     a plane advertise a substrate every allocation then fails on."""
-    from flash.providers._auth import load_provider_key
+    from flash.providers._lifecycle.auth import load_provider_key
 
     monkeypatch.setenv("LAMBDA_API_KEY", "   \n ")
     assert load_provider_key("LAMBDA_API_KEY") is None
@@ -301,7 +301,7 @@ def test_standalone_does_not_charge_a_recovered_managed_run(monkeypatch, tmp_pat
     carries a managed-mode billing_context. Charging it would send the operator's key to
     FREESOLO_BASE_URL and bill an organization this plane has no relationship with, so the inline
     charge has to read the SHARED gate rather than the env var directly."""
-    from flash.runner import lifecycle
+    from flash.runner.supervise import lifecycle
 
     charged: list[str] = []
 
@@ -350,7 +350,7 @@ def test_standalone_run_ownership_survives_operator_key_rotation(monkeypatch, tm
     for the new credential to stop it, so rotating a COMPROMISED key was the thing that cost you
     control of the plane.
     """
-    from flash.server import db
+    from flash.server.platform import db
 
     monkeypatch.setenv(auth.STANDALONE_ENV, "1")
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
@@ -376,7 +376,7 @@ def test_standalone_run_ownership_survives_operator_key_rotation(monkeypatch, tm
 
 def test_the_standalone_owner_row_is_not_reachable_by_presenting_a_token(monkeypatch, tmp_path):
     """The owner row is keyed on a sentinel, not a hash, so no token can resolve to it directly."""
-    from flash.server import db
+    from flash.server.platform import db
 
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
     owner = db.ensure_standalone_owner()
@@ -404,7 +404,7 @@ def test_adoption_does_not_write_once_every_run_is_already_owned(monkeypatch, tm
     Counted at the sqlite layer rather than timed: a timing assertion on a small fixture is noise,
     and asserting "no write was issued" is what actually distinguishes the implementations.
     """
-    from flash.server import db
+    from flash.server.platform import db
 
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
 
@@ -456,7 +456,7 @@ def test_the_owner_row_is_still_provisioned_on_a_cold_database(monkeypatch, tmp_
     """The counterpart to the steady-state check above: the owner INSERT sits behind a read now,
     so a database that has never seen it must still get one -- and the first call is the only
     chance, since nothing else provisions that row."""
-    from flash.server import db
+    from flash.server.platform import db
 
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
 
@@ -610,7 +610,7 @@ def test_a_blank_github_token_is_not_forwarded_as_a_credential(monkeypatch) -> N
     whitespace-only GITHUB_TOKEN makes PUBLIC environment repos fail -- repos that load fine with
     no token at all. Every consumer must read blank as absent."""
     from flash.envs import loader
-    from flash.server import envs as server_envs
+    from flash.server.domain import envs as server_envs
 
     monkeypatch.setenv("GITHUB_TOKEN", "   \n  ")
     assert loader._github_token() is None
@@ -628,8 +628,8 @@ def test_a_blank_github_token_is_not_forwarded_as_a_credential(monkeypatch) -> N
 def test_a_blank_github_token_is_not_shipped_to_the_worker(monkeypatch) -> None:
     """The worker's git askpass branches on presence, so forwarding a blank token turns an
     anonymous public clone into an authenticated one with an invalid credential."""
-    from flash.providers._worker import build_worker_env
-    from flash.spec import JobSpec, TrainSpec
+    from flash.core.spec import JobSpec, TrainSpec
+    from flash.providers._lifecycle.worker import build_worker_env
 
     spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
@@ -672,7 +672,7 @@ def test_the_serving_repos_are_not_on_the_training_path() -> None:
     """
     import pathlib
 
-    from flash.catalog import MODELS, SERVING_MODEL_REPOS
+    from flash.core.catalog import MODELS, SERVING_MODEL_REPOS
 
     root = pathlib.Path(__file__).resolve().parent.parent / "flash"
     # every module that runs while a job trains -- allocation, launch, the worker itself.
@@ -704,7 +704,7 @@ def test_enabling_standalone_adopts_runs_already_in_the_store(monkeypatch, tmp_p
     Adoption is sound because standalone is SINGLE-TENANT: one principal, so every run in this
     store is already the operator's and there is no second identity to take a run away from.
     """
-    from flash.server import db
+    from flash.server.platform import db
 
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
     monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key")
@@ -738,7 +738,7 @@ def test_enabling_standalone_adopts_runs_already_in_the_store(monkeypatch, tmp_p
 def test_managed_mode_never_reassigns_a_users_run(monkeypatch, tmp_path) -> None:
     """The adoption above is standalone-ONLY. In managed mode two identities coexist, so pulling
     runs onto one row would hand another user's run to the internal key."""
-    from flash.server import db
+    from flash.server.platform import db
 
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
     monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key")
@@ -766,7 +766,7 @@ def _deps_module():
     so these tests really run there; a client-only checkout skips instead of failing on an optional
     dependency it was never expected to have."""
     pytest.importorskip("fastapi")
-    from flash.server import _deps
+    from flash.server.platform import deps as _deps
 
     return _deps
 

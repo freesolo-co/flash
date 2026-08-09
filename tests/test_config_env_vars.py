@@ -17,12 +17,12 @@ import sys
 
 import pytest
 
-from flash import _logging as flash_logging
-from flash._paths import DATA_DIR_ENV, data_dir
+from flash._internal import logging as flash_logging
+from flash._internal.paths import DATA_DIR_ENV, data_dir
 
 # Modules that read the data dir at import time. Resolution is centralized, but these bind the
 # result to a module constant, so the subprocess probes below re-import rather than reload.
-_STATE_MODULES = ("flash.client.config", "flash.runner", "flash.server.db")
+_STATE_MODULES = ("flash.client.config", "flash.runner", "flash.server.platform.db")
 
 
 def _resolve_paths_in(env_overrides: dict[str, str]) -> dict[str, str]:
@@ -34,8 +34,8 @@ def _resolve_paths_in(env_overrides: dict[str, str]) -> dict[str, str]:
     """
     code = (
         "import json\n"
-        "import flash.client.config as c, flash.runner as r, flash.server.db as d\n"
-        "from flash._paths import data_dir\n"
+        "import flash.client.config as c, flash.runner as r, flash.server.platform.db as d\n"
+        "from flash._internal.paths import data_dir\n"
         "print(json.dumps({\n"
         "  'config': str(c.CONFIG_PATH),\n"
         "  'config_dir': str(c.CONFIG_DIR),\n"
@@ -304,13 +304,13 @@ class TestServerBind:
 
 class TestSqliteBusyTimeout:
     def test_default_is_the_previous_thirty_seconds(self, monkeypatch):
-        from flash.server import db
+        from flash.server.platform import db
 
         monkeypatch.delenv(db.BUSY_TIMEOUT_ENV, raising=False)
         assert db.busy_timeout_s() == 30.0
 
     def test_env_var_sets_the_timeout(self, monkeypatch):
-        from flash.server import db
+        from flash.server.platform import db
 
         monkeypatch.setenv(db.BUSY_TIMEOUT_ENV, "120")
         assert db.busy_timeout_s() == 120.0
@@ -318,7 +318,7 @@ class TestSqliteBusyTimeout:
     @pytest.mark.parametrize("value", ["abc", "0", "-5"])
     def test_unusable_value_keeps_the_default(self, monkeypatch, value):
         """A zero or negative timeout would turn ordinary contention into failed API calls."""
-        from flash.server import db
+        from flash.server.platform import db
 
         monkeypatch.setenv(db.BUSY_TIMEOUT_ENV, value)
         assert db.busy_timeout_s() == 30.0
@@ -329,7 +329,7 @@ class TestSqliteBusyTimeout:
         Missing one leaves a deployment that raised the timeout still failing on whichever path
         was overlooked, which is indistinguishable from the variable not working.
         """
-        from flash.server import db
+        from flash.server.platform import db
 
         monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
         monkeypatch.setenv(db.BUSY_TIMEOUT_ENV, "7")

@@ -41,7 +41,7 @@ def sft_profile_for(spec: Any, *, input_digest: str, producer_version: str):
     digest, producer version, tokenizer revision -- and the internal consistency the schema
     enforces.
     """
-    from flash.workload_profile import SftWorkloadProfile, sft_sample_policy
+    from flash.engine.profiling.workload_profile import SftWorkloadProfile, sft_sample_policy
 
     train = spec.train
     retained = max(1, int(train.max_examples or 8))
@@ -93,7 +93,7 @@ def stub_revision_geometry(monkeypatch) -> None:
     numbers, which is what a matching pin resolves to anyway; revision geometry has its own
     dedicated coverage.
     """
-    from flash.engine import vram
+    from flash.engine.plan import vram
 
     monkeypatch.setattr(
         vram,
@@ -117,7 +117,7 @@ def attach_sft_profile(spec: Any) -> Any:
     from dataclasses import replace as _replace
 
     from flash import __version__
-    from flash.workload_profile import sft_profile_input_digest
+    from flash.engine.profiling.workload_profile import sft_profile_input_digest
 
     pinned = _pin_env_revision(_pin_model_revision(spec))
     if not pinned.environment.id:
@@ -153,7 +153,7 @@ def record_sft_profile(runner, spec: Any) -> str:
     runner's own state store -- and pass the same shas the runner will resolve, because a digest
     keyed on anything else is exactly the mismatch the gate is built to reject.
     """
-    from flash.workload_profile import (
+    from flash.engine.profiling.workload_profile import (
         SFT_PROFILE_KIND,
         sft_profile_input_digest,
         sft_profile_run_id,

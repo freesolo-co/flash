@@ -7,7 +7,7 @@ import os
 import pytest
 
 import flash.providers.preflight as pf
-import flash.providers.runpod.keys as runpod_keys
+import flash.providers.runpod.auth as runpod_keys
 
 # Credentials every control plane needs regardless of which GPU substrate it runs on.
 _ALWAYS_REQUIRED = (

@@ -9,7 +9,7 @@ GC on for the 80 GB H100 / long context / unknown dims, and never touches the co
 
 from __future__ import annotations
 
-from flash.engine.vram import sft_gc_off_peak_gb, sft_grad_checkpoint_can_disable
+from flash.engine.plan.vram import sft_gc_off_peak_gb, sft_grad_checkpoint_can_disable
 from flash.engine.worker.perf.memory import grad_checkpointing_on
 
 # Qwen3.6-35B-A3B real architecture dims (from its config.json text_config).
@@ -22,7 +22,7 @@ def test_active_params_resolution_is_null_safe():
     # allocation path, where a stale id should degrade to the dense default rather than abort.
     import pytest
 
-    from flash.catalog import MODELS, get_model
+    from flash.core.catalog import MODELS, get_model
 
     unknown_id = "some/unknown-model"
     with pytest.raises(ValueError, match="unsupported model"):
@@ -104,7 +104,7 @@ def test_dense_and_moe_activation_constants_are_separate():
     35B-A3B -- the only model whose truthy ``active_params_b`` reaches this gate -- from GC-off to
     GC-on at seq >= 2048 and pay ~+33% compute per step on evidence from a different architecture.
     """
-    from flash.engine.vram import _GC_OFF_ACT_K_DENSE, _GC_OFF_ACT_K_MOE
+    from flash.engine.plan.vram import _GC_OFF_ACT_K_DENSE, _GC_OFF_ACT_K_MOE
 
     assert _GC_OFF_ACT_K_DENSE > _GC_OFF_ACT_K_MOE
     # same geometry, same params: only the MoE signal differs -> the dense estimate must be larger.
@@ -263,7 +263,7 @@ def test_grpo_use_reentrant_false_for_non_gdn_dense():
 
 
 def test_is_moe_property():
-    from flash.catalog import MODELS
+    from flash.core.catalog import MODELS
 
     assert MODELS["Qwen/Qwen3.6-35B-A3B"].is_moe is True
     # every dense entry: active_params_b defaults to 0.0

@@ -3,7 +3,7 @@
 The published worker image ships DEPS only — the flash code (incl. kernel_warmup.py) is fetched from
 HF at runtime, exactly like a real worker. So this entry:
   1. snapshot_downloads the flash package (code/**) the CI helper uploaded to a temp HF dataset,
-  2. runs flash.engine.worker.kernel_warmup --arch <arch> --out /out on the live GPU,
+  2. runs flash.engine.worker.runtime.kernel_warmup --arch <arch> --out /out on the live GPU,
   3. uploads the produced /out (mega_cache.bin + .json + triton/inductor trees) back under out/,
   4. writes an out/STATUS marker LAST so the helper knows the run finished (and its rc).
 
@@ -65,7 +65,7 @@ def main() -> int:
     )
 
     env = {**os.environ, "PYTHONPATH": "/runcode/code"}
-    cmd = [sys.executable, "-m", "flash.engine.worker.kernel_warmup", "--out", "/out"]
+    cmd = [sys.executable, "-m", "flash.engine.worker.runtime.kernel_warmup", "--out", "/out"]
     if arch:
         cmd += ["--arch", arch]
     print(f"[bake] running: {' '.join(cmd)}", flush=True)

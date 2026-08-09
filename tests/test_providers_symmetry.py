@@ -36,7 +36,7 @@ PROVIDER_METHODS = (
 )
 
 
-_PKG = {"runpod": "runpod", "lambda": "lambdalabs", "vast": "vast"}
+_PKG = {"runpod": "runpod", "lambda": "lambda_", "vast": "vast"}
 
 
 def test_registry_lists_all_providers():
@@ -87,7 +87,7 @@ def test_method_signatures_match_runpod(provider):
 
 def test_setup_vs_training_gate_contract():
     """define the canonical setup-vs-training classifier contract used by provider polling."""
-    from flash.providers._poll import (
+    from flash.providers._lifecycle.poll import (
         SETUP_HEARTBEAT_STAGES,
         STEP_GATED_STAGES,
         is_training_heartbeat,
@@ -110,7 +110,7 @@ def test_setup_vs_training_gate_contract():
 
 
 def test_format_heartbeat_includes_rl_step_metrics():
-    from flash.providers._poll import _format_heartbeat
+    from flash.providers._lifecycle.poll import _format_heartbeat
 
     rendered = _format_heartbeat(
         {
@@ -378,8 +378,8 @@ def test_the_key_sent_on_the_wire_is_the_key_preflight_accepted(monkeypatch, pro
     """
     import urllib.request
 
-    from flash.providers._auth import load_provider_key
-    from flash.providers._http import RestClient
+    from flash.providers._lifecycle.auth import load_provider_key
+    from flash.providers._lifecycle.http import RestClient
 
     padded = "\n  key-with-padding  \n"
     monkeypatch.setenv(env_var, padded)

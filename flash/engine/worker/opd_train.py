@@ -18,19 +18,18 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
-from flash.engine.recipe import RECIPE
-from flash.engine.sft_workload import (
-    _materialize_verl_images,
-    _multimodal_messages_with_images,
-)
-from flash.engine.steps import (
+from flash.content.structured_outputs import reasoning_parser_for
+from flash.engine.plan.recipe import RECIPE
+from flash.engine.plan.steps import (
     final_save_due,
     on_policy_steps,
     resolve_update_horizon,
     validate_save_steps,
 )
-from flash.engine.structured_outputs import reasoning_parser_for
-from flash.engine.worker._pkg import W as _w
+from flash.engine.profiling.sft_workload import (
+    _materialize_verl_images,
+    _multimodal_messages_with_images,
+)
 from flash.engine.worker.backend_common import (
     BoundedThreadingHTTPServer,
     ChildOutputTail,
@@ -60,26 +59,14 @@ from flash.engine.worker.backend_common import (
     verl_device_capability,
     verl_step_number,
 )
-from flash.engine.worker.heartbeat import liveness_heartbeat
-from flash.engine.worker.multiturn_glue import (
-    EnvGlueTokenizer,
-    dedup_seam_terminator,
-    validate_glue_template,
-    validate_transcript_messages,
-)
-from flash.engine.worker.opd import (
+from flash.engine.worker.entry.opd import (
     _drop_fully_forced_groups,
     _resolve_opd_knobs,
     _thinking_prefill_text,
 )
-from flash.engine.worker.opd_gkd import (
-    _rollout_terminated,
-    _teacher_prompt_text,
-    _trim_trailing_stop,
-    generation_eos_from_cached_config,
-    student_tokens_with_offsets,
-)
-from flash.engine.worker.rng import seed_training_rngs
+from flash.engine.worker.io.heartbeat import liveness_heartbeat
+from flash.engine.worker.runtime.pkg_proxy import W as _w
+from flash.engine.worker.runtime.rng import seed_training_rngs
 from flash.engine.worker.score_batcher import ScoreBatcher
 from flash.engine.worker.sft_train import (
     _build_verl_child_env,
@@ -93,18 +80,34 @@ from flash.engine.worker.sft_train import (
     _VerlCheckpointWatcher,
     _warmstart_adapter_path,
 )
-from flash.engine.worker.teacher import (
+from flash.engine.worker.teacher.client import (
     _MAX_LOGPROB_ROUNDING_ERROR,
     TeacherError,
     TeacherScore,
 )
-from flash.engine.worker.tokenizer_align import (
+from flash.engine.worker.teacher.tokenizer_align import (
     TeacherToken,
     groupwise_alignment,
     groupwise_coverage,
 )
-from flash.opd_limits import OPD_TEACHER_SCORING_CONCURRENCY
-from flash.opd_retry_contract import OPD_RESUME_STATE_VERSION, validate_opd_resume_state_metadata
+from flash.engine.worker.train.core.child.glue import (
+    EnvGlueTokenizer,
+    dedup_seam_terminator,
+    validate_glue_template,
+    validate_transcript_messages,
+)
+from flash.engine.worker.train.opd.gkd import (
+    _rollout_terminated,
+    _teacher_prompt_text,
+    _trim_trailing_stop,
+    generation_eos_from_cached_config,
+    student_tokens_with_offsets,
+)
+from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
+from flash.teacher.retry_contract import (
+    OPD_RESUME_STATE_VERSION,
+    validate_opd_resume_state_metadata,
+)
 
 _PERMANENT_TEACHER_EXIT = 86
 _TRANSIENT_TEACHER_EXIT = 87
@@ -344,7 +347,7 @@ def _processor_expanded_prompt_ids(
     *,
     enable_thinking: bool,
 ) -> tuple[int, ...]:
-    from flash.multimodal import decode_image_descriptors
+    from flash.content.multimodal import decode_image_descriptors
 
     images = decode_image_descriptors(list(image_descriptors), package_root)
     prepared = _multimodal_messages_with_images(messages, images)
@@ -2078,13 +2081,13 @@ def _processed_resume_steps(required_steps: tuple[int, ...], resume_step: int) -
 
 def run_opd_train(spec=None) -> None:
     """Run flash OPD through verl's native rollout and weight-sync path."""
-    from flash.engine.worker.teacher import TeacherClient
-    from flash.multimodal import (
+    from flash.content.multimodal import (
         image_teacher_prompt_messages,
         normalize_prompt_images,
         record_has_images,
         validate_multimodal_training,
     )
+    from flash.engine.worker.teacher.client import TeacherClient
 
     spec = spec or _w.JOB_SPEC
     env = _w.require_active_env()
@@ -2115,7 +2118,7 @@ def run_opd_train(spec=None) -> None:
         )
     model_id = spec.model if spec else RECIPE.hf_model_id
     model_revision = getattr(spec, "model_revision", "") if spec else ""
-    from flash.opd_validation import validate_opd_structured_outputs
+    from flash.engine.worker.train.opd.validation import validate_opd_structured_outputs
 
     structured_validation = validate_opd_structured_outputs(
         knobs.structured_outputs,
@@ -2156,7 +2159,7 @@ def run_opd_train(spec=None) -> None:
     # validate the control-panel broker transport before the gpu probe and model prefetch so a malformed
     # attempt fails
     # before any additional paid setup. raw managed-teacher provider credentials never enter the worker.
-    from flash.spec import CONTROL_PANEL_URL_ENV, TEACHER_CAPABILITY_ENV
+    from flash.core.spec import CONTROL_PANEL_URL_ENV, TEACHER_CAPABILITY_ENV
 
     control_panel_url = os.environ.get(CONTROL_PANEL_URL_ENV, "").strip()
     capability = os.environ.get(TEACHER_CAPABILITY_ENV, "").strip()
@@ -2359,7 +2362,7 @@ def run_opd_train(spec=None) -> None:
         # model_is_gdn_hybrid already returns False on its own probe failure, so it needs no guard.
         # the modeling module is resolved HERE, in the parent, because it needs a hub/cache read the
         # child must not repeat; "" skips the gdn question for a non-hybrid.
-        from flash.engine.worker.packing import model_is_gdn_hybrid
+        from flash.engine.worker.model.packing import model_is_gdn_hybrid
 
         gdn_hybrid = model_is_gdn_hybrid(model_id, revision=model_revision)
         gdn_module = gdn_probe_module(model_id, model_revision) if gdn_hybrid else ""
@@ -2399,20 +2402,22 @@ def run_opd_train(spec=None) -> None:
     attention_backend, mm_encoder_attn_backend = resolve_blackwell_attention_backends(caps, verl_cc)
 
     plugin_path = os.path.join(shim_dir, "flash_opd_plugin.py")
-    shutil.copy2(os.path.join(os.path.dirname(__file__), "opd_plugin.py"), plugin_path)
+    shutil.copy2(
+        os.path.join(os.path.dirname(__file__), "train", "opd", "child", "plugin.py"), plugin_path
+    )
     structured_helper_path = os.path.join(shim_dir, "flash_opd_structured.py")
     shutil.copy2(
-        os.path.join(os.path.dirname(__file__), "opd_structured.py"),
+        os.path.join(os.path.dirname(__file__), "train", "opd", "child", "structured.py"),
         structured_helper_path,
     )
     multiturn_helper_path = os.path.join(shim_dir, "flash_opd_multiturn.py")
     shutil.copy2(
-        os.path.join(os.path.dirname(__file__), "opd_multiturn.py"),
+        os.path.join(os.path.dirname(__file__), "train", "opd", "child", "multiturn.py"),
         multiturn_helper_path,
     )
     glue_helper_path = os.path.join(shim_dir, "flash_multiturn_glue.py")
     shutil.copy2(
-        os.path.join(os.path.dirname(__file__), "multiturn_glue.py"),
+        os.path.join(os.path.dirname(__file__), "train", "core", "child", "glue.py"),
         glue_helper_path,
     )
     entry_path = os.path.join(shim_dir, "flash_opd_entry.py")

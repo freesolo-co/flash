@@ -32,7 +32,7 @@ def _http_error(code: int, body: bytes = b"{}"):
 # keys.py — parsing, ordering, failover advance, env collapse
 # ---------------------------------------------------------------------------
 def test_single_key_pool(monkeypatch):
-    import flash.providers.runpod.keys as keys
+    import flash.providers.runpod.auth as keys
 
     monkeypatch.setenv("RUNPOD_API_KEY", "rk-solo")
     keys.reset()
@@ -44,7 +44,7 @@ def test_single_key_pool(monkeypatch):
 
 
 def test_comma_separated_pool_parsed_and_trimmed(monkeypatch):
-    import flash.providers.runpod.keys as keys
+    import flash.providers.runpod.auth as keys
 
     monkeypatch.setenv("RUNPOD_API_KEY", " rk-a , rk-b ,, rk-c ")
     keys.reset()
@@ -55,7 +55,7 @@ def test_comma_separated_pool_parsed_and_trimmed(monkeypatch):
 def test_advance_collapses_env_and_reorders(monkeypatch):
     import os
 
-    import flash.providers.runpod.keys as keys
+    import flash.providers.runpod.auth as keys
 
     monkeypatch.setenv("RUNPOD_API_KEY", "rk-a,rk-b")
     keys.reset()
@@ -83,7 +83,7 @@ def test_advance_key_count_bound_visits_every_account_from_any_start(monkeypatch
     OTHER account exactly once — from ANY starting account, including mid-pool (a prior run may have
     left the pointer advanced). This is the contract deploy_train_endpoint relies on; a wrap-to-0
     'exhaustion' heuristic would wrongly stop a mid-pool failover before the wrapped-over keys."""
-    import flash.providers.runpod.keys as keys
+    import flash.providers.runpod.auth as keys
 
     monkeypatch.setenv("RUNPOD_API_KEY", "rk-a,rk-b,rk-c")
     keys.reset()
@@ -106,7 +106,7 @@ def test_advance_key_count_bound_visits_every_account_from_any_start(monkeypatch
 def test_select_active_collapses_env(monkeypatch):
     import os
 
-    import flash.providers.runpod.keys as keys
+    import flash.providers.runpod.auth as keys
 
     monkeypatch.setenv("RUNPOD_API_KEY", "rk-a,rk-b")
     keys.reset()
@@ -116,7 +116,7 @@ def test_select_active_collapses_env(monkeypatch):
 
 
 def test_no_key_pool(monkeypatch):
-    import flash.providers.runpod.keys as keys
+    import flash.providers.runpod.auth as keys
 
     monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
     keys.reset()
@@ -128,7 +128,7 @@ def test_no_key_pool(monkeypatch):
 
 
 def test_is_failover_error(monkeypatch):
-    import flash.providers.runpod.keys as keys
+    import flash.providers.runpod.auth as keys
 
     def with_cause(code):
         try:
@@ -160,7 +160,7 @@ def test_is_failover_error(monkeypatch):
 # ---------------------------------------------------------------------------
 def _fake_urlopen_by_key(monkeypatch, behavior):
     """Route urlopen by the bearer key. ``behavior(key) -> bytes | Exception``."""
-    from flash.providers import _http
+    from flash.providers._lifecycle import http as _http
 
     seen = []
 
@@ -179,7 +179,7 @@ def _fake_urlopen_by_key(monkeypatch, behavior):
 
 def test_rest_waterfall_fails_over_on_401(monkeypatch):
     import flash.providers.runpod.api as runpod_api
-    import flash.providers.runpod.keys as keys
+    import flash.providers.runpod.auth as keys
 
     monkeypatch.setenv("RUNPOD_API_KEY", "rk-bad,rk-good")
     keys.reset()
@@ -195,7 +195,7 @@ def test_rest_waterfall_fails_over_on_401(monkeypatch):
 
 def test_rest_waterfall_single_key_does_not_swallow_4xx(monkeypatch):
     import flash.providers.runpod.api as runpod_api
-    import flash.providers.runpod.keys as keys
+    import flash.providers.runpod.auth as keys
 
     monkeypatch.setenv("RUNPOD_API_KEY", "rk-only")
     keys.reset()
@@ -207,7 +207,7 @@ def test_rest_waterfall_single_key_does_not_swallow_4xx(monkeypatch):
 
 def test_rest_waterfall_hard_4xx_not_retried_across_keys(monkeypatch):
     import flash.providers.runpod.api as runpod_api
-    import flash.providers.runpod.keys as keys
+    import flash.providers.runpod.auth as keys
 
     monkeypatch.setenv("RUNPOD_API_KEY", "rk-a,rk-b")
     keys.reset()
@@ -220,7 +220,7 @@ def test_rest_waterfall_hard_4xx_not_retried_across_keys(monkeypatch):
 
 def test_rest_waterfall_all_keys_exhausted_raises(monkeypatch):
     import flash.providers.runpod.api as runpod_api
-    import flash.providers.runpod.keys as keys
+    import flash.providers.runpod.auth as keys
 
     monkeypatch.setenv("RUNPOD_API_KEY", "rk-a,rk-b")
     keys.reset()
@@ -237,7 +237,7 @@ def test_rest_waterfall_persistent_429_fails_over(monkeypatch):
     failover predicate can see the 429 status — otherwise it stops on the first account.
     """
     import flash.providers.runpod.api as runpod_api
-    import flash.providers.runpod.keys as keys
+    import flash.providers.runpod.auth as keys
 
     monkeypatch.setenv("RUNPOD_API_KEY", "rk-a,rk-b")
     keys.reset()
@@ -253,7 +253,7 @@ def test_rest_waterfall_persistent_429_fails_over(monkeypatch):
 def test_rest_waterfall_persistent_5xx_does_not_fail_over(monkeypatch):
     """A 5xx is a server-side error (same on every account) -> do NOT try the next key."""
     import flash.providers.runpod.api as runpod_api
-    import flash.providers.runpod.keys as keys
+    import flash.providers.runpod.auth as keys
 
     monkeypatch.setenv("RUNPOD_API_KEY", "rk-a,rk-b")
     keys.reset()
@@ -275,7 +275,7 @@ def test_rest_waterfall_persistent_5xx_does_not_fail_over(monkeypatch):
 def test_list_endpoints_aggregates_across_all_keys(monkeypatch):
     """Endpoints from every account are merged into a single list."""
     import flash.providers.runpod.api as runpod_api
-    import flash.providers.runpod.keys as keys
+    import flash.providers.runpod.auth as keys
 
     monkeypatch.setenv("RUNPOD_API_KEY", "rk-a,rk-b")
     keys.reset()
@@ -300,7 +300,7 @@ def test_list_endpoints_aggregates_across_all_keys(monkeypatch):
 def test_list_endpoints_raises_when_any_key_fails(monkeypatch):
     """A per-key failure propagates so callers don't act on a partial view."""
     import flash.providers.runpod.api as runpod_api
-    import flash.providers.runpod.keys as keys
+    import flash.providers.runpod.auth as keys
 
     monkeypatch.setenv("RUNPOD_API_KEY", "rk-a,rk-b")
     keys.reset()
@@ -321,7 +321,7 @@ def test_list_endpoints_raises_when_no_key_configured(monkeypatch):
     """No RUNPOD_API_KEY -> raise instead of returning [] without any authenticated call. Callers
     (teardown/idle reaper) treat [] as 'fleet confirmed empty' and would act on a false view."""
     import flash.providers.runpod.api as runpod_api
-    import flash.providers.runpod.keys as keys
+    import flash.providers.runpod.auth as keys
 
     monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
     keys.reset()
@@ -340,7 +340,7 @@ def test_list_endpoints_raises_on_non_list_response(monkeypatch):
     """A 200 whose body isn't a list is NOT an empty account — silently skipping it would yield a
     partial fleet view callers trust as complete, so raise."""
     import flash.providers.runpod.api as runpod_api
-    import flash.providers.runpod.keys as keys
+    import flash.providers.runpod.auth as keys
 
     monkeypatch.setenv("RUNPOD_API_KEY", "rk-a")
     keys.reset()
@@ -362,7 +362,7 @@ def test_billing_endpoints_queries_every_pool_account(monkeypatch):
     empty 200 (not a 404), so a single-key waterfall stops at the active account and silently
     reports $0. Best-effort: a single account's failure is skipped, not fatal."""
     import flash.providers.runpod.api as runpod_api
-    import flash.providers.runpod.keys as keys
+    import flash.providers.runpod.auth as keys
 
     monkeypatch.setenv("RUNPOD_API_KEY", "rk-a,rk-b,rk-c")
     keys.reset()

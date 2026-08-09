@@ -27,7 +27,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.spec import JobSpec
+from flash.core.spec import JobSpec
 from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
 # Infra-shaped failure categories the retry loop resumes on (see lifecycle._submit_seed_supervised).
@@ -670,8 +670,8 @@ def test_unconfirmed_instance_teardown_fails_terminal_and_reaps(orch, monkeypatc
 def test_unconfirmed_lambda_teardown_blocks_replacement_and_preserves_handle(orch, monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import Allocation, Candidate, PollResult
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs as lambda_jobs
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs as lambda_jobs
 
     submits = []
     gc_calls = []
@@ -773,7 +773,7 @@ def test_await_runpod_completed_metrics_bounds_pending_poll_to_grace(monkeypatch
     # to ~the grace window measured from first observation, not the run deadline that callers pass in.
     import time as _time
 
-    import flash.runner.lifecycle as lifecycle
+    import flash.runner.supervise.lifecycle as lifecycle
 
     fake_clock = {"now": 1_000.0}
     monkeypatch.setattr(_time, "time", lambda: fake_clock["now"])
@@ -808,7 +808,7 @@ def test_await_runpod_completed_metrics_bounds_pending_poll_to_grace(monkeypatch
 
 
 def test_await_runpod_completed_metrics_checks_cancellation_before_sleep(monkeypatch):
-    import flash.runner.lifecycle as lifecycle
+    import flash.runner.supervise.lifecycle as lifecycle
     from flash.runner import _RunCancelled
 
     monkeypatch.setattr(
@@ -853,7 +853,7 @@ def test_unconfirmed_runpod_teardown_blocks_replacement_and_preserves_handle(
     from flash.providers.base import PollResult
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs as rp_jobs
-    from flash.providers.runpod import train as runpod_train
+    from flash.providers.runpod import serverless as runpod_train
 
     submits = []
     teardown_events = []

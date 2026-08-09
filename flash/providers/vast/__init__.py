@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from flash.providers._instance import InstanceJobHandle
-from flash.providers._instance_provider import InstanceProvider
+from flash.providers._lifecycle.instance import InstanceJobHandle
+from flash.providers._lifecycle.provider import InstanceProvider
 from flash.providers.base import (
     AllocationConstraints,
     Candidate,

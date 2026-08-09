@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from flash.lora_rank import preflight_train_context_within_serving
-from flash.spec import JobSpec, TrainSpec
+from flash.adapters.lora_rank import preflight_train_context_within_serving
+from flash.core.spec import JobSpec, TrainSpec
 
 
 def _spec(
@@ -124,7 +124,7 @@ def test_a_model_without_a_serving_entry_is_skipped(monkeypatch):
     # curated model rather than by naming an uncataloged one (submit rejects those outright).
     from dataclasses import replace
 
-    import flash.catalog as catalog
+    import flash.core.catalog as catalog
 
     model = "Qwen/Qwen3.5-4B"
     monkeypatch.setitem(catalog.MODELS, model, replace(catalog.MODELS[model], serving=None))
