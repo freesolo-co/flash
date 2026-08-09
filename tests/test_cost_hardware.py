@@ -388,7 +388,14 @@ def test_allocator_ranking_narrows_a_vast_combination_it_is_pricing():
     }
     assert single["vast"] == single["runpod"]
     # not a blanket penalty: a genuinely cheaper vast pair still wins, it is just priced honestly.
-    assert at("vast", hourly=1.70) < at("runpod", hourly=1.95)
+    #
+    # the discount has to clear the interconnect penalty, and how big that is depends on how much of
+    # the step is gpu work. it used to be swamped: a phantom `completions x 1.0s` reward wall sat
+    # beside a step floor already fitted with grading included, so most of a modelled grpo step was
+    # an off-gpu wait no interconnect touches and a 12.8% discount was enough. with the double-count
+    # removed the step is gpu-bound, pcie costs ~17.4% more wall, and the discount must beat that.
+    # 1.70 (12.8% off) no longer does; 1.55 (20.5% off) does.
+    assert at("vast", hourly=1.55) < at("runpod", hourly=1.95)
 
 
 def test_a_live_vast_allocation_is_requoted_without_nvlink_credit():
