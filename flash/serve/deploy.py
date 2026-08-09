@@ -20,6 +20,7 @@ from flash._internal.logging import get_logger
 from flash.adapters.artifacts import ADAPTER_WEIGHT_FILES
 from flash.adapters.lora_rank import rank_from_adapter_config
 from flash.content.structured_outputs import parse_structured_outputs
+from flash.envs.loader import is_commit_sha
 from flash.schema import format_adapter_revision
 from flash.serve.urls import is_freesolo_hosted_url, openai_base_url, serving_control_url
 
@@ -307,7 +308,7 @@ def resolve_hf_revision(hf_repo: str) -> str:
         ).strip()
     except Exception as exc:
         raise ServingError(f"could not resolve adapter revision for {hf_repo}: {exc}") from exc
-    if len(revision) != 40 or any(char not in "0123456789abcdefABCDEF" for char in revision):
+    if not is_commit_sha(revision):
         raise ServingError(f"could not resolve full Hub commit SHA for {hf_repo}")
     return revision.lower()
 

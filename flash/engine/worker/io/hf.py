@@ -25,6 +25,7 @@ from flash._internal.diagnostics import sanitize_diagnostic
 from flash.adapters.artifacts import ADAPTER_WEIGHT_FILES, attempt_scoped_artifact_name
 from flash.engine.worker.perf import RetriableInfraError, gpu_diagnostics
 from flash.engine.worker.runtime.pkg_proxy import W as _w
+from flash.envs.loader import is_commit_sha
 from flash.teacher.retry_contract import (
     canonical_opd_optimizer_start_json,
     opd_optimizer_start_marker_path,
@@ -628,11 +629,6 @@ def _prefetch_error_is_retriable(exc: BaseException) -> bool:
     return False
 
 
-def _is_commit_sha(value: str) -> bool:
-    """True when value is a full 40-hex-char git commit id (an immutable HF revision)."""
-    return len(value) == 40 and all(c in "0123456789abcdef" for c in value.lower())
-
-
 def resolve_cached_model_commit(model_id: str, revision: str = "") -> str:
     """Best-effort, offline lookup of the immutable base-model commit already in the HF cache.
 
@@ -657,7 +653,7 @@ def resolve_cached_model_commit(model_id: str, revision: str = "") -> str:
         except Exception:
             continue
         commit = os.path.basename(os.path.normpath(snapshot_dir))
-        if _is_commit_sha(commit):
+        if is_commit_sha(commit):
             return commit
     return ""
 
