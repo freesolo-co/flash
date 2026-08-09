@@ -4234,10 +4234,16 @@ def test_the_child_caps_each_turn_at_max_completion_tokens_not_the_whole_episode
 
     body = " ".join(inspect.getsource(grpo_multiturn).split())
     assert 'max_completion_tokens = int(os.environ["FLASH_VERL_MAX_COMPLETION_TOKENS"])' in body
+    # the three budgets now live in _EpisodeTranscript.turn_budget, which the turn loop calls once
+    # per turn. same min() over the same three quantities, spelled against the transcript's own
+    # accumulators rather than loop locals.
     assert (
-        "max_tokens = min( max_completion_tokens, max_model_len - len(prefix_ids), "
-        "response_capacity - len(response_ids), )" in body
+        "return min( max_completion_tokens, self.max_model_len - len(self.prefix_ids), "
+        "self.response_capacity - len(self.response_ids), )" in body
     ), "the per-turn cap is not one of the three budgets bounding a turn"
+    assert "max_tokens = episode.turn_budget(max_completion_tokens)" in body, (
+        "the turn loop no longer applies the per-turn budget"
+    )
 
 
 def test_the_child_puts_no_deadline_on_a_bridge_call():
