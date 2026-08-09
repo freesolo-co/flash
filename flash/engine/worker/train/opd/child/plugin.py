@@ -737,7 +737,7 @@ def _init_transfer_queue(
         raise failure[0]
 
 
-def _install_verl_extensions() -> None:
+def _load_verl_extension_dependencies():
     import numpy as np
     import ray
     import torch
@@ -769,66 +769,67 @@ def _install_verl_extensions() -> None:
     from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker
     from verl.workers.utils.padding import no_padding_2_padding
 
-    @register_distillation_loss(
-        DistillationLossSettings(names=["flash_groupwise_reverse_kl"], use_estimator=True)
+    return types.SimpleNamespace(
+        np=np,
+        ray=ray,
+        torch=torch,
+        OmegaConf=OmegaConf,
+        tq=tq,
+        KVBatchMeta=KVBatchMeta,
+        AgentLoopBase=AgentLoopBase,
+        AgentLoopOutput=AgentLoopOutput,
+        AgentLoopWorker=AgentLoopWorker,
+        register=register,
+        SingleTurnAgentLoop=SingleTurnAgentLoop,
+        ResourcePoolManager=ResourcePoolManager,
+        DistillationLossSettings=DistillationLossSettings,
+        register_distillation_loss=register_distillation_loss,
+        Role=Role,
+        need_critic=need_critic,
+        need_reference_policy=need_reference_policy,
+        omega_conf_to_dataclass=omega_conf_to_dataclass,
+        AggregationType=AggregationType,
+        Metric=Metric,
+        reduce_metrics=reduce_metrics,
+        rename_dict=rename_dict,
+        DistillationConfig=DistillationConfig,
+        DistillationLossConfig=DistillationLossConfig,
+        ActorRolloutRefWorker=ActorRolloutRefWorker,
+        TrainingWorker=TrainingWorker,
+        no_padding_2_padding=no_padding_2_padding,
     )
-    def flash_groupwise_reverse_kl(config, distillation_config, model_output, data):
-        _set_current_global_batch_info(config, data)
-        student_logprobs = no_padding_2_padding(model_output["log_probs"], data)
-        teacher_logsums = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
-        group_ids = no_padding_2_padding(data["teacher_ids"], data).squeeze(-1).long()
-        response_mask = data["response_mask"]
-        if response_mask.is_nested:
-            response_mask = response_mask.to_padded_tensor(False)
-        losses = _flash_groupwise_reverse_kl_values(
-            student_logprobs,
-            teacher_logsums,
-            group_ids,
-            response_mask,
-            distillation_config.kl_penalty_coef,
-        )
-        selected = (group_ids >= 0) & response_mask.bool()
-        selected_losses = losses[selected]
-        mean_abs = selected_losses.abs().mean() if selected_losses.numel() else losses.new_zeros(())
-        return losses, {
-            "distillation/abs_loss": Metric(AggregationType.MEAN, mean_abs),
-            "distillation/signal_sequences": Metric(
-                AggregationType.SUM, _signal_sequences(group_ids, response_mask).sum()
-            ),
-        }
 
-    @dataclass
-    class FlashRemoteDistillationConfig(DistillationConfig):
-        # verl's BaseConfig.__setattr__ rejects any assignment to a field that is not listed here
-        # (base_config.py:33-38), so __post_init__ below can only normalize distillation_loss if the
-        # field is declared mutable. verl's own DistillationConfig declares teacher_models for exactly
-        # the same reason; it never reassigns distillation_loss, so it did not need to.
-        _mutable_fields = DistillationConfig._mutable_fields | {"distillation_loss"}
 
-        bridge_url: str = ""
-        bridge_token: str = ""
-        kl_penalty_coef: float = 1.0
+def _compute_flash_groupwise_reverse_kl(deps, config, distillation_config, model_output, data):
+    _set_current_global_batch_info(config, data)
+    student_logprobs = deps.no_padding_2_padding(model_output["log_probs"], data)
+    teacher_logsums = deps.no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
+    group_ids = deps.no_padding_2_padding(data["teacher_ids"], data).squeeze(-1).long()
+    response_mask = data["response_mask"]
+    if response_mask.is_nested:
+        response_mask = response_mask.to_padded_tensor(False)
+    losses = _flash_groupwise_reverse_kl_values(
+        student_logprobs,
+        teacher_logsums,
+        group_ids,
+        response_mask,
+        distillation_config.kl_penalty_coef,
+    )
+    selected = (group_ids >= 0) & response_mask.bool()
+    selected_losses = losses[selected]
+    mean_abs = selected_losses.abs().mean() if selected_losses.numel() else losses.new_zeros(())
+    return losses, {
+        "distillation/abs_loss": deps.Metric(deps.AggregationType.MEAN, mean_abs),
+        "distillation/signal_sequences": deps.Metric(
+            deps.AggregationType.SUM, _signal_sequences(group_ids, response_mask).sum()
+        ),
+    }
 
-        def __post_init__(self):
-            if not self.enabled:
-                return
-            self.distillation_loss = omega_conf_to_dataclass(
-                self.distillation_loss, dataclass_type=DistillationLossConfig
-            )
-            if self.distillation_loss.loss_mode != "flash_groupwise_reverse_kl":
-                raise ValueError("flash remote distillation requires flash_groupwise_reverse_kl")
-            if not self.bridge_url or not self.bridge_token:
-                raise ValueError("flash remote distillation bridge configuration is missing")
-            if self.kl_penalty_coef <= 0:
-                raise ValueError("flash remote distillation kl_penalty_coef must be positive")
-            self.teacher_models = {}
 
-    FlashRemoteDistillationConfig.__module__ = __name__
-    globals()["FlashRemoteDistillationConfig"] = FlashRemoteDistillationConfig
-
+def _build_flash_teacher_bridge_extensions(deps):
     class FlashBridgeTeacherManager:
         def __init__(self, config, teacher_client=None):
-            resolved = omega_conf_to_dataclass(config.distillation)
+            resolved = deps.omega_conf_to_dataclass(config.distillation)
             self.bridge_url = resolved.bridge_url
             self.bridge_token = resolved.bridge_token
 
@@ -862,9 +863,11 @@ def _install_verl_extensions() -> None:
                 _exit_for_score_failure(error)
             except Exception:
                 os._exit(_PERMANENT_TEACHER_EXIT)
-            teacher_ids = torch.tensor(payload["teacher_ids"], dtype=torch.int32).unsqueeze(-1)
-            teacher_logprobs = torch.tensor(
-                payload["teacher_logprobs"], dtype=torch.float32
+            teacher_ids = deps.torch.tensor(
+                payload["teacher_ids"], dtype=deps.torch.int32
+            ).unsqueeze(-1)
+            teacher_logprobs = deps.torch.tensor(
+                payload["teacher_logprobs"], dtype=deps.torch.float32
             ).unsqueeze(-1)
             if teacher_ids.shape != teacher_logprobs.shape:
                 raise RuntimeError("flash OPD bridge returned inconsistent teacher tensors")
@@ -924,71 +927,62 @@ def _install_verl_extensions() -> None:
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
 
-    import verl.experimental.teacher_loop.teacher_manager as teacher_manager_module
+    original_prefix = "_install_verl_extensions.<locals>"
+    FlashBridgeTeacherManager.__qualname__ = f"{original_prefix}.FlashBridgeTeacherManager"
+    FlashBridgeTeacherManager.__init__.__qualname__ = (
+        f"{original_prefix}.FlashBridgeTeacherManager.__init__"
+    )
+    FlashBridgeTeacherManager.compute_teacher_logprobs_single.__qualname__ = (
+        f"{original_prefix}.FlashBridgeTeacherManager.compute_teacher_logprobs_single"
+    )
+    compute_flash_teacher_logprobs.__qualname__ = (
+        f"{original_prefix}.compute_flash_teacher_logprobs"
+    )
+    return FlashBridgeTeacherManager, compute_flash_teacher_logprobs
 
-    AgentLoopWorker._compute_teacher_logprobs = compute_flash_teacher_logprobs
-    teacher_manager_module.AsyncTeacherLLMServerManager = FlashBridgeTeacherManager
 
-    # import main_ppo_sync only after the patch above. applying `@ray.remote` to a class copies the
-    # methods it inherits onto the actor class, so `AgentLoopWorkerTQ(AgentLoopWorker)` freezes
-    # whatever `_compute_teacher_logprobs` resolves to at decoration time. importing this module
-    # earlier snapshots verl's original, which then calls the flash teacher manager with
-    # `sequence_ids=` instead of prompt_ids/response_ids and kills the first rollout.
-    from verl.trainer.main_ppo_sync import PPOTrainer
+async def _run_flash_single_turn_agent_loop(self, agent_loop_type, sampling_params, kwargs):
+    params = dict(sampling_params)
+    if _raw_prompt_has_image_block(kwargs.get("raw_prompt")):
+        image_token_id = _resolve_image_token_id(self.processor, self.tokenizer)
+        logit_bias = dict(params.get("logit_bias") or {})
+        logit_bias[image_token_id] = -100.0
+        params["logit_bias"] = logit_bias
+    flash_seed = int(os.environ["FLASH_OPD_SEED"])
+    global_step = int(kwargs["global_steps"])
+    example_index = int(kwargs["index"])
+    rollout_ordinal = int(kwargs.get("session_id", 0))
+    no_signal_attempt_ordinal = int(kwargs.get("flash_no_signal_attempt", 0))
+    params["seed"] = deterministic_rollout_seed(
+        flash_seed,
+        global_step,
+        example_index,
+        rollout_ordinal,
+        no_signal_attempt_ordinal=no_signal_attempt_ordinal,
+    )
+    stops = json.loads(os.environ.get("FLASH_OPD_STOP_SEQUENCES", "[]"))
+    if stops:
+        params["stop"] = stops
+        params["include_stop_str_in_output"] = True
+    eos_ids = json.loads(os.environ.get("FLASH_OPD_EOS_TOKEN_IDS", "[]"))
+    if eos_ids:
+        params["stop_token_ids"] = eos_ids
+    structured_spec = os.environ.get("FLASH_OPD_STRUCTURED_OUTPUTS", "")
+    if structured_spec:
+        _require_structured_runtime_versions()
+        from vllm.sampling_params import StructuredOutputsParams
 
-    class FlashSingleTurnAgentLoop(SingleTurnAgentLoop):
-        async def run(self, sampling_params: dict[str, Any], **kwargs):
-            params = dict(sampling_params)
-            if _raw_prompt_has_image_block(kwargs.get("raw_prompt")):
-                image_token_id = _resolve_image_token_id(self.processor, self.tokenizer)
-                logit_bias = dict(params.get("logit_bias") or {})
-                logit_bias[image_token_id] = -100.0
-                params["logit_bias"] = logit_bias
-            flash_seed = int(os.environ["FLASH_OPD_SEED"])
-            global_step = int(kwargs["global_steps"])
-            example_index = int(kwargs["index"])
-            rollout_ordinal = int(kwargs.get("session_id", 0))
-            no_signal_attempt_ordinal = int(kwargs.get("flash_no_signal_attempt", 0))
-            params["seed"] = deterministic_rollout_seed(
-                flash_seed,
-                global_step,
-                example_index,
-                rollout_ordinal,
-                no_signal_attempt_ordinal=no_signal_attempt_ordinal,
-            )
-            stops = json.loads(os.environ.get("FLASH_OPD_STOP_SEQUENCES", "[]"))
-            if stops:
-                params["stop"] = stops
-                params["include_stop_str_in_output"] = True
-            eos_ids = json.loads(os.environ.get("FLASH_OPD_EOS_TOKEN_IDS", "[]"))
-            if eos_ids:
-                params["stop_token_ids"] = eos_ids
-            structured_spec = os.environ.get("FLASH_OPD_STRUCTURED_OUTPUTS", "")
-            if structured_spec:
-                _require_structured_runtime_versions()
-                from vllm.sampling_params import StructuredOutputsParams
+        params["structured_outputs"] = StructuredOutputsParams(**json.loads(structured_spec))
+    output = await super(agent_loop_type, self).run(params, **kwargs)
+    output.reward_score = 0.0
+    return output
 
-                params["structured_outputs"] = StructuredOutputsParams(
-                    **json.loads(structured_spec)
-                )
-            output = await super().run(params, **kwargs)
-            output.reward_score = 0.0
-            return output
 
-    # verl's `register` freezes `f"{__module__}.{__qualname__}"` into the agent-loop registry at
-    # decoration time, and hydra later resolves that string with a plain dotted-path lookup. this
-    # class is defined inside a function, so its qualname carries `<locals>` and no lookup can
-    # reach it. rewrite both dunders to the importable module-level name first, publish the class
-    # there, and only then register, exactly as the multi-turn loop already does.
-    FlashSingleTurnAgentLoop.__module__ = __name__
-    FlashSingleTurnAgentLoop.__qualname__ = "FlashSingleTurnAgentLoop"
-    globals()["FlashSingleTurnAgentLoop"] = FlashSingleTurnAgentLoop
-    register("flash_single_turn")(FlashSingleTurnAgentLoop)
-
+def _install_flash_multi_turn_agent_loop(deps):
     FlashMultiTurnAgentLoop = build_flash_multi_turn_agent_loop(
-        register=register,
-        agent_loop_base=AgentLoopBase,
-        agent_loop_output=AgentLoopOutput,
+        register=deps.register,
+        agent_loop_base=deps.AgentLoopBase,
+        agent_loop_output=deps.AgentLoopOutput,
         post_json=_post_json,
         score_failure_handler=_exit_for_score_failure,
         deterministic_seed=deterministic_rollout_seed,
@@ -997,185 +991,176 @@ def _install_verl_extensions() -> None:
     )
     globals()["FlashMultiTurnAgentLoop"] = FlashMultiTurnAgentLoop
 
-    def filter_signal_batch(batch):
-        fields = tq.kv_batch_get(
-            keys=batch.keys,
-            partition_id=batch.partition_id,
-            select_fields=["teacher_ids"],
+
+def _filter_signal_batch(batch, deps):
+    fields = deps.tq.kv_batch_get(
+        keys=batch.keys,
+        partition_id=batch.partition_id,
+        select_fields=["teacher_ids"],
+    )
+    group_ids = fields["teacher_ids"]
+    if group_ids.is_nested:
+        keep = deps.torch.tensor(
+            [row.ge(0).any().item() for row in group_ids.unbind()], dtype=deps.torch.bool
         )
-        group_ids = fields["teacher_ids"]
-        if group_ids.is_nested:
-            keep = torch.tensor(
-                [row.ge(0).any().item() for row in group_ids.unbind()], dtype=torch.bool
-            )
-        else:
-            keep = _full_sequence_signal_sequences(group_ids)
-        keys = [key for key, selected in zip(batch.keys, keep.tolist(), strict=True) if selected]
-        tags = [tag for tag, selected in zip(batch.tags, keep.tolist(), strict=True) if selected]
-        if not keys:
-            raise _AllNoSignalBatch(batch)
-        return KVBatchMeta(
-            keys=keys,
-            tags=tags,
-            partition_id=batch.partition_id,
-            fields=batch.fields,
-            extra_info=batch.extra_info,
+    else:
+        keep = _full_sequence_signal_sequences(group_ids)
+    keys = [key for key, selected in zip(batch.keys, keep.tolist(), strict=True) if selected]
+    tags = [tag for tag, selected in zip(batch.tags, keep.tolist(), strict=True) if selected]
+    if not keys:
+        raise _AllNoSignalBatch(batch)
+    return deps.KVBatchMeta(
+        keys=keys,
+        tags=tags,
+        partition_id=batch.partition_id,
+        fields=batch.fields,
+        extra_info=batch.extra_info,
+    )
+
+
+def _init_flash_ppo_trainer(self, trainer_type, deps):
+    self.use_teacher_policy = False
+    super(trainer_type, self).init_workers()
+    self.use_teacher_policy = True
+    self.distillation_config = deps.omega_conf_to_dataclass(self.config.distillation)
+
+
+def _step_flash_ppo_trainer(self, trainer_type, batch_dict, metrics, timing_raw, deps):
+    def run_attempt(attempt_ordinal: int):
+        batch_dict["flash_no_signal_attempt"] = deps.np.full(
+            len(batch_dict["raw_prompt"]), attempt_ordinal, dtype=deps.np.int64
         )
+        return super(trainer_type, self).step(batch_dict, metrics, timing_raw)
 
-    class FlashPPOTrainer(PPOTrainer):
-        def init_workers(self):
-            self.use_teacher_policy = False
-            super().init_workers()
-            self.use_teacher_policy = True
-            self.distillation_config = omega_conf_to_dataclass(self.config.distillation)
+    def cleanup_attempt(batch) -> None:
+        prompt_keys = [str(uid) for uid in batch_dict["uid"]]
+        keys = list(dict.fromkeys([*batch.keys, *prompt_keys]))
+        deps.tq.kv_clear(keys=keys, partition_id=batch.partition_id)
+        self.replay_buffer.remove(batch.partition_id, keys)
 
-        def step(self, batch_dict, metrics, timing_raw):
-            def run_attempt(attempt_ordinal: int):
-                batch_dict["flash_no_signal_attempt"] = np.full(
-                    len(batch_dict["raw_prompt"]), attempt_ordinal, dtype=np.int64
-                )
-                return super(FlashPPOTrainer, self).step(batch_dict, metrics, timing_raw)
+    def prepare_replacement() -> None:
+        self.checkpoint_manager.update_weights()
 
-            def cleanup_attempt(batch) -> None:
-                prompt_keys = [str(uid) for uid in batch_dict["uid"]]
-                keys = list(dict.fromkeys([*batch.keys, *prompt_keys]))
-                tq.kv_clear(keys=keys, partition_id=batch.partition_id)
-                self.replay_buffer.remove(batch.partition_id, keys)
+    return _run_with_no_signal_replacements(
+        run_attempt,
+        cleanup_attempt,
+        prepare_replacement,
+        lambda: _post_no_signal_resample(
+            os.environ["FLASH_OPD_BRIDGE_URL"],
+            os.environ["FLASH_OPD_BRIDGE_TOKEN"],
+        ),
+        lambda: _post_no_signal_abandoned(
+            os.environ["FLASH_OPD_BRIDGE_URL"],
+            os.environ["FLASH_OPD_BRIDGE_TOKEN"],
+        ),
+    )
 
-            def prepare_replacement() -> None:
-                self.checkpoint_manager.update_weights()
 
-            return _run_with_no_signal_replacements(
-                run_attempt,
-                cleanup_attempt,
-                prepare_replacement,
-                lambda: _post_no_signal_resample(
-                    os.environ["FLASH_OPD_BRIDGE_URL"],
-                    os.environ["FLASH_OPD_BRIDGE_TOKEN"],
-                ),
-                lambda: _post_no_signal_abandoned(
-                    os.environ["FLASH_OPD_BRIDGE_URL"],
-                    os.environ["FLASH_OPD_BRIDGE_TOKEN"],
-                ),
-            )
+def _compute_flash_ppo_reward_colocate(self, batch, deps):
+    data = deps.tq.kv_batch_get(
+        keys=batch.keys,
+        partition_id=batch.partition_id,
+        select_fields=["response_mask"],
+    )
+    data["rm_scores"] = deps.torch.zeros_like(data["response_mask"], dtype=deps.torch.float32)
+    deps.tq.kv_batch_put(
+        keys=batch.keys,
+        partition_id=batch.partition_id,
+        fields=data.select("rm_scores"),
+    )
+    return batch
 
-        def _compute_reward_colocate(self, batch, metrics):
-            data = tq.kv_batch_get(
-                keys=batch.keys,
-                partition_id=batch.partition_id,
-                select_fields=["response_mask"],
-            )
-            data["rm_scores"] = torch.zeros_like(data["response_mask"], dtype=torch.float32)
-            tq.kv_batch_put(
-                keys=batch.keys,
-                partition_id=batch.partition_id,
-                fields=data.select("rm_scores"),
-            )
-            return batch
 
-        def _get_required_batch_multiple(self, dp_size: int) -> int:
-            return dp_size
+def _balance_flash_ppo_batch(
+    super_balance_batch, batch, metrics, logging_prefix, keep_minibatch, deps
+):
+    return super_balance_batch(
+        _filter_signal_batch(batch, deps),
+        metrics,
+        logging_prefix=logging_prefix,
+        keep_minibatch=keep_minibatch,
+    )
 
-        def _balance_batch(
-            self, batch, metrics, logging_prefix="global_seqlen", keep_minibatch=False
-        ):
-            return super()._balance_batch(
-                filter_signal_batch(batch),
-                metrics,
-                logging_prefix=logging_prefix,
-                keep_minibatch=keep_minibatch,
-            )
 
-        def _update_actor(self, batch, metrics):
-            real_batch_size = sum(not tag.get("is_padding", False) for tag in batch.tags)
-            extra_info = {
-                "calculate_entropy": self.config.actor_rollout_ref.actor.calculate_entropy,
-                "distillation_use_topk": False,
-                "global_batch_size": real_batch_size,
-                "mini_batch_size": len(batch),
-                "epochs": self.config.actor_rollout_ref.actor.ppo_epochs,
-                "seed": self.config.actor_rollout_ref.actor.data_loader_seed,
-                "dataloader_kwargs": {"shuffle": False},
-                "temperature": self.config.actor_rollout_ref.rollout.temperature,
-            }
-            batch.extra_info.update(extra_info)
-            output = _update_actor_after_teacher_cycle_commit(
-                self.actor_rollout_wg,
-                batch,
-                os.environ["FLASH_OPD_BRIDGE_URL"],
-                os.environ["FLASH_OPD_BRIDGE_TOKEN"],
-            )
-            output = rename_dict(output["metrics"], "actor/")
-            output["perf/mfu/actor"] = output.pop("actor/mfu")
-            metrics.update(reduce_metrics(output))
-            return batch
+def _update_flash_ppo_actor(self, batch, metrics, deps):
+    real_batch_size = sum(not tag.get("is_padding", False) for tag in batch.tags)
+    extra_info = {
+        "calculate_entropy": self.config.actor_rollout_ref.actor.calculate_entropy,
+        "distillation_use_topk": False,
+        "global_batch_size": real_batch_size,
+        "mini_batch_size": len(batch),
+        "epochs": self.config.actor_rollout_ref.actor.ppo_epochs,
+        "seed": self.config.actor_rollout_ref.actor.data_loader_seed,
+        "dataloader_kwargs": {"shuffle": False},
+        "temperature": self.config.actor_rollout_ref.rollout.temperature,
+    }
+    batch.extra_info.update(extra_info)
+    output = _update_actor_after_teacher_cycle_commit(
+        self.actor_rollout_wg,
+        batch,
+        os.environ["FLASH_OPD_BRIDGE_URL"],
+        os.environ["FLASH_OPD_BRIDGE_TOKEN"],
+    )
+    output = deps.rename_dict(output["metrics"], "actor/")
+    output["perf/mfu/actor"] = output.pop("actor/mfu")
+    metrics.update(deps.reduce_metrics(output))
+    return batch
 
-    FlashPPOTrainer.__module__ = __name__
-    globals()["FlashPPOTrainer"] = FlashPPOTrainer
 
-    @ray.remote
-    class FlashTaskRunner:
-        def __init__(self):
-            self.role_worker_mapping = {}
-            self.mapping = {}
+def _add_flash_actor_rollout_worker(self, config, deps):
+    lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
+    if lora_rank <= 0:
+        lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
+    ref_in_actor = (
+        lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+    )
+    role = (
+        deps.Role.ActorRolloutRef
+        if deps.need_reference_policy(config) and not ref_in_actor
+        else deps.Role.ActorRollout
+    )
+    self.role_worker_mapping[role] = deps.ray.remote(deps.ActorRolloutRefWorker)
+    self.mapping[role] = "global_pool"
 
-        def add_actor_rollout_worker(self, config):
-            lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
-            if lora_rank <= 0:
-                lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
-            ref_in_actor = (
-                lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
-            )
-            role = (
-                Role.ActorRolloutRef
-                if need_reference_policy(config) and not ref_in_actor
-                else Role.ActorRollout
-            )
-            self.role_worker_mapping[role] = ray.remote(ActorRolloutRefWorker)
-            self.mapping[role] = "global_pool"
 
-        def add_critic_worker(self, config):
-            if need_critic(config):
-                self.role_worker_mapping[Role.Critic] = ray.remote(TrainingWorker)
-                self.mapping[Role.Critic] = "global_pool"
+def _add_flash_critic_worker(self, config, deps):
+    if deps.need_critic(config):
+        self.role_worker_mapping[deps.Role.Critic] = deps.ray.remote(deps.TrainingWorker)
+        self.mapping[deps.Role.Critic] = "global_pool"
 
-        def init_resource_pool_mgr(self, config):
-            resource_pool_spec = {
-                "global_pool": [config.trainer.n_gpus_per_node] * config.trainer.nnodes
-            }
-            config.reward.reward_model.nnodes = config.trainer.nnodes
-            config.reward.reward_model.n_gpus_per_node = config.trainer.n_gpus_per_node
-            self.mapping[Role.RewardModel] = "global_pool"
-            self.resource_pool_manager = ResourcePoolManager(
-                resource_pool_spec=resource_pool_spec, mapping=self.mapping
-            )
 
-        def run(self, config):
-            OmegaConf.resolve(config)
-            _init_transfer_queue(tq.init, config.transfer_queue)
-            trainer = None
-            try:
-                self.add_actor_rollout_worker(config)
-                self.add_critic_worker(config)
-                self.init_resource_pool_mgr(config)
-                trainer = FlashPPOTrainer(
-                    config=config,
-                    role_worker_mapping=self.role_worker_mapping,
-                    resource_pool_manager=self.resource_pool_manager,
-                )
-                trainer.init_workers()
-                trainer.fit()
-            finally:
-                if trainer:
-                    trainer.replay_buffer.close()
-                tq.close()
+def _init_flash_resource_pool_manager(self, config, deps):
+    resource_pool_spec = {"global_pool": [config.trainer.n_gpus_per_node] * config.trainer.nnodes}
+    config.reward.reward_model.nnodes = config.trainer.nnodes
+    config.reward.reward_model.n_gpus_per_node = config.trainer.n_gpus_per_node
+    self.mapping[deps.Role.RewardModel] = "global_pool"
+    self.resource_pool_manager = deps.ResourcePoolManager(
+        resource_pool_spec=resource_pool_spec, mapping=self.mapping
+    )
 
-    globals()["FlashTaskRunner"] = FlashTaskRunner
 
-    import verl.trainer.main_ppo_sync as main_ppo_sync
+def _run_flash_task(self, config, trainer_type, deps):
+    deps.OmegaConf.resolve(config)
+    _init_transfer_queue(deps.tq.init, config.transfer_queue)
+    trainer = None
+    try:
+        self.add_actor_rollout_worker(config)
+        self.add_critic_worker(config)
+        self.init_resource_pool_mgr(config)
+        trainer = trainer_type(
+            config=config,
+            role_worker_mapping=self.role_worker_mapping,
+            resource_pool_manager=self.resource_pool_manager,
+        )
+        trainer.init_workers()
+        trainer.fit()
+    finally:
+        if trainer:
+            trainer.replay_buffer.close()
+        deps.tq.close()
 
-    main_ppo_sync.TaskRunner = FlashTaskRunner
 
+def _wrap_flash_fsdp_optimizer_build():
     from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
 
     original_build_optimizer = FSDPEngine._build_optimizer
@@ -1190,6 +1175,146 @@ def _install_verl_extensions() -> None:
         )
 
     FSDPEngine._build_optimizer = build_optimizer_with_mutation_notice
+
+
+def _install_verl_extensions() -> None:
+    deps = _load_verl_extension_dependencies()
+    AgentLoopWorker = deps.AgentLoopWorker
+    DistillationLossSettings = deps.DistillationLossSettings
+    register_distillation_loss = deps.register_distillation_loss
+
+    @register_distillation_loss(
+        DistillationLossSettings(names=["flash_groupwise_reverse_kl"], use_estimator=True)
+    )
+    def flash_groupwise_reverse_kl(config, distillation_config, model_output, data):
+        return _compute_flash_groupwise_reverse_kl(
+            deps, config, distillation_config, model_output, data
+        )
+
+    @dataclass
+    class FlashRemoteDistillationConfig(deps.DistillationConfig):
+        # verl's BaseConfig.__setattr__ rejects any assignment to a field that is not listed here
+        # (base_config.py:33-38), so __post_init__ below can only normalize distillation_loss if the
+        # field is declared mutable. verl's own DistillationConfig declares teacher_models for exactly
+        # the same reason; it never reassigns distillation_loss, so it did not need to.
+        _mutable_fields = deps.DistillationConfig._mutable_fields | {"distillation_loss"}
+
+        bridge_url: str = ""
+        bridge_token: str = ""
+        kl_penalty_coef: float = 1.0
+
+        def __post_init__(self):
+            if not self.enabled:
+                return
+            self.distillation_loss = deps.omega_conf_to_dataclass(
+                self.distillation_loss, dataclass_type=deps.DistillationLossConfig
+            )
+            if self.distillation_loss.loss_mode != "flash_groupwise_reverse_kl":
+                raise ValueError("flash remote distillation requires flash_groupwise_reverse_kl")
+            if not self.bridge_url or not self.bridge_token:
+                raise ValueError("flash remote distillation bridge configuration is missing")
+            if self.kl_penalty_coef <= 0:
+                raise ValueError("flash remote distillation kl_penalty_coef must be positive")
+            self.teacher_models = {}
+
+    FlashRemoteDistillationConfig.__module__ = __name__
+    globals()["FlashRemoteDistillationConfig"] = FlashRemoteDistillationConfig
+
+    FlashBridgeTeacherManager, compute_flash_teacher_logprobs = (
+        _build_flash_teacher_bridge_extensions(deps)
+    )
+
+    import verl.experimental.teacher_loop.teacher_manager as teacher_manager_module
+
+    AgentLoopWorker._compute_teacher_logprobs = compute_flash_teacher_logprobs
+    teacher_manager_module.AsyncTeacherLLMServerManager = FlashBridgeTeacherManager
+
+    # import main_ppo_sync only after the patch above. applying `@ray.remote` to a class copies the
+    # methods it inherits onto the actor class, so `AgentLoopWorkerTQ(AgentLoopWorker)` freezes
+    # whatever `_compute_teacher_logprobs` resolves to at decoration time. importing this module
+    # earlier snapshots verl's original, which then calls the flash teacher manager with
+    # `sequence_ids=` instead of prompt_ids/response_ids and kills the first rollout.
+    from verl.trainer.main_ppo_sync import PPOTrainer
+
+    class FlashSingleTurnAgentLoop(deps.SingleTurnAgentLoop):
+        async def run(self, sampling_params: dict[str, Any], **kwargs):
+            return await _run_flash_single_turn_agent_loop(
+                self, FlashSingleTurnAgentLoop, sampling_params, kwargs
+            )
+
+    # verl's `register` freezes `f"{__module__}.{__qualname__}"` into the agent-loop registry at
+    # decoration time, and hydra later resolves that string with a plain dotted-path lookup. this
+    # class is defined inside a function, so its qualname carries `<locals>` and no lookup can
+    # reach it. rewrite both dunders to the importable module-level name first, publish the class
+    # there, and only then register, exactly as the multi-turn loop already does.
+    FlashSingleTurnAgentLoop.__module__ = __name__
+    FlashSingleTurnAgentLoop.__qualname__ = "FlashSingleTurnAgentLoop"
+    globals()["FlashSingleTurnAgentLoop"] = FlashSingleTurnAgentLoop
+    deps.register("flash_single_turn")(FlashSingleTurnAgentLoop)
+
+    _install_flash_multi_turn_agent_loop(deps)
+
+    def filter_signal_batch(batch):
+        return _filter_signal_batch(batch, deps)
+
+    class FlashPPOTrainer(PPOTrainer):
+        def init_workers(self):
+            _init_flash_ppo_trainer(self, FlashPPOTrainer, deps)
+
+        def step(self, batch_dict, metrics, timing_raw):
+            return _step_flash_ppo_trainer(
+                self, FlashPPOTrainer, batch_dict, metrics, timing_raw, deps
+            )
+
+        def _compute_reward_colocate(self, batch, metrics):
+            return _compute_flash_ppo_reward_colocate(self, batch, deps)
+
+        def _get_required_batch_multiple(self, dp_size: int) -> int:
+            return dp_size
+
+        def _balance_batch(
+            self, batch, metrics, logging_prefix="global_seqlen", keep_minibatch=False
+        ):
+            return _balance_flash_ppo_batch(
+                super()._balance_batch,
+                batch,
+                metrics,
+                logging_prefix,
+                keep_minibatch,
+                deps,
+            )
+
+        def _update_actor(self, batch, metrics):
+            return _update_flash_ppo_actor(self, batch, metrics, deps)
+
+    FlashPPOTrainer.__module__ = __name__
+    globals()["FlashPPOTrainer"] = FlashPPOTrainer
+
+    @deps.ray.remote
+    class FlashTaskRunner:
+        def __init__(self):
+            self.role_worker_mapping = {}
+            self.mapping = {}
+
+        def add_actor_rollout_worker(self, config):
+            _add_flash_actor_rollout_worker(self, config, deps)
+
+        def add_critic_worker(self, config):
+            _add_flash_critic_worker(self, config, deps)
+
+        def init_resource_pool_mgr(self, config):
+            _init_flash_resource_pool_manager(self, config, deps)
+
+        def run(self, config):
+            _run_flash_task(self, config, FlashPPOTrainer, deps)
+
+    globals()["FlashTaskRunner"] = FlashTaskRunner
+
+    import verl.trainer.main_ppo_sync as main_ppo_sync
+
+    main_ppo_sync.TaskRunner = FlashTaskRunner
+
+    _wrap_flash_fsdp_optimizer_build()
 
 
 def main() -> None:
