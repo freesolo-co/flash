@@ -139,6 +139,15 @@ A bare `namespace/name` slug is **not** a generic shorthand - it always resolves
 Freesolo's hub, so a self-hosted plane should use the explicit `github:` form. `ref` may be
 a branch, tag, or commit sha; pin a sha if you want runs to be reproducible.
 
+**The two GitHub forms are self-hosted-only.** Freesolo's managed service accepts
+`namespace/name` and nothing else: the hub is the only repo it can vouch for, being the one
+`flash env push` writes to and the one whose packages carry a validated project association.
+Submitting a `github:` or browser-URL ref there is rejected at submit with a `400`. A
+standalone plane (`FLASH_STANDALONE=1`) accepts all three forms, which is what makes
+self-hosting possible at all - it cannot publish to Freesolo's hub, and a local directory is
+not a supported source either (see below). The check reads `FLASH_STANDALONE` on the server,
+so it is the plane you submit to, not the CLI you submit from, that decides.
+
 Public repos work without credentials, subject to GitHub's unauthenticated rate limit. Set
 `GITHUB_TOKEN` for private repos. `flash env push` publishes to the managed hub and is not
 part of a self-hosted deployment.

@@ -28,7 +28,9 @@ SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "project": "11111111-1111-4111-8111-111111111111",
     "algorithm": "grpo",
-    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
+    # A hub slug, because this fixture drives the HOSTED api: the managed plane accepts
+    # `namespace/name` only, and a `github:` ref is refused at submit (see test_server_standalone).
+    "environment": {"id": "acme/gsm8k"},
     "train": {"epochs": 1, "max_examples": 1},
     "gpu": {},
 }
@@ -190,17 +192,7 @@ def test_project_validation_blocks_before_run_preparation(api, monkeypatch) -> N
     assert response.json()["detail"] == "project denied"
 
 
-@pytest.mark.parametrize(
-    "environment_id",
-    [
-        "acme/my-env",
-        "github:freesolo-co/environment-hub@main:acme/my-env/environment.py",
-        "github:FREESOLO-CO/ENVIRONMENT-HUB@main:acme/my-env/environment.py",
-    ],
-)
-def test_environment_project_validation_blocks_before_run_preparation(
-    api, monkeypatch, environment_id
-) -> None:
+def test_environment_project_validation_blocks_before_run_preparation(api, monkeypatch) -> None:
     from fastapi import HTTPException
 
     import flash.server.domain.environment_registry as registry
@@ -222,19 +214,70 @@ def test_environment_project_validation_blocks_before_run_preparation(
     response = api.post(
         "/v1/runs",
         headers=_bearer(_login()),
-        json={"spec": {**SPEC, "environment": {"id": environment_id}}},
+        json={"spec": {**SPEC, "environment": {"id": "acme/my-env"}}},
     )
     assert response.status_code == 409
     assert response.json()["detail"] == "flash environment belongs to another project"
 
 
-def test_non_hub_github_environment_skips_project_ownership_validation(api, monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "environment_id",
+    [
+        # a repo Freesolo has no relationship with
+        "github:acme/envs@main:gsm8k/environment.py",
+        "https://github.com/acme/envs/tree/main/gsm8k",
+        # the hub's OWN repo, spelled the long way: still refused, so there is exactly one
+        # accepted spelling of a hub environment rather than two that must agree.
+        "github:freesolo-co/environment-hub@main:acme/my-env/environment.py",
+        "github:FREESOLO-CO/ENVIRONMENT-HUB@main:acme/my-env/environment.py",
+        # references that used to fail closed further downstream as "malformed hub reference";
+        # they are now refused earlier, by form, which subsumes that check.
+        "github:freesolo-co/environment-hub@dev:acme/my-env/environment.py",
+        "github:freesolo-co/environment-hub@main:acme/my-env/other.py",
+    ],
+)
+def test_a_github_environment_is_refused_before_validation_or_preparation(
+    api, monkeypatch, environment_id
+) -> None:
+    """The hosted plane runs hub environments only, and refuses the rest at the submit boundary.
+
+    Refusing early is the point: a GitHub ref must not reach project-ownership validation (which
+    is meaningless for a repo the plane does not own) nor job preparation (which would fetch and
+    run the code). Both are asserted by failing the test if either is called.
+    """
     import flash.server.domain.environment_registry as registry
+    import flash.server.routes.runs as runs_route
 
     monkeypatch.setattr(
         registry,
         "require_environment_project",
-        lambda **_kwargs: pytest.fail("non-hub environment must not reach project validation"),
+        lambda **_kwargs: pytest.fail("a github environment must not reach project validation"),
+    )
+    monkeypatch.setattr(
+        runs_route._app,
+        "prepare_job",
+        lambda *_args, **_kwargs: pytest.fail("a github environment must block preparation"),
+    )
+
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": {**SPEC, "environment": {"id": environment_id}}},
+    )
+
+    assert response.status_code == 400, response.text
+    assert "hub" in response.json()["detail"]
+
+
+def test_a_hub_environment_still_reaches_preparation(api, monkeypatch) -> None:
+    """The counterpart: the refusal above is about the FORM, not the parser blocking every run."""
+    import flash.server.domain.environment_registry as registry
+
+    seen: list[str] = []
+    monkeypatch.setattr(
+        registry,
+        "require_environment_project",
+        lambda **kwargs: seen.append(kwargs["slug"]),
     )
 
     response = api.post(
@@ -244,41 +287,7 @@ def test_non_hub_github_environment_skips_project_ownership_validation(api, monk
     )
 
     assert response.status_code == 200, response.text
-
-
-@pytest.mark.parametrize(
-    "environment_id",
-    [
-        "github:freesolo-co/environment-hub@dev:acme/my-env/environment.py",
-        "github:freesolo-co/environment-hub@main:acme/my-env/other.py",
-    ],
-)
-def test_malformed_managed_hub_reference_fails_closed(api, monkeypatch, environment_id) -> None:
-    import flash.server.domain.environment_registry as registry
-    import flash.server.routes.runs as runs_route
-
-    monkeypatch.setattr(
-        registry,
-        "require_environment_project",
-        lambda **_kwargs: pytest.fail("malformed hub reference must not reach project validation"),
-    )
-    monkeypatch.setattr(
-        runs_route._app,
-        "prepare_job",
-        lambda *_args, **_kwargs: pytest.fail("malformed hub reference must block preparation"),
-    )
-
-    response = api.post(
-        "/v1/runs",
-        headers=_bearer(_login()),
-        json={"spec": {**SPEC, "environment": {"id": environment_id}}},
-    )
-
-    assert response.status_code == 400
-    assert response.json()["detail"] == (
-        "managed environment GitHub reference must be "
-        "github:freesolo-co/environment-hub@main:<namespace>/<name>/environment.py"
-    )
+    assert seen == ["acme/gsm8k"]
 
 
 @pytest.mark.parametrize("environment_id", ["Acme/My-Env", " acme/my-env "])
@@ -380,11 +389,22 @@ def _install_real_internal_project_validation(monkeypatch):
     return requests
 
 
+_INTERNAL_PROJECT_VALIDATE_URL = "https://api.freesolo.co/api/flash/projects/validate/internal"
+
+
 def _assert_internal_project_request(requests: list[dict]) -> None:
-    assert requests == [
+    """Exactly one PROJECT validation call, with the internal key and the run's org.
+
+    Filtered to that endpoint rather than asserting on the whole list: a hub environment also
+    triggers an ``environments/use/internal`` call, which is correct and is covered by the
+    environment tests. Asserting the full list here would make this project-scoped test fail
+    whenever an unrelated internal call is added.
+    """
+    project_requests = [r for r in requests if r["url"] == _INTERNAL_PROJECT_VALIDATE_URL]
+    assert project_requests == [
         {
             "method": "POST",
-            "url": "https://api.freesolo.co/api/flash/projects/validate/internal",
+            "url": _INTERNAL_PROJECT_VALIDATE_URL,
             "authorization": "Bearer fslo-internal-test",
             "body": {"orgId": "org-test", "projectId": SPEC["project"]},
         }
