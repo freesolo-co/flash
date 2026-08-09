@@ -445,6 +445,7 @@ def _dry_run_preview_line(
     affordability_verified: bool,
     rollout_evidence: dict | None,
     environment_stages_run: tuple[str, ...] = (),
+    rollout_evidence_accepted: bool = False,
 ) -> str:
     """What a dry run actually checked, and what it actually executed on this machine.
 
@@ -480,9 +481,14 @@ def _dry_run_preview_line(
         # so naming a fixed pair of hooks would overclaim on exactly those paths.
         called = [f"{stage}()" for stage in environment_stages_run if stage != "import"]
         ran = f" {' and '.join(called)} ran on a small sample." if called else ""
+        # the SERVER's verdict, not whether the client produced a payload. the client's only gate
+        # is "at least one draw came back", so a deadline-truncated pass of 31 draws, or one whose
+        # truncation rate or prompt coverage fails the trust gate, is evidence here and rejected
+        # there -- and the run is then priced at the cap. reporting the client's optimism as the
+        # outcome tells the user the opposite of what they will be billed against.
         priced = (
             "this quote is priced from the rollouts it measured"
-            if rollout_evidence
+            if rollout_evidence_accepted
             else "no usable measurement came back, so this quote still uses the declared "
             "completion cap"
         )
@@ -804,12 +810,19 @@ def cmd_train(args) -> int:
         # when it was actually checked. absent key = a server that predates the signal, which is
         # equally not a verification -- so treat anything but an explicit True as unverified.
         affordability_verified = status.pop("affordability_verified", None) is True
+        # the server re-derives the digest and re-applies the trust gate, keeping the profile only
+        # when it passes -- so a populated workload_profile IS the acceptance signal, and its
+        # absence means this quote is the cap-based one whatever the client measured.
+        accepted = isinstance(status.get("workload_profile"), dict) and bool(
+            status.get("workload_profile")
+        )
         print(
             _dry_run_preview_line(
                 algorithm=spec.algorithm,
                 affordability_verified=affordability_verified,
                 rollout_evidence=rollout_evidence,
                 environment_stages_run=environment_stages_run,
+                rollout_evidence_accepted=accepted,
             ),
             file=sys.stderr,
         )

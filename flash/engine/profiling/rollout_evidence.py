@@ -39,9 +39,11 @@ def collect_rollout_evidence(
     prompts: Sequence[Sequence[dict]],
     max_completion_tokens: int,
     temperature: float | None,
+    top_p: float | None,
     rollouts: int = DEFAULT_ROLLOUTS,
     stop_sequences: Sequence[str] = (),
     thinking: bool | None = None,
+    prompt_budget: int | None = None,
 ) -> dict[str, Any] | None:
     """measure this config's rollouts, or return None when no measurement is possible.
 
@@ -60,10 +62,12 @@ def collect_rollout_evidence(
         rollouts=max(1, int(rollouts)),
         max_completion_tokens=int(max_completion_tokens),
         temperature=temperature,
+        top_p=top_p,
         base_url=base_url,
         api_key=api_key,
         stop_sequences=stop_sequences,
         thinking=thinking,
+        prompt_budget=prompt_budget,
     )
     if not sampling.completed:
         return None

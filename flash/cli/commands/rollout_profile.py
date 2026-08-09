@@ -201,7 +201,19 @@ def _collect(
     from flash.envs.pull import pull_environment_package_from_archive
 
     with tempfile.TemporaryDirectory(prefix="flash-rollout-profile-") as workdir:
-        package = client.download_env_package(spec.environment.id)
+        # bounded like the env's own hooks. ApiClient.download_env_package hardcodes a 1800s
+        # timeout, which is right for an interactive `flash env pull` the user is waiting on and
+        # wrong here: a stalled package route would hold `flash train` for half an hour before
+        # falling back to the cap-based quote it would have used anyway. bounded at the call site
+        # rather than by adding a timeout parameter to the shared client, which is a different
+        # subsystem and used by callers that legitimately want the long wait.
+        finished, package = _within(
+            _LOCAL_HOOK_DEADLINE_S, client.download_env_package, spec.environment.id
+        )
+        if not finished or package is None:
+            # `is None` rather than falsy: only "did not finish" and "raised" are failures here,
+            # and an empty body is left to the extractor, which is what validates archives.
+            return None
         root = pull_environment_package_from_archive(package, Path(workdir) / "package")
         entrypoint = (root / _DEFAULT_ENVIRONMENT_PATH).resolve()
         # absolute, so the loader takes its local-file branch. a relative dir matches the managed-slug
@@ -264,6 +276,8 @@ def _collect(
             prompts=prompts,
             max_completion_tokens=_completion_cap(spec),
             temperature=_sampling_temperature(spec),
+            top_p=_sampling_top_p(spec),
+            prompt_budget=_prompt_budget(spec),
             # a run configured with stop strings ends generation at the first one, so a sample
             # drawn without them measures a longer completion than training will ever produce.
             stop_sequences=tuple(getattr(spec.train, "stop_sequences", ()) or ()),
@@ -383,11 +397,22 @@ def _within(deadline_s: float, call, *args) -> tuple[bool, Any]:
 
 
 def _training_population(spec, dataset):
-    """the dataset prefix training will actually consume, mirroring the workers' own fence."""
+    """the rows training will consume, in the order it will consume them.
+
+    mirrors the workers exactly: fence to ``max_examples`` FIRST, then shuffle the fence with the
+    run's seed (rl_train.py `train = train[:max_examples]` then `random.Random(SEED).shuffle`, and
+    opd_train.py the same). order matters as much as the fence, because only a prefix of this is
+    ever measured -- a dataset grouped by class or length would otherwise have its first rows
+    priced for the whole run, and those rows are exactly the ones an ordered dataset makes
+    unrepresentative.
+
+    a copy, not an in-place shuffle: this is the caller's dataset object, and reordering it would
+    change what the rest of the submit sees as a side effect of asking for a quote.
+    """
     max_examples = int(getattr(spec.train, "max_examples", 0) or 0)
-    if max_examples > 0:
-        return dataset[:max_examples]
-    return dataset
+    population = list(dataset[:max_examples] if max_examples > 0 else dataset)
+    random.Random(int(getattr(spec, "seed", 0) or 0)).shuffle(population)
+    return population
 
 
 def _prompts_from(environment, dataset) -> list[list[dict]] | None:
@@ -420,8 +445,14 @@ def _prompts_from(environment, dataset) -> list[list[dict]] | None:
         if record_has_images(example if isinstance(example, dict) else {}, messages):
             return None
         usable = _chat_messages(messages)
-        if usable:
-            prompts.append(usable)
+        if not usable:
+            # declined for the same reason a multimodal row is, and it has to be the same reason:
+            # dropping the row instead would leave the plain rows as the WHOLE offered set, so 32
+            # draws over them report full coverage and pass the trust gate while training still
+            # renders the omitted originals. a partial population that looks complete is worse
+            # than no measurement, which just returns the quote to the cap.
+            return None
+        prompts.append(usable)
     return prompts
 
 
@@ -484,3 +515,39 @@ def _sampling_temperature(spec) -> float:
 
     recipe = RECIPE.opd if spec.algorithm == "opd" else RECIPE.rl
     return float(recipe.sampling_temperature)
+
+
+def _prompt_budget(spec) -> int | None:
+    """the prompt length the workers will admit, or None when this run declares no context limit.
+
+    both workers compute `prompt_budget = context - max_completion` and DROP every row whose
+    rendered prompt exceeds it (rl_train.py and opd_train.py), so a draw from such a row measures
+    a prompt the run never trains on. filtered on the endpoint's reported ``prompt_tokens`` rather
+    than a local tokenization, because the cli has no tokenizer and pulling one in for an advisory
+    quote is the wrong trade.
+
+    only the DECLARED context is used. the workers clamp against the model's architectural limit
+    too, which needs an AutoConfig fetch this path must not make -- and the clamp can only lower
+    the budget, so the declared value is the looser bound: it filters the rows the workers are
+    certain to drop and never invents a rejection they would not make.
+    """
+    context = int(getattr(spec.train, "max_context_tokens", 0) or 0)
+    if context <= 0:
+        return None
+    budget = context - _completion_cap(spec)
+    return budget if budget > 0 else None
+
+
+def _sampling_top_p(spec) -> float:
+    """the nucleus-sampling setting this run will use.
+
+    read from the same recipe the workers read (`actor_rollout_ref.rollout.top_p` is set from
+    `sampling_top_p` in both rl_train.py and opd_train.py) rather than assumed, so this keeps
+    matching if the recipe value changes. there is no per-run knob for it today, which is exactly
+    why it must be SENT: an endpoint whose own default is not the recipe's would otherwise decode
+    differently from every run this measures.
+    """
+    from flash.engine.plan.recipe import RECIPE
+
+    recipe = RECIPE.opd if spec.algorithm == "opd" else RECIPE.rl
+    return float(recipe.sampling_top_p)

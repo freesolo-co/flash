@@ -108,6 +108,7 @@ def test_sampling_spreads_draws_across_distinct_prompts_before_repeating_one(mon
         rollouts=8,
         max_completion_tokens=512,
         temperature=1.0,
+        top_p=1.0,
         base_url="https://example.invalid/v1",
         api_key="k",
     )
@@ -136,6 +137,7 @@ def test_a_failed_draw_is_counted_not_raised(monkeypatch):
         rollouts=4,
         max_completion_tokens=512,
         temperature=None,
+        top_p=1.0,
         base_url="https://example.invalid/v1",
         api_key="k",
     )
@@ -166,6 +168,7 @@ def test_a_transient_failure_does_not_leave_the_sample_one_short_of_the_floor(mo
         rollouts=MIN_TRUSTWORTHY_ROLLOUTS,
         max_completion_tokens=512,
         temperature=None,
+        top_p=1.0,
         base_url="https://example.invalid/v1",
         api_key="k",
     )
@@ -195,6 +198,7 @@ def test_a_stalling_endpoint_stops_the_sample_instead_of_delaying_the_submit(mon
         rollouts=32,
         max_completion_tokens=512,
         temperature=None,
+        top_p=1.0,
         base_url="https://example.invalid/v1",
         api_key="k",
     )
@@ -221,6 +225,7 @@ def test_the_failure_cutoff_counts_consecutive_draws_not_total(monkeypatch):
         rollouts=20,
         max_completion_tokens=512,
         temperature=None,
+        top_p=1.0,
         base_url="https://example.invalid/v1",
         api_key="k",
     )
@@ -279,7 +284,7 @@ def test_a_system_turn_reaches_the_sampler_as_a_system_turn():
 
 
 def test_a_prompt_this_cannot_represent_faithfully_is_dropped_not_reshaped():
-    """A multimodal part-list prompt has no faithful single-string form. Dropping it returns the
+    """A multimodal part-list prompt has no faithful single-string form. Declining returns the
     quote to the cap; sending a reshaped one would price a distribution that is not the run's."""
     from flash.cli.commands.rollout_profile import _prompts_from
 
@@ -287,7 +292,27 @@ def test_a_prompt_this_cannot_represent_faithfully_is_dropped_not_reshaped():
         def prompt_messages(self, example):
             return [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
 
-    assert _prompts_from(_Env(), [{"q": "x"}]) == []
+    assert _prompts_from(_Env(), [{"q": "x"}]) is None
+
+
+def test_a_mixed_dataset_declines_rather_than_measuring_only_its_plain_rows():
+    """Skipping the rows this cannot represent leaves the plain ones as the WHOLE offered set.
+
+    Coverage is then reported over the survivors, so a run whose dataset is half tool-calling
+    prompts reports 100% coverage and passes the trust gate on the plain half alone -- while
+    training still renders the omitted originals. Declining prices at the cap instead.
+    """
+    from flash.cli.commands.rollout_profile import _prompts_from
+
+    class _Mixed:
+        def prompt_messages(self, example):
+            if example["kind"] == "tool":
+                # carries `name`, which the worker passes to apply_chat_template and this cannot.
+                return [{"role": "user", "content": "call it", "name": "tool-call"}]
+            return [{"role": "user", "content": example["q"]}]
+
+    rows = [{"kind": "tool", "q": "t"}] * 4 + [{"kind": "plain", "q": "2+2?"}] * 4
+    assert _prompts_from(_Mixed(), rows) is None
 
 
 def test_only_the_rows_training_consumes_are_measured():
@@ -297,9 +322,36 @@ def test_only_the_rows_training_consumes_are_measured():
     from flash.cli.commands.rollout_profile import _training_population
 
     spec = _spec(train=TrainSpec(max_steps=50, batch_size=8, group_size=4, max_examples=2))
-    assert _training_population(spec, [1, 2, 3, 4, 5]) == [1, 2]
+    # the FENCE is a prefix; the order within it is the worker's shuffle, so compare as a set.
+    assert sorted(_training_population(spec, [1, 2, 3, 4, 5])) == [1, 2]
     unfenced = _spec()
-    assert _training_population(unfenced, [1, 2, 3, 4, 5]) == [1, 2, 3, 4, 5]
+    assert sorted(_training_population(unfenced, [1, 2, 3, 4, 5])) == [1, 2, 3, 4, 5]
+
+
+def test_the_measured_rows_are_the_ones_the_worker_shuffles_to():
+    """Only a prefix of the population is ever measured, and both workers SHUFFLE before consuming
+    it (`train = train[:max_examples]` then `random.Random(SEED).shuffle(train)`).
+
+    Measuring the raw prefix instead prices whatever the dataset happens to start with. On a
+    dataset ordered by length or class that is systematically unrepresentative -- and it is exactly
+    the ordered datasets where the first rows differ most from the rest.
+    """
+    import random as _random
+
+    from flash.cli.commands.rollout_profile import _PROMPT_ROWS, _training_population
+
+    rows = [{"i": i} for i in range(64)]
+    spec = _spec(seed=1234)
+
+    measured = [row["i"] for row in _training_population(spec, rows)[:_PROMPT_ROWS]]
+
+    worker_order = list(rows)
+    _random.Random(1234).shuffle(worker_order)
+    assert measured == [row["i"] for row in worker_order[:_PROMPT_ROWS]]
+    # and it is not simply the prefix, which is what made this wrong.
+    assert measured != list(range(_PROMPT_ROWS))
+    # the caller's dataset must not be reordered as a side effect of asking for a quote.
+    assert [row["i"] for row in rows] == list(range(64))
 
 
 def test_summary_reports_the_distribution_not_a_mean_alone():
@@ -665,6 +717,7 @@ def test_configured_stop_sequences_reach_the_sampled_request(monkeypatch):
         rollouts=1,
         max_completion_tokens=512,
         temperature=None,
+        top_p=1.0,
         base_url="https://example.invalid/v1",
         api_key="k",
         stop_sequences=("</answer>",),
@@ -702,6 +755,7 @@ def test_stop_sequences_are_sent_as_the_apis_stop_field(monkeypatch):
         messages=[{"role": "user", "content": "p"}],
         max_completion_tokens=64,
         temperature=None,
+        top_p=1.0,
         base_url="https://example.invalid/v1",
         api_key="k",
         stop_sequences=("</answer>", ""),
@@ -740,6 +794,7 @@ def test_no_stop_field_is_sent_when_the_run_configures_none(monkeypatch):
         messages=[{"role": "user", "content": "p"}],
         max_completion_tokens=64,
         temperature=None,
+        top_p=1.0,
         base_url="https://example.invalid/v1",
         api_key="k",
     )
@@ -1047,6 +1102,7 @@ def test_the_evidence_carries_no_grading_measurement(monkeypatch):
         prompts=[[{"role": "user", "content": "p"}]],
         max_completion_tokens=512,
         temperature=None,
+        top_p=1.0,
     )
     assert not [key for key in evidence if key.startswith("reward")]
     # and the token half still stands on its own.
@@ -1220,6 +1276,7 @@ def test_the_api_key_is_not_disclosed_to_a_redirect_target():
             messages=[{"role": "user", "content": "p"}],
             max_completion_tokens=64,
             temperature=None,
+            top_p=1.0,
             base_url=f"http://127.0.0.1:{redirector.server_address[1]}/v1",
             api_key="sk-USER-PAID-INFERENCE-KEY",
         )
@@ -1278,6 +1335,7 @@ def test_the_sampler_stamps_the_policy_version_it_produced(monkeypatch):
         prompts=[[{"role": "user", "content": "p"}]],
         max_completion_tokens=512,
         temperature=None,
+        top_p=1.0,
     )
     assert evidence["sample_policy_version"] == ROLLOUT_SAMPLE_POLICY_VERSION
     # and it survives the server's gate, which is the point of emitting it.
@@ -1556,6 +1614,7 @@ def test_a_draw_starting_near_the_deadline_cannot_overrun_the_sampling_budget(mo
         rollouts=32,
         max_completion_tokens=128,
         temperature=None,
+        top_p=1.0,
         base_url="https://example.invalid/v1",
         api_key="k",
     )
@@ -1620,29 +1679,31 @@ def test_measuring_does_not_leave_the_process_torch_seeded(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("stages", "evidence", "must_say", "must_not_say"),
+    ("stages", "evidence", "accepted", "must_say", "must_not_say"),
     [
         # a multi-turn env declines on the import alone: naming dataset() here would be a lie.
-        (("import",), None, "no usable measurement came back", "dataset()"),
+        (("import",), None, False, "no usable measurement came back", "dataset()"),
         # an empty dataset stops before prompt_messages().
-        (("import", "dataset"), None, "dataset() ran", "prompt_messages()"),
+        (("import", "dataset"), None, False, "dataset() ran", "prompt_messages()"),
         (
             ("import", "dataset", "prompt_messages"),
             None,
+            False,
             "dataset() and prompt_messages() ran",
             "did NOT import",
         ),
         (
             ("import", "dataset", "prompt_messages"),
             {"completed_rollouts": 32},
+            True,
             "priced from the rollouts it measured",
             "did NOT import",
         ),
-        ((), None, "did NOT import or run your environment.py", "WAS imported locally"),
+        ((), None, False, "did NOT import or run your environment.py", "WAS imported locally"),
     ],
 )
 def test_the_dry_run_reports_the_hooks_that_ran_not_whether_it_measured(
-    stages, evidence, must_say, must_not_say
+    stages, evidence, accepted, must_say, must_not_say
 ):
     """Profiling runs the user's module BEFORE it can find the config unmeasurable, and the declines
     stop at DIFFERENT points.
@@ -1658,9 +1719,45 @@ def test_the_dry_run_reports_the_hooks_that_ran_not_whether_it_measured(
         affordability_verified=True,
         rollout_evidence=evidence,
         environment_stages_run=stages,
+        rollout_evidence_accepted=accepted,
     )
     assert must_say in line
     assert must_not_say not in line
+
+
+def test_the_notice_reports_the_servers_verdict_not_the_clients_payload():
+    """The client's only gate is "at least one draw came back".
+
+    A deadline-truncated pass of 31 draws, or one whose truncation rate or prompt coverage fails
+    the trust gate, is evidence on this side and REJECTED on the server's -- which then prices the
+    run at the declared cap. Reporting the client's optimism tells the user the opposite of what
+    they will be billed against, and pre-spend is exactly when that matters.
+    """
+    from flash.cli.commands import _dry_run_preview_line
+
+    measured = {"completed_rollouts": 31}
+    stages = ("import", "dataset", "prompt_messages")
+
+    rejected = _dry_run_preview_line(
+        algorithm="grpo",
+        affordability_verified=True,
+        rollout_evidence=measured,
+        environment_stages_run=stages,
+        rollout_evidence_accepted=False,
+    )
+    assert "still uses the declared completion cap" in rejected
+    assert "priced from the rollouts it measured" not in rejected
+    # what actually ran locally is unchanged by the server's verdict, and still reported.
+    assert "dataset() and prompt_messages() ran" in rejected
+
+    accepted = _dry_run_preview_line(
+        algorithm="grpo",
+        affordability_verified=True,
+        rollout_evidence=measured,
+        environment_stages_run=stages,
+        rollout_evidence_accepted=True,
+    )
+    assert "priced from the rollouts it measured" in accepted
 
 
 def test_the_submit_path_learns_the_environment_ran_even_with_no_evidence(monkeypatch, tmp_path):
@@ -1793,6 +1890,38 @@ def test_a_draw_that_reasons_against_a_non_thinking_run_is_not_a_measurement():
     assert kept.completion_tokens == 900
 
 
+def test_a_plain_draw_against_a_thinking_run_is_not_a_measurement():
+    """The mismatch has to be rejected in BOTH directions, and this is the likelier one.
+
+    `reasoning` and `chat_template_kwargs` are non-standard, so an endpoint may accept the request
+    and ignore both, answering a `thinking = true` run with a short plain completion. Nothing about
+    that response looks wrong -- it is a clean `stop` with sane token counts -- but every real
+    rollout will emit traces it is missing, so it underprices the run by the whole trace length.
+    """
+    plain_body = {
+        "choices": [{"finish_reason": "stop", "message": {"content": "4"}}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 12},
+    }
+
+    declined = rollout_sampler._sample_from_response(
+        plain_body, max_completion_tokens=2048, thinking=True
+    )
+    assert declined is None
+
+    # the same body IS the measurement for a run that asked for no reasoning.
+    kept = rollout_sampler._sample_from_response(
+        plain_body, max_completion_tokens=2048, thinking=False
+    )
+    assert kept is not None
+    assert kept.completion_tokens == 12
+
+    # a model with no reasoning mode at all (thinking=None) is not checked in either direction.
+    assert (
+        rollout_sampler._sample_from_response(plain_body, max_completion_tokens=2048, thinking=None)
+        is not None
+    )
+
+
 @pytest.mark.parametrize(
     "message",
     [
@@ -1847,6 +1976,7 @@ def test_the_request_states_the_runs_reasoning_setting(monkeypatch):
         messages=[{"role": "user", "content": "2+2?"}],
         max_completion_tokens=512,
         temperature=None,
+        top_p=1.0,
         base_url="https://example.invalid/v1",
         api_key="k",
         thinking=False,
@@ -1854,6 +1984,161 @@ def test_the_request_states_the_runs_reasoning_setting(monkeypatch):
 
     assert captured["body"]["chat_template_kwargs"] == {"enable_thinking": False}
     assert captured["body"]["reasoning"] == {"enabled": False}
+
+
+def test_the_request_states_the_runs_nucleus_sampling(monkeypatch):
+    """Both workers set `actor_rollout_ref.rollout.top_p` explicitly from `sampling_top_p`.
+
+    Nucleus sampling decides which continuations are selectable, so it moves the stopping-length
+    distribution this profile measures. Omitting it from the request inherits whatever the endpoint
+    defaults to, and a draw decoded differently from training cannot price training.
+    """
+    captured: dict = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "choices": [{"finish_reason": "stop", "message": {"content": "4"}}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 40},
+                }
+            ).encode()
+
+    def _open(request, timeout=None):
+        captured["body"] = json.loads(request.data.decode())
+        return _Response()
+
+    monkeypatch.setattr(rollout_sampler._NO_REDIRECT_OPENER, "open", _open)
+
+    rollout_sampler._one_completion(
+        model="Qwen/Qwen3.5-4B",
+        messages=[{"role": "user", "content": "2+2?"}],
+        max_completion_tokens=512,
+        temperature=None,
+        top_p=0.9,
+        base_url="https://example.invalid/v1",
+        api_key="k",
+    )
+
+    assert captured["body"]["top_p"] == 0.9
+
+
+def test_a_prompt_the_worker_would_drop_is_not_measured():
+    """Both workers drop rows over `context - max_completion` before training ever starts.
+
+    The hosted endpoint has no such limit, so it answers those prompts happily -- and their
+    lengths would land in a profile describing steps that never run them. Long rows are also
+    exactly the ones that would dominate the mean, so keeping them skews the direction that
+    overbills.
+    """
+    over = {
+        "choices": [{"finish_reason": "stop", "message": {"content": "4"}}],
+        "usage": {"prompt_tokens": 1600, "completion_tokens": 40},
+    }
+    assert (
+        rollout_sampler._sample_from_response(over, max_completion_tokens=512, prompt_budget=1536)
+        is None
+    )
+
+    # a row inside the budget is measured normally, and no budget means no filter.
+    within = {
+        "choices": [{"finish_reason": "stop", "message": {"content": "4"}}],
+        "usage": {"prompt_tokens": 1536, "completion_tokens": 40},
+    }
+    assert (
+        rollout_sampler._sample_from_response(within, max_completion_tokens=512, prompt_budget=1536)
+        is not None
+    )
+    assert (
+        rollout_sampler._sample_from_response(over, max_completion_tokens=512, prompt_budget=None)
+        is not None
+    )
+
+
+def test_the_submit_path_forwards_the_runs_prompt_budget_to_the_measurement(monkeypatch, tmp_path):
+    """The seam: computing the budget is useless if the sampler never receives it.
+
+    The filter lives in the response reader, so a budget that stops at the CLI leaves every
+    over-budget draw in the profile exactly as before -- and nothing else would notice.
+    """
+    from flash.cli.commands import rollout_profile as rp
+
+    class _Env:
+        multi_turn = False
+
+        def dataset(self):
+            return [{"q": "2+2?"}]
+
+        def prompt_messages(self, example):
+            return [{"role": "user", "content": example["q"]}]
+
+    client, seen = _profiling_stubs(monkeypatch, tmp_path, _Env())
+    spec = _spec(
+        train=TrainSpec(
+            max_steps=10,
+            batch_size=8,
+            group_size=4,
+            max_completion_tokens=512,
+            max_context_tokens=2048,
+        )
+    )
+
+    rp.collect_for_submit(client, spec, debug=True)
+
+    assert seen["prompt_budget"] == 1536
+    # and the run's decoding settings travel with it.
+    assert seen["top_p"] == pytest.approx(1.0)
+
+
+def test_the_prompt_budget_mirrors_the_workers_arithmetic():
+    """`context - max_completion`, and None when the run declares no context limit.
+
+    Only the DECLARED context: the workers also clamp to the model's architectural limit, which
+    needs a config fetch this path must not make. That clamp can only LOWER the budget, so the
+    declared value stays the looser bound -- it never invents a rejection the worker would not make.
+    """
+    from flash.cli.commands.rollout_profile import _prompt_budget
+
+    spec = _spec(
+        train=TrainSpec(
+            max_steps=10,
+            batch_size=8,
+            group_size=4,
+            max_completion_tokens=512,
+            max_context_tokens=2048,
+        )
+    )
+    assert _prompt_budget(spec) == 1536
+
+    # no declared context -> nothing to filter against, rather than a guessed limit.
+    assert _prompt_budget(_spec()) is None
+
+    # a context that leaves no room for a prompt filters nothing rather than everything.
+    airless = _spec(
+        train=TrainSpec(
+            max_steps=10,
+            batch_size=8,
+            group_size=4,
+            max_completion_tokens=2048,
+            max_context_tokens=2048,
+        )
+    )
+    assert _prompt_budget(airless) is None
+
+
+def test_the_measurement_samples_at_the_top_p_the_workers_use(monkeypatch):
+    """Read from the recipe the workers read, not hardcoded, so it stays correct if that changes."""
+    from flash.cli.commands.rollout_profile import _sampling_top_p
+    from flash.engine.plan.recipe import RECIPE
+
+    assert _sampling_top_p(_spec(algorithm="grpo")) == float(RECIPE.rl.sampling_top_p)
+    assert _sampling_top_p(_spec(algorithm="opd")) == float(RECIPE.opd.sampling_top_p)
 
 
 def test_a_blocking_environment_hook_cannot_hang_the_submit(monkeypatch):
@@ -1898,6 +2183,46 @@ def test_a_bounded_hook_still_returns_its_value():
     assert rp._within(30.0, list) == (True, [])
 
 
+def test_a_stalled_package_download_cannot_hold_the_submit(monkeypatch, tmp_path):
+    """`download_env_package` hardcodes a 1800s timeout, right for an interactive `flash env pull`
+    and wrong on an advisory path: a stalled package route would hold `flash train` for half an
+    hour before falling back to the cap-based quote it would have produced anyway.
+
+    It also runs BEFORE the local-hook and sampling deadlines, so neither of those bounds it.
+    """
+    from flash.cli.commands import _rollout_evidence_for
+    from flash.cli.commands import rollout_profile as rp
+
+    monkeypatch.setattr(rp, "_LOCAL_HOOK_DEADLINE_S", 0.2)
+    release = threading.Event()
+
+    class _Fine:
+        multi_turn = False
+
+        def dataset(self):
+            return [{"q": "2+2?"}]
+
+        def prompt_messages(self, _example):
+            return [{"role": "user", "content": "2+2?"}]
+
+    client, _seen = _profiling_stubs(monkeypatch, tmp_path, _Fine())
+    monkeypatch.setattr("flash.cli.commands.client_from_config", lambda: client, raising=False)
+    monkeypatch.setattr(
+        client, "download_env_package", lambda _env_id: release.wait(30) or b"", raising=False
+    )
+
+    began = time.monotonic()
+    try:
+        evidence, stages = _rollout_evidence_for(client, _spec())
+        elapsed = time.monotonic() - began
+        assert evidence is None
+        # nothing of the user's code ran: the archive it lives in never arrived.
+        assert stages == ()
+        assert elapsed < 5.0, f"waited {elapsed:.1f}s, so the download was not bounded"
+    finally:
+        release.set()
+
+
 def test_a_prompt_the_endpoint_always_refuses_does_not_count_as_sampled():
     """`sampled_prompts` must mean "produced a draw", not "was attempted".
 
@@ -1921,6 +2246,7 @@ def test_a_prompt_the_endpoint_always_refuses_does_not_count_as_sampled():
             rollouts=32,
             max_completion_tokens=512,
             temperature=None,
+            top_p=1.0,
             base_url="https://example.invalid/v1",
             api_key="k",
         )

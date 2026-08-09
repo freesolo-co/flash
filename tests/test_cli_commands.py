@@ -761,6 +761,55 @@ def test_train_dry_run_keeps_compatibility_on_stderr(
     assert call[1]["train"] == {"epochs": 1, "max_examples": 2}
 
 
+@pytest.mark.parametrize(
+    ("server_profile", "must_say"),
+    [
+        ({"kind": "rollout", "completed_rollouts": 32}, "priced from the rollouts it measured"),
+        # the server re-applied the trust gate and dropped it: this run IS cap-priced.
+        (None, "still uses the declared completion cap"),
+    ],
+)
+def test_train_dry_run_reports_whether_the_server_kept_the_measurement(
+    fake_client, tmp_path, capsys, monkeypatch, server_profile, must_say
+) -> None:
+    """The notice must read the server's verdict out of the response, not the client's payload.
+
+    The client's only gate is "at least one draw came back", so it can hand over evidence the
+    server rejects -- and the server then prices at the cap. Reading `workload_profile` off the
+    response is what makes the pre-spend line match what the user will be billed against.
+    """
+    config = tmp_path / "train.toml"
+    config.write_text(
+        'model = "Qwen/Qwen3.5-4B"\n'
+        'project = "11111111-1111-4111-8111-111111111111"\n'
+        'algorithm = "grpo"\n'
+        '[environment]\nid = "owner/env"\n'
+        "[train]\nepochs = 1\nmax_examples = 2\n"
+    )
+
+    # the client measured something either way; only the server's answer differs.
+    def _measured(*_args, on_environment_loaded=None, **_kwargs):
+        for stage in ("import", "dataset", "prompt_messages"):
+            if on_environment_loaded is not None:
+                on_environment_loaded(stage)
+        return {"completed_rollouts": 32}
+
+    monkeypatch.setattr(
+        "flash.cli.commands.rollout_profile.collect_for_submit", _measured, raising=False
+    )
+    original_create_run = fake_client.create_run
+
+    def _create_run(*args, **kwargs):
+        response = original_create_run(*args, **kwargs)
+        response["workload_profile"] = server_profile
+        return response
+
+    fake_client.create_run = _create_run
+
+    assert _run(["train", str(config), "--dry-run"]) == 0
+    assert must_say in capsys.readouterr().err
+
+
 def test_train_dry_run_sends_declared_runtime_secrets(
     fake_client, tmp_path, capsys, monkeypatch
 ) -> None:

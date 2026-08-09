@@ -154,10 +154,12 @@ def sample_rollouts(
     rollouts: int,
     max_completion_tokens: int,
     temperature: float | None,
+    top_p: float | None,
     base_url: str,
     api_key: str,
     stop_sequences: Sequence[str] = (),
     thinking: bool | None = None,
+    prompt_budget: int | None = None,
 ) -> RolloutSampling:
     """draw ``rollouts`` generations, spreading across ``prompts`` before repeating one.
 
@@ -207,11 +209,13 @@ def sample_rollouts(
             messages=prompts[slot],
             max_completion_tokens=max_completion_tokens,
             temperature=temperature,
+            top_p=top_p,
             base_url=base_url,
             api_key=api_key,
             stop_sequences=stop_sequences,
             timeout_s=min(REQUEST_TIMEOUT_S, remaining),
             thinking=thinking,
+            prompt_budget=prompt_budget,
         )
         if sample is None:
             failures += 1
@@ -236,11 +240,13 @@ def _one_completion(
     messages: Sequence[dict],
     max_completion_tokens: int,
     temperature: float | None,
+    top_p: float | None,
     base_url: str,
     api_key: str,
     stop_sequences: Sequence[str] = (),
     timeout_s: float = REQUEST_TIMEOUT_S,
     thinking: bool | None = None,
+    prompt_budget: int | None = None,
 ) -> RolloutSample | None:
     """one generation's token counts, or None when the draw failed for any reason.
 
@@ -257,6 +263,12 @@ def _one_completion(
     }
     if temperature is not None:
         payload["temperature"] = float(temperature)
+    # nucleus sampling decides which continuations can be selected at all, so it moves the stopping
+    # length this profile measures. both workers set it explicitly
+    # (`actor_rollout_ref.rollout.top_p`), so leaving it off the request would inherit whatever the
+    # endpoint defaults to and measure a decoding the run never uses.
+    if top_p is not None:
+        payload["top_p"] = float(top_p)
     # the training rollout passes these as `stop`, so a run configured with them ends generation at
     # the first one. sampling without them lets the hosted model run on to the cap and reports a
     # mean no rollout produces -- biased HIGH, the direction that overbills. a stop-string draw ends
@@ -286,20 +298,25 @@ def _one_completion(
     except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
         return None
     return _sample_from_response(
-        body, max_completion_tokens=int(max_completion_tokens), thinking=thinking
+        body,
+        max_completion_tokens=int(max_completion_tokens),
+        thinking=thinking,
+        prompt_budget=prompt_budget,
     )
 
 
 def _reasoned(usage: dict, choice: object) -> bool:
-    """whether this response carries reasoning the request asked not to have.
+    """whether this response carries visible reasoning.
 
     three signals, because providers disagree on where reasoning surfaces: a token accounting
     breakdown, a separate reasoning field on the message, and the literal think tags a chat template
-    emits when reasoning is on. any one of them is enough to disqualify a draw.
+    emits when reasoning is on. any one of them is enough to decide the answer either way.
 
-    absence proves nothing on its own -- an endpoint that silently ignored the request and returned
-    plain text is indistinguishable from one that honoured it -- but reasoning is what inflates
-    completion length, so catching it wherever it IS visible is what protects the measurement.
+    the reading is symmetric because BOTH mismatches misprice. reasoning against a thinking=False
+    run inflates completion length; a plain answer to a thinking=True run understates it, and that
+    is the likelier failure -- `reasoning` and `chat_template_kwargs` are non-standard, so an
+    endpoint may accept the request and ignore both, returning a short answer that looks perfectly
+    valid. an unreasoned draw cannot stand for a run that renders every prompt with thinking on.
     """
     details = usage.get("completion_tokens_details")
     if isinstance(details, dict):
@@ -319,17 +336,23 @@ def _reasoned(usage: dict, choice: object) -> bool:
 
 
 def _sample_from_response(
-    body: object, *, max_completion_tokens: int, thinking: bool | None = None
+    body: object,
+    *,
+    max_completion_tokens: int,
+    thinking: bool | None = None,
+    prompt_budget: int | None = None,
 ) -> RolloutSample | None:
     """token counts for one draw, or None when the response cannot stand as a measurement."""
     usage = body.get("usage") if isinstance(body, dict) else None
     choices = body.get("choices") if isinstance(body, dict) else None
     if not isinstance(usage, dict) or not isinstance(choices, list) or not choices:
         return None
-    if thinking is False and _reasoned(usage, choices[0]):
-        # the request asked for no reasoning and the endpoint reasoned anyway. those tokens are
-        # billed in completion_tokens and the training rollout will not generate them, so this draw
-        # measures different work. dropped rather than kept, which returns the quote to the cap.
+    if thinking is not None and _reasoned(usage, choices[0]) is not thinking:
+        # the draw's reasoning does not match the run's, in either direction, so it measures
+        # different work. reasoning against a thinking=False run adds tokens billed in
+        # completion_tokens that the rollout never generates; a plain answer to a thinking=True run
+        # is missing the traces every rollout WILL generate, which underprices by far more. both
+        # are dropped, which returns the quote to the cap rather than to a confident wrong number.
         return None
     try:
         completion_tokens = int(usage["completion_tokens"])
@@ -337,6 +360,12 @@ def _sample_from_response(
     except (KeyError, TypeError, ValueError):
         return None
     if completion_tokens <= 0 or prompt_tokens <= 0:
+        return None
+    if prompt_budget is not None and prompt_tokens > prompt_budget:
+        # both workers drop a row whose rendered prompt exceeds `context - max_completion` before
+        # training (rl_train.py and opd_train.py both filter on their own prompt_budget), so this
+        # row is never trained on. keeping its draw would put a length in the profile that no step
+        # produces -- and the long rows are exactly the ones that would dominate the mean.
         return None
     first = choices[0]
     finish = first.get("finish_reason") if isinstance(first, dict) else None
