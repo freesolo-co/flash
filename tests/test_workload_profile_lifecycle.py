@@ -453,10 +453,13 @@ def test_profile_provenance_is_covered_by_preparation_digest(tmp_path, monkeypat
         runner.effective_spec_from_status(status)
 
 
-def test_preparation_digest_ignores_public_lora_alpha(tmp_path, monkeypatch) -> None:
+def test_preparation_digest_omits_public_lora_alpha_only_for_legacy_snapshots(
+    tmp_path, monkeypatch
+) -> None:
     # lora_alpha became user-authorable, so to_dict() emits it for non-warm-start runs. A snapshot
-    # prepared before that change hashed a public spec WITHOUT alpha, so the digest must not see it:
-    # otherwise every in-flight run with a workload profile fails integrity validation on recovery.
+    # prepared before that change hashed a public spec WITHOUT alpha, so its digest must be
+    # reproduced that way -- otherwise every in-flight run with a workload profile fails integrity
+    # validation on recovery. That omission is scoped to those snapshots: a new digest binds alpha.
     runner = fresh_runner(tmp_path, monkeypatch)
     spec = _spec()
 
@@ -475,8 +478,13 @@ def test_preparation_digest_ignores_public_lora_alpha(tmp_path, monkeypatch) -> 
             return self._inner.to_internal_dict()
 
     assert "lora_alpha" in spec.to_dict()["train"]  # guard: the public form really does carry it
-    assert runner._preparation_digest(spec, spec, None) == runner._preparation_digest(
-        _PreAlphaPublic(spec), spec, None
+    assert runner._preparation_digest(
+        spec, spec, None, legacy_public_alpha=True
+    ) == runner._preparation_digest(_PreAlphaPublic(spec), spec, None, legacy_public_alpha=True)
+
+    # a NEW digest binds the public alpha, so the legacy omission is not the default.
+    assert runner._preparation_digest(spec, spec, None) != runner._preparation_digest(
+        spec, spec, None, legacy_public_alpha=True
     )
 
     # the worker half still covers alpha, so a changed alpha must still change the digest.
@@ -484,3 +492,110 @@ def test_preparation_digest_ignores_public_lora_alpha(tmp_path, monkeypatch) -> 
     assert runner._preparation_digest(other, other, None) != runner._preparation_digest(
         spec, spec, None
     )
+
+
+def _profile_status(runner, *, public: JobSpec, worker: JobSpec, profile: dict, legacy: bool):
+    """A persisted workload-profile run, snapshotted as a legacy or a current preparation."""
+    public_spec = public.to_dict()
+    if legacy:
+        public_spec["train"].pop("lora_alpha", None)
+
+        class _PreAlphaPublic:
+            def to_dict(self) -> dict:
+                return dict(public_spec, train=dict(public_spec["train"]))
+
+            def to_internal_dict(self) -> dict:
+                return public.to_internal_dict()
+
+        digest_public = _PreAlphaPublic()
+    else:
+        digest_public = public
+    return runner.RunStatus(
+        run_id=worker.run_id,
+        state="queued",
+        spec=public_spec,
+        effective_preparation={
+            "worker_spec": worker.to_internal_dict(),
+            "workload_profile": profile,
+            "adapter_identity": None,
+            "preparation_digest": runner._preparation_digest(
+                digest_public, worker, None, legacy_public_alpha=legacy
+            ),
+        },
+    )
+
+
+def test_public_lora_alpha_is_bound_into_new_preparation_digests(tmp_path, monkeypatch) -> None:
+    """A tampered public alpha must not survive recovery on a newly prepared run.
+
+    _validate_effective_spec() excludes lora_alpha from its structural comparison, so the digest is
+    the only thing covering the public value. Leaving it out let the two halves disagree silently:
+    recovery would train with the worker's alpha while the public status reported another.
+    """
+    runner = fresh_runner(tmp_path, monkeypatch)
+    spec = _spec()
+    digest = _input_digest(spec)
+    profile = _profile(digest).to_dict()
+    worker = replace(
+        spec,
+        run_id="training-run",
+        workload_profile_input_digest=digest,
+        workload_profile_producer_version="1.2.3",
+        workload_profile=profile,
+    )
+    public = replace(
+        worker,
+        workload_profile_input_digest="",
+        workload_profile_producer_version="",
+        workload_profile={},
+    )
+
+    status = _profile_status(runner, public=public, worker=worker, profile=profile, legacy=False)
+    assert runner.effective_spec_from_status(status) == worker
+
+    intact = status.spec
+    status.spec = {
+        **intact,
+        "train": {**intact["train"], "lora_alpha": intact["train"]["lora_alpha"] + 8},
+    }
+    with pytest.raises(ValueError, match="failed integrity validation"):
+        runner.effective_spec_from_status(status)
+
+    # deleting alpha must not forge a legacy snapshot out of a current one.
+    status.spec = {
+        **intact,
+        "train": {k: v for k, v in intact["train"].items() if k != "lora_alpha"},
+    }
+    with pytest.raises(ValueError, match="failed integrity validation"):
+        runner.effective_spec_from_status(status)
+
+
+def test_legacy_pre_alpha_snapshot_still_recovers(tmp_path, monkeypatch) -> None:
+    """A run prepared before alpha was public keeps its historical digest and stays recoverable."""
+    runner = fresh_runner(tmp_path, monkeypatch)
+    spec = _spec()
+    digest = _input_digest(spec)
+    profile = _profile(digest).to_dict()
+    worker = replace(
+        spec,
+        run_id="training-run",
+        workload_profile_input_digest=digest,
+        workload_profile_producer_version="1.2.3",
+        workload_profile=profile,
+    )
+    public = replace(
+        worker,
+        workload_profile_input_digest="",
+        workload_profile_producer_version="",
+        workload_profile={},
+    )
+
+    status = _profile_status(runner, public=public, worker=worker, profile=profile, legacy=True)
+    assert "lora_alpha" not in status.spec["train"]  # guard: it really is the pre-upgrade shape
+    assert runner.effective_spec_from_status(status) == worker
+
+    # re-persisting (quote refresh, realloc) has to hash the same way, or the digest it writes now
+    # is one the next integrity check cannot reproduce.
+    runner._save_status(status)
+    assert runner._persist_effective_worker_spec(worker)
+    assert runner.effective_spec_from_status(runner.get_status(worker.run_id)) == worker

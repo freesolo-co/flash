@@ -1162,6 +1162,25 @@ def _mark_warmstart_source(worker_spec: JobSpec, child_run_id: str) -> None:
         )
 
 
+def _prepared_before_public_alpha(raw_public: object) -> bool:
+    """True when this run's PERSISTED public spec predates ``lora_alpha`` becoming authorable.
+
+    The discriminator is the stored bytes, not this build's serialization: a snapshot prepared
+    before the change hashed a public spec with no alpha key, and its digest can only be reproduced
+    the same way. status.spec is never rewritten, so this answer is stable for the run's life.
+
+    A warm-start spec is excluded even though it also omits alpha -- to_dict() strips rank and alpha
+    for those in every version, so absence there says nothing about when the run was prepared, and
+    treating it as legacy would drop a binding that costs nothing to keep.
+    """
+    if not isinstance(raw_public, dict):
+        return False
+    train = raw_public.get("train")
+    if not isinstance(train, dict) or "lora_alpha" in train:
+        return False
+    return not train.get("init_from_adapter")
+
+
 def _preparation_digest(
     public_spec: JobSpec,
     worker_spec: JobSpec,
@@ -1169,6 +1188,7 @@ def _preparation_digest(
     *,
     legacy_keys: dict | None = None,
     legacy_public_keys: dict | None = None,
+    legacy_public_alpha: bool = False,
 ) -> str:
     worker_payload = worker_spec.to_internal_dict()
     public_payload = public_spec.to_dict()
@@ -1197,12 +1217,17 @@ def _preparation_digest(
     for key, value in (legacy_public_keys or {}).items():
         if key in _DROPPED_TOP_LEVEL_KEYS:
             public_payload[key] = value
-    # ``lora_alpha`` became user-authorable, so to_dict() now emits it for non-warm-start runs. Same
-    # reason as the omissions and restorations above: a snapshot prepared before that change hashed a
-    # public spec without alpha, and rehashing it with alpha would fail a still-valid run's integrity
-    # check on recovery. The worker half of this payload carries the authoritative alpha either way,
-    # so dropping it here costs no integrity coverage.
-    public_payload["train"].pop("lora_alpha", None)
+    # ``lora_alpha`` became user-authorable, so to_dict() now emits it for non-warm-start runs. A
+    # snapshot prepared BEFORE that change hashed a public spec without alpha, so rehashing it with
+    # alpha would fail a still-valid run's integrity check on recovery -- same reason as the
+    # omissions and restorations above. That omission is scoped to those legacy snapshots only: a
+    # digest created from here on binds the public alpha, so tampering with the persisted public
+    # value is caught. Without that binding the two halves can disagree silently, because
+    # _validate_effective_spec() excludes lora_alpha from its structural comparison (the worker's
+    # warm-start-inherited alpha legitimately differs from the public one), leaving the digest as
+    # the only thing that could cover it.
+    if legacy_public_alpha:
+        public_payload["train"].pop("lora_alpha", None)
     payload = {
         "version": 1,
         "public_spec": public_payload,
@@ -1599,6 +1624,7 @@ def _persist_effective_worker_spec(
             worker_spec,
             adapter_identity,
             legacy_public_keys=legacy_public_keys,
+            legacy_public_alpha=_prepared_before_public_alpha(raw_public),
         ),
         "backend": TRAINER_BACKEND,
     }
@@ -1812,6 +1838,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     legacy_keys = {k: raw_worker[k] for k in _DROPPED_TOP_LEVEL_KEYS if k in raw_worker}
     raw_public = status.spec if isinstance(status.spec, dict) else {}
     legacy_public_keys = {k: raw_public[k] for k in _DROPPED_TOP_LEVEL_KEYS if k in raw_public}
+    legacy_public_alpha = _prepared_before_public_alpha(raw_public)
     has_workload_profile = bool(
         worker_spec.workload_profile_kind
         or worker_spec.workload_profile_input_digest
@@ -1826,6 +1853,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
             expected,
             legacy_keys=legacy_keys,
             legacy_public_keys=legacy_public_keys,
+            legacy_public_alpha=legacy_public_alpha,
         ):
             raise ValueError("persisted effective preparation failed integrity validation")
     if public_spec.train.init_from_adapter:
@@ -1840,6 +1868,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
             expected,
             legacy_keys=legacy_keys,
             legacy_public_keys=legacy_public_keys,
+            legacy_public_alpha=legacy_public_alpha,
         ):
             raise ValueError("persisted effective preparation failed integrity validation")
     if verify_source and public_spec.train.init_from_adapter:
