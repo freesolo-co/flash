@@ -239,6 +239,40 @@ def test_measured_latency_ages_out_but_the_shape_does_not():
     assert profile.content_digest == _profile().content_digest
 
 
+def test_a_token_only_profile_does_not_age_out():
+    """A client-measured profile carries no latency, so there is no latency to go stale.
+
+    Seconds do not transfer between hosts -- only token counts do -- so
+    ``rollout_profile_from_evidence`` sets generation seconds to 0.0 by construction. Expiring such
+    a profile drops a still-valid token distribution and silently returns the run to cap pricing at
+    the allocation re-quote, for a run whose only offence was being allocated a day after it was
+    quoted. The token counts are digest-keyed: anything that would change them already changes the
+    identity.
+    """
+    token_only = _profile(generation_seconds_per_completion=0.0)
+
+    ok, reason = token_only.trustworthy(now=NOW + ROLLOUT_LATENCY_MAX_AGE_S * 10)
+    assert ok is True
+    assert reason == ""
+
+    # and the exemption must be about ABSENT latency, not about age: a profile that does carry
+    # seconds still ages out at the same boundary.
+    with_latency = _profile(generation_seconds_per_completion=0.42)
+    stale_ok, stale_reason = with_latency.trustworthy(now=NOW + ROLLOUT_LATENCY_MAX_AGE_S + 60)
+    assert stale_ok is False
+    assert "re-measured" in stale_reason
+
+    # the exemption must not swallow the other trust gates either.
+    thin_ok, thin_reason = _profile(
+        generation_seconds_per_completion=0.0,
+        completed_rollouts=4,
+        eos_rollouts=4,
+        truncated_rollouts=0,
+    ).trustworthy(now=NOW)
+    assert thin_ok is False
+    assert "below the" in thin_reason
+
+
 def test_an_unstamped_profile_is_never_trusted():
     # measured_at defaults to 0.0 on a recomputation; that must not read as "measured at the epoch
     # and therefore infinitely stale in a way someone might clamp", nor as fresh.

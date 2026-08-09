@@ -2268,12 +2268,46 @@ def test_the_submit_path_forwards_the_runs_prompt_budget_to_the_measurement(monk
     assert seen["top_p"] == pytest.approx(1.0)
 
 
-def test_the_prompt_budget_mirrors_the_workers_arithmetic():
-    """`context - max_completion`, and None when the run declares no context limit.
+@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
+def test_an_undeclared_context_still_filters_at_the_workers_default(algorithm):
+    """`max_context_tokens` unset is the NORMAL case, and the workers still enforce a budget there.
 
-    Only the DECLARED context: the workers also clamp to the model's architectural limit, which
-    needs a config fetch this path must not make. That clamp can only LOWER the budget, so the
-    declared value stays the looser bound -- it never invents a rejection the worker would not make.
+    GRPO falls back to `max(1024, rl.max_prompt_len + cap)` (rl_train.py:1974-1976) and OPD to
+    `opd.max_prompt_len + cap` (opd_train.py:2194). Reading an unset context as "no budget" meant
+    the common run measured rows the worker is certain to drop -- long prompts inflating an accepted
+    profile with completion lengths that never reach training.
+
+    Asserted against the recipe the workers read, not a copied literal, so a recipe change moves
+    both sides together instead of silently making this a stale number.
+    """
+    from flash.cli.commands.rollout_profile import _completion_cap, _prompt_budget
+    from flash.engine.plan.recipe import RECIPE
+
+    spec = _spec(
+        algorithm=algorithm,
+        train=TrainSpec(max_steps=10, batch_size=8, group_size=4, max_completion_tokens=512),
+    )
+    assert spec.train.max_context_tokens in (0, None), "this test is about the UNSET case"
+
+    cap = _completion_cap(spec)
+    recipe = RECIPE.opd if algorithm == "opd" else RECIPE.rl
+    expected = (
+        recipe.max_prompt_len + cap
+        if algorithm == "opd"
+        else max(1024, recipe.max_prompt_len + cap)
+    ) - cap
+
+    assert _prompt_budget(spec) == expected
+    assert _prompt_budget(spec) is not None, "an unset context must not disable filtering"
+
+
+def test_the_prompt_budget_mirrors_the_workers_arithmetic():
+    """`context - max_completion`, falling back to the same recipe default the workers use.
+
+    Only the DECLARED context is read directly: the workers also clamp to the model's architectural
+    limit, which needs a config fetch this path must not make. That clamp can only LOWER the budget,
+    so the value here stays the looser bound -- it never invents a rejection the worker would not
+    make.
     """
     from flash.cli.commands.rollout_profile import _prompt_budget
 
@@ -2287,9 +2321,6 @@ def test_the_prompt_budget_mirrors_the_workers_arithmetic():
         )
     )
     assert _prompt_budget(spec) == 1536
-
-    # no declared context -> nothing to filter against, rather than a guessed limit.
-    assert _prompt_budget(_spec()) is None
 
     # a context that leaves no room for a prompt filters nothing rather than everything.
     airless = _spec(

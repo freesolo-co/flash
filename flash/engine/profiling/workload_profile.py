@@ -564,6 +564,15 @@ class RolloutWorkloadProfile:
                 f"(below {MIN_TRUSTWORTHY_PROMPT_COVERAGE:.0%} coverage); a prompt the endpoint "
                 "refuses is still trained on, so the sample omits part of the workload"
             )
+        # only LATENCY ages out, which is what this gate has always been about: a provider that
+        # slows down or a card whose neighbours change invalidates the seconds. a client-measured
+        # profile carries no seconds at all (generation_seconds_per_completion is 0.0 by
+        # construction -- seconds do not transfer between hosts, only token counts do), so expiring
+        # it drops a still-valid token distribution and silently returns the run to cap pricing at
+        # the allocation re-quote. the token counts are digest-keyed: any input that would change
+        # them already changes the identity, so they need no age gate.
+        if self.generation_seconds_per_completion <= 0.0:
+            return True, ""
         age = now - self.measured_at
         if self.measured_at <= 0 or age > ROLLOUT_LATENCY_MAX_AGE_S:
             return False, (

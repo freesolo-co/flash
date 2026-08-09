@@ -541,7 +541,7 @@ def _sampling_temperature(spec) -> float:
 
 
 def _prompt_budget(spec) -> int | None:
-    """the prompt length the workers will admit, or None when this run declares no context limit.
+    """the prompt length the workers will admit, or None when no budget can be derived.
 
     both workers compute `prompt_budget = context - max_completion` and DROP every row whose
     rendered prompt exceeds it (rl_train.py and opd_train.py), so a draw from such a row measures
@@ -549,15 +549,26 @@ def _prompt_budget(spec) -> int | None:
     than a local tokenization, because the cli has no tokenizer and pulling one in for an advisory
     quote is the wrong trade.
 
-    only the DECLARED context is used. the workers clamp against the model's architectural limit
-    too, which needs an AutoConfig fetch this path must not make -- and the clamp can only lower
-    the budget, so the declared value is the looser bound: it filters the rows the workers are
+    the context is the DECLARED one when the run sets it, and otherwise the same recipe default the
+    workers fall back to -- grpo `max(1024, rl.max_prompt_len + cap)` (rl_train.py:1974-1976), opd
+    `opd.max_prompt_len + cap` (opd_train.py:2194). an unset context is the normal case, so reading
+    it as "no budget" left the common run measuring rows the worker is certain to drop.
+
+    the architectural clamp both workers also apply is deliberately not reproduced: it needs an
+    AutoConfig fetch this path must not make. that is safe in one direction only -- the clamp can
+    only LOWER the budget, so the value here is the looser bound. it filters rows the workers are
     certain to drop and never invents a rejection they would not make.
     """
     context = int(getattr(spec.train, "max_context_tokens", 0) or 0)
+    cap = _completion_cap(spec)
     if context <= 0:
-        return None
-    budget = context - _completion_cap(spec)
+        from flash.engine.plan.recipe import RECIPE
+
+        if spec.algorithm == "opd":
+            context = RECIPE.opd.max_prompt_len + cap
+        else:
+            context = max(1024, RECIPE.rl.max_prompt_len + cap)
+    budget = context - cap
     return budget if budget > 0 else None
 
 
