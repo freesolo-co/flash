@@ -273,12 +273,27 @@ def download_weight_gb(model_id: str, revision: str = "") -> float:
     return total_params_b(model_id, revision) * 2.0
 
 
-# ~1s mid-range default across grader types (regex ~0.01s to LLM judge ~3s).
-AVG_REWARD_SECONDS_PER_COMPLETION = 1.0
+# Grading time a grpo step pays ON TOP of the step floor, when nothing measured it.
+#
+# 0.0, not a mid-range guess. STEP_FLOOR_BASE_SECONDS/STEP_FLOOR_SECONDS_PER_COMPLETION were fitted
+# as (real step - everything else modelled) WITH measured reward applied, so the floor already
+# carries whatever grading the fit arms paid. Adding a nominal wall on top charges it twice: the
+# old 1.0s default put completions x 1.0s beside a floor that already covered it, which over-quoted
+# a 32-completion step by 32s.
+#
+# Scored on the 64 grpo arms of the 2026-08-01 campaign (ratio = realized/predicted, band
+# 0.70-1.43x): 1.0s default = 0.699x geometric bias and 31/64 in band, every completion class and
+# every card over-quoted. At 0.0 the same arms score 0.995x and 53/64. The fit arms' own graders
+# measured 0.0001-0.001s, so the floor's per-completion slope is what genuinely tracks grading cost.
+#
+# A run whose reward calls a slow external judge still pays for it: an explicit override (a measured
+# rollout profile, or reward_seconds_per_completion on the RunConfig) is added on top. This default
+# only says "assume no grading cost beyond the floor", which is what the floor was fitted to mean.
+AVG_REWARD_SECONDS_PER_COMPLETION = 0.0
 
 
 def reward_seconds_per_completion(override: float | None = None) -> float:
-    """Per-completion reward latency (s): the explicit override, else the single average."""
+    """Per-completion reward latency (s) beyond the step floor: the override, else the default."""
     if override is not None:
         return max(0.0, override)
     return AVG_REWARD_SECONDS_PER_COMPLETION
