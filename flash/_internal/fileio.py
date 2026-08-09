@@ -5,7 +5,32 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
+
+
+def reject_duplicate_keys(
+    on_duplicate: Callable[[str], BaseException],
+) -> Callable[[list[tuple[str, Any]]], dict[str, Any]]:
+    """Build a ``json.loads`` ``object_pairs_hook`` that rejects duplicate keys.
+
+    ``json.loads`` keeps the LAST value for a repeated key, so a payload carrying the same key
+    twice decodes to something neither writer meant, and a checked identity can be smuggled past
+    a comparison. Each caller raises its own error type for the offending key: the decoders here
+    sit on different trust boundaries (a served safetensors header, a resume marker, an API
+    request), and the error each one raises is part of its own contract.
+    """
+
+    def hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise on_duplicate(key)
+            value[key] = item
+        return value
+
+    return hook
 
 
 def read_json_or_empty(path: Path) -> dict:
