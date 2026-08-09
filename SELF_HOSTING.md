@@ -51,10 +51,10 @@ auth backend, pass `--freesolo-url` and verification happens against it.)
 
 Every run config needs a top-level `project` uuid - it groups runs and is required in
 standalone mode too (see [project ids](#what-flashstandalone1-does)). Any uuid works
-on a standalone plane, so you can pick one once and reuse it. `flash projects create` and
-`flash projects list` are **hosted-only** - they talk to the Freesolo org directory, which
-a standalone plane does not have - so generate one yourself (`python -c "import uuid;
-print(uuid.uuid4())"`) and pass it explicitly to `flash env setup --project <uuid>`:
+on a standalone plane, so you can pick one once and reuse it. `flash projects create <name>`
+mints one locally for you (there is no org directory to record it in, and your plane accepts
+any well-formed uuid), so pass it to `flash env setup --project <uuid>`. `flash projects list`
+has nothing to enumerate and says so; keep track of the ids you use:
 
 ```toml
 project = "11111111-1111-4111-8111-111111111111"
@@ -191,6 +191,12 @@ With it set:
 - **Backend reporting is off** - billing precheck and charge, realized-cost
   reconciliation, checkpoint registration, and the hosted artifact GC sweep. Otherwise these would send your operator key to `api.freesolo.co`
   (and, for the GC, `serve.freesolo.co`) and log a warning per run or per startup.
+- **Hosted-only CLI commands say so.** `flash projects create` mints a uuid locally instead
+  of calling the org directory; `flash projects list` and `flash traces export` have no local
+  store to read and refuse with the reason. Traces are recorded by the freesolo SDK into the
+  hosted backend, so write the same `{"input", "output"}` JSONL rows yourself and train on
+  them directly. Setting `FREESOLO_BASE_URL` to a Freesolo-compatible backend you run keeps
+  all three on the normal hosted path, since they then have a directory to call.
 
 Self-hosting relaxes the billing boundaries, not the catalog. Trainable models are the
 curated ones on both deployments; see [adding a model](#adding-a-model).
