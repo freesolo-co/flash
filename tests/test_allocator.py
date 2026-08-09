@@ -6,7 +6,7 @@ import pytest
 
 
 def test_required_vram_catalog_and_open(monkeypatch):
-    from flash.engine import vram
+    from flash.engine.plan import vram
     from flash.providers import allocator
     from flash.providers.allocator import required_vram_gb
 
@@ -164,8 +164,8 @@ def test_default_max_retries():
     and matches INFRA_RETRY_FLOOR (runner.lifecycle), which the runner already floored the effective
     budget to — so the declared default now reflects the real GPU-walk budget. Covers both the
     GpuSpec default and the JobSpec.from_dict default (the worker payload path)."""
-    from flash.runner.lifecycle import INFRA_RETRY_FLOOR
-    from flash.spec import GpuSpec, JobSpec
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.runner.supervise.lifecycle import INFRA_RETRY_FLOOR
 
     assert GpuSpec().max_retries == 5
     assert GpuSpec().max_retries == INFRA_RETRY_FLOOR  # default tracks the runner's infra floor
@@ -435,7 +435,7 @@ def test_estimator_matches_measured_seq_boundaries():
     """The raw VRAM physics reproduces the MEASURED RunPod capacity sweep: each anchor
     is a real train/OOM boundary observed on a pinned card (the calibration ground truth).
     estimate_vram_gb is the accurate estimate; model_required adds the safety headroom."""
-    from flash.engine.vram import estimate_vram_gb as e
+    from flash.engine.plan.vram import estimate_vram_gb as e
 
     # 0.8B (0.9B): GRPO seq up to 32k fits the cheapest 24 GB card. Real SFT materializes
     # dense logits, so only a shorter context stays in that class.
@@ -457,7 +457,7 @@ def test_estimator_matches_measured_seq_boundaries():
 def test_required_vram_policy_floors_and_downrouting():
     """model_required_vram_gb: hard floors never under-provision; small runs down-route to
     a cheaper card; bigger context/group/thinking only ever size UP (never down)."""
-    from flash.engine.vram import model_required_vram_gb as need
+    from flash.engine.plan.vram import model_required_vram_gb as need
 
     m4 = "Qwen/Qwen3.5-4B"
     # context length lifts GRPO need monotonically
@@ -532,8 +532,8 @@ def test_required_vram_sizes_weights_from_curated_params_b_not_display_string():
     (params_b_from_str was removed): re-parsing the string was fragile for an MoE whose string lists
     BOTH counts ("35B total / ~3B active") — the first parsed token could be the ~3B active count,
     sizing the ~70 GB resident weights ~10x too small and under-provisioning the card."""
-    from flash.catalog import MODELS, ModelInfo
-    from flash.engine.vram import model_required_vram_gb
+    from flash.core.catalog import MODELS, ModelInfo
+    from flash.engine.plan.vram import model_required_vram_gb
 
     fake_id = "test/moe-active-first-string"
     # A pathological display string that lists the ACTIVE count FIRST — the exact footgun the curated
@@ -560,8 +560,8 @@ def test_required_vram_sizes_weights_from_curated_params_b_not_display_string():
 def test_estimator_logits_term_uses_max_tokens_and_caps_at_budget():
     """The GRPO estimate must include the fp32-logits term (it scales with max_tokens, NOT
     seq_len) and cap it at the per-device logits budget so it never over-reserves."""
-    from flash.engine import vram
-    from flash.engine.vram import estimate_vram_gb as e
+    from flash.engine.plan import vram
+    from flash.engine.plan.vram import estimate_vram_gb as e
 
     # Holding seq fixed, a longer completion (max_tokens) raises the GRPO train-phase estimate.
     # Use the non-colocate path (use_vllm=False) so the rollout term doesn't mask the train peak
@@ -578,7 +578,7 @@ def test_estimator_logits_term_uses_max_tokens_and_caps_at_budget():
 
 
 def test_opd_vram_estimate_reserves_one_dense_image_loss_peak():
-    from flash.engine.vram import estimate_vram_gb as e
+    from flash.engine.plan.vram import estimate_vram_gb as e
 
     seq_len = 4096
     completion = 512
@@ -616,7 +616,7 @@ def test_opd_uses_opd_sizing_not_grpo():
     an OPD run was sized as a colocated-vLLM GRPO job -- rejecting fitting runs or routing them to
     pricier GPUs. The real algorithm must reach the estimator, so the two diverge.
     """
-    from flash.engine.vram import model_required_vram_gb
+    from flash.engine.plan.vram import model_required_vram_gb
 
     train = {"max_context_tokens": 8192, "max_completion_tokens": 8192, "lora_rank": 16}
     for model_id in ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B"):
@@ -629,7 +629,7 @@ def test_opd_uses_opd_sizing_not_grpo():
 def test_opd_applies_the_colocated_vllm_floor():
     """OPD starts a resident colocated vLLM engine, so a tiny model cannot be admitted on its tiny
     training estimate -- the engine's own footprint sets a floor the training term never reaches."""
-    from flash.engine.vram import model_required_vram_gb
+    from flash.engine.plan.vram import model_required_vram_gb
 
     train = {
         "max_context_tokens": 1536,
@@ -652,7 +652,7 @@ def test_vram_headroom_consistent_across_sizing_paths():
     a_need = allocator.required_vram_gb(
         "Qwen/Qwen3.5-4B", "grpo", train={"max_context_tokens": 4096}
     )
-    from flash.engine.vram import model_required_vram_gb
+    from flash.engine.plan.vram import model_required_vram_gb
 
     direct = model_required_vram_gb(
         "Qwen/Qwen3.5-4B", "grpo", train={"max_context_tokens": 4096}, headroom=1.1
@@ -918,7 +918,7 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
     """OPD-specific matrix guard: each catalog OPD model across representative train configs must
     resolve to a GPU that satisfies the shared VRAM requirement, or reject before provisioning when
     the config exceeds every managed single-GPU class."""
-    from flash.catalog import MODELS
+    from flash.core.catalog import MODELS
     from flash.cost import RunConfig, estimate_cost
     from flash.providers import allocator
     from flash.providers.allocator import required_vram_gb
@@ -1058,7 +1058,7 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
 def test_catalog_model_algorithm_gpu_matrix_routes_to_fitting_cards(monkeypatch):
     """Full catalog matrix guard: every supported model x algorithm route must pick a card that
     meets the shared VRAM requirement across schema preview, submit allocation, and cost estimate."""
-    from flash.catalog import ALGORITHMS, MODELS
+    from flash.core.catalog import ALGORITHMS, MODELS
     from flash.cost import RunConfig, estimate_cost
     from flash.providers import allocator
     from flash.providers.base import GPU_INFO, combined_vram_gb, get_gpu_info, provisional_gpu
@@ -1130,7 +1130,7 @@ def test_catalog_model_algorithm_gpu_matrix_routes_to_fitting_cards(monkeypatch)
 
 def test_catalog_model_algorithm_config_gpu_matrix_enforces_pins(monkeypatch):
     """Every active validated GPU pin is preserved when it fits and rejected when it does not."""
-    from flash.catalog import ALGORITHMS, MODELS
+    from flash.core.catalog import ALGORITHMS, MODELS
     from flash.providers import allocator
     from flash.providers.base import GPU_INFO, get_gpu_info, providers_for
     from flash.schema import ConfigError, spec_from_dict
@@ -1195,8 +1195,8 @@ def test_catalog_model_algorithm_config_gpu_matrix_enforces_pins(monkeypatch):
 
 def test_sft_big_vocab_logits_term_present_and_bounded():
     """plain nll reserves dense logits while chunked nll reserves one bounded projection chunk."""
-    from flash.engine import vram
-    from flash.engine.vram import estimate_vram_gb as e
+    from flash.engine.plan import vram
+    from flash.engine.plan.vram import estimate_vram_gb as e
 
     V = 248_320  # Qwen3.5's padded vocab
     with_logits = e(0.9, "sft", seq_len=1024, vocab=V, batch_size=4)
@@ -1218,7 +1218,7 @@ def test_sft_per_device_cap_keeps_unfused_logits_within_budget():
     within _LOGITS_BUDGET_GB whenever pd CAN be reduced -- the SFT mirror of rl_per_device_comps. At
     the pd=1 floor the logits are irreducible (a near-2048 big-vocab ctx can exceed the budget); the
     estimator then reserves that true floor (no clamp), so what's reserved still == what runs."""
-    from flash.engine import vram
+    from flash.engine.plan import vram
 
     V = 248_320
     for seq in (256, 512, 1024, 1536, 2000):  # all < 2048 -> un-fused for a small model
@@ -1239,8 +1239,8 @@ def test_required_vram_qwen_chunked_nll_drops_big_vocab_logits():
     """validated qwen sft sizing bounds vocab logits while retaining activation growth."""
     import math
 
-    from flash.catalog import MODELS, vocab_size_for
-    from flash.engine.vram import estimate_vram_gb
+    from flash.core.catalog import MODELS, vocab_size_for
+    from flash.engine.plan.vram import estimate_vram_gb
     from flash.providers.allocator import required_vram_gb
 
     model_id = "Qwen/Qwen3.5-0.8B"
@@ -1299,9 +1299,9 @@ def test_qwen4b_sft_8192_chunked_nll_routes_to_32gb_card(monkeypatch):
 def test_required_vram_sft_plain_nll_fallback_keeps_logits_term(monkeypatch):
     import math
 
-    from flash.catalog import vocab_size_for
-    from flash.engine import vram
-    from flash.engine.vram import estimate_vram_gb, model_required_vram_gb
+    from flash.core.catalog import vocab_size_for
+    from flash.engine.plan import vram
+    from flash.engine.plan.vram import estimate_vram_gb, model_required_vram_gb
 
     mid = "meta-llama/Llama-3.2-1B"
     params_b = 1.2
@@ -1337,9 +1337,9 @@ def test_sft_equation_covers_honest_peak_across_seq_boundary():
     """the allocator must mirror chunked qwen and plain-nll fallback peaks across the catalog."""
     import math
 
-    from flash.catalog import MODELS, vocab_size_for
-    from flash.engine import vram
-    from flash.engine.vram import sft_chunked_nll_enabled, sft_per_device
+    from flash.core.catalog import MODELS, vocab_size_for
+    from flash.engine.plan import vram
+    from flash.engine.plan.vram import sft_chunked_nll_enabled, sft_per_device
     from flash.providers.allocator import required_vram_gb
     from flash.providers.base import GPU_INFO
 
@@ -1394,7 +1394,7 @@ def test_sft_logits_cap_shrinks_per_device_for_big_vocab():
     per-device micro-batch so the [per_device, seq, vocab] fp32 logits+grad fit the budget;
     grad-accum rises so the realized effective batch is never below the request (the OOM the
     fix addresses: a 0.8B SFT OOM'd a 24 GB card in backward)."""
-    from flash.engine.vram import (
+    from flash.engine.plan.vram import (
         _LOGITS_BUDGET_GB,
         _SFT_LOGITS_BYTES_PER_ELEM,
         sft_grad_accum,
@@ -1413,7 +1413,7 @@ def test_sft_logits_cap_shrinks_per_device_for_big_vocab():
 
 
 def test_sft_chunked_nll_restores_qwen_microbatch_and_gc_gate():
-    from flash.engine.vram import sft_chunked_nll_enabled, sft_grad_accum
+    from flash.engine.plan.vram import sft_chunked_nll_enabled, sft_grad_accum
     from flash.engine.worker.perf import grad_checkpointing_on
 
     model_id = "Qwen/Qwen3.5-0.8B"
@@ -1440,7 +1440,7 @@ def test_sft_chunked_nll_restores_qwen_microbatch_and_gc_gate():
 def test_sft_logits_cap_no_regression_small_vocab_or_fused():
     """The cap must NOT shrink the micro-batch for a small-vocab model, nor when the fused CE is
     on (Liger fuses the logits away) — those keep the fixed per-device 4."""
-    from flash.engine.vram import sft_grad_accum, sft_per_device
+    from flash.engine.plan.vram import sft_grad_accum, sft_per_device
 
     # Small vocab (e.g. ~32k): the [pd, seq, vocab] logits are tiny -> no cap, keep 4.
     assert sft_per_device(8, seq_len=1024, vocab=32_000, fused=False) == 4
@@ -1451,7 +1451,7 @@ def test_sft_logits_cap_no_regression_small_vocab_or_fused():
 
 
 def test_sft_chunked_nll_model_gate_mirrors_worker():
-    from flash.engine.vram import sft_chunked_nll_enabled
+    from flash.engine.plan.vram import sft_chunked_nll_enabled
 
     assert sft_chunked_nll_enabled("Qwen/Qwen3.5-0.8B") is True
     assert sft_chunked_nll_enabled("Qwen/Qwen3.5-9B") is True
@@ -1469,8 +1469,8 @@ def test_every_sft_catalog_model_is_sized_for_the_fused_loss():
     every catalog model is a qwen3_5/qwen3_5_moe checkpoint, and verl dispatches both to the fused
     torch backend, so the sft-capable catalog and the set must stay identical.
     """
-    from flash.catalog import MODELS
-    from flash.engine.vram import sft_chunked_nll_enabled
+    from flash.core.catalog import MODELS
+    from flash.engine.plan.vram import sft_chunked_nll_enabled
 
     missing = sorted(
         mid
@@ -1484,8 +1484,8 @@ def test_every_sft_catalog_model_is_sized_for_the_fused_loss():
 
 def test_sft_estimate_includes_capped_logits_term():
     """the direct conservative estimate keeps dense logits; chunked mode uses a smaller fixed term."""
-    from flash.engine.vram import _LOGITS_BUDGET_GB
-    from flash.engine.vram import estimate_vram_gb as e
+    from flash.engine.plan.vram import _LOGITS_BUDGET_GB
+    from flash.engine.plan.vram import estimate_vram_gb as e
 
     big = e(0.8, "sft", seq_len=1024, vocab=248_320, batch_size=8)
     small = e(0.8, "sft", seq_len=1024, vocab=8_000, batch_size=8)
@@ -1705,7 +1705,7 @@ def test_sft_default_context_tracks_thinking_mode():
     flat non-thinking default sized activations for half the real sequence.
     """
     from flash.engine.recipe import RECIPE
-    from flash.engine.vram import model_required_vram_gb
+    from flash.engine.plan.vram import model_required_vram_gb
 
     assert RECIPE.sft.max_seq_len_thinking > RECIPE.sft.max_seq_len
     mid = "Qwen/Qwen3.5-4B"

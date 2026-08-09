@@ -4,8 +4,8 @@ from dataclasses import replace
 
 import pytest
 
-from flash.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
-from flash.workload_profile import (
+from flash.core.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
+from flash.engine.profiling.workload_profile import (
     SFT_PROFILE_KIND,
     SftWorkloadProfile,
     sft_profile_input_digest,

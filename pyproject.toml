@@ -25,7 +25,7 @@ dependencies = []
 
 [project.optional-dependencies]
 # heavy deps for running the fine-tuning worker locally (on the gpu worker these are
-# installed by runpod flash from the dependency list in flash/providers/_worker.py).
+# installed by runpod flash from the dependency list in flash/providers/_lifecycle/worker.py).
 gpu = [
     "torch==2.10.0",
     "transformers>=5.6,<5.11",
@@ -85,7 +85,7 @@ dev = [
     "transformers>=5.6,<5.11",
     "tokenizers>=0.22",
     "tiktoken>=0.12",
-    # flash/multimodal.py imports PIL directly to validate and decode every image source, so the
+    # flash/content/multimodal.py imports PIL directly to validate and decode every image source, so the
     # image tests are not optional coverage: without Pillow they importorskip and CI reports green
     # on a multimodal path it never executed. test-only, hence dev and not server -- the control
     # plane does not decode images.
@@ -146,7 +146,7 @@ dev = [
     "freesolo>=0.4.0",
     "tokenizers>=0.22",
     "tiktoken>=0.12",
-    # flash/multimodal.py imports PIL directly to validate and decode every image source, so the
+    # flash/content/multimodal.py imports PIL directly to validate and decode every image source, so the
     # image tests are not optional coverage: without Pillow they importorskip and CI reports green
     # on a multimodal path it never executed. test-only, hence dev and not server -- the control
     # plane does not decode images.
@@ -224,5 +224,3 @@ ignore = [
 # `_ScoredResponseText` subclasses `str` to stay grader-compatible while carrying the structured
 # views as attributes; __slots__ would defeat that.
 "flash/envs/adapter.py" = ["SLOT000"]
-# `_RunLock` is never subclassed, so returning the concrete type from __enter__ is correct.
-"flash/server/_locks.py" = ["PYI034"]

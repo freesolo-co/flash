@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 import flash.cli as cli
-from flash.cli.env_test import cmd_env_test
+from flash.cli.commands.env.test import cmd_env_test
 from flash.envs.base import RolloutReward
 
 

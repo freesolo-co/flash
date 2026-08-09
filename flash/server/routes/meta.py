@@ -7,9 +7,9 @@ from typing import Annotated
 from fastapi import APIRouter, Depends
 
 from flash import __version__
-from flash.catalog import public_model_rows
-from flash.server._deps import require_key
-from flash.server.auth import _IDENTITY_PASSTHROUGH_FIELDS
+from flash.core.catalog import public_model_rows
+from flash.server.platform.auth import _IDENTITY_PASSTHROUGH_FIELDS
+from flash.server.platform.deps import require_key
 
 router = APIRouter()
 

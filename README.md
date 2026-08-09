@@ -208,9 +208,9 @@ model — in short, **pull requests go into `dev`**.
 
 ### Layout
 
-- `flash/catalog.py` — curated model catalog (Qwen3.5 and Qwen3.6, dense and MoE),
+- `flash/core/catalog.py` — curated model catalog (Qwen3.5 and Qwen3.6, dense and MoE),
   VRAM-fit sizing, and each model's `thinking` capability
-- `flash/schema/`, `flash/spec.py` — TOML to `JobSpec`
+- `flash/schema/`, `flash/core/spec.py` — TOML to `JobSpec`
 - `flash/runner/` — server-side run supervisor (durable job handle, retries, cost guard,
   endpoint GC)
 - `flash/providers/` — GPU substrate (pricing, GPU classes, durable submit/poll,
@@ -223,8 +223,14 @@ model — in short, **pull requests go into `dev`**.
 - `flash/envs/` — environment registry and the adapter that loads Freesolo SDK
   environments onto the worker's interface
 - `flash/serve/`, `flash/server/` — serving client and the FastAPI control plane (run via
-  the separate `flash-server` command)
+  the separate `flash-server` command). Inside `server/`: `platform/` (auth, db, deps,
+  locks, runtime), `domain/` (envs, projects, runs, checkpoints), `billing/`
 - `tests/` — pytest suite (CPU-only, offline-by-default)
+
+Within `flash/engine/worker/`, the trainers live under `train/`, split by algorithm
+(`sft/`, `rl/`, `opd/`) over a shared `core/`. Each carries a `child/` holding the
+stdlib-only modules that are **copied** into the verl subprocess rather than imported —
+flash and verl pin incompatible torch/vllm versions, so neither can import the other.
 
 ## Self-hosting
 
@@ -257,7 +263,7 @@ so keep it off untrusted networks. See
 Two seams remain Freesolo-operated and are not part of this repository:
 
 1. **Multi-tenant identity.** Real per-user keys and org ownership need a backend serving
-   the `/api/auth/verify` contract in `flash/server/auth.py`, pointed at by
+   the `/api/auth/verify` contract in `flash/server/platform/auth.py`, pointed at by
    `FREESOLO_BASE_URL`. Standalone mode is single-tenant instead.
 2. **Serving.** `flash/serve/` is a client for a multi-LoRA serving app; point it elsewhere
    with `FREESOLO_SERVING_URL`. Training, checkpoint streaming, and adapter export are
@@ -274,7 +280,7 @@ docker pull ghcr.io/freesolo-co/flash-worker:cu128
 ## Release channels
 
 Two channels are published to PyPI from the _same source_, distinguished by one line in
-`flash/_channel.py` (`CHANNEL`):
+`flash/_internal/channel.py` (`CHANNEL`):
 
 | Channel | PyPI package         | CLI         | Default plane           | Published from                                                                                         |
 | ------- | -------------------- | ----------- | ----------------------- | ------------------------------------------------------------------------------------------------------ |

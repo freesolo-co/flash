@@ -10,7 +10,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Header, HTTPException
 
 import flash.runner as _runner
-from flash.multimodal import preflight_validate_image_opd
+from flash.content.multimodal import preflight_validate_image_opd
 from flash.runner import (
     DeploymentRevocationError,
     DeploymentStatePersistenceError,
@@ -21,8 +21,8 @@ from flash.runner import (
 from flash.schema import train_schema_metadata
 from flash.serve.preflight import ServingPreflightError
 from flash.server import app as _app
-from flash.server import db
-from flash.server._deps import (
+from flash.server.platform import db
+from flash.server.platform.deps import (
     _parse_spec,
     _require_bool,
     _runtime_secrets,
@@ -125,18 +125,18 @@ def _precheck_budget_or_block(*, run_id: str, estimate_usd: float, org_id: str) 
     let the run through on a billing-infra problem, but a caller that reports the outcome must be
     able to tell that apart from a real pass: an unverified run can still be rejected 402 later.
     """
-    from flash.server._internal_client import internal_key as _internal_key
+    from flash.server.platform.internal_client import internal_key as _internal_key
 
     key = _internal_key()
     if not key:
         # internal reporting is off -> no completion billing either, so there is nothing to gate.
         return False
     try:
-        from flash.server.billing import precheck_training_run
+        from flash.server.billing.charges import precheck_training_run
 
         precheck_training_run(internal_key=key, org_id=org_id, estimate_usd=estimate_usd)
     except Exception as exc:
-        from flash.server.billing import BillingError
+        from flash.server.billing.charges import BillingError
 
         if isinstance(exc, BillingError) and exc.status_code == 402:
             raise HTTPException(status_code=402, detail=exc.detail) from exc
@@ -163,7 +163,7 @@ def create_run(
         if detail is None:
             raise
         raise HTTPException(status_code=400, detail=detail) from exc
-    from flash.server.projects import require_project_access
+    from flash.server.domain.projects import require_project_access
 
     project_id = require_project_access(
         project_id=spec.project,
@@ -179,8 +179,8 @@ def create_run(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if environment_slug is not None:
-        from flash.server import envs as managed_envs
-        from flash.server.environment_registry import require_environment_project
+        from flash.server.domain import envs as managed_envs
+        from flash.server.domain.environment_registry import require_environment_project
 
         try:
             environment_slug = managed_envs.canonical_env_id(environment_slug)
@@ -368,7 +368,7 @@ def create_run(
             raise
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
-        from flash.server.environment_registry import record_environment_use
+        from flash.server.domain.environment_registry import record_environment_use
 
         if environment_slug is not None:
             record_environment_use(
@@ -495,7 +495,7 @@ def run_checkpoints(run_id: str, key: Annotated[dict, Depends(require_key)]):
     spec = _internal_spec_from_status(status)
     checkpoints = _app.list_checkpoints(spec)
     with contextlib.suppress(Exception):
-        from flash.server.checkpoints import register_checkpoints_best_effort
+        from flash.server.domain.checkpoints import register_checkpoints_best_effort
 
         register_checkpoints_best_effort(status)
     return {"run_id": run_id, "checkpoints": checkpoints}

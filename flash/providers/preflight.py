@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 
-from flash._logging import get_logger
+from flash._internal.logging import get_logger
 from flash.providers.runpod.preflight import PreflightError
 
 __all__ = [
@@ -112,8 +112,8 @@ def _normalize_operator_credentials() -> None:
 def check_run_preflight() -> None:
     """Raise PreflightError if the plane cannot run a job; warn on degraded-but-workable config."""
     from flash.providers import available_providers
-    from flash.providers.runpod import keys as runpod_keys
-    from flash.server.auth import standalone
+    from flash.providers.runpod import auth as runpod_keys
+    from flash.server.platform.auth import standalone
 
     _normalize_operator_credentials()
 

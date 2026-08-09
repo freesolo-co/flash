@@ -6,8 +6,8 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response
 
-from flash._logging import get_logger
-from flash.server._deps import require_key
+from flash._internal.logging import get_logger
+from flash.server.platform.deps import require_key
 
 logger = get_logger("flash.server.routes.envs")
 router = APIRouter()
@@ -25,8 +25,8 @@ def publish_env(
     authorization: Annotated[str | None, Header()] = None,
     x_freesolo_org_id: Annotated[str | None, Header()] = None,
 ):
-    from flash.server import envs
-    from flash.server.projects import require_project_access
+    from flash.server.domain import envs
+    from flash.server.domain.projects import require_project_access
 
     project_raw = payload.get("project_id")
     if not isinstance(project_raw, str):
@@ -49,7 +49,7 @@ def publish_env(
         )
     except envs.EnvPublishError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
-    from flash.server.environment_registry import record_published_environment
+    from flash.server.domain.environment_registry import record_published_environment
 
     try:
         recorded = record_published_environment(
@@ -71,7 +71,7 @@ def publish_env(
 @router.get("/v1/envs/{env_id:path}/package")
 def download_env_package(env_id: str, key: Annotated[dict, Depends(require_key)]):
     """Download a managed Freesolo environment package from the GitHub-backed hub."""
-    from flash.server import envs
+    from flash.server.domain import envs
 
     try:
         env_id = envs.canonical_env_id(env_id)
@@ -104,13 +104,13 @@ def delete_env(
     # ``namespace/name`` slug and carries a slash, so the route uses the ``:path`` converter.
     # Authorization (own-namespace for user keys, any for the internal key) lives in
     # ``delete_package`` so it can't be bypassed.
-    from flash.server import envs
-    from flash.server.environment_registry import (
+    from flash.core.spec import require_project_id
+    from flash.server.domain import envs
+    from flash.server.domain.environment_registry import (
         record_deleted_environment,
         require_environment_project,
     )
-    from flash.server.projects import require_project_access
-    from flash.spec import require_project_id
+    from flash.server.domain.projects import require_project_access
 
     try:
         project_id = require_project_id(x_freesolo_project_id)

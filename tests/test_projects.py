@@ -9,7 +9,7 @@ import pytest
 from fastapi import HTTPException
 
 from flash.client import ClientError, create_project, get_project, list_projects
-from flash.server.projects import require_project_access
+from flash.server.domain.projects import require_project_access
 
 
 class _Response:
@@ -97,7 +97,7 @@ def test_server_project_validation_uses_authenticated_bearer_and_org(monkeypatch
         )
 
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.test")
-    monkeypatch.setattr("flash.server.projects.urllib.request.urlopen", urlopen)
+    monkeypatch.setattr("flash.server.domain.projects.urllib.request.urlopen", urlopen)
 
     assert (
         require_project_access(
@@ -137,7 +137,7 @@ def test_internal_project_validation_uses_internal_service_endpoint(monkeypatch)
         )
         return _Response({"ok": True, "orgId": "org-one", "projectId": project_id})
 
-    monkeypatch.setattr("flash.server.projects.urllib.request.urlopen", urlopen)
+    monkeypatch.setattr("flash.server.domain.projects.urllib.request.urlopen", urlopen)
     assert (
         require_project_access(
             project_id=f"  {project_id}  ",
@@ -162,7 +162,7 @@ def test_internal_project_validation_uses_internal_service_endpoint(monkeypatch)
 def test_internal_project_validation_requires_service_token(monkeypatch) -> None:
     monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
     monkeypatch.setattr(
-        "flash.server.projects.urllib.request.urlopen",
+        "flash.server.domain.projects.urllib.request.urlopen",
         lambda *_args, **_kwargs: pytest.fail("missing token must fail before transport"),
     )
 
@@ -193,7 +193,7 @@ def test_internal_project_validation_fails_closed_on_http_errors(
         io.BytesIO(json.dumps({"detail": "validation failed"}).encode()),
     )
     monkeypatch.setattr(
-        "flash.server.projects.urllib.request.urlopen",
+        "flash.server.domain.projects.urllib.request.urlopen",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
     )
 
@@ -222,7 +222,7 @@ def test_internal_project_validation_rejects_malformed_or_mismatched_success(
 ) -> None:
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "service-internal-key")
     monkeypatch.setattr(
-        "flash.server.projects.urllib.request.urlopen",
+        "flash.server.domain.projects.urllib.request.urlopen",
         lambda *_args, **_kwargs: _Response(payload),
     )
 
@@ -252,7 +252,7 @@ def test_internal_project_validation_rejects_invalid_json(monkeypatch) -> None:
             return False
 
     monkeypatch.setattr(
-        "flash.server.projects.urllib.request.urlopen",
+        "flash.server.domain.projects.urllib.request.urlopen",
         lambda *_args, **_kwargs: _InvalidResponse(),
     )
 
@@ -269,7 +269,7 @@ def test_internal_project_validation_rejects_invalid_json(monkeypatch) -> None:
 def test_internal_project_validation_fails_closed_on_transport_error(monkeypatch) -> None:
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "service-internal-key")
     monkeypatch.setattr(
-        "flash.server.projects.urllib.request.urlopen",
+        "flash.server.domain.projects.urllib.request.urlopen",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(urllib.error.URLError("offline")),
     )
 
@@ -292,7 +292,7 @@ def test_server_project_validation_rejects_cross_org_project(monkeypatch) -> Non
         io.BytesIO(json.dumps({"detail": "not found"}).encode()),
     )
     monkeypatch.setattr(
-        "flash.server.projects.urllib.request.urlopen",
+        "flash.server.domain.projects.urllib.request.urlopen",
         lambda *a, **k: (_ for _ in ()).throw(error),
     )
     with pytest.raises(HTTPException) as excinfo:

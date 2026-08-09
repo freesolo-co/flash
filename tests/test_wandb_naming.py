@@ -12,8 +12,8 @@ import os
 
 import pytest
 
+from flash.core.spec import JobSpec, WandbSpec
 from flash.schema import ConfigError, spec_and_train_keys_from_file, spec_from_dict
-from flash.spec import JobSpec, WandbSpec
 
 
 def _base(**extra: object) -> dict:

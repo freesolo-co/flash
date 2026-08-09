@@ -11,10 +11,8 @@ import sys
 from typing import NoReturn
 
 from flash import __version__
-from flash._channel import CLI_NAME
-from flash._logging import configure_logging
-from flash.catalog import ALGORITHMS
-from flash.cli import render
+from flash._internal.channel import CLI_NAME
+from flash._internal.logging import configure_logging
 
 # package-level command imports remain available through flash.cli.
 from flash.cli.commands import (  # noqa: F401
@@ -42,24 +40,26 @@ from flash.cli.commands import (  # noqa: F401
     cmd_whoami,
     verify_freesolo_key,
 )
-from flash.cli.env_eval import (
+from flash.cli.commands.env.eval import (
     _MAX_CONCURRENCY,
     bounded_concurrency,
     cmd_env_eval,
     finite_float,
     positive_int,
 )
-from flash.cli.env_setup import cmd_env_setup
-from flash.cli.env_test import cmd_env_test
-from flash.cli.envpush import cmd_env_delete, cmd_env_pull, cmd_env_push
-from flash.cli.traces import (
+from flash.cli.commands.env.push import cmd_env_delete, cmd_env_pull, cmd_env_push
+from flash.cli.commands.env.setup import cmd_env_setup
+from flash.cli.commands.env.test import cmd_env_test
+from flash.cli.commands.traces import (
     DEFAULT_EXPORT_PATH,
     EXPORT_FORMATS,
     RAW_EXPORT_PATH,
     RECORDS_FORMAT,
     cmd_traces_export,
 )
+from flash.cli.ui import render
 from flash.client.config import shadowed_login_warning
+from flash.core.catalog import ALGORITHMS
 
 # Themed `flash --help` catalog. Groups are ordered along the training workflow; each row's
 # summary is the short one-liner the themed grid shows (the verbose per-command text stays on

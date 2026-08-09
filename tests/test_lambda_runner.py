@@ -16,7 +16,7 @@ import time
 
 import pytest
 
-from flash.spec import JobSpec
+from flash.core.spec import JobSpec
 
 CODE_PREFIX = "code/0123456789abcdef0123456789abcdef/flash"
 
@@ -58,7 +58,7 @@ def _submit(jobs, *args, **kwargs):
 
 
 def _inst(gpu="A10", region="us-east-1", itype="gpu_1x_a10", price=1.29):
-    from flash.providers.lambdalabs.jobs.builders import LambdaInstance
+    from flash.providers.lambda_.jobs.builders import LambdaInstance
 
     return LambdaInstance(
         gpu=gpu, instance_type=itype, region=region, vram_gb=24, price_usd_hr=price
@@ -66,7 +66,7 @@ def _inst(gpu="A10", region="us-east-1", itype="gpu_1x_a10", price=1.29):
 
 
 def _handle(started_ts=10_000.0, rate=1.29):
-    from flash.providers.lambdalabs.jobs.builders import LambdaJobHandle
+    from flash.providers.lambda_.jobs.builders import LambdaJobHandle
 
     return LambdaJobHandle(
         instance_id="i-9999",
@@ -97,7 +97,7 @@ def _terminal_marker(*, ok: bool, retriable: bool = False, error: str = "") -> s
 # cloud-init user_data + bootstrap
 # ---------------------------------------------------------------------------
 def test_user_data_ships_payload_and_runs_worker_image(monkeypatch):
-    from flash.providers.lambdalabs.jobs import builders
+    from flash.providers.lambda_.jobs import builders
 
     monkeypatch.setenv("LAMBDA_API_KEY", "lk-supersecret")
     monkeypatch.setenv("HF_TOKEN", "hf-worker-token")
@@ -126,7 +126,7 @@ def test_user_data_ships_payload_and_runs_worker_image(monkeypatch):
     assert "FLASH_BOOTSTRAP_EOF" in script
     assert "metrics.json" in script
     # runs the prebuilt WORKER_IMAGE via Docker with the GPU + the bootstrap as the command
-    from flash.providers.runpod.train import WORKER_IMAGE
+    from flash.providers.runpod.serverless import WORKER_IMAGE
 
     assert WORKER_IMAGE in script
     assert "docker run -d" in script
@@ -148,7 +148,7 @@ def test_user_data_ships_payload_and_runs_worker_image(monkeypatch):
 
 def test_user_data_skips_capacity_for_baked_image_default(monkeypatch):
     """build_user_data always uses the baked WORKER_IMAGE (no per-host stack install)."""
-    from flash.providers.lambdalabs.jobs import builders
+    from flash.providers.lambda_.jobs import builders
 
     payload = _build_payload(builders, _spec(), seed=0, attempt=0)
     script = builders.build_user_data(payload)
@@ -161,8 +161,8 @@ def test_image_per_sm_selects_arch_tag(monkeypatch):
     """Per-SM warmed images (PR #213) reach Lambda too: the GPU class always picks the matching -smXX
     tag for baked arches (so the worker's baked kernel cache matches the rented GPU's arch). A call
     with no GPU class + the FLASH_WORKER_IMAGE override semantics are unchanged."""
-    from flash.providers.lambdalabs.jobs import builders
-    from flash.providers.runpod.train import WORKER_IMAGE
+    from flash.providers.lambda_.jobs import builders
+    from flash.providers.runpod.serverless import WORKER_IMAGE
 
     monkeypatch.delenv("FLASH_WORKER_IMAGE", raising=False)
 
@@ -182,7 +182,7 @@ def test_image_per_sm_selects_arch_tag(monkeypatch):
 
 
 def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True):
-    from flash.providers import _instance_bootstrap as lb
+    from flash.providers._lifecycle import bootstrap as lb
 
     calls: list[str] = []
     markers: list[tuple[bool, str, bool]] = []
@@ -224,7 +224,7 @@ def test_build_worker_env_exports_attempt():
     # accepts only matching attempt and timestamp provenance. the shared instance bootstrap (Vast + Lambda)
     # must export ATTEMPT, or a worker on a nonzero retry defaults to attempt 0 and its current heartbeat is
     # rejected as mismatched, potentially losing valid retriable evidence.
-    from flash.providers import _instance_bootstrap as lb
+    from flash.providers._lifecycle import bootstrap as lb
 
     payload = {"phase": "sft", "seed": 0, "flash_arm": "vast", "attempt": 2, "job_spec_json": "{}"}
     env = lb.build_worker_env(payload)
@@ -289,7 +289,7 @@ def test_bootstrap_fetch_code_failure_is_retriable(monkeypatch):
 def test_bootstrap_sets_lambda_arm():
     """The shared bootstrap stamps FLASH_ARM from payload['flash_arm'] so the metrics record
     attributes the substrate (Lambda's build_payload sets it to 'lambda')."""
-    from flash.providers import _instance_bootstrap as lb
+    from flash.providers._lifecycle import bootstrap as lb
 
     env = lb.build_worker_env(
         {
@@ -304,7 +304,7 @@ def test_bootstrap_sets_lambda_arm():
     )
     assert env["FLASH_ARM"] == "lambda"
     # And Lambda's build_payload is what sets flash_arm='lambda'.
-    from flash.providers.lambdalabs.jobs.builders import build_payload
+    from flash.providers.lambda_.jobs.builders import build_payload
 
     assert build_payload(_spec(), 0, 0, deadline_at=_deadline_at())["flash_arm"] == "lambda"
 
@@ -313,7 +313,7 @@ def test_bootstrap_extra_pip_uses_payload_env_credentials_and_cleans(monkeypatch
     import os
     from pathlib import Path
 
-    from flash.providers import _instance_bootstrap as lb
+    from flash.providers._lifecycle import bootstrap as lb
 
     calls = []
     askpass_paths = []
@@ -345,7 +345,7 @@ def test_bootstrap_extra_pip_uses_payload_env_credentials_and_cleans(monkeypatch
 def test_bootstrap_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
     from pathlib import Path
 
-    from flash.providers import _instance_bootstrap as lb
+    from flash.providers._lifecycle import bootstrap as lb
 
     askpass_paths = []
 
@@ -381,8 +381,8 @@ def test_bootstrap_promotes_attempt_to_env_for_heartbeat_gating():
     # The instance bootstrap must stamp ATTEMPT into the worker env (RunPod does it in jobs.py) — the
     # worker reads it into every heartbeat, and the poller's stale-heartbeat rejection is dead without
     # it (a prior attempt's leftover heartbeat would disarm the new attempt's fast failover).
-    from flash.providers import _instance_bootstrap as lb
-    from flash.providers.lambdalabs.jobs.builders import build_payload
+    from flash.providers._lifecycle import bootstrap as lb
+    from flash.providers.lambda_.jobs.builders import build_payload
 
     base = {
         "job_spec_json": "{}",
@@ -405,7 +405,7 @@ def test_bootstrap_fetch_code_uses_prefix_tree(monkeypatch, tmp_path):
 
     import huggingface_hub
 
-    from flash.providers import _instance_bootstrap as lb
+    from flash.providers._lifecycle import bootstrap as lb
 
     monkeypatch.setattr(lb, "CODE_ROOT", str(tmp_path))
     list_calls = []
@@ -484,8 +484,8 @@ def test_bootstrap_fetch_code_uses_prefix_tree(monkeypatch, tmp_path):
 # launch_and_submit: capacity (region) walk
 # ---------------------------------------------------------------------------
 def test_launch_walks_regions_on_capacity_rejection(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
 
     monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
     attempts = []
@@ -509,8 +509,8 @@ def test_launch_walks_regions_on_capacity_rejection(monkeypatch):
 
 
 def test_launch_refreshes_capacity_once_when_all_taken(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
 
     monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
     created = []
@@ -533,8 +533,8 @@ def test_launch_refreshes_capacity_once_when_all_taken(monkeypatch):
 
 
 def test_launch_refuses_primary_creation_below_minimum_deadline_allowance(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
 
     monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
     monkeypatch.setattr(jobs.time, "time", lambda: 100.0)
@@ -552,7 +552,7 @@ def test_launch_refuses_primary_creation_below_minimum_deadline_allowance(monkey
 
 
 def test_create_filesystem_posts_once_without_retries(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     calls = []
 
@@ -582,8 +582,9 @@ def test_create_filesystem_posts_once_without_retries(monkeypatch):
 def test_filesystem_listing_caps_request_and_retry_sleep_at_deadline(monkeypatch):
     import urllib.error
 
-    from flash.providers import _deadline, _http
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers._lifecycle import deadline as _deadline
+    from flash.providers._lifecycle import http as _http
+    from flash.providers.lambda_ import api as lambda_api
 
     clock = {"now": 100.0}
     calls = []
@@ -612,7 +613,7 @@ def test_filesystem_listing_caps_request_and_retry_sleep_at_deadline(monkeypatch
 
 
 def test_create_filesystem_rejects_deadline_below_minimum(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     monkeypatch.setattr(lambda_api.time, "time", lambda: 100.0)
     calls = []
@@ -630,7 +631,7 @@ def test_create_filesystem_rejects_deadline_below_minimum(monkeypatch):
 
 @pytest.mark.parametrize("matches", [0, 2])
 def test_ambiguous_filesystem_create_fails_closed_without_second_post(monkeypatch, matches):
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     posts = []
     listings = {"count": 0}
@@ -664,7 +665,7 @@ def test_ambiguous_filesystem_create_fails_closed_without_second_post(monkeypatc
 
 
 def test_lambda_failure_detail_is_bounded_and_redacts_credentials(monkeypatch):
-    from flash.providers.lambdalabs import jobs
+    from flash.providers.lambda_ import jobs
 
     monkeypatch.setenv("HF_TOKEN", "hf-private-token")
 
@@ -691,7 +692,7 @@ def test_lambda_failure_detail_is_bounded_and_redacts_credentials(monkeypatch):
 
 
 def test_lambda_cleanup_logs_suppress_provider_detail(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     warnings = []
     monkeypatch.setattr(lambda_api.logger, "warning", lambda *args: warnings.append(args))
@@ -707,7 +708,7 @@ def test_lambda_cleanup_logs_suppress_provider_detail(monkeypatch):
 
 
 def test_ambiguous_filesystem_create_adopts_single_exact_match(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     posts = []
     listings = {"count": 0}
@@ -745,8 +746,8 @@ def test_ambiguous_filesystem_create_adopts_single_exact_match(monkeypatch):
 
 
 def test_launch_raises_when_no_capacity(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
 
     monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
     monkeypatch.setattr(
@@ -764,8 +765,8 @@ def test_launch_raises_when_no_capacity(monkeypatch):
 
 
 def test_resolve_ssh_key_names(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs.jobs import resolve_ssh_key_names
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.jobs import resolve_ssh_key_names
 
     monkeypatch.setattr(lambda_api, "list_ssh_keys", lambda: [{"name": "jk"}, {"name": "other"}])
     assert resolve_ssh_key_names() == ["jk"]  # first registered key
@@ -779,8 +780,8 @@ def test_resolve_ssh_key_names(monkeypatch):
 # ---------------------------------------------------------------------------
 def _wire_launch(monkeypatch):
     """Common launch wiring: ssh key + a launch that records (region, user_data, file_system_names)."""
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
 
     monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
     calls = []
@@ -840,7 +841,7 @@ def test_cache_bind_uses_returned_mount_point(monkeypatch):
 def test_cache_payload_points_base_model_prefetch_at_the_bind(monkeypatch):
     """The base64 payload points the base-model prefetch (FLASH_WEIGHT_CACHE_DIR) at the bind so the
     model download persists — NOT a process-global HF_HOME, so env/reward downloads stay ephemeral (#252)."""
-    from flash.providers.lambdalabs.jobs import build_payload
+    from flash.providers.lambda_.jobs import build_payload
 
     payload = build_payload(
         _spec(network_volume="flash-weights"),
@@ -871,8 +872,8 @@ def test_cache_falls_back_to_cold_when_filesystem_unavailable(monkeypatch):
 def test_filesystem_attach_reject_retries_same_region_cold(monkeypatch):
     """A clean reject whose error mentions the FILESYSTEM retries THIS region cache-less before
     walking — so a best-effort attach can't make a region the cold path would have served fail."""
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
 
     monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
     monkeypatch.setattr(
@@ -902,8 +903,8 @@ def test_filesystem_attach_reject_retries_same_region_cold(monkeypatch):
 
 
 def test_filesystem_reject_rechecks_deadline_before_cacheless_creation(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
 
     monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
     monkeypatch.setattr(
@@ -939,8 +940,8 @@ def test_filesystem_reject_rechecks_deadline_before_cacheless_creation(monkeypat
 
 def test_capacity_reject_does_not_trigger_cold_fs_retry(monkeypatch):
     """A plain CAPACITY reject (no filesystem in the error) walks normally — no extra cold retry."""
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
 
     monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
     monkeypatch.setattr(
@@ -974,8 +975,8 @@ def test_preload_mode_skips_region_when_cache_unavailable(monkeypatch):
     boot a full training run (GPU billing, timeout) and warm nothing. The walk must try the next
     region, and fail if none can host the cache.
     """
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
 
     monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
     monkeypatch.setattr(
@@ -1010,8 +1011,8 @@ def test_preload_mode_does_not_refresh_to_a_different_region(monkeypatch):
     region as warmed. If the launch is rejected and the walk refreshed (usable_instances) to a
     different region and launched there, the caller would report the cold target region as warmed.
     """
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
 
     monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
     monkeypatch.setattr(
@@ -1064,8 +1065,8 @@ def test_no_cache_never_touches_filesystems(monkeypatch):
 def test_cache_ensured_per_region_in_the_walk(monkeypatch):
     """Lazy per-region: the FS is ensured ONLY in the region the run actually lands in (walk skips on
     capacity, ensuring then launching cold/cache per region)."""
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
 
     monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
     ensured, attempts = [], []
@@ -1105,8 +1106,8 @@ def _wire_poll(
     error=None,
     step=10.0,
 ):
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
 
     if marker is _AUTO_MARKER:
         if done is None:
@@ -1439,7 +1440,7 @@ def test_poll_active_persistent_boot_log_absence_stalls_after_threshold(monkeypa
     ran). After BOOT_LOG_ABSENT_POLLS consecutive absent reads the first-liveness check declares the
     region 'stalled' (retriable, escaped cross-provider). Asserts the absence-count threshold is what
     gates the failover, not a single read."""
-    from flash.providers._poll import BOOT_LOG_ABSENT_POLLS
+    from flash.providers._lifecycle.poll import BOOT_LOG_ABSENT_POLLS
 
     calls = {"n": 0}
 
@@ -1529,7 +1530,7 @@ def test_cloud_init_emits_boot_log_before_pull_and_attempt_scoped(monkeypatch):
     """The host boot-log uploader must run BEFORE the docker image pull (so a box that ran cloud-init
     leaves an HF liveness artifact within ~2 min, well before the worker's first heartbeat), and its
     HF path must be attempt-scoped so a prior attempt's boot.log can't falsely prove liveness."""
-    from flash.providers.lambdalabs.jobs import builders
+    from flash.providers.lambda_.jobs import builders
 
     monkeypatch.setenv("LAMBDA_API_KEY", "lk")
     monkeypatch.setenv("HF_TOKEN", "hf")
@@ -1722,7 +1723,7 @@ def test_poll_recovered_deadline_without_artifacts_still_stalls(monkeypatch):
 def test_provider_initial_and_reattached_poll_use_same_absolute_deadline(monkeypatch):
     """Initial and reattached polling consume the same persisted terminal cutoff."""
     from flash.providers.base import JobHandle, PollResult
-    from flash.providers.lambdalabs import LambdaProvider, jobs
+    from flash.providers.lambda_ import LambdaProvider, jobs
 
     deadline_at = 12_345.0
     captured = []
@@ -1746,7 +1747,7 @@ def test_provider_initial_and_reattached_poll_use_same_absolute_deadline(monkeyp
     monkeypatch.setattr(jobs, "heartbeat_reader_for", lambda _spec: None)
     monkeypatch.setattr(jobs, "poll_lambda_job", fake_poll)
     monkeypatch.setattr(
-        "flash.providers.lambdalabs.api.terminate_instance_confirmed", lambda instance_id: None
+        "flash.providers.lambda_.api.terminate_instance_confirmed", lambda instance_id: None
     )
     spec = _spec()
     provider = LambdaProvider()
@@ -1762,7 +1763,7 @@ def test_provider_poll_uses_uniform_wait_ignoring_on_last_gpu(monkeypatch):
     first_liveness / setup grace — the poll relies on its unscaled defaults, matching the submit path.
     (on_last_gpu stays a Provider-interface param for RunPod; the instance providers ignore it.)"""
     from flash.providers.base import JobHandle
-    from flash.providers.lambdalabs import LambdaProvider
+    from flash.providers.lambda_ import LambdaProvider
 
     captured = {}
 
@@ -1783,9 +1784,9 @@ def test_provider_poll_uses_uniform_wait_ignoring_on_last_gpu(monkeypatch):
 
         return PollResult(True)
 
-    monkeypatch.setattr("flash.providers.lambdalabs.jobs.poll_lambda_job", fake_poll)
+    monkeypatch.setattr("flash.providers.lambda_.jobs.poll_lambda_job", fake_poll)
     monkeypatch.setattr(
-        "flash.providers.lambdalabs.api.terminate_instance_confirmed", lambda instance_id: None
+        "flash.providers.lambda_.api.terminate_instance_confirmed", lambda instance_id: None
     )
     spec = _spec()
     # on_last_gpu=True must NOT override the timing -> the poll's unscaled defaults apply.
@@ -1824,8 +1825,8 @@ def test_poll_surfaces_worker_progress_in_log(monkeypatch):
 # ---------------------------------------------------------------------------
 def _wire_runner(monkeypatch, poll_outcome):
     from flash.providers.base import PollResult
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
 
     terminated = []
     monkeypatch.setattr(
@@ -1860,7 +1861,7 @@ def test_runner_terminates_on_success(monkeypatch):
 
 def test_runner_preserves_success_when_teardown_is_unconfirmed(monkeypatch, caplog):
     from flash.providers.base import PollResult
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     jobs, _, _ = _wire_runner(monkeypatch, PollResult(True, metrics={"a": 1}))
     cleanup_runs = []
@@ -1889,7 +1890,7 @@ def test_runner_preserves_success_when_teardown_is_unconfirmed(monkeypatch, capl
 @pytest.mark.parametrize("control_exc", [KeyboardInterrupt, SystemExit])
 def test_runner_propagates_process_control_from_teardown(monkeypatch, control_exc):
     from flash.providers.base import PollResult
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     jobs, _, _ = _wire_runner(monkeypatch, PollResult(True, metrics={"a": 1}))
     monkeypatch.setattr(
@@ -1932,8 +1933,8 @@ def test_runner_terminates_when_handle_persist_fails(monkeypatch):
 def test_submit_rejects_policy_word_gpu():
     """submit_run_lambda needs a concrete class; a policy word ("cheapest") — which the allocator
     resolves upstream — must fail with a clear error, not an opaque KeyError."""
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs.jobs import submit_run_lambda
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.jobs import submit_run_lambda
 
     spec = _spec()
     object.__setattr__(spec.gpu, "type", "cheapest")
@@ -1945,7 +1946,7 @@ def test_submit_rejects_policy_word_gpu():
 # labels, gc, orphan sweep
 # ---------------------------------------------------------------------------
 def test_instance_label_always_sweepable():
-    from flash.providers.lambdalabs.jobs.builders import instance_label
+    from flash.providers.lambda_.jobs.builders import instance_label
 
     assert instance_label("flash-1700-abcd", 0, 1) == "flash-1700-abcd-s0-a1"
     assert instance_label("fail-fast", 0, 0) == "flash-fail-fast-s0-a0"  # prefix forced
@@ -1956,8 +1957,8 @@ def test_instance_label_bounds_seed_and_attempt():
     run prefix: an absurd seed OR attempt (or a non-int) must NOT push the name past the 60-char
     provider cap, which would get the name silently truncated and desync it from the sweep-matched
     prefix. BOTH numeric fields are bounded so the WHOLE suffix stays <= _SUFFIX_BUDGET."""
-    from flash.providers._instance import _MAX_NAME, _SUFFIX_BUDGET, run_label_prefix
-    from flash.providers.lambdalabs.jobs.builders import instance_label
+    from flash.providers._lifecycle.instance import _MAX_NAME, _SUFFIX_BUDGET, run_label_prefix
+    from flash.providers.lambda_.jobs.builders import instance_label
 
     def suffix_of(rid, label):
         return label[len(run_label_prefix(rid)) :]
@@ -1989,8 +1990,8 @@ def test_instance_label_bounds_seed_and_attempt():
 
 
 def test_terminate_run_instances_matches_forced_prefix(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
 
     instances = [
         {"id": "i-1", "name": "flash-fail-fast-s0-a0"},  # forced-prefix name
@@ -2006,11 +2007,11 @@ def test_terminate_run_instances_matches_forced_prefix(monkeypatch):
 
 
 def test_run_instances_remaining_uses_exact_labels_and_exact_lookup(monkeypatch):
-    from flash.providers.lambdalabs import (
+    from flash.providers.lambda_ import (
         LambdaProvider,
         jobs,
     )
-    from flash.providers.lambdalabs import (
+    from flash.providers.lambda_ import (
         api as lambda_api,
     )
 
@@ -2034,11 +2035,11 @@ def test_run_instances_remaining_uses_exact_labels_and_exact_lookup(monkeypatch)
 
 
 def test_run_instances_remaining_fails_closed_on_enumeration_lookup_or_identity(monkeypatch):
-    from flash.providers.lambdalabs import (
+    from flash.providers.lambda_ import (
         LambdaProvider,
         jobs,
     )
-    from flash.providers.lambdalabs import (
+    from flash.providers.lambda_ import (
         api as lambda_api,
     )
 
@@ -2074,7 +2075,7 @@ def test_run_instances_remaining_fails_closed_on_enumeration_lookup_or_identity(
 
 
 def test_handle_roundtrip():
-    from flash.providers.lambdalabs.jobs.builders import LambdaJobHandle
+    from flash.providers.lambda_.jobs.builders import LambdaJobHandle
 
     h = _handle()
     d = h.to_dict()
@@ -2083,8 +2084,8 @@ def test_handle_roundtrip():
 
 
 def test_sweep_orphans_label_safety(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
 
     instances = [
         {"id": "i-1", "name": "flash-1700-aaaa-s0-a0"},  # orphan -> terminate
@@ -2104,8 +2105,8 @@ def test_sweep_orphans_label_safety(monkeypatch):
 
 def test_sweep_orphans_prefix_not_shielded_by_longer_run_id(monkeypatch):
     """A live run id that is a STRING prefix of another must not shield the other's orphan."""
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
 
     instances = [
         {"id": "i-1", "name": jobs.instance_label("flash-100", 0, 0)},  # live -> KEEP
@@ -2121,8 +2122,8 @@ def test_sweep_orphans_prefix_not_shielded_by_longer_run_id(monkeypatch):
 
 
 def test_sweep_orphans_protects_unprefixed_active_run_id(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
 
     instances = [
         {"id": "i-1", "name": jobs.instance_label("fail-fast", 0, 0)},  # live run -> KEEP
@@ -2146,10 +2147,10 @@ def test_sweep_orphans_exempts_warm_preload_boxes(monkeypatch):
     """
     import time
 
-    from flash.providers._instance import instance_label
-    from flash.providers._poll import preload_instance_run_id
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
+    from flash.providers._lifecycle.instance import instance_label
+    from flash.providers._lifecycle.poll import preload_instance_run_id
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
 
     # Build the name the way a launch does (instance_label bounds it to the provider name budget) so the
     # reap parser is tested against the REAL, possibly-truncated VM name, not the raw run id.
@@ -2178,10 +2179,10 @@ def test_sweep_orphans_reaps_stale_preload_box(monkeypatch):
     must reap it to bound the billing leak rather than exempt it forever."""
     import time
 
-    from flash.providers._instance import instance_label
-    from flash.providers._poll import PRELOAD_REAP_GRACE_S, preload_instance_run_id
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
+    from flash.providers._lifecycle.instance import instance_label
+    from flash.providers._lifecycle.poll import PRELOAD_REAP_GRACE_S, preload_instance_run_id
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
 
     # Deadline well past now + the reap grace -> driver provably gone. Name built via instance_label so
     # the front-loaded deadline token must survive the provider name-budget truncation to be reaped.
@@ -2204,7 +2205,7 @@ def test_sweep_orphans_reaps_stale_preload_box(monkeypatch):
 def test_provider_cancel_destroy_require_authoritative_teardown(monkeypatch):
     from flash.providers import get_provider
     from flash.providers.base import JobHandle
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     terminated = []
     monkeypatch.setattr(
@@ -2226,14 +2227,14 @@ def test_provider_cancel_destroy_require_authoritative_teardown(monkeypatch):
 
 
 def test_usable_instances_only_capacity_regions(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs.jobs import usable_instances
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.jobs import usable_instances
 
     monkeypatch.setattr(
         lambda_api, "regions_with_capacity", lambda itype, force=False: ["us-east-1", "us-west-1"]
     )
     monkeypatch.setattr(
-        "flash.providers.lambdalabs.pricing.hourly_rate", lambda g, *, gpu_count=1, **_k: 1.29
+        "flash.providers.lambda_.pricing.hourly_rate", lambda g, *, gpu_count=1, **_k: 1.29
     )
     out = usable_instances("A10")
     assert {i.region for i in out} == {"us-east-1", "us-west-1"}
@@ -2247,8 +2248,8 @@ def test_allocator_capacity_aware(monkeypatch):
     """Lambda joins the ranked candidate list only for classes with LIVE capacity; a class with no
     capacity is excluded so the runner never walks to a class that would immediately fail to launch."""
     from flash.providers import allocator
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs.jobs.builders import LambdaInstance
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.jobs.builders import LambdaInstance
 
     monkeypatch.setenv("LAMBDA_API_KEY", "lk")  # make lambda "available"
     monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, **k: {"gpu_1x_a10": {}})
@@ -2261,7 +2262,7 @@ def test_allocator_capacity_aware(monkeypatch):
             return [LambdaInstance("A10", "gpu_1x_a10", "us-east-1", 24, 1.29, gpu_count=gpu_count)]
         return []
 
-    monkeypatch.setattr("flash.providers.lambdalabs.jobs.usable_instances", fake_usable)
+    monkeypatch.setattr("flash.providers.lambda_.jobs.usable_instances", fake_usable)
     a = allocator.allocate("Qwen/Qwen3.5-0.8B", "sft")
     lam = {c.gpu for c in a.candidates if c.provider == "lambda"}
     assert lam == {"A10"}  # only the in-capacity class
@@ -2291,8 +2292,8 @@ def test_ambiguous_launch_reconciles_and_stops(monkeypatch):
     import io
 
     from flash.providers.base import UnreconciledCreateError
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
 
     monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
     monkeypatch.setattr(
@@ -2352,7 +2353,7 @@ def test_bootstrap_tolerates_nonzero_exit_when_remote_confirmed(monkeypatch):
 def test_remote_completion_confirmed_requires_done_and_metrics(monkeypatch):
     """remote_completion_confirmed is True ONLY when BOTH DONE and metrics.json exist on HF, and
     stays conservative (False) on an HF read error so a non-zero exit propagates."""
-    from flash.providers import _instance_bootstrap as lb
+    from flash.providers._lifecycle import bootstrap as lb
 
     payload = {"hf_repo": "o/r", "hf_prefix": "sft/x", "env": {}}
     present = {"DONE", "metrics.json"}
@@ -2371,7 +2372,7 @@ def test_remote_completion_confirmed_requires_done_and_metrics(monkeypatch):
 def test_bootstrap_fetches_spilled_spec_from_hf(monkeypatch):
     """A large spec is spilled to HF at launch (out of user_data); the bootstrap reconstructs it
     from the sentinel (job_spec_in_hf) by fetching <hf_prefix>/job_spec.json."""
-    from flash.providers import _instance_bootstrap as lb
+    from flash.providers._lifecycle import bootstrap as lb
 
     big = '{"k":"' + "v" * 200_000 + '"}'
     monkeypatch.setattr(lb, "fetch_spec_from_hf", lambda p: big)
@@ -2398,7 +2399,7 @@ def test_build_worker_env_raises_clearly_without_a_spec():
     """A malformed payload carrying NEITHER an inline job_spec_json NOR the job_spec_in_hf sentinel
     must raise a clear RuntimeError naming the cause — not crash on len(None) with an opaque
     TypeError that buries the real (control-plane payload) bug."""
-    from flash.providers import _instance_bootstrap as lb
+    from flash.providers._lifecycle import bootstrap as lb
 
     with pytest.raises(RuntimeError, match="no job spec"):
         lb.build_worker_env(
@@ -2410,7 +2411,7 @@ def test_build_worker_env_spilled_spec_fetch_failure_is_retriable(monkeypatch):
     """The pre-worker HF fetch of a spilled spec is infra-shaped: a transient failure must surface
     as RetriableBootstrapError (not a bare error) so main() marks the attempt retriable and the
     poller retries on a fresh host instead of failing the run fast."""
-    from flash.providers import _instance_bootstrap as lb
+    from flash.providers._lifecycle import bootstrap as lb
 
     monkeypatch.setattr(
         lb, "fetch_spec_from_hf", lambda p: (_ for _ in ()).throw(RuntimeError("hf 503"))
@@ -2431,7 +2432,7 @@ def test_build_worker_env_spilled_spec_fetch_failure_is_retriable(monkeypatch):
 def test_main_marks_spilled_spec_fetch_failure_retriable(monkeypatch):
     """End-to-end: a payload whose spilled-spec HF fetch fails -> main() exits non-zero AND the
     written attempt marker carries retriable=True (so the poller -> job_preempted, not job_failed)."""
-    from flash.providers import _instance_bootstrap as lb
+    from flash.providers._lifecycle import bootstrap as lb
 
     markers: list[tuple[bool, str, bool]] = []
     created_at = time.time()
@@ -2477,7 +2478,7 @@ def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
     small sentinel; small specs ride inline unchanged."""
     import huggingface_hub
 
-    from flash.providers import _instance as inst
+    from flash.providers._lifecycle import instance as inst
 
     uploaded = {}
 
@@ -2535,7 +2536,7 @@ def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
 def test_build_user_data_starts_no_spec_upload_at_deadline(monkeypatch):
     import huggingface_hub
 
-    from flash.providers import _instance as inst
+    from flash.providers._lifecycle import instance as inst
 
     calls = []
 
@@ -2565,7 +2566,7 @@ def test_host_artifact_helpers_start_no_hf_request_at_deadline(monkeypatch):
     import sys
     import types
 
-    from flash.providers import _instance as inst
+    from flash.providers._lifecycle import instance as inst
 
     calls = []
 
@@ -2601,7 +2602,7 @@ def test_failmark_uses_truthful_detection_timestamp(monkeypatch):
     import sys
     import types
 
-    from flash.providers import _instance as inst
+    from flash.providers._lifecycle import instance as inst
 
     uploaded = []
     written = {}
@@ -2659,7 +2660,7 @@ def test_failmark_skips_when_worker_marker_exists(monkeypatch):
     import sys
     import types
 
-    from flash.providers import _instance as inst
+    from flash.providers._lifecycle import instance as inst
 
     created_at = time.time()
     payload = {

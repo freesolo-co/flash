@@ -776,7 +776,7 @@ def test_the_gate_hands_the_shim_the_arch_it_verified(monkeypatch):
     # derive model_type from the child module so the gate and shim cannot disagree. patch the module
     # object because test cleanup may replace the parent package and break dotted monkeypatch
     # lookup.
-    import flash.engine.worker.packing as _packing
+    import flash.engine.worker.model.packing as _packing
 
     monkeypatch.setattr(_packing, "gdn_model_type", lambda *a, **k: "qwen3_5_moe")
     gdn_module = vc.gdn_probe_module("Qwen/Qwen3.6-35B-A3B")
@@ -790,7 +790,7 @@ def test_the_verified_arch_round_trips_for_the_dense_module_too(monkeypatch):
     # the MoE/dense split is the bug this pairing exists to prevent, so prove the recovery is exact
     # for both -- a prefix-stripping slip that returned "qwen3_5" for the MoE module would patch an
     # unrelated forward while the gate reported resets active.
-    import flash.engine.worker.packing as _packing
+    import flash.engine.worker.model.packing as _packing
 
     monkeypatch.setattr(_packing, "gdn_model_type", lambda *a, **k: "qwen3_5")
     gdn_module = vc.gdn_probe_module("Qwen/Qwen3.5-4B")
@@ -1301,7 +1301,7 @@ def test_verl_pin_matches_the_version_opd_requires_exactly():
     # the pin MUST stay on the verl 0.8.0 base. opd_plugin patches 0.8.0 internals and imports
     # verl.trainer.main_ppo_sync, which verl deleted after 0.8.0, so a pin built on a newer base
     # installs a verl that fails opd's exact-version gate and cannot import its own entrypoint.
-    from flash.engine.worker import opd_plugin as plugin
+    from flash.engine.worker.train.opd.child import plugin as plugin
 
     assert plugin._STRUCTURED_RUNTIME_EXACT_VERSIONS["verl"] == "0.8.0"
     # bind the pin to its verified base: 1bea7d68 remains verl 0.8.0 with main_ppo_sync.py plus the
@@ -2673,7 +2673,7 @@ def test_a_job_that_succeeds_still_drains_the_stragglers_an_earlier_one_left(mon
 
 # the worker as the runpod handler really runs it: a short-lived process that records a straggler
 # and then EXITS, with no second job to sweep it. `_train_body.run_mode` in
-# `flash/providers/runpod/train/endpoints.py`
+# `flash/providers/runpod/serverless/endpoints.py`
 # spawns one of these per phase and waits for it, so anything the phase leaves behind reparents to
 # the persistent handler -- which waits only on the worker -- and stays a zombie for the container's
 # life. driven as a subprocess because the leak is about process EXIT, which pytest cannot perform.

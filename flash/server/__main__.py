@@ -6,8 +6,8 @@ import argparse
 import logging
 import os
 
-from .._logging import configure_logging
-from .app import run_server
+from flash._internal.logging import configure_logging
+from flash.server.app import run_server
 
 HOST_ENV = "FLASH_SERVER_HOST"
 PORT_ENV = "FLASH_SERVER_PORT"

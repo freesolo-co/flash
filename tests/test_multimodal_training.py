@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash import multimodal as mm
+from flash.content import multimodal as mm
 from tests._helpers.profile import attach_sft_profile
 
 # one text row and one image row: the shape a ceiling-based quote cannot describe.
@@ -303,7 +303,7 @@ def test_a_row_whose_completion_truncated_away_is_dropped_not_trained_on():
     verl pre-tokenizes to `input_ids`/`loss_mask` instead, so the check moved to `has_real_target`
     -- same invariant, different representation, and nothing covered it after the move.
     """
-    from flash.engine.worker.sft import has_real_target
+    from flash.engine.worker.entry.sft import has_real_target
 
     eos = 2
     special = {eos}
@@ -323,7 +323,7 @@ def test_grpo_rows_retain_arrow_safe_images_and_reward_examples(tmp_path):
     pytest.importorskip("datasets")
     from datasets import Dataset
 
-    from flash.engine.worker.grpo import build_grpo_prompt_dataset
+    from flash.engine.worker.train.rl.config import build_grpo_prompt_dataset
 
     root, _image = _package(tmp_path)
     descriptor = mm.normalize_image_source("dataset/red.png", root)
@@ -356,7 +356,7 @@ def test_single_turn_conversational_completion_keeps_text_reward_semantics():
 
 
 def test_sft_rejects_image_completion_when_prompt_is_text_only():
-    from flash.engine.worker.sft import _reject_image_completion
+    from flash.engine.worker.entry.sft import _reject_image_completion
 
     completion = [
         {
@@ -378,7 +378,7 @@ def test_sft_mixed_text_completion_shapes_are_arrow_safe():
     pytest.importorskip("datasets")
     from datasets import Dataset
 
-    from flash.engine import sft_workload
+    from flash.engine.profiling import sft_workload
 
     completions = [
         [{"role": "assistant", "content": "red"}],
@@ -552,7 +552,7 @@ def test_image_opd_submit_preflight_rejects_supported_single_turn_records(
     monkeypatch, tmp_path, background
 ):
     from flash import runner
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
@@ -588,7 +588,7 @@ def test_image_opd_submit_preflight_rejects_supported_single_turn_records(
 
 def test_image_opd_submit_preflight_preserves_unsupported_model_precedence(monkeypatch, tmp_path):
     from flash import runner
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     algorithm = "opd"
     model = "meta-llama/Llama-3.2-1B"
@@ -630,8 +630,8 @@ def test_grpo_prices_the_full_context_budget_for_image_and_mixed_rows():
     dataset is the whole point of measuring. The companion test below holds the multimodal half of
     that -- an image sft run cannot be quoted from an assumed context.
     """
+    from flash.core.spec import JobSpec
     from flash.cost.spec import runconfig_from_spec
-    from flash.spec import JobSpec
 
     grpo_spec = JobSpec.from_dict(
         {
@@ -657,9 +657,9 @@ def test_image_sft_cannot_be_priced_from_an_assumed_context():
     mixed dataset is a guess wearing an exact number. Pricing now requires the profile that
     tokenized these exact rows, and without one the quote fails rather than defaulting.
     """
+    from flash.core.spec import JobSpec
     from flash.cost.spec import runconfig_from_spec
-    from flash.spec import JobSpec
-    from flash.workload_profile import WorkloadProfileMismatch
+    from flash.engine.profiling.workload_profile import WorkloadProfileMismatch
 
     sft_spec = JobSpec.from_dict(
         {
@@ -679,7 +679,7 @@ def test_image_sft_cannot_be_priced_from_an_assumed_context():
 
 
 def test_catalog_image_capability_does_not_change_public_rows():
-    from flash.catalog import public_model_rows, supports_image_training
+    from flash.core.catalog import public_model_rows, supports_image_training
 
     assert supports_image_training("Qwen/Qwen3.5-4B")
     assert supports_image_training("Qwen/Qwen3.6-27B")

@@ -3,7 +3,7 @@ import os
 import sys
 import types
 
-from flash.engine.worker import kernel_warmup
+from flash.engine.worker.runtime import kernel_warmup
 
 
 class _FakeCuda:

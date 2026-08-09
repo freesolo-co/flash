@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from flash.catalog import normalize_algorithm, samples_on_policy
-from flash.engine.recipe import RECIPE
+from flash.core.catalog import normalize_algorithm, samples_on_policy
+from flash.core.spec import parse_positive_int_tuple
+from flash.engine.plan.recipe import RECIPE
 from flash.providers import PROVIDER_NAMES
 from flash.providers.base import GPU_INFO, canonical_gpu, providers_for
-from flash.spec import parse_positive_int_tuple
 
 
 @dataclass(frozen=True)

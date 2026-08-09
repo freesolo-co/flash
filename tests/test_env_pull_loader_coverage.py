@@ -15,8 +15,8 @@ from pathlib import Path
 import pytest
 
 from flash.envs import loader, pull
-from flash.envs.archive import extract_validated_archive_members
-from flash.envs.archive_policy import LimitedArchiveReader
+from flash.envs.package.limits import LimitedArchiveReader
+from flash.envs.package.unpack import extract_validated_archive_members
 
 
 def _package_tarball(entries: dict[str, bytes]) -> bytes:

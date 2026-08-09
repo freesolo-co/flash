@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from flash.catalog import ALGORITHMS, normalize_algorithm
+from flash.core.catalog import ALGORITHMS, normalize_algorithm
 from flash.schema import ConfigError, spec_from_dict
 
 
@@ -43,8 +43,8 @@ def test_opd_algorithm_accepted():
 
 def test_opd_capability_gated_per_model():
     # A model whose algos lack "opd" rejects a opd run through the config path.
-    from flash import catalog
-    from flash.catalog import ModelInfo
+    from flash.core import catalog
+    from flash.core.catalog import ModelInfo
 
     catalog.MODELS["test/no-opd"] = ModelInfo(
         id="test/no-opd",
@@ -72,8 +72,8 @@ def test_opd_capability_gated_per_model():
 def test_grpo_capability_still_enforced():
     # The guardrail: an SFT-only model rejects GRPO through the config path. No catalog
     # entry is SFT-only anymore, so inject a temporary one.
-    from flash import catalog
-    from flash.catalog import ModelInfo
+    from flash.core import catalog
+    from flash.core.catalog import ModelInfo
 
     catalog.MODELS["test/sft-only"] = ModelInfo(
         id="test/sft-only",
