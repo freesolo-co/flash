@@ -232,18 +232,75 @@ def sft_max_length(spec) -> int:
     return int(RECIPE.sft.max_seq_len_thinking if spec.thinking else RECIPE.sft.max_seq_len)
 
 
-def prepare_sft_workload(
+@dataclass(frozen=True)
+class _PreparedSftRows:
+    source: list[Any]
+    selected: list[Any]
+    rows: list[dict[str, Any]]
+    multimodal: bool
+    tokenizer: Any
+    processor: Any | None
+    sampled_texts: list[str]
+    multiturn_targets: int
+    dropped: int
+    retained_untruncated: list[int]
+
+
+def _filter_sft_rows(
+    row_by_index: dict[int, dict[str, Any]],
+    untruncated_by_index: dict[int, int],
+    text_specs: list[dict[str, Any]],
+    tokenizer,
+    max_length: int,
+) -> tuple[list[dict[str, Any]], int, list[int]]:
+    dropped = 0
+    if text_specs:
+        kept_specs, tokenized_rows, text_dropped = _pretokenize_completion_only(
+            text_specs,
+            tokenizer,
+            max_length,
+        )
+        dropped += text_dropped
+        for spec_row, tokenized in zip(kept_specs, tokenized_rows, strict=True):
+            input_ids = tokenized["input_ids"]
+            untruncated_by_index[spec_row["row_index"]] = tokenized["untruncated_length"]
+            row_by_index[spec_row["row_index"]] = {
+                "input_ids": input_ids,
+                "loss_mask": tokenized["completion_mask"],
+                "images": [],
+                "multimodal_inputs": b"",
+            }
+
+    special_ids = set(getattr(tokenizer, "all_special_ids", None) or [])
+    unpacked_rows = []
+    retained_untruncated: list[int] = []
+    for row_index in sorted(row_by_index):
+        row = row_by_index[row_index]
+        if has_real_target(row["input_ids"], row["loss_mask"], special_ids):
+            unpacked_rows.append(row)
+            # appended in lockstep with the row it measures, so the truncation counts below describe
+            # the rows that are actually trained on rather than the ones that were dropped.
+            retained_untruncated.append(untruncated_by_index[row_index])
+        else:
+            dropped += 1
+    if not unpacked_rows:
+        raise ValueError(
+            "every SFT example has an empty completion after sft_max_len truncation "
+            "(nothing to train on); increase sft_max_len or shorten the prompts"
+        )
+    return unpacked_rows, dropped, retained_untruncated
+
+
+def _prepare_sft_rows(
     spec,
     env,
     *,
     tokenizer_loader: Callable[[str, str], Any],
-    producer_version: str,
-    processor_loader: Callable[[str, str], Any] | None = None,
-    image_dir: str | None = None,
-    allow_packing: bool = True,
-    packing_support: Callable[[str, str], tuple[str, bool]] | None = None,
-) -> PreparedSftWorkload:
-    """Render, tokenize, filter, and pack the exact rows consumed by SFT."""
+    processor_loader: Callable[[str, str], Any] | None,
+    image_dir: str | None,
+    max_examples: int,
+    max_length: int,
+) -> _PreparedSftRows:
     from flash.content.multimodal import (
         decode_image_descriptors,
         normalize_prompt_images,
@@ -251,15 +308,6 @@ def prepare_sft_workload(
         text_only_prompt_messages,
         validate_multimodal_training,
     )
-
-    train_spec = spec.train
-    max_length = sft_max_length(spec)
-    epochs = int(train_spec.epochs if train_spec.epochs is not None else RECIPE.sft.num_epochs)
-    effective_batch = int(
-        train_spec.batch_size if train_spec.batch_size is not None else RECIPE.sft.effective_batch
-    )
-    max_examples = int(train_spec.max_examples or 0)
-    max_steps = int(train_spec.max_steps or 0)
 
     source = list(env.dataset())
     selected = select_sft_examples(source, max_examples, spec.seed)
@@ -345,41 +393,68 @@ def prepare_sft_workload(
             sampled_texts.append(text)
             text_specs.append({"text": text, "prompt_text": prompt_text, "row_index": row_index})
 
-    dropped = 0
-    if text_specs:
-        kept_specs, tokenized_rows, text_dropped = _pretokenize_completion_only(
-            text_specs,
-            tokenizer,
-            max_length,
-        )
-        dropped += text_dropped
-        for spec_row, tokenized in zip(kept_specs, tokenized_rows, strict=True):
-            input_ids = tokenized["input_ids"]
-            untruncated_by_index[spec_row["row_index"]] = tokenized["untruncated_length"]
-            row_by_index[spec_row["row_index"]] = {
-                "input_ids": input_ids,
-                "loss_mask": tokenized["completion_mask"],
-                "images": [],
-                "multimodal_inputs": b"",
-            }
+    unpacked_rows, dropped, retained_untruncated = _filter_sft_rows(
+        row_by_index,
+        untruncated_by_index,
+        text_specs,
+        tokenizer,
+        max_length,
+    )
 
-    special_ids = set(getattr(tokenizer, "all_special_ids", None) or [])
-    unpacked_rows = []
-    retained_untruncated: list[int] = []
-    for row_index in sorted(row_by_index):
-        row = row_by_index[row_index]
-        if has_real_target(row["input_ids"], row["loss_mask"], special_ids):
-            unpacked_rows.append(row)
-            # appended in lockstep with the row it measures, so the truncation counts below describe
-            # the rows that are actually trained on rather than the ones that were dropped.
-            retained_untruncated.append(untruncated_by_index[row_index])
-        else:
-            dropped += 1
-    if not unpacked_rows:
-        raise ValueError(
-            "every SFT example has an empty completion after sft_max_len truncation "
-            "(nothing to train on); increase sft_max_len or shorten the prompts"
-        )
+    return _PreparedSftRows(
+        source=source,
+        selected=selected,
+        rows=unpacked_rows,
+        multimodal=multimodal,
+        tokenizer=tokenizer,
+        processor=processor,
+        sampled_texts=sampled_texts,
+        multiturn_targets=multiturn_targets,
+        dropped=dropped,
+        retained_untruncated=retained_untruncated,
+    )
+
+
+def prepare_sft_workload(
+    spec,
+    env,
+    *,
+    tokenizer_loader: Callable[[str, str], Any],
+    producer_version: str,
+    processor_loader: Callable[[str, str], Any] | None = None,
+    image_dir: str | None = None,
+    allow_packing: bool = True,
+    packing_support: Callable[[str, str], tuple[str, bool]] | None = None,
+) -> PreparedSftWorkload:
+    """Render, tokenize, filter, and pack the exact rows consumed by SFT."""
+    train_spec = spec.train
+    max_length = sft_max_length(spec)
+    epochs = int(train_spec.epochs if train_spec.epochs is not None else RECIPE.sft.num_epochs)
+    effective_batch = int(
+        train_spec.batch_size if train_spec.batch_size is not None else RECIPE.sft.effective_batch
+    )
+    max_examples = int(train_spec.max_examples or 0)
+    max_steps = int(train_spec.max_steps or 0)
+
+    prepared = _prepare_sft_rows(
+        spec,
+        env,
+        tokenizer_loader=tokenizer_loader,
+        processor_loader=processor_loader,
+        image_dir=image_dir,
+        max_examples=max_examples,
+        max_length=max_length,
+    )
+    source = prepared.source
+    selected = prepared.selected
+    rows = prepared.rows
+    multimodal = prepared.multimodal
+    tokenizer = prepared.tokenizer
+    processor = prepared.processor
+    sampled_texts = prepared.sampled_texts
+    multiturn_targets = prepared.multiturn_targets
+    dropped = prepared.dropped
+    retained_untruncated = prepared.retained_untruncated
 
     packing_mode, architecture_mode = _packing_mode(
         spec.model,
@@ -388,7 +463,6 @@ def prepare_sft_workload(
         allow_packing=allow_packing,
         packing_support=packing_support,
     )
-    rows = unpacked_rows
     real_tokens = sum(len(row["input_ids"]) for row in rows)
     supervised_tokens = sum(sum(int(item) for item in row["loss_mask"]) for row in rows)
     padded_compute_tokens = real_tokens
@@ -442,7 +516,7 @@ def prepare_sft_workload(
         environment_revision=spec.environment.resolved_sha,
         source_examples=len(source),
         selected_examples=len(selected),
-        retained_examples=len(unpacked_rows),
+        retained_examples=len(rows),
         dropped_examples=dropped,
         epochs=epochs,
         max_length=max_length,
