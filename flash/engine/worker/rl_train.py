@@ -1810,8 +1810,8 @@ def _check_grpo_had_a_gradient(
 # --------------------------------------------------------------------------------------------
 # orchestration.
 # --------------------------------------------------------------------------------------------
-def _resolve_grpo_inputs():
-    """reproduce run_rl's front-half config + dataset prep for text, multimodal, and multi-turn."""
+def _grpo_env_and_turn_mode():
+    """the active env and its turn mode, past the gates that must fail before anything launches."""
     env = _w.require_active_env()
     if getattr(env, "is_tool_env", False):
         raise RuntimeError(
@@ -1833,12 +1833,11 @@ def _resolve_grpo_inputs():
             )
         if int(getattr(env, "max_turns", 0) or 0) <= 0:
             raise RuntimeError("multi-turn grpo environment requires a positive bounded turn limit")
-    seed_training_rngs(_w.SEED)
-    model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
-    model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
+    return env, multi_turn
 
-    rl = RECIPE.rl
-    _t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
+
+def _grpo_feature_flags(_t, multi_turn):
+    """the knobs verl has no config for, which ride sitecustomize shims instead of hydra."""
     # fail loudly on unsupported verl features. structured-output constraints travel in per-sample
     # params via render_structured_outputs_shim; the reasoning parser is a hydra override. malformed
     # payloads raise instead of training unconstrained.
@@ -1874,14 +1873,21 @@ def _resolve_grpo_inputs():
             f"{DEFAULT_CREDIT_ASSIGNMENT} for single-turn environments",
             flush=True,
         )
-    # flash's lora dropout is fixed at 0.0; verl matches (peft default). guard defensively so a future
-    # non-zero recipe value can never be silently ignored.
+    return structured_outputs, stop_sequences, entropy_quantile, per_turn_credit
+
+
+def _grpo_validate_lora_dropout():
+    """flash's lora dropout is fixed at 0.0; verl matches (peft default). guard defensively so a
+    future non-zero recipe value can never be silently ignored."""
     if float(RECIPE.lora.dropout) != 0.0:
         raise RuntimeError(
             f"RECIPE.lora.dropout={RECIPE.lora.dropout} is not wired on the verl backend; "
             "add actor_rollout_ref.model.lora_dropout support before setting it non-zero."
         )
-    gcfg = _w.grpo_overrides()
+
+
+def _grpo_sampling_scalars(_t, rl, gcfg):
+    """batch shape and sampling knobs, job spec first and recipe second."""
     prompts_per_step = int(
         _t.batch_size if _t and _t.batch_size is not None else rl.prompts_per_step
     )
@@ -1891,7 +1897,11 @@ def _resolve_grpo_inputs():
     think_penalty = float(gcfg.get("thinking_length_penalty_coef") or 0.0)
     # flash defaults kl_penalty_coef to 0 (dr-grpo, no kl term); honor it rather than forcing a kl.
     kl_coef = float(gcfg.get("kl_penalty_coef") or 0.0)
-    mask_truncated_completions = _w.grpo_mask_truncated_completions(_t)
+    return prompts_per_step, group_size, temperature, think_penalty, kl_coef
+
+
+def _grpo_optimizer_and_lora_dims(_t, rl):
+    """the learning rate and the adapter dimensions a cold start trains at."""
     learning_rate = float(
         _t.learning_rate if _t and _t.learning_rate is not None else rl.learning_rate
     )
@@ -1899,37 +1909,93 @@ def _resolve_grpo_inputs():
     # from the job spec (falling back to the recipe) exactly like the retired trl path's lora config.
     lora_rank = int(_t.lora_rank) if (_t and _t.lora_rank) else int(RECIPE.lora.rank)
     lora_alpha = int(_t.lora_alpha) if (_t and _t.lora_alpha) else int(RECIPE.lora.alpha)
-    # warm-start: continue the sft adapter in place (verl lora_adapter_path). uses the SOURCE
-    # adapter's rank/alpha (flash forbids a child lora_rank on warm-start).
-    warmstart_adapter = ""
-    if _t and getattr(_t, "init_from_adapter", ""):
-        from flash.engine.worker.model.adapter import _download_adapter
+    return learning_rate, lora_rank, lora_alpha
 
-        # a multi-GB adapter pull emits nothing of its own, so it must run under a liveness wrap or
-        # the provider judges the silence as a stall.
-        with liveness_heartbeat("rl_adapter_loading"):
-            warmstart_adapter = _download_adapter(_t.init_from_adapter)
-        if not warmstart_adapter:
-            raise RuntimeError(
-                "warm-start source adapter could not be downloaded; refusing to start from the base."
-            )
-        with open(os.path.join(warmstart_adapter, "adapter_config.json")) as f:
-            _src_cfg = json.load(f)
-        _w.validate_lora_target_parameters(_src_cfg, model_id)
-        # a patterned adapter trains some modules at higher rank than the base `r`; verl allocates
-        # one uniform rank, so it must cover the MAXIMUM prepared rank or the load truncates.
-        _ranks = [int(_src_cfg.get("r", lora_rank))]
-        _ranks += [int(v) for v in (_src_cfg.get("rank_pattern") or {}).values()]
-        lora_rank = max(_ranks)
-        _alphas = [int(_src_cfg.get("lora_alpha", lora_alpha))]
-        _alphas += [int(v) for v in (_src_cfg.get("alpha_pattern") or {}).values()]
-        lora_alpha = max(_alphas)
-        print(
-            f"[rl-verl] warm-start: continuing source adapter (r={lora_rank}, alpha={lora_alpha}) "
-            f"from {_t.init_from_adapter}",
-            flush=True,
-        )
 
+def _grpo_warmstart_lora_dims(
+    warmstart_adapter, model_id, lora_rank, lora_alpha, init_from_adapter
+):
+    """widen the adapter dimensions to cover the downloaded source adapter."""
+    with open(os.path.join(warmstart_adapter, "adapter_config.json")) as f:
+        _src_cfg = json.load(f)
+    _w.validate_lora_target_parameters(_src_cfg, model_id)
+    # a patterned adapter trains some modules at higher rank than the base `r`; verl allocates
+    # one uniform rank, so it must cover the MAXIMUM prepared rank or the load truncates.
+    _ranks = [int(_src_cfg.get("r", lora_rank))]
+    _ranks += [int(v) for v in (_src_cfg.get("rank_pattern") or {}).values()]
+    lora_rank = max(_ranks)
+    _alphas = [int(_src_cfg.get("lora_alpha", lora_alpha))]
+    _alphas += [int(v) for v in (_src_cfg.get("alpha_pattern") or {}).values()]
+    lora_alpha = max(_alphas)
+    print(
+        f"[rl-verl] warm-start: continuing source adapter (r={lora_rank}, alpha={lora_alpha}) "
+        f"from {init_from_adapter}",
+        flush=True,
+    )
+    return lora_rank, lora_alpha
+
+
+def _grpo_download_warmstart_adapter(init_from_adapter):
+    """pull the source adapter the run continues from."""
+    from flash.engine.worker.model.adapter import _download_adapter
+
+    return _download_adapter(init_from_adapter)
+
+
+def _grpo_has_images(train, message_prompts):
+    """whether any row in the dataset carries an image."""
+    from flash.content.multimodal import record_has_images
+
+    return any(
+        record_has_images(ex, messages) for ex, messages in zip(train, message_prompts, strict=True)
+    )
+
+
+def _grpo_processor_and_tokenizer(model_id, model_revision, multimodal):
+    """the processor a multimodal job renders with (none when text-only) and the tokenizer to use."""
+    if not multimodal:
+        return None, _w.load_tokenizer(model_id, revision=model_revision)
+    from flash.content.multimodal import validate_multimodal_training
+
+    # the model must actually support image training; this raises for a text-only checkpoint
+    # rather than letting the processor silently drop the pixels.
+    validate_multimodal_training(model_id, "grpo")
+    from transformers import AutoProcessor
+
+    processor = AutoProcessor.from_pretrained(
+        model_id, trust_remote_code=True, **_w.model_revision_kwargs(model_revision)
+    )
+    return processor, processor.tokenizer
+
+
+def _grpo_eos_token_ids(model_id, model_revision, tok, multi_turn):
+    """the full halting set the child judges a turn's ending against.
+
+    the child decides whether an assistant turn ended naturally or was cut off, and it has no
+    access to the model config -- so the full halting set is resolved here and handed over.
+    the union of the tokenizer's eos and the model's generation_config eos, because a model can
+    stop on a secondary id its tokenizer never exposes.
+    """
+    if not multi_turn:
+        return frozenset()
+    return generation_eos_from_cached_config(model_id, model_revision, tok)
+
+
+def _grpo_response_width(prompts, max_completion, vllm_max_len, multi_turn):
+    """the response TENSOR's width, which is the whole episode on a multi-turn job.
+
+    single-turn responses are max_completion wide. multi-turn responses contain the whole episode,
+    and verl silently right-truncates beyond data.max_response_length. size to engine budget minus
+    the shortest admitted prompt so no possible episode is cut mid-turn; max_completion remains the
+    per-turn cap.
+    """
+    if not multi_turn:
+        return max_completion
+    return max(max_completion, vllm_max_len - min(int(p["prompt_len"]) for p in prompts))
+
+
+def _grpo_shuffled_dataset(env, _t):
+    """the seed-shuffled training rows and the prompt messages each one renders to."""
     train = env.dataset()
     _max_examples = getattr(_t, "max_examples", None) if _t else None
     if _max_examples:
@@ -1937,36 +2003,11 @@ def _resolve_grpo_inputs():
     rng = random.Random(_w.SEED)
     rng.shuffle(train)
     message_prompts = [env.prompt_messages(ex) for ex in train]
+    return train, message_prompts
 
-    from flash.content.multimodal import (
-        normalize_prompt_images,
-        record_has_images,
-        resolve_image_pad_token_id,
-        validate_multimodal_training,
-    )
 
-    multimodal = any(
-        record_has_images(ex, messages) for ex, messages in zip(train, message_prompts, strict=True)
-    )
-    package_root = getattr(env, "package_root", None)
-    processor = None
-    image_pad_token_id = None
-    if multimodal:
-        # the model must actually support image training; this raises for a text-only checkpoint
-        # rather than letting the processor silently drop the pixels.
-        validate_multimodal_training(model_id, "grpo")
-        from transformers import AutoProcessor
-
-        processor = AutoProcessor.from_pretrained(
-            model_id, trust_remote_code=True, **_w.model_revision_kwargs(model_revision)
-        )
-        tok = processor.tokenizer
-        image_pad_token_id = resolve_image_pad_token_id(processor, tok)
-    else:
-        tok = _w.load_tokenizer(model_id, revision=model_revision)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-
+def _grpo_length_budget(_t, rl, gcfg, model_id, model_revision, tok, multi_turn):
+    """the completion cap, the engine sequence length, and the prompt budget left over."""
     max_completion = int(
         gcfg.get("max_tokens")
         or (rl.max_completion_len_thinking if _w.THINKING else rl.max_completion_len)
@@ -1995,7 +2036,21 @@ def _resolve_grpo_inputs():
         # round-trip assistant content would fail on the first environment reply, after the rollout
         # has already burned gpu time -- fail here instead, before anything is launched.
         validate_glue_template(tok, thinking=bool(_w.THINKING))
+    return max_completion, vllm_max_len, prompt_budget
 
+
+def _grpo_admitted_prompts(
+    train,
+    message_prompts,
+    *,
+    multimodal,
+    processor,
+    tok,
+    package_root,
+    prompt_budget,
+    normalize_prompt_images,
+):
+    """render every row and keep the ones that fit the prompt budget."""
     prompts = []
     if multimodal:
         # verl raises rather than truncating over-budget multimodal prompts because truncation corrupts
@@ -2043,38 +2098,15 @@ def _resolve_grpo_inputs():
                         "prompt_len": prompt_len,
                     }
                 )
-    if len(prompts) < len(train):
-        print(
-            f"[rl-verl] dropped {len(train) - len(prompts)} prompts over the "
-            f"{prompt_budget}-token prompt budget",
-            flush=True,
-        )
-    if not prompts:
-        raise ValueError(f"every training prompt exceeds the {prompt_budget}-token prompt budget")
+    return prompts
 
-    # single-turn responses are max_completion wide. multi-turn responses contain the whole episode,
-    # and verl silently right-truncates beyond data.max_response_length. size to engine budget minus
-    # the shortest admitted prompt so no possible episode is cut mid-turn; max_completion remains the
-    # per-turn cap.
-    max_response_len = (
-        max(max_completion, vllm_max_len - min(int(p["prompt_len"]) for p in prompts))
-        if multi_turn
-        else max_completion
-    )
 
-    prompts_per_step = _w.resolve_grpo_prompts_per_step(prompts_per_step, len(prompts))
-    prompt_opened_thinking = bool(_w.THINKING) and _w.prompt_opens_thinking(prompts[0]["rendered"])
-    # hand the same derived flag to the multi-turn grading path. the env cannot derive it itself --
-    # it has no tokenizer and never sees a rendered prompt -- and the template opens the block in
-    # EVERY assistant generation prompt (the glue tokenizer renders the next turn's header the same
-    # way), so one run-level value covers every turn, exactly as it does single-turn.
-    if hasattr(env, "prompt_opens_thinking"):
-        env.prompt_opens_thinking = prompt_opened_thinking
-
+def _grpo_update_schedule(_t, rl, prompts_per_step, prompt_count):
+    """the optimizer-update horizon and the checkpoint cadence that serves it."""
     # optimizer-update horizon, honoring [train].max_steps exactly.
     epochs = int(_t.epochs) if (_t and _t.epochs is not None) else int(rl.num_epochs)
     derived_steps = on_policy_steps(
-        epochs=epochs, prompt_count=len(prompts), prompts_per_step=prompts_per_step
+        epochs=epochs, prompt_count=prompt_count, prompts_per_step=prompts_per_step
     )
     steps = resolve_update_horizon(derived_steps, getattr(_t, "max_steps", None) if _t else None)
     # verl stops at both total_epochs and total_training_steps. give its hardcoded drop_last
@@ -2082,7 +2114,7 @@ def _resolve_grpo_inputs():
     # for user-facing metadata. total_training_steps prevents the capacity headroom from over-training.
     verl_total_epochs = _verl_epochs_for_horizon(
         epochs=epochs,
-        prompt_count=len(prompts),
+        prompt_count=prompt_count,
         prompts_per_step=prompts_per_step,
         steps=int(steps),
     )
@@ -2098,6 +2130,93 @@ def _resolve_grpo_inputs():
     # consecutive required steps can leave a short merger window; a small history prevents a slow
     # export from losing a requested step.
     ckpt_to_keep = 3 if save_at_steps else 1
+    return epochs, verl_total_epochs, steps, save_freq, save_at_steps, ckpt_to_keep
+
+
+def _resolve_grpo_inputs():
+    """reproduce run_rl's front-half config + dataset prep for text, multimodal, and multi-turn."""
+    env, multi_turn = _grpo_env_and_turn_mode()
+    seed_training_rngs(_w.SEED)
+    model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
+    model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
+
+    rl = RECIPE.rl
+    _t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
+    structured_outputs, stop_sequences, entropy_quantile, per_turn_credit = _grpo_feature_flags(
+        _t, multi_turn
+    )
+    _grpo_validate_lora_dropout()
+    gcfg = _w.grpo_overrides()
+    prompts_per_step, group_size, temperature, think_penalty, kl_coef = _grpo_sampling_scalars(
+        _t, rl, gcfg
+    )
+    mask_truncated_completions = _w.grpo_mask_truncated_completions(_t)
+    learning_rate, lora_rank, lora_alpha = _grpo_optimizer_and_lora_dims(_t, rl)
+    # warm-start: continue the sft adapter in place (verl lora_adapter_path). uses the SOURCE
+    # adapter's rank/alpha (flash forbids a child lora_rank on warm-start).
+    warmstart_adapter = ""
+    if _t and getattr(_t, "init_from_adapter", ""):
+        # a multi-GB adapter pull emits nothing of its own, so it must run under a liveness wrap or
+        # the provider judges the silence as a stall.
+        with liveness_heartbeat("rl_adapter_loading"):
+            warmstart_adapter = _grpo_download_warmstart_adapter(_t.init_from_adapter)
+        if not warmstart_adapter:
+            raise RuntimeError(
+                "warm-start source adapter could not be downloaded; refusing to start from the base."
+            )
+        lora_rank, lora_alpha = _grpo_warmstart_lora_dims(
+            warmstart_adapter, model_id, lora_rank, lora_alpha, _t.init_from_adapter
+        )
+
+    train, message_prompts = _grpo_shuffled_dataset(env, _t)
+
+    from flash.content.multimodal import normalize_prompt_images, resolve_image_pad_token_id
+
+    multimodal = _grpo_has_images(train, message_prompts)
+    package_root = getattr(env, "package_root", None)
+    image_pad_token_id = None
+    processor, tok = _grpo_processor_and_tokenizer(model_id, model_revision, multimodal)
+    if multimodal:
+        image_pad_token_id = resolve_image_pad_token_id(processor, tok)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+
+    max_completion, vllm_max_len, prompt_budget = _grpo_length_budget(
+        _t, rl, gcfg, model_id, model_revision, tok, multi_turn
+    )
+    prompts = _grpo_admitted_prompts(
+        train,
+        message_prompts,
+        multimodal=multimodal,
+        processor=processor,
+        tok=tok,
+        package_root=package_root,
+        prompt_budget=prompt_budget,
+        normalize_prompt_images=normalize_prompt_images,
+    )
+    if len(prompts) < len(train):
+        print(
+            f"[rl-verl] dropped {len(train) - len(prompts)} prompts over the "
+            f"{prompt_budget}-token prompt budget",
+            flush=True,
+        )
+    if not prompts:
+        raise ValueError(f"every training prompt exceeds the {prompt_budget}-token prompt budget")
+
+    max_response_len = _grpo_response_width(prompts, max_completion, vllm_max_len, multi_turn)
+
+    prompts_per_step = _w.resolve_grpo_prompts_per_step(prompts_per_step, len(prompts))
+    prompt_opened_thinking = bool(_w.THINKING) and _w.prompt_opens_thinking(prompts[0]["rendered"])
+    # hand the same derived flag to the multi-turn grading path. the env cannot derive it itself --
+    # it has no tokenizer and never sees a rendered prompt -- and the template opens the block in
+    # EVERY assistant generation prompt (the glue tokenizer renders the next turn's header the same
+    # way), so one run-level value covers every turn, exactly as it does single-turn.
+    if hasattr(env, "prompt_opens_thinking"):
+        env.prompt_opens_thinking = prompt_opened_thinking
+
+    epochs, verl_total_epochs, steps, save_freq, save_at_steps, ckpt_to_keep = (
+        _grpo_update_schedule(_t, rl, prompts_per_step, len(prompts))
+    )
 
     return {
         "env": env,
@@ -2106,15 +2225,7 @@ def _resolve_grpo_inputs():
         "multimodal": multimodal,
         "multi_turn": multi_turn,
         "max_turns": int(getattr(env, "max_turns", 0) or 0) if multi_turn else 0,
-        # the child decides whether an assistant turn ended naturally or was cut off, and it has no
-        # access to the model config -- so the full halting set is resolved here and handed over.
-        # the union of the tokenizer's eos and the model's generation_config eos, because a model can
-        # stop on a secondary id its tokenizer never exposes.
-        "eos_token_ids": (
-            generation_eos_from_cached_config(model_id, model_revision, tok)
-            if multi_turn
-            else frozenset()
-        ),
+        "eos_token_ids": _grpo_eos_token_ids(model_id, model_revision, tok, multi_turn),
         "package_root": package_root,
         "image_pad_token_id": image_pad_token_id,
         "model_id": model_id,
