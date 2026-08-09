@@ -16,7 +16,7 @@ import multiprocessing  # noqa: F401
 import os
 import time
 from threading import Event
-from typing import Annotated
+from typing import Annotated, NoReturn
 
 import regex as safe_regex  # noqa: F401
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -460,6 +460,137 @@ def deployment(
     return _public_deployment({**persisted, "run_id": run_id})
 
 
+def _reject_contended_deploy(
+    run_id: str,
+    key: dict,
+    x_freesolo_org_id: str | None,
+    x_freesolo_project_id: str | None,
+) -> NoReturn:
+    """Raise the 409 for a deploy that could not take the per-run lock.
+
+    Always raises. The lock was NOT acquired on this path, so the caller must not release it.
+    """
+    status = manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
+    current_deployment = status.deployment or {}
+    current_deployment_state = current_deployment.get("state")
+    if current_deployment_state in _DEPLOYMENT_BUSY_STATES:
+        detail = (
+            f"run {run_id} already has a deployment in "
+            f"{current_deployment_state} state; run `flash models deployments` "
+            "to check progress"
+        )
+    else:
+        # the per-run lock is shared with undeploy, export, and startup recovery, so a
+        # contended acquire cannot claim a deployment is running unless the state says so.
+        detail = f"another operation is in progress for run {run_id}; retry shortly"
+    raise HTTPException(status_code=409, detail=detail)
+
+
+def _queued_deployment_record(
+    run_id: str,
+    spec: JobSpec,
+    effective_spec: JobSpec,
+    deploy_prefix: str,
+    checkpoint_step,
+    is_checkpoint: bool,
+    current_deployment: dict,
+    previous_deployment,
+) -> dict:
+    """Build the ``queued`` deployment record that gets persisted before the job starts."""
+    # Validate the cheap configured-rank part synchronously so obvious spec errors return 400
+    # instead of becoming background deployment failures.
+    try:
+        from flash.serve.deploy import validate_serving_lora_rank
+
+        validate_serving_lora_rank(
+            spec.model,
+            effective_spec.train.lora_rank,
+            rank_source="effective prepared LoRA rank",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        dep_dict = _app.deployment_record(
+            run_id=run_id,
+            model=spec.model,
+            adapter_prefix=deploy_prefix,
+            state="queued",
+            checkpoint_step=checkpoint_step,
+        ).to_dict()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    dep_dict = _deployment_state(
+        dep_dict,
+        "queued",
+        detail="deployment queued",
+        verify=True,
+        requested_at=time.time(),
+    )
+    dep_dict["verification_generation"] = verified_adapter_revision_generation(run_id)
+    if current_deployment.get("activation_outcome_unknown"):
+        dep_dict["activation_outcome_unknown"] = True
+    if is_checkpoint:
+        dep_dict["checkpoint_step"] = checkpoint_step
+    if previous_deployment:
+        dep_dict["previous_deployment"] = previous_deployment
+    return dep_dict
+
+
+def _validate_deploy_request(
+    run_id: str, status, spec: JobSpec, payload: dict, dry_run: bool
+) -> tuple[JobSpec, dict]:
+    """Reject a deploy that cannot proceed, before anything is queued or registered.
+
+    Returns the effective spec and the current deployment record for the caller to work from.
+    """
+    if spec.model_revision:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "deployment does not support revision-pinned base models; "
+                "train without model_revision to deploy this run"
+            ),
+        )
+    try:
+        effective_spec = effective_spec_from_status(status)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    # smoke verification is mandatory for every real deployment: a loadable-but-broken
+    # revision must never become the bare-run alias target. reject an explicit opt-out
+    # before anything is queued or registered (dry runs never register or activate, so
+    # the flag is meaningless there too).
+    if _require_bool(payload, "verify", True) is False:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "verify=false is not supported: deployment smoke verification is "
+                "mandatory before alias activation"
+            ),
+        )
+    current_deployment = status.deployment or {}
+    current_deployment_state = current_deployment.get("state")
+    completed_unknown_activation = (
+        current_deployment_state == "reconciling"
+        and current_deployment.get("activation_outcome_unknown") is True
+    )
+    if (
+        not dry_run
+        and current_deployment_state in _DEPLOYMENT_BUSY_STATES
+        and not completed_unknown_activation
+        and not _deployment_attempt_is_stale(current_deployment)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"run {run_id} already has a deployment in "
+                f"{current_deployment.get('state')} state; run `flash models deployments` "
+                "to check progress"
+            ),
+        )
+    return effective_spec, current_deployment
+
+
 @router.post("/v1/runs/{run_id}/deploy")
 def deploy(
     run_id: str,
@@ -471,69 +602,15 @@ def deploy(
     payload = payload or {}
     deploy_lock = _app._deploy_lock(run_id)
     if not deploy_lock.acquire(blocking=False):
-        status = manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
-        current_deployment = status.deployment or {}
-        current_deployment_state = current_deployment.get("state")
-        if current_deployment_state in _DEPLOYMENT_BUSY_STATES:
-            detail = (
-                f"run {run_id} already has a deployment in "
-                f"{current_deployment_state} state; run `flash models deployments` "
-                "to check progress"
-            )
-        else:
-            # the per-run lock is shared with undeploy, export, and startup recovery, so a
-            # contended acquire cannot claim a deployment is running unless the state says so.
-            detail = f"another operation is in progress for run {run_id}; retry shortly"
-        raise HTTPException(status_code=409, detail=detail)
+        _reject_contended_deploy(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
     job_owns_lock = False
     try:
         status = manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
         spec = JobSpec.from_dict(status.spec)
-        if spec.model_revision:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "deployment does not support revision-pinned base models; "
-                    "train without model_revision to deploy this run"
-                ),
-            )
-        try:
-            effective_spec = effective_spec_from_status(status)
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
         dry_run = _require_bool(payload, "dry_run", False)
-        # smoke verification is mandatory for every real deployment: a loadable-but-broken
-        # revision must never become the bare-run alias target. reject an explicit opt-out
-        # before anything is queued or registered (dry runs never register or activate, so
-        # the flag is meaningless there too).
-        if _require_bool(payload, "verify", True) is False:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "verify=false is not supported: deployment smoke verification is "
-                    "mandatory before alias activation"
-                ),
-            )
-        current_deployment = status.deployment or {}
-        current_deployment_state = current_deployment.get("state")
-        completed_unknown_activation = (
-            current_deployment_state == "reconciling"
-            and current_deployment.get("activation_outcome_unknown") is True
+        effective_spec, current_deployment = _validate_deploy_request(
+            run_id, status, spec, payload, dry_run
         )
-        if (
-            not dry_run
-            and current_deployment_state in _DEPLOYMENT_BUSY_STATES
-            and not completed_unknown_activation
-            and not _deployment_attempt_is_stale(current_deployment)
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"run {run_id} already has a deployment in "
-                    f"{current_deployment.get('state')} state; run `flash models deployments` "
-                    "to check progress"
-                ),
-            )
         checkpoint_step, is_checkpoint, deploy_prefix = _resolve_deployable_target(
             run_id,
             effective_spec,
@@ -597,43 +674,16 @@ def deploy(
                 raise
             return dep.to_dict()
 
-        # Validate the cheap configured-rank part synchronously so obvious spec errors return 400
-        # instead of becoming background deployment failures.
-        try:
-            from flash.serve.deploy import validate_serving_lora_rank
-
-            validate_serving_lora_rank(
-                spec.model,
-                effective_spec.train.lora_rank,
-                rank_source="effective prepared LoRA rank",
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-        try:
-            dep_dict = _app.deployment_record(
-                run_id=run_id,
-                model=spec.model,
-                adapter_prefix=deploy_prefix,
-                state="queued",
-                checkpoint_step=checkpoint_step,
-            ).to_dict()
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        dep_dict = _deployment_state(
-            dep_dict,
-            "queued",
-            detail="deployment queued",
-            verify=True,
-            requested_at=time.time(),
+        dep_dict = _queued_deployment_record(
+            run_id,
+            spec,
+            effective_spec,
+            deploy_prefix,
+            checkpoint_step,
+            is_checkpoint,
+            current_deployment,
+            previous_deployment,
         )
-        dep_dict["verification_generation"] = verified_adapter_revision_generation(run_id)
-        if current_deployment.get("activation_outcome_unknown"):
-            dep_dict["activation_outcome_unknown"] = True
-        if is_checkpoint:
-            dep_dict["checkpoint_step"] = checkpoint_step
-        if previous_deployment:
-            dep_dict["previous_deployment"] = previous_deployment
         marked = mark_deployment_pending(run_id, dep_dict, expect_state=prev_state)
         if marked.deployment != dep_dict:
             raise HTTPException(
