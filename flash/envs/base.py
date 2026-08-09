@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Protocol, TypeVar
 
@@ -30,24 +30,37 @@ def map_bounded(
     Serial when ``serial`` is set (a scorer that cannot be raced) or when there is nothing to
     overlap -- a pool for a single call is pure overhead.
 
-    Failures are bounded to roughly one pool width: the first raise abandons the loop, and the
-    teardown's ``cancel_futures`` drops everything still queued behind it.
+    Failures cost at most ``cap`` extra calls, because only ``cap`` items are ever submitted: the
+    window refills as results are CONSUMED, never ahead of them. Submitting everything up front and
+    relying on ``cancel_futures`` does not bound anything when ``fn`` is fast -- the workers drain
+    the whole queue before the main thread gets back around to reading a result, so there is nothing
+    left to cancel by the time the first failure is seen. Measured at width 8 failing on item 1:
+    eager submission ran 36 of 40, and 10000 of 10000; this runs 9.
 
-    Completions are awaited as they ARRIVE, not in input order, and the results are placed back by
-    index. ``pool.map`` would be shorter but yields strictly in input order, so one slow leading
-    item defers the raise until the whole batch has drained -- measured on a 40-item batch at width
-    8, a slow head runs all 40 whichever item fails, where this runs 9 and 27. Scorer cost is
-    per-group and uneven, so that case is the normal one, not a corner.
+    Completions are consumed as they ARRIVE, not in input order, and results are placed back by
+    index. Awaiting in input order (what ``pool.map`` yields) defers the raise behind a slow leading
+    item until the batch drains: at width 8 with a slow head, 29 of 40 against 9 here.
+
+    Both halves matter because they fail in opposite regimes -- fast scorers defeat an eager submit,
+    a slow head defeats in-order consumption -- and reward scoring produces both.
     """
     if serial or len(items) <= 1:
         return [fn(item) for item in items]
+    results: list[_R] = [None] * len(items)  # type: ignore[list-item]
     pool = ThreadPoolExecutor(max_workers=min(cap, len(items)))
     try:
-        futures = {pool.submit(fn, item): index for index, item in enumerate(items)}
-        results: list[_R] = [None] * len(items)  # type: ignore[list-item]
-        for future in as_completed(futures):
-            results[futures[future]] = future.result()
-        return results
+        pending: dict[Future[_R], int] = {}
+        cursor = 0
+        while True:
+            while cursor < len(items) and len(pending) < cap:
+                pending[pool.submit(fn, items[cursor])] = cursor
+                cursor += 1
+            if not pending:
+                return results
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                # raises on the first failed item, dropping the window with the pool teardown
+                results[pending.pop(future)] = future.result()
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
 

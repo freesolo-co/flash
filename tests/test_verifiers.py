@@ -1667,11 +1667,17 @@ class _FailingGroupedEnv(_FakeSingleTurnEnv):
     real scorers look like -- group cost tracks completion length and judge latency, so it is
     uneven. A pool that waits on results in INPUT order cannot report the failure until that
     leading group returns, by which time the whole batch has drained.
+
+    ``fast`` removes the per-group sleep entirely, which is the OPPOSITE regime and defeats a
+    different implementation: when every call returns immediately, workers drain an eagerly
+    submitted queue before the consumer reads its first result, so there is nothing left for
+    ``cancel_futures`` to drop. A cheap scorer (a regex or exact-match grader) is exactly this.
     """
 
-    def __init__(self, fail_on: str, slow_head: bool = False):
+    def __init__(self, fail_on: str, slow_head: bool = False, fast: bool = False):
         self.fail_on = fail_on
         self.slow_head = slow_head
+        self.fast = fast
         self.lock = threading.Lock()
         self.executed = 0
 
@@ -1681,23 +1687,28 @@ class _FailingGroupedEnv(_FakeSingleTurnEnv):
         # hold the worker long enough that the groups queued behind this one are still QUEUED, not
         # started, when the raise surfaces -- that is what cancel_futures can drop.
         head = self.slow_head and str(example.input) == "q0"
-        time.sleep(0.5 if head else 0.05)
+        if head:
+            time.sleep(0.5)
+        elif not self.fast:
+            time.sleep(0.05)
         if str(example.input) == self.fail_on:
             raise RuntimeError("scorer exploded")
         return [_RewardResult(score=1.0, success=True, metrics=()) for _text in response_texts]
 
 
 @pytest.mark.parametrize(
-    ("fail_on", "ceiling", "slow_head"),
+    ("fail_on", "ceiling", "slow_head", "fast"),
     [
-        ("q1", 16, False),
-        ("q19", 32, False),
-        ("q1", 16, True),
-        ("q19", 32, True),
+        ("q1", 16, False, False),
+        ("q19", 32, False, False),
+        ("q1", 16, True, False),
+        ("q19", 32, True, False),
+        ("q1", 16, False, True),
+        ("q19", 32, False, True),
     ],
 )
 def test_a_failing_scorer_group_wastes_at_most_a_pool_width(
-    monkeypatch, fail_on, ceiling, slow_head
+    monkeypatch, fail_on, ceiling, slow_head, fast
 ):
     """A raise must not drag the whole batch through the scorer before it propagates.
 
@@ -1705,17 +1716,22 @@ def test_a_failing_scorer_group_wastes_at_most_a_pool_width(
     and rl_train.py's batch-level retry re-scores everything serially afterwards, so those calls are
     billed TWICE. Bounding that waste is what makes the concurrency acceptable.
 
-    The ``slow_head`` arms are the ones with teeth. Scorer cost is uneven in production, and
-    `pool.map` yields strictly in INPUT order, so a slow leading group defers the raise until every
-    other group has run: measured 40/40 under `map` for both failure points, against 9 and 27 when
-    completions are consumed as they arrive. The uniform-cost arms pass either way, so they cannot
-    catch that regression on their own.
+    The uniform-cost arms pass under every implementation tried, so the two skewed arms are the ones
+    with teeth, and they bite in OPPOSITE directions:
+
+    ``slow_head`` breaks consuming results in input order (what `pool.map` yields) -- a slow leading
+    group defers the raise until every other group has run: 40/40 under `map`, against 9 here.
+
+    ``fast`` breaks submitting the whole batch up front and relying on `cancel_futures`. With no
+    sleep at all the workers drain the entire queue before the consumer reads its first result, so
+    the cancel finds nothing pending: measured 36/40, and 10000/10000 on a larger batch, against 6
+    here. Only submitting a window at a time bounds it.
 
     Asserted as a CEILING (one pool width past the failure point, doubled for scheduling slack), not
     an equality: the exact count depends on how many workers have picked up work when the raise
     lands.
     """
-    sdk_env = _FailingGroupedEnv(fail_on, slow_head=slow_head)
+    sdk_env = _FailingGroupedEnv(fail_on, slow_head=slow_head, fast=fast)
     _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
 
     from flash.envs.adapter import FreesoloEnvironment
