@@ -862,12 +862,14 @@ with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA
 
 - **Pick the teacher with `[train] teacher_model`; the key stays managed.** The teacher defaults to
   the managed **GLM 5.2** and is selectable from a fixed, managed allow-list:
-  `glm-5.2` (default), `kimi-k3`, `qwen3.5-397b-a17b`, or `deepseek-v4-pro`. Every option is
-  a Parasail-hosted model reached through the control-plane broker, so there is nothing to export or
+  `glm-5.2` (default), `kimi-k3`, `qwen3.5-397b-a17b`, `deepseek-v4-pro`, `qwen3-vl-235b`, or
+  `qwen3-vl-8b`. Every option is a Parasail-hosted model reached through the control-plane broker, so
+  there is nothing to export or
   declare. An opd run submits like any other, and a `PARASAIL_API_KEY` in your shell is ignored.
   Arbitrary bring-your-own teacher models or keys are not supported (the allow-list is curated to
-  teachers verified to echo-score the student's tokens). The key is never stored in the spec or needed
-  at serving time; teacher token cost varies by model and is shown in the pre-flight estimate.
+  teachers verified to score the student's tokens). Image-bearing opd requires `qwen3-vl-235b` or
+  `qwen3-vl-8b` and is single-turn only. The key is never stored in the spec or needed at serving time;
+  teacher token cost varies by model and is shown in the pre-flight estimate.
 - **The student (Qwen) and the teacher have different tokenizers.** Flash
   bridges the vocabulary mismatch with **groupwise reverse-KL** (the collinear-ai _spider_ / Tinker
   method): it aligns the two tokenizations by shared source-text spans and applies per-span reverse
@@ -898,7 +900,8 @@ max_examples = 2
 lora_rank = 32
 # teacher_model = "glm-5.2"                             # managed teacher to distil from; one of
 #                                                       # glm-5.2 (default) | kimi-k3 |
-#                                                       # qwen3.5-397b-a17b | deepseek-v4-pro
+#                                                       # qwen3.5-397b-a17b | deepseek-v4-pro |
+#                                                       # qwen3-vl-235b | qwen3-vl-8b
 #                                                       # (key stays managed)
 # kl_penalty_coef = 1.0                                 # reverse-KL scale
 ```

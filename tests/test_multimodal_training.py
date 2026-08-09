@@ -464,13 +464,22 @@ def test_text_only_prompt_messages_drops_images_and_preserves_text_order():
     assert messages[1]["content"][1]["image"] is pil
 
 
-def test_multimodal_algorithm_validation_rejects_all_image_opd_after_model_validation():
-    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "sft")
-    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "grpo")
-    with pytest.raises(ValueError, match="image-bearing opd is not supported"):
-        mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "opd")
+def test_multimodal_algorithm_validation_requires_a_vision_teacher_after_model_validation():
+    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "sft", None)
+    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "grpo", None)
+    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "opd", "qwen3-vl-235b")
+    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "opd", "qwen3-vl-8b")
+    with pytest.raises(
+        ValueError,
+        match=r"requires.*qwen3-vl-235b.*selected teacher \'glm-5\.2\' cannot see images",
+    ):
+        mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "opd", "glm-5.2")
     with pytest.raises(ValueError, match="does not support"):
-        mm.validate_multimodal_training("meta-llama/Llama-3.2-1B", "opd")
+        mm.validate_multimodal_training(
+            "meta-llama/Llama-3.2-1B",
+            "opd",
+            "glm-5.2",
+        )
 
 
 def test_native_single_turn_image_grpo_suppresses_image_pad_generation():
@@ -501,19 +510,55 @@ def test_image_opd_preflight_rejects_packaged_dataset_before_allocation(tmp_path
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
         environment=environment,
+        train=SimpleNamespace(teacher_model="qwen3-vl-8b"),
+    )
+    mm.preflight_validate_image_opd(supported)
+
+    text_teacher = SimpleNamespace(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        environment=environment,
         train=SimpleNamespace(teacher_model="kimi-k3"),
     )
-    with pytest.raises(ValueError, match="image-bearing opd is not supported"):
-        mm.preflight_validate_image_opd(supported)
+    with pytest.raises(ValueError, match="selected teacher 'kimi-k3' cannot see images"):
+        mm.preflight_validate_image_opd(text_teacher)
 
     unsupported = SimpleNamespace(
         model="meta-llama/Llama-3.2-1B",
         algorithm="opd",
         environment=environment,
-        train=SimpleNamespace(teacher_model="kimi-k3"),
+        train=SimpleNamespace(teacher_model="qwen3-vl-8b"),
     )
     with pytest.raises(ValueError, match="does not support image-bearing"):
         mm.preflight_validate_image_opd(unsupported)
+
+
+def test_image_opd_preflight_rejects_multi_turn_with_a_vision_teacher():
+    spec = SimpleNamespace(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        environment=SimpleNamespace(
+            id="local",
+            params={
+                "multi_turn": True,
+                "records": [
+                    {
+                        "input": [
+                            {
+                                "role": "user",
+                                "content": [{"type": "image"}],
+                            }
+                        ],
+                        "image": _data_uri(_png_bytes()),
+                    }
+                ],
+            },
+        ),
+        train=SimpleNamespace(teacher_model="qwen3-vl-8b"),
+    )
+
+    with pytest.raises(ValueError, match="multi-turn image-bearing opd is not supported"):
+        mm.preflight_validate_image_opd(spec)
 
 
 @pytest.mark.parametrize("record_source", ["inline", "packaged"])
@@ -548,7 +593,7 @@ def test_image_opd_preflight_limits_scan_to_max_examples(tmp_path, record_source
 
 
 @pytest.mark.parametrize("background", [False, True])
-def test_image_opd_submit_preflight_rejects_supported_single_turn_records(
+def test_image_opd_submit_preflight_rejects_text_teacher_before_state_mutation(
     monkeypatch, tmp_path, background
 ):
     from flash import runner
@@ -580,7 +625,7 @@ def test_image_opd_submit_preflight_rejects_supported_single_turn_records(
         }
     )
 
-    with pytest.raises(ValueError, match="image-bearing opd is not supported"):
+    with pytest.raises(ValueError, match="selected teacher 'kimi-k3' cannot see images"):
         runner.submit_job(spec, background=background)
     with pytest.raises(FileNotFoundError):
         runner.get_status(spec.run_id)

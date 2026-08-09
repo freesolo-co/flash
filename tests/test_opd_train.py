@@ -2585,27 +2585,64 @@ def test_a_usable_opd_turn_still_reaches_the_environment():
     assert response["terminal"] is False
 
 
-def test_multimodal_bridge_rejects_managed_teacher_scoring():
+def test_multimodal_bridge_scores_frozen_images_through_structured_teacher_messages(
+    monkeypatch,
+):
+    from flash.content import multimodal
+
+    captured = {}
+
+    class Teacher:
+        def score_many_multimodal(self, items):
+            captured["items"] = items
+            return [
+                _teacher_score(
+                    [TeacherToken(text="A", logprob=-0.4, start=0, end=1)],
+                    input_tokens=91,
+                )
+            ]
+
+    monkeypatch.setattr(
+        multimodal,
+        "image_descriptors_to_data_uris",
+        lambda descriptors, package_root: [
+            f"data:image/png;base64,{descriptors[0]}:{package_root}"
+        ],
+    )
     bridge = _TeacherAlignmentBridge(
         prompts=[
             _BridgePrompt(
                 student_messages=[{"role": "user", "content": [{"type": "image"}]}],
-                teacher_messages=[{"role": "user", "content": "<|media_pad|>"}],
+                teacher_messages=[{"role": "user", "content": "<|media_pad|>question"}],
                 prompt_ids=(10, 11),
                 image_descriptors=("frozen-descriptor",),
-                package_root=None,
+                package_root="/package",
             )
         ],
         tokenizer=_BridgeTokenizer(),
-        teacher=object(),
-        thinking_prefill="",
+        teacher=Teacher(),
+        thinking_prefill="<think>\n",
         eos_token_ids=frozenset({99}),
         stop_sequences=(),
         mutation_callback=lambda: None,
     )
 
-    with pytest.raises(ValueError, match="not supported by managed Parasail teachers"):
-        bridge.score(0, 2, [10, 11, 65, 99], image_count=1)
+    encoded = bridge.score(0, 2, [10, 11, 65, 99], image_count=1)
+
+    assert captured["items"] == [
+        (
+            [
+                {"role": "user", "content": "<|media_pad|>question"},
+                {"role": "assistant", "content": "<think>\n"},
+            ],
+            "A",
+            ["data:image/png;base64,frozen-descriptor:/package"],
+        )
+    ]
+    assert encoded["teacher_ids"] == [-1, 0, -1, -1]
+    assert encoded["teacher_logprobs"] == [0.0, -0.4, 0.0, 0.0]
+    assert bridge.teacher_input_tokens == 91
+    assert bridge.teacher_output_tokens == 1
 
 
 def test_bridge_rejects_parent_child_image_count_mismatch_before_scoring():
