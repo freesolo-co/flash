@@ -558,16 +558,107 @@ def test_public_lora_alpha_is_bound_into_new_preparation_digests(tmp_path, monke
         **intact,
         "train": {**intact["train"], "lora_alpha": intact["train"]["lora_alpha"] + 8},
     }
-    with pytest.raises(ValueError, match="failed integrity validation"):
+    with pytest.raises(ValueError):
         runner.effective_spec_from_status(status)
 
-    # deleting alpha must not forge a legacy snapshot out of a current one.
+    # deleting alpha must not forge a legacy snapshot out of a current one. the structural check
+    # cannot see this one -- from_dict() rederives 2 x rank, which equals the worker's alpha here --
+    # so reaching the digest is exactly what rejects it.
     status.spec = {
         **intact,
         "train": {k: v for k, v in intact["train"].items() if k != "lora_alpha"},
     }
     with pytest.raises(ValueError, match="failed integrity validation"):
         runner.effective_spec_from_status(status)
+
+    # and the binding is the digest's own, not a side effect of the structural check: tamper BOTH
+    # halves identically so the structural comparison passes, and only the digest can reject it.
+    status.spec = intact
+    status.effective_preparation = {
+        **status.effective_preparation,
+        "worker_spec": replace(
+            worker, train=replace(worker.train, lora_alpha=worker.train.lora_alpha + 8)
+        ).to_internal_dict(),
+    }
+    status.spec = {
+        **intact,
+        "train": {**intact["train"], "lora_alpha": intact["train"]["lora_alpha"] + 8},
+    }
+    with pytest.raises(ValueError, match="failed integrity validation"):
+        runner.effective_spec_from_status(status)
+
+
+def test_profile_free_run_compares_lora_topology_structurally(tmp_path, monkeypatch) -> None:
+    """A plain GRPO/OPD run reaches NEITHER digest branch, so rank/alpha need the structural check.
+
+    No workload profile and no warm-start source means effective_spec_from_status() never verifies
+    the preparation digest at all. Excluding rank/alpha from the structural comparison therefore
+    left them covered by nothing: recovery would train with the worker's topology while the public
+    status reported another. They only diverge on a warm start, so comparing them here is safe.
+    """
+    runner = fresh_runner(tmp_path, monkeypatch)
+    worker = JobSpec(
+        model="Qwen/Qwen3.5-0.8B",
+        model_revision="a" * 40,
+        algorithm="grpo",
+        environment=EnvironmentSpec(id="team/example", resolved_sha="b" * 40),
+        train=TrainSpec(lora_rank=20, lora_alpha=40, epochs=1),
+        gpu=GpuSpec(count=1),
+        seed=1,
+        run_id="grpo-run",
+    )
+    public_dict = worker.to_dict()
+    status = runner.RunStatus(
+        run_id=worker.run_id,
+        state="queued",
+        spec=public_dict,
+        effective_preparation={
+            "worker_spec": worker.to_internal_dict(),
+            "workload_profile": None,
+            "adapter_identity": None,
+            "preparation_digest": runner._preparation_digest(worker, worker, None),
+        },
+    )
+    # guard: this run really does bypass both digest branches.
+    assert not worker.workload_profile_kind and not worker.train.init_from_adapter
+    assert runner.effective_spec_from_status(status) == worker
+
+    for field, tampered in (("lora_alpha", 48), ("lora_rank", 99)):
+        status.spec = {**public_dict, "train": {**public_dict["train"], field: tampered}}
+        with pytest.raises(ValueError, match="does not match the public run"):
+            runner.effective_spec_from_status(status)
+
+
+def test_warm_start_topology_may_differ_between_the_halves(tmp_path, monkeypatch) -> None:
+    """The warm-start exclusion must survive: the source adapter's topology is authoritative.
+
+    _prepared_warm_start_specs() writes the SOURCE rank onto the worker spec while the public spec
+    keeps none, so comparing rank structurally would fail every warm-start recovery.
+    """
+    runner = fresh_runner(tmp_path, monkeypatch)
+    public = JobSpec(
+        model="Qwen/Qwen3.5-0.8B",
+        model_revision="a" * 40,
+        algorithm="grpo",
+        environment=EnvironmentSpec(id="team/example", resolved_sha="b" * 40),
+        train=TrainSpec(init_from_adapter="parent-run", lora_rank=32, lora_alpha=64, epochs=1),
+        gpu=GpuSpec(count=1),
+        seed=1,
+        run_id="child-run",
+    )
+    # the resolved worker half carries the source adapter's topology, which differs from the public.
+    worker = replace(
+        public,
+        train=replace(
+            public.train,
+            init_from_adapter="org/repo:rl/parent-run",
+            init_from_adapter_revision="c" * 40,
+            lora_rank=8,
+            lora_alpha=16,
+        ),
+    )
+    assert worker.train.lora_rank != public.train.lora_rank  # guard: they really do diverge
+    runner._validate_effective_spec(public, worker)  # must not raise
 
 
 def test_legacy_pre_alpha_snapshot_still_recovers(tmp_path, monkeypatch) -> None:

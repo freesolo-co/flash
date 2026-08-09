@@ -1257,15 +1257,22 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
     effective_train = dict(effective["train"])
     public_ref = public_train.get("init_from_adapter") or ""
     internal_ref = effective_train.get("init_from_adapter") or ""
-    for train_field in (
+    excluded_train_fields = [
         "init_from_adapter",
         "init_from_adapter_revision",
-        "lora_rank",
-        "lora_alpha",
         # platform-managed artifact repo: stripped from the public spec (digest-protected), so the
         # reconstructed public spec carries only the default. exclude it from the structural check.
         "hf_repo",
-    ):
+    ]
+    # rank and alpha diverge between the halves ONLY on a warm start, where the source adapter's
+    # topology is authoritative and _prepared_warm_start_specs() writes it onto the worker spec.
+    # Without one they are equal by construction, so comparing them costs nothing and is the only
+    # thing covering them on a plain run: that path reaches neither digest branch below (no
+    # workload profile, no warm-start source), so an edited public rank/alpha would otherwise be
+    # accepted and recovery would train with a topology the reported spec disagrees with.
+    if public_ref or internal_ref:
+        excluded_train_fields += ["lora_rank", "lora_alpha"]
+    for train_field in excluded_train_fields:
         effective_train[train_field] = public_train.get(train_field)
     effective["train"] = effective_train
     public_environment = dict(public["environment"])
