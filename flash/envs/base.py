@@ -30,19 +30,26 @@ def map_bounded(
     Serial when ``serial`` is set (a scorer that cannot be raced) or when there is nothing to
     overlap -- a pool for a single call is pure overhead.
 
-    Failures cost at most ``cap`` extra calls, because only ``cap`` items are ever submitted: the
-    window refills as results are CONSUMED, never ahead of them. Submitting everything up front and
-    relying on ``cancel_futures`` does not bound anything when ``fn`` is fast -- the workers drain
-    the whole queue before the main thread gets back around to reading a result, so there is nothing
-    left to cancel by the time the first failure is seen. Measured at width 8 failing on item 1:
-    eager submission ran 36 of 40, and 10000 of 10000; this runs 9.
+    Failures cost at most ``cap`` extra calls. Three separate things are required for that bound,
+    because three different shapes of ``fn`` each defeat a different one, and reward scoring
+    produces all three:
 
-    Completions are consumed as they ARRIVE, not in input order, and results are placed back by
-    index. Awaiting in input order (what ``pool.map`` yields) defers the raise behind a slow leading
-    item until the batch drains: at width 8 with a slow head, 29 of 40 against 9 here.
+    1. Only ``cap`` items are ever in flight, and the window refills as results are CONSUMED.
+       Submitting everything up front and relying on ``cancel_futures`` bounds nothing when ``fn``
+       is FAST: the workers drain the queue before the consumer reads its first result, so nothing
+       is left to cancel. At width 8 failing on item 1, eager submission ran 36 of 40 and 10000 of
+       10000.
+    2. Completions are consumed as they ARRIVE, not in input order, and placed back by index.
+       Consuming in input order (what ``pool.map`` yields) defers the raise behind a SLOW LEADING
+       item until the batch drains: 29 of 40 at width 8.
+    3. Refilling stops as soon as a failure is PENDING rather than observed. A call that fails
+       SLOWLY -- an HTTP timeout or a late 5xx, which is the normal shape of a real failure -- sits
+       in flight while fast successes are consumed around it, and each consumed success pulls
+       another item in. Waste then tracks error-latency over success-latency instead of ``cap``:
+       measured 2000 of 2000 at width 8 before this, against 8 after.
 
-    Both halves matter because they fail in opposite regimes -- fast scorers defeat an eager submit,
-    a slow head defeats in-order consumption -- and reward scoring produces both.
+    The bound is on calls STARTED, not billed twice by accident: `rl_train.py` discards the batch on
+    any raise and re-scores serially, so everything started here is charged again.
     """
     if serial or len(items) <= 1:
         return [fn(item) for item in items]
@@ -52,7 +59,11 @@ def map_bounded(
         pending: dict[Future[_R], int] = {}
         cursor = 0
         while True:
-            while cursor < len(items) and len(pending) < cap:
+            # the window is anchored to the OLDEST unconsumed item, not to how many futures happen
+            # to be settled. an in-flight call that will fail is indistinguishable from a slow one
+            # that will succeed, so nothing can be inferred from its state -- the only safe rule is
+            # to never run ahead of the item whose outcome is still unknown.
+            while cursor < len(items) and cursor - min(pending.values(), default=cursor) < cap:
                 pending[pool.submit(fn, items[cursor])] = cursor
                 cursor += 1
             if not pending:

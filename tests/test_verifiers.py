@@ -1672,12 +1672,26 @@ class _FailingGroupedEnv(_FakeSingleTurnEnv):
     different implementation: when every call returns immediately, workers drain an eagerly
     submitted queue before the consumer reads its first result, so there is nothing left for
     ``cancel_futures`` to drop. A cheap scorer (a regex or exact-match grader) is exactly this.
+
+    ``slow_error`` makes the FAILING group slow while the rest stay fast, which is what a real
+    failure looks like -- an HTTP timeout or a late 5xx takes longer than a success, not less. The
+    doomed call sits in flight while successes are consumed around it, and a window that refills on
+    each consumed success walks the whole batch before the raise is ever seen. An in-flight call
+    that will fail is indistinguishable from a slow one that will succeed, so only refusing to run
+    ahead of the oldest unconsumed item bounds this.
     """
 
-    def __init__(self, fail_on: str, slow_head: bool = False, fast: bool = False):
+    def __init__(
+        self,
+        fail_on: str,
+        slow_head: bool = False,
+        fast: bool = False,
+        slow_error: bool = False,
+    ):
         self.fail_on = fail_on
         self.slow_head = slow_head
         self.fast = fast
+        self.slow_error = slow_error
         self.lock = threading.Lock()
         self.executed = 0
 
@@ -1687,28 +1701,31 @@ class _FailingGroupedEnv(_FakeSingleTurnEnv):
         # hold the worker long enough that the groups queued behind this one are still QUEUED, not
         # started, when the raise surfaces -- that is what cancel_futures can drop.
         head = self.slow_head and str(example.input) == "q0"
-        if head:
+        doomed = str(example.input) == self.fail_on
+        if head or (doomed and self.slow_error):
             time.sleep(0.5)
-        elif not self.fast:
+        elif not (self.fast or self.slow_error):
             time.sleep(0.05)
-        if str(example.input) == self.fail_on:
+        if doomed:
             raise RuntimeError("scorer exploded")
         return [_RewardResult(score=1.0, success=True, metrics=()) for _text in response_texts]
 
 
 @pytest.mark.parametrize(
-    ("fail_on", "ceiling", "slow_head", "fast"),
+    ("fail_on", "ceiling", "slow_head", "fast", "slow_error"),
     [
-        ("q1", 16, False, False),
-        ("q19", 32, False, False),
-        ("q1", 16, True, False),
-        ("q19", 32, True, False),
-        ("q1", 16, False, True),
-        ("q19", 32, False, True),
+        ("q1", 16, False, False, False),
+        ("q19", 32, False, False, False),
+        ("q1", 16, True, False, False),
+        ("q19", 32, True, False, False),
+        ("q1", 16, False, True, False),
+        ("q19", 32, False, True, False),
+        ("q1", 16, False, False, True),
+        ("q19", 32, False, False, True),
     ],
 )
 def test_a_failing_scorer_group_wastes_at_most_a_pool_width(
-    monkeypatch, fail_on, ceiling, slow_head, fast
+    monkeypatch, fail_on, ceiling, slow_head, fast, slow_error
 ):
     """A raise must not drag the whole batch through the scorer before it propagates.
 
@@ -1716,22 +1733,26 @@ def test_a_failing_scorer_group_wastes_at_most_a_pool_width(
     and rl_train.py's batch-level retry re-scores everything serially afterwards, so those calls are
     billed TWICE. Bounding that waste is what makes the concurrency acceptable.
 
-    The uniform-cost arms pass under every implementation tried, so the two skewed arms are the ones
-    with teeth, and they bite in OPPOSITE directions:
+    The uniform-cost arms pass under every implementation tried, so the three skewed arms are the
+    ones with teeth, and each defeats a DIFFERENT implementation:
 
     ``slow_head`` breaks consuming results in input order (what `pool.map` yields) -- a slow leading
     group defers the raise until every other group has run: 40/40 under `map`, against 9 here.
 
     ``fast`` breaks submitting the whole batch up front and relying on `cancel_futures`. With no
     sleep at all the workers drain the entire queue before the consumer reads its first result, so
-    the cancel finds nothing pending: measured 36/40, and 10000/10000 on a larger batch, against 6
-    here. Only submitting a window at a time bounds it.
+    the cancel finds nothing pending: measured 36/40, and 10000/10000 on a larger batch, against 6.
+
+    ``slow_error`` breaks a window that refills whenever any success is consumed. The doomed call is
+    still in flight, so each consumed success pulls in another item and the window walks the whole
+    batch: measured 2000/2000, waste scaling with error-latency over success-latency rather than
+    with the cap, against 9 once the window refuses to run ahead of the oldest unconsumed item.
 
     Asserted as a CEILING (one pool width past the failure point, doubled for scheduling slack), not
     an equality: the exact count depends on how many workers have picked up work when the raise
     lands.
     """
-    sdk_env = _FailingGroupedEnv(fail_on, slow_head=slow_head, fast=fast)
+    sdk_env = _FailingGroupedEnv(fail_on, slow_head=slow_head, fast=fast, slow_error=slow_error)
     _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
 
     from flash.envs.adapter import FreesoloEnvironment
