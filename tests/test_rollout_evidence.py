@@ -1716,6 +1716,48 @@ def test_a_later_decline_reports_the_hooks_it_got_through(monkeypatch, tmp_path)
     assert stages == ("import", "dataset", "prompt_messages")
 
 
+@pytest.mark.parametrize(
+    ("hangs_in", "expected"),
+    [("dataset", ("import",)), ("prompt_messages", ("import", "dataset"))],
+)
+def test_a_hook_that_hangs_is_not_reported_as_having_run(monkeypatch, tmp_path, hangs_in, expected):
+    """The deadline bounds the wait; it does not make the hook finish.
+
+    The hook is still running on a daemon thread when the deadline expires, so a notice saying it
+    "ran on a small sample" describes work that never completed -- the exact overclaim the
+    per-stage reporting was added to remove. Both bounded hooks are covered: they are separate
+    call sites, so reporting-before-checking can be reintroduced in one without the other noticing.
+    """
+    from flash.cli.commands import _rollout_evidence_for
+    from flash.cli.commands import rollout_profile as rp
+
+    monkeypatch.setattr(rp, "_LOCAL_HOOK_DEADLINE_S", 0.2)
+    release = threading.Event()
+
+    class _HangingHook:
+        multi_turn = False
+
+        def dataset(self):
+            if hangs_in == "dataset":
+                release.wait(30)
+            return [{"q": "2+2?"}]
+
+        def prompt_messages(self, _example):
+            if hangs_in == "prompt_messages":
+                release.wait(30)
+            return [{"role": "user", "content": "2+2?"}]
+
+    client, _seen = _profiling_stubs(monkeypatch, tmp_path, _HangingHook())
+    monkeypatch.setattr("flash.cli.commands.client_from_config", lambda: client, raising=False)
+
+    try:
+        evidence, stages = _rollout_evidence_for(client, _spec())
+        assert evidence is None
+        assert stages == expected, f"claimed a hung hook ran: {stages}"
+    finally:
+        release.set()
+
+
 def test_a_draw_that_reasons_against_a_non_thinking_run_is_not_a_measurement():
     """Every catalog model is hybrid-thinking, so `thinking = false` is the common case.
 
@@ -1834,8 +1876,9 @@ def test_a_blocking_environment_hook_cannot_hang_the_submit(monkeypatch):
 
     began = time.monotonic()
     try:
-        assert rp._within(rp._LOCAL_HOOK_DEADLINE_S, _never_returns) is None
+        finished, value = rp._within(rp._LOCAL_HOOK_DEADLINE_S, _never_returns)
         elapsed = time.monotonic() - began
+        assert (finished, value) == (False, None)
         assert started.is_set(), "the call never actually started"
         # the point of the fix: it came back on the DEADLINE, not when the hook finished.
         assert elapsed < 5.0, f"waited {elapsed:.1f}s, so the deadline did not bound the call"
@@ -1847,9 +1890,12 @@ def test_a_bounded_hook_still_returns_its_value():
     """The deadline must not cost a measurement for every env whose dataset() is merely slow."""
     from flash.cli.commands import rollout_profile as rp
 
-    assert rp._within(30.0, lambda: [{"q": "2+2?"}]) == [{"q": "2+2?"}]
-    # a raising hook is reported as "no measurement", like any other failure on this path.
-    assert rp._within(30.0, lambda: (_ for _ in ()).throw(RuntimeError("boom"))) is None
+    assert rp._within(30.0, lambda: [{"q": "2+2?"}]) == (True, [{"q": "2+2?"}])
+    # a raising hook is reported as "no measurement", like any other failure on this path -- but it
+    # COMPLETED: the user's code ran, so the notice may say so. only a hang reports False.
+    assert rp._within(30.0, lambda: (_ for _ in ()).throw(RuntimeError("boom"))) == (True, None)
+    # a hook that legitimately returns something falsy must not be mistaken for one that hung.
+    assert rp._within(30.0, list) == (True, [])
 
 
 def test_a_prompt_the_endpoint_always_refuses_does_not_count_as_sampled():
@@ -1929,7 +1975,7 @@ def test_an_install_that_cannot_load_environments_says_so_instead_of_going_quiet
     from flash.cli.commands import rollout_profile as rp
 
     def _no_sdk(*_a, **_k):
-        raise ImportError("could not import the Freesolo environment tools: No module named ...")
+        raise ImportError(f"{rp._MISSING_ENVIRONMENT_TOOLS}: No module named ...")
 
     monkeypatch.setenv(rollout_sampler.ROLLOUT_SAMPLER_API_KEY_ENV, "k")
     monkeypatch.setattr(rp, "_collect", _no_sdk)
@@ -1939,3 +1985,45 @@ def test_an_install_that_cannot_load_environments_says_so_instead_of_going_quiet
 
     assert "rollout profiling is unavailable in this install" in caplog.text
     # and it still fails OPEN -- an unusable install must not break the submit.
+
+
+def test_a_missing_dependency_in_the_users_env_does_not_blame_the_flash_install(
+    monkeypatch, caplog
+):
+    """An import inside the user's own `environment.py` reaches the same handler.
+
+    Both arrive as `ImportError`, but they are fixed on different machines: one means "this flash
+    install cannot load environments", the other means "your env needs a dependency". Reporting the
+    first for the second sends the user to reinstall a working tool while the real cause is in
+    their file, and reads as if profiling worked.
+    """
+    from flash.cli.commands import rollout_profile as rp
+
+    def _env_missing_dep(*_a, **_k):
+        # exactly what `import pandas` at the top of a user environment.py raises.
+        raise ModuleNotFoundError("No module named 'pandas'")
+
+    monkeypatch.setenv(rollout_sampler.ROLLOUT_SAMPLER_API_KEY_ENV, "k")
+    monkeypatch.setattr(rp, "_collect", _env_missing_dep)
+
+    with caplog.at_level(logging.WARNING, logger="flash.cli"):
+        assert rp.collect_for_submit(object(), _spec()) is None
+
+    assert "your environment.py could not be imported" in caplog.text
+    assert "pandas" in caplog.text, "the actual cause has to survive into the warning"
+    assert "unavailable in this install" not in caplog.text
+
+
+def test_the_install_failure_prefix_still_matches_the_loader():
+    """The two sides are separate files, and the discriminator is a copied string literal.
+
+    If the loader ever rewords its own diagnostic, the check above silently stops matching and
+    every unusable install starts being reported as a broken user env -- with nothing failing.
+    """
+    import inspect
+
+    from flash.cli.commands import rollout_profile as rp
+    from flash.envs import loader
+
+    source = inspect.getsource(loader._import_freesolo_environment_tools)
+    assert rp._MISSING_ENVIRONMENT_TOOLS in source

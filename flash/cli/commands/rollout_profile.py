@@ -43,6 +43,11 @@ _SAMPLABLE_MESSAGE_KEYS = frozenset({"role", "content"})
 # measurable run to cap pricing. it exists to stop UNBOUNDED blocking, not to police slow hooks.
 _LOCAL_HOOK_DEADLINE_S = 120.0
 
+# the prefix flash/envs/loader.py puts on its OWN import failure. the only way to tell "this install
+# cannot load environments" from "the user's environment.py imports something missing", which arrive
+# here as the same exception type.
+_MISSING_ENVIRONMENT_TOOLS = "could not import the Freesolo environment tools"
+
 
 def collect_for_submit(
     client,
@@ -90,11 +95,23 @@ def collect_for_submit(
         # `freesolo` SDK -- so an isolated `uv tool`/`pipx` install cannot load an environment at
         # all. still fail open, but say so once: the user set a sampler key expecting a measured
         # quote, and silently pricing at the cap looks identical to the feature working.
-        logger.warning(
-            "rollout profiling is unavailable in this install, so this quote uses the declared "
-            "completion cap: %s",
-            exc,
-        )
+        #
+        # an import inside the user's own environment.py raises here too, and blaming the flash
+        # install for that sends them to fix the wrong machine. the loader already distinguishes
+        # them -- it re-raises its own failure with a fixed prefix -- so key off that rather than
+        # guessing from the module name, which cannot tell a missing SDK dep from a missing env dep.
+        if _MISSING_ENVIRONMENT_TOOLS in str(exc):
+            logger.warning(
+                "rollout profiling is unavailable in this install, so this quote uses the declared "
+                "completion cap: %s",
+                exc,
+            )
+        else:
+            logger.warning(
+                "your environment.py could not be imported, so this quote uses the declared "
+                "completion cap: %s",
+                exc,
+            )
         return None
     except Exception:
         if debug:
@@ -208,7 +225,12 @@ def _collect(
         # bounded: dataset() is user code that may block on a download or a stalled mount, and a
         # submit must not hang because the optional sampler happened to be configured. no exception
         # is raised by a hang, so the outer `except` could never regain control.
-        dataset = _within(_LOCAL_HOOK_DEADLINE_S, environment.dataset)
+        finished, dataset = _within(_LOCAL_HOOK_DEADLINE_S, environment.dataset)
+        if not finished:
+            # still running at the deadline, so it did NOT run "on a small sample" -- saying it did
+            # is the same overclaim the per-stage reporting exists to stop. the thread is a daemon
+            # and keeps going, which is exactly why completion has to be reported, not attempted.
+            return None
         _ran("dataset", on_environment_loaded)
         if not dataset:
             return None
@@ -222,7 +244,9 @@ def _collect(
 
         # bounded for the same reason as dataset(): prompt_messages() is user code, called once per
         # row, and a stall in any one of them would hang the submit.
-        prompts = _within(_LOCAL_HOOK_DEADLINE_S, _prompts_from, environment, dataset)
+        finished, prompts = _within(_LOCAL_HOOK_DEADLINE_S, _prompts_from, environment, dataset)
+        if not finished:
+            return None
         _ran("prompt_messages", on_environment_loaded)
         if not prompts:
             return None
@@ -323,8 +347,8 @@ def _ran(stage: str, report: Callable[[str], None] | None) -> None:
         report(stage)
 
 
-def _within(deadline_s: float, call, *args):
-    """``call(*args)``, or None when it does not finish within ``deadline_s``.
+def _within(deadline_s: float, call, *args) -> tuple[bool, Any]:
+    """``(completed, value)`` for ``call(*args)``, bounded by ``deadline_s``.
 
     a daemon thread rather than a signal: signals only work on the main thread and this is library
     code inside a cli, and rather than a subprocess because the env is already loaded in THIS
@@ -333,6 +357,11 @@ def _within(deadline_s: float, call, *args):
 
     that trade is only acceptable because this whole path is advisory: an expired hook returns the
     quote to the declared cap, which is what an unmeasured run was priced at anyway.
+
+    ``completed`` is separate from ``value`` because they answer different questions and a hook can
+    return a falsy value legitimately. False means only one thing: still running at the deadline. a
+    hook that RAISED completed -- the user's code ran and failed -- and the caller reports it as
+    having run, because the notice describes what executed on their machine, not what succeeded.
     """
     import threading
 
@@ -349,7 +378,8 @@ def _within(deadline_s: float, call, *args):
     worker = threading.Thread(target=_run, daemon=True)
     worker.start()
     worker.join(deadline_s)
-    return box[0] if box else None
+    # an append is the only thing that ends _run, so a non-empty box IS "it finished".
+    return (bool(box), box[0] if box else None)
 
 
 def _training_population(spec, dataset):
