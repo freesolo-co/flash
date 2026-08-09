@@ -714,6 +714,117 @@ def _run_deployment_smoke(
     }
 
 
+def _assert_deployment_activation_fence(
+    run_id: str, deployment: dict, is_checkpoint: bool, prev_state: str
+) -> None:
+    """Raise ``ServingError`` unless this attempt still owns the record and may activate the alias.
+
+    Re-read on every call: the point of the fence is that a cancel or a newer deploy can land while
+    smoke is blocked, so a cached status would defeat it.
+    """
+    latest = _app.get_status(run_id)
+    latest_deployment = latest.deployment or {}
+    if (
+        latest_deployment.get("requested_at") != deployment.get("requested_at")
+        or latest_deployment.get("state") not in _DEPLOYMENT_BUSY_STATES
+    ):
+        raise ServingError("deployment attempt was superseded before alias activation")
+    if is_checkpoint:
+        if prev_state in _app._DEPLOYABLE_STATES and latest.state != prev_state:
+            raise ServingError(
+                f"run state changed from {prev_state!r} to {latest.state!r} before alias activation"
+            )
+        if latest.state in {"cancelled", "failed", "dry_run"} and latest.state != prev_state:
+            raise ServingError(f"run became {latest.state!r} before checkpoint alias activation")
+    elif latest.state != prev_state:
+        raise ServingError(
+            f"run state changed from {prev_state!r} to {latest.state!r} before alias activation"
+        )
+    expected_generation = deployment.get("verification_generation")
+    if verified_adapter_revision_generation(run_id) != expected_generation:
+        raise ServingError("deployment verification generation changed before alias activation")
+
+
+def _commit_ready_deployment(
+    run_id: str,
+    current: dict,
+    verification_generation,
+    is_checkpoint: bool,
+    prev_state: str,
+) -> bool:
+    """Persist the ready deployment record. Returns whether the guarded write landed."""
+    previous = _app.get_status(run_id)
+    if is_checkpoint:
+        state_guard = prev_state if prev_state in _app._DEPLOYABLE_STATES else None
+        marked = mark_checkpoint_deployed(
+            run_id,
+            current,
+            expect_state=state_guard,
+            verification_generation=verification_generation,
+        )
+        persisted = marked.deployment == current
+    else:
+        marked = mark_deployed(
+            run_id,
+            current,
+            expect_state=prev_state,
+            verification_generation=verification_generation,
+        )
+        persisted = marked.state == "deployed" and marked.deployment == current
+    if persisted:
+        _report_persisted_transition(previous, marked, persisted=marked.deployment == current)
+    return persisted
+
+
+def _reconcile_ready_commit_miss(
+    run_id: str,
+    current: dict,
+    verification_generation,
+    is_checkpoint: bool,
+    deployment: dict,
+) -> None:
+    # deploy_adapter already flipped the serving alias when this runs, so a lost
+    # control-plane cas must never be dropped silently — and the alias is never
+    # reverted here (post-promotion recovery reads the authoritative alias; a revert
+    # could clobber a newer deployment).
+    latest = _app.get_status(run_id)
+    latest_deployment = latest.deployment or {}
+    owned = latest_deployment.get("requested_at") == deployment.get("requested_at")
+    if owned and latest_deployment.get("state") in _DEPLOYMENT_BUSY_STATES:
+        # this attempt still owns the record; only the run state moved under the
+        # guard. retry the write once against the fresh state.
+        previous = latest
+        if is_checkpoint:
+            marked = mark_checkpoint_deployed(
+                run_id,
+                current,
+                verification_generation=verification_generation,
+            )
+        else:
+            marked = mark_deployed(
+                run_id,
+                current,
+                expect_state=latest.state,
+                verification_generation=verification_generation,
+            )
+        if marked.deployment == current:
+            _report_persisted_transition(previous, marked, persisted=marked.deployment == current)
+            return
+        latest = marked
+        latest_deployment = latest.deployment or {}
+    # superseded, undeployed, or uncommittable: a newer actor owns the record now, so
+    # log the divergence loudly but never write over what that actor recorded — a
+    # clobber here would erase a concurrent final deploy's ready record or resurrect
+    # an explicit undeploy.
+    divergence = (
+        "deployment_record_diverged: serving alias targets "
+        f"{current.get('adapter_revision')} but the deployment record moved to "
+        f"{latest_deployment.get('state')!r} (run state {latest.state!r}) during "
+        "activation; serving alias left as activated"
+    )
+    print(f"deploy[{run_id}]: {divergence}", flush=True)
+
+
 def _finish_deployment_unlocked(
     *,
     run_id: str,
@@ -736,29 +847,7 @@ def _finish_deployment_unlocked(
     activated = False
 
     def _assert_activation_fence() -> None:
-        latest = _app.get_status(run_id)
-        latest_deployment = latest.deployment or {}
-        if (
-            latest_deployment.get("requested_at") != deployment.get("requested_at")
-            or latest_deployment.get("state") not in _DEPLOYMENT_BUSY_STATES
-        ):
-            raise ServingError("deployment attempt was superseded before alias activation")
-        if is_checkpoint:
-            if prev_state in _app._DEPLOYABLE_STATES and latest.state != prev_state:
-                raise ServingError(
-                    f"run state changed from {prev_state!r} to {latest.state!r} before alias activation"
-                )
-            if latest.state in {"cancelled", "failed", "dry_run"} and latest.state != prev_state:
-                raise ServingError(
-                    f"run became {latest.state!r} before checkpoint alias activation"
-                )
-        elif latest.state != prev_state:
-            raise ServingError(
-                f"run state changed from {prev_state!r} to {latest.state!r} before alias activation"
-            )
-        expected_generation = deployment.get("verification_generation")
-        if verified_adapter_revision_generation(run_id) != expected_generation:
-            raise ServingError("deployment verification generation changed before alias activation")
+        _assert_deployment_activation_fence(run_id, deployment, is_checkpoint, prev_state)
 
     def _before_activate(adapter_revision: str, checkpoint: str) -> None:
         nonlocal current
@@ -810,74 +899,14 @@ def _finish_deployment_unlocked(
         current = _public_deployment(current)
 
         def _commit_ready() -> bool:
-            previous = _app.get_status(run_id)
-            state_guard = prev_state
-            if is_checkpoint:
-                state_guard = prev_state if prev_state in _app._DEPLOYABLE_STATES else None
-                marked = mark_checkpoint_deployed(
-                    run_id,
-                    current,
-                    expect_state=state_guard,
-                    verification_generation=verification_generation,
-                )
-                persisted = marked.deployment == current
-            else:
-                marked = mark_deployed(
-                    run_id,
-                    current,
-                    expect_state=prev_state,
-                    verification_generation=verification_generation,
-                )
-                persisted = marked.state == "deployed" and marked.deployment == current
-            if persisted:
-                _report_persisted_transition(
-                    previous, marked, persisted=marked.deployment == current
-                )
-            return persisted
+            return _commit_ready_deployment(
+                run_id, current, verification_generation, is_checkpoint, prev_state
+            )
 
         def _reconcile_commit_miss() -> None:
-            # deploy_adapter already flipped the serving alias when this runs, so a lost
-            # control-plane cas must never be dropped silently — and the alias is never
-            # reverted here (post-promotion recovery reads the authoritative alias; a revert
-            # could clobber a newer deployment).
-            latest = _app.get_status(run_id)
-            latest_deployment = latest.deployment or {}
-            owned = latest_deployment.get("requested_at") == deployment.get("requested_at")
-            if owned and latest_deployment.get("state") in _DEPLOYMENT_BUSY_STATES:
-                # this attempt still owns the record; only the run state moved under the
-                # guard. retry the write once against the fresh state.
-                previous = latest
-                if is_checkpoint:
-                    marked = mark_checkpoint_deployed(
-                        run_id,
-                        current,
-                        verification_generation=verification_generation,
-                    )
-                else:
-                    marked = mark_deployed(
-                        run_id,
-                        current,
-                        expect_state=latest.state,
-                        verification_generation=verification_generation,
-                    )
-                if marked.deployment == current:
-                    _report_persisted_transition(
-                        previous, marked, persisted=marked.deployment == current
-                    )
-                    return
-                latest = marked
-                latest_deployment = latest.deployment or {}
-            # superseded, undeployed, or uncommittable: a newer actor owns the record now, so
-            # log the divergence loudly but never write over what that actor recorded — a
-            # clobber here would erase a concurrent final deploy's ready record or resurrect
-            # an explicit undeploy.
-            divergence = (
-                "deployment_record_diverged: serving alias targets "
-                f"{current.get('adapter_revision')} but the deployment record moved to "
-                f"{latest_deployment.get('state')!r} (run state {latest.state!r}) during "
-                "activation; serving alias left as activated"
+            _reconcile_ready_commit_miss(
+                run_id, current, verification_generation, is_checkpoint, deployment
             )
-            print(f"deploy[{run_id}]: {divergence}", flush=True)
 
         if not _commit_ready():
             _reconcile_commit_miss()
@@ -916,31 +945,43 @@ def _finish_deployment_unlocked(
                 )
                 print(f"deploy[{run_id}]: {divergence}", flush=True)
             return
-        error = str(exc)
-        if not is_checkpoint and isinstance(exc, AdapterConfigMissing):
-            steps = [c["step"] for c in _app.list_checkpoints(spec)]
-            if steps:
-                error = (
-                    f"run {run_id} has no run-level adapter at "
-                    f"{deployment.get('adapter_hf_prefix')} (the run likely never finalized); "
-                    f"deploy a saved checkpoint instead, e.g. `flash models deploy "
-                    f"{run_id}/step-{steps[-1]}` (available steps: "
-                    f"{', '.join(str(step) for step in steps)})"
-                )
-        failed_source = dict(current)
-        if not deployment.get("activation_outcome_unknown"):
-            failed_source.pop("activation_outcome_unknown", None)
-        failed = _deployment_state(
-            failed_source,
-            "failed",
-            error=error,
-            detail="deployment failed; previous working alias was preserved",
-        )
-        previous = _app.get_status(run_id)
-        marked = mark_deployment_failed(run_id, failed)
-        _report_persisted_transition(
-            previous, marked, persisted=_deployment_failure_persisted(marked, failed)
-        )
+        _record_deployment_failure(run_id, spec, exc, current, deployment, is_checkpoint)
+
+
+def _record_deployment_failure(
+    run_id: str,
+    spec: JobSpec,
+    exc: Exception,
+    current: dict,
+    deployment: dict,
+    is_checkpoint: bool,
+) -> None:
+    """Persist the failed record for an attempt that never activated the alias."""
+    error = str(exc)
+    if not is_checkpoint and isinstance(exc, AdapterConfigMissing):
+        steps = [c["step"] for c in _app.list_checkpoints(spec)]
+        if steps:
+            error = (
+                f"run {run_id} has no run-level adapter at "
+                f"{deployment.get('adapter_hf_prefix')} (the run likely never finalized); "
+                f"deploy a saved checkpoint instead, e.g. `flash models deploy "
+                f"{run_id}/step-{steps[-1]}` (available steps: "
+                f"{', '.join(str(step) for step in steps)})"
+            )
+    failed_source = dict(current)
+    if not deployment.get("activation_outcome_unknown"):
+        failed_source.pop("activation_outcome_unknown", None)
+    failed = _deployment_state(
+        failed_source,
+        "failed",
+        error=error,
+        detail="deployment failed; previous working alias was preserved",
+    )
+    previous = _app.get_status(run_id)
+    marked = mark_deployment_failed(run_id, failed)
+    _report_persisted_transition(
+        previous, marked, persisted=_deployment_failure_persisted(marked, failed)
+    )
 
 
 def _finish_deployment(*, deploy_lock, **kwargs) -> None:
