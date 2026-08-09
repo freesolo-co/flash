@@ -62,10 +62,20 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
 
+      # Downloaded to disk and checksum-verified before extraction, rather than piped straight
+      # into tar: a piped stream is extracted as it arrives, so a corrupted or substituted
+      # artifact is already on PATH by the time anything could notice. Bump the version and the
+      # digest together (the vendor publishes checksums.txt alongside each release).
       - name: Install crane
         run: |
-          curl -sSL https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz \
-            | sudo tar -xz -C /usr/local/bin crane
+          set -euo pipefail
+          ver=v0.20.2
+          sha=c14340087103ba9dadf61d45acd20675490fd0ccbd56ac7901fc1b502137f44b
+          curl -fsSL -o /tmp/crane.tar.gz \
+            "https://github.com/google/go-containerregistry/releases/download/${ver}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${sha}  /tmp/crane.tar.gz" | sha256sum -c -
+          sudo tar -xz -C /usr/local/bin -f /tmp/crane.tar.gz crane
+          rm -f /tmp/crane.tar.gz
           crane version
 
       - name: Log in to GHCR
