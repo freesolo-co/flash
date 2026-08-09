@@ -88,10 +88,15 @@ def _reward_evidence(
         return {"reward_seconds_per_completion": 0.0, "reward_samples": 0, "reward_failures": 0}
     profile = profile_reward_latency(score_one, list(reward_samples))
     if not profile.trustworthy:
+        # report the no-measurement WITHOUT the failure count. `reward_failures > reward_samples`
+        # violates a RolloutWorkloadProfile invariant, so carrying the count here made the whole
+        # payload unconstructable -- a scorer that raised discarded an otherwise good 32-rollout
+        # token measurement and returned the quote to the cap. the two readings are independent:
+        # a broken grader costs the reward number, not the generation-length one.
         return {
             "reward_seconds_per_completion": 0.0,
             "reward_samples": 0,
-            "reward_failures": profile.failures,
+            "reward_failures": 0,
         }
     return {
         "reward_seconds_per_completion": float(profile.seconds_per_completion),

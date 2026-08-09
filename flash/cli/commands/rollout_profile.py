@@ -67,6 +67,16 @@ def _unsamplable_reason(spec) -> str:
         # grammar-constrained decoding has its own length distribution, and the hosted request
         # carries no schema. forwarding one is a larger contract than this path has.
         return "structured outputs"
+    if getattr(spec, "model_revision", ""):
+        # the worker loads the pinned revision; the hosted endpoint serves whatever its model id
+        # currently points at. keying the revision in the digest stops the measurement being reused
+        # for a DIFFERENT run, but cannot make this draw come from the pinned weights.
+        return "pinned model revision"
+    if getattr(spec, "thinking", False):
+        # the worker renders prompts with enable_thinking=spec.thinking. the chat-completions
+        # request has no portable way to say that, and reasoning traces move completion length by
+        # far more than the trust gate's tolerance, so a wrong default is not a small error.
+        return "thinking mode"
     return ""
 
 

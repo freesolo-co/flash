@@ -918,3 +918,54 @@ def test_opd_measures_length_but_does_not_run_the_task_reward(monkeypatch, tmp_p
     rp.collect_for_submit(_Client(), _spec(algorithm="opd"), debug=True)
     assert seen.get("prompts"), "opd must still sample completion length"
     assert seen.get("score_one") is None, "opd must not hand a scorer to the timer"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("model_revision", "abc123"), ("thinking", True)],
+)
+def test_a_run_whose_generation_the_endpoint_cannot_match_is_not_measured(
+    field, value, monkeypatch
+):
+    """Keying a field in the digest stops a measurement being REUSED for another config.
+
+    It cannot make this draw faithful. A pinned revision is served by the worker but not by the
+    hosted model id, and the chat-completions request has no portable way to say enable_thinking --
+    and reasoning traces move length by far more than the trust gate tolerates.
+    """
+    from flash.cli.commands import rollout_profile as rp
+
+    monkeypatch.setenv(rollout_sampler.ROLLOUT_SAMPLER_API_KEY_ENV, "k")
+
+    def _must_not_run(*_a, **_k):
+        raise AssertionError("an unsamplable config must not reach the sampler")
+
+    monkeypatch.setattr(rp, "_collect", _must_not_run)
+    assert rp.collect_for_submit(object(), _spec(**{field: value}), debug=True) is None
+
+
+def test_a_broken_grader_does_not_discard_the_token_measurement():
+    """The two readings are independent, and only one of them failed.
+
+    `reward_failures > reward_samples` violates a RolloutWorkloadProfile invariant, so reporting the
+    failure count alongside `reward_samples: 0` made the whole payload unconstructable -- a scorer
+    that raised threw away an otherwise good 32-rollout token measurement and returned the quote to
+    the cap.
+    """
+    from flash.engine.profiling.rollout_evidence import _reward_evidence
+
+    def _raises(_index, _completion):
+        raise RuntimeError("grader down")
+
+    evidence = _reward_evidence(_raises, [(0, "a"), (1, "b")])
+    assert evidence["reward_samples"] == 0, "a failed grading is not a measurement"
+    assert evidence["reward_seconds_per_completion"] == 0.0
+    assert evidence["reward_failures"] <= evidence["reward_samples"], (
+        "the profile invariant must hold, or the token aggregates are discarded with it"
+    )
+
+    # and the full payload must actually build, which is the property that was broken.
+    spec = _spec()
+    profile = rollout_profile_from_evidence(spec, _evidence(**evidence), producer_version=VERSION)
+    assert profile is not None
+    assert profile["completion_tokens_mean"] == pytest.approx(53.6875)
