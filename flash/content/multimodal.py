@@ -22,6 +22,9 @@ MAX_IMAGE_DESCRIPTOR_BYTES = 64 * 1024 * 1024
 MAX_TOTAL_IMAGE_DESCRIPTOR_BYTES = 64 * 1024 * 1024
 _IMAGE_BLOCK_TYPES = frozenset({"image", "image_url", "input_image"})
 IMAGE_TEACHER_PLACEHOLDER = "<|media_pad|>"
+# the model's real image-expansion token, as opposed to the placeholder above. one definition so
+# the renderer's rejection and the teacher client's drop guard cannot drift apart.
+IMAGE_PAD_TOKEN = "<|image_pad|>"
 
 
 @dataclass(frozen=True)
@@ -273,20 +276,26 @@ def text_only_prompt_messages(messages: list[dict]) -> list[dict]:
 
 
 def _reject_literal_image_placeholder(text: str, message_index: int) -> None:
-    """Reject prompt text that already contains the media placeholder.
+    """Reject prompt text that already contains a reserved image marker.
 
-    the rendered prompt marks image positions with a placeholder string, and the teacher client
-    splits on every occurrence to pair each one with an image. a placeholder occurring in the
-    USER'S OWN text is indistinguishable from one this renderer inserted, so it would be paired
-    with an image that does not exist. rejecting here names the real problem against the source
-    message, instead of failing later as a placeholder/URI count mismatch that reads like an
-    internal bug.
+    two distinct markers, one reason. the rendered prompt marks image positions with
+    ``IMAGE_TEACHER_PLACEHOLDER`` and the teacher client splits on every occurrence to pair each
+    one with an image, so a placeholder in the USER'S OWN text is indistinguishable from one this
+    renderer inserted and would be paired with an image that does not exist.
+
+    ``IMAGE_PAD_TOKEN`` is the model's real special token: whatever the provider expands an image
+    into. the silent-drop guard counts its runs in the returned prompt ids and requires at least
+    one run per supplied image. text containing the literal token encodes to that same id, so it
+    contributes a run the renderer never produced -- and a run from text can make up for an image
+    the provider silently dropped, which is exactly the failure the guard exists to catch. keeping
+    it out of the source text is what makes "one run per image" mean what it says.
     """
-    if IMAGE_TEACHER_PLACEHOLDER in text:
-        raise ValueError(
-            f"message {message_index} text contains the reserved image placeholder "
-            f"{IMAGE_TEACHER_PLACEHOLDER!r}; remove it from the prompt"
-        )
+    for marker in (IMAGE_TEACHER_PLACEHOLDER, IMAGE_PAD_TOKEN):
+        if marker in text:
+            raise ValueError(
+                f"message {message_index} text contains the reserved image marker "
+                f"{marker!r}; remove it from the prompt"
+            )
 
 
 def image_teacher_prompt_messages(messages: list[dict], descriptor_count: int) -> list[dict]:

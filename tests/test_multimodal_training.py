@@ -449,14 +449,40 @@ def test_image_teacher_prompt_rejects_the_placeholder_in_user_text():
             ],
         }
     ]
-    with pytest.raises(ValueError, match="reserved image placeholder"):
+    with pytest.raises(ValueError, match="reserved image marker"):
         mm.image_teacher_prompt_messages(blocks, 1)
 
     plain = [
         {"role": "system", "content": f"never emit {mm.IMAGE_TEACHER_PLACEHOLDER}"},
         {"role": "user", "content": [{"type": "image"}]},
     ]
-    with pytest.raises(ValueError, match="reserved image placeholder"):
+    with pytest.raises(ValueError, match="reserved image marker"):
+        mm.image_teacher_prompt_messages(plain, 1)
+
+
+def test_image_teacher_prompt_rejects_the_image_pad_token_in_user_text():
+    # <|image_pad|> is the model's REAL expansion token, and the silent-drop guard counts its runs
+    # in the returned prompt ids, requiring at least one run per supplied image. text containing the
+    # literal token encodes to that same id, so it contributes a run the renderer never produced --
+    # and that run can cover for an image the provider silently dropped, defeating the exact guard
+    # the image path depends on. keeping it out of source text is what makes the count meaningful.
+    blocks = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"the marker is {mm.IMAGE_PAD_TOKEN} ok"},
+                {"type": "image"},
+            ],
+        }
+    ]
+    with pytest.raises(ValueError, match="reserved image marker"):
+        mm.image_teacher_prompt_messages(blocks, 1)
+
+    plain = [
+        {"role": "system", "content": f"never emit {mm.IMAGE_PAD_TOKEN}"},
+        {"role": "user", "content": [{"type": "image"}]},
+    ]
+    with pytest.raises(ValueError, match="reserved image marker"):
         mm.image_teacher_prompt_messages(plain, 1)
 
 

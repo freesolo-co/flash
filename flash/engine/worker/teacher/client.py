@@ -28,8 +28,15 @@ from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
 _MAX_LOGPROB_ROUNDING_ERROR = 1e-6
 _BROKER_PROVIDER_TIMEOUT_CEILING_S = 90.0
 _DEFAULT_TEACHER_TIMEOUT_S = 105.0
-_IMAGE_TEACHER_PLACEHOLDER = "<|media_pad|>"
-_IMAGE_PAD_TOKEN = "<|image_pad|>"
+# imported rather than redeclared: the renderer rejects both markers from source text, and the
+# drop guard below counts pad runs. if the two ever named different strings, text-origin runs
+# would silently re-enter the count the guard depends on.
+from flash.content.multimodal import (  # noqa: E402
+    IMAGE_PAD_TOKEN as _IMAGE_PAD_TOKEN,
+)
+from flash.content.multimodal import (  # noqa: E402
+    IMAGE_TEACHER_PLACEHOLDER as _IMAGE_TEACHER_PLACEHOLDER,
+)
 
 
 class TeacherError(RuntimeError):
@@ -610,6 +617,76 @@ class TeacherClient:
             prompt_length=len(prompt_text),
         )
 
+    def _encode_completion_in_context(
+        self,
+        prompt_messages: list[dict[str, Any]],
+        completion_text: str,
+        *,
+        continue_final_assistant: bool,
+    ) -> list[EncodedTeacherToken]:
+        """Encode the completion as it tokenizes AFTER the text it follows, not in isolation.
+
+        BPE merges across the boundary. a completion starting with "\\n" placed after a thinking
+        prefill ending in "\\n" renders as the single token 271, so the standalone encoding
+        ``[198, ...]`` never appears in the provider's prompt ids: the contiguous-run lookup then
+        rejects a perfectly valid rollout, or -- worse -- matches the standalone ids somewhere
+        EARLIER in the conversation and silently returns logprobs for the wrong text.
+
+        so encode ``prefix + completion`` and keep only the tail the prefix does not already
+        account for, which is what the text path gets for free by encoding the whole prompt and
+        slicing. the prefix is only ever the trailing assistant content we are continuing; when the
+        completion opens its own turn there is nothing to merge with and this reduces to the plain
+        encoding.
+
+        the boundary token can belong to BOTH sides -- "<think>\\n" + "\\nred" merges the prefix's
+        trailing "\\n" and the completion's leading "\\n" into one "\\n\\n". that token is kept: it is
+        the token the provider actually emitted, it carries the completion's first character, and
+        dropping it would leave a run that does not occur in the rendered prompt at all. keeping it
+        scores one boundary token that is partly prefill, which is honest about what the model saw;
+        refusing instead would permanently fail every thinking-mode rollout that starts with a
+        newline, which is most of them.
+        """
+        prefix = ""
+        if continue_final_assistant and prompt_messages:
+            last = prompt_messages[-1]
+            if isinstance(last, dict) and last.get("role") == "assistant":
+                content = last.get("content")
+                if isinstance(content, str):
+                    prefix = content
+        if not prefix:
+            return self.tokenizer.encode(completion_text)
+        encoded_prefix = self.tokenizer.encode(prefix)
+        encoded_joined = self.tokenizer.encode(prefix + completion_text)
+        # keep every token from the first position where the two encodings diverge. an unmerged
+        # boundary diverges exactly at len(prefix), reducing this to a plain slice; a merged one
+        # diverges at the shared token and keeps it.
+        shared = 0
+        # strict=False on purpose: the joined encoding is longer than the prefix by construction,
+        # and comparing only the overlap is exactly what locates the divergence point.
+        for joined, pre in zip(encoded_joined, encoded_prefix, strict=False):
+            if joined.token_id != pre.token_id:
+                break
+            shared += 1
+        tail = encoded_joined[shared:]
+        if not tail:
+            raise _permanent(
+                "teacher completion contributed no tokens after its assistant prefix; "
+                "cannot attribute prompt logprobs to the sampled tokens"
+            )
+        # rebase the character spans onto completion_text. they currently index into
+        # prefix + completion, and the caller slices the COMPLETION with them. a merged boundary
+        # token starts inside the prefix, so its rebased start clamps to 0 -- it covers the
+        # completion's first character, which is the part that belongs to the completion.
+        shift = len(prefix)
+        return [
+            EncodedTeacherToken(
+                token_id=token.token_id,
+                start=max(0, token.start - shift),
+                end=max(0, token.end - shift),
+            )
+            for token in tail
+        ]
+
     def _score_one_multimodal(
         self,
         prompt_messages: list[dict[str, Any]],
@@ -617,7 +694,11 @@ class TeacherClient:
         image_data_uris: list[str] | tuple[str, ...],
         continue_final_assistant: bool = False,
     ) -> TeacherScore:
-        encoded_completion = self.tokenizer.encode(completion_text)
+        encoded_completion = self._encode_completion_in_context(
+            prompt_messages,
+            completion_text,
+            continue_final_assistant=continue_final_assistant,
+        )
         image_pad_tokens = self.tokenizer.encode(_IMAGE_PAD_TOKEN)
         if len(image_pad_tokens) != 1:
             raise _permanent(

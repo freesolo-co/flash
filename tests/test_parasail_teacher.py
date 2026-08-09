@@ -478,6 +478,66 @@ def test_multimodal_thinking_prefill_continues_the_same_assistant_turn():
     assert messages[-1] == {"role": "assistant", "content": "<think>\nNEW"}
 
 
+def test_multimodal_completion_is_encoded_after_its_assistant_prefix():
+    # BPE merges across the prefix/completion boundary: a completion starting with "\n" placed
+    # after a thinking prefill ending in "\n" becomes ONE token. encoding the completion alone then
+    # yields ids that never occur in the provider's rendered prompt, so the contiguous-run lookup
+    # either rejects a valid rollout or matches the standalone ids somewhere earlier and silently
+    # scores the wrong text. this stub reproduces the merge: 198 + 198 -> 271.
+    class _MergingTokenizer:
+        def encode(self, text):
+            if text == "<|image_pad|>":
+                return [EncodedTeacherToken(151655, 0, len(text))]
+            table = {
+                "<think>\n": [EncodedTeacherToken(151667, 0, 7), EncodedTeacherToken(198, 7, 8)],
+                "\nred": [EncodedTeacherToken(198, 0, 1), EncodedTeacherToken(1151, 1, 4)],
+                # the merged rendering: the two newlines collapse into 271
+                "<think>\n\nred": [
+                    EncodedTeacherToken(151667, 0, 7),
+                    EncodedTeacherToken(271, 7, 9),
+                    EncodedTeacherToken(1151, 9, 12),
+                ],
+            }
+            if text in table:
+                return list(table[text])
+            raise AssertionError(f"unexpected tokenizer input: {text!r}")
+
+    client = TeacherClient(
+        "capability",
+        "https://broker.example",
+        "parasail-qwen3vl-8b-instruct",
+        tokenizer=_MergingTokenizer(),
+    )
+    # the provider's rendered prompt contains the MERGED ids [271, 1151]; the standalone encoding
+    # [198, 1151] does not occur anywhere in it. scoring must still find the completion, so this
+    # only passes if the request path encodes in context rather than in isolation.
+    prompt_ids = [10, 151655, 11, 271, 1151]
+    client._post = lambda path, body: _multimodal_response(prompt_ids)
+
+    scored = client.score_many_multimodal(
+        [
+            (
+                [
+                    {"role": "user", "content": "<|media_pad|>"},
+                    {"role": "assistant", "content": "<think>\n"},
+                ],
+                "\nred",
+                ["data:image/png;base64,aW1hZ2U="],
+                True,
+            )
+        ]
+    )[0]
+
+    # two scored tokens means the merged run was located; standalone encoding would raise instead.
+    assert len(scored.tokens) == 2
+
+    # with no prefix to merge against, encoding reduces to the plain form.
+    plain = client._encode_completion_in_context(
+        [{"role": "user", "content": "<|media_pad|>"}], "\nred", continue_final_assistant=False
+    )
+    assert [token.token_id for token in plain] == [198, 1151]
+
+
 def test_score_many_caps_in_flight_requests_at_the_measured_ceiling():
     # the multi-turn path hands score_many a WHOLE EPISODE (up to OPD_MAX_EPISODE_TURNS = 64) in
     # one call rather than pre-slicing it, so score_many's own pool is now the only thing standing
