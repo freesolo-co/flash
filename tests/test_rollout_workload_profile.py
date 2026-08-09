@@ -467,12 +467,10 @@ def test_a_profile_with_no_reward_samples_does_not_claim_reward_is_free(monkeypa
     observations, which is a stronger claim than the documented default makes. So the reward term
     falls back rather than being taken from an unsampled field.
 
-    The cost of that fallback is real and known: the default is 1.0s/completion against a measured
-    ~0.0004s on every campaign environment, so this path stacks the legacy reward wall on the
-    per-step floor and scores 27/56 in band where a measured reward scores 47/56. That is a
-    property of the DEFAULT, not of this guard (the same 27/56 applies to every quote with no
-    profile at all), and re-fitting it needs grader classes this campaign never covered: an LLM
-    judge is genuinely ~3s/completion, over half a step.
+    The fallback is now cheap: the default is 0.0s/completion, so an unsampled profile prices the
+    same as a measured-free one and the difference this guard chooses is zero (see the test below).
+    It still matters which one is recorded -- an env whose reward calls an LLM judge is genuinely
+    seconds per completion, and only a measurement can say so.
     """
     from flash.cost.spec import runconfig_from_spec
 
@@ -484,11 +482,19 @@ def test_a_profile_with_no_reward_samples_does_not_claim_reward_is_free(monkeypa
     assert sampled.reward_seconds_per_completion == pytest.approx(0.0003)
 
 
-def test_the_reward_fallback_costs_a_whole_legacy_wall(monkeypatch):
-    """Quantifies what the guard above chooses, end to end, so the tradeoff cannot be silently
-    reversed: an unsampled profile pays 1.0s per completion that a sampled one does not."""
+def test_the_reward_fallback_no_longer_costs_a_legacy_wall(monkeypatch):
+    """Quantifies what the guard above chooses, end to end, so the tradeoff cannot silently return.
+
+    It used to cost a full ``completions x 1.0s``. That charge was surplus: the step floor was
+    fitted as (real step - everything else modelled) WITH measured reward applied, so it already
+    carried the fit arms' grading and the wall billed it a second time. With the default at 0.0 the
+    unsampled fallback and a measured-free grader now price identically, which is the point -- "not
+    measured" and "measured as free" should cost the same, and the floor covers both.
+
+    A genuinely slow grader is still charged: that is the assertion below, and it is what keeps this
+    from becoming "reward is free" rather than "reward beyond the floor is what we bill".
+    """
     from flash.cost.analytical import seconds_per_step
-    from flash.cost.facts import AVG_REWARD_SECONDS_PER_COMPLETION
     from flash.cost.spec import runconfig_from_spec
 
     monkeypatch.setattr("time.time", lambda: NOW)
@@ -497,5 +503,9 @@ def test_the_reward_fallback_costs_a_whole_legacy_wall(monkeypatch):
     completions = _Train.group_size * (none_sampled.batch_size or 1)
 
     extra = seconds_per_step(none_sampled, "H200") - seconds_per_step(sampled, "H200")
-    assert extra == pytest.approx(completions * AVG_REWARD_SECONDS_PER_COMPLETION)
-    assert extra > 0.0
+    assert extra == pytest.approx(0.0)
+
+    # an env that really does wait on a judge still pays for every completion of it.
+    judge = runconfig_from_spec(_spec_with_profile(reward_seconds_per_completion=2.0))
+    judged = seconds_per_step(judge, "H200") - seconds_per_step(sampled, "H200")
+    assert judged == pytest.approx(completions * 2.0)

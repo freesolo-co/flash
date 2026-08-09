@@ -147,15 +147,24 @@ def test_step_cost_key_none_for_uncatalogued_model():
 def test_latency_bound_step_ignores_gpu_speed():
     """When a step is dominated by waits no card shortens, ranking collapses back toward $/hr.
 
-    GRPO spends most of a step waiting on concurrent reward grading, so buying more FLOPs cannot
-    pay for itself and the cheaper rental legitimately wins.
+    The wait has to be MEASURED to exist. This used to pass on the default reward wall, which put
+    ``completions x 1.0s`` beside a step floor already fitted with grading included -- so the step
+    read as latency-bound because of a charge that was counted twice. The realized graders in the
+    2026-08-01 campaign ran 0.0001-0.001s and left GRPO firmly gpu-bound. An env whose reward calls
+    an LLM judge genuinely does wait seconds per completion, and that is the case this covers.
     """
+    from dataclasses import replace
+
     from flash.cost.analytical import step_seconds_split
     from flash.cost.types import RunConfig
 
-    gpu_bound, fixed = step_seconds_split(
-        RunConfig(model_id="Qwen/Qwen3.5-0.8B", method="grpo", steps=1), "H100"
-    )
+    fast = RunConfig(model_id="Qwen/Qwen3.5-0.8B", method="grpo", steps=1)
+    gpu_bound, fixed = step_seconds_split(fast, "H100")
+    # a local grader adds nothing beyond the floor: the math, not a wait, is the step.
+    assert gpu_bound > fixed
+
+    judge = replace(fast, reward_seconds_per_completion=5.0)
+    gpu_bound, fixed = step_seconds_split(judge, "H100")
     assert fixed > gpu_bound  # the wait, not the math, is what the step is made of
 
 

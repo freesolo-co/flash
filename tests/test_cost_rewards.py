@@ -25,7 +25,7 @@ def test_unmeasured_grading_is_not_charged_on_top_of_the_step_floor():
     """
     assert AVG_REWARD_SECONDS_PER_COMPLETION == 0.0
 
-    base = dict(batch_size=8, group_size=4)
+    base = {"batch_size": 8, "group_size": 4}
     default = RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, **base)
     explicit_zero = RunConfig(
         "Qwen/Qwen3.5-0.8B", "grpo", 10, reward_seconds_per_completion=0.0, **base
