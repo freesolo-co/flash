@@ -28,6 +28,7 @@ from flash.teacher.limits import (
 PARASAIL_PROVIDER = "parasail"
 PARASAIL_ORIGIN = "https://api.parasail.io"
 PARASAIL_COMPLETIONS_PATH = "/v1/completions"
+PARASAIL_CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
 PARASAIL_SCORING_MODE = "supplied_token_completion_v1"
 PARASAIL_API_KEY_ENV = "PARASAIL_API_KEY"
 
@@ -116,7 +117,14 @@ def require_teacher_broker_configuration(
             f"{PARASAIL_API_KEY_ENV} is required on the control plane for managed opd teachers"
         )
     teacher = resolve_teacher(spec.train.teacher_model)
-    if teacher.alias not in {"kimi-k3", "glm-5.2", "qwen3.5-397b-a17b", "deepseek-v4-pro"}:
+    if teacher.alias not in {
+        "kimi-k3",
+        "glm-5.2",
+        "qwen3.5-397b-a17b",
+        "deepseek-v4-pro",
+        "qwen3-vl-235b",
+        "qwen3-vl-8b",
+    }:
         raise RuntimeError("the selected managed teacher is not supported by the Parasail broker")
     capability_limits_for_spec(spec)
     if deadline_at is not None:
@@ -349,6 +357,81 @@ def validate_completion_request(
     )
 
 
+def _validate_chat_messages(value: Any) -> None:
+    if not isinstance(value, list) or not value:
+        raise TeacherBrokerError("unsupported_scoring_parameters", status_code=400)
+    for message in value:
+        if not isinstance(message, dict) or set(message) != {"role", "content"}:
+            raise TeacherBrokerError("invalid_chat_messages", status_code=400)
+        if not isinstance(message["role"], str) or not message["role"]:
+            raise TeacherBrokerError("invalid_chat_messages", status_code=400)
+        content = message["content"]
+        if isinstance(content, str):
+            continue
+        if not isinstance(content, list) or not content:
+            raise TeacherBrokerError("invalid_chat_messages", status_code=400)
+        for block in content:
+            if not isinstance(block, dict) or not isinstance(block.get("type"), str):
+                raise TeacherBrokerError("invalid_chat_content_block", status_code=400)
+            block_type = block["type"]
+            if block_type == "text":
+                if set(block) != {"type", "text"} or not isinstance(block["text"], str):
+                    raise TeacherBrokerError("invalid_chat_content_block", status_code=400)
+            elif block_type == "image_url":
+                image_url = block.get("image_url")
+                if (
+                    set(block) != {"type", "image_url"}
+                    or not isinstance(image_url, dict)
+                    or set(image_url) != {"url"}
+                    or not isinstance(image_url["url"], str)
+                    or not image_url["url"].startswith("data:image/")
+                ):
+                    raise TeacherBrokerError("invalid_chat_content_block", status_code=400)
+            else:
+                raise TeacherBrokerError("unknown_chat_content_block_type", status_code=400)
+
+
+def validate_chat_completion_request(
+    body: dict[str, Any], capability: dict[str, Any]
+) -> ValidatedCompletionRequest:
+    required = {
+        "model",
+        "messages",
+        "max_tokens",
+        "temperature",
+        "seed",
+        "prompt_logprobs",
+        "return_token_ids",
+    }
+    if set(body) - required:
+        raise TeacherBrokerError("extra_request_fields", status_code=400)
+    if set(body) != required:
+        raise TeacherBrokerError("missing_request_fields", status_code=400)
+    if body["model"] != capability["model"]:
+        raise TeacherBrokerError("model_scope_mismatch", status_code=403)
+    if (
+        isinstance(body["max_tokens"], bool)
+        or body["max_tokens"] != 1
+        or isinstance(body["temperature"], bool)
+        or body["temperature"] != 0
+        or isinstance(body["seed"], bool)
+        or body["seed"] != 0
+        or isinstance(body["prompt_logprobs"], bool)
+        or body["prompt_logprobs"] != 1
+        or body["return_token_ids"] is not True
+    ):
+        raise TeacherBrokerError("unsupported_scoring_parameters", status_code=400)
+    _validate_chat_messages(body["messages"])
+    canonical = _canonical_json(body)
+    if len(canonical) > capability["max_request_bytes"]:
+        raise TeacherBrokerError("request_too_large", status_code=413)
+    return ValidatedCompletionRequest(
+        body=dict(body),
+        canonical_body=canonical,
+        score_items=1,
+    )
+
+
 def request_fingerprint(capability: str, canonical_body: bytes) -> str:
     return hmac.new(capability.encode("utf-8"), canonical_body, hashlib.sha256).hexdigest()
 
@@ -438,7 +521,7 @@ def _provider_timeout(capability: dict[str, Any]) -> float:
     return min(MAX_PROVIDER_TIMEOUT_S, remaining)
 
 
-def _provider_post(body: bytes, api_key: str, timeout: float) -> tuple[int, bytes]:
+def _provider_post_path(path: str, body: bytes, api_key: str, timeout: float) -> tuple[int, bytes]:
     parsed = urllib.parse.urlsplit(PARASAIL_ORIGIN)
     if parsed.hostname is None:
         raise RuntimeError("Parasail origin is missing a hostname")
@@ -446,7 +529,7 @@ def _provider_post(body: bytes, api_key: str, timeout: float) -> tuple[int, byte
     try:
         connection.request(
             "POST",
-            PARASAIL_COMPLETIONS_PATH,
+            path,
             body=body,
             headers={
                 "Authorization": f"Bearer {api_key}",
@@ -468,6 +551,14 @@ def _provider_post(body: bytes, api_key: str, timeout: float) -> tuple[int, byte
         return int(response.status), payload
     finally:
         connection.close()
+
+
+def _provider_post(body: bytes, api_key: str, timeout: float) -> tuple[int, bytes]:
+    return _provider_post_path(PARASAIL_COMPLETIONS_PATH, body, api_key, timeout)
+
+
+def _provider_chat_post(body: bytes, api_key: str, timeout: float) -> tuple[int, bytes]:
+    return _provider_post_path(PARASAIL_CHAT_COMPLETIONS_PATH, body, api_key, timeout)
 
 
 def _validated_provider_response(
@@ -539,17 +630,86 @@ def _validated_provider_response(
     )
 
 
-def complete_teacher_request(
+def _validated_chat_provider_response(
+    raw: bytes, *, score_items: int, capability: dict[str, Any]
+) -> ProviderResponse:
+    if len(raw) > capability["max_response_bytes"]:
+        raise TeacherBrokerError("provider_response_too_large", status_code=502)
+    try:
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_nonfinite,
+        )
+    except TeacherBrokerError as exc:
+        raise TeacherBrokerError("provider_contract_error", status_code=502) from exc
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise TeacherBrokerError("provider_contract_error", status_code=502) from exc
+    if not isinstance(value, dict) or score_items != 1:
+        raise TeacherBrokerError("provider_contract_error", status_code=502)
+    choices = value.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+        raise TeacherBrokerError("provider_contract_error", status_code=502)
+    prompt_ids = value.get("prompt_token_ids")
+    prompt_logprobs = value.get("prompt_logprobs")
+    output_ids = choices[0].get("token_ids")
+    if (
+        not isinstance(prompt_ids, list)
+        or not prompt_ids
+        or any(
+            isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in prompt_ids
+        )
+        or not isinstance(prompt_logprobs, list)
+        or len(prompt_logprobs) != len(prompt_ids)
+        or not isinstance(output_ids, list)
+        or len(output_ids) != 1
+        or isinstance(output_ids[0], bool)
+        or not isinstance(output_ids[0], int)
+        or output_ids[0] < 0
+    ):
+        raise TeacherBrokerError("provider_contract_error", status_code=502)
+    usage = value.get("usage")
+    if not isinstance(usage, dict):
+        raise TeacherBrokerError("provider_contract_error", status_code=502)
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        count = usage.get(key)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise TeacherBrokerError("provider_contract_error", status_code=502)
+    input_tokens = int(usage["prompt_tokens"])
+    output_tokens = int(usage["completion_tokens"])
+    total_tokens = int(usage["total_tokens"])
+    if (
+        input_tokens != len(prompt_ids)
+        or output_tokens != 1
+        or total_tokens != input_tokens + output_tokens
+    ):
+        raise TeacherBrokerError("provider_contract_error", status_code=502)
+    if total_tokens > capability["max_request_tokens"]:
+        raise TeacherBrokerError("provider_token_limit_exceeded", status_code=502)
+    return ProviderResponse(
+        body=value,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+
+
+def _complete_teacher_request(
     *,
     capability_token: str,
     request_id: str,
     raw_body: bytes | bytearray,
+    chat: bool,
 ) -> dict[str, Any]:
     request_id, capability_token, capability = authenticate_teacher_capability(
         capability_token=capability_token,
         request_id=request_id,
     )
-    request = validate_completion_request(parse_strict_json(raw_body), capability)
+    body = parse_strict_json(raw_body)
+    request = (
+        validate_chat_completion_request(body, capability)
+        if chat
+        else validate_completion_request(body, capability)
+    )
     fingerprint = request_fingerprint(capability_token, request.canonical_body)
     try:
         reservation = db.reserve_teacher_request(
@@ -572,8 +732,9 @@ def complete_teacher_request(
         ) from exc
     capability = reservation["capability"]
     replay_body = reservation.get("response_body")
+    response_validator = _validated_chat_provider_response if chat else _validated_provider_response
     if isinstance(replay_body, bytes):
-        return _validated_provider_response(
+        return response_validator(
             replay_body,
             score_items=request.score_items,
             capability=capability,
@@ -619,8 +780,9 @@ def complete_teacher_request(
             retryable=True,
             request_id=request_id,
         ) from exc
+    provider_post = _provider_chat_post if chat else _provider_post
     try:
-        status, response_body = _provider_post(encoded, api_key, _provider_timeout(capability))
+        status, response_body = provider_post(encoded, api_key, _provider_timeout(capability))
     except TeacherBrokerError as exc:
         with contextlib.suppress(Exception):
             db.complete_teacher_request(
@@ -665,7 +827,7 @@ def complete_teacher_request(
             request_id=request_id,
         )
     try:
-        response = _validated_provider_response(
+        response = response_validator(
             response_body,
             score_items=request.score_items,
             capability=capability,
@@ -708,3 +870,31 @@ def complete_teacher_request(
             request_id=request_id,
         ) from exc
     return response.body
+
+
+def complete_teacher_request(
+    *,
+    capability_token: str,
+    request_id: str,
+    raw_body: bytes | bytearray,
+) -> dict[str, Any]:
+    return _complete_teacher_request(
+        capability_token=capability_token,
+        request_id=request_id,
+        raw_body=raw_body,
+        chat=False,
+    )
+
+
+def complete_teacher_chat_request(
+    *,
+    capability_token: str,
+    request_id: str,
+    raw_body: bytes | bytearray,
+) -> dict[str, Any]:
+    return _complete_teacher_request(
+        capability_token=capability_token,
+        request_id=request_id,
+        raw_body=raw_body,
+        chat=True,
+    )

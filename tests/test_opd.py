@@ -464,6 +464,8 @@ def test_opd_selects_only_managed_parasail_aliases():
     assert _spec("GLM 5.2").train.teacher_model == "glm-5.2"
     assert _spec("qwen3.5-397b-a17b").train.teacher_model == "qwen3.5-397b-a17b"
     assert _spec("deepseek-v4-pro").train.teacher_model == "deepseek-v4-pro"
+    assert _spec("qwen3-vl-235b").train.teacher_model == "qwen3-vl-235b"
+    assert _spec("qwen3-vl-8b").train.teacher_model == "qwen3-vl-8b"
     assert _spec("DeepSeek V4 Pro").train.teacher_model == "deepseek-v4-pro"
     assert _spec("").train.teacher_model == ""
 
@@ -585,9 +587,10 @@ def test_opd_validates_dynamic_image_compatibility_before_gpu_wait():
     from flash.engine.worker.opd_train import run_opd_train
 
     source = inspect.getsource(run_opd_train)
-    validation = 'validate_multimodal_training(model_id, "opd")'
+    validation = "validate_multimodal_training("
 
     assert source.index(validation) < source.index("_probe_gpu_in_subprocess(")
+    assert 'getattr(spec.train, "teacher_model", None)' in source
 
 
 class _CharTok:
@@ -1290,6 +1293,8 @@ def test_opd_teacher_price_table_covers_exact_parasail_catalog():
     assert teacher_price_per_1m("kimi-k3") == (3.00, 15.00)
     assert teacher_price_per_1m("qwen3.5-397b-a17b") == (0.50, 3.60)
     assert teacher_price_per_1m("deepseek-v4-pro") == (1.74, 3.48)
+    assert teacher_price_per_1m("qwen3-vl-235b") == (0.21, 1.90)
+    assert teacher_price_per_1m("qwen3-vl-8b") == (0.25, 0.75)
     with pytest.raises(ValueError, match="not a supported teacher"):
         teacher_price_per_1m("parasail-deepseek-v4-pro")
 
@@ -1355,6 +1360,8 @@ def test_resolve_opd_knobs_maps_alias_to_parasail_model(monkeypatch):
     assert _knobs("kimi-k3").teacher_model == "parasail-kimi-k3-fast"
     assert _knobs("qwen3.5-397b-a17b").teacher_model == "parasail-qwen35-397b-a17b"
     assert _knobs("deepseek-v4-pro").teacher_model == "parasail-deepseek-v4-pro"
+    assert _knobs("qwen3-vl-235b").teacher_model == ("parasail-qwen3-vl-235b-a22b-instruct")
+    assert _knobs("qwen3-vl-8b").teacher_model == "parasail-qwen3vl-8b-instruct"
     assert _knobs("").teacher_model == "parasail-glm-52"
     assert _knobs(None).teacher_model == "parasail-glm-52"
     for teacher in (
@@ -1474,8 +1481,8 @@ class _TinyLM:
         return self
 
 
-def test_opd_worker_rejects_images_before_gpu_or_teacher_use(monkeypatch):
-    """Image-bearing OPD must fail before teacher construction or paid GPU work."""
+def test_opd_worker_rejects_text_teacher_for_images_before_gpu_use(monkeypatch):
+    """Image-bearing OPD with a text teacher must fail before paid GPU work."""
     teacher_model = "glm-5.2"
     fake_torch = types.ModuleType("torch")
     fake_torch.manual_seed = lambda _seed: None
@@ -1534,5 +1541,5 @@ def test_opd_worker_rejects_images_before_gpu_or_teacher_use(monkeypatch):
     # ValueError, not RuntimeError: TRL re-wrapped this as `RuntimeError(f"opd: {exc}")`, verl lets it
     # propagate. The type carries no behavioral difference -- `_worker_failure_flags` branches only on
     # RetriableInfraError/GitHubRateLimitError and CUDA OOM, so both are fatal and non-retriable.
-    with pytest.raises(ValueError, match="image-bearing opd is not supported"):
+    with pytest.raises(ValueError, match=r"selected teacher 'glm-5\.2' cannot see images"):
         opd_mod.run_opd_train()

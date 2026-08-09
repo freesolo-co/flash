@@ -660,8 +660,6 @@ class _TeacherAlignmentBridge:
                 f"verl rollout reported {int(image_count)} image(s) for dataset index {index}; "
                 f"the frozen prompt has {expected_image_count}"
             )
-        if expected_image_count:
-            raise ValueError("image-bearing opd is not supported by managed Parasail teachers")
         prompt_ids = list(prompt.prompt_ids)
         prompt_length = int(prompt_length)
         sequence_ids = [int(token_id) for token_id in sequence_ids]
@@ -696,12 +694,32 @@ class _TeacherAlignmentBridge:
         )
         if not completion_text.strip() or "�" in completion_text:
             return self._empty(prompt_length, len(response_ids))
-        teacher_prompt = _teacher_prompt_text(prompt.teacher_messages, self.thinking_prefill)
         try:
-            if self._text_teacher_batcher is None:
-                teacher_score = self.teacher.score(teacher_prompt, completion_text)
+            if prompt.image_descriptors:
+                from flash.content.multimodal import image_descriptors_to_data_uris
+
+                teacher_messages = list(prompt.teacher_messages)
+                if self.thinking_prefill:
+                    teacher_messages.append({"role": "assistant", "content": self.thinking_prefill})
+                teacher_images = image_descriptors_to_data_uris(
+                    prompt.image_descriptors,
+                    prompt.package_root,
+                )
+                teacher_score = self.teacher.score_many_multimodal(
+                    [(teacher_messages, completion_text, teacher_images)]
+                )[0]
             else:
-                teacher_score = self._text_teacher_batcher.score(teacher_prompt, completion_text)
+                teacher_prompt = _teacher_prompt_text(
+                    prompt.teacher_messages,
+                    self.thinking_prefill,
+                )
+                if self._text_teacher_batcher is None:
+                    teacher_score = self.teacher.score(teacher_prompt, completion_text)
+                else:
+                    teacher_score = self._text_teacher_batcher.score(
+                        teacher_prompt,
+                        completion_text,
+                    )
         except TeacherError as error:
             if error.permanent:
                 raise
@@ -2152,7 +2170,13 @@ def run_opd_train(spec=None) -> None:
             _scanned[0] += 1
     multimodal = any(record_has_images(example, messages) for example, messages in prompt_rows)
     if multimodal:
-        validate_multimodal_training(model_id, "opd")
+        validate_multimodal_training(
+            model_id,
+            "opd",
+            getattr(spec.train, "teacher_model", None),
+        )
+        if multi_turn:
+            raise ValueError("multi-turn image-bearing opd is not supported")
     # shuffle cached rendered rows, not examples: prompt_messages may be stateful and a second
     # render
     # could change multimodal classification. the same seeded permutation preserves resume order.

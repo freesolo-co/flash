@@ -20,6 +20,7 @@ class TeacherModel:
     tokenizer_revision: str
     tokenizer_kind: str
     tokenizer_files: tuple[tuple[str, str], ...]
+    supports_images: bool = False
 
 
 DEFAULT_TEACHER_ALIAS = "glm-5.2"
@@ -89,6 +90,38 @@ TEACHER_MODELS: dict[str, TeacherModel] = {
             ),
         ),
     ),
+    "qwen3-vl-235b": TeacherModel(
+        alias="qwen3-vl-235b",
+        model_id="parasail-qwen3-vl-235b-a22b-instruct",
+        display_name="Qwen3-VL 235B A22B",
+        usd_per_1m=(0.21, 1.90),
+        tokenizer_repo="Qwen/Qwen3-VL-235B-A22B-Instruct",
+        tokenizer_revision="710c13861be6c466e66de3f484069440b8f31389",
+        tokenizer_kind="tokenizer_json",
+        tokenizer_files=(
+            (
+                "tokenizer.json",
+                "a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7",
+            ),
+        ),
+        supports_images=True,
+    ),
+    "qwen3-vl-8b": TeacherModel(
+        alias="qwen3-vl-8b",
+        model_id="parasail-qwen3vl-8b-instruct",
+        display_name="Qwen3-VL 8B",
+        usd_per_1m=(0.25, 0.75),
+        tokenizer_repo="Qwen/Qwen3-VL-8B-Instruct",
+        tokenizer_revision="0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
+        tokenizer_kind="tokenizer_json",
+        tokenizer_files=(
+            (
+                "tokenizer.json",
+                "a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7",
+            ),
+        ),
+        supports_images=True,
+    ),
 }
 
 
@@ -109,6 +142,11 @@ def resolve_teacher(value: str | None) -> TeacherModel:
         f"teacher_model {value!r} is not a supported teacher; choose one of: {allowed} "
         f"(default {DEFAULT_TEACHER_ALIAS})"
     )
+
+
+def teacher_supports_images(value: str) -> bool:
+    """Return whether the selected managed teacher can condition on image inputs."""
+    return resolve_teacher(value).supports_images
 
 
 def teacher_for_model_id(model_id: str) -> TeacherModel:

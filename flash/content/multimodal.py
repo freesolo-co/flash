@@ -574,13 +574,19 @@ def resolve_image_pad_token_id(processor, tok) -> int:
     raise ValueError("could not resolve a valid image-pad token id from the processor or tokenizer")
 
 
-def validate_multimodal_training(model_id: str, algorithm: str) -> None:
+def validate_multimodal_training(model_id: str, algorithm: str, teacher_model: str | None) -> None:
     from flash.core.catalog import supports_image_training
+    from flash.engine.plan.recipe import resolve_teacher, teacher_supports_images
 
     if not supports_image_training(model_id):
         raise ValueError(f"{model_id} does not support image-bearing training records")
     if algorithm == "opd":
-        raise ValueError("image-bearing opd is not supported")
+        teacher = resolve_teacher(teacher_model)
+        if not teacher_supports_images(teacher.alias):
+            raise ValueError(
+                'image-bearing opd requires [train] teacher_model = "qwen3-vl-235b" or '
+                f'"qwen3-vl-8b"; the selected teacher {teacher.alias!r} cannot see images'
+            )
 
 
 def message_content_text(content: object) -> str:
@@ -689,5 +695,11 @@ def preflight_validate_image_opd(spec) -> None:
         records = records[:max_examples]
     for record in records:
         if record_has_images(record, _record_messages(record)):
-            validate_multimodal_training(str(getattr(spec, "model", "")), "opd")
+            validate_multimodal_training(
+                str(getattr(spec, "model", "")),
+                "opd",
+                getattr(train, "teacher_model", None),
+            )
+            if params.get("multi_turn") is True or params.get("max_turns") is not None:
+                raise ValueError("multi-turn image-bearing opd is not supported")
             return

@@ -23,6 +23,18 @@ class _FixedTokenizer:
         return list(self.tokens)
 
 
+class _MultimodalTokenizer:
+    def encode(self, text):
+        if text == "<|image_pad|>":
+            return [EncodedTeacherToken(151655, 0, len(text))]
+        if text == "red":
+            return [
+                EncodedTeacherToken(201, 0, 1),
+                EncodedTeacherToken(202, 1, 3),
+            ]
+        raise AssertionError(f"unexpected tokenizer input: {text!r}")
+
+
 def _tokens():
     return [
         EncodedTeacherToken(10, 0, 1),
@@ -65,6 +77,26 @@ def _positional_response():
     }
 
 
+def _multimodal_response(prompt_ids=None):
+    prompt_ids = prompt_ids or [10, 151655, 11, 201, 202]
+    return {
+        "choices": [{"index": 0, "token_ids": [999], "message": {"role": "assistant"}}],
+        "prompt_token_ids": prompt_ids,
+        "prompt_logprobs": [
+            None,
+            *[
+                {str(token_id): {"logprob": -0.1 * index, "rank": 1}}
+                for index, token_id in enumerate(prompt_ids[1:], 1)
+            ],
+        ],
+        "usage": {
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": 1,
+            "total_tokens": len(prompt_ids) + 1,
+        },
+    }
+
+
 def _client(response, capture=None):
     client = TeacherClient(
         "capability",
@@ -82,23 +114,43 @@ def _client(response, capture=None):
     return client
 
 
+def _multimodal_client(response, capture=None):
+    client = TeacherClient(
+        "capability",
+        "https://broker.example",
+        "parasail-qwen3vl-8b-instruct",
+        tokenizer=_MultimodalTokenizer(),
+    )
+
+    def post(path, body):
+        if capture is not None:
+            capture.update({"path": path, "body": body})
+        return response
+
+    client._post = post
+    return client
+
+
 def test_training_guide_lists_only_the_managed_teacher_aliases():
     guide = (Path(__file__).parents[1] / "flash" / "cli" / "scaffold" / "TRAINING.md").read_text()
 
     assert "glm-5.2 (default) | kimi-k3 |" in guide
-    assert "qwen3.5-397b-a17b | deepseek-v4-pro" in guide
+    assert "qwen3.5-397b-a17b | deepseek-v4-pro |" in guide
+    assert "qwen3-vl-235b | qwen3-vl-8b" in guide
     assert "kimi-k2.6" not in guide
     assert "The control-plane broker owns `PARASAIL_API_KEY`" in guide
     assert "`FLASH_CONTROL_PANEL_URL` and an attempt-scoped `FLASH_TEACHER_CAPABILITY`" in guide
     assert "platform's Parasail key is used only inside the paid OPD worker" not in guide
 
 
-def test_catalog_contains_exactly_four_parasail_aliases():
+def test_catalog_contains_exactly_six_parasail_aliases():
     assert set(TEACHER_MODELS) == {
         "kimi-k3",
         "glm-5.2",
         "qwen3.5-397b-a17b",
         "deepseek-v4-pro",
+        "qwen3-vl-235b",
+        "qwen3-vl-8b",
     }
     assert resolve_teacher("").alias == "glm-5.2"
     assert {model.model_id for model in TEACHER_MODELS.values()} == {
@@ -106,6 +158,12 @@ def test_catalog_contains_exactly_four_parasail_aliases():
         "parasail-glm-52",
         "parasail-qwen35-397b-a17b",
         "parasail-deepseek-v4-pro",
+        "parasail-qwen3-vl-235b-a22b-instruct",
+        "parasail-qwen3vl-8b-instruct",
+    }
+    assert {alias for alias, model in TEACHER_MODELS.items() if model.supports_images} == {
+        "qwen3-vl-235b",
+        "qwen3-vl-8b",
     }
     for rejected in (
         "kimi-k2.6",
@@ -135,6 +193,14 @@ def test_pinned_tokenizer_hashes_are_complete():
     assert dict(TEACHER_MODELS["deepseek-v4-pro"].tokenizer_files)["tokenizer.json"] == (
         "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf"
     )
+    for alias, revision in (
+        ("qwen3-vl-235b", "710c13861be6c466e66de3f484069440b8f31389"),
+        ("qwen3-vl-8b", "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"),
+    ):
+        assert TEACHER_MODELS[alias].tokenizer_revision == revision
+        assert dict(TEACHER_MODELS[alias].tokenizer_files)["tokenizer.json"] == (
+            "a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7"
+        )
 
 
 def test_normalized_offsets_expand_to_exact_source_coverage():
@@ -231,8 +297,94 @@ def test_response_contract_rejects_nonfinite_scores(score):
         _client(response).score("P: ", "hi!")
 
 
-def test_multimodal_scoring_surface_is_removed():
-    assert not hasattr(_client(_token_keyed_response()), "score_many_multimodal")
+def test_multimodal_scoring_builds_chat_body_and_reads_top_level_prompt_scores():
+    capture = {}
+    image_uri = "data:image/png;base64,aW1hZ2U="
+    scored = _multimodal_client(_multimodal_response(), capture).score_many_multimodal(
+        [
+            (
+                [
+                    {"role": "system", "content": "rules"},
+                    {
+                        "role": "user",
+                        "content": "before<|media_pad|>after",
+                    },
+                ],
+                "red",
+                [image_uri],
+            )
+        ]
+    )[0]
+
+    assert capture == {
+        "path": "/v1/teacher/chat_completions",
+        "body": {
+            "model": "parasail-qwen3vl-8b-instruct",
+            "messages": [
+                {"role": "system", "content": "rules"},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "before"},
+                        {"type": "image_url", "image_url": {"url": image_uri}},
+                        {"type": "text", "text": "after"},
+                    ],
+                },
+                {"role": "assistant", "content": "red"},
+            ],
+            "max_tokens": 1,
+            "temperature": 0,
+            "seed": 0,
+            "prompt_logprobs": 1,
+            "return_token_ids": True,
+        },
+    }
+    assert [(token.text, token.start, token.end, token.logprob) for token in scored.tokens] == [
+        ("r", 0, 1, -0.30000000000000004),
+        ("ed", 1, 3, -0.4),
+    ]
+    assert (scored.input_tokens, scored.output_tokens) == (5, 1)
+
+
+def test_multimodal_scoring_rejects_prompt_ids_unchanged_by_image():
+    response = _multimodal_response([10, 11, 201, 202])
+
+    with pytest.raises(TeacherError, match="silently dropped") as error:
+        _multimodal_client(response).score_many_multimodal(
+            [
+                (
+                    [{"role": "user", "content": "<|media_pad|>"}],
+                    "red",
+                    ["data:image/png;base64,aW1hZ2U="],
+                )
+            ]
+        )
+
+    assert error.value.permanent is True
+
+
+@pytest.mark.parametrize(
+    ("prompt_ids", "matches"),
+    [
+        ([10, 151655, 11, 203, 204], 0),
+        ([10, 151655, 201, 202, 11, 201, 202], 2),
+    ],
+)
+def test_multimodal_completion_id_run_must_be_unique(prompt_ids, matches):
+    response = _multimodal_response(prompt_ids)
+
+    with pytest.raises(TeacherError, match=rf"found {matches} matches") as error:
+        _multimodal_client(response).score_many_multimodal(
+            [
+                (
+                    [{"role": "user", "content": "<|media_pad|>"}],
+                    "red",
+                    ["data:image/png;base64,aW1hZ2U="],
+                )
+            ]
+        )
+
+    assert error.value.permanent is True
 
 
 def test_score_many_caps_in_flight_requests_at_the_measured_ceiling():

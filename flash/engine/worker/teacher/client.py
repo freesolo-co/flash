@@ -28,6 +28,8 @@ from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
 _MAX_LOGPROB_ROUNDING_ERROR = 1e-6
 _BROKER_PROVIDER_TIMEOUT_CEILING_S = 90.0
 _DEFAULT_TEACHER_TIMEOUT_S = 105.0
+_IMAGE_TEACHER_PLACEHOLDER = "<|media_pad|>"
+_IMAGE_PAD_TOKEN = "<|image_pad|>"
 
 
 class TeacherError(RuntimeError):
@@ -335,6 +337,119 @@ def _normalize_response(
     )
 
 
+def _chat_messages(
+    prompt_messages: list[dict[str, Any]],
+    completion_text: str,
+    image_data_uris: list[str] | tuple[str, ...],
+) -> list[dict[str, Any]]:
+    if not prompt_messages:
+        raise _permanent("teacher multimodal scoring requires prompt messages")
+    if not completion_text:
+        raise _permanent("teacher scoring requires a nonempty completion")
+    images = iter(image_data_uris)
+    image_count = 0
+    output: list[dict[str, Any]] = []
+    for message_index, message in enumerate(prompt_messages):
+        if not isinstance(message, dict):
+            raise _permanent(f"teacher prompt message {message_index} is not an object")
+        role = message.get("role")
+        content = message.get("content")
+        if not isinstance(role, str) or not role or not isinstance(content, str):
+            raise _permanent(
+                f"teacher prompt message {message_index} requires string role and content"
+            )
+        if _IMAGE_TEACHER_PLACEHOLDER not in content:
+            output.append({"role": role, "content": content})
+            continue
+        blocks: list[dict[str, Any]] = []
+        parts = content.split(_IMAGE_TEACHER_PLACEHOLDER)
+        for part_index, part in enumerate(parts):
+            if part:
+                blocks.append({"type": "text", "text": part})
+            if part_index == len(parts) - 1:
+                continue
+            try:
+                image_uri = next(images)
+            except StopIteration:
+                raise _permanent(
+                    "teacher prompt has more image placeholders than image data URIs"
+                ) from None
+            if not isinstance(image_uri, str) or not image_uri.startswith("data:image/"):
+                raise _permanent("teacher multimodal scoring requires image data URIs")
+            blocks.append({"type": "image_url", "image_url": {"url": image_uri}})
+            image_count += 1
+        output.append({"role": role, "content": blocks})
+    try:
+        next(images)
+    except StopIteration:
+        pass
+    else:
+        raise _permanent("teacher prompt has fewer image placeholders than image data URIs")
+    if image_count == 0:
+        raise _permanent("teacher multimodal scoring requires at least one image")
+    if output[-1]["role"] == "assistant" and isinstance(output[-1]["content"], str):
+        output[-1]["content"] += completion_text
+    else:
+        output.append({"role": "assistant", "content": completion_text})
+    return output
+
+
+def _contiguous_run_starts(values: list[int], target: list[int]) -> list[int]:
+    if not target or len(target) > len(values):
+        return []
+    return [
+        start
+        for start in range(len(values) - len(target) + 1)
+        if values[start : start + len(target)] == target
+    ]
+
+
+def _normalize_multimodal_response(
+    response: dict[str, Any],
+    *,
+    encoded_completion: list[EncodedTeacherToken],
+    completion_text: str,
+    image_count: int,
+    image_pad_token_id: int,
+) -> TeacherScore:
+    choices = response.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+        raise _permanent("teacher response must contain exactly one choice")
+    generated_ids = _integer_list(choices[0].get("token_ids"), field="token_ids")
+    if len(generated_ids) != 1:
+        raise _permanent("teacher response must contain exactly one generated token id")
+    remote_ids = _integer_list(response.get("prompt_token_ids"), field="prompt_token_ids")
+    if remote_ids.count(image_pad_token_id) < image_count:
+        raise _permanent(
+            "teacher response contains no image token expansion; the provider may have silently "
+            "dropped an image"
+        )
+    local_completion_ids = [token.token_id for token in encoded_completion]
+    matches = _contiguous_run_starts(remote_ids, local_completion_ids)
+    if len(matches) != 1:
+        raise _permanent(
+            "teacher response must contain the completion token ids as exactly one contiguous run; "
+            f"found {len(matches)} matches"
+        )
+    input_tokens, output_tokens = _validated_usage(response, len(remote_ids))
+    scores = _token_keyed_scores(response.get("prompt_logprobs"), remote_ids)
+    if scores is None:
+        raise _permanent("teacher response is missing top-level prompt_logprobs")
+    start = matches[0]
+    completion_scores = scores[start : start + len(encoded_completion)]
+    tokens = _completion_tokens(
+        encoded_completion,
+        completion_scores,
+        full=completion_text,
+        prompt_length=0,
+    )
+    return TeacherScore(
+        tokens=tuple(tokens),
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+
+
 class TeacherClient:
     def __init__(
         self,
@@ -461,6 +576,39 @@ class TeacherClient:
             prompt_length=len(prompt_text),
         )
 
+    def _score_one_multimodal(
+        self,
+        prompt_messages: list[dict[str, Any]],
+        completion_text: str,
+        image_data_uris: list[str] | tuple[str, ...],
+    ) -> TeacherScore:
+        encoded_completion = self.tokenizer.encode(completion_text)
+        image_pad_tokens = self.tokenizer.encode(_IMAGE_PAD_TOKEN)
+        if len(image_pad_tokens) != 1:
+            raise _permanent(
+                "managed vision teacher tokenizer must encode the image-pad marker as one token"
+            )
+        messages = _chat_messages(prompt_messages, completion_text, image_data_uris)
+        response = self._post(
+            "/v1/teacher/chat_completions",
+            {
+                "model": self.model,
+                "messages": messages,
+                "max_tokens": 1,
+                "temperature": 0,
+                "seed": 0,
+                "prompt_logprobs": 1,
+                "return_token_ids": True,
+            },
+        )
+        return _normalize_multimodal_response(
+            response,
+            encoded_completion=encoded_completion,
+            completion_text=completion_text,
+            image_count=len(image_data_uris),
+            image_pad_token_id=image_pad_tokens[0].token_id,
+        )
+
     def score_many(self, items: list[tuple[str, str]]) -> list[TeacherScore]:
         """Score each unique prompt and completion through one idempotent broker request.
 
@@ -477,6 +625,19 @@ class TeacherClient:
         return map_bounded(
             items,
             lambda item: self._score_one(*item),
+            cap=OPD_TEACHER_SCORING_CONCURRENCY,
+        )
+
+    def score_many_multimodal(
+        self,
+        items: list[tuple[list[dict[str, Any]], str, list[str] | tuple[str, ...]]],
+    ) -> list[TeacherScore]:
+        """Score image-conditioned completions through the managed chat broker route."""
+        if not items:
+            return []
+        return map_bounded(
+            items,
+            lambda item: self._score_one_multimodal(*item),
             cap=OPD_TEACHER_SCORING_CONCURRENCY,
         )
 
