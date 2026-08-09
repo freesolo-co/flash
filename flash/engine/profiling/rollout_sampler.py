@@ -88,6 +88,7 @@ class RolloutSampling:
     samples: tuple[RolloutSample, ...]
     failures: int
     sampled_prompts: int
+    offered_prompts: int = 0
 
     @property
     def completed(self) -> int:
@@ -111,11 +112,13 @@ class RolloutSampling:
         if not lengths:
             return {
                 "sampled_prompts": self.sampled_prompts,
+                "offered_prompts": self.offered_prompts,
                 "completed_rollouts": 0,
                 "failed_rollouts": self.failures,
             }
         return {
             "sampled_prompts": self.sampled_prompts,
+            "offered_prompts": self.offered_prompts,
             "completed_rollouts": len(lengths),
             "failed_rollouts": self.failures,
             "completion_tokens_mean": statistics.fmean(lengths),
@@ -154,6 +157,7 @@ def sample_rollouts(
     base_url: str,
     api_key: str,
     stop_sequences: Sequence[str] = (),
+    thinking: bool | None = None,
 ) -> RolloutSampling:
     """draw ``rollouts`` generations, spreading across ``prompts`` before repeating one.
 
@@ -162,11 +166,16 @@ def sample_rollouts(
     measurement, which returns the quote to the declared cap.
     """
     if not prompts or rollouts <= 0:
-        return RolloutSampling(samples=(), failures=0, sampled_prompts=0)
+        return RolloutSampling(samples=(), failures=0, sampled_prompts=0, offered_prompts=0)
 
     collected: list[RolloutSample] = []
     failures = 0
-    used_prompts: set[int] = set()
+    # prompts that produced a SAMPLE, not prompts attempted. a prompt the endpoint systematically
+    # refuses -- a content filter is the usual cause -- contributes no tokens, and counting the
+    # attempt let the loop make up the shortfall from the other prompts and still report full
+    # coverage. the worker does not reproduce the hosted filter, so that prompt is part of the run
+    # being quoted and its (usually long-tail) length would be missing from an accepted profile.
+    measured_prompts: set[int] = set()
     # this runs in front of a submit the user is waiting on, and the draws are serial. an endpoint
     # that accepts connections but stalls would otherwise burn REQUEST_TIMEOUT_S on every draw
     # before falling back to cap pricing -- 32 draws x 180s is over an hour of dead wait for a
@@ -193,7 +202,6 @@ def sample_rollouts(
         # draw of it failed, which would concentrate the sample on whichever prompt is flakiest.
         slot = attempts % len(prompts)
         attempts += 1
-        used_prompts.add(slot)
         sample = _one_completion(
             model=model,
             messages=prompts[slot],
@@ -203,6 +211,7 @@ def sample_rollouts(
             api_key=api_key,
             stop_sequences=stop_sequences,
             timeout_s=min(REQUEST_TIMEOUT_S, remaining),
+            thinking=thinking,
         )
         if sample is None:
             failures += 1
@@ -211,11 +220,13 @@ def sample_rollouts(
                 break
         else:
             collected.append(sample)
+            measured_prompts.add(slot)
             consecutive_failures = 0
     return RolloutSampling(
         samples=tuple(collected),
         failures=failures,
-        sampled_prompts=len(used_prompts),
+        sampled_prompts=len(measured_prompts),
+        offered_prompts=len(prompts),
     )
 
 
@@ -229,6 +240,7 @@ def _one_completion(
     api_key: str,
     stop_sequences: Sequence[str] = (),
     timeout_s: float = REQUEST_TIMEOUT_S,
+    thinking: bool | None = None,
 ) -> RolloutSample | None:
     """one generation's token counts, or None when the draw failed for any reason.
 
@@ -252,6 +264,14 @@ def _one_completion(
     stops = [str(value) for value in stop_sequences if value]
     if stops:
         payload["stop"] = stops
+    if thinking is not None:
+        # the worker renders with enable_thinking=thinking, so say so rather than inheriting the
+        # endpoint's default. sent both ways: `chat_template_kwargs` is what a vllm-compatible
+        # server applies to the template itself, and `reasoning` is what a router-style gateway
+        # reads. an endpoint that understands neither ignores both, which is why the RESPONSE is
+        # checked below instead of this being trusted.
+        payload["chat_template_kwargs"] = {"enable_thinking": bool(thinking)}
+        payload["reasoning"] = {"enabled": bool(thinking)}
     request = urllib.request.Request(
         f"{base_url.rstrip('/')}/chat/completions",
         data=json.dumps(payload).encode(),
@@ -265,14 +285,51 @@ def _one_completion(
             body = json.load(response)
     except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
         return None
-    return _sample_from_response(body, max_completion_tokens=int(max_completion_tokens))
+    return _sample_from_response(
+        body, max_completion_tokens=int(max_completion_tokens), thinking=thinking
+    )
 
 
-def _sample_from_response(body: object, *, max_completion_tokens: int) -> RolloutSample | None:
+def _reasoned(usage: dict, choice: object) -> bool:
+    """whether this response carries reasoning the request asked not to have.
+
+    three signals, because providers disagree on where reasoning surfaces: a token accounting
+    breakdown, a separate reasoning field on the message, and the literal think tags a chat template
+    emits when reasoning is on. any one of them is enough to disqualify a draw.
+
+    absence proves nothing on its own -- an endpoint that silently ignored the request and returned
+    plain text is indistinguishable from one that honoured it -- but reasoning is what inflates
+    completion length, so catching it wherever it IS visible is what protects the measurement.
+    """
+    details = usage.get("completion_tokens_details")
+    if isinstance(details, dict):
+        try:
+            if int(details.get("reasoning_tokens") or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+    message = choice.get("message") if isinstance(choice, dict) else None
+    if not isinstance(message, dict):
+        return False
+    # `reasoning` and `reasoning_content` name the same thing at different providers.
+    if message.get("reasoning") or message.get("reasoning_content"):
+        return True
+    content = message.get("content")
+    return isinstance(content, str) and "<think>" in content
+
+
+def _sample_from_response(
+    body: object, *, max_completion_tokens: int, thinking: bool | None = None
+) -> RolloutSample | None:
     """token counts for one draw, or None when the response cannot stand as a measurement."""
     usage = body.get("usage") if isinstance(body, dict) else None
     choices = body.get("choices") if isinstance(body, dict) else None
     if not isinstance(usage, dict) or not isinstance(choices, list) or not choices:
+        return None
+    if thinking is False and _reasoned(usage, choices[0]):
+        # the request asked for no reasoning and the endpoint reasoned anyway. those tokens are
+        # billed in completion_tokens and the training rollout will not generate them, so this draw
+        # measures different work. dropped rather than kept, which returns the quote to the cap.
         return None
     try:
         completion_tokens = int(usage["completion_tokens"])

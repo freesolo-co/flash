@@ -32,6 +32,14 @@ MIN_TRUSTWORTHY_ROLLOUTS = 32
 # clipped samples rather than report a censored mean as measurement.
 MAX_TRUSTWORTHY_TRUNCATION_RATE = 0.25
 
+# how many of the prompts offered to the sampler must actually have produced a draw. the client
+# offers 8; requiring all 8 would let one flaky request throw away an otherwise good measurement,
+# while requiring none lets a SYSTEMATICALLY refused prompt -- a content filter is the usual cause --
+# drop out silently while the other prompts make up the rollout count. that prompt is still part of
+# the run being quoted (the worker does not reproduce the hosted filter), and prompt mix is what
+# dominates length variance, so losing one entirely is a biased sample rather than a thin one.
+MIN_TRUSTWORTHY_PROMPT_COVERAGE = 0.75
+
 # which rows the profile measured. sft is never sampled: it either measures every source row or the
 # deterministic max_examples prefix training will consume, so both policies are exact.
 SFT_SAMPLE_POLICY_FULL = "exact-full"
@@ -412,6 +420,8 @@ class RolloutWorkloadProfile:
     # what was sampled, and how much of it survived. a profile whose successes are mostly failures
     # measured the failure path, not the workload.
     sampled_prompts: int
+    # how many distinct prompts the sampler was given, so coverage is measurable rather than assumed.
+    offered_prompts: int
     completed_rollouts: int
     failed_rollouts: int
     # realized generation. the distribution, not a point estimate: a mean alone cannot tell a
@@ -467,6 +477,7 @@ class RolloutWorkloadProfile:
             raise ValueError("sample_policy is required")
         counts = {
             "sampled_prompts": self.sampled_prompts,
+            "offered_prompts": self.offered_prompts,
             "completed_rollouts": self.completed_rollouts,
             "failed_rollouts": self.failed_rollouts,
             "completion_tokens_p50": self.completion_tokens_p50,
@@ -542,6 +553,16 @@ class RolloutWorkloadProfile:
                 f"truncated at the cap ({self.truncation_rate:.0%}, above the "
                 f"{MAX_TRUSTWORTHY_TRUNCATION_RATE:.0%} ceiling); the measured mean is censored "
                 "and would underbill generation"
+            )
+        # a prompt that produced no draw at all is missing from the distribution, not merely
+        # under-sampled. this compares against the prompts the sampler was OFFERED, which is why
+        # `offered_prompts` travels with the evidence rather than being assumed to be 8.
+        offered = self.offered_prompts
+        if offered > 0 and self.sampled_prompts < offered * MIN_TRUSTWORTHY_PROMPT_COVERAGE:
+            return False, (
+                f"only {self.sampled_prompts} of {offered} prompts produced a draw "
+                f"(below {MIN_TRUSTWORTHY_PROMPT_COVERAGE:.0%} coverage); a prompt the endpoint "
+                "refuses is still trained on, so the sample omits part of the workload"
             )
         age = now - self.measured_at
         if self.measured_at <= 0 or age > ROLLOUT_LATENCY_MAX_AGE_S:

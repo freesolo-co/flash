@@ -41,6 +41,7 @@ def collect_rollout_evidence(
     temperature: float | None,
     rollouts: int = DEFAULT_ROLLOUTS,
     stop_sequences: Sequence[str] = (),
+    thinking: bool | None = None,
 ) -> dict[str, Any] | None:
     """measure this config's rollouts, or return None when no measurement is possible.
 
@@ -62,6 +63,7 @@ def collect_rollout_evidence(
         base_url=base_url,
         api_key=api_key,
         stop_sequences=stop_sequences,
+        thinking=thinking,
     )
     if not sampling.completed:
         return None

@@ -9,8 +9,10 @@ leave the quote on the declared cap rather than fail the submit.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
+import threading
 import time
 from dataclasses import replace
 
@@ -59,6 +61,7 @@ def _with_profile(spec: JobSpec, profile: dict) -> JobSpec:
 def _evidence(**overrides) -> dict:
     base = {
         "sampled_prompts": 8,
+        "offered_prompts": 8,
         "completed_rollouts": 32,
         "failed_rollouts": 0,
         "completion_tokens_mean": 53.6875,
@@ -315,9 +318,12 @@ def test_summary_reports_the_distribution_not_a_mean_alone():
 def test_summary_carries_no_prompt_or_completion_text():
     """Aggregates only. Prompts and completions must never leave the client process."""
     samples = (RolloutSample(prompt_tokens=10, completion_tokens=40, truncated=False),)
-    summary = RolloutSampling(samples=samples, failures=0, sampled_prompts=1).summary()
+    summary = RolloutSampling(
+        samples=samples, failures=0, sampled_prompts=1, offered_prompts=1
+    ).summary()
     assert set(summary) == {
         "sampled_prompts",
+        "offered_prompts",
         "completed_rollouts",
         "failed_rollouts",
         "completion_tokens_mean",
@@ -752,7 +758,7 @@ def test_the_dry_run_never_claims_a_paid_scorer_was_called():
         algorithm="grpo",
         affordability_verified=True,
         rollout_evidence=_evidence(),
-        environment_was_executed=True,
+        environment_stages_run=("import", "dataset", "prompt_messages"),
     )
     assert "reward() was NOT called" in line
     assert "external scorer was really called" not in line
@@ -770,7 +776,7 @@ def test_the_dry_run_says_nothing_ran_when_profiling_never_started():
         algorithm="grpo",
         affordability_verified=True,
         rollout_evidence=None,
-        environment_was_executed=False,
+        environment_stages_run=(),
     )
     assert "did NOT import or run your environment.py" in line
 
@@ -965,18 +971,18 @@ def test_no_algorithm_times_the_task_reward_on_the_client_host(algorithm, monkey
     assert seen.get("reward_samples") is None
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [("model_revision", "abc123"), ("thinking", True)],
-)
+@pytest.mark.parametrize(("field", "value"), [("model_revision", "abc123")])
 def test_a_run_whose_generation_the_endpoint_cannot_match_is_not_measured(
     field, value, monkeypatch
 ):
     """Keying a field in the digest stops a measurement being REUSED for another config.
 
-    It cannot make this draw faithful. A pinned revision is served by the worker but not by the
-    hosted model id, and the chat-completions request has no portable way to say enable_thinking --
-    and reasoning traces move length by far more than the trust gate tolerates.
+    It cannot make this draw faithful: a pinned revision is served by the worker but not by the
+    hosted model id, so the draw comes from different weights.
+
+    Reasoning is NOT in this list. It is handled by stating the run's setting in the request and
+    dropping any response that reasons anyway -- declining outright would disable measurement for
+    the entire catalog, since every model in it is hybrid-thinking.
     """
     from flash.cli.commands import rollout_profile as rp
 
@@ -1456,9 +1462,19 @@ def test_the_cost_preview_stays_quiet_when_no_measurement_could_happen(monkeypat
     assert _cmd_train_cost_offline(_spec()) == 0
     assert "declared completion cap" not in capsys.readouterr().err
 
-    # key present, but the config is declined -- still no disagreement.
+    # key present, but the config is declined -- still no disagreement. a warm-start adapter rather
+    # than a pinned revision, since a fabricated revision fails sizing lookup before the preview.
     monkeypatch.setenv(rollout_sampler.ROLLOUT_SAMPLER_API_KEY_ENV, "k")
-    assert _cmd_train_cost_offline(_spec(thinking=True)) == 0
+    declined = _spec(
+        train=TrainSpec(
+            max_steps=50,
+            batch_size=8,
+            group_size=4,
+            max_completion_tokens=512,
+            init_from_adapter="acme/run-1",
+        )
+    )
+    assert _cmd_train_cost_offline(declined) == 0
     assert "declared completion cap" not in capsys.readouterr().err
 
 
@@ -1604,21 +1620,36 @@ def test_measuring_does_not_leave_the_process_torch_seeded(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("executed", "evidence", "must_say", "must_not_say"),
+    ("stages", "evidence", "must_say", "must_not_say"),
     [
-        (True, {"completed_rollouts": 32}, "WAS imported locally", "did NOT import"),
-        (True, None, "no usable measurement came back", "did NOT import"),
-        (False, None, "did NOT import or run your environment.py", "WAS imported locally"),
+        # a multi-turn env declines on the import alone: naming dataset() here would be a lie.
+        (("import",), None, "no usable measurement came back", "dataset()"),
+        # an empty dataset stops before prompt_messages().
+        (("import", "dataset"), None, "dataset() ran", "prompt_messages()"),
+        (
+            ("import", "dataset", "prompt_messages"),
+            None,
+            "dataset() and prompt_messages() ran",
+            "did NOT import",
+        ),
+        (
+            ("import", "dataset", "prompt_messages"),
+            {"completed_rollouts": 32},
+            "priced from the rollouts it measured",
+            "did NOT import",
+        ),
+        ((), None, "did NOT import or run your environment.py", "WAS imported locally"),
     ],
 )
-def test_the_dry_run_reports_whether_the_environment_ran_not_whether_it_measured(
-    executed, evidence, must_say, must_not_say
+def test_the_dry_run_reports_the_hooks_that_ran_not_whether_it_measured(
+    stages, evidence, must_say, must_not_say
 ):
-    """Profiling imports and runs the user's module BEFORE it can find the config unmeasurable.
+    """Profiling runs the user's module BEFORE it can find the config unmeasurable, and the declines
+    stop at DIFFERENT points.
 
-    A multi-turn env, a dataset with no samplable prompts, and a dead sampler all execute
-    environment.py and then return no evidence. Inferring execution from the payload told those
-    users their code had not been imported at all, which is the opposite of what happened.
+    Inferring execution from the payload told these users their code had not been imported at all.
+    Reporting a fixed pair of hooks instead would misstate it the other way: a multi-turn env is
+    refused after the import, having never called dataset().
     """
     from flash.cli.commands import _dry_run_preview_line
 
@@ -1626,7 +1657,7 @@ def test_the_dry_run_reports_whether_the_environment_ran_not_whether_it_measured
         algorithm="grpo",
         affordability_verified=True,
         rollout_evidence=evidence,
-        environment_was_executed=executed,
+        environment_stages_run=stages,
     )
     assert must_say in line
     assert must_not_say not in line
@@ -1650,7 +1681,261 @@ def test_the_submit_path_learns_the_environment_ran_even_with_no_evidence(monkey
     client, _seen = _profiling_stubs(monkeypatch, tmp_path, _MultiTurn())
     monkeypatch.setattr("flash.cli.commands.client_from_config", lambda: client, raising=False)
 
-    evidence, executed = _rollout_evidence_for(client, _spec())
+    evidence, stages = _rollout_evidence_for(client, _spec())
 
     assert evidence is None
-    assert executed is True
+    # the import ran; dataset() did not, because a multi-turn env is declined before it.
+    assert stages == ("import",)
+
+
+def test_a_later_decline_reports_the_hooks_it_got_through(monkeypatch, tmp_path):
+    """The stages must be reported as they RUN, not inferred from where the decline happened.
+
+    An env whose dataset() returns rows but whose prompts are unsamplable gets further than a
+    multi-turn one: dataset() really did run, and a notice that omitted it would understate what
+    executed on the user's machine just as the fixed pair overstated it.
+    """
+    from flash.cli.commands import _rollout_evidence_for
+
+    class _NoUsablePrompts:
+        multi_turn = False
+
+        def dataset(self):
+            return [{"q": "2+2?"}]
+
+        def prompt_messages(self, _example):
+            # a shape the sampler cannot reproduce, so the measurement is declined after this ran.
+            return [{"role": "user", "content": "hi", "name": "tool-call"}]
+
+    client, _seen = _profiling_stubs(monkeypatch, tmp_path, _NoUsablePrompts())
+    monkeypatch.setattr("flash.cli.commands.client_from_config", lambda: client, raising=False)
+
+    evidence, stages = _rollout_evidence_for(client, _spec())
+
+    assert evidence is None
+    assert stages == ("import", "dataset", "prompt_messages")
+
+
+def test_a_draw_that_reasons_against_a_non_thinking_run_is_not_a_measurement():
+    """Every catalog model is hybrid-thinking, so `thinking = false` is the common case.
+
+    Chat-completions has no portable reasoning switch, so an endpoint that reasons by default would
+    answer such a run with traces it will never generate -- and those tokens are billed in
+    `completion_tokens`. Declining the draw returns the quote to the cap; keeping it would quote a
+    length no rollout produces.
+    """
+    reasoning_body = {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {"content": "4", "reasoning": "the user wants 2+2..."},
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 900,
+            "completion_tokens_details": {"reasoning_tokens": 880},
+        },
+    }
+
+    declined = rollout_sampler._sample_from_response(
+        reasoning_body, max_completion_tokens=2048, thinking=False
+    )
+    assert declined is None
+
+    # the SAME response is a valid measurement for a run that asked for thinking.
+    kept = rollout_sampler._sample_from_response(
+        reasoning_body, max_completion_tokens=2048, thinking=True
+    )
+    assert kept is not None
+    assert kept.completion_tokens == 900
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"content": "4", "reasoning": "..."},
+        {"content": "4", "reasoning_content": "..."},
+        {"content": "<think>hmm</think>4"},
+    ],
+)
+def test_reasoning_is_detected_wherever_the_provider_puts_it(message):
+    """Providers disagree on where reasoning surfaces: a usage breakdown, a separate message field
+    under either of two names, or the literal think tags a chat template emits. Checking only one
+    would let the other two through as ordinary long completions."""
+    body = {
+        "choices": [{"finish_reason": "stop", "message": message}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 900},
+    }
+    assert (
+        rollout_sampler._sample_from_response(body, max_completion_tokens=2048, thinking=False)
+        is None
+    )
+
+
+def test_the_request_states_the_runs_reasoning_setting(monkeypatch):
+    """Leaving reasoning to the endpoint's default is what the response check exists to catch --
+    but the request should ask for the right thing first, so the common case is a usable draw
+    rather than a rejected one."""
+    captured: dict = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "choices": [{"finish_reason": "stop", "message": {"content": "4"}}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 40},
+                }
+            ).encode()
+
+    def _open(request, timeout=None):
+        captured["body"] = json.loads(request.data.decode())
+        return _Response()
+
+    monkeypatch.setattr(rollout_sampler._NO_REDIRECT_OPENER, "open", _open)
+
+    rollout_sampler._one_completion(
+        model="Qwen/Qwen3.5-4B",
+        messages=[{"role": "user", "content": "2+2?"}],
+        max_completion_tokens=512,
+        temperature=None,
+        base_url="https://example.invalid/v1",
+        api_key="k",
+        thinking=False,
+    )
+
+    assert captured["body"]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert captured["body"]["reasoning"] == {"enabled": False}
+
+
+def test_a_blocking_environment_hook_cannot_hang_the_submit(monkeypatch):
+    """`dataset()` is user code. A hook that blocks forever raises nothing, so the outer `except`
+    never regains control and merely CONFIGURING the optional sampler would hang `flash train`
+    indefinitely. Bounding it returns the quote to cap pricing instead."""
+    from flash.cli.commands import rollout_profile as rp
+
+    monkeypatch.setattr(rp, "_LOCAL_HOOK_DEADLINE_S", 0.2)
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def _never_returns():
+        started.set()
+        # blocks until the test releases it, so an unbounded join would hang here rather than
+        # returning None -- asserting only on the return value would pass either way.
+        release.wait(30)
+        return [{"q": "2+2?"}]
+
+    began = time.monotonic()
+    try:
+        assert rp._within(rp._LOCAL_HOOK_DEADLINE_S, _never_returns) is None
+        elapsed = time.monotonic() - began
+        assert started.is_set(), "the call never actually started"
+        # the point of the fix: it came back on the DEADLINE, not when the hook finished.
+        assert elapsed < 5.0, f"waited {elapsed:.1f}s, so the deadline did not bound the call"
+    finally:
+        release.set()
+
+
+def test_a_bounded_hook_still_returns_its_value():
+    """The deadline must not cost a measurement for every env whose dataset() is merely slow."""
+    from flash.cli.commands import rollout_profile as rp
+
+    assert rp._within(30.0, lambda: [{"q": "2+2?"}]) == [{"q": "2+2?"}]
+    # a raising hook is reported as "no measurement", like any other failure on this path.
+    assert rp._within(30.0, lambda: (_ for _ in ()).throw(RuntimeError("boom"))) is None
+
+
+def test_a_prompt_the_endpoint_always_refuses_does_not_count_as_sampled():
+    """`sampled_prompts` must mean "produced a draw", not "was attempted".
+
+    A content filter that rejects one prompt every time is invisible in the rollout count: the loop
+    makes up the shortfall from the other prompts and reports full coverage. Prompt mix dominates
+    length variance and the training worker does not reproduce the hosted filter, so that prompt is
+    still trained on -- its (usually long-tail) length would simply be missing from the quote.
+    """
+    prompts = [[{"role": "user", "content": f"p{i}"}] for i in range(8)]
+
+    def _filtered(**kwargs):
+        if kwargs["messages"][0]["content"] == "p3":
+            return None
+        return RolloutSample(prompt_tokens=10, completion_tokens=40, truncated=False)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(rollout_sampler, "_one_completion", _filtered)
+        out = rollout_sampler.sample_rollouts(
+            model="m",
+            prompts=prompts,
+            rollouts=32,
+            max_completion_tokens=512,
+            temperature=None,
+            base_url="https://example.invalid/v1",
+            api_key="k",
+        )
+
+    assert out.completed == 32
+    assert out.failures > 0
+    # 7 of the 8 offered prompts produced draws; the refused one must not be counted.
+    assert out.summary()["sampled_prompts"] == 7
+    assert out.summary()["offered_prompts"] == 8
+
+
+def test_evidence_missing_a_prompt_entirely_is_not_trustworthy():
+    """The honest count alone does not protect the quote -- the trust gate has to act on it.
+
+    A profile whose numbers are all individually valid, but which silently measured only part of
+    the prompt set, must not be allowed to price the run.
+    """
+    from flash.engine.profiling.workload_profile import (
+        MIN_TRUSTWORTHY_PROMPT_COVERAGE,
+        RolloutWorkloadProfile,
+    )
+
+    spec = _spec()
+    full = rollout_profile_from_evidence(
+        spec, _evidence(sampled_prompts=8, offered_prompts=8), producer_version=VERSION
+    )
+    assert full is not None
+    assert RolloutWorkloadProfile.from_dict(full).trustworthy(now=time.time()) == (True, "")
+
+    # three of eight prompts never produced a draw: below the coverage floor.
+    assert MIN_TRUSTWORTHY_PROMPT_COVERAGE > 5 / 8
+    partial = rollout_profile_from_evidence(
+        spec, _evidence(sampled_prompts=5, offered_prompts=8), producer_version=VERSION
+    )
+    # rejected either at parse time or by the trust verdict; both keep it away from the quote.
+    if partial is not None:
+        ok, reason = RolloutWorkloadProfile.from_dict(partial).trustworthy(now=time.time())
+        assert ok is False
+        assert "prompts produced a draw" in reason
+
+
+def test_an_install_that_cannot_load_environments_says_so_instead_of_going_quiet(
+    monkeypatch, caplog
+):
+    """The base `freesolo-flash` package declares no dependencies and the env loader needs the
+    `freesolo` SDK, so an isolated `uv tool`/`pipx` install cannot profile at all.
+
+    Failing open is right -- the quote returns to the cap, which is what an unmeasured run always
+    cost. Failing open SILENTLY is not: the user set a sampler key expecting a measured quote, and
+    no output is indistinguishable from the feature working.
+    """
+    from flash.cli.commands import rollout_profile as rp
+
+    def _no_sdk(*_a, **_k):
+        raise ImportError("could not import the Freesolo environment tools: No module named ...")
+
+    monkeypatch.setenv(rollout_sampler.ROLLOUT_SAMPLER_API_KEY_ENV, "k")
+    monkeypatch.setattr(rp, "_collect", _no_sdk)
+
+    with caplog.at_level(logging.WARNING, logger="flash.cli"):
+        assert rp.collect_for_submit(object(), _spec()) is None
+
+    assert "rollout profiling is unavailable in this install" in caplog.text
+    # and it still fails OPEN -- an unusable install must not break the submit.

@@ -444,7 +444,7 @@ def _dry_run_preview_line(
     algorithm: str,
     affordability_verified: bool,
     rollout_evidence: dict | None,
-    environment_was_executed: bool = False,
+    environment_stages_run: tuple[str, ...] = (),
 ) -> str:
     """What a dry run actually checked, and what it actually executed on this machine.
 
@@ -454,10 +454,14 @@ def _dry_run_preview_line(
     quote that reached profiling imported environment.py too. Only the path that never ran it
     locally ran nothing.
 
-    ``environment_was_executed`` is tracked separately from ``rollout_evidence`` because profiling
-    can execute the user's module and still return nothing -- a multi-turn env, no samplable
-    prompts, or an unreachable sampler. Both facts are things a user could act on: whether their
-    code ran here, and whether this price came from a measurement.
+    ``environment_stages_run`` names the env hooks that actually executed, and is tracked separately
+    from ``rollout_evidence`` because profiling can run the user's module and still return nothing --
+    a multi-turn env, no samplable prompts, or an unreachable sampler. Both facts are things a user
+    could act on: what of their code ran here, and whether this price came from a measurement.
+
+    Per-stage rather than one flag, because the declines differ: a multi-turn env is refused after
+    the import alone, and an empty dataset before prompt_messages(). Naming hooks that never ran
+    would misstate exactly the disclosure this line exists to make.
     """
     # the server fails open on a billing-infra problem, so "cost" is only in the validated list
     # when it was actually checked. absent key = a server that predates the signal, which is
@@ -469,22 +473,23 @@ def _dry_run_preview_line(
             "the workload profile this quote is built on; model load and gpu/training are "
             "first exercised on the worker after cold-start."
         )
-    elif environment_was_executed:
-        # what ran is reported from whether profiling EXECUTED, not from whether it produced a
-        # usable measurement. a multi-turn env, a dataset with no samplable prompts, or a dead
-        # sampler all import environment.py and run dataset() and then return no evidence -- and
-        # inferring execution from the payload told those users nothing had been imported at all.
+    elif environment_stages_run:
+        # what ran is reported from the stages that actually executed, not from whether a payload
+        # came back. a multi-turn env, a dataset with no samplable prompts, or a dead sampler all
+        # import environment.py and then return no evidence -- and they stop at different points,
+        # so naming a fixed pair of hooks would overclaim on exactly those paths.
+        called = [f"{stage}()" for stage in environment_stages_run if stage != "import"]
+        ran = f" {' and '.join(called)} ran on a small sample." if called else ""
         priced = (
-            "and this quote is priced from the rollouts it measured"
+            "this quote is priced from the rollouts it measured"
             if rollout_evidence
-            else "but no usable measurement came back, so this quote still uses the declared "
+            else "no usable measurement came back, so this quote still uses the declared "
             "completion cap"
         )
         environment = (
-            f"your environment.py WAS imported locally: dataset() and prompt_messages() were "
-            f"run on a small sample, {priced}. reward() was NOT called, so its grading cost is "
-            "not in this quote. worker imports, model load, and gpu/training are first "
-            "exercised on the worker after cold-start."
+            f"your environment.py WAS imported locally to measure this quote:{ran} {priced}. "
+            "reward() was NOT called, so its grading cost is not in this quote. worker imports, "
+            "model load, and gpu/training are first exercised on the worker after cold-start."
         )
     else:
         environment = (
@@ -501,7 +506,7 @@ def _dry_run_preview_line(
 
 def _rollout_evidence_for(
     client: ApiClient, spec, runtime_secrets: dict | None = None
-) -> tuple[dict | None, bool]:
+) -> tuple[dict | None, tuple[str, ...]]:
     """Measured rollout aggregates for a grpo/opd submit, or None when nothing was measured.
 
     Advisory, and silent on every failure. The server re-derives the digest and re-applies the same
@@ -514,20 +519,17 @@ def _rollout_evidence_for(
     secrets the worker will; without them an external-judge reward() raises and the measurement is
     silently lost.
 
-    Returns the evidence and whether the user's environment.py was executed here. They are separate
-    facts: profiling imports and runs the module before it can discover that a config is not
-    measurable, so a None payload does not mean nothing ran.
+    Returns the evidence and the env stages that actually ran here ("import", "dataset",
+    "prompt_messages"). They are separate facts: profiling imports and runs the module before it can
+    discover that a config is not measurable, so a None payload does not mean nothing ran -- and
+    which hooks ran differs per decline, so one flag would overclaim.
     """
     from flash.cli.commands.rollout_profile import collect_for_submit
 
-    executed = False
-
-    def _executed() -> None:
-        nonlocal executed
-        executed = True
+    executed: list[str] = []
 
     evidence = collect_for_submit(
-        client, spec, runtime_secrets=runtime_secrets, on_environment_loaded=_executed
+        client, spec, runtime_secrets=runtime_secrets, on_environment_loaded=executed.append
     )
     if evidence:
         logger.info(
@@ -536,7 +538,7 @@ def _rollout_evidence_for(
             evidence.get("completion_tokens_mean") or 0.0,
             spec.train.max_completion_tokens or "recipe default",
         )
-    return evidence, executed
+    return evidence, tuple(executed)
 
 
 def _raise_if_workload_profile_pending(client: ApiClient, exc: ApiError) -> None:
@@ -776,9 +778,7 @@ def cmd_train(args) -> int:
         runtime_secrets_from_local_env(args.config, keys=spec.environment.secrets) or None
     )
     _warn_if_wandb_requested_without_key(spec, runtime_secrets, dry_run=bool(args.dry_run))
-    rollout_evidence, environment_was_executed = _rollout_evidence_for(
-        client, spec, runtime_secrets
-    )
+    rollout_evidence, environment_stages_run = _rollout_evidence_for(client, spec, runtime_secrets)
     if args.dry_run:
         # dry-run runs submit-time server preflights without allocating a training gpu or charging
         # for training. a rejection surfaces as the server's error with exit status 1. for sft it
@@ -809,7 +809,7 @@ def cmd_train(args) -> int:
                 algorithm=spec.algorithm,
                 affordability_verified=affordability_verified,
                 rollout_evidence=rollout_evidence,
-                environment_was_executed=environment_was_executed,
+                environment_stages_run=environment_stages_run,
             ),
             file=sys.stderr,
         )

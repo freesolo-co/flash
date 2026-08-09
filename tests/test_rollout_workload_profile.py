@@ -32,6 +32,7 @@ def _fields(**overrides) -> dict:
         # 8 distinct prompts x group of 4 = 32 rollouts, the measured floor. between-prompt
         # variance dominates, so the sample spreads across prompts before it repeats one.
         "sampled_prompts": 8,
+        "offered_prompts": 8,
         "completed_rollouts": 32,
         "failed_rollouts": 0,
         "completion_tokens_mean": 180.5,
@@ -166,7 +167,11 @@ def test_a_healthy_profile_is_trustworthy():
 
 def test_a_thin_sample_is_refused_even_though_nothing_failed():
     ok, reason = _profile(
-        sampled_prompts=3, completed_rollouts=3, truncated_rollouts=0, eos_rollouts=3
+        sampled_prompts=3,
+        offered_prompts=3,
+        completed_rollouts=3,
+        truncated_rollouts=0,
+        eos_rollouts=3,
     ).trustworthy(now=NOW)
     assert ok is False
     assert f"below the {MIN_TRUSTWORTHY_ROLLOUTS} needed" in reason
@@ -362,7 +367,13 @@ def test_require_rejects_a_profile_for_a_different_spec(kwargs, expected):
 
 def test_require_refuses_a_matching_but_untrustworthy_profile():
     """Identity and trust are checked together: matching this spec exactly is not enough."""
-    thin = _profile(sampled_prompts=2, completed_rollouts=2, truncated_rollouts=0, eos_rollouts=2)
+    thin = _profile(
+        sampled_prompts=2,
+        offered_prompts=2,
+        completed_rollouts=2,
+        truncated_rollouts=0,
+        eos_rollouts=2,
+    )
     with pytest.raises(WorkloadProfileMismatch, match="not trustworthy"):
         require_matching_rollout_profile(
             thin.to_dict(),

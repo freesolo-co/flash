@@ -154,11 +154,12 @@ export FLASH_ROLLOUT_SAMPLER_BASE_URL=...         # defaults to https://openrout
 generating: the prompts your environment builds are placed in chat-completions requests to
 `FLASH_ROLLOUT_SAMPLER_BASE_URL`, which defaults to OpenRouter, a third party. Point it at an
 endpoint you trust with your prompts, or leave the key unset. Your model is also named in those
-requests, and your environment's `reward()` is called locally on a small sample, so a reward that
-calls a paid external scorer really calls it.
+requests. Your environment's `dataset()` and `prompt_messages()` run locally to build those prompts,
+but `reward()` is **not** called: no grading happens here, so a reward that calls a paid external
+scorer is not invoked and its cost is not in this quote. The worker times its own scorer instead.
 
-What reaches the **Flash control plane** is aggregates only: token counts, grading latency, and how
-many draws survived. No prompts, completions, token ids, or credentials go to Flash. The server
+What reaches the **Flash control plane** is aggregates only: token counts and how many draws
+survived. No prompts, completions, token ids, or credentials go to Flash. The server
 re-derives the config digest itself and re-applies the same trust checks a server-side profile
 passes, so a measurement can only lower a quote by surviving those checks.
 

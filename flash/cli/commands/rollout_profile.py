@@ -23,6 +23,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from flash._internal.logging import get_logger
+
+logger = get_logger("flash.cli")
+
 _DEFAULT_ENVIRONMENT_PATH = "environment.py"
 
 # how many dataset rows to draw prompts from. prompt difficulty dominates length variance, so a
@@ -34,6 +38,11 @@ _PROMPT_ROWS = 8
 # template renders -- and this sampler would not send it.
 _SAMPLABLE_MESSAGE_KEYS = frozenset({"role", "content"})
 
+# wall-clock ceiling for the env's own data hooks. generous: a dataset() that pulls a real corpus
+# legitimately takes tens of seconds, and expiring early would silently return an otherwise
+# measurable run to cap pricing. it exists to stop UNBOUNDED blocking, not to police slow hooks.
+_LOCAL_HOOK_DEADLINE_S = 120.0
+
 
 def collect_for_submit(
     client,
@@ -41,7 +50,7 @@ def collect_for_submit(
     *,
     runtime_secrets: Mapping[str, str] | None = None,
     debug: bool = False,
-    on_environment_loaded: Callable[[], None] | None = None,
+    on_environment_loaded: Callable[[str], None] | None = None,
 ) -> dict[str, Any] | None:
     """measured rollout aggregates for ``spec``, or None when nothing could be measured.
 
@@ -51,10 +60,12 @@ def collect_for_submit(
     key would otherwise raise locally, and the broad except below would quietly return the quote to
     the cap. they are never persisted and never travel in the evidence, which is aggregates only.
 
-    ``on_environment_loaded`` fires once the user's module has been imported, before any of it is
-    called. returning None does NOT mean nothing ran: a multi-turn env, a dataset with no samplable
-    prompts, or a dead sampler all execute the user's code first. the caller reports what ran from
-    this hook rather than inferring it from the payload.
+    ``on_environment_loaded`` is called with the name of each env stage that actually ran
+    ("import", "dataset", "prompt_messages"). returning None does NOT mean nothing ran: a multi-turn
+    env, a dataset with no samplable prompts, or a dead sampler all execute some of the user's code
+    first. the caller reports what ran from these calls rather than inferring it from the payload,
+    and per-stage rather than one flag -- a multi-turn env declines after the import alone, so a
+    single "it ran" would still overclaim which hooks were called.
     """
     if spec.algorithm not in ("grpo", "opd"):
         return None
@@ -72,6 +83,19 @@ def collect_for_submit(
     try:
         with _runtime_secret_env(spec, runtime_secrets), _restored_host_rng():
             return _collect(client, spec, on_environment_loaded=on_environment_loaded)
+    except ImportError as exc:
+        if debug:
+            raise
+        # the base `freesolo-flash` package declares no dependencies, and the env loader needs the
+        # `freesolo` SDK -- so an isolated `uv tool`/`pipx` install cannot load an environment at
+        # all. still fail open, but say so once: the user set a sampler key expecting a measured
+        # quote, and silently pricing at the cap looks identical to the feature working.
+        logger.warning(
+            "rollout profiling is unavailable in this install, so this quote uses the declared "
+            "completion cap: %s",
+            exc,
+        )
+        return None
     except Exception:
         if debug:
             raise
@@ -130,16 +154,30 @@ def unsamplable_reason(spec) -> str:
         # currently points at. keying the revision in the digest stops the measurement being reused
         # for a DIFFERENT run, but cannot make this draw come from the pinned weights.
         return "pinned model revision"
-    if getattr(spec, "thinking", False):
-        # the worker renders prompts with enable_thinking=spec.thinking. the chat-completions
-        # request has no portable way to say that, and reasoning traces move completion length by
-        # far more than the trust gate's tolerance, so a wrong default is not a small error.
-        return "thinking mode"
     return ""
 
 
+def _thinking_for(spec) -> bool | None:
+    """the reasoning setting a draw must reproduce, or None when the model has no reasoning mode.
+
+    the worker renders every prompt with enable_thinking=spec.thinking, and BOTH values need saying
+    out loud: an endpoint that reasons by default would answer a thinking=False run with traces the
+    run never generates, which moves completion length by far more than the trust gate tolerates.
+    so the request states the setting explicitly and the response is checked against it, rather than
+    either value being left to the endpoint's default.
+    """
+    from flash.core.catalog import MODELS
+
+    model = MODELS.get(getattr(spec, "model", ""))
+    if model is not None and getattr(model, "thinking", "none") == "none":
+        # nothing to diverge. keyed off the catalog rather than hardcoded, so this stays true if a
+        # non-reasoning model is ever added.
+        return None
+    return bool(getattr(spec, "thinking", False))
+
+
 def _collect(
-    client, spec, *, on_environment_loaded: Callable[[], None] | None = None
+    client, spec, *, on_environment_loaded: Callable[[str], None] | None = None
 ) -> dict[str, Any] | None:
     from flash.engine.profiling.rollout_evidence import collect_rollout_evidence
     from flash.envs.loader import load_freesolo_environment
@@ -154,8 +192,7 @@ def _collect(
         environment = load_freesolo_environment(str(entrypoint), **(spec.environment.params or {}))
         # the user's module has executed by now. every return below this point is a decline, and
         # each one still ran their code -- so the caller is told here, not from the return value.
-        if on_environment_loaded is not None:
-            on_environment_loaded()
+        _ran("import", on_environment_loaded)
         if getattr(environment, "multi_turn", False):
             # the worker generates an assistant turn per step_episode call and trains on the whole
             # transcript. one hosted completion is the FIRST turn only, so its token mean
@@ -168,7 +205,11 @@ def _collect(
         # seed_host_rngs rather than seed_training_rngs: the same split the sft workload profile
         # uses, because it must not import torch into the cli.
         _seed_environment_rngs(spec)
-        dataset = environment.dataset()
+        # bounded: dataset() is user code that may block on a download or a stalled mount, and a
+        # submit must not hang because the optional sampler happened to be configured. no exception
+        # is raised by a hang, so the outer `except` could never regain control.
+        dataset = _within(_LOCAL_HOOK_DEADLINE_S, environment.dataset)
+        _ran("dataset", on_environment_loaded)
         if not dataset:
             return None
         # the grpo and opd workers fence the training population to a max_examples prefix
@@ -179,7 +220,10 @@ def _collect(
         if not dataset:
             return None
 
-        prompts = _prompts_from(environment, dataset)
+        # bounded for the same reason as dataset(): prompt_messages() is user code, called once per
+        # row, and a stall in any one of them would hang the submit.
+        prompts = _within(_LOCAL_HOOK_DEADLINE_S, _prompts_from, environment, dataset)
+        _ran("prompt_messages", on_environment_loaded)
         if not prompts:
             return None
 
@@ -199,6 +243,9 @@ def _collect(
             # a run configured with stop strings ends generation at the first one, so a sample
             # drawn without them measures a longer completion than training will ever produce.
             stop_sequences=tuple(getattr(spec.train, "stop_sequences", ()) or ()),
+            # stated explicitly and then verified against each response, because the worker renders
+            # every prompt with this value and the endpoint would otherwise apply its own default.
+            thinking=_thinking_for(spec),
         )
 
 
@@ -268,6 +315,41 @@ def _optional_torch():
     except ImportError:
         return None
     return torch
+
+
+def _ran(stage: str, report: Callable[[str], None] | None) -> None:
+    """record that one env stage actually executed."""
+    if report is not None:
+        report(stage)
+
+
+def _within(deadline_s: float, call, *args):
+    """``call(*args)``, or None when it does not finish within ``deadline_s``.
+
+    a daemon thread rather than a signal: signals only work on the main thread and this is library
+    code inside a cli, and rather than a subprocess because the env is already loaded in THIS
+    process. the cost is that an expired call keeps running in the background -- it cannot be
+    killed -- but it is a daemon, so it cannot keep the interpreter alive at exit.
+
+    that trade is only acceptable because this whole path is advisory: an expired hook returns the
+    quote to the declared cap, which is what an unmeasured run was priced at anyway.
+    """
+    import threading
+
+    box: list = []
+
+    def _run() -> None:
+        try:
+            box.append(call(*args))
+        except Exception:
+            # reported as "no measurement", like any other failure on this path. Exception rather
+            # than BaseException so a KeyboardInterrupt still propagates out of the worker.
+            box.append(None)
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(deadline_s)
+    return box[0] if box else None
 
 
 def _training_population(spec, dataset):

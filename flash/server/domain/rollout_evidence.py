@@ -32,6 +32,7 @@ _MAX_REWARD_SECONDS = 3600.0
 
 _REQUIRED_FIELDS = (
     "sampled_prompts",
+    "offered_prompts",
     "completed_rollouts",
     "failed_rollouts",
     "completion_tokens_mean",
@@ -138,6 +139,7 @@ def _validated_fields(evidence: dict) -> dict[str, Any] | None:
     try:
         fields: dict[str, Any] = {
             "sampled_prompts": int(evidence["sampled_prompts"]),
+            "offered_prompts": int(evidence["offered_prompts"]),
             "completed_rollouts": int(evidence["completed_rollouts"]),
             "failed_rollouts": int(evidence["failed_rollouts"]),
             "completion_tokens_mean": float(evidence["completion_tokens_mean"]),
@@ -163,6 +165,7 @@ def _validated_fields(evidence: dict) -> dict[str, Any] | None:
     # though: a claimed 10^9 rollouts of 10^9 tokens each is accepted there and scores trustworthy.
     counts = (
         fields["sampled_prompts"],
+        fields["offered_prompts"],
         fields["completed_rollouts"],
         fields["failed_rollouts"],
         fields["truncated_rollouts"],
