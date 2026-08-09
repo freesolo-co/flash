@@ -700,6 +700,13 @@ def preflight_validate_image_opd(spec) -> None:
                 "opd",
                 getattr(train, "teacher_model", None),
             )
-            if params.get("multi_turn") is True or params.get("max_turns") is not None:
+            # only `multi_turn` is a preflight signal. the authoritative source is the env CLASS
+            # (adapter.py sets multi_turn from isinstance(sdk_env, EnvironmentMultiTurn)), which
+            # this path deliberately cannot see: it reads the dataset file rather than importing
+            # user environment code before allocation. so a class-based multi-turn env is caught
+            # by the worker's fail-closed guard instead. `max_turns` must NOT reject here -- it is
+            # a turn CAP that single-turn envs may legitimately carry, and rejecting on it fails
+            # jobs the worker would happily run.
+            if params.get("multi_turn") is True:
                 raise ValueError("multi-turn image-bearing opd is not supported")
             return
