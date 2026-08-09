@@ -18,25 +18,19 @@ from flash.engine.worker.perf.attn import (
     _attn_impl_for_capability,
     _flash_attn_3_available,
     _flash_attn_available,
-    _sdpa_cudnn_ctx,
     optimal_attn_impl,
 )
 from flash.engine.worker.perf.diagnostics import (
     _clean_diag,
     _float_or_none,
-    _GpuPeakSampler,
     _int_or_none,
-    _peak_gpu_gb,
     _query_nvidia_gpu,
     _query_nvidia_processes,
-    _reset_peak_gpu,
     _round_gb_from_mib,
     gpu_diagnostics,
 )
 from flash.engine.worker.perf.lifecycle import (
     RetriableInfraError,
-    _metric_curve,
-    free_gpu,
     is_cuda_oom,
     wait_for_gpu,
 )
@@ -44,14 +38,10 @@ from flash.engine.worker.perf.liger import (
     _estimate_params,
     _liger_default_for_model,
 )
-from flash.engine.worker.perf.loraplus import loraplus_optimizer_cls
 from flash.engine.worker.perf.memory import (
     _memory_mode,
-    enable_multimodal_input_require_grads,
-    fused_optim_name,
     grad_checkpointing_on,
     grpo_use_reentrant,
-    make_multimodal_input_require_grads_callback,
 )
 
 
@@ -431,7 +421,6 @@ def _ensure_fla_fastpath_on_hopper() -> None:
 
 __all__ = [
     "RetriableInfraError",
-    "_GpuPeakSampler",
     "_attn_impl_for_capability",
     "_clean_diag",
     "_ensure_fla_fastpath_on_hopper",
@@ -444,25 +433,16 @@ __all__ = [
     "_int_or_none",
     "_liger_default_for_model",
     "_memory_mode",
-    "_metric_curve",
     "_neutralize_tilelang_cudart_stub",
-    "_peak_gpu_gb",
     "_query_nvidia_gpu",
     "_query_nvidia_processes",
     "_remove_fla_from_disk",
-    "_reset_peak_gpu",
     "_restrict_fla_gdn_autotune_on_blackwell",
     "_round_gb_from_mib",
-    "_sdpa_cudnn_ctx",
-    "enable_multimodal_input_require_grads",
-    "free_gpu",
-    "fused_optim_name",
     "gpu_diagnostics",
     "grad_checkpointing_on",
     "grpo_use_reentrant",
     "is_cuda_oom",
-    "loraplus_optimizer_cls",
-    "make_multimodal_input_require_grads_callback",
     "optimal_attn_impl",
     "wait_for_gpu",
 ]

@@ -234,30 +234,3 @@ def wait_for_gpu(requested_gpu: str | None = None, *, gpu_type: str = ""):
         print(f"GPU not ready (try {i + 1}/12): {last}; sleeping 10s")
         _t.sleep(10)
     raise RetriableInfraError(f"GPU never became ready after 12 tries: {last}")
-
-
-def free_gpu(trainer=None):
-    try:
-        import gc
-
-        import torch
-
-        try:
-            if trainer is not None and hasattr(trainer, "model"):
-                trainer.model = None
-        except Exception:
-            pass
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception as e:
-        print("free_gpu warn:", e)
-
-
-def _metric_curve(trainer, key: str) -> list:
-    """Logged values of `key` from trainer log history, rounded and capped at 400. Never raises."""
-    try:
-        vals = [round(float(h[key]), 4) for h in trainer.state.log_history if key in h]
-        return vals[:400]
-    except Exception:
-        return []
