@@ -363,17 +363,10 @@ def test_multimodal_scoring_rejects_prompt_ids_unchanged_by_image():
     assert error.value.permanent is True
 
 
-@pytest.mark.parametrize(
-    ("prompt_ids", "matches"),
-    [
-        ([10, 151655, 11, 203, 204], 0),
-        ([10, 151655, 201, 202, 11, 201, 202], 2),
-    ],
-)
-def test_multimodal_completion_id_run_must_be_unique(prompt_ids, matches):
-    response = _multimodal_response(prompt_ids)
+def test_multimodal_completion_ids_must_be_present():
+    response = _multimodal_response([10, 151655, 11, 203, 204])
 
-    with pytest.raises(TeacherError, match=rf"found {matches} matches") as error:
+    with pytest.raises(TeacherError, match="found no match") as error:
         _multimodal_client(response).score_many_multimodal(
             [
                 (
@@ -385,6 +378,64 @@ def test_multimodal_completion_id_run_must_be_unique(prompt_ids, matches):
         )
 
     assert error.value.permanent is True
+
+
+def test_multimodal_scoring_anchors_to_the_trailing_completion_run():
+    # a valid rollout whose PROMPT quotes the answer: the completion ids appear twice. requiring
+    # global uniqueness would permanently fail it, so anchor to the trailing run -- the one
+    # _chat_messages appends. the scored logprobs must come from that occurrence, not the first.
+    prompt_ids = [10, 151655, 201, 202, 11, 201, 202]
+    scored = _multimodal_client(_multimodal_response(prompt_ids)).score_many_multimodal(
+        [
+            (
+                [{"role": "user", "content": "<|media_pad|>"}],
+                "red",
+                ["data:image/png;base64,aW1hZ2U="],
+            )
+        ]
+    )[0]
+
+    # logprob is -0.1 * index, so the trailing pair (indices 5, 6) is distinguishable from the
+    # leading one (indices 2, 3). asserting the VALUES is what proves which run was scored.
+    assert [round(token.logprob, 4) for token in scored.tokens] == [-0.5, -0.6]
+
+
+def test_multimodal_scoring_rejects_a_partially_dropped_image():
+    # two images supplied, one expanded. a raw pad COUNT cannot catch this -- the surviving image
+    # alone contributes more pads than the image count -- so this is the case that proves the
+    # guard counts per-image runs.
+    prompt_ids = [10, 151655, 151655, 151655, 11, 201, 202]
+    response = _multimodal_response(prompt_ids)
+
+    with pytest.raises(TeacherError, match="fewer images") as error:
+        _multimodal_client(response).score_many_multimodal(
+            [
+                (
+                    [{"role": "user", "content": "<|media_pad|><|media_pad|>"}],
+                    "red",
+                    ["data:image/png;base64,aW1hZ2U=", "data:image/png;base64,aW1hZ2Uy"],
+                )
+            ]
+        )
+
+    assert error.value.permanent is True
+
+
+def test_multimodal_scoring_admits_two_genuinely_expanded_images():
+    # the paired control: the same two-image request, both expanded, must be ADMITTED. a guard
+    # that rejects valid traffic is as broken as one that never fires.
+    prompt_ids = [10, 151655, 151655, 11, 151655, 151655, 12, 201, 202]
+    scored = _multimodal_client(_multimodal_response(prompt_ids)).score_many_multimodal(
+        [
+            (
+                [{"role": "user", "content": "<|media_pad|><|media_pad|>"}],
+                "red",
+                ["data:image/png;base64,aW1hZ2U=", "data:image/png;base64,aW1hZ2Uy"],
+            )
+        ]
+    )[0]
+
+    assert len(scored.tokens) == 2
 
 
 def test_score_many_caps_in_flight_requests_at_the_measured_ceiling():

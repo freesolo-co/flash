@@ -404,6 +404,23 @@ def _contiguous_run_starts(values: list[int], target: list[int]) -> list[int]:
     ]
 
 
+def _image_pad_runs(values: list[int], image_pad_token_id: int) -> int:
+    """Count maximal runs of the image-pad token, i.e. how many images actually expanded.
+
+    one image expands to MANY identical pad tokens (64 for a 64px image), so a raw count cannot
+    distinguish "two images" from "one image, one silently dropped": the surviving image alone
+    supplies far more pads than the image count. runs are per-image, so they can.
+    """
+    runs = 0
+    previous_was_pad = False
+    for value in values:
+        is_pad = value == image_pad_token_id
+        if is_pad and not previous_was_pad:
+            runs += 1
+        previous_was_pad = is_pad
+    return runs
+
+
 def _normalize_multimodal_response(
     response: dict[str, Any],
     *,
@@ -419,23 +436,27 @@ def _normalize_multimodal_response(
     if len(generated_ids) != 1:
         raise _permanent("teacher response must contain exactly one generated token id")
     remote_ids = _integer_list(response.get("prompt_token_ids"), field="prompt_token_ids")
-    if remote_ids.count(image_pad_token_id) < image_count:
+    if _image_pad_runs(remote_ids, image_pad_token_id) < image_count:
         raise _permanent(
-            "teacher response contains no image token expansion; the provider may have silently "
-            "dropped an image"
+            "teacher response expanded fewer images than were supplied; the provider may have "
+            "silently dropped an image"
         )
     local_completion_ids = [token.token_id for token in encoded_completion]
     matches = _contiguous_run_starts(remote_ids, local_completion_ids)
-    if len(matches) != 1:
+    if not matches:
         raise _permanent(
-            "teacher response must contain the completion token ids as exactly one contiguous run; "
-            f"found {len(matches)} matches"
+            "teacher response must contain the completion token ids as a contiguous run; "
+            "found no match"
         )
     input_tokens, output_tokens = _validated_usage(response, len(remote_ids))
     scores = _token_keyed_scores(response.get("prompt_logprobs"), remote_ids)
     if scores is None:
         raise _permanent("teacher response is missing top-level prompt_logprobs")
-    start = matches[0]
+    # the LAST occurrence, not the only one. _chat_messages always appends the completion to the
+    # trailing assistant turn, so it is the final run by construction. requiring global uniqueness
+    # instead would permanently fail valid rollouts whose prompt happens to quote the answer -- a
+    # list-style prompt ("The options are:\nsquare\ncircle") answered with "square" matches twice.
+    start = matches[-1]
     completion_scores = scores[start : start + len(encoded_completion)]
     tokens = _completion_tokens(
         encoded_completion,
