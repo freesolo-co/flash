@@ -3767,3 +3767,159 @@ def test_grpo_does_not_enable_tf32_in_the_parent():
     assert "setup_perf_backends" not in called, (
         "rl_train calls setup_perf_backends in the parent; the trainer child inherits none of it"
     )
+
+
+def test_agent_loop_workers_warns_when_a_prime_batch_serializes_the_rollout(capsys):
+    """A prime rollout batch silently costs up to 8x rollout throughput, so it must be announced.
+
+    ``agent_loop_workers`` returns the largest divisor of the batch that is <= cap because verl
+    asserts the chunk split is exact. For a prime batch the only such divisor is 1, so the pool
+    collapses to a single worker and the rollout runs fully serialized. Nothing raises and nothing
+    else reports it, so the only symptom is a slower run -- which is indistinguishable from a slow
+    environment unless the worker says so.
+    """
+    assert vc.agent_loop_workers(13) == 1
+    warned = capsys.readouterr().out
+    assert "serialized" in warned
+    assert "13" in warned
+
+    # a composite batch keeps its parallelism and stays quiet: a warning on every run would train
+    # the operator to ignore it.
+    assert vc.agent_loop_workers(16) == 8
+    assert capsys.readouterr().out == ""
+
+    # batch 1 is genuinely one unit of work, not a degraded split, so it is not a warning either.
+    assert vc.agent_loop_workers(1) == 1
+    assert capsys.readouterr().out == ""
+
+
+def _fake_torch(*, available=True, capability=(9, 0), raises=False):
+    class _Cuda:
+        @staticmethod
+        def is_available():
+            if raises:
+                raise RuntimeError("driver died")
+            return available
+
+        @staticmethod
+        def get_device_capability(_index=0):
+            if raises:
+                raise RuntimeError("driver died")
+            return capability
+
+    return SimpleNamespace(cuda=_Cuda())
+
+
+def test_fused_ce_backend_picks_triton_only_where_it_measured_faster():
+    """The triton fused-CE backend wins on sm90+ and LOSES below it, so the choice is per card.
+
+    Measured fwd+bwd at 4096x2560 into a 248320 vocab, paired and alternating: triton is 2.25x
+    faster on H100 (sm90) but 3.28x SLOWER on A100 (sm80) and 1.43x slower on A40 (sm86). A blanket
+    flip to triton -- which reads as the obvious "use the fused kernel" change -- would therefore
+    slow down every run on the two oldest fleet classes. Pin the boundary so a later edit cannot
+    quietly widen it.
+    """
+    for capability in ((9, 0), (10, 0), (12, 0)):
+        assert vc.fused_ce_backend({"capability": list(capability)}) == "triton", capability
+
+    # sm80 (A100) and sm86 (A10/A40) are real fleet classes, not hypotheticals, and sm89 is the
+    # RTX 4090 -- the cheapest class the allocator reaches first.
+    for capability in ((8, 0), (8, 6), (8, 9)):
+        assert vc.fused_ce_backend({"capability": list(capability)}) == "torch", capability
+
+
+def test_fused_ce_backend_falls_back_to_the_current_behaviour_when_it_cannot_probe():
+    """No device, or a device that will not answer, must yield `torch` -- today's behaviour.
+
+    The fallback matters more than it looks: `torch` is what all three trainers pinned before this
+    gate existed, so an unreadable capability degrades to the previously shipping configuration
+    rather than to an untested one. The probe reports every one of these as a missing or unusable
+    `capability` entry (`probe_verl_capabilities` emits None when cuda is absent or the import
+    raises), so they all funnel through `verl_device_capability` returning None.
+    """
+    for caps in ({}, {"capability": None}, {"capability": []}, {"capability": ["x", "y"]}):
+        assert vc.fused_ce_backend(caps) == "torch", caps
+
+
+def test_fused_ce_backend_does_not_open_a_cuda_context_in_the_parent():
+    """The gate must read the child's probe, never `torch.cuda` in this long-lived process.
+
+    Initializing cuda here to answer one question retains a context for the process lifetime on the
+    devices `torchrun` is about to own -- unbudgeted VRAM against a reserve sized without it. It is
+    also the wrong interpreter: verl pins its own torch, and the question is about verl's kernels.
+
+    A stub torch whose `get_device_capability` raises stands in for "somebody reintroduced the live
+    probe": if the gate touches it at all, this fails instead of silently regressing.
+    """
+    exploding = _fake_torch(raises=True)
+
+    with mock.patch.dict(sys.modules, {"torch": exploding}):
+        assert vc.fused_ce_backend({"capability": [9, 0]}) == "triton"
+        assert vc.fused_ce_backend({"capability": [8, 0]}) == "torch"
+
+
+def test_every_trainer_asks_for_the_backend_rather_than_hardcoding_one():
+    """All three algos must route through the gate; a leftover literal would silently opt out.
+
+    Asserted on the source because the alternative -- building each trainer's full hydra override
+    list -- needs a model download and a GPU. The literal `impl_backend=torch` is exactly what this
+    change removes, so its absence is the property worth pinning.
+
+    Each trainer resolves the backend once from `caps` and threads the ANSWER through its config
+    dict, so the override builders read `cfg[...]` and only the call sites name the helper.
+    """
+    import flash.engine.worker.opd_train as opd_train
+    import flash.engine.worker.rl_train as rl_train
+    import flash.engine.worker.sft_train as sft_train
+
+    for module in (sft_train, rl_train, opd_train):
+        source = pathlib.Path(module.__file__).read_text()
+        code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
+        assert "impl_backend=torch" not in code, module.__name__
+        assert "fused_ce_backend(caps)" in code, module.__name__
+        # the caps-taking form is the whole point of the fix; a bare call would be the parent-cuda
+        # probe coming back.
+        assert "fused_ce_backend()" not in code, module.__name__
+
+
+def test_every_trainer_probes_capabilities_for_every_model_not_just_gdn():
+    """`caps` must be populated unconditionally, or the backend gate silently degrades to torch.
+
+    Only `gdn_module` is architecture-conditional -- it is `""` for a non-hybrid, which the probe
+    accepts as "skip the gdn question" (`probe_verl_capabilities(python_bin, gdn_module="")`). The
+    PROBE ITSELF answers questions that have nothing to do with gdn: the device capability this
+    backend gate reads, the logger set, the vllm field list.
+
+    Binding `caps` under an `if gdn_hybrid:` would leave it empty for every non-gdn checkpoint, so
+    `verl_device_capability` would return None and the gate would yield `torch` on a card where
+    triton measured 2.25x faster. That failure is invisible today -- every catalog model is a gdn
+    hybrid -- which is exactly why it needs a test rather than a reader noticing it later.
+    """
+    import flash.engine.worker.opd_train as opd_train
+    import flash.engine.worker.rl_train as rl_train
+    import flash.engine.worker.sft_train as sft_train
+
+    for module in (sft_train, rl_train, opd_train):
+        lines = pathlib.Path(module.__file__).read_text().splitlines()
+        probes = [
+            (n, line)
+            for n, line in enumerate(lines, 1)
+            if "caps = probe_verl_capabilities(" in line
+        ]
+        assert len(probes) == 1, f"{module.__name__}: expected exactly one probe, got {probes}"
+
+        n, line = probes[0]
+        indent = len(line) - len(line.lstrip())
+        # walk back to the nearest enclosing statement that is less indented; it must not be a
+        # conditional on the architecture. checking the text of the probe line alone would pass
+        # even when the whole block is skipped for a non-hybrid.
+        for prev in reversed(lines[: n - 1]):
+            if not prev.strip() or prev.lstrip().startswith("#"):
+                continue
+            prev_indent = len(prev) - len(prev.lstrip())
+            if prev_indent < indent:
+                assert "gdn" not in prev.lower(), (
+                    f"{module.__name__}:{n} probes capabilities under `{prev.strip()}` -- "
+                    "non-gdn runs would get empty caps and lose the triton backend"
+                )
+                break

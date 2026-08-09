@@ -13,9 +13,9 @@ def test_required_vram_catalog_and_open(monkeypatch):
     # MEASURED: tiny-model GRPO OOMs a 20 GB card (vLLM-colocate engine overhead the param
     # estimate missed); floored to the 24 GB vLLM-colocate minimum (_VLLM_COLOCATE_FLOOR_GB).
     assert required_vram_gb("Qwen/Qwen3.5-0.8B", "grpo") == 24
-    assert (
-        required_vram_gb("Qwen/Qwen3.5-4B", "sft") == 19
-    )  # chunked nll bounds the vocab projection to 256 tokens
+    # chunked nll bounds the vocab projection to one verl FusedLinearForPPO chunk (512 token rows,
+    # NOT 256): 512 * 248320 * 16 B = 2.03 GB, which is what the child actually allocates.
+    assert required_vram_gb("Qwen/Qwen3.5-4B", "sft") == 20
     # sized for GRPO (the heavier phase of the usual SFT+GRPO run) + headroom
     monkeypatch.setattr(vram, "fetch_hf_params_b", lambda m, **k: 4.0)
     est = vram.estimate_vram_gb(4.0, "grpo")
@@ -1256,7 +1256,8 @@ def test_required_vram_qwen_chunked_nll_drops_big_vocab_logits():
         )
         * 1.1
     )
-    assert n_short == expected == 9
+    # 10, not 9: the reserved projection is one 512-row verl fused-CE chunk, not 256 rows.
+    assert n_short == expected == 10
     n_long = required_vram_gb(model_id, "sft", train={"max_context_tokens": 2048})
     assert n_long >= n_short
 
@@ -1272,7 +1273,7 @@ def test_qwen4b_sft_8192_chunked_nll_routes_to_32gb_card(monkeypatch):
     train = {"epochs": 1, "max_examples": 4020, "max_context_tokens": 8192, "lora_rank": 32}
 
     need = required_vram_gb("Qwen/Qwen3.5-4B", "sft", train=train)
-    assert need == 27
+    assert need == 28
 
     preview_gpu = provisional_gpu("Qwen/Qwen3.5-4B", "sft", train=train)
     alloc = allocator.allocate("Qwen/Qwen3.5-4B", "sft", train=train)
@@ -1680,3 +1681,34 @@ def test_combo_summary_shows_count_and_total(monkeypatch):
     s = allocator.allocation_summary(a)
     assert "2x A100 PCIe" in s
     assert "$3.00/hr" in s
+
+
+def test_fused_ce_chunk_matches_verl_default():
+    """the reserved vocab projection must equal what the verl child actually allocates.
+
+    both sizing paths bound the projection by verl's ``FusedLinearForPPO(chunk_size=...)`` default.
+    reserving fewer rows than the child projects under-reserves, which admits a job that then OOMs
+    on a paid gpu -- the failure this pins. the literal 512 is deliberate: deriving it from
+    ``VERL_FUSED_CE_CHUNK_TOKENS`` would move with the constant and never fail.
+    """
+    from flash.engine.plan import vram
+
+    assert vram.VERL_FUSED_CE_CHUNK_TOKENS == 512
+    assert vram._SFT_CHUNKED_NLL_TOKENS == 512
+    assert vram.OPD_CE_CHUNK_SIZE == 512
+
+
+def test_sft_default_context_tracks_thinking_mode():
+    """unauthored sft context must size at the length the worker trains on, per mode.
+
+    ``sft_max_length`` trims rows to ``RECIPE.sft.max_seq_len_thinking`` when thinking is on, so a
+    flat non-thinking default sized activations for half the real sequence.
+    """
+    from flash.engine.plan.recipe import RECIPE
+    from flash.engine.plan.vram import model_required_vram_gb
+
+    assert RECIPE.sft.max_seq_len_thinking > RECIPE.sft.max_seq_len
+    mid = "Qwen/Qwen3.5-4B"
+    plain = model_required_vram_gb(mid, "sft", thinking=False)
+    thinking = model_required_vram_gb(mid, "sft", thinking=True)
+    assert thinking > plain, (plain, thinking)
