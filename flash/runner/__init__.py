@@ -736,9 +736,9 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
     public_sha = public_environment.get("resolved_sha")
     effective_sha = effective_environment.get("resolved_sha")
     if not public_sha and isinstance(effective_sha, str):
-        from flash.envs.loader import _is_commit_sha
+        from flash.envs.loader import is_commit_sha
 
-        if _is_commit_sha(effective_sha):
+        if is_commit_sha(effective_sha):
             effective_environment["resolved_sha"] = ""
     effective["environment"] = effective_environment
     public_gpu = dict(public["gpu"])
