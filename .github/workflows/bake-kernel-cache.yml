@@ -135,7 +135,7 @@ jobs:
 
       - name: Log in to GHCR
         if: steps.gate.outputs.run == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -167,14 +167,14 @@ jobs:
       # Pin the checkout to the base's source commit so the warmed flash code matches the base exactly
       # (the cache is content-keyed by the code that compiled it). Falls back to the event sha if the
       # base predates the revision label.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         if: steps.gate.outputs.run == 'true'
         with:
           ref: ${{ steps.base.outputs.revision || github.sha }}
 
       - name: Install uv
         if: steps.gate.outputs.run == 'true'
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           # no cache: the post-run cache-prune calls `uv`, but the "Free disk space" step deletes
           # /opt/hostedtoolcache (where setup-uv put uv), so the post step fails ("uv not found") and
@@ -215,7 +215,7 @@ jobs:
           sudo docker image prune -af || true
           df -h /
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
         if: steps.gate.outputs.run == 'true'
 
       # thin layer FROM the SAME base the warmup ran inside -> the cache toolchain always matches the
@@ -223,7 +223,7 @@ jobs:
       # published base and bake a cache that silently won't load). GHCR auth from the login step above.
       - name: Build + push baked per-sm image (thin layer on the warmed base)
         if: steps.gate.outputs.run == 'true'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: docker/Dockerfile.kernelcache

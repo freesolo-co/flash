@@ -6,17 +6,36 @@ on:
   pull_request:
     branches: [main, dev]
 
+permissions:
+  contents: read
+
+# A public repo takes a full run on every push to every fork PR branch. Without this, a
+# superseded run keeps a runner for the whole suite while its replacement queues behind it.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    name: lint + offline tests
+    name: lint + offline tests (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    # The suite is CPU-only and finishes well inside this; the cap is here so a wedged run
+    # releases its runner instead of holding it for the 6-hour default.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # pyproject declares `requires-python = ">=3.11,<3.13"`, so both supported interpreters
+        # are tested. Testing only 3.11 let a 3.12-only failure reach a user the project claims
+        # to support.
+        python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
 
       - name: Sync (server extra + dev)
         run: uv sync --extra server --dev
@@ -30,5 +49,55 @@ jobs:
       - name: Ruff format check
         run: uv run ruff format --check .
 
+      # The job has always been NAMED offline (tests/conftest.py stubs the network boundaries in
+      # Python), but nothing enforced it, so a test that reached hf.co passed on a connected
+      # runner and would go red on a blip. Setting these makes the name true: an unstubbed call
+      # fails locally and deterministically instead of intermittently in CI.
       - name: Tests (CPU, offline)
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+          HF_HUB_DISABLE_TELEMETRY: "1"
         run: uv run pytest -q
+
+  # `lint + offline tests` is the required status check, and the matrix above turned that one
+  # check into two per-version checks. This aggregate keeps a single stable name for branch
+  # protection to require, and fails if either matrix leg failed or was cancelled.
+  test-result:
+    name: lint + offline tests
+    runs-on: ubuntu-latest
+    needs: test
+    if: always()
+    timeout-minutes: 5
+    steps:
+      - name: Require every matrix leg to have succeeded
+        env:
+          RESULT: ${{ needs.test.result }}
+        run: |
+          if [ "$RESULT" != "success" ]; then
+            echo "::error::matrix job 'test' finished with result '$RESULT'."
+            exit 1
+          fi
+          echo "All matrix legs passed."
+
+  typecheck:
+    name: mypy (non-blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # mypy is configured in pyproject but has never been enforced, and currently reports 352
+    # errors across 75 files. Running it non-blocking makes that debt visible on every PR
+    # without turning an unrelated contribution red; flip this to a hard gate once it is clean.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          python-version: "3.11"
+
+      - name: Sync (server extra + dev)
+        run: uv sync --extra server --dev
+
+      - name: mypy
+        run: uv run mypy flash
