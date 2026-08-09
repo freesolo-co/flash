@@ -7,7 +7,12 @@ from pathlib import Path
 import pytest
 
 from flash.engine.plan.recipe import TEACHER_MODELS, resolve_teacher
-from flash.engine.worker.teacher.client import TeacherClient, TeacherError, TeacherScore
+from flash.engine.worker.teacher.client import (
+    TeacherClient,
+    TeacherError,
+    TeacherScore,
+    _chat_messages,
+)
 from flash.engine.worker.teacher.encoding import (
     EncodedTeacherToken,
     _byte_piece_offsets,
@@ -436,6 +441,41 @@ def test_multimodal_scoring_admits_two_genuinely_expanded_images():
     )[0]
 
     assert len(scored.tokens) == 2
+
+
+def test_multimodal_completion_opens_a_new_assistant_turn():
+    # the student froze its prompt with add_generation_prompt=True, so the sampled tokens follow a
+    # NEW assistant boundary. gluing them onto an assistant turn from the environment's own history
+    # would score them as a continuation of that turn -- a silently different conditioning prefix,
+    # which produces plausible logprobs against the wrong context rather than an error.
+    messages = _chat_messages(
+        [
+            {"role": "user", "content": "<|media_pad|>"},
+            {"role": "assistant", "content": "Earlier reply."},
+        ],
+        "NEW",
+        ["data:image/png;base64,aW1hZ2U="],
+    )
+
+    assert messages[-2] == {"role": "assistant", "content": "Earlier reply."}
+    assert messages[-1] == {"role": "assistant", "content": "NEW"}
+
+
+def test_multimodal_thinking_prefill_continues_the_same_assistant_turn():
+    # the ONE case that legitimately continues the trailing turn: the student sampled AFTER the
+    # synthetic prefill inside that same assistant turn, so the teacher must condition identically.
+    messages = _chat_messages(
+        [
+            {"role": "user", "content": "<|media_pad|>"},
+            {"role": "assistant", "content": "<think>\n"},
+        ],
+        "NEW",
+        ["data:image/png;base64,aW1hZ2U="],
+        continue_final_assistant=True,
+    )
+
+    assert [m["role"] for m in messages].count("assistant") == 1
+    assert messages[-1] == {"role": "assistant", "content": "<think>\nNEW"}
 
 
 def test_score_many_caps_in_flight_requests_at_the_measured_ceiling():

@@ -341,6 +341,8 @@ def _chat_messages(
     prompt_messages: list[dict[str, Any]],
     completion_text: str,
     image_data_uris: list[str] | tuple[str, ...],
+    *,
+    continue_final_assistant: bool = False,
 ) -> list[dict[str, Any]]:
     if not prompt_messages:
         raise _permanent("teacher multimodal scoring requires prompt messages")
@@ -387,7 +389,18 @@ def _chat_messages(
         raise _permanent("teacher prompt has fewer image placeholders than image data URIs")
     if image_count == 0:
         raise _permanent("teacher multimodal scoring requires at least one image")
-    if output[-1]["role"] == "assistant" and isinstance(output[-1]["content"], str):
+    # the student froze its prompt with add_generation_prompt=True, so the sampled tokens live
+    # after a NEW assistant boundary. concatenating onto a historical assistant turn would score
+    # them as a continuation of that turn, conditioning the opd target on a different prefix than
+    # the one the student actually sampled under. the text path has the same contract: it always
+    # appends a fresh "Assistant: " (see _teacher_prompt_text). the ONE case that genuinely
+    # continues the trailing turn is the synthetic thinking prefill, which the caller flags,
+    # because the student sampled after that prefill within the same assistant turn.
+    if (
+        continue_final_assistant
+        and output[-1]["role"] == "assistant"
+        and isinstance(output[-1]["content"], str)
+    ):
         output[-1]["content"] += completion_text
     else:
         output.append({"role": "assistant", "content": completion_text})
@@ -602,6 +615,7 @@ class TeacherClient:
         prompt_messages: list[dict[str, Any]],
         completion_text: str,
         image_data_uris: list[str] | tuple[str, ...],
+        continue_final_assistant: bool = False,
     ) -> TeacherScore:
         encoded_completion = self.tokenizer.encode(completion_text)
         image_pad_tokens = self.tokenizer.encode(_IMAGE_PAD_TOKEN)
@@ -609,7 +623,12 @@ class TeacherClient:
             raise _permanent(
                 "managed vision teacher tokenizer must encode the image-pad marker as one token"
             )
-        messages = _chat_messages(prompt_messages, completion_text, image_data_uris)
+        messages = _chat_messages(
+            prompt_messages,
+            completion_text,
+            image_data_uris,
+            continue_final_assistant=continue_final_assistant,
+        )
         response = self._post(
             "/v1/teacher/chat_completions",
             {
@@ -651,7 +670,7 @@ class TeacherClient:
 
     def score_many_multimodal(
         self,
-        items: list[tuple[list[dict[str, Any]], str, list[str] | tuple[str, ...]]],
+        items: list[tuple[list[dict[str, Any]], str, list[str] | tuple[str, ...], bool]],
     ) -> list[TeacherScore]:
         """Score image-conditioned completions through the managed chat broker route."""
         if not items:

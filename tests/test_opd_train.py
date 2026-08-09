@@ -2637,6 +2637,10 @@ def test_multimodal_bridge_scores_frozen_images_through_structured_teacher_messa
             ],
             "A",
             ["data:image/png;base64,frozen-descriptor:/package"],
+            # a thinking prefill IS the trailing assistant turn the student sampled after, so the
+            # teacher continues it. without a prefill this is False and the completion opens its
+            # own turn, so an environment's historical assistant message cannot absorb it.
+            True,
         )
     ]
     assert encoded["teacher_ids"] == [-1, 0, -1, -1]

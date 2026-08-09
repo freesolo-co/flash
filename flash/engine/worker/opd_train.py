@@ -705,8 +705,17 @@ class _TeacherAlignmentBridge:
                     prompt.image_descriptors,
                     prompt.package_root,
                 )
+                # only the synthetic thinking prefill continues the trailing assistant turn; an
+                # assistant turn from the environment's own history must not absorb the completion.
                 teacher_score = self.teacher.score_many_multimodal(
-                    [(teacher_messages, completion_text, teacher_images)]
+                    [
+                        (
+                            teacher_messages,
+                            completion_text,
+                            teacher_images,
+                            bool(self.thinking_prefill),
+                        )
+                    ]
                 )[0]
             else:
                 teacher_prompt = _teacher_prompt_text(

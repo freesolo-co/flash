@@ -435,6 +435,31 @@ def test_image_teacher_prompt_uses_one_media_pad_per_descriptor_in_order():
         mm.image_teacher_prompt_messages(messages, 1)
 
 
+def test_image_teacher_prompt_rejects_the_placeholder_in_user_text():
+    # the placeholder marks image positions and the client splits on EVERY occurrence, so one
+    # sitting in the user's own text would be paired with an image that does not exist. reject it
+    # here, naming the offending message, rather than failing downstream as a count mismatch that
+    # reads like an internal bug. covers both the block-list and plain-string content shapes.
+    blocks = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"what is {mm.IMAGE_TEACHER_PLACEHOLDER} here?"},
+                {"type": "image"},
+            ],
+        }
+    ]
+    with pytest.raises(ValueError, match="reserved image placeholder"):
+        mm.image_teacher_prompt_messages(blocks, 1)
+
+    plain = [
+        {"role": "system", "content": f"never emit {mm.IMAGE_TEACHER_PLACEHOLDER}"},
+        {"role": "user", "content": [{"type": "image"}]},
+    ]
+    with pytest.raises(ValueError, match="reserved image placeholder"):
+        mm.image_teacher_prompt_messages(plain, 1)
+
+
 def test_text_only_prompt_messages_drops_images_and_preserves_text_order():
     image_module = pytest.importorskip("PIL.Image")
     pil = image_module.new("RGB", (1, 1), "red")

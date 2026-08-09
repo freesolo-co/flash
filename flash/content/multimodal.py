@@ -272,6 +272,23 @@ def text_only_prompt_messages(messages: list[dict]) -> list[dict]:
     return stripped
 
 
+def _reject_literal_image_placeholder(text: str, message_index: int) -> None:
+    """Reject prompt text that already contains the media placeholder.
+
+    the rendered prompt marks image positions with a placeholder string, and the teacher client
+    splits on every occurrence to pair each one with an image. a placeholder occurring in the
+    USER'S OWN text is indistinguishable from one this renderer inserted, so it would be paired
+    with an image that does not exist. rejecting here names the real problem against the source
+    message, instead of failing later as a placeholder/URI count mismatch that reads like an
+    internal bug.
+    """
+    if IMAGE_TEACHER_PLACEHOLDER in text:
+        raise ValueError(
+            f"message {message_index} text contains the reserved image placeholder "
+            f"{IMAGE_TEACHER_PLACEHOLDER!r}; remove it from the prompt"
+        )
+
+
 def image_teacher_prompt_messages(messages: list[dict], descriptor_count: int) -> list[dict]:
     """Render normalized image blocks as Kimi media placeholders without changing text order."""
     rendered: list[dict] = []
@@ -289,6 +306,7 @@ def image_teacher_prompt_messages(messages: list[dict], descriptor_count: int) -
                     )
                 block_type = block.get("type")
                 if block_type == "text" and isinstance(block.get("text"), str):
+                    _reject_literal_image_placeholder(block["text"], message_index)
                     parts.append(block["text"])
                 elif block_type in _IMAGE_BLOCK_TYPES:
                     parts.append(IMAGE_TEACHER_PLACEHOLDER)
@@ -301,7 +319,9 @@ def image_teacher_prompt_messages(messages: list[dict], descriptor_count: int) -
             copied["content"] = "".join(parts)
         elif content is None:
             copied["content"] = ""
-        elif not isinstance(content, str):
+        elif isinstance(content, str):
+            _reject_literal_image_placeholder(content, message_index)
+        else:
             raise ValueError(f"message {message_index} content must be text or content blocks")
         rendered.append(copied)
     if image_count != descriptor_count:
