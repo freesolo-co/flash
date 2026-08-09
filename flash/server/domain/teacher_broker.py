@@ -539,20 +539,13 @@ def _validated_provider_response(
     )
 
 
-def complete_teacher_request(
-    *,
-    capability_token: str,
-    request_id: str,
-    raw_body: bytes | bytearray,
-) -> dict[str, Any]:
-    request_id, capability_token, capability = authenticate_teacher_capability(
-        capability_token=capability_token,
-        request_id=request_id,
-    )
-    request = validate_completion_request(parse_strict_json(raw_body), capability)
+def _reserve_teacher_request(
+    *, capability_token: str, request_id: str, request, capability: dict
+) -> dict:
+    """Reserve the ledger row for this request, mapping ledger faults onto broker errors."""
     fingerprint = request_fingerprint(capability_token, request.canonical_body)
     try:
-        reservation = db.reserve_teacher_request(
+        return db.reserve_teacher_request(
             token=capability_token,
             request_id=request_id,
             request_fingerprint=fingerprint,
@@ -570,15 +563,16 @@ def complete_teacher_request(
             retryable=True,
             request_id=request_id,
         ) from exc
-    capability = reservation["capability"]
-    replay_body = reservation.get("response_body")
-    if isinstance(replay_body, bytes):
-        return _validated_provider_response(
-            replay_body,
-            score_items=request.score_items,
-            capability=capability,
-        ).body
-    capability_id = int(capability["id"])
+
+
+def _prepare_teacher_dispatch(
+    *, capability_id: int, request_id: str, capability: dict, request
+) -> tuple[str, bytes]:
+    """Resolve the provider credential, encode the upstream body, and fence the dispatch.
+
+    Returns ``(api_key, encoded_body)``. Every failure here readmits the request for retry before
+    anything is dispatched, so no upstream call can have happened.
+    """
     api_key = os.environ.get(PARASAIL_API_KEY_ENV, "").strip()
     if not api_key:
         with contextlib.suppress(Exception):
@@ -619,6 +613,13 @@ def complete_teacher_request(
             retryable=True,
             request_id=request_id,
         ) from exc
+    return api_key, encoded
+
+
+def _dispatch_to_teacher_provider(
+    *, capability_id: int, request_id: str, capability: dict, api_key: str, encoded: bytes
+) -> tuple[int, bytes]:
+    """Post to the provider and return ``(status, response_body)`` for a 2xx answer only."""
     try:
         status, response_body = _provider_post(encoded, api_key, _provider_timeout(capability))
     except TeacherBrokerError as exc:
@@ -664,6 +665,19 @@ def complete_teacher_request(
             status_code=502,
             request_id=request_id,
         )
+    return status, response_body
+
+
+def _settle_teacher_response(
+    *,
+    capability_id: int,
+    request_id: str,
+    capability: dict,
+    request,
+    status: int,
+    response_body: bytes,
+) -> dict[str, Any]:
+    """Validate the provider answer against the capability, then close the ledger row."""
     try:
         response = _validated_provider_response(
             response_body,
@@ -708,3 +722,52 @@ def complete_teacher_request(
             request_id=request_id,
         ) from exc
     return response.body
+
+
+def complete_teacher_request(
+    *,
+    capability_token: str,
+    request_id: str,
+    raw_body: bytes | bytearray,
+) -> dict[str, Any]:
+    request_id, capability_token, capability = authenticate_teacher_capability(
+        capability_token=capability_token,
+        request_id=request_id,
+    )
+    request = validate_completion_request(parse_strict_json(raw_body), capability)
+    reservation = _reserve_teacher_request(
+        capability_token=capability_token,
+        request_id=request_id,
+        request=request,
+        capability=capability,
+    )
+    capability = reservation["capability"]
+    replay_body = reservation.get("response_body")
+    if isinstance(replay_body, bytes):
+        return _validated_provider_response(
+            replay_body,
+            score_items=request.score_items,
+            capability=capability,
+        ).body
+    capability_id = int(capability["id"])
+    api_key, encoded = _prepare_teacher_dispatch(
+        capability_id=capability_id,
+        request_id=request_id,
+        capability=capability,
+        request=request,
+    )
+    status, response_body = _dispatch_to_teacher_provider(
+        capability_id=capability_id,
+        request_id=request_id,
+        capability=capability,
+        api_key=api_key,
+        encoded=encoded,
+    )
+    return _settle_teacher_response(
+        capability_id=capability_id,
+        request_id=request_id,
+        capability=capability,
+        request=request,
+        status=status,
+        response_body=response_body,
+    )
