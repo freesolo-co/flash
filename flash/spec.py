@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Literal
@@ -57,13 +58,6 @@ def coerce_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() not in _FALSE_STRINGS
     return bool(value)
-
-
-def _coerce_str_map(value: Any) -> dict[str, str]:
-    """Coerce to dict[str, str]; non-dict input returns empty dict."""
-    if not isinstance(value, dict):
-        return {}
-    return {str(k): str(v) for k, v in value.items()}
 
 
 def require_project_id(value: Any) -> str:
@@ -192,7 +186,7 @@ def parse_max_steps(value: Any) -> int | None:
 CONTROL_PANEL_URL_ENV = "FLASH_CONTROL_PANEL_URL"
 TEACHER_CAPABILITY_ENV = "FLASH_TEACHER_CAPABILITY"
 MANAGED_TEACHER_CREDENTIAL_ENV_KEYS = frozenset({"PARASAIL_API_KEY"})
-RESERVED_WORKER_ENV_KEYS = frozenset(
+CONTROL_PLANE_OWNED_ENV_KEYS = frozenset(
     {
         "RUN_ID",
         "HF_REPO",
@@ -206,27 +200,9 @@ RESERVED_WORKER_ENV_KEYS = frozenset(
 )
 
 
-def validate_worker_env_reserved(worker_env: Any) -> None:
-    """Reject worker env overrides for control-plane-owned fields."""
-    if not isinstance(worker_env, dict):
-        return
-    conflicts = sorted(
-        str(key) for key in worker_env if str(key).upper() in RESERVED_WORKER_ENV_KEYS
-    )
-    if conflicts:
-        detail = (
-            "; set top-level seed instead"
-            if any(key.upper() == "SEED" for key in conflicts)
-            else ""
-        )
-        raise ValueError(
-            f"[worker_env] must not override control-plane key(s): {', '.join(conflicts)}{detail}"
-        )
-
-
 # the trainer every run reports. run_sft, run_opd and run_rl all delegate straight to verl, so this
-# is a constant rather than a resolution: nothing in [worker_env] or the spec can select anything
-# else. recorded on effective_preparation so a stored run says which trainer produced it.
+# is a constant rather than a resolution: no job-spec field can select anything else. recorded on
+# effective_preparation so a stored run says which trainer produced it.
 TRAINER_BACKEND = "verl"
 
 
@@ -382,7 +358,42 @@ MANAGED_GPU_KEYS = frozenset(
 #
 # Ignored on READ only: nothing here is a JobSpec field, so an authored config naming one is still
 # rejected as unknown by the schema layer's own key check (see schema._TOP_LEVEL_KEYS).
-_DROPPED_TOP_LEVEL_KEYS = frozenset({"model_policy"})
+_DROPPED_TOP_LEVEL_KEYS = frozenset({"model_policy", "worker_env"})
+
+# Tolerating a dropped key keeps a pre-upgrade run's recovery path, but the values behind it stop
+# being applied -- so a run that authored them now trains on managed defaults instead of what was
+# submitted. That is announced rather than silent. Only user-authorable keys qualify: model_policy
+# was platform-managed (to_dict popped it), so its loss cannot change what a submitted config asked
+# for. The values are deliberately NOT forwarded -- doing so would reinstate the override table this
+# removal exists to close, and would deliver it without the validation the deleted parser performed.
+_ANNOUNCED_DROPPED_KEYS = frozenset({"worker_env"})
+
+
+def _announce_dropped_keys(data: dict[str, Any]) -> None:
+    """Log the removed user-authored keys a persisted record still carries and no longer applies.
+
+    Only announced when the payload names the run. A public spec is ``to_dict()`` output, which pops
+    the server-assigned run_id, and the same stored run is read through both shapes -- so warning
+    without an id would emit an unactionable "run <unknown>" line and duplicate the identified one
+    the worker-spec read already produced. Every provisioned run records an internal worker spec
+    (asdict, run_id included), and that is the read this fires on.
+    """
+    run_id = str(data.get("run_id") or "").strip()
+    if not run_id:
+        return
+    for key in sorted(_ANNOUNCED_DROPPED_KEYS):
+        value = data.get(key)
+        if not value:
+            continue
+        names = ", ".join(sorted(str(k) for k in value)) if isinstance(value, dict) else str(value)
+        logging.getLogger("flash.spec").warning(
+            "run %s was submitted with [%s] (%s); that table was removed and its values are NOT "
+            "applied -- this run uses managed defaults instead. resubmit without it if the run "
+            "depends on those values.",
+            run_id,
+            key,
+            names,
+        )
 
 
 @dataclass(frozen=True)
@@ -400,8 +411,6 @@ class JobSpec:
     gpu: GpuSpec = field(default_factory=GpuSpec)
     run_id: str = "local"
     seed: int = FIXED_SEED
-    # per-run env overrides forwarded to the gpu worker; never put secrets here.
-    worker_env: dict[str, str] = field(default_factory=dict)
     thinking: bool = False
     wandb: WandbSpec = field(default_factory=WandbSpec)
     model_revision: str = ""
@@ -434,7 +443,6 @@ class JobSpec:
             raise TypeError("workload_profile must be an object")
         if profile_digest and not str(self.workload_profile_producer_version or ""):
             raise ValueError("workload profile digest requires its producer version")
-        validate_worker_env_reserved(self.worker_env)
 
     @property
     def phase(self) -> str:
@@ -485,6 +493,7 @@ class JobSpec:
         unknown_top_level = sorted(set(data) - allowed_top_level - _DROPPED_TOP_LEVEL_KEYS)
         if unknown_top_level:
             raise ValueError(f"job spec has unknown key(s): {', '.join(unknown_top_level)}")
+        _announce_dropped_keys(data)
         env = data.get("environment") or {}
         # Reject stale payloads carrying a local `path`; worker only runs published env ids.
         if isinstance(env, dict) and env.get("path"):
@@ -591,7 +600,6 @@ class JobSpec:
                 count=gpu.get("count", 1),
             ),
             run_id=data.get("run_id", "local"),
-            worker_env=_coerce_str_map(data.get("worker_env")),
             thinking=coerce_bool(data.get("thinking", False)),
             wandb=_coerce_wandb(data.get("wandb")),
             seed=parse_seed(data.get("seed", FIXED_SEED)),

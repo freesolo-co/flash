@@ -32,7 +32,6 @@ from flash.schema.fields import (
     _train_structured_outputs,
     _train_teacher,
     _wandb_spec,
-    _worker_env,
 )
 from flash.spec import (
     FIXED_SEED,
@@ -237,7 +236,6 @@ _TOP_LEVEL_KEYS = frozenset(
         "environment",
         "train",
         "gpu",
-        "worker_env",
         "wandb",
         "project",
     }
@@ -292,7 +290,7 @@ def spec_from_dict(
         noun = "section(s)" if any(isinstance(raw[key], dict) for key in unknown) else "key(s)"
         raise ConfigError(
             f"unknown config {noun}: {', '.join(unknown)} "
-            f"(allowed tables: environment, train, gpu, wandb, worker_env){hint}"
+            f"(allowed tables: environment, train, gpu, wandb){hint}"
         )
     try:
         model = raw["model"]
@@ -472,7 +470,6 @@ def spec_from_dict(
             "after real-GPU validation"
         )
 
-    worker_env = _worker_env(raw.get("worker_env"))
     wandb_spec = _wandb_spec(raw.get("wandb"))
 
     try:
@@ -525,7 +522,6 @@ def spec_from_dict(
         ),
         run_id=run_id or "local",  # server-assigned at create_run; never user-set
         seed=_job_seed(raw),
-        worker_env=worker_env,
         thinking=thinking,
         wandb=wandb_spec,
         project=project,

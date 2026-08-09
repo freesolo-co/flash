@@ -15,12 +15,11 @@ from flash.providers._hf_retry import hf_call, hf_status_code
 from flash.providers.base import get_gpu_info
 from flash.spec import (
     CONTROL_PANEL_URL_ENV,
+    CONTROL_PLANE_OWNED_ENV_KEYS,
     MANAGED_TEACHER_CREDENTIAL_ENV_KEYS,
-    RESERVED_WORKER_ENV_KEYS,
     TEACHER_CAPABILITY_ENV,
     JobSpec,
     require_matching_seed,
-    validate_worker_env_reserved,
 )
 
 # pinned literal (not __name__): keeps the logger stream named "flash.providers.runpod.train"
@@ -130,8 +129,8 @@ def resolve_worker_deps() -> list[str]:
 DEFAULT_EXECUTION_TIMEOUT_MS = 6 * 3600 * 1000  # 6h cap
 
 
-# Optimization toggles dropped in PR #175 (deterministic behavior). Filtered from [worker_env]
-# to prevent recipes re-injecting e.g. expandable_segments (crashes GRPO vLLM sleep mode).
+# optimization toggles dropped in pr #175. filter declared runtime secrets so dead keys cannot
+# reach the worker, including allocator settings that crash grpo vllm sleep mode.
 _REMOVED_OPTIMIZATION_ENV = frozenset(
     {
         "PYTORCH_ALLOC_CONF",
@@ -188,9 +187,8 @@ def build_worker_env(
     seed: int,
     runtime_secrets: dict[str, str] | None = None,
 ) -> dict:
-    """Per-run env passed to the worker (platform creds + recipe overrides)."""
+    """Per-run env passed to the worker from managed control-plane inputs."""
     canonical_seed = require_matching_seed(spec, seed)
-    validate_worker_env_reserved(spec.worker_env)
     declared_managed_credentials = sorted(
         set(spec.environment.secrets) & MANAGED_TEACHER_CREDENTIAL_ENV_KEYS
     )
@@ -231,28 +229,17 @@ def build_worker_env(
     env["HF_REPO"] = spec.train.hf_repo
     if getattr(spec.gpu, "network_volume", None):
         env.update(weight_cache_env())
-    for k, v in (getattr(spec, "worker_env", None) or {}).items():
-        ku = str(k).upper()
-        if ku in _REMOVED_OPTIMIZATION_ENV:
-            logger.warning(
-                "ignoring removed optimization toggle %s in [worker_env] (flash is fully "
-                "managed; behavior is deterministic)",
-                k,
-            )
-            continue
-        env[str(k)] = str(v)
     # runtime secrets and declared env secrets may never clobber a control-plane-owned key:
     # the canonical seed, run id, hf repo, and arm are set above, and a runtime seed override
     # would break the authoritative-seed invariant regardless of how environment.secrets was
     # populated. removed keys are filtered here too. the two sets are disjoint and answer
-    # different questions -- RESERVED_WORKER_ENV_KEYS is ownership (a caller may not override
-    # SEED), _REMOVED_OPTIMIZATION_ENV is deadness (the key configures nothing now) -- so
-    # checking only ownership left [environment].secrets as a second door that delivered a
-    # dead key with none of the warning that the [worker_env] path emits.
+    # different questions: control-plane ownership prevents overrides such as SEED, while removed
+    # optimization keys configure nothing and must not silently reach the worker.
     allowed_runtime_secrets = {
         k
         for k in (set(DEFAULT_RUNTIME_SECRET_KEYS) | set(spec.environment.secrets))
-        if k.upper() not in RESERVED_WORKER_ENV_KEYS and k.upper() not in _REMOVED_OPTIMIZATION_ENV
+        if k.upper() not in CONTROL_PLANE_OWNED_ENV_KEYS
+        and k.upper() not in _REMOVED_OPTIMIZATION_ENV
     }
     for k, v in (runtime_secrets or {}).items():
         if k in allowed_runtime_secrets and v:
