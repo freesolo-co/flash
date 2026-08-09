@@ -41,7 +41,7 @@ def test_remaining_env_subcommands_still_parse():
 
 
 def test_install_manifest_machinery_is_removed():
-    import flash.envs.registry as registry
+    import flash.envs.base as registry
 
     for gone in (
         "record_installed_env",

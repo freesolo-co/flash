@@ -22,28 +22,6 @@ from types import SimpleNamespace
 import pytest
 
 from flash.engine.worker import opd_train, rl_train, score_batcher
-from flash.engine.worker.opd_plugin import (
-    FlashTeacherBridgeError,
-    _AllNoSignalBatch,
-    _bridge_score_payload,
-    _flash_groupwise_reverse_kl_values,
-    _full_sequence_signal_sequences,
-    _init_transfer_queue,
-    _multi_modal_image_count,
-    _post_json,
-    _raw_prompt_has_image_block,
-    _require_structured_runtime_versions,
-    _resolve_image_token_id,
-    _run_with_no_signal_replacements,
-    _set_current_global_batch_info,
-    _signal_sequences,
-    deterministic_rollout_seed,
-)
-from flash.engine.worker.opd_structured import (
-    StructuredOutputReplay,
-    _count_legal_tokens,
-    canonical_structured_spec,
-)
 from flash.engine.worker.opd_train import (
     _OPD_PARQUET_WRITE_BATCH_ROWS,
     _BridgePrompt,
@@ -66,10 +44,32 @@ from flash.engine.worker.opd_train import (
     build_opd_overrides,
     encode_shifted_group_metadata,
 )
-from flash.engine.worker.teacher import TeacherScore
-from flash.engine.worker.tokenizer_align import TeacherToken
-from flash.opd_retry_contract import OPD_RESUME_STATE_VERSION
-from flash.opd_validation import validate_opd_structured_outputs
+from flash.engine.worker.teacher.client import TeacherScore
+from flash.engine.worker.teacher.tokenizer_align import TeacherToken
+from flash.engine.worker.train.opd.child.plugin import (
+    FlashTeacherBridgeError,
+    _AllNoSignalBatch,
+    _bridge_score_payload,
+    _flash_groupwise_reverse_kl_values,
+    _full_sequence_signal_sequences,
+    _init_transfer_queue,
+    _multi_modal_image_count,
+    _post_json,
+    _raw_prompt_has_image_block,
+    _require_structured_runtime_versions,
+    _resolve_image_token_id,
+    _run_with_no_signal_replacements,
+    _set_current_global_batch_info,
+    _signal_sequences,
+    deterministic_rollout_seed,
+)
+from flash.engine.worker.train.opd.child.structured import (
+    StructuredOutputReplay,
+    _count_legal_tokens,
+    canonical_structured_spec,
+)
+from flash.engine.worker.train.opd.validation import validate_opd_structured_outputs
+from flash.teacher.retry_contract import OPD_RESUME_STATE_VERSION
 
 
 def _reference_groupwise_reverse_kl(sp_t, groups, kl_coef=1.0):
@@ -96,7 +96,7 @@ def _reference_groupwise_reverse_kl(sp_t, groups, kl_coef=1.0):
 
 
 def _write_mutation_failure_after_start(start, classification, message):
-    from flash.engine.worker.opd_plugin import _write_mutation_failure_fallback
+    from flash.engine.worker.train.opd.child.plugin import _write_mutation_failure_fallback
 
     start.wait()
     _write_mutation_failure_fallback(classification, message)
@@ -124,7 +124,7 @@ def _send_malformed_json_response(handler, status, _payload):
 
 
 def _capture_client_only_score_delivery_loss(bridge, monkeypatch, tmp_path):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
     from flash.engine.worker.opd_train import _read_classified_failure_fallback
 
     failure_path = str(tmp_path / "score-delivery-failure")
@@ -823,7 +823,7 @@ def test_processor_expanded_prompt_ids_enforce_visual_token_budget(tmp_path):
         }
     ]
 
-    from flash.multimodal import normalize_image_source
+    from flash.content.multimodal import normalize_image_source
 
     prompt_ids = _processor_expanded_prompt_ids(
         processor,
@@ -1098,11 +1098,11 @@ class _BatchingTeacher:
             self.batches.append(list(items))
         self.called.set()
         if self.failure == "transient":
-            from flash.engine.worker.teacher import TeacherError
+            from flash.engine.worker.teacher.client import TeacherError
 
             raise TeacherError("teacher unavailable", permanent=False)
         if self.failure == "permanent":
-            from flash.engine.worker.teacher import TeacherError
+            from flash.engine.worker.teacher.client import TeacherError
 
             raise TeacherError("permanent teacher failure", permanent=True)
         if self.failure == "wrong_count":
@@ -1295,7 +1295,7 @@ def test_text_teacher_batcher_enforces_max_batch_size_across_concurrent_requests
     # rather than hardcoded: the invariant under test is "a full batch is reached and no batch ever
     # exceeds the bound", and a fixed 17 prompts stopped exercising that the moment the ceiling rose
     # above 17 -- the test would have passed while never once filling a batch.
-    from flash.opd_limits import OPD_TEACHER_SCORING_CONCURRENCY as bound
+    from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY as bound
 
     # one full batch plus a partial remainder, capped by the server's own listen backlog: every
     # prompt is posted concurrently, so more prompts than _TEXT_TEACHER_REQUEST_BACKLOG (64) cannot
@@ -1689,7 +1689,7 @@ def test_text_teacher_batcher_shutdown_raises_a_permanent_teacher_error():
     is right by accident while the sample-level transient path is skipped. The
     strand test above cannot see this: it asserts the classification, which both error types produce.
     """
-    from flash.engine.worker.teacher import TeacherError
+    from flash.engine.worker.teacher.client import TeacherError
 
     batcher = _TextTeacherBatcher(object(), max_batch_size=4, flush_wait_s=0.01)
     batcher.close(timeout_s=0.1)
@@ -1707,7 +1707,7 @@ def test_text_teacher_batcher_preserves_teacher_error_permanence_through_the_bat
     anything else as fatal, so a transient provider error that arrives re-wrapped as permanent (or as
     a bare RuntimeError) aborts a run that should have dropped one sample and continued.
     """
-    from flash.engine.worker.teacher import TeacherError
+    from flash.engine.worker.teacher.client import TeacherError
 
     class FailingTeacher:
         def __init__(self, error):
@@ -1745,7 +1745,7 @@ def test_text_teacher_batcher_preserves_teacher_error_permanence_through_the_bat
 
 def test_transient_teacher_sample_returns_no_signal_while_following_peer_trains():
     torch = pytest.importorskip("torch")
-    from flash.engine.worker.teacher import TeacherError
+    from flash.engine.worker.teacher.client import TeacherError
 
     class FlakyTeacher:
         def __init__(self):
@@ -1817,7 +1817,7 @@ def test_transient_teacher_sample_returns_no_signal_while_following_peer_trains(
 
 def test_recovered_transient_lost_response_promotes_transient_terminal_cause():
     from flash.engine.worker.perf import RetriableInfraError
-    from flash.engine.worker.teacher import TeacherError
+    from flash.engine.worker.teacher.client import TeacherError
 
     class TransientTeacher:
         def score(self, _prompt_text, _completion_text):
@@ -1853,7 +1853,7 @@ def test_recovered_transient_lost_response_promotes_transient_terminal_cause():
 def test_client_only_score_loss_promotes_recovered_transient_once(monkeypatch, tmp_path):
     from flash.engine.worker.opd_train import _reconcile_score_delivery_failure
     from flash.engine.worker.perf import RetriableInfraError
-    from flash.engine.worker.teacher import TeacherError
+    from flash.engine.worker.teacher.client import TeacherError
 
     class TransientTeacher:
         def score(self, _prompt_text, _completion_text):
@@ -1953,7 +1953,7 @@ def test_client_only_score_loss_preserves_authoritative_permanent_failure(monkey
 
 
 def test_malformed_score_success_is_transient_delivery_unknown(monkeypatch, tmp_path):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
     from flash.engine.worker.opd_train import (
         _read_classified_failure_fallback,
         _reconcile_score_delivery_failure,
@@ -2015,9 +2015,9 @@ def test_malformed_score_success_is_transient_delivery_unknown(monkeypatch, tmp_
 def test_explicit_score_rejection_keeps_classification_without_delivery_fallback(
     monkeypatch, tmp_path
 ):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
     from flash.engine.worker.opd_train import _read_classified_failure_fallback
-    from flash.engine.worker.teacher import TeacherError
+    from flash.engine.worker.teacher.client import TeacherError
 
     class PermanentTeacher:
         def score(self, _prompt_text, _completion_text):
@@ -2182,7 +2182,7 @@ def test_success_delivery_failure_does_not_overwrite_permanent_teacher_failure()
 
 
 def test_recovered_transient_does_not_make_later_deterministic_exhaustion_retriable():
-    from flash.engine.worker.teacher import TeacherError
+    from flash.engine.worker.teacher.client import TeacherError
 
     class TransientSignalThenEmptyTeacher:
         def __init__(self):
@@ -2232,7 +2232,7 @@ def test_recovered_transient_does_not_make_later_deterministic_exhaustion_retria
 
 
 def test_recovered_transient_does_not_mask_unrelated_child_exit():
-    from flash.engine.worker.teacher import TeacherError
+    from flash.engine.worker.teacher.client import TeacherError
 
     class TransientThenSignalTeacher:
         def __init__(self):
@@ -2840,7 +2840,7 @@ def test_the_final_deployable_publish_is_not_suppressed_by_the_processed_marker(
 def test_final_save_due_and_the_watcher_publish_set_never_overlap():
     # the invariant the fix above rests on, asserted rather than assumed: if these two could ever be
     # true for the same step, dropping the processed_steps clause would double-publish.
-    from flash.engine.steps import final_save_due
+    from flash.engine.plan.steps import final_save_due
 
     for save_at_steps in ((), (1,), (4,), (2, 4), (1, 2, 3, 4)):
         for step in (1, 2, 3, 4):
@@ -2861,7 +2861,7 @@ def test_both_ray_trainers_publish_their_final_step_deployable_the_same_way():
 
 
 def test_bridge_preserves_typed_permanent_teacher_failure():
-    from flash.engine.worker.teacher import TeacherError
+    from flash.engine.worker.teacher.client import TeacherError
 
     class FailingTeacher:
         def score(self, _prompt_text, _completion_text):
@@ -2909,7 +2909,7 @@ def test_terminal_teacher_failure_preserves_permanent_precedence(classifications
 
 def test_all_transient_teacher_samples_exhaust_replacements_as_retriable():
     from flash.engine.worker.perf import RetriableInfraError
-    from flash.engine.worker.teacher import TeacherError
+    from flash.engine.worker.teacher.client import TeacherError
 
     class TransientTeacher:
         def score(self, _prompt_text, _completion_text):
@@ -2938,7 +2938,7 @@ def test_all_transient_teacher_samples_exhaust_replacements_as_retriable():
 
 def test_mixed_transient_and_truncated_exhaustion_remains_retriable():
     from flash.engine.worker.perf import RetriableInfraError
-    from flash.engine.worker.teacher import TeacherError
+    from flash.engine.worker.teacher.client import TeacherError
 
     class TransientTeacher:
         def score(self, _prompt_text, _completion_text):
@@ -2985,9 +2985,9 @@ def test_mixed_transient_and_truncated_exhaustion_remains_retriable():
 
 
 def test_abandonment_transport_fallback_promotes_pending_teacher_failure(monkeypatch, tmp_path):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
     from flash.engine.worker.opd_train import _read_classified_failure_fallback
-    from flash.engine.worker.teacher import TeacherError
+    from flash.engine.worker.teacher.client import TeacherError
 
     class TransientTeacher:
         def score(self, _prompt_text, _completion_text):
@@ -3017,9 +3017,9 @@ def test_abandonment_transport_fallback_promotes_pending_teacher_failure(monkeyp
 
 
 def test_accepted_abandonment_lost_response_does_not_duplicate_accounting(monkeypatch, tmp_path):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
     from flash.engine.worker.opd_train import _read_classified_failure_fallback
-    from flash.engine.worker.teacher import TeacherError
+    from flash.engine.worker.teacher.client import TeacherError
 
     class TransientTeacher:
         def score(self, _prompt_text, _completion_text):
@@ -3052,9 +3052,9 @@ def test_accepted_abandonment_lost_response_does_not_duplicate_accounting(monkey
 def test_resample_transport_failure_before_acceptance_promotes_without_replacement(
     monkeypatch, tmp_path
 ):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
     from flash.engine.worker.opd_train import _read_classified_failure_fallback
-    from flash.engine.worker.teacher import TeacherError
+    from flash.engine.worker.teacher.client import TeacherError
 
     class TransientTeacher:
         def score(self, _prompt_text, _completion_text):
@@ -3096,9 +3096,9 @@ def test_resample_transport_failure_before_acceptance_promotes_without_replaceme
 
 
 def test_accepted_resample_lost_response_counts_once_and_promotes(monkeypatch, tmp_path):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
     from flash.engine.worker.opd_train import _read_classified_failure_fallback
-    from flash.engine.worker.teacher import TeacherError
+    from flash.engine.worker.teacher.client import TeacherError
 
     class TransientTeacher:
         def score(self, _prompt_text, _completion_text):
@@ -3129,7 +3129,7 @@ def test_accepted_resample_lost_response_counts_once_and_promotes(monkeypatch, t
 
 
 def test_resample_fallback_without_pending_transient_does_not_promote(monkeypatch, tmp_path):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
     from flash.engine.worker.opd_train import _read_classified_failure_fallback
 
     bridge = _text_bridge(_BridgeTeacher())
@@ -3157,9 +3157,9 @@ def test_resample_fallback_without_pending_transient_does_not_promote(monkeypatc
 
 
 def test_successful_teacher_signal_suppresses_resample_fallback_promotion(monkeypatch, tmp_path):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
     from flash.engine.worker.opd_train import _read_classified_failure_fallback
-    from flash.engine.worker.teacher import TeacherError
+    from flash.engine.worker.teacher.client import TeacherError
 
     class TransientThenSuccessTeacher:
         def __init__(self):
@@ -3197,7 +3197,7 @@ def test_successful_teacher_signal_suppresses_resample_fallback_promotion(monkey
 
 
 def test_successful_resample_creates_no_marker_and_prepares_replacement(monkeypatch, tmp_path):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
     from flash.engine.worker.opd_train import _read_classified_failure_fallback
 
     bridge = _text_bridge(_BridgeTeacher())
@@ -3240,7 +3240,7 @@ def test_successful_resample_creates_no_marker_and_prepares_replacement(monkeypa
 )
 def test_permanent_no_signal_notification_precedes_pending_transient(failures):
     from flash.engine.worker.opd_train import _reconcile_no_signal_notification_failure
-    from flash.engine.worker.teacher import TeacherError
+    from flash.engine.worker.teacher.client import TeacherError
 
     class TransientTeacher:
         def score(self, _prompt_text, _completion_text):
@@ -3318,8 +3318,8 @@ def test_malformed_accepted_no_signal_notification_is_transient_once(
     reader_name,
     counter_name,
 ):
-    import flash.engine.worker.opd_plugin as plugin
     import flash.engine.worker.opd_train as opd_train
+    import flash.engine.worker.train.opd.child.plugin as plugin
 
     failure_path = str(tmp_path / f"{channel}-failure")
     monkeypatch.setenv(environment_key, failure_path)
@@ -3351,7 +3351,7 @@ def test_malformed_accepted_no_signal_notification_is_transient_once(
 
 
 def test_malformed_accepted_cycle_commit_exhaustion_is_transient(monkeypatch, tmp_path):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
     from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.perf import RetriableInfraError
 
@@ -3423,8 +3423,8 @@ def test_explicit_notification_rejection_remains_permanent(
     environment_key,
     reader_name,
 ):
-    import flash.engine.worker.opd_plugin as plugin
     import flash.engine.worker.opd_train as opd_train
+    import flash.engine.worker.train.opd.child.plugin as plugin
 
     attempts = []
     failure_path = str(tmp_path / "notification-failure")
@@ -3480,8 +3480,8 @@ def test_unexpected_local_notification_error_remains_permanent(
     reader_name,
     message_prefix,
 ):
-    import flash.engine.worker.opd_plugin as plugin
     import flash.engine.worker.opd_train as opd_train
+    import flash.engine.worker.train.opd.child.plugin as plugin
 
     failure_path = str(tmp_path / "notification-failure")
 
@@ -3518,7 +3518,7 @@ def test_transient_no_signal_notification_without_pending_is_retriable():
 
 def test_transient_no_signal_notification_promotes_causal_teacher_failure():
     from flash.engine.worker.opd_train import _reconcile_no_signal_notification_failure
-    from flash.engine.worker.teacher import TeacherError
+    from flash.engine.worker.teacher.client import TeacherError
 
     class TransientTeacher:
         def score(self, _prompt_text, _completion_text):
@@ -3537,7 +3537,7 @@ def test_transient_no_signal_notification_promotes_causal_teacher_failure():
 
 
 def test_successful_cycle_commit_allows_next_transient_cycle_to_promote():
-    from flash.engine.worker.teacher import TeacherError
+    from flash.engine.worker.teacher.client import TeacherError
 
     class SuccessThenTransientTeacher:
         def __init__(self):
@@ -3561,8 +3561,8 @@ def test_successful_cycle_commit_allows_next_transient_cycle_to_promote():
 
 
 def test_lost_cycle_commit_response_retries_without_mutation_failure(monkeypatch, tmp_path):
-    import flash.engine.worker.opd_plugin as plugin
-    from flash.engine.worker.teacher import TeacherError
+    import flash.engine.worker.train.opd.child.plugin as plugin
+    from flash.engine.worker.teacher.client import TeacherError
 
     class SuccessThenTransientTeacher:
         def __init__(self):
@@ -3613,9 +3613,9 @@ def test_lost_cycle_commit_response_retries_without_mutation_failure(monkeypatch
 def test_incomplete_cycle_commit_response_retries_once_without_mutation_fallback(
     monkeypatch, tmp_path
 ):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
     from flash.engine.worker.opd_train import _read_classified_failure_fallback
-    from flash.engine.worker.teacher import TeacherError
+    from flash.engine.worker.teacher.client import TeacherError
 
     class SuccessThenTransientTeacher:
         def __init__(self):
@@ -3686,7 +3686,7 @@ def test_incomplete_cycle_commit_response_retries_once_without_mutation_fallback
 
 
 def test_transient_cycle_commit_failure_records_retriable_preupdate_cause(monkeypatch, tmp_path):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
     from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.perf import RetriableInfraError
 
@@ -3723,7 +3723,7 @@ def test_transient_cycle_commit_failure_records_retriable_preupdate_cause(monkey
 
 
 def test_explicit_cycle_commit_rejection_aborts_before_actor_update(monkeypatch, tmp_path):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
     from flash.engine.worker.opd_train import _read_classified_failure_fallback
 
     attempts = []
@@ -3758,7 +3758,7 @@ def test_explicit_cycle_commit_rejection_aborts_before_actor_update(monkeypatch,
 
 
 def test_persistent_cycle_commit_failure_aborts_before_actor_update(monkeypatch, tmp_path):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
     from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.perf import RetriableInfraError
 
@@ -3833,7 +3833,7 @@ def test_persistent_cycle_commit_failure_aborts_before_actor_update(monkeypatch,
     ],
 )
 def test_failure_fallback_serialization_is_valid_and_within_reader_limit(tmp_path, message):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
     from flash.engine.worker.opd_train import _read_classified_failure_fallback
 
     failure_path = str(tmp_path / "cycle-commit-failure")
@@ -3857,7 +3857,7 @@ def test_failure_fallback_serialization_is_valid_and_within_reader_limit(tmp_pat
 
 
 def test_cycle_commit_fallback_reader_ignores_incomplete_records(monkeypatch, tmp_path):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
     from flash.engine.worker.opd_train import _read_classified_failure_fallback
 
     failure_path = str(tmp_path / "cycle-commit-failure")
@@ -3878,7 +3878,7 @@ def test_cycle_commit_fallback_reader_ignores_incomplete_records(monkeypatch, tm
 
 
 def test_mixed_transient_and_teacher_empty_alignment_exhaustion_remains_permanent():
-    from flash.engine.worker.teacher import TeacherError
+    from flash.engine.worker.teacher.client import TeacherError
 
     class AlternatingTeacher:
         def __init__(self):
@@ -3957,7 +3957,7 @@ def test_multiturn_teacher_scores_are_chunked_and_ordered(monkeypatch):
     # test above: this pins CHUNKING AND ORDER (one full chunk, then the remainder, with scores
     # still in turn order), and a hardcoded 15 turns would stop chunking at all once the ceiling
     # rose past it -- leaving an assertion that can no longer observe the behaviour it names.
-    from flash.opd_limits import OPD_TEACHER_SCORING_CONCURRENCY as bound
+    from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY as bound
 
     turns = bound + bound // 2
     teacher = OrderedTeacher()
@@ -3990,7 +3990,7 @@ def test_multiturn_teacher_scores_are_chunked_and_ordered(monkeypatch):
 
 def test_multiturn_transient_bridge_failure_latches_terminal_cause():
     from flash.engine.worker.perf import RetriableInfraError
-    from flash.engine.worker.teacher import TeacherError
+    from flash.engine.worker.teacher.client import TeacherError
 
     bridge = _text_bridge(_BridgeTeacher())
 
@@ -4021,13 +4021,13 @@ def test_multiturn_transient_bridge_failure_latches_terminal_cause():
 
 
 def test_client_only_multiturn_score_loss_publishes_retriable_fallback_once(monkeypatch, tmp_path):
-    import flash.engine.worker.opd_plugin as plugin
-    from flash.engine.worker.opd_multiturn import _post_multiturn_score
+    import flash.engine.worker.train.opd.child.plugin as plugin
     from flash.engine.worker.opd_train import (
         _read_classified_failure_fallback,
         _reconcile_score_delivery_failure,
     )
     from flash.engine.worker.perf import RetriableInfraError
+    from flash.engine.worker.train.opd.child.multiturn import _post_multiturn_score
 
     failure_path = str(tmp_path / "score-delivery-failure")
     monkeypatch.setenv("FLASH_OPD_SCORE_DELIVERY_FAILURE_PATH", failure_path)
@@ -4083,7 +4083,7 @@ def test_client_only_multiturn_score_loss_publishes_retriable_fallback_once(monk
 
 
 def test_explicit_multiturn_score_rejection_bypasses_delivery_handler():
-    from flash.engine.worker.opd_multiturn import _post_multiturn_score
+    from flash.engine.worker.train.opd.child.multiturn import _post_multiturn_score
 
     rejection = FlashTeacherBridgeError(
         "multi-turn score rejected",
@@ -4123,7 +4123,7 @@ def test_bridge_transport_failure_is_typed_retriable(monkeypatch):
 def test_mutation_transport_failure_survives_actor_exit_and_generic_driver_status(
     monkeypatch, tmp_path
 ):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
     from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.perf import RetriableInfraError
 
@@ -4184,7 +4184,7 @@ def test_mutation_failure_fallback_publishes_one_atomic_record_per_process(monke
 
 
 def test_mutation_failure_fallback_removes_temp_when_publication_fails(monkeypatch, tmp_path):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
 
     failure_path = str(tmp_path / "mutation-failure")
 
@@ -4234,7 +4234,7 @@ def test_mutation_failure_fallback_selects_permanent_and_ignores_incomplete_reco
 def test_repeated_mutation_notice_maps_later_bridge_failure_to_child_exit(
     monkeypatch, classification, expected_exit
 ):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
     from flash.engine.worker.perf import RetriableInfraError
 
     posts = []
@@ -4283,7 +4283,7 @@ def test_repeated_mutation_notice_maps_later_bridge_failure_to_child_exit(
 
 
 def test_optimizer_rank_posts_marker_once_across_multiple_steps(monkeypatch):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
 
     coordination = []
     updates = []
@@ -4317,7 +4317,7 @@ def test_optimizer_rank_posts_marker_once_across_multiple_steps(monkeypatch):
 def test_wrapped_optimizer_step_survives_the_lr_scheduler_rebind(monkeypatch):
     # torch LRScheduler requires optimizer.step to remain bound and accesses __func__ and __get__.
     # replay that protocol without importing training extras.
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
 
     coordination = []
     updates = []
@@ -4350,7 +4350,7 @@ def test_wrapped_optimizer_step_survives_the_lr_scheduler_rebind(monkeypatch):
 def test_each_optimizer_rank_acknowledges_marker_while_parent_publishes_once(
     monkeypatch,
 ):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
 
     world = _ThreadedDistributedWorld(2)
     callback_calls = []
@@ -4405,7 +4405,7 @@ def test_each_optimizer_rank_acknowledges_marker_while_parent_publishes_once(
 def test_failed_rank_readiness_prevents_marker_callback_and_optimizer_steps(
     monkeypatch,
 ):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
 
     callbacks = []
     updates = []
@@ -4448,7 +4448,7 @@ def test_failed_rank_readiness_prevents_marker_callback_and_optimizer_steps(
 def test_marker_publication_failure_reaches_all_ranks_before_optimizer_step(
     monkeypatch,
 ):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
 
     world = _ThreadedDistributedWorld(2)
     callbacks = []
@@ -4555,7 +4555,7 @@ def test_first_parent_mutation_failure_is_replayed_to_all_ranks_without_steps():
 def test_mutation_marker_failure_preserves_bridge_classification(
     monkeypatch, retriable, expected_exit
 ):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
     from flash.engine.worker.perf import RetriableInfraError
 
     marker_error = (
@@ -4640,7 +4640,7 @@ def test_mutation_success_response_disconnect_does_not_latch_marker_failure():
 def test_mutation_lost_success_response_retries_once_without_republishing_marker(
     monkeypatch, tmp_path
 ):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
 
     callback_calls = []
     optimizer_steps = []
@@ -4683,7 +4683,7 @@ def test_mutation_lost_success_response_retries_once_without_republishing_marker
 def test_incomplete_mutation_response_retries_once_without_republishing_marker(
     monkeypatch, tmp_path
 ):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
 
     callback_calls = []
     optimizer_steps = []
@@ -4726,7 +4726,7 @@ def test_incomplete_mutation_response_retries_once_without_republishing_marker(
 def test_persistent_incomplete_mutation_response_fails_closed_after_one_retry(
     monkeypatch, tmp_path
 ):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
     from flash.engine.worker.opd_train import _read_classified_failure_fallback
 
     callback_calls = []
@@ -4774,7 +4774,7 @@ def test_persistent_incomplete_mutation_response_fails_closed_after_one_retry(
 def test_persistent_mutation_response_loss_writes_fallback_without_optimizer_step(
     monkeypatch, tmp_path
 ):
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
     from flash.engine.worker.opd_train import _read_classified_failure_fallback
 
     callback_calls = []
@@ -5128,7 +5128,7 @@ def test_a_flagged_model_is_actually_reachable_under_opd():
     # the guard above is only meaningful while some catalog model is both sleep_unsupported and
     # opd-capable. if that stops being true this test fails loudly rather than leaving a guard with
     # no subject silently passing forever.
-    from flash.catalog import MODELS
+    from flash.core.catalog import MODELS
 
     flagged = [m for m, i in MODELS.items() if getattr(i, "sleep_unsupported", False)]
     assert flagged, "no catalog model is sleep_unsupported; this guard now has no subject"
@@ -5234,7 +5234,7 @@ def test_remote_distillation_config_declares_every_field_post_init_assigns():
     import ast
     import inspect
 
-    from flash.engine.worker import opd_plugin as plugin
+    from flash.engine.worker.train.opd.child import plugin as plugin
 
     installer = ast.parse(inspect.getsource(plugin._install_verl_extensions))
     class_defs = [
@@ -5289,7 +5289,8 @@ def test_agent_loops_are_registered_under_an_importable_qualname():
     import ast
     import inspect
 
-    from flash.engine.worker import opd_multiturn, opd_plugin
+    from flash.engine.worker.train.opd.child import multiturn as opd_multiturn
+    from flash.engine.worker.train.opd.child import plugin as opd_plugin
 
     sources = {
         "flash_single_turn": inspect.getsource(opd_plugin._install_verl_extensions),
@@ -5323,7 +5324,7 @@ def test_teacher_logprobs_patch_precedes_the_main_ppo_sync_import():
     import ast
     import inspect
 
-    from flash.engine.worker import opd_plugin
+    from flash.engine.worker.train.opd.child import plugin as opd_plugin
 
     body = ast.unparse(ast.parse(inspect.getsource(opd_plugin._install_verl_extensions)))
 
@@ -5484,7 +5485,7 @@ def test_multiturn_child_environment_carries_only_rollout_capabilities(tmp_path)
 
 
 def test_structured_validator_rejects_vllm_mistral_tokenizer_models(monkeypatch):
-    from flash import opd_validation
+    from flash.engine.worker.train.opd import validation as opd_validation
 
     monkeypatch.setattr(
         opd_validation,
@@ -5501,7 +5502,7 @@ def test_structured_validator_rejects_vllm_mistral_tokenizer_models(monkeypatch)
 
 
 def test_unstructured_validator_does_not_resolve_model_metadata(monkeypatch):
-    from flash import opd_validation
+    from flash.engine.worker.train.opd import validation as opd_validation
 
     def unexpected(*_args, **_kwargs):
         pytest.fail("unstructured OPD must not resolve structured model metadata")
@@ -5553,7 +5554,7 @@ def test_structured_runtime_rejects_wrong_xgrammar_version(monkeypatch):
 def test_plugin_initialization_checks_structured_versions_before_verl_install(monkeypatch):
     import importlib as importlib_module
 
-    from flash.engine.worker import opd_plugin as plugin
+    from flash.engine.worker.train.opd.child import plugin as plugin
 
     versions = {"verl": "0.8.0", "vllm": "0.19.1", "xgrammar": "0.1.26"}
     monkeypatch.setenv("FLASH_OPD_STRUCTURED_OUTPUTS", '{"choice":["4"]}')
@@ -5723,7 +5724,7 @@ def test_worker_structured_validator_runs_before_model_download():
 def test_plugin_registers_external_trainer_without_teacher_gpu_pool():
     import inspect
 
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
 
     source = inspect.getsource(plugin)
     assert "@register_distillation_loss(" in source
@@ -5743,9 +5744,9 @@ def test_plugin_registers_external_trainer_without_teacher_gpu_pool():
 def test_plugin_identifiers_remain_provider_neutral():
     import inspect
 
-    import flash.engine.worker.opd_multiturn as multiturn
-    import flash.engine.worker.opd_plugin as plugin
-    import flash.engine.worker.opd_structured as structured
+    import flash.engine.worker.train.opd.child.multiturn as multiturn
+    import flash.engine.worker.train.opd.child.plugin as plugin
+    import flash.engine.worker.train.opd.child.structured as structured
 
     source = (
         inspect.getsource(plugin) + inspect.getsource(structured) + inspect.getsource(multiturn)
@@ -5763,7 +5764,7 @@ def test_opd_delegates_to_verl_with_no_selector_left(monkeypatch):
     Replaces the FLASH_OPD_BACKEND selector test. The TRL OPD body is gone, so there is nothing
     left to select between and no env key can route the phase anywhere else.
     """
-    import flash.engine.worker.opd as opd_mod
+    import flash.engine.worker.entry.opd as opd_mod
     import flash.engine.worker.opd_train as ov
 
     called = []
@@ -5778,8 +5779,8 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
 
     verl sleep mode uses CuMemAllocator, which rejects expandable_segments.
     """
-    from flash.providers._worker import build_worker_env
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
+    from flash.providers._lifecycle.worker import build_worker_env
 
     def _spec():
         return JobSpec.from_dict(
@@ -5891,7 +5892,7 @@ def test_transfer_queue_init_that_never_returns_fails_with_the_resource_state(mo
     # with no timeout, so an unsatisfiable reservation stops the run before a single gpu is touched --
     # silently, because tq's logger defaults to WARNING. without a deadline the run burns the whole
     # setup grace period at 0% gpu and is reported as a generic stall.
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
 
     monkeypatch.setattr(
         plugin,
@@ -5931,7 +5932,7 @@ def test_transfer_queue_init_failure_propagates_unwrapped():
 def test_ray_resource_probe_reports_the_cluster_and_free_counts(monkeypatch):
     # ray is only present inside the verl child image, so the probe is exercised against a stub. the
     # message must name both totals and free counts: a wedged reservation is diagnosed by the gap.
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
 
     stub = types.ModuleType("ray")
     stub.cluster_resources = lambda: {"CPU": 8.0, "GPU": 1.0}
@@ -5948,7 +5949,7 @@ def test_ray_resource_probe_reports_a_fully_consumed_resource_as_zero(monkeypatc
     # that is the exhaustion case this probe exists to name, so rendering it as "free CPU=None" would
     # read as a broken probe at the exact moment the diagnosis matters. an earlier version of this test
     # hardcoded zero-valued keys in the stub and so could not have caught it.
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
 
     stub = types.ModuleType("ray")
     stub.cluster_resources = lambda: {"CPU": 8.0}
@@ -5964,7 +5965,7 @@ def test_ray_resource_probe_reports_a_fully_consumed_resource_as_zero(monkeypatc
 def test_ray_resource_probe_never_raises_on_the_timeout_path(monkeypatch):
     # _describe_ray_resources only runs while building a failure message, so a probe error there would
     # replace the diagnosis it exists to produce.
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
 
     stub = types.ModuleType("ray")
     stub.cluster_resources = lambda: (_ for _ in ()).throw(RuntimeError("ray is gone"))
@@ -5977,7 +5978,7 @@ def test_stalled_thread_probe_names_the_frame_the_thread_is_parked_in():
     # the point of the probe: identify WHICH of tq.init's three unbounded waits is stuck. a placement
     # group that never fills, a ray.get on the controller, and the `while conf is None` get_config spin
     # are indistinguishable from ray's resource counts, so the parked frame is the only discriminator.
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
 
     entered = threading.Event()
     release = threading.Event()
@@ -6003,7 +6004,7 @@ def test_stalled_thread_probe_names_the_frame_the_thread_is_parked_in():
 def test_stalled_thread_probe_reports_a_thread_that_is_gone_instead_of_raising():
     # a thread can finish between the is_alive check and the probe. that must degrade to a note in the
     # failure message, not an exception that replaces the timeout diagnosis.
-    import flash.engine.worker.opd_plugin as plugin
+    import flash.engine.worker.train.opd.child.plugin as plugin
 
     thread = threading.Thread(target=lambda: None, daemon=True)
     thread.start()

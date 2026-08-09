@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from flash.spec import JobSpec, require_project_id
+from flash.core.spec import JobSpec, require_project_id
 
 
 def spec_payload(

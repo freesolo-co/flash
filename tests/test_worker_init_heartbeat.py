@@ -113,7 +113,7 @@ def _liveness_env(monkeypatch, *, tick=0.01):
     """Patch heartbeat's module globals for a fast, side-effect-free liveness run.
 
     Returns (hb_module, worker_pkg, diag_include_torch_calls)."""
-    hb = importlib.import_module("flash.engine.worker.heartbeat")
+    hb = importlib.import_module("flash.engine.worker.io.heartbeat")
     import flash.engine.worker as w
 
     monkeypatch.setattr(hb, "_LIVENESS_TICK_S", tick)
@@ -215,7 +215,7 @@ def test_checkpoint_uploading_keepalive_stage_is_throttled_on_tight_cadence():
     throttled (else ~120/hr blows the HF commit cap) AND ride the tighter setup-liveness interval, so
     the provider stall clock is refreshed well inside STALL_AFTER_S rather than every _HB_MIN_INTERVAL_S."""
     import flash.engine.worker as ne
-    from flash.providers._poll import STALL_AFTER_S
+    from flash.providers._lifecycle.poll import STALL_AFTER_S
 
     assert "checkpoint_uploading" in ne._HB_UPLOAD_LIVENESS_STAGES
     assert "checkpoint_uploading" in ne._HB_TIGHT_LIVENESS_STAGES
@@ -282,7 +282,7 @@ def test_liveness_heartbeat_join_is_bounded_even_if_emit_wedges(monkeypatch):
 def test_liveness_heartbeat_rechecks_done_after_diagnostics():
     """gpu_diagnostics shells out to nvidia-smi (seconds); the wrapped call can finish during it. The
     daemon must re-check done BETWEEN diagnostics and the emit, so no stale stage lands afterward."""
-    hb = importlib.import_module("flash.engine.worker.heartbeat")
+    hb = importlib.import_module("flash.engine.worker.io.heartbeat")
     src = inspect.getsource(inspect.unwrap(hb.liveness_heartbeat))
     between = src[
         src.index("gpu_diagnostics(include_torch=False)") : src.index("_w.heartbeat(stage")
@@ -320,7 +320,7 @@ def test_heartbeat_marks_progress_only_for_real_heartbeats(monkeypatch):
 def test_heartbeat_console_summarizes_metric_backlog():
     import json
 
-    from flash.engine.worker.heartbeat import _console_heartbeat_snapshot
+    from flash.engine.worker.io.heartbeat import _console_heartbeat_snapshot
 
     console = json.loads(
         _console_heartbeat_snapshot(
@@ -546,7 +546,7 @@ def test_initial_rl_step_persists_through_throttle_and_bills_cancel(monkeypatch)
 
 
 def test_initial_rl_step_lock_timeout_is_retriable(monkeypatch):
-    hb = importlib.import_module("flash.engine.worker.heartbeat")
+    hb = importlib.import_module("flash.engine.worker.io.heartbeat")
     import flash.engine.worker as ne
 
     monkeypatch.setattr(hb, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.01)
@@ -718,7 +718,7 @@ def test_setup_liveness_upload_uses_shorter_interval(monkeypatch):
 
     import flash.engine.worker as ne
 
-    hbmod = importlib.import_module("flash.engine.worker.heartbeat")
+    hbmod = importlib.import_module("flash.engine.worker.io.heartbeat")
 
     now = {"t": 1000.0}
     uploads: list[dict] = []
@@ -804,7 +804,7 @@ def test_progress_carry_upgrades_ping_after_throttled_real_heartbeat(monkeypatch
 
     import flash.engine.worker as ne
 
-    hbmod = importlib.import_module("flash.engine.worker.heartbeat")
+    hbmod = importlib.import_module("flash.engine.worker.io.heartbeat")
     now = {"t": 1000.0}
     uploads: list[dict] = []
 
@@ -888,7 +888,7 @@ def test_progress_carry_does_not_mark_new_progress(monkeypatch):
 def test_hf_cache_bytes_counts_blobs_and_reports_unmeasurable_as_none(tmp_path, monkeypatch):
     import huggingface_hub.constants as hconst
 
-    from flash.engine.worker import hf
+    from flash.engine.worker.io import hf
 
     monkeypatch.setattr(hconst, "HF_HUB_CACHE", str(tmp_path))
     assert hf._hf_cache_bytes("org/model") is None  # no repo dir yet -> unmeasurable
@@ -906,7 +906,7 @@ def test_hf_cache_bytes_counts_blobs_and_reports_unmeasurable_as_none(tmp_path, 
 # Provider: liveness pings must NOT count as progress (else a wedged worker pinging "alive" masks the
 # stall). surface_heartbeat — shared by every provider — returns no-advance for a liveness heartbeat.
 def test_is_training_heartbeat_gates_setup_vs_training():
-    from flash.providers._poll import is_training_heartbeat
+    from flash.providers._lifecycle.poll import is_training_heartbeat
 
     # Setup stages (and a missing stage) never tighten — still the cold start.
     assert is_training_heartbeat("rl_train_start", None) is False
@@ -943,7 +943,7 @@ def test_setup_heartbeat_stages_cover_every_pre_training_liveness_stage():
     """The worker's progress-carry latch can upgrade any liveness ping to a REAL heartbeat. Every
     pre-training liveness stage must therefore be in SETUP_HEARTBEAT_STAGES, or a carried setup
     heartbeat would prematurely flip stall detection to the tight training window."""
-    from flash.providers._poll import SETUP_HEARTBEAT_STAGES
+    from flash.providers._lifecycle.poll import SETUP_HEARTBEAT_STAGES
 
     for stage in (
         "model_prefetching",
@@ -962,7 +962,7 @@ def test_setup_heartbeat_stages_cover_every_pre_training_liveness_stage():
 
 
 def test_provider_surface_heartbeat_records_liveness_without_progress(monkeypatch):
-    from flash.providers import _poll
+    from flash.providers._lifecycle import poll as _poll
 
     real = {"stage": "rl_initializing", "step": 0, "ts": 100.0, "attempt": "1"}
     key, stage = _poll.surface_heartbeat(lambda: real, None, lambda _m: None)
@@ -1017,7 +1017,7 @@ def test_train_phase_wraps_train_in_liveness_heartbeat(modname, outer, stage):
 
 
 def test_prefetch_wraps_download_in_liveness_heartbeat_gated_on_bytes():
-    from flash.engine.worker import hf
+    from flash.engine.worker.io import hf
 
     src = inspect.getsource(hf.prefetch_model)
     assert "liveness_heartbeat(" in src
@@ -1117,7 +1117,7 @@ def test_sft_configuring_is_a_setup_stage_on_the_tight_liveness_cadence():
     wide setup grace (it has not even loaded the model yet), refreshes status on the faster setup
     cadence, and is throttled so its 30s re-emit can't blow the HF commit cap."""
     import flash.engine.worker as ne
-    from flash.providers._poll import SETUP_HEARTBEAT_STAGES, is_training_heartbeat
+    from flash.providers._lifecycle.poll import SETUP_HEARTBEAT_STAGES, is_training_heartbeat
 
     assert "sft_configuring" in SETUP_HEARTBEAT_STAGES
     assert is_training_heartbeat("sft_configuring", 0) is False
@@ -1126,7 +1126,7 @@ def test_sft_configuring_is_a_setup_stage_on_the_tight_liveness_cadence():
 
 
 def test_resume_checkpoint_download_is_wrapped_in_liveness_heartbeat():
-    from flash.engine.worker import hf
+    from flash.engine.worker.io import hf
 
     src = inspect.getsource(hf.hf_resume_checkpoint)
     assert 'liveness_heartbeat("checkpoint_prefetching")' in src, (
@@ -1139,13 +1139,13 @@ def test_no_worker_side_stall_watchdog():
     liveness give-up. Guard against re-adding the env-tunable faulthandler timer."""
     import importlib
 
-    hb = importlib.import_module("flash.engine.worker.heartbeat")
+    hb = importlib.import_module("flash.engine.worker.io.heartbeat")
     assert not hasattr(hb, "_rearm_stall_faulthandler")
     assert not hasattr(hb, "_STALL_WATCHDOG_S")
 
 
 def test_bounded_reward_metrics_sanitizes_and_bounds_names() -> None:
-    hb = importlib.import_module("flash.engine.worker.heartbeat")
+    hb = importlib.import_module("flash.engine.worker.io.heartbeat")
     long_name = "x" * 100_000
 
     bounded = hb._bounded_reward_metrics(

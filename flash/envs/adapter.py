@@ -23,7 +23,7 @@ from flash.envs.loader import (
     load_freesolo_environment,
     managed_slug_to_github_ref,
 )
-from flash.opd_limits import (
+from flash.teacher.limits import (
     OPD_DEFAULT_EPISODE_TURNS,
     OPD_MAX_EPISODE_TURNS,
     OPD_MIN_EPISODE_TURNS,
@@ -449,13 +449,13 @@ class FreesoloEnvironment(BaseEnvironment):
         """The assistant turn as the scorer should see it: answer-only, reasoning available.
 
         Both parsers get ``prompt_opens_thinking``, exactly as the single-turn path forwards its
-        own ``_prompt_opens_thinking`` (flash/engine/worker/rl.py). Without it a turn truncated
+        own ``_prompt_opens_thinking`` (flash/engine/worker/entry/rl.py). Without it a turn truncated
         before ``</think>`` is tagless reasoning that ``strip_think`` returns whole as the answer,
         so the rollout can be rewarded for unfinished thinking that single-turn grading scores 0.
         """
         if not self.thinking:
             return content
-        from flash.thinking import strip_think, thinking_text
+        from flash.content.thinking import strip_think, thinking_text
 
         opened = self.prompt_opens_thinking
         answer = strip_think(content, prompt_opened_thinking=opened)
@@ -483,7 +483,7 @@ class FreesoloEnvironment(BaseEnvironment):
             # strip it. keep the raw view in step with it for any later turn.
             final = str(step.final_response_text)
             # wrap the override so `.completion` is env-authored while `.raw` and `.thinking` remain
-            # the model's original turn (flash/cli/training_doc.py). a bare str would discard those
+            # the model's original turn (flash/cli/scaffold/__init__.py). a bare str would discard those
             # scorer views. `raw_response_text` becomes the override because later turns step on it.
             previous = state.get("response_text")
             state["response_text"] = (

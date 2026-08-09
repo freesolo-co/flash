@@ -111,7 +111,7 @@ jobs:
           FP_BASE: ${{ steps.base.outputs.fp_base }}
           REV: ${{ steps.base.outputs.revision }}
         run: |
-          # flash/providers/_worker.py is the single source of truth for the arch list; the bake
+          # flash/providers/_lifecycle/worker.py is the single source of truth for the arch list; the bake
           # matrix mirrors it. read the canonical assignment statically without importing flash.
           arches=$(python3 docker/kernel_fingerprint.py --print-baked-arches)
           relayer=(); gpu=()

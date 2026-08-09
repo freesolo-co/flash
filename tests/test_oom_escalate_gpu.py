@@ -101,7 +101,7 @@ def _card(gpu, vram):
 
 
 def test_oom_escalated_keeps_only_strictly_larger_cards():
-    from flash.runner.lifecycle import _oom_escalated
+    from flash.runner.supervise.lifecycle import _oom_escalated
 
     cands = [_card("A100", 80), _card("A100b", 80), _card("Pro6000", 96), _card("B200", 180)]
     assert [c.gpu for c in _oom_escalated(cands, 0)] == [
@@ -128,7 +128,7 @@ def test_an_oom_retry_never_moves_to_a_shape_the_fit_model_calls_smaller():
     paid attempt to reach the same OOM.
     """
     from flash.providers.base import combined_vram_gb
-    from flash.runner.lifecycle import _candidate_usable_vram_gb, _oom_escalated
+    from flash.runner.supervise.lifecycle import _candidate_usable_vram_gb, _oom_escalated
 
     single_h200 = _shape("H200", 141, 1)
     pair_h100 = _shape("H100x2", 80, 2)
@@ -176,7 +176,7 @@ def test_surfaced_worker_flags_reads_both_flags_in_one_pass():
 
 
 def test_heartbeat_oom_for_attempt_gates_stale_flag():
-    from flash.providers._poll import heartbeat_oom_for_attempt
+    from flash.providers._lifecycle.poll import heartbeat_oom_for_attempt
 
     assert heartbeat_oom_for_attempt({"oom": True, "attempt": 0}, 0) is True
     assert heartbeat_oom_for_attempt({"oom": True, "attempt": 0}, 1) is False
@@ -194,7 +194,7 @@ def test_heartbeat_oom_for_attempt_gates_stale_flag():
 def test_heartbeat_oom_accepts_only_canonical_attempt_identities(
     heartbeat_attempt, current_attempt
 ):
-    from flash.providers._poll import heartbeat_oom_for_attempt
+    from flash.providers._lifecycle.poll import heartbeat_oom_for_attempt
 
     assert heartbeat_oom_for_attempt({"oom": True, "attempt": heartbeat_attempt}, current_attempt)
 
@@ -220,7 +220,7 @@ def test_heartbeat_oom_accepts_only_canonical_attempt_identities(
     ],
 )
 def test_heartbeat_oom_rejects_malformed_heartbeat_attempt(malformed_attempt):
-    from flash.providers._poll import heartbeat_oom_for_attempt
+    from flash.providers._lifecycle.poll import heartbeat_oom_for_attempt
 
     assert heartbeat_oom_for_attempt({"oom": True, "attempt": malformed_attempt}, 1) is False
 
@@ -246,7 +246,7 @@ def test_heartbeat_oom_rejects_malformed_heartbeat_attempt(malformed_attempt):
     ],
 )
 def test_heartbeat_oom_rejects_malformed_current_attempt(malformed_attempt):
-    from flash.providers._poll import heartbeat_oom_for_attempt
+    from flash.providers._lifecycle.poll import heartbeat_oom_for_attempt
 
     assert heartbeat_oom_for_attempt({"oom": True, "attempt": 1}, malformed_attempt) is False
 

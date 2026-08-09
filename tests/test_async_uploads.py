@@ -30,7 +30,7 @@ class _BlockingHfApi:
 @pytest.fixture
 def upload_worker(monkeypatch, tmp_path):
     import flash.engine.worker as worker
-    from flash.engine.worker import hf as worker_hf
+    from flash.engine.worker.io import hf as worker_hf
 
     monkeypatch.setattr(worker_hf, "_OPTIONAL_CHECKPOINT_UPLOADER", worker_hf._SingleSlotUploader())
     monkeypatch.setattr(worker_hf, "_OPTIONAL_AUX_UPLOADER", worker_hf._SingleSlotUploader())
@@ -249,7 +249,7 @@ def test_optional_flush_preserves_terminal_deadline_reserve(upload_worker, monke
 
 
 def test_copy_snapshot_falls_back_without_fcntl(monkeypatch, tmp_path):
-    from flash.engine.worker import hf as worker_hf
+    from flash.engine.worker.io import hf as worker_hf
 
     source = tmp_path / "source.bin"
     destination = tmp_path / "destination.bin"
@@ -261,7 +261,7 @@ def test_copy_snapshot_falls_back_without_fcntl(monkeypatch, tmp_path):
 
 
 def test_single_slot_coalesces_pending_uploads_in_order(tmp_path):
-    from flash.engine.worker.hf import _SingleSlotUploader
+    from flash.engine.worker.io.hf import _SingleSlotUploader
 
     uploader = _SingleSlotUploader()
     release = threading.Event()
@@ -360,7 +360,7 @@ def test_optional_checkpoint_emits_no_stale_heartbeat(
     import importlib
 
     worker, worker_hf = upload_worker
-    heartbeat_module = importlib.import_module("flash.engine.worker.heartbeat")
+    heartbeat_module = importlib.import_module("flash.engine.worker.io.heartbeat")
     heartbeats: list[tuple[str, dict]] = []
 
     class RecordingApi:

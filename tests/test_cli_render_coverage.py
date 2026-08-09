@@ -1,4 +1,4 @@
-"""Behavior tests for the pure formatting/theme/table helpers in ``flash.cli.render``.
+"""Behavior tests for the pure formatting/theme/table helpers in ``flash.cli.ui.render``.
 
 These target the render helpers the existing suite (test_cli_render_theme / test_cli_help)
 doesn't exercise: the tri-state env flag, the isatty fallback, the identity/login cards, the
@@ -16,7 +16,7 @@ import types
 
 import pytest
 
-from flash.cli import render
+from flash.cli.ui import render
 
 
 @pytest.fixture

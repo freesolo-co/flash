@@ -13,14 +13,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.server import db, teacher_broker
-from flash.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
+from flash.core.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
+from flash.server.domain import teacher_broker
+from flash.server.platform import db
 
 
 @pytest.fixture(autouse=True)
 def stub_worker_teacher_tokenizer(monkeypatch):
-    from flash.engine.worker import teacher as worker_teacher
-    from flash.engine.worker.teacher_encoding import EncodedTeacherToken
+    from flash.engine.worker.teacher import client as worker_teacher
+    from flash.engine.worker.teacher.encoding import EncodedTeacherToken
 
     class Tokenizer:
         def encode(self, text):
@@ -179,7 +180,7 @@ def test_exact_24_hour_capability_deadline_is_accepted(broker_db, monkeypatch):
 
 def test_48_hour_opd_wall_is_rejected_before_allocation(monkeypatch):
     import flash.providers.allocator as allocator
-    from flash.runner import lifecycle
+    from flash.runner.supervise import lifecycle
 
     monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
@@ -208,7 +209,7 @@ def test_48_hour_opd_wall_is_rejected_before_allocation(monkeypatch):
 def test_broker_accepts_every_catalog_teacher(monkeypatch):
     # the broker keeps its own alias set, so a catalog addition that is not mirrored here
     # would be rejected at submit despite resolving fine.
-    from flash.engine.recipe import TEACHER_MODELS
+    from flash.engine.plan.recipe import TEACHER_MODELS
 
     monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
@@ -623,7 +624,7 @@ def test_every_provider_reject_is_terminal_for_the_logical_request(broker_db, mo
 
 
 def test_worker_default_timeout_exceeds_broker_provider_ceiling():
-    from flash.engine.worker import teacher as worker_teacher
+    from flash.engine.worker.teacher import client as worker_teacher
 
     client = worker_teacher.TeacherClient(
         "capability-value", "https://broker.example", "parasail-glm-52"
@@ -637,7 +638,7 @@ def test_worker_default_timeout_exceeds_broker_provider_ceiling():
 def test_worker_reuses_one_logical_request_id_across_transport_retries(monkeypatch):
     import urllib.error
 
-    from flash.engine.worker import teacher as worker_teacher
+    from flash.engine.worker.teacher import client as worker_teacher
 
     payload = json.loads(_response())
     request_ids = []
@@ -672,7 +673,7 @@ def test_worker_reuses_one_logical_request_id_across_transport_retries(monkeypat
 def test_worker_retries_body_ingress_timeout_with_same_request_id(monkeypatch):
     import urllib.error
 
-    from flash.engine.worker import teacher as worker_teacher
+    from flash.engine.worker.teacher import client as worker_teacher
 
     request_ids = []
 
@@ -714,7 +715,7 @@ def test_worker_retries_body_ingress_timeout_with_same_request_id(monkeypatch):
 def test_worker_retries_request_in_progress_with_same_request_id(monkeypatch):
     import urllib.error
 
-    from flash.engine.worker import teacher as worker_teacher
+    from flash.engine.worker.teacher import client as worker_teacher
 
     request_ids = []
     sleeps = []
@@ -760,7 +761,7 @@ def test_worker_retries_request_in_progress_with_same_request_id(monkeypatch):
 def test_worker_fails_closed_on_nontransient_broker_classification(monkeypatch, classification):
     import urllib.error
 
-    from flash.engine.worker import teacher as worker_teacher
+    from flash.engine.worker.teacher import client as worker_teacher
 
     request_ids = []
 
@@ -1111,7 +1112,7 @@ def test_legacy_teacher_broker_url_does_not_configure_the_control_panel(monkeypa
 @pytest.mark.parametrize("missing", ["FLASH_CONTROL_PANEL_URL", "PARASAIL_API_KEY"])
 def test_missing_broker_configuration_fails_before_allocation(monkeypatch, missing):
     import flash.providers.allocator as allocator
-    from flash.runner import lifecycle
+    from flash.runner.supervise import lifecycle
 
     monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
@@ -1195,7 +1196,7 @@ def test_old_attempt_context_exit_does_not_revoke_new_attempt_token(broker_db, m
 
 def test_cancellation_fences_teacher_capabilities_before_lifecycle_work(monkeypatch):
     import flash.runner as runner
-    from flash.runner.deploy import cancel_run
+    from flash.runner.supervise.deploy import cancel_run
 
     events = []
     status = SimpleNamespace(
@@ -1234,9 +1235,9 @@ def test_cancellation_fences_teacher_capabilities_before_lifecycle_work(monkeypa
 
 
 def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monkeypatch):
-    from flash.providers._worker import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
     from flash.providers.base import PollResult
-    from flash.providers.lambdalabs.jobs.builders import build_payload as build_lambda_payload
+    from flash.providers.lambda_.jobs.builders import build_payload as build_lambda_payload
     from flash.providers.runpod import jobs as runpod_jobs
     from flash.providers.vast.jobs.builders import build_payload as build_vast_payload
 
@@ -1342,7 +1343,7 @@ def test_multiturn_capability_quota_covers_turns_and_no_signal_attempts(max_turn
 
 def test_unknown_external_environment_uses_identical_ceiling_for_quota_and_cost():
     from flash.cost.spec import runconfig_from_spec
-    from flash.opd_limits import opd_teacher_request_multiplier
+    from flash.teacher.limits import opd_teacher_request_multiplier
 
     spec = JobSpec(
         model="Qwen/Qwen3.5-4B",

@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from flash.server import auth
+from flash.server.platform import auth
 
 
 class _Response:

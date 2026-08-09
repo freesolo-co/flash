@@ -59,7 +59,7 @@ def _spec(monkeypatch):
 
 
 def test_cents_rounds_and_floors_at_zero():
-    from flash.server.billing import _cents
+    from flash.server.billing.charges import _cents
 
     assert _cents(12.34) == 1234
     assert _cents(0.0) == 0
@@ -69,7 +69,7 @@ def test_cents_rounds_and_floors_at_zero():
 def test_cents_rounds_half_up_not_bankers():
     """Money rounding is round-HALF-UP, not Python's ties-to-even (which would undercharge a
     half-cent tie, e.g. $0.005 -> 0)."""
-    from flash.server.billing import _cents
+    from flash.server.billing.charges import _cents
 
     assert _cents(0.005) == 1  # ties-to-even would give 0
     assert _cents(0.015) == 2  # ties-to-even would give 2 as well, but via half-up here
@@ -93,7 +93,7 @@ def _completed_status(monkeypatch, *, cost_usd: float = 12.345, org_id: str = "o
 
 
 def test_charge_posts_completed_run_cost_and_parses_response(monkeypatch):
-    from flash.server import billing
+    from flash.server.billing import charges as billing
 
     captured = {}
 
@@ -142,7 +142,7 @@ def test_charge_bills_cost_usd_for_a_cancelled_run(monkeypatch):
     """A cancelled run is charged its cost_usd exactly like a completed one -- the cancel path already
     set cost_usd to the estimate at the steps actually run, so charge_completed_run just bills it."""
     from flash.runner import RunStatus
-    from flash.server import billing
+    from flash.server.billing import charges as billing
 
     captured = {}
 
@@ -182,7 +182,7 @@ def test_charge_bills_cost_usd_for_a_cancelled_run(monkeypatch):
 
 
 def test_charge_completed_run_raises_billing_error_on_402(monkeypatch):
-    from flash.server import billing
+    from flash.server.billing import charges as billing
 
     def fake_urlopen(req, timeout=None):
         body = json.dumps(
@@ -204,7 +204,7 @@ def test_charge_completed_run_raises_billing_error_on_402(monkeypatch):
 
 
 def test_charge_completed_run_unreachable_raises_503(monkeypatch):
-    from flash.server import billing
+    from flash.server.billing import charges as billing
 
     def fake_urlopen(req, timeout=None):
         raise urllib.error.URLError("connection refused")
@@ -217,7 +217,7 @@ def test_charge_completed_run_unreachable_raises_503(monkeypatch):
 
 
 def test_charge_completed_run_requires_billing_org(monkeypatch):
-    from flash.server import billing
+    from flash.server.billing import charges as billing
 
     status = _completed_status(monkeypatch, org_id="")
 
@@ -230,7 +230,7 @@ def test_charge_completed_run_requires_billing_org(monkeypatch):
 def test_http_error_detail_falls_back_to_reason():
     """When the error body is missing/unparseable, the detail keeps the backend REASON
     (not a bare ``billing failed (<code>)``) so a 4xx/5xx stays diagnosable."""
-    from flash.server.billing import _http_error_detail
+    from flash.server.billing.charges import _http_error_detail
 
     # Unparseable body -> reason phrase is preserved in the detail.
     bad_body = urllib.error.HTTPError(
@@ -257,14 +257,14 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
-    # runpod.keys caches the parsed pool on first read; reset so the startup preflight reads THIS
+    # runpod.auth caches the parsed pool on first read; reset so the startup preflight reads THIS
     # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make the fixture self-contained).
-    import flash.providers.runpod.keys as runpod_keys
+    import flash.providers.runpod.auth as runpod_keys
 
     runpod_keys.reset()
     import flash.runner as runner
-    import flash.server.auth as auth_mod
-    import flash.server.db as db_mod
+    import flash.server.platform.auth as auth_mod
+    import flash.server.platform.db as db_mod
 
     importlib.reload(runner)
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
@@ -279,8 +279,8 @@ def api(tmp_path, monkeypatch):
     # configured provider keys would trigger orphan sweeps and status reporting. stub both because
     # these billing tests assert only on the API response and must remain network-free.
     import flash.providers as providers_mod
-    import flash.server.projects as projects_mod
-    import flash.server.run_registry as run_registry
+    import flash.server.domain.projects as projects_mod
+    import flash.server.domain.run_registry as run_registry
 
     monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
     monkeypatch.setattr(
@@ -294,7 +294,7 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
     # The new submit-time budget precheck would urllib-POST the real backend; stub it to a pass so
     # the default submit path stays hermetic. Gate-specific tests below override this per-test.
-    import flash.server.billing as billing_mod
+    import flash.server.billing.charges as billing_mod
 
     monkeypatch.setattr(billing_mod, "precheck_training_run", lambda **k: {"ok": True})
     with TestClient(app_mod.create_app()) as client:
@@ -314,8 +314,8 @@ def test_submit_records_pending_completion_billing(api):
 
 
 def test_budget_precheck_uses_prepared_estimate_before_record_run(api, monkeypatch):
-    import flash.server.billing as billing_mod
-    import flash.server.db as db_mod
+    import flash.server.billing.charges as billing_mod
+    import flash.server.platform.db as db_mod
 
     events = []
     original_record_run = db_mod.record_run
@@ -365,7 +365,7 @@ def test_internal_identity_skips_billing(api, monkeypatch):
 def test_submit_blocked_when_precheck_402(api, monkeypatch):
     # a hard 402 from the budget precheck rejects the run up front, before any GPU is allocated,
     # and the run is never recorded.
-    import flash.server.billing as billing_mod
+    import flash.server.billing.charges as billing_mod
 
     def _block(**k):
         raise billing_mod.BillingError(402, "insufficient balance")
@@ -381,7 +381,7 @@ def test_submit_blocked_when_precheck_402(api, monkeypatch):
 def test_submit_fails_open_when_precheck_unreachable(api, monkeypatch):
     # a non-402 billing error (backend unreachable / 5xx) must NOT block training; the completion
     # charge is the backstop. The run is still accepted and recorded.
-    import flash.server.billing as billing_mod
+    import flash.server.billing.charges as billing_mod
 
     def _unreachable(**k):
         raise billing_mod.BillingError(503, "billing service unavailable")
@@ -398,8 +398,8 @@ def test_dry_run_verifies_affordability_and_still_persists(api, monkeypatch):
     # a dry run is the pre-submit validation gate, so it must also answer "can this org afford
     # this run". the precheck is verify-only (moves no money), so running it here costs nothing
     # and stops a config from passing --dry-run only to be rejected 402 on real submission.
-    import flash.server.billing as billing_mod
-    import flash.server.db as db_mod
+    import flash.server.billing.charges as billing_mod
+    import flash.server.platform.db as db_mod
 
     events = []
     original_record_run = db_mod.record_run
@@ -431,7 +431,7 @@ def test_dry_run_verifies_affordability_and_still_persists(api, monkeypatch):
 def test_dry_run_blocked_when_org_cannot_afford_the_estimate(api, monkeypatch):
     # the whole point of validating billing on --dry-run: an unaffordable config fails here
     # instead of passing validation and being rejected only when the user really submits.
-    import flash.server.billing as billing_mod
+    import flash.server.billing.charges as billing_mod
 
     def _block(**k):
         raise billing_mod.BillingError(402, "insufficient balance")
@@ -449,7 +449,7 @@ def test_dry_run_blocked_when_org_cannot_afford_the_estimate(api, monkeypatch):
 
 def test_dry_run_fails_open_when_billing_backend_is_unreachable(api, monkeypatch):
     # a billing-infra blip must not block local validation, matching real submission's behavior.
-    import flash.server.billing as billing_mod
+    import flash.server.billing.charges as billing_mod
 
     def _unreachable(**k):
         raise billing_mod.BillingError(503, "billing service unavailable")
@@ -470,7 +470,7 @@ def test_dry_run_fails_open_when_billing_backend_is_unreachable(api, monkeypatch
 
 def test_dry_run_reports_affordability_verified_when_the_check_ran(api, monkeypatch):
     """A real pass and a failed-open skip must be distinguishable, since both answer 200."""
-    import flash.server.billing as billing_mod
+    import flash.server.billing.charges as billing_mod
 
     monkeypatch.setattr(billing_mod, "precheck_training_run", lambda **k: {"ok": True})
     res = api.post(
@@ -485,7 +485,7 @@ def test_dry_run_reports_affordability_verified_when_the_check_ran(api, monkeypa
 
 def test_dry_run_reports_unverified_when_internal_reporting_is_off(api, monkeypatch):
     """The other fail-open path: no internal key, so the precheck returns before calling billing."""
-    import flash.server._internal_client as internal_mod
+    import flash.server.platform.internal_client as internal_mod
 
     monkeypatch.setattr(internal_mod, "internal_key", lambda: None)
     res = api.post(
@@ -502,7 +502,7 @@ def test_billable_dry_run_without_an_org_is_rejected_like_a_real_submit(api, mon
     # the org requirement belongs to the key, not the mode. when it was checked only for real
     # submits, an org-less billable key skipped the affordability conjunct and got 200 from
     # --dry-run, then 400 for the identical spec on submit: the preview contradicting the launch.
-    import flash.server.billing as billing_mod
+    import flash.server.billing.charges as billing_mod
 
     def _unexpected(**kwargs):
         raise AssertionError("affordability cannot be checked without an org")
@@ -521,7 +521,7 @@ def test_billable_dry_run_without_an_org_is_rejected_like_a_real_submit(api, mon
 def test_unsupported_spec_reports_itself_rather_than_insufficient_balance(api, monkeypatch):
     # static launch validation must precede billing. otherwise an unsupported spec reports 402 and
     # sends the user to top up for a failure money cannot fix.
-    import flash.server.billing as billing_mod
+    import flash.server.billing.charges as billing_mod
 
     def _block(**k):
         raise billing_mod.BillingError(402, "insufficient balance")
@@ -565,8 +565,8 @@ def test_unsupported_spec_reports_itself_rather_than_insufficient_balance(api, m
 
 
 def test_internal_submit_skips_affordability_precheck_before_persistence(api, monkeypatch):
-    import flash.server.billing as billing_mod
-    import flash.server.db as db_mod
+    import flash.server.billing.charges as billing_mod
+    import flash.server.platform.db as db_mod
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-secret")
     events = []
@@ -594,7 +594,7 @@ def test_internal_submit_skips_affordability_precheck_before_persistence(api, mo
 
 
 def test_external_identity_with_internal_prefix_is_still_billed(api, monkeypatch):
-    import flash.server.auth as auth_mod
+    import flash.server.platform.auth as auth_mod
 
     token = "fslo-user-spoof"
     auth_mod._verify_cache[token] = (
@@ -638,7 +638,7 @@ def test_submit_failure_records_nothing(api, monkeypatch):
 def test_record_run_failure_does_not_submit(api, monkeypatch):
     """If ``db.record_run`` fails (e.g. SQLite locked/full), submit_job is not reached."""
     import flash.server.app as app_mod
-    import flash.server.db as db_mod
+    import flash.server.platform.db as db_mod
 
     def failing_record(run_id, key_id):
         raise RuntimeError("database is locked")
@@ -701,8 +701,8 @@ def test_a_profile_is_prechecked_and_persisted_as_its_own_charge(api, monkeypatc
     Charging it against the training estimate would gate a $0.25 cpu job on whether the org can
     afford the gpu run it has not been quoted for yet -- and would bill the two as one.
     """
-    import flash.server.billing as billing_mod
-    from flash.server import db
+    import flash.server.billing.charges as billing_mod
+    from flash.server.platform import db
 
     profile_run_id = "profile-sft-" + "c" * 64
     submitted = _pending_profile(monkeypatch, profile_run_id=profile_run_id)
@@ -729,8 +729,8 @@ def test_an_unaffordable_profile_leaves_no_run_and_no_launch(api, monkeypatch):
     The id is global to the workload, so a stranded row is not one user's problem: every later
     submitter of this config would be told to wait for a profile nobody is running.
     """
-    import flash.server.billing as billing_mod
-    from flash.server import db
+    import flash.server.billing.charges as billing_mod
+    from flash.server.platform import db
 
     profile_run_id = "profile-sft-" + "c" * 64
     submitted = _pending_profile(monkeypatch, profile_run_id=profile_run_id)
@@ -750,7 +750,7 @@ def test_an_unaffordable_profile_leaves_no_run_and_no_launch(api, monkeypatch):
 def test_a_profile_that_cannot_be_launched_releases_its_claim(api, monkeypatch):
     """Same invariant on the other failure: the claim is released when the launch does not happen."""
     import flash.server.app as app_mod
-    from flash.server import db
+    from flash.server.platform import db
 
     profile_run_id = "profile-sft-" + "c" * 64
     _pending_profile(monkeypatch, profile_run_id=profile_run_id)
@@ -776,7 +776,7 @@ def test_a_profile_that_failed_after_persisting_its_run_keeps_its_claim(api, mon
 
     import flash.server.app as app_mod
     from flash.runner import runs_file_path
-    from flash.server import db
+    from flash.server.platform import db
 
     profile_run_id = "profile-sft-" + "c" * 64
     _pending_profile(monkeypatch, profile_run_id=profile_run_id)
@@ -807,7 +807,7 @@ def test_a_profile_miss_creates_no_training_run_and_no_training_charge(api, monk
     This is the invariant that makes a separate profile charge defensible. If a miss also recorded
     a training run, the profile would be a surcharge on top of the run rather than its own job.
     """
-    from flash.server import db
+    from flash.server.platform import db
 
     profile_run_id = "profile-sft-" + "c" * 64
     _pending_profile(monkeypatch, profile_run_id=profile_run_id)
@@ -825,7 +825,8 @@ def test_a_profile_miss_creates_no_training_run_and_no_training_charge(api, monk
 
 def test_completion_hook_charges_final_cost(monkeypatch, tmp_path):
     import flash.runner as runner
-    from flash.runner import RunStatus, lifecycle
+    from flash.runner import RunStatus
+    from flash.runner.supervise import lifecycle
 
     spec = _spec(monkeypatch)
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
@@ -848,7 +849,7 @@ def test_completion_hook_charges_final_cost(monkeypatch, tmp_path):
         calls.append((internal_key, status.run_id, status.cost_usd))
         return {"amountCents": 123, "balanceCents": 877, "replay": False}
 
-    monkeypatch.setattr("flash.server.billing.charge_completed_run", fake_charge)
+    monkeypatch.setattr("flash.server.billing.charges.charge_completed_run", fake_charge)
     log = io.StringIO()
 
     lifecycle._charge_completed_run_by_id(spec.run_id, log)
@@ -863,7 +864,8 @@ def test_completion_hook_charges_final_cost(monkeypatch, tmp_path):
 
 def test_completion_hook_records_missing_internal_key(monkeypatch, tmp_path):
     import flash.runner as runner
-    from flash.runner import RunStatus, lifecycle
+    from flash.runner import RunStatus
+    from flash.runner.supervise import lifecycle
 
     spec = _spec(monkeypatch)
     monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
@@ -879,7 +881,7 @@ def test_completion_hook_records_missing_internal_key(monkeypatch, tmp_path):
         )
     )
     monkeypatch.setattr(
-        "flash.server.billing.charge_completed_run",
+        "flash.server.billing.charges.charge_completed_run",
         lambda **_: (_ for _ in ()).throw(AssertionError("must not charge without internal key")),
     )
 

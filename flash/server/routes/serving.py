@@ -24,8 +24,9 @@ from jsonschema.validators import validator_for
 from referencing import Registry
 from referencing.exceptions import Unresolvable
 
-from flash.engine.structured_outputs import parse_structured_outputs
-from flash.lora_rank import serving_completion_token_capacity
+from flash.adapters.lora_rank import serving_completion_token_capacity
+from flash.content.structured_outputs import parse_structured_outputs
+from flash.core.spec import JobSpec
 from flash.runner import (
     adapter_prefix,
     effective_spec_from_status,
@@ -38,7 +39,7 @@ from flash.runner import (
     read_verified_adapter_revisions,
     verified_adapter_revision_generation,
 )
-from flash.runner.checkpoints import checkpoint_adapter_prefix
+from flash.runner.results.checkpoints import checkpoint_adapter_prefix
 from flash.schema import parse_adapter_revision
 from flash.serve.deploy import (
     ActivationOutcomeUnknown,
@@ -56,10 +57,9 @@ from flash.serve.preflight import (
 )
 from flash.serve.urls import public_deployment
 from flash.server import app as _app
-from flash.server import db
-from flash.server._deps import _require_bool, manageable_run, owned_run, require_key
-from flash.server._internal_client import run_org_id
-from flash.spec import JobSpec
+from flash.server.platform import db
+from flash.server.platform.deps import _require_bool, manageable_run, owned_run, require_key
+from flash.server.platform.internal_client import run_org_id
 
 router = APIRouter()
 
@@ -562,7 +562,7 @@ def _thinking_tag_is_guaranteed(spec) -> bool:
     has nothing to do with either, and treating that raise as "guaranteed" would demand the tag
     from precisely the models that cannot promise it.
     """
-    from flash.catalog import MODELS
+    from flash.core.catalog import MODELS
 
     model = getattr(spec, "model", None)
     return isinstance(model, str) and model.strip() in MODELS
@@ -1393,7 +1393,7 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
     # best-effort product-analytics report: exports never otherwise touch the
     # platform backend (the copy is hf-to-hf inside flash).
     with contextlib.suppress(Exception):
-        from flash.server.run_registry import record_model_exported
+        from flash.server.domain.run_registry import record_model_exported
 
         record_model_exported(
             status=status,

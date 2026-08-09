@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 import pytest
 
 from flash.runner import _DEFAULT_ARTIFACT_NAMESPACE
-from flash.server import repo_cleanup as rc
+from flash.server.domain import repo_cleanup as rc
 
 # Real implementations captured before the offline conftest stub swaps in a no-op sweep.
 _REAL_DEPLOYED = rc.deployed_prefixes
@@ -140,7 +140,7 @@ def test_scan_workers_ignores_environment(value):
         [
             sys.executable,
             "-c",
-            "from flash.server.repo_cleanup import _SCAN_WORKERS; print(_SCAN_WORKERS)",
+            "from flash.server.domain.repo_cleanup import _SCAN_WORKERS; print(_SCAN_WORKERS)",
         ],
         env=env,
         check=True,
@@ -196,7 +196,7 @@ def test_scan_repo_classifies_paths():
 
 
 def test_private_opd_retry_markers_are_never_cleanup_targets(monkeypatch):
-    from flash.opd_retry_contract import opd_optimizer_start_marker_path
+    from flash.teacher.retry_contract import opd_optimizer_start_marker_path
 
     repo = _managed("opd-retry")
     marker_path = opd_optimizer_start_marker_path("flash-1-a", 0)
@@ -609,7 +609,7 @@ def test_cooperative_stop_halts_before_deleting(monkeypatch):
 
 
 def test_hold_run_lock_is_nonblocking_and_mutually_exclusive():
-    from flash.server._locks import _deploy_lock
+    from flash.server.platform.locks import _deploy_lock
 
     held = _REAL_HOLD_RUN_LOCK("flash-lock-a")  # free -> acquired and returned
     assert held is not None

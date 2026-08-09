@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import pytest
 
+from flash.core.spec import JobSpec
 from flash.schema import ConfigError, spec_from_dict
-from flash.spec import JobSpec
 from tests._helpers.specs import raw_spec
 
 # (id, raw-dict override applied to a minimal valid spec, expected error fragment). Each override

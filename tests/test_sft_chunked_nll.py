@@ -22,7 +22,7 @@ def test_sft_worker_requests_the_fused_loss_its_sizing_assumes():
     Flash no longer requests `loss_type="chunked_nll"` anywhere and verl trains out-of-process, so
     there is no in-process model to patch and nothing left of ours for those to cover.
     """
-    from flash.engine.vram import sft_chunked_nll_enabled
+    from flash.engine.plan.vram import sft_chunked_nll_enabled
     from flash.engine.worker import sft_train
 
     source = inspect.getsource(sft_train)

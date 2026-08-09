@@ -246,7 +246,7 @@ def test_invalid_config_rejected():
 def test_omitted_grpo_context_sizes_like_the_real_allocator():
     # An omitted GRPO context mirrors the worker's max(1024, max_prompt_len + completion), not
     # bare max_prompt_len -- else the estimate under-sizes VRAM by the completion budget.
-    from flash.engine.recipe import RECIPE
+    from flash.engine.plan.recipe import RECIPE
     from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
 
     cfg = RunConfig(MID, "grpo", 100)  # max_context_tokens / seq_len omitted
@@ -265,7 +265,7 @@ def test_omitted_grpo_context_sizes_like_the_real_allocator():
 
 def test_omitted_grpo_context_mirrors_worker_with_thinking():
     # The thinking completion budget (larger) feeds the same worker-mirrored default.
-    from flash.engine.recipe import RECIPE
+    from flash.engine.plan.recipe import RECIPE
 
     cfg = RunConfig(MID, "grpo", 100, thinking=True)
     worker_len = max(1024, RECIPE.rl.max_prompt_len + RECIPE.rl.max_completion_len_thinking)
@@ -347,7 +347,7 @@ def test_opd_teacher_latency_uses_conservative_retry_and_turn_wave_policy(
 ):
     from flash.cost.analytical import step_seconds_split
     from flash.cost.facts import teacher_seconds_per_completion
-    from flash.opd_limits import OPD_TEACHER_SCORING_CONCURRENCY
+    from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
 
     config = RunConfig(
         MID,
