@@ -2422,17 +2422,6 @@ def _grpo_child_env_extras(reward_url, inp):
     return extras
 
 
-def _grpo_export_adapter(actor_dir, adapter_dir, preprocessor, inp, python_bin):
-    """merge the trained actor into a peft adapter and publish it with its provenance."""
-    export_peft_adapter(
-        actor_dir, adapter_dir, base_model_id=inp["model_id"], python_bin=python_bin
-    )
-    preprocessor.save_pretrained(adapter_dir)
-    stamp_adapter_dir_provenance(adapter_dir, inp["model_id"], inp["model_revision"])
-    _w.write_base_model_provenance(adapter_dir, inp["model_id"], inp["model_revision"])
-    _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-
-
 def run_rl_train():
     """grpo training on verl, output-compatible with run_rl. see module docstring for scope."""
     t_start = time.time()

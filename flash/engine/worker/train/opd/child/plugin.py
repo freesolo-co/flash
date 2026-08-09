@@ -1254,9 +1254,6 @@ def _install_verl_extensions() -> None:
 
     _install_flash_multi_turn_agent_loop(deps)
 
-    def filter_signal_batch(batch):
-        return _filter_signal_batch(batch, deps)
-
     class FlashPPOTrainer(PPOTrainer):
         def init_workers(self):
             _init_flash_ppo_trainer(self, FlashPPOTrainer, deps)

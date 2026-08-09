@@ -584,10 +584,13 @@ def test_opd_validates_dynamic_image_compatibility_before_gpu_wait():
 
     from flash.engine.worker.opd_train import _prepare_opd_train, _scan_opd_prompt_rows
 
-    source = inspect.getsource(_scan_opd_prompt_rows) + inspect.getsource(_prepare_opd_train)
-    validation = 'validate_multimodal_training(model_id, "opd")'
-
-    assert source.index(validation) < source.index("_probe_gpu_in_subprocess(")
+    # the scan carries the validation, so the order that matters is the order the caller invokes
+    # them in. concatenating two sources cannot show that: it would fix the order in the test.
+    assert 'validate_multimodal_training(model_id, "opd")' in inspect.getsource(
+        _scan_opd_prompt_rows
+    )
+    caller = inspect.getsource(_prepare_opd_train)
+    assert caller.index("_scan_opd_prompt_rows(") < caller.index("_probe_gpu_in_subprocess(")
 
 
 class _CharTok:
@@ -1163,13 +1166,17 @@ def test_opd_worker_fp8_kv_flag_matches_the_sizing_assumption():
     from flash.engine.worker import opd_train
 
     # the probe runs under run_opd_train's configuring wrap and hands its answers to the resolver,
-    # so the gdn question and the flag it feeds sit in different functions of the same path.
-    src = inspect.getsource(opd_train.run_opd_train) + inspect.getsource(
-        opd_train._prepare_opd_verl
-    )
-    assert "model_is_gdn_hybrid(model_id, revision=model_revision)" in src
-    assert "fp8_kv = _cc_ok and not gdn_hybrid" in src
-    assert "get_device_capability() >= (8, 9)" in src
+    # so follow the VALUE across the two functions rather than concatenating their sources: a
+    # concatenation proves only that the fragments exist somewhere, not that they are connected.
+    probe = inspect.getsource(opd_train.run_opd_train)
+    assert "gdn_hybrid = model_is_gdn_hybrid(model_id, revision=model_revision)" in probe
+    assert "return python_bin, gdn_hybrid, gdn_module, caps" in probe
+    resolver = inspect.getsource(opd_train._prepare_opd_verl)
+    assert "python_bin, gdn_hybrid, gdn_module, caps = probe_verl_child(" in resolver
+    assert "fp8_kv = _cc_ok and not gdn_hybrid" in resolver
+    assert "get_device_capability() >= (8, 9)" in resolver
+    # and the resolver is the one the live entrypoint calls, with that probe.
+    assert "_prepare_opd_verl(prepared, probe_verl_child)" in probe
 
     # and the override is emitted only when the resolved flag is true, so a bf16 worker never sends
     # fp8 (an absent key means bf16, which is the conservative direction).

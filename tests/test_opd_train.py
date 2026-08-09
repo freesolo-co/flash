@@ -5092,22 +5092,25 @@ def test_both_ray_rollouts_resolve_eager_from_the_same_hardware_probe():
     # during the first weight sync. opd is the more exposed path, not the less -- it always runs
     # rollout.mode=async, whose server hardcodes cudagraph_mode=FULL_AND_PIECEWISE. a fix applied to
     # only one trainer is how this reached production in the first place.
-    for module, source in (
-        ("rl_train", inspect.getsource(rl_train.run_rl_train)),
-        (
-            "opd_train",
-            # the one child probe runs under run_opd_train's configuring wrap; the eager decision
-            # reads its answers downstream, so the pair spans all three functions.
-            inspect.getsource(opd_train.run_opd_train)
-            + inspect.getsource(opd_train._prepare_opd_verl)
-            + inspect.getsource(opd_train._prepare_opd_execution),
-        ),
-    ):
-        assert "resolve_rollout_enforce_eager(" in source, module
-        # every capability question rides ONE child probe per run; the eager decision reads that
-        # blob rather than spawning a torch import of its own.
-        assert "caps = probe_verl_capabilities(python_bin, gdn_module)" in source, module
-        assert "verl_cc = verl_device_capability(caps)" in source, module
+    # grpo keeps the whole chain in one function, so read it off that function directly.
+    grpo = inspect.getsource(rl_train.run_rl_train)
+    assert "caps = probe_verl_capabilities(python_bin, gdn_module)" in grpo
+    assert "verl_cc = verl_device_capability(caps)" in grpo
+    assert "resolve_rollout_enforce_eager(" in grpo
+
+    # opd splits the same chain across the probe and the resolver, so follow the VALUE rather than
+    # concatenating sources: a concatenation would only prove the fragments exist in some file.
+    probe = inspect.getsource(opd_train.run_opd_train)
+    assert "caps = probe_verl_capabilities(python_bin, gdn_module)" in probe
+    # the probe's caps is the last element it hands back...
+    assert "return python_bin, gdn_hybrid, gdn_module, caps" in probe
+    resolver = inspect.getsource(opd_train._prepare_opd_verl)
+    # ...and the resolver binds that same position before deriving the eager decision from it.
+    assert "python_bin, gdn_hybrid, gdn_module, caps = probe_verl_child(" in resolver
+    assert "verl_cc = verl_device_capability(caps)" in resolver
+    assert "enforce_eager = resolve_rollout_enforce_eager(verl_cc)" in resolver
+    # and the resolver is the one the live entrypoint actually calls, with that probe.
+    assert "_prepare_opd_verl(prepared, probe_verl_child)" in probe
 
 
 def test_overrides_pin_the_rollout_resident_for_sleep_unsupported_models():
@@ -5645,9 +5648,13 @@ def test_worker_filters_over_budget_prompts_before_downloading_the_weights():
 def test_worker_refuses_to_publish_a_loss_curve_shorter_than_the_final_checkpoint():
     import inspect
 
-    from flash.engine.worker.opd_train import _finalize_opd_train, _write_opd_train_meta
+    from flash.engine.worker.opd_train import (
+        _execute_opd_train,
+        _finalize_opd_train,
+        _write_opd_train_meta,
+    )
 
-    source = inspect.getsource(_finalize_opd_train) + inspect.getsource(_write_opd_train_meta)
+    source = inspect.getsource(_finalize_opd_train)
     # record_step only checks that each metric line FOLLOWS the previous one, so it cannot notice a
     # MISSING TRAILING metric: on_line silently skips any step-tagged line whose loss it cannot
     # parse, and no later step ever arrives to trip the sequence check. that leaves a curve of
@@ -5656,10 +5663,12 @@ def test_worker_refuses_to_publish_a_loss_curve_shorter_than_the_final_checkpoin
     assert 'if len(final_accounting["loss_curve"]) != final_step:' in source
     guard = source[source.index('if len(final_accounting["loss_curve"]) != final_step:') :]
     assert "raise RuntimeError(" in guard[:600]
-    # and it must sit BEFORE the publish, not after it.
-    assert source.index('if len(final_accounting["loss_curve"]) != final_step:') < source.index(
-        "_w.write_train_meta("
-    )
+    # and it must sit BEFORE the publish. the guard and the publish are in different functions now,
+    # so the order that matters is the caller's: concatenating the two sources would fix the order
+    # in the test rather than read it off the code.
+    assert "_w.write_train_meta(" in inspect.getsource(_write_opd_train_meta)
+    caller = inspect.getsource(_execute_opd_train)
+    assert caller.index("_finalize_opd_train(") < caller.index("_write_opd_train_meta(")
 
 
 def test_train_meta_reports_the_teacher_call_shape_only_where_one_is_enforced():
