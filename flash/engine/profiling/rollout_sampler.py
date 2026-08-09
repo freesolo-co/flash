@@ -132,6 +132,7 @@ def sample_rollouts(
     temperature: float | None,
     base_url: str,
     api_key: str,
+    stop_sequences: Sequence[str] = (),
 ) -> RolloutSampling:
     """draw ``rollouts`` generations, spreading across ``prompts`` before repeating one.
 
@@ -165,6 +166,7 @@ def sample_rollouts(
             temperature=temperature,
             base_url=base_url,
             api_key=api_key,
+            stop_sequences=stop_sequences,
         )
         if sample is None:
             failures += 1
@@ -189,6 +191,7 @@ def _one_completion(
     temperature: float | None,
     base_url: str,
     api_key: str,
+    stop_sequences: Sequence[str] = (),
 ) -> RolloutSample | None:
     """one generation's token counts, or None when the draw failed for any reason."""
     payload: dict[str, object] = {
@@ -201,6 +204,13 @@ def _one_completion(
     }
     if temperature is not None:
         payload["temperature"] = float(temperature)
+    # the training rollout passes these as `stop`, so a run configured with them ends generation at
+    # the first one. sampling without them lets the hosted model run on to the cap and reports a
+    # mean no rollout produces -- biased HIGH, the direction that overbills. a stop-string draw ends
+    # with finish_reason "stop", which is the natural end this already counts as EOS.
+    stops = [str(value) for value in stop_sequences if value]
+    if stops:
+        payload["stop"] = stops
     request = urllib.request.Request(
         f"{base_url.rstrip('/')}/chat/completions",
         data=json.dumps(payload).encode(),

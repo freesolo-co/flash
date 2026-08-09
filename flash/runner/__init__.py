@@ -899,14 +899,24 @@ def _attach_rollout_workload_profile(spec: JobSpec, evidence: object) -> JobSpec
     # back on the fail-open path below.
     pinned = _assign_resolved_env_sha(spec)
 
+    producer_version = _profile_producer_version()
     profile = rollout_profile_from_evidence(
         pinned,
         evidence,
-        producer_version=_profile_producer_version(),
+        producer_version=producer_version,
     )
     if not profile:
         return spec
-    return replace(pinned, workload_profile=profile)
+    # stamp the version that keyed this profile, exactly as the sft path does. the re-quote at
+    # allocation re-derives the identity, and reading it from the live `flash.__version__` would
+    # make the answer depend on which process does the arithmetic: after a package bump the
+    # re-derived version no longer matches, the profile is dropped, and a run that submitted at a
+    # measured price is re-quoted at the cap.
+    return replace(
+        pinned,
+        workload_profile=profile,
+        workload_profile_producer_version=producer_version,
+    )
 
 
 def _require_sft_workload_profile(spec: JobSpec) -> JobSpec:

@@ -423,6 +423,10 @@ def _spec_with_profile(**profile_overrides):
     class _WithProfile(_Spec):
         train = _QuotableTrain()
         workload_profile_kind = ""
+        # the runner stamps the version that keyed the profile, and the quote path reads it from
+        # here rather than from the live flash.__version__ so a package bump cannot silently
+        # invalidate a measurement taken at submit time.
+        workload_profile_producer_version = __version__
         gpu = type(
             "G",
             (),

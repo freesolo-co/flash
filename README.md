@@ -142,17 +142,25 @@ times the generation it performs.
 
 If you point `flash train` at an OpenAI-compatible inference endpoint, it samples a handful of real
 completions for your model and prompts before submitting, and times your environment's own reward
-function. Both are optional:
+function. This is **off unless you set the key** — no measurement happens, and the quote uses the
+cap, until you opt in:
 
 ```bash
 export FLASH_ROLLOUT_SAMPLER_API_KEY=...          # unset = no measurement, quote uses the cap
 export FLASH_ROLLOUT_SAMPLER_BASE_URL=...         # defaults to https://openrouter.ai/api/v1
 ```
 
-Only aggregates are sent: token counts, grading latency, and how many draws survived. No prompts,
-completions, token ids, or credentials leave your machine. The server re-derives the config digest
-itself and re-applies the same trust checks a server-side profile passes, so a measurement can only
-lower a quote by surviving those checks.
+**Setting that key sends your prompts to that endpoint.** Measuring generation length means
+generating: the prompts your environment builds are placed in chat-completions requests to
+`FLASH_ROLLOUT_SAMPLER_BASE_URL`, which defaults to OpenRouter, a third party. Point it at an
+endpoint you trust with your prompts, or leave the key unset. Your model is also named in those
+requests, and your environment's `reward()` is called locally on a small sample, so a reward that
+calls a paid external scorer really calls it.
+
+What reaches the **Flash control plane** is aggregates only: token counts, grading latency, and how
+many draws survived. No prompts, completions, token ids, or credentials go to Flash. The server
+re-derives the config digest itself and re-applies the same trust checks a server-side profile
+passes, so a measurement can only lower a quote by surviving those checks.
 
 Unlike SFT, this fails **open**. An SFT profile is an exact census of the rows training consumes, so
 a mismatch means refusing is correct. A rollout profile is a sample of a stochastic process, and one

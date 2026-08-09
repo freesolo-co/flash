@@ -8,6 +8,7 @@ leave the quote on the declared cap rather than fail the submit.
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import replace
 
@@ -41,6 +42,15 @@ def _spec(**overrides) -> JobSpec:
     }
     base.update(overrides)
     return JobSpec(**base)
+
+
+def _with_profile(spec: JobSpec, profile: dict) -> JobSpec:
+    """Attach a profile the way the runner does, stamping the version that keyed it.
+
+    The producer version is part of the profile's identity, so a spec carrying a profile without it
+    is a state the runner never produces -- and one whose quote silently drops the measurement.
+    """
+    return replace(spec, workload_profile=profile, workload_profile_producer_version=VERSION)
 
 
 def _evidence(**overrides) -> dict:
@@ -77,7 +87,7 @@ def test_sampling_spreads_draws_across_distinct_prompts_before_repeating_one(mon
     """
     seen: list[str] = []
 
-    def _fake(*, model, messages, max_completion_tokens, temperature, base_url, api_key):
+    def _fake(*, model, messages, max_completion_tokens, temperature, base_url, api_key, **_kw):
         seen.append(messages[-1]["content"])
         return RolloutSample(prompt_tokens=10, completion_tokens=40, truncated=False)
 
@@ -457,7 +467,7 @@ def test_measured_length_lowers_a_grpo_quote_below_the_cap():
     assert profile is not None
 
     capped = runconfig_from_spec(spec)
-    measured = runconfig_from_spec(replace(spec, workload_profile=profile))
+    measured = runconfig_from_spec(_with_profile(spec, profile))
     assert capped.measured_completion_tokens is None
     assert measured.measured_completion_tokens == pytest.approx(53.6875)
     # 54 realized tokens against a 512 cap: the cap-based quote prices ~10x the generation.
@@ -469,7 +479,7 @@ def test_a_measured_reward_latency_reaches_the_cost_model():
 
     spec = _spec()
     profile = rollout_profile_from_evidence(spec, _evidence(), producer_version=VERSION)
-    measured = runconfig_from_spec(replace(spec, workload_profile=profile))
+    measured = runconfig_from_spec(_with_profile(spec, profile))
     assert measured.reward_seconds_per_completion == pytest.approx(0.0102)
 
 
@@ -485,7 +495,7 @@ def test_an_unmeasured_reward_leaves_the_cost_model_on_its_default():
         producer_version=VERSION,
     )
     assert profile is not None
-    measured = runconfig_from_spec(replace(spec, workload_profile=profile))
+    measured = runconfig_from_spec(_with_profile(spec, profile))
     assert measured.reward_seconds_per_completion is None
 
 
@@ -562,3 +572,212 @@ def test_an_unreachable_pin_returns_the_quote_to_the_cap_instead_of_failing(monk
     monkeypatch.setattr("flash.envs.loader._resolve_ref_sha", _boom)
     attached = _attach_rollout_workload_profile(wire, _evidence())
     assert attached.workload_profile == {}
+
+
+def test_a_measured_quote_survives_a_package_version_bump(monkeypatch):
+    """The re-quote at allocation must not silently drop the measurement after a bump.
+
+    The producer version keys the profile identity. Re-deriving it from the live
+    ``flash.__version__`` makes the answer depend on which process does the arithmetic: a run that
+    submitted at a measured price gets re-quoted at the cap once the package moves under it. The
+    sft path stamps the version on the spec for exactly this reason; this pins the rollout path to
+    the same contract.
+    """
+    from flash.core.spec import JobSpec
+    from flash.cost.spec import _rollout_profile
+    from flash.runner import _attach_rollout_workload_profile
+
+    wire = JobSpec.from_dict(_spec().to_dict())
+    monkeypatch.setattr("flash.envs.loader._resolve_ref_sha", lambda *a, **k: "c" * 40)
+    attached = _attach_rollout_workload_profile(wire, _evidence())
+    assert attached.workload_profile, "precondition: the measurement must have attached"
+    assert attached.workload_profile_producer_version, "the keying version must travel on the spec"
+    assert _rollout_profile(attached) is not None, "precondition: it re-quotes at the same version"
+
+    monkeypatch.setattr(flash, "__version__", "9.9.99")
+    assert _rollout_profile(attached) is not None, (
+        "a package bump between submit and allocation must not re-quote the run at the cap"
+    )
+
+
+def test_configured_stop_sequences_reach_the_sampled_request(monkeypatch):
+    """A run with stop strings ends generation at the first one.
+
+    Sampling without them lets the hosted model run on toward the cap, so the measured mean is
+    biased HIGH -- the direction that overbills the user this feature exists to price correctly.
+    """
+    seen: dict = {}
+
+    def _capture(*, model, messages, max_completion_tokens, temperature, base_url, api_key, **kw):
+        seen.update(kw)
+        return RolloutSample(prompt_tokens=10, completion_tokens=40, truncated=False)
+
+    monkeypatch.setattr(
+        "flash.engine.profiling.rollout_sampler._one_completion", _capture, raising=True
+    )
+    sample_rollouts(
+        model="m",
+        prompts=[[{"role": "user", "content": "p"}]],
+        rollouts=1,
+        max_completion_tokens=512,
+        temperature=None,
+        base_url="https://example.invalid/v1",
+        api_key="k",
+        stop_sequences=("</answer>",),
+    )
+    assert seen.get("stop_sequences") == ("</answer>",)
+
+
+def test_stop_sequences_are_sent_as_the_apis_stop_field(monkeypatch):
+    """The wire contract: an OpenAI-compatible endpoint honours `stop`, so it must be in the body."""
+    captured: dict = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _fake_urlopen(request, timeout=None):
+        captured["body"] = json.loads(request.data.decode())
+        return _Response()
+
+    monkeypatch.setattr(
+        "flash.engine.profiling.rollout_sampler.json.load",
+        lambda _r: {
+            "usage": {"completion_tokens": 12, "prompt_tokens": 20},
+            "choices": [{"finish_reason": "stop"}],
+        },
+    )
+    monkeypatch.setattr(
+        "flash.engine.profiling.rollout_sampler.urllib.request.urlopen", _fake_urlopen
+    )
+    rollout_sampler._one_completion(
+        model="m",
+        messages=[{"role": "user", "content": "p"}],
+        max_completion_tokens=64,
+        temperature=None,
+        base_url="https://example.invalid/v1",
+        api_key="k",
+        stop_sequences=("</answer>", ""),
+    )
+    # the empty string is dropped: an empty stop string would end every generation immediately.
+    assert captured["body"]["stop"] == ["</answer>"]
+
+
+def test_no_stop_field_is_sent_when_the_run_configures_none(monkeypatch):
+    """An unconditional `stop: []` is not the same request; leave the key off entirely."""
+    captured: dict = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _fake_urlopen(request, timeout=None):
+        captured["body"] = json.loads(request.data.decode())
+        return _Response()
+
+    monkeypatch.setattr(
+        "flash.engine.profiling.rollout_sampler.json.load",
+        lambda _r: {
+            "usage": {"completion_tokens": 12, "prompt_tokens": 20},
+            "choices": [{"finish_reason": "stop"}],
+        },
+    )
+    monkeypatch.setattr(
+        "flash.engine.profiling.rollout_sampler.urllib.request.urlopen", _fake_urlopen
+    )
+    rollout_sampler._one_completion(
+        model="m",
+        messages=[{"role": "user", "content": "p"}],
+        max_completion_tokens=64,
+        temperature=None,
+        base_url="https://example.invalid/v1",
+        api_key="k",
+    )
+    assert "stop" not in captured["body"]
+
+
+@pytest.mark.parametrize(
+    ("reward_samples", "must_say", "must_not_say"),
+    [
+        (3, "reward() were run", "was NOT called"),
+        (0, "was NOT called", "external scorer was really called"),
+    ],
+)
+def test_the_dry_run_claims_reward_ran_only_when_it_did(
+    reward_samples, must_say, must_not_say, capsys
+):
+    """Grading is skipped for a multi-turn or thread-unsafe env, and for one whose gold completions
+    cannot be read -- evidence still arrives from generation sampling alone. Telling a user a paid
+    external scorer was called when it was not is the one claim here they could act on wrongly."""
+    from flash.cli.commands import _dry_run_preview_line
+
+    line = _dry_run_preview_line(
+        algorithm="grpo",
+        affordability_verified=True,
+        rollout_evidence=_evidence(reward_samples=reward_samples),
+    )
+    assert must_say in line
+    assert must_not_say not in line
+
+
+def test_the_dry_run_says_nothing_ran_when_there_was_no_measurement():
+    from flash.cli.commands import _dry_run_preview_line
+
+    line = _dry_run_preview_line(
+        algorithm="grpo", affordability_verified=True, rollout_evidence=None
+    )
+    assert "did NOT import or run your environment.py" in line
+
+
+def test_the_submit_path_forwards_the_runs_stop_sequences_to_the_measurement(monkeypatch, tmp_path):
+    """The seam between the spec and the sampler.
+
+    Testing the sampler alone leaves this uncovered: dropping the argument at the call site is
+    silent, and the measured mean is then biased HIGH for every run that configures stop strings.
+    """
+    from flash.cli.commands import rollout_profile as rp
+
+    entry = tmp_path / "package" / "environment.py"
+    entry.parent.mkdir(parents=True)
+    entry.write_text("")
+
+    class _Env:
+        def dataset(self):
+            return [{"q": "2+2?"}]
+
+        def prompt_messages(self, example):
+            return [{"role": "user", "content": example["q"]}]
+
+    class _Client:
+        def download_env_package(self, _env_id):
+            return b""
+
+    seen: dict = {}
+    # collect_for_submit imports each of these in-body, so the DEFINING module is the binding a
+    # patch has to reach -- patching an alias on `rp` would leave the real call untouched.
+    monkeypatch.setattr(
+        "flash.envs.pull.pull_environment_package_from_archive",
+        lambda *_a: tmp_path / "package",
+    )
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda *_a, **_k: _Env())
+    monkeypatch.setattr(
+        "flash.engine.profiling.rollout_evidence.collect_rollout_evidence",
+        lambda **kw: seen.update(kw),
+    )
+
+    monkeypatch.setenv(rollout_sampler.ROLLOUT_SAMPLER_API_KEY_ENV, "k")
+    spec = _spec(
+        train=TrainSpec(max_steps=50, batch_size=8, group_size=4, stop_sequences=("</answer>",))
+    )
+    # debug=True so a broken fixture raises instead of being swallowed by the fail-open guard and
+    # read as "the argument was not forwarded".
+    rp.collect_for_submit(_Client(), spec, debug=True)
+    assert seen.get("stop_sequences") == ("</answer>",), (
+        "the run's stop strings must reach the sampler, or the measured length is biased high"
+    )

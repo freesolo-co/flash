@@ -81,6 +81,9 @@ def _collect(client, spec) -> dict[str, Any] | None:
             temperature=_sampling_temperature(spec),
             score_one=score_one,
             reward_samples=references,
+            # a run configured with stop strings ends generation at the first one, so a sample
+            # drawn without them measures a longer completion than training will ever produce.
+            stop_sequences=tuple(getattr(spec.train, "stop_sequences", ()) or ()),
         )
 
 

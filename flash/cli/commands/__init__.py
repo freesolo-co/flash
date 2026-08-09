@@ -407,6 +407,58 @@ def _client_train_schema(authored_train_keys: frozenset[str]) -> dict:
     }
 
 
+def _dry_run_preview_line(
+    *, algorithm: str, affordability_verified: bool, rollout_evidence: dict | None
+) -> str:
+    """What a dry run actually checked, and what it actually executed on this machine.
+
+    Three-way, because what ran locally differs per path. sft required a matching workload profile
+    to get this far, and that profile run already imported environment.py and tokenized the dataset,
+    so claiming otherwise would understate what has been checked and already billed. A measured
+    grpo/opd quote imported environment.py too. Only the unmeasured path ran nothing.
+    """
+    # the server fails open on a billing-infra problem, so "cost" is only in the validated list
+    # when it was actually checked. absent key = a server that predates the signal, which is
+    # equally not a verification -- so treat anything but an explicit True as unverified.
+    cost = "and cost" if affordability_verified else "but NOT cost"
+    if algorithm == "sft":
+        environment = (
+            "your environment.py and the exact dataset were already loaded and tokenized by "
+            "the workload profile this quote is built on; model load and gpu/training are "
+            "first exercised on the worker after cold-start."
+        )
+    elif rollout_evidence:
+        # whether reward() ALSO ran is a separate question from whether the env was imported.
+        # grading is skipped for a multi-turn or thread-unsafe env, and for one whose gold
+        # completions cannot be read, in which case the evidence still arrives from generation
+        # sampling alone. telling a user a paid external scorer was called when it was not is the
+        # one claim here they could act on wrongly, so it is read off what was actually measured.
+        graded = bool(rollout_evidence.get("reward_samples"))
+        ran = (
+            "dataset(), prompt_messages() and reward() were run on a small sample, so a "
+            "reward that calls an external scorer was really called"
+            if graded
+            else "dataset() and prompt_messages() were run on a small sample; reward() was "
+            "NOT called, so its grading cost is not in this quote"
+        )
+        environment = (
+            f"your environment.py WAS imported locally to measure this quote: {ran}. "
+            "worker imports, model load, and gpu/training are first exercised on the worker "
+            "after cold-start."
+        )
+    else:
+        environment = (
+            "it did NOT import or run your environment.py; dataset loading, "
+            "start_episode/episode shapes, reward/scorer, worker imports, model load, and "
+            "gpu/training are first exercised on the worker after cold-start."
+        )
+    return (
+        "dry-run validated: config/schema, model+algorithm compatibility, lora rank, "
+        f"runtime-secret presence, warm-start source, serving context cap, {cost}. "
+        f"{environment}"
+    )
+
+
 def _rollout_evidence_for(client: ApiClient, spec) -> dict | None:
     """Measured rollout aggregates for a grpo/opd submit, or None when nothing was measured.
 
@@ -692,38 +744,12 @@ def cmd_train(args) -> int:
         # when it was actually checked. absent key = a server that predates the signal, which is
         # equally not a verification -- so treat anything but an explicit True as unverified.
         affordability_verified = status.pop("affordability_verified", None) is True
-        cost = "and cost" if affordability_verified else "but NOT cost"
-        # sft additionally required a matching workload profile to get this far, and that profile
-        # run already imported environment.py and tokenized the dataset. claiming otherwise here
-        # would understate what has been checked -- and what has already been billed.
-        # three-way, because what has run locally differs per path and the user is told exactly
-        # which. quoting a measured price while claiming nothing was executed would be false.
-        if spec.algorithm == "sft":
-            environment = (
-                "your environment.py and the exact dataset were already loaded and tokenized by "
-                "the workload profile this quote is built on; model load and gpu/training are "
-                "first exercised on the worker after cold-start."
-            )
-        elif rollout_evidence:
-            # measuring the rollout means importing environment.py and calling dataset(),
-            # prompt_messages() and reward() here. the preview must say so: this quote is the
-            # measured one, and a reward that calls a paid external judge was really called.
-            environment = (
-                "your environment.py WAS imported locally to measure this quote: dataset(), "
-                "prompt_messages() and reward() were run on a small sample, so a reward that "
-                "calls an external scorer was really called. worker imports, model load, and "
-                "gpu/training are first exercised on the worker after cold-start."
-            )
-        else:
-            environment = (
-                "it did NOT import or run your environment.py; dataset loading, "
-                "start_episode/episode shapes, reward/scorer, worker imports, model load, and "
-                "gpu/training are first exercised on the worker after cold-start."
-            )
         print(
-            "dry-run validated: config/schema, model+algorithm compatibility, lora rank, "
-            f"runtime-secret presence, warm-start source, serving context cap, {cost}. "
-            f"{environment}",
+            _dry_run_preview_line(
+                algorithm=spec.algorithm,
+                affordability_verified=affordability_verified,
+                rollout_evidence=rollout_evidence,
+            ),
             file=sys.stderr,
         )
         if not affordability_verified:
