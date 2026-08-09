@@ -1504,7 +1504,7 @@ def test_optional_upload_without_deadline_preserves_single_attempt(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# flash #184: tilelang's libcudart_stub.so shadows the real CUDA runtime in
+# tilelang's libcudart_stub.so shadows the real CUDA runtime in
 # vLLM's CudaRTLibrary (intermittent `undefined symbol: cudaDeviceReset`).
 # ---------------------------------------------------------------------------
 def _fake_tilelang(tmp_path, stub_bytes=b"STUB"):

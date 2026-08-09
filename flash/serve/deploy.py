@@ -33,7 +33,7 @@ def default_serving_url(channel: str = CHANNEL) -> str:
     """Default serving control root for the given release channel.
 
     Serving and control planes use separate per-channel databases; mixing them causes org FK 23503.
-    Dev serving is ``serve-dev.freesolo.co`` per freesolo #667.
+    Dev serving is ``serve-dev.freesolo.co``.
     """
     return DEV_FREESOLO_SERVING_URL if channel == "dev" else PROD_FREESOLO_SERVING_URL
 

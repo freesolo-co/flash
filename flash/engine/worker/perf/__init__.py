@@ -148,7 +148,7 @@ def _find_real_libcudart() -> str | None:
 
 
 def _neutralize_tilelang_cudart_stub() -> None:
-    """Repoint tilelang's libcudart_stub.so at the real libcudart to prevent a vLLM crash (flash #184).
+    """Repoint tilelang's libcudart_stub.so at the real libcudart to prevent a vLLM crash.
 
     tilelang's stub is missing cudaDeviceReset; vLLM scans /proc/self/maps for libcudart and can
     pick up the stub, aborting import. Must run AFTER _ensure_fla_fastpath_on_hopper (tilelang
@@ -173,7 +173,7 @@ def _neutralize_tilelang_cudart_stub() -> None:
     real = _find_real_libcudart()
     if real is None:
         print(
-            "[worker] libcudart stub shadow: no real libcudart found; left as-is (flash #184)",
+            "[worker] libcudart stub shadow: no real libcudart found; left as-is",
             flush=True,
         )
         return
@@ -185,7 +185,7 @@ def _neutralize_tilelang_cudart_stub() -> None:
             with contextlib.suppress(FileNotFoundError):
                 os.remove(stub)
         os.symlink(real, stub)
-        print(f"[worker] redirected tilelang libcudart_stub.so -> {real} (flash #184)", flush=True)
+        print(f"[worker] redirected tilelang libcudart_stub.so -> {real}", flush=True)
     except Exception as e:
         print(f"[worker] libcudart stub neutralize failed: {e}", flush=True)
 

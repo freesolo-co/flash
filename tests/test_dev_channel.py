@@ -48,7 +48,7 @@ def test_default_api_url_follows_channel():
 def test_default_serving_url_follows_channel():
     """The serving plane is per-channel, exactly like the control plane above.
 
-    Each channel's serving app is backed by its own Supabase project (freesolo #667), so an org
+    Each channel's serving app is backed by its own Supabase project, so an org
     row exists in one of them and not the other. A dev-channel client defaulting to prod serving
     posts a dev `org_id` into the prod database and takes a 23503 foreign-key violation -- which
     reads as a serving outage but is a routing defect, and which no retry can clear.
@@ -71,9 +71,9 @@ def test_every_hosted_default_flips_with_the_channel():
 
     This is the regression that was missing. `serve.freesolo.co` sat hardcoded in
     `flash/serve/deploy.py` while `client/config.py` derived its URL from CHANNEL, so the dev
-    package shipped a prod serving endpoint and every dev deploy failed the prod org_id FK
-    (freesolo #667). Each half was internally consistent, so nothing was red -- the same shape as
-    the catalog drift in PR #933.
+    package shipped a prod serving endpoint and every dev deploy failed the prod org_id FK.
+    Each half was internally consistent, so nothing was red -- the same shape as the earlier
+    catalog drift between the flash and serving rank limits.
 
     Asserting per-constant would just re-encode the mistake, so this scans the built dev tree for
     any surviving prod host. It fails on the NEXT hosted endpoint added without a channel split,
