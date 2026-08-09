@@ -65,6 +65,116 @@ def _post_multiturn_score(
         raise
 
 
+def _attach_teacher_rows(outputs, score_payload) -> None:
+    """attach the bridge's teacher tensors to each turn's output, rejecting any shape mismatch.
+
+    one scored row per emitted turn. a count or length disagreement cannot be aligned to tokens,
+    and training on a misaligned teacher is worse than failing the rollout, so both raise.
+    """
+    scored_turns = score_payload["turns"]
+    if len(scored_turns) != len(outputs):
+        raise RuntimeError("multi-turn bridge returned the wrong number of teacher rows")
+
+    import torch
+
+    for output, scored in zip(outputs, scored_turns, strict=True):
+        teacher_ids = torch.tensor(scored["teacher_ids"], dtype=torch.int32).unsqueeze(-1)
+        teacher_logprobs = torch.tensor(scored["teacher_logprobs"], dtype=torch.float32).unsqueeze(
+            -1
+        )
+        expected_length = len(output.prompt_ids) + len(output.response_ids)
+        if teacher_ids.shape != teacher_logprobs.shape:
+            raise RuntimeError("multi-turn OPD teacher tensors are inconsistent")
+        if teacher_ids.shape[0] != expected_length:
+            raise RuntimeError("multi-turn OPD teacher tensors have the wrong sequence length")
+        output.extra_fields["teacher_ids"] = teacher_ids
+        output.extra_fields["teacher_logprobs"] = teacher_logprobs
+
+
+def _opd_turn_sampling_params(
+    sampling_params: dict,
+    *,
+    max_tokens: int,
+    seed: int,
+    stop_sequences,
+    eos_token_ids,
+) -> dict:
+    """the per-turn sampling params: the caller's, plus this turn's cap, seed, and stop conditions."""
+    params = dict(sampling_params)
+    params["max_tokens"] = max_tokens
+    params["seed"] = seed
+    if stop_sequences:
+        params["stop"] = list(stop_sequences)
+        params["include_stop_str_in_output"] = True
+    if eos_token_ids:
+        params["stop_token_ids"] = sorted(eos_token_ids)
+    return params
+
+
+def _opd_turn_output_fields(
+    prefix_ids,
+    response_ids,
+    response_logprobs,
+    generated,
+    *,
+    turn_ordinal: int,
+    generated_seconds: float,
+    num_preempted: int,
+) -> dict:
+    """the fields one OPD turn contributes to its own AgentLoopOutput.
+
+    OPD emits one output per turn rather than one per episode, so the prompt is the prefix this turn
+    conditioned on and the whole response is model-generated (mask all ones).
+    """
+    return {
+        "prompt_ids": list(prefix_ids),
+        "response_ids": list(response_ids),
+        "response_mask": [1] * len(response_ids),
+        "response_logprobs": response_logprobs,
+        "num_turns": turn_ordinal + 1,
+        "metrics": {
+            "generate_sequences": generated_seconds,
+            "tool_calls": 0.0,
+            "compute_score": 0.0,
+            "num_preempted": num_preempted,
+        },
+        "extra_fields": dict(generated.extra_fields or {}),
+    }
+
+
+class _OpdEpisodeSettings:
+    """the per-run rollout settings the parent hands the child through the environment.
+
+    read once per episode rather than per turn. the verl interpreter cannot import flash, so the
+    parent resolves the bridge address, seed, turn limits, halting, and thinking into strings and
+    this reads them back. the capability set is validated here because an environment missing a
+    capability cannot serve this loop at all.
+    """
+
+    def __init__(self):
+        self.bridge_url = os.environ["FLASH_OPD_BRIDGE_URL"]
+        self.bridge_token = os.environ["FLASH_OPD_BRIDGE_TOKEN"]
+        self.flash_seed = int(os.environ["FLASH_OPD_SEED"])
+        self.max_turns = int(os.environ["FLASH_OPD_MAX_TURNS"])
+        self.max_model_len = int(os.environ["FLASH_OPD_MAX_MODEL_LEN"])
+        capabilities = set(json.loads(os.environ.get("FLASH_OPD_ENV_CAPABILITIES", "[]")))
+        required_capabilities = {
+            "new_rollout_state",
+            "record_model_turn",
+            "env_reply",
+            "rollout_done",
+        }
+        if capabilities != required_capabilities:
+            raise RuntimeError("multi-turn OPD environment capability metadata is invalid")
+        self.stop_sequences = tuple(
+            str(value) for value in json.loads(os.environ.get("FLASH_OPD_STOP_SEQUENCES", "[]"))
+        )
+        self.eos_token_ids = frozenset(
+            int(value) for value in json.loads(os.environ.get("FLASH_OPD_EOS_TOKEN_IDS", "[]"))
+        )
+        self.thinking = os.environ.get("FLASH_OPD_THINKING") == "1"
+
+
 def build_flash_multi_turn_agent_loop(
     *,
     register,
@@ -98,36 +208,14 @@ def build_flash_multi_turn_agent_loop(
                 [dict(message) for message in kwargs["raw_prompt"]], source="initial prompt"
             )
             prompt_ids = await self.apply_chat_template(raw_prompt)
-            bridge_url = os.environ["FLASH_OPD_BRIDGE_URL"]
-            bridge_token = os.environ["FLASH_OPD_BRIDGE_TOKEN"]
-            flash_seed = int(os.environ["FLASH_OPD_SEED"])
+            settings = _OpdEpisodeSettings()
+            bridge_url = settings.bridge_url
+            bridge_token = settings.bridge_token
             global_step = int(kwargs["global_steps"])
             example_index = int(kwargs["index"])
             rollout_ordinal = int(kwargs.get("session_id", 0))
-            no_signal_attempt_ordinal = int(kwargs.get("flash_no_signal_attempt", 0))
-            max_turns = int(os.environ["FLASH_OPD_MAX_TURNS"])
-            max_model_len = int(os.environ["FLASH_OPD_MAX_MODEL_LEN"])
-            capabilities = set(json.loads(os.environ.get("FLASH_OPD_ENV_CAPABILITIES", "[]")))
-            required_capabilities = {
-                "new_rollout_state",
-                "record_model_turn",
-                "env_reply",
-                "rollout_done",
-            }
-            if capabilities != required_capabilities:
-                raise RuntimeError("multi-turn OPD environment capability metadata is invalid")
-            stop_sequences = tuple(
-                str(value) for value in json.loads(os.environ.get("FLASH_OPD_STOP_SEQUENCES", "[]"))
-            )
-            eos_token_ids = frozenset(
-                int(value) for value in json.loads(os.environ.get("FLASH_OPD_EOS_TOKEN_IDS", "[]"))
-            )
-            thinking = os.environ.get("FLASH_OPD_THINKING") == "1"
-            glue_tokenizer = EnvGlueTokenizer(self.tokenizer, thinking=thinking)
             session_id = f"{uuid4().hex}-{global_step}-{example_index}-{rollout_ordinal}"
             outputs = []
-            generated_seconds = 0.0
-            num_preempted = -1
             start_attempted = False
             failure_exit_code = None
             try:
@@ -147,107 +235,22 @@ def build_flash_multi_turn_agent_loop(
                     ),
                 )
                 turn_limit = int(start["max_turns"])
-                if turn_limit <= 0 or turn_limit > max_turns:
+                if turn_limit <= 0 or turn_limit > settings.max_turns:
                     raise RuntimeError(
                         "multi-turn bridge returned an invalid per-example turn limit"
                     )
-                prefix_ids = list(prompt_ids)
-                for turn_ordinal in range(turn_limit):
-                    remaining = max_model_len - len(prefix_ids)
-                    if remaining <= 0:
-                        raise RuntimeError(
-                            "multi-turn OPD dispatched a prompt without completion capacity"
-                        )
-                    max_tokens = min(int(self.rollout_config.response_length), remaining)
-                    params = dict(sampling_params)
-                    params["max_tokens"] = max_tokens
-                    params["seed"] = deterministic_seed(
-                        flash_seed,
-                        global_step,
-                        example_index,
-                        rollout_ordinal,
-                        turn_ordinal,
-                        no_signal_attempt_ordinal,
-                    )
-                    if stop_sequences:
-                        params["stop"] = list(stop_sequences)
-                        params["include_stop_str_in_output"] = True
-                    if eos_token_ids:
-                        params["stop_token_ids"] = sorted(eos_token_ids)
-                    request_started = time.perf_counter()
-                    generated = await self.server_manager.generate(
-                        request_id=uuid4().hex,
-                        prompt_ids=prefix_ids,
-                        sampling_params=params,
-                    )
-                    generated_seconds += time.perf_counter() - request_started
-                    num_preempted = sum_preemptions(num_preempted, generated.num_preempted)
-                    turn = prepare_assistant_turn(
-                        self.tokenizer,
-                        generated.token_ids,
-                        stop_reason=generated.stop_reason,
-                        max_tokens=max_tokens,
-                        eos_token_ids=eos_token_ids,
-                        stop_sequences=stop_sequences,
-                    )
-                    response_ids = turn["response_ids"]
-                    response_logprobs = generated.log_probs
-                    if response_logprobs is not None:
-                        response_logprobs = list(response_logprobs[: len(response_ids)])
-                    step = await run_executor_call(
-                        self.loop,
-                        lambda turn_ordinal=turn_ordinal, prefix_ids=list(prefix_ids), turn=dict(turn): (
-                            post_json(
-                                bridge_url,
-                                bridge_token,
-                                "/multiturn/step",
-                                {
-                                    "session_id": session_id,
-                                    "turn_ordinal": turn_ordinal,
-                                    "accepted_prefix": prefix_ids,
-                                    "raw_response_ids": turn["raw_response_ids"],
-                                    "response_ids": turn["response_ids"],
-                                    "completion_text": turn["completion_text"],
-                                    "termination": turn["termination"],
-                                    "stop_reason": turn["stop_reason"],
-                                    "max_tokens": turn["max_tokens"],
-                                    "truncated": turn["truncated"],
-                                    "skip_reason": turn["skip_reason"],
-                                },
-                            )
-                        ),
-                    )
-                    outputs.append(
-                        agent_loop_output(
-                            prompt_ids=list(prefix_ids),
-                            response_ids=list(response_ids),
-                            response_mask=[1] * len(response_ids),
-                            response_logprobs=response_logprobs,
-                            num_turns=turn_ordinal + 1,
-                            metrics={
-                                "generate_sequences": generated_seconds,
-                                "tool_calls": 0.0,
-                                "compute_score": 0.0,
-                                "num_preempted": num_preempted,
-                            },
-                            extra_fields=dict(generated.extra_fields or {}),
-                        )
-                    )
-                    if turn["truncated"] or turn["skip_reason"] or step["terminal"]:
-                        break
-                    prefix_ids.extend(response_ids)
-                    env_messages = validate_transcript_messages(
-                        step["messages"], source="environment reply"
-                    )
-                    if not env_messages:
-                        break
-                    glue_ids = dedup_seam_terminator(response_ids, glue_tokenizer(env_messages))
-                    # stop while at least a minimal generation window remains: gluing right up to
-                    # max_model_len leaves the next turn zero tokens to generate (the engine would
-                    # immediately truncate), so reserve a small slack for the next model turn.
-                    if len(prefix_ids) + len(glue_ids) + 8 > max_model_len:
-                        break
-                    prefix_ids.extend(glue_ids)
+                await self._run_turns(
+                    sampling_params,
+                    outputs,
+                    settings=settings,
+                    prompt_ids=prompt_ids,
+                    session_id=session_id,
+                    turn_limit=turn_limit,
+                    global_step=global_step,
+                    example_index=example_index,
+                    rollout_ordinal=rollout_ordinal,
+                    no_signal_attempt_ordinal=int(kwargs.get("flash_no_signal_attempt", 0)),
+                )
                 score_payload = await run_executor_call(
                     self.loop,
                     lambda: _post_multiturn_score(
@@ -258,29 +261,7 @@ def build_flash_multi_turn_agent_loop(
                         session_id,
                     ),
                 )
-                scored_turns = score_payload["turns"]
-                if len(scored_turns) != len(outputs):
-                    raise RuntimeError(
-                        "multi-turn bridge returned the wrong number of teacher rows"
-                    )
-                import torch
-
-                for output, scored in zip(outputs, scored_turns, strict=True):
-                    teacher_ids = torch.tensor(scored["teacher_ids"], dtype=torch.int32).unsqueeze(
-                        -1
-                    )
-                    teacher_logprobs = torch.tensor(
-                        scored["teacher_logprobs"], dtype=torch.float32
-                    ).unsqueeze(-1)
-                    expected_length = len(output.prompt_ids) + len(output.response_ids)
-                    if teacher_ids.shape != teacher_logprobs.shape:
-                        raise RuntimeError("multi-turn OPD teacher tensors are inconsistent")
-                    if teacher_ids.shape[0] != expected_length:
-                        raise RuntimeError(
-                            "multi-turn OPD teacher tensors have the wrong sequence length"
-                        )
-                    output.extra_fields["teacher_ids"] = teacher_ids
-                    output.extra_fields["teacher_logprobs"] = teacher_logprobs
+                _attach_teacher_rows(outputs, score_payload)
             except Exception as error:
                 failure_exit_code = (
                     transient_teacher_exit
@@ -303,6 +284,128 @@ def build_flash_multi_turn_agent_loop(
                 exit_process(failure_exit_code)
                 raise AssertionError("multi-turn OPD process exit returned unexpectedly")
             return outputs
+
+        async def _run_turns(
+            self,
+            sampling_params: dict[str, Any],
+            outputs: list,
+            *,
+            settings,
+            prompt_ids,
+            session_id: str,
+            turn_limit: int,
+            global_step: int,
+            example_index: int,
+            rollout_ordinal: int,
+            no_signal_attempt_ordinal: int,
+        ) -> None:
+            """generate and record turns until the env, the budget, or the turn limit ends the episode.
+
+            appends one output per emitted turn to ``outputs``; the caller owns the session's start,
+            scoring, and close.
+            """
+            bridge_url = settings.bridge_url
+            bridge_token = settings.bridge_token
+            flash_seed = settings.flash_seed
+            max_model_len = settings.max_model_len
+            stop_sequences = settings.stop_sequences
+            eos_token_ids = settings.eos_token_ids
+            glue_tokenizer = EnvGlueTokenizer(self.tokenizer, thinking=settings.thinking)
+            generated_seconds = 0.0
+            num_preempted = -1
+            prefix_ids = list(prompt_ids)
+            for turn_ordinal in range(turn_limit):
+                remaining = max_model_len - len(prefix_ids)
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "multi-turn OPD dispatched a prompt without completion capacity"
+                    )
+                max_tokens = min(int(self.rollout_config.response_length), remaining)
+                params = _opd_turn_sampling_params(
+                    sampling_params,
+                    max_tokens=max_tokens,
+                    seed=deterministic_seed(
+                        flash_seed,
+                        global_step,
+                        example_index,
+                        rollout_ordinal,
+                        turn_ordinal,
+                        no_signal_attempt_ordinal,
+                    ),
+                    stop_sequences=stop_sequences,
+                    eos_token_ids=eos_token_ids,
+                )
+                request_started = time.perf_counter()
+                generated = await self.server_manager.generate(
+                    request_id=uuid4().hex,
+                    prompt_ids=prefix_ids,
+                    sampling_params=params,
+                )
+                generated_seconds += time.perf_counter() - request_started
+                num_preempted = sum_preemptions(num_preempted, generated.num_preempted)
+                turn = prepare_assistant_turn(
+                    self.tokenizer,
+                    generated.token_ids,
+                    stop_reason=generated.stop_reason,
+                    max_tokens=max_tokens,
+                    eos_token_ids=eos_token_ids,
+                    stop_sequences=stop_sequences,
+                )
+                response_ids = turn["response_ids"]
+                response_logprobs = generated.log_probs
+                if response_logprobs is not None:
+                    response_logprobs = list(response_logprobs[: len(response_ids)])
+                step = await run_executor_call(
+                    self.loop,
+                    lambda turn_ordinal=turn_ordinal, prefix_ids=list(prefix_ids), turn=dict(turn): (
+                        post_json(
+                            bridge_url,
+                            bridge_token,
+                            "/multiturn/step",
+                            {
+                                "session_id": session_id,
+                                "turn_ordinal": turn_ordinal,
+                                "accepted_prefix": prefix_ids,
+                                "raw_response_ids": turn["raw_response_ids"],
+                                "response_ids": turn["response_ids"],
+                                "completion_text": turn["completion_text"],
+                                "termination": turn["termination"],
+                                "stop_reason": turn["stop_reason"],
+                                "max_tokens": turn["max_tokens"],
+                                "truncated": turn["truncated"],
+                                "skip_reason": turn["skip_reason"],
+                            },
+                        )
+                    ),
+                )
+                outputs.append(
+                    agent_loop_output(
+                        **_opd_turn_output_fields(
+                            prefix_ids,
+                            response_ids,
+                            response_logprobs,
+                            generated,
+                            turn_ordinal=turn_ordinal,
+                            generated_seconds=generated_seconds,
+                            num_preempted=num_preempted,
+                        )
+                    )
+                )
+                if turn["truncated"] or turn["skip_reason"] or step["terminal"]:
+                    break
+                prefix_ids.extend(response_ids)
+                env_messages = validate_transcript_messages(
+                    step["messages"], source="environment reply"
+                )
+                if not env_messages:
+                    break
+                glue_ids = dedup_seam_terminator(response_ids, glue_tokenizer(env_messages))
+                # stop while at least a minimal generation window remains: gluing right up to
+                # max_model_len leaves the next turn zero tokens to generate (the engine would
+                # immediately truncate), so reserve a small slack for the next model turn.
+                if len(prefix_ids) + len(glue_ids) + 8 > max_model_len:
+                    break
+                prefix_ids.extend(glue_ids)
 
     FlashMultiTurnAgentLoop.__module__ = __name__
     FlashMultiTurnAgentLoop.__qualname__ = "FlashMultiTurnAgentLoop"
