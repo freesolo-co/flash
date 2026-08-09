@@ -33,6 +33,7 @@ from flash.engine.worker.backend_common import (
     render_gdn_varlen_shim,
     render_tf32_shim,
     render_wandb_link_shim,
+    require_gdn_boundary_resets,
     resolve_checkpoint_actor_dir,
     resolve_verl_loggers,
     resolve_verl_python,
@@ -993,23 +994,6 @@ def run_sft_train(spec=None) -> None:
         rows = prepared_workload.rows
         multimodal = prepared_workload.multimodal
         profile = prepared_workload.profile
-        # the quote's packing gate is device-independent (it has to be: the profile job runs
-        # cpu-only and this profile is compared byte-for-byte above). that leaves one question it
-        # structurally cannot ask -- whether the conv kernel actually RUNS on this card. a
-        # causal_conv1d compiled without this arch imports fine and raises at the first forward, so
-        # verify it here, before optimizer work, rather than discovering it at a packed boundary.
-        # failing closed is not an option for a packed gdn run: the fallbacks accept cu_seq_lens_q
-        # and seq_idx and discard them, so silently continuing trains across example boundaries.
-        if profile.packing_mode == "packed" and profile.architecture_mode == "gdn-hybrid":
-            from flash.engine.worker.model.packing import gdn_packing_available
-
-            if not gdn_packing_available(model_id, revision=model_revision):
-                raise RuntimeError(
-                    "packed gdn training was quoted, but this worker cannot reset example "
-                    "boundaries: fla/causal_conv1d are missing or the conv kernel was built "
-                    "without this gpu's arch. training would bleed recurrent state across packed "
-                    "examples while appearing patched. rebuild the worker image for this card."
-                )
         # the context window comes from the profile, not a second reading of the train fields. the
         # rows were truncated at the profile's max_length and the quote was priced at it, so a
         # locally re-derived value could disagree with both while the parity check above still
@@ -1138,11 +1122,22 @@ def run_sft_train(spec=None) -> None:
     # accept both and discard them. so the shim is installed only when the child proves it can reset.
     # `gdn_hybrid`/`gdn_module` and the child's answer are resolved above, inside the configuring
     # liveness wrap, because the probe is part of the setup silence that wrap exists to cover.
-    gdn_reset_arch = gdn_reset_arch_from_caps(caps, gdn_module) if gdn_hybrid else None
+    #
+    # a PACKED profile demands the resets instead of merely preferring them: the quote-side gate is
+    # device-independent by construction (the cpu-only profile job freezes it), so it can prove the
+    # kernels are installed but not that the conv kernel runs on THIS card. the child probe is the
+    # only place that question can be answered, and continuing without resets would train across
+    # packed example boundaries while looking patched. an exact-unpacked run keeps the soft form:
+    # examples_per_update is 1, so there are no packed neighbours to contaminate.
+    if gdn_hybrid and profile.packing_mode == "packed":
+        gdn_reset_arch = require_gdn_boundary_resets(caps, gdn_module)
+    else:
+        gdn_reset_arch = gdn_reset_arch_from_caps(caps, gdn_module) if gdn_hybrid else None
     # remove-padding is required by this custom dataset and verl's no_padding loss; disabling it
-    # hands sft_loss a strided tensor and fails on the first step. gdn remains safe because unsupported
-    # packing pins examples_per_update and train_batch_size to 1, leaving no adjacent example state to
-    # contaminate. batch size 1 is the isolation lever, not the tensor-layout flag.
+    # hands sft_loss a strided tensor and fails on the first step. an unsupported gdn stack stays
+    # safe because packing pins examples_per_update and train_batch_size to 1, leaving no adjacent
+    # example state to contaminate; a supported one is safe because the shim above resets at every
+    # boundary. batch size 1 is the isolation lever, not the tensor-layout flag.
     use_remove_padding = True
 
     config = {

@@ -2187,7 +2187,7 @@ def test_grpo_and_opd_do_not_launch_into_the_unrunnable_padded_fallback():
     import ast
     import inspect as _inspect
 
-    from flash.engine.worker import backend_common, opd_train, rl_train
+    from flash.engine.worker import backend_common, opd_train, rl_train, sft_train
 
     # the gate lives in one shared helper, so the assertions split: the helper must raise, and each
     # affected algorithm must route through it rather than re-deriving a decision of its own.
@@ -2219,3 +2219,21 @@ def test_grpo_and_opd_do_not_launch_into_the_unrunnable_padded_fallback():
             f"{module.__name__} sets use_remove_padding=False, which verl's fsdp engine cannot run "
             "alongside the use_fused_kernels=True this recipe also sets."
         )
+
+    # sft is conditional where grpo/opd are unconditional, and the condition is the whole point: a
+    # PACKED gdn profile has packed neighbours to contaminate, so it must take the raising gate. the
+    # quote-side gate cannot answer this -- it is device-independent by construction (the profile job
+    # is cpu-only), so it proves the kernels are installed, never that the conv kernel runs on this
+    # card. only the child probe knows. an exact-unpacked run keeps the soft form because
+    # examples_per_update is 1.
+    sft_src = _inspect.getsource(sft_train.run_sft_train)
+    assert "require_gdn_boundary_resets(" in sft_src, (
+        "packed sft no longer routes through the raising gate, so a gdn hybrid whose child cannot "
+        "reset boundaries would train across packed example boundaries while appearing patched: "
+        "transformers' fallbacks ACCEPT cu_seq_lens_q and seq_idx and silently discard them."
+    )
+    assert 'profile.packing_mode == "packed"' in sft_src, (
+        "the sft gate no longer keys on the packed profile. it must stay conditional: raising on "
+        "an exact-unpacked run would fail runs that are already boundary-safe at "
+        "examples_per_update=1, and dropping the condition entirely would let a packed run through."
+    )

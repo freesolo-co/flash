@@ -751,9 +751,12 @@ def require_gdn_boundary_resets(caps: dict, gdn_module: str) -> str | None:
     alternative: ``engine/vram.py`` sizes assuming no dense ``[b, s, vocab]`` logits tensor exists
     (~130 GB at 32k on a 248k vocab), trading this crash for an OOM. Give the child the kernels.
 
-    sft reaches the same branch but is safe without resets: every gdn model profiles as
-    exact-unpacked, pinning ``examples_per_update`` to 1 (``sft_workload.py:410``), so there are no
-    packed neighbours to contaminate.
+    sft reaches this too, and a PACKED sft run needs resets for the same reason: its quote-side gate
+    is device-independent by construction (the profile job is cpu-only, see
+    ``gdn_packing_contract_available``), so it can prove the kernels are installed but never that
+    the conv kernel runs on this card. an ``exact-unpacked`` sft run stays safe without resets --
+    ``examples_per_update`` is 1, so there are no packed neighbours to contaminate -- which is why
+    sft asks this only for a packed profile.
     """
     if not gdn_module:
         return None
