@@ -145,6 +145,79 @@ def test_a_pre_upgrade_snapshot_still_passes_its_integrity_digest(tmp_path, monk
     assert loaded.model == "Qwen/Qwen3.5-4B"
 
 
+def test_a_pre_upgrade_worker_env_snapshot_still_passes_its_integrity_digest(tmp_path, monkeypatch):
+    """The same replay for worker_env, which unlike model_policy was hashed on BOTH sides.
+
+    model_policy was platform-managed, so to_dict() popped it and only the worker payload carried it.
+    worker_env was user-authorable, so a pre-upgrade snapshot hashed it into the PUBLIC spec too, and
+    restoring only the worker side leaves the digest mismatching -- the run parses and then fails
+    integrity validation, still blocking recovery, deploy and serving.
+    """
+    import hashlib
+    import json
+
+    monkeypatch.setenv("FLASH_HOME", str(tmp_path))
+    import flash.runner as runner
+
+    spec = spec_from_dict(_raw(model="Qwen/Qwen3.5-4B"))
+    spec = type(spec).from_dict(
+        {
+            **spec.to_internal_dict(),
+            "workload_profile_kind": "sft",
+            "workload_profile": {"steps": 10},
+        }
+    )
+    public, worker = spec.to_dict(), spec.to_internal_dict()
+
+    # what the OLD plane wrote and hashed: asdict emitted worker_env into both payloads.
+    old_worker = {**worker, "worker_env": {}}
+    old_public = {**public, "worker_env": {}}
+    hashed_worker = {
+        k: v
+        for k, v in old_worker.items()
+        if v
+        or k
+        not in (
+            "workload_profile_kind",
+            "workload_profile_input_digest",
+            "workload_profile_producer_version",
+            "workload_profile",
+        )
+    }
+    payload = {
+        "version": 1,
+        "public_spec": old_public,
+        "worker_spec": hashed_worker,
+        "adapter_identity": None,
+    }
+    old_digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=old_public,
+            effective_preparation={
+                "worker_spec": old_worker,
+                "workload_profile": {"steps": 10},
+                "preparation_digest": old_digest,
+            },
+        )
+    )
+    loaded = runner.effective_spec_from_status(runner.get_status(spec.run_id))
+    assert loaded.model == "Qwen/Qwen3.5-4B"
+
+    # a quote refresh or realloc REWRITES the digest, but never status.spec -- so the write path has
+    # to hash the legacy public keys exactly as the read path restores them. otherwise the run
+    # survives the upgrade, gets re-persisted, and only then becomes permanently unrecoverable.
+    runner._persist_effective_worker_spec(spec, estimated_cost_usd=1.23)
+
+    reloaded = runner.effective_spec_from_status(runner.get_status(spec.run_id))
+    assert reloaded.model == "Qwen/Qwen3.5-4B"
+
+
 # ---------------------------------------------------------------------------
 # Estimator sanity: calibrated against catalog anchors
 # ---------------------------------------------------------------------------

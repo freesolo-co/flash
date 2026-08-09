@@ -67,9 +67,9 @@ def test_shape_sizing_keeps_the_measured_lora_floor(model_id: str):
 @pytest.mark.parametrize("model_id", tuple(MODELS))
 def test_sizing_covers_fp32_adamw_for_sft_and_opd(model_id: str, algorithm: str):
     """SFT and OPD size on fp32 AdamW. verl builds torch.optim.AdamW for both -- OPD inherits verl's
-    own default and SFT names it explicitly for FSDP2/DTensor safety -- and the backend lives in the
-    spec's [worker_env], which never reaches this sizing path. so the estimate must cover the AdamW
-    footprint unconditionally; sizing on the 8-bit paged optimizer under-reserves a verl run and
+    own default and SFT names it explicitly for FSDP2/DTensor safety. the managed backend is not a
+    sizing input, so the estimate must cover the AdamW footprint unconditionally; sizing on the
+    8-bit paged optimizer under-reserves a verl run and
     places it on a card that cannot hold its optimizer state.
 
     GRPO is excluded on purpose: verl GRPO runs AdamW too, but its estimate is already at the B200

@@ -294,10 +294,7 @@ def test_resolve_verl_python_prefers_preset(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("blank", ["", "   "])
 def test_resolve_verl_python_treats_an_empty_preset_as_unset(monkeypatch, tmp_path, blank):
-    # a worker IMAGE can export FLASH_VERL_PYTHON itself, and [worker_env] can only SET a key, never
-    # delete one -- so omitting it from a spec leaves the image's interpreter in place. an empty
-    # value is the only way a run can say "ignore the image's verl and provision the pinned fork",
-    # and the error at rl_train.py's mask_truncated_completions gate names exactly this remedy.
+    # a missing or blank image preset takes the isolated pinned-fork provisioning path.
     calls = []
     monkeypatch.setenv("FLASH_VERL_PYTHON", blank)
     monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
@@ -306,30 +303,6 @@ def test_resolve_verl_python_treats_an_empty_preset_as_unset(monkeypatch, tmp_pa
 
     assert python_bin.endswith("/verl-venv/bin/python")
     assert any(vc.VERL_REQUIREMENT_URL in arg for arg in calls[1])
-
-
-def test_worker_env_remedies_are_copy_pasteable_toml():
-    # a [worker_env] snippet in an error gets pasted into a config verbatim, so it has to survive the
-    # real parser: '[worker_env] KEY = "..."' reads fine in prose but is invalid TOML, because a
-    # table header must end its line. a blocked run would just hit a second, more confusing error.
-    import re
-    import tomllib
-
-    from flash.engine.worker import rl_train
-
-    # only assignment forms -- '[worker_env] can set a key but never delete one' is prose, not a
-    # snippet, and carries no '=' to paste.
-    pattern = re.compile(r"\[worker_env\][^\n]*?[A-Z_]+\s*=\s*(\"[^\"]*\"|'[^']*')")
-    snippets = [m.group(0) for m in pattern.finditer(inspect.getsource(rl_train))]
-    assert snippets, "expected rl_train to advertise at least one [worker_env] remedy"
-
-    for snippet in snippets:
-        # a valid snippet is the header, a newline, then the assignment -- exactly what we tell users.
-        header, _, assignment = snippet.partition("]")
-        parsed = tomllib.loads(f"{header}]\n{assignment.split('as ')[-1].strip()}")
-        assert parsed == {"worker_env": {"FLASH_VERL_PYTHON": ""}}
-        # and the prose must not run the header into the assignment on one line.
-        assert not re.match(r"\[worker_env\]\s+[A-Z_]+\s*=", snippet), snippet
 
 
 def _fake_verl_venv(tmp_path, *, stamp: str | None):
@@ -1156,6 +1129,48 @@ def test_the_venv_stamp_covers_the_conv_kernel_so_an_older_venv_is_rebuilt():
     failing `require_gdn_boundary_resets`.
     """
     assert vc.CAUSAL_CONV1D_REQUIREMENT in vc.VERL_VENV_STAMP
+
+
+def test_the_fallback_pins_transformers_like_the_image_does(monkeypatch, tmp_path):
+    """The fallback venv must carry the same transformers ceiling as /opt/verl-venv.
+
+    is_flash_linear_attention_available() and is_causal_conv1d_available() are find_spec probes
+    whose import path moved in 5.13, so an unpinned resolve lands 5.14.x and both answer False for
+    packages that ARE installed. The child then reports no gdn boundary-reset capability and
+    grpo/opd fail closed -- after the gpu is already rented. verl and vllm both depend on
+    transformers with no upper bound, so the pin has to be in the override file too: a direct pin
+    alone loses to their transitive declarations.
+    """
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+
+    vc.resolve_verl_python(str(tmp_path))
+
+    install = calls[1]
+    override_file = install[install.index("--override") + 1]
+    assert vc.TRANSFORMERS_REQUIREMENT in pathlib.Path(override_file).read_text()
+    assert vc.TRANSFORMERS_REQUIREMENT in install
+
+
+def test_transformers_pin_stays_in_lockstep_with_the_worker_image():
+    # same argument as VERL_SPEC lockstep: the image bakes its own pin, this path resolves its own.
+    # if they drift, the interpreter that TRAINS differs between the image and the no-image path,
+    # and the gdn capability probe silently answers differently on each.
+    dockerfile = pathlib.Path(__file__).resolve().parents[1] / "Dockerfile.worker"
+    text = dockerfile.read_text()
+    quoted = f'"{vc.TRANSFORMERS_REQUIREMENT}"'
+    assert quoted in text, (
+        "Dockerfile.worker's transformers pin drifted from backend_common.TRANSFORMERS_REQUIREMENT"
+    )
+    # and specifically in the verl venv's override file, not only the main interpreter's install.
+    assert f'"{vc.TRANSFORMERS_REQUIREMENT}" > /tmp/verl-overrides.txt' in text
+
+
+def test_the_venv_stamp_covers_the_transformers_pin_so_a_prepin_venv_is_rebuilt():
+    # a venv provisioned before this pin holds the 5.14.x that makes both probes answer False. if
+    # the stamp ignored the range, a retry on the same pod would reuse that venv forever.
+    assert vc.TRANSFORMERS_REQUIREMENT in vc.VERL_VENV_STAMP
 
 
 def test_the_venv_stamp_covers_fla_so_a_prefla_venv_is_rebuilt(monkeypatch, tmp_path):
