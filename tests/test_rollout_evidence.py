@@ -354,6 +354,35 @@ def test_the_measured_rows_are_the_ones_the_worker_shuffles_to():
     assert [row["i"] for row in rows] == list(range(64))
 
 
+def test_the_measured_rows_match_opd_which_shuffles_after_it_renders():
+    """The two workers reach their rows differently and must still land on the same ones.
+
+    GRPO shuffles the examples and then renders them (rl_train.py:1933-1939). OPD renders every
+    example in dataset order and shuffles the rendered (example, messages) PAIRS afterwards
+    (opd_train.py:2146-2159), deliberately, because prompt_messages may be stateful.
+
+    One seed over one length is one permutation, so the row at each position is the same either
+    way -- but that is a property of the two shuffles agreeing, not something either worker
+    promises. If it stopped holding, an OPD quote would be measured from rows that run never
+    trains on, and nothing else in this suite would notice.
+    """
+    import random as _random
+
+    from flash.cli.commands.rollout_profile import _PROMPT_ROWS, _training_population
+
+    rows = [{"i": i} for i in range(64)]
+
+    spec = _spec(algorithm="opd", seed=1234)
+
+    measured = [row["i"] for row in _training_population(spec, rows)[:_PROMPT_ROWS]]
+
+    # the opd worker's own construction: render in dataset order, shuffle the pairs.
+    pairs = [(row, f"rendered-{row['i']}") for row in rows]
+    _random.Random(1234).shuffle(pairs)
+    assert measured == [row["i"] for row, _ in pairs[:_PROMPT_ROWS]]
+    assert measured != list(range(_PROMPT_ROWS))
+
+
 def test_summary_reports_the_distribution_not_a_mean_alone():
     """A mean cannot tell a uniformly short workload from a bimodal one whose tail sets step time."""
     samples = tuple(
@@ -2181,6 +2210,61 @@ def test_a_bounded_hook_still_returns_its_value():
     assert rp._within(30.0, lambda: (_ for _ in ()).throw(RuntimeError("boom"))) == (True, None)
     # a hook that legitimately returns something falsy must not be mistaken for one that hung.
     assert rp._within(30.0, list) == (True, [])
+
+
+def test_an_environment_that_blocks_at_import_cannot_hold_the_submit(monkeypatch, tmp_path):
+    """Module scope is user code too.
+
+    An environment.py that blocks while importing -- waiting on a mount, a client connect, a model
+    download -- raises nothing, so the outer `except` never regains control and the submit hangs
+    before either hook deadline has been established.
+    """
+    from flash.cli.commands import _rollout_evidence_for
+    from flash.cli.commands import rollout_profile as rp
+
+    monkeypatch.setattr(rp, "_LOCAL_HOOK_DEADLINE_S", 0.2)
+    release = threading.Event()
+
+    class _Fine:
+        multi_turn = False
+
+        def dataset(self):
+            return [{"q": "2+2?"}]
+
+        def prompt_messages(self, _example):
+            return [{"role": "user", "content": "2+2?"}]
+
+    client, _seen = _profiling_stubs(monkeypatch, tmp_path, _Fine())
+    monkeypatch.setattr("flash.cli.commands.client_from_config", lambda: client, raising=False)
+
+    def _blocks_at_import(*_args, **_kwargs):
+        release.wait(30)
+        return _Fine()
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", _blocks_at_import)
+
+    began = time.monotonic()
+    try:
+        evidence, stages = _rollout_evidence_for(client, _spec())
+        elapsed = time.monotonic() - began
+        assert evidence is None
+        # the import never completed, so it must not be reported as having run.
+        assert stages == ()
+        assert elapsed < 5.0, f"waited {elapsed:.1f}s, so the import was not bounded"
+    finally:
+        release.set()
+
+
+def test_environment_params_cannot_collide_with_the_deadline_helper():
+    """The bounded call forwards the user's `[environment.params]` as keyword arguments.
+
+    A param named "call" or "deadline_s" would bind to `_within`'s own positionals and raise
+    TypeError, turning a legal config into a crashed submit.
+    """
+    from flash.cli.commands import rollout_profile as rp
+
+    finished, value = rp._within(5.0, lambda **kw: kw, call="x", deadline_s=1)
+    assert (finished, value) == (True, {"call": "x", "deadline_s": 1})
 
 
 def test_a_stalled_package_download_cannot_hold_the_submit(monkeypatch, tmp_path):

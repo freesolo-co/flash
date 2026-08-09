@@ -218,7 +218,17 @@ def _collect(
         entrypoint = (root / _DEFAULT_ENVIRONMENT_PATH).resolve()
         # absolute, so the loader takes its local-file branch. a relative dir matches the managed-slug
         # pattern and would resolve remotely, re-downloading what was just extracted.
-        environment = load_freesolo_environment(str(entrypoint), **(spec.environment.params or {}))
+        # bounded like the hooks below it: module scope is user code too, and an environment.py
+        # that blocks at import -- waiting on a mount, a client connect, a model download -- never
+        # raises, so the outer `except` could not fail open and the submit would hang.
+        finished, environment = _within(
+            _LOCAL_HOOK_DEADLINE_S,
+            load_freesolo_environment,
+            str(entrypoint),
+            **(spec.environment.params or {}),
+        )
+        if not finished or environment is None:
+            return None
         # the user's module has executed by now. every return below this point is a decline, and
         # each one still ran their code -- so the caller is told here, not from the return value.
         _ran("import", on_environment_loaded)
@@ -361,8 +371,11 @@ def _ran(stage: str, report: Callable[[str], None] | None) -> None:
         report(stage)
 
 
-def _within(deadline_s: float, call, *args) -> tuple[bool, Any]:
-    """``(completed, value)`` for ``call(*args)``, bounded by ``deadline_s``.
+def _within(deadline_s: float, call, /, *args, **kwargs) -> tuple[bool, Any]:
+    """``(completed, value)`` for ``call(*args, **kwargs)``, bounded by ``deadline_s``.
+
+    positional-only, because the kwargs are the user's ``[environment.params]``: a param named
+    "call" or "deadline_s" would otherwise collide with this signature and crash the submit.
 
     a daemon thread rather than a signal: signals only work on the main thread and this is library
     code inside a cli, and rather than a subprocess because the env is already loaded in THIS
@@ -383,7 +396,7 @@ def _within(deadline_s: float, call, *args) -> tuple[bool, Any]:
 
     def _run() -> None:
         try:
-            box.append(call(*args))
+            box.append(call(*args, **kwargs))
         except Exception:
             # reported as "no measurement", like any other failure on this path. Exception rather
             # than BaseException so a KeyboardInterrupt still propagates out of the worker.
@@ -399,12 +412,22 @@ def _within(deadline_s: float, call, *args) -> tuple[bool, Any]:
 def _training_population(spec, dataset):
     """the rows training will consume, in the order it will consume them.
 
-    mirrors the workers exactly: fence to ``max_examples`` FIRST, then shuffle the fence with the
-    run's seed (rl_train.py `train = train[:max_examples]` then `random.Random(SEED).shuffle`, and
-    opd_train.py the same). order matters as much as the fence, because only a prefix of this is
-    ever measured -- a dataset grouped by class or length would otherwise have its first rows
-    priced for the whole run, and those rows are exactly the ones an ordered dataset makes
-    unrepresentative.
+    fence to ``max_examples`` FIRST, then shuffle the fence with the run's seed. order matters as
+    much as the fence, because only a prefix of this is ever measured -- a dataset grouped by class
+    or length would otherwise have its first rows priced for the whole run, and those rows are
+    exactly the ones an ordered dataset makes unrepresentative.
+
+    both algorithms select the SAME rows in the same order. they reach them differently -- grpo
+    shuffles the examples and then renders (rl_train.py:1933-1939), opd renders every example in
+    dataset order and shuffles the rendered rows after (opd_train.py:2146-2159) -- but one seed
+    over one length is one permutation, so the fenced row at each position is identical either way.
+    that is the property this function has to hold, and it is the one the measurement depends on.
+
+    what does NOT carry across is the sequence prompt_messages is CALLED in, which is only
+    observable for a stateful env. no subset render can reproduce that: both workers render the
+    whole fence, so the worker's Nth call has seen N-1 predecessors this function only measures 8
+    of. rendering the head in dataset order would match opd's call ORDER while still giving it the
+    wrong call COUNT, so it is left alone rather than made to look faithful.
 
     a copy, not an in-place shuffle: this is the caller's dataset object, and reordering it would
     change what the rest of the submit sees as a side effect of asking for a quote.
