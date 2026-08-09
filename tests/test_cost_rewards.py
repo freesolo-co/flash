@@ -14,6 +14,33 @@ def test_single_average_is_generalizable():
     assert reward_seconds_per_completion() == AVG_REWARD_SECONDS_PER_COMPLETION
 
 
+def test_unmeasured_grading_is_not_charged_on_top_of_the_step_floor():
+    """An unmeasured grader adds nothing beyond the floor, which was fitted to include grading.
+
+    Pins the VALUE, not the constant: the assertion above compares the accessor to the constant it
+    returns, so it holds at any default and never protected this. The old 1.0s default put
+    ``completions x 1.0s`` beside a step floor already fitted with measured reward applied, which
+    double-charged grading -- 32s of a 32-completion step, and 0.699x geometric bias over the 64
+    grpo arms of the 2026-08-01 campaign against 0.995x at 0.0.
+    """
+    assert AVG_REWARD_SECONDS_PER_COMPLETION == 0.0
+
+    base = dict(batch_size=8, group_size=4)
+    default = RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, **base)
+    explicit_zero = RunConfig(
+        "Qwen/Qwen3.5-0.8B", "grpo", 10, reward_seconds_per_completion=0.0, **base
+    )
+    # the default run must cost exactly what a run that measured "no grading cost" costs.
+    assert seconds_per_step(default, "RTX 5090") == pytest.approx(
+        seconds_per_step(explicit_zero, "RTX 5090")
+    )
+    # and a measured slow grader is still charged, on top of the floor.
+    slow = RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, reward_seconds_per_completion=2.0, **base)
+    assert seconds_per_step(slow, "RTX 5090") == pytest.approx(
+        seconds_per_step(default, "RTX 5090") + 2.0 * 8 * 4
+    )
+
+
 def test_override_wins_and_clamps():
     assert reward_seconds_per_completion(override=1.5) == 1.5
     assert reward_seconds_per_completion(override=-3.0) == 0.0  # clamped to >= 0
