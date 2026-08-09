@@ -970,6 +970,40 @@ class _SftResolvedInputs:
 
 
 @dataclass(frozen=True)
+class _SftVerlProbe:
+    """what the one capability child answered, resolved under the caller's configuring wrap."""
+
+    python_bin: str
+    gdn_hybrid: bool
+    gdn_module: str
+    caps: Any
+
+    def __iter__(self):
+        return iter((self.python_bin, self.gdn_hybrid, self.gdn_module, self.caps))
+
+
+def _record_sft_grad_norm(runtime, grad_norm: float) -> None:
+    """latch one observed grad norm and fail the run once too many consecutive ones are dead."""
+    runtime.progress["grad_norm"] = grad_norm
+    runtime.observed_grad_norms.append(grad_norm)
+    # a 0.0 grad norm means backward produced nothing for every trainable parameter. fail the
+    # run instead of billing and serving an unchanged adapter (GRAD-001).
+    #
+    # VERL-138: do not condition on lr. transformer_impl.py:683-688 computes grad_norm from
+    # p.grad before optimizer.step() and scheduler advance, so lr cannot make the gradient zero.
+    if grad_norm == 0.0:
+        runtime.zero_grad_steps.append(int(runtime.progress["step"] or 0))
+        if len(runtime.zero_grad_steps) >= _MAX_ZERO_GRAD_STEPS:
+            raise RuntimeError(
+                "verl reported train/grad_norm=0.0 on "
+                f"{len(runtime.zero_grad_steps)} steps: no gradient is reaching the "
+                "lora parameters, so this run would train nothing. see GRAD-001"
+            )
+    else:
+        runtime.zero_grad_steps.clear()
+
+
+@dataclass(frozen=True)
 class _SftVerlSetup:
     python_bin: str
     caps: Any
@@ -1017,8 +1051,10 @@ def _prepare_sft_workload_inputs(
     model_revision: str,
     data_dir: str,
     image_dir: str,
+    data_loading_wrap,
 ) -> _SftWorkloadInputs:
-    with liveness_heartbeat("sft_data_loading"):
+    # the caller owns the liveness wrap so the stage stays visible in run_sft_train.
+    with data_loading_wrap():
         from flash.engine.profiling.workload_profile import require_matching_sft_profile
 
         # carried on the spec, not read from `flash.__version__` here: the worker runs the plane's
@@ -1104,24 +1140,9 @@ def _resolve_sft_verl_setup(
     model_id: str,
     model_revision: str,
     workdir: str,
+    probe: _SftVerlProbe,
 ) -> _SftVerlSetup:
-    # provisioning the verl interpreter builds a venv and installs the whole training stack when the
-    # run has no prebuilt worker image, which is minutes of silence with no training step to report
-    # and no liveness thread otherwise running here -- long enough for the stall watchdog to fail a
-    # healthy run. no progress= : there is no monotonic counter to read, only the keepalive.
-    with liveness_heartbeat("sft_configuring"):
-        python_bin = resolve_verl_python(
-            workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
-        )
-        # packed gdn hybrids require child support for seq_idx and cu_seqlens resets; no-fla fallbacks
-        # accept and discard them. probe before packing, otherwise use boundary-correct padded input.
-        # resolve the modeling module in the parent to avoid repeating the hub/cache read; empty means
-        # non-hybrid.
-        gdn_hybrid = model_is_gdn_hybrid(model_id, model_revision)
-        gdn_module = gdn_probe_module(model_id, model_revision) if gdn_hybrid else ""
-        # ONE child answers every independent capability question. each used to cost its own
-        # interpreter, and the torch/verl import -- not the question -- was the price.
-        caps = probe_verl_capabilities(python_bin, gdn_module)
+    python_bin, gdn_hybrid, gdn_module, caps = probe
     model_path = _cached_model_path(model_id, model_revision)
     # verl logs from the verl interpreter, so gate wandb on THAT env (see resolve_verl_loggers).
     loggers = resolve_verl_loggers(caps)
@@ -1161,6 +1182,8 @@ def _resolve_sft_inputs(
     resolve_vocab_size,
     sft_chunked_nll_enabled,
     sft_grad_accum,
+    data_loading_wrap,
+    probe_verl_child,
 ) -> _SftResolvedInputs:
     model_id = spec.model if spec else RECIPE.hf_model_id
     model_revision = getattr(spec, "model_revision", "") if spec else ""
@@ -1194,6 +1217,7 @@ def _resolve_sft_inputs(
         model_revision=model_revision,
         data_dir=data_dir,
         image_dir=image_dir,
+        data_loading_wrap=data_loading_wrap,
     )
     download_seconds = _w.prefetch_model(model_id, revision=model_revision)
     setup_seconds = time.time() - started_at
@@ -1255,6 +1279,7 @@ def _resolve_sft_inputs(
         model_id=model_id,
         model_revision=model_revision,
         workdir=workdir,
+        probe=probe_verl_child(workdir),
     )
     return _SftResolvedInputs(
         model_id=model_id,
@@ -1295,6 +1320,7 @@ def _resolve_sft_inputs(
 
 
 def _build_sft_config(inputs: _SftResolvedInputs, use_remove_padding: bool) -> dict[str, Any]:
+    caps = inputs.caps
     return {
         "train_files": inputs.workload.train_file,
         "train_batch_size": inputs.train_batch_size,
@@ -1333,7 +1359,7 @@ def _build_sft_config(inputs: _SftResolvedInputs, use_remove_padding: bool) -> d
         "total_epochs": inputs.epochs if inputs.max_steps <= 0 else None,
         "use_remove_padding": use_remove_padding,
         # resolved from the out-of-process capability probe, never by opening cuda in this parent.
-        "fused_ce_backend": fused_ce_backend(inputs.caps),
+        "fused_ce_backend": fused_ce_backend(caps),
     }
 
 
@@ -1441,6 +1467,8 @@ def _run_sft_child(
     on_line,
     on_step,
     child_heartbeat,
+    train_under_wrap,
+    finalize_under_wrap,
 ) -> _SftTrainResult:
     gpu_sampler = _NvidiaSmiPeakSampler().start()
     train_started_at = time.time()
@@ -1452,19 +1480,17 @@ def _run_sft_child(
         # with a missing-save error. opd_train uses the same guard.
         training_completed = False
         try:
-            with liveness_heartbeat(
-                "sft_step",
-                progress=lambda: int(runtime.progress["step"] or 0),
-                progress_step=True,
-            ):
-                return_code = run_verl_training(
+            # the caller owns the liveness wrap so the stage stays visible in run_sft_train.
+            return_code = train_under_wrap(
+                lambda: run_verl_training(
                     child.command,
                     env=child.child_env,
                     on_step=on_step,
                     on_line=on_line,
                     heartbeat=child_heartbeat,
                 )
-                training_completed = return_code == 0
+            )
+            training_completed = return_code == 0
         finally:
             child.watcher.stop(require_complete=training_completed)
     train_wall = time.time() - train_started_at
@@ -1499,12 +1525,7 @@ def _run_sft_child(
         field="input_ids",
     )
 
-    with liveness_heartbeat(
-        "sft_finalizing",
-        progress=lambda: final_step,
-        progress_step=True,
-        keepalive=True,
-    ):
+    def publish() -> str:
         adapter_dir = os.path.join(inputs.workdir, "adapter")
         _export_checkpoint_adapter(
             actor_dir,
@@ -1519,6 +1540,10 @@ def _run_sft_child(
             and final_step not in child.watcher.processed_steps
         ):
             _w.publish_deployable_checkpoint(adapter_dir, final_step)
+        return adapter_dir
+
+    # the caller owns the liveness wrap so the stage stays visible in run_sft_train.
+    adapter_dir = finalize_under_wrap(publish, final_step)
 
     _w.heartbeat(
         "sft_trained",
@@ -1611,6 +1636,33 @@ def run_sft_train(spec=None) -> None:
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.type if spec else "",
     )
+
+    # env load and dataset render run for minutes on a large split and emit nothing of their own,
+    # and provisioning the verl interpreter is minutes more silence with no step to report. both
+    # stages are wrapped here rather than inside the resolvers so this function keeps naming every
+    # phase the stall watchdog measures.
+    def probe_verl_child(workdir):
+        # provisioning the verl interpreter builds a venv and installs the whole training stack when
+        # the run has no prebuilt worker image, which is minutes of silence with no training step to
+        # report and no liveness thread otherwise running here -- long enough for the stall watchdog
+        # to fail a healthy run. no progress= : there is no monotonic counter, only the keepalive.
+        with liveness_heartbeat("sft_configuring"):
+            python_bin = resolve_verl_python(
+                workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
+            )
+            # packed gdn hybrids require child support for seq_idx and cu_seqlens resets; no-fla
+            # fallbacks accept and discard them. probe before packing, otherwise use
+            # boundary-correct padded input. resolve the modeling module in the parent to avoid
+            # repeating the hub/cache read; empty means non-hybrid.
+            gdn_hybrid = model_is_gdn_hybrid(probe_model_id, model_revision)
+            gdn_module = gdn_probe_module(probe_model_id, model_revision) if gdn_hybrid else ""
+            # ONE child answers every independent capability question. each used to cost its own
+            # interpreter, and the torch/verl import -- not the question -- was the price.
+            caps = probe_verl_capabilities(python_bin, gdn_module)
+        return _SftVerlProbe(python_bin, gdn_hybrid, gdn_module, caps)
+
+    probe_model_id = spec.model if spec else RECIPE.hf_model_id
+    model_revision = getattr(spec, "model_revision", "") if spec else ""
     inputs = _resolve_sft_inputs(
         spec,
         env,
@@ -1620,6 +1672,8 @@ def run_sft_train(spec=None) -> None:
         resolve_vocab_size=resolve_vocab_size,
         sft_chunked_nll_enabled=sft_chunked_nll_enabled,
         sft_grad_accum=sft_grad_accum,
+        data_loading_wrap=lambda: liveness_heartbeat("sft_data_loading"),
+        probe_verl_child=probe_verl_child,
     )
 
     # remove-padding is required by this custom dataset and verl's no_padding loss; disabling it
@@ -1654,23 +1708,7 @@ def run_sft_train(spec=None) -> None:
             runtime.loss_curve.append(round(loss, 4))
             runtime.progress["loss"] = loss
         if grad_norm is not None:
-            runtime.progress["grad_norm"] = grad_norm
-            runtime.observed_grad_norms.append(grad_norm)
-            # a 0.0 grad norm means backward produced nothing for every trainable parameter. fail the
-            # run instead of billing and serving an unchanged adapter (GRAD-001).
-            #
-            # VERL-138: do not condition on lr. transformer_impl.py:683-688 computes grad_norm from
-            # p.grad before optimizer.step() and scheduler advance, so lr cannot make the gradient zero.
-            if grad_norm == 0.0:
-                runtime.zero_grad_steps.append(int(runtime.progress["step"] or 0))
-                if len(runtime.zero_grad_steps) >= _MAX_ZERO_GRAD_STEPS:
-                    raise RuntimeError(
-                        "verl reported train/grad_norm=0.0 on "
-                        f"{len(runtime.zero_grad_steps)} steps: no gradient is reaching the "
-                        "lora parameters, so this run would train nothing. see GRAD-001"
-                    )
-            else:
-                runtime.zero_grad_steps.clear()
+            _record_sft_grad_norm(runtime, grad_norm)
         if learning_rate_value is not None:
             runtime.progress["lr"] = learning_rate_value
 
@@ -1689,6 +1727,27 @@ def run_sft_train(spec=None) -> None:
     def child_heartbeat() -> None:
         _w.heartbeat("sft_step", liveness=True, step=int(runtime.progress["step"] or 0))
 
+    def train_under_wrap(run_child):
+        # the cold first step emits no real heartbeat and looks like a hang without this wrap, and
+        # without progress= the daemon can win the throttled upload slot with a bare liveness ping.
+        with liveness_heartbeat(
+            "sft_step",
+            progress=lambda: int(runtime.progress["step"] or 0),
+            progress_step=True,
+        ):
+            return run_child()
+
+    def finalize_under_wrap(publish, final_step):
+        # the save/merge/upload runs for minutes with no step line of its own; keepalive holds the
+        # provider's stall clock open while it drains.
+        with liveness_heartbeat(
+            "sft_finalizing",
+            progress=lambda: final_step,
+            progress_step=True,
+            keepalive=True,
+        ):
+            return publish()
+
     result = _run_sft_child(
         inputs,
         child,
@@ -1696,5 +1755,7 @@ def run_sft_train(spec=None) -> None:
         on_line=on_line,
         on_step=on_step,
         child_heartbeat=child_heartbeat,
+        train_under_wrap=train_under_wrap,
+        finalize_under_wrap=finalize_under_wrap,
     )
     _write_sft_train_meta(inputs, child, runtime, result)

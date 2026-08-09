@@ -2349,6 +2349,90 @@ class _GrpoSubprocessStream:
         return return_code
 
 
+def _grpo_verl_workdir(seed):
+    """the per-seed verl workdir, wiped of any prior attempt and restored to its resume point."""
+    workdir = f"/tmp/rl_train_seed{seed}"
+    os.makedirs(workdir, exist_ok=True)
+    local_dir = os.path.join(workdir, "ckpt")
+    # a retry reuses the pod workdir; stale global_step_N dirs from a prior attempt would satisfy
+    # latest_global_step_dir and publish an old policy as if this attempt trained it.
+    shutil.rmtree(local_dir, ignore_errors=True)
+    # restore after the wipe, never before: the wipe is what makes a stale local dir safe, and the
+    # resume checkpoint is the one global_step_N this attempt is entitled to start from.
+    os.makedirs(local_dir, exist_ok=True)
+    resume_step = _restore_verl_resume(local_dir)
+    return workdir, local_dir, resume_step
+
+
+def _grpo_verl_dataset_rows(prompts):
+    """the parquet rows and the rollout examples the reward bridge maps an index back to."""
+    # stable int index -> rollout example, exactly as the retired trl path (reward maps back via this).
+    ds_rows, rollout_examples = _w.build_grpo_prompt_dataset(prompts)
+    message_prompts = [p["prompt"] for p in prompts]
+    indices = [int(r["example_idx"]) for r in ds_rows]
+    # ground_truth is a verl-schema placeholder only; the reward bridge scores by example_idx
+    # against the live env and never reads it.
+    ground_truths = [
+        str(ex.get("answer", "") or "") if isinstance(ex, dict) else "" for ex in rollout_examples
+    ]
+    return rollout_examples, message_prompts, indices, ground_truths
+
+
+def _grpo_write_verl_inputs(workdir, prompts, inp, message_prompts, indices, ground_truths):
+    """materialize the parquet splits and the reward module the child imports."""
+    train_pq = os.path.join(workdir, "train.parquet")
+    val_pq = os.path.join(workdir, "val.parquet")
+    reward_py = os.path.join(workdir, "reward.py")
+
+    # multimodal: decode each prompt's images to png on disk and carry file:// uris in the parquet.
+    # verl's dataset loads them through qwen_vl_utils.fetch_image, which reads file:// natively, so
+    # the pixels never have to round-trip through arrow. same contract the opd verl path writes.
+    image_uris = None
+    if inp["multimodal"]:
+        image_dir = os.path.join(workdir, "images")
+        shutil.rmtree(image_dir, ignore_errors=True)
+        image_uris = [
+            _materialize_verl_images(
+                list(prompt.get("images") or []), inp["package_root"], image_dir, index
+            )
+            for index, prompt in enumerate(prompts)
+        ]
+
+    rows = build_verl_dataset_rows(message_prompts, indices, ground_truths, image_uris)
+    write_verl_grpo_parquet(rows, train_pq)
+    write_verl_grpo_parquet(rows[: max(1, min(4, len(rows)))], val_pq)
+    with open(reward_py, "w") as f:
+        f.write(render_reward_module())
+    return train_pq, val_pq, reward_py
+
+
+def _grpo_child_env_extras(reward_url, inp):
+    """the run-specific settings layered onto the allowlisted child environment."""
+    extras = {
+        "FLASH_VERL_REWARD_URL": reward_url,
+        # the model is prefetched above; keep the subprocess off hf's rate-limited api.
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "HF_HUB_DISABLE_XET": "1",
+    }
+    if inp["multi_turn"]:
+        # the plugin named here and the loop it builds live in shim_dir, so PYTHONPATH must
+        # carry it -- see the caller.
+        extras.update(multi_turn_child_env(inp, reward_url=reward_url, thinking=bool(_w.THINKING)))
+    return extras
+
+
+def _grpo_export_adapter(actor_dir, adapter_dir, preprocessor, inp, python_bin):
+    """merge the trained actor into a peft adapter and publish it with its provenance."""
+    export_peft_adapter(
+        actor_dir, adapter_dir, base_model_id=inp["model_id"], python_bin=python_bin
+    )
+    preprocessor.save_pretrained(adapter_dir)
+    stamp_adapter_dir_provenance(adapter_dir, inp["model_id"], inp["model_revision"])
+    _w.write_base_model_provenance(adapter_dir, inp["model_id"], inp["model_revision"])
+    _w.hf_upload_folder(adapter_dir, "adapter", required=True)
+
+
 def run_rl_train():
     """grpo training on verl, output-compatible with run_rl. see module docstring for scope."""
     t_start = time.time()
@@ -2384,49 +2468,12 @@ def run_rl_train():
     # both and raises RetriableInfraError so the run can move to a healthy worker.
     model_path_for_verl = _cached_model_path(inp["model_id"], inp["model_revision"])
 
-    # stable int index -> rollout example, exactly as the retired trl path (reward maps back via this).
-    ds_rows, rollout_examples = _w.build_grpo_prompt_dataset(prompts)
-    message_prompts = [p["prompt"] for p in prompts]
-    indices = [int(r["example_idx"]) for r in ds_rows]
-    # ground_truth is a verl-schema placeholder only; the reward bridge scores by example_idx
-    # against the live env and never reads it.
-    ground_truths = [
-        str(ex.get("answer", "") or "") if isinstance(ex, dict) else "" for ex in rollout_examples
-    ]
+    rollout_examples, message_prompts, indices, ground_truths = _grpo_verl_dataset_rows(prompts)
 
-    workdir = f"/tmp/rl_train_seed{_w.SEED}"
-    os.makedirs(workdir, exist_ok=True)
-    local_dir = os.path.join(workdir, "ckpt")
-    # a retry reuses the pod workdir; stale global_step_N dirs from a prior attempt would satisfy
-    # latest_global_step_dir and publish an old policy as if this attempt trained it.
-    shutil.rmtree(local_dir, ignore_errors=True)
-    # restore after the wipe, never before: the wipe is what makes a stale local dir safe, and the
-    # resume checkpoint is the one global_step_N this attempt is entitled to start from.
-    os.makedirs(local_dir, exist_ok=True)
-    resume_step = _restore_verl_resume(local_dir)
-    train_pq = os.path.join(workdir, "train.parquet")
-    val_pq = os.path.join(workdir, "val.parquet")
-    reward_py = os.path.join(workdir, "reward.py")
-
-    # multimodal: decode each prompt's images to png on disk and carry file:// uris in the parquet.
-    # verl's dataset loads them through qwen_vl_utils.fetch_image, which reads file:// natively, so
-    # the pixels never have to round-trip through arrow. same contract the opd verl path writes.
-    image_uris = None
-    if inp["multimodal"]:
-        image_dir = os.path.join(workdir, "images")
-        shutil.rmtree(image_dir, ignore_errors=True)
-        image_uris = [
-            _materialize_verl_images(
-                list(prompt.get("images") or []), inp["package_root"], image_dir, index
-            )
-            for index, prompt in enumerate(prompts)
-        ]
-
-    rows = build_verl_dataset_rows(message_prompts, indices, ground_truths, image_uris)
-    write_verl_grpo_parquet(rows, train_pq)
-    write_verl_grpo_parquet(rows[: max(1, min(4, len(rows)))], val_pq)
-    with open(reward_py, "w") as f:
-        f.write(render_reward_module())
+    workdir, local_dir, resume_step = _grpo_verl_workdir(_w.SEED)
+    train_pq, val_pq, reward_py = _grpo_write_verl_inputs(
+        workdir, prompts, inp, message_prompts, indices, ground_truths
+    )
 
     # runtime patches for the verl interpreter. a stale shim from a prior attempt would otherwise
     # keep patching this one, so the file is rewritten every time.
@@ -2691,17 +2738,7 @@ def run_rl_train():
         # the child needs no platform hf token, github token, or user secrets. FLA_ kernel settings
         # still cross through _CHILD_ENV_PREFIXES.
         env_for_verl = _build_verl_child_env(shim_dir=shim_dir, wandb_enabled="wandb" in loggers)
-        env_for_verl["FLASH_VERL_REWARD_URL"] = reward_url
-        # the model is prefetched above; keep the subprocess off hf's rate-limited api.
-        env_for_verl["HF_HUB_OFFLINE"] = "1"
-        env_for_verl["TRANSFORMERS_OFFLINE"] = "1"
-        env_for_verl["HF_HUB_DISABLE_XET"] = "1"
-        if inp["multi_turn"]:
-            # the plugin named here and the loop it builds live in shim_dir, so PYTHONPATH must
-            # carry it -- see below.
-            env_for_verl.update(
-                multi_turn_child_env(inp, reward_url=reward_url, thinking=bool(_w.THINKING))
-            )
+        env_for_verl.update(_grpo_child_env_extras(reward_url, inp))
         # python imports sitecustomize automatically at startup, so the shim patches verl before
         # main_ppo runs. prepend rather than replace: an inherited PYTHONPATH may carry the verl
         # install itself, and ray workers inherit this env so every actor gets the same patch.
