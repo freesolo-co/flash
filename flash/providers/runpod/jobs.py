@@ -431,6 +431,163 @@ def _sweep_idle_flash_endpoints(
     return deleted
 
 
+def _reconciles_managed_cache(spec, cache_volumes: dict[str, int] | None) -> bool:
+    """Whether a grow on this call can actually spend budget.
+
+    Mirrors ``grow_weight_cache_volumes``'s own early return: a run attaching no managed cache
+    reconciles nothing, so reserving for it would shorten the deadline for a create that was
+    never going to grow anything.
+    """
+    if cache_volumes is not None:
+        return bool(cache_volumes)
+    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
+    base = getattr(spec.gpu, "network_volume", None) if spec is not None else None
+    return str(base or "") == WEIGHT_CACHE_VOLUME_NAME
+
+
+def _endpoint_create_deadline(
+    deadline_at: float | None,
+    spec,
+    cache_volumes: dict[str, int] | None,
+    reconciled: set[str],
+    rp_keys,
+) -> float | None:
+    """``deadline_at`` less the grow budget still owed to unreconciled accounts.
+
+    Creates, sweeps, and backoffs cannot spend this reserve. Any attempt reaching create has
+    reconciled; cache-free runs reserve nothing. See `_require_launchable` for admission.
+    """
+    if deadline_at is None or not _reconciles_managed_cache(spec, cache_volumes):
+        return deadline_at
+    owed = max(0, rp_keys.key_count() - len(reconciled))
+    return deadline_at - WEIGHT_CACHE_GROW_BUDGET_S * owed
+
+
+def _endpoint_attempt_deadline(
+    deadline_at: float | None,
+    spec,
+    cache_volumes: dict[str, int] | None,
+    reconciled: set[str],
+    rp_keys,
+    owning_key: str | None = None,
+) -> float | None:
+    """``deadline_at`` less the ONE grow slice this attempt's own reconciliation can need.
+
+    Admission funds only this attempt's grow. Once its account reconciles, do not charge the
+    slice again; before selection, reserve conservatively.
+    """
+    if deadline_at is None or not _reconciles_managed_cache(spec, cache_volumes):
+        return deadline_at
+    key = owning_key if owning_key is not None else rp_keys.active_key()
+    if key is not None and key in reconciled:
+        return deadline_at
+    if rp_keys.key_count() <= len(reconciled):
+        return deadline_at
+    return deadline_at - WEIGHT_CACHE_GROW_BUDGET_S
+
+
+def _require_endpoint_launchable(
+    deadline_at: float | None,
+    spec,
+    cache_volumes: dict[str, int] | None,
+    reconciled: set[str],
+    rp_keys,
+    owning_key: str | None = None,
+) -> None:
+    """Fail closed unless this attempt can still reconcile itself and then create.
+
+    Raw-deadline admission can yield zero growth and mount a stale volume. Reserving one slice
+    prevents the later "Disk quota exceeded" failure.
+    """
+    if deadline_at is not None:
+        require_create_allowance(
+            _endpoint_attempt_deadline(
+                deadline_at,
+                spec,
+                cache_volumes,
+                reconciled,
+                rp_keys,
+                owning_key,
+            )
+        )
+
+
+def _deploy_endpoint_with_failover(
+    deploy_once,
+    require_launchable,
+    create_deadline,
+    rp_keys,
+    name: str,
+    deadline_at: float | None,
+) -> tuple[object, str | None]:
+    _QUOTA_MAX_RETRIES = 3
+    resource = None
+    owning_fingerprint = None
+    # Bound by count, not advance_key() return value — advance_key() always wraps so can't signal exhaustion.
+    failovers_left = max(0, rp_keys.key_count() - 1)
+    while resource is None:
+        deploy_failover_exc: Exception | None = None
+        for quota_attempt in range(_QUOTA_MAX_RETRIES):
+            if quota_attempt > 0:
+                # under quota pressure, reap only scaled-to-zero orphans on this account.
+                # `reap_warm=False` protects live runs' between-job workers; reserve failover growth
+                # from this sweep and backoff.
+                require_launchable()
+                quota_deadline = create_deadline()
+                swept = _sweep_idle_flash_endpoints(
+                    protected={canonical_endpoint_name(name)},
+                    min_idle_s=0.0,
+                    reap_warm=False,
+                    **deadline_kwargs(_sweep_idle_flash_endpoints, quota_deadline),
+                )
+                wait_s = 30 * quota_attempt
+                if deadline_at is not None:
+                    wait_s = min(wait_s, remaining_seconds(quota_deadline))
+                logger.warning(
+                    "RunPod worker quota hit (attempt %d/%d): swept %d idle flash-* endpoint(s); "
+                    "retrying in %ds",
+                    quota_attempt + 1,
+                    _QUOTA_MAX_RETRIES,
+                    swept,
+                    wait_s,
+                )
+                if wait_s > 0:
+                    time.sleep(wait_s)
+            try:
+                resource, owning_fingerprint = deploy_once()
+                break  # success
+            except Exception as exc:
+                if _is_balance_error(exc):
+                    # a broke account can't be helped by sweeping idle endpoints — fail over now
+                    deploy_failover_exc = exc
+                    break
+                if not _is_workers_quota_error(exc):
+                    raise
+                deploy_failover_exc = exc
+        if resource is not None:
+            break
+        if failovers_left > 0:
+            with FLASH_SDK_LOCK:
+                rp_keys.advance_key()
+            failovers_left -= 1
+            reason = (
+                "has insufficient balance"
+                if deploy_failover_exc is not None and _is_balance_error(deploy_failover_exc)
+                else "worker quota exhausted after sweeping"
+            )
+            logger.warning(
+                "RunPod account %s; failing over to the next RUNPOD_API_KEY account (%d configured)",
+                reason,
+                rp_keys.key_count(),
+            )
+            continue
+        raise deploy_failover_exc or RuntimeError(
+            "deploy_train_endpoint: deploy failover exhausted"
+        )
+    return resource, owning_fingerprint
+
+
 def deploy_train_endpoint(
     friendly_gpu: str,
     execution_timeout_ms: int | None = None,
@@ -456,69 +613,21 @@ def deploy_train_endpoint(
     friendly = canonical_gpu(friendly_gpu)
     name = endpoint_name(friendly, name_suffix)
     image = worker_image_for_gpu(friendly, allow_default=True)
-
     reconciled: set[str] = set()
-
-    def _reconciles_a_managed_cache() -> bool:
-        """Whether a grow on this call can actually spend budget.
-
-        Mirrors ``grow_weight_cache_volumes``'s own early return: a run attaching no managed cache
-        reconciles nothing, so reserving for it would shorten the deadline for a create that was
-        never going to grow anything.
-        """
-        if cache_volumes is not None:
-            return bool(cache_volumes)
-        from flash.runner import WEIGHT_CACHE_VOLUME_NAME
-
-        base = getattr(spec.gpu, "network_volume", None) if spec is not None else None
-        return str(base or "") == WEIGHT_CACHE_VOLUME_NAME
-
-    def _create_deadline() -> float | None:
-        """``deadline_at`` less the grow budget still owed to unreconciled accounts.
-
-        Creates, sweeps, and backoffs cannot spend this reserve. Any attempt reaching create has
-        reconciled; cache-free runs reserve nothing. See `_require_launchable` for admission.
-        """
-        if deadline_at is None or not _reconciles_a_managed_cache():
-            return deadline_at
-        owed = max(0, rp_keys.key_count() - len(reconciled))
-        return deadline_at - WEIGHT_CACHE_GROW_BUDGET_S * owed
-
-    def _attempt_deadline(owning_key: str | None = None) -> float | None:
-        """``deadline_at`` less the ONE grow slice this attempt's own reconciliation can need.
-
-        Admission funds only this attempt's grow. Once its account reconciles, do not charge the
-        slice again; before selection, reserve conservatively.
-        """
-        if deadline_at is None or not _reconciles_a_managed_cache():
-            return deadline_at
-        key = owning_key if owning_key is not None else rp_keys.active_key()
-        if key is not None and key in reconciled:
-            return deadline_at
-        if rp_keys.key_count() <= len(reconciled):
-            return deadline_at
-        return deadline_at - WEIGHT_CACHE_GROW_BUDGET_S
-
-    def _require_launchable(owning_key: str | None = None) -> None:
-        """Fail closed unless this attempt can still reconcile itself and then create.
-
-        Raw-deadline admission can yield zero growth and mount a stale volume. Reserving one slice
-        prevents the later "Disk quota exceeded" failure.
-        """
-        if deadline_at is not None:
-            require_create_allowance(_attempt_deadline(owning_key))
 
     def _deploy_once() -> tuple[object, str]:
         """Create under one serialized account selection and return its owning fingerprint."""
         from flash.core.spec import gpu_count_of
 
-        _require_launchable()
+        _require_endpoint_launchable(deadline_at, spec, cache_volumes, reconciled, rp_keys)
         with FLASH_SDK_LOCK:
             owning_key = ensure_auth()
             # re-check the selected key under the lock: another deploy may advance the global key
             # after admission. an unreconciled real account must retain its grow slice or fail
             # closed.
-            _require_launchable(owning_key)
+            _require_endpoint_launchable(
+                deadline_at, spec, cache_volumes, reconciled, rp_keys, owning_key
+            )
             owning_fingerprint = runpod_api.key_fingerprint(owning_key)
             isolate_flash_state(name_suffix)
             kwargs = {
@@ -558,8 +667,12 @@ def deploy_train_endpoint(
                 # This attempt's own grow has run by now (the reconciled check above), so the
                 # re-check is judged without its slice -- charging it again would re-deduct a cost
                 # already paid and reject a launchable create within one slice of the deadline.
-                _require_launchable(owning_key)
-                create_deadline = _create_deadline()
+                _require_endpoint_launchable(
+                    deadline_at, spec, cache_volumes, reconciled, rp_keys, owning_key
+                )
+                create_deadline = _endpoint_create_deadline(
+                    deadline_at, spec, cache_volumes, reconciled, rp_keys
+                )
                 # create may spend only down to the failover grow reserve. yield the proven create
                 # allowance so a large reserve cannot produce a zero timeout.
                 remaining = max(CREATE_ALLOWANCE_S, remaining_seconds(create_deadline))
@@ -571,71 +684,14 @@ def deploy_train_endpoint(
                 )
             return resource, owning_fingerprint
 
-    _QUOTA_MAX_RETRIES = 3
-    resource = None
-    owning_fingerprint = None
-    # Bound by count, not advance_key() return value — advance_key() always wraps so can't signal exhaustion.
-    failovers_left = max(0, rp_keys.key_count() - 1)
-    while resource is None:
-        deploy_failover_exc: Exception | None = None
-        for quota_attempt in range(_QUOTA_MAX_RETRIES):
-            if quota_attempt > 0:
-                # under quota pressure, reap only scaled-to-zero orphans on this account.
-                # `reap_warm=False` protects live runs' between-job workers; reserve failover growth
-                # from this sweep and backoff.
-                _require_launchable()
-                quota_deadline = _create_deadline()
-                swept = _sweep_idle_flash_endpoints(
-                    protected={canonical_endpoint_name(name)},
-                    min_idle_s=0.0,
-                    reap_warm=False,
-                    **deadline_kwargs(_sweep_idle_flash_endpoints, quota_deadline),
-                )
-                wait_s = 30 * quota_attempt
-                if deadline_at is not None:
-                    wait_s = min(wait_s, remaining_seconds(quota_deadline))
-                logger.warning(
-                    "RunPod worker quota hit (attempt %d/%d): swept %d idle flash-* endpoint(s); "
-                    "retrying in %ds",
-                    quota_attempt + 1,
-                    _QUOTA_MAX_RETRIES,
-                    swept,
-                    wait_s,
-                )
-                if wait_s > 0:
-                    time.sleep(wait_s)
-            try:
-                resource, owning_fingerprint = _deploy_once()
-                break  # success
-            except Exception as exc:
-                if _is_balance_error(exc):
-                    # a broke account can't be helped by sweeping idle endpoints — fail over now
-                    deploy_failover_exc = exc
-                    break
-                if not _is_workers_quota_error(exc):
-                    raise
-                deploy_failover_exc = exc
-        if resource is not None:
-            break
-        if failovers_left > 0:
-            with FLASH_SDK_LOCK:
-                rp_keys.advance_key()
-            failovers_left -= 1
-            reason = (
-                "has insufficient balance"
-                if deploy_failover_exc is not None and _is_balance_error(deploy_failover_exc)
-                else "worker quota exhausted after sweeping"
-            )
-            logger.warning(
-                "RunPod account %s; failing over to the next RUNPOD_API_KEY account (%d configured)",
-                reason,
-                rp_keys.key_count(),
-            )
-            continue
-        raise deploy_failover_exc or RuntimeError(
-            "deploy_train_endpoint: deploy failover exhausted"
-        )
-
+    resource, owning_fingerprint = _deploy_endpoint_with_failover(
+        _deploy_once,
+        lambda: _require_endpoint_launchable(deadline_at, spec, cache_volumes, reconciled, rp_keys),
+        lambda: _endpoint_create_deadline(deadline_at, spec, cache_volumes, reconciled, rp_keys),
+        rp_keys,
+        name,
+        deadline_at,
+    )
     endpoint_id = getattr(resource, "id", None)
     if not endpoint_id:
         raise RuntimeError(f"deploy_train_endpoint: no endpoint id on resource {resource!r}")
