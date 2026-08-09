@@ -51,6 +51,27 @@ MAX_CONSECUTIVE_FAILURES = 5
 SAMPLE_POLICY_DISTINCT_PROMPTS = "distinct-prompts-round-robin"
 
 
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """refuse to follow redirects, so the api key never reaches an origin the user did not name.
+
+    urllib copies request headers onto the redirected request, Authorization included, so a 30x from
+    the configured endpoint hands the user's PAID inference key to whatever host the Location names.
+    A 302 also rewrites the POST to a GET, and the redirected response is still parsed as a sample --
+    so the same hop both leaks the credential and lets a foreign host dictate the measurement.
+
+    raising here surfaces as urllib.error.HTTPError, which ``_one_completion`` already treats as a
+    failed draw: a redirecting endpoint measures nothing and the quote returns to the declared cap.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+# module-level: an opener carries no per-request state, and rebuilding it per draw would add a
+# handler chain construction to every sample for nothing.
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirects)
+
+
 @dataclass(frozen=True)
 class RolloutSample:
     """one realized generation: the token counts, and why it stopped."""
@@ -153,11 +174,19 @@ def sample_rollouts(
     # overall deadline, or enough consecutive failures to show the endpoint is not answering.
     deadline = time.monotonic() + SAMPLING_DEADLINE_S
     consecutive_failures = 0
-    for index in range(rollouts):
+    # count SUCCESSES, not attempts. `rollouts` defaults to the server's trust floor, so a loop over
+    # attempts meant one transient failure left 31 samples and the server rejected the whole
+    # measurement as too thin -- the endpoint recovered, and the run was still priced at the cap.
+    # the deadline and the consecutive-failure cutoff remain the bounds; only the exit condition
+    # changed, so a dead endpoint still gives up after MAX_CONSECUTIVE_FAILURES draws.
+    attempts = 0
+    while len(collected) < rollouts:
         if time.monotonic() >= deadline:
             break
-        # round-robin: draw one from every distinct prompt before taking a second from any.
-        slot = index % len(prompts)
+        # round-robin over ATTEMPTS: keeps one prompt from being redrawn just because an earlier
+        # draw of it failed, which would concentrate the sample on whichever prompt is flakiest.
+        slot = attempts % len(prompts)
+        attempts += 1
         used_prompts.add(slot)
         sample = _one_completion(
             model=model,
@@ -220,7 +249,7 @@ def _one_completion(
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_S) as response:
+        with _NO_REDIRECT_OPENER.open(request, timeout=REQUEST_TIMEOUT_S) as response:
             body = json.load(response)
     except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
         return None

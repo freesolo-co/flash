@@ -28,6 +28,7 @@ from flash.engine.profiling.workload_profile import (
     MAX_TRUSTWORTHY_TRUNCATION_RATE,
     MIN_TRUSTWORTHY_ROLLOUTS,
     ROLLOUT_LATENCY_MAX_AGE_S,
+    ROLLOUT_SAMPLE_POLICY_VERSION,
 )
 from flash.server.domain.rollout_evidence import rollout_profile_from_evidence
 
@@ -68,6 +69,7 @@ def _evidence(**overrides) -> dict:
         "truncated_rollouts": 0,
         "eos_rollouts": 32,
         "sample_policy": "distinct-prompts-round-robin",
+        "sample_policy_version": ROLLOUT_SAMPLE_POLICY_VERSION,
         "reward_seconds_per_completion": 0.0102,
         "reward_samples": 3,
         "reward_failures": 0,
@@ -134,8 +136,40 @@ def test_a_failed_draw_is_counted_not_raised(monkeypatch):
         base_url="https://example.invalid/v1",
         api_key="k",
     )
-    assert sampling.completed == 2
-    assert sampling.failures == 2
+    # the loop collects SUCCESSES, so a half-failing endpoint takes 8 attempts to return 4 samples.
+    # failures are still reported: they are what the trust gate reads to judge the sample.
+    assert sampling.completed == 4
+    assert sampling.failures == 4
+
+
+def test_a_transient_failure_does_not_leave_the_sample_one_short_of_the_floor(monkeypatch):
+    """`rollouts` defaults to the server's trust floor, so an attempt-counting loop meant a single
+    transient failure returned 31 of 32 samples -- rejected as too thin, and the run priced at the
+    cap even though the endpoint recovered immediately."""
+    calls = {"n": 0}
+
+    def _one_bad_draw(**_kwargs):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            return None
+        return RolloutSample(prompt_tokens=10, completion_tokens=40, truncated=False)
+
+    monkeypatch.setattr(
+        "flash.engine.profiling.rollout_sampler._one_completion", _one_bad_draw, raising=True
+    )
+    sampling = sample_rollouts(
+        model="m",
+        prompts=[[{"role": "user", "content": "p"}]],
+        rollouts=MIN_TRUSTWORTHY_ROLLOUTS,
+        max_completion_tokens=512,
+        temperature=None,
+        base_url="https://example.invalid/v1",
+        api_key="k",
+    )
+    assert sampling.completed == MIN_TRUSTWORTHY_ROLLOUTS, (
+        "one transient failure must not put the measurement below the trust floor"
+    )
+    assert sampling.failures == 1
 
 
 def test_a_stalling_endpoint_stops_the_sample_instead_of_delaying_the_submit(monkeypatch):
@@ -187,8 +221,10 @@ def test_the_failure_cutoff_counts_consecutive_draws_not_total(monkeypatch):
         base_url="https://example.invalid/v1",
         api_key="k",
     )
-    assert calls["n"] == 20, "an answering endpoint must not trip the cutoff"
-    assert sampling.completed == 10
+    # 20 successes at a 50% failure rate costs 40 attempts, and none of the failures are
+    # consecutive, so the cutoff must never fire.
+    assert calls["n"] == 40, "an answering endpoint must not trip the cutoff"
+    assert sampling.completed == 20
 
 
 @pytest.mark.parametrize("finish", ["content_filter", "tool_calls", "", None, "unknown"])
@@ -641,7 +677,7 @@ def test_stop_sequences_are_sent_as_the_apis_stop_field(monkeypatch):
         def __exit__(self, *exc):
             return False
 
-    def _fake_urlopen(request, timeout=None):
+    def _fake_open(request, timeout=None):
         captured["body"] = json.loads(request.data.decode())
         return _Response()
 
@@ -652,9 +688,9 @@ def test_stop_sequences_are_sent_as_the_apis_stop_field(monkeypatch):
             "choices": [{"finish_reason": "stop"}],
         },
     )
-    monkeypatch.setattr(
-        "flash.engine.profiling.rollout_sampler.urllib.request.urlopen", _fake_urlopen
-    )
+    # the sampler goes through a redirect-refusing opener, not the module-level urlopen, so the
+    # opener IS the seam. patching urlopen here would leave the real call path untouched.
+    monkeypatch.setattr(rollout_sampler._NO_REDIRECT_OPENER, "open", _fake_open, raising=True)
     rollout_sampler._one_completion(
         model="m",
         messages=[{"role": "user", "content": "p"}],
@@ -679,7 +715,7 @@ def test_no_stop_field_is_sent_when_the_run_configures_none(monkeypatch):
         def __exit__(self, *exc):
             return False
 
-    def _fake_urlopen(request, timeout=None):
+    def _fake_open(request, timeout=None):
         captured["body"] = json.loads(request.data.decode())
         return _Response()
 
@@ -690,9 +726,9 @@ def test_no_stop_field_is_sent_when_the_run_configures_none(monkeypatch):
             "choices": [{"finish_reason": "stop"}],
         },
     )
-    monkeypatch.setattr(
-        "flash.engine.profiling.rollout_sampler.urllib.request.urlopen", _fake_urlopen
-    )
+    # the sampler goes through a redirect-refusing opener, not the module-level urlopen, so the
+    # opener IS the seam. patching urlopen here would leave the real call path untouched.
+    monkeypatch.setattr(rollout_sampler._NO_REDIRECT_OPENER, "open", _fake_open, raising=True)
     rollout_sampler._one_completion(
         model="m",
         messages=[{"role": "user", "content": "p"}],
@@ -1307,3 +1343,139 @@ def test_a_hanging_reference_source_cannot_stall_the_submit(monkeypatch):
     elapsed = time.perf_counter() - started
     assert (score_one, references) == (None, None), "a hung source yields no grading measurement"
     assert elapsed < 5.0, f"reference gathering must be bounded, took {elapsed:.1f}s"
+
+
+def test_the_api_key_is_not_disclosed_to_a_redirect_target():
+    """urllib copies request headers onto a redirected request, Authorization included.
+
+    So a 30x from the configured endpoint hands the user's PAID inference key to whatever host the
+    Location names. The same hop also rewrites POST to GET and its response was still parsed as a
+    sample, letting a foreign host dictate the measurement it was paid to leak.
+
+    Two real local servers rather than a mocked opener: the leak lives in urllib's redirect handler,
+    so a test that stubs the transport asserts on its own stub.
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    seen: dict = {}
+
+    class _Attacker(BaseHTTPRequestHandler):
+        def do_POST(self):
+            seen["authorization"] = self.headers.get("Authorization")
+            body = json.dumps(
+                {
+                    "usage": {"completion_tokens": 10, "prompt_tokens": 5},
+                    "choices": [{"finish_reason": "stop"}],
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        # a 302 turns the POST into a GET, so the credential arrives on the GET.
+        do_GET = do_POST
+
+        def log_message(self, *_args):
+            pass
+
+    class _Redirector(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{attacker_port}/steal")
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    attacker = HTTPServer(("127.0.0.1", 0), _Attacker)
+    attacker_port = attacker.server_address[1]
+    redirector = HTTPServer(("127.0.0.1", 0), _Redirector)
+    threading.Thread(target=attacker.serve_forever, daemon=True).start()
+    threading.Thread(target=redirector.serve_forever, daemon=True).start()
+    try:
+        sample = rollout_sampler._one_completion(
+            model="m",
+            messages=[{"role": "user", "content": "p"}],
+            max_completion_tokens=64,
+            temperature=None,
+            base_url=f"http://127.0.0.1:{redirector.server_address[1]}/v1",
+            api_key="sk-USER-PAID-INFERENCE-KEY",
+        )
+    finally:
+        attacker.shutdown()
+        redirector.shutdown()
+
+    assert seen.get("authorization") is None, "the api key must never reach another origin"
+    assert sample is None, "a redirected response must not stand as a measurement"
+
+
+def test_evidence_from_a_different_sampling_policy_is_rejected():
+    """The server stamps the profile with ITS version, not the client's.
+
+    So without a policy version in the payload, a client from before a sampling-policy change could
+    submit aggregates that are recorded under the newer identity and later reused as matching.
+    """
+    spec = _spec()
+    assert rollout_profile_from_evidence(spec, _evidence(), producer_version=VERSION) is not None
+
+    stale = _evidence(sample_policy_version=ROLLOUT_SAMPLE_POLICY_VERSION + 1)
+    assert rollout_profile_from_evidence(spec, stale, producer_version=VERSION) is None
+
+    missing = _evidence()
+    del missing["sample_policy_version"]
+    assert rollout_profile_from_evidence(spec, missing, producer_version=VERSION) is None
+
+    for junk in ("one", None, [1]):
+        payload = _evidence(sample_policy_version=junk)
+        assert rollout_profile_from_evidence(spec, payload, producer_version=VERSION) is None
+
+
+def test_the_sampler_stamps_the_policy_version_it_produced(monkeypatch):
+    """The seam: the server requires the field, so the client has to emit it or measure nothing."""
+    # rollout_evidence imports both names at module scope, so ITS module is the binding a patch has
+    # to reach -- patching the defining module would leave the real calls untouched.
+    monkeypatch.setattr(
+        "flash.engine.profiling.rollout_evidence.sampler_credentials",
+        lambda: ("https://example.invalid/v1", "k"),
+    )
+    monkeypatch.setattr(
+        "flash.engine.profiling.rollout_evidence.sample_rollouts",
+        lambda **_kw: RolloutSampling(
+            samples=tuple(
+                RolloutSample(prompt_tokens=10, completion_tokens=40, truncated=False)
+                for _ in range(MIN_TRUSTWORTHY_ROLLOUTS)
+            ),
+            failures=0,
+            sampled_prompts=8,
+        ),
+    )
+    from flash.engine.profiling.rollout_evidence import collect_rollout_evidence
+
+    evidence = collect_rollout_evidence(
+        model="m",
+        prompts=[[{"role": "user", "content": "p"}]],
+        max_completion_tokens=512,
+        temperature=None,
+    )
+    assert evidence["sample_policy_version"] == ROLLOUT_SAMPLE_POLICY_VERSION
+    # and it survives the server's gate, which is the point of emitting it.
+    assert rollout_profile_from_evidence(_spec(), evidence, producer_version=VERSION) is not None
+
+
+def test_a_message_the_sampler_cannot_reproduce_is_not_measured():
+    """The workers pass the ORIGINAL message dicts to `apply_chat_template`.
+
+    A template that reads `name` renders a different prompt than a role/content reconstruction, so
+    silently dropping the field would report a confident measurement of a prompt the run never
+    sends. Rejecting returns the quote to the cap, which costs nothing.
+    """
+    from flash.cli.commands.rollout_profile import _chat_messages
+
+    plain = [{"role": "user", "content": "hi"}]
+    assert _chat_messages(plain) == plain
+
+    assert _chat_messages([{"role": "user", "content": "hi", "name": "alice"}]) == []
+    assert _chat_messages([{"role": "assistant", "content": "hi", "tool_calls": []}]) == []

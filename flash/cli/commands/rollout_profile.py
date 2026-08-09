@@ -34,6 +34,11 @@ _REWARD_REFERENCES = 4
 # (rl_train.py `_PROFILE_BUDGET_S`), because both bound the same user-supplied hook.
 _REFERENCE_BUDGET_S = 30.0
 
+# the only message keys this path can reproduce faithfully. the workers pass the original message
+# dicts into the chat template, so anything else (`name`, tool-call fields) can change what the
+# template renders -- and this sampler would not send it.
+_SAMPLABLE_MESSAGE_KEYS = frozenset({"role", "content"})
+
 
 def collect_for_submit(
     client,
@@ -277,12 +282,20 @@ def _chat_messages(messages) -> list[dict]:
     prompt this cannot represent faithfully is better dropped than sent in a shape the run will not
     use -- dropping returns the quote to the cap, sending would price a distribution that is not
     the run's.
+
+    a message carrying keys beyond role/content is rejected for the same reason. the workers hand
+    the ORIGINAL dicts to ``apply_chat_template``, so a template that reads ``name`` renders a
+    different prompt than this reconstruction would -- different tokenization, and potentially a
+    different completion length. reconstructing role/content only would silently drop that and
+    report a confident measurement of a prompt the run never sends.
     """
     if not isinstance(messages, list):
         return []
     out: list[dict] = []
     for message in messages:
         if not isinstance(message, dict):
+            return []
+        if set(message) - _SAMPLABLE_MESSAGE_KEYS:
             return []
         role = message.get("role")
         content = message.get("content")

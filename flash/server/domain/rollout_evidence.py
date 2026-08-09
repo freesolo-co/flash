@@ -17,6 +17,7 @@ from typing import Any
 
 from flash.engine.profiling.workload_profile import (
     ROLLOUT_PROFILE_KINDS,
+    ROLLOUT_SAMPLE_POLICY_VERSION,
     RolloutWorkloadProfile,
     WorkloadProfileMismatch,
     require_matching_rollout_profile,
@@ -41,6 +42,10 @@ _REQUIRED_FIELDS = (
     "truncated_rollouts",
     "eos_rollouts",
     "sample_policy",
+    # which sampler produced these aggregates. required, because this server stamps the profile with
+    # its OWN version: without it, a client from before a sampling-policy change could submit
+    # evidence that is recorded under the newer identity and then reused as matching.
+    "sample_policy_version",
 )
 
 
@@ -121,6 +126,14 @@ def rollout_profile_from_evidence(
 def _validated_fields(evidence: dict) -> dict[str, Any] | None:
     """the submitted aggregates, coerced and bounds-checked, or None if the shape is wrong."""
     if any(name not in evidence for name in _REQUIRED_FIELDS):
+        return None
+    # reject evidence this server's sampling policy did not produce. the profile is stamped with the
+    # server's version, so accepting a foreign or missing policy version would let a client on an
+    # older release have its aggregates recorded under the newer identity and reused as matching.
+    try:
+        if int(evidence["sample_policy_version"]) != ROLLOUT_SAMPLE_POLICY_VERSION:
+            return None
+    except (TypeError, ValueError):
         return None
     try:
         fields: dict[str, Any] = {

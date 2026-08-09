@@ -23,7 +23,10 @@ from flash.engine.profiling.rollout_sampler import (
     sample_rollouts,
     sampler_credentials,
 )
-from flash.engine.profiling.workload_profile import MIN_TRUSTWORTHY_ROLLOUTS
+from flash.engine.profiling.workload_profile import (
+    MIN_TRUSTWORTHY_ROLLOUTS,
+    ROLLOUT_SAMPLE_POLICY_VERSION,
+)
 
 # draw enough to clear the server's trust floor. sampling fewer guarantees a rejected profile, which
 # would spend api calls to produce nothing.
@@ -71,6 +74,10 @@ def collect_rollout_evidence(
 
     evidence = dict(sampling.summary())
     evidence.update(_reward_evidence(score_one, reward_samples))
+    # name which sampler produced these aggregates. the server stamps the profile with ITS own
+    # version, so without this a client from before a sampling-policy change could submit evidence
+    # that gets recorded under the new identity and reused as if it matched.
+    evidence["sample_policy_version"] = int(ROLLOUT_SAMPLE_POLICY_VERSION)
     return evidence
 
 
