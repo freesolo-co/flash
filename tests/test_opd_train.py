@@ -967,9 +967,9 @@ def test_failure_accounting_metadata_uses_trl_skip_reason_names():
 def test_write_train_meta_integrates_canonical_failure_accounting_metadata():
     import inspect
 
-    from flash.engine.worker.opd_train import _execute_opd_train
+    from flash.engine.worker.opd_train import _write_opd_train_meta
 
-    source = inspect.getsource(_execute_opd_train)
+    source = inspect.getsource(_write_opd_train_meta)
     write_train_meta_source = source[source.index("_w.write_train_meta(") :]
 
     assert "**_failure_accounting_metadata(final_accounting)" in write_train_meta_source
@@ -2832,7 +2832,7 @@ def test_the_watcher_marks_every_step_processed_but_publishes_only_required_ones
 def test_the_final_deployable_publish_is_not_suppressed_by_the_processed_marker():
     # final_save_due applies only when save_at_steps is empty, while the watcher publishes only
     # requested steps. the paths are disjoint, so processed_steps cannot suppress the final publish.
-    source = inspect.getsource(opd_train._execute_opd_train)
+    source = inspect.getsource(opd_train._finalize_opd_train)
     assert "final_save_due(final_step, knobs.save_at_steps)" in source
     assert "final_step not in watcher.processed_steps" not in source
 
@@ -5027,7 +5027,7 @@ def test_the_resolved_eager_flag_reaches_the_opd_verl_config():
     # the string assertions above pass against a resolver whose answer is never carried into the
     # config, which is exactly the shape of the bug this fixes. pin the wiring.
     built = inspect.getsource(opd_train._prepare_opd_verl) + inspect.getsource(
-        opd_train._execute_opd_train
+        opd_train._prepare_opd_execution
     )
     # one probe now feeds both eager and the attention pins, so the call is bound to a name rather
     # than nested inline. assert the resolver still consumes THAT probe, not a second one.
@@ -5065,23 +5065,25 @@ def test_both_ray_rollouts_pin_blackwell_attention_from_the_same_resolver():
     # the enforce_eager cross-trainer check below exists because a one-sided fix is how that bug
     # shipped. the attention pins are the same divergence one knob over, so assert them the same
     # way rather than trusting opd alone.
-    for module, source in (
-        ("rl_train", inspect.getsource(rl_train.run_rl_train)),
+    for module, source, config_wiring in (
+        (
+            "rl_train",
+            inspect.getsource(rl_train.run_rl_train),
+            "mm_encoder_attn_backend=mm_encoder_attn_backend",
+        ),
         (
             "opd_train",
             inspect.getsource(opd_train._prepare_opd_verl)
-            + inspect.getsource(opd_train._execute_opd_train),
+            + inspect.getsource(opd_train._prepare_opd_execution),
+            '"mm_encoder_attn_backend": mm_encoder_attn_backend,',
         ),
     ):
         # the resolver must be CALLED and its second return value must be carried onward. the two
         # trainers spell the handoff differently (rl_train passes it as a kwarg into
-        # _rl_runconfig, opd_train builds its config dict inline), so assert the binding both
-        # share rather than either one's syntax.
+        # _rl_runconfig, opd_train builds its config dict inline), so assert each exact handoff.
         assert "resolve_blackwell_attention_backends(" in source, module
         assert "attention_backend, mm_encoder_attn_backend = " in source, module
-        assert "mm_encoder_attn_backend=mm_encoder_attn_backend" in source or (
-            '"mm_encoder_attn_backend": mm_encoder_attn_backend,' in source
-        ), module
+        assert config_wiring in source, module
 
 
 def test_both_ray_rollouts_resolve_eager_from_the_same_hardware_probe():
@@ -5095,7 +5097,7 @@ def test_both_ray_rollouts_resolve_eager_from_the_same_hardware_probe():
         (
             "opd_train",
             inspect.getsource(opd_train._prepare_opd_verl)
-            + inspect.getsource(opd_train._execute_opd_train),
+            + inspect.getsource(opd_train._prepare_opd_execution),
         ),
     ):
         assert "resolve_rollout_enforce_eager(" in source, module
@@ -5120,7 +5122,7 @@ def test_overrides_pin_the_rollout_resident_for_sleep_unsupported_models():
 def test_the_resolved_sleep_flag_reaches_the_opd_verl_config():
     # the assertions above pass against a resolver whose answer never reaches the config, which is
     # the exact shape of the bug this fixes. pin the wiring, not just the string.
-    built = inspect.getsource(opd_train._execute_opd_train)
+    built = inspect.getsource(opd_train._prepare_opd_execution)
     assert '"sleep_unsupported": rollout_sleep_unsupported(model_id),' in built
 
 
@@ -5609,9 +5611,9 @@ def test_deterministic_seed_uses_every_rollout_identity_component():
 def test_train_meta_records_the_optimizer_steps_that_actually_produced_a_loss():
     import inspect
 
-    from flash.engine.worker.opd_train import _execute_opd_train
+    from flash.engine.worker.opd_train import _write_opd_train_meta
 
-    notes = inspect.getsource(_execute_opd_train)
+    notes = inspect.getsource(_write_opd_train_meta)
     notes = notes[notes.index("_w.write_train_meta(") :]
     # `steps` is the REQUESTED horizon. a step whose batch carried no teacher signal never applies
     # an update, so reporting the horizon as the work done would overstate a partly-starved run.
@@ -5640,9 +5642,9 @@ def test_worker_filters_over_budget_prompts_before_downloading_the_weights():
 def test_worker_refuses_to_publish_a_loss_curve_shorter_than_the_final_checkpoint():
     import inspect
 
-    from flash.engine.worker.opd_train import _execute_opd_train
+    from flash.engine.worker.opd_train import _finalize_opd_train, _write_opd_train_meta
 
-    source = inspect.getsource(_execute_opd_train)
+    source = inspect.getsource(_finalize_opd_train) + inspect.getsource(_write_opd_train_meta)
     # record_step only checks that each metric line FOLLOWS the previous one, so it cannot notice a
     # MISSING TRAILING metric: on_line silently skips any step-tagged line whose loss it cannot
     # parse, and no later step ever arrives to trip the sequence check. that leaves a curve of
@@ -5660,20 +5662,18 @@ def test_worker_refuses_to_publish_a_loss_curve_shorter_than_the_final_checkpoin
 def test_train_meta_reports_the_teacher_call_shape_only_where_one_is_enforced():
     import inspect
 
-    from flash.engine.worker.opd_train import _execute_opd_train
+    from flash.engine.worker.opd_train import _write_opd_train_meta
 
-    notes = inspect.getsource(_execute_opd_train)
+    notes = inspect.getsource(_write_opd_train_meta)
     notes = notes[notes.index("_w.write_train_meta(") :]
     # only single-turn text uses the serial batcher; multimodal and multi-turn use bridge threads.
     # report at most the samples one step can produce.
     assert (
         '"opd_teacher_batch_size": (\n'
-        "                    min(\n"
-        "                        OPD_TEACHER_SCORING_CONCURRENCY, max(1, prompts_per_step * knobs.group_size)\n"
-        "                    )\n"
-        "                    if not multimodal and not multi_turn\n"
-        "                    else None\n"
-        "                ),"
+        "                min(OPD_TEACHER_SCORING_CONCURRENCY, max(1, prompts_per_step * knobs.group_size))\n"
+        "                if not multimodal and not multi_turn\n"
+        "                else None\n"
+        "            ),"
     ) in notes
     assert ('"opd_teacher_workers": 1 if not multimodal and not multi_turn else None,') in notes
     # the engine length handed to vllm, not a hardcoded default: prompt filtering is carved out of
@@ -6097,7 +6097,7 @@ def test_opd_renders_each_prompt_once_so_a_stateful_environment_is_not_run_twice
 
     from flash.engine.worker import opd_train as opd_mod
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(opd_mod._prepare_opd_train)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(opd_mod._scan_opd_prompt_rows)))
     renders = [
         node
         for node in ast.walk(tree)

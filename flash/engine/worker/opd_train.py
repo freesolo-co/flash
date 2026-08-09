@@ -2110,6 +2110,21 @@ class _PreparedOpdTrain:
 
 
 @dataclass(frozen=True)
+class _OpdWorkspace:
+    workdir: str
+    shim_dir: str
+    local_dir: str
+    export_root: str
+    mutation_failure_path: str
+    score_delivery_failure_path: str
+    abandonment_failure_path: str
+    resample_failure_path: str
+    cycle_commit_failure_path: str
+    train_file: str
+    val_file: str
+
+
+@dataclass(frozen=True)
 class _PreparedOpdVerl:
     workdir: str
     shim_dir: str
@@ -2145,17 +2160,7 @@ class _PreparedOpdVerl:
     resume_state: dict | None
 
 
-def _prepare_opd_train(spec=None) -> _PreparedOpdTrain:
-    from flash.content.multimodal import (
-        image_teacher_prompt_messages,
-        normalize_prompt_images,
-        record_has_images,
-        validate_multimodal_training,
-    )
-    from flash.engine.worker.teacher.client import TeacherClient
-
-    spec = spec or _w.JOB_SPEC
-    env = _w.require_active_env()
+def _resolve_opd_multi_turn(env) -> tuple[bool, int]:
     if getattr(env, "is_tool_env", False):
         raise RuntimeError("native tool-calling OPD environments are not supported")
     multi_turn = bool(getattr(env, "multi_turn", False))
@@ -2176,22 +2181,16 @@ def _prepare_opd_train(spec=None) -> _PreparedOpdTrain:
             raise RuntimeError("multi-turn OPD environment requires a positive bounded turn limit")
     else:
         max_turns = 0
-    knobs = _resolve_opd_knobs()
-    if multi_turn and knobs.structured_outputs:
-        raise RuntimeError(
-            "multi-turn structured-output OPD is not supported until a per-turn constraint contract exists"
-        )
-    model_id = spec.model if spec else RECIPE.hf_model_id
-    model_revision = getattr(spec, "model_revision", "") if spec else ""
-    from flash.engine.worker.train.opd.validation import validate_opd_structured_outputs
+    return multi_turn, max_turns
 
-    structured_validation = validate_opd_structured_outputs(
-        knobs.structured_outputs,
-        model_id=model_id,
-        model_revision=model_revision,
-    )
-    structured_outputs = structured_validation.constraint
-    model_vocab_size = structured_validation.model_vocab_size
+
+def _scan_opd_prompt_rows(
+    env,
+    spec,
+    model_id: str,
+    record_has_images,
+    validate_multimodal_training,
+) -> tuple[list[tuple[object, object]], bool]:
     # the child trainer is seeded through its own config, but the environment's dataset /
     # prompt_messages calls run HERE in the parent. an unseeded parent can build a different prompt
     # pool across attempts, whose fingerprint then rejects a valid resume checkpoint. seed just
@@ -2219,59 +2218,21 @@ def _prepare_opd_train(spec=None) -> _PreparedOpdTrain:
     # render
     # could change multimodal classification. the same seeded permutation preserves resume order.
     random.Random(_w.SEED).shuffle(prompt_rows)
+    return prompt_rows, multimodal
 
-    started_at = time.time()
-    # validate the control-panel broker transport before the gpu probe and model prefetch so a malformed
-    # attempt fails
-    # before any additional paid setup. raw managed-teacher provider credentials never enter the worker.
-    from flash.core.spec import CONTROL_PANEL_URL_ENV, TEACHER_CAPABILITY_ENV
 
-    control_panel_url = os.environ.get(CONTROL_PANEL_URL_ENV, "").strip()
-    capability = os.environ.get(TEACHER_CAPABILITY_ENV, "").strip()
-    if not control_panel_url or not capability:
-        raise RuntimeError(
-            "managed teacher control-panel transport is missing from the OPD parent worker"
-        )
-    _w.heartbeat("opd_start", gpu=_w.gpu_diagnostics(include_torch=False))
-    _probe_gpu_in_subprocess(
-        spec.gpu.type if spec else None,
-        exact_type=spec.gpu.type if spec else "",
-    )
-    teacher = TeacherClient(capability, control_panel_url, knobs.teacher_model)
-    processor = None
-    if multimodal:
-        from transformers import AutoProcessor
-
-        processor = AutoProcessor.from_pretrained(
-            model_id,
-            trust_remote_code=True,
-            **_w.model_revision_kwargs(model_revision),
-        )
-        tokenizer = processor.tokenizer
-    else:
-        tokenizer = _w.load_tokenizer(model_id, revision=model_revision)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    thinking_prefill = _thinking_prefill_text(tokenizer)
-    requested_len = knobs.max_length or (RECIPE.opd.max_prompt_len + knobs.max_completion)
-    # clamp to the architecture BEFORE deriving the prompt budget, so every downstream length agrees.
-    # clamping only the engine would admit prompts sized against the unclamped budget and then fail
-    # them at rollout instead of training on the shorter context.
-    max_model_len = clamp_engine_len(
-        requested_len, model_max_position_embeddings(model_id, model_revision)
-    )
-    if max_model_len < requested_len:
-        print(
-            f"[opd-verl] max_context_tokens {requested_len} exceeds the {model_id} context limit; "
-            f"training at {max_model_len}",
-            flush=True,
-        )
-    prompt_budget = max_model_len - knobs.max_completion
-    if prompt_budget < 1:
-        raise RuntimeError("opd max_context_tokens leaves no room for a prompt")
-    if multi_turn:
-        validate_glue_template(tokenizer, thinking=bool(_w.THINKING))
-
+def _build_opd_prompts(
+    env,
+    *,
+    multi_turn: bool,
+    processor,
+    prompt_budget: int,
+    prompt_rows: list[tuple[object, object]],
+    tokenizer,
+    image_teacher_prompt_messages,
+    normalize_prompt_images,
+    record_has_images,
+) -> tuple[list[_BridgePrompt], int]:
     prompts: list[_BridgePrompt] = []
     dropped_long = 0
     package_root_value = getattr(env, "package_root", None)
@@ -2336,6 +2297,104 @@ def _prepare_opd_train(spec=None) -> _PreparedOpdTrain:
                     example=example if multi_turn else None,
                 )
             )
+    return prompts, dropped_long
+
+
+def _prepare_opd_train(spec=None) -> _PreparedOpdTrain:
+    from flash.content.multimodal import (
+        image_teacher_prompt_messages,
+        normalize_prompt_images,
+        record_has_images,
+        validate_multimodal_training,
+    )
+    from flash.engine.worker.teacher.client import TeacherClient
+
+    spec = spec or _w.JOB_SPEC
+    env = _w.require_active_env()
+    multi_turn, max_turns = _resolve_opd_multi_turn(env)
+    knobs = _resolve_opd_knobs()
+    if multi_turn and knobs.structured_outputs:
+        raise RuntimeError(
+            "multi-turn structured-output OPD is not supported until a per-turn constraint contract exists"
+        )
+    model_id = spec.model if spec else RECIPE.hf_model_id
+    model_revision = getattr(spec, "model_revision", "") if spec else ""
+    from flash.engine.worker.train.opd.validation import validate_opd_structured_outputs
+
+    structured_validation = validate_opd_structured_outputs(
+        knobs.structured_outputs,
+        model_id=model_id,
+        model_revision=model_revision,
+    )
+    structured_outputs = structured_validation.constraint
+    model_vocab_size = structured_validation.model_vocab_size
+    prompt_rows, multimodal = _scan_opd_prompt_rows(
+        env, spec, model_id, record_has_images, validate_multimodal_training
+    )
+
+    started_at = time.time()
+    # validate the control-panel broker transport before the gpu probe and model prefetch so a malformed
+    # attempt fails
+    # before any additional paid setup. raw managed-teacher provider credentials never enter the worker.
+    from flash.core.spec import CONTROL_PANEL_URL_ENV, TEACHER_CAPABILITY_ENV
+
+    control_panel_url = os.environ.get(CONTROL_PANEL_URL_ENV, "").strip()
+    capability = os.environ.get(TEACHER_CAPABILITY_ENV, "").strip()
+    if not control_panel_url or not capability:
+        raise RuntimeError(
+            "managed teacher control-panel transport is missing from the OPD parent worker"
+        )
+    _w.heartbeat("opd_start", gpu=_w.gpu_diagnostics(include_torch=False))
+    _probe_gpu_in_subprocess(
+        spec.gpu.type if spec else None,
+        exact_type=spec.gpu.type if spec else "",
+    )
+    teacher = TeacherClient(capability, control_panel_url, knobs.teacher_model)
+    processor = None
+    if multimodal:
+        from transformers import AutoProcessor
+
+        processor = AutoProcessor.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            **_w.model_revision_kwargs(model_revision),
+        )
+        tokenizer = processor.tokenizer
+    else:
+        tokenizer = _w.load_tokenizer(model_id, revision=model_revision)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    thinking_prefill = _thinking_prefill_text(tokenizer)
+    requested_len = knobs.max_length or (RECIPE.opd.max_prompt_len + knobs.max_completion)
+    # clamp to the architecture BEFORE deriving the prompt budget, so every downstream length agrees.
+    # clamping only the engine would admit prompts sized against the unclamped budget and then fail
+    # them at rollout instead of training on the shorter context.
+    max_model_len = clamp_engine_len(
+        requested_len, model_max_position_embeddings(model_id, model_revision)
+    )
+    if max_model_len < requested_len:
+        print(
+            f"[opd-verl] max_context_tokens {requested_len} exceeds the {model_id} context limit; "
+            f"training at {max_model_len}",
+            flush=True,
+        )
+    prompt_budget = max_model_len - knobs.max_completion
+    if prompt_budget < 1:
+        raise RuntimeError("opd max_context_tokens leaves no room for a prompt")
+    if multi_turn:
+        validate_glue_template(tokenizer, thinking=bool(_w.THINKING))
+
+    prompts, dropped_long = _build_opd_prompts(
+        env,
+        multi_turn=multi_turn,
+        processor=processor,
+        prompt_budget=prompt_budget,
+        prompt_rows=prompt_rows,
+        tokenizer=tokenizer,
+        image_teacher_prompt_messages=image_teacher_prompt_messages,
+        normalize_prompt_images=normalize_prompt_images,
+        record_has_images=record_has_images,
+    )
     if not prompts:
         raise RuntimeError("every OPD prompt exceeds the configured prompt budget")
     # weights come AFTER the budget filter: a dataset whose every prompt is over budget is a
@@ -2381,15 +2440,10 @@ def _prepare_opd_train(spec=None) -> _PreparedOpdTrain:
     )
 
 
-def _prepare_opd_verl(prepared: _PreparedOpdTrain) -> _PreparedOpdVerl:
-    knobs = prepared.knobs
-    model_id = prepared.model_id
-    model_revision = prepared.model_revision
+def _prepare_opd_workspace(prepared: _PreparedOpdTrain) -> _OpdWorkspace:
     multimodal = prepared.multimodal
-    prompt_pool_fingerprint = prepared.prompt_pool_fingerprint
     prompts = prepared.prompts
     prompts_per_step = prepared.prompts_per_step
-    spec = prepared.spec
     update_horizon = prepared.update_horizon
     workdir = os.path.join("/tmp", "flash-opd-verl", _w.RUN_ID, f"seed-{_w.SEED}")
     shutil.rmtree(workdir, ignore_errors=True)
@@ -2444,6 +2498,88 @@ def _prepare_opd_verl(prepared: _PreparedOpdTrain) -> _PreparedOpdVerl:
     val_file = os.path.join(data_dir, "val.parquet")
     _write_opd_parquet(rows, train_file)
     _write_opd_parquet([rows[0]], val_file)
+    return _OpdWorkspace(
+        workdir=workdir,
+        shim_dir=shim_dir,
+        local_dir=local_dir,
+        export_root=export_root,
+        mutation_failure_path=mutation_failure_path,
+        score_delivery_failure_path=score_delivery_failure_path,
+        abandonment_failure_path=abandonment_failure_path,
+        resample_failure_path=resample_failure_path,
+        cycle_commit_failure_path=cycle_commit_failure_path,
+        train_file=train_file,
+        val_file=val_file,
+    )
+
+
+def _write_opd_shims(
+    shim_dir: str,
+    *,
+    knobs,
+    update_horizon: int,
+    gdn_reset_arch,
+    loggers,
+) -> tuple[str, str]:
+    plugin_path = os.path.join(shim_dir, "flash_opd_plugin.py")
+    shutil.copy2(
+        os.path.join(os.path.dirname(__file__), "train", "opd", "child", "plugin.py"), plugin_path
+    )
+    structured_helper_path = os.path.join(shim_dir, "flash_opd_structured.py")
+    shutil.copy2(
+        os.path.join(os.path.dirname(__file__), "train", "opd", "child", "structured.py"),
+        structured_helper_path,
+    )
+    multiturn_helper_path = os.path.join(shim_dir, "flash_opd_multiturn.py")
+    shutil.copy2(
+        os.path.join(os.path.dirname(__file__), "train", "opd", "child", "multiturn.py"),
+        multiturn_helper_path,
+    )
+    glue_helper_path = os.path.join(shim_dir, "flash_multiturn_glue.py")
+    shutil.copy2(
+        os.path.join(os.path.dirname(__file__), "train", "core", "child", "glue.py"),
+        glue_helper_path,
+    )
+    entry_path = os.path.join(shim_dir, "flash_opd_entry.py")
+    with open(entry_path, "w", encoding="utf-8") as file:
+        file.write("import verl\nfrom flash_opd_plugin import main\nmain()\n")
+    # use a zero custom reward: verl still runs scoring when use_task_rewards=false, and its default
+    # registry has no flash_opd entry (reward_loop.py:146-155).
+    reward_path = os.path.join(shim_dir, "flash_opd_reward.py")
+    with open(reward_path, "w", encoding="utf-8") as file:
+        file.write(_OPD_ZERO_REWARD_SOURCE)
+    opd_shim_source = _render_opd_sitecustomize(
+        save_at_steps=knobs.save_at_steps,
+        total_steps=update_horizon,
+    )
+    if gdn_reset_arch is not None:
+        opd_shim_source += render_gdn_varlen_shim(gdn_reset_arch)
+    if "wandb" in loggers:
+        opd_shim_source += render_wandb_link_shim()
+    with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
+        file.write(opd_shim_source)
+    return entry_path, reward_path
+
+
+def _prepare_opd_verl(prepared: _PreparedOpdTrain) -> _PreparedOpdVerl:
+    knobs = prepared.knobs
+    model_id = prepared.model_id
+    model_revision = prepared.model_revision
+    prompt_pool_fingerprint = prepared.prompt_pool_fingerprint
+    spec = prepared.spec
+    update_horizon = prepared.update_horizon
+    workspace = _prepare_opd_workspace(prepared)
+    workdir = workspace.workdir
+    shim_dir = workspace.shim_dir
+    local_dir = workspace.local_dir
+    export_root = workspace.export_root
+    mutation_failure_path = workspace.mutation_failure_path
+    score_delivery_failure_path = workspace.score_delivery_failure_path
+    abandonment_failure_path = workspace.abandonment_failure_path
+    resample_failure_path = workspace.resample_failure_path
+    cycle_commit_failure_path = workspace.cycle_commit_failure_path
+    train_file = workspace.train_file
+    val_file = workspace.val_file
 
     lora_config = _w.make_lora(model_id)
     lora_rank = int(lora_config.r)
@@ -2502,43 +2638,13 @@ def _prepare_opd_verl(prepared: _PreparedOpdTrain) -> _PreparedOpdVerl:
     # missing cutlass.cute.core.ThrMma, including text-only rollouts on VL models.
     attention_backend, mm_encoder_attn_backend = resolve_blackwell_attention_backends(caps, verl_cc)
 
-    plugin_path = os.path.join(shim_dir, "flash_opd_plugin.py")
-    shutil.copy2(
-        os.path.join(os.path.dirname(__file__), "train", "opd", "child", "plugin.py"), plugin_path
+    entry_path, reward_path = _write_opd_shims(
+        shim_dir,
+        knobs=knobs,
+        update_horizon=update_horizon,
+        gdn_reset_arch=gdn_reset_arch,
+        loggers=loggers,
     )
-    structured_helper_path = os.path.join(shim_dir, "flash_opd_structured.py")
-    shutil.copy2(
-        os.path.join(os.path.dirname(__file__), "train", "opd", "child", "structured.py"),
-        structured_helper_path,
-    )
-    multiturn_helper_path = os.path.join(shim_dir, "flash_opd_multiturn.py")
-    shutil.copy2(
-        os.path.join(os.path.dirname(__file__), "train", "opd", "child", "multiturn.py"),
-        multiturn_helper_path,
-    )
-    glue_helper_path = os.path.join(shim_dir, "flash_multiturn_glue.py")
-    shutil.copy2(
-        os.path.join(os.path.dirname(__file__), "train", "core", "child", "glue.py"),
-        glue_helper_path,
-    )
-    entry_path = os.path.join(shim_dir, "flash_opd_entry.py")
-    with open(entry_path, "w", encoding="utf-8") as file:
-        file.write("import verl\nfrom flash_opd_plugin import main\nmain()\n")
-    # use a zero custom reward: verl still runs scoring when use_task_rewards=false, and its default
-    # registry has no flash_opd entry (reward_loop.py:146-155).
-    reward_path = os.path.join(shim_dir, "flash_opd_reward.py")
-    with open(reward_path, "w", encoding="utf-8") as file:
-        file.write(_OPD_ZERO_REWARD_SOURCE)
-    opd_shim_source = _render_opd_sitecustomize(
-        save_at_steps=knobs.save_at_steps,
-        total_steps=update_horizon,
-    )
-    if gdn_reset_arch is not None:
-        opd_shim_source += render_gdn_varlen_shim(gdn_reset_arch)
-    if "wandb" in loggers:
-        opd_shim_source += render_wandb_link_shim()
-    with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
-        file.write(opd_shim_source)
 
     resume_step, resume_state = _restore_verl_resume(
         local_dir,
@@ -2581,163 +2687,389 @@ def _prepare_opd_verl(prepared: _PreparedOpdTrain) -> _PreparedOpdVerl:
     )
 
 
-def _execute_opd_train(prepared: _PreparedOpdTrain, verl: _PreparedOpdVerl) -> None:
-    spec = prepared.spec
-    env = prepared.env
-    multi_turn = prepared.multi_turn
-    max_turns = prepared.max_turns
+@dataclass(frozen=True)
+class _PreparedOpdExecution:
+    progress_state: object
+    watcher: object
+    child_env: object
+    command: list[str]
+
+
+@dataclass(frozen=True)
+class _FinalizedOpdTrain:
+    final_step: int
+    adapter_dir: str
+    train_wall: float
+    setup_seconds: float
+
+
+def _prepare_opd_execution(
+    prepared: _PreparedOpdTrain,
+    verl: _PreparedOpdVerl,
+    bridge: _TeacherAlignmentBridge,
+) -> _PreparedOpdExecution:
     knobs = prepared.knobs
     model_id = prepared.model_id
     model_revision = prepared.model_revision
     structured_outputs = prepared.structured_outputs
     model_vocab_size = prepared.model_vocab_size
-    started_at = prepared.started_at
-    teacher = prepared.teacher
-    tokenizer = prepared.tokenizer
-    thinking_prefill = prepared.thinking_prefill
+    max_turns = prepared.max_turns
+    multi_turn = prepared.multi_turn
     max_model_len = prepared.max_model_len
     prompt_budget = prepared.prompt_budget
-    prompts = prepared.prompts
-    dropped_long = prepared.dropped_long
-    download_seconds = prepared.download_seconds
     eos_token_ids = prepared.eos_token_ids
     prompts_per_step = prepared.prompts_per_step
     update_horizon = prepared.update_horizon
     prompt_pool_fingerprint = prepared.prompt_pool_fingerprint
-    multimodal = prepared.multimodal
-    workdir = verl.workdir
-    shim_dir = verl.shim_dir
+    train_file = verl.train_file
+    val_file = verl.val_file
+    model_path = verl.model_path
+    lora_rank = verl.lora_rank
+    lora_alpha = verl.lora_alpha
+    target_modules = verl.target_modules
+    warmstart_adapter = verl.warmstart_adapter
     local_dir = verl.local_dir
+    save_freq = verl.save_freq
+    gpu_count = verl.gpu_count
+    project_name = verl.project_name
+    experiment_name = verl.experiment_name
+    reward_path = verl.reward_path
+    fp8_kv = verl.fp8_kv
+    enforce_eager = verl.enforce_eager
+    attention_backend = verl.attention_backend
+    mm_encoder_attn_backend = verl.mm_encoder_attn_backend
+    loggers = verl.loggers
+    caps = verl.caps
     export_root = verl.export_root
+    python_bin = verl.python_bin
+    resume_step = verl.resume_step
+    resume_state = verl.resume_state
+    shim_dir = verl.shim_dir
     mutation_failure_path = verl.mutation_failure_path
     score_delivery_failure_path = verl.score_delivery_failure_path
     abandonment_failure_path = verl.abandonment_failure_path
     resample_failure_path = verl.resample_failure_path
     cycle_commit_failure_path = verl.cycle_commit_failure_path
-    train_file = verl.train_file
-    val_file = verl.val_file
-    lora_rank = verl.lora_rank
-    lora_alpha = verl.lora_alpha
-    target_modules = verl.target_modules
-    warmstart_adapter = verl.warmstart_adapter
-    python_bin = verl.python_bin
-    model_path = verl.model_path
-    gpu_count = verl.gpu_count
-    save_freq = verl.save_freq
-    loggers = verl.loggers
-    project_name = verl.project_name
-    experiment_name = verl.experiment_name
-    caps = verl.caps
-    gdn_hybrid = verl.gdn_hybrid
-    fp8_kv = verl.fp8_kv
-    enforce_eager = verl.enforce_eager
-    attention_backend = verl.attention_backend
-    mm_encoder_attn_backend = verl.mm_encoder_attn_backend
     entry_path = verl.entry_path
-    reward_path = verl.reward_path
-    resume_step = verl.resume_step
-    resume_state = verl.resume_state
-    bridge = _TeacherAlignmentBridge(
-        prompts=prompts,
-        tokenizer=tokenizer,
-        teacher=teacher,
-        thinking_prefill=thinking_prefill,
+    config = {
+        "train_files": [train_file],
+        "val_files": [val_file],
+        "train_batch_size": prompts_per_step,
+        "max_prompt_length": prompt_budget,
+        "max_response_length": knobs.max_completion,
+        "model_path": model_path,
+        "lora_rank": lora_rank,
+        "lora_alpha": lora_alpha,
+        "target_modules": target_modules,
+        "target_parameters": _w.lora_target_parameters(model_id),
+        "lora_adapter_path": warmstart_adapter,
+        "learning_rate": knobs.learning_rate,
+        "local_dir": local_dir,
+        "save_freq": save_freq,
+        "n_gpus_per_node": gpu_count,
+        "ulysses_sequence_parallel_size": gpu_count,
+        "seed": _w.backend_seed(_w.SEED),
+        "project_name": project_name,
+        "experiment_name": experiment_name,
+        "total_training_steps": update_horizon,
+        "group_size": knobs.group_size,
+        "bridge_url": bridge.url,
+        "bridge_token": bridge.token,
+        "reward_path": reward_path,
+        "kl_penalty_coef": knobs.kl_coef,
+        "temperature": knobs.temperature,
+        "top_p": knobs.top_p,
+        # the job's own engine length (prompt + completion), already clamped to the model's
+        # limit. prompt_budget above is carved out of this same value, so the engine, the prompt
+        # filter, and the token budget cannot disagree. a hardcoded engine would size vllm's kv
+        # cache for a context the job never uses, and -- above it -- admit prompts the engine
+        # cannot hold.
+        "max_sequence_length": max_model_len,
+        "multi_turn": multi_turn,
+        "thinking": bool(_w.THINKING),
+        "structured_outputs": structured_outputs,
+        "fp8_kv": fp8_kv,
+        "enforce_eager": enforce_eager,
+        "attention_backend": attention_backend,
+        "mm_encoder_attn_backend": mm_encoder_attn_backend,
+        "sleep_unsupported": rollout_sleep_unsupported(model_id),
+        "loggers": loggers,
+        # resolved from the out-of-process capability probe, never by opening cuda in this
+        # parent -- see fused_ce_backend.
+        "fused_ce_backend": fused_ce_backend(caps),
+    }
+    overrides = build_opd_overrides(config)
+    progress_state = _OpdProgressState(resume_state)
+    watcher = _OpdVerlCheckpointWatcher(
+        local_dir=local_dir,
+        export_root=export_root,
+        python_bin=python_bin,
+        model_id=model_id,
+        model_revision=model_revision,
+        required_steps=knobs.save_at_steps,
+        seed=int(_w.SEED),
+        prompt_pool_fingerprint=prompt_pool_fingerprint,
+        prompts_per_step=prompts_per_step,
+        group_size=knobs.group_size,
+        accounting_state=progress_state.checkpoint_state,
+    )
+    watcher.processed_steps.update(_processed_resume_steps(knobs.save_at_steps, resume_step))
+    child_env = _build_opd_child_env(
+        shim_dir=shim_dir,
+        wandb_enabled="wandb" in loggers,
+        bridge_url=bridge.url,
+        bridge_token=bridge.token,
+        seed=int(_w.SEED),
+        stop_sequences=knobs.stop_sequences,
         eos_token_ids=eos_token_ids,
-        stop_sequences=tuple(str(value) for value in knobs.stop_sequences),
-        structured=structured_outputs is not None,
-        active_env=env if multi_turn else None,
+        structured_outputs=structured_outputs,
+        model_vocab_size=model_vocab_size,
+        thinking=bool(_w.THINKING),
         multi_turn=multi_turn,
         max_turns=max_turns,
+        max_model_len=max_model_len,
+        mutation_failure_path=mutation_failure_path,
+        score_delivery_failure_path=score_delivery_failure_path,
+        abandonment_failure_path=abandonment_failure_path,
+        resample_failure_path=resample_failure_path,
+        cycle_commit_failure_path=cycle_commit_failure_path,
+    )
+    command = [python_bin, entry_path, *overrides]
+    return _PreparedOpdExecution(
+        progress_state=progress_state,
+        watcher=watcher,
+        child_env=child_env,
+        command=command,
+    )
+
+
+def _finalize_opd_train(
+    prepared: _PreparedOpdTrain,
+    verl: _PreparedOpdVerl,
+    final_accounting: dict,
+    train_started_at: float,
+) -> _FinalizedOpdTrain:
+    update_horizon = prepared.update_horizon
+    model_id = prepared.model_id
+    model_revision = prepared.model_revision
+    knobs = prepared.knobs
+    started_at = prepared.started_at
+    local_dir = verl.local_dir
+    workdir = verl.workdir
+    python_bin = verl.python_bin
+    train_wall = float(final_accounting["train_wall_seconds"])
+
+    actor_dir, final_step = latest_global_step_dir(local_dir)
+    if final_step < update_horizon:
+        raise RuntimeError(
+            f"opd completed {final_step}/{update_horizon} requested optimizer updates"
+        )
+    if not final_accounting["loss_curve"]:
+        raise RuntimeError(
+            "verl OPD produced no distillation-loss metrics for the whole run — the "
+            "distillation path never engaged; refusing to publish"
+        )
+    if len(final_accounting["loss_curve"]) != final_step:
+        # record_step only checks that each metric line FOLLOWS the last one, so a missing
+        # trailing metric (on_line skips any step-tagged line whose loss it cannot parse) leaves
+        # a curve shorter than the checkpoint verl actually wrote, and nothing later arrives to
+        # catch it. opt_steps is published from this curve, so a short curve would understate the
+        # updates applied. fail loud instead of reporting a number the curve cannot support.
+        raise RuntimeError(
+            f"verl OPD recorded {len(final_accounting['loss_curve'])} distillation-loss metrics "
+            f"for {final_step} optimizer updates; refusing to publish an accounting that does "
+            "not cover every update"
+        )
+    if int(final_accounting.get("aligned_sequences", 0) or 0) <= 0:
+        # zeroed-mask pass-through batches still emit a (zero) loss metric, so the loss-curve
+        # check alone cannot distinguish real distillation from a run where the teacher never
+        # aligned once. require at least one aligned sequence before publishing.
+        raise RuntimeError(
+            "verl OPD saw zero aligned teacher sequences for the whole run — every batch was "
+            "no-signal; refusing to publish an unchanged adapter"
+        )
+    adapter_dir = os.path.join(workdir, "adapter")
+    with liveness_heartbeat(
+        "opd_finalizing", progress=lambda: final_step, progress_step=True, keepalive=True
+    ):
+        _export_checkpoint_adapter(
+            actor_dir,
+            adapter_dir,
+            model_id=model_id,
+            model_revision=model_revision,
+            python_bin=python_bin,
+        )
+        _w.hf_upload_folder(adapter_dir, "adapter", required=True)
+        # preserve the final checkpoint only when save_at_steps is empty, matching grpo.
+        # watcher and final-save paths are disjoint, so processed_steps must not suppress it.
+        if final_save_due(final_step, knobs.save_at_steps):
+            _w.publish_deployable_checkpoint(adapter_dir, final_step, _provenance_ready=True)
+
+    setup_seconds = train_started_at - started_at
+    _w.heartbeat(
+        "opd_trained",
+        step=final_step,
+        train_wall=train_wall,
+        gpu=_w.gpu_diagnostics(include_torch=False),
+    )
+    return _FinalizedOpdTrain(
+        final_step=final_step,
+        adapter_dir=adapter_dir,
+        train_wall=train_wall,
+        setup_seconds=setup_seconds,
+    )
+
+
+def _write_opd_train_meta(
+    prepared: _PreparedOpdTrain,
+    verl: _PreparedOpdVerl,
+    final_accounting: dict,
+    finalized: _FinalizedOpdTrain,
+    peak_gpu_gb: float,
+    wandb_link: dict[str, str | None],
+) -> None:
+    spec = prepared.spec
+    knobs = prepared.knobs
+    model_id = prepared.model_id
+    max_turns = prepared.max_turns
+    multi_turn = prepared.multi_turn
+    max_model_len = prepared.max_model_len
+    prompts = prepared.prompts
+    dropped_long = prepared.dropped_long
+    download_seconds = prepared.download_seconds
+    prompts_per_step = prepared.prompts_per_step
+    update_horizon = prepared.update_horizon
+    multimodal = prepared.multimodal
+    gpu_count = verl.gpu_count
+    gdn_hybrid = verl.gdn_hybrid
+    warmstart_adapter = verl.warmstart_adapter
+    resume_step = verl.resume_step
+    project_name = verl.project_name
+    experiment_name = verl.experiment_name
+    loggers = verl.loggers
+    final_step = finalized.final_step
+    adapter_dir = finalized.adapter_dir
+    train_wall = finalized.train_wall
+    setup_seconds = finalized.setup_seconds
+    _w.write_train_meta(
+        phase="opd",
+        step=final_step,
+        adapter_dir=adapter_dir,
+        model_id=model_id,
+        train_wall=train_wall,
+        setup_seconds=setup_seconds,
+        train_tokens=0,
+        generated_tokens=int(final_accounting["generated_tokens"]),
+        notes={
+            "steps": update_horizon,
+            # optimizer updates that actually produced a distillation loss. record_step enforces
+            # loss_curve length == the metric step, and the guard above rejects a curve shorter
+            # than final_step, so this is measured, not assumed.
+            "opt_steps": len(final_accounting["loss_curve"]),
+            "epochs": knobs.epochs,
+            "retained_prompts": len(prompts),
+            "dropped_long_prompts": dropped_long,
+            "method": "gkd",
+            "init_from_adapter": spec.train.init_from_adapter or None,
+            "teacher_model": knobs.teacher_model,
+            "download_seconds": download_seconds,
+            "thinking": _w.THINKING,
+            "loss_curve": final_accounting["loss_curve"],
+            "mean_coverage": (
+                float(final_accounting["coverage_sum"]) / int(final_accounting["aligned_sequences"])
+                if final_accounting["aligned_sequences"]
+                else 0.0
+            ),
+            # the real alignment-health signal. mean_coverage reads ~1.0 even when the alignment
+            # has collapsed every student token onto one group, so it cannot flag that failure
+            # mode on its own; this ratio can.
+            "mean_align_granularity": (
+                float(final_accounting["align_group_sum"]) / int(final_accounting["align_group_n"])
+                if final_accounting["align_group_n"]
+                else 0.0
+            ),
+            "truncated_rollouts": int(final_accounting["truncated_rollouts"]),
+            "forced_tokens": int(final_accounting["forced_tokens"]),
+            "dropped_forced_groups": int(final_accounting["dropped_forced_groups"]),
+            "teacher_input_tokens": int(final_accounting["teacher_input_tokens"]),
+            "teacher_output_tokens": int(final_accounting["teacher_output_tokens"]),
+            "aligned_sequences": int(final_accounting["aligned_sequences"]),
+            "empty_alignments": int(final_accounting["empty_alignments"]),
+            "teacher_ok": int(final_accounting["teacher_ok"]),
+            **_failure_accounting_metadata(final_accounting),
+            "temperature": knobs.temperature,
+            "group_size": knobs.group_size,
+            "prompts_per_step": prompts_per_step,
+            "max_completion_len": knobs.max_completion,
+            "multi_turn": multi_turn,
+            "max_turns": max_turns if multi_turn else None,
+            "episodes": int(final_accounting["episodes_seen"]) if multi_turn else None,
+            "mean_turns_per_episode": (
+                int(final_accounting["mt_turn_records"]) / int(final_accounting["episodes_seen"])
+                if multi_turn and final_accounting["episodes_seen"]
+                else None
+            ),
+            # the engine length actually handed to vllm (prompt + completion), already clamped to
+            # the model's own limit. the prompt filter is carved out of this same number.
+            "vllm_max_model_len": max_model_len,
+            # only single-turn text uses the fixed serial batcher; multimodal and multi-turn use
+            # bridge threads. cap the reported batch by samples the step can produce.
+            "opd_teacher_batch_size": (
+                min(OPD_TEACHER_SCORING_CONCURRENCY, max(1, prompts_per_step * knobs.group_size))
+                if not multimodal and not multi_turn
+                else None
+            ),
+            "opd_teacher_workers": 1 if not multimodal and not multi_turn else None,
+            "rollout_backend": "verl_vllm",
+            "verl_version": "0.8.0",
+            "verl_backend": "fsdp",
+            "ulysses_sequence_parallel_size": gpu_count,
+            # record whether the child can reset gdn state at packed boundaries; successful runs
+            # upload no console, and failure here is silent contamination. None means non-gdn.
+            "gdn_boundary_resets": gdn_hybrid or None,
+            "peak_gpu_gb": peak_gpu_gb,
+            "warm_started": bool(warmstart_adapter),
+            "resumed": bool(resume_step),
+            "wandb_project": project_name if "wandb" in loggers else None,
+            "wandb_run_name": experiment_name if "wandb" in loggers else None,
+            # the sdk's link_wandb reads notes["wandb_url"]; trl gets it from the parent's live
+            # wandb.run, verl from the child marker (see backend_common.render_wandb_link_shim).
+            "wandb_url": wandb_link.get("wandb_url"),
+            "wandb_id": wandb_link.get("wandb_id"),
+        },
+    )
+
+
+def _execute_opd_train(prepared: _PreparedOpdTrain, verl: _PreparedOpdVerl) -> None:
+    bridge = _TeacherAlignmentBridge(
+        prompts=prepared.prompts,
+        tokenizer=prepared.tokenizer,
+        teacher=prepared.teacher,
+        thinking_prefill=prepared.thinking_prefill,
+        eos_token_ids=prepared.eos_token_ids,
+        stop_sequences=tuple(str(value) for value in prepared.knobs.stop_sequences),
+        structured=prepared.structured_outputs is not None,
+        active_env=prepared.env if prepared.multi_turn else None,
+        multi_turn=prepared.multi_turn,
+        max_turns=prepared.max_turns,
         thinking=bool(_w.THINKING),
         mutation_callback=_w.publish_opd_optimizer_start_marker,
-        initial_state=resume_state,
+        initial_state=verl.resume_state,
     )
     bridge.start()
     try:
-        config = {
-            "train_files": [train_file],
-            "val_files": [val_file],
-            "train_batch_size": prompts_per_step,
-            "max_prompt_length": prompt_budget,
-            "max_response_length": knobs.max_completion,
-            "model_path": model_path,
-            "lora_rank": lora_rank,
-            "lora_alpha": lora_alpha,
-            "target_modules": target_modules,
-            "target_parameters": _w.lora_target_parameters(model_id),
-            "lora_adapter_path": warmstart_adapter,
-            "learning_rate": knobs.learning_rate,
-            "local_dir": local_dir,
-            "save_freq": save_freq,
-            "n_gpus_per_node": gpu_count,
-            "ulysses_sequence_parallel_size": gpu_count,
-            "seed": _w.backend_seed(_w.SEED),
-            "project_name": project_name,
-            "experiment_name": experiment_name,
-            "total_training_steps": update_horizon,
-            "group_size": knobs.group_size,
-            "bridge_url": bridge.url,
-            "bridge_token": bridge.token,
-            "reward_path": reward_path,
-            "kl_penalty_coef": knobs.kl_coef,
-            "temperature": knobs.temperature,
-            "top_p": knobs.top_p,
-            # the job's own engine length (prompt + completion), already clamped to the model's
-            # limit. prompt_budget above is carved out of this same value, so the engine, the prompt
-            # filter, and the token budget cannot disagree. a hardcoded engine would size vllm's kv
-            # cache for a context the job never uses, and -- above it -- admit prompts the engine
-            # cannot hold.
-            "max_sequence_length": max_model_len,
-            "multi_turn": multi_turn,
-            "thinking": bool(_w.THINKING),
-            "structured_outputs": structured_outputs,
-            "fp8_kv": fp8_kv,
-            "enforce_eager": enforce_eager,
-            "attention_backend": attention_backend,
-            "mm_encoder_attn_backend": mm_encoder_attn_backend,
-            "sleep_unsupported": rollout_sleep_unsupported(model_id),
-            "loggers": loggers,
-            # resolved from the out-of-process capability probe, never by opening cuda in this
-            # parent -- see fused_ce_backend.
-            "fused_ce_backend": fused_ce_backend(caps),
-        }
-        overrides = build_opd_overrides(config)
-        progress_state = _OpdProgressState(resume_state)
-        watcher = _OpdVerlCheckpointWatcher(
-            local_dir=local_dir,
-            export_root=export_root,
-            python_bin=python_bin,
-            model_id=model_id,
-            model_revision=model_revision,
-            required_steps=knobs.save_at_steps,
-            seed=int(_w.SEED),
-            prompt_pool_fingerprint=prompt_pool_fingerprint,
-            prompts_per_step=prompts_per_step,
-            group_size=knobs.group_size,
-            accounting_state=progress_state.checkpoint_state,
-        )
-        watcher.processed_steps.update(_processed_resume_steps(knobs.save_at_steps, resume_step))
-        child_env = _build_opd_child_env(
-            shim_dir=shim_dir,
-            wandb_enabled="wandb" in loggers,
-            bridge_url=bridge.url,
-            bridge_token=bridge.token,
-            seed=int(_w.SEED),
-            stop_sequences=knobs.stop_sequences,
-            eos_token_ids=eos_token_ids,
-            structured_outputs=structured_outputs,
-            model_vocab_size=model_vocab_size,
-            thinking=bool(_w.THINKING),
-            multi_turn=multi_turn,
-            max_turns=max_turns,
-            max_model_len=max_model_len,
-            mutation_failure_path=mutation_failure_path,
-            score_delivery_failure_path=score_delivery_failure_path,
-            abandonment_failure_path=abandonment_failure_path,
-            resample_failure_path=resample_failure_path,
-            cycle_commit_failure_path=cycle_commit_failure_path,
-        )
-        command = [python_bin, entry_path, *overrides]
+        execution = _prepare_opd_execution(prepared, verl, bridge)
+        progress_state = execution.progress_state
+        watcher = execution.watcher
+        child_env = execution.child_env
+        command = execution.command
+        resume_step = verl.resume_step
+        update_horizon = prepared.update_horizon
+        score_delivery_failure_path = verl.score_delivery_failure_path
+        resample_failure_path = verl.resample_failure_path
+        abandonment_failure_path = verl.abandonment_failure_path
+        mutation_failure_path = verl.mutation_failure_path
+        cycle_commit_failure_path = verl.cycle_commit_failure_path
         progress = {"step": resume_step, "loss": None}
         wandb_link: dict[str, str | None] = {}
 
@@ -2832,152 +3164,14 @@ def _execute_opd_train(prepared: _PreparedOpdTrain, verl: _PreparedOpdVerl) -> N
             score_delivery_failure,
         )
         final_accounting = progress_state.final_state(bridge)
-        train_wall = float(final_accounting["train_wall_seconds"])
-
-        actor_dir, final_step = latest_global_step_dir(local_dir)
-        if final_step < update_horizon:
-            raise RuntimeError(
-                f"opd completed {final_step}/{update_horizon} requested optimizer updates"
-            )
-        if not final_accounting["loss_curve"]:
-            raise RuntimeError(
-                "verl OPD produced no distillation-loss metrics for the whole run — the "
-                "distillation path never engaged; refusing to publish"
-            )
-        if len(final_accounting["loss_curve"]) != final_step:
-            # record_step only checks that each metric line FOLLOWS the last one, so a missing
-            # trailing metric (on_line skips any step-tagged line whose loss it cannot parse) leaves
-            # a curve shorter than the checkpoint verl actually wrote, and nothing later arrives to
-            # catch it. opt_steps is published from this curve, so a short curve would understate the
-            # updates applied. fail loud instead of reporting a number the curve cannot support.
-            raise RuntimeError(
-                f"verl OPD recorded {len(final_accounting['loss_curve'])} distillation-loss metrics "
-                f"for {final_step} optimizer updates; refusing to publish an accounting that does "
-                "not cover every update"
-            )
-        if int(final_accounting.get("aligned_sequences", 0) or 0) <= 0:
-            # zeroed-mask pass-through batches still emit a (zero) loss metric, so the loss-curve
-            # check alone cannot distinguish real distillation from a run where the teacher never
-            # aligned once. require at least one aligned sequence before publishing.
-            raise RuntimeError(
-                "verl OPD saw zero aligned teacher sequences for the whole run — every batch was "
-                "no-signal; refusing to publish an unchanged adapter"
-            )
-        adapter_dir = os.path.join(workdir, "adapter")
-        with liveness_heartbeat(
-            "opd_finalizing", progress=lambda: final_step, progress_step=True, keepalive=True
-        ):
-            _export_checkpoint_adapter(
-                actor_dir,
-                adapter_dir,
-                model_id=model_id,
-                model_revision=model_revision,
-                python_bin=python_bin,
-            )
-            _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-            # preserve the final checkpoint only when save_at_steps is empty, matching grpo.
-            # watcher and final-save paths are disjoint, so processed_steps must not suppress it.
-            if final_save_due(final_step, knobs.save_at_steps):
-                _w.publish_deployable_checkpoint(adapter_dir, final_step, _provenance_ready=True)
-
-        setup_seconds = train_started_at - started_at
-        _w.heartbeat(
-            "opd_trained",
-            step=final_step,
-            train_wall=train_wall,
-            gpu=_w.gpu_diagnostics(include_torch=False),
-        )
-        _w.write_train_meta(
-            phase="opd",
-            step=final_step,
-            adapter_dir=adapter_dir,
-            model_id=model_id,
-            train_wall=train_wall,
-            setup_seconds=setup_seconds,
-            train_tokens=0,
-            generated_tokens=int(final_accounting["generated_tokens"]),
-            notes={
-                "steps": update_horizon,
-                # optimizer updates that actually produced a distillation loss. record_step enforces
-                # loss_curve length == the metric step, and the guard above rejects a curve shorter
-                # than final_step, so this is measured, not assumed.
-                "opt_steps": len(final_accounting["loss_curve"]),
-                "epochs": knobs.epochs,
-                "retained_prompts": len(prompts),
-                "dropped_long_prompts": dropped_long,
-                "method": "gkd",
-                "init_from_adapter": spec.train.init_from_adapter or None,
-                "teacher_model": knobs.teacher_model,
-                "download_seconds": download_seconds,
-                "thinking": _w.THINKING,
-                "loss_curve": final_accounting["loss_curve"],
-                "mean_coverage": (
-                    float(final_accounting["coverage_sum"])
-                    / int(final_accounting["aligned_sequences"])
-                    if final_accounting["aligned_sequences"]
-                    else 0.0
-                ),
-                # the real alignment-health signal. mean_coverage reads ~1.0 even when the alignment
-                # has collapsed every student token onto one group, so it cannot flag that failure
-                # mode on its own; this ratio can.
-                "mean_align_granularity": (
-                    float(final_accounting["align_group_sum"])
-                    / int(final_accounting["align_group_n"])
-                    if final_accounting["align_group_n"]
-                    else 0.0
-                ),
-                "truncated_rollouts": int(final_accounting["truncated_rollouts"]),
-                "forced_tokens": int(final_accounting["forced_tokens"]),
-                "dropped_forced_groups": int(final_accounting["dropped_forced_groups"]),
-                "teacher_input_tokens": int(final_accounting["teacher_input_tokens"]),
-                "teacher_output_tokens": int(final_accounting["teacher_output_tokens"]),
-                "aligned_sequences": int(final_accounting["aligned_sequences"]),
-                "empty_alignments": int(final_accounting["empty_alignments"]),
-                "teacher_ok": int(final_accounting["teacher_ok"]),
-                **_failure_accounting_metadata(final_accounting),
-                "temperature": knobs.temperature,
-                "group_size": knobs.group_size,
-                "prompts_per_step": prompts_per_step,
-                "max_completion_len": knobs.max_completion,
-                "multi_turn": multi_turn,
-                "max_turns": max_turns if multi_turn else None,
-                "episodes": int(final_accounting["episodes_seen"]) if multi_turn else None,
-                "mean_turns_per_episode": (
-                    int(final_accounting["mt_turn_records"])
-                    / int(final_accounting["episodes_seen"])
-                    if multi_turn and final_accounting["episodes_seen"]
-                    else None
-                ),
-                # the engine length actually handed to vllm (prompt + completion), already clamped to
-                # the model's own limit. the prompt filter is carved out of this same number.
-                "vllm_max_model_len": max_model_len,
-                # only single-turn text uses the fixed serial batcher; multimodal and multi-turn use
-                # bridge threads. cap the reported batch by samples the step can produce.
-                "opd_teacher_batch_size": (
-                    min(
-                        OPD_TEACHER_SCORING_CONCURRENCY, max(1, prompts_per_step * knobs.group_size)
-                    )
-                    if not multimodal and not multi_turn
-                    else None
-                ),
-                "opd_teacher_workers": 1 if not multimodal and not multi_turn else None,
-                "rollout_backend": "verl_vllm",
-                "verl_version": "0.8.0",
-                "verl_backend": "fsdp",
-                "ulysses_sequence_parallel_size": gpu_count,
-                # record whether the child can reset gdn state at packed boundaries; successful runs
-                # upload no console, and failure here is silent contamination. None means non-gdn.
-                "gdn_boundary_resets": gdn_hybrid or None,
-                "peak_gpu_gb": peak_gpu_gb,
-                "warm_started": bool(warmstart_adapter),
-                "resumed": bool(resume_step),
-                "wandb_project": project_name if "wandb" in loggers else None,
-                "wandb_run_name": experiment_name if "wandb" in loggers else None,
-                # the sdk's link_wandb reads notes["wandb_url"]; trl gets it from the parent's live
-                # wandb.run, verl from the child marker (see backend_common.render_wandb_link_shim).
-                "wandb_url": wandb_link.get("wandb_url"),
-                "wandb_id": wandb_link.get("wandb_id"),
-            },
+        finalized = _finalize_opd_train(prepared, verl, final_accounting, train_started_at)
+        _write_opd_train_meta(
+            prepared,
+            verl,
+            final_accounting,
+            finalized,
+            peak_gpu_gb,
+            wandb_link,
         )
     finally:
         bridge.close()

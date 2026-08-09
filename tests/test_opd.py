@@ -582,9 +582,9 @@ def test_opd_validates_dynamic_image_compatibility_before_gpu_wait():
     # an incompatible model must fail before any paid GPU work starts.
     import inspect
 
-    from flash.engine.worker.opd_train import _prepare_opd_train
+    from flash.engine.worker.opd_train import _prepare_opd_train, _scan_opd_prompt_rows
 
-    source = inspect.getsource(_prepare_opd_train)
+    source = inspect.getsource(_scan_opd_prompt_rows) + inspect.getsource(_prepare_opd_train)
     validation = 'validate_multimodal_training(model_id, "opd")'
 
     assert source.index(validation) < source.index("_probe_gpu_in_subprocess(")
