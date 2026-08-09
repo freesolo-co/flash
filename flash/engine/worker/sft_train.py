@@ -993,6 +993,23 @@ def run_sft_train(spec=None) -> None:
         rows = prepared_workload.rows
         multimodal = prepared_workload.multimodal
         profile = prepared_workload.profile
+        # the quote's packing gate is device-independent (it has to be: the profile job runs
+        # cpu-only and this profile is compared byte-for-byte above). that leaves one question it
+        # structurally cannot ask -- whether the conv kernel actually RUNS on this card. a
+        # causal_conv1d compiled without this arch imports fine and raises at the first forward, so
+        # verify it here, before optimizer work, rather than discovering it at a packed boundary.
+        # failing closed is not an option for a packed gdn run: the fallbacks accept cu_seq_lens_q
+        # and seq_idx and discard them, so silently continuing trains across example boundaries.
+        if profile.packing_mode == "packed" and profile.architecture_mode == "gdn-hybrid":
+            from flash.engine.worker.model.packing import gdn_packing_available
+
+            if not gdn_packing_available(model_id, revision=model_revision):
+                raise RuntimeError(
+                    "packed gdn training was quoted, but this worker cannot reset example "
+                    "boundaries: fla/causal_conv1d are missing or the conv kernel was built "
+                    "without this gpu's arch. training would bleed recurrent state across packed "
+                    "examples while appearing patched. rebuild the worker image for this card."
+                )
         # the context window comes from the profile, not a second reading of the train fields. the
         # rows were truncated at the profile's max_length and the quote was priced at it, so a
         # locally re-derived value could disagree with both while the parity check above still
