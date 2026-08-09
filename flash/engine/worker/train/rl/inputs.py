@@ -32,7 +32,6 @@ from flash.engine.worker.io.heartbeat import liveness_heartbeat
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.runtime.rng import backend_seed
 from flash.engine.worker.train.core.child.glue import validate_glue_template
-from flash.engine.worker.train.opd.gkd import generation_eos_from_cached_config
 from flash.engine.worker.train.rl.verl_config import (
     _processor_expanded_prompt,
     _verl_epochs_for_horizon,
@@ -42,10 +41,11 @@ from flash.engine.worker.train.rl.verl_config import (
 def _rl_train():
     """The orchestrator module, imported lazily because it imports this one.
 
-    `seed_training_rngs` and `model_max_position_embeddings` are patched on `rl_train` by the
-    resolver tests (the second one keeps the context-limit probe from hitting the hub). Binding
-    them here with a `from ... import` would capture the originals at import time, so the patch
-    would rebind an object this module never reads and the resolver would run the real ones.
+    `seed_training_rngs`, `model_max_position_embeddings` and `generation_eos_from_cached_config`
+    are patched on `rl_train` by the resolver tests (the last two keep the context-limit probe and
+    the halting-set read off the hub, which a clean runner has no cache for). Binding them here
+    with a `from ... import` would capture the originals at import time, so the patch would rebind
+    an object this module never reads and the resolver would run the real ones.
     """
     from flash.engine.worker import rl_train
 
@@ -353,7 +353,7 @@ def _resolve_grpo_inputs():
         # the union of the tokenizer's eos and the model's generation_config eos, because a model can
         # stop on a secondary id its tokenizer never exposes.
         "eos_token_ids": (
-            generation_eos_from_cached_config(model_id, model_revision, tok)
+            _rl_train().generation_eos_from_cached_config(model_id, model_revision, tok)
             if multi_turn
             else frozenset()
         ),

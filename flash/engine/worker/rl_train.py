@@ -85,6 +85,12 @@ from flash.engine.worker.sft_train import (
     _cached_model_path,
     _NvidiaSmiPeakSampler,
 )
+
+# kept here purely as the patch surface the resolver tests replace: `_resolve_grpo_inputs` moved
+# to `train/rl/inputs.py` and calls it back through this module, so the name must resolve here.
+from flash.engine.worker.train.opd.gkd import (  # noqa: F401
+    generation_eos_from_cached_config,
+)
 from flash.engine.worker.train.rl.shims import (
     render_entropy_quantile_shim,
     render_exact_save_steps_shim,
