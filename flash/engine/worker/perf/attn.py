@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
-
 
 def _attn_impl_for_capability(
     major: int, minor: int = 0, *, fa3_available: bool = False, fa2_available: bool = False
@@ -83,25 +81,3 @@ def optimal_attn_impl() -> str | None:
     elif not fa2:
         print(f"[attn] sm{major}{minor}: flash_attn wheel absent -> SDPA")
     return impl
-
-
-def _sdpa_cudnn_ctx(attn_impl: str | None):
-    """Force cuDNN SDPA backend on Blackwell (attn_impl=="sdpa"); no-op otherwise."""
-    if attn_impl != "sdpa":
-        return contextlib.nullcontext()
-    try:
-        from torch.nn.attention import SDPBackend, sdpa_kernel
-
-        # MATH must be last-resort: omitting it crashes sm120 GRPO ("No available kernel", measured).
-        return sdpa_kernel(
-            [
-                SDPBackend.CUDNN_ATTENTION,
-                SDPBackend.FLASH_ATTENTION,
-                SDPBackend.EFFICIENT_ATTENTION,
-                SDPBackend.MATH,
-            ],
-            set_priority=True,
-        )
-    except Exception as e:
-        print("[attn] cuDNN SDPA backend unavailable, using default SDPA:", e)
-        return contextlib.nullcontext()

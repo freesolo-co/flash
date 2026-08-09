@@ -294,7 +294,7 @@ def colocate_kv_util(
     kv_params_b = float(active_params_b) if active_params_b else params_b
     # 0.45 starves KV for >=60 GB colocated weight copies on cards with residual headroom.
     # lift to 0.55 only when `0.45 * total_vram_gb - weight_copy_gb >= 10`; this admits B200
-    # but not H200. `_GpuPeakSampler` verifies runtime headroom.
+    # but not H200. `_NvidiaSmiPeakSampler` verifies runtime headroom.
     _util_cap = _colocate_util_cap(weights_gb, total_vram_gb)
     if not sleep_mode:
         # `gpu_memory_utilization` covers weights plus KV, so budget both. scale KV with
