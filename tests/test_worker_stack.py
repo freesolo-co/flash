@@ -1247,10 +1247,13 @@ def test_verl_venv_pins_transformers_to_the_main_interpreters_range():
     """The verl venv must carry the SAME transformers ceiling as the main interpreter.
 
     /opt/verl-venv is built without --system-site-packages, so the main interpreter's pin does not
-    reach it. Left unpinned it resolved 5.14.1, where `is_flash_linear_attention_available()` returns
-    False for the pinned fla build and the venv sanity block fails the image with
-    "flash-linear-attention missing" while fla is installed. The venv is the interpreter that trains,
-    so it is the one whose transformers has to match what the gdn probes were validated against.
+    reach it. The venv is the interpreter that TRAINS, and transformers owns the gdn modelling code
+    the boundary-reset shim patches, so an unbounded resolve there silently moves training onto a
+    transformers line nothing validated.
+
+    This pin does NOT fix the cuda-gated probes -- they are byte-identical in 5.12.1 and 5.14.1 and
+    answer False on any gpu-less builder at every version. See
+    ``test_venv_sanity_block_uses_no_cuda_gated_probe``.
 
     The pin must also be in the OVERRIDE file: verl and vllm both require transformers, so a direct
     pin alone can be re-widened by a transitive requirement.

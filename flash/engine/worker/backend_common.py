@@ -72,18 +72,24 @@ FLA_REQUIREMENT = (
 CAUSAL_CONV1D_REQUIREMENT = "causal-conv1d==1.6.2.post1"
 
 # the SAME transformers range the main interpreter and Dockerfile.worker's verl-venv layer use.
-# is_flash_linear_attention_available() and is_causal_conv1d_available() are find_spec probes whose
-# import path moved in 5.13: an unpinned resolve lands 5.14.x, which answers False for BOTH even
-# though the packages are installed, so the child reports no gdn boundary-reset capability and
-# grpo/opd fail closed on every catalog model. verl and vllm both depend on transformers, so this
-# has to be in the OVERRIDE file as well as the direct list -- a direct pin alone loses to their
-# transitive declarations.
+# this venv is the interpreter that TRAINS, and transformers owns the gdn modelling code the
+# boundary-reset shim patches (chunk_gated_delta_rule, the causal conv, and the kwargs they read),
+# so an unbounded resolve here means the training path silently rides a transformers line nothing
+# validated. bounding it to the range flash tests against is the whole reason. verl and vllm both
+# depend on transformers, so this has to be in the OVERRIDE file as well as the direct list -- a
+# direct pin alone loses to their transitive declarations.
+#
+# NOT the reason: this pin does not affect is_flash_linear_attention_available() or
+# is_causal_conv1d_available(). Those are byte-identical in 5.12.1 and 5.14.1 and both open with
+# is_torch_cuda_available(), so they answer False on any machine without a gpu regardless of the
+# installed version. An earlier revision of this comment claimed a 5.13 import-path move made them
+# answer False; that mechanism does not exist. See Dockerfile.worker's sanity block.
 TRANSFORMERS_REQUIREMENT = "transformers>=5.6,<5.13"
 
 # the stamp must identify every separately installed package the venv holds. omitting flash-attn,
 # fla, causal_conv1d, or the transformers range lets an older partial venv match forever; conv1d
 # leaves GRPO/OPD failing ``require_gdn_boundary_resets`` with no rebuild path, and a stale venv
-# resolved before the transformers pin holds the 5.14.x that makes both probes answer False.
+# resolved before the transformers pin keeps training on an out-of-range transformers indefinitely.
 VERL_VENV_STAMP = (
     f"{VERL_REQUIREMENT}\n{FLASH_ATTN_SPEC}\n{FLA_REQUIREMENT}\n{CAUSAL_CONV1D_REQUIREMENT}\n"
     f"{TRANSFORMERS_REQUIREMENT}"
@@ -740,9 +746,8 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
         # declares vllm>=0.8.5,<=0.12.0 -> flash needs 0.19.1 for the Qwen3.5 archs vllm
         # declares xgrammar>=0.1.32 -> structured opd gates on EXACTLY 0.1.25 verl and
         # vllm both depend on transformers with no upper bound -> an unpinned resolve
-        # lands 5.14.x, whose moved import path makes the fla and causal_conv1d find_spec
-        # probes answer False for packages that ARE installed, so the child reports no
-        # gdn boundary-reset capability and grpo/opd fail closed after the gpu is rented.
+        # drifts the interpreter that TRAINS onto a transformers line nothing validated,
+        # and transformers owns the gdn modelling code the boundary-reset shim patches.
         overrides = os.path.join(workdir, "verl-overrides.txt")
         with open(overrides, "w") as f:
             f.write(f"numpy==2.2.6\nxgrammar==0.1.25\nvllm==0.19.1\n{TRANSFORMERS_REQUIREMENT}\n")

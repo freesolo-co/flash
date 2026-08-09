@@ -279,13 +279,17 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 #
 # transformers is pinned to the SAME range as the main interpreter (>=5.6,<5.13) and in the override
 # file, not just the direct list -- verl and vllm both depend on transformers, so without the
-# override a transitive requirement re-widens it. Left unpinned, this venv resolved 5.14.1, where
-# `is_flash_linear_attention_available()` returns False for the fla build installed two lines below,
-# and the sanity assert further down fails the image with "flash-linear-attention missing" while fla
-# is demonstrably installed. The venv is the interpreter that TRAINS, so its transformers must be the
-# one the gdn probes were validated against; the main interpreter carrying the pin protects nothing
-# in here (/opt/verl-venv is built without --system-site-packages). Raising this ceiling means
-# re-validating the fla and causal_conv1d probes against the new line, not just bumping the number.
+# override a transitive requirement re-widens it. The venv is the interpreter that TRAINS, and
+# transformers owns the gdn modelling code the boundary-reset shim patches (chunk_gated_delta_rule,
+# the causal conv, and the kwargs they read), so leaving it unbounded means the training path rides
+# a transformers line nothing validated. The main interpreter carrying the pin protects nothing in
+# here (/opt/verl-venv is built without --system-site-packages). Raising this ceiling means
+# re-validating the gdn shim against the new line, not just bumping the number.
+#
+# This pin is NOT what makes the sanity block below pass. is_flash_linear_attention_available() and
+# is_causal_conv1d_available() are byte-identical in 5.12.1 and 5.14.1, and both begin with
+# is_torch_cuda_available() -- they answer False on this cpu builder at every version. An earlier
+# revision of this comment blamed a 5.13 import-path move; no such move exists.
 ARG VERL_SPEC=verl[vllm]@git+https://github.com/freesolo-co/verl@1bea7d6825bbb9d2164e86e379b3680e7c53bb8a
 ENV FLASH_VERL_PYTHON=/opt/verl-venv/bin/python
 RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers>=5.6,<5.13" > /tmp/verl-overrides.txt \

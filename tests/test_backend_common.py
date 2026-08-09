@@ -1134,12 +1134,14 @@ def test_the_venv_stamp_covers_the_conv_kernel_so_an_older_venv_is_rebuilt():
 def test_the_fallback_pins_transformers_like_the_image_does(monkeypatch, tmp_path):
     """The fallback venv must carry the same transformers ceiling as /opt/verl-venv.
 
-    is_flash_linear_attention_available() and is_causal_conv1d_available() are find_spec probes
-    whose import path moved in 5.13, so an unpinned resolve lands 5.14.x and both answer False for
-    packages that ARE installed. The child then reports no gdn boundary-reset capability and
-    grpo/opd fail closed -- after the gpu is already rented. verl and vllm both depend on
-    transformers with no upper bound, so the pin has to be in the override file too: a direct pin
-    alone loses to their transitive declarations.
+    This path provisions the interpreter that TRAINS when no image supplies one, and transformers
+    owns the gdn modelling code the boundary-reset shim patches. An unbounded resolve there puts
+    training on a transformers line nothing validated. verl and vllm both depend on transformers
+    with no upper bound, so the pin has to be in the override file too: a direct pin alone loses to
+    their transitive declarations.
+
+    The pin is NOT what makes the cuda-gated probes answer True -- those are identical across
+    5.12.1 and 5.14.1 and depend on a gpu being present, not on the transformers version.
     """
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
@@ -1155,8 +1157,8 @@ def test_the_fallback_pins_transformers_like_the_image_does(monkeypatch, tmp_pat
 
 def test_transformers_pin_stays_in_lockstep_with_the_worker_image():
     # same argument as VERL_SPEC lockstep: the image bakes its own pin, this path resolves its own.
-    # if they drift, the interpreter that TRAINS differs between the image and the no-image path,
-    # and the gdn capability probe silently answers differently on each.
+    # if they drift, the interpreter that TRAINS runs a different transformers depending on whether
+    # an image supplied it -- and transformers owns the gdn modelling code the shim patches.
     dockerfile = pathlib.Path(__file__).resolve().parents[1] / "Dockerfile.worker"
     text = dockerfile.read_text()
     quoted = f'"{vc.TRANSFORMERS_REQUIREMENT}"'
@@ -1168,8 +1170,8 @@ def test_transformers_pin_stays_in_lockstep_with_the_worker_image():
 
 
 def test_the_venv_stamp_covers_the_transformers_pin_so_a_prepin_venv_is_rebuilt():
-    # a venv provisioned before this pin holds the 5.14.x that makes both probes answer False. if
-    # the stamp ignored the range, a retry on the same pod would reuse that venv forever.
+    # a venv provisioned before this pin holds an out-of-range transformers. if the stamp ignored
+    # the range, a retry on the same pod would reuse that venv forever with no rebuild path.
     assert vc.TRANSFORMERS_REQUIREMENT in vc.VERL_VENV_STAMP
 
 
