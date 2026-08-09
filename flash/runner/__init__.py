@@ -1163,8 +1163,10 @@ def _preparation_digest(
     adapter_identity: dict | None,
     *,
     legacy_keys: dict | None = None,
+    legacy_public_keys: dict | None = None,
 ) -> str:
     worker_payload = worker_spec.to_internal_dict()
+    public_payload = public_spec.to_dict()
     # omit empty fields so existing version-1 snapshots keep their historical digest.
     for key in (
         "workload_profile_kind",
@@ -1184,9 +1186,15 @@ def _preparation_digest(
     for key, value in (legacy_keys or {}).items():
         if key in _DROPPED_TOP_LEVEL_KEYS:
             worker_payload[key] = value
+    # a dropped key that was USER-AUTHORABLE was hashed on the public side too, not just the worker
+    # side. model_policy never was, so restoring only the worker payload was enough for it; worker_env
+    # was, so a pre-upgrade public_spec carried it and the digest cannot reproduce without it.
+    for key, value in (legacy_public_keys or {}).items():
+        if key in _DROPPED_TOP_LEVEL_KEYS:
+            public_payload[key] = value
     payload = {
         "version": 1,
-        "public_spec": public_spec.to_dict(),
+        "public_spec": public_payload,
         "worker_spec": worker_payload,
         "adapter_identity": adapter_identity,
     }
@@ -1566,11 +1574,21 @@ def _persist_effective_worker_spec(
         adapter_identity = None
     _reject_managed_volume_removal(snapshot, worker_spec)
     _validate_effective_spec(public_spec, worker_spec)
+    # status.spec is never rewritten, so a pre-upgrade run keeps its dropped keys for life and every
+    # later read rehashes with them restored. re-persisting (quote refresh, realloc) has to hash the
+    # same way or the digest it writes now is one the next integrity check cannot reproduce.
+    raw_public = status.spec if isinstance(status.spec, dict) else {}
+    legacy_public_keys = {k: raw_public[k] for k in _DROPPED_TOP_LEVEL_KEYS if k in raw_public}
     effective_preparation = {
         "worker_spec": worker_spec.to_internal_dict(),
         "workload_profile": worker_spec.workload_profile or None,
         "adapter_identity": adapter_identity,
-        "preparation_digest": _preparation_digest(public_spec, worker_spec, adapter_identity),
+        "preparation_digest": _preparation_digest(
+            public_spec,
+            worker_spec,
+            adapter_identity,
+            legacy_public_keys=legacy_public_keys,
+        ),
         "backend": TRAINER_BACKEND,
     }
     fields = {"effective_preparation": effective_preparation}
@@ -1781,6 +1799,8 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     # A pre-upgrade snapshot hashed since-removed keys into its digest, and `worker_spec` no longer
     # carries them -- so reproducing that digest needs the values the STORED payload holds.
     legacy_keys = {k: raw_worker[k] for k in _DROPPED_TOP_LEVEL_KEYS if k in raw_worker}
+    raw_public = status.spec if isinstance(status.spec, dict) else {}
+    legacy_public_keys = {k: raw_public[k] for k in _DROPPED_TOP_LEVEL_KEYS if k in raw_public}
     has_workload_profile = bool(
         worker_spec.workload_profile_kind
         or worker_spec.workload_profile_input_digest
@@ -1790,7 +1810,11 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
         if snapshot.get("workload_profile") != (worker_spec.workload_profile or None):
             raise ValueError("persisted workload profile does not match the worker spec")
         if not isinstance(stored_digest, str) or stored_digest != _preparation_digest(
-            public_spec, worker_spec, expected, legacy_keys=legacy_keys
+            public_spec,
+            worker_spec,
+            expected,
+            legacy_keys=legacy_keys,
+            legacy_public_keys=legacy_public_keys,
         ):
             raise ValueError("persisted effective preparation failed integrity validation")
     if public_spec.train.init_from_adapter:
@@ -1800,7 +1824,11 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
                 "because its original artifact identity is unavailable"
             )
         if not isinstance(stored_digest, str) or stored_digest != _preparation_digest(
-            public_spec, worker_spec, expected, legacy_keys=legacy_keys
+            public_spec,
+            worker_spec,
+            expected,
+            legacy_keys=legacy_keys,
+            legacy_public_keys=legacy_public_keys,
         ):
             raise ValueError("persisted effective preparation failed integrity validation")
     if verify_source and public_spec.train.init_from_adapter:

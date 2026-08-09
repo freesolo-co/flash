@@ -45,13 +45,6 @@ def test_partial_wandb_section():
     assert spec.wandb.run_name is None
 
 
-def test_wandb_config_does_not_touch_worker_env():
-    # [wandb] is its own typed field now, NOT folded into the worker_env env-var bag.
-    spec = spec_from_dict(_base(wandb={"project": "p", "run_name": "r"}))
-    assert "WANDB_PROJECT" not in spec.worker_env
-    assert "WANDB_NAME" not in spec.worker_env
-
-
 def test_wandb_values_are_trimmed():
     spec = spec_from_dict(_base(wandb={"project": "  p  ", "run_name": "  r  "}))
     assert spec.wandb.project == "p"

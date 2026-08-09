@@ -8,12 +8,11 @@ from typing import Any
 
 from flash.content.structured_outputs import CONSTRAINT_KEYS as _SO_CONSTRAINT_KEYS
 from flash.core.spec import (
+    CONTROL_PLANE_OWNED_ENV_KEYS,
     CREDIT_ASSIGNMENTS,
     DEFAULT_CREDIT_ASSIGNMENT,
-    RESERVED_WORKER_ENV_KEYS,
     CreditAssignment,
     WandbSpec,
-    validate_worker_env_reserved,
 )
 from flash.envs.adapter import is_freesolo_environment_id
 
@@ -304,7 +303,7 @@ _RESERVED_ENVIRONMENT_SECRET_KEYS = frozenset(
         "GITHUB_TOKEN",
         "FREESOLO_API_KEY",
         "FREESOLO_INTERNAL_KEY",
-        *RESERVED_WORKER_ENV_KEYS,
+        *CONTROL_PLANE_OWNED_ENV_KEYS,
     }
 )
 
@@ -325,65 +324,6 @@ def _environment_secrets(raw: Any) -> tuple[str, ...]:
             f"[environment] secrets must not include platform-managed key(s): {', '.join(reserved)}"
         )
     return secrets
-
-
-def _worker_env(raw: Any) -> dict[str, str]:
-    """Parse the optional [worker_env] table: per-run worker env overrides (string-valued)."""
-    if raw is None:
-        return {}
-    if not isinstance(raw, dict):
-        raise ConfigError("[worker_env] must be a table of string key/values")
-    env = {str(k): str(v) for k, v in raw.items()}
-    _validate_env_var_names(env, "[worker_env]")
-    try:
-        validate_worker_env_reserved(env)
-    except ValueError as exc:
-        raise ConfigError(str(exc)) from exc
-    # [worker_env] is serialized into job_spec_json (persisted + logged) — must not carry secrets.
-    # Match by word components (not substring): KEY only flagged when qualified by a credential context.
-    _secret_words = {
-        "TOKEN",
-        "SECRET",
-        "PASSWORD",
-        "PASSWD",
-        "PASSPHRASE",
-        "CREDENTIAL",
-        "CREDENTIALS",
-        "APIKEY",
-        "PRIVATEKEY",
-        "PAT",
-    }
-    _key_qualifiers = {
-        "API",
-        "SECRET",
-        "PRIVATE",
-        "ACCESS",
-        "INTERNAL",
-        "AUTH",
-        "SIGNING",
-        "ENCRYPTION",
-        "SSH",
-        "DEPLOY",
-        "GPG",
-        "PGP",
-        "RSA",
-        "PEM",
-        "SSL",
-        "TLS",
-    }
-
-    def _is_secret_key(name: str) -> bool:
-        words = set(name.upper().split("_"))
-        return bool(words & _secret_words) or ("KEY" in words and bool(words & _key_qualifiers))
-
-    secrets = sorted(k for k in env if _is_secret_key(k))
-    if secrets:
-        raise ConfigError(
-            f"[worker_env] must not contain secret-bearing keys ({', '.join(secrets)}); these are "
-            "serialized into run artifacts; use provider process env or supported runtime secrets "
-            "instead"
-        )
-    return env
 
 
 _WANDB_KEYS = ("project", "run_name")

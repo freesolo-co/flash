@@ -22,13 +22,6 @@ import pytest
 
 from tests._helpers.profile import satisfy_sft_profile
 
-# the keys each phase used to be selected by. all dead: no worker reads any of them now.
-_STALE_BACKEND_ENV = {
-    "sft": "FLASH_SFT_BACKEND",
-    "grpo": "FLASH_RL_BACKEND",
-    "opd": "FLASH_OPD_BACKEND",
-}
-
 _PROVIDERS = ("runpod", "lambda", "vast")
 # the only managed class all three providers stock. a parity test needs one class every provider can
 # actually provision, or the spec is rejected on catalog grounds before parity is ever exercised.
@@ -98,16 +91,13 @@ def all_providers_configured(monkeypatch):
     )
 
 
-def _spec(count: int, algorithm: str = "grpo", backend: str = "", provider: str = "runpod"):
+def _spec(count: int, algorithm: str = "grpo", provider: str = "runpod"):
     from flash.core.spec import JobSpec
 
     gpu: dict = {"type": "RTX 5090", "count": count}
     if provider:
         gpu["provider"] = provider
     body: dict = {"model": "test/gate", "algorithm": algorithm, "gpu": gpu}
-    if backend:
-        key = _STALE_BACKEND_ENV[algorithm]
-        body["worker_env"] = {key: backend}
     return JobSpec.from_dict(body)
 
 
@@ -149,33 +139,6 @@ def test_submit_accepts_multi_gpu_on_every_provider(
         satisfy_sft_profile(runner, monkeypatch, spec)
         status = runner.submit_job(spec, dry_run=True)
         assert status is not None
-
-
-@pytest.mark.parametrize("stale", ["verl", "trl", "bogus"])
-@pytest.mark.parametrize("provider", _PROVIDERS)
-def test_a_stale_backend_key_changes_no_submit_outcome(
-    monkeypatch, all_providers_configured, stale, provider
-):
-    """A [worker_env] selector carried over from the trl era must not move the outcome either way.
-
-    Asserted as "same outcome as the identical spec WITHOUT the key" rather than as a fixed verdict,
-    so it fails the moment anything starts reading worker_env again, in either direction.
-    """
-    from flash import runner
-
-    def outcome(backend: str) -> str:
-        with tempfile.TemporaryDirectory() as tmp:
-            monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
-            try:
-                runner.submit_job(
-                    _submittable("grpo", count=4, provider=provider, backend=backend),
-                    dry_run=True,
-                )
-            except ValueError as exc:
-                return f"rejected: {exc}"
-            return "allowed"
-
-    assert outcome(stale) == outcome("")
 
 
 @pytest.mark.parametrize("provider", _PROVIDERS)
@@ -756,7 +719,6 @@ def test_retry_bookkeeping_distinguishes_card_counts_of_one_class():
 
 def _submittable(
     algorithm: str,
-    backend: str = "",
     *,
     count: int = 1,
     provider: str = "runpod",
@@ -778,24 +740,18 @@ def _submittable(
         # sft is workload-profiled before it is quoted, and the profile is keyed on an immutable
         # environment revision. Pair this with satisfy_sft_profile at the submit site.
         body["environment"] = {"id": "github:owner/repo@main:env/environment.py"}
-    if backend:
-        body["worker_env"] = {_STALE_BACKEND_ENV[algorithm]: backend}
     return JobSpec.from_dict(body)
 
 
-@pytest.mark.parametrize(
-    ("algorithm", "backend"),
-    [("grpo", "verl"), ("grpo", ""), ("grpo", "trl"), ("sft", ""), ("opd", "")],
-)
-def test_submit_records_the_resolved_backend(monkeypatch, algorithm, backend):
+@pytest.mark.parametrize("algorithm", ["grpo", "sft", "opd"])
+def test_submit_records_the_resolved_backend(monkeypatch, algorithm):
     from flash import runner
 
-    # the run records which trainer actually ran, so it stays auditable from the run itself rather
-    # than from what the config appeared to ask for. a stale key must not change the record.
+    # the run records which trainer actually ran, so it stays auditable from the run itself.
     expected = "verl"
     with tempfile.TemporaryDirectory() as tmp:
         monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
-        spec = _submittable(algorithm, backend)
+        spec = _submittable(algorithm)
         satisfy_sft_profile(runner, monkeypatch, spec)
         status = runner.submit_job(spec, dry_run=True)
         assert (status.effective_preparation or {}).get("backend") == expected

@@ -264,7 +264,7 @@ def _worker_runtime_for(algorithm: str) -> dict[str, str] | None:
     }
 
 
-def _worker_env_for(algorithm: str, phase: str) -> dict:
+def _built_env_for(algorithm: str, phase: str) -> dict:
     from flash.core.spec import JobSpec
     from flash.providers._lifecycle.worker import build_worker_env
 
@@ -278,7 +278,7 @@ def test_verl_rollout_never_gets_expandable_segments(algorithm, phase):
     """GRPO and OPD are the algorithms that build a vLLM rollout, so they are the ones whose
     CuMemAllocator asserts on expandable_segments. SFT is covered below: it has no rollout and must
     KEEP the expandable conf."""
-    env = _worker_env_for(algorithm, phase)
+    env = _built_env_for(algorithm, phase)
     for key in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
         assert "expandable_segments" not in env[key], (
             f"verl {algorithm} would build a CuMemAllocator against {env[key]}"
@@ -290,37 +290,4 @@ def test_verl_sft_keeps_the_expandable_allocator():
     so the carve-out must not reach it -- switching SFT to the non-expandable conf would regress the
     large-tensor SFT path onto a fragmentation-prone allocator and OOM jobs that fit today. the
     predicate is "generates through verl", not "runs on verl"."""
-    assert _worker_env_for("sft", "sft")["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
-
-
-@pytest.mark.parametrize("stale_backend", ["trl", "verl", "bogus"])
-def test_a_stale_backend_key_cannot_change_the_allocator(stale_backend):
-    """[worker_env] no longer selects a backend: every phase delegates to verl unconditionally. A
-    stale key left in a config must therefore be inert -- honoring one would pick an allocator for a
-    trainer that cannot run, and "trl" on grpo/opd would hand verl's rollout the expandable conf that
-    trips the CuMemAllocator assert before step 1."""
-    from flash.core.spec import JobSpec
-    from flash.providers._lifecycle.worker import build_worker_env
-
-    for algorithm, phase, expect_expandable in (
-        ("grpo", "rl", False),
-        ("opd", "opd", False),
-        ("sft", "sft", True),
-    ):
-        spec = JobSpec.from_dict(
-            {
-                "model": "m",
-                "seed": 0,
-                "algorithm": algorithm,
-                "worker_env": {f"FLASH_{phase.upper()}_BACKEND": stale_backend},
-            }
-        )
-        env = build_worker_env(
-            spec,
-            0,
-            runtime_secrets=_worker_runtime_for(algorithm),
-        )
-        for key in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
-            assert ("expandable_segments" in env[key]) is expect_expandable, (
-                f"{algorithm} allocator moved under a stale {stale_backend!r} key"
-            )
+    assert _built_env_for("sft", "sft")["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"

@@ -83,7 +83,6 @@ class _Spec:
     model_revision = "main"
     seed = 0
     thinking = False
-    worker_env: ClassVar[dict] = {}
     train = _Train()
     environment = _Env()
 

@@ -1094,59 +1094,113 @@ def test_configure_logging_verbosity() -> None:
     assert logging.getLogger("flash").level == logging.DEBUG
 
 
-# ---------------------------------------------------------------------------
-# [worker_env] secret-key policy — [worker_env] is serialized into job_spec_json
-# (persisted + logged), so secret-bearing keys must be rejected at parse time and set
-# as real env vars instead. These cases pin the _is_secret_key heuristic so it doesn't
-# drift into false positives (legit knobs) or false negatives (real secrets).
-# ---------------------------------------------------------------------------
+def test_removed_worker_environment_table_is_rejected(tmp_path) -> None:
+    # the deleted per-run env override table is now an unknown section, not a silently ignored one:
+    # a config that still carries it must fail loudly rather than train with the overrides dropped.
+    path = tmp_path / "removed-worker-environment.toml"
+    path.write_text(
+        'model = "Qwen/Qwen3.5-0.8B"\nalgorithm = "grpo"\n[worker_env]\nCUSTOM_FLAG = "value"\n'
+    )
+
+    with pytest.raises(ConfigError) as exc_info:
+        spec_and_train_keys_from_file(str(path))
+
+    message = str(exc_info.value)
+    assert "unknown config section(s): worker_env" in message
+    assert "(allowed tables: environment, train, gpu, wandb)" in message
 
 
-@pytest.mark.parametrize(
-    "key",
-    [
-        "HF_TOKEN",  # secret WORD: TOKEN
-        "OPENAI_API_KEY",  # KEY qualified by API
-        "AWS_SECRET_ACCESS_KEY",  # SECRET word + KEY qualified by SECRET/ACCESS
-        "DB_PASSWORD",  # PASSWORD word
-        "GITHUB_TOKEN",
-        "WANDB_API_KEY",
-        "SOME_PRIVATE_KEY",  # KEY qualified by PRIVATE
-        "MY_CREDENTIAL",
-        "AUTH_KEY",  # KEY qualified by AUTH
-        "SSH_KEY",  # KEY qualified by SSH
-        "DEPLOY_KEY",  # KEY qualified by DEPLOY
-        "GITHUB_PAT",  # PAT word (personal access token)
-    ],
-)
-def test_worker_env_rejects_secret_keys(key: str) -> None:
-    with pytest.raises(ConfigError, match="must not contain secret-bearing keys"):
-        spec_from_dict(_raw(worker_env={key: "x"}))
+@pytest.mark.parametrize("stored", [{}, {"CUSTOM_FLAG": "value"}])
+def test_a_run_persisted_before_the_worker_env_removal_still_reloads(stored) -> None:
+    """A record written by the OLD plane must survive the upgrade that drops the field.
+
+    Specs were persisted with asdict, so EVERY record the pre-upgrade plane wrote names worker_env,
+    including the defaulted empty one. Stored records are never rewritten and from_dict is strict, so
+    without the dropped-key tolerance the first reload after deploy raises and a still-running job
+    loses its recovery, deploy, and serving paths.
+    """
+    persisted = {**JobSpec().to_internal_dict(), "worker_env": stored}
+
+    spec = JobSpec.from_dict(persisted)
+
+    # tolerated on read, but genuinely gone: the value must not come back as an attribute.
+    assert not hasattr(spec, "worker_env")
 
 
-@pytest.mark.parametrize(
-    "key",
-    [
-        "RL_VLLM_GPU_UTIL",  # plain knob
-        "SFT_PACKING",
-        "RL_VLLM_MAX_BATCHED_TOKENS",  # word TOKENS, not the secret word TOKEN
-        "SORT_KEY",  # bare KEY without a secret qualifier
-        "WANDB_ENTITY",  # account routing, not a secret
-        "FLASH_MLP_KERNEL",
-        "VLLM_ATTENTION_BACKEND",
-    ],
-)
-def test_worker_env_allows_non_secret_keys(key: str) -> None:
-    spec = spec_from_dict(_raw(worker_env={key: "v"}))
-    assert spec.worker_env[key] == "v"
+def test_the_dropped_worker_env_key_is_tolerated_on_read_only_never_authored() -> None:
+    """Tolerance must not quietly re-open the table as an authorable one.
+
+    from_dict ignores it so old RECORDS load; the schema layer still rejects it so a CONFIG naming it
+    fails loudly rather than training with its overrides silently discarded.
+    """
+    with pytest.raises(ConfigError, match="unknown config section"):
+        spec_from_dict(_raw(worker_env={"CUSTOM_FLAG": "value"}))
 
 
-@pytest.mark.parametrize("name", ["BAD=KEY", "", "BAD KEY", "X\tY"])
-def test_worker_env_rejects_invalid_env_names(name: str) -> None:
-    # Names subprocess.Popen(env=...) would reject on the worker (empty / '=' / whitespace) must
-    # fail at parse time, not after a worker has been provisioned.
-    with pytest.raises(ConfigError, match="invalid environment variable name"):
-        spec_from_dict(_raw(worker_env={name: "v"}))
+def test_an_unknown_top_level_key_is_still_rejected_on_read() -> None:
+    # the tolerance is scoped to keys the spec itself dropped, so it cannot become a general
+    # accept-anything hole in the persisted-spec reader.
+    with pytest.raises(ValueError, match="unknown key"):
+        JobSpec.from_dict({**JobSpec().to_internal_dict(), "not_a_real_key": 1})
+
+
+def test_a_pre_upgrade_run_that_authored_overrides_is_told_they_stopped_applying(caplog) -> None:
+    """Tolerating the key must not make the behavior change silent.
+
+    A run submitted with overrides keeps them in its record forever, but nothing forwards them now,
+    so it trains on managed defaults instead of what was authored. Reloading without a word would
+    make that indistinguishable from a run that never set them -- the operator reading logs after an
+    unexpected result would have nothing pointing at the cause.
+    """
+    persisted = {
+        **JobSpec().to_internal_dict(),
+        "run_id": "run-legacy-1",
+        "worker_env": {"FLASH_VERL_PYTHON": "/custom/verl/bin/python"},
+    }
+
+    with caplog.at_level(logging.WARNING, logger="flash.spec"):
+        JobSpec.from_dict(persisted)
+
+    assert "FLASH_VERL_PYTHON" in caplog.text
+    assert "run-legacy-1" in caplog.text
+    assert "NOT" in caplog.text
+
+
+def test_the_warning_names_the_run_or_is_not_emitted_at_all(caplog) -> None:
+    """An unidentified warning is worse than none: it cannot be acted on, and it duplicates.
+
+    The same stored run is read through both shapes -- the internal worker spec (asdict, keeps
+    run_id) and the public spec (to_dict, pops it). Warning on the public read would emit a second
+    line naming no run, which an operator cannot map back to anything, alongside the identified line
+    the worker-spec read already produced.
+    """
+    spec = JobSpec.from_dict(
+        {**JobSpec().to_internal_dict(), "run_id": "run-legacy-1"},
+    )
+    dropped = {"FLASH_VERL_PYTHON": "/custom/verl/bin/python"}
+
+    with caplog.at_level(logging.WARNING, logger="flash.spec"):
+        JobSpec.from_dict({**spec.to_internal_dict(), "worker_env": dropped})
+    assert "run-legacy-1" in caplog.text
+
+    caplog.clear()
+    # the public shape pops run_id, so this read stays quiet rather than saying "run <unknown>".
+    public = spec.to_dict()
+    assert "run_id" not in public
+    with caplog.at_level(logging.WARNING, logger="flash.spec"):
+        JobSpec.from_dict({**public, "worker_env": dropped})
+    assert caplog.text == ""
+
+
+def test_a_record_without_the_dropped_key_says_nothing(caplog) -> None:
+    # every record the pre-upgrade plane wrote names the key, defaulted-empty included. warning on
+    # the empty ones would fire on effectively every reload and train operators to ignore it.
+    persisted = {**JobSpec().to_internal_dict(), "worker_env": {}}
+
+    with caplog.at_level(logging.WARNING, logger="flash.spec"):
+        JobSpec.from_dict(persisted)
+
+    assert caplog.text == ""
 
 
 @pytest.mark.parametrize(

@@ -5775,40 +5775,37 @@ def test_opd_delegates_to_verl_with_no_selector_left(monkeypatch):
 
 
 def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch):
-    """An OPD spec must build a NON-expandable allocator conf.
+    """an opd spec must build a non-expandable allocator conf.
 
-    verl sleep mode uses CuMemAllocator, which rejects expandable_segments
-    (cumem.py, pytorch#147851); worker_env must not reintroduce it.
+    verl sleep mode uses CuMemAllocator, which rejects expandable_segments.
     """
     from flash.core.spec import JobSpec
     from flash.providers._lifecycle.worker import build_worker_env
 
-    def _spec(worker_env=None):
-        payload = {
-            "run_id": "r-alloc",
-            "algorithm": "opd",
-            "model": "Qwen/Qwen3.5-4B",
-            "environment": {"repo": "x/y", "name": "e"},
-            "train": {"hf_repo": "a/b", "teacher_model": "", "max_examples": 1},
-            "gpu": {"type": "B200", "count": 1, "provider": "runpod"},
-        }
-        if worker_env is not None:
-            payload["worker_env"] = worker_env
-        return JobSpec.from_dict(payload)
+    def _spec():
+        return JobSpec.from_dict(
+            {
+                "run_id": "r-alloc",
+                "algorithm": "opd",
+                "model": "Qwen/Qwen3.5-4B",
+                "environment": {"repo": "x/y", "name": "e"},
+                "train": {"hf_repo": "a/b", "teacher_model": "", "max_examples": 1},
+                "gpu": {"type": "B200", "count": 1, "provider": "runpod"},
+            }
+        )
 
     teacher_runtime = {
         "FLASH_CONTROL_PANEL_URL": "https://broker.example",
         "FLASH_TEACHER_CAPABILITY": "capability-test-value",
     }
-    for worker_env in (None, {"FLASH_OPD_BACKEND": "trl"}, {"FLASH_OPD_BACKEND": "bogus"}):
-        spec = _spec(worker_env)
-        assert spec.phase == "opd"
-        alloc = build_worker_env(
-            spec,
-            spec.seed,
-            runtime_secrets=teacher_runtime,
-        )["PYTORCH_CUDA_ALLOC_CONF"]
-        assert "expandable_segments" not in alloc, (worker_env, alloc)
+    spec = _spec()
+    assert spec.phase == "opd"
+    alloc = build_worker_env(
+        spec,
+        spec.seed,
+        runtime_secrets=teacher_runtime,
+    )["PYTORCH_CUDA_ALLOC_CONF"]
+    assert "expandable_segments" not in alloc
 
     # sft is verl-only too, but it builds no rollout engine at all, so expandable segments stay.
     sft = JobSpec.from_dict(

@@ -575,19 +575,6 @@ def test_worker_seed_prefers_jobspec_when_present():
     assert _resolve_worker_seed(None, "-1") == 42
 
 
-@pytest.mark.parametrize(
-    "key", ["SEED", "seed", "Run_Id", "HF_REPO", "flash_arm", "FLASH_OPD_RESUME_REVISION"]
-)
-def test_worker_env_rejects_control_plane_owned_keys(key, tmp_path):
-    with pytest.raises(ValueError, match="control-plane key"):
-        JobSpec(worker_env={key: "override"})
-
-    path = tmp_path / "reserved-worker-env.toml"
-    path.write_text(_BASE_TOML + f'\n[worker_env]\n{key} = "override"\n')
-    with pytest.raises(ConfigError, match="control-plane key"):
-        spec_and_train_keys_from_file(str(path))
-
-
 def test_provider_worker_env_emits_authoritative_spec_seed():
     from flash.providers._lifecycle.worker import build_worker_env
 
