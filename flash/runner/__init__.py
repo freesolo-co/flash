@@ -888,15 +888,26 @@ def _attach_rollout_workload_profile(spec: JobSpec, evidence: object) -> JobSpec
     """
     if not evidence or spec.algorithm not in ("grpo", "opd"):
         return spec
-    from flash.server.domain.rollout_evidence import rollout_profile_from_evidence
+    from flash.server.domain.rollout_evidence import (
+        evidence_is_well_formed,
+        rollout_profile_from_evidence,
+    )
 
-    # pin the environment ref->sha BEFORE validating. to_dict() strips resolved_sha as a
+    # the SPEC-dependent checks cannot run before the pin: to_dict() strips resolved_sha as a
     # platform-managed key and the public schema rejects a caller who authors it, so a spec that
     # arrived over the wire always has "" here. rollout_profile_from_evidence refuses an unpinned
-    # environment, so validating first would reject every real managed submit and silently cap-price
-    # it -- the measurement would never move a quote in production. _assign_resolved_env_sha is
-    # best-effort and returns the spec untouched when GitHub cannot be reached, which just puts us
-    # back on the fail-open path below.
+    # environment, so validating all of it first would reject every real managed submit and silently
+    # cap-price it -- the measurement would never move a quote in production.
+    #
+    # the shape, bounds and policy checks depend on the EVIDENCE alone, though, so those run first.
+    # the pin is a blocking github call with a 10s timeout, and a submit carrying no evidence never
+    # pays it on this path; without this guard any junk payload buys that call against a quota the
+    # whole control plane shares. asking early cannot change the verdict, because the full function
+    # re-runs these same checks below.
+    if not evidence_is_well_formed(evidence):
+        return spec
+    # _assign_resolved_env_sha is best-effort and returns the spec untouched when GitHub cannot be
+    # reached, which just puts us back on the fail-open path below.
     pinned = _assign_resolved_env_sha(spec)
 
     producer_version = _profile_producer_version()

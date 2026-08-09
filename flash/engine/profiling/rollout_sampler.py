@@ -45,6 +45,13 @@ SAMPLING_DEADLINE_S = 300.0
 # turns a misconfigured sampler into a fast fallback instead of a long wait.
 MAX_CONSECUTIVE_FAILURES = 5
 
+# ceiling on one chat-completion response body. this path reads whatever the configured endpoint
+# sends, and json.load consumes the stream with no bound -- so a malfunctioning or hostile origin
+# could exhaust memory in the user's `flash train` process instead of taking the fail-open path this
+# whole module is built on. generous by two orders of magnitude: the largest legitimate reply here is
+# one completion at the 2048-token cap plus usage accounting, a few tens of kilobytes.
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+
 # prompt-mix dominates the variance (measured: between-prompt 304846 vs within-prompt 61082, a word
 # problem running a median 1642 tokens against ~290 for arithmetic), so spread draws across DISTINCT
 # prompts before repeating any one of them.
@@ -294,7 +301,13 @@ def _one_completion(
     )
     try:
         with _NO_REDIRECT_OPENER.open(request, timeout=timeout_s) as response:
-            body = json.load(response)
+            # read one byte past the ceiling rather than trusting Content-Length, which an origin
+            # can understate or omit entirely. over the limit is a declined draw, not an exception:
+            # the caller's fallback is the declared cap either way.
+            raw = response.read(MAX_RESPONSE_BYTES + 1)
+        if len(raw) > MAX_RESPONSE_BYTES:
+            return None
+        body = json.loads(raw)
     except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
         return None
     return _sample_from_response(

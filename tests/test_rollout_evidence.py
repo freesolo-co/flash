@@ -383,6 +383,103 @@ def test_the_measured_rows_match_opd_which_shuffles_after_it_renders():
     assert measured != list(range(_PROMPT_ROWS))
 
 
+def test_an_oversized_response_body_is_declined_rather_than_read(monkeypatch):
+    """The endpoint is user-configured and this reads whatever it sends.
+
+    An unbounded read of a hostile or malfunctioning origin's body exhausts memory in the user's
+    `flash train` process -- turning an advisory measurement into a failed submit, when every other
+    failure on this path quietly returns the quote to the declared cap.
+
+    Reads one byte past the ceiling rather than trusting Content-Length, which an origin can
+    understate or omit, so the stub serves the body without declaring a size.
+    """
+    from flash.engine.profiling import rollout_sampler
+
+    served: dict = {}
+
+    class _Huge:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self, size=-1):
+            served["asked"] = size
+            # a valid reply, just far too large to be one chat completion -- and padded with
+            # TRAILING WHITESPACE, so the prefix the ceiling cuts is still well-formed json.
+            # padding inside a string would make the truncated body a parse error instead, and the
+            # draw would be declined by json.loads no matter what the size check does: the test
+            # would pass with the guard deleted.
+            raw = json.dumps(
+                {
+                    "choices": [{"finish_reason": "stop", "message": {"content": "4"}}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 40},
+                }
+            ).encode()
+            raw += b" " * (rollout_sampler.MAX_RESPONSE_BYTES + 4096 - len(raw))
+            return raw if size is None or size < 0 else raw[:size]
+
+    monkeypatch.setattr(
+        rollout_sampler._NO_REDIRECT_OPENER, "open", lambda request, timeout=None: _Huge()
+    )
+
+    sample = rollout_sampler._one_completion(
+        model="Qwen/Qwen3.5-4B",
+        messages=[{"role": "user", "content": "2+2?"}],
+        max_completion_tokens=512,
+        temperature=None,
+        top_p=1.0,
+        base_url="https://example.invalid/v1",
+        api_key="k",
+        thinking=False,
+    )
+
+    assert sample is None
+    # the ceiling has to reach the read itself: asking for everything and measuring afterwards has
+    # already spent the memory this guards.
+    assert served["asked"] == rollout_sampler.MAX_RESPONSE_BYTES + 1
+
+
+def test_a_normal_response_is_still_read_whole(monkeypatch):
+    """The byte ceiling must not truncate a legitimate reply into a parse failure."""
+    from flash.engine.profiling import rollout_sampler
+
+    class _Normal:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self, size=-1):
+            raw = json.dumps(
+                {
+                    "choices": [{"finish_reason": "stop", "message": {"content": "4"}}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 40},
+                }
+            ).encode()
+            return raw if size is None or size < 0 else raw[:size]
+
+    monkeypatch.setattr(
+        rollout_sampler._NO_REDIRECT_OPENER, "open", lambda request, timeout=None: _Normal()
+    )
+
+    sample = rollout_sampler._one_completion(
+        model="Qwen/Qwen3.5-4B",
+        messages=[{"role": "user", "content": "2+2?"}],
+        max_completion_tokens=512,
+        temperature=None,
+        top_p=1.0,
+        base_url="https://example.invalid/v1",
+        api_key="k",
+        thinking=False,
+    )
+
+    assert sample is not None
+    assert sample.completion_tokens == 40
+
+
 def test_summary_reports_the_distribution_not_a_mean_alone():
     """A mean cannot tell a uniformly short workload from a bimodal one whose tail sets step time."""
     samples = tuple(
@@ -684,6 +781,38 @@ def test_a_measurement_survives_the_wire_round_trip_a_real_submit_makes(monkeypa
     assert attached.workload_profile, "a measurement must reach the quote on the real submit path"
 
 
+def test_junk_evidence_does_not_buy_a_github_resolution(monkeypatch):
+    """Evidence that cannot possibly validate must not reach the environment pin.
+
+    The pin is a blocking GitHub call with a 10s timeout against a quota the whole control plane
+    shares. A submit carrying NO evidence never pays it on this path, so accepting a junk payload
+    first made any authenticated caller able to add that call -- and that latency -- to every
+    submit, cheaply and repeatedly, for a payload guaranteed to be rejected a few lines later.
+
+    The shape checks depend on the evidence alone, so running them first cannot change the verdict.
+    """
+    from flash.core.spec import JobSpec
+    from flash.runner import _attach_rollout_workload_profile
+
+    wire = JobSpec.from_dict(_spec().to_dict())
+    calls: list = []
+
+    def _counted(*a, **k):
+        calls.append(1)
+        return "c" * 40
+
+    monkeypatch.setattr("flash.envs.loader._resolve_ref_sha", _counted)
+
+    for junk in ({"garbage": 1}, {**_evidence(), "completed_rollouts": -5}):
+        attached = _attach_rollout_workload_profile(wire, junk)
+        assert attached.workload_profile == {}
+    assert calls == [], "junk evidence must be rejected before the pin, not after"
+
+    # and the guard must not have swallowed the real path: valid evidence still pins and attaches.
+    assert _attach_rollout_workload_profile(wire, _evidence()).workload_profile
+    assert len(calls) == 1
+
+
 def test_an_unreachable_pin_returns_the_quote_to_the_cap_instead_of_failing(monkeypatch):
     """Pinning is best-effort: GitHub being unreachable must land on fail-open, never raise."""
     from flash.core.spec import JobSpec
@@ -765,17 +894,21 @@ def test_stop_sequences_are_sent_as_the_apis_stop_field(monkeypatch):
         def __exit__(self, *exc):
             return False
 
+        def read(self, size=-1):
+            # the sampler reads the body itself, under a byte ceiling, and parses the bytes. a stub
+            # that only satisfied a patched json.load would no longer exercise that path.
+            raw = json.dumps(
+                {
+                    "usage": {"completion_tokens": 12, "prompt_tokens": 20},
+                    "choices": [{"finish_reason": "stop"}],
+                }
+            ).encode()
+            return raw if size is None or size < 0 else raw[:size]
+
     def _fake_open(request, timeout=None):
         captured["body"] = json.loads(request.data.decode())
         return _Response()
 
-    monkeypatch.setattr(
-        "flash.engine.profiling.rollout_sampler.json.load",
-        lambda _r: {
-            "usage": {"completion_tokens": 12, "prompt_tokens": 20},
-            "choices": [{"finish_reason": "stop"}],
-        },
-    )
     # the sampler goes through a redirect-refusing opener, not the module-level urlopen, so the
     # opener IS the seam. patching urlopen here would leave the real call path untouched.
     monkeypatch.setattr(rollout_sampler._NO_REDIRECT_OPENER, "open", _fake_open, raising=True)
@@ -804,17 +937,21 @@ def test_no_stop_field_is_sent_when_the_run_configures_none(monkeypatch):
         def __exit__(self, *exc):
             return False
 
+        def read(self, size=-1):
+            # the sampler reads the body itself, under a byte ceiling, and parses the bytes. a stub
+            # that only satisfied a patched json.load would no longer exercise that path.
+            raw = json.dumps(
+                {
+                    "usage": {"completion_tokens": 12, "prompt_tokens": 20},
+                    "choices": [{"finish_reason": "stop"}],
+                }
+            ).encode()
+            return raw if size is None or size < 0 else raw[:size]
+
     def _fake_open(request, timeout=None):
         captured["body"] = json.loads(request.data.decode())
         return _Response()
 
-    monkeypatch.setattr(
-        "flash.engine.profiling.rollout_sampler.json.load",
-        lambda _r: {
-            "usage": {"completion_tokens": 12, "prompt_tokens": 20},
-            "choices": [{"finish_reason": "stop"}],
-        },
-    )
     # the sampler goes through a redirect-refusing opener, not the module-level urlopen, so the
     # opener IS the seam. patching urlopen here would leave the real call path untouched.
     monkeypatch.setattr(rollout_sampler._NO_REDIRECT_OPENER, "open", _fake_open, raising=True)
@@ -1986,13 +2123,16 @@ def test_the_request_states_the_runs_reasoning_setting(monkeypatch):
         def __exit__(self, *_exc):
             return False
 
-        def read(self):
-            return json.dumps(
+        def read(self, size=-1):
+            # mirrors HTTPResponse.read(size): the sampler caps the read, so a no-arg stub would
+            # not accept the call the real code makes.
+            raw = json.dumps(
                 {
                     "choices": [{"finish_reason": "stop", "message": {"content": "4"}}],
                     "usage": {"prompt_tokens": 10, "completion_tokens": 40},
                 }
             ).encode()
+            return raw if size is None or size < 0 else raw[:size]
 
     def _open(request, timeout=None):
         captured["body"] = json.loads(request.data.decode())
@@ -2031,13 +2171,16 @@ def test_the_request_states_the_runs_nucleus_sampling(monkeypatch):
         def __exit__(self, *_exc):
             return False
 
-        def read(self):
-            return json.dumps(
+        def read(self, size=-1):
+            # mirrors HTTPResponse.read(size): the sampler caps the read, so a no-arg stub would
+            # not accept the call the real code makes.
+            raw = json.dumps(
                 {
                     "choices": [{"finish_reason": "stop", "message": {"content": "4"}}],
                     "usage": {"prompt_tokens": 10, "completion_tokens": 40},
                 }
             ).encode()
+            return raw if size is None or size < 0 else raw[:size]
 
     def _open(request, timeout=None):
         captured["body"] = json.loads(request.data.decode())

@@ -50,6 +50,19 @@ _REQUIRED_FIELDS = (
 )
 
 
+def evidence_is_well_formed(evidence: object) -> bool:
+    """whether ``evidence`` can pass the shape, bounds and policy checks, spec aside.
+
+    exists so a caller can reject an unusable payload BEFORE paying for work that only exists to
+    build the profile -- pinning the environment ref->sha costs a blocking github call. the answer
+    depends on the evidence alone, so asking early cannot change the verdict reached later.
+
+    a cheap precondition, never the enforcing layer: ``rollout_profile_from_evidence`` re-runs this
+    and everything spec-dependent, so a caller that skips it loses latency, not safety.
+    """
+    return isinstance(evidence, dict) and _validated_fields(evidence) is not None
+
+
 def rollout_profile_from_evidence(
     spec: Any,
     evidence: object,
