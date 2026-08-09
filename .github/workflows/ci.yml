@@ -32,3 +32,10 @@ jobs:
 
       - name: Tests (CPU, offline)
         run: uv run pytest -q
+
+      # The offline suite can only compare the pin against a hardcoded copy of itself, so a
+      # mis-transcribed sha passes every pin test while naming a commit that was never pushed --
+      # which then fails EVERY worker install at provisioning time. This is the one pin check that
+      # asks the fork instead of asking the repo about itself, so it needs the network.
+      - name: verl pin exists on the fork
+        run: uv run python scripts/check_verl_pin_exists.py
