@@ -1482,6 +1482,19 @@ def build_opd_overrides(config: dict) -> list[str]:
         "++data.apply_chat_template_kwargs={enable_thinking:"
         + _hydra_val(config.get("thinking", False))
         + "}",
+        *_opd_model_and_actor_overrides(config, max_tokens=max_tokens),
+    ]
+    if config.get("multi_turn"):
+        overrides.append(f"actor_rollout_ref.rollout.prompt_length={_hydra_val(max_tokens)}")
+    structured_outputs = config.get("structured_outputs")
+    if structured_outputs:
+        overrides.extend(_opd_structured_output_overrides(config, structured_outputs))
+    return overrides
+
+
+def _opd_model_and_actor_overrides(config: dict, *, max_tokens: int) -> list[str]:
+    """the policy model, actor optimizer, rollout engine, distillation loss, and trainer surface."""
+    return [
         f"actor_rollout_ref.model.path={_hydra_val(config['model_path'])}",
         "actor_rollout_ref.model.trust_remote_code=true",
         # packing the micro-batch into one row is only safe for a gdn hybrid when the child can
@@ -1625,25 +1638,24 @@ def build_opd_overrides(config: dict) -> list[str]:
         "trainer.resume_mode=auto",
         "trainer.max_actor_ckpt_to_keep=null",
     ]
-    if config.get("multi_turn"):
-        overrides.append(f"actor_rollout_ref.rollout.prompt_length={_hydra_val(max_tokens)}")
-    structured_outputs = config.get("structured_outputs")
-    if structured_outputs:
-        structured_outputs_config = {
-            "backend": "xgrammar",
-            "disable_any_whitespace": bool(structured_outputs.get("disable_any_whitespace", False)),
-        }
-        reasoning_parser = reasoning_parser_for(
-            thinking=bool(config.get("thinking", False)),
-            structured_outputs=structured_outputs,
-        )
-        if reasoning_parser is not None:
-            structured_outputs_config["reasoning_parser"] = reasoning_parser
-        overrides.append(
-            "+actor_rollout_ref.rollout.engine_kwargs.vllm.structured_outputs_config="
-            + _hydra_val(structured_outputs_config)
-        )
-    return overrides
+
+
+def _opd_structured_output_overrides(config: dict, structured_outputs: dict) -> list[str]:
+    """the guided-decoding grammar, held until the thinking trace closes when a parser applies."""
+    structured_outputs_config = {
+        "backend": "xgrammar",
+        "disable_any_whitespace": bool(structured_outputs.get("disable_any_whitespace", False)),
+    }
+    reasoning_parser = reasoning_parser_for(
+        thinking=bool(config.get("thinking", False)),
+        structured_outputs=structured_outputs,
+    )
+    if reasoning_parser is not None:
+        structured_outputs_config["reasoning_parser"] = reasoning_parser
+    return [
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.structured_outputs_config="
+        + _hydra_val(structured_outputs_config)
+    ]
 
 
 def _render_opd_sitecustomize(*, save_at_steps: tuple[int, ...], total_steps: int) -> str:
