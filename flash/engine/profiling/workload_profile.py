@@ -365,6 +365,13 @@ def rollout_profile_input_payload(
             # keyed distinctly from any float: it means "whatever the backend defaults to",
             # which is not knowably the same distribution as an explicit value.
             "temperature": (None if train.temperature is None else float(train.temperature)),
+            # stop strings end generation early, so they move the same length distribution
+            # temperature does and are keyed for the same reason: a sample drawn WITH them is
+            # shorter than the run without them would produce, and reusing it there under-quotes.
+            # ordered as configured -- the api honours the list, and the first match wins.
+            "stop_sequences": [
+                str(value) for value in (getattr(train, "stop_sequences", ()) or ())
+            ],
         },
     }
 

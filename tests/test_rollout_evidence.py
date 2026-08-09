@@ -781,3 +781,36 @@ def test_the_submit_path_forwards_the_runs_stop_sequences_to_the_measurement(mon
     assert seen.get("stop_sequences") == ("</answer>",), (
         "the run's stop strings must reach the sampler, or the measured length is biased high"
     )
+
+
+def test_stop_sequences_are_part_of_the_measurements_identity():
+    """The digest binds a measurement to the config it describes.
+
+    Stop strings shorten generation, so a sample drawn WITH them is shorter than the same run
+    without them would produce. If they are not keyed, those two configs share an identity and the
+    stop-shortened sample can be reused to price the unstopped run -- under-quoting it. This is the
+    same reason temperature is keyed, and the control below pins that reasoning.
+    """
+    from flash.engine.profiling.workload_profile import rollout_profile_input_digest
+
+    def _digest(**train_kwargs):
+        spec = _spec(
+            train=TrainSpec(
+                max_steps=50,
+                batch_size=8,
+                group_size=4,
+                max_completion_tokens=512,
+                **train_kwargs,
+            )
+        )
+        return rollout_profile_input_digest(
+            spec, tokenizer_revision="main", producer_version=VERSION
+        )
+
+    unstopped = _digest()
+    assert _digest() == unstopped, "an unchanged config must key to a stable identity"
+    assert _digest(stop_sequences=("</answer>",)) != unstopped, (
+        "a stop-shortened sample must not be reusable for a run without stops"
+    )
+    # different stop strings stop at different points, so they are different distributions too.
+    assert _digest(stop_sequences=("</answer>",)) != _digest(stop_sequences=("</s>",))
