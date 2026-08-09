@@ -66,13 +66,15 @@ def test_parse_adapter_revision_rejects_zero_padded_steps(step):
         # `seeds` is no longer a valid [train] key (multi-seed removed); it's now rejected
         # as an unknown key rather than seed-validated.
         ({"train.seeds": [0]}, "unknown key"),
-        # lora_rank now parses via _train_int(minimum=1), so out-of-range values are rejected at
-        # parse time with the shared ">= 1" message (a non-positive int never reaches the later
-        # "must be positive" guard). lora_alpha is not a user knob (managed, derived as 2 x
-        # lora_rank), so it has no value-validation case here; authoring it is an unknown key.
+        # lora_rank and lora_alpha parse via _train_int(minimum=1), so out-of-range values are
+        # rejected at parse time with the shared ">= 1" message (a non-positive int never reaches
+        # the later "must be positive" guard).
         ({"train.lora_rank": 0}, "lora_rank must be >= 1"),
+        ({"train.lora_alpha": 0}, "lora_alpha must be >= 1"),
+        ({"train.lora_alpha": -8}, "lora_alpha must be >= 1"),
         # bools must be rejected (bool is an int subclass: True would coerce to 1).
         ({"train.lora_rank": True}, "lora_rank must be an integer"),
+        ({"train.lora_alpha": False}, "lora_alpha must be an integer"),
         ({"algorithm": "ppo"}, "unsupported algorithm"),
         # An unhashable model (TOML array / `[model]` table) used to TypeError on MODELS.get() -> 500;
         # it must be a clean ConfigError like every other scalar.
@@ -132,6 +134,9 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
     assert TRAIN_KEY_MIN_VERSIONS["save_at_steps"] == "0.2.57"
     assert TRAIN_KEY_MIN_VERSIONS["credit_assignment"] == "1.0.2"
     assert TRAIN_KEY_MIN_VERSIONS["entropy_quantile"] == "1.0.15"
+    # re-introduced as a user knob after being managed-and-derived; gated on the release that
+    # restored it, not on lora_rank's original 0.2.0.
+    assert TRAIN_KEY_MIN_VERSIONS["lora_alpha"] == "1.1.35"
     # opd has no auxiliary eos loss or user-facing eos-loss key.
     assert "opd_eos_loss_coef" not in TRAIN_KEY_MIN_VERSIONS
     assert {
@@ -146,6 +151,7 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
             "save_at_steps",
             "credit_assignment",
             "entropy_quantile",
+            "lora_alpha",
         }
     } == {"0.2.0"}
 
@@ -270,10 +276,10 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
 
     # historical snapshots remain exact to their commits, including fields now managed or removed.
     # current adds save_at_steps, credit_assignment, and entropy_quantile; opd eos is removed.
+    # lora_alpha is in both: authorable then, managed in between, and a user knob again now.
     assert historical_shapes["861571e7"] - {
         "opd_eos_loss_coef",
         "hf_repo",
-        "lora_alpha",
         "advantage_clip",
     } == TRAIN_SCHEMA_KEYS - {
         "credit_assignment",
@@ -317,6 +323,88 @@ def test_warmstart_rejects_explicit_child_rank(lora_rank) -> None:
         spec_from_dict(
             _raw(**{"train.init_from_adapter": "source-run", "train.lora_rank": lora_rank})
         )
+
+
+@pytest.mark.parametrize(
+    "lora_alpha",
+    [
+        pytest.param(256, id="non-default"),
+        pytest.param(16, id="matching-derived"),
+        pytest.param(None, id="null"),
+        pytest.param(0, id="invalid"),
+    ],
+)
+def test_warmstart_rejects_explicit_child_alpha(lora_alpha) -> None:
+    # the source adapter's alpha is authoritative, so authoring one is rejected rather than
+    # silently overwritten by the inherited value.
+    raw = _raw(**{"train.init_from_adapter": "source-run", "train.lora_alpha": lora_alpha})
+    raw["train"].pop("lora_rank")
+    with pytest.raises(
+        ConfigError,
+        match=(
+            r"train\.lora_alpha cannot be set with train\.init_from_adapter because source adapter "
+            r"alpha metadata is authoritative"
+        ),
+    ):
+        spec_from_dict(raw)
+
+
+@pytest.mark.parametrize(("lora_rank", "expected_alpha"), [(16, 32), (32, 64), (8, 16)])
+def test_lora_alpha_defaults_to_twice_rank(lora_rank, expected_alpha) -> None:
+    spec = spec_from_dict(_raw(**{"train.lora_rank": lora_rank}))
+    assert spec.train.lora_alpha == expected_alpha
+
+
+def test_default_lora_rank_defaults_alpha_to_64() -> None:
+    raw = _raw()
+    raw["train"].pop("lora_rank")
+    spec = spec_from_dict(raw)
+    assert spec.train.lora_rank == 32
+    assert spec.train.lora_alpha == 64
+
+
+def test_directly_constructed_trainspec_derives_alpha_from_rank() -> None:
+    # A library caller building TrainSpec(...) directly must get the same 2 x rank default as the
+    # parsed path. to_dict() no longer strips alpha, so a stale scalar default would be SUBMITTED
+    # and trained with (rank 8 shipping alpha 64 instead of 16) rather than re-derived server-side.
+    assert TrainSpec(lora_rank=8).lora_alpha == 16
+    assert TrainSpec().lora_alpha == 64  # default rank 32
+    assert TrainSpec(lora_rank=8, lora_alpha=48).lora_alpha == 48  # explicit still wins
+
+
+def test_internal_from_dict_round_trips_stored_lora_alpha() -> None:
+    # The internal carrier preserves a stored alpha so an authored value and a warm-start's
+    # inherited parent alpha (which need not equal 2 x rank) survive control-plane -> worker
+    # serialization; alpha falls back to 2 x rank only when the payload omits it.
+    base = {
+        "model": "Qwen/Qwen3.5-0.8B",
+        "algorithm": "grpo",
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
+        "train": {"epochs": 1, "max_examples": 8, "lora_rank": 16, "lora_alpha": 48},
+    }
+    assert JobSpec.from_dict(base).train.lora_alpha == 48  # present -> round-trip
+    absent = {**base, "train": {"epochs": 1, "max_examples": 8, "lora_rank": 16}}
+    assert JobSpec.from_dict(absent).train.lora_alpha == 32  # absent -> derive 2 x rank
+
+
+def test_internal_dict_emits_an_authored_lora_alpha_to_the_worker() -> None:
+    # the EMISSION direction, not just from_dict: to_internal_dict() is what the worker rehydrates
+    # from, so an authored alpha that never reached the internal carrier would silently train at
+    # the derived 2 x rank scaling instead of the value the user wrote.
+    spec = spec_from_dict(_raw(**{"train.lora_rank": 16, "train.lora_alpha": 48}))
+    assert spec.to_internal_dict()["train"]["lora_alpha"] == 48
+    derived = spec_from_dict(_raw(**{"train.lora_rank": 16}))
+    assert derived.to_internal_dict()["train"]["lora_alpha"] == 32
+
+
+def test_authored_lora_alpha_overrides_the_derived_default() -> None:
+    # an authored alpha need not equal 2 x rank, and it survives the public round trip the client
+    # submits and the server re-validates.
+    spec = spec_from_dict(_raw(**{"train.lora_rank": 16, "train.lora_alpha": 48}))
+    assert spec.train.lora_alpha == 48
+    public = spec.to_dict()
+    assert public["train"]["lora_alpha"] == 48
+    assert spec_from_dict(public).train.lora_alpha == 48
 
 
 def test_warmstart_accepts_omitted_child_rank_with_internal_placeholder() -> None:

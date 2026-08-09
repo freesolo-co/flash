@@ -36,6 +36,7 @@ from flash.engine.worker.backend_common import (
     ChildTailStaleness,
     agent_loop_workers,
     clamp_engine_len,
+    fused_ce_backend,
     gdn_probe_module,
     latest_global_step_dir,
     model_max_position_embeddings,
@@ -1052,13 +1053,14 @@ class _TeacherAlignmentBridge:
                     )
                     for position in scorable
                 ]
-                teacher_batches = []
-                for start in range(0, len(items), OPD_TEACHER_SCORING_CONCURRENCY):
-                    teacher_batches.extend(
-                        self.teacher.score_many(
-                            items[start : start + OPD_TEACHER_SCORING_CONCURRENCY]
-                        )
-                    )
+                # ONE call, not a chunk-and-drain loop. score_many already bounds itself to
+                # OPD_TEACHER_SCORING_CONCURRENCY workers, so slicing the items first did not lower
+                # the provider-facing rate -- it only added a BARRIER every 32 items, where the
+                # slowest request in a wave held back the whole next wave and the gpu idled behind
+                # it. handing the full list over keeps the same concurrency ceiling while letting a
+                # finished worker start the next item immediately. `executor.map` preserves input
+                # order, so the zip with `scorable` below is unchanged.
+                teacher_batches = self.teacher.score_many(items)
                 if len(teacher_batches) != len(scorable):
                     raise RuntimeError("teacher returned the wrong number of multi-turn OPD scores")
                 with self._stats_lock:
@@ -1490,9 +1492,10 @@ def build_opd_overrides(config: dict) -> list[str]:
         # 32k contexts: the fused linear-CE forward computes per-token log_probs from hidden states
         # + lm_head in chunks (FusedLinearForPPO), never materializing the [tokens, vocab] logits
         # tensor (~130 GB at 32k on a 248k vocab). the distillation loss consumes exactly
-        # model_output["log_probs"], so the fused path is loss-equivalent. torch backend = exact.
+        # model_output["log_probs"], so the fused path is loss-equivalent. the backend is chosen
+        # per card; see fused_ce_backend for the measured table.
         "actor_rollout_ref.model.use_fused_kernels=true",
-        "actor_rollout_ref.model.fused_kernel_options.impl_backend=torch",
+        f"actor_rollout_ref.model.fused_kernel_options.impl_backend={config['fused_ce_backend']}",
         "actor_rollout_ref.model.enable_gradient_checkpointing=true",
         f"actor_rollout_ref.model.lora_rank={_hydra_val(config['lora_rank'])}",
         f"actor_rollout_ref.model.lora_alpha={_hydra_val(config['lora_alpha'])}",
@@ -2504,6 +2507,9 @@ def run_opd_train(spec=None) -> None:
             "mm_encoder_attn_backend": mm_encoder_attn_backend,
             "sleep_unsupported": rollout_sleep_unsupported(model_id),
             "loggers": loggers,
+            # resolved from the out-of-process capability probe, never by opening cuda in this
+            # parent -- see fused_ce_backend.
+            "fused_ce_backend": fused_ce_backend(caps),
         }
         overrides = build_opd_overrides(config)
         progress_state = _OpdProgressState(resume_state)

@@ -2,9 +2,78 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Callable, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, TypeVar
+
+# the two units reward scoring overlaps, kept together so the difference between them is a decision
+# rather than a coincidence of where each was written.
+#
+# SCALAR pools over individual rollouts, each one `reward()` call. GROUP pools over task groups,
+# each a BATCHED scorer call that fans out again inside the env's own per-instance pool -- so a
+# group is the heavier unit and gets the smaller cap. neither bounds the provider-facing rate: the
+# env enforces `max_score_concurrency` across overlapping calls. these only keep a large rollout
+# batch from creating one thread per row.
+SCALAR_REWARD_CONCURRENCY = 16
+REWARD_GROUP_CONCURRENCY = 8
+
+_T = TypeVar("_T")
+_R = TypeVar("_R")
+
+
+def map_bounded(
+    items: Sequence[_T], fn: Callable[[_T], _R], *, cap: int, serial: bool = False
+) -> list[_R]:
+    """Apply ``fn`` to every item, returning results in input order, at most ``cap`` at a time.
+
+    Serial when ``serial`` is set (a scorer that cannot be raced) or when there is nothing to
+    overlap -- a pool for a single call is pure overhead.
+
+    Failures cost at most ``cap`` extra calls. Three separate things are required for that bound,
+    because three different shapes of ``fn`` each defeat a different one, and reward scoring
+    produces all three:
+
+    1. Only ``cap`` items are ever in flight, and the window refills as results are CONSUMED.
+       Submitting everything up front and relying on ``cancel_futures`` bounds nothing when ``fn``
+       is FAST: the workers drain the queue before the consumer reads its first result, so nothing
+       is left to cancel. At width 8 failing on item 1, eager submission ran 36 of 40 and 10000 of
+       10000.
+    2. Completions are consumed as they ARRIVE, not in input order, and placed back by index.
+       Consuming in input order (what ``pool.map`` yields) defers the raise behind a SLOW LEADING
+       item until the batch drains: 29 of 40 at width 8.
+    3. Refilling stops as soon as a failure is PENDING rather than observed. A call that fails
+       SLOWLY -- an HTTP timeout or a late 5xx, which is the normal shape of a real failure -- sits
+       in flight while fast successes are consumed around it, and each consumed success pulls
+       another item in. Waste then tracks error-latency over success-latency instead of ``cap``:
+       measured 2000 of 2000 at width 8 before this, against 8 after.
+
+    The bound is on calls STARTED, not billed twice by accident: `rl_train.py` discards the batch on
+    any raise and re-scores serially, so everything started here is charged again.
+    """
+    if serial or len(items) <= 1:
+        return [fn(item) for item in items]
+    results: list[_R] = [None] * len(items)  # type: ignore[list-item]
+    pool = ThreadPoolExecutor(max_workers=min(cap, len(items)))
+    try:
+        pending: dict[Future[_R], int] = {}
+        cursor = 0
+        while True:
+            # the window is anchored to the OLDEST unconsumed item, not to how many futures happen
+            # to be settled. an in-flight call that will fail is indistinguishable from a slow one
+            # that will succeed, so nothing can be inferred from its state -- the only safe rule is
+            # to never run ahead of the item whose outcome is still unknown.
+            while cursor < len(items) and cursor - min(pending.values(), default=cursor) < cap:
+                pending[pool.submit(fn, items[cursor])] = cursor
+                cursor += 1
+            if not pending:
+                return results
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                # raises on the first failed item, dropping the window with the pool teardown
+                results[pending.pop(future)] = future.result()
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 @dataclass(frozen=True)
@@ -62,19 +131,12 @@ class BaseEnvironment:
                 example, state = item
                 return float(self.reward("", example, state))
 
-            if len(items) <= 1 or not getattr(self, "reward_thread_safe", True):
-                episode_rewards = [score_one(item) for item in items]
-            else:
-                pool = ThreadPoolExecutor(max_workers=min(16, len(items)))
-                try:
-                    futures = {
-                        pool.submit(score_one, item): index for index, item in enumerate(items)
-                    }
-                    episode_rewards = [0.0] * len(items)
-                    for future in as_completed(futures):
-                        episode_rewards[futures[future]] = future.result()
-                finally:
-                    pool.shutdown(wait=True, cancel_futures=True)
+            episode_rewards = map_bounded(
+                items,
+                score_one,
+                cap=SCALAR_REWARD_CONCURRENCY,
+                serial=not getattr(self, "reward_thread_safe", True),
+            )
 
         return [
             RolloutReward(episode=float(episode_reward), turns=None)
