@@ -1094,6 +1094,42 @@ def test_control_panel_url_requires_a_canonical_worker_reachable_https_origin(ur
     )
 
 
+def test_control_panel_url_falls_back_to_the_client_api_url(monkeypatch):
+    monkeypatch.delenv("FLASH_CONTROL_PANEL_URL", raising=False)
+    monkeypatch.setenv("FLASH_API_URL", "https://flash.example.com/")
+
+    assert teacher_broker.resolve_control_panel_url() == "https://flash.example.com"
+
+
+def test_control_panel_url_wins_over_the_client_api_url(monkeypatch):
+    monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://worker-reachable.example")
+    monkeypatch.setenv("FLASH_API_URL", "https://localhost:8000")
+
+    assert teacher_broker.resolve_control_panel_url() == "https://worker-reachable.example"
+
+
+def test_control_panel_url_unset_everywhere_still_fails(monkeypatch):
+    """the fallback must not reach flash.client.config's channel default.
+
+    resolving to the hosted plane when the operator set nothing would issue capabilities against
+    a plane that never minted them, and only after the gpu is allocated.
+    """
+    monkeypatch.delenv("FLASH_CONTROL_PANEL_URL", raising=False)
+    monkeypatch.delenv("FLASH_API_URL", raising=False)
+
+    with pytest.raises(RuntimeError, match="FLASH_CONTROL_PANEL_URL"):
+        teacher_broker.resolve_control_panel_url()
+
+
+def test_unusable_client_api_url_names_both_variables(monkeypatch):
+    monkeypatch.delenv("FLASH_CONTROL_PANEL_URL", raising=False)
+    monkeypatch.setenv("FLASH_API_URL", "http://flash.example.com")
+
+    with pytest.raises(RuntimeError, match="FLASH_API_URL") as error:
+        teacher_broker.resolve_control_panel_url()
+    assert "FLASH_CONTROL_PANEL_URL" in str(error.value)
+
+
 def test_legacy_teacher_broker_url_does_not_configure_the_control_panel(monkeypatch):
     monkeypatch.delenv("FLASH_CONTROL_PANEL_URL", raising=False)
     monkeypatch.setenv("FLASH_TEACHER_BROKER_URL", "https://broker.example")

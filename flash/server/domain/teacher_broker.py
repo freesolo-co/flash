@@ -16,7 +16,12 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Any
 
-from flash.core.spec import CONTROL_PANEL_URL_ENV, TEACHER_CAPABILITY_ENV, JobSpec
+from flash.core.spec import (
+    CLIENT_API_URL_ENV,
+    CONTROL_PANEL_URL_ENV,
+    TEACHER_CAPABILITY_ENV,
+    JobSpec,
+)
 from flash.engine.plan.recipe import RECIPE, resolve_teacher
 from flash.server.platform import db
 from flash.teacher.limits import (
@@ -102,6 +107,38 @@ def validate_control_panel_url(value: str) -> str:
     return url
 
 
+def resolve_control_panel_url() -> str:
+    """Resolve this plane's worker-reachable origin, falling back to the CLI's api url.
+
+    on the managed plane both names hold the same origin, so requiring the operator to set two
+    variables to one value is friction with no invariant behind it. the fallback reads only an
+    explicitly exported FLASH_API_URL: flash.client.config would layer config.json and the
+    channel default underneath, and a plane with neither variable set must keep failing here
+    rather than silently issuing capabilities against the hosted plane.
+
+    the fallback is a convenience, not a reachability claim. FLASH_API_URL is where the operator's
+    cli dials in from, which is only the workers' origin when the plane is publicly addressed at
+    that name; a self-hosted plane reached over a tunnel, a vpn, or localhost must still set
+    CONTROL_PANEL_URL_ENV explicitly. validation only constrains the url's shape, so an
+    https://localhost origin or a public origin belonging to a different plane passes here and is
+    caught only when the worker fails to present its capability, after the gpu is allocated.
+    """
+    configured = os.environ.get(CONTROL_PANEL_URL_ENV, "").strip()
+    if configured:
+        return validate_control_panel_url(configured)
+    fallback = os.environ.get(CLIENT_API_URL_ENV, "").strip()
+    if not fallback:
+        # keep the unset-everything diagnostic pointed at the variable an operator should set.
+        return validate_control_panel_url("")
+    try:
+        return validate_control_panel_url(fallback)
+    except RuntimeError as error:
+        raise RuntimeError(
+            f"{CONTROL_PANEL_URL_ENV} is unset and {CLIENT_API_URL_ENV} is not usable as this "
+            f"plane's worker-reachable origin: {error}"
+        ) from error
+
+
 def require_teacher_broker_configuration(
     spec: JobSpec,
     *,
@@ -110,7 +147,7 @@ def require_teacher_broker_configuration(
 ) -> str:
     if spec.algorithm != "opd":
         raise RuntimeError("teacher broker configuration is only valid for opd runs")
-    control_panel_url = validate_control_panel_url(os.environ.get(CONTROL_PANEL_URL_ENV, ""))
+    control_panel_url = resolve_control_panel_url()
     if not os.environ.get(PARASAIL_API_KEY_ENV, "").strip():
         raise RuntimeError(
             f"{PARASAIL_API_KEY_ENV} is required on the control plane for managed opd teachers"
