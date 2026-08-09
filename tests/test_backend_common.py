@@ -342,7 +342,7 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert "cp312" in vc.FLASH_ATTN_SPEC
     install = calls[1]
     assert vc.VERL_REQUIREMENT == (
-        "verl @ git+https://github.com/freesolo-co/verl@1bea7d6825bbb9d2164e86e379b3680e7c53bb8a"
+        "verl @ git+https://github.com/freesolo-co/verl@32d6200de81dcc9e97e3aa2ae4a2b3ba30d33e93"
     )
     assert any(vc.VERL_REQUIREMENT_URL in arg for arg in install)
     assert "liger-kernel" in install
@@ -1304,11 +1304,12 @@ def test_verl_pin_matches_the_version_opd_requires_exactly():
     from flash.engine.worker.train.opd.child import plugin as plugin
 
     assert plugin._STRUCTURED_RUNTIME_EXACT_VERSIONS["verl"] == "0.8.0"
-    # bind the pin to its verified base: 1bea7d68 remains verl 0.8.0 with main_ppo_sync.py plus the
-    # truncation, position-id, fused-label, and qwen3.5 shift-label fixes.
+    # bind the pin to its verified base: 32d6200d remains verl 0.8.0 with main_ppo_sync.py plus the
+    # truncation, position-id, fused-label, and qwen3.5 shift-label fixes, and the opd dead-compute
+    # skip on top of them.
     _, _, ref = vc.VERL_REQUIREMENT.partition("git+")
     _, _, commit = ref.rpartition("@")
-    assert commit == "1bea7d6825bbb9d2164e86e379b3680e7c53bb8a"
+    assert commit == "32d6200de81dcc9e97e3aa2ae4a2b3ba30d33e93"
 
 
 def test_resolve_verl_python_installs_wandb_best_effort_when_requested(monkeypatch, tmp_path):

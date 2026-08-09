@@ -38,7 +38,7 @@ from flash._internal.diagnostics import sanitize_diagnostic
 # version file this branch pins to the release value.
 VERL_REQUIREMENT_NAME = "verl"
 VERL_REQUIREMENT_URL = (
-    "git+https://github.com/freesolo-co/verl@1bea7d6825bbb9d2164e86e379b3680e7c53bb8a"
+    "git+https://github.com/freesolo-co/verl@32d6200de81dcc9e97e3aa2ae4a2b3ba30d33e93"
 )
 # the pin, as the venv stamp records it. the provisioning install asks for the [vllm] extra of this
 # same commit; the stamp stays extra-free so it identifies the verl a venv holds, not how it was
