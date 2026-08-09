@@ -31,6 +31,9 @@ _DEFAULT_TEACHER_TIMEOUT_S = 105.0
 # the token every managed vision teacher's chat template uses to close a turn. it bounds the text
 # we supplied: the provider's own generation header comes after it.
 _TURN_END_TOKEN = "<|im_end|>"
+# the text an assistant header ends with ("<|im_start|>assistant\n"). a completion opening a new
+# turn is tokenized directly after it, so it is the prefix that completion merges against.
+_ASSISTANT_HEADER_TRAILING_TEXT = "\n"
 # imported rather than redeclared: the renderer rejects both markers from source text, and the
 # drop guard below counts pad runs. if the two ever named different strings, text-origin runs
 # would silently re-enter the count the guard depends on.
@@ -653,9 +656,14 @@ class TeacherClient:
 
         so encode ``prefix + completion`` and keep only the tail the prefix does not already
         account for, which is what the text path gets for free by encoding the whole prompt and
-        slicing. the prefix is only ever the trailing assistant content we are continuing; when the
-        completion opens its own turn there is nothing to merge with and this reduces to the plain
-        encoding.
+        slicing.
+
+        a completion that opens its own turn still has a boundary: the chat template renders
+        "<|im_start|>assistant\\n", so the header's trailing newline merges with a completion that
+        starts with one exactly as a thinking prefill would. measured on the pinned Qwen3-VL
+        tokenizer, encoding in isolation loses 5 of 8 whitespace-leading completions -- "\\nred"
+        encodes to [198, 1151] while the render contains [..., 77091, 271, 1151]. so the new-turn
+        prefix is that newline, not the empty string.
 
         the boundary token can belong to BOTH sides -- "<think>\\n" + "\\nred" merges the prefix's
         trailing "\\n" and the completion's leading "\\n" into one "\\n\\n". that token is kept: it is
@@ -673,7 +681,8 @@ class TeacherClient:
                 if isinstance(content, str):
                     prefix = content
         if not prefix:
-            return self.tokenizer.encode(completion_text)
+            # the assistant header's own trailing newline, which is what a new turn merges against.
+            prefix = _ASSISTANT_HEADER_TRAILING_TEXT
         encoded_prefix = self.tokenizer.encode(prefix)
         encoded_joined = self.tokenizer.encode(prefix + completion_text)
         # keep every token from the first position where the two encodings diverge. an unmerged

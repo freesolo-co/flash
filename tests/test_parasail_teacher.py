@@ -34,10 +34,21 @@ class _MultimodalTokenizer:
             return [EncodedTeacherToken(151655, 0, len(text))]
         if text == "<|im_end|>":
             return [EncodedTeacherToken(151645, 0, len(text))]
+        # the assistant header's trailing newline, which a new-turn completion is encoded after
+        if text == "\n":
+            return [EncodedTeacherToken(198, 0, 1)]
         if text == "red":
             return [
                 EncodedTeacherToken(201, 0, 1),
                 EncodedTeacherToken(202, 1, 3),
+            ]
+        # "red" does not merge with the header newline, so the joined encoding is the plain
+        # concatenation and the prefix-diff tail is exactly the completion's own ids.
+        if text == "\nred":
+            return [
+                EncodedTeacherToken(198, 0, 1),
+                EncodedTeacherToken(201, 1, 2),
+                EncodedTeacherToken(202, 2, 4),
             ]
         raise AssertionError(f"unexpected tokenizer input: {text!r}")
 
@@ -423,7 +434,13 @@ def test_multimodal_scoring_ignores_the_trailing_generation_header():
             table = {
                 "<|image_pad|>": [EncodedTeacherToken(151655, 0, len(text))],
                 "<|im_end|>": [EncodedTeacherToken(151645, 0, len(text))],
+                "\n": [EncodedTeacherToken(198, 0, 1)],
                 "assistant": [EncodedTeacherToken(77091, 0, len("assistant"))],
+                # no merge across the header boundary here, so the tail is just 77091
+                "\nassistant": [
+                    EncodedTeacherToken(198, 0, 1),
+                    EncodedTeacherToken(77091, 1, 10),
+                ],
             }
             if text in table:
                 return list(table[text])
@@ -582,11 +599,59 @@ def test_multimodal_completion_is_encoded_after_its_assistant_prefix():
     # two scored tokens means the merged run was located; standalone encoding would raise instead.
     assert len(scored.tokens) == 2
 
-    # with no prefix to merge against, encoding reduces to the plain form.
-    plain = client._encode_completion_in_context(
-        [{"role": "user", "content": "<|media_pad|>"}], "\nred", continue_final_assistant=False
+
+def test_multimodal_new_turn_completion_merges_with_the_assistant_header():
+    # the same merge happens with NO thinking prefill. the chat template renders
+    # "<|im_start|>assistant\n", so a completion starting with "\n" merges against the header's
+    # own newline exactly as it would against a prefill. measured on the pinned Qwen3-VL
+    # tokenizer, isolated encoding loses 5 of 8 whitespace-leading completions: "\nred" encodes
+    # to [198, 1151] while the render contains [..., 77091, 271, 1151]. encoding a new turn in
+    # isolation therefore rejects those rollouts permanently.
+    class _HeaderMergingTokenizer:
+        def encode(self, text):
+            table = {
+                "<|image_pad|>": [EncodedTeacherToken(151655, 0, len(text))],
+                "<|im_end|>": [EncodedTeacherToken(151645, 0, len(text))],
+                "\n": [EncodedTeacherToken(198, 0, 1)],
+                "\nred": [EncodedTeacherToken(198, 0, 1), EncodedTeacherToken(1151, 1, 4)],
+                # header newline + completion newline collapse into 271, exactly as BPE does
+                "\n\nred": [
+                    EncodedTeacherToken(271, 0, 2),
+                    EncodedTeacherToken(1151, 2, 5),
+                ],
+            }
+            if text in table:
+                return list(table[text])
+            raise AssertionError(f"unexpected tokenizer input: {text!r}")
+
+    client = TeacherClient(
+        "capability",
+        "https://broker.example",
+        "parasail-qwen3vl-8b-instruct",
+        tokenizer=_HeaderMergingTokenizer(),
     )
-    assert [token.token_id for token in plain] == [198, 1151]
+    # what the provider really returns: the merged [271, 1151]. the isolated encoding [198, 1151]
+    # never occurs, so this only passes if a new turn is encoded after the header's newline.
+    prompt_ids = [10, 151655, 11, 271, 1151, 151645, 198]
+    client._post = lambda path, body: _multimodal_response(prompt_ids)
+
+    scored = client.score_many_multimodal(
+        [
+            (
+                [{"role": "user", "content": "<|media_pad|>"}],
+                "\nred",
+                ["data:image/png;base64,aW1hZ2U="],
+                False,
+            )
+        ]
+    )[0]
+
+    # two scored tokens means the MERGED run [271, 1151] was located. the isolated encoding
+    # [198, 1151] does not occur in prompt_ids at all, so this raises without the header prefix.
+    assert len(scored.tokens) == 2
+    # the spans still address the COMPLETION, not the header: the merged token clamps to 0 and the
+    # last token ends at len("\nred"), so the caller's slice of completion_text stays exact.
+    assert (scored.tokens[0].start, scored.tokens[-1].end) == (0, 4)
 
 
 def test_multimodal_encoding_rejects_a_boundary_that_eats_multiple_prefix_tokens():
