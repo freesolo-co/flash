@@ -2422,6 +2422,39 @@ def _grpo_child_env_extras(reward_url, inp):
     return extras
 
 
+def _grpo_profile_score(env, rollout_examples, tok, inp, index, solution_str) -> float:
+    """grade one completion for the reward profiler, raising rather than timing a broken grader."""
+    return score_single_turn(
+        env,
+        solution_str,
+        rollout_examples[int(index)],
+        tok=tok,
+        thinking=bool(_w.THINKING),
+        prompt_opened_thinking=inp["prompt_opened_thinking"],
+        think_penalty=inp["think_penalty"],
+        raise_on_error=True,
+    )
+
+
+def _grpo_raise_for_child_exit(rc) -> None:
+    """turn a nonzero verl child exit into the failure the parent reports."""
+    if rc != 0:
+        raise RuntimeError(
+            f"verl.trainer.main_ppo exited {rc}; see the flash log for the traceback"
+        )
+
+
+def _grpo_reap_stragglers() -> None:
+    """collect leftover children at every job boundary, not just the failing ones.
+
+    `kill_process_group` runs on exceptions alone, so a straggler an earlier teardown SIGKILLed but
+    could not drain in time would otherwise be collected only by the next FAILING job: a reusable
+    worker running successful grpo jobs after one late straggler keeps that zombie for life.
+    """
+    with contextlib.suppress(Exception):
+        reap_stragglers()
+
+
 def run_rl_train():
     """grpo training on verl, output-compatible with run_rl. see module docstring for scope."""
     t_start = time.time()
@@ -2538,16 +2571,7 @@ def run_rl_train():
 
         do not seed rollout buffers. errors propagate so a broken grader is not measured as fast.
         """
-        return score_single_turn(
-            env,
-            solution_str,
-            rollout_examples[int(index)],
-            tok=tok,
-            thinking=bool(_w.THINKING),
-            prompt_opened_thinking=inp["prompt_opened_thinking"],
-            think_penalty=inp["think_penalty"],
-            raise_on_error=True,
-        )
+        return _grpo_profile_score(env, rollout_examples, tok, inp, index, solution_str)
 
     # the profiler times the single-turn grading path (env.reward / env.scores_breakdown on one
     # completion). a multi-turn env scores a terminal episode instead, so that timing would neither
@@ -2860,10 +2884,7 @@ def run_rl_train():
                 # for every later job on a reusable worker.
                 child_stream.terminate()
                 raise
-        if rc != 0:
-            raise RuntimeError(
-                f"verl.trainer.main_ppo exited {rc}; see the flash log for the traceback"
-            )
+        _grpo_raise_for_child_exit(rc)
         # the gradient verdict runs here, ahead of required-save completeness, because a zero-spread
         # run withholds every required deployable BY DESIGN: checking completeness first would raise
         # on artifacts the gate is deliberately holding and report a checkpoint-publication failure
@@ -2899,12 +2920,7 @@ def run_rl_train():
             with contextlib.suppress(Exception):
                 multi_turn_bridge.shutdown()
         server.shutdown()
-        # every job boundary, not just the failing ones. `kill_process_group` runs on exceptions
-        # alone here, so a straggler an earlier teardown SIGKILLed but could not drain in time would
-        # otherwise be collected only by the next FAILING job: a reusable worker running successful
-        # grpo jobs after one late straggler keeps that zombie for life.
-        with contextlib.suppress(Exception):
-            reap_stragglers()
+        _grpo_reap_stragglers()
 
     # collect verl's lora checkpoint -> flash-servable peft adapter, then reuse flash finalize.
     out_dir = f"/tmp/rl_seed{_w.SEED}"
