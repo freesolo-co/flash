@@ -407,6 +407,28 @@ def _client_train_schema(authored_train_keys: frozenset[str]) -> dict:
     }
 
 
+def _rollout_evidence_for(client: ApiClient, spec) -> dict | None:
+    """Measured rollout aggregates for a grpo/opd submit, or None when nothing was measured.
+
+    Advisory, and silent on every failure. The server re-derives the digest and re-applies the same
+    trust verdict a first-party measurement passes, so this can only ever supply evidence that is
+    rejected or evidence that survives those checks. Returning None leaves the quote on the declared
+    completion cap, which is the pricing this path had before any of it existed -- so a submit must
+    never fail because a sampler was unreachable, slow, or unconfigured.
+    """
+    from flash.cli.commands.rollout_profile import collect_for_submit
+
+    evidence = collect_for_submit(client, spec)
+    if evidence:
+        logger.info(
+            "measured %s rollouts for the quote: mean %.0f completion tokens (cap %s)",
+            evidence.get("completed_rollouts"),
+            evidence.get("completion_tokens_mean") or 0.0,
+            spec.train.max_completion_tokens or "recipe default",
+        )
+    return evidence
+
+
 def _raise_if_workload_profile_pending(client: ApiClient, exc: ApiError) -> None:
     """Explain a profile-pending rejection and fail, or return so the caller keeps handling `exc`.
 
@@ -644,6 +666,7 @@ def cmd_train(args) -> int:
         runtime_secrets_from_local_env(args.config, keys=spec.environment.secrets) or None
     )
     _warn_if_wandb_requested_without_key(spec, runtime_secrets, dry_run=bool(args.dry_run))
+    rollout_evidence = _rollout_evidence_for(client, spec)
     if args.dry_run:
         # dry-run runs submit-time server preflights without allocating a training gpu or charging
         # for training. a rejection surfaces as the server's error with exit status 1. for sft it
@@ -655,6 +678,7 @@ def cmd_train(args) -> int:
                 runtime_secrets=runtime_secrets,
                 dry_run=True,
                 client_train_schema=client_train_schema,
+                rollout_evidence=rollout_evidence,
             )
         except ApiError as exc:
             _raise_if_workload_profile_pending(client, exc)
@@ -707,6 +731,7 @@ def cmd_train(args) -> int:
             payload,
             runtime_secrets=runtime_secrets,
             client_train_schema=client_train_schema,
+            rollout_evidence=rollout_evidence,
         )
     except ApiError as exc:
         # a real submit misses the profile cache the same way a preview does, and the miss starts a

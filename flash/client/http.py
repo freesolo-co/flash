@@ -640,6 +640,7 @@ class ApiClient:
         runtime_secrets: dict[str, str] | None = None,
         dry_run: bool = False,
         client_train_schema: dict | None = None,
+        rollout_evidence: dict | None = None,
     ) -> dict:
         if not isinstance(spec, dict):
             raise ClientError("spec must be an object")
@@ -659,6 +660,10 @@ class ApiClient:
             body["dry_run"] = True
         if client_train_schema is not None:
             body["client_train_schema"] = client_train_schema
+        if rollout_evidence:
+            # aggregates only, and never a price: the server re-derives this config's digest and
+            # applies its own trust verdict before any of it can move a quote.
+            body["rollout_evidence"] = rollout_evidence
         return self._request("POST", "/v1/runs", body=body)
 
     def list_runs(self) -> list[dict]:

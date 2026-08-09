@@ -122,7 +122,14 @@ def test_train_dry_run_emits_run_id_and_state(tmp_path: Path, capsys, monkeypatc
     seen: dict = {}
 
     class _FakeClient:
-        def create_run(self, spec, runtime_secrets=None, dry_run=False, client_train_schema=None):
+        def create_run(
+            self,
+            spec,
+            runtime_secrets=None,
+            dry_run=False,
+            client_train_schema=None,
+            rollout_evidence=None,
+        ):
             seen["dry_run"] = dry_run
             seen["runtime_secrets"] = runtime_secrets
             seen["client_train_schema"] = client_train_schema

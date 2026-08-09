@@ -382,7 +382,14 @@ class _QuotingClient:
             else response
         )
 
-    def create_run(self, spec, runtime_secrets=None, dry_run=False, client_train_schema=None):
+    def create_run(
+        self,
+        spec,
+        runtime_secrets=None,
+        dry_run=False,
+        client_train_schema=None,
+        rollout_evidence=None,
+    ):
         self.calls.append(
             {
                 "spec": spec,
@@ -420,7 +427,14 @@ class _PendingClient:
         self.profile_quote = profile_quote
         self.get_run_calls: list[str] = []
 
-    def create_run(self, spec, runtime_secrets=None, dry_run=False, client_train_schema=None):
+    def create_run(
+        self,
+        spec,
+        runtime_secrets=None,
+        dry_run=False,
+        client_train_schema=None,
+        rollout_evidence=None,
+    ):
         raise self.error
 
     def get_run(self, run_id):
@@ -689,7 +703,14 @@ def test_sft_cost_leaves_unrelated_api_errors_alone(tmp_path, monkeypatch):
     from flash.client import ApiError
 
     class _Rejecting:
-        def create_run(self, spec, runtime_secrets=None, dry_run=False, client_train_schema=None):
+        def create_run(
+            self,
+            spec,
+            runtime_secrets=None,
+            dry_run=False,
+            client_train_schema=None,
+            rollout_evidence=None,
+        ):
             raise ApiError(402, "insufficient balance")
 
     _use_client(monkeypatch, _Rejecting())
