@@ -62,20 +62,31 @@ VERL_VENV_PYTHON = "3.12"
 # verl-venv layer. fla resets the DeltaNet recurrence at packed example boundaries (cu_seqlens)
 # and causal_conv1d resets the short causal conv (seq_idx); WITHOUT them transformers falls back
 # to implementations that accept both arguments and silently discard them, so packed GDN training
-# is contaminated across example boundaries while appearing patched. fla is required;
-# causal_conv1d is best-effort (a failed build makes the gdn capability answer False, which turns
-# remove-padding off and trains padded rather than wrong).
+# is contaminated across example boundaries while appearing patched. both are required in the
+# IMAGE; here causal_conv1d stays best-effort to install because this path has no build environment
+# to guarantee, but a venv that misses it is left unstamped rather than reused (see below).
 FLA_REQUIREMENT = (
     "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git"
     "@f0e213dbd8b5fb90c3c7eca869ac1706d5377139"
 )
 CAUSAL_CONV1D_REQUIREMENT = "causal-conv1d==1.6.2.post1"
 
+# the SAME transformers range the main interpreter and Dockerfile.worker's verl-venv layer use.
+# is_flash_linear_attention_available() and is_causal_conv1d_available() are find_spec probes whose
+# import path moved in 5.13: an unpinned resolve lands 5.14.x, which answers False for BOTH even
+# though the packages are installed, so the child reports no gdn boundary-reset capability and
+# grpo/opd fail closed on every catalog model. verl and vllm both depend on transformers, so this
+# has to be in the OVERRIDE file as well as the direct list -- a direct pin alone loses to their
+# transitive declarations.
+TRANSFORMERS_REQUIREMENT = "transformers>=5.6,<5.13"
+
 # the stamp must identify every separately installed package the venv holds. omitting flash-attn,
-# fla, or causal_conv1d lets an older partial venv match forever; the latter leaves GRPO/OPD failing
-# ``require_gdn_boundary_resets`` with no rebuild path.
+# fla, causal_conv1d, or the transformers range lets an older partial venv match forever; conv1d
+# leaves GRPO/OPD failing ``require_gdn_boundary_resets`` with no rebuild path, and a stale venv
+# resolved before the transformers pin holds the 5.14.x that makes both probes answer False.
 VERL_VENV_STAMP = (
-    f"{VERL_REQUIREMENT}\n{FLASH_ATTN_SPEC}\n{FLA_REQUIREMENT}\n{CAUSAL_CONV1D_REQUIREMENT}"
+    f"{VERL_REQUIREMENT}\n{FLASH_ATTN_SPEC}\n{FLA_REQUIREMENT}\n{CAUSAL_CONV1D_REQUIREMENT}\n"
+    f"{TRANSFORMERS_REQUIREMENT}"
 )
 
 
@@ -757,10 +768,8 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
     """return an interpreter that can import verl.
 
     prefer ``FLASH_VERL_PYTHON`` unchanged; otherwise provision an isolated venv with the pinned verl
-    stack and optional wandb. rebuild owned venvs when their stamp differs.
-
-    an explicit empty value means ignore an image-provided interpreter, because worker env can set a
-    key but cannot delete one.
+    stack and optional wandb. rebuild owned venvs when their stamp differs. a missing or blank preset
+    takes the provisioning path.
     """
     preset = os.environ.get("FLASH_VERL_PYTHON", "").strip()
     if preset:
@@ -781,18 +790,22 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
         # dev-only fallback (production uses FLASH_VERL_PYTHON on a prebuilt verl image): verl brings
         # its own torch/vllm, so use a full install rather than --no-deps to include runtime deps.
         subprocess.run(["uv", "venv", "--python", VERL_VENV_PYTHON, venv], check=True)
-        # the SAME three overrides Dockerfile.worker writes, for the same reason: this pin
-        # set deliberately violates three declared ceilings, and a bare pin cannot break
+        # the SAME four overrides Dockerfile.worker writes, for the same reason: this pin
+        # set deliberately violates declared ceilings, and a bare pin cannot break
         # any of them -- a pin is a constraint the resolver must satisfy alongside the
         # declaration, so the pair is simply unsatisfiable and the install fails outright.
-        # only --override makes uv IGNORE the declaration. all three lines are required;
-        # dropping any one leaves the set unsatisfiable: verl + transferqueue declare
-        # numpy<2.0.0 -> vllm 0.19.1 needs numpy>=2 verl[vllm] declares
-        # vllm>=0.8.5,<=0.12.0 -> flash needs 0.19.1 for the Qwen3.5 archs vllm declares
-        # xgrammar>=0.1.32 -> structured opd gates on EXACTLY 0.1.25
+        # only --override makes uv IGNORE the declaration. all four lines are required;
+        # dropping any one leaves the set unsatisfiable or silently wrong: verl +
+        # transferqueue declare numpy<2.0.0 -> vllm 0.19.1 needs numpy>=2 verl[vllm]
+        # declares vllm>=0.8.5,<=0.12.0 -> flash needs 0.19.1 for the Qwen3.5 archs vllm
+        # declares xgrammar>=0.1.32 -> structured opd gates on EXACTLY 0.1.25 verl and
+        # vllm both depend on transformers with no upper bound -> an unpinned resolve
+        # lands 5.14.x, whose moved import path makes the fla and causal_conv1d find_spec
+        # probes answer False for packages that ARE installed, so the child reports no
+        # gdn boundary-reset capability and grpo/opd fail closed after the gpu is rented.
         overrides = os.path.join(workdir, "verl-overrides.txt")
         with open(overrides, "w") as f:
-            f.write("numpy==2.2.6\nxgrammar==0.1.25\nvllm==0.19.1\n")
+            f.write(f"numpy==2.2.6\nxgrammar==0.1.25\nvllm==0.19.1\n{TRANSFORMERS_REQUIREMENT}\n")
         subprocess.run(
             [
                 "uv",
@@ -808,6 +821,7 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
                 f"{VERL_REQUIREMENT_NAME}[vllm] @ {VERL_REQUIREMENT_URL}",
                 "vllm==0.19.1",
                 "numpy==2.2.6",
+                TRANSFORMERS_REQUIREMENT,
                 # NOT transitively guaranteed: verl imports these at MODULE level on the launch path
                 # (main_ppo -> ppo.ray_trainer -> rollout.llm_server imports cachetools, and
                 # rollout.utils imports uvicorn + fastapi), yet declares none of them. vllm happens

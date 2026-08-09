@@ -362,18 +362,6 @@ def test_build_worker_env_no_cache_without_volume():
     assert "HF_HOME" not in env
 
 
-def test_build_worker_env_per_run_override_wins():
-    from flash.providers._worker import build_worker_env
-
-    spec = _vol_spec()
-    # network_volume is managed -> carried by the internal dict, so the cache redirect is present
-    # and the per-run [worker_env] override (merged last) genuinely wins over it.
-    spec = JobSpec.from_dict(
-        {**spec.to_internal_dict(), "worker_env": {"FLASH_WEIGHT_CACHE_DIR": "/custom/hub"}}
-    )
-    assert build_worker_env(spec, 0)["FLASH_WEIGHT_CACHE_DIR"] == "/custom/hub"
-
-
 # ---------------------------------------------------------------------------
 # worker engine.worker.hf.prefetch_model — base-model-scoped caching (issue #252)
 # The shared mount holds ONLY the trusted public base model; the run's env/reward HF downloads use the
@@ -1644,34 +1632,6 @@ def test_instance_build_payload_no_mode_by_default():
     )
     assert "mode" not in p  # ordinary train payload
     assert "models" not in p
-
-
-def test_instance_build_payload_preserves_worker_env_hf_home(monkeypatch):
-    """A per-run [worker_env].HF_HOME override is NOT clobbered by the instance cache path (parity
-    with RunPod, where the worker_env override wins), and disables the platform cache redirect."""
-    from flash.providers import _instance
-
-    spec = JobSpec.from_dict(
-        {
-            "model": "Qwen/Qwen3.5-0.8B",
-            "algorithm": "sft",
-            "run_id": "flash-1700000000-abcd1234",
-            "train": {"max_examples": 8, "hf_repo": "org/repo"},
-            "gpu": {"type": "A10", "max_wall_seconds": 3600, "network_volume": "flash-weights"},
-            "worker_env": {"HF_HOME": "/custom/hf"},  # user-set override
-        }
-    )
-    p = _instance.build_payload(
-        spec,
-        spec.seed,
-        0,
-        arm="lambda",
-        deadline_at=10_000_000_000.0,
-        cache_host_mount="/lambda/nfs/flash-weights",
-    )
-    # the user's HF_HOME survives, and the platform cache redirect is NOT installed on top of it.
-    assert p["env"]["HF_HOME"] == "/custom/hf"
-    assert "FLASH_WEIGHT_CACHE_DIR" not in p["env"]
 
 
 def test_instance_preload_requires_mounted_cache():

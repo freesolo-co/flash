@@ -33,7 +33,6 @@ def _spec() -> JobSpec:
         ),
         gpu=GpuSpec(count=2),
         seed=42,
-        worker_env={"FLASH_FLA_SM120": "free"},
         thinking=True,
     )
 
@@ -171,7 +170,6 @@ def test_sft_profile_key_changes_for_every_workload_shaping_input() -> None:
         replace(spec, train=replace(spec.train, max_context_tokens=2048)),
         replace(spec, train=replace(spec.train, max_steps=13)),
         replace(spec, train=replace(spec.train, max_examples=63)),
-        replace(spec, worker_env={"FLASH_FLA_SM120": "pydelta"}),
     ]
 
     for variant in variants:
@@ -201,7 +199,7 @@ def test_sft_profile_key_changes_for_every_workload_shaping_input() -> None:
     )
 
 
-def test_sft_profile_input_payload_hashes_environment_params_and_worker_env() -> None:
+def test_sft_profile_input_payload_hashes_environment_params() -> None:
     payload = sft_profile_input_payload(
         _spec(),
         tokenizer_revision="tokenizer-a",
@@ -211,9 +209,7 @@ def test_sft_profile_input_payload_hashes_environment_params_and_worker_env() ->
 
     assert "private_selector" not in encoded
     assert "not-persisted" not in encoded
-    assert "FLASH_FLA_SM120" not in encoded
     assert "params_sha256" in encoded
-    assert "worker_env_sha256" in encoded
 
 
 def test_sft_profile_contains_only_aggregate_evidence() -> None:

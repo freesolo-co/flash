@@ -1160,7 +1160,6 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
         algorithm="sft",
         seed=7,
         thinking=False,
-        worker_env={},
         workload_profile_input_digest="",
         workload_profile_producer_version=_PROFILE_PRODUCER_VERSION,
         workload_profile={},

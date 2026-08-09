@@ -2468,9 +2468,8 @@ def run_rl_train():
         ):
             raise RuntimeError(
                 f"grpo requested mask_truncated_completions but the verl at {python_bin} does not "
-                "support it. that verl predates the freesolo fork; point FLASH_VERL_PYTHON at an "
-                f"interpreter with '{VERL_REQUIREMENT}' installed, or set it EMPTY under "
-                '[worker_env] as FLASH_VERL_PYTHON = "" to provision one.'
+                "support it. the worker image's baked interpreter predates the freesolo fork; "
+                f"rebuild the worker image with '{VERL_REQUIREMENT}' installed."
             )
         # the shim is appended here rather than with the shims above because the answer needs
         # python_bin, resolved in the block above; sitecustomize is imported by the child, which has
