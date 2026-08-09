@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import pytest
 
-from flash.catalog import ModelInfo
+from flash.core.catalog import ModelInfo
+from flash.core.spec import JobSpec
 from flash.schema import ConfigError, spec_and_train_keys_from_file, spec_from_dict
-from flash.spec import JobSpec
 from tests._helpers.specs import raw_spec as _raw
 
 
@@ -32,8 +32,8 @@ def test_thinking_true_on_hybrid_model():
 def test_thinking_rejected_for_non_thinking_model():
     # No catalog entry is thinking="none" anymore, so inject a temporary one to exercise
     # the "this model can't think" rejection path.
-    from flash import catalog
-    from flash.catalog import ModelInfo
+    from flash.core import catalog
+    from flash.core.catalog import ModelInfo
 
     catalog.MODELS["test/none-think"] = ModelInfo(
         id="test/none-think",
@@ -83,7 +83,7 @@ def test_every_catalog_entry_states_a_thinking_capability():
     admitted the run with a warning instead of a verdict. Every trainable model is now curated and
     states its capability, which is what lets the two hard rejections above BE hard.
     """
-    from flash.catalog import MODELS
+    from flash.core.catalog import MODELS
 
     for model_id, info in MODELS.items():
         assert info.thinking in ("none", "always", "hybrid"), (

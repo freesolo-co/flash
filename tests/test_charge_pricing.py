@@ -75,7 +75,7 @@ def test_cancelled_profile_is_billed_all_or_nothing():
     """
     from dataclasses import replace
 
-    from flash.workload_profile import SFT_PROFILE_KIND
+    from flash.engine.profiling.workload_profile import SFT_PROFILE_KIND
 
     profile = replace(
         _spec(), run_id="profile-sft-abc", workload_profile_kind=SFT_PROFILE_KIND, algorithm="sft"
@@ -150,7 +150,7 @@ def test_actual_steps_run_reads_last_heartbeat_step():
 
 
 def test_cancel_run_prices_mid_training_cancel_at_actual_steps(monkeypatch, tmp_path):
-    from flash.runner import deploy
+    from flash.runner.supervise import deploy
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)
@@ -176,7 +176,7 @@ def test_cancel_run_prices_mid_training_cancel_at_actual_steps(monkeypatch, tmp_
 
 
 def test_cancel_run_before_any_step_is_free(monkeypatch, tmp_path):
-    from flash.runner import deploy
+    from flash.runner.supervise import deploy
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)

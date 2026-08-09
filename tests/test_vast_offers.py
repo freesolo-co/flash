@@ -13,7 +13,7 @@ def _wall_capped_spec(max_wall_seconds: float):
     """
     from dataclasses import replace
 
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     spec = JobSpec.from_dict(
         {

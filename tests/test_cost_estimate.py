@@ -144,7 +144,7 @@ def test_estimate_honors_exact_gpu_instead_of_cheaper_fit():
 def test_selected_candidate_replaces_the_provisional_quote(monkeypatch):
     from flash.providers import allocator, get_provider
     from flash.providers.base import Candidate
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda"))
     monkeypatch.setattr(
@@ -212,8 +212,8 @@ def test_estimate_exact_gpu_enforces_provider_support_and_vram():
 
 
 def test_runconfig_from_spec_preserves_gpu_constraints():
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.cost.spec import runconfig_from_spec
-    from flash.spec import GpuSpec, JobSpec, TrainSpec
     from tests._helpers.profile import attach_sft_profile
 
     # the subject is hardware passthrough, not sft pricing; the profile is attached because
@@ -243,8 +243,8 @@ def test_runconfig_from_spec_preserves_gpu_constraints():
     ],
 )
 def test_runconfig_from_spec_preserves_conservative_opd_turn_budget(environment, expected):
+    from flash.core.spec import JobSpec
     from flash.cost.spec import runconfig_from_spec
-    from flash.spec import JobSpec
 
     spec = JobSpec.from_dict(
         {
@@ -593,8 +593,8 @@ def test_the_offline_probe_sizes_a_pinned_catalog_model_by_its_revision(monkeypa
     revision through rather than quoting default-revision weights -- still holds for a pinned
     catalog model, which is the only way to reach revision-specific sizing at all.)
     """
-    import flash.engine.vram as vram
-    from flash.catalog import MODELS
+    import flash.engine.plan.vram as vram
+    from flash.core.catalog import MODELS
     from flash.cost.analytical import _offline_gpu_shape
     from flash.cost.facts import _PINNED_SIZE_MEMO
 

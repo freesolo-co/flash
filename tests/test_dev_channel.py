@@ -1,7 +1,7 @@
 """The dev-channel (`freesolo-flash-dev` / `flash-dev`) derivation and build transforms.
 
 The dev channel is the same source as `freesolo-flash`, built with a single flipped line in
-flash/_channel.py (CHANNEL "prod" -> "dev"). These tests pin both ends of that contract: the
+flash/_internal/channel.py (CHANNEL "prod" -> "dev"). These tests pin both ends of that contract: the
 checked-in source is the prod channel, and the build-time rewrites produce a coherent dev package.
 """
 
@@ -24,7 +24,7 @@ def _load_build_module():
 
 
 def test_checked_in_source_is_prod_channel():
-    from flash import _channel
+    from flash._internal import channel as _channel
     from flash.client import config
 
     assert _channel.CHANNEL == "prod"
@@ -82,9 +82,11 @@ def test_every_hosted_default_flips_with_the_channel():
     import re
 
     build = _load_build_module()
-    dev_channel_src = build.rewrite_channel((REPO_ROOT / "flash" / "_channel.py").read_text())
+    dev_channel_src = build.rewrite_channel(
+        (REPO_ROOT / "flash" / "_internal" / "channel.py").read_text()
+    )
     namespace: dict = {}
-    exec(compile(dev_channel_src, "flash/_channel.py[dev]", "exec"), namespace)
+    exec(compile(dev_channel_src, "flash/_internal/channel.py[dev]", "exec"), namespace)
     dev_channel = namespace["CHANNEL"]
     assert dev_channel == "dev"
 
@@ -111,14 +113,14 @@ def test_every_hosted_default_flips_with_the_channel():
 
 
 def test_dev_channel_marker_derives_dev_names():
-    # Run the real flash/_channel.py through the build rewrite and confirm everything that differs
+    # Run the real flash/_internal/channel.py through the build rewrite and confirm everything that differs
     # between channels (CLI name, dist name, and thus the default URL) flips together.
     build = _load_build_module()
-    channel_src = (REPO_ROOT / "flash" / "_channel.py").read_text()
+    channel_src = (REPO_ROOT / "flash" / "_internal" / "channel.py").read_text()
     dev_src = build.rewrite_channel(channel_src)
 
     namespace: dict = {}
-    exec(compile(dev_src, "flash/_channel.py[dev]", "exec"), namespace)
+    exec(compile(dev_src, "flash/_internal/channel.py[dev]", "exec"), namespace)
     assert namespace["CHANNEL"] == "dev"
     assert namespace["CLI_NAME"] == "flash-dev"
     assert namespace["DIST_NAME"] == "freesolo-flash-dev"
@@ -177,8 +179,8 @@ def test_no_build_flips_channel_and_pyproject_together(tmp_path):
     channel-only flip would point that lookup at a distribution name nothing installed,
     silently downgrading __version__ to "0+unknown" in the built image."""
     build = _load_build_module()
-    (tmp_path / "flash").mkdir()
-    channel_path = tmp_path / "flash" / "_channel.py"
+    (tmp_path / "flash" / "_internal").mkdir(parents=True)
+    channel_path = tmp_path / "flash" / "_internal" / "channel.py"
     channel_path.write_text('CHANNEL = "prod"\n')
     pyproject_path = tmp_path / "pyproject.toml"
     pyproject_path.write_text(

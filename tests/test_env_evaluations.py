@@ -577,7 +577,7 @@ def test_env_eval_refuses_a_pinned_step_whose_run_lost_its_verified_ledger(
     """The exemption above is `failed` only, because that is the state that spares the ledger.
 
     `mark_deployment_revocation_failed` and the undeploy paths call
-    `invalidate_verified_adapter_revisions` (`flash/runner/deploy.py`), so under those states there
+    `invalidate_verified_adapter_revisions` (`flash/runner/supervise/deploy.py`), so under those states there
     is no ledger left for `RUN/step-N` to resolve against and every case 409s -- the wasted suite of
     generation failures this check exists to avoid. Exempting every terminal state for a pinned step
     let `revocation_failed` through.
@@ -1067,7 +1067,7 @@ def test_env_eval_preflight_never_shows_the_plane_key_to_the_hosted_api(monkeypa
     ownership lookup against the hosted backend would leak it (SELF_HOSTING.md) -- and be rejected,
     breaking `flash env eval` for every self-hosted operator.
     """
-    from flash.cli.env_eval import _require_accessible_project
+    from flash.cli.commands.env.eval import _require_accessible_project
 
     monkeypatch.setattr(
         "flash.client.config.load_credentials", lambda: ("http://127.0.0.1:8080", "operator-key")
@@ -1083,7 +1083,7 @@ def test_env_eval_preflight_never_shows_the_plane_key_to_the_hosted_api(monkeypa
 
 def test_env_eval_preflight_still_resolves_ownership_when_hosted(monkeypatch) -> None:
     """The hosted path keeps its real accessibility check, so an inaccessible project still refuses."""
-    from flash.cli.env_eval import _require_accessible_project
+    from flash.cli.commands.env.eval import _require_accessible_project
     from flash.client import ApiError, ClientError
 
     monkeypatch.setattr(
@@ -2152,7 +2152,7 @@ def test_env_eval_is_an_org_binding_command(monkeypatch, tmp_path, capsys) -> No
     # FREESOLO_API_KEY belonging to another org has to be reported BEFORE the paid requests run, not
     # discovered at upload time with the whole evaluation already spent.
     from flash.cli import _ORG_BINDING_COMMANDS
-    from flash.cli.env_eval import cmd_env_eval
+    from flash.cli.commands.env.eval import cmd_env_eval
 
     assert cmd_env_eval in _ORG_BINDING_COMMANDS
 
@@ -2233,14 +2233,14 @@ def test_env_eval_abort_does_not_hold_the_process_open(tmp_path) -> None:
     driver = tmp_path / "abort_driver.py"
     driver.write_text(
         "import argparse, threading, sys\n"
-        "from flash.cli.env_eval import _generate_concurrently\n"
+        "from flash.cli.commands.env.eval import _generate_concurrently\n"
         "release = threading.Event()\n"
         "def chat(*a, **k):\n"
         # stands in for a generation still streaming when the user aborts. a real one blocks on
         # the client's 30-minute read timeout; 300s is far past any plausible clean exit.
         "    release.wait(timeout=300)\n"
         "    return 'late'\n"
-        "import flash.cli.env_eval as env_eval\n"
+        "import flash.cli.commands.env.eval as env_eval\n"
         "env_eval._generate_case = chat\n"
         # the fan-out settles the step-selector capability on this thread first, so the client
         # has to answer that call; 't' carries no step, so the real one does nothing here.
@@ -2271,7 +2271,7 @@ def test_case_ids_stay_unique_when_an_id_looks_like_a_disambiguated_one() -> Non
     # until it is free. cases `a`, `a`, `a#2` resolved to `a`, `a#2`, `a#2` and reintroduced
     # the very collision `_case_ids` exists to remove: the upload pairs positionally, but the
     # printed report and the recorded case ids still showed one label for two graded cases.
-    from flash.cli.env_eval import _case_ids
+    from flash.cli.commands.env.eval import _case_ids
 
     def ids(*case_ids):
         return _case_ids([EvalCase(id=case_id, input="x") for case_id in case_ids])
@@ -2339,7 +2339,7 @@ def test_env_eval_reports_the_whole_completion_it_graded() -> None:
     # the strip itself is covered by `test_env_eval_strips_reasoning_only_for_a_thinking_run`;
     # what is pinned here is that the two views stay distinct rather than the stripped answer
     # overwriting the record.
-    from flash.cli.env_eval import _score_case
+    from flash.cli.commands.env.eval import _score_case
 
     seen: list[str] = []
 
@@ -3027,7 +3027,7 @@ def _stub_pil(monkeypatch, mime: str = "image/png") -> None:
     module.Image = image_module
     monkeypatch.setitem(sys.modules, "PIL", module)
     monkeypatch.setitem(sys.modules, "PIL.Image", image_module)
-    monkeypatch.setattr("flash.multimodal._is_pil_image", lambda _value: False)
+    monkeypatch.setattr("flash.content.multimodal._is_pil_image", lambda _value: False)
 
 
 def test_env_eval_sends_a_top_level_image_the_prompt_never_mentions(monkeypatch, tmp_path) -> None:
@@ -3039,7 +3039,7 @@ def test_env_eval_sends_a_top_level_image_the_prompt_never_mentions(monkeypatch,
     message, which is how training sees it, and sending prompt_messages() unchanged would lose it
     with no error at all.
     """
-    from flash.cli.env_eval import _case_messages
+    from flash.cli.commands.env.eval import _case_messages
 
     _stub_pil(monkeypatch)
 
@@ -3070,7 +3070,7 @@ def test_env_eval_leaves_a_text_only_prompt_exactly_as_the_environment_built_it(
     # the common path must stay byte-identical: no content-block rewrapping for a text suite, or
     # every existing non-multimodal environment would be graded on a prompt shape it never trained
     # on. this is the half that must NOT change, so it needs no PIL at all.
-    from flash.cli.env_eval import _case_messages
+    from flash.cli.commands.env.eval import _case_messages
 
     class Environment:
         def prompt_messages(self, example):

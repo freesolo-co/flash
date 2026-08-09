@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from flash.engine.recipe import TEACHER_MODELS, resolve_teacher
-from flash.engine.worker.teacher import TeacherClient, TeacherError, TeacherScore
-from flash.engine.worker.teacher_encoding import (
+from flash.engine.plan.recipe import TEACHER_MODELS, resolve_teacher
+from flash.engine.worker.teacher.client import TeacherClient, TeacherError, TeacherScore
+from flash.engine.worker.teacher.encoding import (
     EncodedTeacherToken,
     _byte_piece_offsets,
     _exact_source_spans,
@@ -83,7 +83,7 @@ def _client(response, capture=None):
 
 
 def test_training_guide_lists_only_the_managed_teacher_aliases():
-    guide = (Path(__file__).parents[1] / "flash" / "cli" / "TRAINING.md").read_text()
+    guide = (Path(__file__).parents[1] / "flash" / "cli" / "scaffold" / "TRAINING.md").read_text()
 
     assert "glm-5.2 (default) | kimi-k3 |" in guide
     assert "qwen3.5-397b-a17b | deepseek-v4-pro" in guide

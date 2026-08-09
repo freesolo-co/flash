@@ -13,26 +13,26 @@ import sys
 import time
 from collections.abc import Callable
 
-from flash._logging import get_logger
-from flash.diagnostics import sanitize_diagnostic
-from flash.providers._deadline import (
+from flash._internal.diagnostics import sanitize_diagnostic
+from flash._internal.logging import get_logger
+from flash.providers._lifecycle.deadline import (
     deadline_kwargs,
     remaining_seconds,
     require_create_allowance,
     require_deadline_at,
 )
-from flash.providers._hf_artifacts import (
-    error_artifact_name,
-    heartbeat_reader_for,
-    make_hf_text_reader,
-)
-from flash.providers._instance_poll import InstancePollAdapter, poll_instance_job
-from flash.providers._poll import (
+from flash.providers._lifecycle.poll import (
     FIRST_LIVENESS_S,
     LOAD_TIMEOUT_S,
     SETUP_GRACE_S,
     STALL_AFTER_S,
     make_say,
+)
+from flash.providers._lifecycle.poll_instance import InstancePollAdapter, poll_instance_job
+from flash.providers.artifacts.hf import (
+    error_artifact_name,
+    heartbeat_reader_for,
+    make_hf_text_reader,
 )
 from flash.providers.base import (
     GPU_INFO,
@@ -336,7 +336,7 @@ def deploy_and_submit(
 
     Try five ranked offers, then refresh once while excluding machines already tried.
     """
-    from flash.spec import gpu_count_of
+    from flash.core.spec import gpu_count_of
 
     say = make_say(log)
     absolute_deadline = require_deadline_at(deadline_at)
@@ -629,7 +629,7 @@ def submit_run_vast(
         raise vast_api.VastApiError(
             f"submit_run_vast needs a concrete gpu class, got {spec.gpu.type!r}"
         )
-    from flash.spec import gpu_count_of
+    from flash.core.spec import gpu_count_of
 
     absolute_deadline = require_deadline_at(deadline_at)
     info = GPU_INFO[spec.gpu.type]

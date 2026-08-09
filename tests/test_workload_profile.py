@@ -5,8 +5,8 @@ from dataclasses import replace
 
 import pytest
 
-from flash.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
-from flash.workload_profile import (
+from flash.core.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
+from flash.engine.profiling.workload_profile import (
     SftWorkloadProfile,
     sft_profile_input_digest,
     sft_profile_input_payload,
@@ -133,7 +133,7 @@ def test_content_digest_covers_every_measured_field() -> None:
 
 
 def test_sample_policy_must_describe_the_rows_the_profile_measured() -> None:
-    from flash.workload_profile import sft_sample_policy
+    from flash.engine.profiling.workload_profile import sft_sample_policy
 
     assert sft_sample_policy(0) == "exact-full"
     assert sft_sample_policy(None) == "exact-full"

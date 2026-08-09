@@ -253,8 +253,8 @@ def test_config_defaults_gpu_to_auto():
 
 
 def test_build_worker_env():
-    from flash.providers.runpod.train import build_worker_env
-    from flash.spec import JobSpec, TrainSpec
+    from flash.core.spec import JobSpec, TrainSpec
+    from flash.providers.runpod.serverless import build_worker_env
 
     spec = JobSpec(
         run_id="r1",
@@ -274,8 +274,8 @@ def test_grpo_kv_floor_escalates_large_group_long_context():
     """vLLM KV-cache init preflight: a rollout whose concurrent-group KV cannot fit under the
     colocate utilization cap on a small card must size onto a bigger one — previously such runs
     passed preflight and died at vLLM init with 'No available memory for the cache blocks'."""
-    from flash.catalog import MODELS
-    from flash.engine.vram import grpo_kv_floor_gb, model_required_vram_gb
+    from flash.core.catalog import MODELS
+    from flash.engine.plan.vram import grpo_kv_floor_gb, model_required_vram_gb
 
     info = MODELS["Qwen/Qwen3.5-4B"]
     floor = grpo_kv_floor_gb(
@@ -305,8 +305,8 @@ def test_opd_kv_floor_keeps_the_bf16_floor_for_a_gdn_hybrid():
     onto a card that cannot hold it -- it then OOMs at rollout init on a paid GPU. Every model in
     the flash catalog is currently a GDN hybrid, so the routed requirement must be the bf16 floor.
     """
-    from flash.catalog import MODELS
-    from flash.engine.vram import grpo_kv_floor_gb, model_required_vram_gb
+    from flash.core.catalog import MODELS
+    from flash.engine.plan.vram import grpo_kv_floor_gb, model_required_vram_gb
     from flash.providers.base import max_non_fp8_kv_vram_gb
 
     info = MODELS["Qwen/Qwen3.5-2B"]
@@ -343,8 +343,8 @@ def test_opd_kv_floor_keeps_the_bf16_floor_for_a_gdn_hybrid():
 
 
 def test_35b_expert_lora_shapes_and_multicard_sizing():
-    from flash.catalog import MODELS
-    from flash.engine.vram import model_required_vram_gb
+    from flash.core.catalog import MODELS
+    from flash.engine.plan.vram import model_required_vram_gb
     from flash.providers.base import UnsupportedGpuError, provisional_gpu
 
     model_id = "Qwen/Qwen3.6-35B-A3B"
@@ -384,8 +384,8 @@ def test_35b_expert_lora_shapes_and_multicard_sizing():
 
 
 def test_pinned_revision_retains_calibrated_vram_floors(monkeypatch):
-    from flash.catalog import MODELS
-    from flash.engine import vram
+    from flash.core.catalog import MODELS
+    from flash.engine.plan import vram
 
     info = MODELS["Qwen/Qwen3.6-35B-A3B"]
     monkeypatch.setattr(

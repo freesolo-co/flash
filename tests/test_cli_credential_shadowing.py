@@ -16,9 +16,9 @@ import pytest
 import flash.cli as cli
 import flash.client.config as client_config
 from flash.cli.commands import cmd_train, cmd_whoami
-from flash.cli.env_eval import cmd_env_eval
-from flash.cli.env_setup import cmd_env_setup
-from flash.cli.traces import cmd_traces_export
+from flash.cli.commands.env.eval import cmd_env_eval
+from flash.cli.commands.env.setup import cmd_env_setup
+from flash.cli.commands.traces import cmd_traces_export
 
 
 def _patch_saved_key(monkeypatch, saved: str | None) -> None:

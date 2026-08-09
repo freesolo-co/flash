@@ -6,7 +6,7 @@ from typing import ClassVar
 
 import pytest
 
-from flash.workload_profile import (
+from flash.engine.profiling.workload_profile import (
     MIN_TRUSTWORTHY_ROLLOUTS,
     ROLLOUT_LATENCY_MAX_AGE_S,
     RolloutWorkloadProfile,

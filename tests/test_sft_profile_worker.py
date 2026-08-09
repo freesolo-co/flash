@@ -21,8 +21,8 @@ from dataclasses import replace
 
 import pytest
 
-from flash.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
-from flash.workload_profile import SFT_PROFILE_KIND, sft_profile_input_digest
+from flash.core.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
+from flash.engine.profiling.workload_profile import SFT_PROFILE_KIND, sft_profile_input_digest
 
 _PRODUCER_VERSION = "9.9.9"
 
@@ -109,8 +109,8 @@ def profile_worker(monkeypatch):
     an offline run would fail these tests for a reason that has nothing to do with what they assert.
     """
     import flash.engine.worker as worker
-    from flash.engine import sft_workload
-    from flash.engine.worker import sft_profile
+    from flash.engine.profiling import sft_workload
+    from flash.engine.worker.entry import profile as sft_profile
 
     monkeypatch.setattr(
         sft_workload,
@@ -256,7 +256,7 @@ def test_profile_seeds_after_loading_the_environment_like_training_does(
     the digests match whichever way round it is, so a test comparing them cannot fail.
     """
     import flash.engine.worker as worker
-    from flash.engine.worker import sft_profile
+    from flash.engine.worker.entry import profile as sft_profile
 
     order: list[str] = []
 

@@ -2,7 +2,7 @@
 
 from importlib.metadata import version as _dist_version
 
-from flash._channel import DIST_NAME as _DIST_NAME
+from flash._internal.channel import DIST_NAME as _DIST_NAME
 
 __all__ = ["__version__"]
 

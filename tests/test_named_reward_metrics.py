@@ -1,6 +1,6 @@
 import inspect
 
-from flash.engine.worker.heartbeat import RewardObservabilityBuffer
+from flash.engine.worker.io.heartbeat import RewardObservabilityBuffer
 from flash.engine.worker.rl_train import run_rl_train, score_single_turn
 
 

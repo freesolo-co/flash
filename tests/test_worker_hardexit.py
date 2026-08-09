@@ -140,7 +140,7 @@ def test_worker_hard_exits_zero_on_success(monkeypatch):
 
 
 def test_worker_rejects_sft_adapter_continuation_before_handler(monkeypatch):
-    from flash.spec import JobSpec, TrainSpec
+    from flash.core.spec import JobSpec, TrainSpec
 
     _patch_common(monkeypatch, lambda code=0: None)
     monkeypatch.setattr(
