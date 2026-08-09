@@ -10,9 +10,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from flash._internal.channel import CLI_NAME
 from flash.cli.commands import render
 from flash.client import ClientError, export_trace_records, list_trace_projects
 from flash.client.config import load_credentials
+from flash.client.http import has_freesolo_backend
 
 DEFAULT_EXPORT_PATH = Path("dataset/train.jsonl")
 # raw rows are not a dataset. load_freesolo_environment auto-selects
@@ -32,8 +34,15 @@ def default_output_path(export_format: str) -> Path:
     return RAW_EXPORT_PATH if export_format == RAW_FORMAT else DEFAULT_EXPORT_PATH
 
 
-def _require_api_key() -> str:
-    _api_url, api_key = load_credentials()
+def _require_api_key(api_key: str | None) -> str:
+    """The key from a credential snapshot the caller already read, or the logged-out refusal.
+
+    Takes the key instead of reading the config itself so that a caller which decided something
+    from a snapshot -- `cmd_traces_export` deciding on the url -- sends the key from that SAME
+    read. Re-reading here would let a `flash login` landing in between pair a hosted-url decision
+    with a newly stored self-hosted plane credential and send that credential to the hosted
+    backend, including for a caller whose snapshot had already established there was no key.
+    """
     if not api_key:
         raise ClientError(
             "not logged in. Run `flash login` with your freesolo API key (or set FREESOLO_API_KEY)"
@@ -66,15 +75,18 @@ def fetch_records(
     api_key: str | None = None,
     export_format: str = RECORDS_FORMAT,
 ) -> dict:
-    """A project's traces in the requested shape, converted server-side."""
-    return export_trace_records(
-        project_id, api_key or _require_api_key(), export_format=export_format
-    )
+    """A project's traces in the requested shape, converted server-side.
+
+    Omitting `api_key` reads the stored credential, which is right for `env_setup`'s call: it holds
+    no snapshot this key has to agree with.
+    """
+    key = _require_api_key(api_key or load_credentials()[1])
+    return export_trace_records(project_id, key, export_format=export_format)
 
 
-def fetch_projects(api_key: str | None = None) -> list[dict]:
+def fetch_projects(api_key: str) -> list[dict]:
     """Projects in the caller's org that traces can be exported from."""
-    return list_trace_projects(api_key or _require_api_key())
+    return list_trace_projects(api_key)
 
 
 def _resolve_project_id(args, api_key: str) -> str:
@@ -131,7 +143,27 @@ def _empty_export_error(project_id: str, export_format: str) -> ClientError:
 
 
 def cmd_traces_export(args) -> int:
-    api_key = _require_api_key()
+    from flash.cli.commands import unavailable_without_a_freesolo_backend
+
+    # one snapshot for both: the url decides whether to refuse, and the key from that same read is
+    # what gets sent, so a concurrent `flash login` cannot pair this url with a later credential.
+    api_url, snapshot_key = load_credentials()
+    if not has_freesolo_backend(api_url):
+        # unlike `projects create`, there is nothing local to substitute: traces are written by the
+        # freesolo SDK into the hosted backend, and flash itself never records one. so a
+        # self-hosted plane has no trace store to read, not merely no route to it.
+        raise unavailable_without_a_freesolo_backend(
+            "exporting traces",
+            because=(
+                "traces are recorded by the freesolo SDK into the hosted backend, which a "
+                "self-hosted plane does not have"
+            ),
+            instead=(
+                'write the same {"input", "output"} JSONL rows yourself and train on them '
+                f"directly (`{CLI_NAME} env setup` scaffolds the format)"
+            ),
+        )
+    api_key = _require_api_key(snapshot_key)
     project_id = _resolve_project_id(args, api_key)
     export_format = getattr(args, "format", None) or RECORDS_FORMAT
 

@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from flash import __version__
@@ -27,6 +28,7 @@ from flash.client.config import (
     load_credentials_with_source,
     shadowed_login_warning,
 )
+from flash.client.http import has_freesolo_backend
 from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
 from flash.core.catalog import public_model_rows
@@ -94,6 +96,18 @@ def cmd_version(args) -> int:
     else:
         print(f"{CLI_NAME} {__version__}")
     return 0
+
+
+def unavailable_without_a_freesolo_backend(what: str, *, because: str, instead: str) -> ClientError:
+    """The refusal for a command backed only by the hosted Freesolo backend.
+
+    These commands are pure client->api.freesolo.co calls that never touch the plane. Left alone
+    they send the operator's plane credential to a service they have no relationship with, which
+    answers 401 -- the same failure `flash env setup` hit on the documented quickstart. Naming the
+    reason and the way forward is what separates "not built for your deployment" from "your key is
+    wrong", which is what a bare 401 says.
+    """
+    return ClientError(f"{what} is not available on a self-hosted plane: {because}. {instead}.")
 
 
 def _verifies_against_freesolo(api_url: str, freesolo_url: str | None) -> bool:
@@ -194,11 +208,17 @@ def cmd_whoami(args) -> int:
 def cmd_projects_create(args) -> int:
     from flash.client import create_project
 
-    _api_url, api_key = load_credentials()
-    if not api_key:
-        raise ClientError("not logged in. Run `flash login` before creating a project")
-    result = create_project(args.name, getattr(args, "description", None), api_key)
-    project_id = result["id"]
+    api_url, api_key = load_credentials()
+    if not has_freesolo_backend(api_url):
+        # no directory to create a row in, and none needed: the plane accepts any well-shaped
+        # uuid (server/projects.py under standalone()), so minting one locally IS the create.
+        project_id = str(uuid.uuid4())
+    else:
+        if not api_key:
+            raise ClientError("not logged in. Run `flash login` before creating a project")
+        project_id = create_project(args.name, getattr(args, "description", None), api_key)["id"]
+
+    # both ids are reported the same way: where it came from is the only difference above.
     if render.styled():
         print(render.project_created(project_id, str(args.name).strip()))
     else:
@@ -209,7 +229,16 @@ def cmd_projects_create(args) -> int:
 def cmd_projects_list(args) -> int:
     from flash.client import list_projects
 
-    _api_url, api_key = load_credentials()
+    api_url, api_key = load_credentials()
+    if not has_freesolo_backend(api_url):
+        raise unavailable_without_a_freesolo_backend(
+            "listing projects",
+            because="a self-hosted plane keeps no project directory to enumerate",
+            instead=(
+                f"`{CLI_NAME} projects create <name>` mints a project id you record yourself; "
+                "any id you already use in a config keeps working"
+            ),
+        )
     if not api_key:
         raise ClientError("not logged in. Run `flash login` before listing projects")
     projects = list_projects(api_key)
