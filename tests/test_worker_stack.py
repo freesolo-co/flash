@@ -2237,3 +2237,13 @@ def test_grpo_and_opd_do_not_launch_into_the_unrunnable_padded_fallback():
         "an exact-unpacked run would fail runs that are already boundary-safe at "
         "examples_per_update=1, and dropping the condition entirely would let a packed run through."
     )
+    # the OTHER half of that condition has to come from the frozen profile, not from a re-probe.
+    # `model_is_gdn_hybrid` swallows a failed hub/cache read and answers False, so deriving
+    # `gdn_hybrid` from it alone lets a transient failure turn the gate above into dead code on a
+    # profile that is already packed -- resets skipped, shim not installed, state bleeding across
+    # packed neighbours, and nothing raised. the profile's label was frozen by a raising probe.
+    assert 'profile.architecture_mode == "gdn-hybrid"' in sft_src, (
+        "the sft gdn decision no longer consults the frozen profile.architecture_mode. it must, "
+        "because model_is_gdn_hybrid returns False on a transient config-read failure: that would "
+        "silently skip the packed-boundary reset requirement instead of failing closed."
+    )

@@ -1103,7 +1103,15 @@ def run_sft_train(spec=None) -> None:
         # accept and discard them. probe before packing, otherwise use boundary-correct padded input.
         # resolve the modeling module in the parent to avoid repeating the hub/cache read; empty means
         # non-hybrid.
-        gdn_hybrid = model_is_gdn_hybrid(model_id, model_revision)
+        #
+        # the PROFILE is authoritative for "is this a gdn hybrid": it was frozen by a RAISING probe
+        # (see `_packing_mode`), while `model_is_gdn_hybrid` swallows a failed hub/cache read and
+        # answers False. trusting the swallow alone would let a transient failure skip the
+        # boundary-reset requirement below on an already-packed profile -- the one combination that
+        # trains across example boundaries unprotected.
+        gdn_hybrid = profile.architecture_mode == "gdn-hybrid" or model_is_gdn_hybrid(
+            model_id, model_revision
+        )
         gdn_module = gdn_probe_module(model_id, model_revision) if gdn_hybrid else ""
         # ONE child answers every independent capability question. each used to cost its own
         # interpreter, and the torch/verl import -- not the question -- was the price.
