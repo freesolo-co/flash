@@ -3848,6 +3848,13 @@ def _capability_resolve(
     monkeypatch.setattr(_PkgW, "load_tokenizer", lambda *a, **k: _Tokenizer(), raising=False)
     monkeypatch.setattr(rl_train, "seed_training_rngs", lambda seed: None)
     monkeypatch.setattr(rl_train, "model_max_position_embeddings", lambda *a, **k: 32768)
+    # offline: the multi_turn branch reads the model's config + generation_config to build the
+    # halting set. Those are local_files_only reads, but they still need the model in the hf cache,
+    # so on a machine without one (a clean CI runner) they raise instead of resolving. The tests
+    # using this helper assert on turn/agent-loop wiring, not on which ids halt a rollout.
+    monkeypatch.setattr(
+        rl_train, "generation_eos_from_cached_config", lambda *a, **k: frozenset({151645})
+    )
     return rl_train._resolve_grpo_inputs()
 
 

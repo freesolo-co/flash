@@ -81,13 +81,17 @@ jobs:
           echo "All matrix legs passed."
 
   typecheck:
-    name: mypy (non-blocking)
+    name: mypy (advisory)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # mypy is configured in pyproject but has never been enforced, and currently reports 352
-    # errors across 75 files. Running it non-blocking makes that debt visible on every PR
-    # without turning an unrelated contribution red; flip this to a hard gate once it is clean.
-    continue-on-error: true
+    # errors across 75 files. This job REPORTS that debt on every PR without gating anything:
+    # flip the `|| true` below into a hard failure once the count reaches zero.
+    #
+    # `continue-on-error` alone is not enough -- it stops the job from blocking the run, but the
+    # check still renders red in the PR's check list, which is indistinguishable from a real
+    # failure to a contributor. Swallowing the exit code and printing the count keeps the check
+    # green while the errors stay visible in the job log and the step summary.
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -100,4 +104,18 @@ jobs:
         run: uv sync --extra server --dev
 
       - name: mypy
-        run: uv run mypy flash
+        run: |
+          # --no-color-output: mypy colorizes when it detects a tty-like sink, and the escape
+          # codes break any grep over the result. Report mypy's own total line rather than
+          # recounting error lines, so the summary cannot disagree with the tool.
+          uv run mypy --no-color-output flash > mypy.out 2>&1 || true
+          cat mypy.out
+          {
+            echo "### mypy (advisory)"
+            echo
+            echo '```'
+            grep -E '^(Found|Success)' mypy.out || echo "mypy produced no summary line"
+            echo '```'
+            echo
+            echo "This job reports type errors; it does not gate merges."
+          } >> "$GITHUB_STEP_SUMMARY"
