@@ -890,14 +890,23 @@ def _attach_rollout_workload_profile(spec: JobSpec, evidence: object) -> JobSpec
         return spec
     from flash.server.domain.rollout_evidence import rollout_profile_from_evidence
 
+    # pin the environment ref->sha BEFORE validating. to_dict() strips resolved_sha as a
+    # platform-managed key and the public schema rejects a caller who authors it, so a spec that
+    # arrived over the wire always has "" here. rollout_profile_from_evidence refuses an unpinned
+    # environment, so validating first would reject every real managed submit and silently cap-price
+    # it -- the measurement would never move a quote in production. _assign_resolved_env_sha is
+    # best-effort and returns the spec untouched when GitHub cannot be reached, which just puts us
+    # back on the fail-open path below.
+    pinned = _assign_resolved_env_sha(spec)
+
     profile = rollout_profile_from_evidence(
-        spec,
+        pinned,
         evidence,
         producer_version=_profile_producer_version(),
     )
     if not profile:
         return spec
-    return replace(spec, workload_profile=profile)
+    return replace(pinned, workload_profile=profile)
 
 
 def _require_sft_workload_profile(spec: JobSpec) -> JobSpec:

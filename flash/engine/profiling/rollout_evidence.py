@@ -37,7 +37,7 @@ DEFAULT_PROMPTS = 8
 def collect_rollout_evidence(
     *,
     model: str,
-    prompts: Sequence[str],
+    prompts: Sequence[Sequence[dict]],
     max_completion_tokens: int,
     temperature: float | None,
     rollouts: int = DEFAULT_ROLLOUTS,

@@ -61,6 +61,13 @@ def _collect(client, spec) -> dict[str, Any] | None:
         dataset = environment.dataset()
         if not dataset:
             return None
+        # the grpo and opd workers fence the training population to a max_examples prefix
+        # (rl_train.py and opd_train.py both do `train = train[:max_examples]`). measuring outside
+        # that fence would sample rows the run never consumes, and with a small max_examples those
+        # rows could set the whole measured length and grading latency.
+        dataset = _training_population(spec, dataset)
+        if not dataset:
+            return None
 
         prompts = _prompts_from(environment, dataset)
         if not prompts:
@@ -77,37 +84,58 @@ def _collect(client, spec) -> dict[str, Any] | None:
         )
 
 
-def _prompts_from(environment, dataset) -> list[str]:
-    """prompt text of the first distinct rows, rendered by the env's own prompt builder.
+def _training_population(spec, dataset):
+    """the dataset prefix training will actually consume, mirroring the workers' own fence."""
+    max_examples = int(getattr(spec.train, "max_examples", 0) or 0)
+    if max_examples > 0:
+        return dataset[:max_examples]
+    return dataset
+
+
+def _prompts_from(environment, dataset) -> list[list[dict]]:
+    """chat prompts of the first distinct rows, as the env's own prompt builder returns them.
 
     uses ``prompt_messages`` rather than the raw ``input`` field so the sampled prompt carries the
     system turn and any templating the env applies. that is what sets prompt length, and prompt
     length is half of what this profile measures.
+
+    the message list is passed through with its ROLES INTACT rather than flattened into one user
+    turn: the worker sends what prompt_messages returns, and collapsing a system turn changes both
+    chat-template tokenization and how the model answers, so a flattened sample would describe a
+    different distribution than the run being quoted.
     """
-    prompts: list[str] = []
+    prompts: list[list[dict]] = []
     for example in dataset[:_PROMPT_ROWS]:
         try:
             messages = environment.prompt_messages(example)
         except Exception:
             continue
-        text = _messages_to_text(messages)
-        if text:
-            prompts.append(text)
+        usable = _chat_messages(messages)
+        if usable:
+            prompts.append(usable)
     return prompts
 
 
-def _messages_to_text(messages) -> str:
-    """flatten a chat prompt to the user text the sampler sends."""
+def _chat_messages(messages) -> list[dict]:
+    """the message list as an openai-compatible payload, or [] when it is not one.
+
+    only string content is kept: a multimodal part list is a different measurement problem, and a
+    prompt this cannot represent faithfully is better dropped than sent in a shape the run will not
+    use -- dropping returns the quote to the cap, sending would price a distribution that is not
+    the run's.
+    """
     if not isinstance(messages, list):
-        return ""
-    parts: list[str] = []
+        return []
+    out: list[dict] = []
     for message in messages:
         if not isinstance(message, dict):
-            continue
+            return []
+        role = message.get("role")
         content = message.get("content")
-        if isinstance(content, str) and content.strip():
-            parts.append(content)
-    return "\n\n".join(parts).strip()
+        if not isinstance(role, str) or not isinstance(content, str) or not content.strip():
+            return []
+        out.append({"role": role, "content": content})
+    return out
 
 
 def _reward_inputs(environment, dataset, assistant_completion_text):

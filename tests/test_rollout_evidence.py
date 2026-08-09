@@ -15,6 +15,7 @@ import pytest
 
 import flash
 from flash.core.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
+from flash.engine.profiling import rollout_sampler
 from flash.engine.profiling.rollout_sampler import (
     RolloutSample,
     RolloutSampling,
@@ -76,14 +77,14 @@ def test_sampling_spreads_draws_across_distinct_prompts_before_repeating_one(mon
     """
     seen: list[str] = []
 
-    def _fake(*, model, prompt, max_completion_tokens, temperature, base_url, api_key):
-        seen.append(prompt)
+    def _fake(*, model, messages, max_completion_tokens, temperature, base_url, api_key):
+        seen.append(messages[-1]["content"])
         return RolloutSample(prompt_tokens=10, completion_tokens=40, truncated=False)
 
     monkeypatch.setattr(
         "flash.engine.profiling.rollout_sampler._one_completion", _fake, raising=True
     )
-    prompts = [f"p{i}" for i in range(4)]
+    prompts = [[{"role": "user", "content": f"p{i}"}] for i in range(4)]
     sampling = sample_rollouts(
         model="m",
         prompts=prompts,
@@ -114,7 +115,7 @@ def test_a_failed_draw_is_counted_not_raised(monkeypatch):
     )
     sampling = sample_rollouts(
         model="m",
-        prompts=["p"],
+        prompts=[[{"role": "user", "content": "p"}]],
         rollouts=4,
         max_completion_tokens=512,
         temperature=None,
@@ -123,6 +124,131 @@ def test_a_failed_draw_is_counted_not_raised(monkeypatch):
     )
     assert sampling.completed == 2
     assert sampling.failures == 2
+
+
+def test_a_stalling_endpoint_stops_the_sample_instead_of_delaying_the_submit(monkeypatch):
+    """The draws are serial and a user is waiting on the submit behind them.
+
+    Without a cutoff, an endpoint that accepts connections but never answers burns the per-request
+    timeout on every draw -- 32 x 180s -- for a measurement that is advisory anyway.
+    """
+    calls = {"n": 0}
+
+    def _always_fails(**_kwargs):
+        calls["n"] += 1
+
+    monkeypatch.setattr(
+        "flash.engine.profiling.rollout_sampler._one_completion", _always_fails, raising=True
+    )
+    sampling = sample_rollouts(
+        model="m",
+        prompts=[[{"role": "user", "content": "p"}]],
+        rollouts=32,
+        max_completion_tokens=512,
+        temperature=None,
+        base_url="https://example.invalid/v1",
+        api_key="k",
+    )
+    assert calls["n"] == rollout_sampler.MAX_CONSECUTIVE_FAILURES
+    assert sampling.completed == 0
+
+
+def test_the_failure_cutoff_counts_consecutive_draws_not_total(monkeypatch):
+    """A flaky endpoint that still answers must be sampled to completion, not abandoned."""
+    calls = {"n": 0}
+
+    def _every_other(**_kwargs):
+        calls["n"] += 1
+        if calls["n"] % 2:
+            return None
+        return RolloutSample(prompt_tokens=10, completion_tokens=40, truncated=False)
+
+    monkeypatch.setattr(
+        "flash.engine.profiling.rollout_sampler._one_completion", _every_other, raising=True
+    )
+    sampling = sample_rollouts(
+        model="m",
+        prompts=[[{"role": "user", "content": "p"}]],
+        rollouts=20,
+        max_completion_tokens=512,
+        temperature=None,
+        base_url="https://example.invalid/v1",
+        api_key="k",
+    )
+    assert calls["n"] == 20, "an answering endpoint must not trip the cutoff"
+    assert sampling.completed == 10
+
+
+@pytest.mark.parametrize("finish", ["content_filter", "tool_calls", "", None, "unknown"])
+def test_a_draw_that_did_not_end_naturally_is_not_an_eos_sample(finish, monkeypatch):
+    """Only "stop" is a natural end.
+
+    A filtered or tool-call completion stopped for a reason the training rollout will not reproduce,
+    and is usually short. Counting it as EOS would let such draws pass the trust gate with zero
+    reported truncations and quote a length no rollout produces.
+    """
+    payload = {
+        "usage": {"completion_tokens": 12, "prompt_tokens": 20},
+        "choices": [{"finish_reason": finish}],
+    }
+    assert rollout_sampler._sample_from_response(payload) is None
+
+
+@pytest.mark.parametrize(
+    ("finish", "truncated"),
+    [("stop", False), ("length", True)],
+)
+def test_natural_and_truncated_draws_are_both_kept(finish, truncated):
+    payload = {
+        "usage": {"completion_tokens": 12, "prompt_tokens": 20},
+        "choices": [{"finish_reason": finish}],
+    }
+    sample = rollout_sampler._sample_from_response(payload)
+    assert sample is not None
+    assert sample.truncated is truncated
+
+
+def test_a_system_turn_reaches_the_sampler_as_a_system_turn():
+    """The worker sends what prompt_messages() returns. Flattening a system turn into the user
+    message changes chat-template tokenization and how the model answers, so the sample would
+    describe a different distribution than the run being quoted."""
+    from flash.cli.commands.rollout_profile import _prompts_from
+
+    class _Env:
+        def prompt_messages(self, example):
+            return [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": example["q"]},
+            ]
+
+    prompts = _prompts_from(_Env(), [{"q": "2+2?"}])
+    assert prompts == [
+        [{"role": "system", "content": "be terse"}, {"role": "user", "content": "2+2?"}]
+    ]
+
+
+def test_a_prompt_this_cannot_represent_faithfully_is_dropped_not_reshaped():
+    """A multimodal part-list prompt has no faithful single-string form. Dropping it returns the
+    quote to the cap; sending a reshaped one would price a distribution that is not the run's."""
+    from flash.cli.commands.rollout_profile import _prompts_from
+
+    class _Env:
+        def prompt_messages(self, example):
+            return [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+
+    assert _prompts_from(_Env(), [{"q": "x"}]) == []
+
+
+def test_only_the_rows_training_consumes_are_measured():
+    """grpo and opd both fence the population to a max_examples prefix. Measuring outside that
+    fence samples rows the run never sees, and with a small max_examples those rows could set the
+    whole measured length."""
+    from flash.cli.commands.rollout_profile import _training_population
+
+    spec = _spec(train=TrainSpec(max_steps=50, batch_size=8, group_size=4, max_examples=2))
+    assert _training_population(spec, [1, 2, 3, 4, 5]) == [1, 2]
+    unfenced = _spec()
+    assert _training_population(unfenced, [1, 2, 3, 4, 5]) == [1, 2, 3, 4, 5]
 
 
 def test_summary_reports_the_distribution_not_a_mean_alone():
@@ -397,3 +523,42 @@ def test_the_runner_ignores_rollout_evidence_on_an_sft_spec():
 
     spec = _spec(algorithm="sft", train=TrainSpec(max_steps=50, batch_size=8))
     assert _attach_rollout_workload_profile(spec, _evidence()).workload_profile == {}
+
+
+def test_a_measurement_survives_the_wire_round_trip_a_real_submit_makes(monkeypatch):
+    """The spec the server validates is one the PUBLIC serializer produced, not an in-process one.
+
+    to_dict() strips resolved_sha as a platform-managed key, so a spec that arrived over the wire
+    always carries "" there -- while rollout_profile_from_evidence refuses an unpinned environment.
+    Attaching before the runner pins the ref therefore rejected every real managed submit and
+    silently cap-priced it. Building the spec in-process hides this, because it never loses the pin.
+    """
+    from flash.core.spec import JobSpec
+    from flash.runner import _attach_rollout_workload_profile
+
+    wire = JobSpec.from_dict(_spec().to_dict())
+    assert wire.environment.resolved_sha == "", "to_dict must strip the platform-managed pin"
+
+    monkeypatch.setattr(
+        # _assign_resolved_env_sha imports this in-body, so the defining module is the binding
+        # a patch has to reach; patching flash.runner.artifacts silently hits the real api.
+        "flash.envs.loader._resolve_ref_sha",
+        lambda *a, **k: "c" * 40,
+    )
+    attached = _attach_rollout_workload_profile(wire, _evidence())
+    assert attached.workload_profile, "a measurement must reach the quote on the real submit path"
+
+
+def test_an_unreachable_pin_returns_the_quote_to_the_cap_instead_of_failing(monkeypatch):
+    """Pinning is best-effort: GitHub being unreachable must land on fail-open, never raise."""
+    from flash.core.spec import JobSpec
+    from flash.runner import _attach_rollout_workload_profile
+
+    wire = JobSpec.from_dict(_spec().to_dict())
+
+    def _boom(*a, **k):
+        raise RuntimeError("github unreachable")
+
+    monkeypatch.setattr("flash.envs.loader._resolve_ref_sha", _boom)
+    attached = _attach_rollout_workload_profile(wire, _evidence())
+    assert attached.workload_profile == {}

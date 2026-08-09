@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import statistics
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Sequence
@@ -33,6 +34,16 @@ DEFAULT_ROLLOUT_SAMPLER_BASE_URL = "https://openrouter.ai/api/v1"
 # hung request without cutting off a legitimately long one, whose length is exactly the tail this
 # profile exists to capture.
 REQUEST_TIMEOUT_S = 180.0
+
+# overall ceiling on a sampling pass. the draws are serial and a user is waiting on the submit
+# behind them, so the per-request timeout alone is not a bound: 32 stalled draws would be ~96
+# minutes. an incomplete sample is not a problem -- it fails the trust gate and the quote returns to
+# the declared cap, which is what an unmeasured run was priced at anyway.
+SAMPLING_DEADLINE_S = 300.0
+
+# a stalling or unauthorized endpoint fails identically on every draw. stopping after a few in a row
+# turns a misconfigured sampler into a fast fallback instead of a long wait.
+MAX_CONSECUTIVE_FAILURES = 5
 
 # prompt-mix dominates the variance (measured: between-prompt 304846 vs within-prompt 61082, a word
 # problem running a median 1642 tokens against ~290 for arithmetic), so spread draws across DISTINCT
@@ -115,7 +126,7 @@ def sampler_credentials() -> tuple[str, str]:
 def sample_rollouts(
     *,
     model: str,
-    prompts: Sequence[str],
+    prompts: Sequence[Sequence[dict]],
     rollouts: int,
     max_completion_tokens: int,
     temperature: float | None,
@@ -134,13 +145,22 @@ def sample_rollouts(
     collected: list[RolloutSample] = []
     failures = 0
     used_prompts: set[int] = set()
+    # this runs in front of a submit the user is waiting on, and the draws are serial. an endpoint
+    # that accepts connections but stalls would otherwise burn REQUEST_TIMEOUT_S on every draw
+    # before falling back to cap pricing -- 32 draws x 180s is over an hour of dead wait for a
+    # measurement that is advisory anyway. so the sampling gives up on whichever comes first: an
+    # overall deadline, or enough consecutive failures to show the endpoint is not answering.
+    deadline = time.monotonic() + SAMPLING_DEADLINE_S
+    consecutive_failures = 0
     for index in range(rollouts):
+        if time.monotonic() >= deadline:
+            break
         # round-robin: draw one from every distinct prompt before taking a second from any.
         slot = index % len(prompts)
         used_prompts.add(slot)
         sample = _one_completion(
             model=model,
-            prompt=prompts[slot],
+            messages=prompts[slot],
             max_completion_tokens=max_completion_tokens,
             temperature=temperature,
             base_url=base_url,
@@ -148,8 +168,12 @@ def sample_rollouts(
         )
         if sample is None:
             failures += 1
+            consecutive_failures += 1
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                break
         else:
             collected.append(sample)
+            consecutive_failures = 0
     return RolloutSampling(
         samples=tuple(collected),
         failures=failures,
@@ -160,7 +184,7 @@ def sample_rollouts(
 def _one_completion(
     *,
     model: str,
-    prompt: str,
+    messages: Sequence[dict],
     max_completion_tokens: int,
     temperature: float | None,
     base_url: str,
@@ -169,7 +193,10 @@ def _one_completion(
     """one generation's token counts, or None when the draw failed for any reason."""
     payload: dict[str, object] = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        # the env's own prompt_messages() output, roles intact. flattening a system turn into a
+        # user message would change both chat-template tokenization and model behaviour, so the
+        # sample would describe a different distribution than the one training runs.
+        "messages": [dict(m) for m in messages],
         "max_tokens": int(max_completion_tokens),
     }
     if temperature is not None:
@@ -187,7 +214,11 @@ def _one_completion(
             body = json.load(response)
     except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
         return None
+    return _sample_from_response(body)
 
+
+def _sample_from_response(body: object) -> RolloutSample | None:
+    """token counts for one draw, or None when the response cannot stand as a measurement."""
     usage = body.get("usage") if isinstance(body, dict) else None
     choices = body.get("choices") if isinstance(body, dict) else None
     if not isinstance(usage, dict) or not isinstance(choices, list) or not choices:
@@ -204,8 +235,18 @@ def _one_completion(
     # a truncated draw contributes the CAP rather than its true length, biasing the mean downward --
     # the direction that underbills. counted, so the trust verdict can reject a censored sample
     # rather than report it as a measurement.
+    #
+    # only "stop" is a natural end. a provider can also return "content_filter", "tool_calls", or
+    # an unknown/absent reason, and those completions stopped for a reason the training rollout will
+    # not reproduce -- usually short. treating them as EOS would let 32 filtered draws pass the
+    # trust gate with zero reported truncations and quote a length no rollout produces, so they are
+    # dropped as failed draws instead.
+    if finish == "length":
+        return RolloutSample(
+            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, truncated=True
+        )
+    if finish != "stop":
+        return None
     return RolloutSample(
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        truncated=(finish == "length"),
+        prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, truncated=False
     )

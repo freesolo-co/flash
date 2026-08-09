@@ -696,15 +696,30 @@ def cmd_train(args) -> int:
         # sft additionally required a matching workload profile to get this far, and that profile
         # run already imported environment.py and tokenized the dataset. claiming otherwise here
         # would understate what has been checked -- and what has already been billed.
-        environment = (
-            "your environment.py and the exact dataset were already loaded and tokenized by the "
-            "workload profile this quote is built on; model load and gpu/training are first "
-            "exercised on the worker after cold-start."
-            if spec.algorithm == "sft"
-            else "it did NOT import or run your environment.py; dataset loading, "
-            "start_episode/episode shapes, reward/scorer, worker imports, model load, and "
-            "gpu/training are first exercised on the worker after cold-start."
-        )
+        # three-way, because what has run locally differs per path and the user is told exactly
+        # which. quoting a measured price while claiming nothing was executed would be false.
+        if spec.algorithm == "sft":
+            environment = (
+                "your environment.py and the exact dataset were already loaded and tokenized by "
+                "the workload profile this quote is built on; model load and gpu/training are "
+                "first exercised on the worker after cold-start."
+            )
+        elif rollout_evidence:
+            # measuring the rollout means importing environment.py and calling dataset(),
+            # prompt_messages() and reward() here. the preview must say so: this quote is the
+            # measured one, and a reward that calls a paid external judge was really called.
+            environment = (
+                "your environment.py WAS imported locally to measure this quote: dataset(), "
+                "prompt_messages() and reward() were run on a small sample, so a reward that "
+                "calls an external scorer was really called. worker imports, model load, and "
+                "gpu/training are first exercised on the worker after cold-start."
+            )
+        else:
+            environment = (
+                "it did NOT import or run your environment.py; dataset loading, "
+                "start_episode/episode shapes, reward/scorer, worker imports, model load, and "
+                "gpu/training are first exercised on the worker after cold-start."
+            )
         print(
             "dry-run validated: config/schema, model+algorithm compatibility, lora rank, "
             f"runtime-secret presence, warm-start source, serving context cap, {cost}. "
