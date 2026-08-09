@@ -1168,8 +1168,40 @@ def test_opd_worker_fp8_kv_flag_matches_the_sizing_assumption():
     assert "get_device_capability() >= (8, 9)" in src
 
     # and the override is emitted only when the resolved flag is true, so a bf16 worker never sends
-    # fp8 (an absent key means bf16, which is the conservative direction).
-    assert 'if config.get("fp8_kv")' in inspect.getsource(opd_train.build_opd_overrides)
+    # fp8 (an absent key means bf16, which is the conservative direction). asserted on the emitted
+    # override rather than on the branch's source text, so that splitting the builder into per-
+    # section helpers cannot break the check while the contract still holds.
+    fp8_key = "+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8"
+    config = {
+        "train_files": ["/w/train.parquet"],
+        "val_files": ["/w/val.parquet"],
+        "train_batch_size": 8,
+        "max_prompt_length": 1024,
+        "max_response_length": 512,
+        "max_sequence_length": 1536,
+        "model_path": "/models/student",
+        "lora_rank": 32,
+        "lora_alpha": 64,
+        "target_modules": "all-linear",
+        "learning_rate": 1e-5,
+        "local_dir": "/w/checkpoints",
+        "save_freq": 20,
+        "n_gpus_per_node": 4,
+        "ulysses_sequence_parallel_size": 4,
+        "seed": 42,
+        "project_name": "flash",
+        "experiment_name": "opd-test",
+        "total_training_steps": 10,
+        "group_size": 2,
+        "bridge_url": "http://127.0.0.1:1234",
+        "bridge_token": "token",
+        "kl_penalty_coef": 0.5,
+        "reward_path": "/w/shim/flash_opd_reward.py",
+        "fused_ce_backend": "torch",
+    }
+    assert fp8_key in opd_train.build_opd_overrides({**config, "fp8_kv": True})
+    assert fp8_key not in opd_train.build_opd_overrides({**config, "fp8_kv": False})
+    assert fp8_key not in opd_train.build_opd_overrides(config)
 
 
 def test_opd_oversized_reject_names_the_knobs_to_shrink():

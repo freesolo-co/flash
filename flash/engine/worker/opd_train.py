@@ -1441,7 +1441,12 @@ _REQUIRED_OVERRIDE_KEYS = (
 
 
 def build_opd_overrides(config: dict) -> list[str]:
-    """Render the exact verl 0.8.0 synchronous PPO and distillation config surface."""
+    """Render the exact verl 0.8.0 synchronous PPO and distillation config surface.
+
+    The override list is assembled from one section builder per hydra key family. Concatenation
+    order is the emitted order, and hydra applies overrides in order, so the sequence of the calls
+    below is part of the contract -- do not reorder them to group keys differently.
+    """
     missing = [key for key in _REQUIRED_OVERRIDE_KEYS if key not in config]
     if missing:
         raise KeyError(f"build_opd_overrides missing required config keys: {missing}")
@@ -1449,7 +1454,19 @@ def build_opd_overrides(config: dict) -> list[str]:
     # carving max_response_length out of this same value, so the token budget, the prompt filter,
     # and the engine always agree.
     max_tokens = int(config["max_sequence_length"])
-    overrides = [
+    return [
+        *_opd_algorithm_and_data_overrides(config, max_tokens),
+        *_opd_model_and_actor_overrides(config, max_tokens),
+        *_opd_rollout_overrides(config, max_tokens),
+        *_opd_ray_and_reward_overrides(config),
+        *_opd_distillation_and_trainer_overrides(config),
+        *_opd_conditional_rollout_overrides(config, max_tokens),
+    ]
+
+
+def _opd_algorithm_and_data_overrides(config: dict, max_tokens: int) -> list[str]:
+    """`algorithm.*` and `data.*`, plus the seed and fp8-kv engine kwargs interleaved among them."""
+    return [
         "algorithm.adv_estimator=grpo",
         "algorithm.use_kl_in_reward=false",
         "algorithm.norm_adv_by_std_in_grpo=false",
@@ -1482,6 +1499,12 @@ def build_opd_overrides(config: dict) -> list[str]:
         "++data.apply_chat_template_kwargs={enable_thinking:"
         + _hydra_val(config.get("thinking", False))
         + "}",
+    ]
+
+
+def _opd_model_and_actor_overrides(config: dict, max_tokens: int) -> list[str]:
+    """`actor_rollout_ref.model.*` and `actor_rollout_ref.actor.*`, ending at the dtype overrides."""
+    return [
         f"actor_rollout_ref.model.path={_hydra_val(config['model_path'])}",
         "actor_rollout_ref.model.trust_remote_code=true",
         # packing the micro-batch into one row is only safe for a gdn hybrid when the child can
@@ -1523,6 +1546,12 @@ def build_opd_overrides(config: dict) -> list[str]:
         f"actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size={_hydra_val(config['ulysses_sequence_parallel_size'])}",
         # store the frozen base in bf16, not verl's fp32 yaml default. shared with the rl driver.
         *trainer_dtype_overrides(),
+    ]
+
+
+def _opd_rollout_overrides(config: dict, max_tokens: int) -> list[str]:
+    """`actor_rollout_ref.rollout.*`: engine choice, the hardware-resolved pins, and agent sizing."""
+    return [
         "actor_rollout_ref.rollout.name=vllm",
         "actor_rollout_ref.rollout.mode=async",
         # safetensors is required for lora rollout: the dummy sync appends .base_layer to vision
@@ -1576,6 +1605,12 @@ def build_opd_overrides(config: dict) -> list[str]:
         # whenever that product is not a multiple of 8. size the pool to the batch instead.
         "actor_rollout_ref.rollout.agent.num_workers="
         f"{agent_loop_workers(int(config['train_batch_size']) * int(config['group_size']))}",
+    ]
+
+
+def _opd_ray_and_reward_overrides(config: dict) -> list[str]:
+    """Transfer queue, `ray_kwargs.*`, `critic.*` and the reward-function wiring."""
+    return [
         # verl force-enables TransferQueue and waits forever for every cpu bundle.
         # one storage unit fits flash's single-node trainer regardless of ray cluster sizing.
         "transfer_queue.backend.SimpleStorage.num_data_storage_units=1",
@@ -1597,6 +1632,12 @@ def build_opd_overrides(config: dict) -> list[str]:
         "custom_reward_function.name=compute_score",
         f"reward.custom_reward_function.path={_hydra_val(config['reward_path'])}",
         "reward.custom_reward_function.name=compute_score",
+    ]
+
+
+def _opd_distillation_and_trainer_overrides(config: dict) -> list[str]:
+    """`distillation.*` (the OPD objective and bridge) and `trainer.*` (checkpointing, logging)."""
+    return [
         "distillation._target_=flash_opd_plugin.FlashRemoteDistillationConfig",
         "distillation.enabled=true",
         "distillation.n_gpus_per_node=0",
@@ -1625,6 +1666,15 @@ def build_opd_overrides(config: dict) -> list[str]:
         "trainer.resume_mode=auto",
         "trainer.max_actor_ckpt_to_keep=null",
     ]
+
+
+def _opd_conditional_rollout_overrides(config: dict, max_tokens: int) -> list[str]:
+    """Rollout keys appended after the main body: multi-turn prompt length and structured outputs.
+
+    These stay last because they were appended after the literal, and hydra applies overrides in
+    order -- emitting them earlier would let a later key in the body win instead.
+    """
+    overrides: list[str] = []
     if config.get("multi_turn"):
         overrides.append(f"actor_rollout_ref.rollout.prompt_length={_hydra_val(max_tokens)}")
     structured_outputs = config.get("structured_outputs")
