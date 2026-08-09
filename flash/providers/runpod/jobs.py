@@ -748,6 +748,340 @@ def capacity_escalation_note(on_last_gpu: bool) -> str:
     )
 
 
+@dataclass(frozen=True)
+class _RunpodPollContext:
+    handle: JobHandle
+    say: Callable
+    interval_s: float
+    heartbeat_reader: Callable | None
+    failure_detail_reader: Callable | None
+    stall_after_s: float
+    setup_grace_s: float
+    unhealthy_grace_s: float
+    throttled_grace_s: float
+    queue_grace_s: float
+    absolute_deadline: float | None
+    current_attempt: int
+    launch_ts: float
+    next_gpu_note: str
+
+
+@dataclass
+class _RunpodPollState:
+    poll_errors: PollErrorTracker
+    last_status: str | None
+    last_hb_key: object | None
+    last_hb_ts: float
+    last_hb_attempt: int
+    last_progress: float
+    seen_training_hb: bool
+    last_health_probe: float
+    unhealthy_timer: GraceTimer
+    throttled_timer: GraceTimer
+    queued_timer: GraceTimer
+    worker_coming_up_at: float | None
+
+
+def _new_runpod_poll_state(ctx: _RunpodPollContext) -> _RunpodPollState:
+    poll_errors = PollErrorTracker(ctx.say, ctx.interval_s)
+    last_status = None
+    last_hb_key = None
+    last_hb_ts = 0.0
+    last_hb_attempt = (
+        -1
+    )  # -1 sentinel < any real attempt; gates out prior-attempt leftover heartbeats
+    last_progress = time.time()
+    seen_training_hb = False
+    last_health_probe = 0.0
+    unhealthy_timer = GraceTimer()
+    throttled_timer = GraceTimer()
+    queued_timer = GraceTimer()
+    # a runpod job stays IN_QUEUE for the whole worker cold start, image pull included, so the
+    # queue timer alone cannot tell "runpod never gave us the gpu" from "the gpu arrived and we
+    # are still pulling a multi-GB image". the unhealthy/throttled timers below already refuse to
+    # fire while a worker is initializing or usable; carry that same observation forward so the
+    # capacity timer gets it too, and a heavy image can never self-report as no_capacity.
+    worker_coming_up_at = None
+    return _RunpodPollState(
+        poll_errors=poll_errors,
+        last_status=last_status,
+        last_hb_key=last_hb_key,
+        last_hb_ts=last_hb_ts,
+        last_hb_attempt=last_hb_attempt,
+        last_progress=last_progress,
+        seen_training_hb=seen_training_hb,
+        last_health_probe=last_health_probe,
+        unhealthy_timer=unhealthy_timer,
+        throttled_timer=throttled_timer,
+        queued_timer=queued_timer,
+        worker_coming_up_at=worker_coming_up_at,
+    )
+
+
+def _runpod_worker_is_coming_up(at: float | None, now: float) -> bool:
+    """Whether a worker sighting at ``at`` is recent enough to still suppress the capacity timer."""
+    return at is not None and (now - at) <= WORKER_COMING_UP_TTL_S
+
+
+def _probe_runpod_worker_coming_up_at(ctx: _RunpodPollContext, now: float) -> float | None:
+    """One health read answering only "has runpod granted a worker yet".
+
+    Do not update continuous unhealthy/throttled timers here. A failed read returns None and
+    leaves existing evidence unchanged.
+    """
+    try:
+        h = runpod_api.endpoint_health_for_fingerprint(
+            ctx.handle.endpoint_id,
+            ctx.handle.key_fingerprint,
+            **deadline_kwargs(
+                runpod_api.endpoint_health_for_fingerprint,
+                ctx.absolute_deadline,
+            ),
+        )
+    except Exception:
+        return None
+    workers = h.get("workers") or {}
+    usable = workers.get("running") or workers.get("ready") or workers.get("idle")
+    return now if (usable or workers.get("initializing")) else None
+
+
+def _runpod_terminal_result(
+    ctx: _RunpodPollContext,
+    state: _RunpodPollState,
+    st: dict,
+    status: str | None,
+) -> PollResult | None:
+    if status in TERMINAL_OK:
+        # read heartbeats already committed at the wall deadline (deadline_at=None) so a job that
+        # completes right at the boundary still surfaces its final per-step metrics for `flash runs log -f`
+        forced_reader = (
+            (lambda: ctx.heartbeat_reader(force=True, deadline_at=None))
+            if ctx.heartbeat_reader is not None
+            else None
+        )
+        state.last_hb_key, _ = surface_heartbeat(forced_reader, state.last_hb_key, ctx.say)
+        try:
+            return PollResult(True, metrics=decode_output(st.get("output")))
+        except RuntimeError as e:
+            state.last_hb_key, retriable, oom = surfaced_worker_flags(
+                ctx.heartbeat_reader,
+                state.last_hb_key,
+                ctx.say,
+                ctx.current_attempt,
+                launch_ts=ctx.launch_ts,
+            )
+            detail = _append_failure_artifacts(str(e), ctx.failure_detail_reader)
+            return PollResult(
+                False,
+                failure="oom" if oom else ("job_preempted" if retriable else "job_failed"),
+                detail=detail,
+            )
+    if status in TERMINAL_FAIL:
+        detail = str(st.get("error") or "")[-1500:]
+        out = st.get("output")
+        if isinstance(out, dict) and out.get("stdout"):
+            detail += "\n--- worker stdout tail ---\n" + str(out["stdout"])
+        elif not detail:
+            detail = str(out)[-1500:]
+        if status in PLATFORM_TERMINATIONS:
+            return PollResult(False, failure="job_preempted", detail=f"[{status}] {detail}")
+        state.last_hb_key, retriable, oom = surfaced_worker_flags(
+            ctx.heartbeat_reader,
+            state.last_hb_key,
+            ctx.say,
+            ctx.current_attempt,
+            launch_ts=ctx.launch_ts,
+        )
+        detail = _append_failure_artifacts(detail, ctx.failure_detail_reader)
+        return PollResult(
+            False,
+            failure="oom" if oom else ("job_preempted" if retriable else "job_failed"),
+            detail=f"[{status}] {detail}",
+        )
+    return None
+
+
+def _runpod_queue_result(
+    ctx: _RunpodPollContext,
+    state: _RunpodPollState,
+    status: str | None,
+    now: float,
+) -> PollResult | None:
+    coming_up = _runpod_worker_is_coming_up(state.worker_coming_up_at, now)
+    would_expire = (
+        status == "IN_QUEUE"
+        and not coming_up
+        and state.queued_timer.since is not None
+        and now - state.queued_timer.since > ctx.queue_grace_s
+    )
+    if would_expire:
+        # the last worker reading may be 90s stale, so probe once before abandoning a GPU RunPod
+        # may already have granted. the existing TTL prevents repeated boundary probes.
+        state.last_health_probe = now
+        coming_up = _runpod_worker_is_coming_up(_probe_runpod_worker_coming_up_at(ctx, now), now)
+        if coming_up:
+            state.worker_coming_up_at = now
+    if state.queued_timer.expired(
+        status == "IN_QUEUE" and not coming_up,
+        now,
+        ctx.queue_grace_s,
+    ):
+        return PollResult(
+            False,
+            failure="no_capacity",
+            detail=f"never scheduled: job stuck IN_QUEUE for {int(now - state.queued_timer.since)}s "
+            f"(no RunPod capacity for the pinned GPU class); {ctx.next_gpu_note}",
+        )
+    if status != "IN_QUEUE":
+        # The in-queue grace timers measure CONTINUOUS throttle/unhealthy while queued (like
+        # queued_timer, driven every iteration above); reset them whenever the job leaves the
+        # queue so a re-queue after an IN_PROGRESS spell doesn't fire on a stale arm time.
+        state.unhealthy_timer.since = None
+        state.throttled_timer.since = None
+    elif now - state.last_health_probe > 90:
+        state.last_health_probe = now
+        try:
+            h = runpod_api.endpoint_health_for_fingerprint(
+                ctx.handle.endpoint_id,
+                ctx.handle.key_fingerprint,
+                **deadline_kwargs(
+                    runpod_api.endpoint_health_for_fingerprint,
+                    ctx.absolute_deadline,
+                ),
+            )
+            workers = h.get("workers") or {}
+            usable = workers.get("running") or workers.get("ready") or workers.get("idle")
+            recovering = workers.get("initializing")
+            # runpod granted the gpu the moment a worker is initializing or usable, so from
+            # here on the wait is startup, not capacity starvation. stamped rather than a bare
+            # flag: a probe that starts failing must not leave a stale True suppressing the
+            # capacity timer forever, so it expires after WORKER_COMING_UP_TTL_S.
+            state.worker_coming_up_at = now if (usable or recovering) else None
+            if (
+                any(workers.get(k) for k in ("throttled", "unhealthy", "initializing"))
+                or not usable
+            ):
+                ctx.say(f"queued; workers: {workers}")
+            if state.unhealthy_timer.expired(
+                workers.get("unhealthy") and not usable and not recovering,
+                now,
+                ctx.unhealthy_grace_s,
+            ):
+                return PollResult(
+                    False,
+                    failure="stalled",
+                    detail=f"worker stuck unhealthy for "
+                    f"{int(now - state.unhealthy_timer.since)}s while IN_QUEUE (likely a failed "
+                    f"image pull); retrying on a fresh endpoint",
+                )
+            if state.throttled_timer.expired(
+                workers.get("throttled") and not usable and not recovering,
+                now,
+                ctx.throttled_grace_s,
+            ):
+                return PollResult(
+                    False,
+                    failure="no_capacity",
+                    detail=f"never scheduled: worker stuck THROTTLED for "
+                    f"{int(now - state.throttled_timer.since)}s while IN_QUEUE (no RunPod "
+                    f"capacity for the pinned GPU class); {ctx.next_gpu_note}",
+                )
+        except Exception:
+            pass
+    return None
+
+
+def _runpod_heartbeat_result(
+    ctx: _RunpodPollContext,
+    state: _RunpodPollState,
+    status: str | None,
+) -> PollResult | None:
+    new_key, stage = surface_heartbeat(ctx.heartbeat_reader, state.last_hb_key, ctx.say)
+    if new_key != state.last_hb_key:
+        state.last_hb_key = new_key
+        if stage is not None:
+            hb_ts = new_key[2]
+            hb_step = new_key[1]
+            hb_attempt = _attempt_int(new_key[3])
+            is_training_hb = is_training_heartbeat(stage, hb_step)
+            if hb_attempt != ctx.current_attempt:
+                # Non-current heartbeat: ignore so stale progress never tightens the stall window.
+                pass
+            elif hb_attempt > state.last_hb_attempt:
+                # fresh attempt: reset ts baseline and re-derive seen_training_hb so cold-start grace rearms.
+                state.last_hb_attempt = hb_attempt
+                state.last_hb_ts = hb_ts or 0.0
+                state.last_progress = time.time()
+                state.seen_training_hb = is_training_hb
+            elif hb_attempt == state.last_hb_attempt and (
+                hb_ts is None or hb_ts > state.last_hb_ts
+            ):
+                # Gate progress on ts advancing — a stale late upload must not buy a fresh stall window.
+                if hb_ts is not None:
+                    state.last_hb_ts = hb_ts
+                state.last_progress = time.time()
+                if is_training_hb:
+                    state.seen_training_hb = True
+    in_setup = ctx.heartbeat_reader is not None and not state.seen_training_hb
+    stall_limit = ctx.setup_grace_s if in_setup else ctx.stall_after_s
+    if time.time() - state.last_progress > stall_limit:
+        phase = "setup (pre-training)" if in_setup else "training"
+        return PollResult(
+            False,
+            failure="stalled",
+            detail=f"no worker progress for {int(time.time() - state.last_progress)}s "
+            f"during {phase} (job status {status}, limit {int(stall_limit)}s)",
+        )
+    return None
+
+
+def _sleep_before_runpod_poll(ctx: _RunpodPollContext) -> None:
+    delay = ctx.interval_s
+    if ctx.absolute_deadline is not None:
+        remaining = remaining_seconds(ctx.absolute_deadline)
+        if remaining <= 0:
+            return
+        delay = min(delay, remaining)
+    if delay > 0:
+        time.sleep(delay)
+
+
+def _poll_runpod_job_loop(ctx: _RunpodPollContext, state: _RunpodPollState) -> PollResult:
+    while True:
+        if ctx.absolute_deadline is not None and time.time() >= ctx.absolute_deadline:
+            return PollResult(False, failure="stalled", detail="run wall deadline exceeded")
+        try:
+            st = runpod_api.job_status(
+                ctx.handle.endpoint_id,
+                ctx.handle.job_id,
+                key_fingerprint=ctx.handle.key_fingerprint,
+                **deadline_kwargs(runpod_api.job_status, ctx.absolute_deadline),
+            )
+            state.poll_errors.reset()
+        except runpod_api.RunpodApiError as e:
+            if state.poll_errors.record(e, deadline_at=ctx.absolute_deadline):
+                return PollResult(False, failure="poll_error", detail=str(e))
+            continue
+        if ctx.absolute_deadline is not None and time.time() >= ctx.absolute_deadline:
+            return PollResult(False, failure="stalled", detail="run wall deadline exceeded")
+        status = st.get("status")
+        if status != state.last_status:
+            ctx.say(f"job {ctx.handle.job_id}: {status}")
+            state.last_status = status
+            state.last_progress = time.time()
+        result = _runpod_terminal_result(ctx, state, st, status)
+        if result is not None:
+            return result
+        now = time.time()
+        result = _runpod_queue_result(ctx, state, status, now)
+        if result is not None:
+            return result
+        result = _runpod_heartbeat_result(ctx, state, status)
+        if result is not None:
+            return result
+        _sleep_before_runpod_poll(ctx)
+
+
 def poll_job(
     handle: JobHandle,
     log=None,
@@ -774,8 +1108,6 @@ def poll_job(
 
     say = make_say(log)
     next_gpu_note = capacity_escalation_note(on_last_gpu)
-    poll_errors = PollErrorTracker(say, interval_s)
-
     absolute_deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
     launch_ts = handle.started_ts
     if not math.isfinite(launch_ts) or launch_ts <= 0:
@@ -784,228 +1116,24 @@ def poll_job(
     if attempt_id is None or attempt_id != handle.attempt:
         raise ValueError("RunPod poll attempt identity does not match the persisted handle")
     current_attempt = attempt_id
-    last_status = None
-    last_hb_key = None
-    last_hb_ts = 0.0
-    last_hb_attempt = (
-        -1
-    )  # -1 sentinel < any real attempt; gates out prior-attempt leftover heartbeats
-    last_progress = time.time()
-    seen_training_hb = False
-    last_health_probe = 0.0
-    unhealthy_timer = GraceTimer()
-    throttled_timer = GraceTimer()
-    queued_timer = GraceTimer()
-    # a runpod job stays IN_QUEUE for the whole worker cold start, image pull included, so the
-    # queue timer alone cannot tell "runpod never gave us the gpu" from "the gpu arrived and we
-    # are still pulling a multi-GB image". the unhealthy/throttled timers below already refuse to
-    # fire while a worker is initializing or usable; carry that same observation forward so the
-    # capacity timer gets it too, and a heavy image can never self-report as no_capacity.
-    worker_coming_up_at: float | None = None
-
-    def _worker_is_coming_up(at: float | None, now: float) -> bool:
-        """Whether a worker sighting at ``at`` is recent enough to still suppress the capacity timer."""
-        return at is not None and (now - at) <= WORKER_COMING_UP_TTL_S
-
-    def _probe_worker_coming_up_at(now: float) -> float | None:
-        """One health read answering only "has runpod granted a worker yet".
-
-        Do not update continuous unhealthy/throttled timers here. A failed read returns None and
-        leaves existing evidence unchanged.
-        """
-        try:
-            h = runpod_api.endpoint_health_for_fingerprint(
-                handle.endpoint_id,
-                handle.key_fingerprint,
-                **deadline_kwargs(runpod_api.endpoint_health_for_fingerprint, absolute_deadline),
-            )
-        except Exception:
-            return None
-        workers = h.get("workers") or {}
-        usable = workers.get("running") or workers.get("ready") or workers.get("idle")
-        return now if (usable or workers.get("initializing")) else None
-
-    while True:
-        if absolute_deadline is not None and time.time() >= absolute_deadline:
-            return PollResult(False, failure="stalled", detail="run wall deadline exceeded")
-        try:
-            st = runpod_api.job_status(
-                handle.endpoint_id,
-                handle.job_id,
-                key_fingerprint=handle.key_fingerprint,
-                **deadline_kwargs(runpod_api.job_status, absolute_deadline),
-            )
-            poll_errors.reset()
-        except runpod_api.RunpodApiError as e:
-            if poll_errors.record(e, deadline_at=absolute_deadline):
-                return PollResult(False, failure="poll_error", detail=str(e))
-            continue
-        if absolute_deadline is not None and time.time() >= absolute_deadline:
-            return PollResult(False, failure="stalled", detail="run wall deadline exceeded")
-        status = st.get("status")
-        if status != last_status:
-            say(f"job {handle.job_id}: {status}")
-            last_status = status
-            last_progress = time.time()
-        if status in TERMINAL_OK:
-            # read heartbeats already committed at the wall deadline (deadline_at=None) so a job that
-            # completes right at the boundary still surfaces its final per-step metrics for `flash runs log -f`
-            forced_reader = (
-                (lambda: heartbeat_reader(force=True, deadline_at=None))
-                if heartbeat_reader is not None
-                else None
-            )
-            last_hb_key, _ = surface_heartbeat(forced_reader, last_hb_key, say)
-            try:
-                return PollResult(True, metrics=decode_output(st.get("output")))
-            except RuntimeError as e:
-                last_hb_key, retriable, oom = surfaced_worker_flags(
-                    heartbeat_reader, last_hb_key, say, current_attempt, launch_ts=launch_ts
-                )
-                detail = _append_failure_artifacts(str(e), failure_detail_reader)
-                return PollResult(
-                    False,
-                    failure="oom" if oom else ("job_preempted" if retriable else "job_failed"),
-                    detail=detail,
-                )
-        if status in TERMINAL_FAIL:
-            detail = str(st.get("error") or "")[-1500:]
-            out = st.get("output")
-            if isinstance(out, dict) and out.get("stdout"):
-                detail += "\n--- worker stdout tail ---\n" + str(out["stdout"])
-            elif not detail:
-                detail = str(out)[-1500:]
-            if status in PLATFORM_TERMINATIONS:
-                return PollResult(False, failure="job_preempted", detail=f"[{status}] {detail}")
-            last_hb_key, retriable, oom = surfaced_worker_flags(
-                heartbeat_reader, last_hb_key, say, current_attempt, launch_ts=launch_ts
-            )
-            detail = _append_failure_artifacts(detail, failure_detail_reader)
-            return PollResult(
-                False,
-                failure="oom" if oom else ("job_preempted" if retriable else "job_failed"),
-                detail=f"[{status}] {detail}",
-            )
-        now = time.time()
-
-        coming_up = _worker_is_coming_up(worker_coming_up_at, now)
-        would_expire = (
-            status == "IN_QUEUE"
-            and not coming_up
-            and queued_timer.since is not None
-            and now - queued_timer.since > queue_grace_s
-        )
-        if would_expire:
-            # the last worker reading may be 90s stale, so probe once before abandoning a GPU RunPod
-            # may already have granted. the existing TTL prevents repeated boundary probes.
-            last_health_probe = now
-            coming_up = _worker_is_coming_up(_probe_worker_coming_up_at(now), now)
-            if coming_up:
-                worker_coming_up_at = now
-        if queued_timer.expired(status == "IN_QUEUE" and not coming_up, now, queue_grace_s):
-            return PollResult(
-                False,
-                failure="no_capacity",
-                detail=f"never scheduled: job stuck IN_QUEUE for {int(now - queued_timer.since)}s "
-                f"(no RunPod capacity for the pinned GPU class); {next_gpu_note}",
-            )
-        if status != "IN_QUEUE":
-            # The in-queue grace timers measure CONTINUOUS throttle/unhealthy while queued (like
-            # queued_timer, driven every iteration above); reset them whenever the job leaves the
-            # queue so a re-queue after an IN_PROGRESS spell doesn't fire on a stale arm time.
-            unhealthy_timer.since = None
-            throttled_timer.since = None
-        elif now - last_health_probe > 90:
-            last_health_probe = now
-            try:
-                h = runpod_api.endpoint_health_for_fingerprint(
-                    handle.endpoint_id,
-                    handle.key_fingerprint,
-                    **deadline_kwargs(
-                        runpod_api.endpoint_health_for_fingerprint, absolute_deadline
-                    ),
-                )
-                workers = h.get("workers") or {}
-                usable = workers.get("running") or workers.get("ready") or workers.get("idle")
-                recovering = workers.get("initializing")
-                # runpod granted the gpu the moment a worker is initializing or usable, so from
-                # here on the wait is startup, not capacity starvation. stamped rather than a bare
-                # flag: a probe that starts failing must not leave a stale True suppressing the
-                # capacity timer forever, so it expires after WORKER_COMING_UP_TTL_S.
-                worker_coming_up_at = now if (usable or recovering) else None
-                if (
-                    any(workers.get(k) for k in ("throttled", "unhealthy", "initializing"))
-                    or not usable
-                ):
-                    say(f"queued; workers: {workers}")
-                if unhealthy_timer.expired(
-                    workers.get("unhealthy") and not usable and not recovering,
-                    now,
-                    unhealthy_grace_s,
-                ):
-                    return PollResult(
-                        False,
-                        failure="stalled",
-                        detail=f"worker stuck unhealthy for "
-                        f"{int(now - unhealthy_timer.since)}s while IN_QUEUE (likely a failed "
-                        f"image pull); retrying on a fresh endpoint",
-                    )
-                if throttled_timer.expired(
-                    workers.get("throttled") and not usable and not recovering,
-                    now,
-                    throttled_grace_s,
-                ):
-                    return PollResult(
-                        False,
-                        failure="no_capacity",
-                        detail=f"never scheduled: worker stuck THROTTLED for "
-                        f"{int(now - throttled_timer.since)}s while IN_QUEUE (no RunPod "
-                        f"capacity for the pinned GPU class); {next_gpu_note}",
-                    )
-            except Exception:
-                pass
-        new_key, stage = surface_heartbeat(heartbeat_reader, last_hb_key, say)
-        if new_key != last_hb_key:
-            last_hb_key = new_key
-            if stage is not None:
-                hb_ts = new_key[2]
-                hb_step = new_key[1]
-                hb_attempt = _attempt_int(new_key[3])
-                is_training_hb = is_training_heartbeat(stage, hb_step)
-                if hb_attempt != current_attempt:
-                    # Non-current heartbeat: ignore so stale progress never tightens the stall window.
-                    pass
-                elif hb_attempt > last_hb_attempt:
-                    # fresh attempt: reset ts baseline and re-derive seen_training_hb so cold-start grace rearms.
-                    last_hb_attempt = hb_attempt
-                    last_hb_ts = hb_ts or 0.0
-                    last_progress = time.time()
-                    seen_training_hb = is_training_hb
-                elif hb_attempt == last_hb_attempt and (hb_ts is None or hb_ts > last_hb_ts):
-                    # Gate progress on ts advancing — a stale late upload must not buy a fresh stall window.
-                    if hb_ts is not None:
-                        last_hb_ts = hb_ts
-                    last_progress = time.time()
-                    if is_training_hb:
-                        seen_training_hb = True
-        in_setup = heartbeat_reader is not None and not seen_training_hb
-        stall_limit = setup_grace_s if in_setup else stall_after_s
-        if time.time() - last_progress > stall_limit:
-            phase = "setup (pre-training)" if in_setup else "training"
-            return PollResult(
-                False,
-                failure="stalled",
-                detail=f"no worker progress for {int(time.time() - last_progress)}s "
-                f"during {phase} (job status {status}, limit {int(stall_limit)}s)",
-            )
-        delay = interval_s
-        if absolute_deadline is not None:
-            remaining = remaining_seconds(absolute_deadline)
-            if remaining <= 0:
-                continue
-            delay = min(delay, remaining)
-        if delay > 0:
-            time.sleep(delay)
+    ctx = _RunpodPollContext(
+        handle=handle,
+        say=say,
+        interval_s=interval_s,
+        heartbeat_reader=heartbeat_reader,
+        failure_detail_reader=failure_detail_reader,
+        stall_after_s=stall_after_s,
+        setup_grace_s=setup_grace_s,
+        unhealthy_grace_s=unhealthy_grace_s,
+        throttled_grace_s=throttled_grace_s,
+        queue_grace_s=queue_grace_s,
+        absolute_deadline=absolute_deadline,
+        current_attempt=current_attempt,
+        launch_ts=launch_ts,
+        next_gpu_note=next_gpu_note,
+    )
+    state = _new_runpod_poll_state(ctx)
+    return _poll_runpod_job_loop(ctx, state)
 
 
 def submit_run(
