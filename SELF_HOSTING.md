@@ -39,7 +39,7 @@ flash-server --host 0.0.0.0 --port 8080
 Then point a client at it:
 
 ```bash
-flash login --api-url http://your-plane:8080 --api-key "$FREESOLO_INTERNAL_KEY"
+flash login --api-url https://your-plane.example --api-key "$FREESOLO_INTERNAL_KEY"
 flash train run.toml
 ```
 
@@ -49,8 +49,13 @@ plane authenticates `FREESOLO_INTERNAL_KEY` itself, and that key controls the pl
 must not travel to a service you do not run. (If you operate your own Freesolo-compatible
 auth backend, pass `--freesolo-url` and verification happens against it.)
 
-`--api-url` is the address **your client** reaches the plane at, and a private one like the
-`http://your-plane:8080` above is fine. On-policy distillation additionally needs the address a
+`--api-url` is the address **your client** reaches the plane at. Terminate it with TLS whenever it
+leaves the machine: `flash login` and every command after it send `FREESOLO_INTERNAL_KEY` as an
+`Authorization: Bearer` header, and on a standalone plane that key is the whole authorization
+boundary and owns every run - anyone who observes it on the wire can submit billed GPU jobs and
+read or cancel your existing ones. Plaintext `http://` is for loopback only (`http://127.0.0.1:8080`
+during local development); `flash login` warns when you give it a non-loopback `http://` URL.
+On-policy distillation additionally needs the address a
 **rented GPU worker** reaches it at, which is usually a different, public one - set
 `FLASH_PUBLIC_URL` on the plane for that (see [optional pieces](#optional-pieces)). `sft` and
 `grpo` do not need it.

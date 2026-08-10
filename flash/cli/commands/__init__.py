@@ -119,9 +119,43 @@ def _verifies_against_freesolo(api_url: str, freesolo_url: str | None) -> bool:
     return is_freesolo_hosted_url(api_url)
 
 
+def _plaintext_transport_warning(api_url: str) -> str:
+    """Warn when the api url would carry the key over unencrypted, non-loopback HTTP.
+
+    The key travels as an ``Authorization: Bearer`` header on login and on every command after it,
+    and on a standalone plane it is the entire authorization boundary and owns every run -- so an
+    observer can submit billed GPU jobs and read or cancel existing ones. Loopback never leaves the
+    machine, so it stays quiet: local development is the one place plaintext is fine.
+
+    A warning rather than a refusal: an operator may front the plane with a TLS-terminating proxy
+    reached over a private link, and this cannot see that. It must be printed BEFORE the key is
+    transmitted, so the caller can still abort.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse((api_url or "").strip())
+    if parsed.scheme != "http":
+        return ""
+    host = (parsed.hostname or "").lower()
+    if host in {"localhost", "127.0.0.1", "::1", "0.0.0.0"} or host.endswith(".localhost"):
+        return ""
+    return (
+        f"{api_url} is plaintext HTTP, so your API key is sent unencrypted and anyone who can "
+        "observe the connection can reuse it to submit billed GPU jobs and control your runs. "
+        "Use https:// for a remote plane; plaintext is safe only on localhost."
+    )
+
+
 def cmd_login(args) -> int:
     api_url = args.api_url or load_credentials()[0]
     identity: dict | None = None
+    # before any request: the warning is worthless once the key has already gone over the wire.
+    transport_warning = _plaintext_transport_warning(api_url)
+    if transport_warning:
+        print(
+            render.warn(transport_warning) if render.styled() else f"warning: {transport_warning}",
+            file=sys.stderr,
+        )
     try:
         env_api_key = os.environ.get("FREESOLO_API_KEY")
         api_key = args.api_key or env_api_key

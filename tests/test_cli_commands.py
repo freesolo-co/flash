@@ -3301,3 +3301,58 @@ def test_log_follow_progress_shows_a_settled_zero_like_the_other_surfaces() -> N
         )
         assert "cost=$0.0000" in progress, state
         assert "~" not in progress, state
+
+
+@pytest.mark.parametrize(
+    "api_url",
+    [
+        "http://your-plane:8080",
+        "http://10.0.0.5:8080",
+        "http://plane.internal",
+    ],
+)
+def test_login_warns_before_sending_the_key_over_plaintext_http(monkeypatch, capsys, api_url):
+    """The warning must reach the user BEFORE the key is transmitted.
+
+    On a standalone plane FREESOLO_INTERNAL_KEY is the entire authorization boundary and owns every
+    run, and it rides as a bearer header on login and every command after it. SELF_HOSTING.md used
+    to present a plaintext remote URL as fine, so following the quickstart put a root-equivalent
+    credential on the wire in clear text.
+    """
+    warned_before_request = {}
+
+    def _verify(api_key, url):
+        warned_before_request["stderr"] = capsys.readouterr().err
+        return {"email": "operator@example.com"}
+
+    monkeypatch.setattr(cli.commands, "_verify_key_against_plane", _verify)
+    monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
+    monkeypatch.setattr(cli.commands, "_identity_or_none", lambda *a, **k: None)
+    monkeypatch.delenv("FREESOLO_API_KEY", raising=False)
+
+    args = types.SimpleNamespace(api_url=api_url, api_key="operator-key", debug=False)
+    assert cli.commands.cmd_login(args) == 0
+    assert "plaintext HTTP" in warned_before_request["stderr"]
+
+
+@pytest.mark.parametrize(
+    "api_url",
+    [
+        "http://127.0.0.1:8080",
+        "http://localhost:8080",
+        "https://your-plane.example",
+    ],
+)
+def test_login_stays_quiet_for_loopback_and_tls(monkeypatch, capsys, api_url):
+    """Local development over http is the one safe plaintext case, and https is the fix."""
+    monkeypatch.setattr(
+        cli.commands, "_verify_key_against_plane", lambda *a, **k: {"email": "op@example.com"}
+    )
+    monkeypatch.setattr(cli.commands, "verify_freesolo_key", lambda *a, **k: None)
+    monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
+    monkeypatch.setattr(cli.commands, "_identity_or_none", lambda *a, **k: None)
+    monkeypatch.delenv("FREESOLO_API_KEY", raising=False)
+
+    args = types.SimpleNamespace(api_url=api_url, api_key="operator-key", debug=False)
+    assert cli.commands.cmd_login(args) == 0
+    assert "plaintext HTTP" not in capsys.readouterr().err
