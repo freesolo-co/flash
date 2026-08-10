@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from typing import NoReturn
 
 from flash._internal.logging import get_logger
 from flash.providers import PROVIDER_NAMES, available_providers, get_provider
@@ -192,6 +193,143 @@ def _query_attention_heads(info) -> int:
     return int(getattr(info, "num_attention_heads", 0) or 0)
 
 
+def _resolve_exact_gpu(
+    gpu_type: str,
+    *,
+    need: float,
+    cap: int,
+    max_gpu_count: int,
+    provider: str,
+    available: tuple[str, ...],
+) -> tuple[str, tuple[str, ...]]:
+    """Validate an explicitly pinned GPU class and narrow ``available`` to providers that offer it."""
+    exact = canonical_gpu(gpu_type)
+    exact_info = GPU_INFO.get(exact)
+    if exact_info is None or not exact_info.validated:
+        raise UnsupportedGpuError(f"exact GPU {exact!r} is not an active validated GPU class")
+    if exact_info.vram_gb < need and max_gpu_count <= 1:
+        raise UnsupportedGpuError(
+            f"exact GPU {exact!r} has {exact_info.vram_gb} GB VRAM, "
+            f"but this run requires at least {need} GB"
+        )
+    # the widest shape providers actually rent for this ceiling, not the ceiling itself: a pin
+    # that only fits at a non-rentable count (3) must be rejected here with a precise reason
+    # rather than passing and dying later on a generic no-capacity error.
+    if (
+        exact_info.vram_gb < need
+        and max_gpu_count > 1
+        and combined_vram_gb(exact_info.vram_gb, cap) < need
+    ):
+        raise UnsupportedGpuError(
+            f"exact GPU {exact!r} cannot fit this run even as a {cap}-card combination"
+        )
+    exact_providers = providers_for(exact)
+    if provider and provider not in exact_providers:
+        raise UnsupportedGpuError(f"provider {provider!r} cannot provision exact GPU {exact!r}")
+    return exact, tuple(name for name in available if name in exact_providers)
+
+
+def _gather_candidates(
+    available: tuple[str, ...],
+    *,
+    per_card_need: float,
+    constraints: AllocationConstraints,
+    exact: str,
+    provider: str,
+) -> tuple[list[Candidate], bool, dict[str, UnsupportedGpuError]]:
+    """Query every available provider for fitting shapes.
+
+    Returns ``(candidates, lookup_failed, structurally_unsupported)``. The two failure records are
+    what let an empty result be told apart from a genuine no-fit.
+    """
+    candidates: list[Candidate] = []
+    lookup_failed = False
+    structurally_unsupported: dict[str, UnsupportedGpuError] = {}
+    # runpod prices off a static table (no live lookup), so it never blips; lambda/vast query live
+    # capacity and can. a per-provider blip degrades to the others (we just skip it), but we remember it
+    # so an empty result can be told apart from a genuine no-fit below.
+    # runpod uses the same loop but does not raise CapacityLookupError.
+    for name in available:
+        try:
+            found = get_provider(name).live_candidates(per_card_need, constraints)
+            candidates += [
+                candidate
+                for candidate in found
+                if candidate.provider == name and (not exact or candidate.gpu == exact)
+            ]
+        except UnsupportedGpuError as exc:
+            # A count-specific SKU miss is provider-local during an automatic search. Lambda may not
+            # sell 8x H100 while RunPod or Vast does; aborting here discards candidates already found
+            # elsewhere. An explicitly selected provider still fails immediately with its precise
+            # structural reason.
+            if provider:
+                raise
+            structurally_unsupported[name] = exc
+            logger.info("%s cannot offer this shape (%s); trying other providers", name, exc)
+        except CapacityLookupError as exc:
+            lookup_failed = True
+            logger.warning(
+                "%s capacity lookup failed (%s); allocating without it", name, exc.__cause__
+            )
+    return candidates, lookup_failed, structurally_unsupported
+
+
+def _raise_no_candidate_error(
+    *,
+    model_id: str,
+    need: float,
+    cap: int,
+    exact: str,
+    supported_available: tuple[str, ...],
+    structurally_unsupported: dict[str, UnsupportedGpuError],
+    lookup_failed: bool,
+) -> NoReturn:
+    """Classify an empty candidate set as retryable capacity or a terminal structural miss."""
+    if not supported_available and structurally_unsupported:
+        # Every configured provider rejected the shape structurally. Surface one provider's
+        # concrete reason rather than misclassifying an impossible SKU as temporary capacity.
+        raise next(iter(structurally_unsupported.values()))
+    if lookup_failed:
+        # No candidate fit, but a live capacity lookup blipped and was the only possible source of one
+        # -> retryable, NOT terminal: a Vast/Lambda-only run must ride out a market/API outage on its
+        # infra budget instead of dying as if the job exceeds every GPU class.
+        raise CapacityLookupError(
+            f"no allocatable GPU (>= {need} GB VRAM for {model_id}): a provider's live capacity lookup "
+            f"failed transiently and was the only source of a fitting class — retry may find hidden capacity"
+        )
+    # a provider whose capacity comes from a live market can be structurally able to rent a
+    # shape while having none free right now (retryable), unlike one priced off a static table
+    # where "no candidate" means the shape genuinely is not offered (terminal). this applies to
+    # an unpinned search too: sold out is sold out whether or not the user named the class.
+    live_only = bool(supported_available) and all(
+        getattr(get_provider(name), "live_capacity", False) for name in supported_available
+    )
+    if exact:
+        if live_only:
+            raise CapacityLookupError(
+                f"exact GPU {exact!r} is structurally supported but currently has no capacity on "
+                f"{', '.join(supported_available)}"
+            )
+        raise UnsupportedGpuError(
+            f"exact GPU {exact!r} has no allocatable capacity on the requested active provider set "
+            f"({', '.join(supported_available) or '(none)'})"
+        )
+    # unpinned: only retryable when SOME structurally-offered shape could have held the run.
+    # without that guard a genuinely oversized run would retry until its infra budget ran out
+    # instead of failing immediately with the reason.
+    if live_only and _structurally_fits(supported_available, need, cap):
+        raise CapacityLookupError(
+            f"no allocatable GPU (>= {need} GB VRAM for {model_id}) right now: a fitting class is "
+            f"structurally offered on {', '.join(supported_available)} but has no capacity — "
+            f"retry may find it"
+        )
+    raise UnsupportedGpuError(
+        f"no allocatable GPU (>= {need} GB VRAM for {model_id}) on any available provider "
+        f"({', '.join(supported_available) or '(none)'}); the run genuinely exceeds every "
+        f"active GPU class"
+    )
+
+
 def allocate(
     model_id: str,
     algorithm: str,
@@ -241,30 +379,14 @@ def allocate(
     cap = geometry_safe_gpu_cap(model_id, max_gpu_count, model_revision=model_revision)
     exact = ""
     if gpu_type:
-        exact = canonical_gpu(gpu_type)
-        exact_info = GPU_INFO.get(exact)
-        if exact_info is None or not exact_info.validated:
-            raise UnsupportedGpuError(f"exact GPU {exact!r} is not an active validated GPU class")
-        if exact_info.vram_gb < need and max_gpu_count <= 1:
-            raise UnsupportedGpuError(
-                f"exact GPU {exact!r} has {exact_info.vram_gb} GB VRAM, "
-                f"but this run requires at least {need} GB"
-            )
-        # the widest shape providers actually rent for this ceiling, not the ceiling itself: a pin
-        # that only fits at a non-rentable count (3) must be rejected here with a precise reason
-        # rather than passing and dying later on a generic no-capacity error.
-        if (
-            exact_info.vram_gb < need
-            and max_gpu_count > 1
-            and combined_vram_gb(exact_info.vram_gb, cap) < need
-        ):
-            raise UnsupportedGpuError(
-                f"exact GPU {exact!r} cannot fit this run even as a {cap}-card combination"
-            )
-        exact_providers = providers_for(exact)
-        if provider and provider not in exact_providers:
-            raise UnsupportedGpuError(f"provider {provider!r} cannot provision exact GPU {exact!r}")
-        available = tuple(name for name in available if name in exact_providers)
+        exact, available = _resolve_exact_gpu(
+            gpu_type,
+            need=need,
+            cap=cap,
+            max_gpu_count=max_gpu_count,
+            provider=provider,
+            available=available,
+        )
 
     constraints = AllocationConstraints(
         disk_gb=disk_gb,
@@ -279,82 +401,26 @@ def allocate(
     per_card_need = need
     if cap > 1:
         per_card_need = max(1, math.ceil(need / (cap * SHARD_VRAM_EFFICIENCY)))
-    candidates: list[Candidate] = []
-    lookup_failed = False
-    structurally_unsupported: dict[str, UnsupportedGpuError] = {}
-    # runpod prices off a static table (no live lookup), so it never blips; lambda/vast query live
-    # capacity and can. a per-provider blip degrades to the others (we just skip it), but we remember it
-    # so an empty result can be told apart from a genuine no-fit below.
-    # runpod uses the same loop but does not raise CapacityLookupError.
-    for name in available:
-        try:
-            found = get_provider(name).live_candidates(per_card_need, constraints)
-            candidates += [
-                candidate
-                for candidate in found
-                if candidate.provider == name and (not exact or candidate.gpu == exact)
-            ]
-        except UnsupportedGpuError as exc:
-            # A count-specific SKU miss is provider-local during an automatic search. Lambda may not
-            # sell 8x H100 while RunPod or Vast does; aborting here discards candidates already found
-            # elsewhere. An explicitly selected provider still fails immediately with its precise
-            # structural reason.
-            if provider:
-                raise
-            structurally_unsupported[name] = exc
-            logger.info("%s cannot offer this shape (%s); trying other providers", name, exc)
-        except CapacityLookupError as exc:
-            lookup_failed = True
-            logger.warning(
-                "%s capacity lookup failed (%s); allocating without it", name, exc.__cause__
-            )
+    candidates, lookup_failed, structurally_unsupported = _gather_candidates(
+        available,
+        per_card_need=per_card_need,
+        constraints=constraints,
+        exact=exact,
+        provider=provider,
+    )
     # providers report the shapes they can genuinely rent (RunPod takes a count, Lambda names it in
     # the instance type, Vast bakes it into the offer); the allocator owns only whether a shape fits.
     candidates = [c for c in candidates if _fits(c, need)]
     supported_available = tuple(name for name in available if name not in structurally_unsupported)
     if not candidates:
-        if not supported_available and structurally_unsupported:
-            # Every configured provider rejected the shape structurally. Surface one provider's
-            # concrete reason rather than misclassifying an impossible SKU as temporary capacity.
-            raise next(iter(structurally_unsupported.values()))
-        if lookup_failed:
-            # No candidate fit, but a live capacity lookup blipped and was the only possible source of one
-            # -> retryable, NOT terminal: a Vast/Lambda-only run must ride out a market/API outage on its
-            # infra budget instead of dying as if the job exceeds every GPU class.
-            raise CapacityLookupError(
-                f"no allocatable GPU (>= {need} GB VRAM for {model_id}): a provider's live capacity lookup "
-                f"failed transiently and was the only source of a fitting class — retry may find hidden capacity"
-            )
-        # a provider whose capacity comes from a live market can be structurally able to rent a
-        # shape while having none free right now (retryable), unlike one priced off a static table
-        # where "no candidate" means the shape genuinely is not offered (terminal). this applies to
-        # an unpinned search too: sold out is sold out whether or not the user named the class.
-        live_only = bool(supported_available) and all(
-            getattr(get_provider(name), "live_capacity", False) for name in supported_available
-        )
-        if exact:
-            if live_only:
-                raise CapacityLookupError(
-                    f"exact GPU {exact!r} is structurally supported but currently has no capacity on "
-                    f"{', '.join(supported_available)}"
-                )
-            raise UnsupportedGpuError(
-                f"exact GPU {exact!r} has no allocatable capacity on the requested active provider set "
-                f"({', '.join(supported_available) or '(none)'})"
-            )
-        # unpinned: only retryable when SOME structurally-offered shape could have held the run.
-        # without that guard a genuinely oversized run would retry until its infra budget ran out
-        # instead of failing immediately with the reason.
-        if live_only and _structurally_fits(supported_available, need, cap):
-            raise CapacityLookupError(
-                f"no allocatable GPU (>= {need} GB VRAM for {model_id}) right now: a fitting class is "
-                f"structurally offered on {', '.join(supported_available)} but has no capacity — "
-                f"retry may find it"
-            )
-        raise UnsupportedGpuError(
-            f"no allocatable GPU (>= {need} GB VRAM for {model_id}) on any available provider "
-            f"({', '.join(supported_available) or '(none)'}); the run genuinely exceeds every "
-            f"active GPU class"
+        _raise_no_candidate_error(
+            model_id=model_id,
+            need=need,
+            cap=cap,
+            exact=exact,
+            supported_available=supported_available,
+            structurally_unsupported=structurally_unsupported,
+            lookup_failed=lookup_failed,
         )
     # cheapest JOB first, not cheapest rental: rank on the dollars one step costs on each candidate
     # (rate x how long that hardware takes), so a faster card wins whenever it finishes enough sooner

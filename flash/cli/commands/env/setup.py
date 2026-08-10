@@ -488,15 +488,8 @@ def _setup_interactive(args) -> bool:
     return render.can_prompt()
 
 
-def cmd_env_setup(args) -> int:
-    project_id = _require_setup_project(args)
-    _validate_existing_config_projects(project_id)
-    starter_env = Path("environment.py")
-    starter_evaluations = Path(_DEFAULT_EVALUATIONS_PATH)
-    dataset = Path("dataset/train.jsonl")
-    # trace import is optional and can only read the selected project. an existing dataset is never
-    # overwritten, so importing into it would be a silently discarded download.
-    traces_jsonl = None if dataset.exists() else _traces_dataset(args, project_id)
+def _resolve_turn_mode(args, starter_env: Path, dataset: Path) -> tuple[bool, bool]:
+    """resolve the turn-mode reconciliation phase."""
     # An existing environment.py is the authoritative signal for which turn mode this
     # scaffold already uses (the dataset is plain JSONL with no reliable mode marker).
     # Anchor to it so a re-run never leaves a single-turn env beside a multi-turn
@@ -533,20 +526,16 @@ def cmd_env_setup(args) -> int:
         )
     else:
         multi_turn = False
+    return multi_turn, starter_env_exists
 
+
+def _resolve_reasoning_mode(args, reasoning_configs: tuple[Path, ...]) -> bool:
+    """resolve the reasoning-mode reconciliation phase."""
     # Resolve reasoning. Like the turn mode, an existing config is authoritative: configs are only
     # written when absent, so applying a reasoning flag to an already-scaffolded project would
     # silently no-op (or write one config with reasoning and leave the other without). Anchor to the
     # existing config's `thinking` state and warn if a flag disagrees; otherwise the flag wins;
     # otherwise ask on a terminal; else off.
-    rl = Path("configs/rl.toml")
-    sft = Path("configs/sft.toml")
-    opd = Path("configs/opd.toml")
-    # All THREE configs persist `thinking`, so all three must anchor it and all three must be named in
-    # the deletion guidance. Anchoring on a subset lets a user follow this warning literally, delete
-    # exactly what it names, and end up with the deleted configs rewritten one way and the unnamed one
-    # still holding the old setting -- the same silent cross-algorithm mismatch, just relocated.
-    reasoning_configs = (rl, opd, sft)
     existing_reasoning = _existing_reasoning(reasoning_configs)
     flag_reason = getattr(args, "reasoning", None)
     if existing_reasoning is not None:
@@ -567,6 +556,139 @@ def cmd_env_setup(args) -> int:
         reasoning = render.select("Train with reasoning (thinking)?", _REASONING_OPTIONS) == "on"
     else:
         reasoning = False
+    return reasoning
+
+
+def _write_rl_config(
+    rl: Path,
+    project_line: str,
+    thinking_line: str,
+    env_comment: str,
+    max_examples_line: str,
+    rl_reasoning_train: str,
+) -> None:
+    """write the rl config-file phase."""
+    if not rl.exists():
+        rl.write_text(
+            'model = "Qwen/Qwen3.5-4B"\n'
+            f"{project_line}"
+            'algorithm = "grpo"\n'
+            f"{thinking_line}"
+            "\n"
+            f"{env_comment}"
+            "[train]\n"
+            "epochs = 1\n"
+            f"{max_examples_line}"
+            f"{rl_reasoning_train}"
+            "lora_rank = 32\n"
+            "# Constrain every rollout with guided decoding (a JSON schema is shown; regex and\n"
+            "# choice forms also parse) — see `flash train --doc`:\n"
+            '# structured_outputs = \'{"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}\'\n'
+            "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
+            "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
+        )
+
+
+def _write_sft_config(
+    sft: Path,
+    project_line: str,
+    thinking_line: str,
+    env_comment: str,
+    max_examples_line: str,
+    sft_reasoning_note: str,
+) -> None:
+    """write the sft config-file phase."""
+    if not sft.exists():
+        sft.write_text(
+            'model = "Qwen/Qwen3.5-4B"\n'
+            f"{project_line}"
+            'algorithm = "sft"\n'
+            f"{thinking_line}"
+            "\n"
+            f"{env_comment}"
+            "[train]\n"
+            "epochs = 1\n"
+            f"{max_examples_line}"
+            "lora_rank = 32\n"
+            f"{sft_reasoning_note}"
+            "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
+            "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
+        )
+
+
+def _write_opd_config(
+    opd: Path,
+    multi_turn: bool,
+    project_line: str,
+    project_id: str,
+    thinking_line: str,
+    max_examples_line: str,
+) -> None:
+    """write the opd config-file phase."""
+    if not opd.exists():
+        # opd (on-policy distillation) works in BOTH modes: single-turn distils one sampled completion
+        # per prompt; multi-turn rolls out each episode and distils every assistant turn against the
+        # transcript so far. The scaffold differs only by a one-line note pointing at the mode.
+        opd_multiturn_note = (
+            "# note: opd rolls out each episode and distils every assistant turn (conditioned on the\n"
+            "# transcript so far) against the managed parasail teacher - the multi-turn distillation path.\n\n"
+            if multi_turn
+            else ""
+        )
+        opd.write_text(
+            f"{opd_multiturn_note}"
+            'model = "Qwen/Qwen3.5-4B"\n'
+            f"{project_line}"
+            'algorithm = "opd"   # on-policy distillation from a managed parasail teacher (default glm 5.2)\n'
+            f"{thinking_line}"
+            "\n"
+            "# Environment: upload this project folder with\n"
+            f"# `flash env push --project {project_id} --name my-env .`, then paste the returned id below.\n"
+            "# the teacher and its parasail key are platform-managed; nothing to set up or export.\n"
+            "[environment]\n"
+            'id = ""\n\n'
+            "[train]\n"
+            "epochs = 1\n"
+            f"{max_examples_line}"
+            "lora_rank = 32\n"
+            '# teacher_model = "glm-5.2"   # teacher: glm-5.2 (default) | kimi-k3 |\n'
+            "#                             # qwen3.5-397b-a17b | deepseek-v4-pro\n"
+            "#                             # (key stays managed)\n"
+            "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
+            "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
+        )
+
+
+def _write_training_guide(training: Path, project_id: str) -> None:
+    """write the training guide phase."""
+    if not training.exists():
+        # Explicit UTF-8: TRAINING_MD has non-ASCII chars that raise UnicodeEncodeError under a non-UTF-8 locale.
+        training.write_text(
+            TRAINING_MD.replace("PROJECT_UUID", project_id).replace("<project-uuid>", project_id),
+            encoding="utf-8",
+        )
+
+
+def cmd_env_setup(args) -> int:
+    project_id = _require_setup_project(args)
+    _validate_existing_config_projects(project_id)
+    starter_env = Path("environment.py")
+    starter_evaluations = Path(_DEFAULT_EVALUATIONS_PATH)
+    dataset = Path("dataset/train.jsonl")
+    # trace import is optional and can only read the selected project. an existing dataset is never
+    # overwritten, so importing into it would be a silently discarded download.
+    traces_jsonl = None if dataset.exists() else _traces_dataset(args, project_id)
+    multi_turn, starter_env_exists = _resolve_turn_mode(args, starter_env, dataset)
+
+    rl = Path("configs/rl.toml")
+    sft = Path("configs/sft.toml")
+    opd = Path("configs/opd.toml")
+    # All THREE configs persist `thinking`, so all three must anchor it and all three must be named in
+    # the deletion guidance. Anchoring on a subset lets a user follow this warning literally, delete
+    # exactly what it names, and end up with the deleted configs rewritten one way and the unnamed one
+    # still holding the old setting -- the same silent cross-algorithm mismatch, just relocated.
+    reasoning_configs = (rl, opd, sft)
+    reasoning = _resolve_reasoning_mode(args, reasoning_configs)
 
     env_py = (_STARTER_ENV_MULTITURN_PY if multi_turn else _STARTER_ENV_PY).replace(
         "PROJECT_UUID", project_id
@@ -621,81 +743,26 @@ def cmd_env_setup(args) -> int:
         if reasoning
         else ""
     )
-    if not rl.exists():
-        rl.write_text(
-            'model = "Qwen/Qwen3.5-4B"\n'
-            f"{project_line}"
-            'algorithm = "grpo"\n'
-            f"{thinking_line}"
-            "\n"
-            f"{env_comment}"
-            "[train]\n"
-            "epochs = 1\n"
-            f"{max_examples_line}"
-            f"{rl_reasoning_train}"
-            "lora_rank = 32\n"
-            "# Constrain every rollout with guided decoding (a JSON schema is shown; regex and\n"
-            "# choice forms also parse) — see `flash train --doc`:\n"
-            '# structured_outputs = \'{"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}\'\n'
-            "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
-            "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
-        )
-    if not sft.exists():
-        sft.write_text(
-            'model = "Qwen/Qwen3.5-4B"\n'
-            f"{project_line}"
-            'algorithm = "sft"\n'
-            f"{thinking_line}"
-            "\n"
-            f"{env_comment}"
-            "[train]\n"
-            "epochs = 1\n"
-            f"{max_examples_line}"
-            "lora_rank = 32\n"
-            f"{sft_reasoning_note}"
-            "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
-            "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
-        )
+    _write_rl_config(
+        rl,
+        project_line,
+        thinking_line,
+        env_comment,
+        max_examples_line,
+        rl_reasoning_train,
+    )
+    _write_sft_config(
+        sft,
+        project_line,
+        thinking_line,
+        env_comment,
+        max_examples_line,
+        sft_reasoning_note,
+    )
     opd = Path("configs/opd.toml")
-    if not opd.exists():
-        # opd (on-policy distillation) works in BOTH modes: single-turn distils one sampled completion
-        # per prompt; multi-turn rolls out each episode and distils every assistant turn against the
-        # transcript so far. The scaffold differs only by a one-line note pointing at the mode.
-        opd_multiturn_note = (
-            "# note: opd rolls out each episode and distils every assistant turn (conditioned on the\n"
-            "# transcript so far) against the managed parasail teacher - the multi-turn distillation path.\n\n"
-            if multi_turn
-            else ""
-        )
-        opd.write_text(
-            f"{opd_multiturn_note}"
-            'model = "Qwen/Qwen3.5-4B"\n'
-            f"{project_line}"
-            'algorithm = "opd"   # on-policy distillation from a managed parasail teacher (default glm 5.2)\n'
-            f"{thinking_line}"
-            "\n"
-            "# Environment: upload this project folder with\n"
-            f"# `flash env push --project {project_id} --name my-env .`, then paste the returned id below.\n"
-            "# the teacher and its parasail key are platform-managed; nothing to set up or export.\n"
-            "[environment]\n"
-            'id = ""\n\n'
-            "[train]\n"
-            "epochs = 1\n"
-            f"{max_examples_line}"
-            "lora_rank = 32\n"
-            '# teacher_model = "glm-5.2"   # teacher: glm-5.2 (default) | kimi-k3 |\n'
-            "#                             # qwen3.5-397b-a17b | deepseek-v4-pro\n"
-            "#                             # (key stays managed)\n"
-            "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
-            "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
-        )
+    _write_opd_config(opd, multi_turn, project_line, project_id, thinking_line, max_examples_line)
     training = Path("TRAINING.md")
-    if not training.exists():
-        # Explicit UTF-8: TRAINING_MD has non-ASCII chars that raise UnicodeEncodeError under a non-UTF-8 locale.
-        training.write_text(
-            TRAINING_MD.replace("PROJECT_UUID", project_id).replace("<project-uuid>", project_id),
-            encoding="utf-8",
-        )
+    _write_training_guide(training, project_id)
     scaffolded = [
         "environment.py",
         *([_DEFAULT_EVALUATIONS_PATH] if starter_evaluations.exists() else []),

@@ -10,10 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import os
-import re
-import shutil
 import subprocess
-import time
 
 from flash.core.spec import gpu_count_of
 
@@ -25,31 +22,18 @@ from flash.engine.plan.steps import (
     on_policy_steps,  # noqa: F401
     resolve_update_horizon,  # noqa: F401
 )
-from flash.engine.profiling.sft_workload import (
-    _materialize_verl_images,
-)
-from flash.engine.result.rollout_samples import (
-    sample_completion_text,
-    sanitize_rollout_text,
-)
-from flash.engine.worker.backend_common import (
+from flash.engine.worker.backend_common import (  # noqa: F401
     _ORPHANED_PIPE_GRACE_S,
     _TEARDOWN_GRACE_S,
     VERL_REQUIREMENT,
     ChildOutputTail,
     _ChildExitWatchdog,
-    adopt_orphaned_descendants,
-    append_step_metrics,
-    clamp_engine_len,  # noqa: F401
+    clamp_engine_len,
     export_peft_adapter,
     fused_ce_backend,
     gdn_probe_module,
     kill_process_group,
-    latest_global_step_dir,
-    model_max_position_embeddings,  # noqa: F401
-    parse_verl_metric,
-    parse_verl_step_metrics,
-    parse_wandb_link,
+    model_max_position_embeddings,
     probe_verl_capabilities,
     raise_for_classified_verl_exit,
     reap_stragglers,
@@ -65,22 +49,17 @@ from flash.engine.worker.backend_common import (
     verl_declares_rollout_field,
     verl_device_capability,
 )
-from flash.engine.worker.io.heartbeat import (
-    GRPO_METRIC_HISTORY_LIMIT,
-    LATEST_GRPO_METRICS_LAST,
-    RewardObservabilityBuffer,
-    liveness_heartbeat,
-)
+from flash.engine.worker.io.heartbeat import liveness_heartbeat
 
 # no call site in this module since the uploader moved to `.train.rl.checkpoints`, but it is kept
 # imported here on purpose: the resume tests patch `rl_train._deployable_adapter_on_hf`, and the
 # uploader reads it back through this module. removing it as unused would silently break them.
 from flash.engine.worker.io.hf import _deployable_adapter_on_hf  # noqa: F401
 from flash.engine.worker.model.packing import model_is_gdn_hybrid
-from flash.engine.worker.perf import gpu_diagnostics, wait_for_gpu
+from flash.engine.worker.perf import gpu_diagnostics
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.runtime.rng import seed_training_rngs  # noqa: F401
-from flash.engine.worker.sft_train import (
+from flash.engine.worker.sft_train import (  # noqa: F401
     _build_verl_child_env,
     _cached_model_path,
     _NvidiaSmiPeakSampler,
@@ -91,7 +70,7 @@ from flash.engine.worker.sft_train import (
 from flash.engine.worker.train.opd.gkd import (  # noqa: F401
     generation_eos_from_cached_config,
 )
-from flash.engine.worker.train.rl.shims import (
+from flash.engine.worker.train.rl.shims import (  # noqa: F401
     render_entropy_quantile_shim,
     render_exact_save_steps_shim,
     render_image_pad_ban_shim,
@@ -192,571 +171,26 @@ class _GrpoSubprocessStream:
         return return_code
 
 
-def run_rl_train():
-    """grpo training on verl, output-compatible with run_rl. see module docstring for scope."""
-    t_start = time.time()
-    _w.heartbeat("rl_start", gpu=gpu_diagnostics())
-    wait_for_gpu(
-        _w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None,
-        gpu_type=_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else "",
-    )
-    # no setup_perf_backends() here: torch's tf32 flags are per-process state that a subprocess does
-    # not inherit, and this process trains nothing -- verl does, out of process. the child opts in
-    # from its own sitecustomize instead (render_tf32_shim, wired into shim_source below).
-
-    # env load, prompt render and tokenization run for minutes on a large split and emit nothing of
-    # their own; without the wrap the provider sees silence from rl_start until rl_train_start.
-    # (the warm-start adapter pull nested inside carries its own rl_adapter_loading wrap.)
-    with liveness_heartbeat("rl_data_loading"):
-        inp = _resolve_grpo_inputs()
-    env, tok = inp["env"], inp["tok"]
-    # what gets saved next to a published adapter. a multimodal adapter is unservable without its
-    # image preprocessor, so save the whole processor there; a text run saves the tokenizer alone.
-    preprocessor = inp["processor"] or tok
-    prompts = inp["prompts"]
-
-    # cache the base model before launching verl, then run verl fully offline so its vllm /
-    # transformers never hit hf's (rate-limited) api. flash already owns model prefetch; the verl
-    # subprocess simply reuses that cache.
-    if inp["model_revision"]:
-        download_seconds = _w.prefetch_model(inp["model_id"], revision=inp["model_revision"])
-    else:
-        download_seconds = _w.prefetch_model(inp["model_id"])
-    # verl resolves model.path with HF_HUB_OFFLINE=1, so pass a real snapshot directory. bare ids can
-    # miss pinned revisions or cache symlinks and fail after gpu rental. _cached_model_path handles
-    # both and raises RetriableInfraError so the run can move to a healthy worker.
-    model_path_for_verl = _cached_model_path(inp["model_id"], inp["model_revision"])
-
-    # stable int index -> rollout example, exactly as the retired trl path (reward maps back via this).
-    ds_rows, rollout_examples = _w.build_grpo_prompt_dataset(prompts)
-    message_prompts = [p["prompt"] for p in prompts]
-    indices = [int(r["example_idx"]) for r in ds_rows]
-    # ground_truth is a verl-schema placeholder only; the reward bridge scores by example_idx
-    # against the live env and never reads it.
-    ground_truths = [
-        str(ex.get("answer", "") or "") if isinstance(ex, dict) else "" for ex in rollout_examples
-    ]
-
-    workdir = f"/tmp/rl_train_seed{_w.SEED}"
-    os.makedirs(workdir, exist_ok=True)
-    local_dir = os.path.join(workdir, "ckpt")
-    # a retry reuses the pod workdir; stale global_step_N dirs from a prior attempt would satisfy
-    # latest_global_step_dir and publish an old policy as if this attempt trained it.
-    shutil.rmtree(local_dir, ignore_errors=True)
-    # restore after the wipe, never before: the wipe is what makes a stale local dir safe, and the
-    # resume checkpoint is the one global_step_N this attempt is entitled to start from.
-    os.makedirs(local_dir, exist_ok=True)
-    resume_step = _restore_verl_resume(local_dir)
-    train_pq = os.path.join(workdir, "train.parquet")
-    val_pq = os.path.join(workdir, "val.parquet")
-    reward_py = os.path.join(workdir, "reward.py")
-
-    # multimodal: decode each prompt's images to png on disk and carry file:// uris in the parquet.
-    # verl's dataset loads them through qwen_vl_utils.fetch_image, which reads file:// natively, so
-    # the pixels never have to round-trip through arrow. same contract the opd verl path writes.
-    image_uris = None
-    if inp["multimodal"]:
-        image_dir = os.path.join(workdir, "images")
-        shutil.rmtree(image_dir, ignore_errors=True)
-        image_uris = [
-            _materialize_verl_images(
-                list(prompt.get("images") or []), inp["package_root"], image_dir, index
-            )
-            for index, prompt in enumerate(prompts)
-        ]
-
-    rows = build_verl_dataset_rows(message_prompts, indices, ground_truths, image_uris)
-    write_verl_grpo_parquet(rows, train_pq)
-    write_verl_grpo_parquet(rows[: max(1, min(4, len(rows)))], val_pq)
-    with open(reward_py, "w") as f:
-        f.write(render_reward_module())
-
-    # runtime patches for the verl interpreter. a stale shim from a prior attempt would otherwise
-    # keep patching this one, so the file is rewritten every time.
-    shim_dir = os.path.join(workdir, "shim")
-    os.makedirs(shim_dir, exist_ok=True)
-    shim_py = os.path.join(shim_dir, "sitecustomize.py")
-    # one sitecustomize holds every patch: python imports it once, so a second file would never be
-    # loaded. each feature renderer returns "" when its feature is off; the tf32 fragment is
-    # unconditional, so this source is never empty.
-    shim_source = "".join(
-        part
-        for part in (
-            # first: torch's matmul flags are process-wide state, and reading them back is how the
-            # rest of the child sees the choice. nothing below depends on it, but a later fragment
-            # that raised would otherwise cost the whole run its tensor-core throughput.
-            render_tf32_shim(),
-            render_reentrant_checkpointing_shim(
-                inp["reentrant_checkpointing"], multimodal=bool(inp["multimodal"])
-            ),
-            render_entropy_quantile_shim(inp["entropy_quantile"]),
-            render_per_turn_credit_shim(inp["per_turn_credit"]),
-            render_stop_sequences_shim(inp["stop_sequences"]),
-            render_image_pad_ban_shim(inp["image_pad_token_id"]),
-            render_structured_outputs_shim(inp["structured_outputs"]),
-            render_exact_save_steps_shim(inp["save_at_steps"], inp["steps"]),
-            render_kl_ref_adapter_shim(
-                bool(inp["warmstart_adapter"]) and float(inp["kl_coef"]) > 0
-            ),
-            # gated on the key rather than the resolved logger list: that list needs python_bin,
-            # which is resolved after this file is written. the shim is inert either way -- it only
-            # fires when verl actually calls wandb.init, which requires wandb in the logger list.
-            render_wandb_link_shim() if os.environ.get("WANDB_API_KEY") else "",
-        )
-        if part
-    )
-    with open(shim_py, "w") as f:
-        f.write(shim_source)
-
-    # multi-turn: copy the child-side agent loop next to the shim so the verl interpreter can
-    # import it (see copy_multi_turn_child_modules for why it is a copy and not an import).
-    if inp["multi_turn"]:
-        copy_multi_turn_child_modules(shim_dir)
-
-    # the localhost bridge carries rollouts and #607 reward components. generation_size closes each
-    # generation when its last scoring call finishes, before a later stdout step line can mix in the
-    # next generation. test_freq=-1 and val_before_train=false make every bridged completion training
-    # data.
-    observability = RewardObservabilityBuffer(
-        generation_size=int(inp["prompts_per_step"]) * int(inp["group_size"]),
-    )
-    # filled from the child's marker line; stays empty when wandb is off (see render_wandb_link_shim).
-    wandb_link: dict[str, str | None] = {}
-
-    def _score_batch(requests: list[tuple[int, str]]) -> list[float]:
-        # grade the whole batch before touching the observability lock. the env's scorer may block on
-        # judge i/o, while record is intentionally a short per-result critical section.
-        scored = score_single_turn_batch(
-            env,
-            [(solution_str, rollout_examples[int(index)]) for index, solution_str in requests],
-            tok=tok,
-            thinking=bool(_w.THINKING),
-            prompt_opened_thinking=inp["prompt_opened_thinking"],
-            think_penalty=inp["think_penalty"],
-        )
-        results = []
-        for (index, solution_str), (score, breakdowns) in zip(requests, scored, strict=True):
-            observability.record(message_prompts[int(index)], solution_str, score, breakdowns)
-            results.append(score)
-        return results
-
-    def _score_for_profile(index: int, solution_str: str) -> float:
-        """score for profiling without training observability side effects.
-
-        do not seed rollout buffers. errors propagate so a broken grader is not measured as fast.
-        """
-        return score_single_turn(
-            env,
-            solution_str,
-            rollout_examples[int(index)],
-            tok=tok,
-            thinking=bool(_w.THINKING),
-            prompt_opened_thinking=inp["prompt_opened_thinking"],
-            think_penalty=inp["think_penalty"],
-            raise_on_error=True,
-        )
-
-    # the profiler times the single-turn grading path (env.reward / env.scores_breakdown on one
-    # completion). a multi-turn env scores a terminal episode instead, so that timing would neither
-    # describe nor even validly reach its reward path.
-    reward_profile = (
-        None
-        if inp["multi_turn"]
-        else _log_reward_profile(
-            env,
-            _score_for_profile,
-            rollout_examples,
-            int(inp["prompts_per_step"]) * int(inp["group_size"]),
-        )
-    )
-
-    multi_turn_bridge = (
-        MultiTurnBridge(
-            env,
-            rollout_examples,
-            # index-aligned with rollout_examples: build_grpo_prompt_dataset preserves order.
-            env_prompts=[p["env_prompt"] for p in prompts],
-            max_turns=int(inp["max_turns"]),
-            per_turn_credit=bool(inp["per_turn_credit"]),
-            on_episode_scored=observability.record,
-        )
-        if inp["multi_turn"]
-        else None
-    )
-    server, reward_url = start_reward_server(
-        _score_for_profile,
-        example_count=len(rollout_examples),
-        multi_turn_bridge=multi_turn_bridge,
-        rollout_batch=int(inp["prompts_per_step"]) * int(inp["group_size"]),
-        score_batch=None if inp["multi_turn"] else _score_batch,
-    )
-    # bound before the try so the finally can always ask whether it was started.
-    resume_uploader: _VerlResumeUploader | None = None
-    # verl trains out-of-process, so torch's in-process allocator counter never sees the trainer.
-    # nvidia-smi is the only reading that covers the child, and it must be sampled while the child
-    # runs; stopping it in the finally keeps the reading even when the run crashes or is cancelled.
-    gpu_sampler = _NvidiaSmiPeakSampler().start()
-    device_peak_gpu_gb: float | None = None
-    try:
-        # provisioning and the cold verl capability probe can take minutes without step output. keep
-        # liveness running so the stall watchdog does not fail healthy setup (#442). there is no
-        # monotonic progress counter here, only the keepalive.
-        with liveness_heartbeat("rl_configuring"):
-            python_bin = resolve_verl_python(
-                workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
-            )
-            # gdn boundary resets need the CHILD to have fla + causal_conv1d: without them the
-            # kwargs are accepted and discarded, so packed examples bleed state into each other.
-            # the modeling module is resolved HERE, in the parent, because it needs a hub/cache read
-            # the child must not repeat; "" skips the question for a non-hybrid.
-            gdn_hybrid = model_is_gdn_hybrid(inp["model_id"], inp["model_revision"])
-            gdn_module = (
-                gdn_probe_module(inp["model_id"], inp["model_revision"]) if gdn_hybrid else ""
-            )
-            # ONE child answers every independent capability question. each used to cost its own
-            # interpreter, and the torch/verl import -- not the question -- was the price.
-            caps = probe_verl_capabilities(python_bin, gdn_module)
-        # masking truncated completions is a fork-only rollout field. FLASH_VERL_PYTHON can point at a
-        # stock verl, and hydra would compose the unknown key only to abort in dataclass conversion.
-        # fail here with the cause instead, and never silently train on truncated completions.
-        if inp["mask_truncated_completions"] and not verl_declares_rollout_field(
-            caps, "mask_truncated_completions"
-        ):
-            raise RuntimeError(
-                f"grpo requested mask_truncated_completions but the verl at {python_bin} does not "
-                "support it. the worker image's baked interpreter predates the freesolo fork; "
-                f"rebuild the worker image with '{VERL_REQUIREMENT}' installed."
-            )
-        # the shim is appended here rather than with the shims above because the answer needs
-        # python_bin, resolved in the block above; sitecustomize is imported by the child, which has
-        # not started yet.
-        # raises when a gdn child cannot honor resets: the padded fallback that used to handle that
-        # case cannot complete a step on verl's fsdp engine. see require_gdn_boundary_resets.
-        gdn_reset_arch = require_gdn_boundary_resets(caps, gdn_module)
-        if gdn_reset_arch is not None:
-            with open(shim_py, "a") as f:
-                f.write(render_gdn_varlen_shim(gdn_reset_arch))
-
-        expected_steps = int(inp["steps"])
-        # verl logs from its own interpreter; gate wandb on that env (see resolve_verl_loggers).
-        loggers = resolve_verl_loggers(caps)
-        _spec = _w.JOB_SPEC
-        project_name = (_spec.wandb.project if _spec and _spec.wandb else None) or "flash"
-        experiment_name = _w.wandb_run_name()
-        # fp8 kv cache on ada/hopper+ (cc>=8.9), matching the sizing math in engine/vram.py. NOT for
-        # hybrid linear-attention (GDN) models: vllm's fp8-kv wake path (init_fp8_kv_scales) assumes a
-        # plain kv tensor and crashes on the hybrid cache ('list' has no zero_) under verl sleep/wake.
-        try:
-            import torch as _torch_cc
-
-            _cc_ok = bool(
-                _torch_cc.cuda.is_available() and _torch_cc.cuda.get_device_capability() >= (8, 9)
-            )
-        except Exception:  # no cuda / probe failure -> conservative bf16 kv
-            _cc_ok = False
-        # reuse the gdn answer resolved above rather than re-probing; see gdn_hybrid.
-        fp8_kv = _cc_ok and not gdn_hybrid
-        # one capability probe, both rollout decisions below. asked of the verl interpreter, whose
-        # torch/vllm stack is the one that has to run the rollout.
-        verl_cc = verl_device_capability(caps)
-        # blackwell needs both rollout attention backends pinned; vllm 0.19.1's own defaults pick
-        # flash-attn, which is PTX-unreliable on sm120 (silent empty rollouts) and routes the ViT
-        # into an unimportable CUTE kernel on sm100/sm120. no-op off blackwell.
-        attention_backend, mm_encoder_attn_backend = resolve_blackwell_attention_backends(
-            caps, verl_cc
-        )
-        # sm86 is the one arch whose vllm 0.19.1 graph capture is a measured failure (completions
-        # repeat to the token cap without emitting EOS), so only it runs the rollout eagerly. see
-        # resolve_rollout_enforce_eager for the per-arch evidence and why one knob is enough.
-        enforce_eager = resolve_rollout_enforce_eager(verl_cc)
-        cfg = _build_verl_training_cfg(
-            inp,
-            train_files=train_pq,
-            val_files=val_pq,
-            model_id=model_path_for_verl,
-            thinking=bool(_w.THINKING),
-            loggers=loggers,
-            fp8_kv=fp8_kv,
-            enforce_eager=enforce_eager,
-            attention_backend=attention_backend,
-            mm_encoder_attn_backend=mm_encoder_attn_backend,
-            reward_path=reward_py,
-            local_dir=local_dir,
-            project_name=project_name,
-            experiment_name=experiment_name,
-            gpu_type=(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else ""),
-            n_gpus=gpu_count_of(_w.JOB_SPEC),
-            # resolved from the out-of-process capability probe, never by opening cuda in this
-            # parent -- see fused_ce_backend.
-            ce_backend=fused_ce_backend(caps),
-        )
-        overrides = build_verl_overrides(cfg)
-        # the executor budget is sized per run now, so print what this one actually asked for --
-        # a vllm init failure reports the demand against the free memory, and the demand is
-        # otherwise invisible in the log.
-        print(
-            f"[rl-verl] rollout gpu_memory_utilization={cfg['gpu_mem_util']:.4f}",
-            flush=True,
-        )
-
-        setup_seconds = time.time() - t_start
-        _w.heartbeat("rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
-        _w.heartbeat("rl_step", step=0, initial=True)
-        t_train = time.time()
-        # equal within-group rewards produce zero advantages and gradients. collect per-step spread;
-        # reward mean and pg_loss cannot prove a signal. declare this before the uploader because its
-        # publication gate closes over the histories.
-        adv_spread_history: list[float] = []
-        resume_uploader = _VerlResumeUploader(
-            local_dir,
-            resume_step=resume_step,
-            required_steps=inp["save_at_steps"],
-            export_root=os.path.join(workdir, "exports"),
-            python_bin=python_bin,
-            model_id=inp["model_id"],
-            model_revision=inp["model_revision"],
-            preprocessor=preprocessor,
-            # a resumed run's restored weights already carry the earlier steps' updates, so this
-            # worker's own spread history cannot speak for them; let it publish as before and leave
-            # the verdict to the same abstention _check_grpo_had_a_gradient makes.
-            had_gradient=(
-                None if resume_step else lambda: any(spread > 0.0 for spread in adv_spread_history)
-            ),
-        )
-        resume_uploader.credit_durable_required_steps(resume_step)
-        resume_uploader.start()
-        step_box = [0]
-
-        def _progress():
-            return step_box[0]
-
-        # allowlist the child env because ray fans it to every actor; scoring stays in the parent, so
-        # the child needs no platform hf token, github token, or user secrets. FLA_ kernel settings
-        # still cross through _CHILD_ENV_PREFIXES.
-        env_for_verl = _build_verl_child_env(shim_dir=shim_dir, wandb_enabled="wandb" in loggers)
-        env_for_verl["FLASH_VERL_REWARD_URL"] = reward_url
-        # the model is prefetched above; keep the subprocess off hf's rate-limited api.
-        env_for_verl["HF_HUB_OFFLINE"] = "1"
-        env_for_verl["TRANSFORMERS_OFFLINE"] = "1"
-        env_for_verl["HF_HUB_DISABLE_XET"] = "1"
-        if inp["multi_turn"]:
-            # the plugin named here and the loop it builds live in shim_dir, so PYTHONPATH must
-            # carry it -- see below.
-            env_for_verl.update(
-                multi_turn_child_env(inp, reward_url=reward_url, thinking=bool(_w.THINKING))
-            )
-        # python imports sitecustomize automatically at startup, so the shim patches verl before
-        # main_ppo runs. prepend rather than replace: an inherited PYTHONPATH may carry the verl
-        # install itself, and ray workers inherit this env so every actor gets the same patch.
-        # multi-turn needs the same entry for its copied-in agent loop modules. unconditional: the
-        # shim always carries at least the tf32 fragment, so a skipped entry would silently drop it.
-        env_for_verl["PYTHONPATH"] = os.pathsep.join(
-            item for item in (shim_dir, os.environ.get("PYTHONPATH", "")) if item
-        )
-        step_re = re.compile(r"step:\s*(\d+)")
-        reward_history: list[float] = []
-        resp_len_history: list[float] = []
-        loss_curve: list[float] = []
-        last_dump_step = [-1]
-        # consecutive LocalLogger metric arrival gaps are complete optimizer-step walls. do not use
-        # train_wall/steps_run: it includes setup/upload and divides session wall by an absolute resumed
-        # checkpoint step.
-        step_line_times: list[float] = []
-        # per-step backlog for `flash runs log -f`, rebuilt from verl's own step lines because its
-        # trainer runs out of process and cannot host an in-process trainer callback. read by the liveness thread
-        # below, so mutate it in place (append_step_metrics) rather than rebinding.
-        metrics_last: list[dict] = []
-        sent_first_metrics = False
-
-        def _reward_observability() -> dict:
-            """return reward metrics and sampled completions for one heartbeat.
-
-            verl is out of process, so liveness/stdout threads read the bridge's buffer. this is
-            read-only: only generation completion drains it, and mid-generation heartbeats repeat the
-            last complete reading.
-            """
-            return observability.heartbeat_fields()
-
-        with liveness_heartbeat(
-            "rl_step",
-            progress=_progress,
-            fields=lambda: {"metrics_last": list(metrics_last), **_reward_observability()},
-            progress_step=True,
-        ):
-            # claimed before the child exists, so a grandchild it orphans reparents here and can be
-            # reaped at teardown. this process is not pid 1 (the runpod handler is), so without it
-            # every wait answers ChildProcessError for a zombie nobody will collect.
-            adopt_orphaned_descendants()
-            proc = subprocess.Popen(
-                [python_bin, "-m", "verl.trainer.main_ppo", *overrides],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                env=env_for_verl,
-                start_new_session=True,
-            )
-            child_stream = _GrpoSubprocessStream(proc)
-            try:
-                for line in child_stream:
-                    print(f"[verl] {line}", end="", flush=True)
-                    link = parse_wandb_link(line)
-                    if link is not None:
-                        wandb_link.update(link)
-                    m = step_re.search(line)
-                    if m:
-                        step_box[0] = int(m.group(1))
-                        # dump one sample completion per new step to the flash log (#607).
-                        if step_box[0] != last_dump_step[0]:
-                            # the generation boundary: verl logs this line once its step is scored,
-                            # so everything the reward bridge buffered since the last one is that
-                            # step's complete output. seal it before the preview reads `latest`, so
-                            # both the log line and the heartbeat describe the same generation.
-                            observability.close_generation(step_box[0])
-                            # asks for THIS step's rows, not merely the newest: when the line is
-                            # spent on a generation the queue already dropped, nothing is published
-                            # and the previous generation's text would print under this step.
-                            samp = observability.latest_for_step(step_box[0])
-                            if samp:
-                                last_dump_step[0] = step_box[0]
-                                _, completion, reward = samp
-                                text = sanitize_rollout_text(sample_completion_text(completion))
-                                preview = " ".join(text[:300].split())
-                                print(
-                                    f"[rl-verl] step {step_box[0]} sample (reward={reward:.3f}): {preview}",
-                                    flush=True,
-                                )
-                    step_metrics = parse_verl_step_metrics(line)
-                    if step_metrics is not None:
-                        step_line_times.append(time.time())
-                        # a run constant rather than a verl metric, so it is stamped here from
-                        # the resolved run config.
-                        step_metrics["max_completion_tokens"] = inp["max_completion"]
-                        append_step_metrics(
-                            metrics_last, step_metrics, limit=GRPO_METRIC_HISTORY_LIMIT
-                        )
-                        # the worker's error path reads this global, so a run that dies mid-training
-                        # still reports the steps it did complete (worker/__init__.py:_err_metrics).
-                        LATEST_GRPO_METRICS_LAST[:] = metrics_last
-                        # rl_train_start arms a 900s throttle, so force the first backlog through like
-                        # heartbeat.py force_first_samples and retry until committed. later emissions remain
-                        # throttled to protect the hf commit cap.
-                        if not sent_first_metrics:
-                            sent_first_metrics = _w.heartbeat(
-                                "rl_step",
-                                force=True,
-                                step=step_metrics["step"],
-                                metrics_last=list(metrics_last),
-                                **_reward_observability(),
-                                gpu=gpu_diagnostics(include_torch=False),
-                            )
-                        # per-step series for train_meta observability parity. these live on the same
-                        # line as everything else: verl's only console metric sink is LocalLogger,
-                        # which always prints "step:N - ..." (verl/utils/logger/aggregate_logger.py),
-                        # so a line without a step carries no metric to collect.
-                        for verl_key, sink in (
-                            ("critic/rewards/mean", reward_history),
-                            ("actor/pg_loss", loss_curve),
-                            ("response_length/mean", resp_len_history),
-                        ):
-                            value = parse_verl_metric(line, verl_key)
-                            if value is not None:
-                                sink.append(value)
-                        # advantages/max and /min are emitted for every step outside verl's
-                        # use_critic branch (trainer/ppo/metric_utils.py), so they are present under
-                        # grpo even though the key is namespaced critic/.
-                        adv_max = parse_verl_metric(line, "critic/advantages/max")
-                        adv_min = parse_verl_metric(line, "critic/advantages/min")
-                        if adv_max is not None and adv_min is not None:
-                            adv_spread_history.append(adv_max - adv_min)
-                rc = child_stream.wait_and_classify()
-            except BaseException:
-                # the stream loop died (upload error, cancel, oom in the parent): a still-running
-                # verl child would keep burning the gpu unattended, so kill its whole process group.
-                # this escalates to SIGKILL after the grace period, which a bare SIGTERM does not: a
-                # vllm EngineCore that ignores the term keeps its cuda context and strands the gpu
-                # for every later job on a reusable worker.
-                child_stream.terminate()
-                raise
-        if rc != 0:
-            raise RuntimeError(
-                f"verl.trainer.main_ppo exited {rc}; see the flash log for the traceback"
-            )
-        # the gradient verdict runs here, ahead of required-save completeness, because a zero-spread
-        # run withholds every required deployable BY DESIGN: checking completeness first would raise
-        # on artifacts the gate is deliberately holding and report a checkpoint-publication failure
-        # -- the symptom -- instead of the constant reward signal that caused it. raising inside the
-        # try still runs the finally below, so the reward server and gpu sampler shut down either way.
-        _check_grpo_had_a_gradient(
-            reward_history,
-            adv_spread_history,
-            resumed=bool(resume_step),
-            # a resume already at the target runs zero steps and emits zero metrics; that is a
-            # complete policy, not a broken reward bridge. steps_run below still has to reach
-            # expected_steps, so this cannot excuse a run that stopped short.
-            already_complete=bool(resume_step) and resume_step >= expected_steps,
-        )
-        # training finished cleanly, so a missing required save is a real defect rather than a
-        # side effect of a crash. stop here (not in finally, which suppresses) to surface it.
-        # only when exact saves were requested: without them the drain stays best-effort, and
-        # letting a slow resume upload raise here would fail an otherwise-successful run.
-        if resume_uploader is not None and resume_uploader.required_steps:
-            resume_uploader.stop()
-            resume_uploader.raise_if_incomplete()
-    finally:
-        # drain before the reward server goes down: on a cancel or crash the last completed
-        # checkpoint is exactly the one a retry needs, so it is worth uploading on the way out.
-        if resume_uploader is not None:
-            with contextlib.suppress(Exception):
-                resume_uploader.stop()
-        with contextlib.suppress(Exception):
-            device_peak_gpu_gb = gpu_sampler.stop_gb()
-        # bridge first: the scoring thread is what the server's routes block on, so stopping the
-        # server before it would strand a scoring episode on an event nothing will ever set.
-        if multi_turn_bridge is not None:
-            with contextlib.suppress(Exception):
-                multi_turn_bridge.shutdown()
-        server.shutdown()
-        # every job boundary, not just the failing ones. `kill_process_group` runs on exceptions
-        # alone here, so a straggler an earlier teardown SIGKILLed but could not drain in time would
-        # otherwise be collected only by the next FAILING job: a reusable worker running successful
-        # grpo jobs after one late straggler keeps that zombie for life.
-        with contextlib.suppress(Exception):
-            reap_stragglers()
-
-    # collect verl's lora checkpoint -> flash-servable peft adapter, then reuse flash finalize.
-    out_dir = f"/tmp/rl_seed{_w.SEED}"
-    adapter_dir = f"{out_dir}/adapter"
-    shutil.rmtree(adapter_dir, ignore_errors=True)
-    os.makedirs(adapter_dir, exist_ok=True)
-    train_wall = time.time() - t_train
-    # the zero-gradient verdict already ran inside the try above, ahead of required-save
-    # completeness, so that a withheld deployable reports the reward cause rather than the
-    # publication symptom.
-    actor_dir, steps_run = latest_global_step_dir(local_dir)
-    if steps_run < expected_steps:
-        raise RuntimeError(
-            f"grpo completed {steps_run}/{expected_steps} requested optimizer updates"
-        )
-
-    with liveness_heartbeat(
-        "rl_finalizing",
-        progress=lambda: steps_run,
-        fields=lambda: {"metrics_last": list(metrics_last)},
-        progress_step=True,
-        keepalive=True,
-    ):
-        export_peft_adapter(
-            actor_dir, adapter_dir, base_model_id=inp["model_id"], python_bin=python_bin
-        )
-        preprocessor.save_pretrained(adapter_dir)
-        stamp_adapter_dir_provenance(adapter_dir, inp["model_id"], inp["model_revision"])
-        _w.write_base_model_provenance(adapter_dir, inp["model_id"], inp["model_revision"])
-        _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-        # preserve the final checkpoint only when exact save steps are not configured: with
-        # save_at_steps set the customer asked for those steps and nothing else.
-        if final_save_due(steps_run, inp["save_at_steps"]):
-            _w.publish_deployable_checkpoint(adapter_dir, steps_run)
-
+def _write_terminal_metadata(
+    *,
+    inp,
+    prompts,
+    adapter_dir,
+    steps_run,
+    train_wall,
+    setup_seconds,
+    state,
+    resume_step,
+    download_seconds,
+    device_peak_gpu_gb,
+    fp8_kv,
+    project_name,
+    loggers,
+    experiment_name,
+    reward_runtime,
+    gdn_hybrid,
+):
+    metrics_last = state.metrics_last
     _w.heartbeat(
         "rl_trained",
         train_wall=train_wall,
@@ -778,33 +212,256 @@ def run_rl_train():
         step=steps_run,
         heartbeat_fields={"metrics_last": list(metrics_last)},
         generated_tokens=int(
-            sum(resp_len_history)
-            / max(1, len(resp_len_history))
+            sum(state.resp_len_history)
+            / max(1, len(state.resp_len_history))
             * steps_run
             * inp["prompts_per_step"]
             * inp["group_size"]
         )
-        if resp_len_history
+        if state.resp_len_history
         else 0,
         notes=_build_verl_train_notes(
             inp,
             steps_run=steps_run,
             retained_prompts=len(prompts),
-            reward_history=reward_history,
-            loss_curve=loss_curve,
+            reward_history=state.reward_history,
+            loss_curve=state.loss_curve,
             resumed=bool(resume_step),
             download_seconds=download_seconds,
             device_peak_gpu_gb=device_peak_gpu_gb,
             fp8_kv=fp8_kv,
             wandb_project=project_name if "wandb" in loggers else None,
             wandb_run_name=experiment_name if "wandb" in loggers else None,
-            wandb_url=wandb_link.get("wandb_url"),
-            wandb_id=wandb_link.get("wandb_id"),
-            reward_profile=reward_profile,
-            step_intervals=_step_intervals(step_line_times),
+            wandb_url=reward_runtime.wandb_link.get("wandb_url"),
+            wandb_id=reward_runtime.wandb_link.get("wandb_id"),
+            reward_profile=reward_runtime.reward_profile,
+            step_intervals=_step_intervals(state.step_line_times),
             reward_bridge_batching=not inp["multi_turn"],
             gdn_boundary_resets=gdn_hybrid or None,
         ),
+    )
+
+
+def _configure_rl_child(
+    *, inp, files, model_path_for_verl, t_start, python_bin, gdn_hybrid, gdn_module, caps
+):
+    # masking truncated completions is a fork-only rollout field. FLASH_VERL_PYTHON can point at a
+    # stock verl, and hydra would compose the unknown key only to abort in dataclass conversion.
+    # fail here with the cause instead, and never silently train on truncated completions.
+    if inp["mask_truncated_completions"] and not verl_declares_rollout_field(
+        caps, "mask_truncated_completions"
+    ):
+        raise RuntimeError(
+            f"grpo requested mask_truncated_completions but the verl at {python_bin} does not "
+            "support it. the worker image's baked interpreter predates the freesolo fork; "
+            f"rebuild the worker image with '{VERL_REQUIREMENT}' installed."
+        )
+    # the shim is appended here rather than with the shims above because the answer needs
+    # python_bin, resolved before this helper; sitecustomize has not been imported by the child yet.
+    # raises when a gdn child cannot honor resets: the padded fallback that used to handle that
+    # case cannot complete a step on verl's fsdp engine. see require_gdn_boundary_resets.
+    gdn_reset_arch = require_gdn_boundary_resets(caps, gdn_module)
+    if gdn_reset_arch is not None:
+        with open(files["shim_py"], "a") as f:
+            f.write(render_gdn_varlen_shim(gdn_reset_arch))
+
+    expected_steps, loggers, project_name, experiment_name, cc_ok = _resolve_training_settings(
+        inp, caps
+    )
+    # reuse the gdn answer resolved above rather than re-probing; see gdn_hybrid.
+    fp8_kv = cc_ok and not gdn_hybrid
+    # one capability probe, both rollout decisions below. asked of the verl interpreter, whose
+    # torch/vllm stack is the one that has to run the rollout.
+    verl_cc = verl_device_capability(caps)
+    # blackwell needs both rollout attention backends pinned; vllm 0.19.1's own defaults pick
+    # flash-attn, which is PTX-unreliable on sm120 (silent empty rollouts) and routes the ViT
+    # into an unimportable CUTE kernel on sm100/sm120. no-op off blackwell.
+    attention_backend, mm_encoder_attn_backend = resolve_blackwell_attention_backends(caps, verl_cc)
+    # sm86 is the one arch whose vllm 0.19.1 graph capture is a measured failure (completions
+    # repeat to the token cap without emitting EOS), so only it runs the rollout eagerly. see
+    # resolve_rollout_enforce_eager for the per-arch evidence and why one knob is enough.
+    enforce_eager = resolve_rollout_enforce_eager(verl_cc)
+    cfg = _build_verl_training_cfg(
+        inp,
+        train_files=files["train_pq"],
+        val_files=files["val_pq"],
+        model_id=model_path_for_verl,
+        thinking=bool(_w.THINKING),
+        loggers=loggers,
+        fp8_kv=fp8_kv,
+        enforce_eager=enforce_eager,
+        attention_backend=attention_backend,
+        mm_encoder_attn_backend=mm_encoder_attn_backend,
+        reward_path=files["reward_py"],
+        local_dir=files["local_dir"],
+        project_name=project_name,
+        experiment_name=experiment_name,
+        gpu_type=(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else ""),
+        n_gpus=gpu_count_of(_w.JOB_SPEC),
+        # resolved from the out-of-process capability probe, never by opening cuda in this
+        # parent -- see fused_ce_backend.
+        ce_backend=fused_ce_backend(caps),
+    )
+    setup_seconds, t_train = _announce_training(t_start, cfg)
+    return {
+        "expected_steps": expected_steps,
+        "loggers": loggers,
+        "project_name": project_name,
+        "experiment_name": experiment_name,
+        "fp8_kv": fp8_kv,
+        "overrides": build_verl_overrides(cfg),
+        "setup_seconds": setup_seconds,
+        "t_train": t_train,
+    }
+
+
+def run_rl_train():
+    """grpo training on verl, output-compatible with run_rl. see module docstring for scope."""
+    # env load, prompt render and tokenization run for minutes on a large split and emit nothing of
+    # their own; without the wrap the provider sees silence from rl_start until rl_train_start.
+    # (the warm-start adapter pull nested inside carries its own rl_adapter_loading wrap.)
+    with liveness_heartbeat("rl_data_loading"):
+        t_start, inp, env, tok, preprocessor, prompts, download_seconds = _prepare_rl_inputs()
+    # verl resolves model.path with HF_HUB_OFFLINE=1, so pass a real snapshot directory. bare ids can
+    # miss pinned revisions or cache symlinks and fail after gpu rental. _cached_model_path handles
+    # both and raises RetriableInfraError so the run can move to a healthy worker.
+    model_path_for_verl = _cached_model_path(inp["model_id"], inp["model_revision"])
+    files, reward_runtime = _prepare_rl_runtime(inp, env, tok, prompts)
+
+    resume_uploader, gpu_sampler, device_peak_gpu_gb = _initialize_teardown_state()
+    try:
+        # provisioning and the cold verl capability probe can take minutes without step output. keep
+        # liveness running so the stall watchdog does not fail healthy setup (#442). there is no
+        # monotonic progress counter here, only the keepalive.
+        with liveness_heartbeat("rl_configuring"):
+            python_bin = resolve_verl_python(
+                files["workdir"], install_wandb=bool(os.environ.get("WANDB_API_KEY"))
+            )
+            # gdn boundary resets need the child to have fla + causal_conv1d. resolve the model here
+            # because the answer requires a hub/cache read the child must not repeat.
+            gdn_hybrid = model_is_gdn_hybrid(inp["model_id"], inp["model_revision"])
+            gdn_module = (
+                gdn_probe_module(inp["model_id"], inp["model_revision"]) if gdn_hybrid else ""
+            )
+            # one child answers every independent capability question. each used to cost its own
+            # interpreter, and the torch/verl import -- not the question -- was the price.
+            caps = probe_verl_capabilities(python_bin, gdn_module)
+        configured = _configure_rl_child(
+            inp=inp,
+            files=files,
+            model_path_for_verl=model_path_for_verl,
+            t_start=t_start,
+            python_bin=python_bin,
+            gdn_hybrid=gdn_hybrid,
+            gdn_module=gdn_module,
+            caps=caps,
+        )
+        expected_steps, loggers = configured["expected_steps"], configured["loggers"]
+        _w.heartbeat("rl_step", step=0, initial=True)
+        state = _StepMetricState()
+        # equal within-group rewards produce zero advantages and gradients. collect per-step spread;
+        # reward mean and pg_loss cannot prove a signal. declare this before the uploader because its
+        # publication gate closes over the histories.
+        adv_spread_history = state.adv_spread_history
+        resume_uploader = _start_resume_uploader(
+            local_dir=files["local_dir"],
+            resume_step=files["resume_step"],
+            inp=inp,
+            workdir=files["workdir"],
+            python_bin=python_bin,
+            preprocessor=preprocessor,
+            adv_spread_history=adv_spread_history,
+        )
+        env_for_verl = _build_rl_child_env(inp, files, loggers, reward_runtime.reward_url)
+        metrics_last = state.metrics_last
+
+        def _progress():
+            return state.progress["step"]
+
+        def _reward_observability() -> dict:
+            """return reward metrics and sampled completions for one heartbeat."""
+            return reward_runtime.observability.heartbeat_fields()
+
+        with liveness_heartbeat(
+            "rl_step",
+            progress=_progress,
+            fields=lambda: {"metrics_last": list(metrics_last), **_reward_observability()},
+            progress_step=True,
+        ):
+            rc = _execute_rl_child(
+                python_bin=python_bin,
+                overrides=configured["overrides"],
+                env_for_verl=env_for_verl,
+                inp=inp,
+                state=state,
+                reward_runtime=reward_runtime,
+                _reward_observability=_reward_observability,
+            )
+        _validate_rl_child(
+            rc,
+            state,
+            files["resume_step"],
+            expected_steps,
+            resume_uploader,
+        )
+    finally:
+        # drain before the reward server goes down: on a cancel or crash the last completed
+        # checkpoint is exactly the one a retry needs, so it is worth uploading on the way out.
+        if resume_uploader is not None:
+            with contextlib.suppress(Exception):
+                resume_uploader.stop()
+        with contextlib.suppress(Exception):
+            device_peak_gpu_gb = gpu_sampler.stop_gb()
+        # bridge first: the scoring thread is what the server's routes block on, so stopping the
+        # server before it would strand a scoring episode on an event nothing will ever set.
+        if reward_runtime.multi_turn_bridge is not None:
+            with contextlib.suppress(Exception):
+                reward_runtime.multi_turn_bridge.shutdown()
+        reward_runtime.server.shutdown()
+        # every job boundary, not just the failing ones. `kill_process_group` runs on exceptions
+        # alone here, so a straggler an earlier teardown SIGKILLed but could not drain in time would
+        # otherwise be collected only by the next failing job.
+        with contextlib.suppress(Exception):
+            reap_stragglers()
+
+    actor_dir, adapter_dir, steps_run, train_wall = _prepare_final_adapter(
+        files["local_dir"], configured["t_train"]
+    )
+    if steps_run < expected_steps:
+        raise RuntimeError(
+            f"grpo completed {steps_run}/{expected_steps} requested optimizer updates"
+        )
+    with liveness_heartbeat(
+        "rl_finalizing",
+        progress=lambda: steps_run,
+        fields=lambda: {"metrics_last": list(metrics_last)},
+        progress_step=True,
+        keepalive=True,
+    ):
+        _export_final_adapter(actor_dir, adapter_dir, inp, python_bin)
+        preprocessor.save_pretrained(adapter_dir)
+        _w.hf_upload_folder(adapter_dir, "adapter", required=True)
+        # preserve the final checkpoint only when exact save steps are not configured: with
+        # save_at_steps set the customer asked for those steps and nothing else.
+        if final_save_due(steps_run, inp["save_at_steps"]):
+            _w.publish_deployable_checkpoint(adapter_dir, steps_run)
+    _write_terminal_metadata(
+        inp=inp,
+        prompts=prompts,
+        adapter_dir=adapter_dir,
+        steps_run=steps_run,
+        train_wall=train_wall,
+        setup_seconds=configured["setup_seconds"],
+        state=state,
+        resume_step=files["resume_step"],
+        download_seconds=download_seconds,
+        device_peak_gpu_gb=device_peak_gpu_gb,
+        fp8_kv=configured["fp8_kv"],
+        project_name=configured["project_name"],
+        loggers=loggers,
+        experiment_name=configured["experiment_name"],
+        reward_runtime=reward_runtime,
+        gdn_hybrid=gdn_hybrid,
     )
 
 
@@ -822,7 +479,26 @@ _PROFILE_BUDGET_S = 30.0
 # checkpoint upload and the zero-gradient publish guard, implemented in `.train.rl.checkpoints`.
 # imported at the BOTTOM because that module reaches back here for the export helpers the upload
 # tests patch on this module, so a top-level import would be circular.
-from flash.engine.worker.train.rl.checkpoints import (  # noqa: E402
+from flash.engine.worker.rl_train_runner import (  # noqa: E402,F401
+    _announce_training,
+    _build_rl_child_env,
+    _execute_rl_child,
+    _export_final_adapter,
+    _ingest_step_metrics,
+    _initialize_teardown_state,
+    _prepare_final_adapter,
+    _prepare_rl_files,
+    _prepare_rl_inputs,
+    _prepare_rl_runtime,
+    _resolve_training_settings,
+    _RewardRuntime,
+    _start_resume_uploader,
+    _start_reward_runtime,
+    _StepMetricState,
+    _validate_rl_child,
+    _write_rl_shim,
+)
+from flash.engine.worker.train.rl.checkpoints import (  # noqa: E402,F401
     _check_grpo_had_a_gradient,
     _restore_verl_resume,
     _VerlResumeUploader,
@@ -830,7 +506,7 @@ from flash.engine.worker.train.rl.checkpoints import (  # noqa: E402
 
 # re-exported so `rl_train._resolve_grpo_inputs` keeps working: the resolver is called and
 # source-inspected through this module by a large number of tests.
-from flash.engine.worker.train.rl.inputs import _resolve_grpo_inputs  # noqa: E402
+from flash.engine.worker.train.rl.inputs import _resolve_grpo_inputs  # noqa: E402,F401
 from flash.engine.worker.train.rl.multi_turn import (  # noqa: E402,F401
     _MULTI_TURN_SCORE_BATCH_SIZE,
     _MULTI_TURN_SCORE_FLUSH_WAIT_S,
