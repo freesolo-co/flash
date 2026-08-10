@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 import time
 import uuid
@@ -23,7 +22,11 @@ from flash.client import (
     save_credentials,
     verify_freesolo_key,
 )
-from flash.client.config import (
+
+# `shadowed_login_warning` has no call site left here since the cost quote moved to
+# `.train_cost`, but the estimate tests patch it on THIS module and that quote reads it back
+# through the package. an autofix that drops it as unused breaks those tests.
+from flash.client.config import (  # noqa: F401
     load_credentials,
     load_credentials_with_source,
     shadowed_login_warning,
@@ -32,12 +35,10 @@ from flash.client.http import has_freesolo_backend
 from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
 from flash.core.catalog import public_model_rows
-from flash.cost.spec import runconfig_from_spec
 from flash.runner import TERMINAL_STATES
 from flash.schema import (
     ConfigError,
     spec_and_train_keys_from_file,
-    train_schema_metadata,
 )
 from flash.serve.urls import is_freesolo_hosted_url
 
@@ -55,11 +56,6 @@ _CLI_DONE_STATES = TERMINAL_STATES | {"deployed"}
 _OK_STATES = {"done", "dry_run", "deployed"}
 _SPINNER_FRAMES = "|/-\\"
 _SPINNER_TICK_SECONDS = 0.1
-_LEGACY_TRAIN_UNKNOWN_KEYS_RE = re.compile(
-    r"\A\[train\] unknown key\(s\): "
-    r"(?P<keys>[A-Za-z_][A-Za-z0-9_]*(?:, [A-Za-z_][A-Za-z0-9_]*)*) "
-    r"\(allowed: [A-Za-z_][A-Za-z0-9_]*(?:, [A-Za-z_][A-Za-z0-9_]*)*\)\Z"
-)
 
 
 class _LogFollowSpinner(TtyStatusLine):
@@ -322,449 +318,6 @@ def cmd_env_list(args) -> int:
     else:
         print("no environments yet - scaffold one with `flash env setup`")
     return 0
-
-
-def _cmd_train_cost(args) -> int:
-    """`flash train --cost`: print the pre-flight USD cost for the config and exit (no submit).
-
-    grpo and opd quote offline from the catalog. sft has no offline quote at all: its cost is
-    derived from the exact tokenized dataset, and only a workload profile knows that, so sft asks
-    the server for the same profile-backed quote a real submit would freeze. There is deliberately
-    no analytical sft fallback -- a guessed row count is what this whole path exists to remove.
-    """
-    from flash.adapters.lora_rank import preflight_train_context_within_serving
-
-    spec, authored_train_keys = spec_and_train_keys_from_file(
-        args.config,
-        run_id=None,
-        overrides=args.overrides,
-        extra_configs=args.extra_configs,
-        project_required=True,
-    )
-    preflight_train_context_within_serving(spec)
-    if spec.algorithm == "sft":
-        return _cmd_train_cost_sft(args, spec, authored_train_keys)
-    return _cmd_train_cost_offline(spec)
-
-
-def _cmd_train_cost_offline(spec) -> int:
-    """Catalog-only quote for the algorithms that do not need workload evidence yet (grpo, opd)."""
-    from flash.cost import estimate_cost
-
-    if _measured_quote_would_differ(spec):
-        # this command prices rollouts at the declared completion cap, but a dry-run or submit on
-        # the same config measures them and quotes the measured length instead -- so the two
-        # deliberately disagree, and this is the one meant for pre-spend decisions. it stays
-        # cap-based rather than measuring: measuring imports and runs the user's environment.py and
-        # can call a paid external scorer, which is not what `--cost` promises. say which number
-        # this is instead of letting the difference surface as an unexplained change at submit.
-        print(
-            "note: this quote prices generation at the declared completion cap. A sampler key is "
-            "configured, so `flash train --dry-run` measures real rollout length and can quote a "
-            "different (usually lower) amount for this same config.",
-            file=sys.stderr,
-        )
-    if spec.train.init_from_adapter:
-        # --cost is offline/catalog-only and cannot read the source adapter, so the rank stays at the
-        # local default. Warm starts train and are priced at the SOURCE adapter's authoritative rank
-        # (resolved server-side at submit/dry-run), which can be higher — so this estimate may
-        # under-quote. stderr keeps stdout clean for machine-readable callers.
-        print(
-            "warning: warm-start (train.init_from_adapter) cost uses the default LoRA rank; the "
-            "source adapter's rank is authoritative and resolved at submit, so a higher-rank source "
-            "may cost more than this estimate. Run `flash train --dry-run` for a source-rank quote.",
-            file=sys.stderr,
-        )
-    estimate = estimate_cost(runconfig_from_spec(spec))
-    if render.styled():
-        print(render.cost_panel(estimate))
-    else:
-        print(estimate.breakdown())
-    return 0
-
-
-def _measured_quote_would_differ(spec) -> bool:
-    """whether a dry-run on this same config would quote from measured rollouts instead.
-
-    only true when a measurement could actually happen: the algorithm samples rollouts, a sampler
-    key is configured, and nothing about the config makes a hosted draw unrepresentative. a config
-    that would be declined is quoted from the cap on BOTH paths, so warning about it would describe
-    a disagreement that does not exist.
-    """
-    from flash.core.catalog import samples_on_policy
-
-    if not samples_on_policy(spec.algorithm):
-        return False
-    from flash.cli.commands.rollout_profile import unsamplable_reason
-    from flash.engine.profiling.rollout_sampler import sampler_credentials
-
-    _base_url, api_key = sampler_credentials()
-    return bool(api_key) and not unsamplable_reason(spec)
-
-
-def _cmd_train_cost_sft(args, spec, authored_train_keys: frozenset[str]) -> int:
-    """Exact sft quote, served by the same authenticated path that freezes a real submit's quote."""
-    # cli._warn_if_login_shadowed() suppresses this warning for `--cost` because the catalog path
-    # never reaches an organization. the sft path does: it authenticates, resolves the project, and
-    # can start a billed profile run, so the warning has to fire here after all.
-    message = shadowed_login_warning()
-    if message:
-        print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
-    client = client_from_config()
-    try:
-        status = client.create_run(
-            spec_payload(spec, authored_train_keys=authored_train_keys),
-            runtime_secrets=runtime_secrets_from_local_env(
-                args.config, keys=spec.environment.secrets
-            )
-            or None,
-            dry_run=True,
-            client_train_schema=_client_train_schema(authored_train_keys),
-        )
-    except ApiError as exc:
-        _raise_if_workload_profile_pending(client, exc)
-        detail = _legacy_train_key_rejection_detail(exc, authored_train_keys)
-        if detail is None:
-            raise
-        raise ApiError(exc.status, detail, detail=detail) from exc
-    _print_exact_sft_cost(status, spec)
-    return 0
-
-
-def _client_train_schema(authored_train_keys: frozenset[str]) -> dict:
-    return {
-        "version": __version__,
-        "fields": train_schema_metadata(),
-        "authored_keys": sorted(authored_train_keys),
-    }
-
-
-def _dry_run_preview_line(
-    *,
-    algorithm: str,
-    affordability_verified: bool,
-    rollout_evidence: dict | None,
-    environment_stages_run: tuple[str, ...] = (),
-    rollout_evidence_accepted: bool = False,
-) -> str:
-    """What a dry run actually checked, and what it actually executed on this machine.
-
-    Three-way, because what ran locally differs per path. sft required a matching workload profile
-    to get this far, and that profile run already imported environment.py and tokenized the dataset,
-    so claiming otherwise would understate what has been checked and already billed. A grpo/opd
-    quote that reached profiling imported environment.py too. Only the path that never ran it
-    locally ran nothing.
-
-    ``environment_stages_run`` names the env hooks that actually executed, and is tracked separately
-    from ``rollout_evidence`` because profiling can run the user's module and still return nothing --
-    a multi-turn env, no samplable prompts, or an unreachable sampler. Both facts are things a user
-    could act on: what of their code ran here, and whether this price came from a measurement.
-
-    Per-stage rather than one flag, because the declines differ: a multi-turn env is refused after
-    the import alone, and an empty dataset before prompt_messages(). Naming hooks that never ran
-    would misstate exactly the disclosure this line exists to make.
-    """
-    # the server fails open on a billing-infra problem, so "cost" is only in the validated list
-    # when it was actually checked. absent key = a server that predates the signal, which is
-    # equally not a verification -- so treat anything but an explicit True as unverified.
-    cost = "and cost" if affordability_verified else "but NOT cost"
-    if algorithm == "sft":
-        environment = (
-            "your environment.py and the exact dataset were already loaded and tokenized by "
-            "the workload profile this quote is built on; model load and gpu/training are "
-            "first exercised on the worker after cold-start."
-        )
-    elif environment_stages_run:
-        # what ran is reported from the stages that actually executed, not from whether a payload
-        # came back. a multi-turn env, a dataset with no samplable prompts, or a dead sampler all
-        # import environment.py and then return no evidence -- and they stop at different points,
-        # so naming a fixed pair of hooks would overclaim on exactly those paths.
-        called = [f"{stage}()" for stage in environment_stages_run if stage != "import"]
-        ran = f" {' and '.join(called)} ran on a small sample." if called else ""
-        # the SERVER's verdict, not whether the client produced a payload. the client's only gate
-        # is "at least one draw came back", so a deadline-truncated pass of 31 draws, or one whose
-        # truncation rate or prompt coverage fails the trust gate, is evidence here and rejected
-        # there -- and the run is then priced at the cap. reporting the client's optimism as the
-        # outcome tells the user the opposite of what they will be billed against.
-        priced = (
-            "this quote is priced from the rollouts it measured"
-            if rollout_evidence_accepted
-            else "no usable measurement came back, so this quote still uses the declared "
-            "completion cap"
-        )
-        environment = (
-            f"your environment.py WAS imported locally to measure this quote:{ran} {priced}. "
-            "reward() was NOT called, so its grading cost is not in this quote. worker imports, "
-            "model load, and gpu/training are first exercised on the worker after cold-start."
-        )
-    else:
-        environment = (
-            "it did NOT import or run your environment.py; dataset loading, "
-            "start_episode/episode shapes, reward/scorer, worker imports, model load, and "
-            "gpu/training are first exercised on the worker after cold-start."
-        )
-    return (
-        "dry-run validated: config/schema, model+algorithm compatibility, lora rank, "
-        f"runtime-secret presence, warm-start source, serving context cap, {cost}. "
-        f"{environment}"
-    )
-
-
-def _rollout_evidence_for(
-    client: ApiClient, spec, runtime_secrets: dict | None = None
-) -> tuple[dict | None, tuple[str, ...]]:
-    """Measured rollout aggregates for a grpo/opd submit, or None when nothing was measured.
-
-    Advisory, and silent on every failure. The server re-derives the digest and re-applies the same
-    trust verdict a first-party measurement passes, so this can only ever supply evidence that is
-    rejected or evidence that survives those checks. Returning None leaves the quote on the declared
-    completion cap, which is the pricing this path had before any of it existed -- so a submit must
-    never fail because a sampler was unreachable, slow, or unconfigured.
-
-    ``runtime_secrets`` are forwarded so the env code executed locally sees the same declared
-    secrets the worker will; without them an external-judge reward() raises and the measurement is
-    silently lost.
-
-    Returns the evidence and the env stages that actually ran here ("import", "dataset",
-    "prompt_messages"). They are separate facts: profiling imports and runs the module before it can
-    discover that a config is not measurable, so a None payload does not mean nothing ran -- and
-    which hooks ran differs per decline, so one flag would overclaim.
-    """
-    from flash.cli.commands.rollout_profile import collect_for_submit
-
-    executed: list[str] = []
-
-    evidence = collect_for_submit(
-        client, spec, runtime_secrets=runtime_secrets, on_environment_loaded=executed.append
-    )
-    if evidence:
-        logger.info(
-            "measured %s rollouts for the quote: mean %.0f completion tokens (cap %s)",
-            evidence.get("completed_rollouts"),
-            evidence.get("completion_tokens_mean") or 0.0,
-            spec.train.max_completion_tokens or "recipe default",
-        )
-    return evidence, tuple(executed)
-
-
-def _raise_if_workload_profile_pending(client: ApiClient, exc: ApiError) -> None:
-    """Explain a profile-pending rejection and fail, or return so the caller keeps handling `exc`.
-
-    A miss is not a validation error: the server started a real, separately billed profile run that
-    tokenizes the exact dataset. Saying only "409" would leave the user with a charge they cannot
-    see the reason for, and re-running blindly would look like the same request failing twice.
-    """
-    detail = exc.detail
-    if exc.code != "workload_profile_pending" or not isinstance(detail, dict):
-        return
-    profile_run_id = str(detail.get("profile_run_id") or "")
-    state = str(detail.get("state") or "unknown")
-    # the profile id is deterministic in the workload, so this config's profile may already be
-    # running under another key. that run is not readable here and is not billed here either, so
-    # both the follow-up command and the charge sentence have to change.
-    owned = detail.get("owned") is not False
-    # only a request that WON the claim started and billed a profile. an owner re-running `train`,
-    # `--cost` or `--dry-run` while its own profile is still queued/running joins that run: nothing
-    # is launched and nothing is charged again, so the start-and-bill wording would name a second
-    # charge that does not exist. absent reads as launched, matching `owned` above: an older server
-    # omits the field, and telling a user who WAS charged that nothing happened is the worse error.
-    launched = detail.get("launched") is not False
-    charge = _profile_charge(client, profile_run_id) if owned and launched else None
-    if owned and launched:
-        lines = [
-            "no exact workload profile exists for this config yet, so there is no training quote "
-            "to print. the server started a separate profile run that loads your environment and "
-            "tokenizes the exact dataset this training would consume.",
-            "that profile run is real work and is billed on its own"
-            + (f" (estimated ${charge:.2f})" if charge is not None else "")
-            + "; no training run was created, no training gpu was allocated, and nothing was "
-            "charged for training.",
-            f"follow it with `{CLI_NAME} runs status {profile_run_id}`, then re-run this command "
-            "once it reports done."
-            if profile_run_id
-            else "re-run this command once the profile reports done.",
-        ]
-    elif owned:
-        lines = [
-            "no exact workload profile exists for this config yet, so there is no training quote "
-            f"to print. the profile run you already started is still {state}; this command "
-            "launched nothing and charged nothing.",
-            f"follow it with `{CLI_NAME} runs status {profile_run_id}`, then re-run this command "
-            "once it reports done."
-            if profile_run_id
-            else "re-run this command once the profile reports done.",
-        ]
-    else:
-        lines = [
-            "no exact workload profile exists for this config yet, so there is no training quote "
-            "to print. one is already being measured for this exact config and will be reused, so "
-            "nothing was started or charged here.",
-            "re-run this command in a few minutes.",
-        ]
-    for line in lines:
-        print(render.note(line) if render.styled() else line, file=sys.stderr)
-    raise ClientError(
-        f"workload profile {profile_run_id or '(unknown)'} is {state}; "
-        "the exact quote is available once it succeeds"
-    )
-
-
-def _profile_charge(client: ApiClient, profile_run_id: str) -> float | None:
-    """The profile run's own quote, or None when it cannot be read (not owned by this key, etc)."""
-    if not profile_run_id:
-        return None
-    try:
-        status = client.get_run(profile_run_id)
-    except (ApiError, ClientError):
-        return None
-    quote = status.get("estimated_cost_usd") if isinstance(status, dict) else None
-    # bool is an int subclass, so an unchecked isinstance would render a JSON `true` as "$1.00" --
-    # a charge the user is told to expect that no profile ever quoted.
-    if not isinstance(quote, (int, float)) or isinstance(quote, bool):
-        return None
-    return float(quote)
-
-
-def _exact_sft_cost_rows(spec, profile: dict) -> list[tuple[str, str | None]]:
-    """Rows describing the exact measured workload behind an sft quote.
-
-    Only aggregates the server actually returned are shown. A field that is absent is dropped
-    rather than defaulted, so the panel never reports a count the profile did not measure.
-    """
-
-    def count(key: str) -> int | None:
-        value = profile.get(key)
-        return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-    steps = count("authoritative_steps")
-    retained, selected = count("retained_examples"), count("selected_examples")
-    dropped = count("dropped_examples")
-    compute, supervised = (
-        count("authoritative_compute_tokens"),
-        count("authoritative_supervised_tokens"),
-    )
-    packing = str(profile.get("packing_mode") or "")
-    architecture = str(profile.get("architecture_mode") or "")
-    digest = str(profile.get("content_digest") or "")
-    examples = None
-    if retained is not None and selected is not None:
-        examples = f"{retained:,} trained of {selected:,} selected"
-        if dropped:
-            examples += f" ({dropped:,} dropped)"
-    tokens = None
-    if compute is not None:
-        tokens = f"{compute:,} compute"
-        if supervised is not None:
-            tokens += f", {supervised:,} supervised"
-    return [
-        ("run", f"{spec.model}  [SFT{f', {steps} steps' if steps is not None else ''}]"),
-        ("workload", f"{packing} ({architecture})" if packing and architecture else None),
-        ("examples", examples),
-        ("tokens", tokens),
-        ("profile", digest[:12] or None),
-    ]
-
-
-def _print_exact_sft_cost(status: dict, spec) -> None:
-    total = status.get("estimated_cost_usd") if isinstance(status, dict) else None
-    if not isinstance(total, (int, float)) or isinstance(total, bool):
-        raise ClientError(
-            "the server accepted this SFT config but returned no cost estimate; "
-            f"run `{CLI_NAME} train --dry-run` to see the full server response"
-        )
-    profile = status.get("workload_profile")
-    rows = _exact_sft_cost_rows(spec, profile if isinstance(profile, dict) else {})
-    if render.styled():
-        print(render.exact_cost_panel(rows, float(total)))
-    else:
-        for key, value in rows:
-            if value is not None:
-                print(f"{key.ljust(8)}: {value}")
-        print(f"{'TOTAL'.ljust(8)}: ${float(total):.2f}")
-    print(
-        "quoted from the exact tokenized workload, not an assumed row count. no training gpu was "
-        "allocated and nothing was charged for training.",
-        file=sys.stderr,
-    )
-
-
-def _legacy_train_key_rejection_detail(
-    exc: ApiError, authored_train_keys: frozenset[str]
-) -> str | None:
-    if exc.status != 400:
-        return None
-    match = _LEGACY_TRAIN_UNKNOWN_KEYS_RE.fullmatch(str(exc))
-    if match is None:
-        return None
-    metadata = train_schema_metadata()
-    unsupported = sorted(set(match.group("keys").split(", ")) & authored_train_keys & set(metadata))
-    if not unsupported:
-        return None
-    declared = ", ".join(
-        f"{key} (minimum released Flash version {metadata[key]})" for key in unsupported
-    )
-    return (
-        f"{exc}. Unsupported authored [train] key(s): {declared}; "
-        "client/server [train] schemas disagree"
-    )
-
-
-def _print_train_schema_compatibility(result: object) -> None:
-    if not isinstance(result, dict):
-        message = "client/server [train] schema compatibility is unverifiable (legacy server)"
-    elif result.get("status") == "agreement":
-        message = "client/server [train] schemas agree exactly"
-    else:
-        differences = []
-        for label, key in (
-            ("client-only keys", "client_only"),
-            ("server-only keys", "server_only"),
-        ):
-            values = result.get(key)
-            if isinstance(values, list) and values:
-                differences.append(f"{label}: {', '.join(str(value) for value in values)}")
-        metadata = result.get("introduced_in_differences")
-        if isinstance(metadata, list) and metadata:
-            rendered = ", ".join(
-                f"{item['key']} (client {item['client']}, server {item['server']})"
-                for item in metadata
-                if isinstance(item, dict)
-                and all(isinstance(item.get(key), str) for key in ("key", "client", "server"))
-            )
-            if rendered:
-                differences.append(f"introduced_in differences: {rendered}")
-        suffix = f"; {'; '.join(differences)}" if differences else ""
-        message = f"client/server [train] schemas disagree{suffix}"
-    text = f"train schema: {message}"
-    print(render.note(text) if render.styled() else text, file=sys.stderr)
-
-
-def _warn_if_wandb_requested_without_key(
-    spec, runtime_secrets: dict | None, *, dry_run: bool
-) -> None:
-    """Warn when a config asks for W&B but no ``WANDB_API_KEY`` was found locally.
-
-    ``WANDB_API_KEY`` is an optional runtime secret, and discovery only looks at the process env and
-    the ``.env``/``.env.local`` files beside the cwd and the config. A key one directory up is not
-    found, and an absent optional secret is not an error, so the run trains to completion with
-    logging silently off, which is only discoverable after the GPU spend, when the curve is gone.
-    """
-    if not (spec.wandb.project or spec.wandb.run_name):
-        return
-    # a dry-run allocates no gpu and trains nothing, so "this run will train" would contradict the
-    # dry-run notice printed moments later and can read as though a paid run started.
-    subject = "a run submitted with this config will train" if dry_run else "this run will train"
-    # strip before deciding: the server's _runtime_secrets() strips and drops the value, so a
-    # whitespace-only key reaches the worker as no key at all -- the exact silent-no-logging
-    # failure this warning exists to prevent, but with the warning suppressed.
-    if str((runtime_secrets or {}).get("WANDB_API_KEY") or "").strip():
-        return
-    message = (
-        "[wandb] is configured but no WANDB_API_KEY was found in the environment, "
-        f"./.env(.local), or the .env(.local) beside the config; {subject} with W&B logging "
-        "DISABLED. Export WANDB_API_KEY or put it in a .env next to the config."
-    )
-    print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
 
 
 def cmd_train(args) -> int:
@@ -1248,321 +801,6 @@ def cmd_checkpoints(args) -> int:
     return 0
 
 
-# the states a deployment sits in before the requested revision is actually servable, mirroring
-# the set the control plane transitions through. anything else ends the wait: ready, failed, or a
-# state this client does not know, which must not spin until the timeout.
-_DEPLOYMENT_BUSY_STATES = frozenset({"queued", "smoke_testing", "reconciling"})
-# the only states in which the control plane will actually serve the revision, mirroring
-# flash/server/routes/serving.py. leaving the busy set is NOT the same as arriving here:
-# `revocation_failed` (a concurrent undeploy whose backend cleanup failed) and any state a newer
-# plane introduces are both non-busy and non-servable, so `--wait` must fail closed on them
-# rather than let `deploy --wait && evaluate` proceed against nothing.
-_DEPLOYMENT_READY_STATES = frozenset({"ready", "deployed"})
-_DEPLOY_POLL_SECONDS = 5.0
-# `--wait 0` still owes the caller its one read, and a read needs a positive timeout. keep that
-# bound short enough that "check once, do not block" stays true against a stalled plane: a longer
-# fixed budget just moves the overshoot the per-poll bound exists to prevent.
-_DEPLOY_ZERO_WAIT_READ_SECONDS = 1.0
-# withheld from each sleep so the read that follows it starts inside the deadline. without this the
-# sleep spends the whole remainder and the wait ends on the deadline check having never looked
-# again, so a revision that went ready early in a short window reads as queued.
-_DEPLOY_FINAL_READ_SECONDS = 1.0
-# how much of the final window is slept before its one read. the rest bounds that read, so it stays
-# inside the deadline rather than in flight past it. late in the window, not halfway: a midpoint
-# read stops watching with half the advertised wait still to run.
-_DEPLOY_FINAL_READ_FRACTION = 0.9
-# an auth or authorization rejection answers the same way every time; polling through it just
-# spends the whole timeout to arrive at the identical error.
-_PERMANENT_POLL_STATUSES = frozenset({401, 403})
-
-
-def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> dict:
-    """Poll until the requested revision leaves the busy states, or the timeout expires.
-
-    POST deploy returns as soon as the record is persisted, normally in ``queued`` while the
-    previous revision is still the ready one. A caller that starts evaluating on that return
-    talks to a reconciling endpoint and mostly gets errors. Polling here makes the returned
-    record mean what it appears to mean.
-    """
-    if str(deployment.get("state") or "") not in _DEPLOYMENT_BUSY_STATES:
-        return deployment
-    waiting = (
-        f"waiting up to {timeout:g}s for {run_id} to become servable; "
-        "ctrl-c stops waiting, not the deployment"
-    )
-    print(render.note(waiting) if render.styled() else f"note: {waiting}", file=sys.stderr)
-    deadline = time.monotonic() + timeout
-    latest = deployment
-    first = True
-    # set once the wait enters its final window, so the read that window funds is the last one.
-    # see the sleep below: without a stop it would repeat down to clock granularity.
-    final_read = False
-    while True:
-        remaining = deadline - time.monotonic()
-        if not first and (remaining <= 0 or final_read):
-            break
-        if not first:
-            # reserve a fixed final-read budget so the loop terminates and observes readiness inside
-            # the last window. place that read late, but before the deadline, to avoid both unused wait
-            # time and an in-flight overshoot; see
-            # `test_deploy_wait_does_not_start_a_read_after_the_deadline_expires`.
-            slice_seconds = min(_DEPLOY_POLL_SECONDS, remaining)
-            if slice_seconds > _DEPLOY_FINAL_READ_SECONDS:
-                slice_seconds -= _DEPLOY_FINAL_READ_SECONDS
-            else:
-                slice_seconds *= _DEPLOY_FINAL_READ_FRACTION
-                final_read = True
-            time.sleep(slice_seconds)
-            remaining = deadline - time.monotonic()
-            # the sleep can consume the whole budget. issuing the read anyway, with the fallback
-            # bound below, is how `--wait 0.1` came to block for over a second: check after waking.
-            if remaining <= 0:
-                break
-        # `--wait 0` is documented as "check once, do not block", so the first read happens before
-        # the deadline applies. without it zero never calls deployment_for at all and the command
-        # judges readiness from the POST body, which is queued on every normal async deploy.
-        first = False
-        try:
-            # bound the read by what is left of the wait. the client's default timeout is 60s, so
-            # an unbounded poll inside `--wait 5` blocks far past the deadline the user set. a
-            # blanket 1s floor would do the same to shorter waits, so only the expired-budget read
-            # -- which is just the zero-wait one-shot -- takes the fixed bound; every other read
-            # honours the remainder exactly.
-            budget = remaining if remaining > 0 else _DEPLOY_ZERO_WAIT_READ_SECONDS
-            current = client.deployment_for(run_id, timeout=budget)
-        except ApiError as exc:
-            if exc.status in _PERMANENT_POLL_STATUSES:
-                # retrying will not fix a rejected key or a run this key cannot see. without this
-                # the loop burns the full timeout (30 minutes by default) on a request that
-                # answers identically every time, and then reports it as "still queued".
-                print(f"warning: cannot check {run_id}: {exc}", file=sys.stderr)
-                return latest
-        except ClientError:
-            # a transient control-plane blip must not fail a deploy that is otherwise progressing;
-            # keep polling to the deadline and report whatever we last saw.
-            pass
-        else:
-            if current is None:
-                # absence may mean rollback, not deletion: `deployment_for` filters by checkpoint
-                # step while `mark_deployment_failed` restores the predecessor. inspect the run's
-                # other revision to preserve `last_deploy_error`. recompute the remaining budget and
-                # floor it at the zero-wait one-read bound so this classification can complete.
-                left = deadline - time.monotonic()
-                other = _rollback_record(client, run_id, max(left, _DEPLOY_ZERO_WAIT_READ_SECONDS))
-                if other is not None:
-                    return other
-                print(
-                    f"warning: {run_id} is no longer an active deployment; "
-                    f"run `{CLI_NAME} models deployments` to check what happened",
-                    file=sys.stderr,
-                )
-                return latest
-            latest = current
-            if str(current.get("state") or "") not in _DEPLOYMENT_BUSY_STATES:
-                return current
-    print(
-        f"warning: still {str(latest.get('state') or 'unknown')!r} after {timeout:g}s; "
-        f"run `{CLI_NAME} models deployments` to keep checking {run_id}",
-        file=sys.stderr,
-    )
-    return latest
-
-
-def _rollback_record(client, run_id: str, timeout: float) -> dict | None:
-    """Return another listed revision after the requested one disappears.
-
-    A failed cross-step redeploy restores the predecessor with ``last_deploy_error``. Preserve its
-    real step and attempt stamp so ``_deployment_attempt_failed`` can report rollback accurately.
-    """
-    from flash.schema import parse_checkpoint_ref
-
-    parsed = parse_checkpoint_ref(run_id)
-    if parsed is None:
-        return None
-    base_run_id, _ = parsed
-    # do not exempt final-adapter requests: a failed final redeploy can restore a checkpoint that
-    # `deployment_for` excludes by step. `last_deploy_error`, not step direction, identifies rollback.
-    try:
-        entries = client.deployments(timeout=timeout)
-    except (ApiError, ClientError):
-        # this runs on the way out of a wait that has already ended; a failed lookup just means we
-        # fall back to the original "no longer active" message rather than failing the command.
-        return None
-    # deployment_for is no help here: it resolves an exact revision, so asking it for the bare run
-    # id means "the final adapter" (step None) and it rejects the rolled-back step just as it
-    # rejected the requested one. match on the run id alone and let the caller judge identity.
-    for entry in entries or ():
-        listed = entry.get("deployment") or {}
-        if base_run_id not in (listed.get("run_id"), entry.get("run_id")):
-            continue
-        if not listed.get("last_deploy_error"):
-            # without a recorded error there is nothing tying this revision to the requested one's
-            # disappearance, and reporting an unrelated deployment as this command's rollback would
-            # be the "settle on whichever revision is listed" defect the step filter exists to stop.
-            continue
-        if not listed.get("run_id") and entry.get("run_id"):
-            listed = {**listed, "run_id": entry["run_id"]}
-        return listed
-    return None
-
-
-def _deployment_attempt_failed(requested: dict, final: dict) -> bool:
-    """True when the requested revision is not the one now served.
-
-    ``mark_deployment_failed`` restores the previous ready record and writes only
-    ``last_deploy_error``. Compare attempt identity or ``deploy --wait`` can accept the old adapter.
-    """
-    if str(final.get("state") or "") == "failed":
-        return True
-    asked = requested.get("requested_at")
-    got = final.get("requested_at")
-    # a POST that already answered with a settled record ran the deployment synchronously
-    # (FLASH_DEPLOY_SYNC, flash/server/routes/serving.py), so it returned the FINISHED row and never
-    # exposed the queued attempt. `requested` and `final` are then the same row and their stamps
-    # match by construction -- a restored previous revision compares equal to itself and reads as
-    # success. the recorded error is the only evidence left, and a deploy that really succeeded
-    # writes a fresh record that carries none, so this cannot fire on one.
-    if str(requested.get("state") or "") not in _DEPLOYMENT_BUSY_STATES:
-        return bool(final.get("last_deploy_error"))
-    # a differing stamp means the record on the plane belongs to some other deploy request. that
-    # happens without any error at all: a concurrent `deploy` for the same run supersedes this one
-    # and reaches ready on ITS checkpoint, and reading only last_deploy_error would call that this
-    # command's success. compare the stamps whenever both sides carry one.
-    if asked is not None and got is not None:
-        return asked != got
-    # no attempt stamp to compare: a recorded error is the only signal left.
-    return bool(final.get("last_deploy_error"))
-
-
-def cmd_deploy(args) -> int:
-    from flash.schema import parse_checkpoint_ref
-
-    # `flash models deploy <run_id>/step-n` is the same ref `flash runs checkpoint` prints.
-    parsed = parse_checkpoint_ref(args.run_id)
-    if parsed is None:
-        print(
-            f"invalid run/checkpoint reference {args.run_id!r} "
-            "(expected <run_id> or <run_id>/step-N)",
-            file=sys.stderr,
-        )
-        return 1
-    base_run_id, _step = parsed
-    client = client_from_config()
-    dep = client.deploy(args.run_id, dry_run=args.dry_run)
-    wait_seconds = getattr(args, "wait", None)
-    # a dry run creates no deployment to poll for, so --wait has nothing to observe. test against
-    # None, not truthiness: `--wait 0` is an explicit "poll once, do not block" and 0.0 is falsy.
-    waited_but_unservable = False
-    if wait_seconds is not None and dep.get("state") != "dry_run":
-        requested = dep
-        dep = _await_deployment(client, args.run_id, dep, wait_seconds)
-        # --wait promises the revision is servable on return, so require the plane to SAY it is
-        # servable. "not busy" is a weaker claim that also covers a timeout, a vanished listing, an
-        # unpollable plane, `revocation_failed`, and any state a newer plane adds; a restored
-        # previous revision means the requested one never made it. exiting 0 on any of those lets
-        # `deploy --wait && evaluate` run against the wrong adapter, or against none.
-        not_ready = str(dep.get("state") or "") not in _DEPLOYMENT_READY_STATES
-        waited_but_unservable = not_ready or _deployment_attempt_failed(requested, dep)
-    if render.styled():
-        print(render.deployed(dep))
-    else:
-        print(json.dumps(dep, indent=2))
-    # a dry run creates no deployment, so the billing / undeploy hint would be misleading.
-    if dep.get("state") != "dry_run":
-        openai_base = str(dep.get("openai_base_url") or "")
-        note = (
-            f"serving is billed per token only; use `{CLI_NAME} models undeploy {base_run_id}` "
-            "to deregister the adapter."
-        )
-        print(render.arrow(note) if render.styled() else f"note: {note}", file=sys.stderr)
-        if openai_base:
-            url_note = (
-                f"OpenAI-compatible base URL: {openai_base} — point clients at this /v1 base, "
-                "not the bare endpoint (which 404s on /chat/completions)."
-            )
-            print(
-                render.arrow(url_note) if render.styled() else f"note: {url_note}", file=sys.stderr
-            )
-        state = dep.get("state", "deploying")
-        if state == "failed":
-            detail = str(dep.get("error") or dep.get("detail") or "unknown error")
-            status_note = (
-                f"deployment failed: {detail}; run `{CLI_NAME} models deployments` for details "
-                f"and retry `{CLI_NAME} models deploy {args.run_id}` after fixing the error."
-            )
-        elif waited_but_unservable and dep.get("last_deploy_error"):
-            # state reads `ready`, but it is the PREVIOUS revision: say so, or the reader trusts
-            # the word and never learns the requested checkpoint is not the one being served.
-            detail = str(dep.get("last_deploy_error"))
-            status_note = (
-                f"the requested revision did not become servable ({detail}); the previously "
-                f"deployed revision is still serving. retry "
-                f"`{CLI_NAME} models deploy {args.run_id}` after fixing the error."
-            )
-        elif waited_but_unservable:
-            # the wait ended without the plane calling this revision servable, and there is no
-            # recorded error to explain it: a timeout, or a terminal state that is not ready. the
-            # generic "use chat once it is ready" below would read as success next to the exit 1.
-            status_note = (
-                f"deployment state is {state!r} after waiting; the requested revision is not "
-                f"servable yet. run `{CLI_NAME} models deployments` to keep checking it."
-            )
-        else:
-            status_note = (
-                f"deployment state is {state!r}; run `{CLI_NAME} models deployments` to check "
-                f"progress and use `{CLI_NAME} models chat` once it is ready."
-            )
-        print(
-            render.arrow(status_note) if render.styled() else f"note: {status_note}",
-            file=sys.stderr,
-        )
-    return 1 if dep.get("state") == "failed" or waited_but_unservable else 0
-
-
-def cmd_export(args) -> int:
-    from flash.client.runtime_secrets import resolve_hf_token
-
-    hf_token = resolve_hf_token(args.api_key)
-    if not hf_token:
-        raise ClientError(
-            "no HuggingFace token: pass `--api-key <hf_...>`, or set HF_TOKEN "
-            "(export it in your shell or put it in a local .env / .env.local)"
-        )
-    client = client_from_config()
-    progress = (
-        f"exporting adapter {args.adapter_id} to {args.repository} — "
-        "downloading then re-uploading; this can take a minute..."
-    )
-    print(render.note(progress) if render.styled() else progress, file=sys.stderr)
-    result = client.export(
-        args.adapter_id,
-        repository=args.repository,
-        hf_token=hf_token,
-        private=not args.public,
-    )
-    if render.styled():
-        # the control-plane result carries no `private` key, so reflect the privacy we requested
-        # (the server applies exactly this) rather than mislabeling a private export as public.
-        print(render.exported({**result, "private": not args.public}))
-    else:
-        print(json.dumps(result, indent=2))
-    url = result.get("url", args.repository)
-    print(
-        render.arrow(f"exported to {url}") if render.styled() else f"exported to {url}",
-        file=sys.stderr,
-    )
-    return 0
-
-
-def cmd_undeploy(args) -> int:
-    result = client_from_config().undeploy(args.run_id)
-    if render.styled():
-        print(render.undeployed(result))
-    else:
-        print(json.dumps(result, indent=2))
-    return 0
-
-
 def cmd_deployments(args) -> int:
     rows = client_from_config().deployments()
     if getattr(args, "json", False):
@@ -1653,3 +891,42 @@ def cmd_chat(args) -> int:
         return 1
     print()
     return 0
+
+
+# re-exported at the bottom rather than imported at the top: `deploy` resolves names back through
+# this package, so a top import would be circular. the parser and the cli tests both address these
+# handlers as attributes of `flash.cli.commands`, which is why they stay on it after the move.
+from flash.cli.commands.deploy import (  # noqa: E402,F401
+    _DEPLOY_FINAL_READ_FRACTION,
+    _DEPLOY_FINAL_READ_SECONDS,
+    _DEPLOY_POLL_SECONDS,
+    _DEPLOY_ZERO_WAIT_READ_SECONDS,
+    _DEPLOYMENT_BUSY_STATES,
+    _DEPLOYMENT_READY_STATES,
+    _PERMANENT_POLL_STATUSES,
+    _await_deployment,
+    _deployment_attempt_failed,
+    _rollback_record,
+    cmd_deploy,
+    cmd_export,
+    cmd_undeploy,
+)
+
+# re-exported at the bottom rather than imported at the top: `train_cost` resolves names back
+# through this package, so a top import would be circular. `cmd_train` below calls these, and the
+# estimate tests import `_warn_if_wandb_requested_without_key` from this package by name.
+from flash.cli.commands.train_cost import (  # noqa: E402,F401
+    _client_train_schema,
+    _cmd_train_cost,
+    _cmd_train_cost_offline,
+    _cmd_train_cost_sft,
+    _dry_run_preview_line,
+    _exact_sft_cost_rows,
+    _legacy_train_key_rejection_detail,
+    _print_exact_sft_cost,
+    _print_train_schema_compatibility,
+    _profile_charge,
+    _raise_if_workload_profile_pending,
+    _rollout_evidence_for,
+    _warn_if_wandb_requested_without_key,
+)

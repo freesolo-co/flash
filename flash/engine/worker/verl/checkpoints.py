@@ -1,0 +1,185 @@
+"""Turn a verl checkpoint directory into a deployable peft adapter.
+
+verl writes a full training checkpoint per save step, in a layout that differs between its sft and
+ppo trainers. These helpers find the right directory inside it, work out which steps are already
+complete, and export the one flash actually deploys.
+
+Split out of `flash.engine.worker.backend_common` to keep that module under the file-size limit.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+
+
+def resolve_checkpoint_actor_dir(step_dir: str) -> str:
+    """return the directory inside ``global_step_N`` that holds the saved model + ``huggingface/``.
+
+    verl's two trainers do not agree on this layout, and the difference is not configurable:
+
+    * RL nests per-role, ``global_step_N/actor/`` (``trainer/ppo/ray_trainer.py`` builds
+      ``os.path.join(local_global_step_folder, "actor")``).
+    * SFT writes the shards straight into ``global_step_N/``
+      (``utils/checkpoint/checkpoint_handler.py`` passes ``local_path`` unmodified).
+    """
+    nested = os.path.join(step_dir, "actor")
+    if os.path.isdir(os.path.join(nested, "huggingface")):
+        return nested
+    if os.path.isdir(os.path.join(step_dir, "huggingface")):
+        return step_dir
+    # neither marker is present (an interrupted save, or a layout this code has not seen). prefer the
+    # nested dir when it exists at all so the error names the RL path the caller most likely wanted.
+    return nested if os.path.isdir(nested) else step_dir
+
+
+def latest_global_step_dir(local_dir: str) -> tuple[str, int]:
+    """return (actor_dir, step) for the highest global_step_N checkpoint verl wrote."""
+    best_step, best = -1, ""
+    if os.path.isdir(local_dir):
+        for name in os.listdir(local_dir):
+            m = re.fullmatch(r"global_step_(\d+)", name)
+            if m and int(m.group(1)) > best_step:
+                best_step = int(m.group(1))
+                best = resolve_checkpoint_actor_dir(os.path.join(local_dir, name))
+    if best_step < 0:
+        raise RuntimeError(f"no global_step_N checkpoint found under {local_dir}")
+    return best, best_step
+
+
+def completed_checkpoint_step(local_dir: str) -> int:
+    """read verl's completion marker; 0 when it is absent or unreadable.
+
+    verl writes ``global_step_N`` in full and only THEN advances
+    ``latest_checkpointed_iteration.txt`` (the file ``stage_verl_resume`` writes above), so gating a
+    publish on this marker never reads a half-written checkpoint dir. an unreadable marker reads as
+    "nothing completed yet" rather than raising: the watchers poll this on a loop, and a torn read
+    mid-write must retry on the next tick, not fail the run.
+    """
+    tracker = os.path.join(local_dir, "latest_checkpointed_iteration.txt")
+    try:
+        with open(tracker) as file:
+            return int(file.read().strip())
+    except (FileNotFoundError, OSError, ValueError):
+        return 0
+
+
+def unprocessed_checkpoint_dirs(
+    local_dir: str, completed_step: int, processed_steps: set[int]
+) -> list[tuple[int, str]]:
+    """``(step, dir)`` for every completed ``global_step_N`` not yet in ``processed_steps``, ascending.
+
+    Bounded by ``completed_step`` so a directory verl is still writing is never handed to a
+    publisher, and by ``processed_steps`` so each checkpoint is published exactly once.
+    """
+    found: list[tuple[int, str]] = []
+    try:
+        names = os.listdir(local_dir)
+    except OSError:
+        return found
+    for name in names:
+        match = re.fullmatch(r"global_step_(\d+)", name)
+        if match is None:
+            continue
+        step = int(match.group(1))
+        path = os.path.join(local_dir, name)
+        if step <= completed_step and step not in processed_steps and os.path.isdir(path):
+            found.append((step, path))
+    return sorted(found)
+
+
+def stage_verl_resume(resume_dir: str, local_dir: str, *, job_label: str) -> int:
+    """stage a downloaded ``checkpoint-N`` into local_dir where verl looks; return its step.
+
+    the resume artifact is keyed on the run prefix, not the job type, so the control plane hands
+    every trainer the same ``checkpoint-N`` layout. verl finds it via
+    latest_checkpointed_iteration.txt under trainer.default_local_dir once resume_mode=auto.
+    ``job_label`` only names the job in the error raised for an unparseable path, which is the sole
+    thing the trainers ever varied here.
+    """
+    match = re.fullmatch(r"checkpoint-(\d+)", os.path.basename(resume_dir))
+    if match is None:
+        raise RuntimeError(f"invalid {job_label} resume checkpoint path {resume_dir!r}")
+    step = int(match.group(1))
+    shutil.copytree(resume_dir, os.path.join(local_dir, f"global_step_{step}"), dirs_exist_ok=True)
+    with open(os.path.join(local_dir, "latest_checkpointed_iteration.txt"), "w") as file:
+        file.write(str(step))
+    return step
+
+
+def export_peft_adapter(
+    ckpt_actor_dir: str,
+    out_adapter_dir: str,
+    *,
+    base_model_id: str,
+    python_bin: str,
+) -> None:
+    """turn verl's saved lora checkpoint into a flash-servable peft adapter dir.
+
+    verl saves fsdp-sharded checkpoints (model/optim shards + a ``huggingface/`` config+tokenizer
+    subfolder) under ``<local_dir>/global_step_N/actor`` for RL and ``<local_dir>/global_step_N``
+    for SFT -- pass the dir that ``resolve_checkpoint_actor_dir`` picked, not a hardcoded one.
+    """
+    os.makedirs(out_adapter_dir, exist_ok=True)
+    merge_out = out_adapter_dir.rstrip("/") + "_merge"
+    shutil.rmtree(merge_out, ignore_errors=True)
+    merge_env = dict(os.environ)
+    # the merger reads only local checkpoint files: strip credentials/tokens from its env (least
+    # privilege), and keep it fully offline so it never touches hf's rate-limited api.
+    for _k in list(merge_env):
+        if any(t in _k.upper() for t in ("TOKEN", "SECRET", "API_KEY", "PASSWORD", "CREDENTIAL")):
+            merge_env.pop(_k)
+    merge_env["HF_HUB_OFFLINE"] = "1"
+    merge_env["TRANSFORMERS_OFFLINE"] = "1"
+    merge_env["HF_HUB_DISABLE_XET"] = "1"
+    subprocess.run(
+        [
+            python_bin,
+            "-m",
+            "verl.model_merger",
+            "merge",
+            "--backend",
+            "fsdp",
+            "--local_dir",
+            ckpt_actor_dir,
+            "--target_dir",
+            merge_out,
+        ],
+        check=True,
+        env=merge_env,
+    )
+    lora_dir = os.path.join(merge_out, "lora_adapter")
+    if not os.path.exists(os.path.join(lora_dir, "adapter_config.json")):
+        raise RuntimeError(
+            f"verl model_merger did not produce a peft adapter at {lora_dir} (no adapter_config.json); "
+            "the merger output layout must be adjusted for this verl version."
+        )
+    for name in os.listdir(lora_dir):
+        shutil.copy2(os.path.join(lora_dir, name), os.path.join(out_adapter_dir, name))
+    shutil.rmtree(merge_out, ignore_errors=True)
+
+
+def stamp_adapter_dir_provenance(adapter_dir: str, model_id: str, model_revision: str = "") -> None:
+    """stamp the saved adapter's immutable base identity into adapter_config.json.
+
+    dir-based analogue of the in-memory peft-model provenance stamp: same validation + fields,
+    applied to the json verl produced. raises if the adapter already names a different base.
+    """
+    cfg_path = os.path.join(adapter_dir, "adapter_config.json")
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    current_base = str(cfg.get("base_model_name_or_path", "") or "").strip()
+    if current_base and current_base != model_id:
+        raise RuntimeError(
+            f"adapter base model {current_base!r} does not match validated target {model_id!r}"
+        )
+    current_rev = str(cfg.get("revision", "") or "").strip()
+    if current_rev and model_revision and current_rev != model_revision:
+        raise RuntimeError("adapter base revision does not match the validated target commit")
+    cfg["base_model_name_or_path"] = model_id
+    cfg["revision"] = model_revision or None
+    with open(cfg_path, "w") as f:
+        json.dump(cfg, f, indent=2)

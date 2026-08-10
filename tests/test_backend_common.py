@@ -182,6 +182,22 @@ def test_the_cpu_pool_scales_with_gpu_count():
             assert vc.ray_num_cpus(gpus) >= vc.verl_cpu_demand(gpus), gpus
 
 
+def _trainer_source(module: str) -> str:
+    """Every file a trainer's verl config is rendered from, concatenated.
+
+    opd renders its hydra overrides in `train/opd/overrides.py` rather than in `opd_train.py`, so a
+    guard that reads only `worker/<module>.py` would stop seeing the opd call sites and pass
+    vacuously. These are read by PATH rather than imported because the assertions are on source
+    text, so the set of files has to be maintained here when a trainer is split further.
+    """
+    parts = [f"flash/engine/worker/{module}.py"]
+    if module == "opd_train":
+        parts.append("flash/engine/worker/train/opd/overrides.py")
+    if module == "rl_train":
+        parts.append("flash/engine/worker/train/rl/verl_config.py")
+    return "\n".join(pathlib.Path(_REPO_ROOT, p).read_text() for p in parts)
+
+
 def test_both_trainers_size_the_cpu_pool_from_their_own_gpu_count():
     # a floor that the call sites never pass a gpu count to is a floor that only ever protects
     # 1-gpu jobs, which is the shape of the bug this fixes. pin the wiring, not just the helper.
@@ -189,8 +205,7 @@ def test_both_trainers_size_the_cpu_pool_from_their_own_gpu_count():
         ("rl_train", "ray_num_cpus(cfg['n_gpus'])"),
         ("opd_train", "ray_num_cpus(config['n_gpus_per_node'])"),
     ):
-        src = pathlib.Path(_REPO_ROOT, "flash", "engine", "worker", f"{module}.py").read_text()
-        assert expected in src, module
+        assert expected in _trainer_source(module), module
 
 
 def test_every_ray_backed_trainer_constrains_rays_cpu_pool():
@@ -198,8 +213,7 @@ def test_every_ray_backed_trainer_constrains_rays_cpu_pool():
     # and eagerly forks one idle worker per core, which killed grpo (fatal raylet fork failure) and
     # opd (host-ram oom) on real gpus. sft is excluded on purpose -- it runs torchrun, not ray.
     for module in ("rl_train", "opd_train"):
-        src = pathlib.Path(_REPO_ROOT, "flash", "engine", "worker", f"{module}.py").read_text()
-        assert "ray_kwargs.ray_init.num_cpus={ray_num_cpus(" in src, module
+        assert "ray_kwargs.ray_init.num_cpus={ray_num_cpus(" in _trainer_source(module), module
 
 
 def test_latest_global_step_dir_picks_highest(tmp_path):
