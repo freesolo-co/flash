@@ -129,6 +129,13 @@ testpaths = ["tests"]
 addopts = "-q"
 markers = [
   "live: hits real provider APIs; opt in with FLASH_LIVE=1 (plus provider creds)",
+  # These assert on REAL elapsed time -- they sleep instead of faking the clock, to prove the
+  # shutdown path actually reserves its cleanup budget before the watchdog deadline. Their margins
+  # are tens of milliseconds, which is smaller than one scheduler preemption, so they fail if
+  # another test process is competing for the core. CI therefore runs the suite with `-n 2` while
+  # DESELECTING this marker, then runs the marked tests alone in a second, serial pass (~5s).
+  # Prefer a fake clock in new tests; add this marker only when real elapsed time IS the assertion.
+  "wallclock: asserts on real elapsed time; must run serially, never alongside another worker",
 ]
 
 [tool.uv]
@@ -151,6 +158,7 @@ dev = [
     # on a multimodal path it never executed. test-only, hence dev and not server -- the control
     # plane does not decode images.
     "pillow>=11",
+    "pytest-xdist>=3.6",
 ]
 
 [tool.mypy]

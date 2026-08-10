@@ -111,9 +111,8 @@ def test_every_shipped_worker_actually_reaches_wandb():
             for name in (f"{phase}.py", f"{phase}_train.py")
             if (worker_dir / name).exists()
         )
-        # resolve_verl_loggers() is what adds "wandb" to trainer.logger. wandb_run_info() only reads
-        # whichever run is already live and returns {} when none is, so a worker holding just that
-        # one would still log nowhere -- accepting it as evidence would let the warning lie again.
+        # resolve_verl_loggers() is what adds "wandb" to trainer.logger. metadata readers do not
+        # start a run, so accepting one as evidence would let the warning lie again.
         if "resolve_verl_loggers" not in source:
             without_wandb.add(algorithm)
 

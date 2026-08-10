@@ -154,7 +154,6 @@ def test_worker_rejects_sft_adapter_continuation_before_handler(monkeypatch):
     monkeypatch.setattr(worker, "gpu_diagnostics", lambda **k: {})
     monkeypatch.setattr(worker, "error_artifact_name", lambda *a, **k: "error.txt")
     monkeypatch.setattr(worker, "hf_upload_file", lambda *a, **k: None)
-    monkeypatch.setattr(worker, "wandb_finish", lambda *a, **k: None)
     monkeypatch.setattr(
         worker,
         "run_sft",
@@ -204,7 +203,6 @@ def test_idempotency_replay_metrics_read_failure_is_retriable(monkeypatch, tmp_p
     monkeypatch.setattr(worker, "gpu_diagnostics", lambda **k: {})
     monkeypatch.setattr(worker, "error_artifact_name", lambda *a, **k: "error.txt")
     monkeypatch.setattr(worker, "hf_upload_file", lambda *a, **k: None)
-    monkeypatch.setattr(worker, "wandb_finish", lambda *a, **k: None)
     monkeypatch.setattr(worker.time, "sleep", lambda *a, **k: None)
     monkeypatch.setattr(worker, "heartbeat", lambda *a, **k: hb.append((a, k)))
 
@@ -237,7 +235,6 @@ def test_idempotency_metrics_reread_backoff_stops_at_run_deadline(monkeypatch, t
     monkeypatch.setattr(worker, "gpu_diagnostics", lambda **_kwargs: {})
     monkeypatch.setattr(worker, "error_artifact_name", lambda *_args, **_kwargs: "error.txt")
     monkeypatch.setattr(worker, "hf_upload_file", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(worker, "wandb_finish", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(worker, "heartbeat", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(worker.time, "time", lambda: clock["now"])
 

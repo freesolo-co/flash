@@ -32,18 +32,14 @@ def test_resolve_params_b_pinned_revision_reads_the_pinned_size(monkeypatch):
     assert vram.resolve_params_b("Qwen/Qwen3.5-9B") == 9.7
 
 
-def test_resolve_params_b_none_when_uncataloged(monkeypatch):
-    """Best-effort: an uncataloged id returns None, and never reaches the network to guess.
+def test_resolve_params_b_none_when_uncataloged():
+    """Best-effort: an uncataloged id returns None rather than inventing a size.
 
     Submit rejects uncataloged models, so only a stale caller can produce one here. Callers degrade
     to the size-unknown path (memory-safe fused-CE gate, loose colocate cap) rather than raising on
-    the allocation path -- but a size must never be invented for an id the catalog does not state.
+    the allocation path.
     """
     from flash.engine.plan import vram
 
-    def _boom(*_args, **_kwargs):
-        raise AssertionError("an uncataloged id must not be sized over the network")
-
-    monkeypatch.setattr(vram, "fetch_hf_params_b", _boom, raising=False)
     assert vram.resolve_params_b("acme/totally-unknown") is None
     assert vram.resolve_params_b("acme/totally-unknown", "a" * 40) is None

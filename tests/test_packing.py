@@ -15,7 +15,6 @@ import pytest
 from flash.engine.worker.model import packing
 from flash.engine.worker.model.packing import (
     completion_mask_from_ids,
-    gdn_packing_available,
     model_is_gdn_hybrid,
     tokenize_for_packing,
     untruncated_lengths_for_packing,
@@ -121,22 +120,6 @@ def test_gdn_forward_probe_resolves_actual_arch():
     assert _gdn_forward_threads_reset_kwargs(None) is True
 
 
-def test_gdn_packing_available_false_when_either_kernel_missing(monkeypatch):
-    # Safety-critical: if EITHER find_spec probe is False the gate short-circuits to False BEFORE the
-    # heavy real-import / source-API checks — a missing kernel must NEVER enable packing (it would
-    # leak). (The both-present path additionally requires the real kernels + a kwargs-aware
-    # transformers; that is GPU-validated end-to-end, not unit-tested here.)
-    pytest.importorskip("transformers")
-    import transformers.utils.import_utils as iu
-
-    for fla, conv in [(False, True), (True, False), (False, False)]:
-        monkeypatch.setattr(
-            iu, "is_flash_linear_attention_available", lambda fla=fla: fla, raising=False
-        )
-        monkeypatch.setattr(iu, "is_causal_conv1d_available", lambda conv=conv: conv, raising=False)
-        assert gdn_packing_available() is False
-
-
 # ---------------------------------------------------------------- completion-only loss masking
 def _mask(tok, prompt, full):
     # Mirror the SFT path: tokenize the prompt the SAME way the full row is tokenized (one batched
@@ -237,15 +220,14 @@ def _patch_cfg_raises(monkeypatch, exc):
     monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", _boom)
 
 
-def test_swallowing_wrappers_keep_returning_false_on_probe_failure(monkeypatch):
-    """The runtime gates must keep their fail-closed-to-False contract.
+def test_gdn_swallowing_wrapper_keeps_returning_false_on_probe_failure(monkeypatch):
+    """The runtime GDN gate must keep its fail-closed-to-False contract.
 
-    sft_train/rl_train/opd_train only ever ask "may I pack"; answering False when the config cannot
-    be read is the safe answer there and must not become an exception.
+    Answering False when the config cannot be read is the safe runtime answer and must not become an
+    exception.
     """
     _patch_cfg_raises(monkeypatch, OSError("hub read timed out"))
     assert packing.model_is_gdn_hybrid("any/model") is False
-    assert packing.model_is_pure_attention("any/model") is False
 
 
 def test_raising_probes_propagate_so_a_digest_is_never_frozen_from_a_failure(monkeypatch):
@@ -261,15 +243,11 @@ def test_raising_probes_propagate_so_a_digest_is_never_frozen_from_a_failure(mon
         packing.probe_is_pure_attention("any/model")
 
 
-def test_raising_and_swallowing_probes_agree_when_the_config_resolves(monkeypatch):
-    """Same answer on the happy path -- the wrapper only adds the except clause."""
+def test_live_probes_resolve_when_the_config_loads(monkeypatch):
+    """The GDN wrapper agrees with its probe, and the pure-attention probe returns its answer."""
     _patch_cfg(
         monkeypatch, types.SimpleNamespace(layer_types=["linear_attention", "full_attention"])
     )
     assert packing.probe_is_gdn_hybrid("any/gdn") is packing.model_is_gdn_hybrid("any/gdn") is True
     _patch_cfg(monkeypatch, types.SimpleNamespace(layer_types=["full_attention"]))
-    assert (
-        packing.probe_is_pure_attention("any/dense")
-        is packing.model_is_pure_attention("any/dense")
-        is True
-    )
+    assert packing.probe_is_pure_attention("any/dense") is True

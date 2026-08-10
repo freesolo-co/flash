@@ -10,14 +10,6 @@ from flash.content.thinking import thinking_text as thinking_text
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 
 
-def render_prompt(tokenizer, item) -> str:
-    item = item if isinstance(item, dict) else {"question": item}
-    msgs = _w.require_active_env().prompt_messages(item)
-    return tokenizer.apply_chat_template(
-        msgs, tokenize=False, add_generation_prompt=True, enable_thinking=_w.THINKING
-    )
-
-
 def prompt_opens_thinking(prompt: str | None) -> bool:
     """True when the rendered prompt ends with an unclosed <think> — derived from the prompt itself,
     NOT the enable_thinking flag (an uncurated template may ignore it)."""

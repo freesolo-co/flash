@@ -32,85 +32,54 @@ from flash.engine.worker.io.heartbeat import (
     _HB_UPLOAD_LOCK,
     LATEST_GRPO_METRICS_LAST,
     heartbeat,
-    make_sft_heartbeat_callback,
 )
 from flash.engine.worker.io.hf import (
     _hf_upload,
-    _latest_checkpoint_dir,
     error_artifact_name,
-    flush_optional_uploads,
     hf_api,
     hf_prefix,
     hf_resume_checkpoint,
     hf_upload_file,
     hf_upload_folder,
     load_tokenizer,
-    make_checkpoint_upload_callback,
     model_revision_kwargs,
     prefetch_model,
     publish_deployable_checkpoint,
     publish_opd_optimizer_start_marker,
     ray_log_artifact_name,
-    upload_debug_jsonl,
     upload_resume_checkpoint,
     write_base_model_provenance,
 )
 from flash.engine.worker.io.wandb_log import (
-    wandb_finish,
-    wandb_report_to,
-    wandb_run_info,
     wandb_run_name,
 )
 from flash.engine.worker.model.adapter import (
     _download_adapter,
-    _init_adapter_model,
     lora_target_parameters,
     make_lora,
-    prepare_fresh_lora_base,
-    require_vllm_for_rollout_func,
-    stamp_adapter_provenance,
     validate_lora_target_parameters,
 )
 from flash.engine.worker.model.decoding import (
     graded_text,
     prompt_opens_thinking,
-    render_prompt,
     strip_think,
     think_token_count,
     thinking_text,
 )
-from flash.engine.worker.model.lora import (
-    assert_adapter_delta_nonzero,
-    assert_adapter_load_clean,
-    assert_lora_applied,
-    is_vl_checkpoint,
-)
 from flash.engine.worker.perf import (
     RetriableInfraError,
-    _attn_impl_for_capability,
     _ensure_fla_fastpath_on_hopper,
     _estimate_params,
-    _flash_attn_3_available,
-    _flash_attn_available,
     _force_fla_triton_gdn_on_sm100,
-    _GpuPeakSampler,
     _liger_default_for_model,
     _memory_mode,
-    _metric_curve,
     _neutralize_tilelang_cudart_stub,
-    _peak_gpu_gb,
     _remove_fla_from_disk,
-    _reset_peak_gpu,
     _restrict_fla_gdn_autotune_on_blackwell,
-    _sdpa_cudnn_ctx,
-    free_gpu,
-    fused_optim_name,
     gpu_diagnostics,
     grad_checkpointing_on,
     grpo_use_reentrant,
     is_cuda_oom,
-    loraplus_optimizer_cls,
-    optimal_attn_impl,
     wait_for_gpu,
 )
 from flash.engine.worker.runtime.kernel_warmup import _current_cuda_sm, load_mega_cache
@@ -190,9 +159,6 @@ _HB_FORCE_MIN_INTERVAL_S = 60.0
 _HB_SETUP_LIVENESS_INTERVAL_S = 240.0
 _HB_TERMINAL_ONLY = False
 
-_WANDB_FINISH_WAIT_S = 120.0
-_WANDB_FINISH_FAIL_WAIT_S = 5.0
-
 
 def _remaining_worker_wall_seconds() -> float | None:
     raw_deadline = os.environ.get("FLASH_RUN_DEADLINE_AT")
@@ -257,8 +223,6 @@ THINKING = JOB_SPEC.thinking if JOB_SPEC else False
 
 
 def _finalize(metrics: RunMetrics, *, heartbeat_fields=None):
-    if not flush_optional_uploads():
-        print("optional upload flush timed out before final publication")
     metrics.save("/tmp/metrics.json")
     hf_upload_file("/tmp/metrics.json", "metrics.json", required=True)
     with open("/tmp/DONE", "w") as f:
@@ -360,7 +324,6 @@ def main():
         if RUN_MODE == "profile":
             heartbeat("boot")
             handler()
-            wandb_finish(exit_code=0)
             sys.stdout.flush()
             sys.stderr.flush()
             os._exit(0)
@@ -380,14 +343,11 @@ def main():
         load_mega_cache()
         handler()
         # Hard-exit: colocated vLLM can deadlock on NCCL/CUDA teardown; all artifacts already on HF.
-        wandb_finish(exit_code=0)
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(0)
     except Exception as e:
         tb = sanitize_diagnostic(traceback.format_exc(), limit=16_000)
-        if not flush_optional_uploads():
-            print("optional upload flush timed out on worker error")
         try:
             err_name = error_artifact_name(RUN_MODE, ATTEMPT)
             err_path = f"/tmp/{err_name}"
@@ -432,7 +392,6 @@ def main():
             )
         except Exception:
             heartbeat(f"error_{RUN_MODE}", error=detail, **hb_flags, **_err_metrics)
-        wandb_finish(exit_code=1)
         remaining = _remaining_worker_wall_seconds()
         delay = 10.0 if remaining is None else min(10.0, remaining)
         if delay > 0:
@@ -467,42 +426,24 @@ __all__ = [
     "_HB_TIGHT_LIVENESS_STAGES",
     "_HB_UPLOAD_LIVENESS_STAGES",
     "_HB_UPLOAD_LOCK",
-    "_WANDB_FINISH_FAIL_WAIT_S",
-    "_WANDB_FINISH_WAIT_S",
     "RetriableInfraError",
-    "_GpuPeakSampler",
-    "_attn_impl_for_capability",
     "_current_cuda_sm",
     "_download_adapter",
     "_ensure_fla_fastpath_on_hopper",
     "_estimate_params",
     "_finalize",
-    "_flash_attn_3_available",
-    "_flash_attn_available",
     "_force_fla_triton_gdn_on_sm100",
     "_hf_upload",
-    "_init_adapter_model",
-    "_latest_checkpoint_dir",
     "_liger_default_for_model",
     "_load_active_env",
     "_memory_mode",
-    "_metric_curve",
     "_neutralize_tilelang_cudart_stub",
-    "_peak_gpu_gb",
     "_remove_fla_from_disk",
-    "_reset_peak_gpu",
     "_restrict_fla_gdn_autotune_on_blackwell",
-    "_sdpa_cudnn_ctx",
-    "assert_adapter_delta_nonzero",
-    "assert_adapter_load_clean",
-    "assert_lora_applied",
     "backend_seed",
     "build_grpo_prompt_dataset",
     # gpu/backend setup
     "error_artifact_name",
-    "flush_optional_uploads",
-    "free_gpu",
-    "fused_optim_name",
     "gpu_diagnostics",
     "grad_checkpointing_on",
     "graded_text",
@@ -515,42 +456,29 @@ __all__ = [
     "hf_resume_checkpoint",
     "hf_upload_file",
     "hf_upload_folder",
-    "is_vl_checkpoint",
     "load_mega_cache",
     "load_tokenizer",
     "lora_target_parameters",
-    "loraplus_optimizer_cls",
     "main",
-    "make_checkpoint_upload_callback",
     "make_lora",
-    "make_sft_heartbeat_callback",
     "model_revision_kwargs",
-    "optimal_attn_impl",
     "prefetch_model",
-    "prepare_fresh_lora_base",
     "prompt_opens_thinking",
     "publish_deployable_checkpoint",
     "publish_opd_optimizer_start_marker",
     "ray_log_artifact_name",
-    "render_prompt",
     "require_active_env",
-    "require_vllm_for_rollout_func",
     "resolve_grpo_prompts_per_step",
     "run_opd",
     "run_rl",
     "run_sft",
     "seed_training_rngs",
-    "stamp_adapter_provenance",
     "strip_think",
     "think_token_count",
     "thinking_text",
-    "upload_debug_jsonl",
     "upload_resume_checkpoint",
     "validate_lora_target_parameters",
     "wait_for_gpu",
-    "wandb_finish",
-    "wandb_report_to",
-    "wandb_run_info",
     "wandb_run_name",
     "write_base_model_provenance",
     "write_train_meta",

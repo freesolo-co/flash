@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import importlib
 import inspect
-import sys
-import types
 from types import SimpleNamespace
 
 import pytest
@@ -88,49 +86,6 @@ def test_gdn_forward_probe_swallows_import_and_inspection_failures(monkeypatch) 
     assert packing._gdn_forward_threads_reset_kwargs(None) is False
 
 
-def _enable_kernel_probes(monkeypatch) -> None:
-    import transformers.utils.import_utils as import_utils
-
-    monkeypatch.setattr(import_utils, "is_flash_linear_attention_available", lambda: True)
-    monkeypatch.setattr(import_utils, "is_causal_conv1d_available", lambda: True)
-
-
-def test_gdn_packing_rejects_a_broken_causal_conv_import(monkeypatch) -> None:
-    """A package that is discoverable but ABI-broken at import time must disable packing."""
-    _enable_kernel_probes(monkeypatch)
-    real_import = importlib.import_module
-
-    def fake_import(name):
-        if name == "causal_conv1d":
-            raise ImportError("bad abi")
-        return real_import(name)
-
-    monkeypatch.setattr(importlib, "import_module", fake_import)
-
-    assert packing.gdn_packing_available() is False
-
-
-def test_gdn_packing_rejects_a_forward_signature_without_resets(monkeypatch) -> None:
-    """Installed kernels are insufficient when the model forward cannot reset sequence state."""
-    _enable_kernel_probes(monkeypatch)
-    monkeypatch.setattr(importlib, "import_module", lambda name: SimpleNamespace())
-    monkeypatch.setattr(packing, "_gdn_forward_threads_reset_kwargs", lambda *a, **k: False)
-
-    assert packing.gdn_packing_available() is False
-
-
-def test_gdn_packing_succeeds_on_cpu_when_all_non_gpu_probes_pass(monkeypatch) -> None:
-    """CPU-only control-plane probing must succeed without attempting a CUDA kernel smoke."""
-    fake_torch = types.ModuleType("torch")
-    fake_torch.cuda = SimpleNamespace(is_available=lambda: False)
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    _enable_kernel_probes(monkeypatch)
-    monkeypatch.setattr(importlib, "import_module", lambda name: SimpleNamespace())
-    monkeypatch.setattr(packing, "_gdn_forward_threads_reset_kwargs", lambda *a, **k: True)
-
-    assert packing.gdn_packing_available("owner/model") is True
-
-
 def test_the_packing_contract_gate_never_consults_the_device() -> None:
     """The quote-side gate must decide without a gpu, or every catalog sft run fails.
 
@@ -144,7 +99,6 @@ def test_the_packing_contract_gate_never_consults_the_device() -> None:
     main path. ``is_flash_linear_attention_available`` / ``is_causal_conv1d_available`` are banned
     here specifically: both open with ``is_torch_cuda_available()``.
 
-    The device-dependent check belongs in ``gdn_packing_available``, which runs only on the worker.
     """
     import ast
     import inspect
@@ -165,19 +119,6 @@ def test_the_packing_contract_gate_never_consults_the_device() -> None:
             "the gpu worker can disagree on packing_mode -- which fails the frozen-quote parity "
             "check in sft_train for every gdn model"
         )
-
-
-def test_gdn_packing_catches_unexpected_probe_failures(monkeypatch) -> None:
-    """Unexpected reset-probe errors must fail safely rather than aborting worker setup."""
-    _enable_kernel_probes(monkeypatch)
-    monkeypatch.setattr(importlib, "import_module", lambda name: SimpleNamespace())
-    monkeypatch.setattr(
-        packing,
-        "_gdn_forward_threads_reset_kwargs",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("probe failed")),
-    )
-
-    assert packing.gdn_packing_available() is False
 
 
 def test_the_strict_module_resolver_refuses_to_guess_the_arch(monkeypatch) -> None:

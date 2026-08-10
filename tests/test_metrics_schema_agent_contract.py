@@ -32,9 +32,8 @@ if _AGENT_SRC.is_dir() and str(_AGENT_SRC) not in sys.path:
 
 from flash.engine.result.accounting import RunMetrics
 
-# The `notes` dicts engine/worker.py write_train_meta() is called with, mirrored from
-# the SFT (worker.py ~L1293) and RL (worker.py ~L1942) finalize blocks. wandb_run_info()
-# spreads {wandb_url, wandb_id, wandb_project} into notes when W&B is active.
+# the `notes` dicts write_train_meta() is called with, mirrored from the sft and rl finalize blocks.
+# the verl child link channel adds {wandb_url, wandb_id, wandb_project} when w&b is active.
 _WANDB_NOTES = {
     "wandb_url": "https://wandb.ai/org/proj/runs/abc",
     "wandb_id": "abc",
