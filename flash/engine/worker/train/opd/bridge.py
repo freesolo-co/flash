@@ -39,9 +39,9 @@ from flash.engine.worker.train.opd.batching import (
 from flash.engine.worker.train.opd.gkd import (
     _rollout_terminated,
     _teacher_prompt_text,
-    _trim_trailing_stop,
     student_tokens_with_offsets,
 )
+from flash.engine.worker.train.opd.multiturn_validation import validated_multiturn_response
 from flash.engine.worker.train.opd.prompts import (
     _trim_response_and_forced,
     _validate_forced_mask,
@@ -543,55 +543,12 @@ class _TeacherAlignmentBridge:
         return {"max_turns": turn_limit}
 
     def _validated_multiturn_response(self, payload: dict) -> tuple[list[int], list[int], str, str]:
-        raw_response_ids = [int(token_id) for token_id in payload.get("raw_response_ids", [])]
-        response_ids = [int(token_id) for token_id in payload.get("response_ids", [])]
-        completion_text = payload.get("completion_text")
-        if not isinstance(completion_text, str):
-            raise ValueError("multi-turn assistant completion text must be a string")
-        termination = str(payload.get("termination") or "")
-        truncated = bool(payload.get("truncated"))
-        skip_reason = str(payload.get("skip_reason") or "")
-        if skip_reason not in {
-            "",
-            "empty_completion",
-            "replacement_char",
-            "truncated_rollout",
-        }:
-            raise ValueError("multi-turn assistant turn has an unknown skip reason")
-        if truncated:
-            if termination != "truncated" or skip_reason != "truncated_rollout":
-                raise ValueError("multi-turn truncated assistant turn has inconsistent metadata")
-            if response_ids != raw_response_ids:
-                raise ValueError(
-                    "multi-turn truncated assistant ids must preserve the sampled span"
-                )
-        elif termination == "eos":
-            if self.eos_token_ids.isdisjoint(raw_response_ids):
-                raise ValueError("multi-turn eos termination is not present in the sampled ids")
-            if response_ids != raw_response_ids:
-                raise ValueError("multi-turn eos response ids must preserve the sampled span")
-        elif termination == "stop":
-            stop_text = self.tokenizer.decode(raw_response_ids, skip_special_tokens=False)
-            expected_ids, expected_text = _trim_trailing_stop(
-                self.tokenizer, raw_response_ids, stop_text, self.stop_sequences
-            )
-            if expected_ids != response_ids or expected_text != completion_text:
-                raise ValueError("multi-turn stop trimming does not match the legacy OPD contract")
-        elif termination == "accepted_stop":
-            max_tokens = int(payload.get("max_tokens", 0))
-            if (
-                payload.get("stop_reason") != "completed"
-                or max_tokens <= 0
-                or len(raw_response_ids) >= max_tokens
-                or response_ids != raw_response_ids
-            ):
-                raise ValueError("multi-turn accepted-stop metadata is not verifiable")
-        else:
-            raise ValueError("multi-turn assistant turn did not end at a verified boundary")
-        decoded = self.tokenizer.decode(response_ids, skip_special_tokens=True)
-        if decoded != completion_text:
-            raise ValueError("multi-turn assistant text does not match its accepted token span")
-        return raw_response_ids, response_ids, completion_text, skip_reason
+        return validated_multiturn_response(
+            payload,
+            tokenizer=self.tokenizer,
+            eos_token_ids=self.eos_token_ids,
+            stop_sequences=self.stop_sequences,
+        )
 
     def step_multiturn(self, payload: dict) -> dict:
         self._require_multiturn()

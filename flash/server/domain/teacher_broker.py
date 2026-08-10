@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import contextlib
-import hashlib
-import hmac
 import http.client
 import json
 import math
 import os
-import re
 import sqlite3
 import time
 import urllib.parse
@@ -19,6 +16,45 @@ from typing import Any
 from flash._internal.fileio import reject_duplicate_keys
 from flash.core.spec import PUBLIC_URL_ENV, TEACHER_CAPABILITY_ENV, JobSpec
 from flash.engine.plan.recipe import RECIPE, resolve_teacher
+from flash.server.domain.teacher_errors import TeacherBrokerError, ValidatedCompletionRequest
+from flash.server.domain.teacher_requests import (
+    CAPABILITY_PATTERN,
+    REQUEST_ID_PATTERN,
+    _canonical_json,
+    _reject_nonfinite,
+    parse_strict_json,
+    request_fingerprint,
+    validate_capability_token,
+    validate_chat_completion_request,
+    validate_completion_request,
+    validate_request_id,
+)
+
+# the validation half moved to `teacher_requests`, but routes and tests reach these names through
+# THIS module (`teacher_broker.validate_completion_request`, and patch seams like
+# `teacher_broker._provider_chat_post`). re-export so the split stays invisible to callers; the
+# names below are unused in this file by design, which is what __all__ tells ruff.
+__all__ = [
+    "CAPABILITY_PATTERN",
+    "REQUEST_ID_PATTERN",
+    "TeacherBrokerError",
+    "ValidatedCompletionRequest",
+    "authenticate_teacher_capability",
+    "capability_limits_for_spec",
+    "complete_teacher_chat_request",
+    "complete_teacher_request",
+    "issue_teacher_capability",
+    "parse_strict_json",
+    "request_fingerprint",
+    "require_teacher_broker_configuration",
+    "resolve_public_url",
+    "teacher_attempt_transport",
+    "validate_capability_token",
+    "validate_chat_completion_request",
+    "validate_completion_request",
+    "validate_public_url",
+    "validate_request_id",
+]
 from flash.server.platform import db
 from flash.teacher.limits import (
     OPD_TEACHER_SCORING_CONCURRENCY,
@@ -43,40 +79,6 @@ MAX_TOTAL_REQUESTS = 1_000_000
 MAX_TOTAL_TOKENS = 2_000_000_000
 MAX_CAPABILITY_LIFETIME_S = 24 * 60 * 60
 MAX_PROVIDER_TIMEOUT_S = 90.0
-REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9._~-]{16,128}\Z")
-CAPABILITY_PATTERN = re.compile(r"[A-Za-z0-9_-]{40,128}\Z")
-
-
-class TeacherBrokerError(RuntimeError):
-    def __init__(
-        self,
-        code: str,
-        *,
-        status_code: int,
-        retryable: bool = False,
-        request_id: str | None = None,
-    ) -> None:
-        super().__init__(code)
-        self.code = code
-        self.status_code = status_code
-        self.retryable = retryable
-        self.request_id = request_id
-
-    def payload(self) -> dict[str, Any]:
-        error: dict[str, Any] = {
-            "code": self.code,
-            "classification": "transient" if self.retryable else "permanent",
-        }
-        if self.request_id is not None:
-            error["request_id"] = self.request_id
-        return {"error": error}
-
-
-@dataclass(frozen=True)
-class ValidatedCompletionRequest:
-    body: dict[str, Any]
-    canonical_body: bytes
-    score_items: int
 
 
 @dataclass(frozen=True)
@@ -279,184 +281,6 @@ def teacher_attempt_transport(
 _reject_duplicate_keys = reject_duplicate_keys(
     lambda _key: TeacherBrokerError("duplicate_json_key", status_code=400)
 )
-
-
-def _reject_nonfinite(_value: str) -> None:
-    raise TeacherBrokerError("non_finite_number", status_code=400)
-
-
-def parse_strict_json(raw: bytes | bytearray) -> dict[str, Any]:
-    if len(raw) > MAX_REQUEST_BODY_BYTES:
-        raise TeacherBrokerError("request_too_large", status_code=413)
-    try:
-        value = json.loads(
-            raw.decode("utf-8"),
-            object_pairs_hook=_reject_duplicate_keys,
-            parse_constant=_reject_nonfinite,
-        )
-    except TeacherBrokerError:
-        raise
-    except (TypeError, ValueError) as exc:
-        raise TeacherBrokerError("invalid_json", status_code=400) from exc
-    if not isinstance(value, dict):
-        raise TeacherBrokerError("request_must_be_object", status_code=400)
-    return value
-
-
-def _canonical_json(value: dict[str, Any]) -> bytes:
-    try:
-        return json.dumps(
-            value,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
-    except (TypeError, ValueError) as exc:
-        raise TeacherBrokerError("invalid_request_value", status_code=400) from exc
-
-
-def validate_request_id(value: str) -> str:
-    request_id = str(value or "").strip()
-    if not REQUEST_ID_PATTERN.fullmatch(request_id):
-        raise TeacherBrokerError("invalid_request_id", status_code=400)
-    return request_id
-
-
-def validate_capability_token(value: str) -> str:
-    capability = str(value or "").strip()
-    if not CAPABILITY_PATTERN.fullmatch(capability):
-        raise TeacherBrokerError("invalid_capability", status_code=401)
-    return capability
-
-
-def validate_completion_request(
-    body: dict[str, Any], capability: dict[str, Any]
-) -> ValidatedCompletionRequest:
-    required = {
-        "model",
-        "prompt",
-        "max_tokens",
-        "echo",
-        "logprobs",
-        "prompt_logprobs",
-        "return_token_ids",
-        "temperature",
-        "top_p",
-        "seed",
-    }
-    if set(body) - required:
-        raise TeacherBrokerError("extra_request_fields", status_code=400)
-    if set(body) != required:
-        raise TeacherBrokerError("missing_request_fields", status_code=400)
-    if body["model"] != capability["model"]:
-        raise TeacherBrokerError("model_scope_mismatch", status_code=403)
-    if (
-        not isinstance(body["prompt"], str)
-        or not body["prompt"]
-        or isinstance(body["max_tokens"], bool)
-        or body["max_tokens"] != 1
-        or body["echo"] is not True
-        or isinstance(body["logprobs"], bool)
-        or body["logprobs"] != 1
-        or isinstance(body["prompt_logprobs"], bool)
-        or body["prompt_logprobs"] != 1
-        or body["return_token_ids"] is not True
-        or isinstance(body["temperature"], bool)
-        or body["temperature"] != 0
-        or isinstance(body["top_p"], bool)
-        or body["top_p"] != 1
-        or isinstance(body["seed"], bool)
-        or body["seed"] != 0
-    ):
-        raise TeacherBrokerError("unsupported_scoring_parameters", status_code=400)
-    canonical = _canonical_json(body)
-    if len(canonical) > capability["max_request_bytes"]:
-        raise TeacherBrokerError("request_too_large", status_code=413)
-    return ValidatedCompletionRequest(
-        body=dict(body),
-        canonical_body=canonical,
-        score_items=1,
-    )
-
-
-def _validate_chat_messages(value: Any) -> None:
-    if not isinstance(value, list) or not value:
-        raise TeacherBrokerError("unsupported_scoring_parameters", status_code=400)
-    for message in value:
-        if not isinstance(message, dict) or set(message) != {"role", "content"}:
-            raise TeacherBrokerError("invalid_chat_messages", status_code=400)
-        if not isinstance(message["role"], str) or not message["role"]:
-            raise TeacherBrokerError("invalid_chat_messages", status_code=400)
-        content = message["content"]
-        if isinstance(content, str):
-            continue
-        if not isinstance(content, list) or not content:
-            raise TeacherBrokerError("invalid_chat_messages", status_code=400)
-        for block in content:
-            if not isinstance(block, dict) or not isinstance(block.get("type"), str):
-                raise TeacherBrokerError("invalid_chat_content_block", status_code=400)
-            block_type = block["type"]
-            if block_type == "text":
-                if set(block) != {"type", "text"} or not isinstance(block["text"], str):
-                    raise TeacherBrokerError("invalid_chat_content_block", status_code=400)
-            elif block_type == "image_url":
-                image_url = block.get("image_url")
-                if (
-                    set(block) != {"type", "image_url"}
-                    or not isinstance(image_url, dict)
-                    or set(image_url) != {"url"}
-                    or not isinstance(image_url["url"], str)
-                    or not image_url["url"].startswith("data:image/")
-                ):
-                    raise TeacherBrokerError("invalid_chat_content_block", status_code=400)
-            else:
-                raise TeacherBrokerError("unknown_chat_content_block_type", status_code=400)
-
-
-def validate_chat_completion_request(
-    body: dict[str, Any], capability: dict[str, Any]
-) -> ValidatedCompletionRequest:
-    required = {
-        "model",
-        "messages",
-        "max_tokens",
-        "temperature",
-        "seed",
-        "prompt_logprobs",
-        "return_token_ids",
-    }
-    if set(body) - required:
-        raise TeacherBrokerError("extra_request_fields", status_code=400)
-    if set(body) != required:
-        raise TeacherBrokerError("missing_request_fields", status_code=400)
-    if body["model"] != capability["model"]:
-        raise TeacherBrokerError("model_scope_mismatch", status_code=403)
-    if (
-        isinstance(body["max_tokens"], bool)
-        or body["max_tokens"] != 1
-        or isinstance(body["temperature"], bool)
-        or body["temperature"] != 0
-        or isinstance(body["seed"], bool)
-        or body["seed"] != 0
-        or isinstance(body["prompt_logprobs"], bool)
-        or body["prompt_logprobs"] != 1
-        or body["return_token_ids"] is not True
-    ):
-        raise TeacherBrokerError("unsupported_scoring_parameters", status_code=400)
-    _validate_chat_messages(body["messages"])
-    canonical = _canonical_json(body)
-    if len(canonical) > capability["max_request_bytes"]:
-        raise TeacherBrokerError("request_too_large", status_code=413)
-    return ValidatedCompletionRequest(
-        body=dict(body),
-        canonical_body=canonical,
-        score_items=1,
-    )
-
-
-def request_fingerprint(capability: str, canonical_body: bytes) -> str:
-    return hmac.new(capability.encode("utf-8"), canonical_body, hashlib.sha256).hexdigest()
 
 
 def _require_current_attempt(capability: dict[str, Any]) -> None:
