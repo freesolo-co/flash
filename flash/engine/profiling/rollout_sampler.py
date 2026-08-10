@@ -253,7 +253,19 @@ def sample_rollouts(
             break
         # round-robin over ATTEMPTS: keeps one prompt from being redrawn just because an earlier
         # draw of it failed, which would concentrate the sample on whichever prompt is flakiest.
-        slot = attempts % len(prompts)
+        #
+        # the rotation is over the prompts still ELIGIBLE. a filtered prompt is settled -- the
+        # endpoint already reported its length and the worker will drop the row -- so redrawing it
+        # buys nothing and costs a paid completion every time. measured before this: with all 8
+        # prompts over budget the loop issued 186,249 paid requests and collected zero samples,
+        # because `collected` never grows and neither counter advances.
+        eligible = [i for i in range(len(prompts)) if i not in filtered_prompts]
+        if not eligible:
+            # every prompt is one the worker drops. there is nothing left to measure, and the pass
+            # has established that -- so stop rather than spend the remaining deadline re-confirming
+            # it. an empty sample fails the trust gate and the quote returns to the declared cap.
+            break
+        slot = eligible[attempts % len(eligible)]
         attempts += 1
         sample = _one_completion(
             model=model,
@@ -355,6 +367,12 @@ def _read_within_deadline(response, limit: int, deadline: float) -> bytes | None
     every drip and can compare the ABSOLUTE deadline, and a drip-feeder buys one socket operation
     rather than an unbounded run of them. None rather than an exception, because a timed-out draw is
     an ordinary failed draw: the quote returns to the declared cap.
+
+    checking between reads is not enough on its own, though. the socket keeps whatever timeout the
+    request was opened with, so a byte arriving just inside the deadline passes the check and then
+    blocks for that FULL original timeout: measured, a byte at 1.8s held a 2.0s deadline out to 3.8s.
+    so the socket's own timeout is shrunk to the remaining budget before each read, which makes the
+    absolute deadline the real bound rather than an advisory one.
     """
     # http.client responses implement read1; a test double or an exotic file-like may not, and for
     # those the bounded read is still correct, just without the mid-body deadline check.
@@ -364,14 +382,37 @@ def _read_within_deadline(response, limit: int, deadline: float) -> bytes | None
     chunks: list[bytes] = []
     remaining = limit
     while remaining > 0:
-        if time.monotonic() >= deadline:
+        left = deadline - time.monotonic()
+        if left <= 0:
             return None
+        _limit_socket_timeout(response, left)
         chunk = read1(min(_READ_CHUNK_BYTES, remaining))
         if not chunk:
             break
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
+
+
+def _limit_socket_timeout(response, seconds: float) -> None:
+    """lower the underlying socket's timeout to ``seconds``, best effort.
+
+    without this the deadline is only checked BETWEEN reads: a byte arriving just inside it starts a
+    read that then blocks for the socket's original timeout, so the pass overshoots by up to one
+    full REQUEST_TIMEOUT_S. narrowing it per read makes the absolute deadline binding.
+
+    best effort because the socket is reached through http.client internals that a test double or a
+    future stdlib layout may not expose. failing to narrow it costs the old overshoot, not
+    correctness, so an unexpected shape is left alone rather than raised on.
+    """
+    sock = getattr(getattr(response, "fp", None), "raw", None)
+    sock = getattr(sock, "_sock", None)
+    if sock is None:
+        return
+    try:
+        sock.settimeout(max(0.001, seconds))
+    except (OSError, ValueError, AttributeError):
+        return
 
 
 def _one_completion(

@@ -30,6 +30,23 @@ _MAX_ROLLOUTS = 100_000
 _MAX_TOKENS = 10_000_000
 _MAX_REWARD_SECONDS = 3600.0
 
+# floor on how far an UNATTESTED measurement may discount the quote, as a fraction of the declared
+# completion cap. nothing here proves sampling happened -- re-deriving the config digest binds the
+# numbers to the caller's own config, not to any real generation -- so a caller could claim a 1-token
+# mean against a 2048-token cap and be billed for it: measured, that payload is accepted and scores
+# `(True, '')`, and `charge_completed_run` bills the quote while `precheck_training_run` admits the
+# run against it.
+#
+# a floor is the smallest correction that keeps the feature honest. it does not make the claim
+# trustworthy; it bounds what a false one is worth, from a 2048x understatement to at most this
+# factor. real samples sit far above it -- the measured means this feature exists to capture run
+# several-fold under the cap, not a thousand-fold -- so a genuine measurement is unaffected and only
+# implausible discounts are clamped.
+#
+# it is a stopgap, not the answer. the real fix is a server-side or attested measurement, which needs
+# the worker's own realized lengths and is a separate change.
+_MIN_UNATTESTED_MEAN_FRACTION = 0.05
+
 _REQUIRED_FIELDS = (
     "sampled_prompts",
     "offered_prompts",
@@ -48,6 +65,30 @@ _REQUIRED_FIELDS = (
     # evidence that is recorded under the newer identity and then reused as matching.
     "sample_policy_version",
 )
+
+
+def _discounts_below_the_unattested_floor(fields: dict[str, Any], spec: Any) -> bool:
+    """whether these aggregates claim a discount too large to accept on a client's word alone.
+
+    the mean is the field that sets the price, and nothing on this path proves a generation ever
+    happened. so the claim is compared against the run's own declared cap: a mean below
+    ``_MIN_UNATTESTED_MEAN_FRACTION`` of it is rejected outright rather than priced.
+
+    rejecting, not clamping. a clamped value would be reported as a measurement while being a
+    server-invented number, and every other rejection here returns the quote to the declared cap --
+    the pricing an unmeasured run always had. so an implausible claim costs its author nothing but
+    the discount they could not substantiate.
+    """
+    cap = 0
+    try:
+        cap = int(getattr(getattr(spec, "train", None), "max_completion_tokens", 0) or 0)
+    except (TypeError, ValueError):
+        cap = 0
+    if cap <= 0:
+        # no declared cap to measure the claim against. the profile cannot underquote relative to a
+        # bound that does not exist, and inventing one here would reject valid submits.
+        return False
+    return fields["completion_tokens_mean"] < cap * _MIN_UNATTESTED_MEAN_FRACTION
 
 
 def evidence_is_well_formed(evidence: object) -> bool:
@@ -92,6 +133,8 @@ def rollout_profile_from_evidence(
 
     fields = _validated_fields(evidence)
     if fields is None:
+        return None
+    if _discounts_below_the_unattested_floor(fields, spec):
         return None
 
     tokenizer_revision = str(getattr(spec, "model_revision", "") or "")

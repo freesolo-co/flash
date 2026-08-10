@@ -532,6 +532,77 @@ def test_a_slow_drip_response_gives_up_at_the_deadline():
     assert elapsed < deadline_s * 4, f"read ran {elapsed:.1f}s past a {deadline_s}s deadline"
 
 
+def test_a_byte_arriving_just_inside_the_deadline_cannot_extend_it():
+    """Checking the deadline BETWEEN reads is not the same as enforcing it.
+
+    The socket keeps whatever timeout the request was opened with. A byte arriving just inside the
+    deadline passes the between-reads check and then starts a read that can block for that full
+    original timeout -- measured before this fix, a byte at 1.8s held a 2.0s deadline out to 3.8s,
+    which at production values is REQUEST_TIMEOUT_S of overshoot past SAMPLING_DEADLINE_S.
+
+    So the socket's own timeout is narrowed to the remaining budget before each read.
+    """
+    import socket
+    import threading
+    import time
+
+    from flash.engine.profiling import rollout_sampler
+
+    deadline_s = 2.0
+    stop = threading.Event()
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+
+    def serve():
+        try:
+            conn, _ = server.accept()
+        except OSError:
+            return
+        try:
+            conn.recv(65536)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n")
+            # one byte just before the deadline, then silence: the read starts legally and would
+            # otherwise inherit the socket's original timeout
+            time.sleep(deadline_s * 0.9)
+            conn.sendall(b"{")
+            while not stop.is_set():
+                time.sleep(0.05)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        started = time.monotonic()
+        sample = rollout_sampler._one_completion(
+            model="Qwen/Qwen3.5-4B",
+            messages=[{"role": "user", "content": "hi"}],
+            max_completion_tokens=16,
+            temperature=None,
+            top_p=1.0,
+            base_url=f"http://127.0.0.1:{port}/v1",
+            api_key="k",
+            timeout_s=deadline_s,
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        stop.set()
+        server.close()
+        thread.join(timeout=5)
+
+    assert sample is None
+    # the late byte may buy one more read, never another full timeout. 1.5x separates "bounded by
+    # the deadline" from "bounded by the socket timeout" without pinning scheduler jitter.
+    assert elapsed < deadline_s * 1.5, (
+        f"a late byte extended a {deadline_s}s deadline to {elapsed:.1f}s"
+    )
+
+
 def test_an_oversized_prompt_is_declined_without_serializing_it(monkeypatch):
     """Declining is not enough on its own: WHERE it declines is the whole point.
 
@@ -2572,6 +2643,82 @@ def test_a_systematically_refused_prompt_fails_coverage_but_an_out_of_budget_one
     assert verdict(filtered) == (True, "")
 
 
+def test_out_of_budget_prompts_leave_the_rotation_instead_of_being_redrawn():
+    """A filtered prompt is settled, so redrawing it is a paid request that can never help.
+
+    `OUT_OF_BUDGET` is not a failure and not a sample, so it advances neither `collected` nor the
+    consecutive-failure cutoff. With the rotation running over every offered prompt, a set that is
+    entirely over budget therefore loops until the 300s deadline: measured before this fix, 186,249
+    paid chat-completion requests for zero collected samples.
+
+    The endpoint has already reported that prompt's length and the worker will drop the row, so
+    there is nothing further to learn by asking again.
+    """
+    import json
+
+    from flash.engine.profiling import rollout_sampler
+
+    class _Response:
+        def __init__(self, prompt_tokens):
+            self._body = json.dumps(
+                {
+                    "choices": [{"finish_reason": "stop", "message": {"content": "x"}}],
+                    "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 180},
+                }
+            ).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, size=-1):
+            return self._body
+
+        def read1(self, size=-1):
+            body, self._body = self._body, b""
+            return body
+
+    def draw(over_budget: set[int]):
+        issued = {"n": 0}
+
+        def fake_open(request, timeout=None):
+            issued["n"] += 1
+            index = int(json.loads(request.data)["messages"][0]["content"][1:])
+            return _Response(500 if index in over_budget else 50)
+
+        original = rollout_sampler._NO_REDIRECT_OPENER.open
+        rollout_sampler._NO_REDIRECT_OPENER.open = fake_open
+        try:
+            out = rollout_sampler.sample_rollouts(
+                model="Qwen/Qwen3.5-4B",
+                prompts=[[{"role": "user", "content": f"p{i}"}] for i in range(8)],
+                rollouts=32,
+                max_completion_tokens=4096,
+                temperature=None,
+                top_p=1.0,
+                base_url="https://example.invalid/v1",
+                api_key="k",
+                prompt_budget=100,
+            )
+        finally:
+            rollout_sampler._NO_REDIRECT_OPENER.open = original
+        return issued["n"], out
+
+    # every prompt filtered: each is asked exactly once, then the pass ends
+    issued, out = draw(set(range(8)))
+    assert out.completed == 0
+    assert issued == 8, f"asked a settled prompt again: {issued} requests for 8 prompts"
+
+    # one prompt filtered: the other seven still supply the full sample, and the filtered one is
+    # asked once rather than every time its turn comes around
+    issued_one, out_one = draw({3})
+    assert out_one.completed == 32
+    assert out_one.offered_prompts == 7
+    assert issued_one <= 40, f"redrew the filtered prompt: {issued_one} requests"
+
+
 def test_a_transient_failure_still_reaches_full_prompt_coverage():
     """Requiring every offered prompt is only safe because a blip does not cost coverage.
 
@@ -2918,6 +3065,56 @@ def test_a_prompt_the_endpoint_always_refuses_does_not_count_as_sampled():
     # 7 of the 8 offered prompts produced draws; the refused one must not be counted.
     assert out.summary()["sampled_prompts"] == 7
     assert out.summary()["offered_prompts"] == 8
+
+
+def test_an_implausible_discount_is_not_priced_on_the_clients_word_alone():
+    """Nothing on this path proves a generation ever happened.
+
+    Re-deriving the config digest binds the numbers to the caller's own config; it does not attest
+    that anything was sampled. Measured before this: evidence claiming 32 one-token rollouts with
+    full coverage and consistent percentiles is accepted and scores `(True, '')`, and the mean is
+    what sets the price -- `precheck_training_run` admits the run against that quote and
+    `charge_completed_run` bills it, so a caller could price its own GPU time ~2000x under.
+
+    The floor does not make the claim trustworthy, it bounds what a false one is worth. Real
+    measurements are unaffected: the means this feature exists to capture run several-fold under the
+    cap, not a thousand-fold, which is exactly what the accepted cases below assert.
+    """
+    spec = _spec()
+    cap = spec.train.max_completion_tokens
+
+    forged = rollout_profile_from_evidence(
+        spec,
+        _evidence(
+            completion_tokens_mean=1.0,
+            completion_tokens_p50=1,
+            completion_tokens_p90=1,
+            completion_tokens_max=1,
+        ),
+        producer_version=VERSION,
+    )
+    assert forged is None, "a one-token claim against a 512-token cap was accepted"
+
+    # and the rejection must be about the SIZE of the discount, not about small numbers generally:
+    # a mean at the floor is priced, so this cannot pass by rejecting everything.
+    from flash.server.domain.rollout_evidence import _MIN_UNATTESTED_MEAN_FRACTION
+
+    at_floor = cap * _MIN_UNATTESTED_MEAN_FRACTION
+    accepted = rollout_profile_from_evidence(
+        spec,
+        _evidence(
+            completion_tokens_mean=at_floor,
+            completion_tokens_p50=int(at_floor),
+            completion_tokens_p90=int(at_floor) + 4,
+            completion_tokens_max=int(at_floor) + 8,
+        ),
+        producer_version=VERSION,
+    )
+    assert accepted is not None, "a plausible measurement at the floor was rejected"
+
+    # a realistic measured mean -- the case this whole feature exists for -- is well clear of it
+    realistic = rollout_profile_from_evidence(spec, _evidence(), producer_version=VERSION)
+    assert realistic is not None
 
 
 def test_evidence_missing_a_prompt_entirely_is_not_trustworthy():
