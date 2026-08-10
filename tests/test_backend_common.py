@@ -2970,7 +2970,7 @@ def test_the_claim_is_made_before_the_trainer_is_spawned():
     Claiming after the child exists leaves any grandchild it has already orphaned parented
     elsewhere, so the fix would work only for the second job onward on a reused worker.
     """
-    for fn in (vc.run_verl_training, rl_train.run_rl_train):
+    for fn in (vc.run_verl_training, rl_train._execute_rl_child):
         src = " ".join(inspect.getsource(fn).split())
         assert "adopt_orphaned_descendants()" in src, f"{fn.__name__} never claims its orphans"
         assert src.index("adopt_orphaned_descendants()") < src.index("subprocess.Popen("), (
@@ -3734,7 +3734,7 @@ def test_every_verl_backend_enables_tf32_in_the_child(backend, monkeypatch):
         assign = next(
             node
             for node in ast.walk(
-                ast.parse(textwrap.dedent(inspect.getsource(rl_train.run_rl_train)))
+                ast.parse(textwrap.dedent(inspect.getsource(rl_train._write_rl_shim)))
             )
             if isinstance(node, ast.Assign)
             and any(getattr(t, "id", "") == "shim_source" for t in node.targets)

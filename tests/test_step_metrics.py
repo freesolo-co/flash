@@ -176,7 +176,15 @@ def test_backlog_is_mutated_in_place_for_the_heartbeat_reader():
 def _verl_rl_tree() -> ast.Module:
     from flash.engine.worker import rl_train
 
-    return ast.parse(textwrap.dedent(inspect.getsource(rl_train.run_rl_train)))
+    source = "\n".join(
+        inspect.getsource(fn)
+        for fn in (
+            rl_train.run_rl_train,
+            rl_train._ingest_step_metrics,
+            rl_train._write_terminal_metadata,
+        )
+    )
+    return ast.parse(textwrap.dedent(source))
 
 
 def test_verl_rl_lifecycle_heartbeats_carry_latest_metrics():

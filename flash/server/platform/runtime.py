@@ -554,16 +554,6 @@ def recover_runs() -> None:
     """Recover every in-flight run after a restart so a redeploy never loses a training session:
     re-attach to ``running`` jobs, and resubmit ``queued``/``provisioning`` runs that never reached
     a worker."""
-    from flash.runner import (
-        _drain_cleanup_remotes,
-        _gc_run_endpoints,
-        _mark_warmstart_source,
-        _update,
-        attach_run,
-        get_status,
-        reallocation_spec_from_status,
-    )
-
     active: set[str] = set()
     # Every run this plane knows about (whatever its state). This is the multi-plane safety scope for
     # the orphan sweep below — WITHOUT it, a restarting plane sharing a Vast/Lambda account sees the
@@ -576,9 +566,35 @@ def recover_runs() -> None:
     # attempt is reaped without racing the resubmit's fresh allocation.
     resubmit: list[tuple[JobSpec, str]] = []
 
-    def _drain_cleanup_remotes_bg(run_id: str) -> None:
-        with contextlib.suppress(Exception):
-            _drain_cleanup_remotes(run_id)
+    _classify_recoverable_runs(active, known, resubmit)
+    _sweep_provider_orphans(active, known)
+    _resubmit_recovered_runs(resubmit)
+
+
+def _drain_cleanup_remotes_bg(run_id: str) -> None:
+    from flash.runner import _drain_cleanup_remotes
+
+    with contextlib.suppress(Exception):
+        _drain_cleanup_remotes(run_id)
+
+
+def _classify_recoverable_runs(
+    active: set[str], known: set[str], resubmit: list[tuple[JobSpec, str]]
+) -> None:
+    """Sort every persisted run into reattach, resubmit, or terminally-failed.
+
+    Mutates the three collections in place: ``known`` gains every run id (the multi-plane
+    don't-touch scope), ``active`` only the handle-backed ones the sweep must keep, and ``resubmit``
+    the handle-less ones, deferred so the orphan sweep runs before their fresh allocation.
+    """
+    from flash.runner import (
+        _gc_run_endpoints,
+        _mark_warmstart_source,
+        _update,
+        attach_run,
+        get_status,
+        reallocation_spec_from_status,
+    )
 
     for row in db.all_runs():
         known.add(row["run_id"])
@@ -691,12 +707,20 @@ def recover_runs() -> None:
                     _append_run_log(status.run_id, detail)
                 continue
             resubmit.append((spec, status.state))
-    # Reap orphaned per-run provider resources; each provider sweeps its own.
+
+
+def _sweep_provider_orphans(active: set[str], known: set[str]) -> None:
+    """Reap orphaned per-run provider resources; each provider sweeps its own."""
     from flash.providers import configured_providers
 
     for prov in configured_providers():
         with contextlib.suppress(Exception):
             prov.sweep_orphans(active_labels=active, known_labels=known)
+
+
+def _resubmit_recovered_runs(resubmit: list[tuple[JobSpec, str]]) -> None:
+    """Relaunch the handle-less runs, deferring any whose teardown could not be confirmed."""
+    from flash.runner import get_status
 
     for spec, prior_state in resubmit:
         reason = _recovery_block_reason(spec)

@@ -154,6 +154,11 @@ class _TeacherAlignmentBridge:
         self.no_signal_resamples = int(state.get("no_signal_resamples", 0))
         self.no_signal_skipped_steps = int(state.get("no_signal_skipped_steps", 0))
         self.skip_counts = dict(state.get("skip_counts", {}))
+        # what `skip_counts` already held at the start of the current step. the fatal no-signal
+        # message subtracts this so it reports only the gates that fired for THAT step. seeded from
+        # the restored counts, never from empty: on resume the rehydrated totals belong to steps
+        # that already happened, and a zero baseline would re-blame every one of them.
+        self._skip_baseline = dict(self.skip_counts)
         self.opd_phase_seconds = dict(state.get("opd_phase_seconds", {}))
         self.opd_phase_counts = dict(state.get("opd_phase_counts", {}))
         self._teacher_failure: tuple[str, str] | None = None
@@ -794,13 +799,27 @@ class _TeacherAlignmentBridge:
             # cause. the stats snapshot that also carries these is only built after the child has
             # already raised, so without this a run that loses every rollout dies reporting "no
             # aligned teacher signal" and the artifacts cannot say which gate dropped them.
-            skips = dict(self.skip_counts)
+            #
+            # report the DELTA since the last committed step, not `skip_counts` itself. that dict is
+            # a lifetime accumulator -- it is never zeroed and line 156 even rehydrates it from
+            # resume state -- so returning it raw would let a gate that fired in an earlier step be
+            # named as the cause of this one, which is worse than saying nothing.
+            skips = {
+                reason: count - self._skip_baseline.get(reason, 0)
+                for reason, count in self.skip_counts.items()
+                if count - self._skip_baseline.get(reason, 0) > 0
+            }
+            self._skip_baseline = dict(self.skip_counts)
         return {"ok": True, "skip_counts": skips}
 
     def commit_teacher_cycle(self) -> dict:
         with self._stats_lock:
             self._pending_teacher_transient = None
             self._pending_teacher_success = False
+            # a committed step closes the window the next failure reports on. without this the
+            # baseline would only move on failures, so skips absorbed by a SUCCESSFUL step would be
+            # attributed to whatever step failed next.
+            self._skip_baseline = dict(self.skip_counts)
         return {"ok": True}
 
     def notify_mutation(self) -> None:

@@ -207,6 +207,10 @@ def _run_with_no_signal_replacements(
                 # name WHY every rollout was dropped. the three pre-teacher gates fail for very
                 # different reasons (cap reached without EOS, empty response, undecodable text) and
                 # the bare message sent a paid debugging cycle after the wrong one.
+                #
+                # the bridge returns the delta for THIS step, not its lifetime totals, and omits
+                # reasons that did not fire. an empty dict therefore means the rollouts were lost
+                # after scoring, and the message correctly says nothing rather than guessing.
                 skips = record_abandoned() or {}
                 detail = (
                     "; dropped before teacher scoring: "
@@ -403,36 +407,12 @@ def _init_transfer_queue(
         raise failure[0]
 
 
-def _install_verl_extensions() -> None:
-    import numpy as np
-    import ray
-    import torch
-    from omegaconf import OmegaConf
-
-    try:
-        import transfer_queue as tq
-        from transfer_queue import KVBatchMeta
-    except ImportError:
-        from verl.utils.transferqueue_utils import KVBatchMeta, tq
-
-    from verl.experimental.agent_loop.agent_loop import (
-        AgentLoopBase,
-        AgentLoopOutput,
-        AgentLoopWorker,
-        register,
-    )
-    from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
-    from verl.single_controller.ray import ResourcePoolManager
+def _register_flash_distillation_loss() -> None:
     from verl.trainer.distillation.losses import (
         DistillationLossSettings,
         register_distillation_loss,
     )
-    from verl.trainer.ppo.utils import Role, need_critic, need_reference_policy
-    from verl.utils.config import omega_conf_to_dataclass
-    from verl.utils.metric import AggregationType, Metric, reduce_metrics
-    from verl.utils.py_functional import rename_dict
-    from verl.workers.config import DistillationConfig, DistillationLossConfig
-    from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker
+    from verl.utils.metric import AggregationType, Metric
     from verl.workers.utils.padding import no_padding_2_padding
 
     @register_distillation_loss(
@@ -463,34 +443,10 @@ def _install_verl_extensions() -> None:
             ),
         }
 
-    @dataclass
-    class FlashRemoteDistillationConfig(DistillationConfig):
-        # verl's BaseConfig.__setattr__ rejects any assignment to a field that is not listed here
-        # (base_config.py:33-38), so __post_init__ below can only normalize distillation_loss if the
-        # field is declared mutable. verl's own DistillationConfig declares teacher_models for exactly
-        # the same reason; it never reassigns distillation_loss, so it did not need to.
-        _mutable_fields = DistillationConfig._mutable_fields | {"distillation_loss"}
 
-        bridge_url: str = ""
-        bridge_token: str = ""
-        kl_penalty_coef: float = 1.0
-
-        def __post_init__(self):
-            if not self.enabled:
-                return
-            self.distillation_loss = omega_conf_to_dataclass(
-                self.distillation_loss, dataclass_type=DistillationLossConfig
-            )
-            if self.distillation_loss.loss_mode != "flash_groupwise_reverse_kl":
-                raise ValueError("flash remote distillation requires flash_groupwise_reverse_kl")
-            if not self.bridge_url or not self.bridge_token:
-                raise ValueError("flash remote distillation bridge configuration is missing")
-            if self.kl_penalty_coef <= 0:
-                raise ValueError("flash remote distillation kl_penalty_coef must be positive")
-            self.teacher_models = {}
-
-    FlashRemoteDistillationConfig.__module__ = __name__
-    globals()["FlashRemoteDistillationConfig"] = FlashRemoteDistillationConfig
+def _build_flash_teacher_extensions():
+    import torch
+    from verl.utils.config import omega_conf_to_dataclass
 
     class FlashBridgeTeacherManager:
         def __init__(self, config, teacher_client=None):
@@ -590,78 +546,15 @@ def _install_verl_extensions() -> None:
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
 
-    import verl.experimental.teacher_loop.teacher_manager as teacher_manager_module
+    return FlashBridgeTeacherManager, compute_flash_teacher_logprobs
 
-    AgentLoopWorker._compute_teacher_logprobs = compute_flash_teacher_logprobs
-    teacher_manager_module.AsyncTeacherLLMServerManager = FlashBridgeTeacherManager
 
-    # import main_ppo_sync only after the patch above. applying `@ray.remote` to a class copies the
-    # methods it inherits onto the actor class, so `AgentLoopWorkerTQ(AgentLoopWorker)` freezes
-    # whatever `_compute_teacher_logprobs` resolves to at decoration time. importing this module
-    # earlier snapshots verl's original, which then calls the flash teacher manager with
-    # `sequence_ids=` instead of prompt_ids/response_ids and kills the first rollout.
-    from verl.trainer.main_ppo_sync import PPOTrainer
-
-    class FlashSingleTurnAgentLoop(SingleTurnAgentLoop):
-        async def run(self, sampling_params: dict[str, Any], **kwargs):
-            params = dict(sampling_params)
-            if _raw_prompt_has_image_block(kwargs.get("raw_prompt")):
-                image_token_id = _resolve_image_token_id(self.processor, self.tokenizer)
-                logit_bias = dict(params.get("logit_bias") or {})
-                logit_bias[image_token_id] = -100.0
-                params["logit_bias"] = logit_bias
-            flash_seed = int(os.environ["FLASH_OPD_SEED"])
-            global_step = int(kwargs["global_steps"])
-            example_index = int(kwargs["index"])
-            rollout_ordinal = int(kwargs.get("session_id", 0))
-            no_signal_attempt_ordinal = int(kwargs.get("flash_no_signal_attempt", 0))
-            params["seed"] = deterministic_rollout_seed(
-                flash_seed,
-                global_step,
-                example_index,
-                rollout_ordinal,
-                no_signal_attempt_ordinal=no_signal_attempt_ordinal,
-            )
-            stops = json.loads(os.environ.get("FLASH_OPD_STOP_SEQUENCES", "[]"))
-            if stops:
-                params["stop"] = stops
-                params["include_stop_str_in_output"] = True
-            eos_ids = json.loads(os.environ.get("FLASH_OPD_EOS_TOKEN_IDS", "[]"))
-            if eos_ids:
-                params["stop_token_ids"] = eos_ids
-            structured_spec = os.environ.get("FLASH_OPD_STRUCTURED_OUTPUTS", "")
-            if structured_spec:
-                _require_structured_runtime_versions()
-                from vllm.sampling_params import StructuredOutputsParams
-
-                params["structured_outputs"] = StructuredOutputsParams(
-                    **json.loads(structured_spec)
-                )
-            output = await super().run(params, **kwargs)
-            output.reward_score = 0.0
-            return output
-
-    # verl's `register` freezes `f"{__module__}.{__qualname__}"` into the agent-loop registry at
-    # decoration time, and hydra later resolves that string with a plain dotted-path lookup. this
-    # class is defined inside a function, so its qualname carries `<locals>` and no lookup can
-    # reach it. rewrite both dunders to the importable module-level name first, publish the class
-    # there, and only then register, exactly as the multi-turn loop already does.
-    FlashSingleTurnAgentLoop.__module__ = __name__
-    FlashSingleTurnAgentLoop.__qualname__ = "FlashSingleTurnAgentLoop"
-    globals()["FlashSingleTurnAgentLoop"] = FlashSingleTurnAgentLoop
-    register("flash_single_turn")(FlashSingleTurnAgentLoop)
-
-    FlashMultiTurnAgentLoop = build_flash_multi_turn_agent_loop(
-        register=register,
-        agent_loop_base=AgentLoopBase,
-        agent_loop_output=AgentLoopOutput,
-        post_json=_post_json,
-        score_failure_handler=_exit_for_score_failure,
-        deterministic_seed=deterministic_rollout_seed,
-        permanent_teacher_exit=_PERMANENT_TEACHER_EXIT,
-        transient_teacher_exit=_TRANSIENT_TEACHER_EXIT,
-    )
-    globals()["FlashMultiTurnAgentLoop"] = FlashMultiTurnAgentLoop
+def _build_flash_ppo_trainer(PPOTrainer, tq, KVBatchMeta):
+    import numpy as np
+    import torch
+    from verl.utils.config import omega_conf_to_dataclass
+    from verl.utils.metric import reduce_metrics
+    from verl.utils.py_functional import rename_dict
 
     def filter_signal_batch(batch):
         fields = tq.kv_batch_get(
@@ -776,8 +669,15 @@ def _install_verl_extensions() -> None:
             metrics.update(reduce_metrics(output))
             return batch
 
-    FlashPPOTrainer.__module__ = __name__
-    globals()["FlashPPOTrainer"] = FlashPPOTrainer
+    return FlashPPOTrainer
+
+
+def _build_flash_task_runner(FlashPPOTrainer, tq):
+    import ray
+    from omegaconf import OmegaConf
+    from verl.single_controller.ray import ResourcePoolManager
+    from verl.trainer.ppo.utils import Role, need_critic, need_reference_policy
+    from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker
 
     @ray.remote
     class FlashTaskRunner:
@@ -836,12 +736,10 @@ def _install_verl_extensions() -> None:
                     trainer.replay_buffer.close()
                 tq.close()
 
-    globals()["FlashTaskRunner"] = FlashTaskRunner
+    return FlashTaskRunner
 
-    import verl.trainer.main_ppo_sync as main_ppo_sync
 
-    main_ppo_sync.TaskRunner = FlashTaskRunner
-
+def _patch_fsdp_optimizer() -> None:
     from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
 
     original_build_optimizer = FSDPEngine._build_optimizer
@@ -856,6 +754,142 @@ def _install_verl_extensions() -> None:
         )
 
     FSDPEngine._build_optimizer = build_optimizer_with_mutation_notice
+
+
+def _install_verl_extensions() -> None:
+    try:
+        import transfer_queue as tq
+        from transfer_queue import KVBatchMeta
+    except ImportError:
+        from verl.utils.transferqueue_utils import KVBatchMeta, tq
+
+    from verl.experimental.agent_loop.agent_loop import (
+        AgentLoopBase,
+        AgentLoopOutput,
+        AgentLoopWorker,
+        register,
+    )
+    from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
+    from verl.utils.config import omega_conf_to_dataclass
+    from verl.workers.config import DistillationConfig, DistillationLossConfig
+
+    _register_flash_distillation_loss()
+
+    @dataclass
+    class FlashRemoteDistillationConfig(DistillationConfig):
+        # verl's BaseConfig.__setattr__ rejects any assignment to a field that is not listed here
+        # (base_config.py:33-38), so __post_init__ below can only normalize distillation_loss if the
+        # field is declared mutable. verl's own DistillationConfig declares teacher_models for exactly
+        # the same reason; it never reassigns distillation_loss, so it did not need to.
+        _mutable_fields = DistillationConfig._mutable_fields | {"distillation_loss"}
+
+        bridge_url: str = ""
+        bridge_token: str = ""
+        kl_penalty_coef: float = 1.0
+
+        def __post_init__(self):
+            if not self.enabled:
+                return
+            self.distillation_loss = omega_conf_to_dataclass(
+                self.distillation_loss, dataclass_type=DistillationLossConfig
+            )
+            if self.distillation_loss.loss_mode != "flash_groupwise_reverse_kl":
+                raise ValueError("flash remote distillation requires flash_groupwise_reverse_kl")
+            if not self.bridge_url or not self.bridge_token:
+                raise ValueError("flash remote distillation bridge configuration is missing")
+            if self.kl_penalty_coef <= 0:
+                raise ValueError("flash remote distillation kl_penalty_coef must be positive")
+            self.teacher_models = {}
+
+    FlashRemoteDistillationConfig.__module__ = __name__
+    globals()["FlashRemoteDistillationConfig"] = FlashRemoteDistillationConfig
+
+    FlashBridgeTeacherManager, compute_flash_teacher_logprobs = _build_flash_teacher_extensions()
+
+    import verl.experimental.teacher_loop.teacher_manager as teacher_manager_module
+
+    AgentLoopWorker._compute_teacher_logprobs = compute_flash_teacher_logprobs
+    teacher_manager_module.AsyncTeacherLLMServerManager = FlashBridgeTeacherManager
+
+    # import main_ppo_sync only after the patch above. applying `@ray.remote` to a class copies the
+    # methods it inherits onto the actor class, so `AgentLoopWorkerTQ(AgentLoopWorker)` freezes
+    # whatever `_compute_teacher_logprobs` resolves to at decoration time. importing this module
+    # earlier snapshots verl's original, which then calls the flash teacher manager with
+    # `sequence_ids=` instead of prompt_ids/response_ids and kills the first rollout.
+    from verl.trainer.main_ppo_sync import PPOTrainer
+
+    class FlashSingleTurnAgentLoop(SingleTurnAgentLoop):
+        async def run(self, sampling_params: dict[str, Any], **kwargs):
+            params = dict(sampling_params)
+            if _raw_prompt_has_image_block(kwargs.get("raw_prompt")):
+                image_token_id = _resolve_image_token_id(self.processor, self.tokenizer)
+                logit_bias = dict(params.get("logit_bias") or {})
+                logit_bias[image_token_id] = -100.0
+                params["logit_bias"] = logit_bias
+            flash_seed = int(os.environ["FLASH_OPD_SEED"])
+            global_step = int(kwargs["global_steps"])
+            example_index = int(kwargs["index"])
+            rollout_ordinal = int(kwargs.get("session_id", 0))
+            no_signal_attempt_ordinal = int(kwargs.get("flash_no_signal_attempt", 0))
+            params["seed"] = deterministic_rollout_seed(
+                flash_seed,
+                global_step,
+                example_index,
+                rollout_ordinal,
+                no_signal_attempt_ordinal=no_signal_attempt_ordinal,
+            )
+            stops = json.loads(os.environ.get("FLASH_OPD_STOP_SEQUENCES", "[]"))
+            if stops:
+                params["stop"] = stops
+                params["include_stop_str_in_output"] = True
+            eos_ids = json.loads(os.environ.get("FLASH_OPD_EOS_TOKEN_IDS", "[]"))
+            if eos_ids:
+                params["stop_token_ids"] = eos_ids
+            structured_spec = os.environ.get("FLASH_OPD_STRUCTURED_OUTPUTS", "")
+            if structured_spec:
+                _require_structured_runtime_versions()
+                from vllm.sampling_params import StructuredOutputsParams
+
+                params["structured_outputs"] = StructuredOutputsParams(
+                    **json.loads(structured_spec)
+                )
+            output = await super().run(params, **kwargs)
+            output.reward_score = 0.0
+            return output
+
+    # verl's `register` freezes `f"{__module__}.{__qualname__}"` into the agent-loop registry at
+    # decoration time, and hydra later resolves that string with a plain dotted-path lookup. this
+    # class is defined inside a function, so its qualname carries `<locals>` and no lookup can
+    # reach it. rewrite both dunders to the importable module-level name first, publish the class
+    # there, and only then register, exactly as the multi-turn loop already does.
+    FlashSingleTurnAgentLoop.__module__ = __name__
+    FlashSingleTurnAgentLoop.__qualname__ = "FlashSingleTurnAgentLoop"
+    globals()["FlashSingleTurnAgentLoop"] = FlashSingleTurnAgentLoop
+    register("flash_single_turn")(FlashSingleTurnAgentLoop)
+
+    FlashMultiTurnAgentLoop = build_flash_multi_turn_agent_loop(
+        register=register,
+        agent_loop_base=AgentLoopBase,
+        agent_loop_output=AgentLoopOutput,
+        post_json=_post_json,
+        score_failure_handler=_exit_for_score_failure,
+        deterministic_seed=deterministic_rollout_seed,
+        permanent_teacher_exit=_PERMANENT_TEACHER_EXIT,
+        transient_teacher_exit=_TRANSIENT_TEACHER_EXIT,
+    )
+    globals()["FlashMultiTurnAgentLoop"] = FlashMultiTurnAgentLoop
+
+    FlashPPOTrainer = _build_flash_ppo_trainer(PPOTrainer, tq, KVBatchMeta)
+    FlashPPOTrainer.__module__ = __name__
+    globals()["FlashPPOTrainer"] = FlashPPOTrainer
+
+    FlashTaskRunner = _build_flash_task_runner(FlashPPOTrainer, tq)
+    globals()["FlashTaskRunner"] = FlashTaskRunner
+
+    import verl.trainer.main_ppo_sync as main_ppo_sync
+
+    main_ppo_sync.TaskRunner = FlashTaskRunner
+    _patch_fsdp_optimizer()
 
 
 def main() -> None:

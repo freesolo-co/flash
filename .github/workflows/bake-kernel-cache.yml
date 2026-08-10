@@ -59,7 +59,25 @@ jobs:
   # second manual approval here would be redundant. Re-add an `approve` job with `environment: gpu-bake`
   # (and `needs: approve`) if you ever want a human checkpoint back.
   bake:
+    # Upstream only -- see publish.yml. "Ungated" above means no human APPROVAL step; it never meant
+    # any repository may start it. This workflow is directly dispatchable (`workflow_dispatch`), so
+    # a fork reaches it without passing auto-rebake's fingerprint gate, and it both requests the
+    # org-only `ubuntu-24.04-8core` runner (a label a fork has no runner for, so the job QUEUES
+    # instead of failing) and creates paid RunPod resources. `workflow_call` from auto-rebake still
+    # satisfies this, because a called workflow evaluates `github.repository` as the CALLER's repo.
+    if: github.repository == 'freesolo-co/flash'
     runs-on: ubuntu-24.04-8core
+    # 47min is the slowest run on record (the rest sit at 12-23min); 120 absorbs a slow provider
+    # allocation without letting a hung bake hold the runner for the 6-hour default.
+    #
+    # This bounds the RUNNER, and only indirectly the spend. The rented pod is released by the
+    # `finally` in docker/bake_kernel_cache.py, so the pod outlives the timeout in exactly the case
+    # the timeout exists for: if the controller is wedged inside a blocking call, GitHub kills it
+    # and that `finally` may never complete, leaving a billed pod with nothing left to terminate it.
+    # Closing that needs a server-side pod lifetime or an out-of-band reaper -- a change to the bake
+    # tooling rather than to this workflow, so it is deliberately NOT bundled here. Until then, read
+    # this cap as "the runner stops waiting", not "the bill stops".
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:

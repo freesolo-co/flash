@@ -716,26 +716,13 @@ def _validated_chat_provider_response(
     )
 
 
-def _complete_teacher_request(
-    *,
-    capability_token: str,
-    request_id: str,
-    raw_body: bytes | bytearray,
-    chat: bool,
-) -> dict[str, Any]:
-    request_id, capability_token, capability = authenticate_teacher_capability(
-        capability_token=capability_token,
-        request_id=request_id,
-    )
-    body = parse_strict_json(raw_body)
-    request = (
-        validate_chat_completion_request(body, capability)
-        if chat
-        else validate_completion_request(body, capability)
-    )
+def _reserve_teacher_request(
+    *, capability_token: str, request_id: str, request, capability: dict
+) -> dict:
+    """Reserve the ledger row for this request, mapping ledger faults onto broker errors."""
     fingerprint = request_fingerprint(capability_token, request.canonical_body)
     try:
-        reservation = db.reserve_teacher_request(
+        return db.reserve_teacher_request(
             token=capability_token,
             request_id=request_id,
             request_fingerprint=fingerprint,
@@ -753,16 +740,16 @@ def _complete_teacher_request(
             retryable=True,
             request_id=request_id,
         ) from exc
-    capability = reservation["capability"]
-    replay_body = reservation.get("response_body")
-    response_validator = _validated_chat_provider_response if chat else _validated_provider_response
-    if isinstance(replay_body, bytes):
-        return response_validator(
-            replay_body,
-            score_items=request.score_items,
-            capability=capability,
-        ).body
-    capability_id = int(capability["id"])
+
+
+def _prepare_teacher_dispatch(
+    *, capability_id: int, request_id: str, capability: dict, request
+) -> tuple[str, bytes]:
+    """Resolve the provider credential, encode the upstream body, and fence the dispatch.
+
+    Returns ``(api_key, encoded_body)``. Every failure here readmits the request for retry before
+    anything is dispatched, so no upstream call can have happened.
+    """
     api_key = os.environ.get(PARASAIL_API_KEY_ENV, "").strip()
     if not api_key:
         with contextlib.suppress(Exception):
@@ -803,6 +790,23 @@ def _complete_teacher_request(
             retryable=True,
             request_id=request_id,
         ) from exc
+    return api_key, encoded
+
+
+def _dispatch_to_teacher_provider(
+    *,
+    capability_id: int,
+    request_id: str,
+    capability: dict,
+    api_key: str,
+    encoded: bytes,
+    chat: bool,
+) -> tuple[int, bytes]:
+    """Post to the provider and return ``(status, response_body)`` for a 2xx answer only.
+
+    ``chat`` selects the upstream endpoint: image scoring has to go to chat/completions because
+    only that route accepts image parts, while text scoring stays on the completions route.
+    """
     provider_post = _provider_chat_post if chat else _provider_post
     try:
         status, response_body = provider_post(encoded, api_key, _provider_timeout(capability))
@@ -849,6 +853,25 @@ def _complete_teacher_request(
             status_code=502,
             request_id=request_id,
         )
+    return status, response_body
+
+
+def _settle_teacher_response(
+    *,
+    capability_id: int,
+    request_id: str,
+    capability: dict,
+    request,
+    status: int,
+    response_body: bytes,
+    chat: bool,
+) -> dict[str, Any]:
+    """Validate the provider answer against the capability, then close the ledger row.
+
+    ``chat`` picks the validator: the two routes return different shapes, and the chat one is the
+    only one that can carry an image-scored answer.
+    """
+    response_validator = _validated_chat_provider_response if chat else _validated_provider_response
     try:
         response = response_validator(
             response_body,
@@ -893,6 +916,70 @@ def _complete_teacher_request(
             request_id=request_id,
         ) from exc
     return response.body
+
+
+def _complete_teacher_request(
+    *,
+    capability_token: str,
+    request_id: str,
+    raw_body: bytes | bytearray,
+    chat: bool,
+) -> dict[str, Any]:
+    """Run one teacher request end to end on either upstream route.
+
+    ``chat`` is threaded rather than duplicated into two near-identical bodies: the routes differ
+    only in which request validator, provider endpoint, and response validator apply, and every
+    ledger and fencing step between them must stay identical or the two paths drift apart.
+    """
+    request_id, capability_token, capability = authenticate_teacher_capability(
+        capability_token=capability_token,
+        request_id=request_id,
+    )
+    body = parse_strict_json(raw_body)
+    request = (
+        validate_chat_completion_request(body, capability)
+        if chat
+        else validate_completion_request(body, capability)
+    )
+    reservation = _reserve_teacher_request(
+        capability_token=capability_token,
+        request_id=request_id,
+        request=request,
+        capability=capability,
+    )
+    capability = reservation["capability"]
+    replay_body = reservation.get("response_body")
+    response_validator = _validated_chat_provider_response if chat else _validated_provider_response
+    if isinstance(replay_body, bytes):
+        return response_validator(
+            replay_body,
+            score_items=request.score_items,
+            capability=capability,
+        ).body
+    capability_id = int(capability["id"])
+    api_key, encoded = _prepare_teacher_dispatch(
+        capability_id=capability_id,
+        request_id=request_id,
+        capability=capability,
+        request=request,
+    )
+    status, response_body = _dispatch_to_teacher_provider(
+        capability_id=capability_id,
+        request_id=request_id,
+        capability=capability,
+        api_key=api_key,
+        encoded=encoded,
+        chat=chat,
+    )
+    return _settle_teacher_response(
+        capability_id=capability_id,
+        request_id=request_id,
+        capability=capability,
+        request=request,
+        status=status,
+        response_body=response_body,
+        chat=chat,
+    )
 
 
 def complete_teacher_request(

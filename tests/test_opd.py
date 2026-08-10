@@ -581,15 +581,20 @@ def test_opd_validates_dynamic_image_compatibility_before_gpu_wait():
     # so this follows the wiring to where the validation and the GPU probe actually sit. verl probes
     # the GPU in a subprocess rather than calling wait_for_gpu, but the invariant is the same one:
     # an incompatible model must fail before any paid GPU work starts.
+    # The validation itself sits in `_validate_multimodal_opd`, so the ordering is proven in two
+    # steps: the caller runs that helper before the probe, and the helper is what calls the
+    # validator. Asserting only on the call site would pass if the helper stopped validating, and
+    # asserting only on the helper would pass if the caller moved it after the probe.
     import inspect
 
-    from flash.engine.worker.opd_train import run_opd_train
+    from flash.engine.worker.opd_train import _validate_multimodal_opd, run_opd_train
 
-    source = inspect.getsource(run_opd_train)
-    validation = "validate_multimodal_training("
+    caller = inspect.getsource(run_opd_train)
+    assert caller.index("_validate_multimodal_opd(") < caller.index("_probe_gpu_in_subprocess(")
 
-    assert source.index(validation) < source.index("_probe_gpu_in_subprocess(")
-    assert 'getattr(spec.train, "teacher_model", None)' in source
+    helper = inspect.getsource(_validate_multimodal_opd)
+    assert "validate_multimodal_training(" in helper
+    assert 'getattr(spec.train, "teacher_model", None)' in helper
 
 
 class _CharTok:

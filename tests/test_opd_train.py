@@ -3022,6 +3022,53 @@ def test_no_signal_failure_names_the_gate_that_dropped_the_rollouts():
     assert "not_terminated=3" in message, message
 
 
+def test_no_signal_failure_counts_only_the_step_that_failed():
+    """The named tally must cover the failing step alone, not the run's lifetime.
+
+    ``skip_counts`` is a lifetime accumulator: it is never zeroed, and a resumed bridge rehydrates
+    it from prior state. Reporting it raw would let a gate that fired during an EARLIER, successful
+    step be named as the cause of this failure, which is worse than a bare message because it reads
+    as evidence. A step that commits closes the window, so only the drops after it may be counted.
+    """
+    import flash.engine.worker.train.opd.child.plugin as plugin
+
+    bridge = _text_bridge(_BridgeTeacher())
+    bridge.start()
+    try:
+        # step one: a rollout is dropped at the not-terminated gate, then the step COMMITS. this
+        # skip belongs to a step that already finished and must not appear in a later message.
+        _post_json(bridge.url, bridge.token, "/score", _bridge_score_payload(0, [10, 11], [65, 66]))
+        _post_json(bridge.url, bridge.token, "/teacher-cycle/committed", {})
+
+        # step two loses one rollout to the same gate and then abandons.
+        def run_attempt(attempt_ordinal):
+            if attempt_ordinal == 0:
+                _post_json(
+                    bridge.url,
+                    bridge.token,
+                    "/score",
+                    _bridge_score_payload(0, [10, 11], [65, 66]),
+                )
+            raise _AllNoSignalBatch(attempt_ordinal)
+
+        with pytest.raises(RuntimeError) as failure:
+            _run_with_no_signal_replacements(
+                run_attempt,
+                lambda _batch: None,
+                lambda: None,
+                lambda: _post_json(bridge.url, bridge.token, "/no-signal/resample", {}),
+                lambda: plugin._post_no_signal_abandoned(bridge.url, bridge.token),
+            )
+    finally:
+        bridge.close()
+
+    message = str(failure.value)
+    # one drop in this step, not the two the lifetime counter holds. `=2` is exactly what the
+    # unfixed code reports, so this assertion is what separates the two behaviors.
+    assert "not_terminated=1" in message, message
+    assert "not_terminated=2" not in message, message
+
+
 def test_mixed_transient_and_truncated_exhaustion_remains_retriable():
     from flash.engine.worker.perf import RetriableInfraError
     from flash.engine.worker.teacher.client import TeacherError
@@ -5173,7 +5220,7 @@ def test_both_ray_rollouts_pin_blackwell_attention_from_the_same_resolver():
     # shipped. the attention pins are the same divergence one knob over, so assert them the same
     # way rather than trusting opd alone.
     for module, source in (
-        ("rl_train", inspect.getsource(rl_train.run_rl_train)),
+        ("rl_train", inspect.getsource(rl_train._configure_rl_child)),
         ("opd_train", inspect.getsource(opd_train.run_opd_train)),
     ):
         # the resolver must be CALLED and its second return value must be carried onward. the two
@@ -5194,7 +5241,11 @@ def test_both_ray_rollouts_resolve_eager_from_the_same_hardware_probe():
     # rollout.mode=async, whose server hardcodes cudagraph_mode=FULL_AND_PIECEWISE. a fix applied to
     # only one trainer is how this reached production in the first place.
     for module, source in (
-        ("rl_train", inspect.getsource(rl_train.run_rl_train)),
+        (
+            "rl_train",
+            inspect.getsource(rl_train.run_rl_train)
+            + inspect.getsource(rl_train._configure_rl_child),
+        ),
         ("opd_train", inspect.getsource(opd_train.run_opd_train)),
     ):
         assert "resolve_rollout_enforce_eager(" in source, module
@@ -6030,18 +6081,22 @@ def test_opd_line_handler_reads_the_loss_through_the_shared_parser():
     import inspect
     import textwrap
 
-    import flash.engine.worker.opd_train as ov
+    import flash.engine.worker.opd_train_runner as opd_runner
 
-    source = textwrap.dedent(inspect.getsource(ov.run_opd_train))
+    source = textwrap.dedent(inspect.getsource(opd_runner._build_child_callbacks))
     handler = next(
         node
         for node in ast.walk(ast.parse(source))
         if isinstance(node, ast.FunctionDef) and node.name == "on_line"
     )
+    # the handler moved to a sibling module and now reaches the parser through the parent module,
+    # so the call node is an Attribute rather than a Name. collect BOTH spellings: matching only
+    # Attribute would stop seeing a bare `_metric_value(...)`, which is the exact regression the
+    # negative assertion below exists to catch.
     calls = [
-        node.func.id
+        node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id
         for node in ast.walk(handler)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute | ast.Name)
     ]
     assert "parse_verl_metric" in calls
     assert "_metric_value" not in calls
@@ -6247,9 +6302,9 @@ def test_opd_renders_each_prompt_once_so_a_stateful_environment_is_not_run_twice
     import ast
     import textwrap
 
-    from flash.engine.worker import opd_train as opd_mod
+    from flash.engine.worker import opd_train_runner
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(opd_mod.run_opd_train)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(opd_train_runner._render_prompt_rows)))
     renders = [
         node
         for node in ast.walk(tree)
@@ -6258,7 +6313,7 @@ def test_opd_renders_each_prompt_once_so_a_stateful_environment_is_not_run_twice
         and node.func.attr == "prompt_messages"
     ]
     assert len(renders) == 1, (
-        f"run_opd_train calls env.prompt_messages() {len(renders)} times; each extra call re-runs "
+        f"_render_prompt_rows calls env.prompt_messages() {len(renders)} times; each extra call re-runs "
         "user environment code on every example, and a second rendering that differs from the "
         "first reaches the build loop with multimodal already latched from the first"
     )
