@@ -955,7 +955,6 @@ def make_checkpoint_upload_callback(save_at_steps=()):
 # worker entry points import `prefetch_model` from here.
 from flash.engine.worker.io.prefetch import (  # noqa: E402,F401
     _hf_cache_bytes,
-    _is_commit_sha,
     _prefetch_error_is_retriable,
     _shared_weight_cache_dir,
     _snapshot_has_weights,
@@ -964,3 +963,7 @@ from flash.engine.worker.io.prefetch import (  # noqa: E402,F401
     resolve_cached_model_commit,
     write_base_model_provenance,
 )
+
+# the sha predicate lives in the client-safe `envs.loader`; re-exported here because the
+# provenance tests patch and assert it as `hf.is_commit_sha`.
+from flash.envs.loader import is_commit_sha  # noqa: E402,F401
