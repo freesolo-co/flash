@@ -717,6 +717,27 @@ def test_opd_teacher_prompt_includes_thinking_prefill():
     assert opd_gkd._teacher_prompt_text(msgs, "<think>\n").endswith("Assistant: <think>\n")
 
 
+def test_teacher_prompt_text_reads_content_blocks_rather_than_their_repr():
+    """A mixed image/text opd job carries block content on its TEXT-only rows too.
+
+    Those rows take the plain completion route, so rendering `content` with `!s` would hand the
+    teacher a python repr ("[{'type': 'text', 'text': 'hi'}]") and score that literal. It does not
+    raise, so only an assertion on the rendered text catches it.
+    """
+    from flash.engine.worker.train.opd import gkd as opd_gkd
+
+    blocks = [{"role": "user", "content": [{"type": "text", "text": "describe it"}]}]
+    rendered = opd_gkd._teacher_prompt_text(blocks)
+    assert "User: describe it" in rendered
+    assert "'type'" not in rendered, rendered
+    assert "[{" not in rendered, rendered
+    # an image-only turn contributes no text rather than a repr of the image block.
+    image_only = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]
+    assert opd_gkd._teacher_prompt_text(image_only).startswith("User: \n")
+    # a plain string stays byte-identical: the fix must not reformat the common path.
+    assert opd_gkd._teacher_prompt_text([{"role": "user", "content": "hi"}]).startswith("User: hi")
+
+
 def test_thinking_prefill_text_is_template_delta(monkeypatch):
     """Regression (opd.py): the thinking prefill is the DELTA a thinking-mode chat template
     opens after the generation prompt (enable_thinking True vs False). Empty when thinking is off (the

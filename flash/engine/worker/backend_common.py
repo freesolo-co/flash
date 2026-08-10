@@ -84,9 +84,16 @@ TRANSFORMERS_REQUIREMENT = "transformers>=5.6,<5.13"
 # fla, causal_conv1d, or the transformers range lets an older partial venv match forever; conv1d
 # leaves GRPO/OPD failing ``require_gdn_boundary_resets`` with no rebuild path, and a stale venv
 # resolved before the transformers pin keeps training on an out-of-range transformers indefinitely.
+# bump when a repair applied at build time changes what a fully provisioned venv looks like. the
+# libcudart repair runs only on the rebuild path, so a venv stamped by a release that predates it
+# matches, is reused, and keeps tilelang's original stub -- vLLM then aborts its import in the child
+# after the gpu is already rented. carrying it in the stamp identity forces exactly one rebuild of
+# those venvs instead of re-running the repair on every reuse.
+VERL_VENV_BUILD_REPAIRS = "libcudart-stub-neutralized-v1"
+
 VERL_VENV_STAMP = (
     f"{VERL_REQUIREMENT}\n{FLASH_ATTN_SPEC}\n{FLA_REQUIREMENT}\n{CAUSAL_CONV1D_REQUIREMENT}\n"
-    f"{TRANSFORMERS_REQUIREMENT}"
+    f"{TRANSFORMERS_REQUIREMENT}\n{VERL_VENV_BUILD_REPAIRS}"
 )
 
 

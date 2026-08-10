@@ -1148,6 +1148,21 @@ def test_the_venv_stamp_covers_the_conv_kernel_so_an_older_venv_is_rebuilt():
     assert vc.CAUSAL_CONV1D_REQUIREMENT in vc.VERL_VENV_STAMP
 
 
+def test_the_venv_stamp_covers_build_time_repairs_so_a_pre_fix_venv_is_rebuilt():
+    """The same argument for a repair rather than a package.
+
+    The libcudart repair runs only on the rebuild path, so a venv stamped by a release that predates
+    it matches the stamp, is reused unrepaired, and keeps tilelang's stub -- vLLM then aborts its
+    import in the child AFTER the gpu is rented. The stamp has to change when the repair set does,
+    or the fix never reaches the venvs that need it most (retries and upgraded workers that preserve
+    the workdir).
+    """
+    assert vc.VERL_VENV_BUILD_REPAIRS in vc.VERL_VENV_STAMP
+    # and it must be the LAST field: appending keeps the earlier fields' offsets stable, so a stamp
+    # written by this release is still diffable against one from before the repairs existed.
+    assert vc.VERL_VENV_STAMP.endswith(vc.VERL_VENV_BUILD_REPAIRS)
+
+
 def test_the_fallback_pins_transformers_like_the_image_does(monkeypatch, tmp_path):
     """The fallback venv must carry the same transformers ceiling as /opt/verl-venv.
 
