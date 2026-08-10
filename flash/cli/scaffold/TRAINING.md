@@ -250,9 +250,16 @@ see below) belongs on a `grpo` run, and setting it on `sft` or `opd` is a submit
 
 `reward_seconds_per_completion` exists for one case: a `reward()` that calls a slow external
 grader, such as an LLM judge. The quote already covers a local scorer, so leave it unset unless
-your grading blocks for roughly a second or more per completion — nothing can time it before your
-run is priced, so an undeclared slow judge is quoted low and billed from that estimate. At 3s with
-32 completions per step it is worth about 96 seconds a step.
+your grading blocks for roughly a second or more per completion. Nothing can time it before your
+run is priced, so an undeclared slow judge is quoted low and billed from that estimate.
+
+Declare the wall your grading adds **per completion, after your own batching and concurrency**, not
+the latency of one judge call. The quote multiplies this by every completion in the step
+(`batch_size * group_size`), while the default adapter scores one call per prompt group and runs up
+to 8 of those groups at once, so a judge that overlaps its work costs far less wall than its
+per-call latency suggests. If a 3s judge scores a group of 4 in one 3s call and your 8 groups run
+concurrently, the step pays about 3s, not 96s: declare about `0.1`, not `3`. Overstating this key
+overquotes the run. When you are unsure, start low and compare the quote against a short real run.
 
 **Key placement that is easy to get wrong.** Every one of these is a real submit-time
 error or a wrong-config-that-still-runs; `--dry-run` catches the loud ones for free.

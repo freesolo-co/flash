@@ -46,9 +46,14 @@ def test_a_declared_slow_judge_reaches_the_quote():
 
     The 0.0 default is right for the population it was fitted on (local scorers, 0.0001-0.001s), but
     nothing measures a seconds-long judge before the quote is persisted, so without a declared path
-    that run is billed from an underestimate: 3s x 32 completions is 96s per step. Goes through
-    runconfig_from_spec rather than RunConfig directly -- an in-process RunConfig could always carry
-    the value, and it was the SPEC path that had no way to supply it.
+    that run is billed from an underestimate. Goes through runconfig_from_spec rather than RunConfig
+    directly -- an in-process RunConfig could always carry the value, and it was the SPEC path that
+    had no way to supply it.
+
+    The declared value is per completion AFTER the caller's own batching, because the quote
+    multiplies it by every completion in the step while the default adapter scores one call per
+    prompt group and runs those groups concurrently. TRAINING.md documents that unit; 3.0 here is a
+    magnitude the arithmetic can be checked against, not a recommended setting for a 3s judge.
     """
     from flash.core.spec import JobSpec
     from flash.cost.spec import runconfig_from_spec
@@ -73,6 +78,61 @@ def test_a_declared_slow_judge_reaches_the_quote():
     assert seconds_per_step(judge, "H200") == pytest.approx(
         seconds_per_step(default, "H200") + 3.0 * 8 * 4
     )
+
+
+def test_a_failed_reward_probe_does_not_discard_the_declaration():
+    """An all-failed reward probe is not a measurement, so the declaration must survive it.
+
+    ``reward_failures == reward_samples`` is a state __post_init__ permits and trustworthy() does
+    not check, so a profile whose every probe failed still arrives here carrying its ~0s latency.
+    Treating that as evidence would silently discard the declared judge wall and underquote exactly
+    the slow or unavailable grader the knob exists for.
+    """
+    from flash.core.spec import JobSpec
+    from flash.cost.spec import runconfig_from_spec
+
+    def _run(profile):
+        spec = JobSpec.from_dict(
+            {
+                "model": "Qwen/Qwen3.5-0.8B",
+                "algorithm": "grpo",
+                "project": "11111111-1111-1111-1111-111111111111",
+                "environment": {"id": "acme/env"},
+                "train": {
+                    "batch_size": 8,
+                    "group_size": 4,
+                    "max_steps": 10,
+                    "reward_seconds_per_completion": 3.0,
+                },
+            }
+        )
+        object.__setattr__(spec, "_test_rollout", profile)
+        return spec
+
+    class _Profile:
+        reward_seconds_per_completion = 0.0004
+        reward_samples = 3
+        reward_failures = 3  # every probe failed
+        completion_tokens_mean = 180.5
+        prompt_tokens_mean = 95.0
+
+    import flash.cost.spec as cost_spec
+
+    original = cost_spec._rollout_profile
+    try:
+        cost_spec._rollout_profile = lambda spec: getattr(spec, "_test_rollout", None)
+        # all probes failed -> not a measurement -> the declaration is kept
+        assert runconfig_from_spec(_run(_Profile())).reward_seconds_per_completion == 3.0
+
+        class _OneSucceeded(_Profile):
+            reward_failures = 2  # 3 samples, 1 real success
+
+        # a single successful sample IS a measurement, and it wins over the declaration
+        assert runconfig_from_spec(
+            _run(_OneSucceeded())
+        ).reward_seconds_per_completion == pytest.approx(0.0004)
+    finally:
+        cost_spec._rollout_profile = original
 
 
 @pytest.mark.parametrize("algorithm", ["sft", "opd"])

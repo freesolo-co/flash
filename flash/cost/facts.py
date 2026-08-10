@@ -290,7 +290,10 @@ def download_weight_gb(model_id: str, revision: str = "") -> float:
 # nothing can measure it before the quote is persisted: timing on the submitting host does not
 # describe the worker, and the worker publishes its own latency as telemetry only AFTER pricing.
 # Such a run declares the cost instead, via `[train] reward_seconds_per_completion`, which arrives
-# as the override below. Measured on a 32-completion step: 3s/completion adds 96s.
+# as the override below. The declared value is per completion AFTER the caller's own batching: the
+# quote multiplies it by every completion in the step, while the default adapter scores one call per
+# prompt group and runs those groups concurrently, so a judge that overlaps its work costs far less
+# wall than its per-call latency. TRAINING.md documents that unit for the operator.
 #
 # A nominal default cannot stand in for that declaration. The alternative was never "0.0 vs
 # correct" but "0.0 vs 1.0", and 1.0 was wrong for the population it was applied to (0.699x bias,

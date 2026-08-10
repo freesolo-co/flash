@@ -312,10 +312,12 @@ class TrainSpec:
     credit_assignment: CreditAssignment = field(
         default=DEFAULT_CREDIT_ASSIGNMENT, metadata={"introduced_in": "1.0.2"}
     )
-    # grpo/opd only: seconds one completion spends in reward() beyond what the step floor already
-    # covers. the floor was fitted on graders running 0.0001-0.001s, so it tracks a local scorer but
-    # cannot cover an external judge: at 3s x 32 completions the quote is short by 96s per step.
-    # nothing can measure this before the quote is persisted -- timing on the submitting host does
+    # grpo only: seconds one completion spends in reward() beyond what the step floor already
+    # covers, AFTER the caller's own batching. the floor was fitted on graders running 0.0001-0.001s,
+    # so it tracks a local scorer but cannot cover an external judge. the quote multiplies this by
+    # every completion in the step while the default adapter scores one call per prompt group and
+    # runs those groups concurrently, so this is not the latency of a single judge call.
+    # nothing can measure it before the quote is persisted -- timing on the submitting host does
     # not describe the worker, and the worker reports its own latency only after pricing -- so a run
     # with a slow judge declares it here. unset keeps the measured-population default of 0.0.
     reward_seconds_per_completion: float | None = field(

@@ -221,6 +221,36 @@ def _prepared_before_public_alpha(raw_public: object) -> bool:
     return not train.get("init_from_adapter")
 
 
+def _prepared_before_reward_latency(raw_public: object, raw_worker: object) -> bool:
+    """True when this run's PERSISTED snapshot predates ``reward_seconds_per_completion``.
+
+    Same reason as ``_prepared_before_public_alpha``: a snapshot prepared before the field existed
+    hashed train dicts with no such key, so reproducing its digest means hashing without one. This
+    key is emitted on BOTH payloads, so a genuine pre-upgrade snapshot lacks it in BOTH -- and both
+    are required here, because either one alone is ambiguous:
+
+    - the public spec alone is not enough. ``to_dict()`` strips train keys for a warm start, and a
+      caller can persist a hand-built public dict, so absence there does not date the snapshot.
+    - the worker spec alone is not stable. A re-persist (quote refresh, realloc) rewrites it with
+      today's serialization, which carries the key, so the answer would flip mid-life while the
+      digest beside it was computed the legacy way.
+
+    Requiring both is stable across a re-persist for the runs that need it: a rewritten worker
+    payload carries the key, which makes this False, and the digest written in the same breath is
+    the modern one. The pair only reads legacy while the ORIGINAL pre-upgrade bytes are still there.
+    """
+    if not isinstance(raw_public, dict) or not isinstance(raw_worker, dict):
+        return False
+    public_train = raw_public.get("train")
+    worker_train = raw_worker.get("train")
+    if not isinstance(public_train, dict) or not isinstance(worker_train, dict):
+        return False
+    return (
+        "reward_seconds_per_completion" not in public_train
+        and "reward_seconds_per_completion" not in worker_train
+    )
+
+
 def _preparation_digest(
     public_spec: JobSpec,
     worker_spec: JobSpec,
@@ -229,6 +259,7 @@ def _preparation_digest(
     legacy_keys: dict | None = None,
     legacy_public_keys: dict | None = None,
     legacy_public_alpha: bool = False,
+    legacy_reward_latency: bool = False,
 ) -> str:
     worker_payload = worker_spec.to_internal_dict()
     public_payload = public_spec.to_dict()
@@ -268,6 +299,14 @@ def _preparation_digest(
     # the only thing that could cover it.
     if legacy_public_alpha:
         public_payload["train"].pop("lora_alpha", None)
+    # ``reward_seconds_per_completion`` was added in 1.1.40 and is serialized on both payloads, so a
+    # snapshot prepared before it hashed neither -- rehashing with it would fail a still-valid
+    # in-flight run's integrity check on recovery, blocking attach and reallocation. Scoped to those
+    # legacy snapshots only: a digest created from here on binds the key, so a later tampering with
+    # the persisted value is still caught.
+    if legacy_reward_latency:
+        worker_payload["train"].pop("reward_seconds_per_completion", None)
+        public_payload["train"].pop("reward_seconds_per_completion", None)
     payload = {
         "version": 1,
         "public_spec": public_payload,
