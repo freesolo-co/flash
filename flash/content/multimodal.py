@@ -612,9 +612,12 @@ def validate_multimodal_training(model_id: str, algorithm: str, teacher_model: s
     if algorithm == "opd":
         teacher = resolve_teacher(teacher_model)
         if not teacher_supports_images(teacher.alias):
+            from flash.engine.plan.recipe import image_capable_teacher_aliases
+
+            choices = " or ".join(f'"{alias}"' for alias in image_capable_teacher_aliases())
             raise ValueError(
-                'image-bearing opd requires [train] teacher_model = "qwen3-vl-235b" or '
-                f'"qwen3-vl-8b"; the selected teacher {teacher.alias!r} cannot see images'
+                f"image-bearing opd requires [train] teacher_model = {choices}; "
+                f"the selected teacher {teacher.alias!r} cannot see images"
             )
 
 

@@ -89,6 +89,11 @@ TEACHER_MODELS: dict[str, TeacherModel] = {
                 "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
             ),
         ),
+        # qwen3.5 unified text and vision in one checkpoint, so this is a vision model despite the
+        # name carrying no "-vl": its config is Qwen3_5MoeForConditionalGeneration with a
+        # vision_config, its tokenizer defines <|image_pad|>, and the parasail route tokenizes an
+        # image (14 -> 212 prompt tokens as the image grows) and names its color correctly.
+        supports_images=True,
     ),
     "qwen3-vl-235b": TeacherModel(
         alias="qwen3-vl-235b",
@@ -97,22 +102,6 @@ TEACHER_MODELS: dict[str, TeacherModel] = {
         usd_per_1m=(0.21, 1.90),
         tokenizer_repo="Qwen/Qwen3-VL-235B-A22B-Instruct",
         tokenizer_revision="710c13861be6c466e66de3f484069440b8f31389",
-        tokenizer_kind="tokenizer_json",
-        tokenizer_files=(
-            (
-                "tokenizer.json",
-                "a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7",
-            ),
-        ),
-        supports_images=True,
-    ),
-    "qwen3-vl-8b": TeacherModel(
-        alias="qwen3-vl-8b",
-        model_id="parasail-qwen3vl-8b-instruct",
-        display_name="Qwen3-VL 8B",
-        usd_per_1m=(0.25, 0.75),
-        tokenizer_repo="Qwen/Qwen3-VL-8B-Instruct",
-        tokenizer_revision="0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
         tokenizer_kind="tokenizer_json",
         tokenizer_files=(
             (
@@ -147,6 +136,16 @@ def resolve_teacher(value: str | None) -> TeacherModel:
 def teacher_supports_images(value: str) -> bool:
     """Return whether the selected managed teacher can condition on image inputs."""
     return resolve_teacher(value).supports_images
+
+
+def image_capable_teacher_aliases() -> tuple[str, ...]:
+    """The aliases a user may select for image-bearing opd, in catalog order.
+
+    Derived from the catalog rather than written out at the call site: the set has already changed
+    twice, and a hardcoded list in an error message goes stale silently -- it still renders, just
+    naming a teacher that no longer exists or omitting one that does.
+    """
+    return tuple(alias for alias, teacher in TEACHER_MODELS.items() if teacher.supports_images)
 
 
 def teacher_for_model_id(model_id: str) -> TeacherModel:

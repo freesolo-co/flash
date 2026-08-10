@@ -682,7 +682,7 @@ def cmd_env_setup(args) -> int:
             "lora_rank = 32\n"
             '# teacher_model = "glm-5.2"   # teacher: glm-5.2 (default) | kimi-k3 |\n'
             "#                             # qwen3.5-397b-a17b | deepseek-v4-pro |\n"
-            "#                             # qwen3-vl-235b | qwen3-vl-8b\n"
+            "#                             # qwen3-vl-235b\n"
             "#                             # (key stays managed)\n"
             "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"

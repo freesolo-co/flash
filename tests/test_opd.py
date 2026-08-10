@@ -465,7 +465,6 @@ def test_opd_selects_only_managed_parasail_aliases():
     assert _spec("qwen3.5-397b-a17b").train.teacher_model == "qwen3.5-397b-a17b"
     assert _spec("deepseek-v4-pro").train.teacher_model == "deepseek-v4-pro"
     assert _spec("qwen3-vl-235b").train.teacher_model == "qwen3-vl-235b"
-    assert _spec("qwen3-vl-8b").train.teacher_model == "qwen3-vl-8b"
     assert _spec("DeepSeek V4 Pro").train.teacher_model == "deepseek-v4-pro"
     assert _spec("").train.teacher_model == ""
 
@@ -1294,7 +1293,6 @@ def test_opd_teacher_price_table_covers_exact_parasail_catalog():
     assert teacher_price_per_1m("qwen3.5-397b-a17b") == (0.50, 3.60)
     assert teacher_price_per_1m("deepseek-v4-pro") == (1.74, 3.48)
     assert teacher_price_per_1m("qwen3-vl-235b") == (0.21, 1.90)
-    assert teacher_price_per_1m("qwen3-vl-8b") == (0.25, 0.75)
     with pytest.raises(ValueError, match="not a supported teacher"):
         teacher_price_per_1m("parasail-deepseek-v4-pro")
 
@@ -1361,7 +1359,6 @@ def test_resolve_opd_knobs_maps_alias_to_parasail_model(monkeypatch):
     assert _knobs("qwen3.5-397b-a17b").teacher_model == "parasail-qwen35-397b-a17b"
     assert _knobs("deepseek-v4-pro").teacher_model == "parasail-deepseek-v4-pro"
     assert _knobs("qwen3-vl-235b").teacher_model == ("parasail-qwen3-vl-235b-a22b-instruct")
-    assert _knobs("qwen3-vl-8b").teacher_model == "parasail-qwen3vl-8b-instruct"
     assert _knobs("").teacher_model == "parasail-glm-52"
     assert _knobs(None).teacher_model == "parasail-glm-52"
     for teacher in (

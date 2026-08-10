@@ -151,7 +151,6 @@ def require_teacher_broker_configuration(
         "qwen3.5-397b-a17b",
         "deepseek-v4-pro",
         "qwen3-vl-235b",
-        "qwen3-vl-8b",
     }:
         raise RuntimeError("the selected managed teacher is not supported by the Parasail broker")
     capability_limits_for_spec(spec)

@@ -519,7 +519,6 @@ def test_multimodal_algorithm_validation_requires_a_vision_teacher_after_model_v
     mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "sft", None)
     mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "grpo", None)
     mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "opd", "qwen3-vl-235b")
-    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "opd", "qwen3-vl-8b")
     with pytest.raises(
         ValueError,
         match=r"requires.*qwen3-vl-235b.*selected teacher \'glm-5\.2\' cannot see images",
@@ -561,7 +560,7 @@ def test_image_opd_preflight_rejects_packaged_dataset_before_allocation(tmp_path
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
         environment=environment,
-        train=SimpleNamespace(teacher_model="qwen3-vl-8b"),
+        train=SimpleNamespace(teacher_model="qwen3-vl-235b"),
     )
     mm.preflight_validate_image_opd(supported)
 
@@ -578,7 +577,7 @@ def test_image_opd_preflight_rejects_packaged_dataset_before_allocation(tmp_path
         model="meta-llama/Llama-3.2-1B",
         algorithm="opd",
         environment=environment,
-        train=SimpleNamespace(teacher_model="qwen3-vl-8b"),
+        train=SimpleNamespace(teacher_model="qwen3-vl-235b"),
     )
     with pytest.raises(ValueError, match="does not support image-bearing"):
         mm.preflight_validate_image_opd(unsupported)
@@ -605,7 +604,7 @@ def test_image_opd_preflight_rejects_multi_turn_with_a_vision_teacher():
                 ],
             },
         ),
-        train=SimpleNamespace(teacher_model="qwen3-vl-8b"),
+        train=SimpleNamespace(teacher_model="qwen3-vl-235b"),
     )
 
     with pytest.raises(ValueError, match="multi-turn image-bearing opd is not supported"):
@@ -630,7 +629,7 @@ def test_image_opd_preflight_allows_max_turns_on_a_single_turn_env():
                 ],
             },
         ),
-        train=SimpleNamespace(teacher_model="qwen3-vl-8b"),
+        train=SimpleNamespace(teacher_model="qwen3-vl-235b"),
     )
 
     mm.preflight_validate_image_opd(spec)

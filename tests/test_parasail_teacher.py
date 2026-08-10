@@ -139,7 +139,7 @@ def _multimodal_client(response, capture=None):
     client = TeacherClient(
         "capability",
         "https://broker.example",
-        "parasail-qwen3vl-8b-instruct",
+        "parasail-qwen3-vl-235b-a22b-instruct",
         tokenizer=_MultimodalTokenizer(),
     )
 
@@ -157,21 +157,20 @@ def test_training_guide_lists_only_the_managed_teacher_aliases():
 
     assert "glm-5.2 (default) | kimi-k3 |" in guide
     assert "qwen3.5-397b-a17b | deepseek-v4-pro |" in guide
-    assert "qwen3-vl-235b | qwen3-vl-8b" in guide
+    assert "#                                                       # qwen3-vl-235b" in guide
     assert "kimi-k2.6" not in guide
     assert "The control-plane broker owns `PARASAIL_API_KEY`" in guide
     assert "`FLASH_PUBLIC_URL` and an attempt-scoped `FLASH_TEACHER_CAPABILITY`" in guide
     assert "platform's Parasail key is used only inside the paid OPD worker" not in guide
 
 
-def test_catalog_contains_exactly_six_parasail_aliases():
+def test_catalog_contains_exactly_five_parasail_aliases():
     assert set(TEACHER_MODELS) == {
         "kimi-k3",
         "glm-5.2",
         "qwen3.5-397b-a17b",
         "deepseek-v4-pro",
         "qwen3-vl-235b",
-        "qwen3-vl-8b",
     }
     assert resolve_teacher("").alias == "glm-5.2"
     assert {model.model_id for model in TEACHER_MODELS.values()} == {
@@ -180,11 +179,20 @@ def test_catalog_contains_exactly_six_parasail_aliases():
         "parasail-qwen35-397b-a17b",
         "parasail-deepseek-v4-pro",
         "parasail-qwen3-vl-235b-a22b-instruct",
-        "parasail-qwen3vl-8b-instruct",
     }
+    # qwen3.5 is a vision model despite the alias carrying no "-vl": the checkpoint is a
+    # ForConditionalGeneration with a vision_config, and the served route tokenizes an image and
+    # answers questions about it. asserting the exact set keeps a text-only teacher from being
+    # marked image-capable, which would not fail loudly -- a text route accepts the request and
+    # drops the image.
     assert {alias for alias, model in TEACHER_MODELS.items() if model.supports_images} == {
         "qwen3-vl-235b",
-        "qwen3-vl-8b",
+        "qwen3.5-397b-a17b",
+    }
+    assert {alias for alias, model in TEACHER_MODELS.items() if not model.supports_images} == {
+        "kimi-k3",
+        "glm-5.2",
+        "deepseek-v4-pro",
     }
     for rejected in (
         "kimi-k2.6",
@@ -198,6 +206,39 @@ def test_catalog_contains_exactly_six_parasail_aliases():
     ):
         with pytest.raises(ValueError, match="not a supported teacher"):
             resolve_teacher(rejected)
+
+
+def test_removed_qwen3_vl_8b_alias_is_not_resolvable():
+    with pytest.raises(ValueError, match="not a supported teacher"):
+        resolve_teacher("qwen3-vl-8b")
+
+
+def test_image_capable_aliases_come_from_the_catalog_in_order():
+    """The image-teacher list a user is shown must be derived, not written out beside the check."""
+    from flash.engine.plan.recipe import image_capable_teacher_aliases
+
+    aliases = image_capable_teacher_aliases()
+    assert aliases == ("qwen3.5-397b-a17b", "qwen3-vl-235b"), aliases
+    # catalog order, so the message is stable rather than set-iteration order.
+    assert list(aliases) == [a for a in TEACHER_MODELS if TEACHER_MODELS[a].supports_images]
+
+
+def test_image_capable_teachers_declare_the_image_pad_token():
+    """A teacher may only be flagged image-capable if its own tokenizer can express an image.
+
+    `_score_one_multimodal` raises a permanent error unless the teacher tokenizer encodes
+    `<|image_pad|>` as exactly one token, so flagging a teacher whose pinned tokenizer lacks that
+    marker would fail every image rollout after the gpu is already rented. This reads the pinned
+    tokenizer contract in the catalog rather than the network.
+    """
+    for alias, teacher in TEACHER_MODELS.items():
+        if not teacher.supports_images:
+            continue
+        assert teacher.tokenizer_kind == "tokenizer_json", (
+            f"{alias} is flagged image-capable but pins a {teacher.tokenizer_kind} tokenizer; the "
+            "multimodal scoring path needs the image-pad marker as a single token."
+        )
+        assert "vl" in teacher.tokenizer_repo.lower() or "qwen3.5" in teacher.tokenizer_repo.lower()
 
 
 def test_pinned_tokenizer_hashes_are_complete():
@@ -214,14 +255,12 @@ def test_pinned_tokenizer_hashes_are_complete():
     assert dict(TEACHER_MODELS["deepseek-v4-pro"].tokenizer_files)["tokenizer.json"] == (
         "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf"
     )
-    for alias, revision in (
-        ("qwen3-vl-235b", "710c13861be6c466e66de3f484069440b8f31389"),
-        ("qwen3-vl-8b", "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"),
-    ):
-        assert TEACHER_MODELS[alias].tokenizer_revision == revision
-        assert dict(TEACHER_MODELS[alias].tokenizer_files)["tokenizer.json"] == (
-            "a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7"
-        )
+    assert TEACHER_MODELS["qwen3-vl-235b"].tokenizer_revision == (
+        "710c13861be6c466e66de3f484069440b8f31389"
+    )
+    assert dict(TEACHER_MODELS["qwen3-vl-235b"].tokenizer_files)["tokenizer.json"] == (
+        "a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7"
+    )
 
 
 def test_normalized_offsets_expand_to_exact_source_coverage():
@@ -340,7 +379,7 @@ def test_multimodal_scoring_builds_chat_body_and_reads_top_level_prompt_scores()
     assert capture == {
         "path": "/v1/teacher/chat_completions",
         "body": {
-            "model": "parasail-qwen3vl-8b-instruct",
+            "model": "parasail-qwen3-vl-235b-a22b-instruct",
             "messages": [
                 {"role": "system", "content": "rules"},
                 {
@@ -450,7 +489,7 @@ def test_multimodal_scoring_ignores_the_trailing_generation_header():
     client = TeacherClient(
         "capability",
         "https://broker.example",
-        "parasail-qwen3vl-8b-instruct",
+        "parasail-qwen3-vl-235b-a22b-instruct",
         tokenizer=_CollidingTokenizer(),
     )
     client._post = lambda path, body: _multimodal_response(prompt_ids)
@@ -535,7 +574,7 @@ def test_multimodal_drop_guard_ignores_pads_inside_the_completion():
     client = TeacherClient(
         "capability",
         "https://broker.example",
-        "parasail-qwen3vl-8b-instruct",
+        "parasail-qwen3-vl-235b-a22b-instruct",
         tokenizer=_PadInCompletionTokenizer(),
     )
     # one real image expanded (index 1-2), then the completion's own pad at index 4. counting the
@@ -625,7 +664,7 @@ def test_multimodal_completion_is_encoded_after_its_assistant_prefix():
     client = TeacherClient(
         "capability",
         "https://broker.example",
-        "parasail-qwen3vl-8b-instruct",
+        "parasail-qwen3-vl-235b-a22b-instruct",
         tokenizer=_MergingTokenizer(),
     )
     # the provider's rendered prompt contains the MERGED ids [271, 1151]; the standalone encoding
@@ -679,7 +718,7 @@ def test_multimodal_new_turn_completion_merges_with_the_assistant_header():
     client = TeacherClient(
         "capability",
         "https://broker.example",
-        "parasail-qwen3vl-8b-instruct",
+        "parasail-qwen3-vl-235b-a22b-instruct",
         tokenizer=_HeaderMergingTokenizer(),
     )
     # what the provider really returns: the merged [271, 1151]. the isolated encoding [198, 1151]
@@ -733,7 +772,7 @@ def test_multimodal_encoding_rejects_a_boundary_that_eats_multiple_prefix_tokens
     client = TeacherClient(
         "capability",
         "https://broker.example",
-        "parasail-qwen3vl-8b-instruct",
+        "parasail-qwen3-vl-235b-a22b-instruct",
         tokenizer=_OvermergingTokenizer(),
     )
 

@@ -545,7 +545,7 @@ def test_unsupported_spec_reports_itself_rather_than_insufficient_balance(api, m
         # image-bearing OPD is single-turn only, so a multi-turn environment carrying an image
         # record can never launch regardless of the org's balance.
         "algorithm": "opd",
-        "train": {**SPEC["train"], "teacher_model": "qwen3-vl-8b"},
+        "train": {**SPEC["train"], "teacher_model": "qwen3-vl-235b"},
         "environment": {
             **SPEC["environment"],
             "params": {
