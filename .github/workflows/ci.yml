@@ -53,6 +53,11 @@ jobs:
       - name: File size check
         run: uv run python scripts/check_file_size.py
 
+      # The file gate alone leaves a 700-line function room to hide inside a 900-line module, so
+      # the 150-line limit on functions is gated too.
+      - name: Function size check
+        run: uv run python scripts/check_function_size.py
+
       # The job has always been NAMED offline (tests/conftest.py stubs the network boundaries in
       # Python), but nothing enforced it, so a test that reached hf.co passed on a connected
       # runner and would go red on a blip. Setting these makes the name true: an unstubbed call
