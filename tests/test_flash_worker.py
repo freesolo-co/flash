@@ -88,7 +88,7 @@ def test_build_worker_env_opd_uses_sleep_safe_allocator(monkeypatch):
         opd_spec,
         0,
         runtime_secrets={
-            "FLASH_CONTROL_PANEL_URL": "https://broker.example",
+            "FLASH_PUBLIC_URL": "https://broker.example",
             "FLASH_TEACHER_CAPABILITY": "capability-test-value",
         },
     )
@@ -139,15 +139,15 @@ def test_build_worker_env_forwards_only_managed_teacher_capability_for_opd(monke
         opd_spec,
         0,
         runtime_secrets={
-            "FLASH_CONTROL_PANEL_URL": "https://broker.example",
+            "FLASH_PUBLIC_URL": "https://broker.example",
             "FLASH_TEACHER_CAPABILITY": "capability-test-value",
         },
     )
-    assert env["FLASH_CONTROL_PANEL_URL"] == "https://broker.example"
+    assert env["FLASH_PUBLIC_URL"] == "https://broker.example"
     assert env["FLASH_TEACHER_CAPABILITY"] == "capability-test-value"
     assert "PARASAIL_API_KEY" not in env
     grpo = build_worker_env(_spec(), 0)
-    assert "FLASH_CONTROL_PANEL_URL" not in grpo
+    assert "FLASH_PUBLIC_URL" not in grpo
     assert "FLASH_TEACHER_CAPABILITY" not in grpo
 
 
@@ -190,7 +190,7 @@ def test_build_worker_env_rejects_managed_teacher_byo_names():
             0,
             runtime_secrets={
                 "PARASAIL_API_KEY": "byo-parasail-key",
-                "FLASH_CONTROL_PANEL_URL": "https://broker.example",
+                "FLASH_PUBLIC_URL": "https://broker.example",
                 "FLASH_TEACHER_CAPABILITY": "capability-test-value",
             },
         )
@@ -585,7 +585,11 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     assert "completion_mask_from_ids(" in workload_src
     assert '"loss_mask": tokenized["completion_mask"]' in workload_src
 
-    train_src = inspect.getsource(sft_train)
+    # sft renders its hydra overrides and child shims in train.sft.config, so the trainer's half of
+    # this guard spans both modules. keep these in step when sft_train is split further.
+    from flash.engine.worker.train.sft import config as sft_config
+
+    train_src = inspect.getsource(sft_train) + inspect.getsource(sft_config)
     # revision-aware vocab resolution: the worker must size the realized batch through the SAME
     # resolver the cost quote priced with, else a revision-pinned run drifts from its quote.
     assert "resolve_vocab_size(" in train_src

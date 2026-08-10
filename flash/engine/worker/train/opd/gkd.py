@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 
 from flash.engine.worker.teacher.tokenizer_align import StudentToken
+from flash.engine.worker.train.core.child.glue import trim_trailing_stop
 
 
 def _teacher_prompt_text(prompt_messages: list[dict], thinking_prefill: str = "") -> str:
@@ -143,36 +144,7 @@ def student_tokens_with_offsets(tok, completion_ids, completion_text: str):
     return ids, toks
 
 
-def _trim_trailing_stop(tok, completion_ids, stop_text: str, stops):
-    """Drop a trailing stop delimiter from BOTH the sampled ids and the decoded text (token-level).
-
-    HF ``stop_strings`` halts only AFTER the delimiter text is emitted, so a run with e.g. ``[train]
-    stop_sequences=["</answer>"]`` would otherwise score/distil the delimiter the user asked to stop
-    at.
-    """
-    ids = [int(t) for t in completion_ids]
-    # Pick the LONGEST configured stop that is a trailing match (the earliest stop boundary in the
-    # text). Overlapping delimiters like ["\n", "\n\n"] would otherwise trim only the first-listed
-    # shorter suffix off a "\n\n" tail, leaving one newline for the teacher to score/distil; taking
-    # the longest match removes the whole delimiter in one shot regardless of config order.
-    stop = max(
-        (s for s in stops if s and stop_text.endswith(s)),
-        key=len,
-        default="",
-    )
-    if not stop:
-        return ids, tok.decode(ids, skip_special_tokens=True)
-    keep_len = len(stop_text) - len(stop)
-    # Locate the kept prefix by scanning from the END on the SAME (special-tokens-included) decode
-    # keep_len is measured in, so a special-token delimiter's id(s) are dropped correctly. Scanning
-    # from the END is O(dropped * completion): the delimiter is short so only a handful of trailing
-    # tokens drop; decoding growing prefixes from the START would be O(completion^2).
-    kept = len(ids)
-    while kept > 0 and len(tok.decode(ids[:kept], skip_special_tokens=False)) > keep_len:
-        kept -= 1
-    # Return the kept ids decoded WITHOUT special tokens — the teacher/alignment text. Decoding the
-    # kept ids (not slicing stop_text at keep_len) keeps the teacher-scored text and the student ids
-    # identical even when the stop starts INSIDE the final sampled token (that token decodes to e.g.
-    # "B</answer>"): the whole token is excluded from `kept`, so the fused "B" is dropped rather than
-    # left dangling to desync the loss alignment / token count.
-    return ids[:kept], tok.decode(ids[:kept], skip_special_tokens=True)
+# the OPD single-turn path and the shared child rollout loops trim the same delimiter the same way,
+# so both read one implementation. it lives in the child glue module because that file is stdlib-only
+# and gets copied into the verl child workdir, which cannot import flash.
+_trim_trailing_stop = trim_trailing_stop

@@ -8,17 +8,19 @@ from dataclasses import replace
 
 import flash.runner as runner
 from flash.core.spec import JobSpec
+from flash.providers._lifecycle.deadline import require_finite_positive
 from flash.runner import RunStatus
 
 
 def _require_valid_deadline(value: object) -> float:
-    """Return a finite positive unix deadline or fail closed."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise RuntimeError("run wall deadline is invalid; no further provisioning is allowed")
-    deadline = float(value)
-    if not math.isfinite(deadline) or deadline <= 0:
-        raise RuntimeError("run wall deadline is invalid; no further provisioning is allowed")
-    return deadline
+    """Return a finite positive unix deadline or fail closed.
+
+    The control plane's message names the consequence the provider-side one cannot: reaching here
+    with an unusable deadline means no further provisioning may happen for this run.
+    """
+    return require_finite_positive(
+        value, "run wall deadline is invalid; no further provisioning is allowed"
+    )
 
 
 def _profile_wall_armed_at(raw: dict) -> float | None:

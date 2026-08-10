@@ -1,0 +1,380 @@
+"""Reading and writing a run's persisted status record.
+
+`~/.flash/runs/<run_id>.json` is the only durable record a run has, so everything here is written to
+survive a partial read: unknown keys are dropped rather than fatal, `list_run_ids` never parses JSON
+so one corrupt file cannot hide the rest, and `_update` is a sticky compare-and-set that refuses to
+move a run back out of a terminal state. `effective_spec_from_status` is the recovery half -- it
+re-derives the private worker spec and refuses it if the stored preparation digest no longer checks
+out.
+
+Split out of `flash.runner` to keep that module under the file-size limit.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import math
+import os
+import time
+
+import flash.runner as runner
+from flash.core.spec import _DROPPED_TOP_LEVEL_KEYS, JobSpec
+from flash.runner import RunStatus
+
+# every other collaborator is reached through `runner.` rather than bound here. `RUNS_DIR`,
+# `get_status`, `_update`, `effective_spec_from_status`, `_gpu_rate`, `_internal_spec_from_status`
+# and `_report_status` are all patched as attributes of `flash.runner` by the tests, and binding any
+# of them by value would capture the original before the patch lands. the rest go the same way for
+# uniformity and to stay independent of the order the parent imports its submodules in.
+
+
+def _runstatus_from_json(d: dict) -> RunStatus:
+    # Tolerant load: drop unknown keys before constructing RunStatus. ``resume_seed_index``
+    # from the pre-#317 multi-seed era) -- and `~/.flash/runs/*.json` is never GC'd, so those
+    # files exist in prod RIGHT NOW.
+    return RunStatus(**{k: v for k, v in d.items() if k in RunStatus.__dataclass_fields__})
+
+
+def _load_status_json(run_id: str) -> dict:
+    path = runner.runs_file_path(run_id, ".json")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"unknown run_id: {run_id}")
+    with open(path) as f:
+        value = json.load(f)
+    if not isinstance(value, dict):
+        raise ValueError(f"invalid stored run status for {run_id}")
+    return value
+
+
+def get_status(run_id: str) -> RunStatus:
+    return runner._runstatus_from_json(runner._load_status_json(run_id))
+
+
+def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False) -> JobSpec:
+    """Load the private prepared worker spec, optionally revalidating its source artifact."""
+    public_spec = JobSpec.from_dict(status.spec)
+    snapshot = status.effective_preparation
+    if not isinstance(snapshot, dict):
+        if public_spec.train.init_from_adapter:
+            raise ValueError(
+                f"warm-start source {public_spec.train.init_from_adapter!r} cannot be recovered "
+                "because its original preparation snapshot is unavailable"
+            )
+        return public_spec
+    raw_worker = snapshot.get("worker_spec")
+    if not isinstance(raw_worker, dict):
+        raise ValueError("persisted effective preparation is malformed")
+    worker_spec = JobSpec.from_dict(raw_worker)
+    runner._validate_effective_spec(public_spec, worker_spec)
+    expected = snapshot.get("adapter_identity")
+    stored_digest = snapshot.get("preparation_digest")
+    # A pre-upgrade snapshot hashed since-removed keys into its digest, and `worker_spec` no longer
+    # carries them -- so reproducing that digest needs the values the STORED payload holds.
+    legacy_keys = {k: raw_worker[k] for k in _DROPPED_TOP_LEVEL_KEYS if k in raw_worker}
+    raw_public = status.spec if isinstance(status.spec, dict) else {}
+    legacy_public_keys = {k: raw_public[k] for k in _DROPPED_TOP_LEVEL_KEYS if k in raw_public}
+    legacy_public_alpha = runner._prepared_before_public_alpha(raw_public)
+    has_workload_profile = bool(
+        worker_spec.workload_profile_kind
+        or worker_spec.workload_profile_input_digest
+        or worker_spec.workload_profile
+    )
+    if has_workload_profile:
+        if snapshot.get("workload_profile") != (worker_spec.workload_profile or None):
+            raise ValueError("persisted workload profile does not match the worker spec")
+        if not isinstance(stored_digest, str) or stored_digest != runner._preparation_digest(
+            public_spec,
+            worker_spec,
+            expected,
+            legacy_keys=legacy_keys,
+            legacy_public_keys=legacy_public_keys,
+            legacy_public_alpha=legacy_public_alpha,
+        ):
+            raise ValueError("persisted effective preparation failed integrity validation")
+    if public_spec.train.init_from_adapter:
+        if not isinstance(expected, dict) or not expected.get("digest"):
+            raise ValueError(
+                f"warm-start source {public_spec.train.init_from_adapter!r} cannot be recovered "
+                "because its original artifact identity is unavailable"
+            )
+        if not isinstance(stored_digest, str) or stored_digest != runner._preparation_digest(
+            public_spec,
+            worker_spec,
+            expected,
+            legacy_keys=legacy_keys,
+            legacy_public_keys=legacy_public_keys,
+            legacy_public_alpha=legacy_public_alpha,
+        ):
+            raise ValueError("persisted effective preparation failed integrity validation")
+    if verify_source and public_spec.train.init_from_adapter:
+        try:
+            from flash.adapters.lora_rank import (
+                adapter_artifact_identity,
+                inspect_adapter_config,
+                load_hf_adapter_config,
+            )
+
+            revision = worker_spec.train.init_from_adapter_revision
+            config = load_hf_adapter_config(
+                worker_spec.train.init_from_adapter,
+                os.environ.get("HF_TOKEN"),
+                revision,
+            )
+            metadata = inspect_adapter_config(
+                config,
+                source="pinned warm-start adapter",
+                target_model=worker_spec.model,
+            )
+            if (
+                metadata.rank != worker_spec.train.lora_rank
+                or metadata.alpha != worker_spec.train.lora_alpha
+            ):
+                raise ValueError("prepared adapter topology changed")
+            current = adapter_artifact_identity(
+                worker_spec.train.init_from_adapter,
+                config,
+                os.environ.get("HF_TOKEN"),
+                revision,
+            ).to_dict()
+        except Exception as exc:
+            raise ValueError(
+                f"warm-start source {public_spec.train.init_from_adapter!r} could not be revalidated"
+            ) from exc
+        if current != expected:
+            raise ValueError(
+                f"warm-start source {public_spec.train.init_from_adapter!r} changed after submission; "
+                "recovery was refused"
+            )
+    return worker_spec
+
+
+def reallocation_spec_from_status(status: RunStatus, *, verify_source: bool = False) -> JobSpec:
+    """Effective worker spec for RE-ALLOCATING a recovered run.
+
+    Feeding that straight back to allocate() would re-enter recovery with the prior attempt's answer
+    as its input -- hard-pinning an originally-unpinned run to one class (blocking OOM escalation
+    and retries on other providers/classes), and lowering the ceiling to the one shape that already
+    failed, so a run authored for up to 4 cards can never again be offered a 4-card shape. gpu.count
+    is a CEILING, so restoring it re-widens the search rather than forcing a size.
+    """
+    worker_spec = runner.effective_spec_from_status(status, verify_source=verify_source)
+    public_gpu = JobSpec.from_dict(status.spec).gpu
+    if worker_spec.gpu.type == public_gpu.type and worker_spec.gpu.count == public_gpu.count:
+        return worker_spec
+    restored = worker_spec.to_internal_dict()
+    restored["gpu"] = {**restored["gpu"], "type": public_gpu.type, "count": public_gpu.count}
+    return JobSpec.from_dict(restored)
+
+
+def list_runs() -> list[RunStatus]:
+    os.makedirs(runner.RUNS_DIR, exist_ok=True)
+    runs = []
+    for name in sorted(os.listdir(runner.RUNS_DIR)):
+        if name.endswith(".json"):
+            with open(os.path.join(runner.RUNS_DIR, name)) as f:
+                runs.append(runner._runstatus_from_json(json.load(f)))
+    return runs
+
+
+def list_run_ids() -> list[str]:
+    """Run ids by filename only (no JSON parse) so a corrupt record can't break the listing."""
+    os.makedirs(runner.RUNS_DIR, exist_ok=True)
+    return [
+        name[: -len(".json")]
+        for name in sorted(os.listdir(runner.RUNS_DIR))
+        if name.endswith(".json")
+    ]
+
+
+def get_logs(run_id: str) -> str:
+    log_path = runner.runs_file_path(run_id, ".log")
+    if not os.path.exists(log_path):
+        return ""
+    with open(log_path) as f:
+        return f.read()
+
+
+_STATUS_LIST_LIMIT = 16
+_STATUS_METRICS_HISTORY_LIMIT = 1024
+
+
+def _sanitize_status_value(value, *, depth: int = 0, field: str = ""):
+    """Bound a heartbeat payload before persisting it in run status JSON."""
+    if depth > 5:
+        return str(value)[:200]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:1000]
+    if isinstance(value, list):
+        if field == "metrics_last":
+            values = value[-_STATUS_METRICS_HISTORY_LIMIT:]
+        else:
+            values = value[:_STATUS_LIST_LIMIT]
+        return [runner._sanitize_status_value(v, depth=depth + 1) for v in values]
+    if isinstance(value, dict):
+        out = {}
+        for i, (k, v) in enumerate(value.items()):
+            if i >= 64:
+                out["truncated"] = True
+                break
+            sanitized_key = str(k)[:120]
+            out[sanitized_key] = runner._sanitize_status_value(
+                v, depth=depth + 1, field=sanitized_key
+            )
+        return out
+    return str(value)[:500]
+
+
+def record_heartbeat(run_id: str, heartbeat: dict) -> None:
+    """Persist the latest worker heartbeat/GPU snapshot without changing run state."""
+    if not run_id or not isinstance(heartbeat, dict):
+        return
+    if not os.path.exists(runner.runs_file_path(run_id, ".json")):
+        return
+    hb = runner._sanitize_status_value(heartbeat)
+    gpu = (hb.get("gpu") or hb.get("diag")) if isinstance(hb, dict) else None
+    with runner._status_guard(run_id):
+        try:
+            status = runner.get_status(run_id)
+        except FileNotFoundError:
+            return
+        # atomically store a profile's first current-attempt heartbeat arm and deadline; readers reject
+        # a partial pair as tampering. reused run ids can retain an earlier lifecycle's heartbeat, so
+        # provenance must pass before the work budget starts.
+        arm_kwargs: dict[str, float] = {}
+        raw = runner._load_status_json(run_id)
+        armed_spec = runner._internal_spec_from_status(status)
+        if armed_spec.workload_profile_kind and runner._profile_wall_armed_at(raw) is None:
+            hb_ts = hb.get("ts") if isinstance(hb, dict) else None
+            fresh = (
+                not isinstance(hb_ts, bool)
+                and isinstance(hb_ts, (int, float))
+                and math.isfinite(float(hb_ts))
+                and float(hb_ts) >= runner._require_valid_deadline(status.created_at)
+                # ...and it must be THIS attempt. a timestamp test alone admits a still-live worker
+                # from a cancelled earlier lifecycle: it writes to the same workload-derived prefix
+                # and its heartbeats are genuinely recent, so they pass `>= created_at` and arm the
+                # replacement's work budget while it is still queuing for capacity.
+                and runner._heartbeat_attempt_is_current(hb, raw)
+            )
+            if fresh:
+                armed_at = time.time()
+                arm_kwargs = {
+                    "_profile_wall_armed_at": armed_at,
+                    "_run_deadline_at": runner._require_valid_deadline(
+                        armed_at + runner._require_valid_deadline(armed_spec.gpu.max_wall_seconds)
+                    ),
+                }
+        # Checkpoint-stage heartbeats (checkpoint_uploading/deployable/uploaded) omit metrics_last; carry
+        # the existing per-step backlog forward so `flash runs log -f` doesn't drop it mid-save until the next
+        # metrics-bearing heartbeat lands.
+        if isinstance(hb, dict) and not hb.get("metrics_last"):
+            prev = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else None
+            prev_metrics = prev.get("metrics_last") if isinstance(prev, dict) else None
+            # only carry the backlog forward within the same attempt; a boot/retry heartbeat for a
+            # new attempt must not inherit the prior attempt's stale per-step metrics.
+            same_attempt = prev is not None and prev.get("attempt") == hb.get("attempt")
+            if same_attempt and isinstance(prev_metrics, list) and prev_metrics:
+                hb["metrics_last"] = prev_metrics
+        status.last_heartbeat = hb
+        status.gpu_status = gpu if isinstance(gpu, dict) else None
+        status.updated_at = time.time()
+        runner._save_status_unlocked(status, **arm_kwargs)
+    runner._report_status(status)
+
+
+def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
+    """Write metrics to results/runpod/<phase>/<run_id> and return the customer training cost.
+
+    The run id keeps concurrent/sequential runs of the same phase from
+    overwriting each other's artifacts. ``metrics["wall_seconds"]`` is the worker's training-loop
+    wall time; setup/cold-start is reported separately and is not included here."""
+    from flash.engine.result.accounting import sanitize_worker_metrics
+
+    metrics = sanitize_worker_metrics(metrics)
+    if spec.workload_profile_kind:
+        from flash.engine.profiling.workload_profile import require_matching_sft_profile
+
+        profile = require_matching_sft_profile(
+            metrics.get("workload_profile"),
+            input_digest=spec.workload_profile_input_digest,
+            producer_version=spec.workload_profile_producer_version,
+            tokenizer_revision=spec.model_revision,
+        )
+        metrics = {**metrics, "workload_profile": profile.to_dict()}
+        current = runner.get_status(spec.run_id)
+        if current.state in runner.TERMINAL_STATES:
+            raise ValueError("workload profile metrics arrived after the run became terminal")
+        runner._update(
+            spec.run_id,
+            current.state,
+            workload_profile=profile.to_dict(),
+        )
+    dest = runner.artifacts_dir(spec)
+    os.makedirs(dest, exist_ok=True)
+    # Use allocated_gpu (worker-stamped) not spec.gpu.type; policy GPUs can be reallocated.
+    gpu_type = metrics.get("allocated_gpu") or spec.gpu.type
+    # the substrate that actually billed the run; empty on a record predating the stamp, in which
+    # case _gpu_rate prices off whichever configured provider offers the class.
+    provider = str(metrics.get("allocated_provider") or "")
+    rate = runner._gpu_rate(gpu_type, provider)
+    # `hourly_rate` is per CARD, so a sharded run costs the wall times the rate times the number of
+    # cards it actually occupied. `allocated_gpu_count` is worker/lifecycle-stamped for the same
+    # reason `allocated_gpu` is: the spec's gpu.count is only a ceiling and allocation may pick
+    # fewer. Absent on records predating the stamp, where one card is the correct reading.
+    gpu_count = max(1, int(metrics.get("allocated_gpu_count") or 1))
+    cost = metrics.get("cost_usd")
+    if cost:
+        cost = float(cost or 0.0)
+    else:
+        wall = float(metrics.get("wall_seconds") or 0.0)
+        cost = wall / 3600.0 * rate * gpu_count
+        metrics = {**metrics, "cost_usd": cost}
+        metrics.setdefault("notes", {})
+        if isinstance(metrics["notes"], dict):
+            metrics["notes"]["provider"] = provider or "unknown"
+            metrics["notes"]["gpu_rate_usd_hr"] = rate
+            metrics["notes"]["gpu"] = gpu_type
+            metrics["notes"]["gpu_count"] = gpu_count
+    with open(os.path.join(dest, "metrics.json"), "w") as f:
+        json.dump(metrics, f, indent=2)
+    with contextlib.suppress(Exception):
+        from flash.server.domain.run_registry import record_training_checkpoint
+
+        record_training_checkpoint(spec=spec, metrics=metrics, artifact_path=dest)
+    return float(cost)
+
+
+def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **updates) -> bool:
+    """Atomically transition run state with terminal-stickiness. Returns False if rejected.
+
+    Returns ``True`` if the transition was applied, ``False`` if it was rejected because the run was
+    already in a terminal state (the sticky compare-and-set below). Callers that gate PAID work on a
+    transition (e.g. the recovery path resuming ``_run_training``) must check this return so a run
+    concurrently flipped terminal does not get resumed.
+    """
+    report_status: RunStatus | None = None
+    with runner._status_guard(run_id):
+        status = runner.get_status(run_id)
+        if (
+            status.state in runner.TERMINAL_STATES
+            and state != status.state
+            and not allow_from_terminal
+        ):
+            return False
+        was_terminal = status.state in runner.TERMINAL_STATES
+        prev_updated_at = status.updated_at
+        status.state = state
+        status.updated_at = time.time()
+        if state in runner.TERMINAL_STATES and status.finished_at is None:
+            # legacy run already terminal: backfill from prior updated_at, not now.
+            status.finished_at = prev_updated_at if was_terminal else status.updated_at
+        for key, value in updates.items():
+            setattr(status, key, value)
+        runner._save_status_unlocked(status)
+        report_status = status
+    if report_status is not None:
+        runner._report_status(report_status)
+    return True

@@ -1,0 +1,286 @@
+"""What the verl child said before it died, and where ray wrote the rest of it.
+
+A wedged or crashed child is diagnosed from two places: the tail of its own stdout, which
+`ChildOutputTail` retains in a bounded ring buffer and `ChildTailStaleness` times, and ray's
+per-session log directory, which holds the raylet and worker output the child never printed. Both
+end up on a heartbeat payload, so both are size-capped and sanitized.
+
+Split out of `flash.engine.worker.backend_common` to keep that module under the file-size limit.
+"""
+
+from __future__ import annotations
+
+import collections
+import os
+
+from flash._internal.diagnostics import sanitize_diagnostic
+
+# how many of the child's most recent output lines to retain for stall reporting. the child's last
+# words before it wedges are the whole diagnostic, and a stall is usually preceded by a short burst
+# (a ray warning, a placement-group notice, a partial traceback), so a small window suffices.
+CHILD_TAIL_LINES = 60
+# per-line cap when rendering the retained tail. verl prints resolved-config blocks thousands of
+# characters wide; an unbounded tail would blow the heartbeat payload it has to travel inside.
+_CHILD_TAIL_LINE_CHARS = 300
+# how many retained lines ride along on a pre-first-step heartbeat. narrower than what is retained:
+# this payload is uploaded every tick, so it stays small enough not to bloat the snapshot.
+STALL_TAIL_LINES = 15
+_RETRIABLE_VERL_CHILD_SIGNATURES = (
+    "cudaErrorDevicesUnavailable",
+    "CUDA-capable device(s) is/are busy or unavailable",
+)
+
+
+def _backend_common():
+    """The parent module, imported lazily because it imports this one.
+
+    Only used to resolve `open`: the bounded-read test replaces `backend_common.open` rather than
+    the builtin, because a global replacement leaks into every later test through pytest's own file
+    handling. Reading it back through the parent is what keeps that patch reaching this collector,
+    and falling through to the builtin is what keeps a test that patches `builtins.open` working.
+    """
+    from flash.engine.worker import backend_common
+
+    return backend_common
+
+
+class ChildOutputTail:
+    """bounded ring buffer of a subprocess's most recent output lines.
+
+    child stdout is absent from collected logs; only heartbeat markers survive. retain the tail so
+    setup stalls can report the child's last words (ISSUES VERL-061).
+    """
+
+    def __init__(self, limit: int = CHILD_TAIL_LINES) -> None:
+        self._lines: collections.deque[str] = collections.deque(maxlen=limit)
+        self._written = 0
+        self._retriable_infra_signature: str | None = None
+        self._cuda_oom_evidence: str | None = None
+
+    def record(self, line: str) -> None:
+        if self._retriable_infra_signature is None:
+            self._retriable_infra_signature = next(
+                (signature for signature in _RETRIABLE_VERL_CHILD_SIGNATURES if signature in line),
+                None,
+            )
+        if self._cuda_oom_evidence is None:
+            from flash.engine.worker.perf.lifecycle import cuda_oom_message_evidence
+
+            self._cuda_oom_evidence = cuda_oom_message_evidence(line)
+        text = line.rstrip("\n")
+        if text:
+            self._lines.append(text[:_CHILD_TAIL_LINE_CHARS])
+            self._written += 1
+
+    @property
+    def retriable_infra_signature(self) -> str | None:
+        """the first stable retriable-infrastructure signature observed in child output."""
+        return self._retriable_infra_signature
+
+    @property
+    def cuda_oom_evidence(self) -> str | None:
+        """the first authoritative cuda oom message evidence observed in child output."""
+        return self._cuda_oom_evidence
+
+    @property
+    def written(self) -> int:
+        """how many non-empty lines the child has produced, ever.
+
+        monotonic and independent of the retention limit, which is what makes it usable as a
+        staleness signal: a child looping on the same line still advances this, and a child that has
+        gone silent cannot advance it even though its retained tail stays fully populated.
+        """
+        return self._written
+
+    def tail(self, limit: int | None = None) -> list[str]:
+        """the retained lines, oldest first, optionally narrowed to the most recent ``limit``."""
+        lines = list(self._lines)
+        if limit is not None and limit >= 0:
+            lines = lines[len(lines) - limit :] if limit < len(lines) else lines
+        return lines
+
+
+def raise_for_classified_verl_exit(return_code: int, tail: ChildOutputTail) -> None:
+    """raise a classified failure when a nonzero verl child reported authoritative evidence."""
+    if return_code == 0:
+        return
+    oom_evidence = tail.cuda_oom_evidence
+    if oom_evidence is not None:
+        raise RuntimeError(
+            f"verl subprocess exited with status {return_code} after reporting {oom_evidence}"
+        )
+    signature = tail.retriable_infra_signature
+    if signature is None:
+        return
+    from flash.engine.worker.perf.lifecycle import RetriableInfraError
+
+    raise RetriableInfraError(
+        f"verl subprocess exited with status {return_code} after reporting {signature}"
+    )
+
+
+class ChildTailStaleness:
+    """tracks how long a child has been silent, across the ticks that sample its tail.
+
+    the tail alone cannot answer the question a stall actually poses. a child still loading shards
+    and a child wedged forever both present a fully populated tail whose newest line is plausible,
+    so the only thing separating them is whether the tail CHANGED between two dumps -- and a
+    stateless report throws that comparison away, leaving it to be reconstructed by hand from
+    consecutive heartbeats after the money is already spent (ISSUES VERL-067). holding the previous
+    line count here turns that into a number the first dump already carries.
+    """
+
+    def __init__(self) -> None:
+        self._written = -1
+        self._since = 0
+
+    def observe(self, written: int) -> int:
+        """record this tick's line count; return consecutive ticks with no new output.
+
+        0 means the child spoke since the last observation. n>0 means it has been silent for n
+        ticks, which is the signal that separates a slow start from a wedge.
+        """
+        if written != self._written:
+            self._written = written
+            self._since = 0
+        else:
+            self._since += 1
+        return self._since
+
+
+def stall_tail_fields(
+    step: int,
+    tail: ChildOutputTail,
+    limit: int = STALL_TAIL_LINES,
+    staleness: ChildTailStaleness | None = None,
+) -> dict[str, object]:
+    """heartbeat fields carrying the child's last words, but only while it has made no progress.
+
+    before the first step, the tail is the only collected setup-stall evidence. with ``staleness``,
+    include silent ticks to distinguish a slow start from a wedge. return empty after progress or
+    before any child output.
+    """
+    if step > 0:
+        return {}
+    recent = tail.tail(limit=limit)
+    if not recent:
+        # observed even with nothing to report, so a child that starts talking later is measured
+        # from its first line rather than from whenever the payload happened to become non-empty.
+        if staleness is not None:
+            staleness.observe(tail.written)
+        return {}
+    fields: dict[str, object] = {"child_tail": recent}
+    if staleness is not None:
+        fields["child_tail_silent_ticks"] = staleness.observe(tail.written)
+    return fields
+
+
+# the ray logs worth keeping when a raylet dies. the driver's own stdout only ever shows the
+# downstream symptom ("Failed to register worker to Raylet: ... End of file"); the reason the raylet
+# went away is in these. deliberately a small allowlist -- a ray session dir also holds per-worker
+# logs that can run to hundreds of files on a 128-core box.
+RAY_FAILURE_LOGS = (
+    "raylet.out",
+    "raylet.err",
+    "gcs_server.out",
+    "gcs_server.err",
+    "dashboard_agent.log",
+    "dashboard.log",
+)
+# per file. enough to carry a stack and the lines before it, without turning an artifact upload into
+# the reason a failing run takes even longer to report. this is the ONLY bound on the result: the
+# sanitize pass below is given the same number so it can never truncate a tail we chose to keep.
+RAY_LOG_TAIL_BYTES = 64 * 1024
+
+
+def latest_ray_session_dir(
+    root: str = "/tmp/ray", *, started_after: float | None = None
+) -> str | None:
+    """the most recent ray session directory, or None if THIS run never started one.
+
+    ``started_after`` rejects sessions older than the caller's start. a retry reuses the pod workdir
+    and /tmp survives it, so a run that fails BEFORE ray starts -- during dependency provisioning or
+    model download -- still finds a previous run's session here. uploading that as the current
+    attempt's evidence is worse than uploading nothing: it reads as a raylet failure that never
+    happened, and sends the next diagnosis after a cause belonging to a different run.
+    """
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return None
+    # stat once, here: a session directory can vanish between listing and stat, and doing it in a
+    # `max(key=...)` would let that raise on an already-failing path.
+    dated: list[tuple[float, str]] = []
+    for name in names:
+        if not name.startswith("session_"):
+            continue
+        path = os.path.join(root, name)
+        try:
+            if not os.path.isdir(path):
+                continue
+            # mtime, not the name's timestamp: the directory keeps being written while ray runs, so
+            # a session that STARTED before this run but was still live during it is still ours.
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if started_after is not None and mtime < started_after:
+            continue
+        dated.append((mtime, path))
+    if not dated:
+        return None
+    return max(dated)[1]
+
+
+def collect_ray_failure_logs(
+    *,
+    root: str = "/tmp/ray",
+    tail_bytes: int = RAY_LOG_TAIL_BYTES,
+    started_after: float | None = None,
+) -> str:
+    """ray's own logs about why a raylet died, as one credential-safe artifact body ("" if none).
+
+    when a raylet dies the driver prints only its own downstream failure, and ray's session dir --
+    which holds the actual cause -- lives on the pod and goes away with it. that makes a raylet
+    failure undiagnosable from uploaded artifacts and costs a paid gpu run per guess (VERL-115). one
+    string rather than a directory of copies: the caller writes it exactly like the traceback
+    artifact beside it, so a dying pod does one upload instead of six against the same bounded hf
+    deadline allowance, and there is no staging directory whose only purpose is to be uploaded.
+    """
+    session = latest_ray_session_dir(root, started_after=started_after)
+    if session is None:
+        return ""
+    logs_dir = os.path.join(session, "logs")
+    sections: list[str] = []
+    for name in RAY_FAILURE_LOGS:
+        src = os.path.join(logs_dir, name)
+        try:
+            opener = getattr(_backend_common(), "open", open)
+            with opener(src, "rb") as handle:
+                # seek relative to the file's OWN end and cap the read: ray may still be writing
+                # while this runs, and a getsize()-then-read() would consume from the old offset
+                # through the new EOF -- unbounded, on a dying pod with a bounded upload deadline.
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                # the tail, not the head: a crash reason is at the end of the file.
+                handle.seek(max(0, size - tail_bytes))
+                payload = handle.read(tail_bytes)
+        except OSError:
+            continue
+        # seeking to a byte offset can land mid-codepoint, and a decode error here would lose the
+        # whole file for a cosmetic reason on the one path that exists to preserve evidence.
+        text = payload.decode("utf-8", errors="replace")
+        if size > tail_bytes:
+            # never begin mid-line: a tail cut can split a credential and defeat prefix or full-value
+            # redaction. drop the partial line, then sanitize multiline values line by line; both are
+            # required for third-party ray logs.
+            newline = text.find("\n")
+            text = text[newline + 1 :] if newline != -1 else ""
+            if not text:
+                # a single line longer than the whole tail. dropping it is the only safe option, but
+                # say so: an empty section would otherwise read as "ray logged nothing here".
+                text = f"<omitted: final {tail_bytes} bytes are one unterminated line>"
+        sections.append(
+            f"===== {name} (last {tail_bytes} bytes) =====\n"
+            f"{sanitize_diagnostic(text, limit=tail_bytes)}"
+        )
+    return "\n\n".join(sections)

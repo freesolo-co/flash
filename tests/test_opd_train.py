@@ -5120,9 +5120,16 @@ def test_both_ray_rollouts_honor_sleep_unsupported_from_the_same_catalog_flag():
     # flagged model declares algos including opd and the parse-time gate ADMITS it (routes to b200),
     # so a driver that ignores the flag wedges on wake. asserted across BOTH trainers because
     # one-trainer-only is precisely how the eager defect above reached production.
+    # each trainer renders its overrides in a separate module from where it resolves the flag, so
+    # both halves of this guard span two modules. keep these in step when a trainer is split again.
+    from flash.engine.worker.train.opd import overrides as opd_overrides
+    from flash.engine.worker.train.rl import verl_config as rl_verl_config
+
+    opd_source = inspect.getsource(opd_train) + inspect.getsource(opd_overrides)
+    rl_source = inspect.getsource(rl_train) + inspect.getsource(rl_verl_config)
     for module, source in (
-        ("rl_train", inspect.getsource(rl_train)),
-        ("opd_train", inspect.getsource(opd_train)),
+        ("rl_train", rl_source),
+        ("opd_train", opd_source),
     ):
         assert "rollout_resident_overrides(" in source, module
         assert "rollout_sleep_unsupported(" in source, module
@@ -5400,7 +5407,7 @@ def test_image_token_suppression_is_gated_on_structured_image_blocks():
 
 def test_child_environment_keeps_bridge_but_excludes_teacher_transport(monkeypatch, tmp_path):
     monkeypatch.setenv("PARASAIL_API_KEY", "parasail-secret")
-    monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
+    monkeypatch.setenv("FLASH_PUBLIC_URL", "https://broker.example")
     monkeypatch.setenv("FLASH_TEACHER_CAPABILITY", "capability-secret")
     monkeypatch.setenv("HF_TOKEN", "hub-secret")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
@@ -5433,7 +5440,7 @@ def test_child_environment_keeps_bridge_but_excludes_teacher_transport(monkeypat
     assert child["VERL_USE_EXTERNAL_MODULES"] == "flash_opd_plugin"
     assert child["CUDA_VISIBLE_DEVICES"] == "0,1"
     assert "PARASAIL_API_KEY" not in child
-    assert "FLASH_CONTROL_PANEL_URL" not in child
+    assert "FLASH_PUBLIC_URL" not in child
     assert "FLASH_TEACHER_CAPABILITY" not in child
     assert "HF_TOKEN" not in child
     assert "FLASH_OPD_STRUCTURED_OUTPUTS" not in child
@@ -5799,7 +5806,7 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
         )
 
     teacher_runtime = {
-        "FLASH_CONTROL_PANEL_URL": "https://broker.example",
+        "FLASH_PUBLIC_URL": "https://broker.example",
         "FLASH_TEACHER_CAPABILITY": "capability-test-value",
     }
     spec = _spec()
@@ -6069,7 +6076,7 @@ def test_opd_missing_managed_teacher_broker_fails_before_the_gpu_probe(monkeypat
     )
     # torch is not installed in this test env; the real seeding is covered in test_training_controls.
     monkeypatch.setattr(opd_mod, "seed_training_rngs", lambda seed: None)
-    monkeypatch.delenv("FLASH_CONTROL_PANEL_URL", raising=False)
+    monkeypatch.delenv("FLASH_PUBLIC_URL", raising=False)
     monkeypatch.delenv("FLASH_TEACHER_CAPABILITY", raising=False)
 
     with pytest.raises(RuntimeError, match="managed teacher control-panel transport is missing"):
