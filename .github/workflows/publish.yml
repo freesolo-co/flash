@@ -306,7 +306,19 @@ jobs:
           # of repo history. The `v[0-9]` pattern deliberately excludes both that legacy tag and the
           # dev channel's `dev-v*` series, whose numbers interleave with these by design.
           # `-V` is version sort, so v1.0.9 sorts before v1.0.10.
-          prev="$(git ls-remote --tags origin \
+          #
+          # The lookup is run on its own line, NOT as the head of the filter pipeline. Piping it
+          # would make a failed lookup and a genuinely empty tag series both come out as "", and
+          # the first release would then silently fall back to GitHub's automatic baseline -- the
+          # ~900-commit changelog this block exists to prevent, published permanently. The filter
+          # still needs `|| true` because `grep` legitimately exits 1 when the series is empty
+          # (the real first release), which is exactly why the two cases have to be separated.
+          all_tags="$(git ls-remote --tags origin)" && rc=0 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Could not query tags on origin (git ls-remote exit ${rc}). Refusing to continue: an empty result from a failed lookup is not the same as an empty tag series, and guessing here would publish the wrong changelog permanently."
+            exit 1
+          fi
+          prev="$(printf '%s\n' "$all_tags" \
             | awk '$2 ~ /^refs\/tags\/v[0-9]/ && $2 !~ /\^\{\}$/ {sub(/^refs\/tags\//,"",$2); print $2}' \
             | grep -Fxv "${TAG}" | sort -V | tail -1 || true)"
           # --generate-notes fills in the commit/PR list; --notes-file content is PREPENDED to it
