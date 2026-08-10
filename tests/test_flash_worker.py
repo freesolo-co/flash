@@ -813,3 +813,36 @@ def test_snapshot_weight_validation(tmp_path):
     assert not _snapshot_has_weights(str(d))  # configs only = stale partial snapshot
     (d / "model.safetensors-00001-of-00001.safetensors").write_text("x")
     assert _snapshot_has_weights(str(d))
+
+
+def test_private_worker_image_is_refused_by_providers_that_cannot_authenticate(monkeypatch):
+    """Lambda and Vast must offer NO capacity while a credential-backed private image is set.
+
+    ``FLASH_WORKER_IMAGE_REGISTRY_AUTH`` is a RunPod provider-side credential id and only RunPod
+    attaches it; these substrates pull the image on the rented instance with no registry login. The
+    image override reaches every provider, so an automatic allocation onto either one rented a box
+    whose pull could not succeed -- and a never-started worker is retriable, so the paid attempt
+    could repeat.
+    """
+    from flash.providers.base import AllocationConstraints, UnsupportedGpuError
+    from flash.providers.lambda_ import LambdaProvider
+    from flash.providers.vast import VastProvider
+
+    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/private-worker:cu13")
+    monkeypatch.setenv("FLASH_WORKER_IMAGE_REGISTRY_AUTH", "auth-123")
+
+    for provider in (LambdaProvider(), VastProvider()):
+        with pytest.raises(UnsupportedGpuError, match="private FLASH_WORKER_IMAGE"):
+            provider.live_candidates(24, AllocationConstraints())
+
+
+def test_a_public_override_image_still_allocates_on_those_providers(monkeypatch):
+    """The guard keys on the CREDENTIAL, not on the override: a public image pulls fine anywhere."""
+    from flash.providers.lambda_ import LambdaProvider
+    from flash.providers.vast import VastProvider
+
+    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/public-worker:cu13")
+    monkeypatch.delenv("FLASH_WORKER_IMAGE_REGISTRY_AUTH", raising=False)
+
+    for provider in (LambdaProvider(), VastProvider()):
+        assert provider._private_image_problem() == ""
