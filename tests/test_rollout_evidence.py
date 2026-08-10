@@ -49,6 +49,29 @@ def _spec(**overrides) -> JobSpec:
     return JobSpec(**base)
 
 
+def _completed_stages(stages: tuple[str, ...]) -> tuple[str, ...]:
+    """The env hooks that FINISHED, dropping the attempted markers.
+
+    Stages are reported twice: once when the hook begins (marked) and once when it returns. Only
+    the unmarked names may be described to the user as having run on a sample.
+    """
+    from flash.cli.commands.rollout_profile import _ATTEMPTED_SUFFIX
+
+    return tuple(stage for stage in stages if not stage.endswith(_ATTEMPTED_SUFFIX))
+
+
+def _unfinished_stages(stages: tuple[str, ...]) -> tuple[str, ...]:
+    """The env hooks that STARTED and never finished -- they raised or hit the local deadline."""
+    from flash.cli.commands.rollout_profile import _ATTEMPTED_SUFFIX
+
+    done = set(_completed_stages(stages))
+    return tuple(
+        stage.removesuffix(_ATTEMPTED_SUFFIX)
+        for stage in stages
+        if stage.endswith(_ATTEMPTED_SUFFIX) and stage.removesuffix(_ATTEMPTED_SUFFIX) not in done
+    )
+
+
 def _with_profile(spec: JobSpec, profile: dict) -> JobSpec:
     """Attach a profile the way the runner does, stamping the version that keyed it.
 
@@ -1540,6 +1563,10 @@ def test_the_evidence_carries_no_grading_measurement(monkeypatch):
             ),
             failures=0,
             sampled_prompts=8,
+            # the real sampler counts both from ONE prompt list, so a stub that leaves this at its
+            # 0 default describes 8 prompts sampled out of 0 offered -- a shape no pass produces,
+            # and one the server now refuses to price.
+            offered_prompts=8,
         ),
     )
     from flash.engine.profiling.rollout_evidence import collect_rollout_evidence
@@ -1773,6 +1800,10 @@ def test_the_sampler_stamps_the_policy_version_it_produced(monkeypatch):
             ),
             failures=0,
             sampled_prompts=8,
+            # the real sampler counts both from ONE prompt list, so a stub that leaves this at its
+            # 0 default describes 8 prompts sampled out of 0 offered -- a shape no pass produces,
+            # and one the server now refuses to price.
+            offered_prompts=8,
         ),
     )
     from flash.engine.profiling.rollout_evidence import collect_rollout_evidence
@@ -2228,8 +2259,11 @@ def test_the_submit_path_learns_the_environment_ran_even_with_no_evidence(monkey
     evidence, stages = _rollout_evidence_for(client, _spec())
 
     assert evidence is None
-    # the import ran; dataset() did not, because a multi-turn env is declined before it.
-    assert stages == ("import",)
+    # the import ran; dataset() did not, because a multi-turn env is declined before it. the
+    # attempt marker precedes the completion, since the user's code starts running before it
+    # finishes -- what matters is that "import" is present UNMARKED.
+    assert stages == ("import?", "import")
+    assert _completed_stages(stages) == ("import",)
 
 
 def test_a_later_decline_reports_the_hooks_it_got_through(monkeypatch, tmp_path):
@@ -2257,7 +2291,9 @@ def test_a_later_decline_reports_the_hooks_it_got_through(monkeypatch, tmp_path)
     evidence, stages = _rollout_evidence_for(client, _spec())
 
     assert evidence is None
-    assert stages == ("import", "dataset", "prompt_messages")
+    assert _completed_stages(stages) == ("import", "dataset", "prompt_messages")
+    # every hook that finished was also reported as attempted first, and nothing is left unfinished.
+    assert _unfinished_stages(stages) == ()
 
 
 @pytest.mark.parametrize(
@@ -2297,7 +2333,10 @@ def test_a_hook_that_hangs_is_not_reported_as_having_run(monkeypatch, tmp_path, 
     try:
         evidence, stages = _rollout_evidence_for(client, _spec())
         assert evidence is None
-        assert stages == expected, f"claimed a hung hook ran: {stages}"
+        assert _completed_stages(stages) == expected, f"claimed a hung hook ran: {stages}"
+        # the hung hook is still reported, as ATTEMPTED: the user's code is running on a daemon
+        # thread right now, and the dry-run line has to be able to say so.
+        assert _unfinished_stages(stages) == (hangs_in,)
     finally:
         release.set()
 
@@ -2643,6 +2682,66 @@ def test_a_systematically_refused_prompt_fails_coverage_but_an_out_of_budget_one
     assert verdict(filtered) == (True, "")
 
 
+def test_a_sample_that_shrank_under_filtering_is_declined_while_rows_remain(monkeypatch):
+    """Over-budget filtering moves BOTH sides of the coverage rule, which is why it hides here.
+
+    The filtered row correctly leaves the offer -- the workers drop it too -- so a prefix where six
+    of eight rows are over budget reports `sampled == offered == 2`: complete coverage of a prompt
+    mix that quietly became a quarter of the intended one, while the workers train on the valid rows
+    further down the population. Measured before this fix, that evidence was accepted, cleared the
+    distinct-prompt floor at exactly 2, and priced every step from two rows.
+
+    Declined only while the population still holds rows to replenish from. When the population IS
+    the offered prefix, the survivors are the whole measurable workload and the sample is as
+    complete as it can be -- asserted below, because a guard that rejected that case would refuse
+    every small dataset.
+    """
+    from flash.engine.profiling import rollout_evidence as client_evidence
+
+    monkeypatch.setattr(
+        client_evidence, "sampler_credentials", lambda: ("https://example.invalid/v1", "k")
+    )
+
+    def _sampling(offered, sampled):
+        return rollout_sampler.RolloutSampling(
+            samples=tuple(
+                rollout_sampler.RolloutSample(
+                    prompt_tokens=50, completion_tokens=180, truncated=False
+                )
+                for _ in range(32)
+            ),
+            failures=0,
+            sampled_prompts=sampled,
+            offered_prompts=offered,
+        )
+
+    prompts = [[{"role": "user", "content": f"p{i}"}] for i in range(8)]
+
+    def collect(sampling, population_rows):
+        monkeypatch.setattr(client_evidence, "sample_rollouts", lambda **_kw: sampling)
+        return client_evidence.collect_rollout_evidence(
+            model="Qwen/Qwen3.5-4B",
+            prompts=prompts,
+            max_completion_tokens=512,
+            temperature=None,
+            top_p=1.0,
+            population_rows=population_rows,
+        )
+
+    # six of the eight offered rows were over budget, and the population holds 100 more.
+    assert collect(_sampling(offered=2, sampled=2), population_rows=100) is None, (
+        "a sample that collapsed to two of eight prompts was submitted as a complete measurement"
+    )
+    # one filtered row is the same defect in a smaller dose, and is declined for the same reason.
+    assert collect(_sampling(offered=7, sampled=7), population_rows=100) is None
+
+    # nothing was filtered: the intended mix is intact and the measurement stands.
+    assert collect(_sampling(offered=8, sampled=8), population_rows=100) is not None
+    # the population IS the prefix, so there is nothing to replenish from and the survivors are the
+    # whole measurable workload. this is the case an over-eager guard would wrongly refuse.
+    assert collect(_sampling(offered=2, sampled=2), population_rows=8) is not None
+
+
 def test_out_of_budget_prompts_leave_the_rotation_instead_of_being_redrawn():
     """A filtered prompt is settled, so redrawing it is a paid request that can never help.
 
@@ -2980,8 +3079,12 @@ def test_an_environment_that_blocks_at_import_cannot_hold_the_submit(monkeypatch
         evidence, stages = _rollout_evidence_for(client, _spec())
         elapsed = time.monotonic() - began
         assert evidence is None
-        # the import never completed, so it must not be reported as having run.
-        assert stages == ()
+        # the import never completed, so it must not be reported as having RUN...
+        assert _completed_stages(stages) == ()
+        # ...but it must be reported as attempted: the module is executing on a daemon thread as
+        # this returns, and telling the user their environment.py was never imported is the false
+        # claim the attempted marker exists to prevent.
+        assert _unfinished_stages(stages) == ("import",)
         assert elapsed < 5.0, f"waited {elapsed:.1f}s, so the import was not bounded"
     finally:
         release.set()
@@ -3221,6 +3324,123 @@ def test_evidence_missing_a_prompt_entirely_is_not_trustworthy():
         ok, reason = RolloutWorkloadProfile.from_dict(partial).trustworthy(now=time.time())
         assert ok is False
         assert "prompts produced a draw" in reason
+
+
+def test_a_zeroed_prompt_claim_cannot_buy_the_discount_the_completion_floor_denies():
+    """opd prices each completion over prompt PLUS completion, so both means set a price.
+
+    The completion floor alone left the prompt side unbounded: hold the completion exactly AT the
+    floor -- where it is accepted by construction -- and claim `prompt_tokens_mean=0.0`, and the
+    sequence the run is billed for collapses to the completion alone. Measured before the fix, that
+    payload was accepted, scored `(True, '')`, and priced 25.6 sequence tokens against the 1536 an
+    unmeasured run pays.
+
+    Asserted through `_sequence_tokens`, not just on acceptance: the quote is what the guard exists
+    to protect, and a rejection that still left the price moved would pass a narrower assertion.
+    """
+    from flash.cost.analytical import _sequence_tokens
+    from flash.cost.spec import runconfig_from_spec
+    from flash.server.domain.rollout_evidence import _MIN_UNATTESTED_MEAN_FRACTION
+
+    spec = _spec(algorithm="opd")
+    unmeasured = runconfig_from_spec(spec).normalized()
+    at_floor = unmeasured.completion_len * _MIN_UNATTESTED_MEAN_FRACTION
+
+    forged = rollout_profile_from_evidence(
+        spec,
+        _evidence(
+            completion_tokens_mean=at_floor,
+            completion_tokens_p50=int(at_floor),
+            completion_tokens_p90=int(at_floor),
+            completion_tokens_max=int(at_floor) + 1,
+            prompt_tokens_mean=0.0,
+        ),
+        producer_version=VERSION,
+    )
+    assert forged is None, (
+        "a zero-token prompt claim was accepted, pricing the prompt side of every opd step at "
+        f"nothing against a {unmeasured.seq_len}-token sequence"
+    )
+
+    # the same completion claim with an honest prompt IS priced, so this cannot pass by rejecting
+    # everything at the completion floor.
+    honest = rollout_profile_from_evidence(
+        spec,
+        _evidence(
+            completion_tokens_mean=at_floor,
+            completion_tokens_p50=int(at_floor),
+            completion_tokens_p90=int(at_floor),
+            completion_tokens_max=int(at_floor) + 1,
+            prompt_tokens_mean=17.0,
+        ),
+        producer_version=VERSION,
+    )
+    assert honest is not None
+    priced = runconfig_from_spec(
+        replace(spec, workload_profile=honest, workload_profile_producer_version=VERSION)
+    ).normalized()
+    assert _sequence_tokens(priced) == pytest.approx(17.0 + at_floor)
+
+
+def test_the_prompt_floor_does_not_refuse_a_genuinely_short_prompt():
+    """The bound has to be absolute, and this is the case that decides it.
+
+    Capacity overstates work worst on the prompt side: a user who sets a long context for headroom
+    and asks short questions is the ordinary run, not an adversarial one. A percentage-of-context
+    floor -- the obvious symmetric choice -- rejects exactly those honest measurements and silently
+    returns them to cap pricing. Measured at the 5% used for completions, the fixture's own 17-token
+    prompt against a 1536-token context is refused.
+    """
+    from flash.server.domain.rollout_evidence import _MIN_UNATTESTED_PROMPT_TOKENS
+
+    spec = _spec(algorithm="opd")
+    # a short prompt with a long completion: unambiguously real work, and the prompt is a rounding
+    # error against the context it runs in.
+    accepted = rollout_profile_from_evidence(
+        spec,
+        _evidence(
+            prompt_tokens_mean=float(_MIN_UNATTESTED_PROMPT_TOKENS),
+            completion_tokens_mean=400.0,
+            completion_tokens_p50=400,
+            completion_tokens_p90=440,
+            completion_tokens_max=480,
+        ),
+        producer_version=VERSION,
+    )
+    assert accepted is not None, "an honest short-prompt measurement was refused"
+    # and the fixture's ordinary values, which are what a real pass looks like.
+    assert rollout_profile_from_evidence(spec, _evidence(), producer_version=VERSION) is not None
+
+
+def test_counts_that_no_sampling_pass_can_produce_are_not_trustworthy():
+    """The coverage rule compares two client-supplied numbers, so it inherits their consistency.
+
+    Both of these skip it rather than fail it. `offered_prompts=0` makes the `offered > 0` guard
+    false, so 32 claimed draws attributed to no prompt at all sail through; `sampled > offered`
+    satisfies "sampled is not less than offered" vacuously. Neither is a state the sampler can
+    produce -- it counts both from one prompt list -- and measured before the fix both scored
+    `(True, '')` and priced the run at 70.7 sequence tokens against an unmeasured 1536.
+    """
+    from flash.engine.profiling.workload_profile import RolloutWorkloadProfile
+
+    for fields, expected in (
+        ({"sampled_prompts": 0, "offered_prompts": 0}, "no prompt is reported as sampled"),
+        ({"sampled_prompts": 0, "offered_prompts": 8}, "no prompt is reported as sampled"),
+        (
+            {"sampled_prompts": 4, "offered_prompts": 0},
+            "nothing the sample can be complete against",
+        ),
+        ({"sampled_prompts": 8, "offered_prompts": 2}, "sample that cannot exist"),
+    ):
+        parsed = rollout_profile_from_evidence(
+            _spec(), _evidence(**fields), producer_version=VERSION
+        )
+        # rejected at parse time or by the verdict; both keep it away from the quote.
+        if parsed is None:
+            continue
+        ok, reason = RolloutWorkloadProfile.from_dict(parsed).trustworthy(now=time.time())
+        assert ok is False, f"{fields} was trusted to price a run"
+        assert expected in reason, f"{fields} rejected for the wrong reason: {reason}"
 
 
 def test_an_install_that_cannot_load_environments_says_so_instead_of_going_quiet(

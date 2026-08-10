@@ -203,8 +203,31 @@ def _dry_run_preview_line(
         # came back. a multi-turn env, a dataset with no samplable prompts, or a dead sampler all
         # import environment.py and then return no evidence -- and they stop at different points,
         # so naming a fixed pair of hooks would overclaim on exactly those paths.
-        called = [f"{stage}()" for stage in environment_stages_run if stage != "import"]
+        #
+        # a stage that STARTED but did not finish arrives marked and reaches this branch -- the
+        # user's code ran, which is what this disclosure is about -- but is excluded from `called`.
+        # a dataset() still running at the deadline did not "run on a small sample", and saying it
+        # did is the same overclaim as the reverse.
+        #
+        # the marker is IMPORTED from the producer rather than spelled again here: two copies of a
+        # sentinel is one rename away from this branch silently reading every stage as completed.
+        from flash.cli.commands.rollout_profile import _ATTEMPTED_SUFFIX as _ATTEMPTED
+
+        completed = [stage for stage in environment_stages_run if not stage.endswith(_ATTEMPTED)]
+        unfinished = [
+            stage.removesuffix(_ATTEMPTED)
+            for stage in environment_stages_run
+            if stage.endswith(_ATTEMPTED)
+        ]
+        unfinished = [stage for stage in unfinished if stage not in completed]
+        called = [f"{stage}()" for stage in completed if stage != "import"]
         ran = f" {' and '.join(called)} ran on a small sample." if called else ""
+        if unfinished:
+            # named, because this is the one case where the user's code may still be RUNNING:
+            # the local deadline abandons the call but the daemon thread carries on. it is also the
+            # likeliest thing they can act on -- a raising import is why the quote fell to the cap.
+            hooks = " and ".join(f"{stage}()" for stage in unfinished)
+            ran += f" {hooks} did not finish: it raised or hit the local deadline."
         # the SERVER's verdict, not whether the client produced a payload. the client's only gate
         # is "at least one draw came back", so a deadline-truncated pass of 31 draws, or one whose
         # truncation rate or prompt coverage fails the trust gate, is evidence here and rejected
@@ -216,8 +239,16 @@ def _dry_run_preview_line(
             else "no usable measurement came back, so this quote still uses the declared "
             "completion cap"
         )
+        # the lead clause turns on whether the import COMPLETED, not on whether it was attempted. an
+        # environment.py that raises at module scope has executed -- the user needs to know that --
+        # but "WAS imported" would be the same false claim in the other direction.
+        opened = (
+            "your environment.py WAS imported locally to measure this quote"
+            if "import" in completed
+            else "flash STARTED importing your environment.py locally to measure this quote"
+        )
         environment = (
-            f"your environment.py WAS imported locally to measure this quote:{ran} {priced}. "
+            f"{opened}:{ran} {priced}. "
             "reward() was NOT called, so its grading cost is not in this quote. worker imports, "
             "model load, and gpu/training are first exercised on the worker after cold-start."
         )

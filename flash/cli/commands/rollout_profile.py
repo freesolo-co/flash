@@ -48,6 +48,11 @@ _LOCAL_HOOK_DEADLINE_S = 120.0
 # here as the same exception type.
 _MISSING_ENVIRONMENT_TOOLS = "could not import the Freesolo environment tools"
 
+# marks a stage that STARTED but did not finish -- it raised, or was still running at the deadline.
+# the user's code ran either way, which is the fact the dry-run disclosure turns on, but only a
+# completed stage may be described as having run on a sample.
+_ATTEMPTED_SUFFIX = "?"
+
 
 def collect_for_submit(
     client,
@@ -234,6 +239,12 @@ def _collect(
         # seed_training_rngs -- the same split the sft workload profile uses, because this must not
         # import torch into the cli.
         _seed_environment_rngs(spec)
+        # reported BEFORE the call: this is the point after which the user's module has run, and a
+        # load that raises or hangs never reaches the `_ran` below. without it the dry-run line
+        # falls to its "did NOT import your environment.py" branch on exactly the runs where the
+        # import is what failed -- and after a timeout the module is still executing in the daemon
+        # thread while the user is told it never started.
+        _attempted("import", on_environment_loaded)
         loaded = _within(
             _LOCAL_HOOK_DEADLINE_S,
             load_freesolo_environment,
@@ -259,6 +270,7 @@ def _collect(
         # bounded: dataset() is user code that may block on a download or a stalled mount, and a
         # submit must not hang because the optional sampler happened to be configured. no exception
         # is raised by a hang, so the outer `except` could never regain control.
+        _attempted("dataset", on_environment_loaded)
         built = _within(_LOCAL_HOOK_DEADLINE_S, environment.dataset)
         dataset = built.value
         if not built.completed:
@@ -279,6 +291,7 @@ def _collect(
 
         # bounded for the same reason as dataset(): prompt_messages() is user code, called once per
         # row, and a stall in any one of them would hang the submit.
+        _attempted("prompt_messages", on_environment_loaded)
         rendered = _within(_LOCAL_HOOK_DEADLINE_S, _prompts_from, environment, dataset)
         prompts = rendered.value
         if not rendered.completed:
@@ -308,6 +321,11 @@ def _collect(
             # stated explicitly and then verified against each response, because the worker renders
             # every prompt with this value and the endpoint would otherwise apply its own default.
             thinking=_thinking_for(spec),
+            # the whole training population, of which `prompts` is the leading slice. it is what
+            # tells a sample that shrank under over-budget filtering (rows remain to replenish
+            # from, so the mix is a fraction of the intended one) from one that is simply the whole
+            # measurable workload.
+            population_rows=len(dataset),
         )
 
 
@@ -383,6 +401,22 @@ def _ran(stage: str, report: Callable[[str], None] | None) -> None:
     """record that one env stage actually executed."""
     if report is not None:
         report(stage)
+
+
+def _attempted(stage: str, report: Callable[[str], None] | None) -> None:
+    """record that one env stage BEGAN, whatever it went on to do.
+
+    reported before the call, and separately from ``_ran``, because the user's code has executed by
+    then either way. a stage that raises or is still running at the deadline would otherwise leave no
+    trace at all, and the dry-run line would tell its author their module was never imported while
+    the import was in fact what failed -- or, after a timeout, is still running in the daemon thread.
+
+    the caller distinguishes the two: ``import`` names a hook that COMPLETED, ``import?`` one that
+    started and did not. collapsing them would swap one false claim for another, since "dataset() ran
+    on a small sample" is exactly what a timed-out dataset() did not do.
+    """
+    if report is not None:
+        report(f"{stage}{_ATTEMPTED_SUFFIX}")
 
 
 class _Outcome(NamedTuple):

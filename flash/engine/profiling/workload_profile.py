@@ -576,7 +576,27 @@ class RolloutWorkloadProfile:
         # removes an over-budget prompt from `offered_prompts` rather than counting it as unmeasured
         # workload, so the bar stays at 100% of the rows the run will actually train on.
         offered = self.offered_prompts
-        if offered > 0 and self.sampled_prompts < offered:
+        # the coverage rule below compares two numbers the payload supplies, so it is only as good
+        # as their internal consistency. a hostile or broken client that reports 0 offered and 0
+        # sampled skips that comparison entirely (0 > 0 is false) and one reporting more sampled
+        # than offered satisfies it vacuously -- either way 32 claimed draws reach a price. neither
+        # is a state the sampler can produce: it counts both from the same prompt list.
+        if self.completed_rollouts > 0 and self.sampled_prompts <= 0:
+            return False, (
+                f"{self.completed_rollouts} rollout(s) are claimed but no prompt is reported as "
+                "sampled; the draws cannot be attributed to any prompt"
+            )
+        if offered <= 0:
+            return False, (
+                "no prompts are reported as offered, so there is nothing the sample can be "
+                "complete against"
+            )
+        if self.sampled_prompts > offered:
+            return False, (
+                f"{self.sampled_prompts} prompt(s) are reported as sampled from {offered} "
+                "offered; the counts describe a sample that cannot exist"
+            )
+        if self.sampled_prompts < offered:
             return False, (
                 f"only {self.sampled_prompts} of {offered} prompts produced a draw; a prompt the "
                 "endpoint refuses is still trained on, so the sample omits part of the workload"

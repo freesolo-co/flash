@@ -48,6 +48,20 @@ _MAX_REWARD_SECONDS = 3600.0
 # the worker's own realized lengths and is a separate change.
 _MIN_UNATTESTED_MEAN_FRACTION = 0.05
 
+# the smallest prompt mean a real sampling pass can report. opd prices each completion over the
+# prompt PLUS the completion, so an unbounded prompt claim is a second way to buy the same discount:
+# hold completion at the floor above and set this to 0, and the sequence the run is billed for
+# collapses to the completion alone.
+#
+# absolute rather than a fraction of the context, deliberately. see the docstring below: a
+# percentage bar refuses the honest short-prompt runs this feature exists to price. this is instead
+# the arithmetic floor of the measurement itself -- the sampler sends role-tagged chat messages with
+# non-empty content, so every draw the endpoint reports has already paid for the chat template's own
+# scaffolding. qwen/llama/mistral templates all spend several tokens per message on role markers and
+# turn delimiters before a single character of user text, so a mean below this is not a short
+# prompt; it is a number no sampling pass produces.
+_MIN_UNATTESTED_PROMPT_TOKENS = 4.0
+
 _REQUIRED_FIELDS = (
     "sampled_prompts",
     "offered_prompts",
@@ -86,13 +100,33 @@ def _discounts_below_the_unattested_floor(fields: dict[str, Any], spec: Any) -> 
     where ``normalized()`` still resolves the recipe cap (grpo 320, opd 512, 1536 thinking) and
     prices the claim at a 320x understatement. any bound the floor compares against has to be the
     one the quote is actually computed from, or the two drift apart again.
+
+    BOTH means are bounded, because both set a price. opd bills each completion over the full
+    prompt+completion length (``_sequence_tokens``), so a payload that keeps completion exactly at
+    the floor and claims ``prompt_tokens_mean=0.0`` passes a completion-only check while pricing the
+    prompt side at nothing: measured on a 1536-token context, that payload is accepted, scores
+    ``(True, '')``, and prices 25.6 sequence tokens where the unmeasured quote is 1536.
+
+    the prompt bound is ABSOLUTE, not a fraction of the context, and the difference is the whole
+    point. capacity overstates work worst on the prompt side -- a user who sets an 8192-token
+    context for headroom and asks 60-token questions is the ordinary case, not an adversarial one --
+    so a percentage-of-context floor rejects exactly the honest short-prompt measurements this
+    feature exists to capture and silently returns them to cap pricing. measured against the 5%
+    figure used for completions: a genuine 17-token prompt with a 53-token completion is refused.
+
+    what IS impossible is a prompt near zero. the sampler sends chat messages with non-empty content
+    and the endpoint reports the RENDERED length, so every real draw pays for the template's own
+    role scaffolding before any user text. a mean below that is not a short prompt, it is a claim no
+    sampling pass can produce.
     """
     cap = _resolved_completion_cap(spec)
     if cap <= 0:
         # no cap even after resolution -- an algorithm that does not sample completions. such a spec
         # is rejected upstream anyway (ROLLOUT_PROFILE_KINDS), so there is no quote to underquote.
         return False
-    return fields["completion_tokens_mean"] < cap * _MIN_UNATTESTED_MEAN_FRACTION
+    if fields["completion_tokens_mean"] < cap * _MIN_UNATTESTED_MEAN_FRACTION:
+        return True
+    return fields["prompt_tokens_mean"] < _MIN_UNATTESTED_PROMPT_TOKENS
 
 
 def _resolved_completion_cap(spec: Any) -> int:
