@@ -553,6 +553,7 @@ def test_env_setup_self_hosted_interactive_requires_an_explicit_project(monkeypa
     from flash.cli.commands.env import setup as env_setup
     from flash.client import ClientError
 
+    monkeypatch.delenv("FREESOLO_BASE_URL", raising=False)
     monkeypatch.setattr(
         "flash.client.config.load_credentials", lambda: ("http://127.0.0.1:8080", "operator-key")
     )
@@ -560,12 +561,61 @@ def test_env_setup_self_hosted_interactive_requires_an_explicit_project(monkeypa
     monkeypatch.setattr(
         "flash.client.list_projects",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("a self-hosted plane has no project directory to enumerate")
+            AssertionError("a backend-less plane has no project directory to enumerate")
         ),
     )
 
-    with pytest.raises(ClientError, match=r"--project PROJECT_UUID.*self-hosted plane"):
+    with pytest.raises(ClientError, match=r"--project PROJECT_UUID.*no\s+Freesolo backend"):
         env_setup._require_setup_project(Namespace(project=""))
+
+
+def test_env_setup_interactive_lists_projects_from_an_operator_backend(monkeypatch) -> None:
+    """A self-hosted plane with its own identity backend HAS a directory, so listing must work.
+
+    Classifying on the control-plane url alone made this topology -- the one SELF_HOSTING.md
+    documents for real multi-tenancy: no FLASH_STANDALONE, FREESOLO_BASE_URL pointing at an
+    operator-run backend -- indistinguishable from a backend-less plane, so interactive setup
+    refused to enumerate a directory that was there the whole time.
+    """
+    from argparse import Namespace
+
+    from flash.cli.commands.env import setup as env_setup
+
+    project_id = "11111111-1111-4111-8111-111111111111"
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://identity.operator.example")
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("http://127.0.0.1:8080", "operator-key")
+    )
+    monkeypatch.setattr(env_setup, "_setup_interactive", lambda _args: True)
+    monkeypatch.setattr(
+        "flash.client.list_projects", lambda api_key: [{"id": project_id, "name": "Example"}]
+    )
+    monkeypatch.setattr(env_setup.render, "select_required", lambda _prompt, _options: project_id)
+    monkeypatch.setattr("flash.client.get_project", lambda *_a, **_k: {"id": project_id})
+
+    assert env_setup._require_setup_project(Namespace(project="")) == project_id
+
+
+def test_supplied_project_is_ownership_checked_against_an_operator_backend(monkeypatch) -> None:
+    """An explicit uuid must still be checked for ownership when a backend can answer.
+
+    The url-only branch returned the id after a shape check, so on this topology any well-formed
+    uuid -- including another tenant's -- was accepted, and `env eval` could run every generation
+    before the upload discovered the project was not reachable.
+    """
+    from flash.client import ApiError, ClientError, resolve_project_id
+
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://identity.operator.example")
+
+    def _forbidden(*_args, **_kwargs):
+        raise ApiError(403, "forbidden")
+
+    monkeypatch.setattr("flash.client.get_project", _forbidden)
+
+    with pytest.raises(ClientError, match="not accessible"):
+        resolve_project_id(
+            "11111111-1111-4111-8111-111111111111", "operator-key", "http://127.0.0.1:8080"
+        )
 
 
 def test_env_setup_hosted_interactive_still_selects_a_project(monkeypatch) -> None:

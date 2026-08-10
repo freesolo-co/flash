@@ -91,10 +91,10 @@ def has_freesolo_backend(api_url: str) -> bool:
     A false positive is the safe direction: assuming a backend exists yields today's behaviour
     (an authenticated call that may fail) rather than refusing a deployment that works.
 
-    Two older callers still decide on the url alone -- ``client.resolve_project_id`` and the
-    interactive branch of ``cli.env_setup`` -- so they refuse a configured backend this would
-    accept. Routing them through here is a behaviour change to paths this helper was not added
-    for, so it is deliberately left as follow-up rather than folded in silently.
+    ``client.resolve_project_id`` and the interactive branch of ``cli.env_setup`` used to decide on
+    the url alone, which answered this question twice and more narrowly: they refused a configured
+    backend this accepts, and skipped the ownership check for one. Both now route through here, so
+    this is the single classifier.
 
     Takes a plain ``str`` because ``load_credentials`` falls back to ``DEFAULT_API_URL`` and so
     never yields ``None``; accepting an optional here would invent a state no caller can reach.
