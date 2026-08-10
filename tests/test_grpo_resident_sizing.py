@@ -259,7 +259,7 @@ def _worker_runtime_for(algorithm: str) -> dict[str, str] | None:
     if algorithm != "opd":
         return None
     return {
-        "FLASH_CONTROL_PANEL_URL": "https://broker.example",
+        "FLASH_PUBLIC_URL": "https://broker.example",
         "FLASH_TEACHER_CAPABILITY": "capability-test-value",
     }
 

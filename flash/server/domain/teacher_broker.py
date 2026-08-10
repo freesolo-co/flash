@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from flash._internal.fileio import reject_duplicate_keys
-from flash.core.spec import CONTROL_PANEL_URL_ENV, TEACHER_CAPABILITY_ENV, JobSpec
+from flash.core.spec import PUBLIC_URL_ENV, TEACHER_CAPABILITY_ENV, JobSpec
 from flash.engine.plan.recipe import RECIPE, resolve_teacher
 from flash.server.platform import db
 from flash.teacher.limits import (
@@ -85,9 +85,21 @@ class ProviderResponse:
     output_tokens: int
 
 
-def validate_control_panel_url(value: str) -> str:
+def validate_public_url(value: str) -> str:
     url = str(value or "").strip().rstrip("/")
     parsed = urllib.parse.urlsplit(url)
+    # urlsplit defers port parsing to attribute access, so a malformed, out-of-range, or zero port
+    # still yields a hostname and would pass every check below. force it here, because the worker
+    # reads parsed.port when it opens the broker connection: an unparseable one raises there, after
+    # the gpu is already allocated, and a zero one is in range but falsy, so the `parsed.port or
+    # 443` at engine/worker/teacher/client.py silently dials 443 instead of the configured port.
+    invalid_port = f"{PUBLIC_URL_ENV} must be a worker-reachable https URL with a valid port"
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise RuntimeError(invalid_port) from error
+    if port == 0:
+        raise RuntimeError(invalid_port)
     if (
         parsed.scheme != "https"
         or not parsed.hostname
@@ -97,10 +109,25 @@ def validate_control_panel_url(value: str) -> str:
         or parsed.fragment
     ):
         raise RuntimeError(
-            f"{CONTROL_PANEL_URL_ENV} must be a worker-reachable https URL without credentials, "
+            f"{PUBLIC_URL_ENV} must be a worker-reachable https URL without credentials, "
             "query parameters, or a fragment"
         )
     return url
+
+
+def resolve_public_url() -> str:
+    """Resolve this plane's worker-reachable origin from the environment.
+
+    reads os.environ directly and does not fall back to the cli's FLASH_API_URL. the two are the
+    same string on a plane addressed publicly at the name its cli dials, but a self-hosted plane
+    reached over a tunnel, a vpn, or localhost has a client url no rented worker can resolve, and
+    falling back would turn that into a failure after the gpu is allocated instead of at submit.
+
+    validation constrains shape and port validity, not reachability, so an https://localhost origin
+    or a public origin belonging to a different plane still passes here and is caught only when the
+    worker fails to present its capability.
+    """
+    return validate_public_url(os.environ.get(PUBLIC_URL_ENV, ""))
 
 
 def require_teacher_broker_configuration(
@@ -111,7 +138,7 @@ def require_teacher_broker_configuration(
 ) -> str:
     if spec.algorithm != "opd":
         raise RuntimeError("teacher broker configuration is only valid for opd runs")
-    control_panel_url = validate_control_panel_url(os.environ.get(CONTROL_PANEL_URL_ENV, ""))
+    public_url = resolve_public_url()
     if not os.environ.get(PARASAIL_API_KEY_ENV, "").strip():
         raise RuntimeError(
             f"{PARASAIL_API_KEY_ENV} is required on the control plane for managed opd teachers"
@@ -129,7 +156,7 @@ def require_teacher_broker_configuration(
             raise RuntimeError(
                 "managed opd teacher capabilities are limited to a 24-hour run deadline"
             )
-    return control_panel_url
+    return public_url
 
 
 def capability_limits_for_spec(spec: JobSpec) -> dict[str, int]:
@@ -197,7 +224,7 @@ def issue_teacher_capability(
     now: float | None = None,
 ) -> tuple[str, str]:
     issued_at = time.time() if now is None else float(now)
-    control_panel_url = require_teacher_broker_configuration(
+    public_url = require_teacher_broker_configuration(
         spec,
         deadline_at=deadline_at,
         now=issued_at,
@@ -215,7 +242,7 @@ def issue_teacher_capability(
         limits=capability_limits_for_spec(spec),
         now=issued_at,
     )
-    return control_panel_url, token
+    return public_url, token
 
 
 @contextlib.contextmanager
@@ -228,14 +255,14 @@ def teacher_attempt_transport(
     if spec.algorithm != "opd":
         yield {}
         return
-    control_panel_url, capability = issue_teacher_capability(
+    public_url, capability = issue_teacher_capability(
         spec,
         attempt=attempt,
         deadline_at=deadline_at,
     )
     try:
         yield {
-            CONTROL_PANEL_URL_ENV: control_panel_url,
+            PUBLIC_URL_ENV: public_url,
             TEACHER_CAPABILITY_ENV: capability,
         }
     finally:
