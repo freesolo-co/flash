@@ -16,6 +16,7 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Any
 
+from flash._internal.fileio import reject_duplicate_keys
 from flash.core.spec import CONTROL_PANEL_URL_ENV, TEACHER_CAPABILITY_ENV, JobSpec
 from flash.engine.plan.recipe import RECIPE, resolve_teacher
 from flash.server.platform import db
@@ -241,13 +242,9 @@ def teacher_attempt_transport(
         db.revoke_teacher_capability(capability)
 
 
-def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    output: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in output:
-            raise TeacherBrokerError("duplicate_json_key", status_code=400)
-        output[key] = value
-    return output
+_reject_duplicate_keys = reject_duplicate_keys(
+    lambda _key: TeacherBrokerError("duplicate_json_key", status_code=400)
+)
 
 
 def _reject_nonfinite(_value: str) -> None:
@@ -265,7 +262,7 @@ def parse_strict_json(raw: bytes | bytearray) -> dict[str, Any]:
         )
     except TeacherBrokerError:
         raise
-    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+    except (TypeError, ValueError) as exc:
         raise TeacherBrokerError("invalid_json", status_code=400) from exc
     if not isinstance(value, dict):
         raise TeacherBrokerError("request_must_be_object", status_code=400)
@@ -483,7 +480,7 @@ def _validated_provider_response(
         )
     except TeacherBrokerError as exc:
         raise TeacherBrokerError("provider_contract_error", status_code=502) from exc
-    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+    except (TypeError, ValueError) as exc:
         raise TeacherBrokerError("provider_contract_error", status_code=502) from exc
     if not isinstance(value, dict) or score_items != 1:
         raise TeacherBrokerError("provider_contract_error", status_code=502)
@@ -634,7 +631,7 @@ def complete_teacher_request(
             status_code=exc.status_code,
             request_id=request_id,
         ) from exc
-    except (TimeoutError, OSError, http.client.HTTPException) as exc:
+    except (OSError, http.client.HTTPException) as exc:
         with contextlib.suppress(Exception):
             db.complete_teacher_request(
                 capability_id,

@@ -5120,9 +5120,16 @@ def test_both_ray_rollouts_honor_sleep_unsupported_from_the_same_catalog_flag():
     # flagged model declares algos including opd and the parse-time gate ADMITS it (routes to b200),
     # so a driver that ignores the flag wedges on wake. asserted across BOTH trainers because
     # one-trainer-only is precisely how the eager defect above reached production.
+    # each trainer renders its overrides in a separate module from where it resolves the flag, so
+    # both halves of this guard span two modules. keep these in step when a trainer is split again.
+    from flash.engine.worker.train.opd import overrides as opd_overrides
+    from flash.engine.worker.train.rl import verl_config as rl_verl_config
+
+    opd_source = inspect.getsource(opd_train) + inspect.getsource(opd_overrides)
+    rl_source = inspect.getsource(rl_train) + inspect.getsource(rl_verl_config)
     for module, source in (
-        ("rl_train", inspect.getsource(rl_train)),
-        ("opd_train", inspect.getsource(opd_train)),
+        ("rl_train", rl_source),
+        ("opd_train", opd_source),
     ):
         assert "rollout_resident_overrides(" in source, module
         assert "rollout_sleep_unsupported(" in source, module

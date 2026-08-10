@@ -129,23 +129,41 @@ def validate_glue_template(tokenizer, *, thinking: bool) -> None:
     )
 
 
-def _trim_trailing_stop(
-    tokenizer, response_ids: list[int], stop_text: str, stop_sequences: tuple[str, ...]
+def trim_trailing_stop(
+    tokenizer, response_ids, stop_text: str, stop_sequences
 ) -> tuple[list[int], str]:
+    """Drop a trailing stop delimiter from BOTH the sampled ids and the decoded text (token-level).
+
+    HF ``stop_strings`` halts only AFTER the delimiter text is emitted, so a run with e.g. ``[train]
+    stop_sequences=["</answer>"]`` would otherwise score/distil the delimiter the user asked to stop
+    at.
+    """
+    ids = [int(token_id) for token_id in response_ids]
+    # Pick the LONGEST configured stop that is a trailing match (the earliest stop boundary in the
+    # text). Overlapping delimiters like ["\n", "\n\n"] would otherwise trim only the first-listed
+    # shorter suffix off a "\n\n" tail, leaving one newline for the teacher to score/distil; taking
+    # the longest match removes the whole delimiter in one shot regardless of config order.
     stop = max(
         (value for value in stop_sequences if value and stop_text.endswith(value)),
         key=len,
         default="",
     )
-    ids = list(response_ids)
     if not stop:
         return ids, tokenizer.decode(ids, skip_special_tokens=True)
     keep_length = len(stop_text) - len(stop)
+    # Locate the kept prefix by scanning from the END on the SAME (special-tokens-included) decode
+    # keep_length is measured in, so a special-token delimiter's id(s) are dropped correctly. Scanning
+    # from the END is O(dropped * completion): the delimiter is short so only a handful of trailing
+    # tokens drop; decoding growing prefixes from the START would be O(completion^2).
     kept = len(ids)
     while kept > 0 and len(tokenizer.decode(ids[:kept], skip_special_tokens=False)) > keep_length:
         kept -= 1
-    ids = ids[:kept]
-    return ids, tokenizer.decode(ids, skip_special_tokens=True)
+    # Return the kept ids decoded WITHOUT special tokens -- the teacher/alignment text. Decoding the
+    # kept ids (not slicing stop_text at keep_length) keeps the teacher-scored text and the student
+    # ids identical even when the stop starts INSIDE the final sampled token (that token decodes to
+    # e.g. "B</answer>"): the whole token is excluded from `kept`, so the fused "B" is dropped rather
+    # than left dangling to desync the loss alignment / token count.
+    return ids[:kept], tokenizer.decode(ids[:kept], skip_special_tokens=True)
 
 
 def prepare_assistant_turn(
@@ -185,7 +203,7 @@ def prepare_assistant_turn(
     # present (the label prefers eos, but the bridge's eos validation requires the trimmed span
     # to match; leaving the stop text in place desyncs response_ids from raw_response_ids).
     if terminated and ended_by_stop and not ended_by_eos:
-        response_ids, completion_text = _trim_trailing_stop(
+        response_ids, completion_text = trim_trailing_stop(
             tokenizer, response_ids, stop_text, stop_sequences
         )
     if not terminated:

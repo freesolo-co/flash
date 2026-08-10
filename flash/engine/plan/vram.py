@@ -50,13 +50,6 @@ def sft_grad_accum(
     return per_device, grad_accum
 
 
-_KV_COEF = 2.0
-_KV_CAP = 8.0
-_KV_BLOCK_TOKENS = 16
-# vllm profile, graph, scheduler, and allocator costs beyond raw cache tensors. the 8 gb measured
-# floor remains authoritative at short context; longer contexts retain 1.5 gb plus 25% fragmentation.
-_KV_PROFILE_OVERHEAD_GB = 1.5
-_KV_FRAGMENTATION_MARGIN = 1.25
 # adapter bytes per trainable parameter: 16 for SFT/OPD AdamW, about 10 for paged GRPO.
 # SFT uses AdamW because bitsandbytes fails on FSDP2 DTensors; OPD inherits it. GRPO's known
 # undercount cannot change alone because its resident-peak model is calibrated at the B200 ceiling.
@@ -161,172 +154,6 @@ def _lora_memory_gb(
     )
     exact = trainable_params * bytes_per_param / 1e9
     return max(floor, exact)
-
-
-def _round_up(value: int, multiple: int) -> int:
-    return max(multiple, math.ceil(max(1, value) / multiple) * multiple)
-
-
-def _architecture_kv_raw_gb(
-    model_info,
-    vllm_max_len: int,
-    num_generations: int,
-    fp8_kv: bool,
-) -> float | None:
-    """Raw per-layer attention KV plus recurrent-state pages from catalog geometry."""
-    attention_layers = int(getattr(model_info, "num_attention_layers", 0) or 0)
-    kv_heads = int(getattr(model_info, "num_key_value_heads", 0) or 0)
-    head_dim = int(getattr(model_info, "head_dim", 0) or 0)
-    if not (attention_layers and kv_heads and head_dim):
-        return None
-
-    sequences = max(1, int(num_generations))
-    seq_len = max(1, int(vllm_max_len))
-    kv_bytes = 1 if fp8_kv else 2
-    attention_bytes_per_token = 2 * kv_heads * head_dim * kv_bytes
-    attention_tokens = _round_up(seq_len, _KV_BLOCK_TOKENS)
-    total_bytes = attention_layers * sequences * attention_tokens * attention_bytes_per_token
-
-    linear_layers = int(getattr(model_info, "num_linear_attention_layers", 0) or 0)
-    if linear_layers:
-        key_heads = int(getattr(model_info, "linear_num_key_heads", 0) or 0)
-        value_heads = int(getattr(model_info, "linear_num_value_heads", 0) or 0)
-        key_dim = int(getattr(model_info, "linear_key_head_dim", 0) or 0)
-        value_dim = int(getattr(model_info, "linear_value_head_dim", 0) or 0)
-        conv_kernel = int(getattr(model_info, "linear_conv_kernel_dim", 0) or 0)
-        if not all((key_heads, value_heads, key_dim, value_dim, conv_kernel)):
-            # linear-attention dims are absent from the catalog: we can't size the recurrent/conv
-            # state, but the standard attention KV already accumulated in total_bytes is a better
-            # (if partial) estimate than the params-only legacy heuristic. The caller floors this
-            # partial value with legacy so a hybrid model is never under-sized below the heuristic.
-            return total_bytes / 1e9
-        # vllm stores qwen gated-deltanet recurrent and convolution state in bf16 pages.
-        state_elements = value_heads * key_dim * value_dim
-        state_elements += (key_heads * key_dim + value_heads * value_dim) * conv_kernel
-        state_bytes = state_elements * 2
-        state_block_tokens = _round_up(
-            math.ceil(state_bytes / attention_bytes_per_token), _KV_BLOCK_TOKENS
-        )
-        catalog_block = int(getattr(model_info, "mamba_block_size", 0) or 0)
-        if fp8_kv and catalog_block:
-            state_block_tokens = max(state_block_tokens, catalog_block)
-        state_pages = math.ceil(seq_len / state_block_tokens)
-        total_bytes += linear_layers * sequences * state_pages * state_bytes
-
-    return total_bytes / 1e9
-
-
-def _resident_kv_gb(
-    params_b: float | None,
-    vllm_max_len: int,
-    num_generations: int = 8,
-    fp8_kv: bool = False,
-    model_info=None,
-    preserve_legacy_floor: bool = False,
-) -> float:
-    """Profiled vLLM cache budget from architecture, with measured conservative floors."""
-    width = math.sqrt(max(float(params_b or 1.0), 0.1))
-    legacy = _KV_COEF * (max(1, vllm_max_len) / 1024.0) * width
-    legacy *= max(1, num_generations) / 8.0
-    if fp8_kv:
-        legacy *= 0.5
-
-    raw = _architecture_kv_raw_gb(model_info, vllm_max_len, num_generations, fp8_kv)
-    if raw is None:
-        return legacy
-    profiled = max(_KV_CAP, _KV_PROFILE_OVERHEAD_GB + raw * _KV_FRAGMENTATION_MARGIN)
-    # opd startup tiers and the resident-only 35b boundary are live-calibrated. retain their old
-    # conservative pool until the architecture equation is validated on those exact gpu paths.
-    # a hybrid model whose linear-attention dims are absent yields a PARTIAL estimate (attention KV
-    # only); floor it with legacy so the dropped recurrent/conv state can't under-size it.
-    _declares_linear = int(getattr(model_info, "num_linear_attention_layers", 0) or 0) > 0
-    _linear_dims_known = all(
-        int(getattr(model_info, _f, 0) or 0)
-        for _f in (
-            "linear_num_key_heads",
-            "linear_num_value_heads",
-            "linear_key_head_dim",
-            "linear_value_head_dim",
-            "linear_conv_kernel_dim",
-        )
-    )
-    if (
-        preserve_legacy_floor
-        or getattr(model_info, "sleep_unsupported", False)
-        or (_declares_linear and not _linear_dims_known)
-    ):
-        profiled = max(profiled, legacy)
-    return profiled
-
-
-def _colocate_util_cap(weights_gb: float, total_vram_gb: float) -> float:
-    """Utilization ceiling for the colocated vLLM executor budget.
-
-    0.45 everywhere the blanket cap was tuned; lifted to 0.55 only when the executor carries a BIG
-    weight copy (>=60 GB) AND the card leaves the trainer's resident copy room alongside the lifted
-    budget (0.45*total - weights >= ~10 GB). See colocate_kv_util for the measured rationale."""
-    big_weight_copy = weights_gb >= 60
-    leaves_room_for_trainer_copy = (0.45 * total_vram_gb - weights_gb) >= 10.0
-    return 0.55 if (big_weight_copy and leaves_room_for_trainer_copy) else 0.45
-
-
-def colocate_kv_util(
-    params_b: float | None,
-    vllm_max_len: int,
-    total_vram_gb: float,
-    sleep_mode: bool,
-    num_generations: int = 8,
-    active_params_b: float | None = None,
-    fp8_kv: bool = False,
-    model_info=None,
-    preserve_legacy_floor: bool = False,
-) -> float:
-    """vllm_gpu_memory_utilization for the colocated GRPO rollout engine.
-
-    Budget vLLM's weight copy plus KV cache. Catalog models use geometry with measured overhead
-    and an 8 GB floor; uncataloged models retain the conservative legacy equation.
-    """
-    weights_gb = (
-        max(0.5, float(params_b or 1.0)) * 2.0
-    )  # vLLM's bf16 weight copy lives in the budget
-    # catalog geometry is authoritative. active params remain only for the uncataloged fallback, while
-    # the weight copy always uses total parameters.
-    kv_params_b = float(active_params_b) if active_params_b else params_b
-    # 0.45 starves KV for >=60 GB colocated weight copies on cards with residual headroom.
-    # lift to 0.55 only when `0.45 * total_vram_gb - weight_copy_gb >= 10`; this admits B200
-    # but not H200. `_NvidiaSmiPeakSampler` verifies runtime headroom.
-    _util_cap = _colocate_util_cap(weights_gb, total_vram_gb)
-    if not sleep_mode:
-        # `gpu_memory_utilization` covers weights plus KV, so budget both. scale KV with
-        # context and group, floor at `_KV_CAP`, and keep the 0.45 cap aligned with
-        # `estimate_vram_gb(..., sleep_offload=False)`.
-        kv_gb = max(
-            _KV_CAP,
-            _resident_kv_gb(
-                kv_params_b,
-                vllm_max_len,
-                num_generations,
-                fp8_kv=fp8_kv,
-                model_info=model_info,
-                preserve_legacy_floor=preserve_legacy_floor,
-            ),
-        )
-        return max(0.10, min(_util_cap, (weights_gb + kv_gb) / max(1.0, total_vram_gb)))
-    # Sleep mode keeps a larger pool (1.5x margin): the engine is offloaded during the backward, so a
-    # bigger rollout-phase KV does not compete with the training peak.
-    kv_pool_gb = max(
-        _KV_CAP,
-        1.5
-        * _resident_kv_gb(
-            kv_params_b,
-            vllm_max_len,
-            num_generations,
-            fp8_kv=fp8_kv,
-            model_info=model_info,
-            preserve_legacy_floor=preserve_legacy_floor,
-        ),
-    )
-    return min(_util_cap, (weights_gb + kv_pool_gb) / max(1.0, total_vram_gb))
 
 
 _TRAIN_COEF = 0.27
@@ -1060,3 +887,20 @@ def resolve_params_b(model_id: str, revision: str = "") -> float | None:
         params_b, _vocab = _validated_revision_geometry(model_id, revision, info)
         return params_b
     return info.params_b or None
+
+
+# The KV-cache sizing helpers and the tuning constants they read live in
+# `flash.engine.plan.kv_sizing`. Re-exported here because the fit estimators above read the
+# constants too and `from flash.engine.plan.vram import colocate_kv_util` must keep working.
+# The import sits at the bottom because those estimators are defined before this point.
+from flash.engine.plan.kv_sizing import (  # noqa: E402,F401
+    _KV_BLOCK_TOKENS,
+    _KV_CAP,
+    _KV_COEF,
+    _KV_FRAGMENTATION_MARGIN,
+    _KV_PROFILE_OVERHEAD_GB,
+    _architecture_kv_raw_gb,
+    _colocate_util_cap,
+    _resident_kv_gb,
+    colocate_kv_util,
+)

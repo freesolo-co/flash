@@ -240,7 +240,8 @@ def _github_token() -> str | None:
     return (os.environ.get("GITHUB_TOKEN") or "").strip() or None
 
 
-def _is_commit_sha(value: str) -> bool:
+def is_commit_sha(value: str) -> bool:
+    """True when value is a full 40-hex-char git commit id (an immutable ref)."""
     return _COMMIT_SHA_RE.fullmatch(value) is not None
 
 
@@ -252,9 +253,9 @@ def _resolve_ref_sha(
     max_rate_limit_retries: int = 5,
 ) -> str:
     # Control plane pins sha once; workers skip GitHub entirely on a fan-out.
-    if pinned_sha and _is_commit_sha(pinned_sha):
+    if pinned_sha and is_commit_sha(pinned_sha):
         return pinned_sha
-    if _is_commit_sha(parsed.ref):
+    if is_commit_sha(parsed.ref):
         return parsed.ref
     # Symbolic refs are NOT cached in-process: managed slugs point at environment-hub@main which moves.
     headers = _github_headers("application/vnd.github+json")
@@ -268,7 +269,7 @@ def _resolve_ref_sha(
             f"Failed to resolve GitHub environment ref {parsed.canonical()}: invalid response"
         ) from exc
     sha = payload.get("sha")
-    if not isinstance(sha, str) or not _is_commit_sha(sha):
+    if not isinstance(sha, str) or not is_commit_sha(sha):
         raise RuntimeError(f"Failed to resolve GitHub environment ref {parsed.canonical()}")
     return sha
 

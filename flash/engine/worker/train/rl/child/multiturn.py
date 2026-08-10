@@ -68,13 +68,13 @@ def post_json(url: str, path: str, payload: dict) -> dict:
         raise RuntimeError(
             f"flash multi-turn bridge returned HTTP {error.code} for {path}"
         ) from error
-    except (OSError, TimeoutError, urllib.error.URLError, http.client.HTTPException) as error:
+    except (OSError, http.client.HTTPException) as error:
         raise RuntimeError(
             f"flash multi-turn bridge transport failed on {path}: {type(error).__name__}"
         ) from error
     try:
         return json.loads(body.decode("utf-8"))
-    except (TypeError, ValueError, UnicodeDecodeError) as error:
+    except (TypeError, ValueError) as error:
         raise RuntimeError(f"flash multi-turn bridge returned malformed json for {path}") from error
 
 
