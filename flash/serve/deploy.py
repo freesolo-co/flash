@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import atexit
 import contextlib
-import json
 import math
 import os
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from urllib.parse import quote
 
@@ -17,10 +16,15 @@ import httpx
 
 from flash._internal.channel import CHANNEL
 from flash._internal.logging import get_logger
-from flash.adapters.artifacts import ADAPTER_WEIGHT_FILES
-from flash.adapters.lora_rank import rank_from_adapter_config
 from flash.content.structured_outputs import parse_structured_outputs
 from flash.schema import format_adapter_revision
+from flash.serve.errors import (  # noqa: F401 -- re-exported: callers import these from here
+    ActivationOutcomeUnknown,
+    AdapterConfigMissing,
+    AdapterTensorMissing,
+    RetryableServingUnavailable,
+    ServingError,
+)
 from flash.serve.urls import is_freesolo_hosted_url, openai_base_url, serving_control_url
 
 logger = get_logger(__name__)
@@ -54,83 +58,6 @@ _HTTP_CLIENT: httpx.Client | None = None
 _CHAT_HTTP_CLIENT: httpx.Client | None = None
 _STREAM_HTTP_CLIENT: httpx.Client | None = None
 _HTTP_CLIENT_LOCK = threading.Lock()
-
-
-class ServingError(RuntimeError):
-    """Serving backend rejected a request or was unreachable; carries the upstream status."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        status_code: int | None = None,
-        retry_after: str | None = None,
-    ):
-        super().__init__(message)
-        self.status_code = status_code
-        self.retry_after = retry_after
-
-
-class ActivationOutcomeUnknown(ServingError):
-    """Alias activation cannot be resolved to the attempted or previous revision."""
-
-    def __init__(self, run_id: str, attempted_revision: str, *, detail: str | None = None):
-        reason = detail or "authoritative alias readback failed"
-        super().__init__(
-            "alias_activation_unknown: serving may have activated "
-            f"{attempted_revision} for {run_id}, but {reason}; retry deployment reconciliation "
-            "before treating either revision as authoritative"
-        )
-        self.run_id = run_id
-        self.attempted_revision = attempted_revision
-
-
-class RetryableServingUnavailable(ServingError):
-    """a recognized serving cold-start envelope that may be retried within a caller deadline."""
-
-    def __init__(self, code: str, retry_after_seconds: float):
-        super().__init__(
-            f"serving_retryable_unavailable: {code}",
-            status_code=503,
-        )
-        self.code = code
-        self.retry_after_seconds = retry_after_seconds
-
-
-class AdapterConfigMissing(ServingError):
-    """The adapter's adapter_config.json could not be read from HF (artifact likely absent)."""
-
-
-class AdapterTensorMissing(ServingError):
-    """The adapter artifact has metadata but no loadable LoRA tensor file."""
-
-
-def _is_adapter_tensor_filename(filename: str) -> bool:
-    name = filename.rsplit("/", 1)[-1]
-    if name in ADAPTER_WEIGHT_FILES:
-        return True
-    return name.startswith("adapter_model-") and name.endswith((".safetensors", ".bin"))
-
-
-def _is_hf_not_found_error(exc: Exception) -> bool:
-    try:
-        import huggingface_hub.errors as hf_errors  # type: ignore[import-not-found]
-
-        not_found_types = tuple(
-            cls
-            for name in (
-                "EntryNotFoundError",
-                "LocalEntryNotFoundError",
-                "RepositoryNotFoundError",
-                "RevisionNotFoundError",
-            )
-            if isinstance((cls := getattr(hf_errors, name, None)), type)
-        )
-        if not_found_types and isinstance(exc, not_found_types):
-            return True
-    except Exception:
-        pass
-    return getattr(getattr(exc, "response", None), "status_code", None) == 404
 
 
 def _http_client() -> httpx.Client:
@@ -335,110 +262,6 @@ def deployment_record(
         openai_base_url=openai_url,
         state=state,
     )
-
-
-def validate_serving_lora_rank(model: str, lora_rank: int, *, rank_source: str = "adapter") -> None:
-    """Fail before registration when a trained adapter rank exceeds serving capacity."""
-    from flash.core.catalog import serving_lora_rank_cap
-
-    max_lora_rank = serving_lora_rank_cap(model)
-    if max_lora_rank is None:
-        return
-    if int(lora_rank) > max_lora_rank:
-        raise ValueError(
-            f"{model} serving supports max_lora_rank={max_lora_rank}; "
-            f"{rank_source} has rank {int(lora_rank)} and cannot be deployed"
-        )
-
-
-def _verify_adapter_artifact_tensors(hf_repo: str, subfolder: str, *, hf_revision: str) -> None:
-    """Confirm the adapter has tensor weights before registering it with serving."""
-    try:
-        from huggingface_hub import HfApi
-    except ImportError as exc:  # pragma: no cover - package extra is present in supported installs
-        raise ServingError(
-            "could not verify adapter tensors: huggingface_hub is not installed"
-        ) from exc
-    try:
-        entries = list(
-            HfApi().list_repo_tree(
-                repo_id=hf_repo,
-                path_in_repo=subfolder.rstrip("/"),
-                repo_type="dataset",
-                recursive=False,
-                revision=hf_revision,
-                token=os.environ.get("HF_TOKEN"),
-            )
-        )
-    except Exception as exc:
-        message = f"could not verify adapter tensors: failed to list {hf_repo}:{subfolder}"
-        if _is_hf_not_found_error(exc):
-            raise AdapterTensorMissing(message) from exc
-        raise ServingError(message) from exc
-
-    tensor_paths: list[str] = []
-    zero_byte_tensor_paths: list[str] = []
-    for entry in entries:
-        path = str(getattr(entry, "path", "") or "")
-        if not _is_adapter_tensor_filename(path):
-            continue
-        tensor_paths.append(path)
-        size = getattr(entry, "size", None)
-        try:
-            if size is not None and int(size) <= 0:
-                zero_byte_tensor_paths.append(path)
-                continue
-        except (TypeError, ValueError):
-            pass
-
-    location = f"{hf_repo}:{subfolder}"
-    if zero_byte_tensor_paths:
-        raise AdapterTensorMissing(
-            f"could not verify adapter tensors: {location} has zero-byte adapter tensor "
-            f"file(s): {', '.join(zero_byte_tensor_paths)}"
-        )
-    if tensor_paths:
-        return
-    raise AdapterTensorMissing(
-        f"could not verify adapter tensors: {location} has no adapter_model tensor file"
-    )
-
-
-def adapter_artifact_lora_rank(hf_repo: str, subfolder: str, *, hf_revision: str) -> int:
-    """Read rank metadata and verify the adapter has tensor weights."""
-    filename = f"{subfolder.rstrip('/')}/adapter_config.json"
-    try:
-        from huggingface_hub import hf_hub_download
-    except ImportError as exc:  # pragma: no cover - package extra is present in supported installs
-        raise ServingError(
-            "could not verify adapter rank: huggingface_hub is not installed"
-        ) from exc
-    try:
-        local = hf_hub_download(
-            repo_id=hf_repo,
-            filename=filename,
-            repo_type="dataset",
-            revision=hf_revision,
-            token=os.environ.get("HF_TOKEN"),
-        )
-    except Exception as exc:
-        message = f"could not verify adapter rank: failed to read {hf_repo}:{filename}"
-        if _is_hf_not_found_error(exc):
-            raise AdapterConfigMissing(message) from exc
-        raise ServingError(message) from exc
-    try:
-        with open(local, encoding="utf-8") as f:
-            config = json.load(f)
-    except Exception as exc:
-        raise ValueError(
-            f"could not verify adapter rank: invalid JSON in {hf_repo}:{filename}"
-        ) from exc
-    if not isinstance(config, dict):
-        raise ValueError(
-            f"could not verify adapter rank: {hf_repo}:{filename} is not a JSON object"
-        )
-    _verify_adapter_artifact_tensors(hf_repo, subfolder, hf_revision=hf_revision)
-    return rank_from_adapter_config(config, source=f"{hf_repo}:{filename}")
 
 
 def deploy_adapter(
@@ -937,141 +760,6 @@ def _retryable_smoke_unavailable(
     return RetryableServingUnavailable(str(code), retry_after_seconds)
 
 
-_TAG_CLOSE = "</think>"
-_TAG_OPEN = "<think>"
-
-
-def _inline_reasoning_block(content: str) -> tuple[int, int] | None:
-    """Span of a balanced ``<think>...</think>`` in ``content``, or ``None``.
-
-    Order matters: an answer may contain the literal ``<think>`` (a ``choice`` constraint, or JSON
-    quoting it), so the close must be found after the open rather than anywhere in the string.
-    """
-    opened = content.find(_TAG_OPEN)
-    if opened < 0:
-        return None
-    closed = content.find(_TAG_CLOSE, opened + len(_TAG_OPEN))
-    if closed < 0:
-        return None
-    return opened, closed
-
-
-def _is_sampled_delimiter(prefix: str, reasoning: str) -> bool:
-    """Whether the text before an inline ``</think>`` marks it as the block's own close.
-
-    Two shapes prove it: nothing before it (the opener went into the prompt), or text duplicating
-    ``reasoning_content`` (a compatibility build emitting the reasoning both inline and on the
-    field), with or without its own opener. Any other prefix is answer text mentioning the tag.
-
-    Compared stripped, since the model often samples the delimiter on its own line.
-    """
-    body = prefix.strip()
-    if body.startswith(_TAG_OPEN):
-        # an explicit opener means a whole block precedes the close, so it is the repeat only if
-        # its body is the reasoning. an empty body is the answer's own pair, not the delimiter.
-        return body[len(_TAG_OPEN) :].strip() == reasoning.strip()
-    return body in ("", reasoning.strip())
-
-
-def _find_delimiter(buffer: str, start: int) -> int:
-    """Index of the sampled close tag at or after ``start``, or ``-1``.
-
-    A named seam for one `str.find`, so the streamed hold path can be measured for scan cost
-    without instrumenting the buffer (deltas are coerced with `str()` before being appended).
-    """
-    return buffer.find(_TAG_CLOSE, start)
-
-
-def _retained_delimiter_end(content: str, close: int, reasoning: str) -> int | None:
-    """Index just past a retained sampled ``</think>``, or ``None`` if it is the answer itself.
-
-    A compatibility build's retained delimiter and an answer that IS the delimiter are identical on
-    the wire, so no prefix test separates them. What does is whether stripping leaves anything: a
-    retained delimiter is followed by the answer, an answer that is the tag by nothing.
-    """
-    if not _is_sampled_delimiter(content[:close], reasoning):
-        return None
-    end = close + len(_TAG_CLOSE)
-    if content[end:].strip():
-        return end
-    return None
-
-
-def _duplicates_reasoning(content: str, inline: tuple[int, int], reasoning: str) -> bool:
-    """Whether this inline pair is ``reasoning_content`` emitted a second time inline.
-
-    A compatibility build repeats the reasoning where a reasoning phase belongs, ahead of the
-    answer, so a pair appearing after answer text is the answer quoting the tag instead. Bodies are
-    compared stripped, since the repeat tends to carry the newline the model sampled after it.
-    """
-    opened, closed = inline
-    if content[:opened].strip():
-        return False
-    return content[opened + len(_TAG_OPEN) : closed].strip() == reasoning.strip()
-
-
-def _balanced_thinking_content(message: dict, *, thinking: bool) -> str:
-    """Fold a split-out ``reasoning_content`` back into a balanced ``<think>...</think>`` block.
-
-    Thinking templates put the opener in the prompt, so reopen split reasoning for content-only
-    consumers. Only do this when the request's ``thinking`` flag is set.
-    """
-    content = str(message.get("content") or "")
-    if not thinking:
-        return content
-    reasoning = message.get("reasoning_content")
-    inline = _inline_reasoning_block(content)
-    if not isinstance(reasoning, str):
-        # tested by type, not falsiness: an explicitly empty string means the model closed its
-        # block immediately, which still needs a pair, while absent means serving never split.
-        close = content.find(_TAG_CLOSE)
-        # the pair must be the one that matched the FIRST close, not merely present somewhere:
-        # an unmatched close followed by an answer-side pair still needs re-opening.
-        if inline is not None and inline[1] == close:
-            return content
-        # a legacy build predating the split leaves `reasoned</think>answer` inline with no field.
-        # with nothing to contradict it, an unbalanced close can only be the sampled delimiter.
-        if close >= 0:
-            return f"{_TAG_OPEN}{content[:close]}{_TAG_CLOSE}{content[close + len(_TAG_CLOSE) :]}"
-        # no close either: a plain answer. leave it rather than inventing a block around it.
-        return content
-    if inline is not None:
-        if _duplicates_reasoning(content, inline, reasoning):
-            return content
-        opened, _ = inline
-        close = content.find(_TAG_CLOSE)
-        if close >= 0 and close < opened and _is_sampled_delimiter(content[:close], reasoning):
-            # the retained close precedes the pair, so the pair belongs to the answer and this
-            # close is the block's own. strip it and keep the answer whole.
-            return f"{_TAG_OPEN}{reasoning}{_TAG_CLOSE}{content[close + len(_TAG_CLOSE) :]}"
-        # a different pair: the answer itself contains a literal block. fold, so the reasoning
-        # survives and the answer stays intact behind the delimiter.
-        return f"{_TAG_OPEN}{reasoning}{_TAG_CLOSE}{content}"
-    close = content.find(_TAG_CLOSE)
-    if _is_terminal_reasoning_repeat(content, reasoning):
-        # the repeat with nothing behind it, so there is no answer to keep. appending it would
-        # hand the smoke `why</think>` as an answer and activate a deployment that answered
-        # nothing; folding to the block alone lets the smoke reject it. same failure direction
-        # the opener-carrying form already takes.
-        return f"{_TAG_OPEN}{reasoning}{_TAG_CLOSE}"
-    end = _retained_delimiter_end(content, close, reasoning) if close >= 0 else None
-    if end is not None:
-        return f"{_TAG_OPEN}{reasoning}{_TAG_CLOSE}{content[end:]}"
-    # an empty reasoning string reaches here and still gets a pair: a thinking consumer splits the
-    # answer on `</think>`, so a bare answer would read as no answer at all.
-    return f"{_TAG_OPEN}{reasoning}{_TAG_CLOSE}{content}"
-
-
-def _balance_thinking_payload(payload: object, *, thinking: bool) -> None:
-    """Rewrite each choice's ``content`` in place so the returned payload is balanced."""
-    if not isinstance(payload, dict):
-        return
-    for choice in payload.get("choices") or []:
-        message = choice.get("message") if isinstance(choice, dict) else None
-        if isinstance(message, dict):
-            message["content"] = _balanced_thinking_content(message, thinking=thinking)
-
-
 def chat(
     run_id: str,
     messages: list[dict],
@@ -1129,252 +817,39 @@ def chat(
         return payload
 
 
-def _delimiter_may_complete(text: str, reasoning: str) -> bool:
-    """Whether ``text`` holds too little to rule out a sampled delimiter still arriving.
+# Adapter artifact validation lives in `flash.serve.adapter_check`, which imports the exception
+# types above. Re-exported so `deploy_adapter` and the serving tests keep resolving them here.
+from flash.serve.adapter_check import (  # noqa: E402,F401
+    _is_adapter_tensor_filename,
+    _is_hf_not_found_error,
+    _verify_adapter_artifact_tensors,
+    adapter_artifact_lora_rank,
+    validate_serving_lora_rank,
+)
 
-    The delimiter has two shapes on the wire (the bare tag, and the tag behind a repeat of
-    ``reasoning_content``) and a backend may split either anywhere, so the question is not "is this
-    the tag" but "could this still become one".
-    """
-    stripped = text.strip()
-    if _TAG_CLOSE.startswith(stripped) or _TAG_OPEN.startswith(stripped):
-        # a strict prefix of either tag, including the empty buffer.
-        return True
-    if stripped.startswith(_TAG_OPEN):
-        # past the repeat's opener, so what remains is judged as the bare repeat is, below.
-        stripped = stripped[len(_TAG_OPEN) :].strip()
-    body = reasoning.strip()
-    # an empty reasoning body is repeated as `<think></think>`, leaving nothing to match past the
-    # opener, so what remains is tested against the close tag directly.
-    if not body:
-        return _TAG_CLOSE.startswith(stripped)
-    if not body.startswith(stripped[: len(body)]):
-        return False
-    # the repeat is still arriving, or it landed whole and the tag behind it has not.
-    return _TAG_CLOSE.startswith(stripped[len(body) :].strip())
+# `chat_stream` and its SSE decoder live in `flash.serve.streaming`, which imports the client
+# helpers above. Re-exported so `from flash.serve.deploy import chat_stream` (flash.server.app,
+# and the CLI through the client) keeps resolving.
+from flash.serve.streaming import (  # noqa: E402,F401
+    _openai_stream_content,
+    chat_stream,
+)
 
-
-def _strip_retained_close(text: str, reasoning: str, start: int = 0) -> tuple[str | None, int]:
-    """Drop a retained sampled ``</think>`` from the head of the post-reasoning content.
-
-    Return ``None`` while a split delimiter may still be arriving. Resume from ``start`` to avoid
-    rescanning the growing buffer; end-of-stream distinguishes a delayed answer from the tag itself.
-    """
-    close = _find_delimiter(text, start)
-    if close >= 0:
-        end = _retained_delimiter_end(text, close, reasoning)
-        if end is not None:
-            return text[end:], close
-        if _is_sampled_delimiter(text[:close], reasoning):
-            return None, close
-        # answer text that merely mentions the tag, so it stays put.
-        return text, close
-    # nothing before the last few characters can still become a tag.
-    clean = max(0, len(text) - (len(_TAG_CLOSE) - 1))
-    if _delimiter_may_complete(text, reasoning):
-        return None, clean
-    return text, clean
-
-
-def _is_only_retained_delimiter(text: str, reasoning: str) -> bool:
-    """Whether a settled buffer holds the block's own retained close and nothing else.
-
-    Asked once no further content can join the buffer, which is the point at which the ambiguity
-    `_strip_retained_close` buffers on becomes decidable.
-    """
-    close = text.find(_TAG_CLOSE)
-    if close < 0 or not _is_sampled_delimiter(text[:close], reasoning):
-        return False
-    return not text[close + len(_TAG_CLOSE) :].strip()
-
-
-def _is_terminal_reasoning_repeat(text: str, reasoning: str) -> bool:
-    """Whether ``text`` is the reasoning repeated inline with nothing behind its close.
-
-    Narrower than `_is_only_retained_delimiter` in requiring text before the close, with or
-    without an opener: a delimiter with nothing at all ahead of it is the answer that IS the tag,
-    and a checkpoint answering its grammar that way must still reach the smoke.
-    """
-    close = text.find(_TAG_CLOSE)
-    if close < 0 or not text[:close].strip():
-        return False
-    return _is_only_retained_delimiter(text, reasoning)
-
-
-def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[str]:
-    # reasoning arrives on its own delta field (see _balanced_thinking_content). re-open the block
-    # around it and close it at the answer boundary, so the streamed text matches the balanced
-    # string the non-streaming path returns.
-    reasoning_open = False
-    # whether a block was ever emitted, which is not the same as whether one is open now: a backend
-    # serializing `reasoning_content: ""` on every delta must not open a second block.
-    reasoning_done = False
-    # buffered content after the block closed, while a retained delimiter may still be arriving.
-    closing: str | None = None
-    # how far into `closing` the delimiter search has already looked.
-    closing_scanned = 0
-    # what arrived on the reasoning field, kept because a compatibility build repeats it inline
-    # ahead of the retained close, and recognising that repeat is how the block's own delimiter is
-    # told from answer text that merely mentions the tag.
-    reasoning_text = ""
-    # legacy inline-thinking streams begin mid-block because the opener is in the prompt; hold until
-    # </think> proves the phase, unless non-thinking mode or a reasoning delta proves split output.
-    # preserve original delta boundaries while maintaining a joined string for linear-time search.
-    held: list[str] | None = [] if thinking else None
-    # `held` joined, kept in step with it. never bound to a second name while being appended to,
-    # since that blocks the in-place concatenation and restores the copy this avoids.
-    held_text = ""
-    # how far into `held_text` the delimiter search has already looked.
-    held_scanned = 0
-    for line in lines:
-        line = line.strip()
-        if not line.startswith("data:"):
-            continue
-        data = line.removeprefix("data:").strip()
-        if data == "[DONE]":
-            break
-        if not data:
-            continue
-        chunk = json.loads(data)
-        for choice in chunk.get("choices") or []:
-            delta = (choice.get("delta") or {}) if isinstance(choice, dict) else {}
-            raw_reasoning = delta.get("reasoning_content")
-            # `thinking` gates this as it gates `_balanced_thinking_content`, and for the same
-            # reason: this path also backs the public chat route. tested by type, not falsiness --
-            # a model that closed its reasoning immediately streams `reasoning_content: ""`, which
-            # still needs a pair.
-            if thinking and isinstance(raw_reasoning, str):
-                if held:
-                    # the backend splits after all, so whatever arrived first was answer text and
-                    # not an unopened block. release it untouched, delta by delta as it arrived.
-                    yield from held
-                held = None
-                held_text = ""
-                # an empty field after the block closed cannot reopen it: it carries no text to
-                # label. a non-empty one still opens a block, or its reasoning streams as answer.
-                if not reasoning_open and not (reasoning_done and not raw_reasoning):
-                    if closing is not None:
-                        # a new block opens here, so no further content can join the buffer and it
-                        # is decidable now, exactly as at end of stream.
-                        settled = (
-                            "" if _is_only_retained_delimiter(closing, reasoning_text) else closing
-                        )
-                        closing = None
-                        if settled:
-                            yield settled
-                    reasoning_open = True
-                    # the text belongs to the block that is opening, not to every block so far.
-                    # accumulating across blocks made the duplicate checks below compare a later
-                    # block's retained close against both blocks' text, so they stopped recognising
-                    # it and streamed the delimiter a second time.
-                    reasoning_text = ""
-                    yield _TAG_OPEN
-                if raw_reasoning:
-                    reasoning_text += raw_reasoning
-                    yield raw_reasoning
-            content = delta.get("content") or ""
-            if content:
-                content = str(content)
-                if reasoning_open:
-                    reasoning_open = False
-                    reasoning_done = True
-                    held = None
-                    yield _TAG_CLOSE
-                    closing = ""
-                    closing_scanned = 0
-                if closing is not None:
-                    closing += content
-                    answer, closing_scanned = _strip_retained_close(
-                        closing, reasoning_text, closing_scanned
-                    )
-                    if answer is None:
-                        # the tag may still be completing across deltas. keep buffering.
-                        continue
-                    closing = None
-                    if answer:
-                        yield answer
-                    continue
-                if held is not None:
-                    held.append(content)
-                    held_text += content
-                    # resume where the last scan stopped: rescanning the whole buffer per delta is
-                    # quadratic in the completion length, and token-sized deltas make that the
-                    # common case. only the last few characters can still be a partial tag.
-                    close = _find_delimiter(held_text, held_scanned)
-                    if close < 0:
-                        held_scanned = max(0, len(held_text) - (len(_TAG_CLOSE) - 1))
-                        continue
-                    joined = held_text
-                    held = None
-                    held_text = ""
-                    inline = _inline_reasoning_block(joined)
-                    if inline is not None and inline[1] == close:
-                        # already balanced: the legacy stream carried its own opener, so re-opening
-                        # would nest one block inside another. the pair must be the one that
-                        # MATCHED this close, or an answer-side pair further down would disable the
-                        # re-open for the very shape it exists for.
-                        yield joined
-                        continue
-                    yield (
-                        f"{_TAG_OPEN}{joined[:close]}{_TAG_CLOSE}"
-                        f"{joined[close + len(_TAG_CLOSE) :]}"
-                    )
-                    continue
-                yield content
-    if reasoning_open:
-        # generation stopped inside the block (a length cap, usually). still close it: an
-        # unbalanced opener is the same defect as the unbalanced closer, mirrored.
-        yield _TAG_CLOSE
-    # the buffer holds the block's own retained close and nothing else, in either the bare or the
-    # opener-carrying form. only decidable at end of stream, since nothing more can arrive. any
-    # other buffer was answer text after all, covering the answer that IS the delimiter.
-    if closing and not _is_terminal_reasoning_repeat(closing, reasoning_text):
-        yield closing
-    if held:
-        # no delimiter ever arrived, so nothing marked a reasoning phase: a plain answer. release
-        # it as sent rather than wrapping it, which would label a valid answer as reasoning.
-        yield from held
-
-
-def chat_stream(
-    run_id: str,
-    messages: list[dict],
-    temperature: float = 0.0,
-    max_tokens: int = 512,
-    thinking: bool = False,
-    stop: list[str] | None = None,
-) -> Iterator[str]:
-    """Yield text deltas from the freesolo OpenAI-compatible streaming endpoint.
-
-    ``stop`` carries the run's own stop sequences, as in ``chat``.
-    """
-    base = serving_openai_base_url()
-    body = {
-        "model": run_id,
-        "messages": messages,
-        "max_tokens": int(max_tokens),
-        "temperature": float(temperature),
-        "chat_template_kwargs": {"enable_thinking": bool(thinking)},
-        "stream": True,
-    }
-    if stop:
-        body["stop"] = [str(value) for value in stop]
-    with _stream_http_client().stream(
-        "POST",
-        f"{base}/chat/completions",
-        json=body,
-        headers=_internal_key_header(),
-        timeout=30 * 60.0,
-    ) as resp:
-        resp.raise_for_status()
-        if "application/json" in resp.headers.get("content-type", ""):
-            # client.stream() leaves body unread; must call resp.read() before .json().
-            resp.read()
-            payload = resp.json()
-            content = _balanced_thinking_content(
-                (payload.get("choices") or [{}])[0].get("message") or {}, thinking=thinking
-            )
-            if content:
-                yield str(content)
-            return
-        yield from _openai_stream_content(resp.iter_lines(), thinking=thinking)
+# The reasoning-delimiter parsing lives in `flash.serve.thinking`, which imports the tag
+# constants above. Re-exported so the existing `deploy._balanced_thinking_content` call sites
+# and tests keep resolving.
+from flash.serve.thinking import (  # noqa: E402,F401
+    _TAG_CLOSE,
+    _TAG_OPEN,
+    _balance_thinking_payload,
+    _balanced_thinking_content,
+    _delimiter_may_complete,
+    _duplicates_reasoning,
+    _find_delimiter,
+    _inline_reasoning_block,
+    _is_only_retained_delimiter,
+    _is_sampled_delimiter,
+    _is_terminal_reasoning_repeat,
+    _retained_delimiter_end,
+    _strip_retained_close,
+)
