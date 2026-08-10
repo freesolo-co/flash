@@ -25,9 +25,9 @@ def test_sft_worker_requests_the_fused_loss_its_sizing_assumes():
     from flash.engine.plan.vram import sft_chunked_nll_enabled
     from flash.engine.worker import sft_train
 
-    # the fused-kernel override is rendered in train.sft_config, the liger choice still in
+    # the fused-kernel override is rendered in train.sft.config, the liger choice still in
     # sft_train, so this guard spans both.
-    from flash.engine.worker.train import sft_config
+    from flash.engine.worker.train.sft import config as sft_config
 
     source = inspect.getsource(sft_train) + inspect.getsource(sft_config)
     assert '"model.use_fused_kernels=true"' in source

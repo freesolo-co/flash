@@ -275,7 +275,7 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # choice, not a contract verl states. This image sets FLASH_VERL_PYTHON, so live workers never take
 # the resolve_verl_python path where that hardening lives -- letting the two lists drift means the
 # fallback protects nobody and a vllm respin breaks launch on the default image alone. Keep them in
-# lockstep with verl_capabilities.py's install list.
+# lockstep with verl/capabilities.py's install list.
 #
 # transformers is pinned to the SAME range as the main interpreter (>=5.6,<5.13) and in the override
 # file, not just the direct list -- verl and vllm both depend on transformers, so without the
@@ -313,7 +313,7 @@ RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers
     && uv cache clean
 
 # flash-attn is REQUIRED in here, not best-effort like it is in the main interpreter above. All three
-# backends default remove-padding ON (train/rl/verl_config.py, train/sft_config.py,
+# backends default remove-padding ON (train/rl/verl_config.py, train/sft/config.py,
 # train/opd/overrides.py; only a GDN model whose child cannot reset packed boundaries turns it off),
 # and verl's CUDA remove-padding path imports
 # flash_attn.bert_padding UNGUARDED (verl/utils/attention_utils.py:30, torch_functional.py:627,657).

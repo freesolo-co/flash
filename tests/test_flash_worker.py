@@ -585,9 +585,9 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     assert "completion_mask_from_ids(" in workload_src
     assert '"loss_mask": tokenized["completion_mask"]' in workload_src
 
-    # sft renders its hydra overrides and child shims in train.sft_config, so the trainer's half of
+    # sft renders its hydra overrides and child shims in train.sft.config, so the trainer's half of
     # this guard spans both modules. keep these in step when sft_train is split further.
-    from flash.engine.worker.train import sft_config
+    from flash.engine.worker.train.sft import config as sft_config
 
     train_src = inspect.getsource(sft_train) + inspect.getsource(sft_config)
     # revision-aware vocab resolution: the worker must size the realized batch through the SAME

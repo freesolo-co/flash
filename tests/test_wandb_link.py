@@ -156,7 +156,7 @@ def test_parser_tolerates_a_missing_id():
 _NOTES_BUILDER_MODULES = {
     "rl_train.py": ("train/rl/verl_config.py",),
     "opd_train.py": ("train/opd/overrides.py",),
-    "sft_train.py": ("train/sft_config.py",),
+    "sft_train.py": ("train/sft/config.py",),
 }
 
 

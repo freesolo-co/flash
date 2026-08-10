@@ -894,7 +894,7 @@ def kill_process_group(proc: subprocess.Popen, *, process_group_id: int | None =
 # `backend_common.<name>`: all three trainers and the tests import them from here.
 # re-exported so the capability probe and the checkpoint exporter stay reachable as
 # `backend_common.<name>`: the trainers and the tests both import them from here.
-from flash.engine.worker.verl_capabilities import (  # noqa: E402,F401
+from flash.engine.worker.verl.capabilities import (  # noqa: E402,F401
     _CAPABILITIES_UNAVAILABLE,
     _CAPABILITY_PROBE,
     _CAPABILITY_PROBE_TIMEOUT_S,
@@ -912,7 +912,7 @@ from flash.engine.worker.verl_capabilities import (  # noqa: E402,F401
     verl_declares_rollout_field,
     verl_device_capability,
 )
-from flash.engine.worker.verl_checkpoints import (  # noqa: E402,F401
+from flash.engine.worker.verl.checkpoints import (  # noqa: E402,F401
     completed_checkpoint_step,
     export_peft_adapter,
     latest_global_step_dir,
@@ -921,7 +921,7 @@ from flash.engine.worker.verl_checkpoints import (  # noqa: E402,F401
     stamp_adapter_dir_provenance,
     unprocessed_checkpoint_dirs,
 )
-from flash.engine.worker.verl_child_io import (  # noqa: E402,F401
+from flash.engine.worker.verl.child_io import (  # noqa: E402,F401
     _VERL_METRIC_FIELDS,
     FLASH_GDN_VARLEN_MARKER,
     FLASH_TF32_MARKER,
@@ -938,7 +938,7 @@ from flash.engine.worker.verl_child_io import (  # noqa: E402,F401
 
 # re-exported so the child-tail and ray-log diagnostics stay reachable as
 # `backend_common.<name>`: the trainers and the tests both read them from here.
-from flash.engine.worker.verl_diagnostics import (  # noqa: E402,F401
+from flash.engine.worker.verl.diagnostics import (  # noqa: E402,F401
     _CHILD_TAIL_LINE_CHARS,
     CHILD_TAIL_LINES,
     RAY_FAILURE_LOGS,

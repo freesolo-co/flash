@@ -812,12 +812,12 @@ def run_sft_train(spec=None) -> None:
 # LoRA+ marker from here.
 # re-exported because the sft tests patch `sft_train._export_checkpoint_adapter` and
 # `sft_train._VerlCheckpointWatcher`, and `run_sft_train` below constructs the watcher.
-from flash.engine.worker.train.sft_checkpoints import (  # noqa: E402,F401
+from flash.engine.worker.train.sft.checkpoints import (  # noqa: E402,F401
     _copy_processing_sidecars,
     _export_checkpoint_adapter,
     _VerlCheckpointWatcher,
 )
-from flash.engine.worker.train.sft_config import (  # noqa: E402,F401
+from flash.engine.worker.train.sft.config import (  # noqa: E402,F401
     _LORAPLUS_READY_MARKER,
     _REQUIRED_OVERRIDE_KEYS,
     _VERL_OPTIMIZER_IMPL,
