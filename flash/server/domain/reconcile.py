@@ -9,7 +9,6 @@ from __future__ import annotations
 import contextlib
 import json
 import time
-import urllib.error
 import urllib.request
 
 from flash import runner
@@ -56,7 +55,7 @@ def _report(body: dict) -> bool:
         with urllib.request.urlopen(req, timeout=_REPORT_TIMEOUT_S) as resp:
             resp.read()
         return True
-    except (urllib.error.URLError, OSError):
+    except OSError:
         return False
 
 

@@ -233,7 +233,7 @@ def cmd_env_pull(args) -> int:
     except ClientError as exc:
         print(f"env pull failed: {exc}", file=sys.stderr)
         return 1
-    except (ValueError, FileNotFoundError, RuntimeError, OSError) as exc:
+    except (ValueError, RuntimeError, OSError) as exc:
         print(f"env pull failed: {exc}", file=sys.stderr)
         return 1
 
