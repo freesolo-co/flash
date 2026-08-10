@@ -7,28 +7,24 @@ Service functions are resolved through ``flash.server.app`` at call time so test
 from __future__ import annotations
 
 import contextlib
-import json
 import math
-import multiprocessing
+
+# `multiprocessing` has no call site left here since the smoke validation moved to
+# `.serving_smoke`, but the schema coverage tests patch `get_context` through THIS module and the
+# spawned validator reads it back that way. same for `safe_regex` and `validator_for` below.
+import multiprocessing  # noqa: F401
 import os
-import re
 import time
 from threading import Event
 from typing import Annotated
 
-import regex as safe_regex
+import regex as safe_regex  # noqa: F401
 from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import StreamingResponse
-from jsonschema import SchemaError, ValidationError
-from jsonschema.validators import validator_for
-from referencing import Registry
-from referencing.exceptions import Unresolvable
+from jsonschema.validators import validator_for  # noqa: F401
 
-from flash.adapters.lora_rank import serving_completion_token_capacity
-from flash.content.structured_outputs import parse_structured_outputs
 from flash.core.spec import JobSpec
 from flash.runner import (
-    adapter_prefix,
     effective_spec_from_status,
     mark_checkpoint_deployed,
     mark_deployed,
@@ -36,24 +32,18 @@ from flash.runner import (
     mark_deployment_pending,
     mark_deployment_revocation_failed,
     mark_undeployed,
-    read_verified_adapter_revisions,
     verified_adapter_revision_generation,
 )
-from flash.runner.results.checkpoints import checkpoint_adapter_prefix
 from flash.schema import parse_adapter_revision
-from flash.serve.deploy import (
+
+# `RetryableServingUnavailable` is raised by the serving-coverage tests as
+# `serving.RetryableServingUnavailable`, so it stays reachable here even though the smoke path
+# that catches it now lives in `.serving_smoke`.
+from flash.serve.deploy import (  # noqa: F401
     ActivationOutcomeUnknown,
     AdapterConfigMissing,
     RetryableServingUnavailable,
     ServingError,
-)
-from flash.serve.preflight import (
-    SERVING_PROMPT_TOKEN_ALLOWANCE,
-    ExternalSchemaReference,
-    reject_external_schema_reference,
-    resolve_smoke_completion_tokens,
-    validate_local_json_schema,
-    validate_structured_output_patterns,
 )
 from flash.serve.urls import public_deployment
 from flash.server import app as _app
@@ -63,171 +53,7 @@ from flash.server.platform.internal_client import run_org_id
 
 router = APIRouter()
 
-_DEPLOYMENT_BUSY_STATES = {"queued", "smoke_testing", "reconciling"}
-_DEPLOYMENT_READY_STATES = {"ready", "deployed"}
 _DEPLOYMENT_STALE_SECONDS = 30 * 60
-
-
-_SMOKE_PROMPT = "Deployment smoke test: answer in one short sentence. What is 2+2?"
-# hard wall-clock budget for the trusted fixed-prompt generation and validation.
-# it remains below the deployment stale threshold.
-_SMOKE_BUDGET_SECONDS = 600.0
-
-
-def _smoke_timeout_error(budget_s: float) -> ServingError:
-    return ServingError(f"deployment_smoke_timeout: bounded smoke exceeded {budget_s:g}s")
-
-
-def _bounded_call(fn, *, deadline: float, budget_s: float):
-    """run the trusted smoke call within the remaining global deadline."""
-    import threading
-
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise _smoke_timeout_error(budget_s)
-    result: dict = {}
-
-    def _target() -> None:
-        try:
-            result["value"] = fn()
-        except BaseException as exc:  # re-raised on the caller thread below
-            result["error"] = exc
-
-    thread = threading.Thread(target=_target, daemon=True)
-    thread.start()
-    thread.join(timeout=remaining)
-    if thread.is_alive():
-        raise _smoke_timeout_error(budget_s)
-    if "error" in result:
-        raise result["error"]
-    return result.get("value")
-
-
-_DIRECT_REGEX_TIMEOUT_SECONDS = 0.05
-_JSON_SCHEMA_TIMEOUT_SECONDS = 3.0
-_JSON_SCHEMA_PROCESS_NAME = "flash-json-schema-validation"
-
-
-def _bounded_regex_fullmatch(pattern: str, value: str, *, deadline: float, budget_s: float):
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise _smoke_timeout_error(budget_s)
-    global_deadline_limits = remaining <= _DIRECT_REGEX_TIMEOUT_SECONDS
-    timeout = min(_DIRECT_REGEX_TIMEOUT_SECONDS, remaining)
-    try:
-        return safe_regex.fullmatch(pattern, value, timeout=timeout)
-    except TimeoutError as exc:
-        if global_deadline_limits:
-            raise _smoke_timeout_error(budget_s) from exc
-        raise ServingError(
-            f"structured-output regex evaluation exceeded the {_DIRECT_REGEX_TIMEOUT_SECONDS:.2f}s deadline"
-        ) from exc
-
-
-def _sanitized_schema_error(exc: Exception) -> str:
-    message = getattr(exc, "message", str(exc))
-    return " ".join(str(message).split())[:500]
-
-
-def _json_schema_validation_worker(connection, instance, schema) -> None:
-    try:
-        validator_class = validate_local_json_schema(schema, validator_factory=validator_for)
-        registry = Registry(retrieve=reject_external_schema_reference)
-        validator_class(schema, registry=registry).validate(instance)
-    except (ExternalSchemaReference, Unresolvable) as exc:
-        outcome = ("reference", _sanitized_schema_error(exc))
-    except SchemaError as exc:
-        outcome = ("schema", _sanitized_schema_error(exc))
-    except ValidationError as exc:
-        outcome = ("validation", _sanitized_schema_error(exc))
-    except Exception as exc:
-        outcome = ("error", f"{type(exc).__name__}: {_sanitized_schema_error(exc)}")
-    else:
-        outcome = ("ok", "")
-    try:
-        connection.send(outcome)
-    finally:
-        connection.close()
-
-
-def _reap_schema_validation_process(process, *, deadline: float) -> None:
-    remaining = max(0.0, deadline - time.monotonic())
-    process.join(timeout=min(0.1, remaining))
-    if process.is_alive():
-        process.terminate()
-        remaining = max(0.0, deadline - time.monotonic())
-        process.join(timeout=min(0.2, remaining))
-    if process.is_alive():
-        process.kill()
-        process.join()
-
-
-def _validate_json_schema(instance, schema: dict, *, deadline: float, budget_s: float) -> None:
-    now = time.monotonic()
-    if deadline <= now:
-        raise _smoke_timeout_error(budget_s)
-    local_deadline = now + _JSON_SCHEMA_TIMEOUT_SECONDS
-    validation_deadline = min(deadline, local_deadline)
-    global_deadline_limits = deadline <= local_deadline
-    context = multiprocessing.get_context("spawn")
-    receive_connection, send_connection = context.Pipe(duplex=False)
-    process = context.Process(
-        target=_json_schema_validation_worker,
-        args=(send_connection, instance, schema),
-        name=_JSON_SCHEMA_PROCESS_NAME,
-        daemon=True,
-    )
-    outcome: tuple[str, str] | None = None
-    timed_out = False
-    try:
-        try:
-            process.start()
-        except Exception as exc:
-            if time.monotonic() >= deadline:
-                raise _smoke_timeout_error(budget_s) from exc
-            raise ServingError(f"could not start isolated JSON schema validation: {exc}") from exc
-        finally:
-            send_connection.close()
-        remaining = max(0.0, validation_deadline - time.monotonic())
-        if receive_connection.poll(remaining):
-            try:
-                outcome = receive_connection.recv()
-            except EOFError:
-                outcome = None
-        else:
-            timed_out = True
-    finally:
-        receive_connection.close()
-        if process.pid is not None:
-            _reap_schema_validation_process(process, deadline=deadline)
-            process.close()
-
-    if outcome is None:
-        if timed_out and global_deadline_limits:
-            raise _smoke_timeout_error(budget_s)
-        raise ServingError(
-            f"JSON schema validation exceeded the {_JSON_SCHEMA_TIMEOUT_SECONDS:.1f}s wall-clock deadline"
-        )
-    status, detail = outcome
-    if status == "ok":
-        return
-    if status == "reference":
-        raise ServingError(f"configured JSON schema reference could not be resolved: {detail}")
-    if status == "schema":
-        raise ServingError(f"configured JSON schema is invalid: {detail}")
-    if status == "validation":
-        raise ServingError(f"structured smoke output violates the configured JSON schema: {detail}")
-    raise ServingError(f"JSON schema validation failed safely: {detail}")
-
-
-def _strict_json_loads(value: str):
-    def reject_constant(constant: str):
-        raise ValueError(f"non-finite JSON constant {constant!r} is not allowed")
-
-    try:
-        return json.loads(value, parse_constant=reject_constant)
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise ServingError(f"structured smoke output is not valid JSON: {exc}") from exc
 
 
 def _deployment_state(deployment: dict, state: str, **fields) -> dict:
@@ -296,160 +122,6 @@ def _deployment_attempt_is_stale(deployment: dict, *, now: float | None = None) 
     except (TypeError, ValueError):
         return True
     return (time.time() if now is None else now) - stamp >= _DEPLOYMENT_STALE_SECONDS
-
-
-def _previous_ready_deployment(deployment: dict) -> dict | None:
-    state = deployment.get("state")
-    if state in _DEPLOYMENT_READY_STATES:
-        return dict(deployment)
-    if state not in _DEPLOYMENT_BUSY_STATES or state == "reconciling":
-        return None
-    previous = deployment.get("previous_deployment")
-    if isinstance(previous, dict) and previous.get("state") in _DEPLOYMENT_READY_STATES:
-        return dict(previous)
-    return None
-
-
-def _deployment_predecessor(deployment: dict) -> dict | None:
-    ready = _previous_ready_deployment(deployment)
-    if ready is not None:
-        return ready
-    if deployment.get("activation_outcome_unknown"):
-        previous = deployment.get("previous_deployment")
-        if isinstance(previous, dict) and previous.get("state") in _DEPLOYMENT_READY_STATES:
-            return dict(previous)
-    return None
-
-
-def _activation_predecessor(run_id: str, deployment: dict) -> tuple[str | None, dict | None]:
-    if not deployment.get("activation_outcome_unknown"):
-        predecessor = _deployment_predecessor(deployment)
-        revision = predecessor.get("adapter_revision") if predecessor is not None else None
-        return (revision if isinstance(revision, str) else None), predecessor
-
-    target = _app.adapter_alias_target(run_id)
-    if target is None:
-        return None, None
-    parsed_target = parse_adapter_revision(target)
-    if parsed_target is None or parsed_target[0] != run_id:
-        raise ServingError(f"serving alias {run_id} targets invalid revision {target!r}")
-
-    nested = deployment.get("previous_deployment")
-    candidates = [deployment, nested if isinstance(nested, dict) else None]
-    predecessor = next(
-        (
-            dict(candidate)
-            for candidate in candidates
-            if candidate is not None and candidate.get("adapter_revision") == target
-        ),
-        {
-            "run_id": run_id,
-            "adapter_revision": target,
-            "checkpoint_step": parsed_target[1],
-            "openai_model": run_id,
-        },
-    )
-    predecessor.pop("previous_deployment", None)
-    predecessor.pop("activation_outcome_unknown", None)
-    predecessor.pop("error", None)
-    predecessor["state"] = (
-        "ready" if target in read_verified_adapter_revisions(run_id) else "reconciling"
-    )
-    return target, predecessor
-
-
-def _verified_adapter_revisions(status) -> set[str]:
-    return set(read_verified_adapter_revisions(status.run_id))
-
-
-def _verified_step_index(verified_revisions: set[str], run_id: str) -> dict[int | None, list[str]]:
-    index: dict[int | None, list[str]] = {}
-    for revision in verified_revisions:
-        parsed = parse_adapter_revision(revision)
-        if parsed is not None and parsed[0] == run_id:
-            index.setdefault(parsed[1], []).append(revision)
-    return index
-
-
-def _format_deployed_steps(index: dict[int | None, list[str]]) -> str:
-    labels = [str(step) for step in sorted(step for step in index if step is not None)]
-    if None in index:
-        labels.append("final")
-    return ", ".join(labels) or "none"
-
-
-def _resolve_explicit_chat_revision(
-    run_id: str,
-    adapter_revision,
-    step,
-    verified_revisions: set[str],
-    *,
-    preferred_revision: str | None = None,
-) -> str | None:
-    """Resolve an explicit chat target to a verified same-run immutable revision to pin, or None
-    for bare-alias chat. 400 on malformed/ambiguous targets, 409 on not-yet-verified targets."""
-    if adapter_revision is not None and step is not None:
-        raise HTTPException(
-            status_code=400, detail="pass either adapter_revision or step, not both"
-        )
-    if adapter_revision is not None:
-        parsed_revision = (
-            parse_adapter_revision(adapter_revision) if isinstance(adapter_revision, str) else None
-        )
-        if parsed_revision is None:
-            raise HTTPException(
-                status_code=400, detail="adapter_revision must be a full immutable adapter revision"
-            )
-        if parsed_revision[0] != run_id:
-            raise HTTPException(
-                status_code=400,
-                detail=f"adapter_revision belongs to run {parsed_revision[0]}, not {run_id}",
-            )
-        revision = adapter_revision.strip()
-        if revision not in verified_revisions:
-            raise HTTPException(
-                status_code=409,
-                detail=f"adapter_revision {revision} has not passed a successful deployment smoke",
-            )
-        return revision
-    if step is not None:
-        want = _parse_checkpoint_step(step)
-        index = _verified_step_index(verified_revisions, run_id)
-        matches = index.get(want, [])
-        if len(matches) == 1:
-            return matches[0]
-        if len(matches) > 1:
-            if preferred_revision in matches:
-                return preferred_revision
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"run {run_id} has multiple verified revisions at step {want}; chat the full "
-                    "immutable adapter revision from `flash models deployments`"
-                ),
-            )
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"run {run_id} has no deployed checkpoint at step {want}; deploy it first with "
-                f"`flash models deploy {run_id}/step-{want}` "
-                f"(currently deployed steps: {_format_deployed_steps(index)})"
-            ),
-        )
-    return None
-
-
-def _spec_is_unservable(status) -> bool:
-    """Whether the serving routes' own `JobSpec.from_dict` would reject this run's persisted spec.
-
-    Asked with the same call the chat and deploy routes make, so the answer cannot drift from what
-    they will actually do with the record.
-    """
-    try:
-        JobSpec.from_dict(status.spec)
-    except Exception:
-        return True
-    return False
 
 
 def recover_deployments() -> int:
@@ -521,197 +193,6 @@ def replay_status_reports(stop: Event | None = None) -> int:
             continue
         replayed += 1
     return replayed
-
-
-def _smoke_provenance(result: dict, adapter_revision: str, checkpoint: str) -> tuple[str, object]:
-    choice = (result.get("choices") or [{}])[0]
-    content = str((choice.get("message") or {}).get("content") or "")
-    finish = choice.get("finish_reason")
-    if not content.strip():
-        raise ServingError(f"smoke generation returned no content (finish_reason={finish!r})")
-    provenance = result.get("freesolo")
-    if not isinstance(provenance, dict):
-        raise ServingError("smoke response omitted immutable revision provenance")
-    if provenance.get("adapter_revision") != adapter_revision:
-        raise ServingError("smoke response returned the wrong adapter revision")
-    if provenance.get("checkpoint") != checkpoint:
-        raise ServingError("smoke response returned the wrong checkpoint")
-    hf_revision = adapter_revision.rsplit(".", 1)[-1]
-    if provenance.get("hf_revision") != hf_revision:
-        raise ServingError("smoke response returned the wrong Hub revision")
-    headers = result.get("_freesolo_headers")
-    expected_headers = {
-        "adapter_revision": adapter_revision,
-        "checkpoint": checkpoint,
-        "hf_revision": hf_revision,
-    }
-    if headers != expected_headers:
-        raise ServingError("smoke response returned mismatched provenance headers")
-    return content, finish
-
-
-def _thinking_tag_is_guaranteed(spec) -> bool:
-    """Whether the catalog vouches that this model's chat template opens a thinking block.
-
-    A curated entry states its ``thinking`` capability, so the tag is required. Only a stale caller
-    can present an uncataloged model -- submit rejects those -- and nothing vouches for its
-    template, so the tag is not demanded of it.
-
-    Asks the catalog DIRECTLY rather than through ``resolve_model``, which validates against an
-    algorithm and raises for an uncataloged id. Whether a chat template opens a ``<think>`` block
-    has nothing to do with either, and treating that raise as "guaranteed" would demand the tag
-    from precisely the models that cannot promise it.
-    """
-    from flash.core.catalog import MODELS
-
-    model = getattr(spec, "model", None)
-    return isinstance(model, str) and model.strip() in MODELS
-
-
-def _thinking_answer(content: str, *, require_tag: bool = True) -> str:
-    """Return the answer a thinking adapter emitted after its reasoning, or reject the smoke.
-
-    Stop sequences can end during reasoning while still reporting ``finish_reason=stop``; require an
-    answer whenever the catalog guarantees a thinking tag. Unknown open models may omit the tag.
-    """
-    closed = content.find("</think>")
-    if closed < 0:
-        if not require_tag:
-            return content.strip()
-        raise ServingError(
-            "smoke generation for a thinking adapter never closed its reasoning with </think>"
-        )
-    answer = content[closed + len("</think>") :].strip()
-    if not answer:
-        raise ServingError("smoke generation returned no answer after </think>")
-    if answer == "</think>":
-        # a compatibility backend that retains only the sampled close leaves the fold no answer to
-        # place behind the block, so it emits the delimiter twice. that shape is indistinguishable
-        # at the source from an adapter whose answer IS the tag, and folding deliberately defers the
-        # call to here. neither is an answer to the smoke prompt, so reject both.
-        raise ServingError("smoke generation returned only a close tag after </think>")
-    return answer
-
-
-def _validate_structured_smoke(
-    answer: str, constraint: dict, *, deadline: float, budget_s: float
-) -> None:
-    if time.monotonic() >= deadline:
-        raise _smoke_timeout_error(budget_s)
-    try:
-        validate_structured_output_patterns(constraint)
-    except ValueError as exc:
-        raise ServingError(f"configured structured-output {exc}") from exc
-    try:
-        if "json" in constraint:
-            _validate_json_schema(
-                _strict_json_loads(answer),
-                constraint["json"],
-                deadline=deadline,
-                budget_s=budget_s,
-            )
-        elif constraint.get("json_object") is True:
-            if not isinstance(_strict_json_loads(answer), dict):
-                raise ServingError("structured smoke output is valid JSON but not a JSON object")
-        elif "choice" in constraint:
-            if answer not in constraint["choice"]:
-                raise ServingError(
-                    f"structured smoke output {answer!r} is not one of {constraint['choice']!r}"
-                )
-        elif (
-            "regex" in constraint
-            and _bounded_regex_fullmatch(
-                str(constraint["regex"]), answer, deadline=deadline, budget_s=budget_s
-            )
-            is None
-        ):
-            raise ServingError("structured smoke output does not match the configured regex")
-    except safe_regex.error as exc:
-        raise ServingError(f"configured structured-output regex is invalid: {exc}") from exc
-
-
-def _run_deployment_smoke(
-    run_id: str,
-    spec: JobSpec,
-    *,
-    serving_model: str,
-    expected_checkpoint: str,
-    budget_s: float = _SMOKE_BUDGET_SECONDS,
-) -> dict:
-    started = time.monotonic()
-    deadline = started + budget_s
-    train = getattr(spec, "train", None)
-    constraint = parse_structured_outputs(getattr(train, "structured_outputs", ""))
-    max_tokens = 256
-    # thinking spends tokens before content, so use the run's own completion budget regardless of
-    # grammar; 256 tokens can truncate the think block and reject a healthy deployment.
-    if spec.thinking:
-        max_tokens = max(256, resolve_smoke_completion_tokens(spec))
-        serving_capacity = serving_completion_token_capacity(
-            spec, prompt_allowance=SERVING_PROMPT_TOKEN_ALLOWANCE
-        )
-        if serving_capacity is not None:
-            max_tokens = min(max_tokens, serving_capacity)
-    # a run trained with stop_sequences terminates on its delimiter and need never emit EOS. without
-    # forwarding them the smoke generates past the answer to max_tokens, comes back
-    # finish_reason="length", and the truncation guard below rejects a checkpoint that answered
-    # correctly.
-    stop_sequences = [str(value) for value in (getattr(train, "stop_sequences", ()) or ())]
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise _smoke_timeout_error(budget_s)
-        try:
-
-            def _smoke_call(timeout_s: float = remaining):
-                return _app.serve_chat(
-                    run_id=serving_model,
-                    messages=[{"role": "user", "content": _SMOKE_PROMPT}],
-                    temperature=0.0,
-                    max_tokens=max_tokens,
-                    thinking=spec.thinking,
-                    expected_checkpoint=expected_checkpoint,
-                    timeout_s=timeout_s,
-                    retry_unavailable=True,
-                    stop=stop_sequences or None,
-                )
-
-            result = _bounded_call(
-                _smoke_call,
-                deadline=deadline,
-                budget_s=budget_s,
-            )
-        except RetryableServingUnavailable as exc:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise _smoke_timeout_error(budget_s) from exc
-            time.sleep(min(exc.retry_after_seconds, remaining))
-            continue
-        break
-    content, finish = _smoke_provenance(result, serving_model, expected_checkpoint)
-    # truncation is a thinking-budget failure whether or not a grammar is configured: serving
-    # returns the reasoning in reasoning_content, so a run cut off mid-thought still arrives with a
-    # balanced <think>...</think> and passes the empty-content check carrying a non-answer.
-    if spec.thinking and finish == "length":
-        raise ServingError("smoke generation was truncated at the maximum token length")
-    answer = (
-        _thinking_answer(content, require_tag=_thinking_tag_is_guaranteed(spec))
-        if spec.thinking
-        else content.strip()
-    )
-    if constraint:
-        _validate_structured_smoke(answer, constraint, deadline=deadline, budget_s=budget_s)
-    if time.monotonic() > deadline:
-        raise _smoke_timeout_error(budget_s)
-    return {
-        "verified_at": time.time(),
-        "verify_kind": "fixed_prompt",
-        "verify_turns": 1,
-        "verify_latency_s": time.monotonic() - started,
-        "verify_finish_reason": finish,
-        "thinking_tag": "<think>" in content or "</think>" in content,
-        "verify_sample": answer[:160],
-    }
 
 
 def _finish_deployment_unlocked(
@@ -950,21 +431,6 @@ def _finish_deployment(*, deploy_lock, **kwargs) -> None:
         deploy_lock.release()
 
 
-def _chat_messages_from_payload(payload: dict) -> list[dict]:
-    raw = payload.get("messages")
-    if raw is None:
-        return []
-    if not isinstance(raw, list):
-        raise HTTPException(status_code=400, detail="messages must be a list")
-    for index, message in enumerate(raw):
-        if not isinstance(message, dict):
-            raise HTTPException(
-                status_code=400,
-                detail=f"messages[{index}] must be a chat message object",
-            )
-    return raw
-
-
 def _validate_hf_repo_id(repository: str) -> None:
     """Validate HF repo id grammar early — malformed ids only 502 AFTER downloading the private source adapter."""
     try:
@@ -978,68 +444,6 @@ def _validate_hf_repo_id(repository: str) -> None:
             status_code=400,
             detail=f"repository is not a valid HuggingFace repo id: {exc}",
         ) from exc
-
-
-def _parse_checkpoint_step(raw_step) -> int:
-    """Validate a raw JSON checkpoint step into a non-negative int; 400 on bad input.
-
-    accepts a bare int, an integral float, or a bounded digit string; rejects bool,
-    non-integer floats, negatives, and unicode/oversized digit strings that would crash int().
-    """
-    want: int | None = None
-    if isinstance(raw_step, bool):
-        want = None
-    elif isinstance(raw_step, int):
-        want = raw_step
-    elif isinstance(raw_step, float):
-        want = int(raw_step) if raw_step.is_integer() else None
-    elif isinstance(raw_step, str):
-        s = raw_step.strip()
-        want = int(s) if re.fullmatch(r"-?[0-9]{1,18}", s) else None
-    if want is None or want < 0:
-        raise HTTPException(status_code=400, detail=f"invalid checkpoint step: {raw_step!r}")
-    return want
-
-
-def _resolve_deploy_step(run_id: str, spec, raw_step) -> int | None:
-    """Validate optional checkpoint step; returns int or None (final adapter). 400 on bad step, 404 on missing."""
-    if raw_step is None:
-        return None
-
-    want = _parse_checkpoint_step(raw_step)
-    checkpoints = _app.list_checkpoints(spec)
-    if any(c["step"] == want for c in checkpoints):
-        return want
-    available = ", ".join(str(c["step"]) for c in checkpoints) or "none"
-    raise HTTPException(
-        status_code=404,
-        detail=f"run {run_id} has no deployable checkpoint at step {want} (available: {available})",
-    )
-
-
-def _resolve_deployable_target(
-    run_id: str, spec, status, raw_step, *, action: str, enforce_state: bool
-) -> tuple[int | None, bool, str]:
-    """Resolve the deploy/export target and gate final-adapter targets on training state."""
-    checkpoint_step = _resolve_deploy_step(run_id, spec, raw_step)
-    is_checkpoint = checkpoint_step is not None
-    # A resolved checkpoint step has already proven a servable adapter exists; only final-adapter
-    # deploy/export needs the run-state gate because the final adapter exists only after completion.
-    if enforce_state and is_checkpoint and status.state == "dry_run":
-        raise HTTPException(
-            status_code=409,
-            detail=f"run {run_id} is 'dry_run'; dry-run runs cannot be {action}ed",
-        )
-    if enforce_state and not is_checkpoint and status.state not in _app._DEPLOYABLE_STATES:
-        detail = (
-            f"run {run_id} is {status.state!r}; only finished runs with "
-            f"trained adapter artifacts can be {'deployed' if action == 'deploy' else 'exported'}"
-        )
-        raise HTTPException(status_code=409, detail=detail)
-    prefix = (
-        checkpoint_adapter_prefix(spec, checkpoint_step) if is_checkpoint else adapter_prefix(spec)
-    )
-    return checkpoint_step, is_checkpoint, prefix
 
 
 @router.get("/v1/runs/{run_id}/deploy")
@@ -1553,3 +957,42 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
         )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"inference failure: {exc}") from exc
+
+
+# re-exported at the bottom rather than imported at the top: both modules resolve names back
+# through this one, so a top import would be circular. the server tests address these helpers as
+# attributes of `flash.server.routes.serving`, which is why they stay on it after the move.
+from flash.server.routes.serving_revisions import (  # noqa: E402,F401
+    _DEPLOYMENT_BUSY_STATES,
+    _DEPLOYMENT_READY_STATES,
+    _activation_predecessor,
+    _chat_messages_from_payload,
+    _deployment_predecessor,
+    _format_deployed_steps,
+    _parse_checkpoint_step,
+    _previous_ready_deployment,
+    _resolve_deploy_step,
+    _resolve_deployable_target,
+    _resolve_explicit_chat_revision,
+    _spec_is_unservable,
+    _verified_adapter_revisions,
+    _verified_step_index,
+)
+from flash.server.routes.serving_smoke import (  # noqa: E402,F401
+    _JSON_SCHEMA_PROCESS_NAME,
+    _SMOKE_BUDGET_SECONDS,
+    _SMOKE_PROMPT,
+    _bounded_call,
+    _bounded_regex_fullmatch,
+    _json_schema_validation_worker,
+    _reap_schema_validation_process,
+    _run_deployment_smoke,
+    _sanitized_schema_error,
+    _smoke_provenance,
+    _smoke_timeout_error,
+    _strict_json_loads,
+    _thinking_answer,
+    _thinking_tag_is_guaranteed,
+    _validate_json_schema,
+    _validate_structured_smoke,
+)

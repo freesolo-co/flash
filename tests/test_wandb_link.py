@@ -151,6 +151,15 @@ def test_parser_tolerates_a_missing_id():
     }
 
 
+# extra files a trainer's write_train_meta notes builder can live in, after the module was split
+# to stay under the file-size limit. paths are relative to _WORKER.
+_NOTES_BUILDER_MODULES = {
+    "rl_train.py": ("train/rl/verl_config.py",),
+    "opd_train.py": ("train/opd/overrides.py",),
+    "sft_train.py": ("train/sft/config.py",),
+}
+
+
 def _dict_literal_keys(node: ast.Dict) -> set[str]:
     """top-level string keys of a dict literal; nested dicts (grpo_recipe) are not notes keys."""
     return {k.value for k in node.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)}
@@ -168,7 +177,19 @@ def _emitted_notes_keys(module: str) -> set[str]:
     nothing, which is the exact defect this module exists to catch.
     """
     tree = ast.parse((_WORKER / module).read_text())
-    builders = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    # the notes builder need not live in the same file as the write_train_meta call: grpo calls it
+    # from rl_train.py but defines it in train/rl/verl_config.py. collect builders from the module
+    # AND from wherever it was split to, or the sentinel below reports every key as unresolvable.
+    builder_sources = [tree]
+    builder_sources.extend(
+        ast.parse((_WORKER / extra).read_text()) for extra in _NOTES_BUILDER_MODULES.get(module, ())
+    )
+    builders = {
+        n.name: n
+        for src in builder_sources
+        for n in ast.walk(src)
+        if isinstance(n, ast.FunctionDef)
+    }
 
     keys: set[str] = set()
     for node in ast.walk(tree):
