@@ -325,12 +325,18 @@ jobs:
           # release creation outright, and by then PyPI and the tag are already published. Splicing
           # ${TAG} into the sorted list and cutting at it is what makes "below" mean version order
           # rather than string order.
+          # `|| true` is REQUIRED here and its absence is fatal, not cosmetic: `grep -Fxv` exits 1
+          # when it emits nothing, which is exactly the first-release case (no earlier `v*` tags).
+          # Under `set -euo pipefail` that exit code propagates and kills the step -- AFTER the
+          # package and tag are already published, and the PyPI gate then blocks every re-run. An
+          # empty candidate list is a legitimate answer here, unlike the `ls-remote` lookup above
+          # where an empty result would mean the query failed; that one must stay fail-closed.
           candidates="$(printf '%s\n' "$all_tags" \
             | awk '$2 ~ /^refs\/tags\/v[0-9]/ && $2 !~ /\^\{\}$/ {sub(/^refs\/tags\//,"",$2); print $2}' \
             | grep -Fxv "${TAG}" \
             | { cat; printf '%s\n' "${TAG}"; } \
             | sort -V \
-            | awk -v t="${TAG}" '$0==t{exit} {print}')"
+            | awk -v t="${TAG}" '$0==t{exit} {print}' || true)"
           # Walk the candidates high-to-low and take the first that is an ancestor of this commit.
           # A tag on an abandoned or parallel line of history is not a valid baseline: GitHub would
           # diff against a commit this release does not descend from. Note the two skip reasons are
