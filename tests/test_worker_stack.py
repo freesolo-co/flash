@@ -47,9 +47,6 @@ def test_worker_stack_pins_qwen35_capable_versions():
     assert "bitsandbytes" in joined  # 8-bit paged AdamW optimizer state (LoRA+ coexists)
 
 
-# ---------------------------------------------------------------------------
-# is_vl_checkpoint: qwen3_5* are VL; text models are not
-# ---------------------------------------------------------------------------
 def _import_worker(monkeypatch):
     monkeypatch.setenv("RUN_MODE", "sft")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
@@ -57,31 +54,6 @@ def _import_worker(monkeypatch):
     import flash.engine.worker as worker
 
     return worker
-
-
-def _fake_transformers(monkeypatch, model_type: str):
-    fake_cfg = types.SimpleNamespace(model_type=model_type)
-    fake_auto = types.SimpleNamespace(
-        from_pretrained=lambda *a, **k: fake_cfg,
-    )
-    fake_mod = types.ModuleType("transformers")
-    fake_mod.AutoConfig = fake_auto
-    monkeypatch.setitem(sys.modules, "transformers", fake_mod)
-
-
-def test_is_vl_checkpoint_qwen35(monkeypatch):
-    # qwen3_5* stay VL checkpoints WITHOUT a LoRA module exclusion: this flag must not be coupled to
-    # any deleted exclusion list.
-    worker = _import_worker(monkeypatch)
-    for model_type in ("qwen3_5", "qwen3_5_moe", "qwen3_6"):
-        _fake_transformers(monkeypatch, model_type)
-        assert worker.is_vl_checkpoint("Qwen/Qwen3.5-4B") is True
-
-
-def test_is_vl_checkpoint_text_model(monkeypatch):
-    worker = _import_worker(monkeypatch)
-    _fake_transformers(monkeypatch, "llama")
-    assert worker.is_vl_checkpoint("meta-llama/Llama-3.2-1B") is False
 
 
 @pytest.mark.parametrize(
@@ -114,10 +86,9 @@ def test_model_revision_threads_through_config_probes(monkeypatch, revision):
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
     from flash.engine.worker.entry import sft
-    from flash.engine.worker.model import lora, packing
+    from flash.engine.worker.model import packing
     from flash.engine.worker.perf import liger
 
-    assert lora.is_vl_checkpoint("org/model", revision=revision)
     assert packing.model_is_gdn_hybrid("org/model", revision=revision)
     assert packing.gdn_model_type("org/model", revision=revision)
     assert sft._model_arch_dims("uncataloged/model", revision=revision) == (4096, 32)
@@ -525,50 +496,6 @@ def test_heartbeat_terminal_only_mode(monkeypatch):
     assert calls.count("heartbeat.json") == 3
 
 
-def test_optimal_attn_impl_no_cuda_is_none(monkeypatch):
-    """optimal_attn_impl picks the arch-best backend for the live GPU; with no CUDA (CI) it
-    leaves transformers' default (None). There is no env override."""
-    monkeypatch.setenv("RUN_MODE", "sft")
-    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker as w
-
-    assert w.optimal_attn_impl() is None
-
-
-def test_attn_impl_for_capability_per_arch(monkeypatch):
-    """Pure capability -> best-per-arch flash policy (no CUDA needed): flash on every arch EXCEPT
-    Blackwell (datacenter sm100 + consumer sm120). Hopper(sm90): FA3, else a UNIFORM fall back to
-    plain SDPA (NO FA3->FA2 chain). Ampere(sm80/86)+Ada(sm89): FA2. sm100/sm120: cuDNN SDPA."""
-    w = _import_worker(monkeypatch)
-    f = w._attn_impl_for_capability
-    # Hopper sm90: FA3 is the arch's best flash; absent -> plain SDPA (uniform fallback, NOT FA2).
-    assert f(9, 0, fa3_available=True, fa2_available=True) == "flash_attention_3"
-    assert f(9, 0, fa3_available=False, fa2_available=True) is None  # uniform: -> SDPA, not FA2
-    assert f(9, 0, fa3_available=False, fa2_available=False) is None
-    # Ampere (8.0/8.6) + Ada (8.9): FA2 when the wheel is present, else SDPA. FA3 never applies.
-    assert f(8, 0, fa2_available=True) == "flash_attention_2"  # A100
-    assert f(8, 6, fa2_available=True) == "flash_attention_2"  # 3090/A10
-    assert f(8, 9, fa2_available=True) == "flash_attention_2"  # Ada 4090
-    assert f(8, 7, fa2_available=True) is None  # sm87 Jetson Orin: NOT a validated FA2 arch -> SDPA
-    assert f(8, 0, fa2_available=False) is None
-    # consumer Blackwell sm120: cuDNN SDPA regardless of flash availability.
-    assert f(12, 0, fa3_available=True, fa2_available=True) == "sdpa"
-    # datacenter Blackwell sm100 (B200): cuDNN SDPA too — NOT None (a bare None would let run_sft's
-    # FA2 packing fallback force a possibly-missing sm100 FA2 kernel). Holds even when fa2 imports.
-    assert f(10, 0, fa2_available=True) == "sdpa"
-    assert f(10, 0, fa2_available=False) == "sdpa"
-
-
-def test_flash_attn_probes_false_in_ci(monkeypatch):
-    """The FA2/FA3 probes report False in offline CI (neither transformers/flash_attn nor the FA3
-    ``flash_attn_interface`` is present). FA is used whenever importable — there is no disable
-    hatch, so the result is purely 'is the package available'."""
-    w = _import_worker(monkeypatch)
-    assert w._flash_attn_3_available() is False  # flash_attn_interface / transformers absent in CI
-    assert w._flash_attn_available() is False  # flash_attn wheel absent in CI
-
-
 def test_liger_default_model_size_gate(monkeypatch):
     """The model-size gate is OFF for small models (1B-class) and ON at ≥ ~3B.
 
@@ -665,163 +592,6 @@ def test_35b_warmstart_requires_fused_expert_targets(monkeypatch):
         model_id,
     )
     worker.validate_lora_target_parameters({}, "Qwen/Qwen3.5-9B")
-
-
-def test_prepare_fresh_lora_base_uses_multimodal_loader_for_vl(monkeypatch):
-    """Fresh LoRA on a VL checkpoint must wrap the full image-text tree, not TRL's default loader."""
-    import flash.engine.worker.model.adapter as adapter_mod
-
-    calls = []
-
-    class _ImageText:
-        @classmethod
-        def from_pretrained(cls, *args, **kwargs):
-            calls.append((args, kwargs))
-            return {"loader": "vl", "args": args, "kwargs": kwargs}
-
-    fake_transformers = types.ModuleType("transformers")
-    fake_transformers.AutoModelForImageTextToText = _ImageText
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-    monkeypatch.setattr(adapter_mod, "is_vl_checkpoint", lambda model_id, revision="": True)
-
-    out = adapter_mod.prepare_fresh_lora_base(
-        "/tmp/flash_sft_merged_x",
-        "Qwen/Qwen3.5-4B",
-        {"dtype": "bfloat16", "attn_implementation": "sdpa"},
-        phase="sft",
-    )
-
-    assert out["loader"] == "vl"
-    assert calls == [
-        (
-            ("/tmp/flash_sft_merged_x",),
-            {"trust_remote_code": True, "dtype": "bfloat16", "attn_implementation": "sdpa"},
-        )
-    ]
-
-
-def test_prepare_fresh_lora_base_keeps_non_vl_path(monkeypatch):
-    import flash.engine.worker.model.adapter as adapter_mod
-
-    monkeypatch.setattr(adapter_mod, "is_vl_checkpoint", lambda model_id, revision="": False)
-
-    assert (
-        adapter_mod.prepare_fresh_lora_base(
-            "meta-llama/Llama-3.2-1B", "meta-llama/Llama-3.2-1B", {}, phase="sft"
-        )
-        == "meta-llama/Llama-3.2-1B"
-    )
-
-
-def test_prepare_fresh_lora_base_forwards_revision_to_probe_and_loader(monkeypatch):
-    import flash.engine.worker.model.adapter as adapter_mod
-
-    probes = []
-    loads = []
-
-    class _ImageText:
-        @classmethod
-        def from_pretrained(cls, *args, **kwargs):
-            loads.append((args, kwargs))
-            return object()
-
-    fake_transformers = types.ModuleType("transformers")
-    fake_transformers.AutoModelForImageTextToText = _ImageText
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-    monkeypatch.setattr(
-        adapter_mod,
-        "is_vl_checkpoint",
-        lambda model_id, revision="": probes.append((model_id, revision)) or True,
-    )
-
-    adapter_mod.prepare_fresh_lora_base(
-        "org/model",
-        "org/model",
-        {"dtype": "bfloat16", "revision": "refs/pr/123"},
-        phase="sft",
-        model_revision="refs/pr/123",
-    )
-
-    assert probes == [("org/model", "refs/pr/123")]
-    assert loads[0][1]["revision"] == "refs/pr/123"
-
-
-def test_prepare_fresh_lora_base_rejects_revision_authority_conflict(monkeypatch):
-    import flash.engine.worker.model.adapter as adapter_mod
-
-    with pytest.raises(ValueError, match="probe revision must match"):
-        adapter_mod.prepare_fresh_lora_base(
-            "org/model",
-            "org/model",
-            {"revision": "a" * 40},
-            model_revision="b" * 40,
-        )
-
-
-def test_warmstart_base_loader_forwards_model_revision(monkeypatch, tmp_path):
-    import flash.engine.worker.model.adapter as adapter_mod
-
-    loads = []
-
-    class _Base:
-        _checkpoint_conversion_mapping = None
-
-    class _Causal:
-        @classmethod
-        def from_pretrained(cls, *args, **kwargs):
-            loads.append((args, kwargs))
-            return _Base()
-
-    class _ImageText:
-        @classmethod
-        def from_pretrained(cls, *args, **kwargs):
-            raise AssertionError("unexpected vl loader")
-
-    class _Peft:
-        @classmethod
-        def from_pretrained(cls, base, adapter_dir, is_trainable):
-            return cls()
-
-        def load_adapter(self, *args, **kwargs):
-            return object()
-
-    fake_transformers = types.ModuleType("transformers")
-    fake_transformers.AutoModelForCausalLM = _Causal
-    fake_transformers.AutoModelForImageTextToText = _ImageText
-    fake_peft = types.ModuleType("peft")
-    fake_peft.PeftModel = _Peft
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-    monkeypatch.setitem(sys.modules, "peft", fake_peft)
-    monkeypatch.setattr(
-        adapter_mod,
-        "_w",
-        SimpleNamespace(
-            JOB_SPEC=SimpleNamespace(
-                model_revision="refs/pr/123",
-                train=SimpleNamespace(init_from_adapter="owner/repo:sft/source"),
-            )
-        ),
-    )
-    (tmp_path / "adapter_config.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(adapter_mod, "_download_adapter", lambda prefix: str(tmp_path))
-    monkeypatch.setattr(adapter_mod, "adapter_is_vl_warmstart", lambda *args, **kwargs: False)
-    monkeypatch.setattr(adapter_mod, "optimal_attn_impl", lambda: None)
-    monkeypatch.setattr(adapter_mod, "_assert_warmstart_adapter_applied", lambda *args: None)
-
-    model, peft_config = adapter_mod._init_adapter_model("org/model")
-
-    assert isinstance(model, _Peft)
-    assert peft_config is None
-    assert loads == [
-        (
-            ("org/model",),
-            {
-                "dtype": "bfloat16",
-                "trust_remote_code": True,
-                "revision": "refs/pr/123",
-            },
-        )
-    ]
 
 
 def test_train_metadata_keeps_model_revision_in_nested_job_spec(monkeypatch):

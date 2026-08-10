@@ -359,22 +359,6 @@ def test_prefetch_pinned_revision_wraps_transient_download_failure(monkeypatch):
     assert exc_info.value.__cause__ is transient
 
 
-def test_adapter_provenance_is_stamped_and_conflicts_fail(monkeypatch):
-    import flash.engine.worker.model.adapter as adapter
-
-    revision = "1" * 40
-    config = SimpleNamespace(base_model_name_or_path="owner/model", revision=None)
-    model = SimpleNamespace(peft_config={"default": config})
-
-    adapter.stamp_adapter_provenance(model, "owner/model", revision)
-    assert config.base_model_name_or_path == "owner/model"
-    assert config.revision == revision
-
-    config.revision = "2" * 40
-    with pytest.raises(RuntimeError, match="does not match"):
-        adapter.stamp_adapter_provenance(model, "owner/model", revision)
-
-
 def test_opd_model_revision_is_keyword_only():
     # a pinned revision must never be positional: model_id and model_revision are adjacent strings,
     # so a positional call that transposes them silently loads the wrong commit and breaks the

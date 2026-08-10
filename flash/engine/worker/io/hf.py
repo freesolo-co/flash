@@ -7,19 +7,12 @@ monkeypatch.setattr(worker, ...) takes effect in tests.
 from __future__ import annotations
 
 import contextlib
-import json
 import os
 import shutil
-import tempfile
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-
-try:
-    import fcntl
-except ImportError:
-    fcntl = None
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.adapters.artifacts import ADAPTER_WEIGHT_FILES, attempt_scoped_artifact_name
@@ -183,9 +176,7 @@ def hf_upload_file(local_path: str, repo_subpath: str, required: bool = False) -
 
 _OPTIONAL_UPLOAD_FLUSH_TIMEOUT_S = 300.0
 _REQUIRED_FINAL_UPLOAD_RESERVE_S = 60.0
-_OPTIONAL_UPLOAD_STAGE_ROOT = "/tmp/flash-optional-uploads"
 _RESUME_CHECKPOINT_UPLOAD_LOCK = threading.Lock()
-_FICLONE = 0x40049409
 
 
 @contextlib.contextmanager
@@ -347,51 +338,6 @@ class _FifoUploader:
 _OPTIONAL_CHECKPOINT_UPLOADER = _SingleSlotUploader()
 _OPTIONAL_AUX_UPLOADER = _SingleSlotUploader()
 _OPTIONAL_DEPLOYABLE_UPLOADER = _FifoUploader()
-_DEBUG_UPLOAD_LOCK = threading.Lock()
-
-
-def _copy_snapshot_file(source: str, destination: str) -> str:
-    """reflink a file when supported, otherwise make an independent copy."""
-    if fcntl is None:
-        shutil.copy2(source, destination, follow_symlinks=False)
-        return destination
-    try:
-        with open(source, "rb") as src, open(destination, "wb") as dst:
-            fcntl.ioctl(dst.fileno(), _FICLONE, src.fileno())
-        shutil.copystat(source, destination, follow_symlinks=False)
-    except OSError:
-        with contextlib.suppress(FileNotFoundError):
-            os.remove(destination)
-        shutil.copy2(source, destination, follow_symlinks=False)
-    return destination
-
-
-def _stage_optional_file(source: str, label: str) -> tuple[str, str]:
-    os.makedirs(_OPTIONAL_UPLOAD_STAGE_ROOT, exist_ok=True)
-    staged_dir = tempfile.mkdtemp(prefix=f"{label}-", dir=_OPTIONAL_UPLOAD_STAGE_ROOT)
-    staged_path = os.path.join(staged_dir, os.path.basename(source))
-    try:
-        _copy_snapshot_file(source, staged_path)
-    except Exception:
-        shutil.rmtree(staged_dir, ignore_errors=True)
-        raise
-    return staged_dir, staged_path
-
-
-def _stage_optional_directory(source: str, label: str) -> tuple[str, str]:
-    os.makedirs(_OPTIONAL_UPLOAD_STAGE_ROOT, exist_ok=True)
-    staged_dir = tempfile.mkdtemp(prefix=f"{label}-", dir=_OPTIONAL_UPLOAD_STAGE_ROOT)
-    staged_path = os.path.join(staged_dir, "artifact")
-    try:
-        shutil.copytree(
-            source,
-            staged_path,
-            copy_function=_copy_snapshot_file,
-        )
-    except Exception:
-        shutil.rmtree(staged_dir, ignore_errors=True)
-        raise
-    return staged_dir, staged_path
 
 
 def _bounded_optional_flush_timeout(timeout_s: float) -> float:
@@ -400,10 +346,6 @@ def _bounded_optional_flush_timeout(timeout_s: float) -> float:
     if remaining is None:
         return timeout_s
     return min(timeout_s, max(0.0, remaining - _REQUIRED_FINAL_UPLOAD_RESERVE_S))
-
-
-def _checkpoint_upload_lock_timeout() -> float:
-    return _bounded_optional_flush_timeout(_OPTIONAL_UPLOAD_FLUSH_TIMEOUT_S)
 
 
 def flush_optional_uploads(timeout_s: float = _OPTIONAL_UPLOAD_FLUSH_TIMEOUT_S) -> bool:
@@ -416,35 +358,6 @@ def flush_optional_uploads(timeout_s: float = _OPTIONAL_UPLOAD_FLUSH_TIMEOUT_S) 
     remaining = max(0.0, timeout_s - (time.monotonic() - started))
     aux_flushed = _OPTIONAL_AUX_UPLOADER.flush(remaining)
     return checkpoints_flushed and deployables_flushed and aux_flushed
-
-
-def upload_debug_jsonl(name: str, rows: list[dict], *, keep_last: int = 200) -> None:
-    """append bounded debug rows and enqueue an immutable optional upload snapshot."""
-    if not rows or not _w.HF_REPO:
-        return
-    repo_name = os.path.basename(name if name.endswith(".jsonl") else f"{name}.jsonl")
-    path = os.path.join("/tmp", repo_name)
-    try:
-        with _DEBUG_UPLOAD_LOCK:
-            existing: list[str] = []
-            # open() is evaluated before suppress() enters, so handle absence explicitly.
-            try:
-                with open(path) as f:
-                    existing = f.readlines()[-keep_last:]
-            except FileNotFoundError:
-                pass
-            with open(path, "w") as f:
-                f.writelines(existing)
-                for row in rows:
-                    f.write(json.dumps(row, default=str, ensure_ascii=True, sort_keys=True) + "\n")
-            staged_dir, staged_path = _stage_optional_file(path, "debug-jsonl")
-            _OPTIONAL_AUX_UPLOADER.enqueue(
-                f"debug {repo_name}",
-                staged_dir,
-                lambda: _w.hf_upload_file(staged_path, repo_name),
-            )
-    except Exception as e:
-        print(f"debug upload warn ({repo_name}): {sanitize_diagnostic(e, limit=500)}")
 
 
 def hf_upload_folder(local_dir: str, repo_subpath: str, required: bool = False) -> bool:
@@ -641,26 +554,6 @@ def _deployable_adapter_on_hf(step: int) -> bool:
         raise RetriableInfraError(f"could not verify required save step {step} on hf") from e
 
 
-def _latest_checkpoint_dir(output_dir: str) -> tuple[int, str] | None:
-    """Return (step, path) for the highest checkpoint-<n> dir under output_dir, or None."""
-    best: tuple[int, str] | None = None
-    try:
-        entries = os.listdir(output_dir)
-    except OSError:
-        return None
-    for name in entries:
-        if not name.startswith("checkpoint-"):
-            continue
-        suffix = name[len("checkpoint-") :]
-        path = os.path.join(output_dir, name)
-        if not suffix.isdigit() or not os.path.isdir(path):
-            continue
-        step = int(suffix)
-        if best is None or step > best[0]:
-            best = (step, path)
-    return best
-
-
 def _prune_stale_resume_checkpoints(keep_step: int) -> None:
     """Delete older ``{prefix}/checkpoint/checkpoint-N`` directories.
 
@@ -782,172 +675,6 @@ def upload_resume_checkpoint(
                         if failure_stage in {"before", "after"}:
                             raise
     return False
-
-
-def make_checkpoint_upload_callback(save_at_steps=()):
-    """stream optional saves in the background while keeping required saves synchronous."""
-    from transformers import TrainerCallback
-
-    required_steps = frozenset(int(step) for step in save_at_steps)
-    deployable_steps: set[int] = set()
-    uploaded_steps: set[int] = set()
-
-    def _publish_deployable(
-        ckpt_dir: str,
-        step: int,
-        *,
-        provenance_ready: bool = False,
-        emit_heartbeat: bool = True,
-    ) -> None:
-        """publish the trainer checkpoint's adapter without changing its contents."""
-        publish_deployable_checkpoint(
-            ckpt_dir,
-            step,
-            required=step in required_steps,
-            _provenance_ready=provenance_ready,
-            _emit_heartbeat=emit_heartbeat,
-        )
-        if step in required_steps:
-            deployable_steps.add(step)
-
-    def _upload(
-        step: int,
-        ckpt_dir: str,
-        *,
-        provenance_ready: bool = False,
-        emit_heartbeat: bool = True,
-        lock_timeout_s: float | None = None,
-    ) -> bool:
-        # publish the small durable deployable before the latest-only resume checkpoint.
-        def _prepare() -> None:
-            if step not in deployable_steps:
-                _publish_deployable(
-                    ckpt_dir,
-                    step,
-                    provenance_ready=provenance_ready,
-                    emit_heartbeat=emit_heartbeat,
-                )
-
-        return upload_resume_checkpoint(
-            step,
-            ckpt_dir,
-            before_upload=_prepare,
-            after_upload=lambda: uploaded_steps.add(step),
-            skip_upload=lambda: step in uploaded_steps,
-            emit_heartbeat=emit_heartbeat,
-            lock_timeout_s=lock_timeout_s,
-        )
-
-    def _enqueue_optional(step: int, ckpt_dir: str) -> None:
-        try:
-            _write_deployable_provenance(ckpt_dir)
-            staged_dir, staged_checkpoint = _stage_optional_directory(
-                ckpt_dir, f"checkpoint-{step}"
-            )
-        except Exception as e:
-            # surface the miss explicitly rather than logging a soft warning and continuing as if
-            # the periodic save reached hf.
-            print(
-                f"[ckpt] step {step} snapshot failed; step not published: "
-                f"{sanitize_diagnostic(e, limit=500)}"
-            )
-            return
-
-        def _publish_coalesced_deployable(
-            replaced: _OptionalUpload,
-            step: int = step,
-            staged_checkpoint: str = staged_checkpoint,
-        ) -> None:
-            # a newer optional save coalesced this resume checkpoint away; still publish this step's
-            # small durable deployable through the non-coalescing fifo path (which owns the staged
-            # tree cleanup) so per-step deployables are never dropped.
-            _OPTIONAL_DEPLOYABLE_UPLOADER.enqueue(
-                f"coalesced deployable step {step}",
-                replaced.staged_dir,
-                lambda: publish_deployable_checkpoint(
-                    staged_checkpoint, step, _provenance_ready=True, _emit_heartbeat=False
-                ),
-            )
-
-        _OPTIONAL_CHECKPOINT_UPLOADER.enqueue(
-            f"checkpoint step {step}",
-            staged_dir,
-            lambda: _upload(step, staged_checkpoint, provenance_ready=True, emit_heartbeat=False),
-            on_coalesce=_publish_coalesced_deployable,
-        )
-
-    class _CheckpointUpload(TrainerCallback):
-        def on_step_end(self, args, state, control, **kwargs):
-            if int(getattr(state, "global_step", 0) or 0) in required_steps:
-                control.should_save = True
-            return control
-
-        def on_train_begin(self, args, state, control, **kwargs):
-            # resume credits a required save only when its deployable adapter is verified on hf.
-            # crediting the restored step alone could accept a save that never reached hf.
-            resumed_step = int(getattr(state, "global_step", 0) or 0)
-            for step in required_steps:
-                if step <= resumed_step and _deployable_adapter_on_hf(step):
-                    deployable_steps.add(step)
-                    uploaded_steps.add(step)
-            return control
-
-        def on_save(self, args, state, control, **kwargs):
-            step = int(state.global_step)
-            if not _w.HF_REPO:
-                if step in required_steps:
-                    raise RuntimeError(f"required save step {step} has no artifact repository")
-                return
-            ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{step}")
-            if not os.path.isdir(ckpt_dir):
-                if step in required_steps:
-                    raise RuntimeError(
-                        f"required save step {step} has no trainer checkpoint directory"
-                    )
-                return
-            if step not in required_steps:
-                _enqueue_optional(step, ckpt_dir)
-                return
-            if not _upload(
-                step,
-                ckpt_dir,
-                lock_timeout_s=_checkpoint_upload_lock_timeout(),
-            ):
-                raise RetriableInfraError(
-                    f"required save step {step} full-state checkpoint was not durably published"
-                )
-
-        def on_train_end(self, args, state, control, **kwargs):
-            if not _w.HF_REPO:
-                if required_steps:
-                    raise RuntimeError("required saves have no artifact repository")
-                return
-            latest = _latest_checkpoint_dir(args.output_dir)
-            if latest is not None:
-                step, ckpt_dir = latest
-                should_flush = not required_steps or step in required_steps
-                if (
-                    should_flush
-                    and step not in uploaded_steps
-                    and not _upload(
-                        step,
-                        ckpt_dir,
-                        lock_timeout_s=_checkpoint_upload_lock_timeout(),
-                    )
-                ):
-                    if step in required_steps:
-                        raise RetriableInfraError(
-                            f"required save step {step} full-state checkpoint was not durably published"
-                        )
-                    print(
-                        f"[ckpt] final resume checkpoint step {step} not durable on HF after retries; "
-                        "the deployable adapter save is preserved."
-                    )
-            missing_required = sorted(required_steps - deployable_steps)
-            if missing_required:
-                raise RuntimeError(f"required saves were not durably published: {missing_required}")
-
-    return _CheckpointUpload()
 
 
 # re-exported so the prefetch surface stays reachable as `hf.<name>`: the tests patch

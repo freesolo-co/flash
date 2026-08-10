@@ -103,12 +103,12 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" MAX_JOBS=4 \
 # attn_implementation="flash_attention_3" to a LOCAL ``flash_attn_interface`` module (the
 # ``flash-attn-3`` build) — NOT the HF Kernels-Hub, whose torch2.10-compatible versions break
 # ``import transformers``. Baking it in lets the trainer use FA3 on the model's FULL-attention
-# (softmax) layers on Hopper (engine.worker.perf.optimal_attn_impl); the Qwen3.5 Gated-DeltaNet
+# (softmax) layers on Hopper (verl resolves the attn impl child-side); the Qwen3.5 Gated-DeltaNet
 # linear-attention layers are unaffected (FA does not apply to linear attention).
 # DEFAULT-ON, like FA2: FLASH_ATTN_3_SPEC defaults to a validated prebuilt cu128/torch2.10 wheel so
 # ``flash_attn_interface`` is ALWAYS present on Hopper — we control the image, so FA3 should never be
 # missing and the engine's SDPA fallback is pure defense-in-depth (only hit via FLASH_DISABLE_FA3).
-# It's a no-op on non-Hopper archs (optimal_attn_impl only probes FA3 on sm90); the wheel just rides
+# It's a no-op on non-Hopper archs (FA3 is only probed on sm90); the wheel just rides
 # along. Override FLASH_ATTN_3_SPEC to pin a different wheel, or set it to "" to drop FA3. Best-effort:
 # a failed install never blocks the image, and ``import flash_attn_interface`` is verified so a broken
 # install can't ship as "present" and then crash a run.
@@ -125,7 +125,7 @@ RUN if [ -n "${FLASH_ATTN_3_SPEC}" ]; then \
 # causal_conv1d: the short depthwise causal conv kernel whose ``seq_idx`` arg resets the conv at
 # example boundaries. Together with fla's ``cu_seqlens`` (which resets the DeltaNet recurrence) it
 # lets the GatedDeltaNet hybrids (Qwen3.5/3.6) PACK boundary-correctly — a 4D block-diagonal mask
-# alone only fixes the full-attention layers (engine.worker.packing.gdn_packing_available gates the
+# alone only fixes the full-attention layers (the verl child's capability probe gates the
 # SFT packing path on this import). GPU-validated (RTX 5090, Qwen3.5-0.8B): a packed example's output
 # is byte-identical regardless of its neighbors' content (zero cross-example leakage).
 # Arch-bounded to the catalog GPUs to cap build time. PINNED (compiled CUDA extension) for

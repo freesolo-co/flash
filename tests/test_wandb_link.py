@@ -1,9 +1,8 @@
 """the w&b run link must survive the verl subprocess boundary, on all three verl backends.
 
-the sdk's link_wandb reads notes["wandb_url"]. trl gets it for free by spreading
-wandb_run_info() -- it calls wandb.init in the flash process, so wandb.run is live there. verl
-calls wandb.init inside the TRAINING SUBPROCESS, so the parent's wandb.run is None and that same
-spread would silently yield nothing. these tests pin both halves of the replacement channel: the
+the sdk's link_wandb reads notes["wandb_url"]. verl calls wandb.init inside the training
+subprocess, so the parent process cannot inspect the live run directly. these tests pin both halves
+of the replacement channel: the
 child-side shim that reports the url, and the parent-side parser that reads it back.
 
 note on scope: tests/test_metrics_schema_agent_contract.py pins what CONSUMERS read, but it

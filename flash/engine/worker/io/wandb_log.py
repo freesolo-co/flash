@@ -21,57 +21,16 @@ def _wandb_importable() -> bool:
         return True  # ambiguous probe -> "present enough to try"
 
 
-def wandb_report_to() -> list[str]:
-    """HF ``report_to`` targets. Returns ["wandb"] when WANDB_API_KEY is set, else [].
-
-    Initializes the run directly (project from JOB_SPEC.wandb, not WANDB_PROJECT env) so the
-    Trainer's WandbCallback reuses the already-initialized run. Best-effort; never aborts training."""
-    if not os.environ.get("WANDB_API_KEY"):
-        return []
-    if not _wandb_importable():
-        print("[wandb] WANDB_API_KEY set but the wandb package is missing; skipping W&B logging")
-        return []
-    try:
-        import wandb
-
-        if wandb.run is None:
-            project = (_w.JOB_SPEC.wandb.project if _w.JOB_SPEC else None) or "flash"
-            wandb.init(project=project, name=wandb_run_name())
-    except Exception as e:
-        print(
-            f"[wandb] W&B init failed ({e}); skipping W&B logging (metrics.json is still written)"
-        )
-        return []
-    return ["wandb"]
-
-
 def wandb_run_name() -> str:
     """W&B run name, from the typed ``[wandb] run_name`` config (``JOB_SPEC.wandb.run_name``) only —
     no WANDB_NAME environment variable. An explicit name is used verbatim (the user owns the
     naming); otherwise a stable id tying the dashboard run to the Flash run
-    (``flash-<phase>-<run_id>``). Passed to the Trainer via ``TrainingArguments.run_name``
-    and to ``wandb.init`` above."""
+    (``flash-<phase>-<run_id>``). Passed into the verl config; the child process runs
+    ``wandb.init`` and reports the run link back over the marker channel."""
     configured = _w.JOB_SPEC.wandb.run_name if _w.JOB_SPEC else None
     if configured and configured.strip():
         return configured.strip()
     return f"flash-{_w.PHASE}-{_w.RUN_ID}"
-
-
-def wandb_run_info() -> dict:
-    """Return live W&B run's {url, id, project}, or {} if not active. Never raises."""
-    try:
-        import wandb
-
-        run = getattr(wandb, "run", None)
-        if run is None:
-            return {}
-        return {
-            "wandb_url": getattr(run, "url", None),
-            "wandb_id": getattr(run, "id", None),
-            "wandb_project": getattr(run, "project", None),
-        }
-    except Exception:
-        return {}
 
 
 def wandb_finish(exit_code: int = 0) -> None:

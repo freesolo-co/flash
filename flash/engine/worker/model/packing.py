@@ -51,24 +51,6 @@ def probe_is_pure_attention(model_id: str, revision: str = "") -> bool:
     return not (sliding and getattr(cfg, "use_sliding_window", True))
 
 
-def model_is_pure_attention(model_id: str, revision: str = "") -> bool:
-    """True when every decoder layer is full softmax attention (safe to pack unconditionally).
-
-    Returns False for GDN hybrids, sliding-window arches, and on any config error.
-
-    the profile needs this and the runtime gate does not: the runtime asks the narrower question
-    "is this a gdn hybrid whose child can reset boundaries", which it answers on the worker with the
-    checkpoint in hand. the profile runs BEFORE any worker exists and has to commit to a packing
-    mode for the quote, so it can only fail closed -- pack when the architecture is provably safe
-    for every backend, otherwise price the unpacked path.
-    """
-    try:
-        return probe_is_pure_attention(model_id, revision)
-    except Exception as e:  # network/parse/arch failure -> do NOT pack (boundary-safe default)
-        print(f"[pack] pure-attention probe failed for {model_id!r} (treating as NOT pure): {e}")
-        return False
-
-
 def probe_is_gdn_hybrid(model_id: str, revision: str = "") -> bool:
     """``model_is_gdn_hybrid`` without the swallow: a failed probe RAISES.
 
@@ -115,69 +97,6 @@ def gdn_model_type(model_id: str | None, revision: str = "") -> str:
         return getattr(cfg, "model_type", None) or "qwen3_5"
     except Exception:
         return "qwen3_5"
-
-
-def _gdn_forward_threads_reset_kwargs(model_id: str | None, revision: str = "") -> bool:
-    """Check that THIS arch's GDN forward actually accepts cu_seq_lens_q and seq_idx (varies by transformers version)."""
-    try:
-        import importlib
-        import inspect
-
-        model_type = gdn_model_type(model_id, revision=revision)
-        mod = importlib.import_module(f"transformers.models.{model_type}.modeling_{model_type}")
-        gdn_cls = next(
-            (
-                c
-                for n, c in vars(mod).items()
-                if isinstance(c, type) and n.endswith("GatedDeltaNet")
-            ),
-            None,
-        )
-        if gdn_cls is None:
-            return False
-        fwd = inspect.getsource(gdn_cls.forward)
-        return ("cu_seq_lens_q" in fwd) and ("seq_idx" in fwd)
-    except Exception:
-        return False
-
-
-def gdn_packing_contract_available(model_id: str | None = None, revision: str = "") -> bool:
-    """True when the installed gdn stack exposes the boundary-reset contract without opening cuda."""
-    try:
-        import importlib
-
-        from transformers.utils.import_utils import (
-            is_causal_conv1d_available,
-            is_flash_linear_attention_available,
-        )
-
-        if not (is_flash_linear_attention_available() and is_causal_conv1d_available()):
-            return False
-        importlib.import_module("causal_conv1d")
-        return _gdn_forward_threads_reset_kwargs(model_id, revision=revision)
-    except Exception:
-        return False
-
-
-def gdn_packing_available(model_id: str | None = None, revision: str = "") -> bool:
-    """True when the gdn reset contract is installed and functional on the current device."""
-    if not gdn_packing_contract_available(model_id, revision=revision):
-        return False
-    try:
-        # causal_conv1d compiled without the current gpu arch imports fine but raises at first forward;
-        # smoke it now so training fails before optimizer work rather than at a packed boundary.
-        import torch
-
-        if torch.cuda.is_available():
-            from causal_conv1d import causal_conv1d_fn
-
-            _x = torch.zeros(1, 4, 8, device="cuda", dtype=torch.bfloat16)
-            conv_weight = torch.zeros(4, 3, device="cuda", dtype=torch.bfloat16)
-            causal_conv1d_fn(_x, conv_weight)
-            torch.cuda.synchronize()
-        return True
-    except Exception:
-        return False
 
 
 def _eos_terminated(texts: list[str], tokenizer) -> list[str]:

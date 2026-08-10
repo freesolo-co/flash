@@ -18,8 +18,6 @@ import time
 from typing import Any
 
 from flash.engine.result.rollout_samples import (
-    sampled_completion_scalar,
-    sanitize_rollout_text,
     select_rollout_samples,
 )
 from flash.engine.worker.perf import gpu_diagnostics
@@ -89,8 +87,6 @@ _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S = 120.0
 # Monotonic claim counter; rollback guard uses SEQ not wall-clock (two threads can share same ts).
 _HB_CLAIM_SEQ = 0
 
-_STEP_GPU_DIAG_INTERVAL_S = 300.0
-_SFT_HEARTBEAT_INTERVAL_S = 60.0
 # retain at least one metric row per second across the 900s training heartbeat throttle window.
 GRPO_METRIC_HISTORY_LIMIT = 1024
 
@@ -258,18 +254,6 @@ def heartbeat(
             print(f"HEARTBEAT upload-lock busy >{lock_timeout}s; skipping commit for {stage}")
     print("HEARTBEAT", _console_heartbeat_snapshot(payload, payload_committed))
     return payload_committed
-
-
-def _maybe_attach_gpu_diag(payload: dict, last_gpu_diag_at: float, now: float) -> float:
-    """Attach GPU diagnostics to ``payload`` at most once per ``_STEP_GPU_DIAG_INTERVAL_S``.
-
-    Returns the value to store back as ``last_gpu_diag_at``: ``now`` when diagnostics were
-    attached this call, otherwise the unchanged prior timestamp.
-    """
-    if last_gpu_diag_at == 0.0 or now - last_gpu_diag_at >= _STEP_GPU_DIAG_INTERVAL_S:
-        payload["gpu"] = gpu_diagnostics()
-        return now
-    return last_gpu_diag_at
 
 
 _REWARD_METRIC_NAME_DISALLOWED = re.compile(r"[^A-Za-z0-9_.-]")
@@ -522,73 +506,6 @@ def _bounded_reward_metrics(metrics) -> dict[str, float]:
     remaining = max(0, _REWARD_METRIC_LIMIT - len(priority))
     rest = sorted(n for n in surviving if n not in priority)[:remaining]
     return {n: surviving[n] for n in sorted(priority + rest)}
-
-
-# Exactly three samples per heartbeat, always. Mirrors rollout_samples._SAMPLE_LIMIT.
-_SAMPLE_LIMIT = 3
-
-
-def _bounded_sampled_completions(samples) -> list[dict]:
-    if not isinstance(samples, (list, tuple)):
-        return []
-    bounded: list[dict] = []
-    for sample in samples:
-        if not isinstance(sample, dict):
-            continue
-        prompt_tail = sample.get("prompt_tail")
-        completion = sample.get("completion")
-        if not isinstance(prompt_tail, str) or not isinstance(completion, str):
-            continue
-        scalar = sampled_completion_scalar(sample)
-        if scalar is None:
-            continue
-        generated_at_step = sample.get("generated_at_step")
-        if generated_at_step is not None:
-            try:
-                generated_at_step = int(generated_at_step)
-            except (TypeError, ValueError):
-                continue
-        scalar_key, scalar_value = scalar
-        bounded.append(
-            {
-                "prompt_tail": sanitize_rollout_text(prompt_tail),
-                "completion": sanitize_rollout_text(completion),
-                scalar_key: scalar_value,
-                "generated_at_step": generated_at_step,
-            }
-        )
-        if len(bounded) >= _SAMPLE_LIMIT:
-            break
-    return bounded
-
-
-def make_sft_heartbeat_callback():
-    """Stream SFT trainer logs so a run is not silent between model load and completion."""
-    from transformers import TrainerCallback
-
-    class _SFTHeartbeat(TrainerCallback):
-        def __init__(self):
-            self.last_heartbeat_at = 0.0
-            self.last_gpu_diag_at = 0.0
-
-        def on_log(self, args, state, control, logs=None, **kwargs):
-            if not logs:
-                return
-            now = time.monotonic()
-            if self.last_heartbeat_at and now - self.last_heartbeat_at < _SFT_HEARTBEAT_INTERVAL_S:
-                return
-            self.last_heartbeat_at = now
-            payload = {
-                "step": int(getattr(state, "global_step", 0) or 0),
-                "epoch": logs.get("epoch"),
-                "loss": logs.get("loss"),
-                "grad_norm": logs.get("grad_norm"),
-                "learning_rate": logs.get("learning_rate"),
-            }
-            self.last_gpu_diag_at = _maybe_attach_gpu_diag(payload, self.last_gpu_diag_at, now)
-            _w.heartbeat("sft_step", **{k: v for k, v in payload.items() if v is not None})
-
-    return _SFTHeartbeat()
 
 
 _LIVENESS_TICK_S = 30.0

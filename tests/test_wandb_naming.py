@@ -8,8 +8,6 @@ the job-spec JSON the worker reads), NOT environment variables; the WANDB_API_KE
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from flash.core.spec import JobSpec, WandbSpec
@@ -137,72 +135,6 @@ def test_worker_run_name_is_toml_only_ignores_env(monkeypatch):
     monkeypatch.setattr(worker, "JOB_SPEC", None)
     monkeypatch.setenv("WANDB_NAME", "should-be-ignored")
     assert worker.wandb_run_name().startswith("flash-")
-
-
-def test_report_to_inits_wandb_from_spec_without_env(monkeypatch):
-    # wandb_report_to initializes the run from the typed [wandb] config via the SDK and sets NO
-    # WANDB_PROJECT env var — the env var is fully gone.
-    import importlib.util
-    import sys
-    import types
-
-    from flash.engine import worker
-
-    calls: dict = {}
-    fake = types.ModuleType("wandb")
-    fake.run = None
-
-    def _init(**kw):
-        calls.update(kw)
-        fake.run = object()
-
-    fake.init = _init
-    monkeypatch.setitem(sys.modules, "wandb", fake)
-    _orig_find = importlib.util.find_spec
-    monkeypatch.setattr(
-        importlib.util,
-        "find_spec",
-        lambda name, *a, **k: object() if name == "wandb" else _orig_find(name, *a, **k),
-    )
-    monkeypatch.setenv("WANDB_API_KEY", "k")
-    monkeypatch.delenv("WANDB_PROJECT", raising=False)
-    monkeypatch.setattr(
-        worker, "JOB_SPEC", JobSpec(wandb=WandbSpec(project="my-proj", run_name="my-run"))
-    )
-
-    assert worker.wandb_report_to() == ["wandb"]
-    assert calls["project"] == "my-proj"  # project from the spec, via wandb.init
-    assert calls["name"] == "my-run"  # run name from the spec
-    assert "WANDB_PROJECT" not in os.environ  # the env var is fully gone
-
-
-def test_report_to_is_best_effort_when_wandb_init_fails(monkeypatch):
-    # W&B logging is optional: a broken wandb install / init failure (auth, network) must NOT
-    # abort training — wandb_report_to falls back to [] instead of propagating the exception.
-    import importlib.util
-    import sys
-    import types
-
-    from flash.engine import worker
-
-    fake = types.ModuleType("wandb")
-    fake.run = None
-
-    def _boom(**kw):
-        raise RuntimeError("wandb backend unreachable")
-
-    fake.init = _boom
-    monkeypatch.setitem(sys.modules, "wandb", fake)
-    _orig_find = importlib.util.find_spec
-    monkeypatch.setattr(
-        importlib.util,
-        "find_spec",
-        lambda name, *a, **k: object() if name == "wandb" else _orig_find(name, *a, **k),
-    )
-    monkeypatch.setenv("WANDB_API_KEY", "k")
-    monkeypatch.setattr(worker, "JOB_SPEC", JobSpec(wandb=WandbSpec(project="p", run_name="r")))
-
-    assert worker.wandb_report_to() == []  # degrades to no W&B logging, no crash
 
 
 def test_runtime_secret_reads_wandb_and_declared_environment_secrets(tmp_path, monkeypatch):

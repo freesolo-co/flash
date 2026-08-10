@@ -14,12 +14,6 @@ import contextlib
 import os
 import sys
 
-from flash.engine.worker.perf.attn import (
-    _attn_impl_for_capability,
-    _flash_attn_3_available,
-    _flash_attn_available,
-    optimal_attn_impl,
-)
 from flash.engine.worker.perf.diagnostics import (
     _clean_diag,
     _float_or_none,
@@ -421,13 +415,10 @@ def _ensure_fla_fastpath_on_hopper() -> None:
 
 __all__ = [
     "RetriableInfraError",
-    "_attn_impl_for_capability",
     "_clean_diag",
     "_ensure_fla_fastpath_on_hopper",
     "_estimate_params",
     "_find_real_libcudart",
-    "_flash_attn_3_available",
-    "_flash_attn_available",
     "_float_or_none",
     "_force_fla_triton_gdn_on_sm100",
     "_int_or_none",
@@ -443,6 +434,5 @@ __all__ = [
     "grad_checkpointing_on",
     "grpo_use_reentrant",
     "is_cuda_oom",
-    "optimal_attn_impl",
     "wait_for_gpu",
 ]
