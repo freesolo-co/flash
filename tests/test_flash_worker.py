@@ -88,7 +88,7 @@ def test_build_worker_env_opd_uses_sleep_safe_allocator(monkeypatch):
         opd_spec,
         0,
         runtime_secrets={
-            "FLASH_CONTROL_PANEL_URL": "https://broker.example",
+            "FLASH_API_URL": "https://broker.example",
             "FLASH_TEACHER_CAPABILITY": "capability-test-value",
         },
     )
@@ -139,15 +139,15 @@ def test_build_worker_env_forwards_only_managed_teacher_capability_for_opd(monke
         opd_spec,
         0,
         runtime_secrets={
-            "FLASH_CONTROL_PANEL_URL": "https://broker.example",
+            "FLASH_API_URL": "https://broker.example",
             "FLASH_TEACHER_CAPABILITY": "capability-test-value",
         },
     )
-    assert env["FLASH_CONTROL_PANEL_URL"] == "https://broker.example"
+    assert env["FLASH_API_URL"] == "https://broker.example"
     assert env["FLASH_TEACHER_CAPABILITY"] == "capability-test-value"
     assert "PARASAIL_API_KEY" not in env
     grpo = build_worker_env(_spec(), 0)
-    assert "FLASH_CONTROL_PANEL_URL" not in grpo
+    assert "FLASH_API_URL" not in grpo
     assert "FLASH_TEACHER_CAPABILITY" not in grpo
 
 
@@ -190,7 +190,7 @@ def test_build_worker_env_rejects_managed_teacher_byo_names():
             0,
             runtime_secrets={
                 "PARASAIL_API_KEY": "byo-parasail-key",
-                "FLASH_CONTROL_PANEL_URL": "https://broker.example",
+                "FLASH_API_URL": "https://broker.example",
                 "FLASH_TEACHER_CAPABILITY": "capability-test-value",
             },
         )

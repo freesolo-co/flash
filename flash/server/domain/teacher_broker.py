@@ -102,6 +102,20 @@ def validate_control_panel_url(value: str) -> str:
     return url
 
 
+def resolve_control_panel_url() -> str:
+    """Resolve this plane's worker-reachable origin from the environment.
+
+    reads os.environ directly rather than flash.client.config, which would layer config.json and
+    the channel default underneath. a plane that set nothing must fail here rather than silently
+    issue capabilities against the hosted plane, which never minted them.
+
+    validation only constrains the url's shape, so an https://localhost origin or a public origin
+    belonging to a different plane passes here and is caught only when the worker fails to present
+    its capability, after the gpu is allocated.
+    """
+    return validate_control_panel_url(os.environ.get(CONTROL_PANEL_URL_ENV, ""))
+
+
 def require_teacher_broker_configuration(
     spec: JobSpec,
     *,
@@ -110,7 +124,7 @@ def require_teacher_broker_configuration(
 ) -> str:
     if spec.algorithm != "opd":
         raise RuntimeError("teacher broker configuration is only valid for opd runs")
-    control_panel_url = validate_control_panel_url(os.environ.get(CONTROL_PANEL_URL_ENV, ""))
+    control_panel_url = resolve_control_panel_url()
     if not os.environ.get(PARASAIL_API_KEY_ENV, "").strip():
         raise RuntimeError(
             f"{PARASAIL_API_KEY_ENV} is required on the control plane for managed opd teachers"

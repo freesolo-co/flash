@@ -64,7 +64,9 @@ def _offline(monkeypatch):
         "LAMBDA_API_KEY",
         "VAST_API_KEY",
         "PARASAIL_API_KEY",
-        "FLASH_CONTROL_PANEL_URL",
+        # the teacher broker reads it, so an ambient value would silently satisfy the
+        # configuration gate a test is trying to prove fails.
+        "FLASH_API_URL",
         "FLASH_TEACHER_CAPABILITY",
         "FLASH_STANDALONE",
         "FLASH_HF_NAMESPACE",
