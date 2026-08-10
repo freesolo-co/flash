@@ -57,12 +57,46 @@ jobs:
       # Python), but nothing enforced it, so a test that reached hf.co passed on a connected
       # runner and would go red on a blip. Setting these makes the name true: an unstubbed call
       # fails locally and deterministically instead of intermittently in CI.
+      #
+      # Sharding: this step is ~300s of the job's ~305s, and almost all of it is waiting rather
+      # than computing (the offline tests exercise retry/backoff/watchdog paths, so 125 sleep call
+      # sites sit idle holding a core). One process left the runner's second core idle for five
+      # minutes; `-n 2` cuts the step roughly in half.
+      #
+      # `loadfile` (not the default `load`, and not `loadscope`) is required, not a preference:
+      # tests in the same FILE share module-level import state -- several re-import
+      # `flash.engine.worker` to re-run its import scope, and others patch dotted targets under it.
+      # Splitting a file across workers breaks that sharing; `loadscope` splits at class/module
+      # granularity and fails tests/test_warmstart_cross_repo.py for exactly this reason. `loadfile`
+      # keeps every file whole on one worker, which is the boundary the suite already assumes.
+      #
+      # `-n 2` is pinned deliberately instead of `-n auto`. `auto` does NOT mean "the cores this
+      # process may use": xdist prefers psutil.cpu_count() when psutil is importable (it is, via a
+      # transitive dep) and that ignores CPU affinity and cgroup limits. So `auto` silently couples
+      # the worker count to a transitive dependency and to whatever tier the runner pool hands out.
+      # A standard GitHub runner is 2-core, which is what this suite was measured against; pinning
+      # keeps the sharding identical on every run instead of changing under us.
+      #
+      # Oversubscription is not free here: at 48 workers on 2 cores, three timing-sensitive tests in
+      # tests/test_server_envs_coverage.py fail, because they assert on a schema-validation timeout
+      # budget that CPU starvation blows through. Raise this only alongside the runner's core count.
       - name: Tests (CPU, offline)
         env:
           HF_HUB_OFFLINE: "1"
           TRANSFORMERS_OFFLINE: "1"
           HF_HUB_DISABLE_TELEMETRY: "1"
-        run: uv run pytest -q
+        run: uv run pytest -q -n 2 --dist loadfile -m "not wallclock"
+
+      # The `wallclock` tests assert on real elapsed time with tens-of-milliseconds margins, so a
+      # second worker competing for the core fails them for reasons unrelated to the code. They are
+      # deselected above and run here alone, single-process: ~5s, which is why isolating them is
+      # cheaper than the scaled-up timing budgets that would be needed to survive contention.
+      - name: Tests (CPU, offline, wall-clock sensitive)
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+          HF_HUB_DISABLE_TELEMETRY: "1"
+        run: uv run pytest -q -m wallclock
 
       # The offline suite can only compare the pin against a hardcoded copy of itself, so a
       # mis-transcribed sha passes every pin test while naming a commit that was never pushed --

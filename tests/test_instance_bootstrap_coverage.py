@@ -1182,6 +1182,7 @@ def test_run_mode_reaps_periodic_uploader_before_terminal_marker_reserve(monkeyp
     assert events[-1] == ("marker", marker_started_at, False)
 
 
+@pytest.mark.wallclock
 @pytest.mark.parametrize("_iteration", range(3))
 def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monkeypatch, _iteration):
     stop_timeout = 0.03
@@ -1315,6 +1316,7 @@ def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monke
     assert terminal_markers[0][1] <= reaping_deadline
 
 
+@pytest.mark.wallclock
 def test_stop_upload_process_reaps_real_sleeping_child_before_marker_reserve():
     context = multiprocessing.get_context("spawn")
     process = _InspectableProcess(context.Process(target=_sleeping_upload_child, daemon=True))
@@ -1344,6 +1346,7 @@ def test_stop_upload_process_reaps_real_sleeping_child_before_marker_reserve():
         process.close_real()
 
 
+@pytest.mark.wallclock
 def test_final_upload_reaps_real_sigterm_ignoring_child_before_marker_reserve(monkeypatch):
     context = multiprocessing.get_context("spawn")
     ready = context.Event()
