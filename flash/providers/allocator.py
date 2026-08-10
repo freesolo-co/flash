@@ -142,17 +142,45 @@ def _structurally_fits(available, need: int, cap: int) -> bool:
 def geometry_safe_gpu_cap(model_id: str, max_gpu_count: int, *, model_revision: str = "") -> int:
     """Rentable ceiling whose sequence-parallel divisibility is known before paid allocation.
 
-    Catalog default revisions have curated attention-head geometry and every row is divisible by 8.
-    Open-policy models and pinned catalog revisions currently validate coarse geometry but not the
-    pinned config's attention-head count, so keep them at the pre-existing four-card ceiling rather
-    than renting 8 cards that verl may reject at startup. ALLOC-004 tracks validating arbitrary and
-    pinned head geometry at every width.
+    The width becomes ``ulysses_sequence_parallel_size``, and verl requires
+    ``num_attention_heads % sp_size == 0``, so a catalog row is only safe at the counts that divide
+    its OWN head count. Curated geometry is not the same as uniform geometry: Qwen3.5-4B has 10
+    query heads (``hidden_size`` 2560 / ``head_dim`` 256), and 0.8B and 27B have 4 and 20, so
+    trusting catalog membership alone accepted a 4-card RTX 4090 shape for the 4B -- a width only
+    that shape's VRAM could reach -- rented it, and then died on Ulysses init before the first step.
+    Derive the ceiling from the row instead.
+
+    Open-policy models and pinned catalog revisions carry no curated geometry here, so they keep the
+    pre-existing four-card ceiling rather than renting 8 cards verl may reject at startup.
+    ALLOC-004 tracks validating arbitrary and pinned head geometry at every width.
     """
     cap = largest_rentable_count(max_gpu_count)
     from flash.core.catalog import MODELS
 
-    default_catalog_revision = model_id in MODELS and not model_revision
-    return cap if default_catalog_revision else min(cap, 4)
+    info = MODELS.get(model_id) if not model_revision else None
+    if info is None:
+        return min(cap, 4)
+    heads = _query_attention_heads(info)
+    if heads <= 0:
+        # geometry we cannot read is geometry we cannot certify; fall back to the safe ceiling.
+        return min(cap, 4)
+    for count in rentable_gpu_counts(cap):
+        if heads % count == 0:
+            return count
+    return 1
+
+
+def _query_attention_heads(info) -> int:
+    """Query-attention head count for a catalog row, or 0 when it cannot be derived.
+
+    The catalog records ``hidden_size`` and ``head_dim`` rather than the head count itself, and
+    verl's sequence-parallel constraint is stated against the head count.
+    """
+    hidden = int(getattr(info, "hidden_size", 0) or 0)
+    head_dim = int(getattr(info, "head_dim", 0) or 0)
+    if hidden <= 0 or head_dim <= 0 or hidden % head_dim:
+        return 0
+    return hidden // head_dim
 
 
 def allocate(

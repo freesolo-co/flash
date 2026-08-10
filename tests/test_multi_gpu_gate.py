@@ -810,10 +810,11 @@ def test_public_max_gpu_count_is_rentable_not_silently_clamped():
 def test_eight_cards_require_validated_head_geometry():
     """A run must not rent 8 cards before its attention-head count is known to divide.
 
-    verl requires ``num_attention_heads % sp_size == 0``. Curated default revisions have hand-checked
-    geometry and every row divides by 8. A PINNED revision does not: the pin's own config is fetched
-    for parameter/vocabulary size but its head count is never validated, so an 8-card pinned run
-    could pay for a box and abort during sequence-parallel initialization. Those stay at four.
+    verl requires ``num_attention_heads % sp_size == 0``. A PINNED revision cannot be checked: the
+    pin's own config is fetched for parameter/vocabulary size but its head count never is, so an
+    8-card pinned run could pay for a box and abort during sequence-parallel initialization. Those
+    stay at four. Catalog rows ARE readable, and are capped on their real geometry -- see
+    ``test_geometry_cap_follows_each_models_own_head_count``.
     """
     from flash.providers.allocator import geometry_safe_gpu_cap
 
@@ -821,6 +822,33 @@ def test_eight_cards_require_validated_head_geometry():
     assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision="a" * 40) == 4
     # odd ceilings still normalize through the shared rentable-count helper.
     assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 3, model_revision="a" * 40) == 2
+
+
+def test_geometry_cap_follows_each_models_own_head_count():
+    """The cap is per-model geometry, not one blanket ceiling.
+
+    Query-head counts are ``hidden_size // head_dim`` and they are NOT all powers of two: 3.5-4B has
+    10 and 3.6-27B has 20. Renting the authored 8 for those hands verl an ``sp_size`` that does not
+    divide the head count, so the run pays for the box and dies in Ulysses init. Every catalog row is
+    checked here so a new model with awkward geometry cannot be added without this failing.
+    """
+    from flash.core.catalog import MODELS
+    from flash.providers.allocator import geometry_safe_gpu_cap
+
+    for model_id, info in MODELS.items():
+        heads = info.hidden_size // info.head_dim
+        cap = geometry_safe_gpu_cap(model_id, 8)
+        assert heads % cap == 0, f"{model_id}: {heads} heads is not divisible by a {cap}-card cap"
+
+    # the reported failure: 10 heads means 4 and 8 both leave a remainder, so 2 is the widest shape.
+    assert MODELS["Qwen/Qwen3.5-4B"].hidden_size // MODELS["Qwen/Qwen3.5-4B"].head_dim == 10
+    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-4B", 8) == 2
+    # models whose geometry does divide are NOT narrowed -- the cap must not become a blanket floor.
+    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8) == 8
+    # an authored ceiling below the geometric limit still wins; the cap only ever narrows.
+    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 2) == 2
+    # a model outside the catalog has no readable geometry, so it keeps the unvalidated ceiling.
+    assert geometry_safe_gpu_cap("some-org/not-in-catalog", 8) == 4
 
 
 def test_schema_preflight_applies_the_geometry_cap_to_provisional_sizing():

@@ -545,7 +545,9 @@ def rentable_gpu_counts(max_gpu_count: int) -> tuple[int, ...]:
     """Return rentable card counts, largest first, up to ``max_gpu_count``.
 
     Use powers of two: providers sell those shapes, and verl requires ``num_attention_heads %
-    sp_size == 0``. Catalog head counts are all divisible by 1, 2, 4, and 8.
+    sp_size == 0``. Catalog head counts are NOT uniformly divisible by every power of two --
+    Qwen3.5-4B has 10 query heads, 0.8B has 4, Qwen3.6-27B has 20 -- so the per-model ceiling comes
+    from ``allocator.geometry_safe_gpu_cap``; this only enumerates the shapes providers rent.
     """
     cap = max(1, int(max_gpu_count))
     counts, count = [], 1
