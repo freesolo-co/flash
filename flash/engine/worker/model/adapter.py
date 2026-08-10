@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 
+from flash.adapters.lora_rank import resolve_adapter_ref
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.worker.io.hf import (
     RetriableInfraError,
@@ -223,20 +224,6 @@ def _init_adapter_model(model_id: str):
     return model, None
 
 
-def _resolve_adapter_ref(adapter_ref: str) -> tuple[str, str] | None:
-    """Resolve the INTERNAL adapter storage reference into (repo, prefix).
-
-    Users write the short ``<run_id>[/step-N]`` form (see ``flash.schema.parse_checkpoint_ref``);
-    the control plane resolves it against the source run's metadata into the storage reference
-    the worker receives here (``flash.runner._prepare_init_from_adapter``). Per-step deployable
-    adapters live at the identical ``<prefix>/adapter`` layout in the artifact repo (see
-    ``publish_deployable_checkpoint``), so the same download path serves both.
-    """
-    from flash.schema import parse_adapter_storage_ref
-
-    return parse_adapter_storage_ref(adapter_ref)
-
-
 def _warmstart_adapter_is_loadable(adir: str) -> bool:
     """return true only for a structurally complete adapter config and weight file."""
     if not _has_deployable_adapter(adir):
@@ -259,7 +246,7 @@ def _download_adapter(adapter_prefix: str | None) -> str | None:
     """
     if not adapter_prefix:
         return None
-    resolved = _resolve_adapter_ref(adapter_prefix)
+    resolved = resolve_adapter_ref(adapter_prefix)
     if not resolved:
         return None
     repo, prefix = resolved

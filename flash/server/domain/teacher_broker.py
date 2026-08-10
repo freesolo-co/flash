@@ -16,6 +16,7 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Any
 
+from flash._internal.fileio import reject_duplicate_keys
 from flash.core.spec import CONTROL_PANEL_URL_ENV, TEACHER_CAPABILITY_ENV, JobSpec
 from flash.engine.plan.recipe import RECIPE, resolve_teacher
 from flash.server.platform import db
@@ -241,13 +242,9 @@ def teacher_attempt_transport(
         db.revoke_teacher_capability(capability)
 
 
-def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    output: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in output:
-            raise TeacherBrokerError("duplicate_json_key", status_code=400)
-        output[key] = value
-    return output
+_reject_duplicate_keys = reject_duplicate_keys(
+    lambda _key: TeacherBrokerError("duplicate_json_key", status_code=400)
+)
 
 
 def _reject_nonfinite(_value: str) -> None:
