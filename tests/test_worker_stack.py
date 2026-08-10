@@ -47,9 +47,6 @@ def test_worker_stack_pins_qwen35_capable_versions():
     assert "bitsandbytes" in joined  # 8-bit paged AdamW optimizer state (LoRA+ coexists)
 
 
-# ---------------------------------------------------------------------------
-# is_vl_checkpoint: qwen3_5* are VL; text models are not
-# ---------------------------------------------------------------------------
 def _import_worker(monkeypatch):
     monkeypatch.setenv("RUN_MODE", "sft")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
@@ -57,31 +54,6 @@ def _import_worker(monkeypatch):
     import flash.engine.worker as worker
 
     return worker
-
-
-def _fake_transformers(monkeypatch, model_type: str):
-    fake_cfg = types.SimpleNamespace(model_type=model_type)
-    fake_auto = types.SimpleNamespace(
-        from_pretrained=lambda *a, **k: fake_cfg,
-    )
-    fake_mod = types.ModuleType("transformers")
-    fake_mod.AutoConfig = fake_auto
-    monkeypatch.setitem(sys.modules, "transformers", fake_mod)
-
-
-def test_is_vl_checkpoint_qwen35(monkeypatch):
-    # qwen3_5* stay VL checkpoints WITHOUT a LoRA module exclusion: this flag must not be coupled to
-    # any deleted exclusion list.
-    worker = _import_worker(monkeypatch)
-    for model_type in ("qwen3_5", "qwen3_5_moe", "qwen3_6"):
-        _fake_transformers(monkeypatch, model_type)
-        assert worker.is_vl_checkpoint("Qwen/Qwen3.5-4B") is True
-
-
-def test_is_vl_checkpoint_text_model(monkeypatch):
-    worker = _import_worker(monkeypatch)
-    _fake_transformers(monkeypatch, "llama")
-    assert worker.is_vl_checkpoint("meta-llama/Llama-3.2-1B") is False
 
 
 @pytest.mark.parametrize(
@@ -114,10 +86,9 @@ def test_model_revision_threads_through_config_probes(monkeypatch, revision):
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
     from flash.engine.worker.entry import sft
-    from flash.engine.worker.model import lora, packing
+    from flash.engine.worker.model import packing
     from flash.engine.worker.perf import liger
 
-    assert lora.is_vl_checkpoint("org/model", revision=revision)
     assert packing.model_is_gdn_hybrid("org/model", revision=revision)
     assert packing.gdn_model_type("org/model", revision=revision)
     assert sft._model_arch_dims("uncataloged/model", revision=revision) == (4096, 32)
@@ -206,31 +177,6 @@ def test_model_revision_threads_through_tokenizer_and_prefetch(monkeypatch):
     assert all("revision" not in kwargs for kwargs in empty_calls)
 
 
-def _fake_torch(monkeypatch):
-    """Inject a stub ``torch`` (the CPU/server venv has no torch) exposing optim.AdamW."""
-
-    class _AdamW:  # marker class; identity is all the tests check
-        pass
-
-    fake = types.ModuleType("torch")
-    fake.optim = types.SimpleNamespace(AdamW=_AdamW)
-    monkeypatch.setitem(sys.modules, "torch", fake)
-    return _AdamW
-
-
-def _fake_bitsandbytes(monkeypatch):
-    """Inject a stub ``bitsandbytes`` so loraplus_optimizer_cls can resolve the 8-bit class
-    without a CUDA build of bnb installed."""
-
-    class _PagedAdamW8bit:  # marker class; identity is all the test checks
-        pass
-
-    fake = types.ModuleType("bitsandbytes")
-    fake.optim = types.SimpleNamespace(PagedAdamW8bit=_PagedAdamW8bit)
-    monkeypatch.setitem(sys.modules, "bitsandbytes", fake)
-    return _PagedAdamW8bit
-
-
 def test_gpu_diagnostics_parses_nvidia_smi(monkeypatch):
     from flash.engine.worker import perf
 
@@ -267,41 +213,6 @@ def test_gpu_diagnostics_parses_nvidia_smi(monkeypatch):
     assert diag["power_w"] == 412.5
     assert diag["processes"][0]["process_name"] == "/usr/bin/python"
     assert diag["processes"][0]["used_memory_gb"] == pytest.approx(23.34, rel=1e-3)
-
-
-def test_loraplus_optimizer_mirrors_8bit_optim(monkeypatch):
-    """An `8bit` optim string -> bnb PagedAdamW8bit (LoRA+ and 8-bit state coexist), always-on."""
-    worker = _import_worker(monkeypatch)
-    _fake_torch(monkeypatch)
-    paged = _fake_bitsandbytes(monkeypatch)
-    cls, extra = worker.loraplus_optimizer_cls("paged_adamw_8bit")
-    assert cls is paged
-    assert extra == {}
-
-
-def test_loraplus_optimizer_fp_optim_uses_adamw(monkeypatch):
-    """A non-8-bit optim string keeps full-precision torch AdamW (mirrors the configured optim)."""
-    worker = _import_worker(monkeypatch)
-    adamw = _fake_torch(monkeypatch)
-    cls, _extra = worker.loraplus_optimizer_cls("adamw_torch")
-    assert cls is adamw
-
-
-def test_loraplus_optimizer_bnb_missing_falls_back(monkeypatch):
-    """If bitsandbytes can't be imported, fall back to fp32 AdamW (never block training)."""
-    import builtins
-
-    worker = _import_worker(monkeypatch)
-    adamw = _fake_torch(monkeypatch)
-    real_import = builtins.__import__
-
-    def _no_bnb(name, *a, **k):
-        if name == "bitsandbytes" or name.startswith("bitsandbytes."):
-            raise ImportError("no bitsandbytes")
-        return real_import(name, *a, **k)
-
-    monkeypatch.setattr(builtins, "__import__", _no_bnb)
-    assert worker.loraplus_optimizer_cls("paged_adamw_8bit")[0] is adamw
 
 
 def test_heartbeat_commit_is_throttled(monkeypatch):
@@ -585,50 +496,6 @@ def test_heartbeat_terminal_only_mode(monkeypatch):
     assert calls.count("heartbeat.json") == 3
 
 
-def test_optimal_attn_impl_no_cuda_is_none(monkeypatch):
-    """optimal_attn_impl picks the arch-best backend for the live GPU; with no CUDA (CI) it
-    leaves transformers' default (None). There is no env override."""
-    monkeypatch.setenv("RUN_MODE", "sft")
-    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker as w
-
-    assert w.optimal_attn_impl() is None
-
-
-def test_attn_impl_for_capability_per_arch(monkeypatch):
-    """Pure capability -> best-per-arch flash policy (no CUDA needed): flash on every arch EXCEPT
-    Blackwell (datacenter sm100 + consumer sm120). Hopper(sm90): FA3, else a UNIFORM fall back to
-    plain SDPA (NO FA3->FA2 chain). Ampere(sm80/86)+Ada(sm89): FA2. sm100/sm120: cuDNN SDPA."""
-    w = _import_worker(monkeypatch)
-    f = w._attn_impl_for_capability
-    # Hopper sm90: FA3 is the arch's best flash; absent -> plain SDPA (uniform fallback, NOT FA2).
-    assert f(9, 0, fa3_available=True, fa2_available=True) == "flash_attention_3"
-    assert f(9, 0, fa3_available=False, fa2_available=True) is None  # uniform: -> SDPA, not FA2
-    assert f(9, 0, fa3_available=False, fa2_available=False) is None
-    # Ampere (8.0/8.6) + Ada (8.9): FA2 when the wheel is present, else SDPA. FA3 never applies.
-    assert f(8, 0, fa2_available=True) == "flash_attention_2"  # A100
-    assert f(8, 6, fa2_available=True) == "flash_attention_2"  # 3090/A10
-    assert f(8, 9, fa2_available=True) == "flash_attention_2"  # Ada 4090
-    assert f(8, 7, fa2_available=True) is None  # sm87 Jetson Orin: NOT a validated FA2 arch -> SDPA
-    assert f(8, 0, fa2_available=False) is None
-    # consumer Blackwell sm120: cuDNN SDPA regardless of flash availability.
-    assert f(12, 0, fa3_available=True, fa2_available=True) == "sdpa"
-    # datacenter Blackwell sm100 (B200): cuDNN SDPA too — NOT None (a bare None would let run_sft's
-    # FA2 packing fallback force a possibly-missing sm100 FA2 kernel). Holds even when fa2 imports.
-    assert f(10, 0, fa2_available=True) == "sdpa"
-    assert f(10, 0, fa2_available=False) == "sdpa"
-
-
-def test_flash_attn_probes_false_in_ci(monkeypatch):
-    """The FA2/FA3 probes report False in offline CI (neither transformers/flash_attn nor the FA3
-    ``flash_attn_interface`` is present). FA is used whenever importable — there is no disable
-    hatch, so the result is purely 'is the package available'."""
-    w = _import_worker(monkeypatch)
-    assert w._flash_attn_3_available() is False  # flash_attn_interface / transformers absent in CI
-    assert w._flash_attn_available() is False  # flash_attn wheel absent in CI
-
-
 def test_liger_default_model_size_gate(monkeypatch):
     """The model-size gate is OFF for small models (1B-class) and ON at ≥ ~3B.
 
@@ -725,163 +592,6 @@ def test_35b_warmstart_requires_fused_expert_targets(monkeypatch):
         model_id,
     )
     worker.validate_lora_target_parameters({}, "Qwen/Qwen3.5-9B")
-
-
-def test_prepare_fresh_lora_base_uses_multimodal_loader_for_vl(monkeypatch):
-    """Fresh LoRA on a VL checkpoint must wrap the full image-text tree, not TRL's default loader."""
-    import flash.engine.worker.model.adapter as adapter_mod
-
-    calls = []
-
-    class _ImageText:
-        @classmethod
-        def from_pretrained(cls, *args, **kwargs):
-            calls.append((args, kwargs))
-            return {"loader": "vl", "args": args, "kwargs": kwargs}
-
-    fake_transformers = types.ModuleType("transformers")
-    fake_transformers.AutoModelForImageTextToText = _ImageText
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-    monkeypatch.setattr(adapter_mod, "is_vl_checkpoint", lambda model_id, revision="": True)
-
-    out = adapter_mod.prepare_fresh_lora_base(
-        "/tmp/flash_sft_merged_x",
-        "Qwen/Qwen3.5-4B",
-        {"dtype": "bfloat16", "attn_implementation": "sdpa"},
-        phase="sft",
-    )
-
-    assert out["loader"] == "vl"
-    assert calls == [
-        (
-            ("/tmp/flash_sft_merged_x",),
-            {"trust_remote_code": True, "dtype": "bfloat16", "attn_implementation": "sdpa"},
-        )
-    ]
-
-
-def test_prepare_fresh_lora_base_keeps_non_vl_path(monkeypatch):
-    import flash.engine.worker.model.adapter as adapter_mod
-
-    monkeypatch.setattr(adapter_mod, "is_vl_checkpoint", lambda model_id, revision="": False)
-
-    assert (
-        adapter_mod.prepare_fresh_lora_base(
-            "meta-llama/Llama-3.2-1B", "meta-llama/Llama-3.2-1B", {}, phase="sft"
-        )
-        == "meta-llama/Llama-3.2-1B"
-    )
-
-
-def test_prepare_fresh_lora_base_forwards_revision_to_probe_and_loader(monkeypatch):
-    import flash.engine.worker.model.adapter as adapter_mod
-
-    probes = []
-    loads = []
-
-    class _ImageText:
-        @classmethod
-        def from_pretrained(cls, *args, **kwargs):
-            loads.append((args, kwargs))
-            return object()
-
-    fake_transformers = types.ModuleType("transformers")
-    fake_transformers.AutoModelForImageTextToText = _ImageText
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-    monkeypatch.setattr(
-        adapter_mod,
-        "is_vl_checkpoint",
-        lambda model_id, revision="": probes.append((model_id, revision)) or True,
-    )
-
-    adapter_mod.prepare_fresh_lora_base(
-        "org/model",
-        "org/model",
-        {"dtype": "bfloat16", "revision": "refs/pr/123"},
-        phase="sft",
-        model_revision="refs/pr/123",
-    )
-
-    assert probes == [("org/model", "refs/pr/123")]
-    assert loads[0][1]["revision"] == "refs/pr/123"
-
-
-def test_prepare_fresh_lora_base_rejects_revision_authority_conflict(monkeypatch):
-    import flash.engine.worker.model.adapter as adapter_mod
-
-    with pytest.raises(ValueError, match="probe revision must match"):
-        adapter_mod.prepare_fresh_lora_base(
-            "org/model",
-            "org/model",
-            {"revision": "a" * 40},
-            model_revision="b" * 40,
-        )
-
-
-def test_warmstart_base_loader_forwards_model_revision(monkeypatch, tmp_path):
-    import flash.engine.worker.model.adapter as adapter_mod
-
-    loads = []
-
-    class _Base:
-        _checkpoint_conversion_mapping = None
-
-    class _Causal:
-        @classmethod
-        def from_pretrained(cls, *args, **kwargs):
-            loads.append((args, kwargs))
-            return _Base()
-
-    class _ImageText:
-        @classmethod
-        def from_pretrained(cls, *args, **kwargs):
-            raise AssertionError("unexpected vl loader")
-
-    class _Peft:
-        @classmethod
-        def from_pretrained(cls, base, adapter_dir, is_trainable):
-            return cls()
-
-        def load_adapter(self, *args, **kwargs):
-            return object()
-
-    fake_transformers = types.ModuleType("transformers")
-    fake_transformers.AutoModelForCausalLM = _Causal
-    fake_transformers.AutoModelForImageTextToText = _ImageText
-    fake_peft = types.ModuleType("peft")
-    fake_peft.PeftModel = _Peft
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-    monkeypatch.setitem(sys.modules, "peft", fake_peft)
-    monkeypatch.setattr(
-        adapter_mod,
-        "_w",
-        SimpleNamespace(
-            JOB_SPEC=SimpleNamespace(
-                model_revision="refs/pr/123",
-                train=SimpleNamespace(init_from_adapter="owner/repo:sft/source"),
-            )
-        ),
-    )
-    (tmp_path / "adapter_config.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(adapter_mod, "_download_adapter", lambda prefix: str(tmp_path))
-    monkeypatch.setattr(adapter_mod, "adapter_is_vl_warmstart", lambda *args, **kwargs: False)
-    monkeypatch.setattr(adapter_mod, "optimal_attn_impl", lambda: None)
-    monkeypatch.setattr(adapter_mod, "_assert_warmstart_adapter_applied", lambda *args: None)
-
-    model, peft_config = adapter_mod._init_adapter_model("org/model")
-
-    assert isinstance(model, _Peft)
-    assert peft_config is None
-    assert loads == [
-        (
-            ("org/model",),
-            {
-                "dtype": "bfloat16",
-                "trust_remote_code": True,
-                "revision": "refs/pr/123",
-            },
-        )
-    ]
 
 
 def test_train_metadata_keeps_model_revision_in_nested_job_spec(monkeypatch):
@@ -2195,8 +1905,9 @@ def test_grpo_and_opd_do_not_launch_into_the_unrunnable_padded_fallback():
     """
     import ast
     import inspect as _inspect
+    import textwrap as _textwrap
 
-    from flash.engine.worker import backend_common, opd_train, rl_train
+    from flash.engine.worker import backend_common, opd_train, rl_train, sft_train
 
     # the gate lives in one shared helper, so the assertions split: the helper must raise, and each
     # affected algorithm must route through it rather than re-deriving a decision of its own.
@@ -2228,3 +1939,98 @@ def test_grpo_and_opd_do_not_launch_into_the_unrunnable_padded_fallback():
             f"{module.__name__} sets use_remove_padding=False, which verl's fsdp engine cannot run "
             "alongside the use_fused_kernels=True this recipe also sets."
         )
+
+    # sft is conditional where grpo/opd are unconditional, and the condition is the whole point: a
+    # PACKED gdn profile has packed neighbours to contaminate, so it must take the raising gate. the
+    # quote-side gate cannot answer this -- it is device-independent by construction (the profile job
+    # is cpu-only), so it proves the kernels are installed, never that the conv kernel runs on this
+    # card. only the child probe knows. an exact-unpacked run keeps the soft form because
+    # examples_per_update is 1.
+    sft_src = _inspect.getsource(sft_train.run_sft_train)
+    assert "require_gdn_boundary_resets(" in sft_src, (
+        "packed sft no longer routes through the raising gate, so a gdn hybrid whose child cannot "
+        "reset boundaries would train across packed example boundaries while appearing patched: "
+        "transformers' fallbacks ACCEPT cu_seq_lens_q and seq_idx and silently discard them."
+    )
+    assert 'profile.packing_mode == "packed"' in sft_src, (
+        "the sft gate no longer keys on the packed profile. it must stay conditional: raising on "
+        "an exact-unpacked run would fail runs that are already boundary-safe at "
+        "examples_per_update=1, and dropping the condition entirely would let a packed run through."
+    )
+    # the OTHER half of that condition has to come from the frozen profile, not from a re-probe.
+    # `model_is_gdn_hybrid` swallows a failed hub/cache read and answers False, so deriving
+    # `gdn_hybrid` from it alone lets a transient failure turn the gate above into dead code on a
+    # profile that is already packed -- resets skipped, shim not installed, state bleeding across
+    # packed neighbours, and nothing raised. the profile's label was frozen by a raising probe.
+    assert 'profile.architecture_mode == "gdn-hybrid"' in sft_src, (
+        "the sft gdn decision no longer consults the frozen profile.architecture_mode. it must, "
+        "because model_is_gdn_hybrid returns False on a transient config-read failure: that would "
+        "silently skip the packed-boundary reset requirement instead of failing closed."
+    )
+    # the module the shim patches must fail closed too. gdn_model_type answers "qwen3_5" both for a
+    # dense model and for a config it could not read, and Qwen/Qwen3.6-35B-A3B is qwen3_5_moe -- so
+    # the guess patches the WRONG module and reports resets active over unpatched MoE layers.
+    #
+    # assert on the GUARD, not on the call: `strict_gdn_probe_module(` survives inside `if False:`,
+    # so a substring check passes with the fix disabled (observed while mutation-testing this).
+    sft_tree = ast.parse(_textwrap.dedent(sft_src))
+    strict_guards = [
+        node
+        for node in ast.walk(sft_tree)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(c, ast.Call)
+            and isinstance(c.func, ast.Name)
+            and c.func.id == "strict_gdn_probe_module"
+            for c in ast.walk(node)
+        )
+    ]
+    assert strict_guards, (
+        "packed sft no longer resolves its modeling module strictly, so a transient config-read "
+        "failure would fall back to the dense qwen3_5 module and patch the wrong arch on a "
+        "qwen3_5_moe model while logging boundary resets as active."
+    )
+    guard_src = " ".join(ast.unparse(node.test) for node in strict_guards)
+    assert "packing_mode" in guard_src, (
+        "the strict module resolve is no longer guarded by the packed profile (guard is "
+        f"{guard_src!r}). an exact-unpacked run has no boundaries and must not be forced to "
+        "resolve its arch strictly."
+    )
+    assert "examples_per_update" in guard_src, (
+        "the strict module resolve is no longer guarded by the realized batch (guard is "
+        f"{guard_src!r}). it must be reached exactly when the reset gate below fires, or the two "
+        "disagree about which runs need a proven arch."
+    )
+
+    # and the demand must key on the REALIZED batch: min(batch_size, len(rows)) can be 1 under a
+    # `packed` label, and one example per update has no neighbour to contaminate. assert on the
+    # expression that actually feeds `require_gdn_boundary_resets`, since the same literal also
+    # appears at the strict-resolve guard above and would satisfy a substring check on its own.
+    require_guards = [
+        node
+        for node in ast.walk(sft_tree)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(c, ast.Call)
+            and isinstance(c.func, ast.Name)
+            and c.func.id == "require_gdn_boundary_resets"
+            for c in ast.walk(node)
+        )
+    ]
+    assert require_guards, "packed sft no longer calls require_gdn_boundary_resets under any guard."
+    # the guard may name a local (packed_neighbours); resolve any plain assignments to it so the
+    # test reads the CONDITION, not the variable name.
+    assigns = {
+        t.id: ast.unparse(n.value)
+        for n in ast.walk(sft_tree)
+        if isinstance(n, ast.Assign)
+        for t in n.targets
+        if isinstance(t, ast.Name)
+    }
+    require_src = " ".join(ast.unparse(node.test) for node in require_guards)
+    resolved = require_src + " " + " ".join(assigns.get(n, "") for n in assigns if n in require_src)
+    assert "examples_per_update" in resolved, (
+        "the packed sft gate no longer checks examples_per_update (condition resolves to "
+        f"{resolved.strip()!r}), so a packed profile that realized a single-example update would "
+        "hard-fail on a missing child capability despite having no packed neighbours to protect."
+    )

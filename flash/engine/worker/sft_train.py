@@ -30,10 +30,12 @@ from flash.engine.worker.backend_common import (
     probe_verl_capabilities,
     render_gdn_varlen_shim,
     render_wandb_link_shim,
+    require_gdn_boundary_resets,
     resolve_verl_loggers,
     resolve_verl_python,
     run_verl_training,
     stage_verl_resume,
+    strict_gdn_probe_module,
     verl_step_number,
 )
 from flash.engine.worker.entry.sft import _model_arch_dims, sft_under_ran
@@ -479,8 +481,28 @@ def run_sft_train(spec=None) -> None:
         # accept and discard them. probe before packing, otherwise use boundary-correct padded input.
         # resolve the modeling module in the parent to avoid repeating the hub/cache read; empty means
         # non-hybrid.
-        gdn_hybrid = model_is_gdn_hybrid(model_id, model_revision)
-        gdn_module = gdn_probe_module(model_id, model_revision) if gdn_hybrid else ""
+        #
+        # the PROFILE is authoritative for "is this a gdn hybrid": it was frozen by a RAISING probe
+        # (see `_packing_mode`), while `model_is_gdn_hybrid` swallows a failed hub/cache read and
+        # answers False. trusting the swallow alone would let a transient failure skip the
+        # boundary-reset requirement below on an already-packed profile -- the one combination that
+        # trains across example boundaries unprotected.
+        gdn_hybrid = profile.architecture_mode == "gdn-hybrid" or model_is_gdn_hybrid(
+            model_id, model_revision
+        )
+        # and the MODULE has to fail closed for the same reason one layer down: `gdn_model_type`
+        # swallows a failed config read and defaults to "qwen3_5". on a packed `qwen3_5_moe` model
+        # (Qwen/Qwen3.6-35B-A3B is in the catalog) that default names the DENSE module, so the child
+        # would clear it, the shim would patch it, and the real MoE layers would stay unpatched --
+        # state crossing packed boundaries while the log says resets are active. resolve it strictly
+        # for a packed run and let the failure surface instead.
+        # keyed on the REALIZED batch, matching the reset gate below: a packed profile whose
+        # examples_per_update is 1 has no neighbours, so it needs neither the strict resolve nor
+        # the hard gate.
+        if gdn_hybrid and profile.packing_mode == "packed" and profile.examples_per_update > 1:
+            gdn_module = strict_gdn_probe_module(model_id, model_revision)
+        else:
+            gdn_module = gdn_probe_module(model_id, model_revision) if gdn_hybrid else ""
         # ONE child answers every independent capability question. each used to cost its own
         # interpreter, and the torch/verl import -- not the question -- was the price.
         caps = probe_verl_capabilities(python_bin, gdn_module)
@@ -498,11 +520,27 @@ def run_sft_train(spec=None) -> None:
     # accept both and discard them. so the shim is installed only when the child proves it can reset.
     # `gdn_hybrid`/`gdn_module` and the child's answer are resolved above, inside the configuring
     # liveness wrap, because the probe is part of the setup silence that wrap exists to cover.
-    gdn_reset_arch = gdn_reset_arch_from_caps(caps, gdn_module) if gdn_hybrid else None
+    #
+    # a PACKED profile demands the resets instead of merely preferring them: the quote-side gate is
+    # device-independent by construction (the cpu-only profile job freezes it), so it can prove the
+    # kernels are installed but not that the conv kernel runs on THIS card. the child probe is the
+    # only place that question can be answered, and continuing without resets would train across
+    # packed example boundaries while looking patched. an exact-unpacked run keeps the soft form:
+    # examples_per_update is 1, so there are no packed neighbours to contaminate.
+    # `packed` with examples_per_update == 1 is still boundary-safe: min(batch_size, len(rows)) can
+    # land on 1, and one example per update has no neighbour to contaminate. requiring resets there
+    # would reject a run the unpacked path executes happily, so key the demand on the REALIZED
+    # batch rather than the label.
+    packed_neighbours = profile.packing_mode == "packed" and profile.examples_per_update > 1
+    if gdn_hybrid and packed_neighbours:
+        gdn_reset_arch = require_gdn_boundary_resets(caps, gdn_module)
+    else:
+        gdn_reset_arch = gdn_reset_arch_from_caps(caps, gdn_module) if gdn_hybrid else None
     # remove-padding is required by this custom dataset and verl's no_padding loss; disabling it
-    # hands sft_loss a strided tensor and fails on the first step. gdn remains safe because unsupported
-    # packing pins examples_per_update and train_batch_size to 1, leaving no adjacent example state to
-    # contaminate. batch size 1 is the isolation lever, not the tensor-layout flag.
+    # hands sft_loss a strided tensor and fails on the first step. an unsupported gdn stack stays
+    # safe because packing pins examples_per_update and train_batch_size to 1, leaving no adjacent
+    # example state to contaminate; a supported one is safe because the shim above resets at every
+    # boundary. batch size 1 is the isolation lever, not the tensor-layout flag.
     use_remove_padding = True
 
     config = {

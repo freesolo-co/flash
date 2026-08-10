@@ -126,33 +126,6 @@ def test_gdn_state_page_and_attention_kv_use_real_geometry():
     )
 
 
-def test_pinned_grpo_resident_check_uses_generic_geometry(monkeypatch):
-    import flash.engine.plan.vram as vram_mod
-
-    captured = {}
-
-    def _capture_estimate(params_b, *_args, **kwargs):
-        captured["params_b"] = params_b
-        captured.update(kwargs)
-        return 1.0
-
-    monkeypatch.setattr(
-        vram_mod,
-        "resolve_params_b",
-        lambda _model_id, revision="": 35.5 if revision == "a" * 40 else None,
-    )
-    monkeypatch.setattr(vram_mod, "estimate_vram_gb", _capture_estimate)
-
-    assert vram_mod.grpo_fits_resident(
-        "Qwen/Qwen3.6-35B-A3B",
-        card_vram_gb=180,
-        revision="a" * 40,
-    )
-    assert captured["params_b"] == 35.5
-    assert captured["active_params_b"] == 0.0
-    assert captured["model_info"] is None
-
-
 def test_sizing_accuracy_matrix_preserves_safe_boundaries_and_removes_overrouting():
     cases = {
         "gdn_vl_small_grpo": (
@@ -217,8 +190,8 @@ def test_sizing_accuracy_matrix_preserves_safe_boundaries_and_removes_overroutin
         assert sized[name] <= old_need
 
     # 0.8B @ 32k ctx is NOT a 24/32 GB run despite the tiny weights: the long-context KV dominates.
-    # The resident peak is ~38.5 GB (grpo_fits_resident rejects 24 and 32, admits 48) and the sleep
-    # pool the worker reserves -- max(_KV_CAP, 1.5 * arch KV) at group 8 -- is likewise > 32 GB. The
+    # The resident peak is ~38.5 GB and the sleep pool the worker reserves -- max(_KV_CAP, 1.5 * arch
+    # KV) at group 8 -- is likewise > 32 GB. The
     # old <= 24 bound encoded the sleep-KV under-count this PR removes (preflight would have admitted a
     # 24 GB card the sleep-mode vLLM executor then OOMs); the run correctly sizes onto the 48 GB tier.
     assert 32 < sized["gdn_vl_small_grpo"] <= 48

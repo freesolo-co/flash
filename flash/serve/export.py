@@ -77,7 +77,7 @@ def _non_lm_tensor_is_live(
 
 
 def _strip_language_model_infix(key: str) -> str:
-    # mirrors _LANGUAGE_MODEL_INFIX namespace semantics in flash/engine/worker/model/lora.py
+    # mirrors the peft `.language_model.` namespace semantics for warm-start vl adapters
     infix = ".language_model."
     index = key.find(infix)
     if index == -1:

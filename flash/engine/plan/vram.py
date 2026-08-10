@@ -6,18 +6,6 @@ import json
 import math
 import os
 
-
-def _gpu_vram_table() -> dict[str, int]:
-    try:
-        from flash.providers.base import GPU_INFO
-
-        return {name: info.vram_gb for name, info in GPU_INFO.items()}
-    except Exception:
-        return {"RTX 4090": 24, "RTX 5090": 32}
-
-
-GPU_VRAM_GB = _gpu_vram_table()
-
 _BYTES_PER_PARAM = {
     "bf16": 2.0,
     "fp16": 2.0,
@@ -424,54 +412,6 @@ def estimate_vram_gb(
     return base + activations + logits
 
 
-def grpo_fits_resident(
-    model_id: str,
-    *,
-    seq_len: int = 1024,
-    max_tokens: int | None = None,
-    lora_rank: int = 32,
-    group_size: int = 8,
-    thinking: bool = False,
-    card_vram_gb: float = 0.0,
-    fp8_kv: bool = False,
-    revision: str = "",
-    margin: float = 1.15,
-) -> bool:
-    """True when GRPO fits resident (no sleep-mode offload); False on unknown model/card (safe default)."""
-    if not card_vram_gb or card_vram_gb <= 0:
-        return False
-    from flash.core.catalog import MODELS, vocab_size_for
-
-    catalog_info = MODELS.get(model_id)
-    if revision:
-        params_b = float(resolve_params_b(model_id, revision=revision) or 0.0)
-    else:
-        params_b = float(getattr(catalog_info, "params_b", 0.0) or 0.0) if catalog_info else 0.0
-    if params_b <= 0:
-        return False
-    quant = (getattr(catalog_info, "quant", "bf16") or "bf16") if catalog_info else "bf16"
-    # pinned revisions use the conservative generic kv and lora geometry, matching the runtime budget.
-    info = None if revision else catalog_info
-    active_b = float(getattr(info, "active_params_b", 0.0) or 0.0) if info else 0.0
-    resident = estimate_vram_gb(
-        params_b,
-        "grpo",
-        quant,
-        seq_len=max(1, int(seq_len or 1024)),
-        max_tokens=max_tokens,
-        lora_rank=lora_rank,
-        group_size=group_size,
-        thinking=thinking,
-        use_vllm=True,
-        vocab=vocab_size_for(model_id),
-        sleep_offload=False,
-        active_params_b=active_b,
-        fp8_kv=fp8_kv,
-        model_info=info,
-    )
-    return resident * margin <= card_vram_gb
-
-
 # gc-off activation factors are empirical and geometry-specific: dense 65.0 from a live RTX 5090
 # fit, and MoE 18.0 as a conservative unvalidated value. remeasure before widening the >=120 GB
 # dense gate or changing the 35B-A3B MoE factor; the estimate scales with layers*batch*seq*hidden.
@@ -806,8 +746,8 @@ def model_required_vram_gb(
                         fp8_kv=True,
                         model_info=sizing_info,
                     )
-                    # match grpo_fits_resident's 1.15 margin (NOT the looser 1.1 headroom) so the
-                    # parse-time reject lands at the SAME resident wall the worker gate enforces.
+                    # 1.15 resident margin (NOT the looser 1.1 headroom) so the parse-time reject
+                    # lands at the SAME resident wall the worker gate enforces.
                     * 1.15
                 )
                 floor = max(floor, resident_need)
@@ -845,28 +785,6 @@ def model_required_vram_gb(
     # conservative default rather than a raise: this is a sizing helper on the allocation path, and
     # a caller probing a stale id should get the smallest managed card, not an exception.
     return 24
-
-
-def fetch_hf_params_b(model_id: str, revision: str = "", *, strict: bool = False) -> float | None:
-    """Total params in billions from revision-aware HF safetensors metadata."""
-    try:
-        from huggingface_hub import HfApi
-
-        kwargs = {"revision": revision} if revision else {}
-        info = HfApi(token=os.environ.get("HF_TOKEN")).model_info(
-            model_id, expand=["safetensors"], **kwargs
-        )
-        total = getattr(getattr(info, "safetensors", None), "total", None)
-        if total:
-            return float(total) / 1e9
-        if strict:
-            raise ValueError("safetensors parameter metadata is unavailable")
-    except Exception as exc:
-        if strict:
-            raise ValueError(
-                f"could not resolve revision-specific parameter metadata for model {model_id!r}"
-            ) from exc
-    return None
 
 
 def resolve_params_b(model_id: str, revision: str = "") -> float | None:

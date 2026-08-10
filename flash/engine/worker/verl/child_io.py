@@ -41,10 +41,9 @@ except Exception:
 
 
 # --------------------------- w&b run link (all three verl backends) ---------------------------
-# trl spreads wandb_run_info() into its notes, giving the sdk's link_wandb a clickable
-# trl spreads wandb_run_info() into its notes, giving the sdk's link_wandb a clickable
-# notes["wandb_url"]. verl calls wandb.init INSIDE the training subprocess, so the flash parent's
-# wandb.run is None and that spread would be a silent no-op. the url is not derivable up here
+# verl calls wandb.init INSIDE the training subprocess, so the flash parent's
+# wandb.run is always None and anything read up here would be a silent no-op. the url is not
+# derivable up here
 # either: it needs entity/project/runs/<wandb-generated-id>, and flash only knows the project and
 # its own run NAME. so the child reports it back over the marker channel the parent already scans.
 FLASH_WANDB_LINK_MARKER = "FLASH_WANDB_LINK"
