@@ -231,10 +231,14 @@ def runconfig_from_spec(spec) -> RunConfig:
             rollout.completion_tokens_mean if rollout is not None else None
         ),
         measured_prompt_tokens=(rollout.prompt_tokens_mean if rollout is not None else None),
+        # a real measurement beats a declaration, which beats the measured-population default.
+        # an unsampled profile is NOT a measurement of zero, so it falls through to the run's own
+        # declaration -- the only way a slow external judge can be priced, since the step floor
+        # covers a local scorer and nothing times the judge before the quote is persisted.
         reward_seconds_per_completion=(
             rollout.reward_seconds_per_completion
             if rollout is not None and rollout.reward_samples > 0
-            else None
+            else t.reward_seconds_per_completion
         ),
     )
 

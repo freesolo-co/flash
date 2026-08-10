@@ -414,6 +414,8 @@ class _QuotableTrain(_Train):
     batch_size = 8
     lora_rank = 32
     save_at_steps: ClassVar[list] = []
+    # unset, like a run that never declares a slow judge: the quote takes the measured default.
+    reward_seconds_per_completion = None
 
 
 def _spec_with_profile(**profile_overrides):

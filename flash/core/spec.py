@@ -308,6 +308,15 @@ class TrainSpec:
     credit_assignment: CreditAssignment = field(
         default=DEFAULT_CREDIT_ASSIGNMENT, metadata={"introduced_in": "1.0.2"}
     )
+    # grpo/opd only: seconds one completion spends in reward() beyond what the step floor already
+    # covers. the floor was fitted on graders running 0.0001-0.001s, so it tracks a local scorer but
+    # cannot cover an external judge: at 3s x 32 completions the quote is short by 96s per step.
+    # nothing can measure this before the quote is persisted -- timing on the submitting host does
+    # not describe the worker, and the worker reports its own latency only after pricing -- so a run
+    # with a slow judge declares it here. unset keeps the measured-population default of 0.0.
+    reward_seconds_per_completion: float | None = field(
+        default=None, metadata={"introduced_in": "1.1.40"}
+    )
 
     def __post_init__(self) -> None:
         if not self.lora_alpha:
@@ -591,6 +600,9 @@ class JobSpec:
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
                 structured_outputs=str(train.get("structured_outputs") or ""),
                 credit_assignment=_coerce_credit_assignment(train.get("credit_assignment")),
+                reward_seconds_per_completion=_opt_float(
+                    train.get("reward_seconds_per_completion")
+                ),
             ),
             gpu=GpuSpec(
                 type=gpu_type,

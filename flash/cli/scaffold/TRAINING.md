@@ -241,12 +241,18 @@ ignored. Everything in the block above (`epochs`, `max_examples`, `max_steps`, `
 | knob                                                                                                            | sft      | grpo     | opd      |
 | --------------------------------------------------------------------------------------------------------------- | -------- | -------- | -------- |
 | `group_size`, `temperature`, `max_completion_tokens`, `kl_penalty_coef`, `stop_sequences`, `structured_outputs` | rejected | yes      | yes      |
-| `entropy_quantile`, `thinking_length_penalty_coef`, `credit_assignment`                                         | rejected | yes      | rejected |
+| `entropy_quantile`, `thinking_length_penalty_coef`, `credit_assignment`, `reward_seconds_per_completion`        | rejected | yes      | rejected |
 | `teacher_model`                                                                                                 | rejected | rejected | yes      |
 
 So `credit_assignment` (multi-turn GRPO defaults to one reward per rollout; `"per_turn"` gives
 turn-level credit, needs `per_turn_rewards` metadata, and is unsupported for tool-calling envs —
 see below) belongs on a `grpo` run, and setting it on `sft` or `opd` is a submit-time error.
+
+`reward_seconds_per_completion` exists for one case: a `reward()` that calls a slow external
+grader, such as an LLM judge. The quote already covers a local scorer, so leave it unset unless
+your grading blocks for roughly a second or more per completion — nothing can time it before your
+run is priced, so an undeclared slow judge is quoted low and billed from that estimate. At 3s with
+32 completions per step it is worth about 96 seconds a step.
 
 **Key placement that is easy to get wrong.** Every one of these is a real submit-time
 error or a wrong-config-that-still-runs; `--dry-run` catches the loud ones for free.

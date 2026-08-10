@@ -152,6 +152,7 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
             "credit_assignment",
             "entropy_quantile",
             "lora_alpha",
+            "reward_seconds_per_completion",
         }
     } == {"0.2.0"}
 
@@ -275,7 +276,8 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
     baseline = {"epochs", "hf_repo", "max_examples"}
 
     # historical snapshots remain exact to their commits, including fields now managed or removed.
-    # current adds save_at_steps, credit_assignment, and entropy_quantile; opd eos is removed.
+    # current adds save_at_steps, credit_assignment, entropy_quantile, and
+    # reward_seconds_per_completion; opd eos is removed.
     # lora_alpha is in both: authorable then, managed in between, and a user knob again now.
     assert historical_shapes["861571e7"] - {
         "opd_eos_loss_coef",
@@ -285,6 +287,7 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
         "credit_assignment",
         "save_at_steps",
         "entropy_quantile",
+        "reward_seconds_per_completion",
     }
     assert "opd_eos_loss_coef" not in TRAIN_SCHEMA_KEYS
     assert "advantage_clip" not in TRAIN_SCHEMA_KEYS

@@ -286,19 +286,17 @@ def download_weight_gb(model_id: str, revision: str = "") -> float:
 # every card over-quoted. At 0.0 the same arms score 0.995x and 53/64. The fit arms' own graders
 # measured 0.0001-0.001s, so the floor's per-completion slope is what genuinely tracks grading cost.
 #
-# KNOWN EXPOSURE, stated rather than papered over: a reward() that calls a seconds-long external
-# judge IS under-quoted here, because nothing measures it before the quote is persisted. The client
-# deliberately does not time grading (seconds measured on the submitting host do not describe the
-# worker), and the worker's own profiler publishes its measurement as telemetry AFTER pricing. So
-# `reward_seconds_per_completion` below is reachable only from a RunConfig built in-process, not
-# from any user-facing config path. Measured: 3s/completion prices a step at 186.6s against the
-# 90.6s this default gives, ~2.06x.
+# A reward() that calls a seconds-long external judge is NOT covered by this default, because
+# nothing can measure it before the quote is persisted: timing on the submitting host does not
+# describe the worker, and the worker publishes its own latency as telemetry only AFTER pricing.
+# Such a run declares the cost instead, via `[train] reward_seconds_per_completion`, which arrives
+# as the override below. Measured on a 32-completion step: 3s/completion adds 96s.
 #
-# 0.0 is still the better default, because the alternative is not "0.0 vs correct" but "0.0 vs 1.0",
-# and 1.0 was wrong for the population it was applied to (0.699x bias, 31/64 in band, over-quoting
-# every completion class and every card). Fixing the slow-judge case needs a trusted pre-quote
-# measurement -- the worker's profiler feeding back before the quote is persisted, or a declared
-# per-run latency -- not a nominal wall re-added on top of a floor that already carries grading.
+# A nominal default cannot stand in for that declaration. The alternative was never "0.0 vs
+# correct" but "0.0 vs 1.0", and 1.0 was wrong for the population it was applied to (0.699x bias,
+# 31/64 in band, over-quoting every completion class and every card) while still leaving a 3s judge
+# 64s short per step. So the default describes the measured population and the declaration covers
+# the rest, rather than a guess being re-added on top of a floor that already carries grading.
 AVG_REWARD_SECONDS_PER_COMPLETION = 0.0
 
 
