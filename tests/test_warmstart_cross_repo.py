@@ -8,7 +8,16 @@ from types import SimpleNamespace
 
 import pytest
 
-import flash.engine.worker as W
+# The LIVE package proxy, not `import flash.engine.worker as W`. The code under test reads its
+# run-scoped globals through this same proxy (see flash/engine/worker/model/adapter.py), which
+# resolves `sys.modules['flash.engine.worker']` on every access. A module-level `import ... as W`
+# binds one package OBJECT at collection time; any earlier test that drops the package from
+# sys.modules and re-imports it (tests/test_worker_stack.py does, to re-run the import scope that
+# captures RUN_MODE/JOB_SPEC) replaces that object, and this alias keeps pointing at the dead one.
+# Patching the stale alias then sets an attribute nothing reads -- `revision` comes back None and
+# the failure is attributed to this file rather than the re-import that caused it. Patching through
+# the proxy targets whatever package the code will actually read.
+from flash.engine.worker.runtime.pkg_proxy import W
 from tests._helpers.runner import provisioned_status
 
 _REVISION = "a" * 40
