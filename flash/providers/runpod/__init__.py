@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from flash.providers._deadline import deadline_kwargs
+from flash.providers._lifecycle.deadline import deadline_kwargs
 from flash.providers.base import (
     AllocationConstraints,
     Candidate,
@@ -12,6 +12,7 @@ from flash.providers.base import (
     JobHandle,
     PollResult,
     Provider,
+    rentable_gpu_counts,
 )
 
 
@@ -23,8 +24,11 @@ class RunpodProvider:
     supports_weight_cache = True
 
     def is_configured(self) -> bool:
-        # Missing key surfaces at preflight, not here.
-        return True
+        # require a usable parsed key pool, not merely a set env var. otherwise the allocator ranks
+        # RunPod classes the operator cannot provision.
+        from flash.providers.runpod import auth
+
+        return bool(auth.keys())
 
     def preflight(self, require_hf: bool = True) -> list[str]:
         from flash.providers.runpod.preflight import missing_credentials
@@ -44,11 +48,16 @@ class RunpodProvider:
     def live_candidates(
         self, need_vram_gb: int, constraints: AllocationConstraints
     ) -> list[Candidate]:
-        """RunPod validated classes fitting the VRAM requirement, priced by the static table."""
+        """RunPod validated classes fitting the VRAM requirement, priced by the static table.
+
+        RunPod takes the card count as a launch parameter and bills per card, so every allowed count
+        is offered at the same per-card rate; the allocator picks which one the run actually needs.
+        """
         return [
-            Candidate("runpod", g.name, self.hourly_rate(g.name), g.vram_gb)
+            Candidate("runpod", g.name, self.hourly_rate(g.name), g.vram_gb, count)
             for g in self.gpu_classes()
             if g.vram_gb >= need_vram_gb and g.validated
+            for count in rentable_gpu_counts(constraints.max_gpu_count)
         ]
 
     def submit_run(
@@ -64,8 +73,8 @@ class RunpodProvider:
         code_prefix: str | None = None,
         _deadline_at: float | None = None,
     ) -> PollResult:
+        from flash.core.spec import require_matching_seed
         from flash.providers.runpod.jobs import submit_run
-        from flash.spec import require_matching_seed
 
         seed = require_matching_seed(spec, seed)
         kwargs = {
@@ -89,6 +98,7 @@ class RunpodProvider:
         log: Any = None,
         _deadline_at: float | None = None,
     ) -> PollResult:
+        from flash.core.spec import require_matching_seed
         from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
         from flash.providers.runpod.jobs import (
             make_hf_failure_detail_reader,
@@ -96,7 +106,6 @@ class RunpodProvider:
             poll_job,
             stall_kwargs,
         )
-        from flash.spec import require_matching_seed
 
         seed = require_matching_seed(spec, seed)
         hf_repo = spec.train.hf_repo
@@ -135,15 +144,9 @@ class RunpodProvider:
             failure_detail_reader=failure_reader,
             current_attempt=rh.attempt,
             **deadline_kwargs(poll_job, _deadline_at),
-            # the persisted flag drives the stall grace only, NOT the capacity wording. it is a
-            # snapshot of the supervisor loop that submitted this attempt, and that loop is gone:
-            # recovery calls reallocation_spec_from_status, which restores the run's original
-            # unpinned gpu type, and re-enters _run_training with empty failed_providers and
-            # tried_classes -- so the replacement really can pick another class or provider.
-            # forwarding the snapshot here would state "no further GPU-class escalation follows"
-            # about a picker that has its whole candidate list back (codex[bot]). the grace is a
-            # different question: how long to wait on hardware that was scarce, which the snapshot
-            # still answers correctly.
+            # the persisted scarcity flag controls stall grace, not capacity wording. recovery
+            # rebuilds the unpinned allocation with a fresh candidate set, so claiming no escalation
+            # remains would be false.
             **stall_kwargs(on_last_gpu=on_last_gpu),
         )
 
@@ -179,7 +182,7 @@ class RunpodProvider:
             )
 
     def gc(self, spec) -> None:
-        from flash.providers.runpod.train import terminate_endpoint
+        from flash.providers.runpod.serverless import terminate_endpoint
 
         terminate_endpoint(spec.gpu.type, spec.run_id)
 

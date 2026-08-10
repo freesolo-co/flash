@@ -8,12 +8,11 @@ from __future__ import annotations
 
 import os
 
-from flash.catalog import (
+from flash.core.catalog import (
     DEFAULT_MODEL,
     MODELS,
-    SERVING_FP8_MODEL_REPOS,
+    SERVING_MODEL_REPOS,
     get_model,
-    opd_mamba_batched_token_floor,
 )
 from flash.providers.base import KNOWN, canonical_gpu
 
@@ -34,8 +33,8 @@ def test_default_model_is_supported():
 
 
 def test_recipe_and_jobspec_defaults_match_catalog_default():
-    from flash.engine.recipe import RECIPE
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
+    from flash.engine.plan.recipe import RECIPE
 
     # When BENCH_HF_MODEL isn't overriding it, the recipe + JobSpec default to the catalog default.
     if not os.environ.get("BENCH_HF_MODEL"):
@@ -52,21 +51,16 @@ def test_opd_mamba_block_size_is_catalogued_only_for_hybrid_rollout_model():
     )
 
 
-def test_opd_mamba_batched_token_floor_only_overrides_unsafe_derived_budgets():
-    model_id = "Qwen/Qwen3.6-35B-A3B"
-    assert opd_mamba_batched_token_floor(model_id, 256, 4) == 1072
-    assert opd_mamba_batched_token_floor(model_id, 1536, 8) is None
-    assert opd_mamba_batched_token_floor("Qwen/Qwen3.5-4B", 256, 4) is None
-
-
 def test_thinking_capability_values_are_valid():
     # The config validator branches on these exact values; "unknown" is reserved for
-    # open-model-policy entries and must not appear in the curated catalog.
+    # a synthesized entry's placeholder, and must not appear in the curated catalog.
     for model_id, info in MODELS.items():
         assert info.thinking in ("none", "hybrid", "always"), (model_id, info.thinking)
 
 
 def test_serving_capacity_matches_validated_matrix():
+    # `expected` is a transcription guard, not a cross-repo lockstep check. flash CI has no
+    # freesolo tree; compare both repos in the pinned freesolo-co/tests checkout.
     expected = {
         "Qwen/Qwen3.5-0.8B": {
             "gpu": "L4",
@@ -86,19 +80,19 @@ def test_serving_capacity_matches_validated_matrix():
             "gpu": "L4",
             "serve_model_id": "Freesolo-Co/Qwen3.5-4B-FP8",
             "max_loras": 16,
-            "max_lora_rank": 64,
+            "max_lora_rank": 128,
             "max_model_len": 32768,
             "max_num_seqs": 8,
             "gpu_memory_utilization": 0.98,
         },
         "Qwen/Qwen3.5-9B": {
-            "gpu": "H100",
+            "gpu": "L40S",
             "serve_model_id": "Freesolo-Co/Qwen3.5-9B-FP8",
             "max_loras": 16,
-            "max_lora_rank": 64,
+            "max_lora_rank": 128,
             "max_model_len": 32768,
             "max_num_seqs": 8,
-            "gpu_memory_utilization": 0.98,
+            "gpu_memory_utilization": 0.90,
         },
         "Qwen/Qwen3.6-27B": {
             "gpu": "H100",
@@ -107,19 +101,17 @@ def test_serving_capacity_matches_validated_matrix():
             "max_lora_rank": 64,
             "max_model_len": 32768,
             "max_num_seqs": 8,
-            "gpu_memory_utilization": 0.98,
+            "gpu_memory_utilization": 0.90,
         },
         "Qwen/Qwen3.6-35B-A3B": {
-            "gpu": "A100-80GB",
-            "serve_model_id": "Qwen/Qwen3.6-35B-A3B-FP8",
+            "gpu": "H200",
+            "serve_model_id": "Qwen/Qwen3.6-35B-A3B",
             "max_loras": 6,
             "max_lora_rank": 64,
-            # 4096 (down from 8192): the 6x64 LoRA ceiling is weight-bound not context-bound, so the
-            # smaller context buys ~2x serving concurrency without costing slots (canary 2026-07-04).
-            "max_model_len": 4096,
+            "max_model_len": 32768,
             "max_num_seqs": 8,
             "max_num_batched_tokens": 4096,
-            "gpu_memory_utilization": 0.98,
+            "gpu_memory_utilization": 0.90,
         },
     }
     for model_id, values in expected.items():
@@ -133,7 +125,7 @@ def test_public_rows_include_serving_capacity():
     row = get_model("Qwen/Qwen3.5-4B").to_dict()
     assert row["serving"]["gpu"] == "L4"
     assert row["serving"]["max_loras"] == 16
-    assert row["serving"]["max_lora_rank"] == 64
+    assert row["serving"]["max_lora_rank"] == 128
     assert row["serving"]["serve_model_id"] == "Freesolo-Co/Qwen3.5-4B-FP8"
 
 
@@ -149,14 +141,14 @@ def test_public_rows_prune_unset_serving_capacity_fields():
     }
 
 
-def test_serving_fp8_repos_match_current_serving_matrix() -> None:
-    # dense models serve freesolo-owned fp8 checkpoints; the qwen3.6 moe serves official qwen fp8.
-    assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-0.8B"] == "Freesolo-Co/Qwen3.5-0.8B-FP8"
-    assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-2B"] == "Freesolo-Co/Qwen3.5-2B-FP8"
-    assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-4B"] == "Freesolo-Co/Qwen3.5-4B-FP8"
-    assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-9B"] == "Freesolo-Co/Qwen3.5-9B-FP8"
-    assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.6-27B"] == "Freesolo-Co/Qwen3.6-27B-FP8"
-    assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.6-35B-A3B"] == "Qwen/Qwen3.6-35B-A3B-FP8"
+def test_serving_repos_match_current_serving_matrix() -> None:
+    # dense models serve freesolo-owned fp8 checkpoints; the qwen3.6 moe serves base bf16 on h200.
+    assert SERVING_MODEL_REPOS["Qwen/Qwen3.5-0.8B"] == "Freesolo-Co/Qwen3.5-0.8B-FP8"
+    assert SERVING_MODEL_REPOS["Qwen/Qwen3.5-2B"] == "Freesolo-Co/Qwen3.5-2B-FP8"
+    assert SERVING_MODEL_REPOS["Qwen/Qwen3.5-4B"] == "Freesolo-Co/Qwen3.5-4B-FP8"
+    assert SERVING_MODEL_REPOS["Qwen/Qwen3.5-9B"] == "Freesolo-Co/Qwen3.5-9B-FP8"
+    assert SERVING_MODEL_REPOS["Qwen/Qwen3.6-27B"] == "Freesolo-Co/Qwen3.6-27B-FP8"
+    assert SERVING_MODEL_REPOS["Qwen/Qwen3.6-35B-A3B"] == "Qwen/Qwen3.6-35B-A3B"
 
 
 def test_qwen36_27b_geometry_is_dense_hybrid():
@@ -186,7 +178,7 @@ def test_default_model_is_a_dense_text_model():
 def test_every_catalog_entry_sets_params_b():
     # params_b is the authoritative numeric model size — the VRAM/disk/cost terms read it DIRECTLY
     # (nothing parses the `params` display string any more). It is a required ModelInfo field, but 0.0
-    # is a legal value only for the open-model policy's "unknown size" path. This guards that every
-    # CURATED entry states a real, positive size, so a new entry can never silently size as 0/unknown.
+    # is the dataclass default. This guards that every entry states a real, positive size, so a new
+    # entry added when forking to extend the catalog can never silently size as 0/unknown.
     for model_id, info in MODELS.items():
         assert info.params_b > 0, f"{model_id} must set params_b > 0 (curated authoritative size)"

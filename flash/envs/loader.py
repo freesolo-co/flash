@@ -26,13 +26,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
-from flash.envs.archive import extract_validated_archive_members
-from flash.envs.archive_policy import (
+from flash.envs.package.limits import (
     ARCHIVE_MEMBER_LIMIT,
     ARCHIVE_SCAN_MEMBER_LIMIT,
     LimitedArchiveReader,
     archive_stream_limit,
 )
+from flash.envs.package.unpack import extract_validated_archive_members
 
 _DEFAULT_GITHUB_REF = "main"
 _DEFAULT_ENVIRONMENT_PATH = "environment.py"
@@ -230,10 +230,18 @@ def _is_safe_github_path_parts(parts: list[str] | tuple[str, ...]) -> bool:
 
 
 def _github_token() -> str | None:
-    return os.environ.get("GITHUB_TOKEN")
+    """The GitHub token, or ``None`` when unset OR blank.
+
+    Blank must collapse to ``None``, not fall through as a truthy string: a whitespace-only
+    GITHUB_TOKEN would otherwise build ``Authorization: Bearer <whitespace>``, and GitHub REJECTS a
+    malformed credential rather than treating the request as anonymous - so a public repo that
+    loads fine with no token at all would fail with one that is merely blank.
+    """
+    return (os.environ.get("GITHUB_TOKEN") or "").strip() or None
 
 
-def _is_commit_sha(value: str) -> bool:
+def is_commit_sha(value: str) -> bool:
+    """True when value is a full 40-hex-char git commit id (an immutable ref)."""
     return _COMMIT_SHA_RE.fullmatch(value) is not None
 
 
@@ -245,9 +253,9 @@ def _resolve_ref_sha(
     max_rate_limit_retries: int = 5,
 ) -> str:
     # Control plane pins sha once; workers skip GitHub entirely on a fan-out.
-    if pinned_sha and _is_commit_sha(pinned_sha):
+    if pinned_sha and is_commit_sha(pinned_sha):
         return pinned_sha
-    if _is_commit_sha(parsed.ref):
+    if is_commit_sha(parsed.ref):
         return parsed.ref
     # Symbolic refs are NOT cached in-process: managed slugs point at environment-hub@main which moves.
     headers = _github_headers("application/vnd.github+json")
@@ -261,7 +269,7 @@ def _resolve_ref_sha(
             f"Failed to resolve GitHub environment ref {parsed.canonical()}: invalid response"
         ) from exc
     sha = payload.get("sha")
-    if not isinstance(sha, str) or not _is_commit_sha(sha):
+    if not isinstance(sha, str) or not is_commit_sha(sha):
         raise RuntimeError(f"Failed to resolve GitHub environment ref {parsed.canonical()}")
     return sha
 
@@ -293,20 +301,34 @@ def _urlopen(
     import random
 
     _RATE_LIMIT_BASE_DELAY = 10.0
+
+    def backoff_delay(attempt: int) -> float:
+        return max(
+            _RATE_LIMIT_BASE_DELAY,
+            min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)),
+        )
+
+    def drain(resp) -> bytes:
+        """Consume the response, honouring the byte cap and the caller's sink.
+
+        Returns ``b""`` whenever ``out`` is given: the bytes went to the file, and also returning
+        them would hold the whole download in memory, which is the thing streaming to ``out`` avoids.
+        """
+        chunks = _iter_capped_chunks(resp, max_bytes) if max_bytes is not None else None
+        if out is None:
+            return b"".join(chunks) if chunks is not None else resp.read()
+        if chunks is not None:
+            for chunk in chunks:
+                out.write(chunk)
+        else:
+            shutil.copyfileobj(resp, out, length=_DOWNLOAD_CHUNK_BYTES)
+        return b""
+
     attempt = 0
     while True:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                if max_bytes is not None:
-                    if out is not None:
-                        for chunk in _iter_capped_chunks(resp, max_bytes):
-                            out.write(chunk)
-                        return b""
-                    return b"".join(_iter_capped_chunks(resp, max_bytes))
-                if out is not None:
-                    shutil.copyfileobj(resp, out, length=_DOWNLOAD_CHUNK_BYTES)
-                    return b""
-                return resp.read()
+                return drain(resp)
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", "replace")
             remaining = (exc.headers.get("X-RateLimit-Remaining") if exc.headers else None) or ""
@@ -315,11 +337,7 @@ def _urlopen(
             )
             is_transient = is_rate_limit or exc.code >= 500
             if is_transient and attempt < max_rate_limit_retries:
-                delay = max(
-                    _RATE_LIMIT_BASE_DELAY,
-                    min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)),
-                )
-                time.sleep(delay)
+                time.sleep(backoff_delay(attempt))
                 attempt += 1
                 continue
             if is_rate_limit:
@@ -335,11 +353,7 @@ def _urlopen(
             ) from exc
         except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
             if attempt < max_rate_limit_retries:
-                delay = max(
-                    _RATE_LIMIT_BASE_DELAY,
-                    min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)),
-                )
-                time.sleep(delay)
+                time.sleep(backoff_delay(attempt))
                 attempt += 1
                 continue
             reason = getattr(exc, "reason", exc)

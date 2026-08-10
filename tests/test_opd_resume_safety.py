@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 from pathlib import Path
@@ -7,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.opd_retry_contract import (
+from flash.teacher.retry_contract import (
     OPD_RESUME_REVISION_ENV,
     OPD_RESUME_STATE_VERSION,
     OPD_RETRY_CONTRACT_STATUS_KEY,
@@ -22,6 +23,26 @@ from tests._helpers.runner import provisioned_status
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
 
 
+@pytest.fixture(autouse=True)
+def _stub_teacher_broker_transport(monkeypatch):
+    import flash.server.domain.teacher_broker as teacher_broker
+
+    monkeypatch.setattr(
+        teacher_broker,
+        "require_teacher_broker_configuration",
+        lambda _spec, **_kwargs: "https://broker.example",
+    )
+
+    @contextlib.contextmanager
+    def teacher_transport(_spec, **_kwargs):
+        yield {
+            "FLASH_PUBLIC_URL": "https://broker.example",
+            "FLASH_TEACHER_CAPABILITY": "capability-test-value",
+        }
+
+    monkeypatch.setattr(teacher_broker, "teacher_attempt_transport", teacher_transport)
+
+
 def _valid_resume_state(step: int, *, seed: int = 42, **overrides) -> dict:
     state = {
         "contract_version": OPD_RESUME_STATE_VERSION,
@@ -34,6 +55,7 @@ def _valid_resume_state(step: int, *, seed: int = 42, **overrides) -> dict:
         "coverage_curve": [1.0] * step,
         "generated_tokens": step,
         "teacher_input_tokens": step,
+        "teacher_output_tokens": step,
         "truncated_rollouts": 0,
         "granularity_sum": 0.0,
         "granularity_n": 0,
@@ -67,7 +89,7 @@ def _remote(*, attempt: int = 0) -> dict:
 
 
 def _opd_spec(run_id: str, *, max_retries: int = 1, seed: int = 42):
-    from flash.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 
     return JobSpec(
         run_id=run_id,
@@ -99,7 +121,7 @@ def _save_status(
 
 def test_status_initialization_stamps_opd_contract_only_when_explicit(monkeypatch, tmp_path):
     import flash.runner as runner
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     contracted = _opd_spec("contract-opd")
@@ -168,89 +190,15 @@ def test_marker_decode_rejects_malformed_or_noncanonical_evidence(raw):
         decode_opd_optimizer_start_json(raw, run_id="run-1", attempt=3, seed=42)
 
 
-def test_optimizer_update_orders_marker_before_mutation_exactly_once(monkeypatch):
-    from flash.engine.worker import opd
+def test_marker_upload_failure_is_retriable_and_attempted_exactly_once(monkeypatch):
+    """A failed marker upload is retriable, preserves its cause, and is attempted once.
 
-    events = []
-
-    class Grad:
-        def mul_(self, value):
-            events.append(("rescale", value))
-
-    class Parameter:
-        requires_grad = True
-        grad = Grad()
-
-    parameter = Parameter()
-    model = SimpleNamespace(parameters=lambda: [parameter])
-    optimizer = SimpleNamespace(step=lambda: events.append(("step", None)))
-    torch = SimpleNamespace(
-        nn=SimpleNamespace(
-            utils=SimpleNamespace(
-                clip_grad_norm_=lambda _parameters, value: events.append(("clip", value))
-            )
-        )
-    )
-    monkeypatch.setattr(
-        opd,
-        "_w",
-        SimpleNamespace(publish_opd_optimizer_start_marker=lambda: events.append(("marker", None))),
-    )
-
-    opt_steps = opd._apply_opd_optimizer_update(
-        model=model,
-        optimizer=optimizer,
-        torch=torch,
-        opt_steps=0,
-        nseq=1,
-        accum_target=2,
-    )
-    opt_steps = opd._apply_opd_optimizer_update(
-        model=model,
-        optimizer=optimizer,
-        torch=torch,
-        opt_steps=opt_steps,
-        nseq=1,
-        accum_target=1,
-    )
-
-    assert opt_steps == 2
-    assert events == [
-        ("rescale", 2.0),
-        ("clip", 1.0),
-        ("marker", None),
-        ("step", None),
-        ("clip", 1.0),
-        ("step", None),
-    ]
-
-
-def test_no_signal_does_not_publish_or_mutate(monkeypatch):
-    from flash.engine.worker import opd
-
-    events = []
-    monkeypatch.setattr(
-        opd,
-        "_w",
-        SimpleNamespace(publish_opd_optimizer_start_marker=lambda: events.append("marker")),
-    )
-    with pytest.raises(ValueError, match="positive sequence counts"):
-        opd._apply_opd_optimizer_update(
-            model=SimpleNamespace(parameters=list),
-            optimizer=SimpleNamespace(step=lambda: events.append("step")),
-            torch=SimpleNamespace(),
-            opt_steps=0,
-            nseq=0,
-            accum_target=1,
-        )
-    assert events == []
-
-
-def test_marker_upload_failure_prevents_optimizer_step_and_preserves_retriable(monkeypatch):
-    from flash.engine.worker import hf, opd
+    Retrying in place could double-commit an ambiguous marker. The optimizer wrapper's pre-step
+    ordering is covered by ``test_optimizer_step_is_blocked_when_marker_publication_fails``.
+    """
+    from flash.engine.worker.io import hf
     from flash.engine.worker.perf import RetriableInfraError
 
-    events = []
     uploads = []
     failure = RetriableInfraError("required upload failed")
 
@@ -271,35 +219,24 @@ def test_marker_upload_failure_prevents_optimizer_step_and_preserves_retriable(m
             _remaining_worker_wall_seconds=lambda: None,
         ),
     )
-    monkeypatch.setattr(
-        opd,
-        "_w",
-        SimpleNamespace(publish_opd_optimizer_start_marker=hf.publish_opd_optimizer_start_marker),
-    )
-    torch = SimpleNamespace(
-        nn=SimpleNamespace(
-            utils=SimpleNamespace(clip_grad_norm_=lambda *_args: events.append("clip"))
-        )
-    )
+
     with pytest.raises(RetriableInfraError) as caught:
-        opd._apply_opd_optimizer_update(
-            model=SimpleNamespace(parameters=list),
-            optimizer=SimpleNamespace(step=lambda: events.append("step")),
-            torch=torch,
-            opt_steps=0,
-            nseq=1,
-            accum_target=1,
-        )
+        hf.publish_opd_optimizer_start_marker()
+
     assert caught.value.__cause__ is failure
     assert len(uploads) == 1
-    assert events == ["clip"]
 
 
-def test_ambiguous_marker_upload_is_not_retried_or_applied(monkeypatch):
-    from flash.engine.worker import hf, opd
+def test_ambiguous_marker_upload_is_not_retried_and_leaks_no_token(monkeypatch):
+    """A lost commit response must not be retried, and its diagnostic must not carry the HF token.
+
+    The dangerous case is a commit that landed while the response was lost: retrying could publish a
+    second marker for the same attempt, and the underlying error text embeds the Authorization header.
+    Both guarantees live in `publish_opd_optimizer_start_marker` (single attempt, `sanitize_diagnostic`
+    at limit 500), which is why this survives the trl deletion unchanged -- only the caller moved.
+    """
+    from flash.engine.worker.io import hf
     from flash.engine.worker.perf import RetriableInfraError
-
-    events = []
 
     class CommitThenLoseFirstResponse:
         def __init__(self):
@@ -328,26 +265,8 @@ def test_ambiguous_marker_upload_is_not_retried_or_applied(monkeypatch):
             _remaining_worker_wall_seconds=lambda: None,
         ),
     )
-    monkeypatch.setattr(
-        opd,
-        "_w",
-        SimpleNamespace(publish_opd_optimizer_start_marker=hf.publish_opd_optimizer_start_marker),
-    )
-    torch = SimpleNamespace(
-        nn=SimpleNamespace(
-            utils=SimpleNamespace(clip_grad_norm_=lambda *_args: events.append("clip"))
-        )
-    )
-
     with pytest.raises(RetriableInfraError) as caught:
-        opd._apply_opd_optimizer_update(
-            model=SimpleNamespace(parameters=list),
-            optimizer=SimpleNamespace(step=lambda: events.append("step")),
-            torch=torch,
-            opt_steps=0,
-            nseq=1,
-            accum_target=1,
-        )
+        hf.publish_opd_optimizer_start_marker()
 
     assert isinstance(caught.value.__cause__, TimeoutError)
     assert "marker-secret" not in str(caught.value)
@@ -359,11 +278,10 @@ def test_ambiguous_marker_upload_is_not_retried_or_applied(monkeypatch):
     assert api.committed == canonical_opd_optimizer_start_json(
         run_id="run-ambiguous", attempt=2, seed=42
     )
-    assert events == ["clip"]
 
 
 def test_worker_marker_rejects_empty_repo(monkeypatch):
-    from flash.engine.worker import hf
+    from flash.engine.worker.io import hf
 
     monkeypatch.setattr(
         hf,
@@ -375,7 +293,7 @@ def test_worker_marker_rejects_empty_repo(monkeypatch):
 
 
 def test_worker_marker_starts_no_hf_call_at_deadline(monkeypatch):
-    from flash.engine.worker import hf
+    from flash.engine.worker.io import hf
     from flash.engine.worker.perf import RetriableInfraError
 
     calls = []
@@ -399,7 +317,7 @@ def test_worker_marker_starts_no_hf_call_at_deadline(monkeypatch):
 
 
 def test_worker_marker_writes_fsync_and_required_upload(monkeypatch):
-    from flash.engine.worker import hf
+    from flash.engine.worker.io import hf
 
     fsync_calls = []
     uploads = []
@@ -485,7 +403,7 @@ class _FakePrivateHf:
 
 
 def test_strict_reader_pins_one_sha_and_any_present_marker_blocks(monkeypatch, tmp_path):
-    from flash.providers._hf_artifacts import verify_opd_replacement_safe
+    from flash.providers.artifacts.hf import verify_opd_replacement_safe
 
     calls = []
     present_path = opd_optimizer_start_marker_path("run-1", 1)
@@ -529,7 +447,7 @@ def test_strict_reader_pins_one_sha_and_any_present_marker_blocks(monkeypatch, t
 
 
 def test_strict_reader_all_absent_is_safe(monkeypatch):
-    from flash.providers._hf_artifacts import verify_opd_replacement_safe
+    from flash.providers.artifacts.hf import verify_opd_replacement_safe
 
     class Api:
         def repo_info(self, **_kwargs):
@@ -555,7 +473,7 @@ def test_strict_reader_all_absent_is_safe(monkeypatch):
 
 @pytest.mark.parametrize("mode", ["malformed", "timeout", "listing"])
 def test_strict_reader_malformed_or_outage_blocks(monkeypatch, tmp_path, mode):
-    from flash.providers._hf_artifacts import verify_opd_replacement_safe
+    from flash.providers.artifacts.hf import verify_opd_replacement_safe
 
     marker_path = opd_optimizer_start_marker_path("run-1", 0)
 
@@ -592,7 +510,7 @@ def test_strict_reader_malformed_or_outage_blocks(monkeypatch, tmp_path, mode):
     [("", 1), ("private/runs", 2), ("private/runs", True), ("private/runs", "1")],
 )
 def test_strict_reader_missing_repo_or_unsupported_contract_blocks(repo, version):
-    from flash.providers._hf_artifacts import verify_opd_replacement_safe
+    from flash.providers.artifacts.hf import verify_opd_replacement_safe
 
     with pytest.raises(RuntimeError, match="replacement is blocked"):
         verify_opd_replacement_safe(
@@ -626,7 +544,7 @@ def test_initial_contracted_opd_reservation_skips_empty_attempt_query(monkeypatc
 
 def test_retry_gate_uses_authoritative_jobspec_seed(monkeypatch, tmp_path):
     import flash.runner as runner
-    from flash.providers import _hf_artifacts
+    from flash.providers.artifacts import hf as _hf_artifacts
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = _opd_spec("custom-seed-opd", seed=987)
@@ -675,7 +593,7 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
     import flash.providers.allocator as allocator
     import flash.runner as runner
     from flash.providers.base import Allocation, Candidate, PollResult
-    from flash.runner import lifecycle
+    from flash.runner.supervise import lifecycle
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     private_hf = _FakePrivateHf(tmp_path)
@@ -727,7 +645,15 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
 
     metrics = lifecycle._submit_seed_supervised(spec, 42, io.StringIO())
 
-    assert metrics == {"train_tokens": 1, "allocated_gpu": "RTX 4090"}
+    assert metrics == {
+        "train_tokens": 1,
+        "allocated_gpu": "RTX 4090",
+        # stamped alongside the gpu so cost attribution prices the class on the substrate
+        # that actually billed it.
+        "allocated_provider": "runpod",
+        # and the card count, since the hourly rate is per card.
+        "allocated_gpu_count": 1,
+    }
     assert provider.attempts == [0, 1]
     retry_submit = provider.events.index(("submit", 1))
     assert provider.events.index(("cancel", 0)) < retry_submit
@@ -741,7 +667,7 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
     import flash.providers.allocator as allocator
     import flash.runner as runner
     from flash.providers.base import Allocation, Candidate, PollResult
-    from flash.runner import lifecycle
+    from flash.runner.supervise import lifecycle
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     private_hf = _FakePrivateHf(tmp_path)
@@ -770,7 +696,7 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
             self.worker_envs = []
 
         def submit_run(self, _spec, _seed, *, attempt, on_handle, **kwargs):
-            from flash.providers._worker import build_worker_env
+            from flash.providers._lifecycle.worker import build_worker_env
 
             secrets = kwargs.get("runtime_secrets")
             self.runtime_secrets.append(secrets)
@@ -809,12 +735,25 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
         },
     )
 
-    assert metrics == {"train_tokens": 1, "allocated_gpu": "RTX 4090"}
+    assert metrics == {
+        "train_tokens": 1,
+        "allocated_gpu": "RTX 4090",
+        # stamped alongside the gpu so cost attribution prices the class on the substrate
+        # that actually billed it.
+        "allocated_provider": "runpod",
+        # and the card count, since the hourly rate is per card.
+        "allocated_gpu_count": 1,
+    }
+    broker_transport = {
+        "FLASH_PUBLIC_URL": "https://broker.example",
+        "FLASH_TEACHER_CAPABILITY": "capability-test-value",
+    }
     assert provider.runtime_secrets == [
-        {"WANDB_API_KEY": "real-secret"},
+        {"WANDB_API_KEY": "real-secret", **broker_transport},
         {
             "WANDB_API_KEY": "real-secret",
             OPD_RESUME_REVISION_ENV: "private-pinned-sha",
+            **broker_transport,
         },
     ]
     assert OPD_RESUME_REVISION_ENV not in provider.worker_envs[0]
@@ -872,7 +811,7 @@ def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkey
 def test_handleless_opd_recovery_blocks_through_recover_runs(monkeypatch, tmp_path):
     import flash.providers as providers
     import flash.runner as runner
-    from flash.server import _runtime
+    from flash.server.platform import runtime as _runtime
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = _opd_spec("handleless-opd-block")
@@ -903,12 +842,17 @@ def test_handleless_opd_recovery_blocks_through_recover_runs(monkeypatch, tmp_pa
     ]
 
 
-def test_ambiguous_marker_upload_prevents_step_and_blocks_replacement(monkeypatch, tmp_path):
+def test_ambiguous_marker_upload_lands_evidence_and_blocks_replacement(monkeypatch, tmp_path):
+    """An ambiguous marker upload still leaves evidence that blocks replacement.
+
+    A lost response cannot prove the commit failed, so the published marker must fail closed before
+    another worker allocates a GPU.
+    """
     import flash.providers.allocator as allocator
     import flash.runner as runner
-    from flash.engine.worker import hf, opd
+    from flash.engine.worker.io import hf
     from flash.engine.worker.perf import RetriableInfraError
-    from flash.runner import lifecycle
+    from flash.runner.supervise import lifecycle
 
     private_hf = _FakePrivateHf(tmp_path, raise_after_upload=True)
     monkeypatch.setattr(hf, "_sleep_with_hf_deadline", lambda _delay: True)
@@ -924,29 +868,9 @@ def test_ambiguous_marker_upload_prevents_step_and_blocks_replacement(monkeypatc
             _remaining_worker_wall_seconds=lambda: None,
         ),
     )
-    monkeypatch.setattr(
-        opd,
-        "_w",
-        SimpleNamespace(publish_opd_optimizer_start_marker=hf.publish_opd_optimizer_start_marker),
-    )
-    events = []
-    torch = SimpleNamespace(
-        nn=SimpleNamespace(
-            utils=SimpleNamespace(clip_grad_norm_=lambda *_args: events.append("clip"))
-        )
-    )
-
     with pytest.raises(RetriableInfraError, match="required upload"):
-        opd._apply_opd_optimizer_update(
-            model=SimpleNamespace(parameters=list),
-            optimizer=SimpleNamespace(step=lambda: events.append("step")),
-            torch=torch,
-            opt_steps=0,
-            nseq=1,
-            accum_target=1,
-        )
+        hf.publish_opd_optimizer_start_marker()
 
-    assert events == ["clip"]
     marker_path = opd_optimizer_start_marker_path("ambiguous-upload", 0)
     assert private_hf.files[marker_path] == canonical_opd_optimizer_start_json(
         run_id="ambiguous-upload", attempt=0, seed=42
@@ -1039,7 +963,7 @@ def _install_marker_gate(
 
 
 def _run_gate():
-    from flash.providers._hf_artifacts import verify_opd_replacement_safe
+    from flash.providers.artifacts.hf import verify_opd_replacement_safe
 
     return verify_opd_replacement_safe(
         hf_repo="private/runs",
@@ -1105,6 +1029,82 @@ def test_gate_blocks_pinned_checkpoint_metadata_download_failure(monkeypatch, tm
 
     with pytest.raises(RuntimeError, match="metadata is unverifiable"):
         _run_gate()
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"align_group_sum": float("nan")},
+        {"align_group_sum": float("inf")},
+        {"align_group_sum": -1.0},
+        {"align_group_n": -1},
+        {"align_group_n": 1.5},
+        {"align_group_n": True},
+    ],
+)
+def test_resume_validator_rejects_corrupt_alignment_granularity(overrides):
+    # the verl worker resumes its granularity accumulators from these fields and publishes their
+    # ratio into train_meta. a tampered or corrupt checkpoint must fail the fail-closed contract
+    # here, not coerce past it and propagate a non-finite or negative mean into every later
+    # checkpoint and the run's reported alignment health.
+    state = _valid_resume_state(2, **overrides)
+    # match on the corrupt field itself: a validator that rejected for some unrelated reason would
+    # pass a bare raises() while leaving this pair entirely unchecked.
+    (field,) = overrides
+
+    with pytest.raises(ValueError, match=field):
+        validate_opd_resume_state_metadata(state, expected_seed=42, checkpoint_step=2)
+
+
+def test_resume_state_version_rejects_states_predating_alignment_granularity():
+    # the verl worker resumes align_group_sum/align_group_n and publishes their ratio as
+    # mean_align_granularity. a state written before those accumulators existed carries neither, so
+    # resuming one restarts the accumulator at zero and the ratio would describe only the
+    # post-resume samples while being reported as the whole run's alignment health. the contract
+    # version is the enforcement point: it must have moved past 2 so the existing fail-closed check
+    # refuses those states outright.
+    assert OPD_RESUME_STATE_VERSION > 2
+
+    stale = _valid_resume_state(2)
+    stale["contract_version"] = 2
+
+    with pytest.raises(ValueError, match="contract_version"):
+        validate_opd_resume_state_metadata(stale, expected_seed=42, checkpoint_step=2)
+
+
+def test_resume_validator_accepts_alignment_granularity_and_states_without_it():
+    # verl writes the pair; trl does not. both must validate, so the fields are checked when present
+    # rather than required -- otherwise adding them would reject every trl checkpoint.
+    with_granularity = _valid_resume_state(2, align_group_sum=3.0, align_group_n=2)
+    validated = validate_opd_resume_state_metadata(
+        with_granularity, expected_seed=42, checkpoint_step=2
+    )
+    assert validated["align_group_sum"] == 3.0
+    assert validated["align_group_n"] == 2
+
+    without = _valid_resume_state(2)
+    assert "align_group_sum" not in without
+    validate_opd_resume_state_metadata(without, expected_seed=42, checkpoint_step=2)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "missing"),
+    [
+        ({"align_group_sum": 3.0}, "align_group_n"),
+        ({"align_group_n": 2}, "align_group_sum"),
+    ],
+)
+def test_resume_validator_rejects_a_half_present_alignment_pair(overrides, missing):
+    # Regression (opd_retry_contract.py): the two accumulators were checked INDEPENDENTLY, so a
+    # state carrying one of them passed. the reader then defaults the absent one to 0 (opd_train
+    # reads each with its own.get default), and the published mean_align_granularity divides a real
+    # sum by a zeroed count -- or reports 0.0 for a run that measured alignment on every group.
+    # absent-together stays valid (trl writes neither, which the test above pins); only the
+    # half-present state is a corrupt one.
+    state = _valid_resume_state(2, **overrides)
+
+    with pytest.raises(ValueError, match=missing):
+        validate_opd_resume_state_metadata(state, expected_seed=42, checkpoint_step=2)
 
 
 def test_shared_resume_metadata_validator_returns_a_copy():

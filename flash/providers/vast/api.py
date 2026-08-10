@@ -15,13 +15,13 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-from flash._logging import get_logger
-from flash.providers._deadline import (
+from flash._internal.logging import get_logger
+from flash.providers._lifecycle.deadline import (
     remaining_seconds,
     require_create_allowance,
     require_deadline_at,
 )
-from flash.providers._http import RestClient, is_not_found
+from flash.providers._lifecycle.http import RestClient, is_not_found
 
 logger = get_logger(__name__)
 
@@ -84,12 +84,8 @@ def search_offers(
 ) -> list[dict]:
     """Rentable offers from verified datacenter hosts, cheapest first.
 
-    ``num_gpus`` filters to hosts advertising exactly that many cards on one machine (1 = the
-    historical single-card search). Threading it from the job spec is left to the multi-gpu
-    allocator work; callers default to 1 today.
-
-    ``min_duration_seconds`` applies Vast's ``duration`` filter (offer available for at least
-    this long from now); prevents renting a short-lived offer that preempts mid-run. 0 = off.
+    `num_gpus` must match the host because Vast bakes card count into the offer. A positive
+    `min_duration_seconds` excludes offers that expire before the run.
     """
     # Server-side datacenter-only filter so the price-sorted page isn't filled with community
     # offers usable_offers would reject (run secrets ship to the box); callers still re-check.
@@ -332,15 +328,9 @@ def list_instances(
     *,
     deadline_at: float | None = None,
 ) -> list[dict]:
-    # v0 list is deprecated (410 "use /api/v1/instances/"); detail/destroy stay on v0. The v1 list
-    # is keyset-paginated (limit max 25; pass the prior page's ``next_token`` as ``after_token``,
-    # null on the last page). Must walk every page or a flash-labeled orphan on a later page (which
-    # every label-keyed cleanup path reads this list for) bills forever.
-    #
-    # ``strict`` (default False) is for callers concluding from an ABSENCE (e.g. "no instance for
-    # this run remains"): any incompleteness — a page fetch failure, a malformed page, or exhausting
-    # the page cap — RAISES instead of returning a partial list, so "couldn't enumerate completely"
-    # is never read as "gone".
+    # list via paginated v1 (`next_token` -> `after_token`, limit 25); detail/destroy remain v0.
+    # walk every page. with `strict=True`, any fetch, shape, or page-cap failure raises so an
+    # incomplete listing cannot prove an instance is gone.
     instances: list[dict] = []
     after_token: str | None = None
     for page_no in range(

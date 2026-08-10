@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from flash.catalog import ALGORITHMS, normalize_algorithm
+from flash.core.catalog import ALGORITHMS, normalize_algorithm
 from flash.schema import ConfigError, spec_from_dict
 
 
@@ -37,15 +37,14 @@ def test_opd_algorithm_accepted():
     assert spec.algorithm == "opd"
     # phase drives RUN_MODE + the artifact path segment; grpo->rl, everything else->itself.
     assert spec.phase == "opd"
-    # The teacher key is platform-managed (injected into the worker env by the control plane, like
-    # HF_TOKEN) — NOT a user-declared secret, so it must not be auto-added to environment.secrets.
-    assert "FIREWORKS_API_KEY" not in spec.environment.secrets
+    # the teacher provider key is control-plane-only, not a user-declared environment secret.
+    assert "PARASAIL_API_KEY" not in spec.environment.secrets
 
 
 def test_opd_capability_gated_per_model():
     # A model whose algos lack "opd" rejects a opd run through the config path.
-    from flash import catalog
-    from flash.catalog import ModelInfo
+    from flash.core import catalog
+    from flash.core.catalog import ModelInfo
 
     catalog.MODELS["test/no-opd"] = ModelInfo(
         id="test/no-opd",
@@ -73,8 +72,8 @@ def test_opd_capability_gated_per_model():
 def test_grpo_capability_still_enforced():
     # The guardrail: an SFT-only model rejects GRPO through the config path. No catalog
     # entry is SFT-only anymore, so inject a temporary one.
-    from flash import catalog
-    from flash.catalog import ModelInfo
+    from flash.core import catalog
+    from flash.core.catalog import ModelInfo
 
     catalog.MODELS["test/sft-only"] = ModelInfo(
         id="test/sft-only",

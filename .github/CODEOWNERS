@@ -1,0 +1,26 @@
+# Every pull request requests a review from an owner listed here. Without this file, an
+# incoming PR on a public repository can sit with no reviewer assigned.
+#
+# Order matters: the LAST matching pattern wins, so the catch-all comes first and the
+# narrower security-relevant paths below it.
+
+*                           @DavidBShan
+
+# Auth, credential handling, and the request surface an external user reaches.
+/flash/server/              @DavidBShan
+/flash/client/              @DavidBShan
+
+# The GPU worker: runs untrusted environment code and holds attempt-scoped capabilities.
+/flash/engine/              @DavidBShan
+/flash/providers/           @DavidBShan
+
+# CI, release, and the credentials those workflows carry.
+/.github/                   @DavidBShan
+/Dockerfile                 @DavidBShan
+/Dockerfile.worker          @DavidBShan
+/pyproject.toml             @DavidBShan
+/uv.lock                    @DavidBShan
+
+# Security policy and the operator-facing credential template.
+/SECURITY.md                @DavidBShan
+/.env.example               @DavidBShan

@@ -16,7 +16,7 @@ import io
 
 import pytest
 
-from flash.spec import JobSpec
+from flash.core.spec import JobSpec
 
 _SHA = "a" * 40
 _NEWER_SHA = "b" * 40
@@ -44,20 +44,20 @@ def _with_sha(spec: JobSpec, sha: str) -> JobSpec:
 # the two helpers, in isolation
 # ============================================================================================
 def test_spec_with_resolved_env_sha_applies_the_pin() -> None:
-    from flash.runner.lifecycle import _spec_with_resolved_env_sha
+    from flash.runner.supervise.lifecycle import _spec_with_resolved_env_sha
 
     assert _spec_with_resolved_env_sha(_env_spec(), _SHA).environment.resolved_sha == _SHA
 
 
 def test_spec_with_resolved_env_sha_is_a_noop_without_a_sha() -> None:
-    from flash.runner.lifecycle import _spec_with_resolved_env_sha
+    from flash.runner.supervise.lifecycle import _spec_with_resolved_env_sha
 
     spec = _env_spec()
     assert _spec_with_resolved_env_sha(spec, "") is spec  # no copy when there is nothing to pin
 
 
 def test_spec_with_resolved_env_sha_is_a_noop_when_already_pinned() -> None:
-    from flash.runner.lifecycle import _spec_with_resolved_env_sha
+    from flash.runner.supervise.lifecycle import _spec_with_resolved_env_sha
 
     spec = _env_spec(_SHA)
     assert _spec_with_resolved_env_sha(spec, _SHA) is spec
@@ -66,7 +66,7 @@ def test_spec_with_resolved_env_sha_is_a_noop_when_already_pinned() -> None:
 def test_pin_keeps_an_existing_pin_without_re_resolving(monkeypatch) -> None:
     """An already-pinned spec must not hit GitHub again; re-resolving is what moves the ref."""
     import flash.runner as runner
-    from flash.runner.lifecycle import _pin_environment_for_run
+    from flash.runner.supervise.lifecycle import _pin_environment_for_run
 
     def _boom(_spec):
         raise AssertionError("must not re-resolve a spec that is already pinned")
@@ -78,7 +78,7 @@ def test_pin_keeps_an_existing_pin_without_re_resolving(monkeypatch) -> None:
 
 def test_pin_resolves_and_reports_when_submit_left_it_unpinned(monkeypatch) -> None:
     import flash.runner as runner
-    from flash.runner.lifecycle import _pin_environment_for_run
+    from flash.runner.supervise.lifecycle import _pin_environment_for_run
 
     monkeypatch.setattr(runner, "_assign_resolved_env_sha", lambda spec: _with_sha(spec, _SHA))
     log = io.StringIO()
@@ -90,7 +90,7 @@ def test_pin_resolves_and_reports_when_submit_left_it_unpinned(monkeypatch) -> N
 def test_pin_warns_in_the_run_log_when_it_cannot_resolve(monkeypatch) -> None:
     # submit's failure only reaches a server-side logger; the user sees the run log, so warn there.
     import flash.runner as runner
-    from flash.runner.lifecycle import _pin_environment_for_run
+    from flash.runner.supervise.lifecycle import _pin_environment_for_run
 
     monkeypatch.setattr(runner, "_assign_resolved_env_sha", lambda spec: spec)
     log = io.StringIO()
@@ -109,7 +109,7 @@ def test_pin_fails_closed_once_an_attempt_has_already_run_unpinned(monkeypatch) 
     answer.
     """
     import flash.runner as runner
-    from flash.runner.lifecycle import _pin_environment_for_run
+    from flash.runner.supervise.lifecycle import _pin_environment_for_run
 
     def _boom(_spec):
         raise AssertionError("must not resolve the ref after an attempt has already run unpinned")
@@ -131,7 +131,7 @@ def test_pin_still_applies_a_submit_time_pin_after_an_attempt_has_run(monkeypatc
     a ref that is still symbolic.
     """
     import flash.runner as runner
-    from flash.runner.lifecycle import _pin_environment_for_run
+    from flash.runner.supervise.lifecycle import _pin_environment_for_run
 
     monkeypatch.setattr(
         runner,

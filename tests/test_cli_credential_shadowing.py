@@ -16,9 +16,9 @@ import pytest
 import flash.cli as cli
 import flash.client.config as client_config
 from flash.cli.commands import cmd_train, cmd_whoami
-from flash.cli.env_eval import cmd_env_eval
-from flash.cli.env_setup import cmd_env_setup
-from flash.cli.traces import cmd_traces_export
+from flash.cli.commands.env.eval import cmd_env_eval
+from flash.cli.commands.env.setup import cmd_env_setup
+from flash.cli.commands.traces import cmd_traces_export
 
 
 def _patch_saved_key(monkeypatch, saved: str | None) -> None:
@@ -121,7 +121,7 @@ def test_env_eval_warns_whether_or_not_it_uploads(monkeypatch, capsys, upload):
     # gating this on whether results are recorded treats a --no-upload eval as local, but every case
     # still makes an authenticated chat_stream request and the target's accessibility is resolved
     # from the ambient key. so such an eval can report the target inaccessible, or spend the whole
-    # suite against the unintended org, with no warning at all (codex[bot]).
+    # suite against the unintended org, with no warning at all.
     monkeypatch.setattr(cli, "shadowed_login_warning", lambda: "shadowed!")
 
     cli._warn_if_login_shadowed(argparse.Namespace(func=cmd_env_eval, upload=upload))

@@ -9,7 +9,17 @@ from collections.abc import Collection
 from dataclasses import fields as dataclass_fields
 from typing import Any
 
-from flash.catalog import normalize_algorithm, resolve_model, serving_lora_rank_cap
+from flash.core.catalog import normalize_algorithm, resolve_model, serving_lora_rank_cap
+from flash.core.spec import (
+    FIXED_SEED,
+    MANAGED_GPU_KEYS,
+    EnvironmentSpec,
+    GpuSpec,
+    JobSpec,
+    TrainSpec,
+    parse_seed,
+    require_project_id,
+)
 from flash.providers import PROVIDER_NAMES
 from flash.providers.base import (
     GPU_INFO,
@@ -32,17 +42,6 @@ from flash.schema.fields import (
     _train_structured_outputs,
     _train_teacher,
     _wandb_spec,
-    _worker_env,
-)
-from flash.spec import (
-    FIXED_SEED,
-    MANAGED_GPU_KEYS,
-    EnvironmentSpec,
-    GpuSpec,
-    JobSpec,
-    TrainSpec,
-    parse_seed,
-    require_project_id,
 )
 
 _OWNER_REPO_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*"
@@ -114,11 +113,10 @@ def parse_adapter_storage_ref(text: str) -> tuple[str, str] | None:
 
 
 def normalize_env_name_segment(value: str) -> str | None:
-    """Normalize one env-name segment to the shared grammar ``[a-z0-9][a-z0-9._-]*``.
+    """normalize one env-name segment to ``[a-z0-9][a-z0-9._-]*``.
 
-    Lowercases, collapses runs of other characters to ``-``, strips edge dashes. Returns None
-    when nothing usable remains (empty, ``.``/``..``, or no alphanumeric). Shared by the CLI's
-    pre-publish name normalization and the server's authoritative publish-slug validation.
+    lowercase, collapse invalid runs to ``-``, strip edge dashes, and return none when no usable
+    alphanumeric content remains. cli and server share this grammar.
     """
     segment = re.sub(r"[^a-z0-9._-]+", "-", str(value or "").lower()).strip("-")
     if segment in {"", ".", ".."} or not re.search(r"[a-z0-9]", segment):
@@ -145,24 +143,6 @@ def load_toml(path: str) -> dict[str, Any]:
     except OSError as exc:
         # permission denied, ENOTDIR on a path component, symlink loops, etc.
         raise ConfigError(f"cannot read config {path}: {exc.strerror or exc}") from exc
-
-
-def spec_from_file(
-    path: str,
-    run_id: str | None = None,
-    overrides: list[str] | None = None,
-    extra_configs: list[str] | None = None,
-    *,
-    project_required: bool = False,
-) -> JobSpec:
-    spec, _ = spec_and_train_keys_from_file(
-        path,
-        run_id=run_id,
-        overrides=overrides,
-        extra_configs=extra_configs,
-        project_required=project_required,
-    )
-    return spec
 
 
 def spec_and_train_keys_from_file(
@@ -242,10 +222,10 @@ def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
     )
 
 
-# unknown tables are rejected loudly: a stray [grpo] table silently dropped grpo knobs and trained
-# at 16x-cost defaults. platform-managed fields (run_id, model_policy; and per-section hf_repo,
-# gpu disk/volume, environment resolved_sha) are NOT accepted here: they are assigned by the control
-# plane / runner, so JobSpec.to_dict() omits them and this parser rejects a user who sets them.
+# unknown tables are rejected LOUDLY: a stray [grpo] table silently dropped grpo knobs and trained
+# at 16x-cost defaults. platform-managed fields (run_id; per-section hf_repo, gpu disk/volume,
+# environment resolved_sha) are assigned by the control plane, so to_dict() omits them and this
+# parser rejects a user who sets them.
 _TOP_LEVEL_KEYS = frozenset(
     {
         "model",
@@ -256,18 +236,20 @@ _TOP_LEVEL_KEYS = frozenset(
         "environment",
         "train",
         "gpu",
-        "worker_env",
         "wandb",
         "project",
     }
 )
-# runner-assigned [gpu] fields (MANAGED_GPU_KEYS, single-sourced in flash.spec) are excluded from the
+# runner-assigned [gpu] fields (MANAGED_GPU_KEYS, single-sourced in flash.core.spec) are excluded from the
 # user-facing surface. GpuSpec still carries them so the internal JobSpec.from_dict round trip
 # preserves the runner's disk sizing, weight-cache volume, and platform retry/wall-clock policy.
 _GPU_KEYS = frozenset(item.name for item in dataclass_fields(GpuSpec)) - MANAGED_GPU_KEYS
 # [environment] user-authorable keys, derived from EnvironmentSpec (mirrors _GPU_KEYS) so a new field
 # is accepted automatically; resolved_sha is control-plane-pinned (see _assign_resolved_env_sha).
-_ENV_MANAGED_KEYS = frozenset({"resolved_sha"})
+# pip is platform-managed: worker_pip_for_env ignores the env id and returns one constant worker
+# requirement, so an override only ever selected the same list or a broken one. EnvironmentSpec still
+# carries the field, and spec_payload/provider submit keep populating it from worker_pip_for_env.
+_ENV_MANAGED_KEYS = frozenset({"resolved_sha", "pip"})
 _ENVIRONMENT_KEYS = (
     frozenset(item.name for item in dataclass_fields(EnvironmentSpec)) - _ENV_MANAGED_KEYS
 )
@@ -308,7 +290,7 @@ def spec_from_dict(
         noun = "section(s)" if any(isinstance(raw[key], dict) for key in unknown) else "key(s)"
         raise ConfigError(
             f"unknown config {noun}: {', '.join(unknown)} "
-            f"(allowed tables: environment, train, gpu, wandb, worker_env){hint}"
+            f"(allowed tables: environment, train, gpu, wandb){hint}"
         )
     try:
         model = raw["model"]
@@ -341,7 +323,6 @@ def spec_from_dict(
         algorithm = normalize_algorithm(raw.get("algorithm"))
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
-    model_policy = "catalog"  # not a user knob; "allow" path exists for internal use only
     thinking = raw.get("thinking", False)
     if not isinstance(thinking, bool):
         raise ConfigError("thinking must be a boolean")
@@ -358,22 +339,11 @@ def spec_from_dict(
             f"[environment] unknown key(s): {', '.join(unknown_env)} "
             f"(allowed: {', '.join(sorted(_ENVIRONMENT_KEYS))})"
         )
-    # Validate the [environment] sub-fields before they reach EnvironmentSpec(...). The
-    # constructor's ``dict(... or {})`` / ``tuple(str(p) for p in ... or ())`` papers over a falsy
-    # value (false -> {}/()) but a present-but-wrong-typed value otherwise crashes opaquely or
-    # silently misbehaves: ``params = "x"`` -> ``dict("x")`` ValueError, ``params = 1`` ->
-    # ``dict(1)`` TypeError (a 500), and ``pip = "x"`` is char-split into ('x',) (the worker then
-    # tries to install bogus one-char packages). A MISSING sub-field — absent OR ``None`` (e.g.
-    # JSON ``null``) — keeps its default; any present, NON-None value must be the right type. A
-    # falsy ``params = false`` is still rejected, mirroring the section-level rule that
-    # ``environment = false`` must fail rather than silently coerce. Mirrors the ``must be a
-    # table`` style; a string is never char-split.
+    # validate environment sub-fields before EnvironmentSpec coercion. missing or none keeps the
+    # default; every present non-none value, including false, must have the correct type so malformed
+    # input fails clearly instead of becoming {} or an opaque dict conversion error.
     if env_raw.get("params") is not None and not isinstance(env_raw["params"], dict):
         raise ConfigError("[environment] params must be a table")
-    if env_raw.get("pip") is not None and not isinstance(env_raw["pip"], (list, tuple)):
-        raise ConfigError("[environment] pip must be a list of strings")
-    if env_raw.get("pip") is not None and not all(isinstance(p, str) for p in env_raw["pip"]):
-        raise ConfigError("[environment] pip entries must be strings")
     environment_secrets = _environment_secrets(env_raw.get("secrets"))
     train_raw = raw.get("train")
     if train_raw is None:
@@ -424,13 +394,24 @@ def spec_from_dict(
                 f"gpu.provider {gpu_provider!r} cannot provision gpu.type {gpu_type!r}"
             )
 
+    from flash.providers.allocator import geometry_safe_gpu_cap
+
+    preflight_gpu_count = geometry_safe_gpu_cap(
+        model, gpu_count or 1, model_revision=model_revision
+    )
     try:
-        # offline sizing/display only; allocator re-resolves auto runs at submit time.
-        provisional_type = provisional_gpu(
+        # called for its rejection, not its return: it raises when no validated class can hold the
+        # run, which is the parse-time "this is unplaceable" gate. The class it picks is offline
+        # sizing/display only -- the allocator re-resolves auto runs at submit time.
+        provisional_gpu(
             model,
             algorithm=algorithm,
             train=train_raw,
             thinking=thinking,
+            # sized against the shape the allocator may actually rent. sizing a --gpus N run
+            # against one card rejected it here before sharding was ever considered, which made
+            # the flag inert for exactly the large runs it exists to serve.
+            gpu_count=preflight_gpu_count,
         )
         if gpu_type and not model_revision:
             from flash.providers.allocator import required_vram_gb
@@ -441,7 +422,13 @@ def spec_from_dict(
                 train=train_raw,
                 thinking=thinking,
             )
-            if get_gpu_info(gpu_type).vram_gb < required_vram:
+            # required_vram is the WHOLE-RUN floor, so it may only be compared against a single
+            # card's VRAM when the run is confined to a single card. above that the allocator
+            # shards the run across a combination and applies its own multi-card fit test
+            # (allocator.py:181), which this gate must not pre-empt: a pinned 141 GB class with
+            # gpu.count=2 holds 282 GB and is rejected here on a 180 GB floor it clears.
+            single_card = gpu_count is None or gpu_count <= 1
+            if single_card and get_gpu_info(gpu_type).vram_gb < required_vram:
                 raise ConfigError(
                     f"gpu.type {gpu_type!r} has {get_gpu_info(gpu_type).vram_gb} GB VRAM, "
                     f"but this run requires at least {required_vram} GB"
@@ -449,9 +436,7 @@ def spec_from_dict(
     except (UnsupportedGpuError, ValueError) as exc:
         raise ConfigError(str(exc)) from exc
     try:
-        info = resolve_model(
-            model, algorithm, policy=model_policy, gpu=gpu_type or provisional_type
-        )
+        info = resolve_model(model, algorithm)
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
     if thinking and info.thinking == "none":
@@ -465,13 +450,6 @@ def spec_from_dict(
             f"{model} always emits <think> reasoning and cannot run with thinking "
             f"disabled; set thinking = true"
         )
-    if thinking and info.thinking == "unknown":
-        # stderr keeps stdout clean for machine-readable callers
-        print(
-            f"warning: open-model policy: cannot verify that {model}'s chat template "
-            f"supports thinking mode; the run proceeds with enable_thinking=true",
-            file=sys.stderr,
-        )
     init_from_adapter = _init_from_adapter_ref(train_raw)
     if algorithm == "sft" and init_from_adapter:
         raise ConfigError(
@@ -483,7 +461,14 @@ def spec_from_dict(
             "train.lora_rank cannot be set with train.init_from_adapter because source adapter "
             "rank metadata is authoritative"
         )
+    if init_from_adapter and "lora_alpha" in train_raw:
+        raise ConfigError(
+            "train.lora_alpha cannot be set with train.init_from_adapter because source adapter "
+            "alpha metadata is authoritative"
+        )
     lora_rank = _train_int(train_raw, "lora_rank", minimum=1) or 32
+    # unset -> the tuned 2 x rank default. authored -> the user's value, which need not be 2 x rank.
+    lora_alpha = _train_int(train_raw, "lora_alpha", minimum=1) or 2 * lora_rank
     max_lora_rank = serving_lora_rank_cap(info)
     if not init_from_adapter and max_lora_rank is not None and lora_rank > max_lora_rank:
         raise ConfigError(
@@ -492,14 +477,13 @@ def spec_from_dict(
             "after real-GPU validation"
         )
 
-    worker_env = _worker_env(raw.get("worker_env"))
     wandb_spec = _wandb_spec(raw.get("wandb"))
 
     try:
         train_spec = TrainSpec(
             epochs=_train_int(train_raw, "epochs", minimum=1),
             lora_rank=lora_rank,
-            lora_alpha=2 * lora_rank,  # derived, not a user knob; always 2 x lora_rank
+            lora_alpha=lora_alpha,
             init_from_adapter=init_from_adapter,
             hf_repo="",  # assigned server-side; see submit_job._assign_managed_hf_repo
             learning_rate=_train_float(train_raw, "learning_rate", minimum=0.0, exclusive=True),
@@ -510,7 +494,6 @@ def spec_from_dict(
             temperature=_train_float(train_raw, "temperature", minimum=0.0),
             max_completion_tokens=_train_int(train_raw, "max_completion_tokens", minimum=1),
             kl_penalty_coef=_train_float(train_raw, "kl_penalty_coef", minimum=0.0),
-            advantage_clip=_train_float(train_raw, "advantage_clip", minimum=0.0),
             entropy_quantile=_train_float(train_raw, "entropy_quantile", minimum=0.0, maximum=1.0),
             thinking_length_penalty_coef=_train_float(
                 train_raw, "thinking_length_penalty_coef", minimum=0.0, maximum=1.0
@@ -546,8 +529,6 @@ def spec_from_dict(
         ),
         run_id=run_id or "local",  # server-assigned at create_run; never user-set
         seed=_job_seed(raw),
-        worker_env=worker_env,
-        model_policy=model_policy,
         thinking=thinking,
         wandb=wandb_spec,
         project=project,
@@ -567,35 +548,102 @@ def spec_from_dict(
     return spec
 
 
-def _validate_sft(spec: JobSpec) -> None:
-    """validate sft row-count and structured-output constraints."""
-    if int(spec.train.max_examples or 0) <= 0:
-        raise ConfigError(
-            "train.max_examples must be set to a positive row count for SFT "
-            "(use the full dataset row count for an uncapped run)"
-        )
-    if spec.train.structured_outputs:
-        # SFT never generates — a constraint here would silently do nothing; reject at parse time
-        # like other no-op configs (see the opd kl_penalty_coef=0 guard).
-        raise ConfigError(
-            "train.structured_outputs only applies to rollout algorithms (grpo, opd); "
-            "SFT trains on dataset completions and never generates"
-        )
+# map each algorithm to meaningful [train] knobs its worker cannot consume. rejecting them prevents
+# shared-table rollout options from being silently ignored by sft and vice versa.
+_INAPPLICABLE_TRAIN_KNOBS: dict[str, dict[str, str]] = {
+    "sft": {
+        "structured_outputs": (
+            "only applies to rollout algorithms (grpo, opd); SFT trains on dataset completions "
+            "and never generates"
+        ),
+        "group_size": (
+            "only applies to rollout algorithms (grpo, opd); it sizes the generations per prompt, "
+            "and SFT never generates"
+        ),
+        "temperature": (
+            "only applies to rollout algorithms (grpo, opd); SFT trains on dataset completions "
+            "and never samples"
+        ),
+        "max_completion_tokens": (
+            "only applies to rollout algorithms (grpo, opd); SFT never generates, so cap the "
+            "training rows with max_context_tokens instead"
+        ),
+        "kl_penalty_coef": (
+            "only applies to rollout algorithms (grpo, opd); SFT's objective has no KL term"
+        ),
+        "entropy_quantile": "only applies to grpo; SFT has no rollout tokens to rank by entropy",
+        "thinking_length_penalty_coef": (
+            "only applies to grpo; it penalizes generated reasoning length, and SFT never generates"
+        ),
+        "teacher_model": "only applies to opd; SFT trains on dataset completions, not a teacher",
+        "credit_assignment": (
+            "only applies to grpo; it distributes rollout advantage across turns, and SFT has no "
+            "rollouts"
+        ),
+        "stop_sequences": (
+            "only applies to rollout algorithms (grpo, opd); they bound sampling, and SFT never "
+            "generates"
+        ),
+    },
+    "opd": {
+        "entropy_quantile": (
+            "only applies to grpo; opd distils every sampled token against the teacher rather than "
+            "ranking tokens by entropy"
+        ),
+        "thinking_length_penalty_coef": (
+            "only applies to grpo; it shapes the grpo reward, and opd optimizes a distillation "
+            "objective with no reward term"
+        ),
+        "credit_assignment": (
+            "only applies to grpo; it distributes group-relative advantage, and opd has no "
+            "advantages to assign"
+        ),
+    },
+    "grpo": {
+        "teacher_model": (
+            "only applies to opd; grpo optimizes its environment reward and has no teacher"
+        ),
+    },
+}
+
+
+# unset value per [train] field, read off TrainSpec so a changed default cannot silently turn an
+# omitted knob into a rejection.
+_TRAIN_DEFAULTS = {item.name: item.default for item in dataclass_fields(TrainSpec)}
+
+
+def _reject_inapplicable_train_knobs(spec: JobSpec) -> None:
+    """reject [train] knobs the selected algorithm cannot consume.
+
+    inspect meaningful values, not presence, because serialized JobSpec dictionaries contain every
+    unset field and must survive client/server and public-status re-parsing.
+    """
+    inapplicable = _INAPPLICABLE_TRAIN_KNOBS.get(spec.algorithm)
+    if not inapplicable:
+        return
+    for key, reason in inapplicable.items():
+        # unset sentinels differ by field (None, "", (), and credit_assignment's non-falsy
+        # "per_episode"), so compare against the dataclass default rather than assuming one
+        # falsy spelling. a value equal to the default is indistinguishable from unset and is
+        # what a full-dict round trip carries, so it must not be rejected.
+        if getattr(spec.train, key) == _TRAIN_DEFAULTS[key]:
+            continue
+        raise ConfigError(f"train.{key} {reason}")
 
 
 def _validate_grpo(spec: JobSpec) -> None:
     """validate the grpo group-size constraint."""
     if spec.train.group_size is not None and spec.train.group_size < 2:
         raise ConfigError(
-            "train.group_size must be >= 2 for GRPO (TRL needs at least two generations "
-            "per prompt to calculate advantages)"
+            "train.group_size must be >= 2 for GRPO (advantages are group-relative, so a "
+            "prompt needs at least two generations to compare against)"
         )
 
 
 def _validate_on_policy_prompt_budget(spec: JobSpec, algorithm: str) -> None:
     if not spec.train.max_context_tokens:
         return
-    from flash.engine.vram import opd_completion_len
+    from flash.engine.plan.vram import opd_completion_len
 
     max_completion = opd_completion_len(spec.train.max_completion_tokens, spec.thinking)
     if spec.train.max_context_tokens - max_completion < 1:
@@ -617,9 +665,11 @@ def _validate_opd(spec: JobSpec) -> None:
     _validate_on_policy_prompt_budget(spec, "opd")
 
 
-# each algorithm's spec-level contract lives in one validator, dispatched by name.
+# each algorithm's spec-level contract lives in one validator, dispatched by name. sft has no entry:
+# its one rule (structured_outputs) moved into _INAPPLICABLE_TRAIN_KNOBS, and it needs no row-count
+# requirement because an sft quote is backed by a workload profile that materializes and tokenizes
+# the real dataset -- an omitted or zero max_examples means "every row" and is measured, not guessed.
 _ALGO_VALIDATORS = {
-    "sft": _validate_sft,
     "grpo": _validate_grpo,
     "opd": _validate_opd,
 }
@@ -640,6 +690,7 @@ def _validate_spec(spec: JobSpec) -> None:
             )
     if spec.gpu.provider and spec.gpu.provider not in PROVIDER_NAMES:
         raise ConfigError(f"unknown gpu.provider {spec.gpu.provider!r}")
+    _reject_inapplicable_train_knobs(spec)
     validator = _ALGO_VALIDATORS.get(spec.algorithm)
     if validator is not None:
         validator(spec)

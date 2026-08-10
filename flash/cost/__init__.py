@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
-from .analytical import estimate_cost
-from .spec import estimate_for_spec, runconfig_from_spec
-from .types import CostEstimate, RunConfig
+from flash.cost.analytical import estimate_cost
+from flash.cost.spec import estimate_for_spec, runconfig_from_spec
+from flash.cost.types import CostEstimate, RunConfig
 
 __all__ = [
     "CostEstimate",

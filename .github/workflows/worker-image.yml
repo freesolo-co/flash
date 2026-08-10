@@ -3,7 +3,7 @@ name: flash worker image
 # builds the prebuilt flash worker image (full training stack + flash-attn baked in) and
 # pushes it to ghcr, so runpod/vast/lambda training cold-start skips the per-host dependency
 # install (the dominant cold-start cost). training providers select the pinned image and operator
-# override through flash/providers/_worker.py. serving has no consumer for this training-worker
+# override through flash/providers/_lifecycle/worker.py. serving has no consumer for this training-worker
 # image or override.
 #
 # Triggered automatically on flash/** changes (worker training code is baked in; skipping a
@@ -53,6 +53,12 @@ concurrency:
 
 jobs:
   build:
+    # Upstream only -- see publish.yml. Two reasons beyond the shared one: it pushes to
+    # `ghcr.io/freesolo-co/flash-worker` (our namespace, unwritable by a fork's token), and it asks
+    # for `ubuntu-24.04-8core`, an org-provisioned larger runner. A fork requesting a label it has
+    # no runner for leaves the job QUEUED indefinitely rather than failing, which is worse than a
+    # red X: nothing reports, and the PR just never settles.
+    if: github.repository == 'freesolo-co/flash'
     runs-on: ubuntu-24.04-8core
     # Single source for the FlashAttention wheels: used BOTH as build-args and as fingerprint inputs
     # (so a wheel bump moves fp_base). Keep FA3_SPEC in sync with Dockerfile.worker's ARG default.
@@ -60,7 +66,7 @@ jobs:
       FA2_SPEC: https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.0/flash_attn-2.8.3%2Bcu128torch2.10-cp312-cp312-linux_x86_64.whl
       FA3_SPEC: ${{ github.event.inputs.flash_attn_3_spec || 'https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.03.19-850211f/flash_attn_3-3.0.0%2B20260318.cu128torch2100cxx11abitrue.8afc61-cp39-abi3-linux_x86_64.whl' }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       # Compute the kernel-cache fingerprints (stdlib-only, no uv sync) and stamp them as labels on
       # :cu128 below, so auto-rebake.yml can read what this base was built from. Fails the build if a
@@ -79,23 +85,23 @@ jobs:
           sudo docker image prune -af || true
           df -h /
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build + push worker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: Dockerfile.worker
           push: true
           # pin the freesolo-co namespace: runpod, vast, and lambda training paths pull the image
-          # declared in flash/providers/_worker.py, so a fork run must not push to its own owner
+          # declared in flash/providers/_lifecycle/worker.py, so a fork run must not push to its own owner
           # namespace and leave the real image stale.
           tags: ghcr.io/freesolo-co/flash-worker:${{ github.event.inputs.tag || 'cu128' }}
           provenance: false

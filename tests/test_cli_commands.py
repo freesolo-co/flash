@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import io
 import json
+import tomllib
 import types
 
 import pytest
 
 import flash.cli as cli
-from flash.providers._poll import _format_heartbeat
+from flash.cli.commands import traces as cli_traces
+from flash.client.config import DEFAULT_API_URL
+from flash.providers._lifecycle.poll import _format_heartbeat
 
 
 def test_format_heartbeat_appends_named_reward_metrics() -> None:
@@ -174,11 +177,15 @@ class _FakeClient:
 
 @pytest.fixture(autouse=True)
 def project_api(monkeypatch):
+    # A Freesolo-HOSTED api_url, because that is the deployment these tests describe. The value
+    # used to be an arbitrary placeholder, which was harmless only while nothing read it: commands
+    # backed solely by the hosted backend now branch on whether api_url is Freesolo's, so a
+    # placeholder domain silently put every one of them on the self-hosted path.
     monkeypatch.setattr(
-        "flash.client.config.load_credentials", lambda: ("https://flash.test", "fslo-test")
+        "flash.client.config.load_credentials", lambda: ("https://flash.freesolo.co", "fslo-test")
     )
     monkeypatch.setattr(
-        cli.commands, "load_credentials", lambda: ("https://flash.test", "fslo-test")
+        cli.commands, "load_credentials", lambda: ("https://flash.freesolo.co", "fslo-test")
     )
     monkeypatch.setattr(
         "flash.client.get_project", lambda project_id, api_key: {"id": project_id, "name": "Test"}
@@ -211,8 +218,10 @@ def test_whoami_prints_identity(fake_client, capsys) -> None:
 
 def test_project_create_prints_only_returned_id_in_plain_mode(monkeypatch, capsys) -> None:
     seen = {}
+    # a Freesolo-hosted api_url: `projects create` only calls the backend on the HOSTED path
+    # (a self-hosted plane mints the id locally, see the standalone tests below).
     monkeypatch.setattr(
-        cli.commands, "load_credentials", lambda: ("https://flash.test", "fslo-test")
+        cli.commands, "load_credentials", lambda: ("https://flash.freesolo.co", "fslo-test")
     )
 
     def create(name, description, api_key):
@@ -250,6 +259,212 @@ def test_projects_create_uses_plural_group(monkeypatch, capsys) -> None:
     assert capsys.readouterr().out == "33333333-3333-4333-8333-333333333333\n"
 
 
+# --- self-hosted plane: commands backed only by the hosted backend -----------------------------
+# All three used to call api.freesolo.co with the operator's plane key, which has no relationship
+# with that service -> 401. Same failure `flash env setup` hit on the documented quickstart.
+
+_SELF_HOSTED = ("http://my-plane:8080", "operator-key")
+
+
+def _self_hosted(monkeypatch) -> None:
+    """Put every input the guard reads on a self-hosted plane with no backend configured.
+
+    Each consuming module is patched by name because they `from`-import `load_credentials`,
+    binding it at import time -- patching `flash.client.config` alone leaves those bindings on
+    the real function, and the command then reads the developer's ambient `~/.flash` config.
+    That is environment-dependent, not a test: it passes on a machine already pointed at a local
+    plane and fails on a clean checkout, where the default is Freesolo-hosted.
+
+    `FREESOLO_BASE_URL` is cleared for the same reason: the guard reads it as a second input, so
+    an operator shell exporting one silently moves every test below onto the configured-backend
+    path, where the hosted call is CORRECT and these assertions fail. The tests that want that
+    path set the var themselves after calling this.
+    """
+    monkeypatch.setattr("flash.client.config.load_credentials", lambda: _SELF_HOSTED)
+    monkeypatch.setattr(cli.commands, "load_credentials", lambda: _SELF_HOSTED)
+    monkeypatch.setattr(cli_traces, "load_credentials", lambda: _SELF_HOSTED)
+    monkeypatch.delenv("FREESOLO_BASE_URL", raising=False)
+
+
+def test_projects_create_mints_a_local_id_on_a_self_hosted_plane(monkeypatch, capsys) -> None:
+    """The plane accepts any well-shaped uuid under standalone(), so minting one locally IS the
+    create. Asserted by CONSUMING the output through the plane's own gate, not by shape alone."""
+    _self_hosted(monkeypatch)
+
+    def _unreachable(*a, **k):  # the hosted backend must not be called at all
+        raise AssertionError("create_project called on a self-hosted plane")
+
+    monkeypatch.setattr("flash.client.create_project", _unreachable)
+
+    assert _run(["projects", "create", "My project"]) == 0
+    minted = capsys.readouterr().out.strip()
+
+    from flash.server.domain.projects import require_project_access
+
+    monkeypatch.setenv("FLASH_STANDALONE", "1")
+    assert (
+        require_project_access(project_id=minted, key={"auth_kind": "internal"}, authorization=None)
+        == minted
+    )
+
+
+def test_projects_create_mints_a_distinct_id_each_time(monkeypatch, capsys) -> None:
+    """A fixed id would collide across every project an operator creates, silently merging runs."""
+    _self_hosted(monkeypatch)
+    monkeypatch.setattr("flash.client.create_project", lambda *a, **k: pytest.fail("hosted call"))
+
+    assert _run(["projects", "create", "one"]) == 0
+    assert _run(["projects", "create", "two"]) == 0
+    first, second = capsys.readouterr().out.split()
+    assert first != second
+
+
+def test_projects_list_refuses_on_a_self_hosted_plane(monkeypatch, capsys) -> None:
+    _self_hosted(monkeypatch)
+    monkeypatch.setattr("flash.client.list_projects", lambda *a, **k: pytest.fail("hosted call"))
+
+    assert _run(["projects", "list"]) == 1
+    err = capsys.readouterr().err.lower()
+    assert "not available on a self-hosted plane" in err
+    # names the way forward, so the refusal is actionable rather than a dead end
+    assert "projects create" in err
+
+
+def test_traces_export_refuses_on_a_self_hosted_plane(monkeypatch, capsys) -> None:
+    """Unlike `projects create` there is nothing local to substitute: traces are written by the
+    freesolo SDK into the hosted backend, so a self-hosted plane has no trace store to read."""
+    _self_hosted(monkeypatch)
+    # stubbed on `traces`, the binding the command actually calls: patching `flash.client` would
+    # leave the real functions in place there, so these fail-fast guards would never fire.
+    monkeypatch.setattr(cli_traces, "export_trace_records", lambda *a, **k: pytest.fail("hosted"))
+    monkeypatch.setattr(cli_traces, "list_trace_projects", lambda *a, **k: pytest.fail("hosted"))
+
+    assert _run(["traces", "export"]) == 1
+    err = capsys.readouterr().err.lower()
+    assert "not available on a self-hosted plane" in err
+    assert "freesolo sdk" in err
+
+
+def test_hosted_plane_still_reaches_the_backend(monkeypatch, capsys) -> None:
+    """The guard must key on the URL, not disable these commands everywhere."""
+    monkeypatch.setattr(
+        "flash.client.create_project",
+        lambda name, description, api_key: {"id": "44444444-4444-4444-8444-444444444444"},
+    )
+
+    assert _run(["projects", "create", "hosted"]) == 0
+    assert capsys.readouterr().out == "44444444-4444-4444-8444-444444444444\n"
+
+
+def test_hosted_plane_still_refuses_when_logged_out(monkeypatch, capsys) -> None:
+    """The logged-out guard moved inside the hosted branch when the self-hosted branch was added.
+    A hosted caller with no key must still get the login refusal rather than reaching the backend
+    with `None` for a bearer token, so assert the relocation kept it on the hosted path.
+    """
+    # the real logged-out shape: `load_credentials` falls back to DEFAULT_API_URL, so the url is a
+    # hosted string and only the key is missing. fabricating a None url would test an unreachable
+    # state and keep an impossible branch alive in the guard.
+    logged_out = (DEFAULT_API_URL, None)
+    monkeypatch.setattr("flash.client.config.load_credentials", lambda: logged_out)
+    monkeypatch.setattr(cli.commands, "load_credentials", lambda: logged_out)
+    monkeypatch.delenv("FREESOLO_BASE_URL", raising=False)
+
+    def _unreachable(*a, **k):
+        raise AssertionError("called the backend without a key")
+
+    monkeypatch.setattr("flash.client.create_project", _unreachable)
+    monkeypatch.setattr("flash.client.list_projects", _unreachable)
+
+    assert _run(["projects", "create", "no key"]) == 1
+    assert "flash login" in capsys.readouterr().err
+    assert _run(["projects", "list"]) == 1
+    assert "flash login" in capsys.readouterr().err
+
+
+def test_configured_backend_keeps_the_hosted_path_on_a_self_hosted_plane(
+    monkeypatch, capsys
+) -> None:
+    """A plane the operator runs can still be pointed at a reachable Freesolo-compatible backend
+    via FREESOLO_BASE_URL, which is what these commands actually call. Keying on the plane url
+    alone would mint an id that backend's directory never got, turning a clean failure into one
+    deferred to project-access validation, and would disable a listing that does work.
+    """
+    _self_hosted(monkeypatch)
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.internal.example")
+    monkeypatch.setattr(
+        "flash.client.create_project",
+        lambda name, description, api_key: {"id": "55555555-5555-4555-8555-555555555555"},
+    )
+
+    # the backend is reached, so the id is ITS id -- not a locally minted uuid
+    assert _run(["projects", "create", "against a configured backend"]) == 0
+    assert capsys.readouterr().out == "55555555-5555-4555-8555-555555555555\n"
+
+
+def test_configured_backend_keeps_project_listing_available(monkeypatch, capsys) -> None:
+    """The refusal is about having no backend, not about who runs the plane."""
+    _self_hosted(monkeypatch)
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.internal.example")
+    sent: list[str] = []
+
+    def _list(api_key):
+        sent.append(api_key)
+        return [{"id": "66666666-6666-4666-8666-666666666666", "name": "configured"}]
+
+    monkeypatch.setattr("flash.client.list_projects", _list)
+
+    assert _run(["projects", "list"]) == 0
+    assert "configured" in capsys.readouterr().out
+    # assert WHICH credential travelled: reaching the backend is only correct if the key sent is
+    # the one the operator configured. a test that ignores the argument passes a leak too.
+    assert sent == ["operator-key"]
+
+
+def test_a_backend_url_pointing_at_freesolo_does_not_unlock_these_commands(
+    monkeypatch, capsys
+) -> None:
+    """FREESOLO_BASE_URL naming Freesolo's own service is NOT an operator-run backend. Honouring
+    it would send the self-hosted plane's operator key to api.freesolo.co as a bearer token --
+    the credential disclosure this guard exists to prevent, reopened by the escape hatch added
+    for genuinely operator-run backends.
+    """
+    _self_hosted(monkeypatch)
+    monkeypatch.delenv("FREESOLO_API_KEY", raising=False)
+    monkeypatch.setattr("flash.client.list_projects", lambda *a, **k: pytest.fail("leaked key"))
+
+    for hosted in ("https://api.freesolo.co", "https://API.Freesolo.CO/", "api.freesolo.co"):
+        monkeypatch.setenv("FREESOLO_BASE_URL", hosted)
+        assert _run(["projects", "list"]) == 1, hosted
+        assert "not available on a self-hosted plane" in capsys.readouterr().err.lower(), hosted
+
+
+def test_an_ambient_api_key_does_not_unlock_these_commands(monkeypatch, capsys) -> None:
+    """FREESOLO_API_KEY cannot prove a hosted account. SELF_HOSTING.md has self-hosters log in
+    with the plane-controlling FREESOLO_INTERNAL_KEY, and `cmd_login` reads this same env var as
+    the login key, so its value is as likely to be the operator key. Treating its presence as a
+    hosted signal ships that credential to api.freesolo.co.
+    """
+    _self_hosted(monkeypatch)
+    monkeypatch.setenv("FREESOLO_API_KEY", "the-plane-operator-key")
+    monkeypatch.setattr("flash.client.list_projects", lambda *a, **k: pytest.fail("leaked key"))
+
+    assert _run(["projects", "list"]) == 1
+    assert "not available on a self-hosted plane" in capsys.readouterr().err.lower()
+
+
+def test_blank_backend_url_does_not_count_as_configured(monkeypatch, capsys) -> None:
+    """An empty or whitespace value is an unset backend, not a reachable one; treating it as
+    configured would restore the 401 this guard exists to prevent."""
+    _self_hosted(monkeypatch)
+    monkeypatch.setenv("FREESOLO_BASE_URL", "   ")
+    # the other hosted-backend signal must be absent, or this asserts nothing about the blank url
+    monkeypatch.delenv("FREESOLO_API_KEY", raising=False)
+    monkeypatch.setattr("flash.client.list_projects", lambda *a, **k: pytest.fail("hosted call"))
+
+    assert _run(["projects", "list"]) == 1
+    assert "not available on a self-hosted plane" in capsys.readouterr().err.lower()
+
+
 def test_train_cost_requires_explicit_project(tmp_path, capsys) -> None:
     config = tmp_path / "run.toml"
     config.write_text(
@@ -270,9 +485,15 @@ def test_train_cost_requires_explicit_project(tmp_path, capsys) -> None:
 def test_env_setup_maps_inaccessible_project_to_client_error(monkeypatch) -> None:
     from argparse import Namespace
 
-    from flash.cli import env_setup
+    from flash.cli.commands.env import setup as env_setup
     from flash.client import ApiError, ClientError
 
+    # pinned to a HOSTED url and a key: ownership is only resolved against the backend when the
+    # plane is Freesolo's, so leaving this to ambient config would let a self-hosted `~/.flash`
+    # take the shape-only branch and pass without ever reaching `get_project`.
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("https://flash.freesolo.co", "key-1")
+    )
     monkeypatch.setattr(
         "flash.client.get_project",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(ApiError(403, "forbidden")),
@@ -283,17 +504,117 @@ def test_env_setup_maps_inaccessible_project_to_client_error(monkeypatch) -> Non
     assert type(excinfo.value) is ClientError
 
 
+def test_env_setup_resolves_the_project_locally_on_a_self_hosted_plane(monkeypatch) -> None:
+    """A self-hosted plane has no org directory, so the id is validated for shape and accepted.
+
+    Resolving it against ``api.freesolo.co`` sent the operator's plane-root key to a service with
+    no relationship to it, which answered 401 -- so `flash env setup`, the first command in the
+    SELF_HOSTING.md quickstart, died before writing a file. The plane exposes no project routes at
+    all, so there is nothing else to ask; ``flash/server/domain/projects.py`` performs exactly this
+    shape-only check under ``standalone()`` when the same run is later submitted.
+    """
+    from argparse import Namespace
+
+    from flash.cli.commands.env import setup as env_setup
+
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("http://127.0.0.1:8080", "operator-key")
+    )
+    monkeypatch.setattr(
+        "flash.client.get_project",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("must not reach the hosted backend from a self-hosted plane")
+        ),
+    )
+
+    resolved = env_setup._require_setup_project(
+        Namespace(project="11111111-1111-4111-8111-111111111111")
+    )
+    assert resolved == "11111111-1111-4111-8111-111111111111"
+
+
+def test_env_setup_still_rejects_a_malformed_project_when_self_hosted(monkeypatch) -> None:
+    """Skipping the ownership lookup must not skip the shape check that stands in for it."""
+    from argparse import Namespace
+
+    from flash.cli.commands.env import setup as env_setup
+
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("http://127.0.0.1:8080", "operator-key")
+    )
+
+    with pytest.raises(ValueError, match="valid UUID"):
+        env_setup._require_setup_project(Namespace(project="not-a-uuid"))
+
+
+def test_env_setup_self_hosted_interactive_requires_an_explicit_project(monkeypatch) -> None:
+    from argparse import Namespace
+
+    from flash.cli.commands.env import setup as env_setup
+    from flash.client import ClientError
+
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("http://127.0.0.1:8080", "operator-key")
+    )
+    monkeypatch.setattr(env_setup, "_setup_interactive", lambda _args: True)
+    monkeypatch.setattr(
+        "flash.client.list_projects",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("a self-hosted plane has no project directory to enumerate")
+        ),
+    )
+
+    with pytest.raises(ClientError, match=r"--project PROJECT_UUID.*self-hosted plane"):
+        env_setup._require_setup_project(Namespace(project=""))
+
+
+def test_env_setup_hosted_interactive_still_selects_a_project(monkeypatch) -> None:
+    from argparse import Namespace
+
+    from flash.cli.commands.env import setup as env_setup
+
+    project_id = "11111111-1111-4111-8111-111111111111"
+    api_url = "https://flash.freesolo.co"
+    seen = {}
+    monkeypatch.setattr("flash.client.config.load_credentials", lambda: (api_url, "key-1"))
+    monkeypatch.setattr(env_setup, "_setup_interactive", lambda _args: True)
+    monkeypatch.setattr(
+        "flash.client.list_projects", lambda api_key: [{"id": project_id, "name": "Example"}]
+    )
+    monkeypatch.setattr(env_setup.render, "select_required", lambda _prompt, _options: project_id)
+
+    def _resolve(selected, api_key, selected_api_url):
+        seen.update(selected=selected, api_key=api_key, api_url=selected_api_url)
+        return selected
+
+    monkeypatch.setattr("flash.client.resolve_project_id", _resolve)
+
+    assert env_setup._require_setup_project(Namespace(project="")) == project_id
+    assert seen == {"selected": project_id, "api_key": "key-1", "api_url": api_url}
+
+
 def test_login_shows_who_you_are(monkeypatch, capsys) -> None:
     # Verify + store are stubbed; login should still surface the identity card itself so the
     # user sees who they are without a separate `flash whoami`. The card is built from the
     # just-verified key via ApiClient, so stub that (not client_from_config).
     monkeypatch.setattr(cli.commands, "verify_freesolo_key", lambda *a, **k: None)
     monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
+    # `kind` mirrors the real /v1/me, which always sends it alongside key_prefix (server/routes/
+    # meta.py); only `email` is conditional. Login now checks for that shape before trusting a
+    # plane's answer, so a fixture missing it would be asserting on a response no server can send.
     monkeypatch.setattr(
         cli.commands,
         "ApiClient",
         lambda *a, **k: type(
-            "_C", (), {"me": lambda self: {"key_prefix": "freesolo", "email": "t@example.com"}}
+            "_C",
+            (),
+            {
+                "me": lambda self: {
+                    "kind": "freesolo_api_key",
+                    "key_prefix": "freesolo",
+                    "email": "t@example.com",
+                }
+            },
         )(),
     )
     assert _run(["login", "--api-key", "fs-secret-key"]) == 0
@@ -321,7 +642,7 @@ def test_login_failure_is_friendly_and_asks_to_retry(monkeypatch, capsys) -> Non
 def test_identity_render_is_ascii_locale_safe(monkeypatch) -> None:
     # Under an ASCII / non-UTF-8 stdout, neither a non-ASCII identity value nor our own
     # punctuation may raise UnicodeEncodeError after a login has already succeeded.
-    from flash.cli import render
+    from flash.cli.ui import render
 
     class _AsciiStdout:
         encoding = "ascii"
@@ -465,19 +786,22 @@ def test_train_dry_run_enriches_legacy_unknown_authored_key_rejection(
 ) -> None:
     from flash.client import ApiError
 
-    detail = "[train] unknown key(s): teacher_model (allowed: epochs, hf_repo, max_examples)"
+    detail = "[train] unknown key(s): save_at_steps (allowed: epochs, hf_repo, max_examples)"
 
     def reject(*_args, **_kwargs):
         raise ApiError(400, detail)
 
     monkeypatch.setattr(fake_client, "create_run", reject)
-    config = _train_config(tmp_path, extra_train='teacher_model = "glm-5.2"\n')
+    # the authored key has to be one THIS algorithm accepts: an sft config authoring a
+    # rollout-only knob is now rejected by the client's own parser, so the request would never
+    # reach the server whose response this test is about.
+    config = _train_config(tmp_path, extra_train="max_steps = 4\nsave_at_steps = [1]\n")
 
     assert _run(["train", str(config), "--dry-run"]) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
     assert detail in captured.err
-    assert "teacher_model (minimum released Flash version 0.2.56)" in captured.err
+    assert "save_at_steps (minimum released Flash version 0.2.57)" in captured.err
     assert "client/server [train] schemas disagree" in captured.err
 
 
@@ -495,7 +819,7 @@ def test_train_dry_run_enriches_legacy_unknown_authored_key_rejection(
         ),
         (
             500,
-            "[train] unknown key(s): teacher_model (allowed: epochs, hf_repo, max_examples)",
+            "[train] unknown key(s): save_at_steps (allowed: epochs, hf_repo, max_examples)",
         ),
     ],
 )
@@ -508,7 +832,8 @@ def test_train_dry_run_does_not_enrich_unrelated_or_unknown_errors(
         raise ApiError(status, detail)
 
     monkeypatch.setattr(fake_client, "create_run", reject)
-    config = _train_config(tmp_path, extra_train='teacher_model = "glm-5.2"\n')
+    # sft-applicable by necessity: see the enrichment test above.
+    config = _train_config(tmp_path, extra_train="max_steps = 4\nsave_at_steps = [1]\n")
 
     assert _run(["train", str(config), "--dry-run"]) == 1
     captured = capsys.readouterr()
@@ -1129,9 +1454,9 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert 'algorithm = "opd"' in opd_text
     assert "epochs = 1" in opd_text
     assert "max_examples = 2" in opd_text
-    # The teacher key is platform-managed: the scaffold neither declares it as a secret nor tells
-    # the user to export it, so the generated config must not mention FIREWORKS_API_KEY at all.
-    assert "FIREWORKS_API_KEY" not in opd_text
+    # the teacher key is platform-managed: the scaffold neither declares it as a secret nor tells
+    # the user to export it, so the generated config must not mention the provider credential.
+    assert "PARASAIL_API_KEY" not in opd_text
     assert "secrets" not in opd_text
     assert "platform-managed" in opd_text
     # single-turn opd runs fine, so it carries NO multi-turn "fails fast" warning
@@ -1222,10 +1547,178 @@ def test_env_setup_multi_turn_scaffolds_opd_for_multi_turn(monkeypatch, tmp_path
     opd_text = (tmp_path / "configs/opd.toml").read_text()
     assert 'algorithm = "opd"' in opd_text
     # ...and the multi-turn opd.toml notes it distils every assistant turn, with NO fail-fast warning
-    assert "distils EVERY assistant turn" in opd_text
+    assert "distils every assistant turn" in opd_text
     assert "SINGLE-TURN only" not in opd_text
     assert "fail fast" not in opd_text
     assert "configs/opd.toml" in capsys.readouterr().out
+
+
+def test_env_setup_reasoning_emits_parseable_opd_config(monkeypatch, tmp_path) -> None:
+    """The reasoning opd.toml must still be valid TOML with the key at top level.
+
+    `thinking` is a root key, not a `[train]` one, so it has to be written before the first table
+    header. Asserting only on the substring would pass just as happily with the line stranded under
+    `[train]` or glued to the `algorithm` line.
+    """
+    monkeypatch.chdir(tmp_path)
+    assert (
+        _run(
+            [
+                "env",
+                "setup",
+                "--project",
+                "11111111-1111-4111-8111-111111111111",
+                "--multi-turn",
+                "--reasoning",
+            ]
+        )
+        == 0
+    )
+
+    for name in ("configs/opd.toml", "configs/rl.toml", "configs/sft.toml"):
+        parsed = tomllib.loads((tmp_path / name).read_text())
+        assert parsed["thinking"] is True, name
+        assert "thinking" not in parsed.get("train", {}), name
+
+
+def test_env_setup_reasoning_conflict_names_every_stale_config(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """Deleting exactly what the conflict warning names must not leave a config behind.
+
+    All three configs persist `thinking`, so a user who follows this warning literally has to end up
+    with three consistent configs. If the warning named only a subset, the unnamed one would keep the
+    old setting while the others were rewritten -- the same silent cross-algorithm mismatch the
+    `thinking` emission fixes, just moved one step later.
+    """
+    monkeypatch.chdir(tmp_path)
+    project = ["--project", "11111111-1111-4111-8111-111111111111"]
+    assert _run(["env", "setup", *project, "--reasoning"]) == 0
+    capsys.readouterr()
+
+    # a rerun that disagrees warns instead of rewriting, and must name every config holding the state.
+    assert _run(["env", "setup", *project, "--no-reasoning"]) == 0
+    warning = capsys.readouterr().err
+    assert "ignoring --no-reasoning" in warning
+    for name in ("configs/rl.toml", "configs/opd.toml", "configs/sft.toml"):
+        assert name in warning, f"{name} missing from: {warning}"
+
+    # follow the instruction exactly: delete what it named, nothing more.
+    named = [w.strip(" ,.") for w in warning.split() if w.startswith("configs/")]
+    for name in named:
+        (tmp_path / name).unlink()
+    assert _run(["env", "setup", *project, "--no-reasoning"]) == 0
+
+    for name in ("configs/rl.toml", "configs/opd.toml", "configs/sft.toml"):
+        parsed = tomllib.loads((tmp_path / name).read_text())
+        assert "thinking" not in parsed, f"{name} kept reasoning after a --no-reasoning re-scaffold"
+
+
+def test_existing_reasoning_ignores_thinking_text_in_comments(tmp_path) -> None:
+    from flash.cli.commands.env import setup as env_setup
+
+    sft = tmp_path / "sft.toml"
+    rl = tmp_path / "rl.toml"
+    sft.write_text(
+        'model = "Qwen/Qwen3.5-4B"\n'
+        "# reasoning is on (thinking = true): gold outputs need think tags\n"
+    )
+    rl.write_text('model = "Qwen/Qwen3.5-4B"\n')
+
+    assert env_setup._existing_reasoning((sft, rl)) is False
+
+
+def _drop_thinking(path) -> None:
+    """Rewrite a config the way the pre-#824 release left opd.toml: no `thinking` key at all."""
+    path.write_text(path.read_text().replace("thinking = true\n", ""))
+
+
+def test_env_setup_refuses_a_scaffold_whose_configs_disagree_about_reasoning(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """Anchoring on the first config found accepts a project whose configs contradict each other.
+
+    This is the exact shape a scaffold from before #824 has: that release wrote `thinking` into rl
+    and sft but never into opd. `configs/rl.toml` is visited first, reports reasoning, and the stale
+    opd config is neither reported nor rewritten -- configs are only written when absent, so the
+    rerun leaves the project training GRPO with reasoning and OPD without it, silently.
+
+    There is no anchor to pick here: either side leaves a mismatch, so setup has to refuse.
+    """
+    monkeypatch.chdir(tmp_path)
+    project = ["--project", "11111111-1111-4111-8111-111111111111"]
+    assert _run(["env", "setup", *project, "--reasoning"]) == 0
+    _drop_thinking(tmp_path / "configs/opd.toml")
+    capsys.readouterr()
+
+    # a user upgrading re-runs setup with no flag at all -- the case that used to pass silently.
+    assert _run(["env", "setup", *project]) == 1
+    err = capsys.readouterr().err
+    assert "disagree about reasoning" in err
+    # the message has to name which side is which, or the user cannot tell what state they are in.
+    assert "configs/rl.toml" in err, err
+    assert "configs/sft.toml" in err, err
+    assert "configs/opd.toml" in err, err
+    # and it must name every config to delete, so following it literally cannot leave one behind.
+    named = {w.strip(" ,.`") for w in err.split() if w.startswith("configs/")}
+    assert named == {"configs/rl.toml", "configs/sft.toml", "configs/opd.toml"}, err
+
+    # refusing must not have half-written anything: the disagreeing scaffold is left exactly as it
+    # was, so the user's own files are still theirs to inspect before deleting.
+    assert "thinking" not in tomllib.loads((tmp_path / "configs/opd.toml").read_text())
+    assert tomllib.loads((tmp_path / "configs/rl.toml").read_text())["thinking"] is True
+
+
+def test_env_setup_refusal_is_not_dodged_by_an_explicit_reasoning_flag(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    # a flag cannot repair the mismatch either: existing configs are never rewritten, so
+    # `--no-reasoning` over a disagreeing scaffold would warn about ignoring the flag and then leave
+    # the same split state. the refusal has to come first, whatever the user asked for.
+    monkeypatch.chdir(tmp_path)
+    project = ["--project", "11111111-1111-4111-8111-111111111111"]
+    assert _run(["env", "setup", *project, "--reasoning"]) == 0
+    _drop_thinking(tmp_path / "configs/opd.toml")
+    capsys.readouterr()
+
+    for flag in ("--reasoning", "--no-reasoning"):
+        assert _run(["env", "setup", *project, flag]) == 1, flag
+        assert "disagree about reasoning" in capsys.readouterr().err, flag
+
+
+def test_env_setup_still_accepts_a_scaffold_whose_configs_agree(monkeypatch, tmp_path) -> None:
+    # the guard must fire on disagreement only. a consistent rerun is the overwhelmingly common
+    # case, and a check that rejects it would break every re-scaffold rather than the broken ones.
+    monkeypatch.chdir(tmp_path)
+    project = ["--project", "11111111-1111-4111-8111-111111111111"]
+    for flag in ("--reasoning", "--no-reasoning"):
+        target = tmp_path / flag.strip("-")
+        target.mkdir()
+        monkeypatch.chdir(target)
+        assert _run(["env", "setup", *project, flag]) == 0
+        assert _run(["env", "setup", *project]) == 0, f"a consistent {flag} rerun was rejected"
+        expected = True if flag == "--reasoning" else None
+        for name in ("configs/rl.toml", "configs/sft.toml", "configs/opd.toml"):
+            parsed = tomllib.loads((target / name).read_text())
+            assert parsed.get("thinking") is expected, name
+
+
+def test_env_setup_reasoning_anchor_survives_a_partially_scaffolded_directory(
+    monkeypatch, tmp_path
+) -> None:
+    # only some configs existing is NOT a disagreement -- a config that is absent is about to be
+    # written from the anchor. treating "missing" as "reasoning off" would reject a directory whose
+    # single existing config is perfectly coherent, which is a normal partial scaffold.
+    monkeypatch.chdir(tmp_path)
+    project = ["--project", "11111111-1111-4111-8111-111111111111"]
+    assert _run(["env", "setup", *project, "--reasoning"]) == 0
+    (tmp_path / "configs/opd.toml").unlink()
+    (tmp_path / "configs/sft.toml").unlink()
+
+    assert _run(["env", "setup", *project]) == 0
+    for name in ("configs/rl.toml", "configs/sft.toml", "configs/opd.toml"):
+        parsed = tomllib.loads((tmp_path / name).read_text())
+        assert parsed["thinking"] is True, f"{name} was rewritten off the surviving anchor"
 
 
 def test_env_setup_default_omits_reasoning(monkeypatch, tmp_path) -> None:
@@ -1235,8 +1728,10 @@ def test_env_setup_default_omits_reasoning(monkeypatch, tmp_path) -> None:
     assert _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
     rl = (tmp_path / "configs/rl.toml").read_text()
     sft = (tmp_path / "configs/sft.toml").read_text()
+    opd = (tmp_path / "configs/opd.toml").read_text()
     assert "thinking = true" not in rl
     assert "thinking = true" not in sft
+    assert "thinking = true" not in opd
     assert "max_completion_tokens" not in rl
     assert "EnvironmentSingleTurn" in (tmp_path / "environment.py").read_text()
 
@@ -1249,13 +1744,24 @@ def test_env_setup_reasoning_flag_enables_thinking(monkeypatch, tmp_path) -> Non
     )
     rl = (tmp_path / "configs/rl.toml").read_text()
     sft = (tmp_path / "configs/sft.toml").read_text()
+    opd = (tmp_path / "configs/opd.toml").read_text()
     assert "thinking = true" in rl
     assert "thinking = true" in sft
+    # opd too. `thinking` is algorithm-agnostic in the spec and the opd worker reads it to pick a
+    # reasoning parser, so a scaffold that emitted it for two of the three algorithms would hand a
+    # user asking for reasoning an opd config that silently trains without it.
+    assert "thinking = true" in opd
     # GRPO raises the generation budget so reasoning does not truncate the answer.
     assert "max_completion_tokens = 2048" in rl
     # SFT can't share a token budget it doesn't generate; it gets the gold think-tag guidance instead.
     assert "warn_missing_think_tags" in sft
     assert "max_completion_tokens" not in sft
+    # nor opd -- not because the knob is inert there (opd honors it, via `_resolve_opd_knobs` ->
+    # `opd_completion_len` at flash/engine/plan/vram.py:97, which feeds verl's max_response_length) but
+    # because opd ALREADY raises its own budget under thinking: 512 -> 1536. Writing a literal would
+    # pin what the recipe should choose, and would go stale the moment that default moves. GRPO needs
+    # the line only because its non-thinking default is 320, too tight to leave to a scaffold reader.
+    assert "max_completion_tokens" not in opd
 
 
 def test_env_setup_no_reasoning_flag_is_explicit_off(monkeypatch, tmp_path) -> None:
@@ -1314,10 +1820,10 @@ def test_env_setup_multi_turn_scaffolds_runnable_evaluations(monkeypatch, tmp_pa
 def test_env_setup_multi_turn_eval_case_does_not_duplicate_the_episode_prompt(
     monkeypatch, tmp_path
 ) -> None:
-    # `env eval` builds the request through environment.prompt_messages(), so the scaffolded
-    # case's `input` is a dataset row, not a finished prompt. spelling the reply-instructions
-    # block into the case as well sent it twice and evaluated a prompt training never used,
-    # defeating the fix that made eval match training in the first place (cursor).
+    # `env eval` builds the request through environment.prompt_messages(), so the scaffolded case's
+    # `input` is a dataset row, not a finished prompt. spelling the reply-instructions block into
+    # the case as well sent it twice and evaluated a prompt training never used, defeating the fix
+    # that made eval match training in the first place.
     monkeypatch.chdir(tmp_path)
     assert (
         _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111", "--multi-turn"])
@@ -1387,6 +1893,9 @@ def test_env_setup_interactive_survey_picks_multi_and_reasoning(monkeypatch, tmp
     monkeypatch.delenv("CI", raising=False)
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setattr("sys.stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("https://flash.freesolo.co", "fslo-test")
+    )
     answers = iter(["1", "", "2", "2"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(answers))
     assert _run(["env", "setup"]) == 0
@@ -1403,6 +1912,9 @@ def test_env_setup_interactive_enter_takes_defaults(monkeypatch, tmp_path) -> No
     monkeypatch.delenv("CI", raising=False)
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setattr("sys.stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("https://flash.freesolo.co", "fslo-test")
+    )
     answers = iter(["1", "", "", ""])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(answers))
     assert _run(["env", "setup"]) == 0
@@ -1485,27 +1997,26 @@ def test_unknown_run_errors_surface_as_nonzero_exit(monkeypatch, capsys) -> None
     assert "unknown run" in capsys.readouterr().err
 
 
-def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
-    from flash.client.specs import spec_payload
-    from flash.spec import EnvironmentSpec, JobSpec
+def test_submit_payload_carries_no_pip_and_the_worker_resolves_it(monkeypatch, tmp_path) -> None:
+    """pip is platform-managed: it leaves the wire, and the submit path supplies it instead.
 
-    # An unrecorded env resolves to the Freesolo SDK; the env is loaded lazily by the worker.
+    Both halves matter. Dropping the key from the payload without the provider still resolving it
+    would ship a worker with no Freesolo SDK, and the failure would surface only on a real GPU.
+    """
+    from flash.client.specs import spec_payload
+    from flash.core.spec import EnvironmentSpec, JobSpec
+    from flash.envs.base import worker_pip_for_env
+
     spec = JobSpec(
         model="Qwen/Qwen3.5-0.8B",
         project="11111111-1111-4111-8111-111111111111",
         environment=EnvironmentSpec(id="owner/env"),
     )
-    assert spec_payload(spec)["environment"]["pip"] == ["freesolo>=0.4.0"]
 
-    # ...and an explicit pip list (the documented escape hatch) wins untouched.
-    spec = JobSpec(
-        model="Qwen/Qwen3.5-0.8B",
-        project="11111111-1111-4111-8111-111111111111",
-        environment=EnvironmentSpec(
-            id="github:owner/repo@main:env/environment.py", pip=("custom==1",)
-        ),
-    )
-    assert list(spec_payload(spec)["environment"]["pip"]) == ["custom==1"]
+    # not an unauthorable key the server would reject, and not a duplicated constant on the wire.
+    assert "pip" not in spec_payload(spec)["environment"]
+    # the value the submit paths substitute for it, unchanged.
+    assert worker_pip_for_env(spec.environment.id) == ["freesolo>=0.4.0"]
 
 
 def test_export_uses_api_key_flag_and_forwards_args(fake_client, capsys, monkeypatch) -> None:
@@ -1829,7 +2340,7 @@ def test_deploy_wait_rollback_lookup_gets_a_usable_bound_near_the_deadline(
     poll before it lands the wait a hair short of the deadline, so the remainder is positive and
     tiny -- and passing it through means the listing read times out, `_rollback_record` swallows the
     error, and the CLI reports the run as vanished instead of printing `last_deploy_error`. The
-    zero-wait floor covers the expired case only, so it does not apply (cursor).
+    zero-wait floor covers the expired case only, so it does not apply.
     """
     _queued_deploy(monkeypatch, fake_client)
     clock = {"t": 0.0}
@@ -2200,7 +2711,7 @@ def test_deploy_wait_watches_the_final_window_to_its_deadline(fake_client, monke
 
     Splitting that window put its one read halfway through and then stopped, so the wait returned
     with half its advertised budget unspent: `--wait 1` read at t=0 and t=0.5 and reported a timeout
-    for a revision that went ready at t=0.75 (chatgpt-codex-connector). Sleeping the window whole
+    for a revision that went ready at t=0.75. Sleeping the window whole
     and reading at the deadline covers it without adding a read.
     """
     _queued_deploy(monkeypatch, fake_client)
@@ -2471,11 +2982,11 @@ def test_log_follow_progress_does_not_trust_a_ping_left_by_a_cleared_remote(
 ) -> None:
     """A supervised retry publishes `remote: null` for its whole allocation window.
 
-    `flash/runner/lifecycle.py` clears `remote` before reserving the replacement attempt and does
+    `flash/runner/supervise/lifecycle.py` clears `remote` before reserving the replacement attempt and does
     not persist the new one until the provider handle lands, so throughout that window flash serves
     a running record whose only attempt identity is the superseded worker's ping. Falling back to it
     there reintroduced exactly what preferring `remote` was meant to fix: the first retry unlabelled
-    (its stale attempt is 0), later ones naming the *previous* attempt (codex[bot]).
+    (its stale attempt is 0), later ones naming the *previous* attempt.
 
     Both parametrizations are the same window one retry apart, and both must refuse the ping.
 
@@ -2732,7 +3243,7 @@ def test_log_follow_progress_shows_a_settled_zero_like_the_other_surfaces() -> N
 
     `runs list` and `runs status` both print $0.0000 for a settled zero because run_cost returns
     (0.0, False) there. Suppressing it only in follow made the same finished run read as costed in
-    one place and uncosted in another, which is the inconsistency, not the zero (cursor).
+    one place and uncosted in another, which is the inconsistency, not the zero.
     """
     for state in sorted(cli.render.SETTLED_COST_STATES):
         _state, progress = cli.commands._log_follow_progress(

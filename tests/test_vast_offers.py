@@ -2,6 +2,29 @@
 
 from __future__ import annotations
 
+import pytest
+
+
+def _wall_capped_spec(max_wall_seconds: float):
+    """A rentable vast spec whose gpu carries an explicit wall grant.
+
+    max_wall_seconds is platform-managed and stripped from the public spec, so set it the way the
+    runner does -- by replacing gpu on a built spec rather than passing it through from_dict.
+    """
+    from dataclasses import replace
+
+    from flash.core.spec import JobSpec
+
+    spec = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "grpo",
+            "gpu": {"type": "H100", "count": 1, "provider": "vast"},
+            "train": {"max_examples": 4},
+        }
+    )
+    return replace(spec, gpu=replace(spec.gpu, max_wall_seconds=max_wall_seconds))
+
 
 def _offer(**kw) -> dict:
     """A fully-passing verified-datacenter RTX 4090 offer; override fields per case."""
@@ -10,6 +33,10 @@ def _offer(**kw) -> dict:
         "machine_id": 1,
         "gpu_name": "RTX 4090",
         "gpu_ram": 24576,
+        # single-card box. the count is load-bearing twice over (it sizes the rented box and divides
+        # dph_total into the per-card rate), so usable_offers re-checks it client-side rather than
+        # trusting the server honoured the num_gpus filter -- a row without it is dropped.
+        "num_gpus": 1,
         "dph_total": 0.25,
         "verification": "verified",
         "hosting_type": 1,
@@ -72,6 +99,7 @@ def test_usable_offers_filters_and_order(monkeypatch):
         min_reliability=0.95,
         min_duration_seconds=0,
         limit=64,
+        num_gpus=1,
         extra_q=None,
     ):
         captured["min_vram_mb"] = min_vram_mb
@@ -125,9 +153,9 @@ def test_usable_offers_exclude_machines(monkeypatch):
 
 
 def test_usable_offers_search_page_spans_all_classes(monkeypatch):
-    # Codex Mr5nO: the price-sorted search page must be wide enough to span EVERY managed class
-    # (callers bucket by class); the old limit=64 let a flood of one cheap class hide a larger fitting
-    # class with usable offers just past the page.
+    # the price-sorted search page must be wide enough to span EVERY managed class (callers bucket
+    # by class); the old limit=64 let a flood of one cheap class hide a larger fitting class with
+    # usable offers just past the page.
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast
 
@@ -140,6 +168,7 @@ def test_usable_offers_search_page_spans_all_classes(monkeypatch):
         min_reliability=0.95,
         min_duration_seconds=0,
         limit=64,
+        num_gpus=1,
         extra_q=None,
     ):
         captured["limit"] = limit
@@ -205,7 +234,7 @@ def test_usable_offers_threads_duration_floor(monkeypatch):
 
     captured = {}
 
-    def fake_search(min_vram_mb, *, min_duration_seconds=0, **k):
+    def fake_search(min_vram_mb, *, min_duration_seconds=0, num_gpus=1, **k):
         captured["min_duration_seconds"] = min_duration_seconds
         return []
 
@@ -219,9 +248,59 @@ def test_usable_offers_threads_duration_floor(monkeypatch):
     assert captured["min_duration_seconds"] == 0
 
 
+def test_rent_search_outlasts_the_boxs_deadline_not_just_the_wall_grant(monkeypatch):
+    # an unarmed workload profile's box deadline carries a provisioning allowance on top of its work
+    # budget, but gpu.max_wall_seconds still names the work budget alone. Searching on the grant
+    # accepts a host whose remaining duration outlasts 600s of work yet expires part-way through the
+    # boot the allowance exists to survive -- the box then dies mid-provisioning on a host that was
+    # never rentable for the window it was handed.
+    from flash.providers.vast import jobs as vast
+
+    captured = {}
+
+    def fake_offers(*a, max_wall_seconds=0, **k):
+        captured["max_wall_seconds"] = max_wall_seconds
+        raise vast.vast_api.VastApiError("stop before renting")
+
+    spec = _wall_capped_spec(600.0)
+    monkeypatch.setattr(vast, "usable_offers", fake_offers)
+    # the box holds a 600s work budget plus a 1200s provisioning allowance.
+    now = 1_800_000_000.0
+    monkeypatch.setattr(vast.time, "time", lambda: now)
+    with pytest.raises(vast.vast_api.VastApiError):
+        vast.submit_run_vast(spec, 42, deadline_at=now + 1800.0)
+    assert captured["max_wall_seconds"] == 1800.0, (
+        "offer search must require a host that outlasts the deadline the box enforces"
+    )
+
+
+def test_rent_search_never_shortens_below_the_granted_wall(monkeypatch):
+    # the ordinary case: the deadline sits exactly one wall grant out, so the floor is unchanged.
+    # a deadline already inside the grant (a late retry) must not lower the duration requirement
+    # below the wall the worker is still allowed to use.
+    from flash.providers.vast import jobs as vast
+
+    captured = {}
+
+    def fake_offers(*a, max_wall_seconds=0, **k):
+        captured["max_wall_seconds"] = max_wall_seconds
+        raise vast.vast_api.VastApiError("stop before renting")
+
+    spec = _wall_capped_spec(600.0)
+    monkeypatch.setattr(vast, "usable_offers", fake_offers)
+    now = 1_800_000_000.0
+    monkeypatch.setattr(vast.time, "time", lambda: now)
+    with pytest.raises(vast.vast_api.VastApiError):
+        vast.submit_run_vast(spec, 42, deadline_at=now + 600.0)
+    assert captured["max_wall_seconds"] == 600.0
+    with pytest.raises(vast.vast_api.VastApiError):
+        vast.submit_run_vast(spec, 42, deadline_at=now + 120.0)
+    assert captured["max_wall_seconds"] == 600.0
+
+
 def test_live_rates_gates_on_min_disk(monkeypatch):
-    # Codex Mr4re: live pricing must gate on MIN_DISK_GB (what create() enforces), not disk_gb=0 —
-    # otherwise it prices off "cheapest" offers that aren't actually provisionable.
+    # live pricing must gate on MIN_DISK_GB (what create() enforces), not disk_gb=0 — otherwise it
+    # prices off "cheapest" offers that aren't actually provisionable.
     from flash.providers.vast import jobs as vast
     from flash.providers.vast import pricing
 
@@ -238,10 +317,10 @@ def test_live_rates_gates_on_min_disk(monkeypatch):
 
 
 def test_live_rates_floors_query_at_smallest_managed_vram(monkeypatch):
-    # Copilot Mtugt: live pricing must floor the market query at the SMALLEST managed Vast class's VRAM,
-    # not 0 — min_vram_gb=0 lets tiny UNMANAGED low-VRAM offers fill the fixed-size price-sorted page and
-    # crowd managed classes off it, so hourly_rate() falls back to static rates even when live offers
-    # exist. The floor keeps it to one market query while making the page relevant.
+    # live pricing must floor the market query at the SMALLEST managed Vast class's VRAM, not 0 —
+    # min_vram_gb=0 lets tiny UNMANAGED low-VRAM offers fill the fixed-size price-sorted page and
+    # crowd managed classes off it, so hourly_rate() falls back to static rates even when live
+    # offers exist. The floor keeps it to one market query while making the page relevant.
     from flash.providers.base import GPU_INFO
     from flash.providers.vast import jobs as vast
     from flash.providers.vast import pricing
@@ -261,7 +340,7 @@ def test_live_rates_floors_query_at_smallest_managed_vram(monkeypatch):
 
 
 def test_live_rates_threads_wall_cap_and_bypasses_cache(monkeypatch):
-    # Codex MtzrI: a duration-bound estimate must price against offers that OUTLAST the run — thread
+    # a duration-bound estimate must price against offers that OUTLAST the run — thread
     # max_wall_seconds into usable_offers (the same duration floor the allocator/submit use), so a
     # cheap short-lived offer that the launch-time filter rejects can't set the rate. Duration-bound
     # queries must also NOT pollute the shared duration-agnostic cache (the `flash gpus` path).
@@ -284,8 +363,8 @@ def test_live_rates_threads_wall_cap_and_bypasses_cache(monkeypatch):
 
 
 def test_live_rates_caches_within_ttl_and_refresh_bypasses(monkeypatch):
-    # Copilot Msbs9: repeated live_rates() within the TTL must share ONE market fetch (the refresh
-    # param was previously ignored); refresh=True forces a fresh query.
+    # repeated live_rates() within the TTL must share ONE market fetch (the refresh param was
+    # previously ignored); refresh=True forces a fresh query.
     from flash.providers.vast import jobs as vast
     from flash.providers.vast import pricing
 
@@ -305,3 +384,33 @@ def test_live_rates_caches_within_ttl_and_refresh_bypasses(monkeypatch):
     assert calls["n"] == 1
     pricing.live_rates(refresh=True)  # forced -> fetches again
     assert calls["n"] == 2
+
+
+def test_usable_offers_threads_and_rechecks_card_count(monkeypatch):
+    """The count reaches the search AND is re-checked on the rows that come back.
+
+    Vast bakes the card count into the offer (create_instance takes no count), so num_gpus is the
+    only way to reach a multi-card box. It is load-bearing twice: it sizes the rented box, and it
+    divides dph_total into the per-card rate the allocator ranks on. A server that ignored the
+    filter would otherwise hand back single-card rows that get priced as if they were multi-card.
+    """
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    captured = {}
+
+    def fake_search(min_vram_mb, **kwargs):
+        captured.update(kwargs)
+        # honour the filter for id=1, ignore it for id=2 (a server that lies about the count)
+        return [
+            _offer(id=1, num_gpus=int(kwargs.get("num_gpus", 1)), dph_total=0.25),
+            _offer(id=2, num_gpus=1, dph_total=0.20),
+        ]
+
+    monkeypatch.setattr(vast_api, "search_offers", fake_search)
+    out = vast.usable_offers(24, disk_gb=60, num_gpus=4)
+
+    assert captured["num_gpus"] == 4, "the count never reached the search"
+    # id=2 is cheaper and would sort first, so dropping it proves the client-side re-check fired
+    # rather than the ordering happening to hide it.
+    assert [o.offer_id for o in out] == [1], "a wrong-count row survived the client-side re-check"

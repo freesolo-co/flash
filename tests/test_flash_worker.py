@@ -8,14 +8,13 @@ Covers:
 
 from __future__ import annotations
 
-import re
 import time
 
 import pytest
 
 
 def _spec():
-    from flash.spec import JobSpec, TrainSpec
+    from flash.core.spec import JobSpec, TrainSpec
 
     return JobSpec(
         model="Qwen/Qwen3.5-4B",
@@ -37,7 +36,7 @@ def _run_deadline_fields() -> dict[str, float | int]:
 
 def test_build_worker_env_does_not_forward_removed_tuning_knobs(monkeypatch):
     """Flash is managed: process-env tuning toggles do not change worker behavior."""
-    from flash.providers.runpod.train import build_worker_env
+    from flash.providers.runpod.serverless import build_worker_env
 
     knobs = {
         "VLLM_USE_V1": "0",
@@ -56,7 +55,7 @@ def test_build_worker_env_does_not_forward_removed_tuning_knobs(monkeypatch):
 def test_build_worker_env_ignores_alloc_conf_override(monkeypatch):
     """flash is fully managed: an operator PYTORCH_CUDA_ALLOC_CONF in the process env does NOT
     override flash's computed allocator conf (RL is non-expandable, sleep-safe)."""
-    from flash.providers.runpod.train import build_worker_env
+    from flash.providers.runpod.serverless import build_worker_env
 
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:999")
     env = build_worker_env(_spec(), 0)  # grpo -> sleep-safe non-expandable
@@ -64,13 +63,18 @@ def test_build_worker_env_ignores_alloc_conf_override(monkeypatch):
     assert "expandable_segments" not in env["PYTORCH_CUDA_ALLOC_CONF"]
 
 
-def test_build_worker_env_opd_uses_expandable_allocator(monkeypatch):
-    """Regression (codex[bot]): OPD has NO vLLM sleep engine (that's GRPO-only) and allocates large HF
-    generate/logit tensors like SFT, so it must get the anti-fragmentation expandable allocator — NOT
-    the sleep-safe non-expandable RL conf. OPD was previously lumped with RL (`not in ("sft",)`) and
-    fragmented / OOM'd on a GPU the VRAM estimate said would fit. GRPO stays non-expandable."""
-    from flash.providers.runpod.train import build_worker_env
-    from flash.spec import JobSpec, TrainSpec
+def test_build_worker_env_opd_uses_sleep_safe_allocator(monkeypatch):
+    """OPD must get the sleep-safe NON-expandable allocator conf, like GRPO.
+
+    This inverts an earlier regression test, and the inversion is the point. Under trl, OPD drove its
+    own HF generate loop with no sleep engine, so the anti-fragmentation expandable allocator was
+    right. run_opd now delegates to verl unconditionally, and verl leaves rollout.enable_sleep_mode
+    defaulted True -- so the engine always builds a CuMemAllocator, which asserts outright on
+    expandable_segments (vllm cumem.py, pytorch#147851). An OPD run with the old conf dies before
+    step 1. SFT keeps expandable: its verl trainer is pure FSDP and builds no rollout at all.
+    """
+    from flash.core.spec import JobSpec, TrainSpec
+    from flash.providers.runpod.serverless import build_worker_env
 
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
@@ -80,10 +84,17 @@ def test_build_worker_env_opd_uses_expandable_allocator(monkeypatch):
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
         seed=0,
     )
-    env = build_worker_env(opd_spec, 0)
-    assert env["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
-    assert env["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
-    # GRPO still ships the sleep-safe non-expandable conf (unchanged by this fix).
+    env = build_worker_env(
+        opd_spec,
+        0,
+        runtime_secrets={
+            "FLASH_PUBLIC_URL": "https://broker.example",
+            "FLASH_TEACHER_CAPABILITY": "capability-test-value",
+        },
+    )
+    assert "expandable_segments" not in env["PYTORCH_CUDA_ALLOC_CONF"]
+    assert "expandable_segments" not in env["PYTORCH_ALLOC_CONF"]
+    # GRPO still ships the sleep-safe non-expandable conf.
     grpo_env = build_worker_env(_spec(), 0)
     assert "expandable_segments" not in grpo_env["PYTORCH_CUDA_ALLOC_CONF"]
 
@@ -94,7 +105,7 @@ def test_build_worker_env_does_not_forward_judge_creds(monkeypatch):
     [environment].secrets entry (forwarded via runtime_secrets); the env's own default judge model
     otherwise applies. A stray control-plane OPENROUTER_API_KEY / OPENAI_API_KEY / FLASH_JUDGE_MODEL
     must NOT leak into every worker."""
-    from flash.providers.runpod.train import build_worker_env
+    from flash.providers.runpod.serverless import build_worker_env
 
     for key in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "FLASH_JUDGE_MODEL"):
         monkeypatch.setenv(key, "control-plane-should-not-forward")
@@ -105,49 +116,84 @@ def test_build_worker_env_does_not_forward_judge_creds(monkeypatch):
 
 def test_build_worker_env_forwards_github_env_source_token(monkeypatch):
     """The worker receives the control-plane token used for managed Freesolo environments."""
-    from flash.providers.runpod.train import build_worker_env
+    from flash.providers.runpod.serverless import build_worker_env
 
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-secret")
     assert build_worker_env(_spec(), 0).get("GITHUB_TOKEN") == "ghp-secret"
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
 
 
-def test_build_worker_env_forwards_managed_teacher_key_for_opd_only(monkeypatch):
-    """The opd GLM teacher key is a platform-owned credential injected from the control-plane env
-    (like GITHUB_TOKEN) — but ONLY for opd runs, since only opd uses it. sft/grpo workers never
-    receive it."""
-    from flash.providers.runpod.train import build_worker_env
-    from flash.spec import JobSpec, TrainSpec
+def test_build_worker_env_forwards_only_managed_teacher_capability_for_opd(monkeypatch):
+    """opd receives bounded broker transport while provider credentials remain control-plane-only."""
+    from flash.core.spec import JobSpec, TrainSpec
+    from flash.providers.runpod.serverless import build_worker_env
 
-    monkeypatch.setenv("FIREWORKS_API_KEY", "platform-managed-teacher")
+    monkeypatch.setenv("PARASAIL_API_KEY", "platform-managed-parasail")
     opd_spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
         seed=0,
     )
-    assert build_worker_env(opd_spec, 0).get("FIREWORKS_API_KEY") == "platform-managed-teacher"
-    # grpo/sft don't use a teacher, so the key is not forwarded to those workers.
-    assert "FIREWORKS_API_KEY" not in build_worker_env(_spec(), 0)
+    env = build_worker_env(
+        opd_spec,
+        0,
+        runtime_secrets={
+            "FLASH_PUBLIC_URL": "https://broker.example",
+            "FLASH_TEACHER_CAPABILITY": "capability-test-value",
+        },
+    )
+    assert env["FLASH_PUBLIC_URL"] == "https://broker.example"
+    assert env["FLASH_TEACHER_CAPABILITY"] == "capability-test-value"
+    assert "PARASAIL_API_KEY" not in env
+    grpo = build_worker_env(_spec(), 0)
+    assert "FLASH_PUBLIC_URL" not in grpo
+    assert "FLASH_TEACHER_CAPABILITY" not in grpo
 
 
-def test_build_worker_env_managed_teacher_key_is_authoritative_no_byo(monkeypatch):
-    """Bring-your-own is not supported: even if a user routes a FIREWORKS_API_KEY runtime_secret
-    (by declaring it in [environment].secrets), the control-plane value wins — it is applied last."""
-    from flash.providers.runpod.train import build_worker_env
-    from flash.spec import EnvironmentSpec, JobSpec, TrainSpec
+def test_build_worker_env_does_not_accept_legacy_teacher_broker_url():
+    from flash.core.spec import JobSpec, TrainSpec
+    from flash.providers.runpod.serverless import build_worker_env
 
-    monkeypatch.setenv("FIREWORKS_API_KEY", "platform-managed-teacher")
     opd_spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
-        environment=EnvironmentSpec(id="org/env", secrets=("FIREWORKS_API_KEY",)),
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
         seed=0,
     )
-    env = build_worker_env(opd_spec, 0, runtime_secrets={"FIREWORKS_API_KEY": "byo-user-key"})
-    assert env["FIREWORKS_API_KEY"] == "platform-managed-teacher"
-    assert "GITHUB_TOKEN" not in build_worker_env(_spec(), 0)
+
+    with pytest.raises(RuntimeError, match="control-panel teacher transport is missing"):
+        build_worker_env(
+            opd_spec,
+            0,
+            runtime_secrets={
+                "FLASH_TEACHER_BROKER_URL": "https://broker.example",
+                "FLASH_TEACHER_CAPABILITY": "capability-test-value",
+            },
+        )
+
+
+def test_build_worker_env_rejects_managed_teacher_byo_names():
+    from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
+    from flash.providers.runpod.serverless import build_worker_env
+
+    opd_spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        environment=EnvironmentSpec(id="org/env", secrets=("PARASAIL_API_KEY",)),
+        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
+        seed=0,
+    )
+    with pytest.raises(ValueError, match="managed teacher credential names"):
+        build_worker_env(
+            opd_spec,
+            0,
+            runtime_secrets={
+                "PARASAIL_API_KEY": "byo-parasail-key",
+                "FLASH_PUBLIC_URL": "https://broker.example",
+                "FLASH_TEACHER_CAPABILITY": "capability-test-value",
+            },
+        )
 
 
 def test_build_worker_env_wandb_is_user_runtime_secret_not_control_plane_env(monkeypatch):
@@ -156,7 +202,7 @@ def test_build_worker_env_wandb_is_user_runtime_secret_not_control_plane_env(mon
     WANDB_API_KEY must therefore come from the per-submit runtime secret path, not from the
     control-plane process env.
     """
-    from flash.providers.runpod.train import build_worker_env
+    from flash.providers.runpod.serverless import build_worker_env
 
     monkeypatch.setenv("WANDB_API_KEY", "platform-should-not-forward")
     env = build_worker_env(_spec(), 0)
@@ -167,8 +213,8 @@ def test_build_worker_env_wandb_is_user_runtime_secret_not_control_plane_env(mon
 
 
 def test_build_worker_env_forwards_declared_environment_runtime_secrets():
-    from flash.providers.runpod.train import build_worker_env
-    from flash.spec import EnvironmentSpec, JobSpec, TrainSpec
+    from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
+    from flash.providers.runpod.serverless import build_worker_env
 
     spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
@@ -192,13 +238,13 @@ def test_build_worker_env_forwards_declared_environment_runtime_secrets():
 
 def test_worker_console_always_uploaded_and_no_flag(monkeypatch):
     """The worker console is ALWAYS uploaded — live (periodic) while the worker runs and once more
-    when it exits — so every print reaches `flash log`, not just a post-mortem tail on
+    when it exits — so every print reaches `flash runs log`, not just a post-mortem tail on
     crash. There is no FLASH_UPLOAD_CONSOLE flag to forget: it is NOT forwarded to the worker (even
     if an operator sets it), and neither worker run_mode path gates the upload."""
     import inspect
 
-    from flash.providers import _instance_bootstrap
-    from flash.providers.runpod.train import build_worker_env, endpoints
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+    from flash.providers.runpod.serverless import build_worker_env, endpoints
 
     # the flag is gone — setting it in the control-plane env does not reach the worker
     monkeypatch.setenv("FLASH_UPLOAD_CONSOLE", "1")
@@ -214,128 +260,50 @@ def test_worker_console_always_uploaded_and_no_flag(monkeypatch):
         assert "_force_console" not in src
 
 
-def _clear_chalk_flags(monkeypatch):
-    monkeypatch.delenv("FLASH_CHALK_SPEC", raising=False)
+def test_removed_keys_cannot_reach_the_worker_through_environment_secrets():
+    """declared runtime secrets must not deliver removed optimization keys to the worker.
 
+    the two filters answer different questions and are deliberately disjoint:
+    CONTROL_PLANE_OWNED_ENV_KEYS prevents overrides such as SEED, while
+    _REMOVED_OPTIMIZATION_ENV blocks dead keys that configure nothing.
+    """
+    from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
+    from flash.providers._lifecycle.worker import _REMOVED_OPTIMIZATION_ENV
+    from flash.providers.runpod.serverless import build_worker_env
 
-def test_chalk_extra_pip_default_on_with_spec(monkeypatch):
-    """chalk is always selected (fixed gap-fillers), so a set FLASH_CHALK_SPEC IS appended to
-    extra_pip (chalk installs + auto-applies)."""
-    from flash.providers.runpod.train import chalk_extra_pip
-
-    _clear_chalk_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_CHALK_SPEC", "freesolo-chalk")
-    assert chalk_extra_pip() == ["freesolo-chalk"]
-
-
-def test_chalk_extra_pip_defaults_to_latest_main_without_spec(monkeypatch):
-    """With FLASH_CHALK_SPEC unset, flash auto-installs the pinned PUBLIC PyPI chalk version by
-    default. A public version pin (not a git+https SHA against the INTERNAL chalk repo) lets
-    tokenless bake/worker pods install it, while still pinning the exact kernel surface."""
-    from flash.providers._worker import DEFAULT_CHALK_VERSION
-    from flash.providers.runpod.train import (
-        DEFAULT_CHALK_SPEC,
-        chalk_extra_pip,
-    )
-
-    _clear_chalk_flags(monkeypatch)
-    assert chalk_extra_pip() == [DEFAULT_CHALK_SPEC]
-    # public PyPI pin so tokenless bake/worker pods can pip-install (chalk repo is internal)
-    assert DEFAULT_CHALK_SPEC.startswith("freesolo-chalk==")
-    assert f"freesolo-chalk=={DEFAULT_CHALK_VERSION}" == DEFAULT_CHALK_SPEC
-
-
-def test_chalk_extra_pip_adds_spec_when_set(monkeypatch):
-    """FLASH_CHALK_SPEC -> the chalk spec is appended to extra_pip, which the worker installs for
-    EVERY job (the durable baked-image path that bypasses resolve_worker_deps)."""
-    from flash.providers.runpod.train import chalk_extra_pip
-
-    _clear_chalk_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_CHALK_SPEC", "git+https://github.com/freesolo-co/chalk@main")
-    assert chalk_extra_pip() == ["git+https://github.com/freesolo-co/chalk@main"]
-
-
-def _spec_worker_env(worker_env: dict):
-    """A grpo JobSpec carrying a per-run [worker_env] block (the TOML override map)."""
-    from flash.spec import JobSpec, TrainSpec
-
-    return JobSpec(
+    # every removed key, not a chalk special case. FLASH_TRITON_LORA stands in for the rest.
+    declared = ["FLASH_CHALK_SPEC", "FLASH_TRITON_LORA", "MY_TOKEN"]
+    spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
         seed=0,
-        worker_env=dict(worker_env),
+        environment=EnvironmentSpec(id="owner/env", secrets=declared),
     )
+    supplied = {
+        "FLASH_CHALK_SPEC": "freesolo-chalk==0.5.7",
+        "FLASH_TRITON_LORA": "1",
+        "MY_TOKEN": "keep-me",
+    }
+    env = build_worker_env(spec, 0, runtime_secrets=supplied)
 
-
-def test_chalk_extra_pip_per_run_worker_env_spec_override(monkeypatch):
-    """A per-run [worker_env] FLASH_CHALK_SPEC overrides the PyPI default install SOURCE for THAT
-    run — resolved against the effective worker env (worker_env merged over os.environ)."""
-    from flash.providers.runpod.train import DEFAULT_CHALK_SPEC, chalk_extra_pip
-
-    _clear_chalk_flags(monkeypatch)  # nothing in os.environ
-    spec = _spec_worker_env({"FLASH_CHALK_SPEC": "git+https://github.com/freesolo-co/chalk@main"})
-    # bare env: the version-pinned PyPI default installs
-    assert chalk_extra_pip() == [DEFAULT_CHALK_SPEC]
-    # the per-run [worker_env] spec overrides the source for that run
-    assert chalk_extra_pip(spec) == ["git+https://github.com/freesolo-co/chalk@main"]
-
-
-def test_build_worker_env_filters_removed_optimization_toggles(monkeypatch):
-    """A per-run [worker_env] block can NOT re-inject the optimization toggles removed in PR #175
-    (flash is deterministic + fully managed). The dangerous case: a recipe pinning
-    PYTORCH_ALLOC_CONF=expandable_segments:True would crash GRPO vLLM sleep mode — it must be
-    dropped, and flash's computed sleep-safe RL conf must survive. Non-removed keys still merge."""
-    from flash.providers.runpod.train import build_worker_env
-
-    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
-    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
-    spec = _spec_worker_env(
-        {
-            # Removed optimization toggles — must all be stripped.
-            "PYTORCH_ALLOC_CONF": "expandable_segments:True",
-            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-            "VLLM_ATTENTION_BACKEND": "FLASHINFER",
-            "VLLM_FLASH_ATTN_VERSION": "2",
-            "VLLM_USE_V1": "0",
-            "SFT_PER_DEVICE_BS": "1",
-            "TORCHDYNAMO_DISABLE": "1",
-            "FLASH_DISABLE_FA2": "1",
-            "RL_VLLM_SLEEP": "0",
-            "FLASH_ROPE_KERNEL": "0",
-            "FLASH_WORKER_DEPS": "evil==9",
-            # Case-insensitive match: a lower-cased re-injection is also stripped.
-            "pytorch_alloc_conf": "expandable_segments:True",
-            # A legitimate, non-removed per-run override still wins.
-            "MY_ENV_FLAG": "keep-me",
-        }
-    )
-    env = build_worker_env(spec, 0)  # grpo -> sleep-safe non-expandable alloc conf
-    # The unsafe alloc conf was NOT injected; flash's computed RL conf stands.
-    assert "expandable_segments" not in env["PYTORCH_ALLOC_CONF"]
-    assert "expandable_segments" not in env["PYTORCH_CUDA_ALLOC_CONF"]
-    for stripped in (
-        "VLLM_ATTENTION_BACKEND",
-        "VLLM_FLASH_ATTN_VERSION",
-        "VLLM_USE_V1",
-        "SFT_PER_DEVICE_BS",
-        "TORCHDYNAMO_DISABLE",
-        "FLASH_DISABLE_FA2",
-        "RL_VLLM_SLEEP",
-        "FLASH_ROPE_KERNEL",
-        "FLASH_WORKER_DEPS",
-    ):
-        assert stripped not in env, f"{stripped} should have been filtered from worker_env"
-    # A non-removed per-run key is honored — the filter is targeted, not a blanket block.
-    assert env["MY_ENV_FLAG"] == "keep-me"
+    # assert on the values this call supplied, not on key presence: some removed names (e.g.
+    # PYTORCH_ALLOC_CONF) are legitimately set by flash itself downstream, so "key absent from env"
+    # would be asserting something the fix never promised.
+    for key in set(supplied) & _REMOVED_OPTIMIZATION_ENV:
+        assert env.get(key) != supplied[key], (
+            f"{key} reached the worker through [environment].secrets"
+        )
+    # a live secret still gets through: this blocks dead keys, not runtime secrets generally.
+    assert env["MY_TOKEN"] == "keep-me"
 
 
 def test_build_worker_env_hf_repo_is_per_run(monkeypatch):
     """The worker env's HF_REPO is seeded from the run's [train] hf_repo, NOT the operator's
     HF_REPO env var (which no longer exists). An operator HF_REPO in the process env is
     ignored — the worker reads its own seeded value, sourced from the spec."""
-    from flash.providers.runpod.train import build_worker_env
-    from flash.spec import JobSpec, TrainSpec
+    from flash.core.spec import JobSpec, TrainSpec
+    from flash.providers.runpod.serverless import build_worker_env
 
     # an operator HF_REPO in the env must NOT leak into the worker env
     monkeypatch.setenv("HF_REPO", "operator/default")
@@ -356,7 +324,7 @@ def test_alloc_conf_rl_is_non_expandable(monkeypatch):
     # sleep-SAFE non-expandable conf; the worker upgrades to expandable_segments at boot once it
     # resolves sleep OFF for the model/context (engine.worker.finalize_alloc_conf_for_sleep). The
     # conf is deterministic — there is no launcher sleep/alloc knob.
-    from flash.providers.runpod.train import build_worker_env
+    from flash.providers.runpod.serverless import build_worker_env
 
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
@@ -368,8 +336,8 @@ def test_alloc_conf_rl_is_non_expandable(monkeypatch):
 
 
 def test_alloc_conf_default_expandable_for_sft(monkeypatch):
-    from flash.providers.runpod.train import build_worker_env
-    from flash.spec import JobSpec, TrainSpec
+    from flash.core.spec import JobSpec, TrainSpec
+    from flash.providers.runpod.serverless import build_worker_env
 
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
@@ -387,7 +355,7 @@ def test_runpod_backoff_no_overflow_on_long_runs():
     """DEFECT: runpod_flash computed base*(2**attempt) then clamped, so a long poll loop
     overflowed (~80 min in) and killed a healthy job. The patch caps the exponent first."""
     pytest.importorskip("runpod_flash")
-    from flash.providers.runpod.train import _patch_runpod_backoff
+    from flash.providers.runpod.serverless import _patch_runpod_backoff
 
     _patch_runpod_backoff()
     from runpod_flash.core.utils import backoff
@@ -399,20 +367,6 @@ def test_runpod_backoff_no_overflow_on_long_runs():
     from runpod_flash.core.resources import serverless
 
     assert serverless.get_backoff_delay(100000, max_seconds=5) <= 5 * 1.2 + 1e-9
-
-
-def test_require_vllm_for_rollout_func_rejects_vllm_off_multiturn():
-    """Multi-turn GRPO with vLLM disabled (the 35B tier's grpo_use_vllm=False, or RL_USE_VLLM=0)
-    must fail fast — the rollout closure reads trainer.vllm_generation.llm, which only exists
-    when use_vllm=True, so otherwise it would AttributeError deep in the first rollout turn."""
-    from flash.engine.worker import require_vllm_for_rollout_func
-
-    with pytest.raises(RuntimeError, match="needs colocated vLLM"):
-        require_vllm_for_rollout_func(True, False, "Qwen/Qwen3.6-35B-A3B")
-    # every supported combination is a no-op (single-turn, or vLLM enabled)
-    require_vllm_for_rollout_func(True, True, "m")
-    require_vllm_for_rollout_func(False, False, "m")
-    require_vllm_for_rollout_func(False, True, "m")
 
 
 def test_error_artifact_name_is_per_phase_and_attempt():
@@ -430,6 +384,45 @@ def test_error_artifact_name_is_per_phase_and_attempt():
             error_artifact_name("sft", invalid)
 
 
+def test_ray_log_artifact_name_is_scoped_exactly_like_the_traceback_beside_it():
+    """Ray's failure logs upload to the same per-RUN hf_prefix() as the traceback, so they need the
+    same per-attempt scoping. A raylet failure is precisely the case that gets retried, and an
+    unscoped name would let the retry overwrite the attempt that actually reproduced it."""
+    from flash.engine.worker import error_artifact_name, ray_log_artifact_name
+
+    assert ray_log_artifact_name("rl") == "raylogs_rl_attempt0.txt"
+    assert ray_log_artifact_name("rl", 0) != ray_log_artifact_name("rl", 1)
+    assert ray_log_artifact_name("rl", 1) != error_artifact_name("rl", 1)
+    for invalid in ("3", "", True, 1.5, -1, 1 << 63):
+        with pytest.raises(ValueError, match="attempt must be"):
+            ray_log_artifact_name("sft", invalid)
+
+
+def test_worker_and_control_plane_agree_on_the_error_artifact_name():
+    """The process that WRITES the error artifact and the one that READS it must spell it the same.
+
+    These live on opposite sides of a machine boundary -- the worker uploads to HF, the pollers fetch
+    from it -- and nothing at runtime ever compares the two names. A disagreement surfaces only as a
+    missing artifact, which is indistinguishable from "the worker crashed before uploading": exactly
+    the situation the file exists to explain, so the failure erases its own evidence.
+
+    They now share one definition, and this pins that. A literal on each side would make the two
+    agree by coincidence of two assertions rather than by construction -- so the assertion is
+    writer-against-reader, not either against a string.
+    """
+    from flash.engine.worker import error_artifact_name as worker_name
+    from flash.providers.artifacts.hf import error_artifact_name as plane_name
+
+    for phase in ("sft", "rl", "opd"):
+        for attempt in (0, 1, 7):
+            assert worker_name(phase, attempt) == plane_name(phase, attempt)
+
+    # and the reader rejects what the writer would refuse to produce, rather than formatting it
+    for invalid in ("3", "", True, 1.5, -1, 1 << 63):
+        with pytest.raises(ValueError, match="attempt must be"):
+            plane_name("sft", invalid)
+
+
 def test_train_body_imports_every_name_it_uses():
     """Flash ships only _train_body's source to the worker, where module-level
     imports are out of scope, so every stdlib/3p name it references must be
@@ -437,7 +430,7 @@ def test_train_body_imports_every_name_it_uses():
     import ast
     import inspect
 
-    from flash.providers.runpod import train
+    from flash.providers.runpod import serverless as train
 
     tree = ast.parse(inspect.getsource(train._train_body))
     fn = tree.body[0]
@@ -457,7 +450,7 @@ def test_train_body_imports_every_name_it_uses():
 def test_train_body_has_no_prime_install_path():
     import inspect
 
-    from flash.providers.runpod import train
+    from flash.providers.runpod import serverless as train
 
     src = inspect.getsource(train._train_body)
     assert '"install", "prime"' not in src
@@ -468,7 +461,7 @@ def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
     import os
     from pathlib import Path
 
-    from flash.providers.runpod.train import endpoints
+    from flash.providers.runpod.serverless import endpoints
 
     calls = []
     askpass_paths = []
@@ -491,7 +484,7 @@ def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
                 "hf_repo": "owner/runs",
                 "job_spec_json": '{"algorithm": "sft", "run_id": "flash-test-run"}',
                 "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
-                "extra_pip": ["git+https://github.com/freesolo-co/chalk.git@abc123"],
+                "extra_pip": ["git+https://github.com/example/some-env-pkg.git@abc123"],
                 "code_prefix": "../code/flash",
                 **_run_deadline_fields(),
             }
@@ -509,7 +502,7 @@ def test_train_body_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
     import os
     from pathlib import Path
 
-    from flash.providers.runpod.train import endpoints
+    from flash.providers.runpod.serverless import endpoints
 
     askpass_paths = []
 
@@ -535,7 +528,7 @@ def test_train_body_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
                     "hf_repo": "owner/runs",
                     "job_spec_json": '{"algorithm": "sft", "run_id": "flash-test-run"}',
                     "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
-                    "extra_pip": ["git+https://github.com/freesolo-co/chalk.git@abc123"],
+                    "extra_pip": ["git+https://github.com/example/some-env-pkg.git@abc123"],
                     "code_prefix": "../code/flash",
                     **_run_deadline_fields(),
                 }
@@ -548,115 +541,52 @@ def test_train_body_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
     assert askpass_paths
 
 
-def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
-    """guard completion-only masking, chunked nll, and the existing sft optimizations together."""
+def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
+    """The verl SFT path must still carry the sizing/memory optimizations, not just train.
+
+    The previous version of this test read run_sft's source. That body was trl's and is deleted:
+    run_sft now delegates to run_sft_train. Rather than drop the coverage, assert against the module
+    that really runs. Three of the old assertions are intentionally NOT reproduced -- kernel
+    installation, LoRA+ B-matrix ratio plumbing, and the chunked_nll loss_type -- because they were
+    properties of trl's SFTTrainer call, and verl owns its own loss and kernel path.
+
+    The optimizations now live in two modules rather than one. Dataset preprocessing moved to
+    flash.engine.profiling.sft_workload so the profile run and the training run share one implementation, and
+    the sizing/memory choices stayed with the trainer that makes them. Each assertion reads the
+    module that actually owns its behaviour: pointing them all at one module would let a symbol
+    disappear from the other and still pass.
+    """
     import inspect
 
-    from flash.engine.worker import sft
+    from flash.engine.profiling import sft_workload
+    from flash.engine.worker import sft_train
+    from flash.engine.worker.entry import sft
 
-    src = inspect.getsource(sft.run_sft)
-    prep_src = inspect.getsource(sft._render_tokenize_sft_batch)
-    output_src = inspect.getsource(sft._prepare_sft_examples)
+    # run_sft is now a pure delegation: no backend selector, no trainer of its own.
+    assert "run_sft_train()" in inspect.getsource(sft.run_sft)
 
-    # completion-only loss is on and the old false literal for that key is gone
-    assert '"completion_only_loss": True' in src
-    assert '"completion_only_loss": False' not in src
-    # the parallel prep path preserves the prompt boundary and pre-tokenized representation
-    assert "completion_mask_from_ids(" in prep_src
-    assert '"completion_mask":' in prep_src
-    assert "tokenize_for_packing(" in prep_src
-    assert '"completion_mask": row["completion_mask"]' in output_src
-    assert "_prepare_sft_examples(" in src
-    assert "Dataset.from_list(_pretok)" in src
-    # both flash custom-packing paths thread the completion mask through the packer
-    assert src.count("pack_token_ids(_ids, sft_max_len, completion_masks=_cmask)") == 2
+    workload_src = inspect.getsource(sft_workload)
+    # completion-only supervision survives, as verl's loss_mask rather than trl's completion_mask.
+    assert "_pretokenize_completion_only(" in workload_src
+    assert "completion_mask_from_ids(" in workload_src
+    assert '"loss_mask": tokenized["completion_mask"]' in workload_src
 
-    # example packing (all three backends: trl bfd, sdpa 4d-mask, gdn varlen)
-    assert 'cfg_kwargs["packing"] = True' in src  # TRL bfd (pure-attn FA2)
-    assert "BlockDiagonalCollator(pad_token_id=tok.pad_token_id)" in src  # SDPA 4D-mask
-    assert "emit_varlen=True" in src  # GDN varlen
-    assert "model_is_pure_attention" in src
-    assert "gdn_packing_available" in src
-    # (tokenize_for_packing now lives in the parallel prep path asserted above.)
-    # chalk standalone RMSNorm/SwiGLU/RoPE stay enabled; chalk flce is OFF on the trl SFT path (returns
-    # logits=None, which trl's SFTTrainer.compute_loss can't consume). when _sft_fused is true, trl's own
-    # chunked_nll owns the output-head loss; the microbatch/grad-accum are sized up front for the chosen path.
-    assert "install_chalk_kernels(" in src
-    assert "fused_ce=False" in src
-    assert "_sft_fused = sft_chunked_nll_enabled(model_id) and not multimodal" in src
-    assert '"loss_type": "chunked_nll" if _sft_fused else "nll"' in src
-    assert "_prepare_chunked_nll_model(sft_model, tok, _lora_config)" in src
-    assert 'cfg_kwargs["use_liger_kernel"] = False' in src
-    assert 'cfg_kwargs["use_liger_kernel"] = True' not in src
-    # LoRA+ (B-matrix LR ratio)
-    assert "create_loraplus_optimizer" in src
-    assert "_lp_ratio" in src
-    # large-vocab logits cap (per-device micro-batch sizing)
-    assert "sft_grad_accum(" in src
-    # PR #538 finding (worker/quote SFT vocab drift): the worker must size the realized batch through the
-    # SAME revision-aware resolver the cost quote priced with (cost/spec.py _sft_realized_batch ->
-    # resolve_vocab_size on the same (model, revision)). sizing via the revision-blind vocab_size_for made a
-    # revision-pinned run's realized batch drift from its quote. resolve once, reuse for the packing path.
-    assert "_sft_vocab = resolve_vocab_size(model_id, model_revision)" in src
-    assert "vocab=_sft_vocab" in src
-    assert "vocab_size_for(model_id)" not in src
-    # gradient checkpointing (non-reentrant) + 8-bit paged optimizer. the gc decision uses the safe
-    # realized maximum after packing, not the configured cap, and remains conservative on unknown memory.
-    # indentation-robust: the assertion is that GC is sized from the post-packing realized maximum,
-    # not that the call sits at any particular nesting depth.
-    assert re.search(r"grad_checkpointing_on\(\s*model_id,\s*_runtime_max_len,", src)
-    assert '"gradient_checkpointing": _grad_ckpt' in src
-    # Reentrant recompute for MoE / GatedDeltaNet (same rule as GRPO's rl.py, #429/#432): those
-    # architectures re-dispatch tokens / lay out saved tensors differently on recompute, so
-    # non-reentrant's metadata-equality assert kills the first backward. Dense stays non-reentrant.
-    assert '"use_reentrant": grpo_use_reentrant(model_id)' in src
-    assert '"optim": fused_optim_name()' in src
+    # sft renders its hydra overrides and child shims in train.sft.config, so the trainer's half of
+    # this guard spans both modules. keep these in step when sft_train is split further.
+    from flash.engine.worker.train.sft import config as sft_config
 
-
-def test_bfd_packing_rederives_grad_accum_to_keep_effective_batch():
-    """When TRL bfd packing stays ON, grad_accum must be re-derived from the ~ex/block estimate so
-    the effective batch stays in EXAMPLES — otherwise bfd bins ~ex_per_block examples per row and
-    inflates the effective batch ~ex_per_block-fold (undertraining). The SDPA/GDN packing paths
-    already do this; pin that the bfd path does too, AFTER the packing-finalization block."""
-    import inspect
-
-    from flash.engine.worker import sft
-
-    src = inspect.getsource(sft.run_sft)
-    # the shared packed-path re-derivation uses the bfd ex/block estimate after backend selection.
-    assert "_bfd_preview = pack_dataset(" in src
-    assert 'strategy="bfd"' in src
-    assert 'f"[sft] {_packing_kind} packing:' in src
-    assert "if _packed_examples_per_block is not None:" in src
-    assert "per_device_bs * _packed_examples_per_block" in src
-    assert 'cfg_kwargs["gradient_accumulation_steps"] = grad_accum' in src
-
-
-def test_trl_collator_masks_prompt_from_pretokenized_rows():
-    """The UNPACKED / TRL-bfd path (not covered by BlockDiagonalCollator tests): feed TRL's real
-    DataCollatorForLanguageModeling pre-tokenized {input_ids, completion_mask} rows with
-    completion_only_loss=True and assert it masks exactly the prompt tokens (labels -100) and keeps
-    the completion — the same representation run_sft now builds."""
-    pytest.importorskip("torch")
-    pytest.importorskip("trl")
-    from trl.trainer.sft_trainer import DataCollatorForLanguageModeling
-
-    col = DataCollatorForLanguageModeling(pad_token_id=0, completion_only_loss=True)
-    rows = [
-        {"input_ids": [10, 11, 12, 13, 14], "completion_mask": [0, 0, 0, 1, 1]},  # 3-tok prompt
-        {"input_ids": [20, 21, 22], "completion_mask": [0, 1, 1]},  # 2-tok prompt
-    ]
-    out = col(rows)
-    labels = out["labels"]
-    # row 0: first three (prompt) masked, last two kept
-    assert labels[0, :3].tolist() == [-100, -100, -100]
-    assert labels[0, 3:5].tolist() == [13, 14]
-    # row 1: first token (prompt) masked, last two kept; trailing pad masked
-    assert labels[1, 0].item() == -100
-    assert labels[1, 1:3].tolist() == [21, 22]
-    # every completion token is trained, every prompt/pad token is ignored
-    keep = labels != -100
-    assert keep.sum().item() == 4  # 2 + 2 completion tokens across the batch
+    train_src = inspect.getsource(sft_train) + inspect.getsource(sft_config)
+    # revision-aware vocab resolution: the worker must size the realized batch through the SAME
+    # resolver the cost quote priced with, else a revision-pinned run drifts from its quote.
+    assert "resolve_vocab_size(" in train_src
+    assert "vocab_size_for(model_id)" not in train_src
+    # per-device micro-batch / grad-accum sizing for the large-vocab logits cap.
+    assert "sft_grad_accum(" in train_src
+    # gradient checkpointing, with the MoE/GDN reentrant rule shared with grpo.
+    assert "grad_checkpointing_on(" in train_src
+    assert "grpo_use_reentrant(" in train_src
+    # LoRA+ survives (verl builds the optimizer itself, but flash still supplies the grouping).
+    assert "create_loraplus_optimizer" in train_src
 
 
 def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
@@ -671,7 +601,7 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
 
     import huggingface_hub
 
-    from flash.providers.runpod.train import endpoints
+    from flash.providers.runpod.serverless import endpoints
 
     code_prefix = "code/0123456789abcdef0123456789abcdef/flash"
     list_calls = []
@@ -780,7 +710,7 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
 def test_train_body_rejects_unsafe_code_prefix(monkeypatch):
     import huggingface_hub
 
-    from flash.providers.runpod.train import endpoints
+    from flash.providers.runpod.serverless import endpoints
 
     monkeypatch.setattr(
         huggingface_hub,
@@ -803,8 +733,8 @@ def test_train_body_rejects_unsafe_code_prefix(monkeypatch):
 
 def test_live_console_uploads_are_throttled_for_shared_artifact_repos():
     import flash.engine.worker as worker
-    from flash.providers import _instance_bootstrap
-    from flash.providers.runpod.train import endpoints
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+    from flash.providers.runpod.serverless import endpoints
 
     assert endpoints._CONSOLE_UPLOAD_INTERVAL_S == 3600.0
     assert _instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S == 3600.0
@@ -812,3 +742,60 @@ def test_live_console_uploads_are_throttled_for_shared_artifact_repos():
         3600.0 / worker._HB_MIN_INTERVAL_S + 3600.0 / endpoints._CONSOLE_UPLOAD_INTERVAL_S
     )
     assert steady_state_commits_per_hour <= 5.0
+
+
+def test_worker_image_override_carries_its_registry_credential(monkeypatch):
+    # a private override image needs its provider-side pull credential; that cannot be derived
+    # from the image ref, so it rides alongside it.
+    from flash.providers._lifecycle import worker as _worker
+
+    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/private-worker:cu13")
+    monkeypatch.setenv("FLASH_WORKER_IMAGE_REGISTRY_AUTH", "auth-123")
+    o = _worker.worker_image_override()
+    assert o.image == "ghcr.io/example/private-worker:cu13"
+    assert o.registry_auth_id == "auth-123"
+    assert _worker.worker_image_for_gpu("H200") == o.image
+
+
+def test_worker_image_override_absent_is_none(monkeypatch):
+    from flash.providers._lifecycle import worker as _worker
+
+    monkeypatch.delenv("FLASH_WORKER_IMAGE", raising=False)
+    assert _worker.worker_image_override() is None
+
+
+def test_min_cuda_for_uses_the_gpu_class_floor(monkeypatch):
+    # the CUDA floor is a property of the GPU class, not of an operator-supplied image tag
+    from flash.providers.runpod.serverless.endpoints import min_cuda_for
+
+    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/w:cu13")
+    assert min_cuda_for("B200") == "13.0"  # blackwell needs cu13 drivers
+    assert min_cuda_for("H200") == "12.8"
+
+
+def test_apply_disk_raises_to_the_requested_floor(monkeypatch):
+    from types import SimpleNamespace
+
+    from flash.providers.runpod.jobs import apply_disk_gb, apply_image_override_constraints
+
+    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/w:big")
+    monkeypatch.setenv("FLASH_WORKER_IMAGE_REGISTRY_AUTH", "auth-xyz")
+    tpl = SimpleNamespace(containerDiskInGb=64, containerRegistryAuthId=None)
+    cfg = SimpleNamespace(template=tpl)
+    apply_disk_gb(cfg, 80)
+    assert tpl.containerDiskInGb == 80  # raise-only: the request wins over the smaller default
+    apply_disk_gb(cfg, 32)
+    assert tpl.containerDiskInGb == 80  # never lowers an already-larger disk
+    apply_image_override_constraints(cfg)
+    assert tpl.containerRegistryAuthId == "auth-xyz"
+
+
+def test_snapshot_weight_validation(tmp_path):
+    from flash.engine.worker.io.hf import _snapshot_has_weights
+
+    d = tmp_path / "snap"
+    d.mkdir()
+    (d / "config.json").write_text("{}")
+    assert not _snapshot_has_weights(str(d))  # configs only = stale partial snapshot
+    (d / "model.safetensors-00001-of-00001.safetensors").write_text("x")
+    assert _snapshot_has_weights(str(d))

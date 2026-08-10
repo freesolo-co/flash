@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
 
 @dataclass(frozen=True)
@@ -141,7 +142,7 @@ KNOWN = tuple(GPU_INFO)
 VALIDATED = tuple(g.name for g in GPU_CLASSES if g.validated)
 
 # fp8 KV cache is an Ada/Hopper/Blackwell feature; the training workers enable it exactly when the
-# device compute capability is >= (8, 9) (see engine/worker/opd_vllm.py, grpo.py, rl.py). Sizing has
+# device compute capability is >= (8, 9) (see engine/worker/rl_train.py and opd_train.py). Sizing has
 # no live device, so it infers fp8 support from a candidate class's ``sm`` string.
 _FP8_KV_MIN_CAPABILITY = (8, 9)
 
@@ -156,11 +157,6 @@ def _sm_capability(sm: str) -> tuple[int, int]:
         return (0, 0)
     n = int(digits)
     return (n // 10, n % 10)
-
-
-def supports_fp8_kv(gpu_name: str) -> bool:
-    """Whether this GPU class's compute capability supports an fp8 KV cache (cc >= 8.9)."""
-    return _sm_capability(get_gpu_info(gpu_name).sm) >= _FP8_KV_MIN_CAPABILITY
 
 
 def max_non_fp8_kv_vram_gb() -> int:
@@ -231,23 +227,19 @@ class UnsupportedGpuError(ValueError):
 
 
 class CapacityLookupError(RuntimeError):
-    """A provider's LIVE capacity/offer lookup failed transiently (network / API blip / rate limit) —
-    distinct from ``UnsupportedGpuError`` ("no GPU class fits this job"). A per-provider failure degrades
-    to the other providers; only when it was the SOLE reason NO candidate was found does ``allocate``
-    re-raise it. Because it is NOT an ``UnsupportedGpuError``, the runner treats it as infra-retryable
-    (poll_error) rather than terminal — so a run whose only fitting capacity a transient outage hid is
-    retried on its infra budget instead of being killed."""
+    """A transient live-capacity lookup failure, distinct from no fitting GPU.
+
+    Allocation can degrade to other providers, but re-raises when an outage alone hid all fitting
+    capacity so the runner uses its infrastructure retry budget.
+    """
 
 
 class UnreconciledCreateError(RuntimeError):
-    """A non-idempotent provider create (e.g. Vast's ``PUT /asks``) failed AMBIGUOUSLY and could NOT be
-    reconciled: the possibly-created resource is not visible yet (object-store / API eventual
-    consistency), so we cannot adopt it and we cannot prove it does not exist. Retrying the run would
-    rent a SECOND instance while a phantom from this attempt may still materialize and bill under the
-    still-active run (where ``sweep_orphans`` shields it). The orchestrator must therefore FAIL THE RUN
-    TERMINALLY rather than consume a retry — the run's teardown plus a later sweep (the run is now
-    inactive, so no longer shielded) reclaim any late-materializing instance, preserving the
-    cost-safety invariant that a rented box is always destroyed."""
+    """An ambiguous non-idempotent create could not be reconciled.
+
+    Retrying could double-provision while the first resource materializes later. Fail terminally so
+    teardown and the later unshielded orphan sweep can reclaim it.
+    """
 
 
 def canonical_gpu(name: str) -> str:
@@ -285,11 +277,10 @@ _VRAM_MATCH_TOLERANCE_GB = 3.5
 
 
 def vast_gpu_for_offer(gpu_name: str, gpu_ram_mb: float) -> str | None:
-    """Map a Vast offer (``gpu_name`` + ``gpu_ram`` MB) to a canonical managed GPU class.
+    """Map a Vast name and reported VRAM to a managed GPU class.
 
-    Returns None for anything not in the managed table — the hard Ampere+ floor (T4 / 2080 Ti /
-    Quadro RTX offers never match). Names shared across VRAM variants ("A100 SXM4" = 40/80 GB) resolve
-    to the LARGEST class the board's actual RAM covers.
+    Unmanaged and pre-Ampere offers return None. Shared names resolve to the largest class whose
+    nominal VRAM the board covers.
     """
     fitting = [
         g
@@ -325,17 +316,134 @@ def min_cuda_modern(name: str) -> str:
     return get_gpu_info(name).min_cuda_modern or "12.8"
 
 
-def cheapest_gpu(min_vram_gb: int) -> str:
-    """Cheapest validated RunPod GPU class with at least ``min_vram_gb`` VRAM."""
+def run_config_for_ranking(
+    model_id: str,
+    algorithm: str,
+    *,
+    train=None,
+    thinking: bool = False,
+    model_revision: str = "",
+):
+    """Build the one-step RunConfig shared by every hardware-ranking path.
+
+    Ranking is per step, so run length is irrelevant. Import lazily because the cost model imports
+    this module.
+    """
+    from flash.cost.types import RunConfig
+
+    def knob(key):
+        """A positive whole number from the spec, or None to take the recipe default.
+
+        Bools are rejected before the numeric coercion because ``bool`` is an ``int`` subclass, so
+        a stray ``True`` would otherwise read as the number 1.
+        """
+        if train is None:
+            return None
+        value = train.get(key) if isinstance(train, dict) else getattr(train, key, None)
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(number) or number < 1:
+            return None
+        return int(number)
+
+    return RunConfig(
+        model_id=model_id,
+        method=algorithm,
+        steps=1,
+        seq_len=knob("max_context_tokens"),
+        completion_len=knob("max_completion_tokens"),
+        batch_size=knob("batch_size"),
+        group_size=knob("group_size"),
+        lora_rank=knob("lora_rank"),
+        thinking=thinking,
+        model_revision=model_revision,
+    )
+
+
+def _run_cost_key(
+    model_id: str,
+    algorithm: str,
+    *,
+    train=None,
+    thinking: bool = False,
+    model_revision: str = "",
+):
+    """``(gpu, hourly_rate) -> dollars per step`` for this run, or None if it can't be priced."""
+    try:
+        from flash.cost.analytical import step_cost_key
+
+        return step_cost_key(
+            run_config_for_ranking(
+                model_id,
+                algorithm,
+                train=train,
+                thinking=thinking,
+                model_revision=model_revision,
+            )
+        )
+    except Exception:  # unpriceable run -- rank on $/hr, never fail selection
+        return None
+
+
+# FSDP shards parameters/optimizer across cards but replicates activations and adds collective
+# buffers; a combination only counts as fitting when the combined VRAM clears the need with this
+# margin. conservative on purpose: a too-optimistic shard model OOMs a paid run.
+SHARD_VRAM_EFFICIENCY = 0.85
+# activations/buffers replicate PER CARD regardless of sharding; every card in a combination must
+# individually hold this floor on top of its parameter shard, so tiny cards cannot fake a fit by
+# count alone (e.g. 4 x 12 GB is not 40 GB of usable capacity for a 24 GB-activation job).
+REPLICATED_PER_CARD_GB = 8
+# the public gpu.count maximum is 8, and every managed model's attention-head count is divisible by
+# 8. keep the allocator aligned with that contract so a live 8-card provider SKU is reachable rather
+# than silently clamping the authored ceiling to 4.
+MAX_COMBINATION_CARDS = 8
+
+
+def combined_vram_gb(vram_gb: int, gpu_count: int) -> float:
+    """Return run-usable VRAM for a multi-card shape.
+
+    All fit gates share this model. Return 0.0 when any card cannot hold the replicated floor; card
+    count cannot compensate for that requirement.
+    """
+    if gpu_count <= 1:
+        return float(vram_gb)
+    if vram_gb <= REPLICATED_PER_CARD_GB:
+        return 0.0
+    return gpu_count * (vram_gb - REPLICATED_PER_CARD_GB) * SHARD_VRAM_EFFICIENCY + (
+        REPLICATED_PER_CARD_GB
+    )
+
+
+def cheapest_gpu(min_vram_gb: int, *, gpu_count: int = 1, cost_key=None) -> str:
+    """Return the cheapest fitting validated GPU class for the card ceiling.
+
+    Size against the rentable multi-card shape so ``--gpus`` is not rejected as single-card. A
+    ``cost_key`` ranks job cost; without one, rank hourly rate.
+    """
+    # the allocator never proposes a wider combination, so sizing against one would admit a spec
+    # here only for submit to reject it -- the same defect this parameter exists to fix, inverted.
+    # size against the largest count providers actually RENT (powers of two): a ceiling of 3 buys
+    # 2 cards at submit, so sizing on 3 would admit a shape that never gets provisioned.
+    cards = largest_rentable_count(gpu_count)
     pool = [
-        g for g in GPU_INFO.values() if g.enum_member and g.vram_gb >= min_vram_gb and g.validated
+        g
+        for g in GPU_INFO.values()
+        if g.enum_member and g.validated and combined_vram_gb(g.vram_gb, cards) >= min_vram_gb
     ]
     if not pool:
-        raise UnsupportedGpuError(
-            f"no validated RunPod-provisionable GPU class has >= {min_vram_gb} GB VRAM"
-        )
+        shape = f" even as a {cards}-card combination" if cards > 1 else ""
+        raise UnsupportedGpuError(f"no validated GPU class has >= {min_vram_gb} GB VRAM{shape}")
     from flash.providers.runpod.pricing import hourly_rate
 
+    if cost_key is not None:
+        return min(
+            pool,
+            key=lambda g: (cost_key(g.name, hourly_rate(g.name)), hourly_rate(g.name), g.vram_gb),
+        ).name
     return min(pool, key=lambda g: (hourly_rate(g.name), g.vram_gb)).name
 
 
@@ -346,9 +454,14 @@ def provisional_gpu(
     train=None,
     thinking: bool = False,
     model_revision: str = "",
+    gpu_count: int = 1,
 ) -> str:
-    """Cheapest validated GPU for this model: parse-time provisional used by the schema for sizing/display."""
-    from flash.engine.vram import model_required_vram_gb
+    """Cheapest validated GPU for this model: parse-time provisional used by the schema for sizing/display.
+
+    ``gpu_count`` is the run's card ceiling, so a run allowed to shard is sized against the shape it
+    will actually be allocated. The returned class name is per-card either way.
+    """
+    from flash.engine.plan.vram import model_required_vram_gb
     from flash.providers.allocator import vram_headroom
 
     min_vram = model_required_vram_gb(
@@ -360,19 +473,38 @@ def provisional_gpu(
         model_revision=model_revision,
     )
     try:
-        return cheapest_gpu(min_vram)
+        # same job-cost basis the submit-time allocator ranks on, so the class previewed here is
+        # the class that actually gets provisioned; falls back to $/hr for an unpriceable run.
+        return cheapest_gpu(
+            min_vram,
+            gpu_count=gpu_count,
+            cost_key=_run_cost_key(
+                model_id, algorithm, train=train, thinking=thinking, model_revision=model_revision
+            ),
+        )
     except UnsupportedGpuError as exc:
         if (algorithm or "").lower() == "opd":
+            cards = largest_rentable_count(gpu_count)
             biggest = max(
-                (g.vram_gb for g in GPU_CLASSES if g.enum_member and g.validated), default=0
+                (
+                    combined_vram_gb(g.vram_gb, cards)
+                    for g in GPU_CLASSES
+                    if g.enum_member and g.validated
+                ),
+                default=0,
             )
             # OPD is resident-only: the HF/PEFT trainer AND the colocated vLLM student rollout engine
             # both stay resident, so the card must hold two model-weight copies plus the rollout KV
             # cache (which scales with batch_size x group_size) at the loss backward peak. Point the
             # user at the knobs that shrink it instead of the opaque "no GPU that big" message.
+            shape = (
+                f"any {cards}-card validated GPU combination"
+                if cards > 1
+                else ("any single validated GPU")
+            )
             raise UnsupportedGpuError(
-                f"opd needs >= {min_vram} GB VRAM, more than any single validated GPU "
-                f"({biggest} GB max). opd is resident-only: the trainer and the colocated vLLM student "
+                f"opd needs >= {min_vram} GB VRAM, more than {shape} "
+                f"({biggest:g} GB max). opd is resident-only: the trainer and the colocated vLLM student "
                 f"rollout engine hold two model-weight copies plus the rollout KV cache at once. "
                 f"Lower [train].group_size and/or [train].batch_size (rollout concurrency = "
                 f"batch_size x group_size; distillation needs no group variance, so group_size=1 is "
@@ -409,12 +541,45 @@ class PollResult:
     detail: str | None = None
 
 
+def rentable_gpu_counts(max_gpu_count: int) -> tuple[int, ...]:
+    """Return rentable card counts, largest first, up to ``max_gpu_count``.
+
+    Use powers of two: providers sell those shapes, and verl requires ``num_attention_heads %
+    sp_size == 0``. Catalog head counts are all divisible by 1, 2, 4, and 8.
+    """
+    cap = max(1, int(max_gpu_count))
+    counts, count = [], 1
+    while count <= cap:
+        counts.append(count)
+        count *= 2
+    return tuple(reversed(counts))
+
+
+def largest_rentable_count(max_gpu_count: int) -> int:
+    """Return the widest shape the card ceiling can actually rent.
+
+    Only powers of two up to ``MAX_COMBINATION_CARDS`` are offered, so a ceiling of 3 buys 2 cards.
+    """
+    return rentable_gpu_counts(min(max(1, int(max_gpu_count)), MAX_COMBINATION_CARDS))[0]
+
+
 @dataclass(frozen=True)
 class Candidate:
     provider: str
     gpu: str
     hourly_usd: float
     vram_gb: int
+    # cards in this candidate combination; hourly_usd and vram_gb stay PER-CARD so existing
+    # single-gpu consumers are unchanged. total cost = gpu_count * hourly_usd.
+    gpu_count: int = 1
+
+    @property
+    def total_hourly_usd(self) -> float:
+        return self.gpu_count * self.hourly_usd
+
+    @property
+    def total_vram_gb(self) -> int:
+        return self.gpu_count * self.vram_gb
 
 
 @dataclass(frozen=True)
@@ -424,17 +589,28 @@ class Allocation:
     hourly_usd: float
     min_vram_gb: int
     candidates: tuple[Candidate, ...]  # full ranked list; retry walks this
+    # cards in the chosen combination (1 = classic single-gpu allocation; hourly_usd is per-card)
+    gpu_count: int = 1
 
 
 @dataclass(frozen=True)
 class AllocationConstraints:
     """Run-scoped extras a capacity/market-aware provider's ``live_candidates`` needs (Vast prices
     against the run's disk/duration floors) — carried here so they don't leak into ``allocate``'s
-    signature per-provider. RunPod/Lambda ignore them."""
+    signature per-provider. A provider ignores the fields it has no use for."""
 
     disk_gb: float = 0.0
     max_wall_seconds: float = 0.0
     gpu_type: str = ""
+    # Whole-run fit floor before the allocator reduces it to a per-card market query. Capacity-aware
+    # providers use this to distinguish a missing rentable shape from a sold-out one.
+    required_vram_gb: int = 0
+    # Ceiling on cards per machine the caller can use (1 = single-card only). Each provider reports
+    # the counts it can ACTUALLY rent on one box, which differ in kind: RunPod takes a count
+    # parameter, Lambda names the count in the instance type, Vast has it baked into the offer. The
+    # allocator owns the fit/cost policy and never assumes a count is rentable just because the
+    # single-card class exists.
+    max_gpu_count: int = 1
 
 
 @runtime_checkable
@@ -517,27 +693,18 @@ class Provider(Protocol):
     # (RunPod). The runner gates its one-shot cache-less retry fallback on it; every other provider
     # defaults False.
 
-    # NOTE: ``run_instances_remaining(run_id) -> list[int]`` is an OPTIONAL capability, intentionally
-    # NOT declared on this ``@runtime_checkable`` Protocol — adding it would make it a REQUIRED member
-    # for ``isinstance(prov, Provider)``, which RunPod (serverless, self-reaping — nothing to enumerate)
-    # and Lambda do not implement. Instance providers that CAN enumerate billable resources by run
-    # label (Vast) implement it so the handle-less recovery resubmit can require a CONFIRMED reap before
-    # launching a second worker (a best-effort ``gc`` returns no error on an unconfirmed teardown).
-    # Callers detect it via ``getattr(prov, "run_instances_remaining", None)`` (see server/_runtime.py).
-    # Contract: ``[]`` == CONFIRMED no resource for the run remains; non-empty == a possibly-live one
-    # survives; RAISES on an incomplete enumeration so a caller can't mistake "couldn't list" for "clear".
+    # ``run_instances_remaining(run_id)`` is optional and must stay off this runtime-checkable
+    # protocol. callers use getattr in server/_runtime.py. ``[]`` confirms clear; non-empty means a
+    # survivor. incomplete enumeration raises so recovery cannot mistake lookup failure for clear.
 
     def sweep_orphans(
         self,
         active_labels: set[str] | Callable[[], set[str]] | None = None,
         known_labels: set[str] | Callable[[], set[str]] | None = None,
     ) -> list[int | str]:
-        """Destroy billable resources this provider owns that no live run claims.
+        """Destroy provider resources unclaimed by live runs.
 
-        ``active_labels``: raw run ids of live runs (may be a callable resolved after listing, to
-        close the launch race). ``known_labels``: universe of run ids this plane may own — reap only
-        resources in this set and not in active_labels (multi-plane safety: two planes sharing one
-        account only reap their own orphans). ``None`` = unscoped single-plane behavior (correct for
-        single-plane prod). Returns destroyed resource ids.
+        Resolve callable ``active_labels`` after listing to close the launch race. ``known_labels``
+        limits cleanup to this plane in shared accounts; None keeps single-plane behavior.
         """
         ...

@@ -9,7 +9,7 @@ GC/reuse, so the fix is a per-run unique endpoint name.
 
 from __future__ import annotations
 
-from flash.providers.runpod.train import _run_suffix, endpoint_name
+from flash.providers.runpod.serverless import _run_suffix, endpoint_name
 
 
 def test_endpoint_name_default():

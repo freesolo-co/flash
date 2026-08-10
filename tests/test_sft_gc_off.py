@@ -9,28 +9,26 @@ GC on for the 80 GB H100 / long context / unknown dims, and never touches the co
 
 from __future__ import annotations
 
-from flash.engine.vram import sft_gc_off_peak_gb, sft_grad_checkpoint_can_disable
+from flash.engine.plan.vram import sft_gc_off_peak_gb, sft_grad_checkpoint_can_disable
 from flash.engine.worker.perf.memory import grad_checkpointing_on
 
 # Qwen3.6-35B-A3B real architecture dims (from its config.json text_config).
 _MOE = {"active_params_b": 3.0, "hidden": 2048, "num_layers": 40, "batch": 4, "lora_rank": 16}
 
 
-def test_open_model_active_params_resolution_is_null_safe():
+def test_active_params_resolution_is_null_safe():
     # The GC-off gate reads active_params_b from the catalog to size the MoE backbone. It must use
-    # MODELS.get (None for an uncataloged id), NOT get_model (which RAISES), so an open-model SFT run
-    # (model_policy="allow") doesn't abort here. Regression for the Cursor "Open-model SFT crashes on
-    # get_model" finding.
+    # MODELS.get (None for an unknown id), NOT get_model (which RAISES): the gate runs on the
+    # allocation path, where a stale id should degrade to the dense default rather than abort.
     import pytest
 
-    from flash.catalog import MODELS, get_model
+    from flash.core.catalog import MODELS, get_model
 
-    open_id = "some/uncataloged-open-model"
+    unknown_id = "some/unknown-model"
     with pytest.raises(ValueError, match="unsupported model"):
-        get_model(open_id)  # the raising path the gate must NOT take
-    # the gate's actual (null-safe) pattern -> dense default, since an open model's MoE active count
-    # is unknown
-    assert (float(getattr(MODELS.get(open_id), "active_params_b", 0.0) or 0.0) or None) is None
+        get_model(unknown_id)  # the raising path the gate must NOT take
+    # the gate's actual (null-safe) pattern -> dense default
+    assert (float(getattr(MODELS.get(unknown_id), "active_params_b", 0.0) or 0.0) or None) is None
     # a cataloged MoE still resolves its active count through the same expression
     assert (
         float(getattr(MODELS.get("Qwen/Qwen3.6-35B-A3B"), "active_params_b", 0.0) or 0.0) or None
@@ -38,14 +36,16 @@ def test_open_model_active_params_resolution_is_null_safe():
 
 
 def test_gc_off_gate_is_lora_rank_aware():
-    # Codex P2 (Mrx13): the GC-off gate must size on the run's REAL LoRA rank, not the default 32.
-    # A higher rank grows the LoRA optimizer/adapter memory, so on a borderline card a high-rank run
-    # that the default-rank estimate would have disabled GC for (then OOM'd) must KEEP GC on.
+    # the GC-off gate must size on the run's REAL LoRA rank, not the default 32. A higher rank grows
+    # the LoRA optimizer/adapter memory, so on a borderline card a high-rank run that the
+    # default-rank estimate would have disabled GC for (then OOM'd) must KEEP GC on.
     p32 = sft_gc_off_peak_gb(35.0, seq_len=2368, **{**_MOE, "lora_rank": 32})
     p512 = sft_gc_off_peak_gb(35.0, seq_len=2368, **{**_MOE, "lora_rank": 512})
     assert p512 > p32  # the peak grows with rank
-    # end-to-end through grad_checkpointing_on: at a 125 GB card the default rank disables GC (returns
+    # end-to-end through grad_checkpointing_on: at a 180 GB card the default rank disables GC (returns
     # False) but rank 512 keeps it on (returns True) -> the configured rank changes the decision.
+    # the card moved up from 125 GB with the routed experts: below ~170 GB the GC-off peak no longer
+    # fits at ANY rank, so both ranks would keep GC on and the rank contrast would vanish.
     kw = {
         "model_id": "Qwen/Qwen3.6-35B-A3B",
         "max_length": 2368,
@@ -57,8 +57,8 @@ def test_gc_off_gate_is_lora_rank_aware():
         "per_device_bs": 4,
         "capability": (9, 0),
     }
-    assert grad_checkpointing_on(card_vram_gb=125.0, lora_rank=32, **kw) is False  # GC off (fits)
-    assert grad_checkpointing_on(card_vram_gb=125.0, lora_rank=512, **kw) is True  # GC kept on
+    assert grad_checkpointing_on(card_vram_gb=180.0, lora_rank=32, **kw) is False  # GC off (fits)
+    assert grad_checkpointing_on(card_vram_gb=180.0, lora_rank=512, **kw) is True  # GC kept on
 
 
 def test_gc_off_peak_scales_linearly_with_seq():
@@ -68,6 +68,53 @@ def test_gc_off_peak_scales_linearly_with_seq():
     assert p8k > p2k
     # weights term alone (~70 GB) dominates the floor.
     assert p2k > 70.0
+
+
+def test_dense_activation_constant_matches_the_live_rtx5090_peak():
+    """The dense K is a live measurement, not the MoE's safety pad.
+
+    Measured on an RTX 5090 (31.37 GB usable), Qwen3.5-0.8B (hidden 1024, 24 layers), LoRA rank 32
+    all-linear, bs 4, bf16, chunked dense-logit-free CE matching ``model.use_fused_kernels=true``:
+    seq 1024 -> 15.09 GB, seq 2048 -> 28.18 GB, seq 4096 -> OOM. The shared 18.0 predicted 9.89 GB at
+    seq 1024 and 20.76 GB at seq 4096 -- it called a run that OOMs a FIT, which is the failure this
+    pins. A safety gate must over-reserve, so the estimate has to sit ABOVE each live peak.
+    """
+    dense = {"active_params_b": None, "hidden": 1024, "num_layers": 24, "batch": 4, "lora_rank": 32}
+    for seq, live_peak in ((1024, 15.09), (2048, 28.18)):
+        est = sft_gc_off_peak_gb(0.8, seq_len=seq, **dense)
+        assert est > live_peak, f"seq {seq}: estimate {est:.2f} under-reserves vs live {live_peak}"
+        # ...but not so far above that the gate becomes useless -- 2x the live peak is the ceiling.
+        assert est < 2.0 * live_peak, f"seq {seq}: estimate {est:.2f} wildly over-reserves"
+    # seq 4096 OOMed a 31.37 GB card, so the estimate must exceed the card and keep GC ON.
+    assert sft_gc_off_peak_gb(0.8, seq_len=4096, **dense) > 31.37
+    assert sft_grad_checkpoint_can_disable(0.8, seq_len=4096, card_vram_gb=31.37, **dense) is False
+    # the 18 GB margin is what blocks the seq lengths that DO fit bare (15.09 GB at seq 1024 leaves
+    # only 16.28 GB), so a 32 GB card never disables GC for this model at any production context.
+    for seq in (1024, 2048):
+        assert (
+            sft_grad_checkpoint_can_disable(0.8, seq_len=seq, card_vram_gb=31.37, **dense) is False
+        )
+
+
+def test_dense_and_moe_activation_constants_are_separate():
+    """One constant cannot describe both geometries.
+
+    K is the per-layer activation cost relative to hidden, and a dense FFN intermediate (4 x 2048)
+    stores far more of it than the MoE's active 8 x 512. Sharing the dense 65.0 would flip the
+    35B-A3B -- the only model whose truthy ``active_params_b`` reaches this gate -- from GC-off to
+    GC-on at seq >= 2048 and pay ~+33% compute per step on evidence from a different architecture.
+    """
+    from flash.engine.plan.vram import _GC_OFF_ACT_K_DENSE, _GC_OFF_ACT_K_MOE
+
+    assert _GC_OFF_ACT_K_DENSE > _GC_OFF_ACT_K_MOE
+    # same geometry, same params: only the MoE signal differs -> the dense estimate must be larger.
+    geom = {"hidden": 2048, "num_layers": 40, "batch": 4, "lora_rank": 16, "seq_len": 2368}
+    as_moe = sft_gc_off_peak_gb(35.0, active_params_b=3.0, **geom)
+    as_dense = sft_gc_off_peak_gb(35.0, active_params_b=None, **geom)
+    assert as_dense > as_moe
+    # the MoE decision on its real card is UNCHANGED by introducing the dense constant.
+    assert sft_grad_checkpoint_can_disable(35.0, seq_len=2368, card_vram_gb=141.0, **_MOE) is True
+    assert sft_grad_checkpoint_can_disable(35.0, seq_len=8192, card_vram_gb=141.0, **_MOE) is False
 
 
 def test_gc_off_unknown_dims_is_inf():
@@ -97,8 +144,29 @@ def test_can_disable_conservative_on_unknown_card_or_dims():
     assert sft_grad_checkpoint_can_disable(35.0, seq_len=2368, card_vram_gb=141.0, **bad) is False
 
 
-def test_gate_turns_gc_off_for_35b_on_h200():
+def test_gate_turns_gc_off_for_35b_on_b200():
+    # training the routed experts grew the adapter/optimizer term, so the GC-off peak no longer fits
+    # the 141 GB H200 -- the speed win now starts at the 180 GB B200. the 141 GB case is covered by
+    # test_gate_keeps_gc_on_for_35b_on_h200 below.
     off = grad_checkpointing_on(
+        "Qwen/Qwen3.6-35B-A3B",
+        2368,
+        allow_disable=True,
+        card_vram_gb=180.0,
+        capability=(9, 0),
+        active_params_b=3.0,
+        hidden=2048,
+        num_layers=40,
+        fused_ce=True,
+        per_device_bs=4,
+    )
+    assert off is False  # GC OFF (the speed win)
+
+
+def test_gate_keeps_gc_on_for_35b_on_h200():
+    # the 141 GB H200 can no longer hold the GC-off peak once the experts are trained, so the gate
+    # must keep gradient checkpointing ON there rather than disabling it into an OOM.
+    on = grad_checkpointing_on(
         "Qwen/Qwen3.6-35B-A3B",
         2368,
         allow_disable=True,
@@ -110,7 +178,7 @@ def test_gate_turns_gc_off_for_35b_on_h200():
         fused_ce=True,
         per_device_bs=4,
     )
-    assert off is False  # GC OFF (the speed win)
+    assert on is True
 
 
 def test_gate_keeps_gc_on_h100_80gb():
@@ -169,7 +237,7 @@ def test_grpo_use_reentrant_true_for_moe():
 
 def test_grpo_use_reentrant_true_for_gdn_hybrid():
     # Dense Qwen3.5/3.6 GatedDeltaNet hybrids ALSO need reentrant GC under GRPO: FA2 varlen-unpad +
-    # the fused GDN chunk-scan + chalk's fused kernels save data-dependent tensors the non-reentrant
+    # the fused GDN chunk-scan + the fused Triton kernels save data-dependent tensors the non-reentrant
     # metadata-equality assert can't reconcile (forward packed [1636,..] vs recompute padded [1024,..]),
     # crashing at step 0 exactly like MoE. Live-confirmed on Qwen3.5-0.8B GRPO / RTX 4090.
     from flash.engine.worker.perf.memory import grpo_use_reentrant
@@ -191,11 +259,11 @@ def test_grpo_use_reentrant_false_for_non_gdn_dense():
 
     assert grpo_use_reentrant("meta-llama/Llama-3.2-1B") is False
     # an uncataloged open non-qwen model is treated as non-gdn dense (null-safe, no crash).
-    assert grpo_use_reentrant("some/uncataloged-open-model") is False
+    assert grpo_use_reentrant("some/non-qwen-dense-model") is False
 
 
 def test_is_moe_property():
-    from flash.catalog import MODELS
+    from flash.core.catalog import MODELS
 
     assert MODELS["Qwen/Qwen3.6-35B-A3B"].is_moe is True
     # every dense entry: active_params_b defaults to 0.0

@@ -71,6 +71,19 @@ def stub():
             if self.path == "/v1/runs/json-chat/chat":
                 self._send(200, {"choices": [{"message": {"content": "json reply"}}]})
                 return
+            if self.path == "/v1/runs" and seen["body"].get("spec", {}).get("model") == "pending":
+                self._send(
+                    409,
+                    {
+                        "detail": {
+                            "code": "workload_profile_pending",
+                            "profile_run_id": "profile-sft-abc",
+                            "state": "queued",
+                            "owned": False,
+                        }
+                    },
+                )
+                return
             if (
                 self.path in {"/v1/runs/r1/chat", "/v1/runs/run-a/chat"}
                 and seen["body"].get("stream") is True
@@ -193,7 +206,7 @@ def test_spec_payload_filters_normalized_train_values_by_authored_keys() -> None
         "max_examples": 1,
         "temperature": 0.0,
         "stop_sequences": (),
-        "teacher_model": "accounts/fireworks/models/glm-5p2",
+        "teacher_model": "glm-5.2",
         "structured_outputs": "",
     }
     assert "lora_rank" not in sparse["train"]
@@ -231,6 +244,36 @@ def test_api_error_carries_server_detail(stub):
         client.get_run("missing")
     assert excinfo.value.status == 404
     assert "unknown run_id: missing" in str(excinfo.value)
+
+
+def test_api_error_preserves_a_structured_detail_over_the_wire(stub):
+    """The pending payload has to arrive as a dict, not as the repr of one.
+
+    Every caller-visible behaviour on a profile miss -- naming the run, quoting its separate
+    charge, deciding whether to tell the user to poll it -- is a branch on a key of this dict. If
+    the transport flattened it to a string the code lookup would return "" and the miss would
+    surface as a bare 409 traceback, which is the same failure whether the server is right or not.
+    """
+    url, _ = stub
+    client = ApiClient(url, "fslo-user-test")
+
+    with pytest.raises(ApiError) as excinfo:
+        client.create_run({"model": "pending", "project": _PROJECT_ID})
+
+    exc = excinfo.value
+    assert exc.status == 409
+    assert exc.detail == {
+        "code": "workload_profile_pending",
+        "profile_run_id": "profile-sft-abc",
+        "state": "queued",
+        "owned": False,
+    }
+    # `code` reads through to the dict, and False survives as False rather than as the string
+    # "False" -- which is truthy, and would flip the ownership branch to the wrong wording.
+    assert exc.code == "workload_profile_pending"
+    assert exc.detail["owned"] is False
+    # the message still stringifies for callers that only print it.
+    assert "workload_profile_pending" in str(exc)
 
 
 def test_api_error_mentions_env_override(stub):
@@ -359,7 +402,7 @@ def test_chat_checkpoint_shorthand_rejects_older_server(stub):
 def test_chat_checkpoint_capability_is_probed_once_per_client(stub):
     # the capability is a property of the control plane, not of the request. `env eval` sends one
     # chat per case, so re-probing each time doubled the request count and let a single transient
-    # /v1/health blip fail an arbitrary case while the chat endpoint was healthy (codex[bot]).
+    # /v1/health blip fail an arbitrary case while the chat endpoint was healthy.
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
 
@@ -374,9 +417,9 @@ def test_chat_checkpoint_capability_is_probed_once_per_client(stub):
 
 
 def test_warming_the_capability_serves_later_chats_from_the_cache(stub):
-    # a caller about to fan out settles the check up front, so its workers inherit the cached
-    # answer instead of every one of them missing the cold cache at once and firing its own
-    # /v1/health (codex[bot]). a target with no step selector needs nothing and must stay silent.
+    # a caller about to fan out settles the check up front, so its workers inherit the cached answer
+    # instead of every one of them missing the cold cache at once and firing its own /v1/health. a
+    # target with no step selector needs nothing and must stay silent.
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
 
