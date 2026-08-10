@@ -935,7 +935,7 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
     import flash.engine.worker.teacher.client as tmod
 
     monkeypatch.setattr(tmod, "TeacherClient", lambda *a, **k: object())
-    monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
+    monkeypatch.setenv("FLASH_PUBLIC_URL", "https://broker.example")
     monkeypatch.setenv("FLASH_TEACHER_CAPABILITY", "unit-test-teacher-capability")
 
     # The all-over-budget guard (RuntimeError) must fire; _student_model's AssertionError would

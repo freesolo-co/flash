@@ -523,7 +523,7 @@ class TeacherClient:
     def __init__(
         self,
         capability: str,
-        control_panel_url: str,
+        public_url: str,
         model: str,
         *,
         timeout: float = _DEFAULT_TEACHER_TIMEOUT_S,
@@ -532,10 +532,10 @@ class TeacherClient:
     ) -> None:
         if not capability:
             raise _permanent("no managed teacher capability available on the worker")
-        if not control_panel_url:
+        if not public_url:
             raise _permanent("no Flash control-panel URL available on the worker")
         self.capability = capability
-        self.base_url = control_panel_url.rstrip("/")
+        self.base_url = public_url.rstrip("/")
         self.model = model
         self.timeout = timeout
         self.max_retries = max_retries

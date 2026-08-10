@@ -160,7 +160,7 @@ def test_training_guide_lists_only_the_managed_teacher_aliases():
     assert "qwen3-vl-235b | qwen3-vl-8b" in guide
     assert "kimi-k2.6" not in guide
     assert "The control-plane broker owns `PARASAIL_API_KEY`" in guide
-    assert "`FLASH_CONTROL_PANEL_URL` and an attempt-scoped `FLASH_TEACHER_CAPABILITY`" in guide
+    assert "`FLASH_PUBLIC_URL` and an attempt-scoped `FLASH_TEACHER_CAPABILITY`" in guide
     assert "platform's Parasail key is used only inside the paid OPD worker" not in guide
 
 
