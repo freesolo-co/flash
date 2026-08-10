@@ -30,6 +30,10 @@ jobs:
     # clone-and-push (neither of which sets the fork flag) is covered too.
     if: github.repository == 'freesolo-co/flash'
     runs-on: ubuntu-latest
+    # Build + upload + tag; every recorded run finishes inside a minute. Kept generous because a
+    # timeout that fires mid-`uv publish` is the one failure this job cannot cleanly retry (see the
+    # non-self-healing limitation documented on the tag step below).
+    timeout-minutes: 30
     permissions:
       # `write` (not `read`) because the release steps at the end of this job push a git tag and
       # create a GitHub release through the default GITHUB_TOKEN.

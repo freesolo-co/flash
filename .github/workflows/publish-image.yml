@@ -30,6 +30,9 @@ jobs:
     # and then fail at the push. A fork that wants its own image builds it from the Dockerfile.
     if: github.repository == 'freesolo-co/flash'
     runs-on: ubuntu-latest
+    # 3min is the slowest run on record (40 runs, median 2min). 45 covers a cold layer cache
+    # rebuilding the control-plane image from scratch.
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
