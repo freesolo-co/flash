@@ -12,6 +12,10 @@ present" check passes while the guard is commented out.
 
 from __future__ import annotations
 
+import os
+import re
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +29,11 @@ UPSTREAM_REPOSITORY = "freesolo-co/flash"
 
 
 def _workflow_paths() -> list[Path]:
-    paths = sorted(WORKFLOW_DIR.glob("*.yml"))
+    # Both extensions: Actions runs `.yaml` exactly as it runs `.yml`, so globbing only `.yml`
+    # would let a `.yaml` workflow run uncapped and unpinned while these contracts still reported
+    # that every workflow complied. The scan has to cover what GitHub covers, not what the repo
+    # happens to use today.
+    paths = sorted(p for ext in ("*.yml", "*.yaml") for p in WORKFLOW_DIR.glob(ext))
     assert paths, f"no workflows found under {WORKFLOW_DIR}"
     return paths
 
@@ -40,6 +48,31 @@ def _jobs(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 def _steps(job: dict[str, Any]) -> list[dict[str, Any]]:
     return job.get("steps") or []
+
+
+def _assert_gated_upstream(condition: str | None, where: str) -> None:
+    """Assert `condition` contains a POSITIVE equality against the upstream repository.
+
+    Substring-matching the repository name is not enough, and this is not hypothetical: flipping
+    `==` to `!=` (which inverts the guard, so the job would run ONLY on forks -- publishing,
+    larger-runner and GPU-spending jobs exactly where they must never run) left every assertion in
+    this file passing. The name is present in both spellings. Match the operator too.
+
+    A compound condition is allowed (`auto-rebake` also requires the triggering run to have
+    succeeded); the requirement is that one conjunct is the positive equality, in either argument
+    order, under either quote style.
+    """
+    assert condition is not None, f"{where} has no `if:` guard at all"
+    normalised = " ".join(condition.split()).replace('"', "'")
+    accepted = (
+        f"github.repository == '{UPSTREAM_REPOSITORY}'",
+        f"'{UPSTREAM_REPOSITORY}' == github.repository",
+    )
+    assert any(form in normalised for form in accepted), (
+        f"{where} must be gated on `github.repository == '{UPSTREAM_REPOSITORY}'`; its condition is "
+        f"{condition!r}. Note a NEGATED comparison still contains the repository name while "
+        "inverting the meaning of the guard."
+    )
 
 
 @pytest.mark.parametrize("path", _workflow_paths(), ids=lambda p: p.name)
@@ -63,7 +96,10 @@ def test_every_action_reference_is_pinned_to_a_full_sha(path: Path):
             continue
         if "@" not in stripped or "./.github/workflows/" in stripped:
             continue
-        assert "#" in stripped, (
+        # A version-SHAPED comment, not merely any comment: `# TODO` would satisfy "has a comment"
+        # while telling a reviewer nothing about which release the sha is. Dependabot writes
+        # `# v6.1.0`; the digits are the part that carries the information.
+        assert re.search(r"#\s*v?\d+(\.\d+)*", stripped), (
             f"{path.name}: {stripped!r} pins a sha with no version comment. Dependabot needs the "
             "comment to know what it is bumping, and a reviewer cannot read a bare sha."
         )
@@ -130,38 +166,66 @@ def test_the_tests_repo_dispatch_cannot_silently_no_op():
     document = _load(WORKFLOW_DIR / "notify-tests-repo.yml")
     job = _jobs(document)["notify"]
 
-    condition = job.get("if")
-    ungated = (
-        "the notify job must be gated to the upstream repository, so that a missing PAT can be "
-        "treated as an error rather than as the fork case"
-    )
-    assert condition is not None, ungated
-    assert UPSTREAM_REPOSITORY in condition, ungated
+    # The fork case must be handled HERE, at the job level, because that is what lets the step
+    # below treat a missing PAT as the error it is.
+    _assert_gated_upstream(job.get("if"), "notify-tests-repo.yml:notify")
 
     scripts = [step["run"] for step in _steps(job) if "run" in step]
     assert scripts, "the notify job must still run the dispatch"
-    raw = "\n".join(scripts)
-    # Strip shell comments before asserting on control flow. The first version of this test read
-    # the raw script and failed on the words "exit 0" inside the comment EXPLAINING the old bug --
-    # a substring assertion cannot tell code from prose, so it would equally have passed on a
-    # workflow whose real `exit 0` had merely been commented out.
-    code = "\n".join(line.split("#", 1)[0] for line in raw.splitlines())
+    script = "\n".join(scripts)
 
-    # `exit 0` on the empty-PAT branch is the precise defect; it is what made the absent secret
-    # indistinguishable from a fork.
-    assert "exit 0" not in code, (
-        "the dispatch step must not exit 0 on a missing credential -- that is the fail-open branch "
-        "that reported success while dispatching nothing"
+    # RUN the script rather than grepping it. Searching for `exit 1` / `::error::` / the dispatch
+    # URL as independent substrings proves only that those characters exist SOMEWHERE -- not that
+    # they are on the missing-PAT path. Both weaknesses were demonstrated, not theorised: a
+    # rewritten step that skipped the curl and returned success on an empty PAT, with the tokens
+    # parked in an `if false` block, passed the substring version of this test. So did a real
+    # `printf '#'; exit 0`, because stripping at the first `#` truncated the line before the
+    # `exit 0` -- a shell comment cannot be found by splitting on a character that also occurs
+    # inside quotes. Executing the script is what makes the two cases distinguishable.
+    #
+    # `curl` is replaced with a recorder on PATH, so nothing leaves the machine and the assertion
+    # is about the OBSERVABLE effect: did a dispatch actually happen.
+    def run(pat: str) -> tuple[int, str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls = root / "curl-calls.txt"
+            fake_curl = root / "bin" / "curl"
+            fake_curl.parent.mkdir()
+            fake_curl.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$CURL_CALLS"\nexit 0\n')
+            fake_curl.chmod(0o755)
+            completed = subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True,
+                text=True,
+                cwd=tmp,
+                env={
+                    "PATH": f"{fake_curl.parent}:{os.environ.get('PATH', '')}",
+                    "CURL_CALLS": str(calls),
+                    "PAT": pat,
+                    "SHA": "0123456789abcdef0123456789abcdef01234567",
+                    "REF": "dev",
+                    "GITHUB_REPOSITORY": UPSTREAM_REPOSITORY,
+                },
+            )
+            recorded = calls.read_text() if calls.exists() else ""
+            return completed.returncode, recorded + completed.stdout + completed.stderr
+
+    # 1. No credential must FAIL, and must not pretend to have dispatched.
+    code, output = run("")
+    assert code != 0, (
+        "the dispatch step exited 0 with no credential -- that is the fail-open branch that "
+        "reported success while dispatching nothing"
     )
-    assert "exit 1" in code, "a missing PAT must fail the job"
-    assert "::error::" in code, "the failure must be annotated so it is visible on the run"
-    # The dispatch itself must survive: a test pinning only the guard would pass on a workflow
-    # whose curl had been deleted.
-    still_dispatches = (
-        "the step must still POST a flash-merged repository_dispatch to freesolo-co/tests"
+    assert "::error::" in output, "the failure must be annotated so it is visible on the run"
+    assert "dispatches" not in output, "no dispatch should be attempted without a credential"
+
+    # 2. With a credential it must actually POST the dispatch, exactly once.
+    code, output = run("fake-token")
+    assert code == 0, f"the dispatch failed with a credential present: {output}"
+    assert output.count("repos/freesolo-co/tests/dispatches") == 1, (
+        f"expected exactly one dispatch to freesolo-co/tests, got: {output}"
     )
-    assert "flash-merged" in code, still_dispatches
-    assert "repos/freesolo-co/tests/dispatches" in code, still_dispatches
+    assert "flash-merged" in output, "the dispatch must carry the flash-merged event type"
 
 
 def test_workflows_that_touch_shared_resources_are_upstream_only():
@@ -178,12 +242,11 @@ def test_workflows_that_touch_shared_resources_are_upstream_only():
         "worker-image.yml": "build",
         "auto-rebake.yml": "gate",
         "notify-tests-repo.yml": "notify",
+        # Reached two ways, and the gate on `auto-rebake` only covers one of them: this workflow is
+        # also directly dispatchable, so it needs its own guard. It is the most expensive job in the
+        # repo to leave ungated -- it rents a GPU.
+        "bake-kernel-cache.yml": "bake",
     }
     for filename, job_name in guarded.items():
         job = _jobs(_load(WORKFLOW_DIR / filename))[job_name]
-        condition = job.get("if")
-        ungated = (
-            f"{filename}:{job_name} must be gated on github.repository == '{UPSTREAM_REPOSITORY}'"
-        )
-        assert condition is not None, ungated
-        assert UPSTREAM_REPOSITORY in condition, ungated
+        _assert_gated_upstream(job.get("if"), f"{filename}:{job_name}")
