@@ -159,6 +159,11 @@ dev = [
     # plane does not decode images.
     "pillow>=11",
     "pytest-xdist>=3.6",
+    # tests/test_workflow_contracts.py parses .github/workflows/*.yml. PyYAML is already present
+    # transitively (datasets/transformers/huggingface-hub), but a test that imports it directly
+    # must declare it: otherwise dropping one of those unrelated deps turns the workflow contract
+    # tests into a collection error, and the invariants they pin stop being checked.
+    "pyyaml>=6",
 ]
 
 [tool.mypy]
