@@ -9,8 +9,8 @@ from huggingface_hub.errors import HfHubHTTPError
 from requests.exceptions import Timeout
 
 import flash.engine.worker as worker
-import flash.engine.worker.adapter as adapter
-from flash.engine.worker.hf import RetriableInfraError
+import flash.engine.worker.model.adapter as adapter
+from flash.engine.worker.io.hf import RetriableInfraError
 
 _ADAPTER_REF = "Freesolo-Co/flashrun-source:sft/source-run"
 _ADAPTER_DIR = "/tmp/evdl/sft/source-run/adapter"

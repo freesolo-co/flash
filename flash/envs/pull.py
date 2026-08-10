@@ -11,11 +11,11 @@ import tempfile
 from pathlib import Path
 
 from flash.envs import loader
-from flash.envs.archive import extract_validated_archive_members
-from flash.envs.archive_policy import (
+from flash.envs.package.limits import (
     LimitedArchiveReader,
     archive_stream_limit,
 )
+from flash.envs.package.unpack import extract_validated_archive_members
 
 
 def _safe_repo_relative_path(path: str) -> str:

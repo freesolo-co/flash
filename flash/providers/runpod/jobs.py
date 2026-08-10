@@ -8,28 +8,22 @@ import contextlib
 import json
 import math
 import os
-import threading
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from flash._logging import get_logger
+from flash._internal.logging import get_logger
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-from flash.providers._deadline import (
+from flash.providers._lifecycle.deadline import (
     CREATE_ALLOWANCE_S,
     deadline_kwargs,
     remaining_seconds,
     require_create_allowance,
     require_deadline_at,
 )
-from flash.providers._hf_artifacts import (
-    make_hf_failure_detail_reader,
-    make_hf_heartbeat_reader,
-    worker_flagged_retriable,
-)
-from flash.providers._poll import (
+from flash.providers._lifecycle.poll import (
     PollErrorTracker,
     _attempt_int,
     heartbeat_oom_for_attempt,
@@ -37,10 +31,15 @@ from flash.providers._poll import (
     make_say,
     surface_heartbeat,
 )
+from flash.providers.artifacts.hf import (
+    make_hf_failure_detail_reader,
+    make_hf_heartbeat_reader,
+    worker_flagged_retriable,
+)
 from flash.providers.base import PollResult, UnreconciledCreateError, canonical_gpu
 from flash.providers.runpod import api as runpod_api
 from flash.providers.runpod.gpus import flash_gpu
-from flash.providers.runpod.train import (
+from flash.providers.runpod.serverless import (
     DEFAULT_EXECUTION_TIMEOUT_MS,
     FLASH_SDK_LOCK,
     WORKER_IMAGE,
@@ -61,6 +60,7 @@ __all__ = [
     "JobHandle",
     "PollResult",
     "apply_disk_gb",
+    "apply_image_override_constraints",
     "build_function_input",
     "capacity_escalation_note",
     "decode_output",
@@ -77,30 +77,17 @@ __all__ = [
     "weight_cache_volumes",
 ]
 
-# Growing an existing cache volume is best-effort reconciliation, so it gets a short fixed ceiling
-# rather than a share of the run deadline. An unreachable account would otherwise burn retries and
-# backoff against the same clock the launch needs, leaving less than the create allowance and
-# failing a deploy the healthy owning account could have served. Under a deadline the effective
-# budget is this OR whatever is left above the create allowance, whichever is smaller.
-WEIGHT_CACHE_GROW_BUDGET_S = 20.0
 
+# capacity grace on the LAST candidate class: there is nowhere left to walk, so wait longer before
+# giving up. purely a timing knob -- it says nothing about whether a retry follows, because
+# on_last_gpu (runner/lifecycle.py) is also true when the infra retry budget is exhausted.
+LAST_GPU_CAPACITY_GRACE_S = 900.0
 
-def weight_cache_grow_headroom_s() -> float:
-    """Reconciliation headroom a whole ``deploy_train_endpoint`` call can need, in seconds.
-
-    Callers that hand the deployer a deadline add this on top of whatever their job needs, so the
-    reconciliation is funded from headroom rather than out of the job's own budget.
-
-    Scoped to the account pool rather than the retry count because a repeat attempt on an account
-    already reconciled in this call is skipped, so at most one grow per account actually runs.
-    Sizing alone does not keep a failover funded -- creates and quota back-offs would drain it
-    first, and a failing create has no bound to size against -- so the deployer additionally holds
-    each unreconciled account's slice back from them. This is the headroom, not the guarantee.
-    """
-    from flash.providers.runpod import keys as rp_keys
-
-    return WEIGHT_CACHE_GROW_BUDGET_S * max(1, rp_keys.key_count())
-
+# how long ONE "a worker is coming up" health reading keeps suppressing the capacity timer. probes
+# run every 90s, so this absorbs a couple of missed or failed probes and no more: if health stops
+# being readable entirely, the capacity timer re-arms rather than waiting out the run on an
+# observation nobody can still confirm.
+WORKER_COMING_UP_TTL_S = 300.0
 
 TERMINAL_OK = {"COMPLETED"}
 # CANCELLED/TIMED_OUT = provider-killed (retriable); FAILED = worker died on its own (fails fast).
@@ -110,7 +97,7 @@ TERMINAL_FAIL = {"FAILED"} | PLATFORM_TERMINATIONS
 
 def stall_kwargs(on_last_gpu: bool = False) -> dict:
     """poll_job stall-window kwargs. queue/throttled grace is ~5 min normally, ~15 min on last GPU (nowhere left to walk)."""
-    grace = 900.0 if on_last_gpu else 300.0
+    grace = LAST_GPU_CAPACITY_GRACE_S if on_last_gpu else 300.0
     return {
         "stall_after_s": 1500.0,
         "setup_grace_s": 3000.0,
@@ -119,117 +106,21 @@ def stall_kwargs(on_last_gpu: bool = False) -> dict:
     }
 
 
-# DCs that do NOT support network volumes — creating one there 500s the whole deploy.
-# SDK exposes no capability flag; stale list degrades gracefully (falls back to cold cross-region run).
-_VOLUME_INCAPABLE_DATACENTERS = frozenset({"US-MO-1"})
+def apply_image_override_constraints(config) -> None:
+    """Attach the override image's registry auth to a built endpoint config.
 
-
-def weight_cache_datacenters() -> list:
-    """Every volume-capable RunPod DC (DataCenter.all() minus _VOLUME_INCAPABLE_DATACENTERS)."""
-    from runpod_flash.core.resources.datacenter import DataCenter
-
-    return [dc for dc in DataCenter.all() if dc.value not in _VOLUME_INCAPABLE_DATACENTERS]
-
-
-def weight_cache_volume_name(base: str, dc) -> str:
-    """Physical volume name for ``base`` in datacenter ``dc``.
-
-    DC MUST be in the name: the SDK keys resource tracking on name alone (no datacenter), so same-named
-    volumes across DCs collide and the 2nd deploy crashes (unimplemented undeploy).
+    Private override images otherwise fail before Flash code starts.
     """
-    return f"{base}-{dc.value.lower()}"
+    from flash.providers._lifecycle.worker import worker_image_override
 
-
-def weight_cache_volumes(spec) -> list:
-    """One NetworkVolume per storage datacenter; empty when the cache is off."""
-    base = getattr(spec.gpu, "network_volume", None) if spec is not None else None
-    if not base:
-        return []
-    dcs = weight_cache_datacenters()
-    if not dcs:
-        return []
-    from runpod_flash import NetworkVolume
-
-    from flash.runner import WEIGHT_CACHE_VOLUME_GB, WEIGHT_CACHE_VOLUME_NAME
-    from flash.spec import _volume_gb
-
-    # The shared cache is platform-managed, so its size comes from the managed constant rather than
-    # whatever the spec happens to carry: a stale/round-tripped spec can still hold a pre-bump size,
-    # and honoring that would create (or attach) an undersized volume. Custom volumes are the
-    # caller's to size, so those keep the spec value.
-    size = _volume_gb(getattr(spec.gpu, "network_volume_gb", WEIGHT_CACHE_VOLUME_GB))
-    if str(base) == WEIGHT_CACHE_VOLUME_NAME:
-        size = max(size, WEIGHT_CACHE_VOLUME_GB)
-    return [
-        NetworkVolume(name=weight_cache_volume_name(str(base), dc), size=size, datacenter=dc)
-        for dc in dcs
-    ]
-
-
-def grow_weight_cache_volumes(
-    spec, key: str, deadline_at: float | None = None, wanted: dict[str, int] | None = None
-) -> None:
-    """Raise this account's already-provisioned shared-cache volumes to the managed size.
-
-    A NetworkVolume is only sized on CREATE: the SDK matches an existing volume by name+datacenter
-    and hands it back untouched, so every volume provisioned before a size bump keeps the old size
-    and the bump is a silent no-op. Requesting the new size on the attach is not enough -- the mount
-    stays small and the download dies with "Disk quota exceeded". Growing over REST is the only way
-    to reconcile one that already exists.
-
-    Scoped to ``key`` because the caller has already picked the account it is deploying under, and
-    only that account's volumes are the ones about to be attached. Callers that attach a volume set
-    of their own -- the warm pins one datacenter -- pass it as ``wanted`` ({name: gb}); everyone else
-    leaves it None and the managed fleet is derived from ``spec``.
-
-    Best-effort by design: a volume that cannot be grown still gets attached, which is no worse than
-    not trying, so this must never fail a deploy. That covers datacenter discovery too, not just the
-    REST calls: an SDK whose ``DataCenter.all()`` raises would otherwise abort the deploy from inside
-    the one helper that promises it cannot. It takes a short fixed budget rather than the run
-    deadline, and under ``deadline_at`` it additionally yields whatever the create allowance needs:
-    the deploy re-checks that allowance after this returns, so spending into it would turn a
-    best-effort reconciliation into the reason an otherwise-launchable deploy is rejected. Time it
-    cannot have, it skips.
-    """
-    from flash.runner import WEIGHT_CACHE_VOLUME_GB, WEIGHT_CACHE_VOLUME_NAME
-
-    try:
-        if wanted is None:
-            base = getattr(spec.gpu, "network_volume", None) if spec is not None else None
-            if str(base or "") != WEIGHT_CACHE_VOLUME_NAME:
-                return  # cache off, or a custom volume the caller owns the sizing of
-            wanted = {
-                weight_cache_volume_name(str(base), dc): WEIGHT_CACHE_VOLUME_GB
-                for dc in weight_cache_datacenters()
-            }
-        if not wanted:
-            return
-        budget = WEIGHT_CACHE_GROW_BUDGET_S
-        if deadline_at is not None:
-            budget = min(budget, remaining_seconds(deadline_at) - CREATE_ALLOWANCE_S)
-        if budget <= 0:
-            logger.warning("weight cache: no room to grow volume(s) before launch; attaching as-is")
-            return
-        grown = runpod_api.grow_network_volumes_for_key(
-            key, wanted, deadline_at=time.time() + budget
-        )
-    except Exception as exc:
-        logger.warning("weight cache: could not grow volume(s) (%s); attaching as-is", exc)
+    override = worker_image_override()
+    if not (override and override.registry_auth_id):
         return
-    for name, size in sorted(grown.items()):
-        logger.info("weight cache: grew %s to %d GB (was under the managed size)", name, size)
-
-
-def weight_cache_endpoint_kwargs(spec) -> dict:
-    """Endpoint kwargs that attach the weight-cache fleet, or ``{}`` (best-effort; cache off = no volumes)."""
-    try:
-        vols = weight_cache_volumes(spec)
-        if not vols:
-            return {}
-        return {"volume": vols, "datacenter": weight_cache_datacenters()}
-    except Exception as exc:
-        logger.warning("weight cache disabled for this run (%s); deploying with no volume", exc)
-        return {}
+    template = getattr(config, "template", None)
+    if template is None:
+        logger.warning("image override registry auth set but endpoint config has no template")
+        return
+    template.containerRegistryAuthId = override.registry_auth_id
 
 
 def apply_disk_gb(config, disk_gb: int | None) -> None:
@@ -240,6 +131,7 @@ def apply_disk_gb(config, disk_gb: int | None) -> None:
     if template is None:
         logger.warning("disk_gb=%s requested but endpoint config has no template", disk_gb)
         return
+
     template.containerDiskInGb = max(int(disk_gb), int(template.containerDiskInGb or 0))
 
 
@@ -307,148 +199,9 @@ def _is_workers_quota_error(exc: Exception) -> bool:
 def _is_balance_error(exc: Exception) -> bool:
     """True when RunPod refuses to create an endpoint because the account is out of balance.
 
-    Like a worker-quota error this is account-specific (another pool account may have funds), so it
-    must trigger failover to the next key — but unlike a quota error, sweeping idle endpoints on the
-    broke account can't help, so the caller fails over immediately instead of sweeping and retrying.
+    Fail over immediately: another account may have funds, while sweeping cannot repair balance.
     """
     return "account balance" in str(exc).lower()
-
-
-# {endpoint_id: (first_observed_idle_ts, owning_key_fingerprint)} — grace timer per endpoint.
-# Serialized by _idle_since_lock; two threads (periodic reaper + deploy-time quota sweep) can race.
-_idle_since: dict[str, tuple[float, str]] = {}
-_idle_since_lock = threading.Lock()
-
-
-def canonical_endpoint_name(name: str) -> str:
-    """Strip the SDK's ``live-`` prefix; the SDK registers ``live-flash-...`` but we track ``flash-...``."""
-    return (name or "").removeprefix("live-")
-
-
-def _is_flash_endpoint(name: str) -> bool:
-    """True for a flash training endpoint (in either bare or live- registered form)."""
-    return canonical_endpoint_name(name).startswith("flash-")
-
-
-def _sweep_idle_flash_endpoints(
-    protected: set[str],
-    min_idle_s: float = 0.0,
-    reap_warm: bool = True,
-    known: set[str] | None = None,
-    deadline_at: float | None = None,
-) -> int:
-    """Delete idle, ORPHANED flash training endpoints — workers doing nothing that still hold
-    RunPod worker quota (runs that finished/crashed without tearing their endpoint down). Returns
-    the count deleted.
-
-    Safe by construction:
-
-    - ``known`` — when supplied, the endpoint names for EVERY run THIS control plane has a record
-      of. Only endpoints in this set are reapable; one whose name this plane has never issued
-      belongs to ANOTHER control plane sharing the account and is left alone (multi-plane safety).
-      ``None`` keeps unscoped behavior. Unlike ``protected`` this guards a second plane's
-      *idle/between-jobs* endpoint — a busy one is already safe (it never reads as idle).
-    - ``protected`` — endpoint names tied to a LIVE run (both the bare ``flash-...`` and the SDK's
-      ``live-flash-...`` form). Never deleted, even if momentarily idle (e.g. between jobs).
-    - ``reap_warm`` — when True (the run-aware periodic reaper, which protects EVERY live run),
-      a merely *warm* ``idle``/``ready`` worker left over after a job counts as doing nothing and
-      is reclaimable; that warm-idle state is the dominant leak, since RunPod keeps a worker warm
-      after each job. When False (the deploy-time reactive sweep, which only protects the current
-      run), a warm worker is treated as busy so the sweep reaps only endpoints that have FULLY
-      scaled to zero — it must not delete another live run's between-jobs warm endpoint.
-    - ``min_idle_s`` requires the idle reading to PERSIST across sweeps, so a single transient
-      zero (cold start / between jobs) never triggers a delete.
-
-    Resilient to a partial pool: ``RUNPOD_API_KEY`` may be a multi-account pool, and we list each
-    account independently (``list_endpoints_by_key``). An account that fails to list this cycle
-    (rejected/expired key, credit/quota, transient blip) is WARNed and SKIPPED — the accounts that
-    DID respond are still reaped, and the skipped account's grace timers are preserved for the next
-    sweep. (Before, the sweep listed via the all-or-nothing ``list_endpoints``: one unhealthy pool
-    key aborted the WHOLE sweep, so idle orphans on healthy accounts piled up indefinitely while the
-    failure was logged only at DEBUG — the bug this guards against.)
-    """
-    deleted = 0
-    try:
-        by_fp, failed_fps = runpod_api.list_endpoints_by_key(
-            **deadline_kwargs(runpod_api.list_endpoints_by_key, deadline_at)
-        )
-    except Exception:
-        logger.warning(
-            "idle-sweep: could not list any RunPod pool account; skipping sweep", exc_info=True
-        )
-        return 0
-    if failed_fps:
-        logger.warning(
-            "idle-sweep: %d of %d RunPod pool account(s) failed to list this cycle; reaping the %d "
-            "that responded and retrying the rest next sweep",
-            len(failed_fps),
-            len(by_fp) + len(failed_fps),
-            len(by_fp),
-        )
-    responded_fps = set(by_fp)
-    now = time.time()
-    still_idle: set[str] = set()
-    with _idle_since_lock:
-        for fp, endpoints in by_fp.items():
-            for ep in endpoints:
-                ep_name = ep.get("name") or ""
-                eid = ep.get("id")
-                if not (eid and _is_flash_endpoint(ep_name)):
-                    continue
-                canon = canonical_endpoint_name(ep_name)
-                if canon in protected:
-                    continue
-                if known is not None and canon not in known:
-                    continue
-                try:
-                    health = (
-                        runpod_api.endpoint_health_for_fingerprint(
-                            eid,
-                            fp,
-                            **deadline_kwargs(
-                                runpod_api.endpoint_health_for_fingerprint, deadline_at
-                            ),
-                        )
-                        or {}
-                    )
-                    workers = health.get("workers")
-                    jobs_info = health.get("jobs")
-                    if (
-                        not isinstance(workers, dict)
-                        or not workers
-                        or not isinstance(jobs_info, dict)
-                    ):
-                        continue
-                    busy_workers = (workers.get("running") or 0) + (
-                        workers.get("initializing") or 0
-                    )
-                    if not reap_warm:
-                        busy_workers += (workers.get("ready") or 0) + (workers.get("idle") or 0)
-                    in_flight = (jobs_info.get("inQueue") or 0) + (jobs_info.get("inProgress") or 0)
-                    if busy_workers != 0 or in_flight != 0:
-                        _idle_since.pop(eid, None)
-                        continue
-                    still_idle.add(eid)
-                    first_idle, _owner = _idle_since.setdefault(eid, (now, fp))
-                    if now - first_idle < min_idle_s:
-                        continue
-                    if runpod_api.delete_endpoint_for_fingerprint(eid, fp):
-                        deleted += 1
-                        _idle_since.pop(eid, None)
-                        logger.info("idle-sweep: deleted idle endpoint %s (%s)", ep_name, eid)
-                except Exception:
-                    logger.debug(
-                        "idle-sweep: error processing endpoint %s (%s)", ep_name, eid, exc_info=True
-                    )
-                    continue
-        # Prune stale timers only for accounts that responded this cycle (authoritative view).
-        # Timers owned by failed accounts are kept — resetting them would restart the grace on each flake.
-        prunable = {
-            eid for eid, (_ts, owner_fp) in _idle_since.items() if owner_fp in responded_fps
-        }
-        for stale in prunable - still_idle:
-            _idle_since.pop(stale, None)
-    return deleted
 
 
 def deploy_train_endpoint(
@@ -463,18 +216,13 @@ def deploy_train_endpoint(
 ) -> tuple[str, str, str]:
     """Deploy a uniquely-named worker endpoint and return its id, name, and owning fingerprint.
 
-    ``endpoint_kwargs`` may be a callable factory — re-invoked per account on quota failover so the
-    SDK doesn't reuse a volume id stamped for the previous account.
-
-    ``cache_volumes`` ({name: gb}) names the shared-cache volumes a caller attaches itself, for
-    callers that pass ``spec=None`` and so cannot have them derived. Each failover attempt reconciles
-    the account it is about to deploy under, so the account a failover lands on never attaches a
-    stale, under-sized volume.
+    Rebuild callable `endpoint_kwargs` per account so failover cannot reuse another account's
+    volume id. `cache_volumes` supplies managed sizes when `spec` is absent.
     """
     from runpod_flash import Endpoint
     from runpod_flash.core.resources.resource_manager import ResourceManager
 
-    from flash.providers.runpod import keys as rp_keys
+    from flash.providers.runpod import auth as rp_keys
     from flash.providers.runpod.auth import ensure_auth
 
     _patch_runpod_backoff()
@@ -487,10 +235,9 @@ def deploy_train_endpoint(
     def _reconciles_a_managed_cache() -> bool:
         """Whether a grow on this call can actually spend budget.
 
-        Mirrors ``grow_weight_cache_volumes``'s own early return. A run that attaches no managed
-        cache -- an open-model run, an oversized catalog model, a spec carrying a custom volume the
-        caller sizes itself -- reconciles nothing, so reserving for it would shorten the deadline
-        for a create that was never going to grow anything.
+        Mirrors ``grow_weight_cache_volumes``'s own early return: a run attaching no managed cache
+        reconciles nothing, so reserving for it would shorten the deadline for a create that was
+        never going to grow anything.
         """
         if cache_volumes is not None:
             return bool(cache_volumes)
@@ -500,72 +247,51 @@ def deploy_train_endpoint(
         return str(base or "") == WEIGHT_CACHE_VOLUME_NAME
 
     def _create_deadline() -> float | None:
-        """``deadline_at`` less the grow budget still owed to accounts this call has not reconciled.
+        """``deadline_at`` less the grow budget still owed to unreconciled accounts.
 
-        Creates, sweeps and quota back-offs run against this rather than the raw deadline, so they
-        cannot spend the slice a later failover's reconciliation needs. Held, not competed for:
-        without the reserve one slow failed create (or a couple of quota back-offs) drags remaining
-        down to the create allowance, the next account's grow clamps to zero, and that account
-        attaches the stale volume this whole path exists to prevent. Sizing the caller's headroom
-        larger cannot close that -- a failing create has no bound to size against -- so the budget
-        is set aside up front instead.
-
-        What this buys is a terminal invariant rather than another guess: an attempt that clears its
-        allowance check always has room to reconcile, so an attempt that reaches the create has
-        reconciled. When the deadline really is gone the attempt now fails on the deadline instead
-        of quietly mounting an undersized volume and dying later on "Disk quota exceeded".
-
-        Reserved only for runs that actually attach the managed cache: holding time back from a
-        volume-free run would buy nothing and could fail an otherwise launchable create against a
-        deadline the create alone would have cleared.
-
-        This bounds how long work may run, not whether it may start -- see ``_require_launchable``.
+        Creates, sweeps, and backoffs cannot spend this reserve. Any attempt reaching create has
+        reconciled; cache-free runs reserve nothing. See `_require_launchable` for admission.
         """
         if deadline_at is None or not _reconciles_a_managed_cache():
             return deadline_at
         owed = max(0, rp_keys.key_count() - len(reconciled))
         return deadline_at - WEIGHT_CACHE_GROW_BUDGET_S * owed
 
-    def _attempt_deadline() -> float | None:
+    def _attempt_deadline(owning_key: str | None = None) -> float | None:
         """``deadline_at`` less the ONE grow slice this attempt's own reconciliation can need.
 
-        What admission is judged against. An attempt has to fund exactly one grow -- its own -- so
-        that is what it must be able to afford. Charging it the whole pool's reserve instead made an
-        attempt that could launch look like one that could not: a deploy holding the create
-        allowance was rejected outright once the pool grew large enough for the reserve to eat the
-        margin, protecting the reconciliation of failovers that would then never run. The training
-        path attaches the managed cache on every ordinary run, so that was the common case.
-
-        Nothing is owed once every account has reconciled: no grow remains to fund, so reserving for
-        one would fail a create that had already done everything the reserve exists to protect.
+        Admission funds only this attempt's grow. Once its account reconciles, do not charge the
+        slice again; before selection, reserve conservatively.
         """
         if deadline_at is None or not _reconciles_a_managed_cache():
+            return deadline_at
+        key = owning_key if owning_key is not None else rp_keys.active_key()
+        if key is not None and key in reconciled:
             return deadline_at
         if rp_keys.key_count() <= len(reconciled):
             return deadline_at
         return deadline_at - WEIGHT_CACHE_GROW_BUDGET_S
 
-    def _require_launchable() -> None:
+    def _require_launchable(owning_key: str | None = None) -> None:
         """Fail closed unless this attempt can still reconcile itself and then create.
 
-        This is the terminal invariant, and it is why admission cannot simply use the raw deadline:
-        ``grow_weight_cache_volumes`` yields the create allowance, so an attempt admitted on the raw
-        deadline with only the allowance left clamps its own grow budget to zero and attaches
-        without reconciling -- the stale, under-sized mount that dies on "Disk quota exceeded",
-        which is precisely the failure this path exists to prevent. Reserving one slice at admission
-        keeps that impossible: an attempt that clears this check has room to reconcile, so an
-        attempt that reaches the create has reconciled.
+        Raw-deadline admission can yield zero growth and mount a stale volume. Reserving one slice
+        prevents the later "Disk quota exceeded" failure.
         """
         if deadline_at is not None:
-            require_create_allowance(_attempt_deadline())
+            require_create_allowance(_attempt_deadline(owning_key))
 
     def _deploy_once() -> tuple[object, str]:
         """Create under one serialized account selection and return its owning fingerprint."""
-        from flash.spec import gpu_count_of
+        from flash.core.spec import gpu_count_of
 
         _require_launchable()
         with FLASH_SDK_LOCK:
             owning_key = ensure_auth()
+            # re-check the selected key under the lock: another deploy may advance the global key
+            # after admission. an unreconciled real account must retain its grow slice or fail
+            # closed.
+            _require_launchable(owning_key)
             owning_fingerprint = runpod_api.key_fingerprint(owning_key)
             isolate_flash_state(name_suffix)
             kwargs = {
@@ -582,16 +308,8 @@ def deploy_train_endpoint(
             else:
                 kwargs["dependencies"] = resolve_worker_deps()
                 kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
-            # Reconcile before attaching: a volume provisioned under an older, smaller managed size
-            # is returned as-is by the SDK, so without this an ordinary training job mounts the
-            # stale size and a model the new size admits fails with "Disk quota exceeded".
-            # Inside the per-attempt body on purpose: failover picks a different account, and the
-            # volume about to be attached is the one owned by whichever account this attempt landed
-            # on. Deadline-aware: the create allowance is re-checked below, so this yields to it.
-            # Once per account, not once per attempt: a quota retry re-selects the account it just
-            # reconciled, and paying for that again would spend the budget the account a later
-            # failover lands on still needs -- leaving the one volume that can still be stale
-            # unreconciled.
+            # reconcile the selected account before attach because the SDK returns existing volumes
+            # at their old size. do this once per account and preserve the later create allowance.
             if owning_key not in reconciled:
                 reconciled.add(owning_key)
                 # Spends against the raw deadline: this account's slice of the reserve is released
@@ -605,18 +323,18 @@ def deploy_train_endpoint(
             ep._qb_target = _train_body
             config = ep._build_resource_config()
             apply_disk_gb(config, disk_gb)
+            apply_image_override_constraints(config)
             rm = ResourceManager()
             if deadline_at is None:
                 resource = asyncio.run(rm.get_or_deploy_resource(config))
             else:
-                _require_launchable()
+                # This attempt's own grow has run by now (the reconciled check above), so the
+                # re-check is judged without its slice -- charging it again would re-deduct a cost
+                # already paid and reject a launchable create within one slice of the deadline.
+                _require_launchable(owning_key)
                 create_deadline = _create_deadline()
-                # The create may still only SPEND down to the reserve, so a slow failed create
-                # cannot drain the slice the account a failover lands on needs to reconcile. The
-                # reserve yields the create allowance back, exactly as the grow it is reserved for
-                # does: a pool large enough for the reserve to exceed what is left would otherwise
-                # hand the create a zero timeout and fail it without ever reaching the provider --
-                # rejecting a launchable deploy again, just one step later than the admission check.
+                # create may spend only down to the failover grow reserve. yield the proven create
+                # allowance so a large reserve cannot produce a zero timeout.
                 remaining = max(CREATE_ALLOWANCE_S, remaining_seconds(create_deadline))
                 resource = asyncio.run(
                     asyncio.wait_for(
@@ -635,14 +353,9 @@ def deploy_train_endpoint(
         deploy_failover_exc: Exception | None = None
         for quota_attempt in range(_QUOTA_MAX_RETRIES):
             if quota_attempt > 0:
-                # Under acute quota pressure, sweep idle orphaned flash training endpoints on THIS
-                # account NOW (min_idle_s=0) to free a slot. This only protects THIS run's endpoint,
-                # so it stays conservative (reap_warm=False): it reaps only endpoints fully scaled
-                # to zero, never another live run's between-jobs WARM endpoint. The control-plane
-                # periodic reaper does the run-aware, graced warm-idle sweep across all live runs.
-                # Reserved deadline, like the create: the sweep and the back-off sleep below are the
-                # likelier drain of the two, since quota pressure is exactly the condition that ends
-                # in a failover to an account that still needs reconciling.
+                # under quota pressure, reap only scaled-to-zero orphans on this account.
+                # `reap_warm=False` protects live runs' between-job workers; reserve failover growth
+                # from this sweep and backoff.
                 _require_launchable()
                 quota_deadline = _create_deadline()
                 swept = _sweep_idle_flash_endpoints(
@@ -767,12 +480,9 @@ def _append_failure_artifacts(detail: str, failure_detail_reader) -> str:
 
 @dataclass
 class GraceTimer:
-    """Grace timer: arms on first active poll, expires after ``grace`` seconds of continuous active state.
+    """Grace timer: arms on first active poll, expires after continuous active state.
 
-    ``since`` is the EFFECTIVE arm time, not the literal one: ``unknown`` shifts it forward by
-    intervals the caller could not observe, so ``now - since`` is always the time the state was
-    confirmed to hold rather than the wall time since arming. Clearing ``since`` is still a complete
-    reset -- ``seen`` only bounds the next unknown gap and means nothing while the timer is disarmed.
+    `since` excludes unobservable intervals; clearing it fully resets the timer.
     """
 
     since: float | None = None
@@ -789,12 +499,9 @@ class GraceTimer:
         return now - self.since > grace
 
     def unknown(self, now: float) -> None:
-        """A reading that proves nothing either way: hold the confirmed duration, drop the blind gap.
+        """A reading that proves nothing either way: hold confirmed duration, drop the blind gap.
 
-        Resetting would let one flaky response restart the window every time, so a state that really
-        is stuck never fires. Charging the gap is the opposite failure: the reading that would have
-        cleared the anchor is exactly what a blackout hides, so the first definite reading after it
-        expires a timer whose current run had only just begun.
+        Resetting hides persistent failure; charging the gap can expire a newly restarted state.
         """
         if self.since is not None and self.seen is not None:
             self.since += now - self.seen
@@ -804,22 +511,8 @@ class GraceTimer:
 def capacity_escalation_note(on_last_gpu: bool) -> str:
     """The escalation clause a capacity failure detail carries. States the escalation fact ONLY.
 
-    on_last_gpu means "no further GPU-class escalation follows", so "next-best GPU" is a false
-    promise there. It is NOT a class-exhaustion signal: the supervisor also sets it when the infra
-    retry budget runs out, which can happen with classes still untried. And it says nothing about
-    WHICH class a retry reuses -- the picker can clamp back to a cheaper already-tried one. So claim
-    neither exhaustion nor a retry; the supervisor owns both and logs them on the action line.
-
-    The false branch has to stay just as neutral, and originally did not. A cache-drop retry fires
-    while classes remain untried, so on_last_gpu is false, yet that path deliberately leaves
-    failed_providers and tried_classes untouched and reselects the SAME class without the volume.
-    Promising "the next-best GPU" there contradicted the action line printed directly beneath it,
-    which names the reused class. poll_job cannot see the cache-fallback intent -- it holds neither
-    the retry budget nor the candidate list -- so it states only the escalation fact and lets the
-    supervisor name the target (codex[bot], cursor).
-
-    Module-level so a supervisor-level test can assert the two log lines agree without hand-writing
-    this string: a stand-in would keep passing after the wording regressed.
+    `on_last_gpu` means no further class escalation follows, not that classes are exhausted or a
+    retry occurs. Keep both branches neutral; the supervisor owns target selection and budget.
     """
     return (
         "no further GPU-class escalation follows"
@@ -845,12 +538,8 @@ def poll_job(
 ) -> PollResult:
     """Poll a queue job to completion; resilient to transient API errors.
 
-    Uses setup_grace_s (large) until first training heartbeat, then stall_after_s (tight).
-    Fails fast on THROTTLED/UNHEALTHY workers and jobs stuck IN_QUEUE past queue_grace_s.
-
-    ``on_last_gpu`` says no further GPU-class escalation follows, so a capacity failure states that.
-    Neither branch asserts that a retry happens, nor which class one would use: the supervisor owns
-    the candidate list and the retry budget, and logs both on the action line that follows.
+    Use setup grace before the first heartbeat, then stall grace; fail fast on sustained throttled,
+    unhealthy, or over-queued states. `on_last_gpu` states only whether escalation remains.
     """
 
     if not handle.job_id:
@@ -880,6 +569,35 @@ def poll_job(
     unhealthy_timer = GraceTimer()
     throttled_timer = GraceTimer()
     queued_timer = GraceTimer()
+    # a runpod job stays IN_QUEUE for the whole worker cold start, image pull included, so the
+    # queue timer alone cannot tell "runpod never gave us the gpu" from "the gpu arrived and we
+    # are still pulling a multi-GB image". the unhealthy/throttled timers below already refuse to
+    # fire while a worker is initializing or usable; carry that same observation forward so the
+    # capacity timer gets it too, and a heavy image can never self-report as no_capacity.
+    worker_coming_up_at: float | None = None
+
+    def _worker_is_coming_up(at: float | None, now: float) -> bool:
+        """Whether a worker sighting at ``at`` is recent enough to still suppress the capacity timer."""
+        return at is not None and (now - at) <= WORKER_COMING_UP_TTL_S
+
+    def _probe_worker_coming_up_at(now: float) -> float | None:
+        """One health read answering only "has runpod granted a worker yet".
+
+        Do not update continuous unhealthy/throttled timers here. A failed read returns None and
+        leaves existing evidence unchanged.
+        """
+        try:
+            h = runpod_api.endpoint_health_for_fingerprint(
+                handle.endpoint_id,
+                handle.key_fingerprint,
+                **deadline_kwargs(runpod_api.endpoint_health_for_fingerprint, absolute_deadline),
+            )
+        except Exception:
+            return None
+        workers = h.get("workers") or {}
+        usable = workers.get("running") or workers.get("ready") or workers.get("idle")
+        return now if (usable or workers.get("initializing")) else None
+
     while True:
         if absolute_deadline is not None and time.time() >= absolute_deadline:
             return PollResult(False, failure="stalled", detail="run wall deadline exceeded")
@@ -904,7 +622,7 @@ def poll_job(
             last_progress = time.time()
         if status in TERMINAL_OK:
             # read heartbeats already committed at the wall deadline (deadline_at=None) so a job that
-            # completes right at the boundary still surfaces its final per-step metrics for `flash log -f`
+            # completes right at the boundary still surfaces its final per-step metrics for `flash runs log -f`
             forced_reader = (
                 (lambda: heartbeat_reader(force=True, deadline_at=None))
                 if heartbeat_reader is not None
@@ -942,7 +660,22 @@ def poll_job(
                 detail=f"[{status}] {detail}",
             )
         now = time.time()
-        if queued_timer.expired(status == "IN_QUEUE", now, queue_grace_s):
+
+        coming_up = _worker_is_coming_up(worker_coming_up_at, now)
+        would_expire = (
+            status == "IN_QUEUE"
+            and not coming_up
+            and queued_timer.since is not None
+            and now - queued_timer.since > queue_grace_s
+        )
+        if would_expire:
+            # the last worker reading may be 90s stale, so probe once before abandoning a GPU RunPod
+            # may already have granted. the existing TTL prevents repeated boundary probes.
+            last_health_probe = now
+            coming_up = _worker_is_coming_up(_probe_worker_coming_up_at(now), now)
+            if coming_up:
+                worker_coming_up_at = now
+        if queued_timer.expired(status == "IN_QUEUE" and not coming_up, now, queue_grace_s):
             return PollResult(
                 False,
                 failure="no_capacity",
@@ -968,6 +701,11 @@ def poll_job(
                 workers = h.get("workers") or {}
                 usable = workers.get("running") or workers.get("ready") or workers.get("idle")
                 recovering = workers.get("initializing")
+                # runpod granted the gpu the moment a worker is initializing or usable, so from
+                # here on the wait is startup, not capacity starvation. stamped rather than a bare
+                # flag: a probe that starts failing must not leave a stale True suppressing the
+                # capacity timer forever, so it expires after WORKER_COMING_UP_TTL_S.
+                worker_coming_up_at = now if (usable or recovering) else None
                 if (
                     any(workers.get(k) for k in ("throttled", "unhealthy", "initializing"))
                     or not usable
@@ -1055,8 +793,8 @@ def submit_run(
     deadline_at: float | None = None,
 ) -> PollResult:
     """Deploy, submit, persist handle via ``on_handle``, and poll to completion."""
-    from flash.envs.registry import worker_pip_for_env
-    from flash.providers.runpod.train import _run_suffix, build_worker_env, chalk_extra_pip
+    from flash.envs.base import worker_pip_for_env
+    from flash.providers.runpod.serverless import _run_suffix, build_worker_env
     from flash.runner import flash_code_prefix
 
     deadline_at = require_deadline_at(deadline_at)
@@ -1068,9 +806,7 @@ def submit_run(
     suffix = _run_suffix(spec.run_id)
     if attempt_id:
         suffix = f"{suffix}r{attempt_id}"
-    extra_pip = (
-        list(spec.environment.pip) or worker_pip_for_env(spec.environment.id)
-    ) + chalk_extra_pip(spec)
+    extra_pip = list(spec.environment.pip) or worker_pip_for_env(spec.environment.id)
     worker_env = build_worker_env(
         spec,
         seed,
@@ -1180,7 +916,7 @@ def submit_run(
 
 
 # make_hf_heartbeat_reader / make_hf_failure_detail_reader and the heartbeat-provenance predicate
-# worker_flagged_retriable are provider-neutral and live in flash.providers._hf_artifacts; they are
+# worker_flagged_retriable are provider-neutral and live in flash.providers.artifacts.hf; they are
 # re-exported here so the runpod package and tests reference them as runpod.jobs.<name>.
 
 
@@ -1199,3 +935,23 @@ def surfaced_worker_flags(
         lambda force=False: hb, launch_ts=launch_ts, current_attempt=current_attempt
     )
     return last_hb_key, retriable, heartbeat_oom_for_attempt(hb, current_attempt)
+
+
+# re-exported so the volume and sweep helpers stay reachable as `jobs.<name>`: the tests patch
+# `_sweep_idle_flash_endpoints` and reach into `_idle_since` here, and `deploy_train_endpoint`
+# below calls all of them.
+from flash.providers.runpod.resources import (  # noqa: E402,F401
+    _VOLUME_INCAPABLE_DATACENTERS,
+    WEIGHT_CACHE_GROW_BUDGET_S,
+    _idle_since,
+    _idle_since_lock,
+    _is_flash_endpoint,
+    _sweep_idle_flash_endpoints,
+    canonical_endpoint_name,
+    grow_weight_cache_volumes,
+    weight_cache_datacenters,
+    weight_cache_endpoint_kwargs,
+    weight_cache_grow_headroom_s,
+    weight_cache_volume_name,
+    weight_cache_volumes,
+)

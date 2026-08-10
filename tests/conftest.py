@@ -1,15 +1,12 @@
 """Offline-by-default test harness.
 
-There is no "skip the network" env flag; instead this autouse fixture stubs the network
-boundaries the production code would otherwise reach, so the whole suite stays hermetic (no
-real RunPod / Hugging Face calls) without any env switch. A test that exercises one of
-these boundaries monkeypatches it itself — applied after this fixture, so the test's patch
-wins. (The freesolo auth verify isn't stubbed here because tests that touch it either patch
-``_freesolo_verify`` or ``urllib.request.urlopen`` directly; a global ``urlopen`` stub would
-also break the client tests, which talk to a real loopback server.)
+Autouse fixtures stub production network boundaries; later test patches still win. Freesolo auth
+is not stubbed globally because client tests use a real loopback server.
 """
 
 from __future__ import annotations
+
+import contextlib
 
 import pytest
 
@@ -31,13 +28,48 @@ def _reset_status_reporter_before_test():
 
 
 @pytest.fixture(autouse=True)
+def _rebind_worker_submodule_attributes():
+    """Repair the ``flash.engine.worker`` package object after a test re-imports it.
+
+    Several tests read module-scope state captured at import (RUN_MODE, JOB_SPEC), so they drop the
+    package from ``sys.modules`` and import it again to re-run that scope. Re-importing a PACKAGE
+    does not rebind its submodule attributes: the submodules stay cached under their own names, so
+    the `import` statements inside the re-executed parent are no-ops that never re-run the
+    attribute assignment the import system does on first load. The replacement package object
+    therefore has no ``.train``/``.io``/``.model`` attributes, and it is the object every later
+    test sees.
+
+    That breaks any later test patching a dotted string target such as
+    ``flash.engine.worker.train.opd.validation._resolve_structured_model_metadata``, because
+    monkeypatch resolves a dotted target by walking getattr from the parent package. Alphabetical
+    file order hides it today -- the re-importing file sorts after its victims -- so the suite is
+    green by accident, and any reordering (``-n`` sharding, ``-p randomly``, a renamed file) turns
+    it into an AttributeError attributed to the innocent test.
+
+    Rebinding is the narrow repair: it fixes the attribute graph while LEAVING the freshly imported
+    object in place, so the re-import those tests want still takes effect. Restoring the original
+    object instead would undo their re-import. Reads only what is already cached -- no import is
+    triggered, and it no-ops when nothing was re-imported.
+    """
+    import sys
+
+    yield
+    package = sys.modules.get("flash.engine.worker")
+    if package is None:
+        return
+    prefix = "flash.engine.worker."
+    for name, module in list(sys.modules.items()):
+        if not name.startswith(prefix):
+            continue
+        child = name[len(prefix) :]
+        if "." in child or module is None:
+            continue
+        if getattr(package, child, None) is not module:
+            setattr(package, child, module)
+
+
+@pytest.fixture(autouse=True)
 def _offline(monkeypatch):
-    # HF param probe -> offline: sizing for an unlisted model falls back to the heuristic
-    # (24 GB tier) instead of hitting the Hugging Face API.
-    import flash.engine.vram as vram
-
-    monkeypatch.setattr(vram, "fetch_hf_params_b", lambda model_id: None, raising=False)
-
     # RunPod endpoint listing -> offline: the idle-endpoint sweep (deploy-time quota reclaim
     # and the startup/post-run orphan sweep) lists account endpoints. Default to "no endpoints"
     # so a sweep never reaches the real API; sweep tests monkeypatch it after this fixture.
@@ -45,13 +77,42 @@ def _offline(monkeypatch):
 
     monkeypatch.setattr(runpod_api, "list_endpoints", list, raising=False)
 
-    # Lambda and Vast are OPT-IN instance-based complements (keyed by LAMBDA_API_KEY / VAST_API_KEY).
-    # On an operator box whose shell sources a .env, those keys are present in the process env — which
-    # would make the provider "available" and pull live capacity/pricing into offline tests (allocation
-    # candidates, registry). Delete them by default so the suite stays hermetic and RunPod-only; a
-    # provider test opts back in with ``monkeypatch.setenv(...)``.
-    monkeypatch.delenv("LAMBDA_API_KEY", raising=False)
-    monkeypatch.delenv("VAST_API_KEY", raising=False)
+    # Credential scrubbing. Importing ``runpod_flash`` runs ``load_dotenv(find_dotenv(usecwd=True))``
+    # at module scope, which walks UP out of the repo and loads whatever .env it finds -- so on an
+    # operator box real keys appear in os.environ partway through the suite, as soon as some test
+    # first imports that package. Deleting a key BEFORE that import is worthless: load_dotenv skips
+    # names already set, so a name we just unset is exactly the one it fills back in.
+    #
+    # Force the import first, then delete. One ordering, one deletion pass, no name that can be
+    # scrubbed on the wrong side of the import.
+    with contextlib.suppress(Exception):  # package absent in a client-only checkout
+        import runpod_flash  # noqa: F401
+
+    # scrub automatically forwarded secrets from the production key set so operator credentials
+    # never enter fixtures. lambda/vast keys enable live providers, FREESOLO_API_KEY changes org
+    # identity, and FLASH_STANDALONE/FLASH_HF_NAMESPACE change global mode. tests opt in after this
+    # fixture; see tests/test_server_standalone.py.
+    from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
+
+    for _key in {
+        "FREESOLO_API_KEY",
+        "LAMBDA_API_KEY",
+        "VAST_API_KEY",
+        "PARASAIL_API_KEY",
+        "FLASH_PUBLIC_URL",
+        "FLASH_TEACHER_CAPABILITY",
+        "FLASH_STANDALONE",
+        "FLASH_HF_NAMESPACE",
+    } | set(DEFAULT_RUNTIME_SECRET_KEYS):
+        monkeypatch.delenv(_key, raising=False)
+
+    # RunPod is OVERWRITTEN, not deleted: same hygiene (no operator key ever reaches a test) with
+    # the default substrate intact. is_configured() is gated on the key pool, so deleting the var
+    # leaves the harness with NO provider at all -- every allocator test then fails "no allocatable
+    # GPU" for want of a credential rather than for the reason it is testing. Two fake accounts so
+    # the multi-account failover paths have a pool to walk. A test that wants runpod unconfigured
+    # (or a specific pool) sets its own value after this fixture.
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test-a,rp-test-b")
 
     # Same hazard, one layer up: the client discovers runtime secrets from the process env at submit
     # time, so an operator shell that exports WANDB_API_KEY makes every dry-run test assert against
@@ -66,19 +127,69 @@ def _offline(monkeypatch):
     # The RunPod key pool caches the parsed RUNPOD_API_KEY at module level (so collapsing
     # it to a single active key never loses the rest of the pool). Reset it around every
     # test so a key set/collapsed by one test can't leak into the next.
-    import flash.providers.runpod.keys as rp_keys
+    import flash.providers.runpod.auth as rp_keys
 
     rp_keys.reset()
+
+    # Provider singletons are @cache'd per name, and is_configured() now reads the env, so a test
+    # that sets or clears a provider key would otherwise see the PREVIOUS test's answer. Clear
+    # around every test: the cache exists to avoid re-importing, not to freeze configuration.
+    import flash.providers as _providers
+
+    _providers._get_provider.cache_clear()
 
     # Always-on artifact GC: the control-plane lifespan sweeps ONCE on startup (when an operator
     # HF_TOKEN is set). Stub it to a no-op so offline TestClient startups never reach HF/serving;
     # tests/test_repo_cleanup.py restores the real function to exercise the genuine sweep.
-    import flash.server.repo_cleanup as _rc
+    import flash.server.domain.repo_cleanup as _rc
 
     monkeypatch.setattr(_rc, "run_scheduled_cleanup", lambda *a, **k: 0, raising=False)
 
     yield
     rp_keys.reset()
+    _providers._get_provider.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _child_subreaper_does_not_leak_between_tests():
+    """Restore PR_SET_CHILD_SUBREAPER after every test, not just the ones that opt in.
+
+    ``adopt_orphaned_descendants`` sets a PROCESS-global flag, and the production entry points call
+    it unconditionally: any test reaching ``run_verl_training`` or ``kill_process_group`` flips this
+    pytest process from 0 to 1 for the rest of the session. From then on every later test adopts
+    orphaned grandchildren it never waits on, so it accumulates zombies and its result depends on
+    what ran before it. The ``subreaper`` fixture in ``test_backend_common`` restores only the tests
+    that ask for it, which is not where the flag is now set.
+
+    Autouse and here rather than in that module: five test files reach those entry points, and the
+    tests harmed are any that follow -- so the guarantee has to cover the whole suite. The module's
+    own ``_child_subreaper_enabled`` still nests inside this untouched.
+
+    ``_ADOPTS_ORPHANS`` is reset alongside the kernel flag. It is the module's memory of having
+    claimed adoption; leaving it True while clearing the flag would leave the module believing a
+    claim the kernel no longer holds, and the next call would skip the prctl it needs to make.
+    """
+    import ctypes
+
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        current = ctypes.c_int(0)
+        # PR_GET_CHILD_SUBREAPER / PR_SET_CHILD_SUBREAPER, from linux/prctl.h.
+        if libc.prctl(37, ctypes.byref(current), 0, 0, 0) != 0:
+            yield  # pragma: no cover - linux 3.4+
+            return
+    except (OSError, AttributeError, ValueError):  # pragma: no cover - not reachable on linux
+        yield  # no libc: nothing can set the flag either, so there is nothing to restore
+        return
+
+    previous = current.value
+    try:
+        yield
+    finally:
+        libc.prctl(36, previous, 0, 0, 0)
+        import flash.engine.worker.backend_common as _vc
+
+        _vc._ADOPTS_ORPHANS = bool(previous)
 
 
 @pytest.fixture(autouse=True)

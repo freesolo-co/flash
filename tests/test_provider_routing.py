@@ -7,23 +7,54 @@ import threading
 
 import pytest
 
-from flash.spec import JobSpec
+from flash.core.spec import JobSpec
+from tests._helpers.profile import (
+    attach_sft_profile,
+    record_sft_profile,
+    satisfy_sft_profile,
+    stub_revision_geometry,
+)
 
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
 
 
-def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
+def _spec(run_id="flash-1700000001-rt01", algorithm="sft", **gpu_kw) -> JobSpec:
+    """A spec in the shape the lifecycle actually receives: post-``prepare_job``.
+
+    Routing behaviour is algorithm-independent, but sft is the algorithm whose quote is
+    profile-backed, so an sft spec has to carry the attached profile its own submit path would have
+    resolved. Without it every routing test re-tests the profile gate instead of routing.
+    ``algorithm`` is for the few tests whose subject is a submit-path behaviour sft no longer
+    reaches; ``attach_sft_profile`` leaves those specs alone.
+    """
     gpu = {"type": "RTX 4090", "max_retries": 2}
     gpu.update(gpu_kw)
-    return JobSpec.from_dict(
-        {
-            "model": "Qwen/Qwen3.5-0.8B",
-            "algorithm": "sft",
-            "run_id": run_id,
-            "train": {"epochs": 1, "max_examples": 8},
-            "gpu": gpu,
-        }
+    return attach_sft_profile(
+        JobSpec.from_dict(
+            {
+                "model": "Qwen/Qwen3.5-0.8B",
+                "algorithm": algorithm,
+                "run_id": run_id,
+                "environment": {"id": "github:owner/repo@main:env/environment.py"},
+                "train": {"epochs": 1, "max_examples": 8},
+                "gpu": gpu,
+            }
+        )
     )
+
+
+def _public_spec(run_id="flash-1700000001-rt01", algorithm="sft") -> JobSpec:
+    """The user-authored shape ``submit_job`` receives: env unpinned, no attached profile.
+
+    ``_spec`` is deliberately post-``prepare_job``, which is the wrong input for a test whose
+    subject IS submission -- it would arrive already carrying the pins that submission is supposed
+    to resolve. Round-tripping through the public serializer drops exactly the platform-managed
+    fields (env sha, the profile carrier, managed gpu policy), so this stays one definition of the
+    spec instead of a second hand-written copy that could drift from it.
+    """
+    public = _spec(run_id=run_id, algorithm=algorithm).to_dict()
+    public.pop("model_revision", None)  # authored-optional; submission resolves it
+    return JobSpec.from_dict({**public, "run_id": run_id})
 
 
 def _alloc(gpu="RTX 4090", rate=0.69, candidates=None):
@@ -72,6 +103,10 @@ def orch(monkeypatch, tmp_path):
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    # _spec pins a model revision, which makes the lifecycle's post-allocation quote refresh
+    # revision-aware. Left unstubbed it reaches github, and the refresh treats any failure as an
+    # infra-shaped transient -- so the whole suite would sit in real retry backoff sleeps.
+    stub_revision_geometry(monkeypatch)
     return runner
 
 
@@ -87,7 +122,7 @@ def test_exact_only_preflight_rejects_unconfigured_provider_set_before_persisten
     import flash.providers as providers
 
     persisted = []
-    spec = _spec(type="H200")
+    spec = satisfy_sft_profile(orch, monkeypatch, _spec(type="H200"))
     monkeypatch.setattr(providers, "available_providers", lambda: ("lambda", "vast"))
     monkeypatch.setattr(orch, "_save_status", lambda *args, **kwargs: persisted.append(args))
 
@@ -157,6 +192,20 @@ def test_auto_gpu_effective_spec_is_transient_and_keeps_base_auto(orch) -> None:
     assert second_attempt is not base
 
 
+def test_effective_spec_carries_the_allocated_card_count(orch) -> None:
+    base = _spec(type="")
+
+    # the allocator can satisfy a run with n cards of a smaller class; the count it chose has to reach
+    # the spec, because the worker sizes its rank count from gpu.count and the payload rents gpu.count.
+    combo = orch._spec_with_gpu(base, "A100 PCIe", 4)
+    assert (combo.gpu.type, combo.gpu.count) == ("A100 PCIe", 4)
+    assert base.gpu.count == 1
+
+    # omitted/zero count preserves the spec's own count (the historical single-card call shape).
+    single = orch._spec_with_gpu(base, "A100 PCIe")
+    assert single.gpu.count == 1
+
+
 def test_terminal_race_before_effective_spec_persistence_skips_provider(orch, monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import PollResult
@@ -168,8 +217,8 @@ def test_terminal_race_before_effective_spec_persistence_skips_provider(orch, mo
 
     original_spec_with_gpu = orch._spec_with_gpu
 
-    def cancel_after_allocation(run_spec, gpu_type):
-        selected = original_spec_with_gpu(run_spec, gpu_type)
+    def cancel_after_allocation(run_spec, gpu_type, gpu_count=0):
+        selected = original_spec_with_gpu(run_spec, gpu_type, gpu_count)
         assert orch._update(run_spec.run_id, "cancelled")
         return selected
 
@@ -192,11 +241,15 @@ def test_terminal_race_before_effective_spec_persistence_skips_provider(orch, mo
     assert provider_calls == []
 
 
-def test_cancel_waits_for_durable_provider_handle_then_tears_down(orch, monkeypatch):
+@pytest.mark.parametrize("first_revocation_fails", [False, True])
+def test_cancel_waits_for_durable_provider_handle_then_tears_down(
+    orch, monkeypatch, first_revocation_fails
+):
     from flash.providers import allocator
     from flash.providers.base import PollResult
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs as rp_jobs
+    from flash.server.platform import db as server_db
 
     spec = _spec(run_id="flash-provider-handshake-cancel", max_retries=0)
     orch._save_status(orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
@@ -213,6 +266,14 @@ def test_cancel_waits_for_durable_provider_handle_then_tears_down(orch, monkeypa
     resource_live = {"value": False}
     cancelled_handles = []
     destroyed_handles = []
+    revocation_calls = 0
+
+    def revoke_capabilities(_run_id):
+        nonlocal revocation_calls
+        revocation_calls += 1
+        if first_revocation_fails and revocation_calls == 1:
+            raise RuntimeError("teacher revocation store unavailable")
+        return 1
 
     def fake_runpod_submit(run_spec, seed, *, on_handle, **kwargs):
         resource_live["value"] = True
@@ -236,6 +297,7 @@ def test_cancel_waits_for_durable_provider_handle_then_tears_down(orch, monkeypa
         return True
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    monkeypatch.setattr(server_db, "revoke_teacher_capabilities_for_run", revoke_capabilities)
     monkeypatch.setattr(runpod_api, "cancel_job", cancel_job)
     monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", delete_endpoint)
 
@@ -248,11 +310,16 @@ def test_cancel_waits_for_durable_provider_handle_then_tears_down(orch, monkeypa
             submit_errors.append(exc)
 
     cancel_results = []
+    cancel_errors = []
 
     def cancel():
         cancellation_started.set()
-        cancel_results.append(orch.cancel_run(spec.run_id))
-        cancellation_finished.set()
+        try:
+            cancel_results.append(orch.cancel_run(spec.run_id))
+        except Exception as exc:
+            cancel_errors.append(exc)
+        finally:
+            cancellation_finished.set()
 
     submit_thread = threading.Thread(target=submit)
     submit_thread.start()
@@ -264,7 +331,9 @@ def test_cancel_waits_for_durable_provider_handle_then_tears_down(orch, monkeypa
     cancel_thread.join(timeout=0.1)
     assert cancel_thread.is_alive()
     assert not cancellation_finished.is_set()
-    assert orch.get_status(spec.run_id).remote is None
+    waiting_status = orch.get_status(spec.run_id)
+    assert waiting_status.state == "running"
+    assert waiting_status.remote is None
     assert resource_live["value"]
 
     allow_handle.set()
@@ -275,7 +344,14 @@ def test_cancel_waits_for_durable_provider_handle_then_tears_down(orch, monkeypa
 
     assert not cancel_thread.is_alive()
     assert submit_thread.is_alive()
-    assert cancel_results[0].state == "cancelled"
+    if first_revocation_fails:
+        assert cancel_results == []
+        assert len(cancel_errors) == 1
+        assert "teacher revocation store unavailable" in str(cancel_errors[0])
+    else:
+        assert cancel_errors == []
+        assert cancel_results[0].state == "cancelled"
+    assert revocation_calls == 2
     status = orch.get_status(spec.run_id)
     assert status.state == "cancelled"
     assert status.remote is None
@@ -365,7 +441,7 @@ def test_provider_submission_paths_release_run_lock(orch, monkeypatch, failure_m
     from flash.providers import allocator
     from flash.providers.base import PollResult
     from flash.providers.runpod import jobs as rp_jobs
-    from flash.server._locks import _deploy_lock
+    from flash.server.platform.locks import _deploy_lock
 
     spec = _spec(run_id=f"flash-lock-release-{failure_mode}", max_retries=0)
     orch._save_status(orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
@@ -403,15 +479,16 @@ def test_provider_submission_paths_release_run_lock(orch, monkeypatch, failure_m
 def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, monkeypatch):
     from dataclasses import replace
 
-    import flash.catalog as catalog
+    import flash.core.catalog as catalog
     import flash.envs.loader as env_loader
     from flash.providers import allocator
     from flash.providers.base import PollResult
     from flash.providers.runpod import jobs as rp_jobs
-    from flash.runner import lifecycle
+    from flash.runner.supervise import lifecycle
 
     resolved_sha = "a" * 40
     resolved_refs = []
+    quote_allocations = []
     submitted = []
 
     def fake_resolve(parsed, *args, **kwargs):
@@ -422,7 +499,7 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
     monkeypatch.setattr(
         orch,
         "_resolve_model_revision",
-        lambda spec: replace(spec, model_revision=resolved_model_sha),
+        lambda spec, **_kwargs: replace(spec, model_revision=resolved_model_sha),
     )
     monkeypatch.setattr(
         orch,
@@ -430,8 +507,17 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
         lambda model, *args, **kwargs: catalog.MODELS[model],
     )
 
+    def fake_estimate(_spec, *, allocation=None):
+        quote_allocations.append(allocation)
+        total_usd = 7.0 if allocation is not None else 1.0
+        return type("Estimate", (), {"total_usd": total_usd})()
+
     def fake_runpod_submit(run_spec, seed, **kwargs):
-        persisted = orch.get_status(run_spec.run_id).effective_preparation["worker_spec"]
+        status = orch.get_status(run_spec.run_id)
+        persisted = status.effective_preparation["worker_spec"]
+        assert status.estimated_cost_usd == 7.0
+        assert quote_allocations[-1] is not None
+        assert quote_allocations[-1].gpu == "RTX 5090"
         assert persisted["environment"]["resolved_sha"] == resolved_sha
         assert persisted["gpu"]["type"] == "RTX 5090"
         assert persisted["gpu"]["network_volume"] == "flash-weights"
@@ -447,24 +533,26 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
         return PollResult(True, metrics={"train_tokens": 4096, "wall_seconds": 1})
 
     monkeypatch.setattr(env_loader, "_resolve_ref_sha", fake_resolve)
-    monkeypatch.setattr(
-        "flash.cost.spec.estimate_for_spec",
-        lambda _spec: type("Estimate", (), {"total_usd": 1.0})(),
-    )
+    monkeypatch.setattr("flash.cost.spec.estimate_for_spec", fake_estimate)
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(gpu="RTX 5090"))
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
-    monkeypatch.setattr("flash.providers._worker.upload_code", lambda *a, **k: None)
+    monkeypatch.setattr("flash.providers._lifecycle.worker.upload_code", lambda *a, **k: None)
     monkeypatch.setattr(orch, "flash_code_prefix", lambda: "code/test/flash")
     monkeypatch.setattr(orch, "_persist_metrics", lambda *a, **k: 0.0)
     monkeypatch.setattr(orch, "_gc_run_endpoints", lambda spec: None)
     monkeypatch.setattr(lifecycle, "_register_checkpoints_best_effort", lambda *a, **k: None)
 
-    public = JobSpec.from_dict(
-        {
-            **_spec().to_internal_dict(),
-            "model_revision": resolved_model_sha,
-            "environment": {"id": "github:owner/repo@main:env/environment.py"},
-        }
+    public = _public_spec()
+    # the profile job for this workload already ran, so preparation reads its record instead of
+    # queueing another one. it is keyed on the two shas submission itself resolves above, so it has
+    # to be recorded against those -- not against the helper's stand-ins.
+    record_sft_profile(
+        orch,
+        replace(
+            public,
+            model_revision=resolved_model_sha,
+            environment=replace(public.environment, resolved_sha=resolved_sha),
+        ),
     )
 
     status = orch.submit_job(public)
@@ -489,6 +577,41 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
     assert worker["gpu"]["network_volume"] == "flash-weights"
 
 
+def test_sft_submission_fails_closed_when_the_environment_cannot_be_pinned(orch, monkeypatch):
+    """sft never reaches the unpinned-at-submit state the lifecycle fallback below recovers.
+
+    Its workload profile is keyed on the immutable environment revision, so a GitHub blip at submit
+    has no pin to key on and no profile can be trusted. The run must not be created at all: pricing
+    it would freeze a quote against a ref that can move before the worker resolves it. grpo and opd
+    have no such key, so for them the best-effort pin plus lifecycle fallback stays correct.
+    """
+    import flash.envs.loader as env_loader
+    from flash.providers import allocator
+
+    persisted = []
+
+    def blip(_parsed, *_args, **_kwargs):
+        raise RuntimeError("github rate limit at submit time")
+
+    from dataclasses import replace
+
+    monkeypatch.setattr(env_loader, "_resolve_ref_sha", blip)
+    monkeypatch.setattr(
+        orch,
+        "_resolve_model_revision",
+        lambda spec, **_kw: replace(spec, model_revision="b" * 40),
+    )
+    monkeypatch.setattr(orch, "_save_status", lambda *a, **k: persisted.append(a))
+    monkeypatch.setattr(
+        allocator, "allocate", lambda *a, **k: pytest.fail("allocated without a profile")
+    )
+
+    with pytest.raises(orch.WorkloadProfileUnavailable, match="immutable resolved environment"):
+        orch.submit_job(_public_spec())
+
+    assert persisted == []
+
+
 def test_lifecycle_fallback_pin_is_persisted_for_recovery(orch, monkeypatch):
     """A pin the lifecycle fallback recovers must survive a control-plane restart.
 
@@ -498,16 +621,20 @@ def test_lifecycle_fallback_pin_is_persisted_for_recovery(orch, monkeypatch):
     record and calls that helper with `attempt_started=True`, which deliberately refuses to resolve
     again. A pin held in the lifecycle's local `spec` alone would leave recovery unpinned, so a later
     attempt could resolve a moved ref to different code while resuming the first attempt's
-    checkpoint (codex[bot]).
+    checkpoint.
+
+    Exercised on grpo because sft can no longer reach this state at all: its profile gate rejects an
+    unpinned environment at submit instead of deferring the pin (the fail-closed test above). grpo
+    and opd keep the best-effort pin, so the fallback they depend on is still live.
     """
     from dataclasses import replace
 
-    import flash.catalog as catalog
+    import flash.core.catalog as catalog
     import flash.envs.loader as env_loader
     from flash.providers import allocator
     from flash.providers.base import PollResult
     from flash.providers.runpod import jobs as rp_jobs
-    from flash.runner import lifecycle
+    from flash.runner.supervise import lifecycle
 
     first_sha = "a" * 40
     # every resolution AFTER the fallback returns a different commit, standing in for a push landing
@@ -523,7 +650,7 @@ def test_lifecycle_fallback_pin_is_persisted_for_recovery(orch, monkeypatch):
         return first_sha if len(resolutions) == 2 else moved_sha
 
     monkeypatch.setattr(
-        orch, "_resolve_model_revision", lambda spec: replace(spec, model_revision="b" * 40)
+        orch, "_resolve_model_revision", lambda spec, **_kw: replace(spec, model_revision="b" * 40)
     )
     monkeypatch.setattr(orch, "resolve_model", lambda model, *a, **k: catalog.MODELS[model])
 
@@ -535,24 +662,17 @@ def test_lifecycle_fallback_pin_is_persisted_for_recovery(orch, monkeypatch):
     monkeypatch.setattr(env_loader, "_resolve_ref_sha", fake_resolve)
     monkeypatch.setattr(
         "flash.cost.spec.estimate_for_spec",
-        lambda _spec: type("Estimate", (), {"total_usd": 1.0})(),
+        lambda _spec, **_kwargs: type("Estimate", (), {"total_usd": 1.0})(),
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(gpu="RTX 5090"))
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
-    monkeypatch.setattr("flash.providers._worker.upload_code", lambda *a, **k: None)
+    monkeypatch.setattr("flash.providers._lifecycle.worker.upload_code", lambda *a, **k: None)
     monkeypatch.setattr(orch, "flash_code_prefix", lambda: "code/test/flash")
     monkeypatch.setattr(orch, "_persist_metrics", lambda *a, **k: 0.0)
     monkeypatch.setattr(orch, "_gc_run_endpoints", lambda spec: None)
     monkeypatch.setattr(lifecycle, "_register_checkpoints_best_effort", lambda *a, **k: None)
 
-    public = JobSpec.from_dict(
-        {
-            **_spec().to_internal_dict(),
-            "model_revision": "b" * 40,
-            "environment": {"id": "github:owner/repo@main:env/environment.py"},
-        }
-    )
-
+    public = _public_spec(algorithm="grpo")
     orch.submit_job(public)
 
     # the pin must already be persisted when the provider is called, not written back afterwards:
@@ -674,6 +794,57 @@ def test_runpod_cost_projection_flows_into_run_status(orch, monkeypatch):
         {"train_tokens": 4096, "wall_seconds": 1800, "allocated_gpu": "RTX 4090"},
     )
     assert cost == pytest.approx(0.345)  # 0.5 hr x $0.69/hr (RTX 4090)
+
+
+def test_a_multi_card_run_is_costed_for_every_card_it_occupied(orch):
+    """`hourly_rate` is per CARD, so the measured cost must multiply by the allocated count.
+
+    without it a 4-card run records a quarter of its real spend, and the cost analytics that compare
+    estimates against actuals are corrupted by exactly that factor. the count has to come from the
+    metrics stamp rather than `spec.gpu.count`, which is only a ceiling -- allocation routinely picks
+    fewer cards than authored.
+    """
+    spec = _spec()
+    _seed_status(orch, spec)
+    base = {"train_tokens": 4096, "wall_seconds": 1800, "allocated_gpu": "RTX 4090"}
+
+    four_card = orch._persist_metrics(spec, {**base, "allocated_gpu_count": 4})
+
+    assert four_card == pytest.approx(0.345 * 4), "a 4-card run was priced as one card"
+    # a record predating the stamp still reads as one card rather than zero or a crash
+    assert orch._persist_metrics(spec, dict(base)) == pytest.approx(0.345)
+
+
+def test_the_allocated_card_count_reaches_the_metrics_the_cost_is_read_from(orch, monkeypatch):
+    """The multiply above is inert unless allocation actually stamps the count it chose.
+
+    this drives the real submit path rather than handing `_persist_metrics` a literal, because the
+    two halves fail independently: pricing can multiply correctly by a count that is never recorded.
+    """
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import jobs as rp_jobs
+
+    monkeypatch.setattr(
+        allocator,
+        "allocate",
+        lambda *a, **k: _alloc(candidates=(Candidate("runpod", "RTX 4090", 0.69, 24, 4),)),
+    )
+
+    def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+        if on_handle:
+            on_handle(_runpod_handle(attempt=attempt))
+        return PollResult(True, metrics={"train_tokens": 4096, "wall_seconds": 1800})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    spec = _spec(provider="runpod", type="RTX 4090", count=4)
+    _seed_status(orch, spec)
+
+    metrics = orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
+
+    assert metrics["allocated_gpu_count"] == 4
+    # and the stamp is what pricing then reads, so the two halves compose
+    assert orch._persist_metrics(spec, metrics) == pytest.approx(0.345 * 4)
 
 
 def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monkeypatch):
@@ -909,7 +1080,7 @@ def test_select_candidate_escapes_failed_provider_then_walks_classes():
     """The retry picker prefers cheapest first, escapes a failed provider cross-provider on retry,
     and only walks classes within a provider once every provider has been burned."""
     from flash.providers.base import Candidate
-    from flash.runner.lifecycle import _select_candidate
+    from flash.runner.supervise.lifecycle import _select_candidate
 
     cands = (
         Candidate("runpod", "H100", 0.49, 48),
@@ -919,13 +1090,15 @@ def test_select_candidate_escapes_failed_provider_then_walks_classes():
     # Attempt 0 (nothing failed): cheapest overall.
     assert _select_candidate(cands, set(), set()) is cands[0]
     # RunPod burned an infra attempt -> escape to the OTHER provider, not the next RunPod class.
-    chosen = _select_candidate(cands, {"runpod"}, {("runpod", "H100")})
+    # the tried set is keyed by SHAPE (provider, class, card count), so a 2-tuple would never match
+    # and every candidate would read as untried.
+    chosen = _select_candidate(cands, {"runpod"}, {("runpod", "H100", 1)})
     assert (chosen.provider, chosen.gpu) == ("lambda", "H100")
     # Both providers burned -> fall back to the cheapest class NOT yet tried (within-provider walk).
     chosen = _select_candidate(
         cands,
         {"runpod", "lambda"},
-        {("runpod", "H100"), ("lambda", "H100")},
+        {("runpod", "H100", 1), ("lambda", "H100", 1)},
     )
     assert (chosen.provider, chosen.gpu) == ("runpod", "RTX Pro 6000")
 
@@ -933,10 +1106,10 @@ def test_select_candidate_escapes_failed_provider_then_walks_classes():
 def test_select_candidate_single_provider_walks_classes():
     """With only one provider configured, the picker degrades to the cheapest untried class."""
     from flash.providers.base import Candidate
-    from flash.runner.lifecycle import _select_candidate
+    from flash.runner.supervise.lifecycle import _select_candidate
 
     cands = (Candidate("runpod", "RTX 4090", 0.39, 24), Candidate("runpod", "H100", 0.49, 48))
-    assert _select_candidate(cands, {"runpod"}, {("runpod", "RTX 4090")}).gpu == "H100"
+    assert _select_candidate(cands, {"runpod"}, {("runpod", "RTX 4090", 1)}).gpu == "H100"
 
 
 def test_select_candidate_single_fitting_gpu_never_breaks():
@@ -945,7 +1118,7 @@ def test_select_candidate_single_fitting_gpu_never_breaks():
     classes, so the walk can never escape to a card too small to hold the model, and the picker
     must still return it (not None / not raise) even after it's been tried and its provider burned."""
     from flash.providers.base import Candidate
-    from flash.runner.lifecycle import _select_candidate
+    from flash.runner.supervise.lifecycle import _select_candidate
 
     only = Candidate("runpod", "H200", 4.0, 141)
     cands = (only,)
@@ -953,7 +1126,7 @@ def test_select_candidate_single_fitting_gpu_never_breaks():
     assert _select_candidate(cands, set(), set()) is only
     # After it failed infra-shaped (provider burned, class tried), the next retry re-picks the SAME
     # class — there is nowhere else to walk, and the picker must not break.
-    assert _select_candidate(cands, {"runpod"}, {("runpod", "H200")}) is only
+    assert _select_candidate(cands, {"runpod"}, {("runpod", "H200", 1)}) is only
 
 
 def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):
@@ -961,7 +1134,7 @@ def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):
     (Lambda) rather than walking to the next RunPod class while Lambda sits available."""
     from flash.providers import allocator
     from flash.providers.base import Candidate, PollResult
-    from flash.providers.lambdalabs import jobs as lambda_jobs
+    from flash.providers.lambda_ import jobs as lambda_jobs
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs as rp_jobs
 
@@ -1104,8 +1277,8 @@ def test_broken_gpu_preempt_retries_on_other_provider(orch, monkeypatch):
     instance is torn down before the retry."""
     from flash.providers import allocator
     from flash.providers.base import Candidate, PollResult
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs as lambda_jobs
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs as lambda_jobs
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs as rp_jobs
 
@@ -1161,8 +1334,8 @@ def test_no_liveness_stalled_escapes_to_other_provider(orch, monkeypatch):
     CANADA-1 case, now caught in ~15 min instead of ~50."""
     from flash.providers import allocator
     from flash.providers.base import Candidate, PollResult
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs as lambda_jobs
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs as lambda_jobs
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs as rp_jobs
 
@@ -1225,7 +1398,7 @@ def test_genuine_worker_error_does_not_retry(orch, monkeypatch):
 
 def test_cancel_rejects_legacy_handle_without_provider_identity(orch, monkeypatch):
     from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import train as rp_train
+    from flash.providers.runpod import serverless as rp_train
 
     cancelled_jobs, deleted_eps = [], []
     monkeypatch.setattr(
@@ -1551,7 +1724,7 @@ def test_sole_class_cache_drop_does_not_claim_the_class_is_exhausted(orch, monke
     class has been tried at all. A cache-drop retry then deliberately leaves tried_classes untouched
     and reselects the same class cold, so the line read "expecting to retry on H100 @ runpod again,
     no untried GPU class fits this run": naming the untried class in the same clause that denies one
-    exists. Derive the clause from the sets the retry will actually see instead (codex[bot])."""
+    exists. Derive the clause from the sets the retry will actually see instead."""
     from flash.providers import allocator
     from flash.providers.base import Candidate, PollResult
     from flash.providers.runpod import api as runpod_api
@@ -1624,3 +1797,66 @@ def test_sole_class_infra_retry_still_reports_exhaustion(orch, monkeypatch):
     action = _retry_action_line(log.getvalue(), 0)
     assert "expecting to retry on H100 @ runpod again" in action, action
     assert "no untried GPU class fits this run" in action, action
+
+
+def test_workload_profile_mismatch_fails_fast_instead_of_retrying(orch, monkeypatch):
+    """A profile whose identity does not match the spec is terminal, not infrastructure.
+
+    The selected-quote refresh re-derives the profile digest from the effective spec, so a mismatch
+    resolves identically on every attempt. Classifying it as infra-shaped burns the run's whole
+    retry budget on real ``time.sleep`` backoffs before failing anyway -- the shape that wedged the
+    suite for 20 minutes on a single test."""
+    from flash.engine.profiling.workload_profile import WorkloadProfileMismatch
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
+
+    submits = []
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        submits.append(attempt)
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+
+    import flash.cost.spec as cost_spec
+
+    def refuse(*_a, **_kw):
+        raise WorkloadProfileMismatch("workload profile input digest does not match")
+
+    monkeypatch.setattr(cost_spec, "estimate_for_spec", refuse)
+
+    # any sleep here means the failure was misclassified as a transient the run should wait out.
+    slept = []
+    from flash.runner.supervise import lifecycle
+
+    monkeypatch.setattr(lifecycle.time, "sleep", lambda s: slept.append(s))
+
+    spec = _spec(max_retries=2)
+    _seed_status(orch, spec)
+    with pytest.raises(WorkloadProfileMismatch):
+        orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
+
+    assert submits == []  # never reached a provider
+    assert slept == []  # and never backed off waiting for it to clear
+
+
+def test_submit_supplies_the_worker_pip_the_payload_no_longer_carries() -> None:
+    """``[environment] pip`` left the public surface, so the provider must resolve it here.
+
+    The knob was platform-managed all along: ``worker_pip_for_env`` ignores the env id and returns
+    one constant. Removing it from the wire without this substitution would ship a worker with no
+    Freesolo SDK, and the failure would only appear once a GPU was already rented.
+    """
+    from flash.providers._lifecycle.instance import build_payload
+
+    spec = _spec()
+    assert not spec.environment.pip
+
+    payload = build_payload(spec, spec.seed, 0, arm="a", deadline_at=1_800_000_000.0)
+
+    assert payload["extra_pip"] == ["freesolo>=0.4.0"]

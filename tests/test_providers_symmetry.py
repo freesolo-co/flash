@@ -36,7 +36,7 @@ PROVIDER_METHODS = (
 )
 
 
-_PKG = {"runpod": "runpod", "lambda": "lambdalabs", "vast": "vast"}
+_PKG = {"runpod": "runpod", "lambda": "lambda_", "vast": "vast"}
 
 
 def test_registry_lists_all_providers():
@@ -87,7 +87,7 @@ def test_method_signatures_match_runpod(provider):
 
 def test_setup_vs_training_gate_contract():
     """define the canonical setup-vs-training classifier contract used by provider polling."""
-    from flash.providers._poll import (
+    from flash.providers._lifecycle.poll import (
         SETUP_HEARTBEAT_STAGES,
         STEP_GATED_STAGES,
         is_training_heartbeat,
@@ -110,7 +110,7 @@ def test_setup_vs_training_gate_contract():
 
 
 def test_format_heartbeat_includes_rl_step_metrics():
-    from flash.providers._poll import _format_heartbeat
+    from flash.providers._lifecycle.poll import _format_heartbeat
 
     rendered = _format_heartbeat(
         {
@@ -235,7 +235,10 @@ def test_vast_competes_purely_on_price(monkeypatch):
     assert a.provider == "vast"
     assert a.hourly_usd == pytest.approx(0.47)
 
-    # When Vast is the pricier offer it does NOT win -> no structural advantage either way.
+    # When Vast is the pricier offer for the SAME class it does NOT win -> no structural advantage
+    # either way. RunPod's 4090 beats Lambda's nominally-cheaper A10 here because ranking is on
+    # what the JOB costs: the A10 sustains ~125 TFLOPS against the 4090's ~165, so the run takes
+    # long enough on it to more than erase the $0.09/hr saving.
     _stub_candidates(
         monkeypatch,
         runpod=[("runpod", "RTX 4090", 0.69, 24)],
@@ -243,8 +246,8 @@ def test_vast_competes_purely_on_price(monkeypatch):
         vast=[("vast", "RTX 4090", 0.80, 24)],
     )
     b = allocate("Qwen/Qwen3.5-0.8B", "sft")
-    assert b.provider == "lambda"
-    assert b.hourly_usd == pytest.approx(0.60)
+    assert b.provider == "runpod"
+    assert b.hourly_usd == pytest.approx(0.69)
 
 
 def test_gpu_name_breaks_price_vram_tie_before_provider_order(monkeypatch):
@@ -355,3 +358,52 @@ def test_runpod_destroy_rejects_unconfirmed_delete(monkeypatch):
 
     with pytest.raises(rp_api.RunpodApiError, match="unconfirmed"):
         get_provider("runpod").destroy(handle)
+
+
+@pytest.mark.parametrize(
+    ("provider", "env_var"),
+    [("runpod", "RUNPOD_API_KEY"), ("lambda", "LAMBDA_API_KEY"), ("vast", "VAST_API_KEY")],
+)
+def test_the_key_sent_on_the_wire_is_the_key_preflight_accepted(monkeypatch, provider, env_var):
+    """A padded provider key must not pass preflight and then go out unstripped.
+
+    ``load_provider_key`` strips, so ``is_configured()`` and the startup preflight accept a key
+    carrying a stray newline from an env file. The outbound REST client used to re-read
+    ``os.environ`` raw, so the request went out as ``Authorization: Bearer <key>\\n`` -- a
+    Lambda-only or Vast-only plane reported a clean preflight while every capacity lookup and
+    allocation was rejected, with nothing pointing at the credential.
+
+    Asserted on the ``Authorization`` HEADER, not on ``api_key()``: the header is what the
+    provider sees, and it is the only place the two halves can be observed disagreeing.
+    """
+    import urllib.request
+
+    from flash.providers._lifecycle.auth import load_provider_key
+    from flash.providers._lifecycle.http import RestClient
+
+    padded = "\n  key-with-padding  \n"
+    monkeypatch.setenv(env_var, padded)
+    assert load_provider_key(env_var) == "key-with-padding"  # what preflight judges
+
+    client = RestClient(env_var=env_var, error_cls=RuntimeError, base_url="https://api.invalid")
+    seen: dict[str, str] = {}
+
+    class _Resp:
+        def read(self):
+            return b"{}"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _capture(req, timeout=None):
+        seen.update(req.headers)
+        return _Resp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", _capture)
+    client.request("/whatever")
+
+    auth = seen.get("Authorization") or seen.get("Authorization".title())
+    assert auth == "Bearer key-with-padding", f"padded credential reached the wire: {auth!r}"

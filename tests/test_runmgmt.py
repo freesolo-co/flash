@@ -63,7 +63,7 @@ def test_background_run_redacts_private_exception_content(monkeypatch, caplog):
     from types import SimpleNamespace
 
     import flash.runner as runner
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     spec = JobSpec(run_id="background-private", model="Qwen/Qwen3.5-4B", algorithm="sft")
     updates = []
@@ -100,7 +100,7 @@ def test_list_and_cancel(monkeypatch):
         importlib.reload(runner)
         # fixed constant; redirect to tmp via monkeypatch so it's restored after the test.
         monkeypatch.setattr(runner, "RUNS_DIR", tmp)
-        from flash.spec import JobSpec
+        from flash.core.spec import JobSpec
 
         # two dry-run records
         for rid in ("a", "b"):
@@ -160,8 +160,8 @@ def test_get_status_tolerates_stale_unknown_keys(monkeypatch):
 
 def test_submit_job_persists_quote_and_completion_charges_it(monkeypatch, tmp_path):
     import flash.runner as runner
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.cost.spec import estimate_for_spec
-    from flash.spec import GpuSpec, JobSpec, TrainSpec
 
     importlib.reload(runner)
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
@@ -206,7 +206,7 @@ def test_missing_persisted_run_deadline_is_rejected(monkeypatch, tmp_path):
     import os
 
     import flash.runner as runner
-    from flash.spec import GpuSpec, JobSpec
+    from flash.core.spec import GpuSpec, JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
@@ -240,7 +240,7 @@ def test_missing_persisted_run_deadline_is_rejected(monkeypatch, tmp_path):
 )
 def test_remaining_run_wall_seconds_rejects_unsafe_current_clock(monkeypatch, tmp_path, unsafe_now):
     import flash.runner as runner
-    from flash.spec import GpuSpec, JobSpec
+    from flash.core.spec import GpuSpec, JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
@@ -264,7 +264,7 @@ def test_remaining_run_wall_seconds_rejects_unsafe_current_clock(monkeypatch, tm
 
 def test_persisted_run_deadline_must_match_canonical_value(monkeypatch, tmp_path):
     import flash.runner as runner
-    from flash.spec import GpuSpec, JobSpec
+    from flash.core.spec import GpuSpec, JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
@@ -292,7 +292,7 @@ def test_persisted_run_deadline_rejects_nonpositive_or_nonfinite_values(
     monkeypatch, tmp_path, deadline
 ):
     import flash.runner as runner
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="invalid-deadline", model="Qwen/Qwen3.5-4B", algorithm="sft")
@@ -308,7 +308,7 @@ def test_persisted_run_deadline_rejects_nonpositive_or_nonfinite_values(
 @pytest.mark.parametrize("created_at", [0, -1, float("nan"), float("inf"), float("-inf")])
 def test_status_save_rejects_invalid_creation_time(monkeypatch, tmp_path, created_at):
     import flash.runner as runner
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="invalid-legacy-deadline", model="Qwen/Qwen3.5-4B", algorithm="sft")
@@ -329,17 +329,17 @@ def test_record_heartbeat_updates_status_without_state_change(monkeypatch):
 
         importlib.reload(runner)
         monkeypatch.setattr(runner, "RUNS_DIR", tmp)
-        from flash.spec import JobSpec, TrainSpec
+        from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
+        from tests._helpers.profile import satisfy_sft_profile
 
-        status = runner.submit_job(
-            JobSpec(
-                run_id="hb",
-                model="Qwen/Qwen3.5-4B",
-                algorithm="sft",
-                train=TrainSpec(max_examples=8),
-            ),
-            dry_run=True,
+        spec = JobSpec(
+            run_id="hb",
+            model="Qwen/Qwen3.5-4B",
+            algorithm="sft",
+            environment=EnvironmentSpec(id="team/example"),
+            train=TrainSpec(max_examples=8),
         )
+        status = runner.submit_job(satisfy_sft_profile(runner, monkeypatch, spec), dry_run=True)
         status.state = "running"
         runner._save_status(status)
 
@@ -387,17 +387,17 @@ def test_record_heartbeat_persists_finalize_liveness_ping_with_step(monkeypatch)
 
         importlib.reload(runner)
         monkeypatch.setattr(runner, "RUNS_DIR", tmp)
-        from flash.spec import JobSpec, TrainSpec
+        from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
+        from tests._helpers.profile import satisfy_sft_profile
 
-        status = runner.submit_job(
-            JobSpec(
-                run_id="hbf",
-                model="Qwen/Qwen3.5-4B",
-                algorithm="sft",
-                train=TrainSpec(max_examples=8),
-            ),
-            dry_run=True,
+        spec = JobSpec(
+            run_id="hbf",
+            model="Qwen/Qwen3.5-4B",
+            algorithm="sft",
+            environment=EnvironmentSpec(id="team/example"),
+            train=TrainSpec(max_examples=8),
         )
+        status = runner.submit_job(satisfy_sft_profile(runner, monkeypatch, spec), dry_run=True)
         status.state = "running"
         runner._save_status(status)
 
@@ -423,7 +423,7 @@ def test_finished_at_frozen_at_terminal_survives_later_updated_at_bumps(monkeypa
 
         importlib.reload(runner)
         monkeypatch.setattr(runner, "RUNS_DIR", tmp)
-        from flash.spec import JobSpec
+        from flash.core.spec import JobSpec
 
         runner.submit_job(
             JobSpec(run_id="fa", model="Qwen/Qwen3.5-4B", algorithm="grpo"), dry_run=True
@@ -461,7 +461,7 @@ def test_legacy_finished_at_backfill_uses_prior_updated_at_on_same_state_touch(m
 
         importlib.reload(runner)
         monkeypatch.setattr(runner, "RUNS_DIR", tmp)
-        from flash.spec import JobSpec
+        from flash.core.spec import JobSpec
 
         runner.submit_job(
             JobSpec(run_id="leg", model="Qwen/Qwen3.5-4B", algorithm="grpo"), dry_run=True
@@ -504,11 +504,11 @@ def test_persist_metrics_keeps_stamped_zero_vast(monkeypatch):
 
         importlib.reload(runner)
         monkeypatch.setattr(runner, "RESULTS_DIR", tmp)
-        monkeypatch.setattr(runner, "_gpu_rate", lambda gpu: 3600.0)
-        from flash.spec import JobSpec
+        monkeypatch.setattr(runner, "_gpu_rate", lambda gpu, provider="": 3600.0)
+        from flash.core.spec import JobSpec
 
         spec = JobSpec(run_id="r0", model="Qwen/Qwen3.5-4B", algorithm="grpo")
-        # A zero placeholder is not a settled provider cost; use the RunPod wall-pricing fallback.
+        # A zero placeholder is not a settled provider cost; use the wall-pricing fallback.
         metrics = {
             "cost_usd": 0.0,
             "wall_seconds": 1.0,
@@ -518,7 +518,44 @@ def test_persist_metrics_keeps_stamped_zero_vast(monkeypatch):
         with open(os.path.join(runner.artifacts_dir(spec), "metrics.json")) as f:
             on_disk = json.load(f)
         assert on_disk["cost_usd"] == 1.0
-        assert on_disk["notes"]["provider"] == "runpod"
+        # No allocated_provider stamped -> say so, rather than attributing the cost to RunPod.
+        assert on_disk["notes"]["provider"] == "unknown"
+
+
+def test_persist_metrics_attributes_the_provider_that_billed_the_run(monkeypatch):
+    """The note records the substrate that ran the job, not a hardcoded default.
+
+    A plane with no RunPod key still prices its runs, and a Lambda/Vast run is not filed under
+    RunPod's rate table.
+    """
+    import json
+    import os
+
+    with tempfile.TemporaryDirectory() as tmp:
+        import flash.runner as runner
+
+        importlib.reload(runner)
+        monkeypatch.setattr(runner, "RESULTS_DIR", tmp)
+        seen = {}
+
+        def _rate(gpu, provider=""):
+            seen["gpu"], seen["provider"] = gpu, provider
+            return 3600.0
+
+        monkeypatch.setattr(runner, "_gpu_rate", _rate)
+        from flash.core.spec import JobSpec
+
+        spec = JobSpec(run_id="r-vast", model="Qwen/Qwen3.5-4B", algorithm="grpo")
+        runner._persist_metrics(
+            spec,
+            {"wall_seconds": 1.0, "allocated_gpu": "RTX 5090", "allocated_provider": "vast"},
+        )
+        assert seen == {"gpu": "RTX 5090", "provider": "vast"}
+        with open(os.path.join(runner.artifacts_dir(spec), "metrics.json")) as f:
+            on_disk = json.load(f)
+        assert on_disk["notes"]["provider"] == "vast"
+        assert on_disk["notes"]["gpu"] == "RTX 5090"
+        assert on_disk["notes"]["gpu_rate_usd_hr"] == 3600.0
 
 
 def test_persist_metrics_falls_back_when_cost_absent(monkeypatch):
@@ -530,16 +567,16 @@ def test_persist_metrics_falls_back_when_cost_absent(monkeypatch):
 
         importlib.reload(runner)
         monkeypatch.setattr(runner, "RESULTS_DIR", tmp)
-        monkeypatch.setattr(runner, "_gpu_rate", lambda gpu: 3600.0)
-        from flash.spec import JobSpec
+        monkeypatch.setattr(runner, "_gpu_rate", lambda gpu, provider="": 3600.0)
+        from flash.core.spec import JobSpec
 
         spec = JobSpec(run_id="r1", model="Qwen/Qwen3.5-4B", algorithm="grpo")
-        # No cost_usd stamped (RunPod path): fall back to wall * rate and attribute runpod.
+        # No cost_usd stamped: fall back to wall * rate.
         out = runner._persist_metrics(spec, {"wall_seconds": 1.0, "allocated_gpu": "RTX 5090"})
         assert out == 1.0  # 1s / 3600 * 3600/hr
         with open(os.path.join(runner.artifacts_dir(spec), "metrics.json")) as f:
             on_disk = json.load(f)
-        assert on_disk["notes"]["provider"] == "runpod"
+        assert on_disk["notes"]["provider"] == "unknown"
 
 
 def test_persist_metrics_bills_training_wall_not_setup(monkeypatch):
@@ -551,8 +588,8 @@ def test_persist_metrics_bills_training_wall_not_setup(monkeypatch):
 
         importlib.reload(runner)
         monkeypatch.setattr(runner, "RESULTS_DIR", tmp)
-        monkeypatch.setattr(runner, "_gpu_rate", lambda gpu: 3600.0)
-        from flash.spec import JobSpec
+        monkeypatch.setattr(runner, "_gpu_rate", lambda gpu, provider="": 3600.0)
+        from flash.core.spec import JobSpec
 
         spec = JobSpec(run_id="r-train-only", model="Qwen/Qwen3.5-4B", algorithm="sft")
         metrics = {
@@ -573,8 +610,8 @@ def test_run_training_charges_persisted_submit_estimate(monkeypatch, tmp_path):
     import io
 
     import flash.runner as runner
-    from flash.runner import lifecycle
-    from flash.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.runner.supervise import lifecycle
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
@@ -619,16 +656,23 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
     import flash.providers as providers
     import flash.providers.allocator as allocator
     import flash.runner as runner
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.providers.base import Allocation, Candidate, PollResult
-    from flash.runner import lifecycle
-    from flash.spec import GpuSpec, JobSpec
+    from flash.runner.supervise import lifecycle
+    from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(
-        run_id="attempt-sequence",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="sft",
-        gpu=GpuSpec(type="", max_retries=1),
+    # the attached profile pins a model revision, which makes the post-allocation quote refresh
+    # resolve revision-specific geometry from the hub. read the catalog's numbers instead.
+    stub_revision_geometry(monkeypatch)
+    spec = attach_sft_profile(
+        JobSpec(
+            run_id="attempt-sequence",
+            model="Qwen/Qwen3.5-4B",
+            algorithm="sft",
+            train=TrainSpec(max_examples=1),
+            gpu=GpuSpec(type="", max_retries=1),
+        )
     )
     runner._save_status(
         runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
@@ -690,16 +734,23 @@ def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monke
     import flash.providers as providers
     import flash.providers.allocator as allocator
     import flash.runner as runner
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.providers.base import Allocation, Candidate, PollResult
-    from flash.runner import lifecycle
-    from flash.spec import GpuSpec, JobSpec
+    from flash.runner.supervise import lifecycle
+    from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(
-        run_id="pre-handle-attempt",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="sft",
-        gpu=GpuSpec(type="", max_retries=1),
+    # the attached profile pins a model revision, which makes the post-allocation quote refresh
+    # resolve revision-specific geometry from the hub. read the catalog's numbers instead.
+    stub_revision_geometry(monkeypatch)
+    spec = attach_sft_profile(
+        JobSpec(
+            run_id="pre-handle-attempt",
+            model="Qwen/Qwen3.5-4B",
+            algorithm="sft",
+            train=TrainSpec(max_examples=1),
+            gpu=GpuSpec(type="", max_retries=1),
+        )
     )
     runner._save_status(
         runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
@@ -755,16 +806,23 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
     import flash.providers as providers
     import flash.providers.allocator as allocator
     import flash.runner as runner
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.providers.base import Allocation, Candidate, PollResult
-    from flash.runner import lifecycle
-    from flash.spec import GpuSpec, JobSpec
+    from flash.runner.supervise import lifecycle
+    from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(
-        run_id="wall-budget",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="sft",
-        gpu=GpuSpec(type="", max_wall_seconds=200, max_retries=1),
+    # the attached profile pins a model revision, which makes the post-allocation quote refresh
+    # resolve revision-specific geometry from the hub. read the catalog's numbers instead.
+    stub_revision_geometry(monkeypatch)
+    spec = attach_sft_profile(
+        JobSpec(
+            run_id="wall-budget",
+            model="Qwen/Qwen3.5-4B",
+            algorithm="sft",
+            train=TrainSpec(max_examples=1),
+            gpu=GpuSpec(type="", max_wall_seconds=200, max_retries=1),
+        )
     )
     runner._save_status(
         provisioned_status(runner, spec, state="running", created_at=100.0),
@@ -837,16 +895,23 @@ def test_retry_backoff_cannot_cross_provider_minimum(monkeypatch, tmp_path):
     import flash.providers as providers
     import flash.providers.allocator as allocator
     import flash.runner as runner
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.providers.base import Allocation, Candidate
-    from flash.runner import lifecycle
-    from flash.spec import GpuSpec, JobSpec
+    from flash.runner.supervise import lifecycle
+    from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(
-        run_id="retry-deadline-minimum",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="sft",
-        gpu=GpuSpec(type="", max_wall_seconds=200, max_retries=1),
+    # the attached profile pins a model revision, which makes the post-allocation quote refresh
+    # resolve revision-specific geometry from the hub. read the catalog's numbers instead.
+    stub_revision_geometry(monkeypatch)
+    spec = attach_sft_profile(
+        JobSpec(
+            run_id="retry-deadline-minimum",
+            model="Qwen/Qwen3.5-4B",
+            algorithm="sft",
+            train=TrainSpec(max_examples=1),
+            gpu=GpuSpec(type="", max_wall_seconds=200, max_retries=1),
+        )
     )
     runner._save_status(
         provisioned_status(runner, spec, state="running", created_at=100.0),
@@ -907,7 +972,7 @@ def test_save_status_flushes_file_and_directory_before_return(monkeypatch, tmp_p
     import os
 
     import flash.runner as runner
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="durable-status", model="Qwen/Qwen3.5-4B", algorithm="sft")
@@ -991,7 +1056,7 @@ def test_save_status_closes_directory_and_cleans_temp_when_directory_fsync_fails
     import os
 
     import flash.runner as runner
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="durable-failure", model="Qwen/Qwen3.5-4B", algorithm="sft")
@@ -1043,7 +1108,7 @@ def test_save_status_cleans_temp_when_replace_fails(monkeypatch, tmp_path):
     import os
 
     import flash.runner as runner
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="replace-failure", model="Qwen/Qwen3.5-4B", algorithm="sft")
@@ -1075,7 +1140,7 @@ def test_concurrent_attempt_reservations_are_unique_and_monotonic(monkeypatch, t
     from concurrent.futures import ThreadPoolExecutor
 
     import flash.runner as runner
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="threaded-attempts", model="Qwen/Qwen3.5-4B", algorithm="sft")
@@ -1095,7 +1160,7 @@ def test_multiprocess_attempt_reservations_preserve_concurrent_status_update(mon
     import multiprocessing
 
     import flash.runner as runner
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     runs_dir = str(tmp_path / "runs")
     monkeypatch.setattr(runner, "RUNS_DIR", runs_dir)
@@ -1155,7 +1220,7 @@ def test_compare_and_clear_remote_uses_exact_provider_resource_identity(
     monkeypatch, tmp_path, remote
 ):
     import flash.runner as runner
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="compare-clear", model="Qwen/Qwen3.5-4B", algorithm="sft")
@@ -1191,7 +1256,7 @@ def test_compare_and_clear_remote_uses_exact_provider_resource_identity(
 )
 def test_compare_and_clear_remote_preserves_newer_resource(monkeypatch, tmp_path, original, newer):
     import flash.runner as runner
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="compare-preserve", model="Qwen/Qwen3.5-4B", algorithm="sft")
@@ -1212,7 +1277,7 @@ def test_cleanup_collection_deduplicates_and_survives_status_writes_and_reload(
     monkeypatch, tmp_path
 ):
     import flash.runner as runner
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     runs_dir = str(tmp_path / "runs")
     monkeypatch.setattr(runner, "RUNS_DIR", runs_dir)
@@ -1245,7 +1310,7 @@ def test_cleanup_collection_deduplicates_and_survives_status_writes_and_reload(
 
 def test_record_cleanup_remote_does_not_revive_cleared_remote(monkeypatch, tmp_path):
     import flash.runner as runner
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="cleanup-record", model="Qwen/Qwen3.5-4B", algorithm="sft")
@@ -1262,7 +1327,7 @@ def test_record_cleanup_remote_does_not_revive_cleared_remote(monkeypatch, tmp_p
 
 def test_recovered_completion_does_not_overwrite_concurrent_cancel(monkeypatch, tmp_path):
     import flash.runner as runner
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="completion-cancel", model="Qwen/Qwen3.5-4B", algorithm="sft")
@@ -1302,8 +1367,8 @@ def test_recovered_terminal_runs_keep_remote_for_cost_reconciliation(
     monkeypatch, tmp_path, terminal_state
 ):
     import flash.runner as runner
-    from flash.server import reconcile
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
+    from flash.server.domain import reconcile
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id=f"recovered-{terminal_state}", model="Qwen/Qwen3.5-4B", algorithm="sft")
@@ -1332,7 +1397,7 @@ def test_recovered_terminal_runs_keep_remote_for_cost_reconciliation(
 def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tmp_path):
     import flash.providers as providers
     import flash.runner as runner
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="cleanup-drain", model="Qwen/Qwen3.5-4B", algorithm="sft")
@@ -1403,7 +1468,7 @@ def test_next_attempt_requires_persisted_integer_identity():
 
 def test_handleless_state_without_next_attempt_is_rejected(monkeypatch, tmp_path):
     import flash.runner as runner
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="missing-next-attempt", model="Qwen/Qwen3.5-4B", algorithm="sft")
@@ -1422,8 +1487,8 @@ def test_new_attempt_requires_full_provider_minimum_before_allocation(monkeypatc
 
     import flash.providers.allocator as allocator
     import flash.runner as runner
-    from flash.runner import lifecycle
-    from flash.spec import GpuSpec, JobSpec
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.runner.supervise import lifecycle
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
@@ -1450,7 +1515,7 @@ def test_new_attempt_requires_full_provider_minimum_before_allocation(monkeypatc
 
 def test_reserved_attempt_survives_handleless_restart_without_reusing_zero(monkeypatch, tmp_path):
     import flash.runner as runner
-    from flash.spec import GpuSpec, JobSpec
+    from flash.core.spec import GpuSpec, JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
@@ -1492,8 +1557,8 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
 
     import flash.providers as providers
     import flash.runner as runner
+    from flash.core.spec import GpuSpec, JobSpec
     from flash.providers.base import PollResult
-    from flash.spec import GpuSpec, JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
@@ -1548,10 +1613,10 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
 def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tmp_path):
     import io
 
-    import flash.providers._hf_artifacts as hf_artifacts
+    import flash.providers.artifacts.hf as hf_artifacts
     import flash.runner as runner
-    import flash.runner.lifecycle as lifecycle
-    from flash.spec import GpuSpec, JobSpec, TrainSpec
+    import flash.runner.supervise.lifecycle as lifecycle
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
@@ -1619,13 +1684,90 @@ def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tm
     assert "adopted a completed attempt at the wall deadline" in log.getvalue()
 
 
+def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp_path):
+    # same gap as the reconciler's, on the OTHER adoption path: attach_run pops the allocation
+    # stamp off the persisted remote before building the handle, and only restores it on the
+    # poll-success return. an adopted run leaves through _completed_attempt_metrics instead, whose
+    # payload is the worker's own metrics.json -- and the worker never knew the card count. without
+    # the carry, a 4-card vast run recovered after a control-plane restart prices its wall as one.
+    import io
+
+    import flash.providers.artifacts.hf as hf_artifacts
+    import flash.runner as runner
+    import flash.runner.supervise.lifecycle as lifecycle
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    spec = JobSpec(
+        run_id="attach-adopt-multicard",
+        model="Qwen/Qwen3.5-4B",
+        algorithm="sft",
+        train=TrainSpec(epochs=1, hf_repo="org/repo"),
+        gpu=GpuSpec(max_wall_seconds=120),
+    )
+    remote = _vast_remote(
+        instance_id=7,
+        attempt=0,
+        started_ts=101.0,
+        allocated_gpu="RTX 4090",
+        allocated_gpu_count=4,
+    )
+    runner._save_status(
+        provisioned_status(runner, spec, state="running", created_at=100.0, remote=remote),
+        _run_deadline_at=220.0,
+        _next_attempt=1,
+    )
+    monkeypatch.setattr(runner.time, "time", lambda: 221.0)
+
+    def artifact_reader(_repo, path):
+        def read(force=False):
+            if path.endswith("/vast_attempt0.json"):
+                return (
+                    '{"attempt":0,"error":"","ok":true,"retriable":false,'
+                    '"run_id":"attach-adopt-multicard","ts":219.0}'
+                )
+            if path.endswith("/metrics.json"):
+                # exactly what the worker writes: a wall, and nothing about the allocation.
+                return '{"wall_seconds":3600.0}'
+            return None
+
+        return read
+
+    adopted = {}
+    real_adopt = lifecycle._adopt_completed_attempt
+
+    def capture_adopt(run_id, adopt_spec, expected_remote, metrics, **kwargs):
+        adopted.update(metrics)
+        return real_adopt(run_id, adopt_spec, expected_remote, metrics, **kwargs)
+
+    monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
+    monkeypatch.setattr(lifecycle, "_adopt_completed_attempt", capture_adopt)
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+
+    status = runner.attach_run(spec.run_id, log_stream=io.StringIO())
+
+    assert status.state == "done"
+    assert adopted["allocated_gpu_count"] == 4, (
+        "an adopted multi-card run reached persistence with no card count, so its wall prices "
+        "as a single card"
+    )
+    assert adopted["allocated_gpu"] == "RTX 4090"
+    # and the substrate that billed it. _gpu_rate falls back to whichever configured provider
+    # offers the class, so without this the run is priced on a provider that never ran it.
+    assert adopted["allocated_provider"] == "vast", (
+        "an adopted vast run reached persistence with no provider, so it is priced on whichever "
+        "provider the plane happens to try first"
+    )
+
+
 def test_attach_success_marker_with_lagging_metrics_stays_pending(monkeypatch, tmp_path):
     import io
 
     import flash.runner as runner
-    import flash.runner.deploy as deploy
-    import flash.runner.lifecycle as lifecycle
-    from flash.spec import GpuSpec, JobSpec, TrainSpec
+    import flash.runner.supervise.deploy as deploy
+    import flash.runner.supervise.lifecycle as lifecycle
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
@@ -1671,9 +1813,9 @@ def test_attach_success_marker_with_lagging_metrics_stays_pending(monkeypatch, t
     ],
 )
 def test_completed_attempt_metrics_bounds_marker_to_wall_grace(monkeypatch, marker_ts, expected):
-    import flash.providers._hf_artifacts as hf_artifacts
-    import flash.runner.lifecycle as lifecycle
-    from flash.spec import JobSpec, TrainSpec
+    import flash.providers.artifacts.hf as hf_artifacts
+    import flash.runner.supervise.lifecycle as lifecycle
+    from flash.core.spec import JobSpec, TrainSpec
 
     spec = JobSpec(
         run_id="late-marker-complete",
@@ -1714,8 +1856,8 @@ def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
 
     import flash.providers as providers
     import flash.runner as runner
-    import flash.runner.lifecycle as lifecycle
-    from flash.spec import GpuSpec, JobSpec
+    import flash.runner.supervise.lifecycle as lifecycle
+    from flash.core.spec import GpuSpec, JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
@@ -1782,7 +1924,7 @@ def test_attach_expired_run_retains_handle_when_teardown_is_unconfirmed(monkeypa
 
     import flash.providers as providers
     import flash.runner as runner
-    from flash.spec import GpuSpec, JobSpec
+    from flash.core.spec import GpuSpec, JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
@@ -1823,15 +1965,14 @@ def test_attach_expired_run_retains_handle_when_teardown_is_unconfirmed(monkeypa
 
 def test_runpod_submit_propagates_attempt_to_worker_environment_and_handle(monkeypatch):
     import flash.providers.runpod.jobs as jobs
-    import flash.providers.runpod.train as train
+    import flash.providers.runpod.serverless as train
+    from flash.core.spec import JobSpec
     from flash.providers.base import PollResult
-    from flash.spec import JobSpec
 
     spec = JobSpec(run_id="worker-attempt", model="Qwen/Qwen3.5-4B", algorithm="sft")
     payloads = []
     handles = []
     monkeypatch.setattr(train, "build_worker_env", lambda *_args, **_kwargs: {})
-    monkeypatch.setattr(train, "chalk_extra_pip", lambda _spec: [])
     monkeypatch.setattr(
         jobs,
         "deploy_train_endpoint",
@@ -1864,8 +2005,8 @@ def test_runpod_submit_propagates_attempt_to_worker_environment_and_handle(monke
 
 def test_fail_blocked_recovery_adopts_completed_handleless_attempt(monkeypatch, tmp_path):
     import flash.runner as runner
-    import flash.server._runtime as runtime
-    from flash.spec import JobSpec
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
@@ -1896,9 +2037,9 @@ def test_fail_blocked_recovery_adopts_completed_handleless_attempt(monkeypatch, 
 
 def test_fail_blocked_recovery_keeps_success_with_lagging_metrics_pending(monkeypatch, tmp_path):
     import flash.runner as runner
-    import flash.runner.lifecycle as lifecycle
-    import flash.server._runtime as runtime
-    from flash.spec import JobSpec
+    import flash.runner.supervise.lifecycle as lifecycle
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="blocked-pending", model="Qwen/Qwen3.5-4B", algorithm="sft")
@@ -1927,8 +2068,8 @@ def test_fail_blocked_recovery_keeps_success_with_lagging_metrics_pending(monkey
 
 def test_start_resubmit_deadline_adopts_completed_handleless_attempt(monkeypatch, tmp_path):
     import flash.runner as runner
-    import flash.server._runtime as runtime
-    from flash.spec import GpuSpec, JobSpec
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import GpuSpec, JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
@@ -1969,8 +2110,8 @@ def test_recover_runs_defers_when_resubmit_waits_for_metrics(
 ):
     import flash.providers as providers
     import flash.runner as runner
-    import flash.server._runtime as runtime
-    from flash.spec import JobSpec
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="recover-pending", model="Qwen/Qwen3.5-4B", algorithm="sft")
@@ -2033,8 +2174,8 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_spec_no_longer_parses
     # the resource -- which is the disposition the handle-less branch already applies.
     import flash.providers as providers
     import flash.runner as runner
-    import flash.server._runtime as runtime
-    from flash.spec import JobSpec
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     remote = {"provider": "runpod", "endpoint_id": "ep-stale", "attempt": 0}
@@ -2069,7 +2210,7 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_spec_no_longer_parses
         torn.append((dict(handle), run_id))
         return True
 
-    monkeypatch.setattr("flash.runner.lifecycle._strict_teardown_handle", fake_teardown)
+    monkeypatch.setattr("flash.runner.supervise.lifecycle._strict_teardown_handle", fake_teardown)
     attached: list[str] = []
     # recover_runs imports attach_run from flash.runner inside the function, so patch it there.
     monkeypatch.setattr(runner, "attach_run", lambda rid: attached.append(rid))
@@ -2096,12 +2237,12 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_spec_no_longer_parses
 def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, tmp_path):
     # when `_strict_teardown_handle` cannot confirm the delete, the handle is recorded for the
     # cleanup drain -- but this run's drain was already dispatched at the top of the loop and had
-    # snapshotted an empty list, and it returns early on empty (cursor). so the record sat there
-    # with nothing scheduled to retry it, and the worker kept billing until the next restart.
+    # snapshotted an empty list, and it returns early on empty. so the record sat there with nothing
+    # scheduled to retry it, and the worker kept billing until the next restart.
     import flash.providers as providers
     import flash.runner as runner
-    import flash.server._runtime as runtime
-    from flash.spec import JobSpec
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     # a COMPLETE handle: `_record_cleanup_remote` drops anything it cannot resolve to an exact
@@ -2142,7 +2283,7 @@ def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, t
         torn.append("drain" if hasattr(handle, "provider") else "direct")
         return False  # unconfirmed, both times: this is the case that records for the drain
 
-    monkeypatch.setattr("flash.runner.lifecycle._strict_teardown_handle", fake_teardown)
+    monkeypatch.setattr("flash.runner.supervise.lifecycle._strict_teardown_handle", fake_teardown)
     monkeypatch.setattr(runner, "attach_run", lambda rid: None)
     # persisting a cleanup record reports the new status, which blocks on its reporter thread. that
     # thread is real in production; here the fake below would stand in for it and never run.
@@ -2175,8 +2316,8 @@ def test_deferred_handleless_loop_resubmits_when_clear_before_deadline(monkeypat
     import time as time_mod
 
     import flash.runner as runner
-    import flash.server._runtime as runtime
-    from flash.spec import JobSpec
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec.from_dict(
@@ -2216,8 +2357,8 @@ def test_deferred_handleless_loop_waits_through_provider_minimum_window(monkeypa
     import time as time_mod
 
     import flash.runner as runner
-    import flash.server._runtime as runtime
-    from flash.spec import GpuSpec, JobSpec
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import GpuSpec, JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
@@ -2260,8 +2401,8 @@ def test_deferred_handleless_loop_reconciles_after_resubmit_cas_loss(monkeypatch
     import time as time_mod
 
     import flash.runner as runner
-    import flash.server._runtime as runtime
-    from flash.spec import JobSpec
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="deferred-cas-loss", model="Qwen/Qwen3.5-4B", algorithm="sft")
@@ -2299,8 +2440,8 @@ def test_deferred_handleless_loop_deadline_cas_fails_with_retry(monkeypatch, tmp
     import time as time_mod
 
     import flash.runner as runner
-    import flash.server._runtime as runtime
-    from flash.spec import JobSpec
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec.from_dict(
@@ -2340,10 +2481,10 @@ def test_deferred_handleless_loop_deadline_cas_fails_with_retry(monkeypatch, tmp
 
 @pytest.mark.parametrize(("now", "pending"), [(201.0, True), (321.0, False)])
 def test_completed_attempt_metrics_bounds_success_marker_metrics_grace(monkeypatch, now, pending):
-    import flash.providers._hf_artifacts as hf_artifacts
-    import flash.providers._instance_poll as instance_poll
-    import flash.runner.lifecycle as lifecycle
-    from flash.spec import JobSpec, TrainSpec
+    import flash.providers._lifecycle.poll_instance as instance_poll
+    import flash.providers.artifacts.hf as hf_artifacts
+    import flash.runner.supervise.lifecycle as lifecycle
+    from flash.core.spec import JobSpec, TrainSpec
 
     spec = JobSpec(
         run_id="metrics-lag",
@@ -2392,8 +2533,8 @@ def test_deferred_handleless_legacy_run_without_attempt_metadata_fails_at_deadli
     import time as time_mod
 
     import flash.runner as runner
-    import flash.server._runtime as runtime
-    from flash.spec import JobSpec
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="deferred-legacy", model="Qwen/Qwen3.5-4B", algorithm="sft")
@@ -2435,16 +2576,23 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
     import flash.providers as providers
     import flash.providers.allocator as allocator
     import flash.runner as runner
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.providers.base import Allocation, Candidate
-    from flash.runner import lifecycle
-    from flash.spec import GpuSpec, JobSpec
+    from flash.runner.supervise import lifecycle
+    from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(
-        run_id=f"terminal-handle-race-{cleanup_confirmed}",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="sft",
-        gpu=GpuSpec(type="", max_retries=2),
+    # the attached profile pins a model revision, which makes the post-allocation quote refresh
+    # resolve revision-specific geometry from the hub. read the catalog's numbers instead.
+    stub_revision_geometry(monkeypatch)
+    spec = attach_sft_profile(
+        JobSpec(
+            run_id=f"terminal-handle-race-{cleanup_confirmed}",
+            model="Qwen/Qwen3.5-4B",
+            algorithm="sft",
+            train=TrainSpec(max_examples=1),
+            gpu=GpuSpec(type="", max_retries=2),
+        )
     )
     runner._save_status(
         runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
@@ -2523,16 +2671,23 @@ def test_terminal_handle_race_retains_second_unconfirmed_cleanup_remote(monkeypa
     import flash.providers as providers
     import flash.providers.allocator as allocator
     import flash.runner as runner
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.providers.base import Allocation, Candidate
-    from flash.runner import lifecycle
-    from flash.spec import GpuSpec, JobSpec
+    from flash.runner.supervise import lifecycle
+    from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(
-        run_id="terminal-handle-race-two-remotes",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="sft",
-        gpu=GpuSpec(type="", max_retries=0),
+    # the attached profile pins a model revision, which makes the post-allocation quote refresh
+    # resolve revision-specific geometry from the hub. read the catalog's numbers instead.
+    stub_revision_geometry(monkeypatch)
+    spec = attach_sft_profile(
+        JobSpec(
+            run_id="terminal-handle-race-two-remotes",
+            model="Qwen/Qwen3.5-4B",
+            algorithm="sft",
+            train=TrainSpec(max_examples=1),
+            gpu=GpuSpec(type="", max_retries=0),
+        )
     )
     runner._save_status(
         runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
@@ -2589,8 +2744,8 @@ def test_run_training_bails_when_running_cas_rejects(monkeypatch):
     import pytest
 
     import flash.runner as runner
-    from flash.runner import lifecycle
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
+    from flash.runner.supervise import lifecycle
 
     importlib.reload(runner)
     spec = JobSpec(run_id="cas", model="Qwen/Qwen3.5-4B", algorithm="grpo")
@@ -2612,3 +2767,758 @@ def test_run_training_bails_when_running_cas_rejects(monkeypatch):
     with pytest.raises(runner._RunCancelled):
         lifecycle._run_training(spec, None, prior_cost=0.0)
     assert submitted == []  # never charged a GPU for an already-terminal run
+
+
+def _profile_spec(run_id: str = "profile-sft-" + "a" * 64):
+    """A profile job spec shaped like _prepared_sft_profile_job's output."""
+    import flash.runner as runner
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.engine.profiling.workload_profile import SFT_PROFILE_KIND
+
+    return JobSpec(
+        run_id=run_id,
+        model="Qwen/Qwen3.5-4B",
+        algorithm="sft",
+        gpu=GpuSpec(
+            type="",
+            provider="",
+            max_wall_seconds=runner._WORKLOAD_PROFILE_WALL_SECONDS,
+            max_retries=runner._WORKLOAD_PROFILE_MAX_RETRIES,
+        ),
+        workload_profile_kind=SFT_PROFILE_KIND,
+        workload_profile_input_digest="a" * 64,
+        workload_profile_producer_version="1.0.0",
+        workload_profile={},
+    )
+
+
+def test_unarmed_profile_deadline_survives_a_capacity_cycle(monkeypatch, tmp_path):
+    """A queued profile keeps its whole work budget behind a separate queue allowance.
+
+    The regression: the wall ran from submission, so provider queue time ate the budget. Each
+    attempt gets its own 300s IN_QUEUE grace and the infra retry floor allows several, so a 600s
+    submission-based deadline died "run wall deadline exceeded" having profiled nothing.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = _profile_spec()
+    created_at = 1000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="queued",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+
+    deadline = runner._load_run_deadline_at(spec.run_id)
+    assert deadline == pytest.approx(
+        created_at
+        + runner._WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS
+        + runner._WORKLOAD_PROFILE_WALL_SECONDS
+    )
+    # the concrete failure: two 300s capacity cycles plus the grace that killed the real run.
+    still_queued_at = created_at + 2 * 301.0
+    assert runner._remaining_run_wall_seconds(spec.run_id, now=still_queued_at) > 0
+    # and the full work budget is still intact at that point, not merely nonzero.
+    assert runner._remaining_run_wall_seconds(spec.run_id, now=still_queued_at) >= (
+        runner._WORKLOAD_PROFILE_WALL_SECONDS
+    )
+
+
+def test_profile_attempt_allowance_never_exceeds_the_work_budget(monkeypatch, tmp_path):
+    """The queue allowance protects the wait; it must never be handed over as work time.
+
+    Otherwise a profile that got capacity immediately would run for the queue budget too, on a job
+    billed for its wall alone (estimate_profile_cost prices wall x hourly).
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = _profile_spec()
+    created_at = 1000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="queued",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+
+    # capacity arrived instantly, so the whole queue allowance is still unspent.
+    attempt_spec = runner._spec_with_remaining_wall(
+        spec, require_provider_minimum=True, now=created_at + 1.0
+    )
+    assert attempt_spec.gpu.max_wall_seconds <= runner._WORKLOAD_PROFILE_WALL_SECONDS
+
+
+def test_exhausted_profile_cannot_provision_on_its_flat_work_grant(monkeypatch, tmp_path):
+    """The exhaustion check reads the real remaining allowance, not the grant that replaces it.
+
+    A profile's wall is granted flat rather than derived from what is left, so judging exhaustion
+    after that assignment would make the check unreachable for profiles: a run past its own
+    deadline would still provision, and the first heartbeat would arm a fresh work window from
+    that moment, turning the bounded queue allowance into an unbounded one.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = _profile_spec()
+    created_at = 1000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="queued",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+
+    deadline = runner._load_run_deadline_at(spec.run_id)
+    assert runner._remaining_run_wall_seconds(spec.run_id, now=deadline + 1.0) == 0.0
+    with pytest.raises(RuntimeError, match="run wall deadline exhausted"):
+        runner._spec_with_remaining_wall(spec, require_provider_minimum=True, now=deadline + 1.0)
+
+    # still provisions normally while allowance remains, with the flat work grant intact.
+    live = runner._spec_with_remaining_wall(
+        spec, require_provider_minimum=True, now=created_at + 1.0
+    )
+    assert live.gpu.max_wall_seconds == int(runner._WORKLOAD_PROFILE_WALL_SECONDS)
+
+
+def test_profile_worker_deadline_excludes_the_unspent_queue_allowance(monkeypatch, tmp_path):
+    """The absolute deadline handed to the worker is bounded the same way its wall budget is.
+
+    Capping ``max_wall_seconds`` is not sufficient on its own. The bootstrap derives its own
+    execution deadline from the absolute ``deadline_at`` it is passed
+    (``_worker_execution_deadline``) and enforces it independently, so handing over the run-global
+    deadline lets a profile that got capacity immediately keep working through the queue window on
+    a job priced for its wall alone -- the same overrun the wall cap was added to prevent.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = _profile_spec()
+    created_at = 1000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="queued",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+
+    # capacity arrived instantly: the queue allowance is entirely unspent, so the persisted
+    # run-global deadline is the one that still contains it.
+    launched_at = created_at + 1.0
+    stored = runner._load_run_deadline_at(spec.run_id)
+    assert stored == pytest.approx(
+        created_at
+        + runner._WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS
+        + runner._WORKLOAD_PROFILE_WALL_SECONDS
+    )
+
+    worker_deadline = runner._worker_deadline_at(spec.run_id, spec, now=launched_at)
+    # work budget plus the provisioning allowance: the deadline runs from RENT, and the box spends
+    # the front of it booting rather than working (see _WORKLOAD_PROFILE_PROVISION_ALLOWANCE_SECONDS).
+    assert worker_deadline == pytest.approx(
+        launched_at
+        + runner._WORKLOAD_PROFILE_WALL_SECONDS
+        + runner._WORKLOAD_PROFILE_PROVISION_ALLOWANCE_SECONDS
+    )
+    # the whole point: strictly earlier than the run-global deadline, by the unspent queue allowance
+    # that provisioning does not reclaim.
+    assert worker_deadline < stored
+    assert stored - worker_deadline == pytest.approx(
+        runner._WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS
+        - runner._WORKLOAD_PROFILE_PROVISION_ALLOWANCE_SECONDS
+        - 1.0
+    )
+
+    # a training run is unaffected -- its deadline is submission-to-terminal by contract.
+    from flash.core.spec import GpuSpec, JobSpec
+
+    train_spec = JobSpec(
+        run_id="train-" + "b" * 20,
+        model="Qwen/Qwen3.5-4B",
+        algorithm="sft",
+        gpu=GpuSpec(type="RTX 5090", provider="runpod", max_wall_seconds=3600.0),
+    )
+    runner._save_status(
+        runner.RunStatus(
+            run_id=train_spec.run_id,
+            state="queued",
+            spec=train_spec.to_dict(),
+            created_at=created_at,
+            effective_preparation={"worker_spec": train_spec.to_internal_dict()},
+        )
+    )
+    assert runner._worker_deadline_at(
+        train_spec.run_id, train_spec, now=launched_at
+    ) == pytest.approx(runner._load_run_deadline_at(train_spec.run_id))
+
+
+def test_armed_profile_worker_deadline_never_extends_past_the_armed_budget(monkeypatch, tmp_path):
+    """Once armed, the persisted deadline is the authority and the bound may not extend it.
+
+    A worker that speaks and then relaunches or stalls must not win a fresh full work budget from
+    the moment of the later launch; the min() keeps the armed deadline binding.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = _profile_spec()
+    created_at = 1000.0
+    armed_at = created_at + 5.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        ),
+        _profile_wall_armed_at=armed_at,
+        _run_deadline_at=armed_at + runner._WORKLOAD_PROFILE_WALL_SECONDS,
+    )
+
+    stored = runner._load_run_deadline_at(spec.run_id)
+    assert stored == pytest.approx(armed_at + runner._WORKLOAD_PROFILE_WALL_SECONDS)
+    # a later launch must inherit the armed deadline, not restart the budget from now.
+    later = armed_at + 120.0
+    assert runner._worker_deadline_at(spec.run_id, spec, now=later) == pytest.approx(stored)
+
+
+def test_first_profile_heartbeat_arms_the_work_budget(monkeypatch, tmp_path):
+    """The wall starts when the worker first speaks, and the tamper guard accepts that pair."""
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_report_status", lambda *a, **k: None)
+    spec = _profile_spec()
+    created_at = 1000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+
+    armed_at = created_at + 900.0  # spent 15 minutes queueing
+    monkeypatch.setattr(runner.time, "time", lambda: armed_at)
+    runner.record_heartbeat(
+        spec.run_id, {"stage": "sft_pretokenizing", "attempt": 0, "ts": armed_at}
+    )
+
+    raw = runner._load_status_json(spec.run_id)
+    assert raw[runner._PROFILE_WALL_ARMED_AT_KEY] == pytest.approx(armed_at)
+    # the budget now runs from first contact, and _load_run_deadline_at (which re-derives the
+    # canonical value and rejects a mismatch) agrees -- so provisioning is not halted.
+    assert runner._load_run_deadline_at(spec.run_id) == pytest.approx(
+        armed_at + runner._WORKLOAD_PROFILE_WALL_SECONDS
+    )
+
+    # a later heartbeat must not re-arm: the budget bounds the work, so it cannot be refreshed by
+    # a worker that keeps talking.
+    monkeypatch.setattr(runner.time, "time", lambda: armed_at + 120.0)
+    runner.record_heartbeat(
+        spec.run_id,
+        {"stage": "sft_pretokenizing", "attempt": 0, "step": 1, "ts": armed_at + 120.0},
+    )
+    assert runner._load_status_json(spec.run_id)[
+        runner._PROFILE_WALL_ARMED_AT_KEY
+    ] == pytest.approx(armed_at)
+
+
+def test_a_previous_lifecycles_heartbeat_cannot_arm_the_profile_wall(monkeypatch, tmp_path):
+    """Only this run's own heartbeat starts its clock.
+
+    A profile's run id is derived from the workload, so a relaunch reuses the id and its artifact
+    prefix. Observed live: a 2.8-hour-old heartbeat from the previous lifecycle armed a 5-second-old
+    run, which would hand the fresh run a budget that had already mostly elapsed.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_report_status", lambda *a, **k: None)
+    spec = _profile_spec()
+    created_at = 10_000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+
+    monkeypatch.setattr(runner.time, "time", lambda: created_at + 5.0)
+    # the leftover artifact: written hours before this run was even created.
+    runner.record_heartbeat(
+        spec.run_id, {"stage": "error_profile", "attempt": 0, "ts": created_at - 10_000.0}
+    )
+
+    raw = runner._load_status_json(spec.run_id)
+    assert runner._PROFILE_WALL_ARMED_AT_KEY not in raw
+    # still unarmed, so the queue allowance is intact and the work budget is untouched.
+    assert runner._load_run_deadline_at(spec.run_id) == pytest.approx(
+        created_at
+        + runner._WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS
+        + runner._WORKLOAD_PROFILE_WALL_SECONDS
+    )
+
+
+def _profile_save_kwargs(runner, status, spec):
+    """The private keys submit_job hands _persist_profile_submission for a profile."""
+    return {
+        "_run_deadline_at": (
+            status.created_at
+            + float(spec.gpu.max_wall_seconds)
+            + runner._WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS
+        ),
+        "_next_attempt": 0,
+    }
+
+
+def _relaunch_profile(runner, spec, *, created_at):
+    """Submit a fresh lifecycle under an id whose previous run is spent."""
+    status = runner.RunStatus(
+        run_id=spec.run_id,
+        state="queued",
+        spec=spec.to_dict(),
+        created_at=created_at,
+        effective_preparation={"worker_spec": spec.to_internal_dict()},
+    )
+    joined = runner._persist_profile_submission(status, _profile_save_kwargs(runner, status, spec))
+    assert joined is None  # a spent record is replaced, not joined
+    return status
+
+
+def _spend_one_lifecycle(runner, spec, *, created_at, attempts=1):
+    """A profile lifecycle that reserved `attempts` ids and then ended."""
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+    for expected in range(attempts):
+        assert runner._reserve_attempt(spec.run_id) == expected
+    runner._update(spec.run_id, "failed")
+
+
+def test_a_prior_lifecycles_live_worker_cannot_arm_the_relaunch(monkeypatch, tmp_path):
+    """A still-live worker from the spent lifecycle must not start the relaunch's work budget.
+
+    The timestamp test cannot catch this one: that worker outlived its record and its heartbeats
+    are genuinely recent, so they pass ``>= created_at``. Only attempt identity separates them --
+    and the relaunch CARRIES the counter (it must, or it inherits the spent lifecycle's
+    attempt-scoped error file), so ``next_attempt - 1`` still names the prior attempt until this
+    lifecycle reserves one of its own. Without the floor the prior worker armed the budget while
+    the relaunch was still queuing for a machine, billing it for hardware it never had.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_report_status", lambda *a, **k: None)
+    spec = _profile_spec()
+    first_created = 1000.0
+    _spend_one_lifecycle(runner, spec, created_at=first_created)
+
+    second_created = first_created + 10_000.0
+    _relaunch_profile(runner, spec, created_at=second_created)
+
+    # the prior lifecycle's worker is still alive and still stamps ITS attempt (0).
+    monkeypatch.setattr(runner.time, "time", lambda: second_created + 6.0)
+    runner.record_heartbeat(
+        spec.run_id, {"stage": "profile_start", "attempt": 0, "ts": second_created + 5.0}
+    )
+
+    raw = runner._load_status_json(spec.run_id)
+    assert runner._PROFILE_WALL_ARMED_AT_KEY not in raw
+    # unarmed, so the relaunch keeps its full queue allowance and untouched work budget.
+    assert runner._load_run_deadline_at(spec.run_id) == pytest.approx(
+        second_created
+        + runner._WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS
+        + runner._WORKLOAD_PROFILE_WALL_SECONDS
+    )
+
+    # and this lifecycle's OWN worker still arms it: the floor rejects the past, not the present.
+    assert runner._reserve_attempt(spec.run_id) == 1
+    armed_at = second_created + 20.0
+    monkeypatch.setattr(runner.time, "time", lambda: armed_at)
+    runner.record_heartbeat(
+        spec.run_id, {"stage": "profile_start", "attempt": 1, "ts": armed_at - 1.0}
+    )
+    assert runner._load_status_json(spec.run_id)[runner._PROFILE_WALL_ARMED_AT_KEY] == armed_at
+
+
+def test_a_cancelled_relaunch_is_not_billed_from_a_prior_lifecycles_heartbeat(
+    monkeypatch, tmp_path
+):
+    """Cancel bills the wall only when a worker of THIS lifecycle spoke.
+
+    ``record_heartbeat`` deliberately stores a leftover heartbeat for visibility while refusing to
+    arm from it, so ``last_heartbeat.stage`` alone reports "started" for a relaunch that never got
+    a machine -- and a profile is charged its whole bounded wall the moment it counts as started.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_report_status", lambda *a, **k: None)
+    spec = _profile_spec()
+    first_created = 1000.0
+    _spend_one_lifecycle(runner, spec, created_at=first_created)
+
+    second_created = first_created + 10_000.0
+    _relaunch_profile(runner, spec, created_at=second_created)
+
+    monkeypatch.setattr(runner.time, "time", lambda: second_created + 6.0)
+    runner.record_heartbeat(
+        spec.run_id, {"stage": "profile_start", "attempt": 0, "ts": second_created + 5.0}
+    )
+
+    status = runner.get_status(spec.run_id)
+    # the leftover is still visible -- that is intentional, and exactly why billing cannot read it.
+    assert (status.last_heartbeat or {}).get("stage") == "profile_start"
+    assert runner.profile_steps_run(status) == 0
+
+    # once this lifecycle's own worker speaks, the wall is owed again.
+    assert runner._reserve_attempt(spec.run_id) == 1
+    armed_at = second_created + 20.0
+    monkeypatch.setattr(runner.time, "time", lambda: armed_at)
+    runner.record_heartbeat(
+        spec.run_id, {"stage": "profile_start", "attempt": 1, "ts": armed_at - 1.0}
+    )
+    assert runner.profile_steps_run(runner.get_status(spec.run_id)) == 1
+
+
+def test_a_late_launched_profile_worker_still_gets_its_whole_work_budget(monkeypatch, tmp_path):
+    """A profile that waited out its queue allowance must still be handed a full work budget.
+
+    The stored deadline is created_at + queue + work while UNARMED, so past the allowance its
+    remainder is SHORTER than the work budget. Taking min(stored, now + work) there freezes the
+    worker to what is left of a window measured from submission, while the provider is granted a
+    full wall and arming expands the plane's deadline to armed_at + work -- an expansion the worker
+    is never told about. It would die mid-measurement on exactly the slow-capacity day the queue
+    allowance exists to survive.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_report_status", lambda *a, **k: None)
+    spec = _profile_spec()
+    created_at = 1000.0
+    status = runner.RunStatus(
+        run_id=spec.run_id,
+        state="queued",
+        spec=spec.to_dict(),
+        created_at=created_at,
+        effective_preparation={"worker_spec": spec.to_internal_dict()},
+    )
+    runner._persist_profile_submission(status, _profile_save_kwargs(runner, status, spec))
+
+    work = float(runner._WORKLOAD_PROFILE_WALL_SECONDS)
+    allowance = float(runner._WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS)
+    # capacity lands AFTER the queue allowance is spent: the stored deadline has less than one
+    # work budget left, which is precisely when the old min() started truncating.
+    launched_at = created_at + allowance + work / 2.0
+    assert runner._load_run_deadline_at(spec.run_id) - launched_at < work
+    handed = runner._worker_deadline_at(spec.run_id, spec, now=launched_at)
+    assert handed == pytest.approx(
+        launched_at + work + runner._WORKLOAD_PROFILE_PROVISION_ALLOWANCE_SECONDS
+    )
+
+    # and once armed the stored deadline is work-from-arm and remains the authority: a worker that
+    # speaks late cannot use this to run past it.
+    armed_at = launched_at + 5.0
+    monkeypatch.setattr(runner.time, "time", lambda: armed_at)
+    runner.record_heartbeat(
+        spec.run_id, {"stage": "profile_start", "attempt": 0, "ts": armed_at - 1.0}
+    )
+    assert runner._load_status_json(spec.run_id)[runner._PROFILE_WALL_ARMED_AT_KEY] == armed_at
+    later = armed_at + work / 2.0
+    assert runner._worker_deadline_at(spec.run_id, spec, now=later) == pytest.approx(
+        armed_at + work
+    )
+
+
+def test_profile_worker_deadline_outlasts_a_slow_box_provisioning(monkeypatch, tmp_path):
+    """A profile must survive a slow boot: provisioning is not the work its wall bounds.
+
+    The regression, from a real run. The deadline handed to the box is absolute and enforced from
+    cloud-init onward, but it was minted as rent + work. That box took 8m36s to reach `running`
+    (docker+gpu wait, image pull, pip install, code fetch) and self-terminated at rent + exactly
+    600s having never emitted the heartbeat that arms the plane's clock -- so the plane's
+    arming-based budget never got the chance to apply. The retry survived with 22s to spare, which
+    is the only reason this looked flaky rather than broken.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_report_status", lambda *a, **k: None)
+    spec = _profile_spec()
+    created_at = 1000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="queued",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+
+    rented_at = created_at + 30.0
+    handed = runner._worker_deadline_at(spec.run_id, spec, now=rented_at)
+    # the observed boot: the worker's first heartbeat lands 8m36s after the box is rented.
+    boot_seconds = 8 * 60 + 36.0
+    first_heartbeat_at = rented_at + boot_seconds
+    assert handed > first_heartbeat_at, "the box would self-terminate before it could ever speak"
+    # and it does not merely reach the heartbeat -- a full work budget remains to measure in.
+    assert handed - first_heartbeat_at >= float(runner._WORKLOAD_PROFILE_WALL_SECONDS)
+
+    # arming then discards the unspent provisioning allowance exactly like the queue allowance:
+    # the stored deadline becomes work-from-arm and is binding again.
+    monkeypatch.setattr(runner.time, "time", lambda: first_heartbeat_at)
+    runner.record_heartbeat(
+        spec.run_id, {"stage": "profile_start", "attempt": 0, "ts": first_heartbeat_at - 1.0}
+    )
+    armed = runner._worker_deadline_at(spec.run_id, spec, now=first_heartbeat_at)
+    assert armed == pytest.approx(first_heartbeat_at + runner._WORKLOAD_PROFILE_WALL_SECONDS)
+    assert armed < handed
+
+
+def test_profile_relaunch_does_not_reuse_the_spent_lifecycles_attempt_ids(monkeypatch, tmp_path):
+    """Attempt identities stay globally monotonic across lifecycles of a reused run id.
+
+    The regression: the relaunch reset next_attempt to 0, so the fresh run reserved attempt 0 and
+    inherited the spent lifecycle's error_profile_attempt0.txt at the shared HF prefix.
+    _instance_poll reads a present attempt-scoped error file as this handle's own crash, so the
+    relaunch died job_failed within seconds of launch without profiling anything.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_report_status", lambda *a, **k: None)
+    spec = _profile_spec()
+    first_created = 1000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="failed",
+            spec=spec.to_dict(),
+            created_at=first_created,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+    # the spent lifecycle burned three attempts, so error_profile_attempt0..2.txt exist on HF.
+    for expected in range(3):
+        assert runner._reserve_attempt(spec.run_id) == expected
+
+    _relaunch_profile(runner, spec, created_at=first_created + 10_000.0)
+
+    # the relaunch's FIRST attempt must not collide with any file the spent one left behind.
+    assert runner._reserve_attempt(spec.run_id) == 3
+
+
+def test_profile_relaunch_clears_the_spent_lifecycles_armed_wall(monkeypatch, tmp_path):
+    """A new lifecycle starts unarmed, or its own deadline reads as tampered.
+
+    The arm records that a worker spoke, and on a reused id the stored one belongs to the previous
+    lifecycle. Carrying it forward dates the fresh run's budget to a heartbeat from before it was
+    created, and because _canonical_run_deadline rebuilds the deadline from that basis, the stored
+    pair stops matching: _load_run_deadline_at raises and the id is wedged for every submitter.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_report_status", lambda *a, **k: None)
+    spec = _profile_spec()
+    first_created = 1000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            created_at=first_created,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+    armed_at = first_created + 100.0
+    monkeypatch.setattr(runner.time, "time", lambda: armed_at)
+    runner.record_heartbeat(spec.run_id, {"stage": "profile_start", "attempt": 0, "ts": armed_at})
+    assert runner._load_status_json(spec.run_id)[runner._PROFILE_WALL_ARMED_AT_KEY] == armed_at
+    runner._update(spec.run_id, "failed")
+
+    second_created = first_created + 10_000.0
+    _relaunch_profile(runner, spec, created_at=second_created)
+
+    raw = runner._load_status_json(spec.run_id)
+    assert runner._PROFILE_WALL_ARMED_AT_KEY not in raw
+    # and the deadline still loads: unarmed, from THIS lifecycle's submission plus the queue
+    # allowance. before the fix this raised "does not match canonical submission deadline".
+    assert runner._load_run_deadline_at(spec.run_id) == pytest.approx(
+        second_created
+        + runner._WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS
+        + runner._WORKLOAD_PROFILE_WALL_SECONDS
+    )
+
+
+def test_profile_submission_joins_a_live_run_under_the_same_id(monkeypatch, tmp_path):
+    """A live profile is joined, never overwritten -- the reuse the deterministic id exists for."""
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_report_status", lambda *a, **k: None)
+    spec = _profile_spec()
+    first_created = 1000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            created_at=first_created,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+
+    status = runner.RunStatus(
+        run_id=spec.run_id,
+        state="queued",
+        spec=spec.to_dict(),
+        created_at=first_created + 50.0,
+        effective_preparation={"worker_spec": spec.to_internal_dict()},
+    )
+    joined = runner._persist_profile_submission(status, _profile_save_kwargs(runner, status, spec))
+
+    assert joined is not None
+    assert joined.state == "running"
+    # the live record is untouched: a second billed copy of identical work never starts.
+    assert runner._load_status_json(spec.run_id)["created_at"] == pytest.approx(first_created)
+
+
+def test_training_run_deadline_still_runs_from_submission(monkeypatch, tmp_path):
+    """The arming basis is profile-only; an ordinary training run is unchanged."""
+    import flash.runner as runner
+    from flash.core.spec import GpuSpec, JobSpec
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_report_status", lambda *a, **k: None)
+    spec = JobSpec(
+        run_id="ordinary-training",
+        model="Qwen/Qwen3.5-4B",
+        algorithm="sft",
+        gpu=GpuSpec(max_wall_seconds=900),
+    )
+    created_at = 1000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            # max_wall_seconds is managed and stripped from the public spec, so the internal worker
+            # spec is what carries it (see _canonical_run_deadline).
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+
+    assert runner._load_run_deadline_at(spec.run_id) == pytest.approx(created_at + 900.0)
+    monkeypatch.setattr(runner.time, "time", lambda: created_at + 100.0)
+    runner.record_heartbeat(spec.run_id, {"stage": "sft_step", "attempt": 0, "step": 1})
+    raw = runner._load_status_json(spec.run_id)
+    assert runner._PROFILE_WALL_ARMED_AT_KEY not in raw
+    assert runner._load_run_deadline_at(spec.run_id) == pytest.approx(created_at + 900.0)
+
+
+def test_a_long_queue_wait_does_not_shorten_the_granted_work_wall(monkeypatch, tmp_path):
+    """The provider must get the full work budget no matter how long capacity took.
+
+    The regression: the grant was min(remaining, work), and `remaining` counts down against a
+    deadline that still holds the unspent queue allowance. Past the allowance the min() truncates,
+    so at a 1900s wait the provider got 500s while the plane grants a full 600s the instant a
+    heartbeat arms -- the short number going to the side actually doing the measuring, on exactly
+    the slow-capacity days the queue allowance exists to survive.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = _profile_spec()
+    created_at = 1000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="queued",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+
+    work = float(runner._WORKLOAD_PROFILE_WALL_SECONDS)
+    queue = float(runner._WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS)
+    # capacity arrived only after the whole queue allowance had been spent waiting.
+    late = created_at + queue + 100.0
+    attempt_spec = runner._spec_with_remaining_wall(spec, require_provider_minimum=True, now=late)
+    assert attempt_spec.gpu.max_wall_seconds == int(work)
+
+    # and it is still capped -- an early arrival cannot claim the queue budget as work time.
+    early_spec = runner._spec_with_remaining_wall(
+        spec, require_provider_minimum=True, now=created_at + 1.0
+    )
+    assert early_spec.gpu.max_wall_seconds == int(work)
+
+
+def test_a_stale_attempts_heartbeat_cannot_arm_even_when_its_timestamp_is_recent(
+    monkeypatch, tmp_path
+):
+    """Timestamp freshness alone is not provenance.
+
+    A worker from a cancelled earlier lifecycle writes to the same workload-derived prefix and its
+    heartbeats are genuinely recent, so `ts >= created_at` passes. Without an attempt match it arms
+    the replacement's work budget while the replacement is still queueing for capacity.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_report_status", lambda *a, **k: None)
+    spec = _profile_spec()
+    created_at = 10_000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+    # this lifecycle reserved attempt 1, so attempt 1 is the only one that may speak for it.
+    runner._save_status_unlocked(runner.get_status(spec.run_id), _next_attempt=2)
+
+    now = created_at + 30.0
+    monkeypatch.setattr(runner.time, "time", lambda: now)
+    # recent enough to pass the timestamp test, but stamped by the PREVIOUS attempt.
+    runner.record_heartbeat(spec.run_id, {"stage": "sft_pretokenizing", "attempt": 0, "ts": now})
+    assert runner._PROFILE_WALL_ARMED_AT_KEY not in runner._load_status_json(spec.run_id)
+
+    # the current attempt arms it normally.
+    runner.record_heartbeat(spec.run_id, {"stage": "sft_pretokenizing", "attempt": 1, "ts": now})
+    raw = runner._load_status_json(spec.run_id)
+    assert raw[runner._PROFILE_WALL_ARMED_AT_KEY] == pytest.approx(now)

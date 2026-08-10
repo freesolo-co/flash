@@ -81,7 +81,7 @@ def test_config_pointed_at_a_directory_is_friendly():
 
 def test_debug_flag_shows_traceback():
     with tempfile.TemporaryDirectory() as tmp:
-        proc = _run(["--debug", "status", "does-not-exist"], env=_logged_out_env(tmp))
+        proc = _run(["--debug", "runs", "status", "does-not-exist"], env=_logged_out_env(tmp))
     assert proc.returncode != 0
     assert "Traceback (most recent call last)" in proc.stderr
 
@@ -117,12 +117,8 @@ def test_missing_env_id_rejected_client_side():
 
 
 def test_dry_run_without_login_fails_fast():
-    # Dry-run now validates on the server — it resolves warm-start refs and runs the submit-time
-    # preflights (serving rank/context caps, continued warm-start rank match) so it is a faithful
-    # preview of a real submit. That needs a login, so a logged-out dry-run fails fast with the same
-    # friendly `not logged in` guidance as a real submit, rather than silently "validating" a config
-    # the server would actually reject. The config itself is still validated client-side first (see
-    # test_bad_model_is_friendly), so only well-formed configs reach the login check.
+    # dry-run uses server submit-time preflights, so it requires login. client validation still runs
+    # first; see test_bad_model_is_friendly.
     with tempfile.TemporaryDirectory() as tmp:
         cfg = os.path.join(tmp, "run.toml")
         with open(cfg, "w") as f:

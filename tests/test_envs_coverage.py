@@ -28,7 +28,7 @@ def test_base_environment_defaults() -> None:
 
 def test_load_environment_requires_env_id() -> None:
     """An empty env id is a hard error (no default env, no local path)."""
-    from flash.envs.registry import load_environment
+    from flash.envs.base import load_environment
 
     with pytest.raises(ValueError, match="no environment specified"):
         load_environment("")
@@ -39,7 +39,7 @@ def test_env_setup_scaffolds_a_loadable_freesolo_env(tmp_path, monkeypatch) -> N
     from argparse import Namespace
 
     from flash.cli import cmd_env_setup
-    from flash.cli import env_setup as env_setup_mod
+    from flash.cli.commands.env import setup as env_setup_mod
 
     monkeypatch.setattr(
         env_setup_mod,
@@ -81,7 +81,7 @@ def test_scaffolded_env_scores_through_real_task_example(tmp_path, monkeypatch) 
     from freesolo.datasets.records import load_task_examples
 
     from flash.cli import cmd_env_setup
-    from flash.cli import env_setup as env_setup_mod
+    from flash.cli.commands.env import setup as env_setup_mod
 
     monkeypatch.setattr(
         env_setup_mod,

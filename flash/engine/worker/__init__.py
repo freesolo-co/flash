@@ -16,132 +16,84 @@ import threading  # noqa: F401
 import time
 import traceback
 
-from flash.diagnostics import sanitize_diagnostic
-from flash.engine.accounting import RunMetrics
-from flash.engine.worker.adapter import (
-    _download_adapter,
-    _init_adapter_model,
-    _resolve_adapter_ref,
-    make_lora,
-    prepare_fresh_lora_base,
-    require_vllm_for_rollout_func,
-    stamp_adapter_provenance,
-)
-from flash.engine.worker.decoding import (
-    graded_text,
-    prompt_opens_thinking,
-    render_prompt,
-    strip_think,
-    think_token_count,
-    thinking_text,
-)
-from flash.engine.worker.finalize import write_train_meta
-from flash.engine.worker.gpu_setup import (
-    finalize_alloc_conf_for_sleep,
-    force_vit_sdpa_on_blackwell,
-    force_vllm_backend_for_sm120,
-    patch_trl_colocate_llm_kwargs,
-)
-from flash.engine.worker.grpo import (
-    _grpo_is_no_op_failure,
-    _grpo_resume_already_complete,
-    build_grpo_prompt_dataset,
-    compute_grpo_batching,
-    grpo_mask_truncated_completions,
-    grpo_overrides,
-    resolve_grpo_prompts_per_step,
-    rl_per_device_comps,
-)
-from flash.engine.worker.heartbeat import (
+from flash._internal.diagnostics import sanitize_diagnostic
+from flash.core.spec import FIXED_SEED, load_job_spec_from_env
+from flash.engine.result.accounting import RunMetrics
+from flash.engine.worker.backend_common import collect_ray_failure_logs
+from flash.engine.worker.entry.opd import run_opd
+from flash.engine.worker.entry.rl import run_rl
+from flash.engine.worker.entry.sft import run_sft
+from flash.engine.worker.io.heartbeat import (
     _HB_LOCK,
     _HB_SETUP_LIVENESS_STAGES,
-    _HB_TERMINAL_ONLY_INTERVAL_S,
-    _HB_TERMINAL_STAGES,
     _HB_THROTTLED_STAGES,
     _HB_TIGHT_LIVENESS_STAGES,
     _HB_UPLOAD_LIVENESS_STAGES,
     _HB_UPLOAD_LOCK,
-    _SFT_HEARTBEAT_INTERVAL_S,
-    _STEP_GPU_DIAG_INTERVAL_S,
     LATEST_GRPO_METRICS_LAST,
     heartbeat,
-    make_reward_heartbeat_callback,
-    make_sft_heartbeat_callback,
 )
-from flash.engine.worker.hf import (
+from flash.engine.worker.io.hf import (
     _hf_upload,
-    _latest_checkpoint_dir,
     error_artifact_name,
-    flush_optional_uploads,
     hf_api,
     hf_prefix,
     hf_resume_checkpoint,
     hf_upload_file,
     hf_upload_folder,
     load_tokenizer,
-    make_checkpoint_upload_callback,
     model_revision_kwargs,
     prefetch_model,
     publish_deployable_checkpoint,
     publish_opd_optimizer_start_marker,
-    upload_debug_jsonl,
+    ray_log_artifact_name,
     upload_resume_checkpoint,
     write_base_model_provenance,
 )
-from flash.engine.worker.kernel_warmup import _current_cuda_sm, load_mega_cache
-from flash.engine.worker.lora import (
-    assert_adapter_delta_nonzero,
-    assert_adapter_load_clean,
-    assert_lora_applied,
-    disable_liger_grpo_torch_compile,
-    is_vl_checkpoint,
-    patch_grpo_mask_aware_lm_head,
-)
-from flash.engine.worker.opd import run_opd
-from flash.engine.worker.perf import (
-    RetriableInfraError,
-    _attn_impl_for_capability,
-    _ensure_fla_fastpath_on_hopper,
-    _estimate_params,
-    _flash_attn_3_available,
-    _flash_attn_available,
-    _force_fla_triton_gdn_on_sm100,
-    _GpuPeakSampler,
-    _liger_default_for_model,
-    _memory_mode,
-    _metric_curve,
-    _neutralize_tilelang_cudart_stub,
-    _peak_gpu_gb,
-    _remove_fla_from_disk,
-    _reset_peak_gpu,
-    _restrict_fla_gdn_autotune_on_blackwell,
-    _sdpa_cudnn_ctx,
-    free_gpu,
-    fused_optim_name,
-    gpu_diagnostics,
-    grad_checkpointing_on,
-    grpo_sleep_mode,
-    grpo_use_reentrant,
-    is_cuda_oom,
-    liger_on,
-    loraplus_optimizer_cls,
-    optimal_attn_impl,
-    setup_perf_backends,
-    wait_for_gpu,
-)
-from flash.engine.worker.rl import run_rl
-from flash.engine.worker.rng import backend_seed, seed_training_rngs
-from flash.engine.worker.sft import run_sft
-from flash.engine.worker.wandb_log import (
-    wandb_finish,
-    wandb_report_to,
-    wandb_run_info,
+from flash.engine.worker.io.wandb_log import (
     wandb_run_name,
 )
+from flash.engine.worker.model.adapter import (
+    _download_adapter,
+    lora_target_parameters,
+    make_lora,
+    validate_lora_target_parameters,
+)
+from flash.engine.worker.model.decoding import (
+    graded_text,
+    prompt_opens_thinking,
+    strip_think,
+    think_token_count,
+    thinking_text,
+)
+from flash.engine.worker.perf import (
+    RetriableInfraError,
+    _ensure_fla_fastpath_on_hopper,
+    _estimate_params,
+    _force_fla_triton_gdn_on_sm100,
+    _liger_default_for_model,
+    _memory_mode,
+    _neutralize_tilelang_cudart_stub,
+    _remove_fla_from_disk,
+    _restrict_fla_gdn_autotune_on_blackwell,
+    gpu_diagnostics,
+    grad_checkpointing_on,
+    grpo_use_reentrant,
+    is_cuda_oom,
+    wait_for_gpu,
+)
+from flash.engine.worker.runtime.kernel_warmup import _current_cuda_sm, load_mega_cache
+from flash.engine.worker.runtime.rng import backend_seed, seed_training_rngs
+from flash.engine.worker.train.finalize import write_train_meta
+from flash.engine.worker.train.rl.config import (
+    build_grpo_prompt_dataset,
+    grpo_mask_truncated_completions,
+    grpo_overrides,
+    resolve_grpo_prompts_per_step,
+)
 from flash.envs.adapter import GitHubRateLimitError
-from flash.envs.registry import load_environment
-from flash.opd_retry_contract import OPD_RESUME_REVISION_ENV
-from flash.spec import FIXED_SEED, load_job_spec_from_env
+from flash.envs.base import load_environment
+from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
 
 def _resolve_worker_seed(job_spec, env_seed: str | None) -> int:
@@ -167,11 +119,17 @@ HF_REPO = os.environ.get("HF_REPO", "")
 RUN_ID = os.environ.get("RUN_ID", "local")
 RUN_MODE = os.environ.get("RUN_MODE", "sft")
 ATTEMPT = _parse_attempt_env()
+# captured at import, which is before this attempt can have started ray. any ray session older than
+# this belongs to a PREVIOUS attempt on the same reused pod (/tmp survives a retry), and reporting
+# one as this attempt's evidence would send the next diagnosis after a failure that never happened.
+WORKER_START_TIME = time.time()
 JOB_SPEC = load_job_spec_from_env()
 SEED = _resolve_worker_seed(JOB_SPEC, os.environ.get("SEED"))
 PHASE = os.environ.get(
     "PHASE",
-    JOB_SPEC.phase if JOB_SPEC else (RUN_MODE if RUN_MODE in ("sft", "rl", "opd") else "sft"),
+    JOB_SPEC.phase
+    if JOB_SPEC
+    else (RUN_MODE if RUN_MODE in ("sft", "rl", "opd", "profile") else "sft"),
 )
 OPD_RESUME_REVISION = os.environ.get(OPD_RESUME_REVISION_ENV, "").strip()
 
@@ -186,36 +144,20 @@ _HB_PROGRESS_SEQ = 0
 _HB_PROGRESS_UPLOADED_SEQ = 0
 # Environment-scoped artifact repos are shared by many runs. Keep heartbeat commits below the HF
 # per-repo commit cap while staying under the provider poller's training stall window
-# (STALL_AFTER_S=1500s in flash/providers/_poll.py).
+# (STALL_AFTER_S=1500s in flash/providers/_lifecycle/poll.py).
 _HB_MIN_INTERVAL_S = 900.0
-# Highest optimizer step whose heartbeat has been COMMITTED. A force=True heartbeat (opd's
-# post-optimizer-step ping) bypasses the 900s throttle iff its step exceeds this — i.e. force is gated
-# on STEP ADVANCE, not elapsed time. That lands every distinct completed step exactly once (so a cancel
-# always bills the true latest step, never a stale one a mid-step progress ping left behind) while
-# self-limiting forced commits to the actual optimizer-step rate: redundant same-step/liveness pings
-# stay throttled below, and opd_step advances are teacher-round-trip-gated (minutes apart), so forced
-# commits stay far under the HF per-repo cap without a time floor that would blind-spot fast steps.
+# highest optimizer step committed by a heartbeat.
+# force bypasses the 900s throttle only on step advance so cancel billing stays current.
 _HB_LAST_COMMITTED_STEP = 0
-# A forced (post-optimizer-step) commit bypasses the 900s throttle on STEP ADVANCE so a cancel bills the
-# true latest step. But a tiny/smoke OPD config (batch=1, group=1, small student, fast/cached teacher)
-# can land optimizer steps many times per MINUTE, and forcing every one would blow the HF per-repo commit
-# cap before the final adapter/DONE upload. So forced commits are additionally throttled to at most one
-# per _HB_FORCE_MIN_INTERVAL_S -- but the floor is measured from the last FORCED commit
-# (_HB_LAST_FORCED_UPLOAD), not any upload, so a force still punches through IMMEDIATELY after an
-# unrelated (liveness / mid-step) commit stole the slot carrying a stale step (exactly when force is
-# needed). Net: when steps are farther apart than the floor (the normal teacher-round-trip-gated regime)
-# every distinct step still commits exactly once (exact cancel-billing preserved); only a sub-floor BURST
-# is coalesced, bounding the cancel under-bill to one floor-window of steps while keeping forced commits
-# under the HF cap (codex[bot]).
+# forced step commits also obey _HB_FORCE_MIN_INTERVAL_S to protect the hf commit cap.
+# measure from _HB_LAST_FORCED_UPLOAD so unrelated liveness uploads cannot delay a needed force;
+# only sub-floor bursts coalesce, bounding cancel under-billing to one floor window.
 _HB_LAST_FORCED_UPLOAD = 0.0
 _HB_FORCE_MIN_INTERVAL_S = 60.0
 # Setup liveness is the user-visible signal during cold model download/load. Keep it below common
 # external "frozen heartbeat" thresholds without relaxing the noisy per-step training throttle.
 _HB_SETUP_LIVENESS_INTERVAL_S = 240.0
 _HB_TERMINAL_ONLY = False
-
-_WANDB_FINISH_WAIT_S = 120.0
-_WANDB_FINISH_FAIL_WAIT_S = 5.0
 
 
 def _remaining_worker_wall_seconds() -> float | None:
@@ -281,18 +223,16 @@ THINKING = JOB_SPEC.thinking if JOB_SPEC else False
 
 
 def _finalize(metrics: RunMetrics, *, heartbeat_fields=None):
-    if not flush_optional_uploads():
-        print("optional upload flush timed out before final publication")
     metrics.save("/tmp/metrics.json")
     hf_upload_file("/tmp/metrics.json", "metrics.json", required=True)
     with open("/tmp/DONE", "w") as f:
         f.write(str(time.time()))
     hf_upload_file("/tmp/DONE", "DONE", required=True)
-    # Carry the completed optimizer step onto the terminal `done` heartbeat. Without it, a cancel that
-    # races the DONE upload (this stepless `done` heartbeat recorded, but the poller hasn't transitioned
-    # the run to done yet) prices from actual_steps_run(), which treats `done` as a non-training stage
-    # with no step and floors a fully-trained run to 0 (codex[bot]). RunMetrics.step carries the
-    # completed optimizer updates for opd; None (other phases) -> stepless as before.
+    # Carry the completed optimizer step onto the terminal `done` heartbeat. Without it, a cancel
+    # that races the DONE upload (this stepless `done` heartbeat recorded, but the poller hasn't
+    # transitioned the run to done yet) prices from actual_steps_run(), which treats `done` as a
+    # non-training stage with no step and floors a fully-trained run to 0. RunMetrics.step carries
+    # the completed optimizer updates for opd; None (other phases) -> stepless as before.
     _step = metrics.step
     _step_field = {"step": int(_step)} if isinstance(_step, (int, float)) and _step > 0 else {}
     heartbeat("done", **_step_field, **(heartbeat_fields or {}), gpu=gpu_diagnostics())
@@ -301,10 +241,13 @@ def _finalize(metrics: RunMetrics, *, heartbeat_fields=None):
 
 def main():
     try:
+        from flash.engine.worker.entry.profile import run_sft_profile
+
         modes = {
             "sft": run_sft,
             "rl": run_rl,
             "opd": run_opd,
+            "profile": run_sft_profile,
         }
         handler = modes.get(RUN_MODE)
         if handler is None:
@@ -375,8 +318,20 @@ def main():
                     "DONE present but metrics.json unreadable after retries "
                     f"(transient HF; {error_kind})"
                 )
-        # BEFORE any model import / fla dispatch: on sm100 the baked tilelang GDN backend
-        # computes wrong gradients — opt out so fla uses its (correct-there) Triton path.
+        # A profile run tokenizes or samples on cpu and never imports a model, so it exits BEFORE
+        # the kernel setup below: none of it would apply, and _ensure_fla_fastpath_on_hopper would
+        # pip-install into a process that is about to leave.
+        if RUN_MODE == "profile":
+            heartbeat("boot")
+            handler()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
+        # these setups run in the parent; verl trains in FLASH_VERL_PYTHON.
+        # only _force_fla_triton_gdn_on_sm100 propagates through FLA_* env vars. the install,
+        # symlink,
+        # and monkeypatch are interpreter-local and must not be treated as child configuration.
+        # run before model imports: sm100 tilelang GDN computes wrong gradients, so use Triton.
         _force_fla_triton_gdn_on_sm100()
         _ensure_fla_fastpath_on_hopper()
         # Must run AFTER fla fast path (may reinstall tilelang) and BEFORE model/vLLM import.
@@ -385,18 +340,14 @@ def main():
         # launch: restrict fla's Blackwell GDN bwd autotune to grad-correct configs (fla #913).
         _restrict_fla_gdn_autotune_on_blackwell()
         heartbeat("boot", gpu=gpu_diagnostics(include_torch=False))
-        finalize_alloc_conf_for_sleep()
         load_mega_cache()
         handler()
         # Hard-exit: colocated vLLM can deadlock on NCCL/CUDA teardown; all artifacts already on HF.
-        wandb_finish(exit_code=0)
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(0)
     except Exception as e:
         tb = sanitize_diagnostic(traceback.format_exc(), limit=16_000)
-        if not flush_optional_uploads():
-            print("optional upload flush timed out on worker error")
         try:
             err_name = error_artifact_name(RUN_MODE, ATTEMPT)
             err_path = f"/tmp/{err_name}"
@@ -405,6 +356,20 @@ def main():
             hf_upload_file(err_path, err_name)
         except Exception as up_err:
             print("error-upload warn:", sanitize_diagnostic(up_err, limit=500))
+        try:
+            # preserve ray session logs because raylet tracebacks show only the downstream EOF and
+            # pod-local logs vanish after failure (VERL-115). all training modes start ray.
+            ray_logs = collect_ray_failure_logs(started_after=WORKER_START_TIME)
+            if ray_logs:
+                ray_name = ray_log_artifact_name(RUN_MODE, ATTEMPT)
+                ray_path = f"/tmp/{ray_name}"
+                with open(ray_path, "w") as f:
+                    f.write(ray_logs)
+                hf_upload_file(ray_path, ray_name)
+        except Exception as ray_err:
+            # this is the failure path already. a collector that could raise here would replace the
+            # run's real error with its own.
+            print("ray-log-collect warn:", sanitize_diagnostic(ray_err, limit=500))
         # A CUDA OOM -> stamp an ``oom`` flag so the runner retries on a LARGER GPU. Infra failures
         # keep same-size retry semantics and must never be reclassified as OOM.
         hb_flags = _worker_failure_flags(e)
@@ -427,7 +392,6 @@ def main():
             )
         except Exception:
             heartbeat(f"error_{RUN_MODE}", error=detail, **hb_flags, **_err_metrics)
-        wandb_finish(exit_code=1)
         remaining = _remaining_worker_wall_seconds()
         delay = 10.0 if remaining is None else min(10.0, remaining)
         if delay > 0:
@@ -458,64 +422,33 @@ __all__ = [
     "_HB_SETUP_LIVENESS_INTERVAL_S",
     "_HB_SETUP_LIVENESS_STAGES",
     "_HB_TERMINAL_ONLY",
-    "_HB_TERMINAL_ONLY_INTERVAL_S",
-    "_HB_TERMINAL_STAGES",
     "_HB_THROTTLED_STAGES",
     "_HB_TIGHT_LIVENESS_STAGES",
     "_HB_UPLOAD_LIVENESS_STAGES",
     "_HB_UPLOAD_LOCK",
-    "_SFT_HEARTBEAT_INTERVAL_S",
-    "_STEP_GPU_DIAG_INTERVAL_S",
-    "_WANDB_FINISH_FAIL_WAIT_S",
-    "_WANDB_FINISH_WAIT_S",
     "RetriableInfraError",
-    "_GpuPeakSampler",
-    "_attn_impl_for_capability",
     "_current_cuda_sm",
     "_download_adapter",
     "_ensure_fla_fastpath_on_hopper",
     "_estimate_params",
     "_finalize",
-    "_flash_attn_3_available",
-    "_flash_attn_available",
     "_force_fla_triton_gdn_on_sm100",
-    "_grpo_is_no_op_failure",
-    "_grpo_resume_already_complete",
     "_hf_upload",
-    "_init_adapter_model",
-    "_latest_checkpoint_dir",
     "_liger_default_for_model",
     "_load_active_env",
     "_memory_mode",
-    "_metric_curve",
     "_neutralize_tilelang_cudart_stub",
-    "_peak_gpu_gb",
     "_remove_fla_from_disk",
-    "_reset_peak_gpu",
-    "_resolve_adapter_ref",
     "_restrict_fla_gdn_autotune_on_blackwell",
-    "_sdpa_cudnn_ctx",
-    "assert_adapter_delta_nonzero",
-    "assert_adapter_load_clean",
-    "assert_lora_applied",
     "backend_seed",
     "build_grpo_prompt_dataset",
-    "compute_grpo_batching",
     # gpu/backend setup
-    "disable_liger_grpo_torch_compile",
     "error_artifact_name",
-    "finalize_alloc_conf_for_sleep",
-    "flush_optional_uploads",
-    "force_vit_sdpa_on_blackwell",
-    "force_vllm_backend_for_sm120",
-    "free_gpu",
-    "fused_optim_name",
     "gpu_diagnostics",
     "grad_checkpointing_on",
     "graded_text",
     "grpo_mask_truncated_completions",
     "grpo_overrides",
-    "grpo_sleep_mode",
     "grpo_use_reentrant",
     "heartbeat",
     "hf_api",
@@ -523,45 +456,29 @@ __all__ = [
     "hf_resume_checkpoint",
     "hf_upload_file",
     "hf_upload_folder",
-    "is_vl_checkpoint",
-    "liger_on",
     "load_mega_cache",
     "load_tokenizer",
-    "loraplus_optimizer_cls",
+    "lora_target_parameters",
     "main",
-    "make_checkpoint_upload_callback",
     "make_lora",
-    "make_reward_heartbeat_callback",
-    "make_sft_heartbeat_callback",
     "model_revision_kwargs",
-    "optimal_attn_impl",
-    "patch_grpo_mask_aware_lm_head",
-    "patch_trl_colocate_llm_kwargs",
     "prefetch_model",
-    "prepare_fresh_lora_base",
     "prompt_opens_thinking",
     "publish_deployable_checkpoint",
     "publish_opd_optimizer_start_marker",
-    "render_prompt",
+    "ray_log_artifact_name",
     "require_active_env",
-    "require_vllm_for_rollout_func",
     "resolve_grpo_prompts_per_step",
-    "rl_per_device_comps",
     "run_opd",
     "run_rl",
     "run_sft",
     "seed_training_rngs",
-    "setup_perf_backends",
-    "stamp_adapter_provenance",
     "strip_think",
     "think_token_count",
     "thinking_text",
-    "upload_debug_jsonl",
     "upload_resume_checkpoint",
+    "validate_lora_target_parameters",
     "wait_for_gpu",
-    "wandb_finish",
-    "wandb_report_to",
-    "wandb_run_info",
     "wandb_run_name",
     "write_base_model_provenance",
     "write_train_meta",

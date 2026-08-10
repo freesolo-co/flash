@@ -8,6 +8,8 @@ import json
 import os
 import sys
 import tarfile
+import threading
+import time
 import tracemalloc
 import types
 from dataclasses import dataclass, field
@@ -197,7 +199,7 @@ def test_single_turn_reward_many_batches_by_example_value_identical(monkeypatch)
 
 
 def test_single_turn_reward_many_serial_when_not_thread_safe(monkeypatch):
-    """Codex MtMlT: an env that opts out with reward_thread_safe = False must NOT have a group's
+    """An env that opts out with reward_thread_safe = False must NOT have a group's
     completions batched into one env-concurrent score_responses call (a scorer with mutable/thread-
     bound state would be raced). reward_many must score each rollout with its OWN single-item call,
     byte-identical and in input order — the pre-batching serial behavior."""
@@ -233,6 +235,92 @@ def test_single_turn_reward_many_serial_when_not_thread_safe(monkeypatch):
     assert out == [1.0, 1.0, 0.0]  # correct + input order
     # ex_a's two rollouts were NOT batched: every score_responses call carried exactly one response.
     assert sdk_env.batch_sizes == [1, 1, 1]
+
+
+def test_single_turn_scores_breakdown_many_batches_named_metrics_in_order(monkeypatch):
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    class _CountingSingleTurnEnv(_FakeSingleTurnEnv):
+        def __init__(self):
+            self.batch_sizes = []
+
+        def score_responses(self, example, response_texts):
+            self.batch_sizes.append(len(response_texts))
+            return super().score_responses(example, response_texts)
+
+    sdk_env = _CountingSingleTurnEnv()
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    ex_a = {"id": "a", "input": "2+2?", "output": "4"}
+    ex_b = {"id": "b", "input": "3+3?", "output": "6"}
+
+    breakdowns = env.scores_breakdown_many(
+        [
+            (ex_a, {"response_text": "4"}),
+            (ex_b, {"response_text": "nope"}),
+            (ex_a, {"response_text": "also 4"}),
+        ]
+    )
+
+    assert breakdowns == [
+        {"match": 1.0, "total": 1.0},
+        {"match": 0.0, "total": 0.0},
+        {"match": 1.0, "total": 1.0},
+    ]
+    assert sorted(sdk_env.batch_sizes) == [1, 2]
+
+
+def test_single_turn_scores_breakdown_many_is_serial_when_not_thread_safe(monkeypatch):
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    class _UnsafeSingleTurnEnv(_FakeSingleTurnEnv):
+        reward_thread_safe = False
+
+        def __init__(self):
+            self.batch_sizes = []
+
+        def score_responses(self, example, response_texts):
+            self.batch_sizes.append(len(response_texts))
+            return super().score_responses(example, response_texts)
+
+    sdk_env = _UnsafeSingleTurnEnv()
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    example = {"id": "a", "input": "2+2?", "output": "4"}
+
+    assert env.scores_breakdown_many(
+        [
+            (example, {"response_text": "4"}),
+            (example, {"response_text": "nope"}),
+        ]
+    ) == [
+        {"match": 1.0, "total": 1.0},
+        {"match": 0.0, "total": 0.0},
+    ]
+    assert sdk_env.batch_sizes == [1, 1]
+
+
+def test_single_turn_scores_breakdown_many_rejects_wrong_length(monkeypatch):
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    class _ShortSingleTurnEnv(_FakeSingleTurnEnv):
+        def score_responses(self, example, response_texts):
+            return super().score_responses(example, response_texts[:-1])
+
+    env = FreesoloEnvironment(_ShortSingleTurnEnv(), "owner/env", source=None, contract_text="")
+    example = {"id": "a", "input": "2+2?", "output": "4"}
+
+    with pytest.raises(RuntimeError, match="score_responses returned the wrong length"):
+        env.scores_breakdown_many(
+            [
+                (example, {"response_text": "4"}),
+                (example, {"response_text": "also 4"}),
+            ]
+        )
 
 
 def test_single_turn_scoring_gets_completion_thinking_and_raw(monkeypatch):
@@ -279,6 +367,14 @@ def test_single_turn_scoring_gets_completion_thinking_and_raw(monkeypatch):
     assert breakdown["raw_reasoning"] == 1.0
     assert breakdown["answer"] == 1.0
     assert breakdown["total"] == 3.0
+    assert env.scores_breakdown_many(
+        [
+            (
+                {"id": "q", "input": "q", "output": "4"},
+                {"response_text": " 5", **state},
+            )
+        ]
+    ) == [breakdown]
 
 
 def test_freesolo_sft_completion_full_gold_trajectory(monkeypatch):
@@ -1027,7 +1123,7 @@ def test_safe_extract_archive_rejects_longname_decompression_bomb(tmp_path):
 
 
 def test_worker_deps():
-    import flash.envs.registry as registry
+    import flash.envs.base as registry
 
     env_id = "github:owner/repo@main:env/environment.py"
     assert registry.worker_pip_for_env(env_id) == ["freesolo>=0.4.0"]
@@ -1182,7 +1278,7 @@ def test_reward_from_messages_strips_thinking_too(monkeypatch):
 def test_worker_marks_the_env_thinking_from_the_job_spec(monkeypatch):
     """The worker is what knows whether the run samples <think>; it must tell the env."""
     import flash.engine.worker as worker
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     class _Env:
         thinking = False
@@ -1239,11 +1335,11 @@ def test_multi_turn_grading_honors_a_prompt_opened_think_block(monkeypatch):
 def test_multi_turn_grading_matches_the_single_turn_path_exactly(monkeypatch):
     """Same completion, same flag, same parsers -- the two modes must not diverge.
 
-    This is the whole point of the shared flash.thinking parsers: pin multi-turn grading against
+    This is the whole point of the shared flash.content.thinking parsers: pin multi-turn grading against
     the single-turn helper rather than against a hand-written expectation, so a future change to
     one path that doesn't reach the other fails here.
     """
-    from flash.thinking import strip_think
+    from flash.content.thinking import strip_think
 
     for opened in (True, False):
         for completion in (_THINK_COMPLETION, _TRUNCATED_THINK_COMPLETION):
@@ -1368,7 +1464,7 @@ def test_a_final_response_override_reaches_both_views(monkeypatch):
 def test_a_final_response_override_keeps_the_models_raw_output_for_scorers(monkeypatch):
     """`.raw` is the model's original output, so an env override must not overwrite it.
 
-    The documented contract (flash/cli/training_doc.py) defines `.raw` as the original raw model
+    The documented contract (flash/cli/scaffold/__init__.py) defines `.raw` as the original raw model
     output, and it is the one view a scorer cannot reconstruct once it is gone: `.completion` and
     `str(response_text)` are both the override already. Assigning the override to `.raw` also left
     the object incoherent -- an env-authored `.raw` paired with the model's own `.thinking`, so
@@ -1411,15 +1507,285 @@ def test_a_final_response_override_keeps_the_models_raw_output_for_scorers(monke
 
 
 def test_rl_hands_the_derived_opener_flag_to_the_env():
-    """The env cannot derive the flag (no tokenizer, no rendered prompt); rl.py must pass it.
+    """The env cannot derive the flag (no tokenizer, no rendered prompt); the rl path must pass it.
 
-    run_rl needs a GPU, so pin the wiring at the source level: the flag the single-turn path
-    derives is the same one the multi-turn env is given.
+    the rl path needs a GPU, so pin the wiring at the source level: the flag the single-turn path
+    derives is the same one the multi-turn env is given. _resolve_grpo_inputs is where the rendered
+    prompt exists, so it is where the flag is derived and handed to the env.
     """
     import inspect
 
-    from flash.engine.worker.rl import run_rl
+    from flash.engine.worker.rl_train import _resolve_grpo_inputs
 
-    src = inspect.getsource(run_rl)
+    src = inspect.getsource(_resolve_grpo_inputs)
     assert 'hasattr(env, "prompt_opens_thinking")' in src
-    assert "env.prompt_opens_thinking = _prompt_opens_thinking" in src
+    assert "env.prompt_opens_thinking = prompt_opened_thinking" in src
+
+
+class _SlowGroupedEnv(_FakeSingleTurnEnv):
+    """Records how many score_responses calls are in flight at once."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.live = 0
+        self.peak = 0
+        self.calls = 0
+
+    def score_responses(self, example, response_texts):
+        with self.lock:
+            self.live += 1
+            self.peak = max(self.peak, self.live)
+            self.calls += 1
+        try:
+            time.sleep(0.05)
+            return [
+                _RewardResult(score=float(len(text)), success=True, metrics=())
+                for text in response_texts
+            ]
+        finally:
+            with self.lock:
+                self.live -= 1
+
+
+def _grouped_items():
+    # four DISTINCT prompts, two rollouts each: four groups, interleaved so a correct scatter
+    # cannot be produced by accident from group-ordered output.
+    return [
+        (
+            {"id": f"ex-{prompt}", "input": f"q{prompt}", "output": "4"},
+            {"response_text": "x" * (prompt * 10 + rollout + 1)},
+        )
+        for rollout in range(2)
+        for prompt in range(4)
+    ]
+
+
+def test_reward_task_groups_are_scored_concurrently(monkeypatch):
+    """Distinct prompts must overlap their scoring instead of waiting on each other.
+
+    Each score_responses call already scores its own completions concurrently, but the adapter used
+    to loop over task groups SERIALLY, so a step with N prompts paid N judge latencies end to end
+    while the gpu sat idle. For a remote-judge env that is the dominant cost of the step. Asserted
+    on observed OVERLAP (peak in-flight calls > 1), not on wall-clock, so it cannot pass on a loaded
+    machine by luck.
+    """
+    sdk_env = _SlowGroupedEnv()
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    rewards = env.reward_many(_grouped_items())
+
+    assert sdk_env.calls == 4, sdk_env.calls
+    assert sdk_env.peak > 1, f"groups did not overlap (peak={sdk_env.peak})"
+    # and the values still land in INPUT order, not group order: each score is the response length.
+    assert rewards == [float(len(state["response_text"])) for _, state in _grouped_items()]
+
+
+class _SlowGroupedMultiTurnEnv(_FakeMultiTurnEnv):
+    """Multi-turn env that records concurrent score_episodes calls."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.live = 0
+        self.peak = 0
+        self.calls = 0
+
+    def score_episodes(self, example, episodes):
+        with self.lock:
+            self.live += 1
+            self.peak = max(self.peak, self.live)
+            self.calls += 1
+        try:
+            time.sleep(0.05)
+            return [
+                _RewardResult(score=0.5, success=True, metrics=(_RewardMetric("episode", 0.5),))
+                for _episode in episodes
+            ]
+        finally:
+            with self.lock:
+                self.live -= 1
+
+
+def _multiturn_grouped_items():
+    return [
+        (
+            {"id": f"ex-{prompt}", "input": f"q{prompt}", "output": "4"},
+            {"response_text": f"r{rollout}", "episode": {"turns": []}},
+        )
+        for rollout in range(2)
+        for prompt in range(4)
+    ]
+
+
+def test_reward_group_concurrency_is_skipped_for_a_non_thread_safe_env(monkeypatch):
+    """`reward_thread_safe = False` means the scorer must never be raced, batching win or not.
+
+    Such an env keeps thread-bound state (sqlite handles, browser sessions). Driven through
+    rollout_rewards_many DELIBERATELY: reward_many diverts a non-thread-safe env to a serial path
+    before _grouped_results is ever reached, so a reward_many-based test passes with the guard
+    deleted and proves nothing. rollout_rewards_many is the door that actually reaches the grouped
+    scorer, so it is the one that can fail.
+    """
+    sdk_env = _SlowGroupedMultiTurnEnv()
+    sdk_env.reward_thread_safe = False
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    rewards = env.rollout_rewards_many(_multiturn_grouped_items())
+
+    assert sdk_env.peak == 1, f"a non-thread-safe scorer was raced (peak={sdk_env.peak})"
+    assert [reward.episode for reward in rewards] == [0.5] * 8
+
+
+def test_multi_turn_reward_groups_are_scored_concurrently(monkeypatch):
+    """The same overlap win must reach the multi-turn path, which scores whole episodes.
+
+    Pairs with the guard test above: together they show the concurrency is real on this path AND
+    that reward_thread_safe is what turns it off, rather than the path being serial anyway.
+    """
+    sdk_env = _SlowGroupedMultiTurnEnv()
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    rewards = env.rollout_rewards_many(_multiturn_grouped_items())
+
+    assert sdk_env.calls == 4, sdk_env.calls
+    assert sdk_env.peak > 1, f"multi-turn groups did not overlap (peak={sdk_env.peak})"
+    assert [reward.episode for reward in rewards] == [0.5] * 8
+
+
+class _FailingGroupedEnv(_FakeSingleTurnEnv):
+    """Raises on one designated group and counts how many groups actually executed.
+
+    ``slow_head`` makes group ``q0`` an order of magnitude slower than the rest, which is what
+    real scorers look like -- group cost tracks completion length and judge latency, so it is
+    uneven. A pool that waits on results in INPUT order cannot report the failure until that
+    leading group returns, by which time the whole batch has drained.
+
+    ``fast`` removes the per-group sleep entirely, which is the OPPOSITE regime and defeats a
+    different implementation: when every call returns immediately, workers drain an eagerly
+    submitted queue before the consumer reads its first result, so there is nothing left for
+    ``cancel_futures`` to drop. A cheap scorer (a regex or exact-match grader) is exactly this.
+
+    ``slow_error`` makes the FAILING group slow while the rest stay fast, which is what a real
+    failure looks like -- an HTTP timeout or a late 5xx takes longer than a success, not less. The
+    doomed call sits in flight while successes are consumed around it, and a window that refills on
+    each consumed success walks the whole batch before the raise is ever seen. An in-flight call
+    that will fail is indistinguishable from a slow one that will succeed, so only refusing to run
+    ahead of the oldest unconsumed item bounds this.
+    """
+
+    def __init__(
+        self,
+        fail_on: str,
+        slow_head: bool = False,
+        fast: bool = False,
+        slow_error: bool = False,
+    ):
+        self.fail_on = fail_on
+        self.slow_head = slow_head
+        self.fast = fast
+        self.slow_error = slow_error
+        self.lock = threading.Lock()
+        self.executed = 0
+
+    def score_responses(self, example, response_texts):
+        with self.lock:
+            self.executed += 1
+        # hold the worker long enough that the groups queued behind this one are still QUEUED, not
+        # started, when the raise surfaces -- that is what cancel_futures can drop.
+        head = self.slow_head and str(example.input) == "q0"
+        doomed = str(example.input) == self.fail_on
+        if head or (doomed and self.slow_error):
+            time.sleep(0.5)
+        elif not (self.fast or self.slow_error):
+            time.sleep(0.05)
+        if doomed:
+            raise RuntimeError("scorer exploded")
+        return [_RewardResult(score=1.0, success=True, metrics=()) for _text in response_texts]
+
+
+@pytest.mark.parametrize(
+    ("fail_on", "ceiling", "slow_head", "fast", "slow_error"),
+    [
+        ("q1", 16, False, False, False),
+        ("q19", 32, False, False, False),
+        ("q1", 16, True, False, False),
+        ("q19", 32, True, False, False),
+        ("q1", 16, False, True, False),
+        ("q19", 32, False, True, False),
+        ("q1", 16, False, False, True),
+        ("q19", 32, False, False, True),
+    ],
+)
+def test_a_failing_scorer_group_wastes_at_most_a_pool_width(
+    monkeypatch, fail_on, ceiling, slow_head, fast, slow_error
+):
+    """A raise must not drag the whole batch through the scorer before it propagates.
+
+    The serial loop stopped AT the failing group; the pool also runs whatever is already in flight,
+    and rl_train.py's batch-level retry re-scores everything serially afterwards, so those calls are
+    billed TWICE. Bounding that waste is what makes the concurrency acceptable.
+
+    The uniform-cost arms pass under every implementation tried, so the three skewed arms are the
+    ones with teeth, and each defeats a DIFFERENT implementation:
+
+    ``slow_head`` breaks consuming results in input order (what `pool.map` yields) -- a slow leading
+    group defers the raise until every other group has run: 40/40 under `map`, against 9 here.
+
+    ``fast`` breaks submitting the whole batch up front and relying on `cancel_futures`. With no
+    sleep at all the workers drain the entire queue before the consumer reads its first result, so
+    the cancel finds nothing pending: measured 36/40, and 10000/10000 on a larger batch, against 6.
+
+    ``slow_error`` breaks a window that refills whenever any success is consumed. The doomed call is
+    still in flight, so each consumed success pulls in another item and the window walks the whole
+    batch: measured 2000/2000, waste scaling with error-latency over success-latency rather than
+    with the cap, against 9 once the window refuses to run ahead of the oldest unconsumed item.
+
+    Asserted as a CEILING (one pool width past the failure point, doubled for scheduling slack), not
+    an equality: the exact count depends on how many workers have picked up work when the raise
+    lands.
+    """
+    sdk_env = _FailingGroupedEnv(fail_on, slow_head=slow_head, fast=fast, slow_error=slow_error)
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    items = [
+        ({"id": f"ex-{prompt}", "input": f"q{prompt}", "output": "4"}, {"response_text": "x"})
+        for prompt in range(40)
+    ]
+
+    with pytest.raises(RuntimeError, match="scorer exploded"):
+        env.reward_many(items)
+
+    assert sdk_env.executed < 40, "the whole batch ran: queued groups were not cancelled"
+    assert sdk_env.executed <= ceiling, sdk_env.executed
+
+
+def test_a_single_task_group_still_scores_inline(monkeypatch):
+    """One group must not spawn a pool: a thread for a single call is pure overhead.
+
+    This is the common single-prompt path, so it stays exactly as it was.
+    """
+    sdk_env = _SlowGroupedEnv()
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    example = {"id": "ex-1", "input": "2+2?", "output": "4"}
+    rewards = env.reward_many(
+        [(example, {"response_text": "ab"}), (example, {"response_text": "c"})]
+    )
+
+    assert sdk_env.calls == 1
+    assert sdk_env.peak == 1
+    assert rewards == [2.0, 1.0]

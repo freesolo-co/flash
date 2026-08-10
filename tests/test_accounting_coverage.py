@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-import flash.engine.accounting as accounting
+import flash.engine.result.accounting as accounting
 
 
 def test_sanitizer_falls_back_safely_when_nested_adapter_parser_raises(monkeypatch) -> None:

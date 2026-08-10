@@ -9,7 +9,7 @@ import pytest
 from fastapi import HTTPException
 
 from flash.client import ClientError, create_project, get_project, list_projects
-from flash.server.projects import require_project_access
+from flash.server.domain.projects import require_project_access
 
 
 class _Response:
@@ -97,7 +97,7 @@ def test_server_project_validation_uses_authenticated_bearer_and_org(monkeypatch
         )
 
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.test")
-    monkeypatch.setattr("flash.server.projects.urllib.request.urlopen", urlopen)
+    monkeypatch.setattr("flash.server.domain.projects.urllib.request.urlopen", urlopen)
 
     assert (
         require_project_access(
@@ -137,7 +137,7 @@ def test_internal_project_validation_uses_internal_service_endpoint(monkeypatch)
         )
         return _Response({"ok": True, "orgId": "org-one", "projectId": project_id})
 
-    monkeypatch.setattr("flash.server.projects.urllib.request.urlopen", urlopen)
+    monkeypatch.setattr("flash.server.domain.projects.urllib.request.urlopen", urlopen)
     assert (
         require_project_access(
             project_id=f"  {project_id}  ",
@@ -162,7 +162,7 @@ def test_internal_project_validation_uses_internal_service_endpoint(monkeypatch)
 def test_internal_project_validation_requires_service_token(monkeypatch) -> None:
     monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
     monkeypatch.setattr(
-        "flash.server.projects.urllib.request.urlopen",
+        "flash.server.domain.projects.urllib.request.urlopen",
         lambda *_args, **_kwargs: pytest.fail("missing token must fail before transport"),
     )
 
@@ -193,7 +193,7 @@ def test_internal_project_validation_fails_closed_on_http_errors(
         io.BytesIO(json.dumps({"detail": "validation failed"}).encode()),
     )
     monkeypatch.setattr(
-        "flash.server.projects.urllib.request.urlopen",
+        "flash.server.domain.projects.urllib.request.urlopen",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
     )
 
@@ -222,7 +222,7 @@ def test_internal_project_validation_rejects_malformed_or_mismatched_success(
 ) -> None:
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "service-internal-key")
     monkeypatch.setattr(
-        "flash.server.projects.urllib.request.urlopen",
+        "flash.server.domain.projects.urllib.request.urlopen",
         lambda *_args, **_kwargs: _Response(payload),
     )
 
@@ -252,7 +252,7 @@ def test_internal_project_validation_rejects_invalid_json(monkeypatch) -> None:
             return False
 
     monkeypatch.setattr(
-        "flash.server.projects.urllib.request.urlopen",
+        "flash.server.domain.projects.urllib.request.urlopen",
         lambda *_args, **_kwargs: _InvalidResponse(),
     )
 
@@ -269,7 +269,7 @@ def test_internal_project_validation_rejects_invalid_json(monkeypatch) -> None:
 def test_internal_project_validation_fails_closed_on_transport_error(monkeypatch) -> None:
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "service-internal-key")
     monkeypatch.setattr(
-        "flash.server.projects.urllib.request.urlopen",
+        "flash.server.domain.projects.urllib.request.urlopen",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(urllib.error.URLError("offline")),
     )
 
@@ -292,7 +292,7 @@ def test_server_project_validation_rejects_cross_org_project(monkeypatch) -> Non
         io.BytesIO(json.dumps({"detail": "not found"}).encode()),
     )
     monkeypatch.setattr(
-        "flash.server.projects.urllib.request.urlopen",
+        "flash.server.domain.projects.urllib.request.urlopen",
         lambda *a, **k: (_ for _ in ()).throw(error),
     )
     with pytest.raises(HTTPException) as excinfo:
@@ -303,3 +303,51 @@ def test_server_project_validation_rejects_cross_org_project(monkeypatch) -> Non
         )
     assert excinfo.value.status_code == 403
     assert "authenticated organization" in excinfo.value.detail
+
+
+def _no_network(monkeypatch) -> None:
+    """Any outbound call from a standalone path is the bug under test, so make one fail loudly."""
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("standalone must not call the Freesolo backend")
+
+    monkeypatch.setattr("urllib.request.urlopen", _boom)
+
+
+def test_standalone_accepts_a_well_formed_project_without_a_backend(monkeypatch) -> None:
+    """A self-hosted plane has no org directory to validate against, so the id is taken as given.
+
+    This is the gate that makes self-hosting work at all: without it every submit resolves
+    api.freesolo.co, fails, and is rejected 503.
+    """
+    monkeypatch.setenv("FLASH_STANDALONE", "1")
+    _no_network(monkeypatch)
+
+    project_id = "11111111-1111-4111-8111-111111111111"
+    assert (
+        require_project_access(
+            project_id=f" {project_id} ",
+            key={"auth_kind": "internal"},
+            authorization=None,
+        )
+        == project_id
+    )
+
+
+def test_standalone_still_requires_a_well_formed_project_id(monkeypatch) -> None:
+    """Standalone relaxes OWNERSHIP, not the requirement itself: runs stay grouped by project.
+
+    A malformed id must fail the same 400 it would against the backend, or self-hosting would
+    become the one mode where the explicit-project contract silently does not apply.
+    """
+    monkeypatch.setenv("FLASH_STANDALONE", "1")
+    _no_network(monkeypatch)
+
+    for bad in ("", "   ", "not-a-uuid"):
+        with pytest.raises(HTTPException) as excinfo:
+            require_project_access(
+                project_id=bad,
+                key={"auth_kind": "internal"},
+                authorization=None,
+            )
+        assert excinfo.value.status_code == 400

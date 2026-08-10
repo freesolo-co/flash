@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-import ast
 import importlib
-import inspect
+import json
+import os
+import subprocess
 import sys
-import textwrap
-import types
 
 import pytest
 
-from flash.engine.worker.rollout_samples import build_rollout_sample, select_rollout_samples
-from flash.providers._poll import _format_heartbeat
+from flash.engine.result.rollout_samples import build_rollout_sample, select_rollout_samples
+from flash.providers._lifecycle.poll import _format_heartbeat
 
 
 def test_build_rollout_sample_shows_full_text_and_sanitizes_without_redacting_placeholder(
@@ -111,6 +110,22 @@ def test_build_rollout_sample_carries_loss_scalar_for_opd() -> None:
     assert sample["generated_at_step"] == 3
 
 
+@pytest.mark.parametrize("scalar", ["reward", "loss"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_a_non_finite_scalar_is_omitted_so_the_heartbeat_stays_parseable(scalar, value) -> None:
+    """A diverged step must not publish a scalar json cannot represent.
+
+    ``json.dumps`` writes bare ``NaN``/``Infinity`` by default -- not json. A strict reader rejects
+    the whole heartbeat over one such field, so the step's OTHER diagnostics die with it. Assert on
+    ``allow_nan=False``, which is exactly the strict reader's behaviour: a plain ``json.dumps`` here
+    would serialize the defect happily and the test could never fail."""
+    sample = build_rollout_sample("prompt", "completion", generated_at_step=2, **{scalar: value})
+
+    assert scalar not in sample, f"non-finite {scalar} reached the wire"
+    assert sample["completion"] == "completion"
+    json.dumps(sample, allow_nan=False)
+
+
 def test_select_rollout_samples_prefers_distinct_prompts_then_fills_repeats() -> None:
     triples = [
         ("prompt-a", "a-first", 0.1),
@@ -154,98 +169,6 @@ def test_select_rollout_samples_rejects_unknown_scalar() -> None:
         select_rollout_samples([("p", "c", 1.0)], generated_at_step=1, scalar="entropy")
 
 
-def test_reward_heartbeat_carries_bounded_samples_and_forces_only_the_first(
-    monkeypatch,
-) -> None:
-    import flash.engine.worker as worker
-
-    heartbeat_module = importlib.import_module("flash.engine.worker.heartbeat")
-    emitted: list[tuple[str, dict]] = []
-
-    def committed_heartbeat(stage, **payload):
-        emitted.append((stage, payload))
-        return True
-
-    monkeypatch.setattr(worker, "heartbeat", committed_heartbeat)
-    monkeypatch.setattr(
-        heartbeat_module,
-        "_maybe_attach_gpu_diag",
-        lambda payload, last, now: last,
-    )
-    transformers = types.ModuleType("transformers")
-    transformers.TrainerCallback = type("TrainerCallback", (), {})
-    monkeypatch.setitem(sys.modules, "transformers", transformers)
-
-    samples = [
-        {
-            "prompt_tail": f"prompt-{index}",
-            "completion": f"completion-{index}",
-            "reward": index / 10,
-            "generated_at_step": 1,
-        }
-        for index in range(6)
-    ]
-    callback = heartbeat_module.make_reward_heartbeat_callback(
-        lambda: {"success": 0.8}, lambda: samples
-    )
-    state = types.SimpleNamespace(global_step=1)
-
-    callback.on_log(None, state, None, logs={"reward": 0.65})
-    callback.on_log(None, state, None, logs={"reward": 0.70})
-
-    first_payload = emitted[0][1]
-    assert emitted[0][0] == "rl_step"
-    assert first_payload["reward"] == 0.65
-    assert first_payload["reward_metrics"] == {"success": 0.8}
-    assert len(first_payload["sampled_completions"]) == 3
-    assert first_payload["force"] is True
-    assert "force" not in emitted[1][1]
-
-
-def test_reward_heartbeat_retries_force_until_sample_payload_commits(monkeypatch) -> None:
-    import flash.engine.worker as worker
-
-    heartbeat_module = importlib.import_module("flash.engine.worker.heartbeat")
-    emitted: list[tuple[str, dict]] = []
-    outcomes = iter([False, True, True])
-
-    def heartbeat(stage, **payload):
-        emitted.append((stage, payload))
-        return next(outcomes)
-
-    monkeypatch.setattr(worker, "heartbeat", heartbeat)
-    monkeypatch.setattr(
-        heartbeat_module,
-        "_maybe_attach_gpu_diag",
-        lambda payload, last, now: last,
-    )
-    transformers = types.ModuleType("transformers")
-    transformers.TrainerCallback = type("TrainerCallback", (), {})
-    monkeypatch.setitem(sys.modules, "transformers", transformers)
-    callback = heartbeat_module.make_reward_heartbeat_callback(
-        samples=lambda: [
-            {
-                "prompt_tail": "prompt",
-                "completion": "completion",
-                "reward": 1.0,
-                "generated_at_step": 1,
-            }
-        ]
-    )
-
-    for step in (1, 2, 3):
-        callback.on_log(
-            None,
-            types.SimpleNamespace(global_step=step),
-            None,
-            logs={"reward": 1.0},
-        )
-
-    assert emitted[0][1]["force"] is True
-    assert emitted[1][1]["force"] is True
-    assert "force" not in emitted[2][1]
-
-
 def test_heartbeat_reports_failed_then_successful_forced_delivery(monkeypatch) -> None:
     import flash.engine.worker as worker
 
@@ -275,7 +198,7 @@ def test_throttled_heartbeat_omits_samples_from_console(monkeypatch, capsys) -> 
     monkeypatch.setattr(worker, "_HB_LAST_PROGRESS_TS", 0.0)
     monkeypatch.setattr(worker, "_HB_PROGRESS_SEQ", 0)
     monkeypatch.setattr(worker, "_HB_PROGRESS_UPLOADED_SEQ", 0)
-    heartbeat_module = importlib.import_module("flash.engine.worker.heartbeat")
+    heartbeat_module = importlib.import_module("flash.engine.worker.io.heartbeat")
     monkeypatch.setattr(heartbeat_module.time, "time", lambda: 1001.0)
 
     committed = worker.heartbeat(
@@ -390,77 +313,6 @@ def test_format_heartbeat_caps_rendered_samples_at_three() -> None:
     assert "sample 4" not in rendered
 
 
-def test_bounded_sampled_completions_resanitizes_and_neutralizes_without_truncating(
-    monkeypatch,
-) -> None:
-    heartbeat_module = importlib.import_module("flash.engine.worker.heartbeat")
-    secret = "heartbeat-secret-boundary-xyz"
-    monkeypatch.setenv("HEARTBEAT_API_KEY", secret)
-
-    bounded = heartbeat_module._bounded_sampled_completions(
-        [
-            {
-                "prompt_tail": f"{'p' * 600}\r api_key={secret}",
-                "completion": f"bad\x1b[2J{'c' * 980}{secret}{'z' * 100}",
-                "reward": 0.5,
-                "generated_at_step": "4",
-            }
-        ]
-    )
-
-    assert len(bounded) == 1
-    sample = bounded[0]
-    # Full text preserved (no length bound), only redaction + control-char neutralization applied.
-    assert len(sample["prompt_tail"]) > 500
-    assert sample["completion"].endswith("z" * 100)
-    assert "[truncated]" not in sample["completion"]
-    assert secret not in sample["prompt_tail"]
-    assert secret not in sample["completion"]
-    assert "api_key=<redacted>" in sample["prompt_tail"]
-    assert "\\x0d" in sample["prompt_tail"]
-    assert "\\x1b" in sample["completion"]
-    assert "\x1b" not in sample["completion"]
-    assert sample["reward"] == 0.5
-    assert sample["generated_at_step"] == 4
-
-
-def test_bounded_sampled_completions_accepts_opd_loss_samples() -> None:
-    heartbeat_module = importlib.import_module("flash.engine.worker.heartbeat")
-
-    bounded = heartbeat_module._bounded_sampled_completions(
-        [
-            {
-                "prompt_tail": "prompt",
-                "completion": "student answer",
-                "loss": 0.375,
-                "generated_at_step": 2,
-            }
-        ]
-    )
-
-    assert len(bounded) == 1
-    assert bounded[0]["loss"] == 0.375
-    assert "reward" not in bounded[0]
-
-
-def test_bounded_sampled_completions_caps_at_three() -> None:
-    heartbeat_module = importlib.import_module("flash.engine.worker.heartbeat")
-
-    bounded = heartbeat_module._bounded_sampled_completions(
-        [
-            {
-                "prompt_tail": f"p{index}",
-                "completion": f"c{index}",
-                "reward": index / 10,
-                "generated_at_step": 1,
-            }
-            for index in range(6)
-        ]
-    )
-
-    assert len(bounded) == 3
-
-
 def test_format_heartbeat_defensively_neutralizes_control_characters() -> None:
     rendered = _format_heartbeat(
         {
@@ -483,123 +335,30 @@ def test_format_heartbeat_defensively_neutralizes_control_characters() -> None:
     assert "\t" not in rendered
 
 
-def _load_nested_reward_fn(monkeypatch):
-    import flash.engine.worker.rl as rl
+@pytest.mark.parametrize(
+    "module",
+    ["flash.providers._lifecycle.poll", "flash.runner", "flash.cli.commands"],
+)
+def test_control_plane_modules_import_without_running_worker_init(module: str) -> None:
+    """The control plane must not execute worker startup just by being imported.
 
-    source = textwrap.dedent(inspect.getsource(rl.run_rl))
-    tree = ast.parse(source)
-    reward_node = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "reward_fn"
-    )
-    module = ast.Module(body=[reward_node], type_ignores=[])
-    ast.fix_missing_locations(module)
+    ``flash.engine.worker.__init__`` parses ``ATTEMPT`` at module scope and RAISES on a malformed
+    value, which is correct inside a managed worker and wrong everywhere else: the CLI and the
+    provider pollers run in processes that never set it. Importing any submodule of that package
+    runs the package ``__init__`` on the way in, so a single ``from flash.engine.worker.x import y``
+    in shared code is enough to make every one of these modules fail to import.
 
-    pending_named_breakdowns: list[dict[str, float] | None] = []
-    latest_samples: list[dict] = []
-
-    def forbidden_upload(*args, **kwargs):
-        pytest.fail("reward_fn must not upload reward_debug.jsonl")
-
-    fake_worker = types.SimpleNamespace(
-        THINKING=False,
-        graded_text=lambda completion, **kwargs: completion,
-        upload_debug_jsonl=forbidden_upload,
-    )
-
-    class FakeEnv:
-        def scores_breakdown(self, completion, example, state):
-            return {"quality": example["reward"] + 0.1, "total": example["reward"]}
-
-    namespace = {
-        "_w": fake_worker,
-        "_prompt_opens_thinking": False,
-        "_think_penalty": 0.0,
-        "tok": object(),
-        "env": FakeEnv(),
-        "rollout_examples": [
-            {"input": "fallback-a", "reward": 0.1},
-            {"input": "fallback-b", "reward": 0.2},
-            {"input": "fallback-a", "reward": 0.3},
-        ],
-        "pending_named_breakdowns": pending_named_breakdowns,
-        "latest_samples": latest_samples,
-        "select_rollout_samples": select_rollout_samples,
-    }
-    exec(compile(module, rl.__file__, "exec"), namespace)
-    return namespace["reward_fn"], pending_named_breakdowns, latest_samples
-
-
-def test_reward_fn_captures_aligned_samples_without_debug_upload(monkeypatch) -> None:
-    reward_fn, pending_named_breakdowns, latest_samples = _load_nested_reward_fn(monkeypatch)
-
-    rewards = reward_fn(
-        ["completion-a1", "completion-b", "completion-a2"],
-        example_idx=[0, 1, 2],
-        prompts=["prompt-a", "prompt-b", "prompt-a"],
-        trainer_state=types.SimpleNamespace(global_step=7),
+    A malformed ``ATTEMPT`` is the cheapest way to arm that: it turns an invisible side effect into
+    a loud one. The subprocess is the point -- an in-process import would find the module already in
+    ``sys.modules`` from collection and prove nothing.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", f"import {module}"],
+        env={**os.environ, "ATTEMPT": "not-a-number"},
+        capture_output=True,
+        text=True,
     )
 
-    assert rewards == [0.1, 0.2, 0.3]
-    assert [breakdown["quality"] for breakdown in pending_named_breakdowns] == pytest.approx(
-        [0.2, 0.3, 0.4]
+    assert result.returncode == 0, (
+        f"importing {module} ran worker init: {result.stderr.strip().splitlines()[-1:]}"
     )
-    assert [sample["completion"] for sample in latest_samples] == [
-        "completion-a1",
-        "completion-b",
-        "completion-a2",
-    ]
-    assert [sample["reward"] for sample in latest_samples] == rewards
-    assert [sample["prompt_tail"] for sample in latest_samples] == [
-        "prompt-a",
-        "prompt-b",
-        "prompt-a",
-    ]
-    assert all(sample["generated_at_step"] == 7 for sample in latest_samples)
-
-    reward_fn(
-        ["completion-a1", "completion-b", "completion-a2"],
-        example_idx=[0, 1, 2],
-        trainer_state=types.SimpleNamespace(global_step=8),
-    )
-
-    assert [sample["prompt_tail"] for sample in latest_samples] == [
-        "fallback-a",
-        "fallback-b",
-        "fallback-a",
-    ]
-
-
-def test_reward_fn_forwarded_rewards_capture_aligned_multi_turn_samples(monkeypatch) -> None:
-    reward_fn, pending_named_breakdowns, latest_samples = _load_nested_reward_fn(monkeypatch)
-    pending_named_breakdowns.append({"stale": 1.0})
-    latest_samples.append({"stale": True})
-    prompts = [
-        [{"role": "user", "content": "question-a"}],
-        [{"role": "user", "content": "question-b"}],
-    ]
-    completions = [
-        [{"role": "assistant", "content": "answer-a"}],
-        [{"role": "assistant", "content": "answer-b"}],
-    ]
-
-    rewards = reward_fn(
-        completions,
-        reward=[0.25, 0.75],
-        prompts=prompts,
-        trainer_state=types.SimpleNamespace(global_step=9),
-    )
-
-    assert rewards == [0.25, 0.75]
-    assert pending_named_breakdowns == [{"stale": 1.0}]
-    assert [sample["prompt_tail"] for sample in latest_samples] == [
-        "user: question-a",
-        "user: question-b",
-    ]
-    assert [sample["completion"] for sample in latest_samples] == [
-        "assistant: answer-a",
-        "assistant: answer-b",
-    ]
-    assert [sample["reward"] for sample in latest_samples] == rewards
-    assert all(sample["generated_at_step"] == 9 for sample in latest_samples)

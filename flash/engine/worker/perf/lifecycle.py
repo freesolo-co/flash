@@ -6,6 +6,13 @@ import contextlib
 import re
 
 RETRIABLE_INFRA_MARKER = "RETRIABLE_INFRA_GPU"
+_CUDA_OOM_PREFLIGHT_RE = re.compile(
+    r"free memory on device\s+cuda:\d+.*less than desired gpu memory utilization"
+)
+_CUDA_OOM_CACHE_BLOCKS = "no available memory for the cache blocks"
+# verl child processes lose the torch exception type and allocator counter. match torch's exact cuda
+# OOM wording so training OOMs retry on larger GPUs without misclassifying host RAM or env errors.
+_CUDA_OOM_TORCH_RE = re.compile(r"(?:torch\.)?(?:cuda\.)?outofmemoryerror|cuda out of memory")
 
 
 class RetriableInfraError(RuntimeError):
@@ -30,12 +37,25 @@ def cuda_oom_count() -> int:
         return 0
 
 
-def is_cuda_oom(exc: BaseException | None) -> bool:
-    """Whether a failure was a CUDA OOM.
+def cuda_oom_message_evidence(message: str) -> str | None:
+    """the authoritative text evidence for a deterministic cuda oom, if present."""
+    normalized = message.lower()
+    preflight = _CUDA_OOM_PREFLIGHT_RE.search(normalized)
+    if preflight is not None:
+        return preflight.group(0)
+    if _CUDA_OOM_CACHE_BLOCKS in normalized:
+        return _CUDA_OOM_CACHE_BLOCKS
+    torch_oom = _CUDA_OOM_TORCH_RE.search(normalized)
+    if torch_oom is not None:
+        return torch_oom.group(0)
+    return None
 
-    Prefer structured torch allocator signals. Also classify vLLM's deterministic startup memory
-    preflight errors: those can fail before torch records a CUDA OOM counter, but a larger GPU is the
-    correct retry action.
+
+def is_cuda_oom(exc: BaseException | None) -> bool:
+    """Return whether a failure was a CUDA OOM.
+
+    Prefer torch signals, but include deterministic vLLM startup preflights that occur before the
+    allocator records an OOM.
     """
     if exc is None or isinstance(exc, MemoryError):
         return False
@@ -46,13 +66,7 @@ def is_cuda_oom(exc: BaseException | None) -> bool:
             return True
     except Exception:
         pass
-    msg = str(exc).lower()
-    if (
-        re.search(
-            r"free memory on device\s+cuda:\d+.*less than desired gpu memory utilization", msg
-        )
-        or "no available memory for the cache blocks" in msg
-    ):
+    if cuda_oom_message_evidence(str(exc)) is not None:
         return True
     return cuda_oom_count() > 0
 
@@ -220,30 +234,3 @@ def wait_for_gpu(requested_gpu: str | None = None, *, gpu_type: str = ""):
         print(f"GPU not ready (try {i + 1}/12): {last}; sleeping 10s")
         _t.sleep(10)
     raise RetriableInfraError(f"GPU never became ready after 12 tries: {last}")
-
-
-def free_gpu(trainer=None):
-    try:
-        import gc
-
-        import torch
-
-        try:
-            if trainer is not None and hasattr(trainer, "model"):
-                trainer.model = None
-        except Exception:
-            pass
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception as e:
-        print("free_gpu warn:", e)
-
-
-def _metric_curve(trainer, key: str) -> list:
-    """Logged values of `key` from trainer log history, rounded and capped at 400. Never raises."""
-    try:
-        vals = [round(float(h[key]), 4) for h in trainer.state.log_history if key in h]
-        return vals[:400]
-    except Exception:
-        return []

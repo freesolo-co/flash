@@ -40,9 +40,8 @@ def _patch_common(monkeypatch, fake_exit):
     monkeypatch.setattr(worker, "heartbeat", lambda *a, **k: None)
     monkeypatch.setattr(worker.time, "sleep", lambda *a, **k: None)
     # main() runs the real boot steps before the handler; this test exercises the hard-exit flow,
-    # so stub out the Hopper fla fast-path setup and the alloc-conf finalize.
+    # so stub out the Hopper fla fast-path setup.
     monkeypatch.setattr(worker, "_ensure_fla_fastpath_on_hopper", lambda: None)
-    monkeypatch.setattr(worker, "finalize_alloc_conf_for_sleep", lambda: None)
 
 
 def _run_safe_entrypoint(tmp_path, sitecustomize):
@@ -141,7 +140,7 @@ def test_worker_hard_exits_zero_on_success(monkeypatch):
 
 
 def test_worker_rejects_sft_adapter_continuation_before_handler(monkeypatch):
-    from flash.spec import JobSpec, TrainSpec
+    from flash.core.spec import JobSpec, TrainSpec
 
     _patch_common(monkeypatch, lambda code=0: None)
     monkeypatch.setattr(
@@ -155,7 +154,6 @@ def test_worker_rejects_sft_adapter_continuation_before_handler(monkeypatch):
     monkeypatch.setattr(worker, "gpu_diagnostics", lambda **k: {})
     monkeypatch.setattr(worker, "error_artifact_name", lambda *a, **k: "error.txt")
     monkeypatch.setattr(worker, "hf_upload_file", lambda *a, **k: None)
-    monkeypatch.setattr(worker, "wandb_finish", lambda *a, **k: None)
     monkeypatch.setattr(
         worker,
         "run_sft",
@@ -205,7 +203,6 @@ def test_idempotency_replay_metrics_read_failure_is_retriable(monkeypatch, tmp_p
     monkeypatch.setattr(worker, "gpu_diagnostics", lambda **k: {})
     monkeypatch.setattr(worker, "error_artifact_name", lambda *a, **k: "error.txt")
     monkeypatch.setattr(worker, "hf_upload_file", lambda *a, **k: None)
-    monkeypatch.setattr(worker, "wandb_finish", lambda *a, **k: None)
     monkeypatch.setattr(worker.time, "sleep", lambda *a, **k: None)
     monkeypatch.setattr(worker, "heartbeat", lambda *a, **k: hb.append((a, k)))
 
@@ -238,7 +235,6 @@ def test_idempotency_metrics_reread_backoff_stops_at_run_deadline(monkeypatch, t
     monkeypatch.setattr(worker, "gpu_diagnostics", lambda **_kwargs: {})
     monkeypatch.setattr(worker, "error_artifact_name", lambda *_args, **_kwargs: "error.txt")
     monkeypatch.setattr(worker, "hf_upload_file", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(worker, "wandb_finish", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(worker, "heartbeat", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(worker.time, "time", lambda: clock["now"])
 

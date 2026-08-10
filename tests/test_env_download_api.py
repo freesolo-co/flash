@@ -36,10 +36,10 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
 
-    import flash.providers.runpod.keys as runpod_keys
+    import flash.providers.runpod.auth as runpod_keys
     import flash.runner as runner
-    import flash.server.auth as auth_mod
-    import flash.server.db as db_mod
+    import flash.server.platform.auth as auth_mod
+    import flash.server.platform.db as db_mod
 
     runpod_keys.reset()
     importlib.reload(runner)
@@ -48,16 +48,12 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "server.db"))
 
     import flash.providers as providers_mod
-    import flash.providers.runpod.train.endpoints as rp_endpoints
     import flash.server.app as app_mod
-    import flash.server.run_registry as run_registry
+    import flash.server.domain.run_registry as run_registry
 
     importlib.reload(app_mod)
     monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
     monkeypatch.setattr(run_registry, "_post", lambda *a, **k: False, raising=False)
-    monkeypatch.setattr(
-        rp_endpoints, "reconcile_endpoint_slots", lambda *a, **k: None, raising=False
-    )
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token == _USER_TOKEN)
     monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
@@ -66,7 +62,7 @@ def api(tmp_path, monkeypatch):
 
 
 def test_download_env_package_endpoint_returns_package(api, monkeypatch):
-    import flash.server.envs as envs_mod
+    import flash.server.domain.envs as envs_mod
 
     seen: dict = {}
 
@@ -88,7 +84,7 @@ def test_download_env_package_endpoint_returns_package(api, monkeypatch):
 
 
 def test_download_env_package_endpoint_rejects_non_canonical_id(api, monkeypatch):
-    import flash.server.envs as envs_mod
+    import flash.server.domain.envs as envs_mod
 
     monkeypatch.setattr(
         envs_mod, "download_package", lambda **_k: pytest.fail("storage must not be touched")

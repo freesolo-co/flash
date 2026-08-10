@@ -7,7 +7,7 @@ from the bake/network-volume instead of re-fetching them from NVIDIA Artifactory
 
 import os
 
-from flash.engine.worker import kernel_warmup
+from flash.engine.worker.runtime import kernel_warmup
 
 
 def test_point_backends_sets_flashinfer_dirs_under_tmp(monkeypatch, tmp_path):

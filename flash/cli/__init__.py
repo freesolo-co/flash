@@ -11,11 +11,8 @@ import sys
 from typing import NoReturn
 
 from flash import __version__
-from flash._channel import CLI_NAME
-from flash._logging import configure_logging
-from flash._update_check import emit_update_notice, maybe_start_update_check
-from flash.catalog import ALGORITHMS
-from flash.cli import render
+from flash._internal.channel import CLI_NAME
+from flash._internal.logging import configure_logging
 
 # package-level command imports remain available through flash.cli.
 from flash.cli.commands import (  # noqa: F401
@@ -43,24 +40,26 @@ from flash.cli.commands import (  # noqa: F401
     cmd_whoami,
     verify_freesolo_key,
 )
-from flash.cli.env_eval import (
+from flash.cli.commands.env.eval import (
     _MAX_CONCURRENCY,
     bounded_concurrency,
     cmd_env_eval,
     finite_float,
     positive_int,
 )
-from flash.cli.env_setup import cmd_env_setup
-from flash.cli.env_test import cmd_env_test
-from flash.cli.envpush import cmd_env_delete, cmd_env_pull, cmd_env_push
-from flash.cli.traces import (
+from flash.cli.commands.env.push import cmd_env_delete, cmd_env_pull, cmd_env_push
+from flash.cli.commands.env.setup import cmd_env_setup
+from flash.cli.commands.env.test import cmd_env_test
+from flash.cli.commands.traces import (
     DEFAULT_EXPORT_PATH,
     EXPORT_FORMATS,
     RAW_EXPORT_PATH,
     RECORDS_FORMAT,
     cmd_traces_export,
 )
+from flash.cli.ui import render
 from flash.client.config import shadowed_login_warning
+from flash.core.catalog import ALGORITHMS
 
 # Themed `flash --help` catalog. Groups are ordered along the training workflow; each row's
 # summary is the short one-liner the themed grid shows (the verbose per-command text stays on
@@ -150,6 +149,21 @@ def _wait_seconds(value: str) -> float:
     if seconds < 0:
         raise argparse.ArgumentTypeError(f"--wait cannot be negative, got {value!r}")
     return seconds
+
+
+def _gpu_count_override(value: str) -> str:
+    """Turn `--gpus N` into the `gpu.count=N` override it is sugar for.
+
+    the flag shares --set's dest, so it lands in the same override list and inherits one precedence
+    order (file < --config < --set/--gpus, left to right) and one validator: gpu.count's 1..8 bound
+    lives in JobSpec, so a bad --gpus is rejected by the code that already rejects a bad [gpu] count.
+    converting here rather than in the command keeps an absent flag indistinguishable from no flag,
+    so a multi-gpu count authored in the config file is never silently downgraded.
+    """
+    try:
+        return f"gpu.count={int(value)}"
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number of gpus, got {value!r}") from None
 
 
 def _friendly_message(message: str) -> str:
@@ -278,7 +292,8 @@ def _build_parser() -> argparse.ArgumentParser:
     projects_list.set_defaults(func=cmd_projects_list)
 
     models = sub.add_parser("models", help="work with models and deployments")
-    models_sub = models.add_subparsers(dest="models_cmd", required=True)
+    models.set_defaults(func=cmd_models)  # hidden bare `flash models` shim, mirrors `flash runs`
+    models_sub = models.add_subparsers(dest="models_cmd", required=False)
     models_list = models_sub.add_parser("list", help="list supported base models")
     models_list.set_defaults(func=cmd_models)
 
@@ -393,9 +408,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="a bare RUN_ID, RUN_ID/step-N, or full immutable adapter revision",
     )
     # the same two knobs `env test` exposes, and for the same reason: an env whose
-    # `load_environment()` requires a difficulty or reads a non-default split cannot be evaluated
-    # at all without them, and a held-out suite scored against a differently-configured
-    # environment than the run trains on is not measuring the run (codex[bot]).
+    # `load_environment()` requires a difficulty or reads a non-default split cannot be evaluated at
+    # all without them, and a held-out suite scored against a differently-configured environment
+    # than the run trains on is not measuring the run.
     env_eval.add_argument(
         "--split",
         default=None,
@@ -552,6 +567,18 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="key=value",
         help="override a config value; repeatable",
     )
+    train.add_argument(
+        "--gpus",
+        dest="overrides",
+        action="append",
+        type=_gpu_count_override,
+        metavar="N",
+        help=(
+            "most cards to run the job on; sets [gpu] count (1-8). a ceiling, not an exact "
+            "count: allocation still picks one card when one fits the run alone, and only "
+            "rentable counts (1, 2, 4, 8) are ever provisioned"
+        ),
+    )
     train.add_argument("--dry-run", action="store_true")
     train.add_argument(
         "--cost",
@@ -604,26 +631,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     runs_checkpoint.add_argument("run_id")
     runs_checkpoint.set_defaults(func=cmd_checkpoints)
-
-    # deployed freesolo agents still invoke these root run-management forms. keep them callable but
-    # omit them from all help and docs while consumers migrate to `flash runs ...`.
-    legacy_status = sub.add_parser("status", help=argparse.SUPPRESS)
-    legacy_status.add_argument("run_id")
-    legacy_status.add_argument("-f", "--follow", action="store_true")
-    legacy_status.set_defaults(func=cmd_status)
-
-    legacy_log = sub.add_parser("log", help=argparse.SUPPRESS)
-    legacy_log.add_argument("run_id")
-    legacy_log.add_argument("-f", "--follow", action="store_true")
-    legacy_log.set_defaults(func=cmd_log)
-
-    legacy_cancel = sub.add_parser("cancel", help=argparse.SUPPRESS)
-    legacy_cancel.add_argument("run_id")
-    legacy_cancel.set_defaults(func=cmd_cancel)
-
-    legacy_checkpoints = sub.add_parser("checkpoints", help=argparse.SUPPRESS)
-    legacy_checkpoints.add_argument("run_id")
-    legacy_checkpoints.set_defaults(func=cmd_checkpoints)
 
     deploy = models_sub.add_parser("deploy", help="deploy a run's adapter to a serving endpoint")
     deploy.add_argument(
@@ -703,11 +710,6 @@ def _build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--temperature", type=float, default=0.0)
     chat.set_defaults(func=cmd_chat)
 
-    hidden_run_aliases = {"status", "log", "cancel", "checkpoints"}
-    sub._choices_actions[:] = [
-        action for action in sub._choices_actions if action.dest not in hidden_run_aliases
-    ]
-
     # The control plane is operator-only and run as a separate one-off service via the
     # `flash-server` console script (flash.server.__main__:main), not a `flash` subcommand.
 
@@ -747,8 +749,10 @@ def _warn_if_login_shadowed(args) -> None:
     """Surface an ambient FREESOLO_API_KEY that binds a command to another org."""
     if getattr(args, "func", None) not in _ORG_BINDING_COMMANDS:
         return
-    # `train --cost` is catalog-only: it never loads credentials or reaches an organization, so a
-    # warning that names the environment key's org would describe a request this command never makes.
+    # `train --cost` cannot be classified here: the algorithm is only known once the config is
+    # parsed, which happens inside the command. grpo/opd stay catalog-only and must not warn about
+    # an org they never reach; sft authenticates and can start a billed profile run, so it emits
+    # this warning itself (see commands._cmd_train_cost_sft).
     if getattr(args, "cost", False):
         return
     message = shadowed_login_warning()
@@ -763,7 +767,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     configure_logging(verbosity=getattr(args, "verbose", 0))
     debug = getattr(args, "debug", False)
-    update_check = maybe_start_update_check()
     _warn_if_login_shadowed(args)
     try:
         return args.func(args)
@@ -795,5 +798,3 @@ def main(argv: list[str] | None = None) -> int:
         print(render.error(str(exc) or exc.__class__.__name__), file=sys.stderr)
         print(render.arrow(f"run `{cmd}` for the full traceback"), file=sys.stderr)
         return 1
-    finally:
-        emit_update_notice(update_check)

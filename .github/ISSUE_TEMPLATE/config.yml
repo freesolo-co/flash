@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/freesolo-co/flash/security/advisories/new
+    about: Report security issues privately. Do not open a public issue.
+  - name: Question about the hosted Freesolo service
+    url: https://freesolo.co
+    about: Account, billing, and quota questions are not tracked in this repository.

@@ -1,4 +1,4 @@
-"""Behavior tests for the pure formatting/theme/table helpers in ``flash.cli.render``.
+"""Behavior tests for the pure formatting/theme/table helpers in ``flash.cli.ui.render``.
 
 These target the render helpers the existing suite (test_cli_render_theme / test_cli_help)
 doesn't exercise: the tri-state env flag, the isatty fallback, the identity/login cards, the
@@ -6,7 +6,7 @@ doesn't exercise: the tri-state env flag, the isatty fallback, the identity/logi
 types, provider redaction over lists, timestamp/age humanizers, the cost panel, object panel, and
 the small confirmation cards. Color is dropped via ``NO_COLOR`` wherever we assert on contiguous
 text (the same discipline the sibling theme tests use); the two tests that must see SGR codes force
-color on with an explicit ``TERM``/``COLORTERM``/``FLASH_THEME`` so they stay deterministic.
+color on with an explicit ``TERM``/``COLORTERM``/``COLORFGBG`` so they stay deterministic.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import types
 
 import pytest
 
-from flash.cli import render
+from flash.cli.ui import render
 
 
 @pytest.fixture
@@ -114,7 +114,6 @@ def test_login_ok_and_failed(styled_plain) -> None:
 
 
 def test_theme_colorfgbg_non_integer_defaults_dark(monkeypatch) -> None:
-    monkeypatch.delenv("FLASH_THEME", raising=False)
     monkeypatch.setenv("COLORFGBG", "foo;bar")  # last field not an int -> ValueError guard
     assert render._theme() == "dark"
 
@@ -124,7 +123,7 @@ def test_sgr_uses_256_color_fallback_without_truecolor(monkeypatch) -> None:
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.setenv("TERM", "xterm-256color")  # not "dumb" -> color stays on
     monkeypatch.delenv("COLORTERM", raising=False)  # not truecolor -> 256 fallback
-    monkeypatch.setenv("FLASH_THEME", "dark")
+    monkeypatch.setenv("COLORFGBG", "15;0")  # light text on dark background -> dark theme
     out = render.badge("done")  # green/dark 256 fallback is 84
     assert "38;5;84" in out
     assert "38;2;" not in out  # no truecolor triple
@@ -253,13 +252,19 @@ def test_humanize_ts_formats_epoch_and_rejects_non_numbers() -> None:
 
 
 def test_humanize_age_buckets(monkeypatch) -> None:
+    # the age panel composes these two: _heartbeat_age_seconds turns a heartbeat ts into an age,
+    # _humanize_age_seconds buckets it. asserted as that pair rather than through a one-line
+    # wrapper, so the bucket edges stay pinned to the composition the panel actually renders.
+    def humanize(value: object) -> str | None:
+        return render._humanize_age_seconds(render._heartbeat_age_seconds(value))
+
     now = 1_000_000.0
     monkeypatch.setattr(render.time, "time", lambda: now)
-    assert render._humanize_age(now - 30) == "30s ago"  # < 90s
-    assert render._humanize_age(now - 600) == "10m ago"  # < 5400s -> minutes
-    assert render._humanize_age(now - 7200) == "2.0h ago"  # >= 5400s -> hours (line 533)
-    assert render._humanize_age(0) is None
-    assert render._humanize_age("x") is None
+    assert humanize(now - 30) == "30s ago"  # < 90s
+    assert humanize(now - 600) == "10m ago"  # < 5400s -> minutes
+    assert humanize(now - 7200) == "2.0h ago"  # >= 5400s -> hours
+    assert humanize(0) is None
+    assert humanize("x") is None
 
 
 # --------------------------------------------------------------------------- panels / tables

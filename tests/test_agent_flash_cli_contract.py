@@ -1,6 +1,7 @@
 """Cross-folder contract: the freesolo Codex trainer agent (../agent) drives the CLI
 and consumes its run-id / run-state / metrics outputs. This asserts that the flash
-side provides what the agent depends on.
+side provides what the agent depends on, and pins the one surface deliberately taken
+away from it (the root run-management aliases).
 
 The agent package lives in a sibling folder (../agent/src) that is NOT installed in
 the flash venv, so we add it to sys.path here (mirroring how the existing
@@ -13,6 +14,9 @@ Run: cd flash && .venv/bin/python -m pytest \
 
 from __future__ import annotations
 
+import dataclasses
+import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -35,6 +39,7 @@ def _import_agent(modpath: str):
 
 # --- flash side (always importable in the flash venv) ---------------------
 from flash.cli import main
+from flash.core.spec import JobSpec
 from flash.runner import (
     TERMINAL_STATES,
     RunStatus,
@@ -42,7 +47,6 @@ from flash.runner import (
     new_run_id,
     require_safe_run_id,
 )
-from flash.spec import JobSpec
 
 
 @pytest.mark.parametrize(
@@ -63,16 +67,19 @@ def test_agent_required_subcommands_exist(command: tuple[str, ...]) -> None:
     assert excinfo.value.code == 0, f"`flash {rendered}` is missing from the CLI"
 
 
-def test_deployed_agent_root_run_shims_remain_callable_but_hidden(capsys) -> None:
-    for command in ("status", "log", "cancel", "checkpoints"):
-        with pytest.raises(SystemExit) as excinfo:
-            main([command, "--help"])
-        assert excinfo.value.code == 0
-    with pytest.raises(SystemExit):
-        main(["--help"])
-    help_text = capsys.readouterr().out
-    for command in ("status", "log", "cancel", "checkpoints"):
-        assert f"\n    {command} " not in help_text
+@pytest.mark.parametrize("command", ["status", "log", "cancel", "checkpoints"])
+def test_deployed_agent_root_run_shims_are_not_registered(command: str, capsys) -> None:
+    """The root run-management forms are gone; only the grouped `flash runs ...` forms remain.
+
+    these were kept registered-but-hidden so deployed agents could migrate. that grace period is
+    over, so pin the removal to keep the shims from creeping back. agent-side prompts still naming
+    them are tracked in freesolo-co/freesolo#618 -- note `checkpoints` became `runs checkpoint`
+    (singular), so a plain `flash ` -> `flash runs ` rewrite gets that one wrong.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        main([command, "--help"])
+    assert excinfo.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
 
 
 def test_env_push_subcommand_exists() -> None:
@@ -255,3 +262,36 @@ def test_done_status_exposes_adapter_ref(tmp_path, monkeypatch) -> None:
     )
     # the public short ref: exactly what train.init_from_adapter accepts
     assert get_status(rid).to_dict()["adapter_ref"] == rid
+
+
+def test_done_status_with_removed_spec_key_serializes_without_adapter_ref(
+    tmp_path, monkeypatch
+) -> None:
+    # a record written by an OLDER plane can carry a since-removed spec key (gpu.exact_type,
+    # pre-#670); strict JobSpec parsing raises on it. the record must still serialize (one bad
+    # record must not 500 the whole runs list) -- it just resolves no adapter ref.
+    from flash import runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    rid = "flash-status-legacy-spec-key"
+    legacy_spec = {
+        "run_id": rid,
+        "algorithm": "sft",
+        "model": "Qwen/Qwen3.5-2B",
+        "gpu": {"type": "H100", "exact_type": "H100 SXM"},
+        "train": {"epochs": 1},
+    }
+    # written directly: these records were created by the older plane and sit on disk as-is
+    # (the current plane's _save_status could never produce one).
+    os.makedirs(runner.RUNS_DIR, exist_ok=True)
+    record = RunStatus(
+        run_id=rid,
+        state="done",
+        spec=legacy_spec,
+        effective_preparation={"worker_spec": dict(legacy_spec)},
+    )
+    with open(os.path.join(runner.RUNS_DIR, f"{rid}.json"), "w") as f:
+        json.dump(dataclasses.asdict(record), f)
+    loaded = get_status(rid).to_dict()
+    assert loaded["state"] == "done"
+    assert loaded["adapter_ref"] is None

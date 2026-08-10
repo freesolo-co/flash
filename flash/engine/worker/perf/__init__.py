@@ -1,8 +1,8 @@
 """Pure GPU/perf/optimizer probes for the fine-tuning worker.
 
-The perf-backend + fla/tilelang/cudart fixup group stays IN THIS MODULE on purpose: tests
-monkeypatch ``perf._find_real_libcudart`` / ``perf._remove_fla_from_disk`` and the callers
-resolve them through the patched module globals. Do NOT move this group into a submodule.
+The fla/tilelang/cudart fixup group stays IN THIS MODULE on purpose: tests monkeypatch
+``perf._find_real_libcudart`` / ``perf._remove_fla_from_disk`` and the callers resolve them
+through the patched module globals. Do NOT move this group into a submodule.
 
 NOTE: ``tests/test_worker_stack.py`` reads THIS file as TEXT to assert the fla SHA /
 TILELANG_PIN stay in lockstep with WORKER_DEPS / Dockerfile.worker.
@@ -14,65 +14,29 @@ import contextlib
 import os
 import sys
 
-from flash.engine.worker.perf.attn import (
-    _attn_impl_for_capability,
-    _flash_attn_3_available,
-    _flash_attn_available,
-    _sdpa_cudnn_ctx,
-    optimal_attn_impl,
-)
 from flash.engine.worker.perf.diagnostics import (
     _clean_diag,
     _float_or_none,
-    _GpuPeakSampler,
     _int_or_none,
-    _peak_gpu_gb,
     _query_nvidia_gpu,
     _query_nvidia_processes,
-    _reset_peak_gpu,
     _round_gb_from_mib,
     gpu_diagnostics,
 )
 from flash.engine.worker.perf.lifecycle import (
-    RETRIABLE_INFRA_MARKER,
     RetriableInfraError,
-    _metric_curve,
-    free_gpu,
     is_cuda_oom,
     wait_for_gpu,
 )
 from flash.engine.worker.perf.liger import (
-    _LIGER_MIN_PARAMS,
     _estimate_params,
     _liger_default_for_model,
-    liger_on,
 )
-from flash.engine.worker.perf.loraplus import loraplus_optimizer_cls
 from flash.engine.worker.perf.memory import (
-    _LONG_CONTEXT_TOKENS,
     _memory_mode,
-    enable_multimodal_input_require_grads,
-    fused_optim_name,
     grad_checkpointing_on,
-    grpo_sleep_mode,
     grpo_use_reentrant,
-    make_multimodal_input_require_grads_callback,
 )
-
-
-def setup_perf_backends() -> None:
-    """Enable TF32 matmul/cuDNN (no-op pre-Ampere)."""
-    try:
-        import torch
-
-        if not torch.cuda.is_available():
-            return
-        torch.set_float32_matmul_precision("high")
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        print("[perf] TF32 matmul/cuDNN enabled")
-    except Exception as e:
-        print("setup_perf_backends skipped:", e)
 
 
 def _remove_fla_from_disk() -> tuple[list[str], bool]:
@@ -168,7 +132,7 @@ def _find_real_libcudart() -> str | None:
 
 
 def _neutralize_tilelang_cudart_stub() -> None:
-    """Repoint tilelang's libcudart_stub.so at the real libcudart to prevent a vLLM crash (flash #184).
+    """Repoint tilelang's libcudart_stub.so at the real libcudart to prevent a vLLM crash.
 
     tilelang's stub is missing cudaDeviceReset; vLLM scans /proc/self/maps for libcudart and can
     pick up the stub, aborting import. Must run AFTER _ensure_fla_fastpath_on_hopper (tilelang
@@ -193,7 +157,7 @@ def _neutralize_tilelang_cudart_stub() -> None:
     real = _find_real_libcudart()
     if real is None:
         print(
-            "[worker] libcudart stub shadow: no real libcudart found; left as-is (flash #184)",
+            "[worker] libcudart stub shadow: no real libcudart found; left as-is",
             flush=True,
         )
         return
@@ -205,7 +169,7 @@ def _neutralize_tilelang_cudart_stub() -> None:
             with contextlib.suppress(FileNotFoundError):
                 os.remove(stub)
         os.symlink(real, stub)
-        print(f"[worker] redirected tilelang libcudart_stub.so -> {real} (flash #184)", flush=True)
+        print(f"[worker] redirected tilelang libcudart_stub.so -> {real}", flush=True)
     except Exception as e:
         print(f"[worker] libcudart stub neutralize failed: {e}", flush=True)
 
@@ -228,7 +192,10 @@ def _force_fla_triton_gdn_on_sm100() -> None:
     wins on every fla version, so this env set reproduces upstream's current gate on our pin and
     stays a correct no-op across a future pin bump.
 
-    * ``setdefault``: an explicitly pre-set FLA_TILELANG (e.g. testing a fixed tilelang) wins.
+    * Unconditional on sm100: this is a correctness floor, not a preference. A pre-set
+      FLA_TILELANG used to win here, which meant an operator could re-enable a backend that
+      silently miscomputes gradients — the worst failure mode there is, since training completes
+      and only the weights are wrong. Flash owns this value on sm100.
     * sm100 only: sm90 NEEDS tilelang (fla #640, the fast-path installer owns it); sm89/sm120
       train healthily today under the pin's default and upstream's next-pin gate flips them to
       Triton anyway — no evidence to justify changing them from here.
@@ -241,14 +208,6 @@ def _force_fla_triton_gdn_on_sm100() -> None:
         if not (torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)):
             return
     except Exception:
-        return
-    prior = os.environ.get("FLA_TILELANG")
-    if prior is not None:
-        print(
-            f"[blackwell] FLA_TILELANG={prior!r} pre-set; respecting it "
-            "(default here is 0 on sm100: tilelang chunk_bwd_dqkwg miscomputes grads)",
-            flush=True,
-        )
         return
     os.environ["FLA_TILELANG"] = "0"
     print(
@@ -455,45 +414,25 @@ def _ensure_fla_fastpath_on_hopper() -> None:
 
 
 __all__ = [
-    "RETRIABLE_INFRA_MARKER",
-    "_LIGER_MIN_PARAMS",
-    "_LONG_CONTEXT_TOKENS",
     "RetriableInfraError",
-    "_GpuPeakSampler",
-    "_attn_impl_for_capability",
     "_clean_diag",
     "_ensure_fla_fastpath_on_hopper",
     "_estimate_params",
     "_find_real_libcudart",
-    "_flash_attn_3_available",
-    "_flash_attn_available",
     "_float_or_none",
     "_force_fla_triton_gdn_on_sm100",
     "_int_or_none",
     "_liger_default_for_model",
     "_memory_mode",
-    "_metric_curve",
     "_neutralize_tilelang_cudart_stub",
-    "_peak_gpu_gb",
     "_query_nvidia_gpu",
     "_query_nvidia_processes",
     "_remove_fla_from_disk",
-    "_reset_peak_gpu",
     "_restrict_fla_gdn_autotune_on_blackwell",
     "_round_gb_from_mib",
-    "_sdpa_cudnn_ctx",
-    "enable_multimodal_input_require_grads",
-    "free_gpu",
-    "fused_optim_name",
     "gpu_diagnostics",
     "grad_checkpointing_on",
-    "grpo_sleep_mode",
     "grpo_use_reentrant",
     "is_cuda_oom",
-    "liger_on",
-    "loraplus_optimizer_cls",
-    "make_multimodal_input_require_grads_callback",
-    "optimal_attn_impl",
-    "setup_perf_backends",
     "wait_for_gpu",
 ]
