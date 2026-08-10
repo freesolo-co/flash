@@ -448,7 +448,7 @@ def resolve_gpu_mem_util(
         model_id = str(inp["model_id"])
         revision = str(inp.get("model_revision") or "")
         catalog_info = MODELS.get(model_id)
-        # a pinned revision is sized on generic architecture geometry, matching grpo_fits_resident:
+        # a pinned revision is sized on generic architecture geometry:
         # the commit's real geometry is not validated, so the curated kv/lora shape may not describe
         # it. the parameter count still comes from the pinned config.
         info = None if revision else catalog_info

@@ -51,22 +51,6 @@ def grpo_overrides() -> dict:
     return {k: v for k, v in cfg.items() if v is not None}
 
 
-def card_vram_gb() -> float | None:
-    """Total VRAM in decimal GB (/1e9), or None if no live card.
-
-    Uses /1e9 not GiB to match all other VRAM logic; binary GiB would under-report ~7%.
-    Returns None (not 0.0) so callers keep their own no-card fallback.
-    """
-    try:
-        import torch
-
-        if not torch.cuda.is_available():
-            return None
-        return torch.cuda.get_device_properties(0).total_memory / 1e9
-    except Exception:
-        return None
-
-
 def grpo_mask_truncated_completions(train) -> bool:
     """Whether GRPO should drop truncated (non-EOS) completions from the loss.
 

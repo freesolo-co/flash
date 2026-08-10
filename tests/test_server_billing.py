@@ -52,8 +52,7 @@ def _bearer(key: str) -> dict:
 def _spec(monkeypatch):
     """Parse SPEC into a JobSpec offline.
 
-    SPEC is a catalog model on a concrete GPU pin, so the parse never probes HF anyway; the
-    autouse ``_offline`` conftest fixture also stubs ``fetch_hf_params_b`` -- no env switch.
+    SPEC is a catalog model on a concrete GPU pin, so the parse never probes HF.
     """
     from flash.schema import spec_from_dict
 

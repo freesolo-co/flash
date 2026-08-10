@@ -1157,12 +1157,6 @@ def test_vram_sft_per_device_bs_is_managed_default(monkeypatch) -> None:
         assert vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32, vocab=1) == at_cap
 
 
-def test_fetch_hf_params_is_offline_safe(monkeypatch) -> None:
-    from flash.engine.plan import vram
-
-    assert vram.fetch_hf_params_b("any/model") is None
-
-
 # ---------------------------------------------------------------------------
 # _logging: namespace + level resolution
 # ---------------------------------------------------------------------------
