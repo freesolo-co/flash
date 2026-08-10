@@ -60,6 +60,11 @@ jobs:
     # red X: nothing reports, and the PR just never settles.
     if: github.repository == 'freesolo-co/flash'
     runs-on: ubuntu-24.04-8core
+    # ~26min is the slowest run on record (40 runs; the median is 15min, and a warm layer cache
+    # keeps a pure-Python change near the low end). 90 leaves room for a cold cache rebuilding
+    # vllm and the flash-attn wheels from scratch, while still releasing the runner well before
+    # the 6-hour default would.
+    timeout-minutes: 90
     # Single source for the FlashAttention wheels: used BOTH as build-args and as fingerprint inputs
     # (so a wheel bump moves fp_base). Keep FA3_SPEC in sync with Dockerfile.worker's ARG default.
     env:
