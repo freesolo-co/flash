@@ -337,7 +337,6 @@ def cmd_train(args) -> int:
         runtime_secrets_from_local_env(args.config, keys=spec.environment.secrets) or None
     )
     _warn_if_wandb_requested_without_key(spec, runtime_secrets, dry_run=bool(args.dry_run))
-    rollout_evidence, environment_stages_run = _rollout_evidence_for(client, spec, runtime_secrets)
     if args.dry_run:
         # dry-run runs submit-time server preflights without allocating a training gpu or charging
         # for training. a rejection surfaces as the server's error with exit status 1. for sft it
@@ -349,7 +348,6 @@ def cmd_train(args) -> int:
                 runtime_secrets=runtime_secrets,
                 dry_run=True,
                 client_train_schema=client_train_schema,
-                rollout_evidence=rollout_evidence,
             )
         except ApiError as exc:
             _raise_if_workload_profile_pending(client, exc)
@@ -363,20 +361,23 @@ def cmd_train(args) -> int:
         # when it was actually checked. absent key = a server that predates the signal, which is
         # equally not a verification -- so treat anything but an explicit True as unverified.
         affordability_verified = status.pop("affordability_verified", None) is True
-        # the server re-derives the digest and re-applies the trust gate, keeping the profile only
-        # when it passes -- so a populated workload_profile IS the acceptance signal, and its
-        # absence means this quote is the cap-based one whatever the client measured.
-        accepted = isinstance(status.get("workload_profile"), dict) and bool(
-            status.get("workload_profile")
+        cost = "and cost" if affordability_verified else "but NOT cost"
+        # sft additionally required a matching workload profile to get this far, and that profile
+        # run already imported environment.py and tokenized the dataset. claiming otherwise here
+        # would understate what has been checked -- and what has already been billed.
+        environment = (
+            "your environment.py and the exact dataset were already loaded and tokenized by the "
+            "workload profile this quote is built on; model load and gpu/training are first "
+            "exercised on the worker after cold-start."
+            if spec.algorithm == "sft"
+            else "it did NOT import or run your environment.py; dataset loading, "
+            "start_episode/episode shapes, reward/scorer, worker imports, model load, and "
+            "gpu/training are first exercised on the worker after cold-start."
         )
         print(
-            _dry_run_preview_line(
-                algorithm=spec.algorithm,
-                affordability_verified=affordability_verified,
-                rollout_evidence=rollout_evidence,
-                environment_stages_run=environment_stages_run,
-                rollout_evidence_accepted=accepted,
-            ),
+            "dry-run validated: config/schema, model+algorithm compatibility, lora rank, "
+            f"runtime-secret presence, warm-start source, serving context cap, {cost}. "
+            f"{environment}",
             file=sys.stderr,
         )
         if not affordability_verified:
@@ -399,7 +400,6 @@ def cmd_train(args) -> int:
             payload,
             runtime_secrets=runtime_secrets,
             client_train_schema=client_train_schema,
-            rollout_evidence=rollout_evidence,
         )
     except ApiError as exc:
         # a real submit misses the profile cache the same way a preview does, and the miss starts a
@@ -920,13 +920,11 @@ from flash.cli.commands.train_cost import (  # noqa: E402,F401
     _cmd_train_cost,
     _cmd_train_cost_offline,
     _cmd_train_cost_sft,
-    _dry_run_preview_line,
     _exact_sft_cost_rows,
     _legacy_train_key_rejection_detail,
     _print_exact_sft_cost,
     _print_train_schema_compatibility,
     _profile_charge,
     _raise_if_workload_profile_pending,
-    _rollout_evidence_for,
     _warn_if_wandb_requested_without_key,
 )

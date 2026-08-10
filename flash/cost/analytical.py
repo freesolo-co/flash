@@ -184,21 +184,7 @@ def _sequence_tokens(n: RunConfig) -> float:
 
 
 def _completion_tokens(n: RunConfig) -> float:
-    """Tokens ONE rollout generates, measured when a profile exists, else the declared cap.
-
-    KNOWN EXPOSURE, stated rather than papered over: the measurement is taken from the INITIAL
-    policy before training starts, and grpo/opd then generate from a policy that changes at every
-    optimizer step. A run whose reward encourages longer answers drifts away from its own quote.
-
-    Not corrected here, because the correction costs more than the error. The measured value is
-    clamped by the cap, so a policy that grows without bound walks the quote UP to exactly
-    `completion_len` -- the cap-based number this path returns when no profile exists, which is what
-    every run was quoted at before any of this was measured. Re-adding a "conservative bound for
-    policy evolution" on top means quoting the cap again, which is the over-quote this measurement
-    exists to remove: measured on real endpoints, the initial-policy mean runs several-fold under
-    the cap. Fixing it properly needs the WORKER's own realized lengths feeding back before the
-    quote is persisted, not a fudge factor over a pre-training sample.
-    """
+    """Tokens ONE rollout generates, measured when a profile exists, else the declared cap."""
     if n.measured_completion_tokens is None:
         return float(n.completion_len)
     return min(float(n.completion_len), n.measured_completion_tokens)

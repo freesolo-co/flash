@@ -67,22 +67,18 @@ def _rollout_profile(spec):
     raw = getattr(spec, "workload_profile", None)
     if not raw:
         return None
-    # the version that keyed the digest travels on the spec, for the same reason it does for sft:
-    # re-deriving it from `flash.__version__` makes the quote depend on which process is doing the
-    # arithmetic, so a package bump between submit and allocation would silently drop the
-    # measurement and re-quote the run at the cap.
-    producer_version = spec.workload_profile_producer_version
+    from flash import __version__
 
     try:
         input_digest = rollout_profile_input_digest(
             spec,
             tokenizer_revision=spec.model_revision,
-            producer_version=producer_version,
+            producer_version=__version__,
         )
         return require_matching_rollout_profile(
             raw,
             input_digest=input_digest,
-            producer_version=producer_version,
+            producer_version=__version__,
             tokenizer_revision=spec.model_revision,
             now=time.time(),
         )

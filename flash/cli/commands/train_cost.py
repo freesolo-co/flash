@@ -14,15 +14,12 @@ import re
 import sys
 
 from flash import __version__
-from flash._internal.logging import get_logger
 from flash.cli.ui import render
 from flash.client import ApiClient, ApiError, ClientError
 from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
 from flash.cost.spec import runconfig_from_spec
 from flash.schema import spec_and_train_keys_from_file, train_schema_metadata
-
-logger = get_logger("flash.cli")
 
 
 def _commands():
@@ -75,19 +72,6 @@ def _cmd_train_cost_offline(spec) -> int:
     """Catalog-only quote for the algorithms that do not need workload evidence yet (grpo, opd)."""
     from flash.cost import estimate_cost
 
-    if _measured_quote_would_differ(spec):
-        # this command prices rollouts at the declared completion cap, but a dry-run or submit on
-        # the same config measures them and quotes the measured length instead -- so the two
-        # deliberately disagree, and this is the one meant for pre-spend decisions. it stays
-        # cap-based rather than measuring: measuring imports and runs the user's environment.py and
-        # can call a paid external scorer, which is not what `--cost` promises. say which number
-        # this is instead of letting the difference surface as an unexplained change at submit.
-        print(
-            "note: this quote prices generation at the declared completion cap. A sampler key is "
-            "configured, so `flash train --dry-run` measures real rollout length and can quote a "
-            "different (usually lower) amount for this same config.",
-            file=sys.stderr,
-        )
     if spec.train.init_from_adapter:
         # --cost is offline/catalog-only and cannot read the source adapter, so the rank stays at the
         # local default. Warm starts train and are priced at the SOURCE adapter's authoritative rank
@@ -136,170 +120,12 @@ def _cmd_train_cost_sft(args, spec, authored_train_keys: frozenset[str]) -> int:
     return 0
 
 
-def _measured_quote_would_differ(spec) -> bool:
-    """whether a dry-run on this same config would quote from measured rollouts instead.
-
-    only true when a measurement could actually happen: the algorithm samples rollouts, a sampler
-    key is configured, and nothing about the config makes a hosted draw unrepresentative. a config
-    that would be declined is quoted from the cap on BOTH paths, so warning about it would describe
-    a disagreement that does not exist.
-    """
-    from flash.core.catalog import samples_on_policy
-
-    if not samples_on_policy(spec.algorithm):
-        return False
-    from flash.cli.commands.rollout_profile import unsamplable_reason
-    from flash.engine.profiling.rollout_sampler import sampler_credentials
-
-    _base_url, api_key = sampler_credentials()
-    return bool(api_key) and not unsamplable_reason(spec)
-
-
 def _client_train_schema(authored_train_keys: frozenset[str]) -> dict:
     return {
         "version": __version__,
         "fields": train_schema_metadata(),
         "authored_keys": sorted(authored_train_keys),
     }
-
-
-def _dry_run_preview_line(
-    *,
-    algorithm: str,
-    affordability_verified: bool,
-    rollout_evidence: dict | None,
-    environment_stages_run: tuple[str, ...] = (),
-    rollout_evidence_accepted: bool = False,
-) -> str:
-    """What a dry run actually checked, and what it actually executed on this machine.
-
-    Three-way, because what ran locally differs per path. sft required a matching workload profile
-    to get this far, and that profile run already imported environment.py and tokenized the dataset,
-    so claiming otherwise would understate what has been checked and already billed. A grpo/opd
-    quote that reached profiling imported environment.py too. Only the path that never ran it
-    locally ran nothing.
-
-    ``environment_stages_run`` names the env hooks that actually executed, and is tracked separately
-    from ``rollout_evidence`` because profiling can run the user's module and still return nothing --
-    a multi-turn env, no samplable prompts, or an unreachable sampler. Both facts are things a user
-    could act on: what of their code ran here, and whether this price came from a measurement.
-
-    Per-stage rather than one flag, because the declines differ: a multi-turn env is refused after
-    the import alone, and an empty dataset before prompt_messages(). Naming hooks that never ran
-    would misstate exactly the disclosure this line exists to make.
-    """
-    # the server fails open on a billing-infra problem, so "cost" is only in the validated list
-    # when it was actually checked. absent key = a server that predates the signal, which is
-    # equally not a verification -- so treat anything but an explicit True as unverified.
-    cost = "and cost" if affordability_verified else "but NOT cost"
-    if algorithm == "sft":
-        environment = (
-            "your environment.py and the exact dataset were already loaded and tokenized by "
-            "the workload profile this quote is built on; model load and gpu/training are "
-            "first exercised on the worker after cold-start."
-        )
-    elif environment_stages_run:
-        # what ran is reported from the stages that actually executed, not from whether a payload
-        # came back. a multi-turn env, a dataset with no samplable prompts, or a dead sampler all
-        # import environment.py and then return no evidence -- and they stop at different points,
-        # so naming a fixed pair of hooks would overclaim on exactly those paths.
-        #
-        # a stage that STARTED but did not finish arrives marked and reaches this branch -- the
-        # user's code ran, which is what this disclosure is about -- but is excluded from `called`.
-        # a dataset() still running at the deadline did not "run on a small sample", and saying it
-        # did is the same overclaim as the reverse.
-        #
-        # the marker is IMPORTED from the producer rather than spelled again here: two copies of a
-        # sentinel is one rename away from this branch silently reading every stage as completed.
-        from flash.cli.commands.rollout_profile import _ATTEMPTED_SUFFIX as _ATTEMPTED
-
-        completed = [stage for stage in environment_stages_run if not stage.endswith(_ATTEMPTED)]
-        unfinished = [
-            stage.removesuffix(_ATTEMPTED)
-            for stage in environment_stages_run
-            if stage.endswith(_ATTEMPTED)
-        ]
-        unfinished = [stage for stage in unfinished if stage not in completed]
-        called = [f"{stage}()" for stage in completed if stage != "import"]
-        ran = f" {' and '.join(called)} ran on a small sample." if called else ""
-        if unfinished:
-            # named, because this is the one case where the user's code may still be RUNNING:
-            # the local deadline abandons the call but the daemon thread carries on. it is also the
-            # likeliest thing they can act on -- a raising import is why the quote fell to the cap.
-            hooks = " and ".join(f"{stage}()" for stage in unfinished)
-            ran += f" {hooks} did not finish: it raised or hit the local deadline."
-        # the SERVER's verdict, not whether the client produced a payload. the client's only gate
-        # is "at least one draw came back", so a deadline-truncated pass of 31 draws, or one whose
-        # truncation rate or prompt coverage fails the trust gate, is evidence here and rejected
-        # there -- and the run is then priced at the cap. reporting the client's optimism as the
-        # outcome tells the user the opposite of what they will be billed against.
-        priced = (
-            "this quote is priced from the rollouts it measured"
-            if rollout_evidence_accepted
-            else "no usable measurement came back, so this quote still uses the declared "
-            "completion cap"
-        )
-        # the lead clause turns on whether the import COMPLETED, not on whether it was attempted. an
-        # environment.py that raises at module scope has executed -- the user needs to know that --
-        # but "WAS imported" would be the same false claim in the other direction.
-        opened = (
-            "your environment.py WAS imported locally to measure this quote"
-            if "import" in completed
-            else "flash STARTED importing your environment.py locally to measure this quote"
-        )
-        environment = (
-            f"{opened}:{ran} {priced}. "
-            "reward() was NOT called, so its grading cost is not in this quote. worker imports, "
-            "model load, and gpu/training are first exercised on the worker after cold-start."
-        )
-    else:
-        environment = (
-            "it did NOT import or run your environment.py; dataset loading, "
-            "start_episode/episode shapes, reward/scorer, worker imports, model load, and "
-            "gpu/training are first exercised on the worker after cold-start."
-        )
-    return (
-        "dry-run validated: config/schema, model+algorithm compatibility, lora rank, "
-        f"runtime-secret presence, warm-start source, serving context cap, {cost}. "
-        f"{environment}"
-    )
-
-
-def _rollout_evidence_for(
-    client: ApiClient, spec, runtime_secrets: dict | None = None
-) -> tuple[dict | None, tuple[str, ...]]:
-    """Measured rollout aggregates for a grpo/opd submit, or None when nothing was measured.
-
-    Advisory, and silent on every failure. The server re-derives the digest and re-applies the same
-    trust verdict a first-party measurement passes, so this can only ever supply evidence that is
-    rejected or evidence that survives those checks. Returning None leaves the quote on the declared
-    completion cap, which is the pricing this path had before any of it existed -- so a submit must
-    never fail because a sampler was unreachable, slow, or unconfigured.
-
-    ``runtime_secrets`` are forwarded so the env code executed locally sees the same declared
-    secrets the worker will; without them an external-judge reward() raises and the measurement is
-    silently lost.
-
-    Returns the evidence and the env stages that actually ran here ("import", "dataset",
-    "prompt_messages"). They are separate facts: profiling imports and runs the module before it can
-    discover that a config is not measurable, so a None payload does not mean nothing ran -- and
-    which hooks ran differs per decline, so one flag would overclaim.
-    """
-    from flash.cli.commands.rollout_profile import collect_for_submit
-
-    executed: list[str] = []
-
-    evidence = collect_for_submit(
-        client, spec, runtime_secrets=runtime_secrets, on_environment_loaded=executed.append
-    )
-    if evidence:
-        logger.info(
-            "measured %s rollouts for the quote: mean %.0f completion tokens (cap %s)",
-            evidence.get("completed_rollouts"),
-            evidence.get("completion_tokens_mean") or 0.0,
-            spec.train.max_completion_tokens or "recipe default",
-        )
-    return evidence, tuple(executed)
 
 
 def _raise_if_workload_profile_pending(client: ApiClient, exc: ApiError) -> None:

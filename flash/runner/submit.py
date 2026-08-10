@@ -42,7 +42,6 @@ def prepare_job(
     billing_context: dict | None = None,
     platform_context: dict | None = None,
     owner_key_id: int | None = None,
-    rollout_evidence: object = None,
 ) -> PreparedJob:
     """Prepare all read-only submission inputs before persistence or allocation."""
     spec = _runner()._resolve_model_revision(spec, required=spec.algorithm == "sft")
@@ -50,8 +49,6 @@ def prepare_job(
     if spec.algorithm == "sft":
         spec = _runner()._require_pinned_profile_environment(spec)
         spec = _runner()._require_sft_workload_profile(spec)
-    else:
-        spec = _runner()._attach_rollout_workload_profile(spec, rollout_evidence)
     if spec.train.structured_outputs:
         from flash.serve.preflight import preflight_serving_path
 

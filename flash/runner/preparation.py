@@ -451,63 +451,6 @@ def _prepared_sft_profile_job(spec: JobSpec, *, input_digest: str) -> PreparedJo
     )
 
 
-def _attach_rollout_workload_profile(spec: JobSpec, evidence: object) -> JobSpec:
-    """Attach client-measured rollout evidence to ``spec``, or return it unchanged.
-
-    Fails OPEN, unlike ``_require_sft_workload_profile``, and the asymmetry is the point. An sft
-    profile is a census of the exact rows training consumes, so a missing one means the quote would
-    describe different work and refusing is correct. A rollout profile is a SAMPLE of a stochastic
-    process, and one cannot be taken for every model -- three of the six catalog models are too small
-    for any provider to host. Raising here would make those models unquotable in order to buy
-    accuracy on the others.
-
-    So an absent, malformed, thin, or mismatched measurement silently leaves the declared cap in
-    place, which is exactly the pricing this path had before any of it existed.
-    """
-    if not evidence or spec.algorithm not in ("grpo", "opd"):
-        return spec
-    from flash.server.domain.rollout_evidence import (
-        evidence_is_well_formed,
-        rollout_profile_from_evidence,
-    )
-
-    # the SPEC-dependent checks cannot run before the pin: to_dict() strips resolved_sha as a
-    # platform-managed key and the public schema rejects a caller who authors it, so a spec that
-    # arrived over the wire always has "" here. rollout_profile_from_evidence refuses an unpinned
-    # environment, so validating all of it first would reject every real managed submit and silently
-    # cap-price it -- the measurement would never move a quote in production.
-    #
-    # the shape, bounds and policy checks depend on the EVIDENCE alone, though, so those run first.
-    # the pin is a blocking github call with a 10s timeout, and a submit carrying no evidence never
-    # pays it on this path; without this guard any junk payload buys that call against a quota the
-    # whole control plane shares. asking early cannot change the verdict, because the full function
-    # re-runs these same checks below.
-    if not evidence_is_well_formed(evidence):
-        return spec
-    # _assign_resolved_env_sha is best-effort and returns the spec untouched when GitHub cannot be
-    # reached, which just puts us back on the fail-open path below.
-    pinned = _runner()._assign_resolved_env_sha(spec)
-
-    producer_version = _profile_producer_version()
-    profile = rollout_profile_from_evidence(
-        pinned,
-        evidence,
-        producer_version=producer_version,
-    )
-    if not profile:
-        return spec
-    # stamp the version that keyed this profile, exactly as the sft path does. the re-quote at
-    # allocation re-derives the identity, and reading it from the live `flash.__version__` would
-    # make the answer depend on which process does the arithmetic: after a package bump the
-    # re-derived version no longer matches, the profile is dropped, and a run that submitted at a
-    # measured price is re-quoted at the cap.
-    return replace(
-        pinned,
-        workload_profile=profile,
-        workload_profile_producer_version=producer_version,
-    )
-
-
 def _require_sft_workload_profile(spec: JobSpec) -> JobSpec:
     """Attach the exact sft workload profile for ``spec``, or fail closed until one exists."""
     from flash.engine.profiling.workload_profile import (

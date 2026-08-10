@@ -32,21 +32,6 @@ MIN_TRUSTWORTHY_ROLLOUTS = 32
 # clipped samples rather than report a censored mean as measurement.
 MAX_TRUSTWORTHY_TRUNCATION_RATE = 0.25
 
-# how many DISTINCT prompts a sample must still cover. the rollout floor above is only defensible
-# because those 32 draws spread across prompts -- variance is dominated by prompt mix, so 32 draws
-# from one row is not a smaller version of the same measurement, it is a measurement of one row.
-#
-# this binds where the coverage rule cannot. coverage compares sampled against OFFERED, and an
-# over-budget row leaves both sides at once: measured, a shuffled prefix with seven over-budget rows
-# collects all 32 draws from the one remaining prompt, reports sampled == offered == 1, and scores
-# `(True, '')`. the run then prices every step from a single unrepresentative row while the workers
-# train on the later valid ones.
-#
-# 2 is deliberately the weakest bar that still rules out the degenerate case, because the population
-# is only 8 rows and a real dataset with several long rows should still be measurable. it is a floor
-# on distinctness, not a target: the sampler already spreads across every prompt it can.
-MIN_TRUSTWORTHY_DISTINCT_PROMPTS = 2
-
 # which rows the profile measured. sft is never sampled: it either measures every source row or the
 # deterministic max_examples prefix training will consume, so both policies are exact.
 SFT_SAMPLE_POLICY_FULL = "exact-full"
@@ -380,13 +365,6 @@ def rollout_profile_input_payload(
             # keyed distinctly from any float: it means "whatever the backend defaults to",
             # which is not knowably the same distribution as an explicit value.
             "temperature": (None if train.temperature is None else float(train.temperature)),
-            # stop strings end generation early, so they move the same length distribution
-            # temperature does and are keyed for the same reason: a sample drawn WITH them is
-            # shorter than the run without them would produce, and reusing it there under-quotes.
-            # ordered as configured -- the api honours the list, and the first match wins.
-            "stop_sequences": [
-                str(value) for value in (getattr(train, "stop_sequences", ()) or ())
-            ],
         },
     }
 
@@ -427,8 +405,6 @@ class RolloutWorkloadProfile:
     # what was sampled, and how much of it survived. a profile whose successes are mostly failures
     # measured the failure path, not the workload.
     sampled_prompts: int
-    # how many distinct prompts the sampler was given, so coverage is measurable rather than assumed.
-    offered_prompts: int
     completed_rollouts: int
     failed_rollouts: int
     # realized generation. the distribution, not a point estimate: a mean alone cannot tell a
@@ -469,22 +445,15 @@ class RolloutWorkloadProfile:
             c not in "0123456789abcdef" for c in self.input_digest
         ):
             raise ValueError("input_digest must be a lowercase sha256 hex digest")
-        for name in ("producer_version", "environment_id"):
+        for name in ("producer_version", "tokenizer_revision", "environment_id"):
             if not getattr(self, name):
                 raise ValueError(f"{name} is required")
-        # tokenizer_revision is deliberately NOT required. It is compared for equality against
-        # ``spec.model_revision``, and an unpinned spec -- the normal case -- has "" there. Requiring
-        # a non-empty value made every ordinary run unmatchable: no profile could be built carrying
-        # the "" it would have to equal, so the measured path was unreachable rather than merely
-        # unused. "" is a real revision value here, meaning "whatever the model's default branch
-        # resolves to", and it keys distinctly from any pinned sha in the digest.
         if not self.environment_revision:
             raise ValueError("environment_revision is required")
         if not self.sample_policy:
             raise ValueError("sample_policy is required")
         counts = {
             "sampled_prompts": self.sampled_prompts,
-            "offered_prompts": self.offered_prompts,
             "completed_rollouts": self.completed_rollouts,
             "failed_rollouts": self.failed_rollouts,
             "completion_tokens_p50": self.completion_tokens_p50,
@@ -561,86 +530,13 @@ class RolloutWorkloadProfile:
                 f"{MAX_TRUSTWORTHY_TRUNCATION_RATE:.0%} ceiling); the measured mean is censored "
                 "and would underbill generation"
             )
-        # a prompt that produced no draw at all is missing from the distribution, not merely
-        # under-sampled. this compares against the prompts the sampler was OFFERED, which is why
-        # `offered_prompts` travels with the evidence rather than being assumed to be 8.
-        #
-        # EVERY offered prompt, not a fraction of them. a percentage bar sounds tolerant but is the
-        # wrong shape: measured, one systematically-refused prompt out of eight drops the mean from
-        # 407.5 to 180.0 tokens (2.26x under) while 7/8 sails past a 75% bar. tolerance is not
-        # needed either, because the sampler round-robins over ATTEMPTS -- measured, a prompt that
-        # fails once still reaches full coverage on a later pass, so a transient blip does not land
-        # here. only a SYSTEMATIC refusal leaves a prompt at zero draws.
-        #
-        # a row the WORKER also drops is a different thing and never reaches this gate: the sampler
-        # removes an over-budget prompt from `offered_prompts` rather than counting it as unmeasured
-        # workload, so the bar stays at 100% of the rows the run will actually train on.
-        offered = self.offered_prompts
-        # the coverage rule below compares two numbers the payload supplies, so it is only as good
-        # as their internal consistency. a hostile or broken client that reports 0 offered and 0
-        # sampled skips that comparison entirely (0 > 0 is false) and one reporting more sampled
-        # than offered satisfies it vacuously -- either way 32 claimed draws reach a price. neither
-        # is a state the sampler can produce: it counts both from the same prompt list.
-        if self.completed_rollouts > 0 and self.sampled_prompts <= 0:
-            return False, (
-                f"{self.completed_rollouts} rollout(s) are claimed but no prompt is reported as "
-                "sampled; the draws cannot be attributed to any prompt"
-            )
-        if offered <= 0:
-            return False, (
-                "no prompts are reported as offered, so there is nothing the sample can be "
-                "complete against"
-            )
-        if self.sampled_prompts > offered:
-            return False, (
-                f"{self.sampled_prompts} prompt(s) are reported as sampled from {offered} "
-                "offered; the counts describe a sample that cannot exist"
-            )
-        if self.sampled_prompts < offered:
-            return False, (
-                f"only {self.sampled_prompts} of {offered} prompts produced a draw; a prompt the "
-                "endpoint refuses is still trained on, so the sample omits part of the workload"
-            )
-        # dropping over-budget rows moves BOTH sides of the rule above, so it cannot catch a sample
-        # that shrank to a single prompt -- see MIN_TRUSTWORTHY_DISTINCT_PROMPTS. the rollout floor
-        # cannot catch it either: 32 draws from one row clears it while measuring one row.
-        if 0 < self.sampled_prompts < MIN_TRUSTWORTHY_DISTINCT_PROMPTS:
-            return False, (
-                f"all {self.completed_rollouts} draws came from {self.sampled_prompts} distinct "
-                f"prompt(s), below the {MIN_TRUSTWORTHY_DISTINCT_PROMPTS} needed; rollout length "
-                "varies by prompt, so this prices the run from one unrepresentative row"
-            )
-        # only LATENCY ages out, which is what this gate has always been about: a provider that
-        # slows down or a card whose neighbours change invalidates the seconds. a client-measured
-        # profile carries no seconds at all (both latency fields are 0.0 by construction -- seconds
-        # do not transfer between hosts, only token counts do), so expiring it drops a still-valid
-        # token distribution and silently returns the run to cap pricing at the allocation re-quote.
-        # the token counts are digest-keyed: any input that would change them already changes the
-        # identity, so they need no age gate.
-        #
-        # the exemption keys on EVERY latency field, not generation alone. reward seconds are just
-        # as host-specific and runconfig_from_spec applies them to every completion, so exempting a
-        # profile that carries them would let one stale measurement price allocations forever.
-        if not self._carries_latency():
-            return True, ""
         age = now - self.measured_at
         if self.measured_at <= 0 or age > ROLLOUT_LATENCY_MAX_AGE_S:
             return False, (
-                "measured latency is older than "
+                "measured generation latency is older than "
                 f"{ROLLOUT_LATENCY_MAX_AGE_S // 3600}h and must be re-measured"
             )
         return True, ""
-
-    def _carries_latency(self) -> bool:
-        """whether this profile carries ANY measured seconds, which is what ages out.
-
-        both fields, because both are host-specific and both reach the quote: generation seconds
-        price the rollout, and reward seconds are applied per completion by ``runconfig_from_spec``.
-        a profile carrying either one has a measurement whose validity depends on when it was taken.
-        """
-        return (
-            self.generation_seconds_per_completion > 0.0 or self.reward_seconds_per_completion > 0.0
-        )
 
     def _content(self) -> dict[str, object]:
         return {name: getattr(self, name) for name in _measurement_field_names(type(self))}
