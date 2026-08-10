@@ -147,8 +147,14 @@ def recover_deployments() -> int:
             deployment = status.deployment or {}
             state = deployment.get("state")
             if state in _DEPLOYMENT_BUSY_STATES:
-                if not _deployment_attempt_is_stale(deployment):
-                    continue
+                # No freshness test here, deliberately. The flock above is the stronger signal: a
+                # live lifecycle holds it for its whole duration, so having ACQUIRED it already
+                # proves no owner survives -- the record is interrupted no matter how recent its
+                # timestamp is. Skipping a fresh record left it busy with nothing running and
+                # nothing scheduled to revisit it (recovery only runs at startup), so a restart
+                # within the staleness window answered every retry with 409 until the clock aged
+                # the record out. Request-time retries still consult staleness, where no lock has
+                # proved the owner gone.
                 error = "deployment lifecycle interrupted by control-plane restart"
                 detail = "deployment interrupted; retry `flash models deploy`"
             elif state in _DEPLOYMENT_READY_STATES and _spec_is_unservable(status):
