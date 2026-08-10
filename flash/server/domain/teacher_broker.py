@@ -87,6 +87,16 @@ class ProviderResponse:
 def validate_control_panel_url(value: str) -> str:
     url = str(value or "").strip().rstrip("/")
     parsed = urllib.parse.urlsplit(url)
+    # urlsplit defers port parsing to attribute access, so a malformed or out-of-range port still
+    # yields a hostname and would pass every check below. force it here: the worker reads
+    # parsed.port when it opens the broker connection, and an unparseable one would otherwise
+    # raise there, after the gpu is already allocated.
+    try:
+        _ = parsed.port
+    except ValueError as error:
+        raise RuntimeError(
+            f"{CONTROL_PANEL_URL_ENV} must be a worker-reachable https URL with a valid port"
+        ) from error
     if (
         parsed.scheme != "https"
         or not parsed.hostname

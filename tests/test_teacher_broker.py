@@ -1094,6 +1094,21 @@ def test_control_panel_url_requires_a_canonical_worker_reachable_https_origin(ur
     )
 
 
+@pytest.mark.parametrize("url", ["https://plane.example:bad", "https://plane.example:99999"])
+def test_control_panel_url_rejects_an_unusable_port_before_allocation(url):
+    """urlsplit yields a hostname for these, so only forcing .port catches them here.
+
+    the worker reads parsed.port when it opens the broker connection, so without this the
+    ValueError surfaces on the worker after the gpu is allocated.
+    """
+    with pytest.raises(RuntimeError, match="valid port"):
+        teacher_broker.validate_control_panel_url(url)
+
+    assert teacher_broker.validate_control_panel_url("https://plane.example:8443") == (
+        "https://plane.example:8443"
+    )
+
+
 def test_control_panel_url_resolves_from_the_api_url(monkeypatch):
     monkeypatch.setenv("FLASH_API_URL", "https://flash.example.com/")
 
