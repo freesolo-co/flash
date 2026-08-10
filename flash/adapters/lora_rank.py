@@ -48,7 +48,14 @@ class AdapterArtifactIdentity:
 
 
 def resolve_adapter_ref(adapter_ref: str) -> tuple[str, str] | None:
-    """Resolve an internal storage ref into ``(repo, artifact_prefix)``."""
+    """Resolve the INTERNAL adapter storage ref into ``(repo, artifact_prefix)``.
+
+    Users write the short ``<run_id>[/step-N]`` form (see ``flash.schema.parse_checkpoint_ref``);
+    the control plane resolves it against the source run's metadata into the storage reference
+    the worker receives (``flash.runner._prepare_init_from_adapter``). Per-step deployable
+    adapters live at the identical ``<prefix>/adapter`` layout in the artifact repo (see
+    ``publish_deployable_checkpoint``), so the same download path serves both.
+    """
     from flash.schema import parse_adapter_storage_ref
 
     return parse_adapter_storage_ref(adapter_ref)

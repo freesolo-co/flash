@@ -17,6 +17,7 @@ import httpx
 from flash._internal.channel import CHANNEL
 from flash._internal.logging import get_logger
 from flash.content.structured_outputs import parse_structured_outputs
+from flash.envs.loader import is_commit_sha
 from flash.schema import format_adapter_revision
 from flash.serve.errors import (  # noqa: F401 -- re-exported: callers import these from here
     ActivationOutcomeUnknown,
@@ -234,7 +235,7 @@ def resolve_hf_revision(hf_repo: str) -> str:
         ).strip()
     except Exception as exc:
         raise ServingError(f"could not resolve adapter revision for {hf_repo}: {exc}") from exc
-    if len(revision) != 40 or any(char not in "0123456789abcdefABCDEF" for char in revision):
+    if not is_commit_sha(revision):
         raise ServingError(f"could not resolve full Hub commit SHA for {hf_repo}")
     return revision.lower()
 
