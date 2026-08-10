@@ -1064,12 +1064,16 @@ class _Completed:
         self.returncode = returncode
 
 
-def _record_run_with_conv_exit(calls, conv_exit, *, import_exit=0):
+def _record_run_with_conv_exit(calls, conv_exit, *, import_exit=0, cudart_exit=0):
     """``_record_run``, but the causal-conv1d install exits with ``conv_exit``.
 
     ``import_exit`` drives the separate ``import causal_conv1d`` probe, because a compiled cuda
     extension can install cleanly (exit 0) and still fail to import on an ABI mismatch.
+    ``cudart_exit`` drives the child libcudart stub repair, which exits nonzero when it leaves the
+    stub shadowing libcudart.
     """
+    from flash.engine.worker.verl.capabilities import _CHILD_CUDART_FIX
+
     inner = _record_run(calls)
 
     def fake_run(command, check, env=None, capture_output=False):
@@ -1078,6 +1082,8 @@ def _record_run_with_conv_exit(calls, conv_exit, *, import_exit=0):
             return _Completed(conv_exit)
         if command[-1] == "import causal_conv1d":
             return _Completed(import_exit)
+        if command[-1] == _CHILD_CUDART_FIX:
+            return _Completed(cudart_exit)
         return _Completed(0)
 
     return fake_run
@@ -1107,6 +1113,42 @@ def test_a_successful_conv_build_still_stamps_the_venv(monkeypatch, tmp_path):
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
     monkeypatch.setattr(vc.subprocess, "run", _record_run_with_conv_exit(calls, 0))
+
+    vc.resolve_verl_python(str(tmp_path))
+
+    stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
+    assert stamp.read_text() == vc.VERL_VENV_STAMP
+
+
+def test_an_unrepaired_child_cudart_stub_leaves_the_venv_unstamped(monkeypatch, tmp_path):
+    """A stub still shadowing libcudart must not be recorded as a complete provisioning.
+
+    The repair runs only on the rebuild path, so stamping here freezes the failure in: every later
+    attempt on this pod reuses a venv whose stamp asserts it is provisioned while its child still
+    aborts on vLLM import, and the repair is never attempted again.
+    """
+    from flash.engine.worker.verl.capabilities import _CHILD_CUDART_FIX
+
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run_with_conv_exit(calls, 0, cudart_exit=1))
+
+    vc.resolve_verl_python(str(tmp_path))
+
+    stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
+    assert not stamp.exists(), (
+        "a venv whose child libcudart stub was left shadowing was stamped as fully provisioned, so "
+        "every later attempt on this pod reuses an interpreter where vLLM aborts its import"
+    )
+    # still fails open within this launch: provisioning returned an interpreter rather than raising.
+    assert any(command[-1] == _CHILD_CUDART_FIX for command in calls)
+
+
+def test_a_repaired_child_cudart_stub_still_stamps_the_venv(monkeypatch, tmp_path):
+    """The guard keys on the repair outcome; it must not stop stamping altogether."""
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run_with_conv_exit(calls, 0, cudart_exit=0))
 
     vc.resolve_verl_python(str(tmp_path))
 

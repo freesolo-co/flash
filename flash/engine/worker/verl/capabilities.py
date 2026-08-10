@@ -497,7 +497,7 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
         # after every install that could have written tilelang into this venv, and before the child
         # ever imports vLLM. only on the rebuild path: a reused venv was repaired when it was built,
         # and re-running it there would turn venv reuse back into work.
-        _neutralize_child_tilelang_cudart_stub(py)
+        cudart_safe = _neutralize_child_tilelang_cudart_stub(py)
         # written only after ALL installs succeed, so a venv that died between them is
         # unstamped and the next attempt rebuilds it rather than reusing a
         # half-provisioned interpreter. the conv kernel is best-effort to INSTALL but not
@@ -506,14 +506,25 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
         # hand every later attempt on this pod the same broken interpreter, with the stamp
         # asserting it is fully provisioned. leaving it unstamped costs one rebuild and
         # gives the next attempt a real chance at the kernel.
-        if conv_installed:
+        # the stub repair is withheld from the stamp for the same reason and on the same terms: it
+        # runs only on this rebuild path, so stamping a venv whose stub still shadows libcudart
+        # freezes that in, and every later attempt on this pod reuses an interpreter that asserts
+        # it is provisioned while its child aborts on vLLM import.
+        if conv_installed and cudart_safe:
             with open(stamp, "w") as f:
                 f.write(VERL_VENV_STAMP)
-        else:
+        elif not conv_installed:
             print(
                 f"[verl] {CAUSAL_CONV1D_REQUIREMENT} did not install; leaving the venv unstamped so "
                 "the next attempt rebuilds it rather than reusing an interpreter that cannot honor "
                 "gdn boundary resets",
+                flush=True,
+            )
+        else:
+            print(
+                "[verl] the child tilelang libcudart stub was not neutralized; leaving the venv "
+                "unstamped so the next attempt rebuilds it rather than reusing an interpreter "
+                "whose child aborts on vLLM import",
                 flush=True,
             )
     if install_wandb:
@@ -596,7 +607,11 @@ else:
         # which is the crash being prevented.
         real = find_real()
         if real is None:
+            # the one outcome that leaves the stub a plain file: it still shadows libcudart, so
+            # vLLM aborts its import here. exit nonzero so the caller can tell this apart from the
+            # benign no-op cases above, which also print and also exit 0.
             print("no real libcudart found in child; left as-is")
+            raise SystemExit(1)
         else:
             backup = stub + ".orig"
             if not os.path.exists(backup):
@@ -611,16 +626,22 @@ else:
 """
 
 
-def _neutralize_child_tilelang_cudart_stub(py: str) -> None:
+def _neutralize_child_tilelang_cudart_stub(py: str) -> bool:
     """Repoint the CHILD venv's tilelang libcudart stub at a real libcudart.
 
     vLLM aborts its import when it finds tilelang's stub (no ``cudaDeviceReset``) in
     /proc/self/maps. The parent's fix only ever sees the parent's site-packages, so without this
     the child dies on vLLM import on a paid GPU, after the pod is already rented.
 
-    Fails open: the repair is a best-effort optimization of the child's library layout, and a
-    child that has no tilelang installed needs nothing done. A failure here must not block launch
-    when the child would have imported fine anyway.
+    Returns whether the child venv is safe to import vLLM in, which is NOT the same as "the repair
+    ran". A child with no tilelang, or whose stub is already a symlink, has nothing shadowing
+    libcudart and is safe untouched -- those exit 0. What is not safe is a stub left as a plain
+    file, which the script reports by exiting nonzero. The caller withholds the venv stamp on
+    False: the repair only runs on the rebuild path, so a stamped failure is frozen in and every
+    later attempt on this pod reuses an interpreter whose child still aborts.
+
+    Still fails open WITHIN a launch: this only decides whether to record the venv as provisioned,
+    and never blocks a child that would have imported fine.
     """
     try:
         result = subprocess.run(
@@ -630,7 +651,7 @@ def _neutralize_child_tilelang_cudart_stub(py: str) -> None:
         )
     except (OSError, subprocess.SubprocessError) as error:
         print(f"[verl] child libcudart stub neutralize did not run: {error}", flush=True)
-        return
+        return False
     for stream in (getattr(result, "stdout", None), getattr(result, "stderr", None)):
         if not stream:
             continue
@@ -639,6 +660,9 @@ def _neutralize_child_tilelang_cudart_stub(py: str) -> None:
         for line in stream.splitlines():
             if line.strip():
                 print(f"[verl] child cudart: {line}", flush=True)
+    # default 0, matching `_install_causal_conv1d`: a fake subprocess.run in a test returns None,
+    # and only an explicit nonzero means the stub was left shadowing libcudart.
+    return getattr(result, "returncode", 0) == 0
 
 
 def resolve_verl_loggers(caps: dict) -> list[str]:

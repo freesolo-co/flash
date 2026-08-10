@@ -2087,14 +2087,17 @@ def test_child_cudart_fix_symlinks_child_stub_to_real_libcudart(tmp_path):
     # point the system resolver at it by making it the only candidate the loader can name.
     result = _run_child_cudart_fix(tmp_path)
 
-    assert result.returncode == 0, f"child fix crashed: {result.stderr}"
     # either it repointed the stub, or it truthfully reported finding no real libcudart. what it
     # must never do is claim success while leaving a plain file, or silently print nothing.
     assert result.stdout.strip(), "child fix produced no output, so it did not run its repair"
     if "redirected" in result.stdout:
+        assert result.returncode == 0, f"child fix crashed: {result.stderr}"
         assert os.path.islink(str(stub))
     else:
         assert "no real libcudart found" in result.stdout, result.stdout
+        # giving up leaves the stub a plain file, which is what aborts vLLM import. it has to be
+        # distinguishable from the benign no-ops, which also print and also exit 0.
+        assert result.returncode != 0, "an unrepaired stub must not report success"
 
 
 def test_child_cudart_fix_is_a_clean_noop_without_tilelang(tmp_path):
@@ -2121,6 +2124,53 @@ def test_child_cudart_fix_leaves_an_already_repointed_stub_alone(tmp_path):
     assert result.returncode == 0, f"child fix crashed: {result.stderr}"
     assert "already repointed" in result.stdout, result.stdout
     assert os.path.realpath(str(stub)) == os.path.realpath(str(real))
+
+
+def test_child_cudart_neutralize_reports_unsafe_when_the_stub_is_left_shadowing(
+    tmp_path, monkeypatch
+):
+    """The helper's verdict is read off the real script's exit, not inferred.
+
+    Drives the shipped script through its give-up path (a tilelang stub present, no real libcudart
+    to point it at) and asserts the caller is told the venv is unsafe. Stubbing subprocess.run here
+    would only assert against the stub.
+    """
+    import os
+    import sys
+
+    from flash.engine.worker.verl.capabilities import _neutralize_child_tilelang_cudart_stub
+
+    _fake_tilelang(tmp_path)
+    # the script probes the real filesystem for a libcudart exporting cudaDeviceReset. an empty
+    # candidate set is the give-up path; a host that happens to have one would repair instead.
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+    monkeypatch.delenv("PYTHONHOME", raising=False)
+
+    safe = _neutralize_child_tilelang_cudart_stub(sys.executable)
+
+    stub = tmp_path / "tilelang" / "lib" / "libcudart_stub.so"
+    if os.path.islink(str(stub)):
+        pytest.skip("this host has a real libcudart, so the script repaired instead of giving up")
+    assert safe is False
+
+
+def test_child_cudart_neutralize_reports_safe_when_there_is_no_tilelang(tmp_path, monkeypatch):
+    """Nothing to shadow libcudart is a benign no-op, and must not withhold the stamp."""
+    import sys
+
+    from flash.engine.worker.verl.capabilities import _neutralize_child_tilelang_cudart_stub
+
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+    monkeypatch.delenv("PYTHONHOME", raising=False)
+
+    assert _neutralize_child_tilelang_cudart_stub(sys.executable) is True
+
+
+def test_child_cudart_neutralize_reports_unsafe_when_the_interpreter_cannot_run(tmp_path):
+    """An interpreter that never started did not repair anything either."""
+    from flash.engine.worker.verl.capabilities import _neutralize_child_tilelang_cudart_stub
+
+    assert _neutralize_child_tilelang_cudart_stub(str(tmp_path / "absent-python")) is False
 
 
 def test_child_cudart_fix_does_not_import_flash():
@@ -2155,3 +2205,10 @@ def test_resolve_verl_python_repairs_a_venv_it_provisions():
     # it must sit on the rebuild path: repairing a reused venv turns reuse back into work.
     rebuilt = src.split("if install_wandb:")[0]
     assert "_neutralize_child_tilelang_cudart_stub(py)" in rebuilt
+    # and its verdict must gate the stamp. behaviourally covered by
+    # test_an_unrepaired_child_cudart_stub_leaves_the_venv_unstamped; pinned here because a repair
+    # whose result is computed and then dropped reads as wired-up while stamping the failure in.
+    assert "cudart_safe" in rebuilt, (
+        "the venv stamp no longer depends on the child libcudart repair, so a failed repair is "
+        "recorded as fully provisioned and reused by every later attempt on this pod."
+    )
