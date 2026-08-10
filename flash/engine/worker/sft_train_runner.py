@@ -128,6 +128,15 @@ class _SftVerified:
     train_tokens: int
 
 
+@dataclass(frozen=True)
+class _SftOutputs:
+    """What the paid child produced: where the adapter landed and what it cost to get there."""
+
+    adapter_dir: str
+    train_wall: float
+    device_peak_gpu_gb: float
+
+
 def _resolve_sft_options(spec) -> _SftOptions:
     spec = spec or _w.JOB_SPEC
     env = _w.require_active_env()
@@ -341,6 +350,7 @@ def _prepare_sft_child(
     model: _SftModelSetup,
     capabilities: _SftCapabilities,
     use_remove_padding: bool,
+    gdn_reset_arch: str | None,
 ) -> _SftChild:
     model_path = _sft_train._cached_model_path(options.model_id, options.model_revision)
     # verl logs from the verl interpreter, so gate wandb on THAT env (see resolve_verl_loggers).
@@ -356,13 +366,9 @@ def _prepare_sft_child(
     # the gdn boundary shim resets conv and recurrent state at packed example boundaries, but only
     # when the verl child has the kernels that read seq_idx and cu_seqlens; the no-fla fallbacks
     # accept both and discard them. so the shim is installed only when the child proves it can reset.
-    # `gdn_hybrid`/`gdn_module` and the child's answer are resolved above, inside the configuring
-    # liveness wrap, because the probe is part of the setup silence that wrap exists to cover.
-    gdn_reset_arch = (
-        gdn_reset_arch_from_caps(capabilities.caps, capabilities.gdn_module)
-        if capabilities.gdn_hybrid
-        else None
-    )
+    # `gdn_reset_arch` is resolved by the caller, inside the configuring liveness wrap, because the
+    # probe is part of the setup silence that wrap exists to cover, and because a packed run must
+    # take the RAISING gate there rather than the soft form.
     config = {
         "train_files": data.train_file,
         "train_batch_size": model.train_batch_size,
@@ -528,6 +534,64 @@ def _invoke_sft_child(child: _SftChild, callbacks: _SftProgressCallbacks, on_lin
         on_line=on_line,
         heartbeat=callbacks.child_heartbeat,
     )
+
+
+def _consume_sft_marker_line(progress: _SftProgress, line: str) -> bool:
+    """Fold a child log line's non-metric markers in; answer whether it is an optimizer step.
+
+    False means the caller has nothing further to do with the line. A True answer additionally
+    asserts the lora+ shim landed before the first step, because a run that reaches an optimizer
+    update without it is training plain lora at the lora+ learning rate.
+    """
+    if _LORAPLUS_READY_MARKER in line:
+        progress.loraplus_applied = True
+    link = _sft_train.parse_wandb_link(line)
+    if link is not None:
+        progress.wandb_link.update(link)
+    if _sft_train.verl_step_number(line) is None:
+        return False
+    if _SFT_LORAPLUS_RATIO > 1 and not progress.loraplus_applied:
+        raise RuntimeError(
+            "verl reached an optimizer step before the required lora+ shim succeeded"
+        )
+    return True
+
+
+def _record_sft_step_metrics(
+    progress: _SftProgress,
+    loss: float | None,
+    grad_norm: float | None,
+    learning_rate_value: float | None,
+) -> None:
+    """Fold one step's parsed metrics into the progress carrier, raising on a dead gradient.
+
+    Parsing stays in the caller's closure: `tests/test_sft_train.py` pins the three
+    `parse_verl_metric` calls to `on_line` itself, and reads the values it hands over here.
+    """
+    values = progress.values
+    if loss is not None:
+        progress.loss_curve.append(round(loss, 4))
+        values["loss"] = loss
+    if grad_norm is not None:
+        values["grad_norm"] = grad_norm
+        progress.observed_grad_norms.append(grad_norm)
+        # a 0.0 grad norm means backward produced nothing for every trainable parameter. fail the
+        # run instead of billing and serving an unchanged adapter (GRAD-001).
+        #
+        # VERL-138: do not condition on lr. transformer_impl.py:683-688 computes grad_norm from
+        # p.grad before optimizer.step() and scheduler advance, so lr cannot make the gradient zero.
+        if grad_norm == 0.0:
+            progress.zero_grad_steps.append(int(values["step"] or 0))
+            if len(progress.zero_grad_steps) >= _MAX_ZERO_GRAD_STEPS:
+                raise RuntimeError(
+                    "verl reported train/grad_norm=0.0 on "
+                    f"{len(progress.zero_grad_steps)} steps: no gradient is reaching the "
+                    "lora parameters, so this run would train nothing. see GRAD-001"
+                )
+        else:
+            progress.zero_grad_steps.clear()
+    if learning_rate_value is not None:
+        values["lr"] = learning_rate_value
 
 
 def _finish_sft_child(
