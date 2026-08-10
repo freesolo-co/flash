@@ -99,10 +99,18 @@ def test_every_action_reference_is_pinned_to_a_full_sha(path: Path):
         # A version-SHAPED comment, not merely any comment: `# TODO` would satisfy "has a comment"
         # while telling a reviewer nothing about which release the sha is. Dependabot writes
         # `# v6.1.0`; the digits are the part that carries the information.
-        assert re.search(r"#\s*v?\d+(\.\d+)*", stripped), (
+        #
+        # Anchored at the START of the comment, not searched anywhere in it. A bare `re.search` for
+        # "# then digits" is satisfied by an issue reference -- `# fixes #194` contains it -- which
+        # recreates the vacuous pass this assertion exists to close. An action reference cannot
+        # itself contain `#`, so the first one begins the comment.
+        _, hash_marker, comment = stripped.partition("#")
+        missing_version = (
             f"{path.name}: {stripped!r} pins a sha with no version comment. Dependabot needs the "
             "comment to know what it is bumping, and a reviewer cannot read a bare sha."
         )
+        assert hash_marker, missing_version
+        assert re.match(r"\s*v?\d+(\.\d+)*(\s|$)", comment), missing_version
 
     for job_name, job in _jobs(document).items():
         # A reusable-workflow call (`jobs.<id>.uses`) is a local path, not a marketplace action.
@@ -185,7 +193,13 @@ def test_the_tests_repo_dispatch_cannot_silently_no_op():
     #
     # `curl` is replaced with a recorder on PATH, so nothing leaves the machine and the assertion
     # is about the OBSERVABLE effect: did a dispatch actually happen.
-    def run(pat: str) -> tuple[int, str]:
+    #
+    # The recorder's log is returned SEPARATELY from the process's stdout/stderr, and every
+    # "it posted" assertion reads only the log. Blending them would undo the point of running the
+    # script: a step that merely echoed the dispatch URL and the event type would satisfy the
+    # blended text while never invoking curl, which is the same substring-matching weakness one
+    # layer further out.
+    def run(pat: str) -> tuple[int, str, str]:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             calls = root / "curl-calls.txt"
@@ -208,24 +222,27 @@ def test_the_tests_repo_dispatch_cannot_silently_no_op():
                 },
             )
             recorded = calls.read_text() if calls.exists() else ""
-            return completed.returncode, recorded + completed.stdout + completed.stderr
+            return completed.returncode, recorded, completed.stdout + completed.stderr
 
     # 1. No credential must FAIL, and must not pretend to have dispatched.
-    code, output = run("")
+    code, dispatched, logged = run("")
     assert code != 0, (
         "the dispatch step exited 0 with no credential -- that is the fail-open branch that "
         "reported success while dispatching nothing"
     )
-    assert "::error::" in output, "the failure must be annotated so it is visible on the run"
-    assert "dispatches" not in output, "no dispatch should be attempted without a credential"
+    assert "::error::" in logged, "the failure must be annotated so it is visible on the run"
+    assert dispatched == "", f"curl was invoked without a credential: {dispatched!r}"
 
-    # 2. With a credential it must actually POST the dispatch, exactly once.
-    code, output = run("fake-token")
-    assert code == 0, f"the dispatch failed with a credential present: {output}"
-    assert output.count("repos/freesolo-co/tests/dispatches") == 1, (
-        f"expected exactly one dispatch to freesolo-co/tests, got: {output}"
+    # 2. With a credential it must actually POST the dispatch, exactly once. These read the
+    # recorder's log alone, so only a real curl invocation can satisfy them.
+    code, dispatched, logged = run("fake-token")
+    assert code == 0, f"the dispatch failed with a credential present: {logged}"
+    assert dispatched.count("repos/freesolo-co/tests/dispatches") == 1, (
+        f"expected exactly one dispatch to freesolo-co/tests, got: {dispatched!r}"
     )
-    assert "flash-merged" in output, "the dispatch must carry the flash-merged event type"
+    assert "flash-merged" in dispatched, (
+        f"the dispatch must carry the flash-merged event type, got: {dispatched!r}"
+    )
 
 
 def test_workflows_that_touch_shared_resources_are_upstream_only():
