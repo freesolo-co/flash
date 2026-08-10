@@ -32,14 +32,6 @@ MIN_TRUSTWORTHY_ROLLOUTS = 32
 # clipped samples rather than report a censored mean as measurement.
 MAX_TRUSTWORTHY_TRUNCATION_RATE = 0.25
 
-# how many of the prompts offered to the sampler must actually have produced a draw. the client
-# offers 8; requiring all 8 would let one flaky request throw away an otherwise good measurement,
-# while requiring none lets a SYSTEMATICALLY refused prompt -- a content filter is the usual cause --
-# drop out silently while the other prompts make up the rollout count. that prompt is still part of
-# the run being quoted (the worker does not reproduce the hosted filter), and prompt mix is what
-# dominates length variance, so losing one entirely is a biased sample rather than a thin one.
-MIN_TRUSTWORTHY_PROMPT_COVERAGE = 0.75
-
 # which rows the profile measured. sft is never sampled: it either measures every source row or the
 # deterministic max_examples prefix training will consume, so both policies are exact.
 SFT_SAMPLE_POLICY_FULL = "exact-full"
@@ -557,29 +549,54 @@ class RolloutWorkloadProfile:
         # a prompt that produced no draw at all is missing from the distribution, not merely
         # under-sampled. this compares against the prompts the sampler was OFFERED, which is why
         # `offered_prompts` travels with the evidence rather than being assumed to be 8.
+        #
+        # EVERY offered prompt, not a fraction of them. a percentage bar sounds tolerant but is the
+        # wrong shape: measured, one systematically-refused prompt out of eight drops the mean from
+        # 407.5 to 180.0 tokens (2.26x under) while 7/8 sails past a 75% bar. tolerance is not
+        # needed either, because the sampler round-robins over ATTEMPTS -- measured, a prompt that
+        # fails once still reaches full coverage on a later pass, so a transient blip does not land
+        # here. only a SYSTEMATIC refusal leaves a prompt at zero draws.
+        #
+        # a row the WORKER also drops is a different thing and never reaches this gate: the sampler
+        # removes an over-budget prompt from `offered_prompts` rather than counting it as unmeasured
+        # workload, so the bar stays at 100% of the rows the run will actually train on.
         offered = self.offered_prompts
-        if offered > 0 and self.sampled_prompts < offered * MIN_TRUSTWORTHY_PROMPT_COVERAGE:
+        if offered > 0 and self.sampled_prompts < offered:
             return False, (
-                f"only {self.sampled_prompts} of {offered} prompts produced a draw "
-                f"(below {MIN_TRUSTWORTHY_PROMPT_COVERAGE:.0%} coverage); a prompt the endpoint "
-                "refuses is still trained on, so the sample omits part of the workload"
+                f"only {self.sampled_prompts} of {offered} prompts produced a draw; a prompt the "
+                "endpoint refuses is still trained on, so the sample omits part of the workload"
             )
         # only LATENCY ages out, which is what this gate has always been about: a provider that
         # slows down or a card whose neighbours change invalidates the seconds. a client-measured
-        # profile carries no seconds at all (generation_seconds_per_completion is 0.0 by
-        # construction -- seconds do not transfer between hosts, only token counts do), so expiring
-        # it drops a still-valid token distribution and silently returns the run to cap pricing at
-        # the allocation re-quote. the token counts are digest-keyed: any input that would change
-        # them already changes the identity, so they need no age gate.
-        if self.generation_seconds_per_completion <= 0.0:
+        # profile carries no seconds at all (both latency fields are 0.0 by construction -- seconds
+        # do not transfer between hosts, only token counts do), so expiring it drops a still-valid
+        # token distribution and silently returns the run to cap pricing at the allocation re-quote.
+        # the token counts are digest-keyed: any input that would change them already changes the
+        # identity, so they need no age gate.
+        #
+        # the exemption keys on EVERY latency field, not generation alone. reward seconds are just
+        # as host-specific and runconfig_from_spec applies them to every completion, so exempting a
+        # profile that carries them would let one stale measurement price allocations forever.
+        if not self._carries_latency():
             return True, ""
         age = now - self.measured_at
         if self.measured_at <= 0 or age > ROLLOUT_LATENCY_MAX_AGE_S:
             return False, (
-                "measured generation latency is older than "
+                "measured latency is older than "
                 f"{ROLLOUT_LATENCY_MAX_AGE_S // 3600}h and must be re-measured"
             )
         return True, ""
+
+    def _carries_latency(self) -> bool:
+        """whether this profile carries ANY measured seconds, which is what ages out.
+
+        both fields, because both are host-specific and both reach the quote: generation seconds
+        price the rollout, and reward seconds are applied per completion by ``runconfig_from_spec``.
+        a profile carrying either one has a measurement whose validity depends on when it was taken.
+        """
+        return (
+            self.generation_seconds_per_completion > 0.0 or self.reward_seconds_per_completion > 0.0
+        )
 
     def _content(self) -> dict[str, object]:
         return {name: getattr(self, name) for name in _measurement_field_names(type(self))}

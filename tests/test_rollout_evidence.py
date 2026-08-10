@@ -460,6 +460,139 @@ def test_an_oversized_prompt_is_declined_before_the_request_is_sent(monkeypatch)
     assert opened == []
 
 
+def test_a_slow_drip_response_gives_up_at_the_deadline():
+    """`urlopen(timeout=...)` bounds each socket operation, not the call.
+
+    `read(n)` loops over as many operations as it takes to fill n bytes, so an origin that sends one
+    byte before each socket timeout expires resets the clock forever. Measured against the real
+    socket stack before the fix: a 3s deadline was still blocked at 30s with no end in sight.
+
+    That hangs `flash train` behind an advisory measurement, when every other failure on this path
+    quietly returns the quote to the declared cap. The whole point of the deadline is that a bad
+    endpoint costs bounded time.
+
+    A real socket is used deliberately -- a stub returning short reads would test the loop against
+    semantics the stdlib does not have, and it is exactly that mismatch (`read` blocking for the
+    full n, `read1` returning on first bytes) that the fix turns on.
+    """
+    import socket
+    import threading
+    import time
+
+    from flash.engine.profiling import rollout_sampler
+
+    stop = threading.Event()
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+
+    def serve():
+        try:
+            conn, _ = server.accept()
+        except OSError:
+            return
+        try:
+            conn.recv(65536)
+            # no Content-Length and never closed, so the client reads until a close that never comes
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n")
+            while not stop.is_set():
+                conn.sendall(b"x")
+                time.sleep(0.05)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        deadline_s = 2.0
+        started = time.monotonic()
+        sample = rollout_sampler._one_completion(
+            model="Qwen/Qwen3.5-4B",
+            messages=[{"role": "user", "content": "hi"}],
+            max_completion_tokens=16,
+            temperature=None,
+            top_p=1.0,
+            base_url=f"http://127.0.0.1:{port}/v1",
+            api_key="k",
+            timeout_s=deadline_s,
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        stop.set()
+        server.close()
+        thread.join(timeout=5)
+
+    assert sample is None
+    # generous multiple of the deadline: the assertion is bounded-versus-unbounded, not a latency
+    # budget. before the fix this ran until the harness killed it.
+    assert elapsed < deadline_s * 4, f"read ran {elapsed:.1f}s past a {deadline_s}s deadline"
+
+
+def test_an_oversized_prompt_is_declined_without_serializing_it(monkeypatch):
+    """Declining is not enough on its own: WHERE it declines is the whole point.
+
+    The encoded-byte check is the accurate bound, but it cannot fire until json.dumps has already
+    built the full string and its encoded copy. Measured, a 200 MB prompt costs ~400 MB peak to
+    reach a check that then rejects it -- the exhaustion the ceiling exists to prevent, paid in the
+    user's `flash train` process before the ceiling gets a vote.
+
+    So this asserts on PEAK ALLOCATION, not on the return value. A guard that declines after
+    serializing returns None too, which is why the existing decline test cannot detect this.
+
+    The character bound is safe to check first because json escaping only ever adds bytes: a prompt
+    of N characters encodes to at least N bytes, so nothing rejected here could have passed the
+    exact check.
+    """
+    import tracemalloc
+
+    from flash.engine.profiling import rollout_sampler
+
+    opened: list = []
+    monkeypatch.setattr(
+        rollout_sampler._NO_REDIRECT_OPENER,
+        "open",
+        lambda request, timeout=None: opened.append(1),
+    )
+
+    # allocated OUTSIDE the traced region, so the measurement is what the call adds, not the cost of
+    # the prompt existing. ascii is deliberate here: it makes the encoded body the same size as the
+    # character count, so the peak below is attributable to serialization alone.
+    huge = "x" * (16 * rollout_sampler.MAX_REQUEST_BYTES)
+    messages = [{"role": "user", "content": huge}]
+
+    def draw():
+        return rollout_sampler._one_completion(
+            model="Qwen/Qwen3.5-4B",
+            messages=messages,
+            max_completion_tokens=512,
+            temperature=None,
+            top_p=1.0,
+            base_url="https://example.invalid/v1",
+            api_key="k",
+            thinking=False,
+        )
+
+    tracemalloc.start()
+    try:
+        before = tracemalloc.get_traced_memory()[0]
+        sample = draw()
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    added = peak - before
+
+    assert sample is None
+    assert opened == []
+    # a serializing guard allocates on the order of the prompt itself, twice over. the threshold sits
+    # far below one copy and far above the traversal's own cost, so it separates the two behaviours
+    # without pinning an exact allocation count.
+    assert added < len(huge) // 8, f"serialized before declining: {added} bytes"
+
+
 def test_an_oversized_response_body_is_declined_rather_than_read(monkeypatch):
     """The endpoint is user-configured and this reads whatever it sends.
 
@@ -2290,9 +2423,11 @@ def test_a_prompt_the_worker_would_drop_is_not_measured():
         "choices": [{"finish_reason": "stop", "message": {"content": "4"}}],
         "usage": {"prompt_tokens": 1600, "completion_tokens": 40},
     }
+    # OUT_OF_BUDGET, not None: not measured either way, but this row is one the worker drops too,
+    # so its absence must not count against prompt coverage the way a refused draw does.
     assert (
         rollout_sampler._sample_from_response(over, max_completion_tokens=512, prompt_budget=1536)
-        is None
+        is rollout_sampler.OUT_OF_BUDGET
     )
 
     # a row inside the budget is measured normally, and no budget means no filter.
@@ -2300,14 +2435,206 @@ def test_a_prompt_the_worker_would_drop_is_not_measured():
         "choices": [{"finish_reason": "stop", "message": {"content": "4"}}],
         "usage": {"prompt_tokens": 1536, "completion_tokens": 40},
     }
-    assert (
-        rollout_sampler._sample_from_response(within, max_completion_tokens=512, prompt_budget=1536)
-        is not None
+    measured = rollout_sampler._sample_from_response(
+        within, max_completion_tokens=512, prompt_budget=1536
     )
-    assert (
-        rollout_sampler._sample_from_response(over, max_completion_tokens=512, prompt_budget=None)
-        is not None
+    assert isinstance(measured, rollout_sampler.RolloutSample)
+    unfiltered = rollout_sampler._sample_from_response(
+        over, max_completion_tokens=512, prompt_budget=None
     )
+    assert isinstance(unfiltered, rollout_sampler.RolloutSample)
+
+
+def test_a_systematically_refused_prompt_fails_coverage_but_an_out_of_budget_one_does_not():
+    """Both leave a prompt with zero draws. Only one of them is missing workload.
+
+    A refused prompt -- a content filter is the usual cause -- is still trained on, because the
+    worker does not reproduce the hosted filter. Measured on the sampler: excluding one such prompt
+    out of eight drops the mean from 407.5 to 180.0 tokens, a 2.26x underquote, since prompt mix is
+    what dominates length variance and the long-tail prompt is the one that goes missing.
+
+    An over-budget prompt is the opposite case: both workers drop that row before training, so the
+    profile not measuring it is agreement with training rather than a gap in it.
+
+    They are indistinguishable by count, which is why the sampler has to separate them at the
+    source -- by dropping the filtered prompt from the OFFER rather than counting it unmeasured.
+    """
+    import json
+
+    from flash.engine.profiling import rollout_sampler
+
+    class _Response:
+        def __init__(self, prompt_tokens, completion_tokens):
+            self._body = json.dumps(
+                {
+                    "choices": [{"finish_reason": "stop", "message": {"content": "x"}}],
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                    },
+                }
+            ).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, size=-1):
+            return self._body
+
+        def read1(self, size=-1):
+            body, self._body = self._body, b""
+            return body
+
+    prompts = [[{"role": "user", "content": f"p{i}"}] for i in range(8)]
+
+    def sample_with(opener):
+        original = rollout_sampler._NO_REDIRECT_OPENER.open
+        rollout_sampler._NO_REDIRECT_OPENER.open = opener
+        try:
+            return rollout_sampler.sample_rollouts(
+                model="Qwen/Qwen3.5-4B",
+                prompts=prompts,
+                rollouts=32,
+                max_completion_tokens=4096,
+                temperature=None,
+                top_p=1.0,
+                base_url="https://example.invalid/v1",
+                api_key="k",
+                prompt_budget=100,
+            )
+        finally:
+            rollout_sampler._NO_REDIRECT_OPENER.open = original
+
+    def refusing(request, timeout=None):
+        # p3 is refused every time, and it is the long-tail prompt
+        if json.loads(request.data)["messages"][0]["content"] == "p3":
+            raise OSError("endpoint refuses this prompt")
+        return _Response(50, 180)
+
+    def over_budget(request, timeout=None):
+        # p3 renders past the worker's own prompt budget, so the worker drops it too
+        if json.loads(request.data)["messages"][0]["content"] == "p3":
+            return _Response(500, 180)
+        return _Response(50, 180)
+
+    refused = sample_with(refusing)
+    assert refused.sampled_prompts == 7
+    # the refused prompt stays in the offer: the run trains on it, so the sample is incomplete
+    assert refused.offered_prompts == 8
+
+    filtered = sample_with(over_budget)
+    assert filtered.sampled_prompts == 7
+    # the filtered prompt LEAVES the offer, so coverage is complete over the rows training will use
+    assert filtered.offered_prompts == 7
+    # and it is not a failure either -- the endpoint answered
+    assert filtered.failures == 0
+
+    from flash.engine.profiling.workload_profile import RolloutWorkloadProfile
+
+    stamp = time.time()
+
+    def verdict(sampling):
+        return RolloutWorkloadProfile(
+            input_digest="a1b2c3d4" * 8,
+            producer_version=VERSION,
+            tokenizer_revision="tok",
+            environment_id="e",
+            environment_revision="r",
+            kind="grpo",
+            sampled_prompts=sampling.sampled_prompts,
+            offered_prompts=sampling.offered_prompts,
+            completed_rollouts=32,
+            failed_rollouts=sampling.failures,
+            completion_tokens_mean=180.5,
+            completion_tokens_p50=170,
+            completion_tokens_p90=240,
+            completion_tokens_max=256,
+            prompt_tokens_mean=95.0,
+            truncated_rollouts=2,
+            eos_rollouts=30,
+            generation_seconds_per_completion=0.0,
+            reward_seconds_per_completion=0.0,
+            reward_samples=0,
+            reward_failures=0,
+            reference_gpu="",
+            reference_provider="",
+            sample_policy=rollout_sampler.SAMPLE_POLICY_DISTINCT_PROMPTS,
+            created_at=stamp,
+            measured_at=stamp,
+        ).trustworthy(now=stamp)
+
+    refused_ok, refused_reason = verdict(refused)
+    assert refused_ok is False
+    assert "prompts produced a draw" in refused_reason
+    assert verdict(filtered) == (True, "")
+
+
+def test_a_transient_failure_still_reaches_full_prompt_coverage():
+    """Requiring every offered prompt is only safe because a blip does not cost coverage.
+
+    The sampler round-robins over ATTEMPTS, not successes, so a prompt that fails once is drawn
+    again on a later pass -- at 32 rollouts over 8 prompts that is four attempts each. This is what
+    makes a 100% bar the right shape instead of a brittle one: only a SYSTEMATIC refusal can leave
+    a prompt at zero draws, and that is exactly the case the bar is meant to catch.
+    """
+    import json
+
+    from flash.engine.profiling import rollout_sampler
+
+    class _Response:
+        def __init__(self):
+            self._body = json.dumps(
+                {
+                    "choices": [{"finish_reason": "stop", "message": {"content": "x"}}],
+                    "usage": {"prompt_tokens": 50, "completion_tokens": 180},
+                }
+            ).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, size=-1):
+            return self._body
+
+        def read1(self, size=-1):
+            body, self._body = self._body, b""
+            return body
+
+    blips = {"left": 1}
+
+    def flaky(request, timeout=None):
+        if json.loads(request.data)["messages"][0]["content"] == "p3" and blips["left"]:
+            blips["left"] -= 1
+            raise OSError("transient blip")
+        return _Response()
+
+    original = rollout_sampler._NO_REDIRECT_OPENER.open
+    rollout_sampler._NO_REDIRECT_OPENER.open = flaky
+    try:
+        out = rollout_sampler.sample_rollouts(
+            model="Qwen/Qwen3.5-4B",
+            prompts=[[{"role": "user", "content": f"p{i}"}] for i in range(8)],
+            rollouts=32,
+            max_completion_tokens=4096,
+            temperature=None,
+            top_p=1.0,
+            base_url="https://example.invalid/v1",
+            api_key="k",
+            prompt_budget=100,
+        )
+    finally:
+        rollout_sampler._NO_REDIRECT_OPENER.open = original
+
+    assert blips["left"] == 0, "the blip never fired, so this proves nothing"
+    assert out.failures == 1
+    assert out.sampled_prompts == 8
+    assert out.offered_prompts == 8
 
 
 def test_the_submit_path_forwards_the_runs_prompt_budget_to_the_measurement(monkeypatch, tmp_path):
@@ -2599,10 +2926,7 @@ def test_evidence_missing_a_prompt_entirely_is_not_trustworthy():
     A profile whose numbers are all individually valid, but which silently measured only part of
     the prompt set, must not be allowed to price the run.
     """
-    from flash.engine.profiling.workload_profile import (
-        MIN_TRUSTWORTHY_PROMPT_COVERAGE,
-        RolloutWorkloadProfile,
-    )
+    from flash.engine.profiling.workload_profile import RolloutWorkloadProfile
 
     spec = _spec()
     full = rollout_profile_from_evidence(
@@ -2611,8 +2935,7 @@ def test_evidence_missing_a_prompt_entirely_is_not_trustworthy():
     assert full is not None
     assert RolloutWorkloadProfile.from_dict(full).trustworthy(now=time.time()) == (True, "")
 
-    # three of eight prompts never produced a draw: below the coverage floor.
-    assert MIN_TRUSTWORTHY_PROMPT_COVERAGE > 5 / 8
+    # three of eight prompts never produced a draw.
     partial = rollout_profile_from_evidence(
         spec, _evidence(sampled_prompts=5, offered_prompts=8), producer_version=VERSION
     )

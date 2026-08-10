@@ -59,6 +59,25 @@ MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 # real work.
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
 
+# preflight on the prompt's CHARACTER count, run before anything is serialized. the encoded check
+# below is the accurate one, but it cannot fire until json.dumps has already built the whole string
+# and its encoded copy: measured, a 200 MB prompt costs ~400 MB peak reaching a check that then
+# rejects it. counting characters costs len() on strings that already exist.
+#
+# the two bounds are complementary, not redundant, and the direction matters. json escaping only ever
+# ADDS bytes -- ascii is one byte, and the worst case, a non-bmp character, is twelve (two escaped
+# surrogates) -- so a prompt of N characters encodes to AT LEAST N bytes. a prompt over
+# MAX_REQUEST_BYTES characters therefore cannot fit the encoded limit whatever it contains, which is
+# what makes declining it here provably free of false declines: nothing rejected by this bound could
+# have passed the exact one. everything it admits still goes through the exact check, which is what
+# accounts for escaping expansion, roles, stop sequences and every other field.
+_MAX_PROMPT_CHARS = MAX_REQUEST_BYTES
+
+# how much of a response body is read per socket operation. small enough that a slow-drip origin is
+# noticed within one chunk of the deadline, large enough that a legitimate reply -- tens of kilobytes
+# -- costs a couple of reads rather than hundreds.
+_READ_CHUNK_BYTES = 64 * 1024
+
 # prompt-mix dominates the variance (measured: between-prompt 304846 vs within-prompt 61082, a word
 # problem running a median 1642 tokens against ~290 for arithmetic), so spread draws across DISTINCT
 # prompts before repeating any one of them.
@@ -93,6 +112,20 @@ class RolloutSample:
     prompt_tokens: int
     completion_tokens: int
     truncated: bool
+
+
+class _OutOfBudget:
+    """sentinel: the draw succeeded, and the row is one the WORKER drops before training.
+
+    distinct from None, which means the draw failed. a failed draw leaves a prompt unmeasured that
+    the run will still train on, so it is missing workload; an out-of-budget row is filtered by both
+    workers, so its absence is the profile agreeing with training rather than a gap in it.
+    """
+
+    __slots__ = ()
+
+
+OUT_OF_BUDGET = _OutOfBudget()
 
 
 @dataclass(frozen=True)
@@ -192,6 +225,10 @@ def sample_rollouts(
     # coverage. the worker does not reproduce the hosted filter, so that prompt is part of the run
     # being quoted and its (usually long-tail) length would be missing from an accepted profile.
     measured_prompts: set[int] = set()
+    # prompts the endpoint reported as over the worker's own prompt budget. these leave the OFFER
+    # rather than counting against coverage: the workers drop those rows before training, so the
+    # profile is not missing workload by not measuring them.
+    filtered_prompts: set[int] = set()
     # this runs in front of a submit the user is waiting on, and the draws are serial. an endpoint
     # that accepts connections but stalls would otherwise burn REQUEST_TIMEOUT_S on every draw
     # before falling back to cap pricing -- 32 draws x 180s is over an hour of dead wait for a
@@ -231,7 +268,14 @@ def sample_rollouts(
             thinking=thinking,
             prompt_budget=prompt_budget,
         )
-        if sample is None:
+        if sample is OUT_OF_BUDGET:
+            # not a failure: the endpoint answered, and the row is one both workers filter out
+            # before training. it is dropped from the OFFER below rather than counted against
+            # coverage, because a prompt the run never trains on cannot be missing from the sample.
+            # the consecutive-failure counter is left alone for the same reason -- a dataset with
+            # several over-long rows is not a misbehaving endpoint.
+            filtered_prompts.add(slot)
+        elif sample is None:
             failures += 1
             consecutive_failures += 1
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
@@ -240,12 +284,94 @@ def sample_rollouts(
             collected.append(sample)
             measured_prompts.add(slot)
             consecutive_failures = 0
+    # a prompt that drew a sample is in budget whatever an earlier draw reported: prompt_tokens is a
+    # property of the prompt, so a slot in both sets means the filter reading came from a flapping
+    # endpoint, not from the row. counting it as offered is the conservative reading.
+    filtered_prompts -= measured_prompts
     return RolloutSampling(
         samples=tuple(collected),
         failures=failures,
         sampled_prompts=len(measured_prompts),
-        offered_prompts=len(prompts),
+        offered_prompts=len(prompts) - len(filtered_prompts),
     )
+
+
+def _prompt_exceeds_chars(messages: Sequence[dict], limit: int) -> bool:
+    """whether a prompt's strings hold more than ``limit`` characters, without building a copy.
+
+    every string is counted, not just ``content``: a message carries whatever prompt_messages() put
+    on it, and an oversized row is as easily oversized in a name or a tool-call argument. containers
+    are WALKED rather than repr'd -- taking len(repr(value)) would materialize exactly the copy this
+    check exists to avoid -- and the walk stops the moment the limit is passed, so a pathological row
+    costs a partial traversal instead of a full one.
+
+    a non-string leaf counts as ONE, below the bytes it actually encodes to. undercounting is the
+    safe direction: it can only admit a payload, never decline one, which is what keeps the bound
+    free of false declines. bulk lives in strings anyway, and the exact encoded check downstream is
+    what bounds the body.
+    """
+    total = 0
+    seen: set[int] = set()
+    stack: list[object] = [messages]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            total += len(item)
+            if total > limit:
+                return True
+            continue
+        if isinstance(item, dict):
+            # a self-referential row would otherwise loop here forever. json.dumps raises on one, so
+            # skipping the repeat only has to keep THIS walk finite: the draw is declined either way.
+            if id(item) in seen:
+                continue
+            seen.add(id(item))
+            stack.extend(item.keys())
+            stack.extend(item.values())
+            continue
+        if isinstance(item, (list, tuple)):
+            if id(item) in seen:
+                continue
+            seen.add(id(item))
+            stack.extend(item)
+            continue
+        total += 1
+        if total > limit:
+            return True
+    return False
+
+
+def _read_within_deadline(response, limit: int, deadline: float) -> bytes | None:
+    """read up to ``limit`` bytes, giving up at ``deadline``. None when the deadline passed.
+
+    ``urlopen(timeout=...)`` bounds each blocking socket operation, NOT the call as a whole, and
+    ``read(n)`` loops over as many operations as it takes to fill n bytes. an origin that sends one
+    byte before each socket timeout expires therefore resets the clock forever: measured, a 3s
+    deadline was still blocked at 30s with no end in sight, which hangs the user's `flash train`
+    instead of taking the fail-open path this module is built on.
+
+    ``read1`` is what makes the deadline checkable: it returns as soon as ANY bytes arrive -- one
+    byte, measured -- where ``read(n)`` blocks until it has all n. so the loop regains control on
+    every drip and can compare the ABSOLUTE deadline, and a drip-feeder buys one socket operation
+    rather than an unbounded run of them. None rather than an exception, because a timed-out draw is
+    an ordinary failed draw: the quote returns to the declared cap.
+    """
+    # http.client responses implement read1; a test double or an exotic file-like may not, and for
+    # those the bounded read is still correct, just without the mid-body deadline check.
+    read1 = getattr(response, "read1", None)
+    if read1 is None:
+        return response.read(limit)
+    chunks: list[bytes] = []
+    remaining = limit
+    while remaining > 0:
+        if time.monotonic() >= deadline:
+            return None
+        chunk = read1(min(_READ_CHUNK_BYTES, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
 
 def _one_completion(
@@ -261,12 +387,20 @@ def _one_completion(
     timeout_s: float = REQUEST_TIMEOUT_S,
     thinking: bool | None = None,
     prompt_budget: int | None = None,
-) -> RolloutSample | None:
-    """one generation's token counts, or None when the draw failed for any reason.
+) -> RolloutSample | _OutOfBudget | None:
+    """one generation's token counts, None when the draw failed, OUT_OF_BUDGET when it was filtered.
+
+    the third outcome exists because "no draw" has two very different meanings for coverage: a row
+    the WORKER also drops is not missing workload, while a row the endpoint refuses is.
 
     ``timeout_s`` is the caller's REMAINING overall budget when that is tighter than the per-request
     ceiling, so no single draw can carry the pass past its deadline.
     """
+    # cheap bound first, on strings that already exist, so an absurd row is declined before
+    # json.dumps builds a copy of it. see _MAX_PROMPT_CHARS: this can only reject prompts the
+    # encoded check below would reject too.
+    if _prompt_exceeds_chars(messages, _MAX_PROMPT_CHARS):
+        return None
     payload: dict[str, object] = {
         "model": model,
         # the env's own prompt_messages() output, roles intact. flattening a system turn into a
@@ -318,13 +452,14 @@ def _one_completion(
             "Content-Type": "application/json",
         },
     )
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
     try:
         with _NO_REDIRECT_OPENER.open(request, timeout=timeout_s) as response:
             # read one byte past the ceiling rather than trusting Content-Length, which an origin
             # can understate or omit entirely. over the limit is a declined draw, not an exception:
             # the caller's fallback is the declared cap either way.
-            raw = response.read(MAX_RESPONSE_BYTES + 1)
-        if len(raw) > MAX_RESPONSE_BYTES:
+            raw = _read_within_deadline(response, MAX_RESPONSE_BYTES + 1, deadline)
+        if raw is None or len(raw) > MAX_RESPONSE_BYTES:
             return None
         body = json.loads(raw)
     except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
@@ -373,8 +508,8 @@ def _sample_from_response(
     max_completion_tokens: int,
     thinking: bool | None = None,
     prompt_budget: int | None = None,
-) -> RolloutSample | None:
-    """token counts for one draw, or None when the response cannot stand as a measurement."""
+) -> RolloutSample | _OutOfBudget | None:
+    """token counts for one draw, None when it cannot stand, OUT_OF_BUDGET when the worker drops it."""
     usage = body.get("usage") if isinstance(body, dict) else None
     choices = body.get("choices") if isinstance(body, dict) else None
     if not isinstance(usage, dict) or not isinstance(choices, list) or not choices:
@@ -398,7 +533,12 @@ def _sample_from_response(
         # training (rl_train.py and opd_train.py both filter on their own prompt_budget), so this
         # row is never trained on. keeping its draw would put a length in the profile that no step
         # produces -- and the long rows are exactly the ones that would dominate the mean.
-        return None
+        #
+        # OUT_OF_BUDGET rather than None, so the caller can tell "the worker drops this row too"
+        # from "the endpoint refused a row the worker WILL train on". they are indistinguishable by
+        # count -- both leave a prompt with zero draws -- but only the second one means the profile
+        # is missing part of the workload.
+        return OUT_OF_BUDGET
     first = choices[0]
     finish = first.get("finish_reason") if isinstance(first, dict) else None
     # a truncated draw contributes the CAP rather than its true length, biasing the mean downward --

@@ -249,7 +249,14 @@ def test_a_token_only_profile_does_not_age_out():
     quoted. The token counts are digest-keyed: anything that would change them already changes the
     identity.
     """
-    token_only = _profile(generation_seconds_per_completion=0.0)
+    # reward seconds zeroed too, or this is not a token-only profile. the shared fixture carries a
+    # small reward latency, and that is a MEASURED second like any other -- see
+    # test_stale_reward_latency_ages_out_even_without_generation_seconds.
+    token_only = _profile(
+        generation_seconds_per_completion=0.0,
+        reward_seconds_per_completion=0.0,
+        reward_samples=0,
+    )
 
     ok, reason = token_only.trustworthy(now=NOW + ROLLOUT_LATENCY_MAX_AGE_S * 10)
     assert ok is True
@@ -271,6 +278,39 @@ def test_a_token_only_profile_does_not_age_out():
     ).trustworthy(now=NOW)
     assert thin_ok is False
     assert "below the" in thin_reason
+
+
+def test_stale_reward_latency_ages_out_even_without_generation_seconds():
+    """Generation seconds are not the only host-specific seconds a profile can carry.
+
+    ``runconfig_from_spec`` applies ``reward_seconds_per_completion`` to every completion, so it
+    reaches the quote exactly as generation latency does, and it is just as tied to the host that
+    measured it. Keying the age exemption on generation alone lets a profile that carries only
+    reward seconds price allocations forever off one stale measurement -- and that combination is
+    not hypothetical: it is what a client-measured profile looks like, since token counts transfer
+    between hosts and seconds do not.
+    """
+    reward_only = _profile(
+        generation_seconds_per_completion=0.0,
+        reward_seconds_per_completion=3.0,
+    )
+
+    fresh_ok, fresh_reason = reward_only.trustworthy(now=NOW)
+    assert fresh_ok is True
+    assert fresh_reason == ""
+
+    stale_ok, stale_reason = reward_only.trustworthy(now=NOW + ROLLOUT_LATENCY_MAX_AGE_S + 3600)
+    assert stale_ok is False
+    assert "re-measured" in stale_reason
+
+    # and the exemption still has to hold for a profile carrying NO seconds at all, which is the
+    # case it exists for. otherwise this would be indistinguishable from deleting the exemption.
+    none_ok, none_reason = _profile(
+        generation_seconds_per_completion=0.0,
+        reward_seconds_per_completion=0.0,
+    ).trustworthy(now=NOW + ROLLOUT_LATENCY_MAX_AGE_S * 10)
+    assert none_ok is True
+    assert none_reason == ""
 
 
 def test_an_unstamped_profile_is_never_trusted():
