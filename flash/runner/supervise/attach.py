@@ -500,7 +500,6 @@ class _AttachContext:
 
 
 def _build_attach_context(
-    status: RunStatus,
     worker_spec: JobSpec,
     persisted_remote: dict,
 ) -> _AttachContext:
@@ -814,7 +813,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
 
     try:
         worker_spec = effective_spec_from_status(status)
-        context = _build_attach_context(status, worker_spec, persisted_remote)
+        context = _build_attach_context(worker_spec, persisted_remote)
         next_attempt = context.next_attempt
         code_prefix = context.code_prefix
         try:
