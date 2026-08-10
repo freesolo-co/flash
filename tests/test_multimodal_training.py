@@ -486,6 +486,60 @@ def test_image_teacher_prompt_rejects_the_image_pad_token_in_user_text():
         mm.image_teacher_prompt_messages(plain, 1)
 
 
+def test_image_teacher_prompt_rejects_a_marker_split_across_adjacent_text_blocks():
+    """A marker assembled from fragments is still a marker once the blocks are joined.
+
+    Per-block validation cannot see this: "<|media_" and "pad|>" are each harmless text, and the
+    reserved marker exists only in the concatenation. That is why the check runs over each RUN of
+    consecutive text blocks rather than over one block at a time.
+
+    The last case is the reason the unit is a run and not the whole joined string: an image block
+    between the fragments puts the renderer's own placeholder there, so the user's text never
+    forms a marker and the prompt is legitimate. A whole-string check would reject it, and a
+    count-based check would accept the split-after-image case above it.
+    """
+    for fragments in (
+        ["<|media_", "pad|>"],
+        ["<|image_", "pad|>"],
+        ["<|med", "ia_p", "ad|>"],
+    ):
+        split = [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": piece} for piece in fragments]
+                + [{"type": "image"}],
+            }
+        ]
+        with pytest.raises(ValueError, match="reserved image marker"):
+            mm.image_teacher_prompt_messages(split, 1)
+
+    after_image = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": "<|media_"},
+                {"type": "text", "text": "pad|>"},
+            ],
+        }
+    ]
+    with pytest.raises(ValueError, match="reserved image marker"):
+        mm.image_teacher_prompt_messages(after_image, 1)
+
+    around_image = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "<|media_"},
+                {"type": "image"},
+                {"type": "text", "text": "pad|>"},
+            ],
+        }
+    ]
+    rendered = mm.image_teacher_prompt_messages(around_image, 1)
+    assert rendered[0]["content"] == f"<|media_{mm.IMAGE_TEACHER_PLACEHOLDER}pad|>"
+
+
 def test_text_only_prompt_messages_drops_images_and_preserves_text_order():
     image_module = pytest.importorskip("PIL.Image")
     pil = image_module.new("RGB", (1, 1), "red")

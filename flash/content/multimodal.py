@@ -307,6 +307,12 @@ def image_teacher_prompt_messages(messages: list[dict], descriptor_count: int) -
         content = copied.get("content")
         if isinstance(content, list):
             parts: list[str] = []
+            # text blocks since the last image, joined and checked as one run. a marker split
+            # across adjacent text blocks ("<|media_" then "pad|>") is invisible per block and
+            # only becomes literal once concatenated, so the run is the unit that has to be
+            # validated. an image block ends a run: the renderer's own placeholder goes there,
+            # and user text on either side of it cannot reach across to form a marker.
+            text_run: list[str] = []
             for block_index, block in enumerate(content):
                 if not isinstance(block, dict):
                     raise ValueError(
@@ -316,8 +322,11 @@ def image_teacher_prompt_messages(messages: list[dict], descriptor_count: int) -
                 block_type = block.get("type")
                 if block_type == "text" and isinstance(block.get("text"), str):
                     _reject_literal_image_placeholder(block["text"], message_index)
+                    text_run.append(block["text"])
                     parts.append(block["text"])
                 elif block_type in _IMAGE_BLOCK_TYPES:
+                    _reject_literal_image_placeholder("".join(text_run), message_index)
+                    text_run = []
                     parts.append(IMAGE_TEACHER_PLACEHOLDER)
                     image_count += 1
                 else:
@@ -325,6 +334,7 @@ def image_teacher_prompt_messages(messages: list[dict], descriptor_count: int) -
                         f"unsupported content block type {block_type!r} at message "
                         f"{message_index}, index {block_index}"
                     )
+            _reject_literal_image_placeholder("".join(text_run), message_index)
             copied["content"] = "".join(parts)
         elif content is None:
             copied["content"] = ""
