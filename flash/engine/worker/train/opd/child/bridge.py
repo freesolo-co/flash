@@ -79,13 +79,7 @@ def _post_json(url: str, token: str, path: str, payload: dict) -> dict:
             details = payload["error"]
             classification = str(details["classification"])
             message = str(details["message"])
-        except (
-            KeyError,
-            TypeError,
-            ValueError,
-            json.JSONDecodeError,
-            UnicodeDecodeError,
-        ) as decode_error:
+        except (KeyError, TypeError, ValueError) as decode_error:
             raise FlashTeacherBridgeError(
                 f"flash OPD bridge returned unclassified HTTP {error.code}",
                 classification="permanent",
@@ -96,12 +90,7 @@ def _post_json(url: str, token: str, path: str, payload: dict) -> dict:
                 classification="permanent",
             ) from error
         raise FlashTeacherBridgeError(message, classification=classification) from error
-    except (
-        OSError,
-        TimeoutError,
-        urllib.error.URLError,
-        http.client.HTTPException,
-    ) as error:
+    except (OSError, http.client.HTTPException) as error:
         raise FlashTeacherBridgeError(
             f"flash OPD bridge transport failed: {type(error).__name__}",
             classification="transient",
@@ -109,7 +98,7 @@ def _post_json(url: str, token: str, path: str, payload: dict) -> dict:
         ) from error
     try:
         return json.loads(body.decode("utf-8"))
-    except (TypeError, ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
+    except (TypeError, ValueError) as error:
         raise FlashTeacherBridgeError(
             "flash OPD bridge returned malformed success JSON",
             classification="permanent",
