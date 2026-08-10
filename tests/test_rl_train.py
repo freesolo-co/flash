@@ -279,11 +279,11 @@ def test_grpo_classified_exit_drains_group_after_leader_is_reaped(tmp_path, monk
 
 
 def test_run_rl_train_reaches_the_executable_grpo_subprocess_stream():
-    source = inspect.getsource(rl_train.run_rl_train)
+    source = inspect.getsource(rl_train._execute_rl_child)
 
-    assert "child_stream = _GrpoSubprocessStream(proc)" in source
+    assert "child_stream = _rl_train()._GrpoSubprocessStream(proc)" in source
     assert "for line in child_stream" in source
-    assert "rc = child_stream.wait_and_classify()" in source
+    assert "return child_stream.wait_and_classify()" in source
 
 
 # ------------------------------- data conversion -------------------------------
@@ -1460,13 +1460,18 @@ def test_build_verl_overrides_enforce_eager_gated_on_hardware():
 def test_the_resolved_eager_flag_reaches_the_verl_config():
     # the string assertions above pass against a resolver whose answer is never carried into the
     # config, which is exactly how the retired trl workaround got dropped. pin the wiring.
-    built = inspect.getsource(rl_train.run_rl_train)
+    built = inspect.getsource(rl_train.run_rl_train) + inspect.getsource(
+        rl_train._configure_rl_child
+    )
     assert "enforce_eager = resolve_rollout_enforce_eager(verl_cc)" in built
     assert "enforce_eager=enforce_eager," in built
     # and the capability it decides from is the one batched child probe every question shares.
     assert "caps = probe_verl_capabilities(python_bin, gdn_module)" in built
     assert "verl_cc = verl_device_capability(caps)" in built
-    assert "resolve_blackwell_attention_backends(\n            caps, verl_cc\n        )" in built
+    assert (
+        "attention_backend, mm_encoder_attn_backend = "
+        "resolve_blackwell_attention_backends(caps, verl_cc)" in " ".join(built.split())
+    )
     cfg = inspect.getsource(rl_train._build_verl_training_cfg)
     assert '"enforce_eager": enforce_eager,' in cfg
 
@@ -2158,7 +2163,7 @@ def test_the_reentrant_shim_is_wired_for_gdn_and_moe_models_and_not_for_dense_on
     # same helper the sft verl path and the retired trl path both keyed on.
     resolved = inspect.getsource(rl_train._resolve_grpo_inputs)
     assert '"reentrant_checkpointing": bool(_w.grpo_use_reentrant(model_id))' in resolved
-    written = inspect.getsource(rl_train.run_rl_train)
+    written = inspect.getsource(rl_train._write_rl_shim)
     assert (
         "render_reentrant_checkpointing_shim( "
         'inp["reentrant_checkpointing"], multimodal=bool(inp["multimodal"]) )'
@@ -2635,7 +2640,7 @@ def test_rollout_shims_survive_verls_real_run_agent_loop_signature():
 
 
 def test_image_pad_ban_shim_is_composed_into_the_sitecustomize(monkeypatch):
-    source = inspect.getsource(rl_train.run_rl_train)
+    source = inspect.getsource(rl_train._write_rl_shim)
     assert 'render_image_pad_ban_shim(inp["image_pad_token_id"])' in source
     combined = rl_train.render_stop_sequences_shim(
         ("</answer>",)
@@ -2656,7 +2661,7 @@ def test_stop_sequences_gate_off_truncated_completion_masking():
 def test_all_shims_compose_into_one_sitecustomize():
     # python imports sitecustomize once, so a second file would never load. the renderers must
     # concatenate into a single source rather than each owning a file.
-    source = inspect.getsource(rl_train.run_rl_train)
+    source = inspect.getsource(rl_train._write_rl_shim)
     assert 'render_entropy_quantile_shim(inp["entropy_quantile"])' in source
     assert 'render_stop_sequences_shim(inp["stop_sequences"])' in source
     assert 'render_structured_outputs_shim(inp["structured_outputs"])' in source
@@ -2782,7 +2787,7 @@ def test_kl_ref_adapter_shim_is_emitted_only_for_a_warm_start():
 def test_kl_ref_adapter_shim_is_wired_only_when_warm_start_and_kl_are_both_on():
     # with kl off no reference logprob is ever consumed, so patching disable_adapter would add a
     # failure mode and buy nothing. both conditions have to gate the renderer, not just warm start.
-    source = inspect.getsource(rl_train.run_rl_train)
+    source = inspect.getsource(rl_train._write_rl_shim)
     assert "render_kl_ref_adapter_shim(" in source
     assert 'bool(inp["warmstart_adapter"]) and float(inp["kl_coef"]) > 0' in source
     combined = rl_train.render_exact_save_steps_shim(
@@ -2963,7 +2968,7 @@ def test_pinned_snapshot_dir_is_what_reaches_verl_model_path():
     import inspect
     import textwrap
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_train.run_rl_train)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_train._configure_rl_child)))
     calls = [
         n
         for n in ast.walk(tree)
@@ -3143,14 +3148,19 @@ def test_advantage_spread_is_parsed_from_a_real_verl_step_line():
 def test_run_rl_train_wires_the_gradient_check_into_the_publish_path():
     # a helper nothing calls is not a guard. assert the training path actually invokes it, and that
     # it does so before the adapter export rather than after a publish has already happened.
-    source = inspect.getsource(rl_train.run_rl_train)
-    assert "_check_grpo_had_a_gradient(" in source
-    assert "resumed=bool(resume_step)," in source
-    assert "already_complete=bool(resume_step) and resume_step >= expected_steps," in source
-    assert source.index("_check_grpo_had_a_gradient") < source.index("export_peft_adapter")
+    entry_source = inspect.getsource(rl_train.run_rl_train)
+    verdict_source = inspect.getsource(rl_train._validate_rl_child)
+    metrics_source = inspect.getsource(rl_train._ingest_step_metrics)
+    export_source = inspect.getsource(rl_train._export_final_adapter)
+    assert "_validate_rl_child(" in entry_source
+    assert "_check_grpo_had_a_gradient(" in verdict_source
+    assert "resumed=bool(resume_step)," in verdict_source
+    assert "already_complete=bool(resume_step) and resume_step >= expected_steps," in verdict_source
+    assert entry_source.index("_validate_rl_child(") < entry_source.index("_export_final_adapter(")
+    assert "export_peft_adapter(" in export_source
     # and that the spread series it passes is actually collected from the child's output.
-    assert 'parse_verl_metric(line, "critic/advantages/max")' in source
-    assert 'parse_verl_metric(line, "critic/advantages/min")' in source
+    assert 'parse_verl_metric(line, "critic/advantages/max")' in metrics_source
+    assert 'parse_verl_metric(line, "critic/advantages/min")' in metrics_source
 
 
 def test_grpo_gradient_check_abstains_for_a_resumed_run():
@@ -3213,16 +3223,17 @@ def test_resume_uploader_treats_an_unreadable_gradient_signal_as_closed():
 
 
 def test_run_rl_train_gates_midtraining_deployables_and_exempts_resumes():
-    source = inspect.getsource(rl_train.run_rl_train)
+    entry_source = inspect.getsource(rl_train.run_rl_train)
+    uploader_source = inspect.getsource(rl_train._start_resume_uploader)
     # the gate must be wired into the uploader, not merely available on it.
-    assert "had_gradient=(" in source
+    assert "had_gradient=(" in uploader_source
     # a resumed run publishes as before: its restored weights already carry earlier updates that
     # this worker's spread history cannot speak for.
-    assert "if resume_step" in source.split("had_gradient=(")[1].split(")")[0] + ")"
+    assert "if resume_step" in uploader_source.split("had_gradient=(")[1].split(")")[0] + ")"
     # the spread series must be declared before the uploader closes over it, or the closure raises
     # NameError the first time the drain thread consults it.
-    assert source.index("adv_spread_history: list[float] = []") < source.index(
-        "_VerlResumeUploader("
+    assert entry_source.index("adv_spread_history = state.adv_spread_history") < entry_source.index(
+        "_start_resume_uploader("
     )
 
 
@@ -3575,7 +3586,7 @@ def test_zero_gradient_is_reported_before_a_withheld_required_save(tmp_path, mon
     # ordering is asserted at the call site: the verdict precedes stop()/raise_if_incomplete().
     # match on the call name alone -- the argument list spans several lines, so pinning an argument
     # would make this fail on a reformat rather than on a reordering, which is the real invariant.
-    source = inspect.getsource(rl_train.run_rl_train)
+    source = inspect.getsource(rl_train._validate_rl_child)
     assert source.count("_check_grpo_had_a_gradient(") == 1
     assert source.count("resume_uploader.raise_if_incomplete()") == 1
     verdict = source.index("_check_grpo_had_a_gradient(")
@@ -4186,7 +4197,7 @@ def test_the_run_body_always_puts_the_shim_dir_on_the_child_path():
     # `if shim_source:` -- true only when some OTHER feature wanted a sitecustomize patch, so a
     # plain multi-turn job copied three modules the child could never import. source-level because
     # the assignment sits inside run_rl_train, past the subprocess launch.
-    src = inspect.getsource(rl_train.run_rl_train)
+    src = inspect.getsource(rl_train._build_rl_child_env)
     # the assignment must remain unconditional because the tf32 fragment applies to every run.
     # inspect the ast so only enclosing guards count.
     tree = ast.parse(textwrap.dedent(src))
@@ -4220,7 +4231,11 @@ def test_the_run_body_always_puts_the_shim_dir_on_the_child_path():
             "PYTHONPATH is conditionally extended again; a multi-turn job (or the tf32 fragment) "
             f"can miss shim_dir. enclosing conditions were: {stack!r}"
         )
-    assert 'if inp["multi_turn"]:\n        copy_multi_turn_child_modules(shim_dir)' in src
+    shim_src = inspect.getsource(rl_train._write_rl_shim)
+    assert (
+        'if inp["multi_turn"]:\n        copy_multi_turn_child_modules(files["shim_dir"])'
+        in shim_src
+    )
 
 
 # ---------------------- multi-turn per-turn generation cap ----------------------
@@ -4234,10 +4249,16 @@ def test_the_child_caps_each_turn_at_max_completion_tokens_not_the_whole_episode
 
     body = " ".join(inspect.getsource(grpo_multiturn).split())
     assert 'max_completion_tokens = int(os.environ["FLASH_VERL_MAX_COMPLETION_TOKENS"])' in body
+    # the three budgets now live in _EpisodeTranscript.turn_budget, which the turn loop calls once
+    # per turn. same min() over the same three quantities, spelled against the transcript's own
+    # accumulators rather than loop locals.
     assert (
-        "max_tokens = min( max_completion_tokens, max_model_len - len(prefix_ids), "
-        "response_capacity - len(response_ids), )" in body
+        "return min( max_completion_tokens, self.max_model_len - len(self.prefix_ids), "
+        "self.response_capacity - len(self.response_ids), )" in body
     ), "the per-turn cap is not one of the three budgets bounding a turn"
+    assert "max_tokens = episode.turn_budget(max_completion_tokens)" in body, (
+        "the turn loop no longer applies the per-turn budget"
+    )
 
 
 def test_the_child_puts_no_deadline_on_a_bridge_call():
@@ -4990,7 +5011,7 @@ def test_the_bridge_is_built_only_for_multi_turn_jobs():
     # and mounting it costs a lock the single-turn scoring path already has.
     # whitespace-normalized: the construction spans several lines, and what is under test is the
     # guard around it, not how the formatter wrapped the call.
-    src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    src = " ".join(inspect.getsource(rl_train._start_reward_runtime).split())
     assert src.count("MultiTurnBridge(") == 1
     assert (
         "MultiTurnBridge( env, rollout_examples, "
@@ -5318,11 +5339,16 @@ def test_the_run_body_passes_the_measured_profile_into_train_meta():
     return a profile that the run body drops on the floor, and every other test here would still
     pass while train_meta always recorded None.
     """
-    src = inspect.getsource(rl_train.run_rl_train)
-    assert "_log_reward_profile(" in src, "the hook is never called"
-    assert "reward_profile = " in src, "the hook's reading is discarded"
-    assert "reward_profile=reward_profile" in src, "the reading never reaches train_meta"
-    assert 'reward_bridge_batching=not inp["multi_turn"]' in src
+    reward_src = inspect.getsource(rl_train._start_reward_runtime)
+    entry_src = inspect.getsource(rl_train.run_rl_train)
+    metadata_src = inspect.getsource(rl_train._write_terminal_metadata)
+    assert "_log_reward_profile(" in reward_src, "the hook is never called"
+    assert "reward_profile = " in reward_src, "the hook's reading is discarded"
+    assert "reward_runtime=reward_runtime" in entry_src, "the reading never reaches train_meta"
+    assert "reward_profile=reward_runtime.reward_profile" in metadata_src, (
+        "the reading never reaches train_meta"
+    )
+    assert 'reward_bridge_batching=not inp["multi_turn"]' in metadata_src
 
 
 def test_the_reward_profiler_is_skipped_on_multi_turn():
@@ -5332,7 +5358,7 @@ def test_the_reward_profiler_is_skipped_on_multi_turn():
     env.reward/scores_breakdown on one completion -- a call that env's contract does not define --
     and record the resulting number as if it described the episode reward path.
     """
-    src = inspect.getsource(rl_train.run_rl_train)
+    src = inspect.getsource(rl_train._start_reward_runtime)
     profile_call = src[src.index("reward_profile = ") : src.index("multi_turn_bridge = ")]
     assert 'if inp["multi_turn"]' in profile_call, "the profiler is not gated off multi-turn"
     assert "None" in profile_call, "multi-turn must record no profile rather than a wrong one"
@@ -5370,7 +5396,7 @@ def _score_buffer(env, *, prompts=None, examples=None, generation_size=0):
 
 def test_score_batch_grades_before_it_records():
     """User grading must finish before the observability lock is taken per result."""
-    src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    src = " ".join(inspect.getsource(rl_train._start_reward_runtime).split())
     body = src[src.index("def _score_batch(requests:") :]
     body = body[: body.index("def _score_for_profile")]
 
@@ -5380,7 +5406,7 @@ def test_score_batch_grades_before_it_records():
 
 def test_the_recorded_prompt_is_the_one_the_batched_completion_was_graded_against():
     """Each scattered sample must use the same request index for its example and prompt."""
-    src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    src = " ".join(inspect.getsource(rl_train._start_reward_runtime).split())
     body = src[src.index("def _score_batch(requests:") :]
     body = body[: body.index("def _score_for_profile")]
 
@@ -5874,7 +5900,7 @@ def test_the_generation_size_is_the_configured_rollout_count():
     # the counted boundary is only correct if it counts a whole generation. verl runs with
     # test_freq=-1 and val_before_train=False, so every completion reaching the bridge is one of
     # these -- a validation pass would desynchronize the count from the step lines.
-    src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    src = " ".join(inspect.getsource(rl_train._start_reward_runtime).split())
     construction = src[src.index("RewardObservabilityBuffer(") :]
     construction = construction[: construction.index("wandb_link")]
     assert 'generation_size=int(inp["prompts_per_step"]) * int(inp["group_size"])' in construction
@@ -5982,7 +6008,7 @@ def test_the_first_sample_bearing_heartbeat_is_forced():
     # the liveness daemon can claim a step before the stdout loop reaches it, and a step-gated stage
     # drops a second payload at an already-committed step. without force, the first heartbeat
     # carrying samples is exactly the one most likely to be suppressed.
-    src = inspect.getsource(rl_train.run_rl_train)
+    src = inspect.getsource(rl_train._ingest_step_metrics)
     forced = src[src.index("if not sent_first_metrics:") :]
     forced = forced[: forced.index("gpu=gpu_diagnostics")]
     assert "force=True" in forced
@@ -6005,19 +6031,20 @@ def test_the_generation_boundary_is_the_step_line_and_the_heartbeat_never_drains
     had finished by then. If the step line did not close the generation, nothing ever would, and the
     buffer would report its first generation for the whole run.
     """
-    src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    entry_src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
 
-    hook = src[src.index("def _reward_observability()") :]
+    hook = entry_src[entry_src.index("def _reward_observability()") :]
     hook = hook[: hook.index("with liveness_heartbeat(")]
-    assert "observability.heartbeat_fields()" in hook
+    assert "reward_runtime.observability.heartbeat_fields()" in hook
     assert "close_generation" not in hook, "the heartbeat drains; the boundary would be bypassed"
 
     # sealed on the new-step branch, and BEFORE the preview reads the published rows so the logged
     # sample and the heartbeat describe the same generation.
-    stdout_loop = src[src.index("step_box[0] = int(m.group(1))") :]
-    assert "observability.close_generation(step_box[0])" in stdout_loop
+    stdout_loop = " ".join(inspect.getsource(rl_train._execute_rl_child).split())
+    stdout_loop = stdout_loop[stdout_loop.index('progress["step"] = int(m.group(1))') :]
+    assert 'reward_runtime.observability.close_generation(progress["step"])' in stdout_loop
     assert stdout_loop.index("observability.close_generation(") < stdout_loop.index(
-        "samp = observability.latest_for_step(step_box[0])"
+        'samp = reward_runtime.observability.latest_for_step(progress["step"])'
     )
     # and the preview asks for THIS step's rows. the unchecked accessor answers with whatever was
     # published last, which on the drop-spend path belongs to an earlier step.
@@ -6323,9 +6350,10 @@ def test_per_turn_credit_is_resolved_only_for_multi_turn_and_reaches_the_bridge(
     source = inspect.getsource(rl_train._resolve_grpo_inputs)
     assert "not supported for multi-turn environments" not in source
     assert '"per_turn_credit": per_turn_credit' in source
-    run_source = inspect.getsource(rl_train.run_rl_train)
-    assert 'render_per_turn_credit_shim(inp["per_turn_credit"])' in run_source
-    assert 'per_turn_credit=bool(inp["per_turn_credit"])' in run_source
+    shim_source = inspect.getsource(rl_train._write_rl_shim)
+    reward_source = inspect.getsource(rl_train._start_reward_runtime)
+    assert 'render_per_turn_credit_shim(inp["per_turn_credit"])' in shim_source
+    assert 'per_turn_credit=bool(inp["per_turn_credit"])' in reward_source
 
 
 def test_multi_turn_bridge_returns_turns_only_under_per_turn_credit():
@@ -6644,8 +6672,8 @@ def test_grpo_builds_its_verl_child_env_from_the_allowlist():
     Scoring remains behind the localhost bridge, so the child needs runtime settings and the bridge
     URL only. This is source-tested because the path requires a GPU and installed verl.
     """
-    source = inspect.getsource(rl_train.run_rl_train)
-    assert "env_for_verl = _build_verl_child_env(" in source
+    source = inspect.getsource(rl_train._build_rl_child_env)
+    assert "env_for_verl = parent._build_verl_child_env(" in source
     assert "env_for_verl = dict(os.environ)" not in source, (
         "grpo must not copy the whole parent environment into the verl child"
     )
@@ -6684,7 +6712,7 @@ def test_grpo_finalization_carries_the_completed_step():
     zero steps and bills $0. The sft and opd finalizers already pass their final step; grpo was the
     only one that did not.
     """
-    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_train.run_rl_train)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_train._write_terminal_metadata)))
     calls = [
         node
         for node in ast.walk(tree)

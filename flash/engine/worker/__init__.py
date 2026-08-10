@@ -239,113 +239,117 @@ def _finalize(metrics: RunMetrics, *, heartbeat_fields=None):
     print("NODE DONE:", metrics.to_json())
 
 
-def main():
-    try:
-        from flash.engine.worker.entry.profile import run_sft_profile
+def _run_worker_mode() -> None:
+    from flash.engine.worker.entry.profile import run_sft_profile
 
-        modes = {
-            "sft": run_sft,
-            "rl": run_rl,
-            "opd": run_opd,
-            "profile": run_sft_profile,
-        }
-        handler = modes.get(RUN_MODE)
-        if handler is None:
-            raise RuntimeError("worker run mode is invalid")
+    modes = {
+        "sft": run_sft,
+        "rl": run_rl,
+        "opd": run_opd,
+        "profile": run_sft_profile,
+    }
+    handler = modes.get(RUN_MODE)
+    if handler is None:
+        raise RuntimeError("worker run mode is invalid")
+    remaining = _remaining_worker_wall_seconds()
+    if remaining is not None and remaining <= 0:
+        raise RuntimeError("worker run wall deadline exceeded")
+    if RUN_MODE == "sft" and JOB_SPEC and JOB_SPEC.train.init_from_adapter:
+        raise ValueError(
+            "train.init_from_adapter is supported only for GRPO and OPD continue-in-place runs; "
+            "SFT adapter continuation is not supported"
+        )
+    # Idempotency: check DONE before any env-mutating pip install (fla fast path).
+    if HF_REPO:
+        from huggingface_hub import hf_hub_download
+
+        try:
+            hf_hub_download(
+                repo_id=HF_REPO,
+                repo_type="dataset",
+                filename=f"{hf_prefix()}/DONE",
+                token=os.environ.get("HF_TOKEN"),
+            )
+            done = True
+        except Exception:
+            done = False
         remaining = _remaining_worker_wall_seconds()
         if remaining is not None and remaining <= 0:
             raise RuntimeError("worker run wall deadline exceeded")
-        if RUN_MODE == "sft" and JOB_SPEC and JOB_SPEC.train.init_from_adapter:
-            raise ValueError(
-                "train.init_from_adapter is supported only for GRPO and OPD continue-in-place runs; "
-                "SFT adapter continuation is not supported"
-            )
-        # Idempotency: check DONE before any env-mutating pip install (fla fast path).
-        if HF_REPO:
-            from huggingface_hub import hf_hub_download
+        if done:
+            print("Run already complete (DONE present); returning persisted metrics.")
+            heartbeat("already_done", gpu=gpu_diagnostics(include_torch=False))
+            # DONE is written only AFTER metrics.json uploads (required=True), so a failed read here
+            # is a transient HF blip, never a missing file. Retry, then signal RETRIABLE (reschedule)
+            # rather than SystemExit — a BaseException that bypasses the retriable-stamping handler
+            # below and would report a genuinely-succeeded run as a fatal failure.
+            last_err: Exception | None = None
+            for attempt in range(3):
+                remaining = _remaining_worker_wall_seconds()
+                if remaining is not None and remaining <= 0:
+                    break
+                try:
+                    got = hf_hub_download(
+                        repo_id=HF_REPO,
+                        repo_type="dataset",
+                        filename=f"{hf_prefix()}/metrics.json",
+                        token=os.environ.get("HF_TOKEN"),
+                    )
+                    import shutil
 
-            try:
-                hf_hub_download(
-                    repo_id=HF_REPO,
-                    repo_type="dataset",
-                    filename=f"{hf_prefix()}/DONE",
-                    token=os.environ.get("HF_TOKEN"),
-                )
-                done = True
-            except Exception:
-                done = False
-            remaining = _remaining_worker_wall_seconds()
-            if remaining is not None and remaining <= 0:
-                raise RuntimeError("worker run wall deadline exceeded")
-            if done:
-                print("Run already complete (DONE present); returning persisted metrics.")
-                heartbeat("already_done", gpu=gpu_diagnostics(include_torch=False))
-                # DONE is written only AFTER metrics.json uploads (required=True), so a failed read here
-                # is a transient HF blip, never a missing file. Retry, then signal RETRIABLE (reschedule)
-                # rather than SystemExit — a BaseException that bypasses the retriable-stamping handler
-                # below and would report a genuinely-succeeded run as a fatal failure.
-                last_err: Exception | None = None
-                for attempt in range(3):
-                    remaining = _remaining_worker_wall_seconds()
-                    if remaining is not None and remaining <= 0:
+                    shutil.copy(got, "/tmp/metrics.json")
+                    sys.stdout.flush()
+                    os._exit(0)
+                except Exception as e:
+                    last_err = e
+                    if attempt >= 2:
                         break
-                    try:
-                        got = hf_hub_download(
-                            repo_id=HF_REPO,
-                            repo_type="dataset",
-                            filename=f"{hf_prefix()}/metrics.json",
-                            token=os.environ.get("HF_TOKEN"),
-                        )
-                        import shutil
-
-                        shutil.copy(got, "/tmp/metrics.json")
-                        sys.stdout.flush()
-                        os._exit(0)
-                    except Exception as e:
-                        last_err = e
-                        if attempt >= 2:
+                    delay = 5 * (attempt + 1)
+                    remaining = _remaining_worker_wall_seconds()
+                    if remaining is not None:
+                        if remaining <= 0:
                             break
-                        delay = 5 * (attempt + 1)
-                        remaining = _remaining_worker_wall_seconds()
-                        if remaining is not None:
-                            if remaining <= 0:
-                                break
-                            delay = min(delay, remaining)
-                        if delay > 0:
-                            time.sleep(delay)
-                error_kind = type(last_err).__name__ if last_err is not None else "unknown error"
-                raise RetriableInfraError(
-                    "DONE present but metrics.json unreadable after retries "
-                    f"(transient HF; {error_kind})"
-                )
-        # A profile run tokenizes or samples on cpu and never imports a model, so it exits BEFORE
-        # the kernel setup below: none of it would apply, and _ensure_fla_fastpath_on_hopper would
-        # pip-install into a process that is about to leave.
-        if RUN_MODE == "profile":
-            heartbeat("boot")
-            handler()
-            sys.stdout.flush()
-            sys.stderr.flush()
-            os._exit(0)
-        # these setups run in the parent; verl trains in FLASH_VERL_PYTHON.
-        # only _force_fla_triton_gdn_on_sm100 propagates through FLA_* env vars. the install,
-        # symlink,
-        # and monkeypatch are interpreter-local and must not be treated as child configuration.
-        # run before model imports: sm100 tilelang GDN computes wrong gradients, so use Triton.
-        _force_fla_triton_gdn_on_sm100()
-        _ensure_fla_fastpath_on_hopper()
-        # Must run AFTER fla fast path (may reinstall tilelang) and BEFORE model/vLLM import.
-        _neutralize_tilelang_cudart_stub()
-        # AFTER the fla fast path (which may (re)install fla), BEFORE any model import / GDN
-        # launch: restrict fla's Blackwell GDN bwd autotune to grad-correct configs (fla #913).
-        _restrict_fla_gdn_autotune_on_blackwell()
-        heartbeat("boot", gpu=gpu_diagnostics(include_torch=False))
-        load_mega_cache()
+                        delay = min(delay, remaining)
+                    if delay > 0:
+                        time.sleep(delay)
+            error_kind = type(last_err).__name__ if last_err is not None else "unknown error"
+            raise RetriableInfraError(
+                "DONE present but metrics.json unreadable after retries "
+                f"(transient HF; {error_kind})"
+            )
+    # A profile run tokenizes or samples on cpu and never imports a model, so it exits BEFORE
+    # the kernel setup below: none of it would apply, and _ensure_fla_fastpath_on_hopper would
+    # pip-install into a process that is about to leave.
+    if RUN_MODE == "profile":
+        heartbeat("boot")
         handler()
-        # Hard-exit: colocated vLLM can deadlock on NCCL/CUDA teardown; all artifacts already on HF.
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(0)
+    # these setups run in the parent; verl trains in FLASH_VERL_PYTHON.
+    # only _force_fla_triton_gdn_on_sm100 propagates through FLA_* env vars. the install,
+    # symlink,
+    # and monkeypatch are interpreter-local and must not be treated as child configuration.
+    # run before model imports: sm100 tilelang GDN computes wrong gradients, so use Triton.
+    _force_fla_triton_gdn_on_sm100()
+    _ensure_fla_fastpath_on_hopper()
+    # Must run AFTER fla fast path (may reinstall tilelang) and BEFORE model/vLLM import.
+    _neutralize_tilelang_cudart_stub()
+    # AFTER the fla fast path (which may (re)install fla), BEFORE any model import / GDN
+    # launch: restrict fla's Blackwell GDN bwd autotune to grad-correct configs (fla #913).
+    _restrict_fla_gdn_autotune_on_blackwell()
+    heartbeat("boot", gpu=gpu_diagnostics(include_torch=False))
+    load_mega_cache()
+    handler()
+    # Hard-exit: colocated vLLM can deadlock on NCCL/CUDA teardown; all artifacts already on HF.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
+
+
+def main():
+    try:
+        _run_worker_mode()
     except Exception as e:
         tb = sanitize_diagnostic(traceback.format_exc(), limit=16_000)
         try:
