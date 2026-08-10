@@ -146,12 +146,37 @@ def _plaintext_transport_warning(api_url: str) -> str:
     )
 
 
+def _plaintext_login_warnings(api_url: str | None, freesolo_url: str | None) -> list[str]:
+    """Warn for every url `flash login` may send the key to, not just the plane's.
+
+    Login has two possible destinations and picks between them at request time: the plane itself, or
+    the Freesolo identity backend via ``verify_freesolo_key(base_url=...)``. Checking only
+    ``api_url`` left the second one silent, so an https plane paired with an ``http://``
+    ``--freesolo-url`` (or ``FREESOLO_BASE_URL``) transmitted the bearer key in cleartext with no
+    warning at all -- the case where the operator is most likely to believe they are protected.
+    """
+    seen: set[str] = set()
+    warnings: list[str] = []
+    for url in (api_url, freesolo_url):
+        normalized = (url or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        warning = _plaintext_transport_warning(normalized)
+        if warning:
+            warnings.append(warning)
+    return warnings
+
+
 def cmd_login(args) -> int:
     api_url = args.api_url or load_credentials()[0]
     identity: dict | None = None
     # before any request: the warning is worthless once the key has already gone over the wire.
-    transport_warning = _plaintext_transport_warning(api_url)
-    if transport_warning:
+    # both destinations are checked here rather than at the branch below, because which one receives
+    # the key is decided after this point and the caller needs the warning while it can still abort.
+    for transport_warning in _plaintext_login_warnings(
+        api_url, getattr(args, "freesolo_url", None)
+    ):
         print(
             render.warn(transport_warning) if render.styled() else f"warning: {transport_warning}",
             file=sys.stderr,

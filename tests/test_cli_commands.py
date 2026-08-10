@@ -3356,3 +3356,43 @@ def test_login_stays_quiet_for_loopback_and_tls(monkeypatch, capsys, api_url):
     args = types.SimpleNamespace(api_url=api_url, api_key="operator-key", debug=False)
     assert cli.commands.cmd_login(args) == 0
     assert "plaintext HTTP" not in capsys.readouterr().err
+
+
+def test_login_warns_about_a_plaintext_freesolo_url_behind_an_https_plane(monkeypatch, capsys):
+    """The identity backend is a SECOND destination for the key, and it must be checked too.
+
+    `cmd_login` sends the key to whichever of the two urls the branch below it selects. Warning only
+    on `api_url` left an https plane paired with an `http://` --freesolo-url completely silent --
+    the configuration where the operator has most reason to believe the key is protected.
+    """
+    warned_before_request = {}
+
+    def _verify(api_key, *, base_url):
+        warned_before_request["stderr"] = capsys.readouterr().err
+
+    monkeypatch.setattr(cli.commands, "verify_freesolo_key", _verify)
+    monkeypatch.setattr(cli.commands, "_verifies_against_freesolo", lambda *a, **k: True)
+    monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
+    monkeypatch.setattr(cli.commands, "_identity_or_none", lambda *a, **k: None)
+    monkeypatch.delenv("FREESOLO_API_KEY", raising=False)
+
+    args = types.SimpleNamespace(
+        api_url="https://your-plane.example",
+        freesolo_url="http://identity.internal:8000",
+        api_key="operator-key",
+        debug=False,
+    )
+    assert cli.commands.cmd_login(args) == 0
+    stderr = warned_before_request["stderr"]
+    assert "plaintext HTTP" in stderr, stderr
+    # it names the offending url, not the https plane that is already fine.
+    assert "identity.internal" in stderr
+    assert "your-plane.example is plaintext" not in stderr
+
+
+def test_login_does_not_warn_twice_for_one_url():
+    """A plane that is also its own identity backend is one destination, so it warns once."""
+    warnings = cli.commands._plaintext_login_warnings(
+        "http://plane.example:8080", "http://plane.example:8080"
+    )
+    assert len(warnings) == 1, warnings

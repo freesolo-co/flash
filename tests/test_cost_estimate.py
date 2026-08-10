@@ -557,20 +557,14 @@ def test_offline_unpinned_estimate_does_not_bill_the_ceiling():
 
 
 def test_offline_estimate_supports_eight_card_only_runs(monkeypatch):
-    """`flash train --cost` must price a run that fits eight cards but no four-card shape.
-
-    The model must be one whose head count divides by 8 -- 3.5-9B has 16 -- because the quote is
-    capped by the same ``geometry_safe_gpu_cap`` allocation uses. 3.5-4B, used here before, has 10
-    query heads and is held to 2 cards, so quoting it at 8 advertised a width verl rejects at
-    Ulysses init.
-    """
+    """`flash train --cost` must price a run that fits eight cards but no four-card shape."""
     monkeypatch.setattr("flash.cost.analytical.required_vram_gb", lambda *a, **k: 700)
-    config = RunConfig("Qwen/Qwen3.5-9B", "sft", 1, gpu_count=8)
+    config = RunConfig("Qwen/Qwen3.5-4B", "sft", 1, gpu_count=8)
     estimate = estimate_cost(config)
     assert estimate.required_vram_gb == 700
     assert estimate.gpu_count == 8
     with pytest.raises(ValueError, match="no GPU class fits"):
-        estimate_cost(RunConfig("Qwen/Qwen3.5-9B", "sft", 1, gpu_count=4))
+        estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "sft", 1, gpu_count=4))
 
 
 def test_offline_estimate_applies_the_pinned_revision_geometry_cap(monkeypatch):
@@ -587,9 +581,9 @@ def test_offline_estimate_applies_the_pinned_revision_geometry_cap(monkeypatch):
         model_revision="a" * 40,
     )
 
-    # two, not four: the pin caps at four, but 3.5-4B has 10 query heads and the cap then narrows to
-    # the widest count that actually divides them. The ceiling bounds the search; it does not end it.
-    with pytest.raises(ValueError, match="across up to 2 cards"):
+    # four: the pin keeps the unvalidated-revision ceiling, and 3.5-4B's 16 recorded heads divide it,
+    # so the geometry check narrows nothing further.
+    with pytest.raises(ValueError, match="across up to 4 cards"):
         _offline_gpu_shape(config)
 
 

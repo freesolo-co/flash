@@ -144,18 +144,20 @@ def geometry_safe_gpu_cap(model_id: str, max_gpu_count: int, *, model_revision: 
 
     The width becomes ``ulysses_sequence_parallel_size``, and verl requires
     ``num_attention_heads % sp_size == 0``, so a catalog row is only safe at the counts that divide
-    its OWN head count. Curated geometry is not the same as uniform geometry: Qwen3.5-4B has 10
-    query heads (``hidden_size`` 2560 / ``head_dim`` 256), and 0.8B and 27B have 4 and 20, so
-    trusting catalog membership alone accepted a 4-card RTX 4090 shape for the 4B -- a width only
-    that shape's VRAM could reach -- rented it, and then died on Ulysses init before the first step.
-    Derive the ceiling from the row instead.
+    its OWN head count. Curated membership is not uniform geometry: catalog head counts are 8, 8,
+    16, 16, 24, and 16, so trusting membership alone accepted an 8-card width for the 27B (24 heads)
+    that verl rejects at Ulysses init, after the box was already rented.
+
+    The head count is READ from the row (``num_attention_heads``), never derived: ``hidden_size //
+    head_dim`` is a different number on four of the six rows -- see ``_query_attention_heads``.
 
     A pinned or unreadable revision keeps the pre-existing four-card ceiling rather than renting 8
     cards verl may reject at startup, but that ceiling only NARROWS the divisor search; it is not a
-    substitute for it. Four divides 10 no better than 8 does, and SFT reaches allocation with the
-    revision already resolved to a sha (``runner.submit.prepare_job`` -> ``_resolve_model_revision``
-    with ``required=True``), so a catalog row keyed on revision-emptiness alone would skip its own
-    geometry on exactly the runs that need it. Match the row by id and check the heads either way.
+    substitute for it. A ceiling is a bound, not a divisibility proof -- 4 divides 24 but not 20 --
+    and SFT reaches allocation with the revision already resolved to a sha
+    (``runner.submit.prepare_job`` -> ``_resolve_model_revision`` with ``required=True``), so a
+    catalog row keyed on revision-emptiness alone would skip its own geometry on exactly the runs
+    that need it. Match the row by id and check the heads either way.
     ALLOC-004 tracks validating arbitrary off-catalog head geometry at every width.
     """
     from flash.core.catalog import MODELS
@@ -163,14 +165,15 @@ def geometry_safe_gpu_cap(model_id: str, max_gpu_count: int, *, model_revision: 
     cap = largest_rentable_count(max_gpu_count)
     if model_revision or model_id not in MODELS:
         # an unvalidated revision keeps the pre-existing four-card ceiling, but that ceiling is a
-        # BOUND, not a divisibility proof: 4 no more divides 10 than 8 does. So it only narrows the
-        # search below, never substitutes for it.
+        # BOUND, not a divisibility proof -- it happens to divide 24 and would not divide 20. So it
+        # only narrows the search below, never substitutes for it.
         cap = min(cap, 4)
     info = MODELS.get(model_id)
     heads = _query_attention_heads(info) if info is not None else 0
     if heads <= 0:
-        # geometry we cannot read is geometry we cannot certify; the ceiling is all we have.
-        return cap
+        # geometry we cannot read is geometry we cannot certify, so a catalog row that records no
+        # head count is treated exactly like an unvalidated revision rather than trusted for 8.
+        return min(cap, 4)
     for count in rentable_gpu_counts(cap):
         if heads % count == 0:
             return count
@@ -178,16 +181,15 @@ def geometry_safe_gpu_cap(model_id: str, max_gpu_count: int, *, model_revision: 
 
 
 def _query_attention_heads(info) -> int:
-    """Query-attention head count for a catalog row, or 0 when it cannot be derived.
+    """Query-attention head count for a catalog row, or 0 when the row does not record one.
 
-    The catalog records ``hidden_size`` and ``head_dim`` rather than the head count itself, and
-    verl's sequence-parallel constraint is stated against the head count.
+    Read, never derived. ``hidden_size // head_dim`` looks like the head count and is not: these
+    checkpoints decouple ``head_dim`` from that ratio, so the quotient is wrong for four of the six
+    catalog rows (3.5-4B is 16 heads, not 2560/256 = 10; 0.8B is 8, not 4; 3.6-27B is 24, not 20;
+    35B-A3B is 16, not 8). A cap computed from the quotient divides the wrong number -- it happened
+    to stay conservative on today's catalog, but nothing makes that hold for the next row added.
     """
-    hidden = int(getattr(info, "hidden_size", 0) or 0)
-    head_dim = int(getattr(info, "head_dim", 0) or 0)
-    if hidden <= 0 or head_dim <= 0 or hidden % head_dim:
-        return 0
-    return hidden // head_dim
+    return int(getattr(info, "num_attention_heads", 0) or 0)
 
 
 def allocate(

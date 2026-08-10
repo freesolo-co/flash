@@ -825,42 +825,73 @@ def test_eight_cards_require_validated_head_geometry():
 
 
 def test_geometry_cap_follows_each_models_own_head_count():
-    """The cap is per-model geometry, not one blanket ceiling.
+    """The cap must divide each row's RECORDED head count, never a derived stand-in.
 
-    Query-head counts are ``hidden_size // head_dim`` and they are NOT all powers of two: 3.5-4B has
-    10 and 3.6-27B has 20. Renting the authored 8 for those hands verl an ``sp_size`` that does not
-    divide the head count, so the run pays for the box and dies in Ulysses init. Every catalog row is
-    checked here so a new model with awkward geometry cannot be added without this failing.
+    ``hidden_size // head_dim`` is not the head count: these checkpoints decouple ``head_dim`` from
+    that ratio, and the quotient is wrong for four of six rows (3.5-4B is 16 heads, not 2560/256 =
+    10). Every row is checked against ``num_attention_heads`` so a future model with, say, 20 heads
+    is capped at 4 instead of rented at 8 and failed in Ulysses init.
     """
     from flash.core.catalog import MODELS
     from flash.providers.allocator import geometry_safe_gpu_cap
 
     for model_id, info in MODELS.items():
-        heads = info.hidden_size // info.head_dim
-        cap = geometry_safe_gpu_cap(model_id, 8)
-        assert heads % cap == 0, f"{model_id}: {heads} heads is not divisible by a {cap}-card cap"
+        heads = info.num_attention_heads
+        assert heads > 0, f"{model_id}: catalog row records no num_attention_heads"
+        # the derived quotient must never be used as the head count; pin the divergence so a future
+        # refactor cannot quietly reintroduce it.
+        assert heads % geometry_safe_gpu_cap(model_id, 8) == 0
         # SFT resolves the omitted revision to a sha BEFORE allocation
         # (`prepare_job` -> `_resolve_model_revision(required=True)`), so the cap must still read
-        # the row's geometry when a revision is present. The four-card ceiling is a bound, not a
-        # divisibility proof -- 4 divides 10 no better than 8 does.
-        resolved = geometry_safe_gpu_cap(model_id, 8, model_revision="a" * 40)
-        assert heads % resolved == 0, (
-            f"{model_id}: {heads} heads is not divisible by a {resolved}-card cap after the "
-            "revision was resolved to a sha"
-        )
+        # the row's geometry when a revision is present.
+        assert heads % geometry_safe_gpu_cap(model_id, 8, model_revision="a" * 40) == 0
 
-    # the reported failure: 10 heads means 4 and 8 both leave a remainder, so 2 is the widest shape.
+    # the derivation this replaced disagrees with the truth on four of six rows.
+    derived_wrong = [
+        m for m, i in MODELS.items() if i.hidden_size // i.head_dim != i.num_attention_heads
+    ]
+    assert len(derived_wrong) == 4, derived_wrong
+    assert MODELS["Qwen/Qwen3.5-4B"].num_attention_heads == 16
     assert MODELS["Qwen/Qwen3.5-4B"].hidden_size // MODELS["Qwen/Qwen3.5-4B"].head_dim == 10
-    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-4B", 8) == 2
-    # models whose geometry does divide are NOT narrowed -- the cap must not become a blanket floor.
-    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8) == 8
+
+    # every CURRENT row divides by 8, so no row is narrowed today. that is a property of this
+    # catalog, not an invariant -- the loop above is what enforces it for whatever is added next.
+    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-4B", 8) == 8
+    assert geometry_safe_gpu_cap("Qwen/Qwen3.6-27B", 8) == 8
     # an authored ceiling below the geometric limit still wins; the cap only ever narrows.
     assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 2) == 2
     # a model outside the catalog has no readable geometry, so it keeps the unvalidated ceiling.
     assert geometry_safe_gpu_cap("some-org/not-in-catalog", 8) == 4
-    # the 4B is the case that motivated this: SFT hands allocation a resolved sha, and keying on
-    # revision-emptiness alone silently returned 4 -- a width its 10 heads still do not divide.
-    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-4B", 8, model_revision="a" * 40) == 2
+
+
+def test_geometry_cap_narrows_a_row_whose_heads_do_not_divide_eight():
+    """A row with awkward geometry must be capped, not rented and failed at Ulysses init.
+
+    No current catalog row exercises this -- all six divide by 8 -- so the guard is proven against a
+    synthetic 20-head row rather than left as untested code that only runs on a future model.
+    """
+    from dataclasses import replace
+
+    from flash.core.catalog import MODELS
+    from flash.providers.allocator import geometry_safe_gpu_cap
+
+    awkward = replace(MODELS["Qwen/Qwen3.5-9B"], id="Qwen/Fake-20-Head", num_attention_heads=20)
+    patched = dict(MODELS)
+    patched["Qwen/Fake-20-Head"] = awkward
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr("flash.core.catalog.MODELS", patched)
+        # 20 % 8 != 0 and 20 % 4 == 0, so the widest legal rentable shape is 4.
+        assert geometry_safe_gpu_cap("Qwen/Fake-20-Head", 8) == 4
+        # 24 heads divide 8, so a 24-head row is NOT narrowed.
+        patched["Qwen/Fake-24-Head"] = replace(awkward, num_attention_heads=24)
+        assert geometry_safe_gpu_cap("Qwen/Fake-24-Head", 8) == 8
+        # a row with no recorded head count cannot be certified, so it keeps the safe ceiling.
+        patched["Qwen/Fake-Unknown"] = replace(awkward, num_attention_heads=0)
+        assert geometry_safe_gpu_cap("Qwen/Fake-Unknown", 8) == 4
+    finally:
+        monkey.undo()
 
 
 def test_schema_preflight_applies_the_geometry_cap_to_provisional_sizing():

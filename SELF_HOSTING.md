@@ -36,10 +36,18 @@ export RUNPOD_API_KEY=...              # or LAMBDA_API_KEY, or VAST_API_KEY
 flash-server --host 0.0.0.0 --port 8080
 ```
 
+`flash-server` speaks plain HTTP. For anything but loopback, put a TLS-terminating reverse proxy
+(nginx, Caddy, a cloud load balancer) in front of it and point DNS for your hostname at the proxy -
+the plane itself never terminates TLS. On the same machine, skip the proxy and use
+`http://127.0.0.1:8080` below.
+
 Then point a client at it:
 
 ```bash
+# remote: the https address of your TLS proxy, not the plane's own :8080
 flash login --api-url https://your-plane.example --api-key "$FREESOLO_INTERNAL_KEY"
+# same machine: loopback plaintext is fine
+# flash login --api-url http://127.0.0.1:8080 --api-key "$FREESOLO_INTERNAL_KEY"
 flash train run.toml
 ```
 
