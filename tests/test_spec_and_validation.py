@@ -801,7 +801,7 @@ def test_environment_subfields_reject_wrong_types() -> None:
     "key",
     [
         "PARASAIL_API_KEY",
-        "FLASH_CONTROL_PANEL_URL",
+        "FLASH_PUBLIC_URL",
         "FLASH_TEACHER_CAPABILITY",
     ],
 )
@@ -1155,12 +1155,6 @@ def test_vram_sft_per_device_bs_is_managed_default(monkeypatch) -> None:
     for val in ("8", "1", "not-an-int"):
         monkeypatch.setenv("SFT_PER_DEVICE_BS", val)
         assert vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32, vocab=1) == at_cap
-
-
-def test_fetch_hf_params_is_offline_safe(monkeypatch) -> None:
-    from flash.engine.plan import vram
-
-    assert vram.fetch_hf_params_b("any/model") is None
 
 
 # ---------------------------------------------------------------------------

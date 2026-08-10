@@ -10,7 +10,8 @@ from __future__ import annotations
 import pytest
 
 from flash.core.catalog import resolve_model
-from flash.engine.plan.vram import GPU_VRAM_GB, estimate_vram_gb
+from flash.engine.plan.vram import estimate_vram_gb
+from flash.providers.base import get_gpu_info
 from flash.schema import ConfigError, spec_from_dict
 from tests._helpers.specs import raw_spec as _raw
 
@@ -232,12 +233,10 @@ def test_a_pre_upgrade_worker_env_snapshot_still_passes_its_integrity_digest(tmp
 def _headroom(params_b: float, algo: str, quant: str, gpu: str) -> str:
     """The advisory fits/tight/too_big banding, applied straight to the sizing equations.
 
-    This used to be `check_fit`, an estimator wrapper that fetched the model's size from HF. Only the
-    open-model path consulted its verdict, so the wrapper went with it -- but the BANDS are what the
-    anchors below calibrate, and those still gate real sizing decisions.
+    The bands below calibrate live sizing decisions directly against managed GPU capacities.
     """
     est = estimate_vram_gb(params_b, algo, quant)
-    gpu_gb = GPU_VRAM_GB[gpu]
+    gpu_gb = get_gpu_info(gpu).vram_gb
     if est > gpu_gb * 1.15:
         return "too_big"
     return "tight" if est > gpu_gb * 0.85 else "fits"

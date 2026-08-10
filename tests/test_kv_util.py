@@ -179,11 +179,9 @@ def test_robust_to_missing_params_and_zero_context():
 
 
 def test_moe_sizes_kv_on_active_backbone_not_total():
-    """An MoE's resident KV pool must scale with the ACTIVE backbone (so the runtime
-    colocate budget matches grpo_fits_resident's sleep-mode gate, which sizes its KV on active), while
-    the bf16 weight copy stays on the FULL total. Keying KV off the 35B total would budget a bigger
-    pool than the gate counted -> the gate could disable sleep while the engine reserves more KV than
-    it sized (the near-margin 35B-A3B GRPO mismatch)."""
+    """An MoE's resident KV pool must scale with the active backbone while the bf16 weight copy
+    stays on the full total. Keying KV off the 35B total would budget a larger pool than resident
+    sizing counts, creating a near-margin 35B-A3B GRPO mismatch."""
     card = 400.0  # large enough that the 0.45 cap doesn't mask the active-vs-total KV difference
     # 35B-A3B, non-sleep resident path: KV on the active 3B, weights on the full 35B.
     u_active = colocate_kv_util(35.0, 2048, card, sleep_mode=False, active_params_b=3.0)

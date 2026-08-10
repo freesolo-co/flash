@@ -5,8 +5,7 @@ from __future__ import annotations
 import pytest
 
 
-def test_required_vram_catalog_and_open(monkeypatch):
-    from flash.engine.plan import vram
+def test_required_vram_catalog_and_open():
     from flash.providers import allocator
     from flash.providers.allocator import required_vram_gb
 
@@ -16,10 +15,6 @@ def test_required_vram_catalog_and_open(monkeypatch):
     # chunked nll bounds the vocab projection to one verl FusedLinearForPPO chunk (512 token rows,
     # NOT 256): 512 * 248320 * 16 B = 2.03 GB, which is what the child actually allocates.
     assert required_vram_gb("Qwen/Qwen3.5-4B", "sft") == 20
-    # sized for GRPO (the heavier phase of the usual SFT+GRPO run) + headroom
-    monkeypatch.setattr(vram, "fetch_hf_params_b", lambda m, **k: 4.0)
-    est = vram.estimate_vram_gb(4.0, "grpo")
-
     # Default GRPO (no [train].max_context_tokens) sizes at the run's REAL engine length, mirroring
     # run_rl()'s max(1024, rl.max_prompt_len + completion) = 2048 + 320 = 2368 tokens (NOT a flat
     # 1024). At 2368 the 4.7B param estimate is ~31.8 GB raw -> 35 GB with headroom, so a 32 GB card
@@ -1303,43 +1298,6 @@ def test_qwen4b_sft_8192_chunked_nll_routes_to_32gb_card(monkeypatch):
     assert estimate.required_vram_gb == need
     assert estimate.gpu == preview_gpu
     assert get_gpu_info(preview_gpu).vram_gb >= need
-
-
-def test_required_vram_sft_plain_nll_fallback_keeps_logits_term(monkeypatch):
-    import math
-
-    from flash.core.catalog import vocab_size_for
-    from flash.engine.plan import vram
-    from flash.engine.plan.vram import estimate_vram_gb, model_required_vram_gb
-
-    mid = "meta-llama/Llama-3.2-1B"
-    params_b = 1.2
-    monkeypatch.setattr(vram, "fetch_hf_params_b", lambda model_id: params_b)
-    train = {"max_context_tokens": 4096, "batch_size": 4}
-    need = model_required_vram_gb(mid, "sft", train=train, headroom=1.0)
-    unfused = math.ceil(
-        estimate_vram_gb(
-            params_b,
-            "sft",
-            seq_len=train["max_context_tokens"],
-            batch_size=train["batch_size"],
-            vocab=vocab_size_for(mid),
-            sft_fused_ce=False,
-        )
-    )
-    fused = math.ceil(
-        estimate_vram_gb(
-            params_b,
-            "sft",
-            seq_len=train["max_context_tokens"],
-            batch_size=train["batch_size"],
-            vocab=vocab_size_for(mid),
-            sft_fused_ce=True,
-        )
-    )
-
-    assert need == unfused
-    assert need > fused
 
 
 def test_sft_equation_covers_honest_peak_across_seq_boundary():

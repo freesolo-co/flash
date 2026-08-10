@@ -25,24 +25,30 @@ def deadline_kwargs(call, deadline_at: float | None) -> dict[str, float | None]:
     return {}
 
 
+def require_finite_positive(value: object, invalid_message: str) -> float:
+    """Return ``value`` as a finite positive float or fail closed with ``invalid_message``.
+
+    ``bool`` is rejected explicitly: it is an ``int`` subclass, so ``True`` would otherwise pass
+    as the timestamp 1.0 and silently arm a deadline that expired in 1970.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError(invalid_message)
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise RuntimeError(invalid_message)
+    return number
+
+
 def require_deadline_at(deadline_at: object) -> float:
     """Return a finite positive unix deadline or fail closed."""
-    if isinstance(deadline_at, bool) or not isinstance(deadline_at, (int, float)):
-        raise RuntimeError("run wall deadline is invalid")
-    deadline = float(deadline_at)
-    if not math.isfinite(deadline) or deadline <= 0:
-        raise RuntimeError("run wall deadline is invalid")
-    return deadline
+    return require_finite_positive(deadline_at, "run wall deadline is invalid")
 
 
 def remaining_seconds(deadline_at: object, *, now: float | None = None) -> float:
     deadline = require_deadline_at(deadline_at)
-    current_value = time.time() if now is None else now
-    if isinstance(current_value, bool) or not isinstance(current_value, (int, float)):
-        raise RuntimeError("current clock is invalid")
-    current = float(current_value)
-    if not math.isfinite(current) or current <= 0:
-        raise RuntimeError("current clock is invalid")
+    current = require_finite_positive(
+        time.time() if now is None else now, "current clock is invalid"
+    )
     return deadline - current
 
 

@@ -923,7 +923,6 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
     monkeypatch.setattr(opd_mod, "_student_model", _boom)
     monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "setup_perf_backends", lambda *a, **k: None)
-    monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "gpu_diagnostics", lambda *a, **k: {})
 
     import transformers
@@ -932,7 +931,7 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
     import flash.engine.worker.teacher.client as tmod
 
     monkeypatch.setattr(tmod, "TeacherClient", lambda *a, **k: object())
-    monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
+    monkeypatch.setenv("FLASH_PUBLIC_URL", "https://broker.example")
     monkeypatch.setenv("FLASH_TEACHER_CAPABILITY", "unit-test-teacher-capability")
 
     # The all-over-budget guard (RuntimeError) must fire; _student_model's AssertionError would

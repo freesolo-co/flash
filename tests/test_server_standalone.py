@@ -810,3 +810,86 @@ def test_a_catalog_run_parses_on_both_deployments(monkeypatch) -> None:
         else:
             monkeypatch.setenv(auth.STANDALONE_ENV, standalone_value)
         assert _deps._parse_spec({"spec": raw_spec()}, run_id="r").model == raw_spec()["model"]
+
+
+# ---------------------------------------------------------------------------
+# Environment admission DOES vary by deployment
+# ---------------------------------------------------------------------------
+_GITHUB_ENV_FORMS: tuple[str, ...] = (
+    "github:owner/repo@main:env/environment.py",
+    "https://github.com/owner/repo/tree/main/env",
+)
+
+
+@pytest.mark.parametrize("env_id", _GITHUB_ENV_FORMS)
+def test_the_managed_service_refuses_a_direct_github_environment(monkeypatch, env_id: str) -> None:
+    """The hub is the only repo the managed plane can vouch for, so it is the only one it runs.
+
+    A ``github:`` ref names a repo Freesolo has no relationship with: nothing reviewed it, nothing
+    associated it with a project, and ``flash env push`` never wrote it. Accepting one would run
+    unreviewed code under a Freesolo run, so the hosted plane refuses both spellings of it.
+    """
+    _deps = _deps_module()
+    from fastapi import HTTPException
+
+    from tests._helpers.specs import raw_spec
+
+    monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
+    payload = {"spec": raw_spec(environment={"id": env_id})}
+    with pytest.raises(HTTPException) as ei:
+        _deps._parse_spec(payload, run_id="r")
+    assert ei.value.status_code == 400
+    assert "hub" in str(ei.value.detail)
+
+
+@pytest.mark.parametrize("env_id", _GITHUB_ENV_FORMS)
+def test_a_self_hosted_plane_still_accepts_a_direct_github_environment(
+    monkeypatch, env_id: str
+) -> None:
+    """The gate must not brick self-hosting, which is the whole reason it is a gate and not a delete.
+
+    A standalone plane cannot publish to Freesolo's hub and a local ``path`` is rejected outright,
+    so the explicit GitHub forms are its ONLY way to name an environment. If this fails, a
+    self-hosted operator has no environment source at all.
+    """
+    _deps = _deps_module()
+
+    from tests._helpers.specs import raw_spec
+
+    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
+    spec = _deps._parse_spec({"spec": raw_spec(environment={"id": env_id})}, run_id="r")
+    assert spec.environment.id == env_id
+
+
+def test_the_hub_slug_is_accepted_on_both_deployments(monkeypatch) -> None:
+    """The counterpart to the refusal: the managed form works everywhere, so the check above is
+    really about the GitHub forms and not about the hosted parser refusing environments at large."""
+    _deps = _deps_module()
+    from tests._helpers.specs import raw_spec
+
+    for standalone_value in ("1", None):
+        if standalone_value is None:
+            monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
+        else:
+            monkeypatch.setenv(auth.STANDALONE_ENV, standalone_value)
+        spec = _deps._parse_spec({"spec": raw_spec(environment={"id": "owner/env"})}, run_id="r")
+        assert spec.environment.id == "owner/env"
+
+
+def test_a_missing_environment_id_keeps_the_schema_error_on_the_hosted_plane(monkeypatch) -> None:
+    """The gate must not intercept an absent id and answer with the wrong message.
+
+    ``[environment] id`` missing is a different mistake from naming an unsupported source, and the
+    schema already explains it (with the `flash env push` hint). Reporting "not a Freesolo
+    environment id" for an id the caller never set would send them looking for a typo.
+    """
+    _deps = _deps_module()
+    from fastapi import HTTPException
+
+    from tests._helpers.specs import raw_spec
+
+    monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
+    with pytest.raises(HTTPException) as ei:
+        _deps._parse_spec({"spec": raw_spec(environment={})}, run_id="r")
+    assert ei.value.status_code == 400
+    assert "must set [environment] id" in str(ei.value.detail)

@@ -18,7 +18,9 @@ SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "project": "11111111-1111-4111-8111-111111111111",
     "algorithm": "grpo",
-    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
+    # A hub slug, because this fixture drives the HOSTED api: the managed plane accepts
+    # `namespace/name` only, and a `github:` ref is refused at submit (see test_server_standalone).
+    "environment": {"id": "acme/gsm8k"},
     "train": {"epochs": 1, "max_examples": 1},
     "gpu": {},
 }
@@ -50,8 +52,7 @@ def _bearer(key: str) -> dict:
 def _spec(monkeypatch):
     """Parse SPEC into a JobSpec offline.
 
-    SPEC is a catalog model on a concrete GPU pin, so the parse never probes HF anyway; the
-    autouse ``_offline`` conftest fixture also stubs ``fetch_hf_params_b`` -- no env switch.
+    SPEC is a catalog model on a concrete GPU pin, so the parse never probes HF.
     """
     from flash.schema import spec_from_dict
 
@@ -287,6 +288,17 @@ def api(tmp_path, monkeypatch):
         projects_mod,
         "require_project_access",
         lambda *, project_id, **_kwargs: project_id,
+    )
+    # A hub environment is validated against the Freesolo backend at submit. These are BILLING
+    # tests, so stub it to a pass the same way `require_project_access` is stubbed above; without
+    # it every submit here 4xxs on environment authorization before reaching any billing code.
+    import flash.server.domain.environment_registry as environment_registry_mod
+
+    monkeypatch.setattr(
+        environment_registry_mod,
+        "require_environment_project",
+        lambda **_kwargs: None,
+        raising=False,
     )
     monkeypatch.setattr(run_registry, "_post", lambda *a, **k: False, raising=False)
     auth_mod._verify_cache.clear()

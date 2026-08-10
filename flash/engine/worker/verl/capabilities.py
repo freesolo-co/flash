@@ -311,6 +311,40 @@ def gdn_probe_module(model_id: str, revision: str = "") -> str:
     return f"transformers.models.{model_type}.modeling_{model_type}"
 
 
+def strict_gdn_probe_module(model_id: str, revision: str = "") -> str:
+    """``gdn_probe_module`` that RAISES rather than guessing the arch, for a packed run.
+
+    ``gdn_model_type`` answers ``qwen3_5`` both when the config says so and when the config could
+    not be read at all. Those are the same string and a different meaning. For a packed run the
+    difference is silent corruption: ``Qwen/Qwen3.6-35B-A3B`` is ``qwen3_5_moe``, so the fallback
+    names the DENSE module -- the child clears it, the shim patches it, the MoE layers it was
+    supposed to protect stay unpatched, and packed examples bleed state while the log reports
+    ``gdn packed-boundary resets active``. A failed read must stop the run instead.
+    """
+    from transformers import AutoConfig
+
+    from flash.engine.worker.io.hf import model_revision_kwargs
+
+    try:
+        cfg = AutoConfig.from_pretrained(
+            model_id, trust_remote_code=True, **model_revision_kwargs(revision)
+        )
+        model_type = getattr(cfg, "model_type", None)
+    except Exception as e:
+        raise RuntimeError(
+            f"packed gdn run could not read the model config for {model_id!r}, so the modeling "
+            "module to patch is unknown. refusing to guess: the fallback arch would patch a "
+            "different module than the model uses and train across packed example boundaries "
+            "while reporting resets as active."
+        ) from e
+    if not model_type:
+        raise RuntimeError(
+            f"packed gdn run read the config for {model_id!r} but it declares no model_type, so "
+            "the modeling module to patch is unknown. refusing to guess."
+        )
+    return f"transformers.models.{model_type}.modeling_{model_type}"
+
+
 def gdn_reset_arch_from_caps(caps: dict, gdn_module: str) -> str | None:
     """the architecture to patch when the VERL CHILD can honor packed GDN boundary resets, else None.
 
@@ -340,9 +374,12 @@ def require_gdn_boundary_resets(caps: dict, gdn_module: str) -> str | None:
     alternative: ``engine/vram.py`` sizes assuming no dense ``[b, s, vocab]`` logits tensor exists
     (~130 GB at 32k on a 248k vocab), trading this crash for an OOM. Give the child the kernels.
 
-    sft reaches the same branch but is safe without resets: every gdn model profiles as
-    exact-unpacked, pinning ``examples_per_update`` to 1 (``sft_workload.py:410``), so there are no
-    packed neighbours to contaminate.
+    sft reaches this too, and a PACKED sft run needs resets for the same reason: its quote-side gate
+    is device-independent by construction (the profile job is cpu-only, see
+    ``gdn_packing_contract_available``), so it can prove the kernels are installed but never that
+    the conv kernel runs on this card. an ``exact-unpacked`` sft run stays safe without resets --
+    ``examples_per_update`` is 1, so there are no packed neighbours to contaminate -- which is why
+    sft asks this only for a packed profile.
     """
     if not gdn_module:
         return None

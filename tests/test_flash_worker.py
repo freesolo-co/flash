@@ -88,7 +88,7 @@ def test_build_worker_env_opd_uses_sleep_safe_allocator(monkeypatch):
         opd_spec,
         0,
         runtime_secrets={
-            "FLASH_CONTROL_PANEL_URL": "https://broker.example",
+            "FLASH_PUBLIC_URL": "https://broker.example",
             "FLASH_TEACHER_CAPABILITY": "capability-test-value",
         },
     )
@@ -139,15 +139,15 @@ def test_build_worker_env_forwards_only_managed_teacher_capability_for_opd(monke
         opd_spec,
         0,
         runtime_secrets={
-            "FLASH_CONTROL_PANEL_URL": "https://broker.example",
+            "FLASH_PUBLIC_URL": "https://broker.example",
             "FLASH_TEACHER_CAPABILITY": "capability-test-value",
         },
     )
-    assert env["FLASH_CONTROL_PANEL_URL"] == "https://broker.example"
+    assert env["FLASH_PUBLIC_URL"] == "https://broker.example"
     assert env["FLASH_TEACHER_CAPABILITY"] == "capability-test-value"
     assert "PARASAIL_API_KEY" not in env
     grpo = build_worker_env(_spec(), 0)
-    assert "FLASH_CONTROL_PANEL_URL" not in grpo
+    assert "FLASH_PUBLIC_URL" not in grpo
     assert "FLASH_TEACHER_CAPABILITY" not in grpo
 
 
@@ -190,7 +190,7 @@ def test_build_worker_env_rejects_managed_teacher_byo_names():
             0,
             runtime_secrets={
                 "PARASAIL_API_KEY": "byo-parasail-key",
-                "FLASH_CONTROL_PANEL_URL": "https://broker.example",
+                "FLASH_PUBLIC_URL": "https://broker.example",
                 "FLASH_TEACHER_CAPABILITY": "capability-test-value",
             },
         )
@@ -367,20 +367,6 @@ def test_runpod_backoff_no_overflow_on_long_runs():
     from runpod_flash.core.resources import serverless
 
     assert serverless.get_backoff_delay(100000, max_seconds=5) <= 5 * 1.2 + 1e-9
-
-
-def test_require_vllm_for_rollout_func_rejects_vllm_off_multiturn():
-    """Multi-turn GRPO with vLLM disabled (the 35B tier's grpo_use_vllm=False, or RL_USE_VLLM=0)
-    must fail fast — the rollout closure reads trainer.vllm_generation.llm, which only exists
-    when use_vllm=True, so otherwise it would AttributeError deep in the first rollout turn."""
-    from flash.engine.worker import require_vllm_for_rollout_func
-
-    with pytest.raises(RuntimeError, match="needs colocated vLLM"):
-        require_vllm_for_rollout_func(True, False, "Qwen/Qwen3.6-35B-A3B")
-    # every supported combination is a no-op (single-turn, or vLLM enabled)
-    require_vllm_for_rollout_func(True, True, "m")
-    require_vllm_for_rollout_func(False, False, "m")
-    require_vllm_for_rollout_func(False, True, "m")
 
 
 def test_error_artifact_name_is_per_phase_and_attempt():
