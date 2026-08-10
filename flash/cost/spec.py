@@ -231,20 +231,14 @@ def runconfig_from_spec(spec) -> RunConfig:
             rollout.completion_tokens_mean if rollout is not None else None
         ),
         measured_prompt_tokens=(rollout.prompt_tokens_mean if rollout is not None else None),
-        # a real measurement beats a declaration, which beats the measured-population default.
-        # an unsampled profile is NOT a measurement of zero, so it falls through to the run's own
-        # declaration -- the only way a slow external judge can be priced, since the step floor
-        # covers a local scorer and nothing times the judge before the quote is persisted.
-        #
-        # a probe that ran and FAILED is not a measurement either. reward_failures == reward_samples
-        # is a permitted profile state and trustworthy() has no reward-success check, so without the
-        # second condition an all-failed probe contributes its ~0s latency as though it were
-        # evidence and silently discards the declaration -- underquoting exactly the slow or
-        # unavailable grader the knob exists to cover.
+        # a probe that ran and FAILED is not a measurement. reward_failures == reward_samples is a
+        # permitted profile state and trustworthy() has no reward-success check, so comparing
+        # against 0 would let an all-failed probe contribute its ~0s latency as though it were
+        # evidence. requiring a successful sample sends that case to the default instead.
         reward_seconds_per_completion=(
             rollout.reward_seconds_per_completion
             if rollout is not None and rollout.reward_samples > rollout.reward_failures
-            else t.reward_seconds_per_completion
+            else None
         ),
     )
 

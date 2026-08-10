@@ -75,33 +75,6 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     raw_public = status.spec if isinstance(status.spec, dict) else {}
     legacy_public_keys = {k: raw_public[k] for k in _DROPPED_TOP_LEVEL_KEYS if k in raw_public}
     legacy_public_alpha = runner._prepared_before_public_alpha(raw_public)
-    legacy_reward_latency = runner._prepared_before_reward_latency(raw_public, raw_worker)
-
-    def _digest_matches(stored: object, adapter_identity: object) -> bool:
-        """Whether ``stored`` reproduces, under this build or the pre-1.1.40 serialization.
-
-        ``reward_seconds_per_completion`` (1.1.40) is emitted on both payloads, so a snapshot
-        prepared before it hashed neither and cannot reproduce under today's serialization. The
-        stored bytes alone cannot date the snapshot -- a caller may persist a hand-built spec that
-        omits the key while its digest was computed the modern way -- so the current form is tried
-        FIRST and the legacy form is only a fallback. That ordering keeps the modern digest
-        authoritative, and the fallback can only ever admit a payload whose bytes lack the key.
-        """
-        if not isinstance(stored, str):
-            return False
-        common = {
-            "legacy_keys": legacy_keys,
-            "legacy_public_keys": legacy_public_keys,
-            "legacy_public_alpha": legacy_public_alpha,
-        }
-        if stored == runner._preparation_digest(
-            public_spec, worker_spec, adapter_identity, **common
-        ):
-            return True
-        return legacy_reward_latency and stored == runner._preparation_digest(
-            public_spec, worker_spec, adapter_identity, legacy_reward_latency=True, **common
-        )
-
     has_workload_profile = bool(
         worker_spec.workload_profile_kind
         or worker_spec.workload_profile_input_digest
@@ -110,7 +83,14 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     if has_workload_profile:
         if snapshot.get("workload_profile") != (worker_spec.workload_profile or None):
             raise ValueError("persisted workload profile does not match the worker spec")
-        if not _digest_matches(stored_digest, expected):
+        if not isinstance(stored_digest, str) or stored_digest != runner._preparation_digest(
+            public_spec,
+            worker_spec,
+            expected,
+            legacy_keys=legacy_keys,
+            legacy_public_keys=legacy_public_keys,
+            legacy_public_alpha=legacy_public_alpha,
+        ):
             raise ValueError("persisted effective preparation failed integrity validation")
     if public_spec.train.init_from_adapter:
         if not isinstance(expected, dict) or not expected.get("digest"):
@@ -118,7 +98,14 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
                 f"warm-start source {public_spec.train.init_from_adapter!r} cannot be recovered "
                 "because its original artifact identity is unavailable"
             )
-        if not _digest_matches(stored_digest, expected):
+        if not isinstance(stored_digest, str) or stored_digest != runner._preparation_digest(
+            public_spec,
+            worker_spec,
+            expected,
+            legacy_keys=legacy_keys,
+            legacy_public_keys=legacy_public_keys,
+            legacy_public_alpha=legacy_public_alpha,
+        ):
             raise ValueError("persisted effective preparation failed integrity validation")
     if verify_source and public_spec.train.init_from_adapter:
         try:

@@ -503,9 +503,6 @@ def spec_from_dict(
             stop_sequences=_train_stops(train_raw),
             structured_outputs=_train_structured_outputs(train_raw),
             credit_assignment=_train_credit_assignment(train_raw),
-            reward_seconds_per_completion=_train_float(
-                train_raw, "reward_seconds_per_completion", minimum=0.0
-            ),
             # minimum=0: explicit 0 means "no cap" per trainspec contract
             max_steps=train_raw.get("max_steps"),
             max_examples=_train_int(train_raw, "max_examples", minimum=0),
@@ -587,10 +584,6 @@ _INAPPLICABLE_TRAIN_KNOBS: dict[str, dict[str, str]] = {
             "only applies to rollout algorithms (grpo, opd); they bound sampling, and SFT never "
             "generates"
         ),
-        "reward_seconds_per_completion": (
-            "only applies to grpo; it prices the wall your reward() spends grading, and SFT never "
-            "calls a reward function"
-        ),
     },
     "opd": {
         "entropy_quantile": (
@@ -604,10 +597,6 @@ _INAPPLICABLE_TRAIN_KNOBS: dict[str, dict[str, str]] = {
         "credit_assignment": (
             "only applies to grpo; it distributes group-relative advantage, and opd has no "
             "advantages to assign"
-        ),
-        "reward_seconds_per_completion": (
-            "only applies to grpo; it prices the wall your reward() spends grading, and opd "
-            "distils against a teacher with no reward function to time"
         ),
     },
     "grpo": {

@@ -286,20 +286,11 @@ def download_weight_gb(model_id: str, revision: str = "") -> float:
 # every card over-quoted. At 0.0 the same arms score 0.995x and 53/64. The fit arms' own graders
 # measured 0.0001-0.001s, so the floor's per-completion slope is what genuinely tracks grading cost.
 #
-# A reward() that calls a seconds-long external judge is NOT covered by this default, because
-# nothing can measure it before the quote is persisted: timing on the submitting host does not
-# describe the worker, and the worker publishes its own latency as telemetry only AFTER pricing.
-# Such a run declares the cost instead, via `[train] reward_seconds_per_completion`, which arrives
-# as the override below. The declared value is per completion AFTER the caller's own batching: the
-# quote multiplies it by every completion in the step, while the default adapter scores one call per
-# prompt group and runs those groups concurrently, so a judge that overlaps its work costs far less
-# wall than its per-call latency. TRAINING.md documents that unit for the operator.
-#
-# A nominal default cannot stand in for that declaration. The alternative was never "0.0 vs
-# correct" but "0.0 vs 1.0", and 1.0 was wrong for the population it was applied to (0.699x bias,
-# 31/64 in band, over-quoting every completion class and every card) while still leaving a 3s judge
-# 64s short per step. So the default describes the measured population and the declaration covers
-# the rest, rather than a guess being re-added on top of a floor that already carries grading.
+# A run whose reward() calls a slow external judge is priced from the ROLLOUT PROFILE, not from this
+# default and not from a human estimate: the profiler times the real reward() on the real worker and
+# publishes `reward_seconds_per_completion`, which arrives as the override below. That measurement
+# is what covers a slow grader, so a nominal default has nothing to add -- the alternative here was
+# never "0.0 vs correct" but "0.0 vs 1.0", and 1.0 over-quoted the whole measured population.
 AVG_REWARD_SECONDS_PER_COMPLETION = 0.0
 
 
