@@ -2977,6 +2977,51 @@ def test_all_transient_teacher_samples_exhaust_replacements_as_retriable():
     assert mutations == []
 
 
+def test_no_signal_failure_names_the_gate_that_dropped_the_rollouts():
+    """The fatal no-signal error must say WHICH pre-teacher gate dropped everything.
+
+    Three very different conditions land on the same "no aligned teacher signal" message: a
+    completion that reached the token cap without EOS, an empty response, and one that decodes to
+    replacement characters. The bridge's stats snapshot carries the tally, but it is only built
+    AFTER the child raises, so a run that loses every rollout leaves artifacts that cannot say
+    which gate fired. That ambiguity cost a paid GPU run, so pin the reason into the message.
+    """
+    import flash.engine.worker.train.opd.child.plugin as plugin
+
+    bridge = _text_bridge(_BridgeTeacher())
+
+    def run_attempt(attempt_ordinal):
+        # the completion carries no eos id and the bridge has no stop sequences, so this lands on
+        # the not-terminated gate and never reaches the teacher.
+        _post_json(
+            bridge.url,
+            bridge.token,
+            "/score",
+            _bridge_score_payload(0, [10, 11], [65, 66]),
+        )
+        raise _AllNoSignalBatch(attempt_ordinal)
+
+    bridge.start()
+    try:
+        with pytest.raises(RuntimeError) as failure:
+            _run_with_no_signal_replacements(
+                run_attempt,
+                lambda _batch: None,
+                lambda: None,
+                lambda: _post_json(bridge.url, bridge.token, "/no-signal/resample", {}),
+                lambda: plugin._post_no_signal_abandoned(bridge.url, bridge.token),
+            )
+    finally:
+        bridge.close()
+
+    message = str(failure.value)
+    # the existing contract still holds...
+    assert "after 3 rollout attempts" in message
+    # ...and the reason now rides along. assert on the COUNT too: a tally that reaches the message
+    # but reads zero would satisfy a substring check while telling the reader nothing.
+    assert "not_terminated=3" in message, message
+
+
 def test_mixed_transient_and_truncated_exhaustion_remains_retriable():
     from flash.engine.worker.perf import RetriableInfraError
     from flash.engine.worker.teacher.client import TeacherError

@@ -204,9 +204,19 @@ def _run_with_no_signal_replacements(
         except _AllNoSignalBatch as error:
             cleanup_attempt(error.batch)
             if attempt_ordinal == max_attempts - 1:
-                record_abandoned()
+                # name WHY every rollout was dropped. the three pre-teacher gates fail for very
+                # different reasons (cap reached without EOS, empty response, undecodable text) and
+                # the bare message sent a paid debugging cycle after the wrong one.
+                skips = record_abandoned() or {}
+                detail = (
+                    "; dropped before teacher scoring: "
+                    + ", ".join(f"{reason}={count}" for reason, count in sorted(skips.items()))
+                    if skips
+                    else ""
+                )
                 raise RuntimeError(
-                    f"flash OPD produced no aligned teacher signal after {max_attempts} rollout attempts"
+                    f"flash OPD produced no aligned teacher signal after {max_attempts} rollout "
+                    f"attempts{detail}"
                 ) from error
             record_resample()
             prepare_replacement()

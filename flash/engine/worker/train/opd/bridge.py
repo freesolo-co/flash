@@ -276,6 +276,17 @@ class _TeacherAlignmentBridge:
                 "align_group_n": self.align_group_n,
             }
 
+    def _record_skip(self, reason: str) -> None:
+        """Count one single-turn rollout dropped BEFORE the teacher was called.
+
+        Call with ``_stats_lock`` already held. Multi-turn already records its own reason; the
+        single-turn gates did not, and that gap cost a paid GPU run: a run that lost every rollout
+        reported only "no aligned teacher signal", which names the symptom and not one of the three
+        very different causes (cap reached without EOS, empty response, undecodable text). The
+        counters live in the same ``skip_counts`` dict the stats snapshot already publishes.
+        """
+        self.skip_counts[reason] = self.skip_counts.get(reason, 0) + 1
+
     def _empty(self, prompt_length: int, response_length: int) -> dict:
         teacher_ids, teacher_logprobs = encode_shifted_group_metadata(
             prompt_length, response_length, []
@@ -321,6 +332,8 @@ class _TeacherAlignmentBridge:
             self.generated_tokens += len(response_ids)
             self.forced_tokens += sum(forced)
         if not response_ids:
+            with self._stats_lock:
+                self._record_skip("empty_response")
             return self._empty(prompt_length, 0)
         stop_text = self.tokenizer.decode(response_ids, skip_special_tokens=False)
         if not _rollout_terminated(
@@ -328,6 +341,7 @@ class _TeacherAlignmentBridge:
         ):
             with self._stats_lock:
                 self.truncated_rollouts += 1
+                self._record_skip("not_terminated")
             return self._empty(prompt_length, len(response_ids))
         kept_ids, completion_text, kept_forced = _trim_response_and_forced(
             self.tokenizer,
@@ -337,6 +351,8 @@ class _TeacherAlignmentBridge:
             forced,
         )
         if not completion_text.strip() or "�" in completion_text:
+            with self._stats_lock:
+                self._record_skip("undecodable_or_blank")
             return self._empty(prompt_length, len(response_ids))
         try:
             teacher_score = score_rollout(
@@ -774,7 +790,12 @@ class _TeacherAlignmentBridge:
                 self._teacher_failure = self._pending_teacher_transient
             self._pending_teacher_transient = None
             self._pending_teacher_success = False
-        return {"ok": True}
+            # hand the per-reason skip tally back to the child so the fatal error can NAME the
+            # cause. the stats snapshot that also carries these is only built after the child has
+            # already raised, so without this a run that loses every rollout dies reporting "no
+            # aligned teacher signal" and the artifacts cannot say which gate dropped them.
+            skips = dict(self.skip_counts)
+        return {"ok": True, "skip_counts": skips}
 
     def commit_teacher_cycle(self) -> dict:
         with self._stats_lock:
