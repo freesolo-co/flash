@@ -7,6 +7,7 @@ from typing import ClassVar
 import pytest
 
 from flash.engine.profiling.workload_profile import (
+    MIN_TRUSTWORTHY_DISTINCT_PROMPTS,
     MIN_TRUSTWORTHY_ROLLOUTS,
     ROLLOUT_LATENCY_MAX_AGE_S,
     RolloutWorkloadProfile,
@@ -175,6 +176,24 @@ def test_a_thin_sample_is_refused_even_though_nothing_failed():
     ).trustworthy(now=NOW)
     assert ok is False
     assert f"below the {MIN_TRUSTWORTHY_ROLLOUTS} needed" in reason
+
+
+def test_a_sample_that_collapsed_onto_one_prompt_is_refused():
+    """Dropping over-budget rows moves BOTH sides of the coverage rule, so it cannot see this.
+
+    Measured: a shuffled prefix whose first eight rows contain seven over-budget prompts collects
+    all 32 draws from the one remaining prompt and reports `sampled == offered == 1`. Coverage is
+    satisfied because both sides collapsed together, and the rollout floor is satisfied because
+    there really are 32 draws -- so the profile scored `(True, '')` and priced every step of the run
+    from a single row while the workers train on the later valid ones.
+    """
+    ok, reason = _profile(sampled_prompts=1, offered_prompts=1).trustworthy(now=NOW)
+    assert ok is False
+    assert f"below the {MIN_TRUSTWORTHY_DISTINCT_PROMPTS} needed" in reason
+
+    # and it must reject for DISTINCTNESS, not by rejecting small offered sets generally: a dataset
+    # whose over-budget rows leave a genuinely multi-prompt sample is still measurable.
+    assert _profile(sampled_prompts=2, offered_prompts=2).trustworthy(now=NOW) == (True, "")
 
 
 def test_a_sample_dominated_by_failures_is_refused():

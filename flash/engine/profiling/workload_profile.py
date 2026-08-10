@@ -32,6 +32,21 @@ MIN_TRUSTWORTHY_ROLLOUTS = 32
 # clipped samples rather than report a censored mean as measurement.
 MAX_TRUSTWORTHY_TRUNCATION_RATE = 0.25
 
+# how many DISTINCT prompts a sample must still cover. the rollout floor above is only defensible
+# because those 32 draws spread across prompts -- variance is dominated by prompt mix, so 32 draws
+# from one row is not a smaller version of the same measurement, it is a measurement of one row.
+#
+# this binds where the coverage rule cannot. coverage compares sampled against OFFERED, and an
+# over-budget row leaves both sides at once: measured, a shuffled prefix with seven over-budget rows
+# collects all 32 draws from the one remaining prompt, reports sampled == offered == 1, and scores
+# `(True, '')`. the run then prices every step from a single unrepresentative row while the workers
+# train on the later valid ones.
+#
+# 2 is deliberately the weakest bar that still rules out the degenerate case, because the population
+# is only 8 rows and a real dataset with several long rows should still be measurable. it is a floor
+# on distinctness, not a target: the sampler already spreads across every prompt it can.
+MIN_TRUSTWORTHY_DISTINCT_PROMPTS = 2
+
 # which rows the profile measured. sft is never sampled: it either measures every source row or the
 # deterministic max_examples prefix training will consume, so both policies are exact.
 SFT_SAMPLE_POLICY_FULL = "exact-full"
@@ -565,6 +580,15 @@ class RolloutWorkloadProfile:
             return False, (
                 f"only {self.sampled_prompts} of {offered} prompts produced a draw; a prompt the "
                 "endpoint refuses is still trained on, so the sample omits part of the workload"
+            )
+        # dropping over-budget rows moves BOTH sides of the rule above, so it cannot catch a sample
+        # that shrank to a single prompt -- see MIN_TRUSTWORTHY_DISTINCT_PROMPTS. the rollout floor
+        # cannot catch it either: 32 draws from one row clears it while measuring one row.
+        if 0 < self.sampled_prompts < MIN_TRUSTWORTHY_DISTINCT_PROMPTS:
+            return False, (
+                f"all {self.completed_rollouts} draws came from {self.sampled_prompts} distinct "
+                f"prompt(s), below the {MIN_TRUSTWORTHY_DISTINCT_PROMPTS} needed; rollout length "
+                "varies by prompt, so this prices the run from one unrepresentative row"
             )
         # only LATENCY ages out, which is what this gate has always been about: a provider that
         # slows down or a card whose neighbours change invalidates the seconds. a client-measured
