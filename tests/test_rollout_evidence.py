@@ -3117,6 +3117,79 @@ def test_an_implausible_discount_is_not_priced_on_the_clients_word_alone():
     assert realistic is not None
 
 
+@pytest.mark.parametrize(
+    ("algorithm", "thinking", "resolved_cap"),
+    [("grpo", False, 320), ("grpo", True, 1536), ("opd", False, 512), ("opd", True, 1536)],
+)
+def test_the_floor_holds_when_the_cap_is_left_to_the_recipe(algorithm, thinking, resolved_cap):
+    """`max_completion_tokens` is optional, and the floor has to bind the runs that omit it.
+
+    Reading the field raw made the guard fail open on exactly the common path: measured, a one-token
+    claim was rejected against an explicit 512-token cap but ACCEPTED with the field unset, where
+    `normalized()` still resolves the recipe cap and prices the claim at a 320x understatement. The
+    floor is only worth anything if it compares against the same bound the quote is computed from.
+    """
+    import math
+
+    from flash.cost.spec import runconfig_from_spec
+
+    spec = _spec(
+        algorithm=algorithm,
+        thinking=thinking,
+        train=TrainSpec(max_steps=50, batch_size=8, group_size=4),
+    )
+    assert spec.train.max_completion_tokens is None, "this test is about the UNSET field"
+
+    # the cap pricing uses for this spec, which is what the floor must read too.
+    assert runconfig_from_spec(spec).normalized().completion_len == resolved_cap
+
+    forged = rollout_profile_from_evidence(
+        spec,
+        _evidence(
+            completion_tokens_mean=1.0,
+            completion_tokens_p50=1,
+            completion_tokens_p90=1,
+            completion_tokens_max=1,
+        ),
+        producer_version=VERSION,
+    )
+    assert forged is None, (
+        f"a one-token claim was accepted against an unset cap that prices at {resolved_cap}"
+    )
+
+    # and it still admits a genuine measurement on this same path, so it cannot pass by rejecting
+    # everything an unset cap submits.
+    from flash.server.domain.rollout_evidence import _MIN_UNATTESTED_MEAN_FRACTION
+
+    mean = math.ceil(resolved_cap * _MIN_UNATTESTED_MEAN_FRACTION) + 1.0
+    accepted = rollout_profile_from_evidence(
+        spec,
+        _evidence(
+            completion_tokens_mean=mean,
+            completion_tokens_p50=int(mean),
+            completion_tokens_p90=int(mean),
+            completion_tokens_max=int(mean),
+        ),
+        producer_version=VERSION,
+    )
+    assert accepted is not None, "a plausible measurement on the recipe-default path was rejected"
+
+
+def test_an_explicit_cap_is_still_measured_against_itself():
+    """Routing the floor through pricing must not move the bound for specs that DECLARE a cap.
+
+    `normalized()` fills only unset knobs, so an explicit cap has to resolve to itself -- otherwise
+    the fix would have swapped one set of specs for another rather than widening the guard.
+    """
+    from flash.cost.spec import runconfig_from_spec
+
+    for cap in (16, 512, 2048, 4096):
+        spec = _spec(
+            train=TrainSpec(max_steps=50, batch_size=8, group_size=4, max_completion_tokens=cap)
+        )
+        assert runconfig_from_spec(spec).normalized().completion_len == cap
+
+
 def test_evidence_missing_a_prompt_entirely_is_not_trustworthy():
     """The honest count alone does not protect the quote -- the trust gate has to act on it.
 

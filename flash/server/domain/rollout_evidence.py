@@ -30,8 +30,9 @@ _MAX_ROLLOUTS = 100_000
 _MAX_TOKENS = 10_000_000
 _MAX_REWARD_SECONDS = 3600.0
 
-# floor on how far an UNATTESTED measurement may discount the quote, as a fraction of the declared
-# completion cap. nothing here proves sampling happened -- re-deriving the config digest binds the
+# floor on how far an UNATTESTED measurement may discount the quote, as a fraction of the completion
+# cap the run is PRICED at -- recipe default included, since the field is optional and most runs omit
+# it. nothing here proves sampling happened -- re-deriving the config digest binds the
 # numbers to the caller's own config, not to any real generation -- so a caller could claim a 1-token
 # mean against a 2048-token cap and be billed for it: measured, that payload is accepted and scores
 # `(True, '')`, and `charge_completed_run` bills the quote while `precheck_training_run` admits the
@@ -78,17 +79,39 @@ def _discounts_below_the_unattested_floor(fields: dict[str, Any], spec: Any) -> 
     server-invented number, and every other rejection here returns the quote to the declared cap --
     the pricing an unmeasured run always had. so an implausible claim costs its author nothing but
     the discount they could not substantiate.
+
+    the cap is read through the SAME resolution pricing uses, not off ``spec.train``. that field is
+    optional, and reading it raw made the floor fail open on exactly the runs that omit it: measured,
+    a 1-token mean is rejected against an explicit cap of 512 but accepted when the field is unset,
+    where ``normalized()`` still resolves the recipe cap (grpo 320, opd 512, 1536 thinking) and
+    prices the claim at a 320x understatement. any bound the floor compares against has to be the
+    one the quote is actually computed from, or the two drift apart again.
     """
-    cap = 0
-    try:
-        cap = int(getattr(getattr(spec, "train", None), "max_completion_tokens", 0) or 0)
-    except (TypeError, ValueError):
-        cap = 0
+    cap = _resolved_completion_cap(spec)
     if cap <= 0:
-        # no declared cap to measure the claim against. the profile cannot underquote relative to a
-        # bound that does not exist, and inventing one here would reject valid submits.
+        # no cap even after resolution -- an algorithm that does not sample completions. such a spec
+        # is rejected upstream anyway (ROLLOUT_PROFILE_KINDS), so there is no quote to underquote.
         return False
     return fields["completion_tokens_mean"] < cap * _MIN_UNATTESTED_MEAN_FRACTION
+
+
+def _resolved_completion_cap(spec: Any) -> int:
+    """the completion cap this spec is PRICED at, recipe defaults included, or 0 if unavailable.
+
+    deliberately routed through ``runconfig_from_spec``/``normalized`` rather than reimplementing the
+    recipe lookup: a second copy of that resolution is a second thing to keep in step, and the whole
+    point of this helper is that the floor and the price read one number.
+    """
+    try:
+        from flash.cost.spec import runconfig_from_spec
+
+        cap = runconfig_from_spec(spec).normalized().completion_len
+        return int(cap or 0)
+    except Exception:
+        # pricing is a heavier path than the rest of this module, so it is not allowed to turn a
+        # submit into an error. failing to resolve leaves the floor inert for this payload, which is
+        # the same fail-open every other rejection here has: the quote stays on the declared cap.
+        return 0
 
 
 def evidence_is_well_formed(evidence: object) -> bool:
