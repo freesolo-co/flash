@@ -855,17 +855,16 @@ def main() -> None:
     verl_main()
 
 
-if os.environ.get("FLASH_OPD_STRUCTURED_OUTPUTS"):
-    _require_structured_runtime_versions()
-
-if importlib.util.find_spec("verl") is not None:
-    _install_verl_extensions()
-
-
 # re-exported so the child plugin keeps its public surface: the opd tests import these from
 # `child.plugin` and patch `plugin._post_json` there. the flat import is the one that runs in
 # the verl child workdir, where `flash` is not on the path and the file is `flash_opd_bridge`;
 # the package import is the one that runs in-repo. same shape as the multiturn import above.
+#
+# this block MUST stay above `_install_verl_extensions()`: that call runs at import time and passes
+# `_post_json` into the multi-turn agent loop, so binding these names afterwards leaves the install
+# path reading an unbound global. the child then dies with `NameError: _post_json`, and since the
+# loss decorator has already registered by that point the retry reports "flash_groupwise_reverse_kl
+# is already registered" instead, which points at the wrong problem entirely.
 try:
     from flash_opd_bridge import (
         FlashTeacherBridgeError,
@@ -912,3 +911,10 @@ except ImportError:
         _write_resample_failure_fallback,
         _write_score_delivery_failure_fallback,
     )
+
+
+if os.environ.get("FLASH_OPD_STRUCTURED_OUTPUTS"):
+    _require_structured_runtime_versions()
+
+if importlib.util.find_spec("verl") is not None:
+    _install_verl_extensions()
