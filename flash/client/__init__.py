@@ -10,6 +10,7 @@ from flash.client.http import (
     create_project,
     export_trace_records,
     get_project,
+    has_freesolo_backend,
     list_projects,
     list_trace_projects,
     upload_eval_run,
@@ -25,24 +26,27 @@ def resolve_project_id(project_id: str, api_key: str, api_url: str | None = None
     -- and neither is distinguishable from a typo, so they collapse into one message naming the way
     out. Every other status stays an ``ApiError``: a 500 is an outage, not a bad id.
 
-    Against a self-hosted plane there is no org directory to resolve through, so the id is only
-    validated for SHAPE -- exactly what ``flash/server/domain/projects.py`` does under ``standalone()``
-    when the same run is submitted. Without this the ownership lookup went to
+    With no Freesolo backend to reach there is no org directory to resolve through, so the id is
+    only validated for SHAPE -- exactly what ``flash/server/domain/projects.py`` does under
+    ``standalone()`` when the same run is submitted. Without this the ownership lookup went to
     ``api.freesolo.co``, which has no relationship with the operator's key and answers 401, so
     ``flash env setup`` died before writing a file on the very quickstart SELF_HOSTING.md
-    documents. The plane exposes no project routes at all, so there is nothing else to ask.
+    documents. A backend-less plane exposes no project routes at all, so there is nothing else to
+    ask.
 
-    ``api_url`` is the standalone signal, passed in rather than re-read from config because the
-    caller has already resolved it (and, like ``_verifies_against_freesolo``, because
-    ``FLASH_STANDALONE`` lives on the SERVER and the client cannot see it). Omitting it keeps the
-    hosted behaviour, so this stays a widening of the contract rather than a change to it.
+    ``api_url`` is passed in rather than re-read from config because the caller has already
+    resolved it (and because ``FLASH_STANDALONE`` lives on the SERVER, so the client cannot see
+    it). It is only one of the two signals though: an operator running their own plane against a
+    Freesolo-compatible backend DOES have a directory, and deciding on the url alone skipped the
+    ownership check for them, accepting any well-formed uuid. ``has_freesolo_backend`` is the
+    classifier the project and trace commands already use, so route through it here too rather
+    than keep a second, narrower answer to the same question. Omitting ``api_url`` keeps the
+    hosted behaviour.
 
     Defined here rather than in ``http`` so ``get_project`` resolves through THIS module's attribute
     at call time, which is the binding the CLI tests patch.
     """
-    from flash.serve.urls import is_freesolo_hosted_url
-
-    if api_url is not None and not is_freesolo_hosted_url(api_url):
+    if api_url is not None and not has_freesolo_backend(api_url):
         return require_project_id(project_id)
     try:
         return str(get_project(project_id, api_key)["id"])

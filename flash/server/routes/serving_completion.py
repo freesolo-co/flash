@@ -30,7 +30,6 @@ from flash.server.platform import db
 # patch would rebind the parent's attribute while this module kept calling the real function.
 from flash.server.routes import serving as _serving
 from flash.server.routes.serving import (
-    _deployment_attempt_is_stale,
     _deployment_failure_persisted,
     _deployment_state,
     _public_deployment,
@@ -65,14 +64,15 @@ def recover_deployments() -> int:
             deployment = status.deployment or {}
             state = deployment.get("state")
             if state in _DEPLOYMENT_BUSY_STATES:
-                if not _deployment_attempt_is_stale(deployment):
-                    continue
+                # No freshness test, deliberately: a live lifecycle holds the flock above for its
+                # whole duration, so ACQUIRING it proves no owner survives however recent the
+                # timestamp looks. Recovery runs only at startup, so skipping fresh records left
+                # them busy with nothing to revisit them, answering retries with 409 until aged out.
                 error = "deployment lifecycle interrupted by control-plane restart"
                 detail = "deployment interrupted; retry `flash models deploy`"
             elif state in _DEPLOYMENT_READY_STATES and _spec_is_unservable(status):
                 # a ready record with an unparseable spec is unservable, so fail it during startup.
-                # handle both readiness spellings from persisted builds; staleness applies only to
-                # busy states.
+                # handle both readiness spellings from persisted builds.
                 error = "deployment spec is no longer supported by this control plane"
                 detail = "deployment retired: its algorithm was removed; submit a new run to deploy"
             else:

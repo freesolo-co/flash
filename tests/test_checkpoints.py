@@ -637,3 +637,52 @@ def test_run_sft_publishes_final_step_as_deployable_checkpoint():
     assert "_export_checkpoint_adapter(" in src
     assert '_w.hf_upload_folder(adapter_dir, "adapter", required=True)' in src
     assert "_w.publish_deployable_checkpoint(adapter_dir, final_step)" in src
+
+
+def test_worker_io_modules_only_reference_attributes_their_siblings_define():
+    """A cross-module `_hf.<name>` reference must name something that exists.
+
+    `flash/engine/worker/io/checkpoint_upload.py` shipped calling five `_hf.` attributes that were
+    defined nowhere in the repo (`_stage_optional_directory`, `_OPTIONAL_CHECKPOINT_UPLOADER`,
+    `_OPTIONAL_DEPLOYABLE_UPLOADER`, `_checkpoint_upload_lock_timeout`, `_latest_checkpoint_dir`).
+    Nothing imported the module, so import-time checks and the linter stayed quiet and only a real
+    save would have raised AttributeError. This walks the io package's own `module.attr` references
+    and fails on any that its sibling does not actually define.
+    """
+    import ast
+    import importlib
+    import pathlib
+
+    io_dir = pathlib.Path(importlib.import_module("flash.engine.worker.io").__file__).parent
+    # module-alias -> real module, as bound by `from ... import x as _y` inside this package.
+    missing: list[str] = []
+    for path in sorted(io_dir.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        aliases: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
+                "flash.engine.worker.io"
+            ):
+                for alias in node.names:
+                    target = f"{node.module}.{alias.name}"
+                    if alias.asname and _module_or_none(target) is not None:
+                        aliases[alias.asname] = target
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id in aliases
+            ):
+                mod = _module_or_none(aliases[node.value.id])
+                if mod is not None and not hasattr(mod, node.attr):
+                    missing.append(f"{path.name}:{node.lineno} -> {node.value.id}.{node.attr}")
+    assert not missing, "references to undefined sibling attributes: " + "; ".join(missing)
+
+
+def _module_or_none(dotted: str):
+    import importlib
+
+    try:
+        return importlib.import_module(dotted)
+    except Exception:
+        return None

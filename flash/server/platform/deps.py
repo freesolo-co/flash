@@ -79,7 +79,24 @@ def manageable_run(
     org_id: str | None = None,
     project_id: str | None = None,
 ):
-    """Load a run for deployment management by its exact owner or matching internal scope."""
+    """Load a run for deployment management by its exact owner or matching internal scope.
+
+    A STANDALONE plane resolves its single operator credential to ``auth_kind == "internal"``
+    against the key-independent standalone-owner row, so the internal branch below sent the plane's
+    own run owner into ``_internal_org_run``, which requires an ``X-Freesolo-Org-Id`` header. The
+    CLI's deploy, poll, and undeploy calls send no such header and a standalone plane has no
+    organization directory to take one from, so the exact owner got 404 from every deployment
+    command.
+
+    The org/project scoping stays mandatory on a MANAGED plane, where the internal key is the
+    platform proxy rather than the user: it owns runs it submitted on a user's behalf, and
+    ``test_internal_owned_run_still_requires_matching_org_for_deployment_management`` pins that
+    even then it must name a matching org AND project to manage a deployment. Only standalone --
+    which is single-tenant by definition and cannot distinguish organizations at all -- takes the
+    exact-owner path.
+    """
+    if auth.standalone() and db.run_owner(run_id) == key["id"]:
+        return _load_status(run_id)
     if key.get("auth_kind") == "internal":
         status = _internal_org_run(run_id, key, org_id)
         persisted_project = status.spec.get("project") if isinstance(status.spec, dict) else None

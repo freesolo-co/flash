@@ -143,17 +143,54 @@ def _structurally_fits(available, need: int, cap: int) -> bool:
 def geometry_safe_gpu_cap(model_id: str, max_gpu_count: int, *, model_revision: str = "") -> int:
     """Rentable ceiling whose sequence-parallel divisibility is known before paid allocation.
 
-    Catalog default revisions have curated attention-head geometry and every row is divisible by 8.
-    Open-policy models and pinned catalog revisions currently validate coarse geometry but not the
-    pinned config's attention-head count, so keep them at the pre-existing four-card ceiling rather
-    than renting 8 cards that verl may reject at startup. ALLOC-004 tracks validating arbitrary and
-    pinned head geometry at every width.
+    The width becomes ``ulysses_sequence_parallel_size``, and verl requires
+    ``num_attention_heads % sp_size == 0``, so a catalog row is only safe at the counts that divide
+    its OWN head count. Curated membership is not uniform geometry: catalog head counts are 8, 8,
+    16, 16, 24, and 16, so trusting membership alone accepted an 8-card width for the 27B (24 heads)
+    that verl rejects at Ulysses init, after the box was already rented.
+
+    The head count is READ from the row (``num_attention_heads``), never derived: ``hidden_size //
+    head_dim`` is a different number on four of the six rows -- see ``_query_attention_heads``.
+
+    A pinned or unreadable revision keeps the pre-existing four-card ceiling rather than renting 8
+    cards verl may reject at startup, but that ceiling only NARROWS the divisor search; it is not a
+    substitute for it. A ceiling is a bound, not a divisibility proof -- 4 divides 24 but not 20 --
+    and SFT reaches allocation with the revision already resolved to a sha
+    (``runner.submit.prepare_job`` -> ``_resolve_model_revision`` with ``required=True``), so a
+    catalog row keyed on revision-emptiness alone would skip its own geometry on exactly the runs
+    that need it. Match the row by id and check the heads either way.
+    ALLOC-004 tracks validating arbitrary off-catalog head geometry at every width.
     """
-    cap = largest_rentable_count(max_gpu_count)
     from flash.core.catalog import MODELS
 
-    default_catalog_revision = model_id in MODELS and not model_revision
-    return cap if default_catalog_revision else min(cap, 4)
+    cap = largest_rentable_count(max_gpu_count)
+    if model_revision or model_id not in MODELS:
+        # an unvalidated revision keeps the pre-existing four-card ceiling, but that ceiling is a
+        # BOUND, not a divisibility proof -- it happens to divide 24 and would not divide 20. So it
+        # only narrows the search below, never substitutes for it.
+        cap = min(cap, 4)
+    info = MODELS.get(model_id)
+    heads = _query_attention_heads(info) if info is not None else 0
+    if heads <= 0:
+        # geometry we cannot read is geometry we cannot certify, so a catalog row that records no
+        # head count is treated exactly like an unvalidated revision rather than trusted for 8.
+        return min(cap, 4)
+    for count in rentable_gpu_counts(cap):
+        if heads % count == 0:
+            return count
+    return 1
+
+
+def _query_attention_heads(info) -> int:
+    """Query-attention head count for a catalog row, or 0 when the row does not record one.
+
+    Read, never derived. ``hidden_size // head_dim`` looks like the head count and is not: these
+    checkpoints decouple ``head_dim`` from that ratio, so the quotient is wrong for four of the six
+    catalog rows (3.5-4B is 16 heads, not 2560/256 = 10; 0.8B is 8, not 4; 3.6-27B is 24, not 20;
+    35B-A3B is 16, not 8). A cap computed from the quotient divides the wrong number -- it happened
+    to stay conservative on today's catalog, but nothing makes that hold for the next row added.
+    """
+    return int(getattr(info, "num_attention_heads", 0) or 0)
 
 
 def _resolve_exact_gpu(

@@ -353,7 +353,7 @@ def _require_setup_project(args) -> str:
     """Resolve and validate the one explicit project used by the whole scaffold."""
     from flash.client import ClientError, list_projects, resolve_project_id
     from flash.client.config import load_credentials
-    from flash.serve.urls import is_freesolo_hosted_url
+    from flash.client.http import has_freesolo_backend
 
     api_url, api_key = load_credentials()
     if not api_key:
@@ -368,10 +368,13 @@ def _require_setup_project(args) -> str:
         raise ClientError(
             "--project PROJECT_UUID is required in noninteractive mode, with redirected stdin, or with --yes"
         )
-    if api_url is not None and not is_freesolo_hosted_url(api_url):
+    # a self-hosted plane pointed at an operator-run Freesolo-compatible backend DOES have a
+    # directory to list, so classify on the backend rather than on the plane url alone -- the same
+    # decision `flash projects list` makes. only a genuinely backend-less plane refuses here.
+    if api_url is not None and not has_freesolo_backend(api_url):
         raise ClientError(
-            "--project PROJECT_UUID is required for interactive setup against a self-hosted plane, "
-            "which has no project directory"
+            "--project PROJECT_UUID is required for interactive setup against a plane with no "
+            "Freesolo backend, which has no project directory"
         )
 
     projects = list_projects(api_key)

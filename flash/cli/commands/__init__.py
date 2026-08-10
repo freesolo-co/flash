@@ -31,7 +31,7 @@ from flash.client.config import (  # noqa: F401
     load_credentials_with_source,
     shadowed_login_warning,
 )
-from flash.client.http import has_freesolo_backend
+from flash.client.http import freesolo_base_url, has_freesolo_backend
 from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
 from flash.core.catalog import public_model_rows
@@ -119,9 +119,76 @@ def _verifies_against_freesolo(api_url: str, freesolo_url: str | None) -> bool:
     return is_freesolo_hosted_url(api_url)
 
 
+def _plaintext_transport_warning(api_url: str) -> str:
+    """Warn when the api url would carry the key over unencrypted, non-loopback HTTP.
+
+    The key travels as an ``Authorization: Bearer`` header on login and on every command after it,
+    and on a standalone plane it is the entire authorization boundary and owns every run -- so an
+    observer can submit billed GPU jobs and read or cancel existing ones. Loopback never leaves the
+    machine, so it stays quiet: local development is the one place plaintext is fine.
+
+    A warning rather than a refusal: an operator may front the plane with a TLS-terminating proxy
+    reached over a private link, and this cannot see that. It must be printed BEFORE the key is
+    transmitted, so the caller can still abort.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse((api_url or "").strip())
+    if parsed.scheme != "http":
+        return ""
+    host = (parsed.hostname or "").lower()
+    if host in {"localhost", "127.0.0.1", "::1", "0.0.0.0"} or host.endswith(".localhost"):
+        return ""
+    return (
+        f"{api_url} is plaintext HTTP, so your API key is sent unencrypted and anyone who can "
+        "observe the connection can reuse it to submit billed GPU jobs and control your runs. "
+        "Use https:// for a remote plane; plaintext is safe only on localhost."
+    )
+
+
+def _plaintext_login_warnings(api_url: str | None, freesolo_url: str | None) -> list[str]:
+    """Warn for every url `flash login` may send the key to, not just the plane's.
+
+    Login has two possible destinations: the plane, which the saved credential targets for every
+    later command, and the Freesolo identity backend that ``verify_freesolo_key`` checks the key
+    against. The second is RESOLVED rather than passed -- ``freesolo_base_url`` falls back to
+    ``FREESOLO_BASE_URL`` and then to the hosted default -- so reading the ``--freesolo-url`` arg
+    alone still sent the bearer key to an ``http://`` identity backend named by that env var with no
+    warning, the case where the operator is most likely to believe they are protected.
+
+    The identity url is resolved only when `_verifies_against_freesolo` says login will really
+    contact it: on a self-hosted plane the key goes to the plane alone, and warning about an env var
+    nothing reads is noise. The hosted default is https, so it never warns on its own.
+    """
+    destinations = [api_url]
+    if _verifies_against_freesolo(api_url or "", freesolo_url):
+        destinations.append(freesolo_base_url(freesolo_url))
+    seen: set[str] = set()
+    warnings: list[str] = []
+    for url in destinations:
+        normalized = (url or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        warning = _plaintext_transport_warning(normalized)
+        if warning:
+            warnings.append(warning)
+    return warnings
+
+
 def cmd_login(args) -> int:
     api_url = args.api_url or load_credentials()[0]
     identity: dict | None = None
+    # before any request: the warning is worthless once the key has already gone over the wire.
+    # both destinations are checked here rather than at the branch below, because which one receives
+    # the key is decided after this point and the caller needs the warning while it can still abort.
+    for transport_warning in _plaintext_login_warnings(
+        api_url, getattr(args, "freesolo_url", None)
+    ):
+        print(
+            render.warn(transport_warning) if render.styled() else f"warning: {transport_warning}",
+            file=sys.stderr,
+        )
     try:
         env_api_key = os.environ.get("FREESOLO_API_KEY")
         api_key = args.api_key or env_api_key
