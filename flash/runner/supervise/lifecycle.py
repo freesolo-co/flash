@@ -495,8 +495,18 @@ def _submit_seed_supervised(
                 # floor submit provisions with — else a high-disk run is advertised Vast capacity that
                 # only exists at 60 GB and then can't rent.
                 disk_gb=float(getattr(attempt_spec.gpu, "disk_gb", 0.0) or 0.0),
-                # the remaining run-global wall cap, so retries cannot reset the duration budget.
-                max_wall_seconds=float(getattr(attempt_spec.gpu, "max_wall_seconds", 0.0) or 0.0),
+                # The duration a capacity search must clear is the one SUBMIT will demand, which is
+                # the offer floor to the launch deadline, not the work grant alone. Vast's
+                # `_rent_duration_floor` already widens to `max(grant, remaining-to-deadline)`, and
+                # an unarmed workload profile carries a 30-minute queue allowance ON TOP of its
+                # grant -- so passing the bare grant here advertised classes whose only live offers
+                # expire before the deadline, and `submit_run_vast` then found no usable offer at
+                # the wider floor. Ask for what we will rent. Retries still cannot reset the
+                # budget: the deadline is run-global and fixed at submission.
+                max_wall_seconds=max(
+                    float(getattr(attempt_spec.gpu, "max_wall_seconds", 0.0) or 0.0),
+                    max(0.0, _load_run_deadline_at(spec.run_id) - time.time()),
+                ),
                 provider=getattr(attempt_spec.gpu, "provider", ""),
                 gpu_type=getattr(attempt_spec.gpu, "type", ""),
                 model_revision=attempt_spec.model_revision,

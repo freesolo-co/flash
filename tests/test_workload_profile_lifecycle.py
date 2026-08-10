@@ -11,7 +11,7 @@ from flash.engine.profiling.workload_profile import (
     sft_profile_input_digest,
     sft_profile_run_id,
 )
-from tests._helpers.runner import fresh_runner
+from tests._helpers.runner import fresh_runner, provisioned_status
 
 
 def _spec() -> JobSpec:
@@ -693,3 +693,57 @@ def test_legacy_pre_alpha_snapshot_still_recovers(tmp_path, monkeypatch) -> None
     runner._save_status(status)
     assert runner._persist_effective_worker_spec(worker)
     assert runner.effective_spec_from_status(runner.get_status(worker.run_id)) == worker
+
+
+class _StopAfterAllocation(Exception):
+    """Sentinel: the test only needs the constraint allocate() was called with."""
+
+
+def test_capacity_search_asks_for_the_deadline_not_just_the_work_grant(
+    tmp_path, monkeypatch
+) -> None:
+    """Allocation must search for the duration SUBMIT will demand, not the bare work grant.
+
+    Vast's ``_rent_duration_floor`` widens the offer search to the launch deadline, and an unarmed
+    workload profile carries a 30-minute queue allowance on top of its wall grant. Passing only the
+    grant advertised classes whose live offers expire before that deadline, so ``submit_run_vast``
+    then found no usable offer at the wider floor and the run failed on capacity that was never
+    really there.
+    """
+    import io
+
+    from flash.providers import allocator
+    from flash.runner.supervise import lifecycle
+
+    runner = fresh_runner(tmp_path, monkeypatch)
+    grant = 600.0
+    spec = replace(
+        _spec(),
+        algorithm="sft",
+        run_id="run-profile-capacity",
+        gpu=GpuSpec(count=1, max_wall_seconds=grant),
+        workload_profile_kind=SFT_PROFILE_KIND,
+    )
+    runner._save_status(provisioned_status(runner, spec, state="queued"))
+
+    seen: dict[str, float] = {}
+
+    def capture(*_args, **kwargs):
+        seen["max_wall_seconds"] = kwargs["max_wall_seconds"]
+        raise _StopAfterAllocation
+
+    monkeypatch.setattr(
+        lifecycle,
+        "_pin_environment_for_run",
+        lambda spec, _log, *, attempt_started: spec,
+    )
+    monkeypatch.setattr(allocator, "allocate", capture)
+
+    # the allocation raise is caught and retried, so the run ends as a failed submit; the
+    # captured constraint is what this test is about.
+    with pytest.raises(RuntimeError, match="failed after retries"):
+        lifecycle._submit_seed_supervised(spec, spec.seed, io.StringIO())
+
+    # the unarmed profile's deadline is created_at + queue allowance + grant, so the search floor
+    # must clear the grant by roughly the whole allowance rather than equal it.
+    assert seen["max_wall_seconds"] > grant + 60
