@@ -64,7 +64,6 @@ from flash.engine.worker.io.wandb_log import (
 from flash.engine.worker.model.adapter import (
     _download_adapter,
     _init_adapter_model,
-    _resolve_adapter_ref,
     lora_target_parameters,
     make_lora,
     prepare_fresh_lora_base,
@@ -492,7 +491,6 @@ __all__ = [
     "_peak_gpu_gb",
     "_remove_fla_from_disk",
     "_reset_peak_gpu",
-    "_resolve_adapter_ref",
     "_restrict_fla_gdn_autotune_on_blackwell",
     "_sdpa_cudnn_ctx",
     "assert_adapter_delta_nonzero",

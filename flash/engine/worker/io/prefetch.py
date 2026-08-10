@@ -18,6 +18,7 @@ import time
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.engine.worker.io.hf import model_revision_kwargs
 from flash.engine.worker.perf import RetriableInfraError
+from flash.envs.loader import is_commit_sha
 
 
 def _hf():
@@ -147,11 +148,6 @@ def _prefetch_error_is_retriable(exc: BaseException) -> bool:
     return False
 
 
-def _is_commit_sha(value: str) -> bool:
-    """True when value is a full 40-hex-char git commit id (an immutable HF revision)."""
-    return len(value) == 40 and all(c in "0123456789abcdef" for c in value.lower())
-
-
 def resolve_cached_model_commit(model_id: str, revision: str = "") -> str:
     """Best-effort, offline lookup of the immutable base-model commit already in the HF cache.
 
@@ -176,7 +172,7 @@ def resolve_cached_model_commit(model_id: str, revision: str = "") -> str:
         except Exception:
             continue
         commit = os.path.basename(os.path.normpath(snapshot_dir))
-        if _is_commit_sha(commit):
+        if is_commit_sha(commit):
             return commit
     return ""
 
