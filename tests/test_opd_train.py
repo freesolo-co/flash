@@ -5752,6 +5752,52 @@ def test_plugin_registers_external_trainer_without_teacher_gpu_pool():
     assert 'params["logprobs"]' not in source
 
 
+def test_plugin_binds_every_bridge_name_before_it_installs_the_verl_extensions():
+    """The bridge re-export must sit ABOVE the `_install_verl_extensions()` call, not below it.
+
+    `_install_verl_extensions` runs at import time and reads module globals that the bridge block
+    binds (`_post_json` is passed into the multi-turn agent loop). Python executes a module top to
+    bottom, so a bridge import placed after the call leaves those names unbound and the child dies
+    with `NameError: name '_post_json' is not defined` -- and because the loss decorator has already
+    registered by then, the retry raises "flash_groupwise_reverse_kl is already registered", which
+    hides the real cause. Nothing in-repo catches it: the test suite imports the module without verl
+    installed, so `find_spec("verl")` is None and the call never runs.
+
+    Asserting on line ORDER rather than on one name keeps this honest as the bridge surface moves.
+    """
+    import ast
+    import inspect
+
+    import flash.engine.worker.train.opd.child.plugin as plugin
+
+    module = ast.parse(inspect.getsource(plugin))
+
+    install_line = None
+    for node in ast.walk(module):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_install_verl_extensions"
+        ):
+            install_line = node.lineno
+    assert install_line is not None, "the plugin no longer installs the verl extensions at import"
+
+    # the names the install path consumes from module scope, taken from the bridge re-export.
+    bridge_imports = [
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.ImportFrom)
+        and node.module in {"flash_opd_bridge", "flash.engine.worker.train.opd.child.bridge"}
+    ]
+    assert bridge_imports, "the plugin no longer re-exports the bridge surface"
+
+    late = sorted(node.lineno for node in bridge_imports if node.lineno > install_line)
+    assert not late, (
+        f"bridge import at line(s) {late} runs AFTER _install_verl_extensions() on line "
+        f"{install_line}; the install path reads those names, so the child raises NameError"
+    )
+
+
 def test_plugin_identifiers_remain_provider_neutral():
     import inspect
 
