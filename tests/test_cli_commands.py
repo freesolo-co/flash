@@ -3396,3 +3396,43 @@ def test_login_does_not_warn_twice_for_one_url():
         "http://plane.example:8080", "http://plane.example:8080"
     )
     assert len(warnings) == 1, warnings
+
+
+def test_login_warns_about_a_plaintext_freesolo_base_url_from_the_environment(monkeypatch, capsys):
+    """The identity url is RESOLVED, not passed, so the env var is a real destination for the key.
+
+    `verify_freesolo_key` calls `freesolo_base_url(override)`, which falls back to
+    FREESOLO_BASE_URL when no --freesolo-url is given. Reading only the CLI arg therefore left the
+    env-var spelling of the exact same destination silent, while the key still went to it.
+    """
+    warned_before_request = {}
+
+    def _verify(api_key, *, base_url):
+        warned_before_request["stderr"] = capsys.readouterr().err
+
+    monkeypatch.setattr(cli.commands, "verify_freesolo_key", _verify)
+    monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
+    monkeypatch.setattr(cli.commands, "_identity_or_none", lambda *a, **k: None)
+    monkeypatch.delenv("FREESOLO_API_KEY", raising=False)
+    monkeypatch.setenv("FREESOLO_BASE_URL", "http://identity.internal.test")
+
+    # a hosted plane, so login really does route the key to the identity backend.
+    args = types.SimpleNamespace(
+        api_url="https://api.freesolo.co", api_key="operator-key", debug=False
+    )
+    assert cli.commands.cmd_login(args) == 0
+    stderr = warned_before_request["stderr"]
+    assert "plaintext HTTP" in stderr, stderr
+    assert "identity.internal.test" in stderr
+
+
+def test_login_ignores_the_identity_url_when_the_key_never_goes_there(monkeypatch):
+    """A self-hosted plane verifies its own key, so an http identity url receives nothing.
+
+    Warning about a destination this login will not contact would train operators to ignore the
+    warning that matters, so the resolution is gated on the same predicate that does the routing.
+    """
+    monkeypatch.setenv("FREESOLO_BASE_URL", "http://identity.internal.test")
+
+    warnings = cli.commands._plaintext_login_warnings("https://plane.example", None)
+    assert warnings == [], warnings

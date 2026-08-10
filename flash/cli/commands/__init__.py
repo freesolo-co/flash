@@ -31,7 +31,7 @@ from flash.client.config import (  # noqa: F401
     load_credentials_with_source,
     shadowed_login_warning,
 )
-from flash.client.http import has_freesolo_backend
+from flash.client.http import freesolo_base_url, has_freesolo_backend
 from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
 from flash.core.catalog import public_model_rows
@@ -149,15 +149,23 @@ def _plaintext_transport_warning(api_url: str) -> str:
 def _plaintext_login_warnings(api_url: str | None, freesolo_url: str | None) -> list[str]:
     """Warn for every url `flash login` may send the key to, not just the plane's.
 
-    Login has two possible destinations and picks between them at request time: the plane itself, or
-    the Freesolo identity backend via ``verify_freesolo_key(base_url=...)``. Checking only
-    ``api_url`` left the second one silent, so an https plane paired with an ``http://``
-    ``--freesolo-url`` (or ``FREESOLO_BASE_URL``) transmitted the bearer key in cleartext with no
-    warning at all -- the case where the operator is most likely to believe they are protected.
+    Login has two possible destinations: the plane, which the saved credential targets for every
+    later command, and the Freesolo identity backend that ``verify_freesolo_key`` checks the key
+    against. The second is RESOLVED rather than passed -- ``freesolo_base_url`` falls back to
+    ``FREESOLO_BASE_URL`` and then to the hosted default -- so reading the ``--freesolo-url`` arg
+    alone still sent the bearer key to an ``http://`` identity backend named by that env var with no
+    warning, the case where the operator is most likely to believe they are protected.
+
+    The identity url is resolved only when `_verifies_against_freesolo` says login will really
+    contact it: on a self-hosted plane the key goes to the plane alone, and warning about an env var
+    nothing reads is noise. The hosted default is https, so it never warns on its own.
     """
+    destinations = [api_url]
+    if _verifies_against_freesolo(api_url or "", freesolo_url):
+        destinations.append(freesolo_base_url(freesolo_url))
     seen: set[str] = set()
     warnings: list[str] = []
-    for url in (api_url, freesolo_url):
+    for url in destinations:
         normalized = (url or "").strip()
         if not normalized or normalized in seen:
             continue
