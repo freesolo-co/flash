@@ -587,7 +587,9 @@ def test_offline_estimate_applies_the_pinned_revision_geometry_cap(monkeypatch):
         model_revision="a" * 40,
     )
 
-    with pytest.raises(ValueError, match="across up to 4 cards"):
+    # two, not four: the pin caps at four, but 3.5-4B has 10 query heads and the cap then narrows to
+    # the widest count that actually divides them. The ceiling bounds the search; it does not end it.
+    with pytest.raises(ValueError, match="across up to 2 cards"):
         _offline_gpu_shape(config)
 
 

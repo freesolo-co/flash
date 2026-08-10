@@ -150,20 +150,27 @@ def geometry_safe_gpu_cap(model_id: str, max_gpu_count: int, *, model_revision: 
     that shape's VRAM could reach -- rented it, and then died on Ulysses init before the first step.
     Derive the ceiling from the row instead.
 
-    Open-policy models and pinned catalog revisions carry no curated geometry here, so they keep the
-    pre-existing four-card ceiling rather than renting 8 cards verl may reject at startup.
-    ALLOC-004 tracks validating arbitrary and pinned head geometry at every width.
+    A pinned or unreadable revision keeps the pre-existing four-card ceiling rather than renting 8
+    cards verl may reject at startup, but that ceiling only NARROWS the divisor search; it is not a
+    substitute for it. Four divides 10 no better than 8 does, and SFT reaches allocation with the
+    revision already resolved to a sha (``runner.submit.prepare_job`` -> ``_resolve_model_revision``
+    with ``required=True``), so a catalog row keyed on revision-emptiness alone would skip its own
+    geometry on exactly the runs that need it. Match the row by id and check the heads either way.
+    ALLOC-004 tracks validating arbitrary off-catalog head geometry at every width.
     """
-    cap = largest_rentable_count(max_gpu_count)
     from flash.core.catalog import MODELS
 
-    info = MODELS.get(model_id) if not model_revision else None
-    if info is None:
-        return min(cap, 4)
-    heads = _query_attention_heads(info)
+    cap = largest_rentable_count(max_gpu_count)
+    if model_revision or model_id not in MODELS:
+        # an unvalidated revision keeps the pre-existing four-card ceiling, but that ceiling is a
+        # BOUND, not a divisibility proof: 4 no more divides 10 than 8 does. So it only narrows the
+        # search below, never substitutes for it.
+        cap = min(cap, 4)
+    info = MODELS.get(model_id)
+    heads = _query_attention_heads(info) if info is not None else 0
     if heads <= 0:
-        # geometry we cannot read is geometry we cannot certify; fall back to the safe ceiling.
-        return min(cap, 4)
+        # geometry we cannot read is geometry we cannot certify; the ceiling is all we have.
+        return cap
     for count in rentable_gpu_counts(cap):
         if heads % count == 0:
             return count

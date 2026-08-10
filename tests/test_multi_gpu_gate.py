@@ -839,6 +839,15 @@ def test_geometry_cap_follows_each_models_own_head_count():
         heads = info.hidden_size // info.head_dim
         cap = geometry_safe_gpu_cap(model_id, 8)
         assert heads % cap == 0, f"{model_id}: {heads} heads is not divisible by a {cap}-card cap"
+        # SFT resolves the omitted revision to a sha BEFORE allocation
+        # (`prepare_job` -> `_resolve_model_revision(required=True)`), so the cap must still read
+        # the row's geometry when a revision is present. The four-card ceiling is a bound, not a
+        # divisibility proof -- 4 divides 10 no better than 8 does.
+        resolved = geometry_safe_gpu_cap(model_id, 8, model_revision="a" * 40)
+        assert heads % resolved == 0, (
+            f"{model_id}: {heads} heads is not divisible by a {resolved}-card cap after the "
+            "revision was resolved to a sha"
+        )
 
     # the reported failure: 10 heads means 4 and 8 both leave a remainder, so 2 is the widest shape.
     assert MODELS["Qwen/Qwen3.5-4B"].hidden_size // MODELS["Qwen/Qwen3.5-4B"].head_dim == 10
@@ -849,6 +858,9 @@ def test_geometry_cap_follows_each_models_own_head_count():
     assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 2) == 2
     # a model outside the catalog has no readable geometry, so it keeps the unvalidated ceiling.
     assert geometry_safe_gpu_cap("some-org/not-in-catalog", 8) == 4
+    # the 4B is the case that motivated this: SFT hands allocation a resolved sha, and keying on
+    # revision-emptiness alone silently returned 4 -- a width its 10 heads still do not divide.
+    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-4B", 8, model_revision="a" * 40) == 2
 
 
 def test_schema_preflight_applies_the_geometry_cap_to_provisional_sizing():
