@@ -343,7 +343,10 @@ def test_rl_lifecycle_heartbeats_carry_latest_metrics():
 
     from flash.engine.worker import rl_train
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_train.run_rl_train)))
+    source = inspect.getsource(rl_train.run_rl_train) + inspect.getsource(
+        rl_train._write_terminal_metadata
+    )
+    tree = ast.parse(textwrap.dedent(source))
     terminal_calls = [
         node
         for node in ast.walk(tree)

@@ -485,7 +485,7 @@ def test_native_single_turn_image_grpo_suppresses_image_pad_generation():
     resolver = inspect.getsource(rl_train._resolve_grpo_inputs)
     assert "image_pad_token_id = resolve_image_pad_token_id(processor, tok)" in resolver
 
-    entry = inspect.getsource(rl_train.run_rl_train)
+    entry = inspect.getsource(rl_train._write_rl_shim)
     assert 'render_image_pad_ban_shim(inp["image_pad_token_id"])' in entry
 
 

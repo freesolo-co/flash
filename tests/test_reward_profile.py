@@ -390,9 +390,9 @@ def test_profiling_does_not_pollute_the_training_sample_buffer():
     """
     import inspect
 
-    from flash.engine.worker.rl_train import run_rl_train
+    from flash.engine.worker.rl_train import _start_reward_runtime
 
-    source = inspect.getsource(run_rl_train)
+    source = inspect.getsource(_start_reward_runtime)
     call = source[source.index("_log_reward_profile(") :]
     call = call[: call.index(")")]
     assert "_score_for_profile" in call, call
