@@ -367,13 +367,16 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert "tqdm" in install
     assert "pyarrow" in install
     # venv, the resolve above, the prebuilt flash_attn wheel on its own --no-build-isolation line,
-    # then causal_conv1d (also its own line: it source-builds against the venv's torch), and last
-    # the import probe that proves the conv extension actually loaded. nothing else: another INSTALL
-    # would be unbudgeted work on a paid pod.
-    assert len(calls) == 5
+    # then causal_conv1d (also its own line: it source-builds against the venv's torch), the import
+    # probe that proves the conv extension actually loaded, and last the libcudart stub repair that
+    # keeps vLLM importable in this venv. nothing else: another INSTALL would be unbudgeted work on
+    # a paid pod (the repair and the probe are local `python -c` calls, not installs).
+    assert len(calls) == 6
     assert calls[2][:3] == ["uv", "pip", "install"]
     assert vc.CAUSAL_CONV1D_REQUIREMENT in calls[3]
     assert calls[4][-1] == "import causal_conv1d"
+    assert calls[5][1] == "-c"
+    assert "libcudart_stub" in calls[5][2]
     assert [c for c in calls if c[:3] == ["uv", "pip", "install"]] == calls[1:4], (
         "the probe must be a check, not an install"
     )
@@ -1270,12 +1273,14 @@ def test_resolve_verl_python_rebuilds_a_venv_that_is_not_the_current_pin(
 
     vc.resolve_verl_python(str(tmp_path))
 
-    # three installs, then the conv import probe (which runs the venv's python, not uv).
+    # three installs, then the conv import probe and the libcudart stub repair (both run the venv's
+    # python, not uv).
     assert [c[:2] for c in calls] == [
         ["uv", "venv"],
         ["uv", "pip"],
         ["uv", "pip"],
         ["uv", "pip"],
+        [str(venv / "bin" / "python"), "-c"],
         [str(venv / "bin" / "python"), "-c"],
     ]
     assert not (venv / "marker").exists()
@@ -1300,6 +1305,7 @@ def test_resolve_verl_python_clears_a_venv_whose_creation_was_interrupted(monkey
         ["uv", "pip"],
         ["uv", "pip"],
         ["uv", "pip"],
+        [str(venv / "bin" / "python"), "-c"],
         [str(venv / "bin" / "python"), "-c"],
     ]
 

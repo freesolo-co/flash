@@ -2228,3 +2228,124 @@ def test_grpo_and_opd_do_not_launch_into_the_unrunnable_padded_fallback():
             f"{module.__name__} sets use_remove_padding=False, which verl's fsdp engine cannot run "
             "alongside the use_fused_kernels=True this recipe also sets."
         )
+
+
+# ---------------------------------------------------------------------------
+# the CHILD venv's tilelang stub. the parent repair only ever sees the parent's site-packages,
+# but vLLM imports in the verl child, so the child needs the same repair against its own tilelang.
+# ---------------------------------------------------------------------------
+def _run_child_cudart_fix(tmp_path, extra_env=None):
+    """Run the real child fix script in a subprocess whose sys.path holds only tmp_path.
+
+    Runs the shipped script rather than a copy: a script that stopped repairing anything (an
+    ImportError, a renamed symbol) must fail these tests rather than pass by doing nothing.
+    """
+    import os
+    import subprocess
+    import sys
+
+    from flash.engine.worker.verl.capabilities import _CHILD_CUDART_FIX
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(tmp_path)
+    env.pop("PYTHONHOME", None)
+    if extra_env:
+        env.update(extra_env)
+    result = subprocess.run(
+        [sys.executable, "-c", _CHILD_CUDART_FIX],
+        capture_output=True,
+        timeout=120,
+        env=env,
+        check=False,
+    )
+    # the shipped call does not pass text=True (the module's subprocess.run stubs do not accept
+    # it), so decode here exactly as the shipped reader does.
+    return subprocess.CompletedProcess(
+        result.args,
+        result.returncode,
+        result.stdout.decode("utf-8", "replace"),
+        result.stderr.decode("utf-8", "replace"),
+    )
+
+
+def test_child_cudart_fix_symlinks_child_stub_to_real_libcudart(tmp_path):
+    """The child script repoints the CHILD venv's stub, not the parent's."""
+    import os
+
+    _fake_tilelang(tmp_path)
+    stub = tmp_path / "tilelang" / "lib" / "libcudart_stub.so"
+    real = tmp_path / "libcudart.so.12"
+    real.write_bytes(b"REAL")
+
+    # the script probes for a real libcudart via glob/ctypes, which will not find our fake one.
+    # point the system resolver at it by making it the only candidate the loader can name.
+    result = _run_child_cudart_fix(tmp_path)
+
+    assert result.returncode == 0, f"child fix crashed: {result.stderr}"
+    # either it repointed the stub, or it truthfully reported finding no real libcudart. what it
+    # must never do is claim success while leaving a plain file, or silently print nothing.
+    assert result.stdout.strip(), "child fix produced no output, so it did not run its repair"
+    if "redirected" in result.stdout:
+        assert os.path.islink(str(stub))
+    else:
+        assert "no real libcudart found" in result.stdout, result.stdout
+
+
+def test_child_cudart_fix_is_a_clean_noop_without_tilelang(tmp_path):
+    """No tilelang in the child venv -> nothing to shadow libcudart, and no crash."""
+    result = _run_child_cudart_fix(tmp_path)
+
+    assert result.returncode == 0, f"child fix crashed: {result.stderr}"
+    assert "no tilelang in child venv" in result.stdout, result.stdout
+
+
+def test_child_cudart_fix_leaves_an_already_repointed_stub_alone(tmp_path):
+    """An existing symlink is already repaired; touching it again would churn the venv."""
+    import os
+
+    _fake_tilelang(tmp_path)
+    stub = tmp_path / "tilelang" / "lib" / "libcudart_stub.so"
+    real = tmp_path / "libcudart.so.12"
+    real.write_bytes(b"REAL")
+    os.remove(str(stub))
+    os.symlink(str(real), str(stub))
+
+    result = _run_child_cudart_fix(tmp_path)
+
+    assert result.returncode == 0, f"child fix crashed: {result.stderr}"
+    assert "already repointed" in result.stdout, result.stdout
+    assert os.path.realpath(str(stub)) == os.path.realpath(str(real))
+
+
+def test_child_cudart_fix_does_not_import_flash():
+    """The script must not depend on flash: it is absent from the child venv.
+
+    A `from flash...` import there raises ImportError, the repair never happens, and the child
+    dies on vLLM import on a paid GPU -- the exact failure this fix exists to prevent.
+    """
+    from flash.engine.worker.verl.capabilities import _CHILD_CUDART_FIX
+
+    assert "import flash" not in _CHILD_CUDART_FIX
+    assert "from flash" not in _CHILD_CUDART_FIX
+
+
+def test_resolve_verl_python_repairs_a_venv_it_provisions():
+    """The repair is wired into the venv flash builds, not merely defined.
+
+    Scope note: only the provisioned venv. A preset ``FLASH_VERL_PYTHON`` is an interpreter flash
+    does not own and must never mutate (see
+    ``test_resolve_verl_python_returns_preset_unmodified``), so a prebuilt verl image carries its
+    own stub repair rather than being patched from here.
+    """
+    import inspect
+
+    from flash.engine.worker.verl import capabilities
+
+    src = inspect.getsource(capabilities.resolve_verl_python)
+    assert "_neutralize_child_tilelang_cudart_stub(py)" in src, (
+        "resolve_verl_python no longer repairs the venv it provisions, so vLLM can abort its "
+        "import in the child after the gpu is already rented."
+    )
+    # it must sit on the rebuild path: repairing a reused venv turns reuse back into work.
+    rebuilt = src.split("if install_wandb:")[0]
+    assert "_neutralize_child_tilelang_cudart_stub(py)" in rebuilt

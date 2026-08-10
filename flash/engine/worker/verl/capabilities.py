@@ -457,6 +457,10 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
         # without it dies at the first training batch on a paid gpu rather than degrading.
         _install_flash_attn(py)
         conv_installed = _install_causal_conv1d(py)
+        # after every install that could have written tilelang into this venv, and before the child
+        # ever imports vLLM. only on the rebuild path: a reused venv was repaired when it was built,
+        # and re-running it there would turn venv reuse back into work.
+        _neutralize_child_tilelang_cudart_stub(py)
         # written only after ALL installs succeed, so a venv that died between them is
         # unstamped and the next attempt rebuilds it rather than reusing a
         # half-provisioned interpreter. the conv kernel is best-effort to INSTALL but not
@@ -481,6 +485,123 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
         # is a cheap no-op.
         subprocess.run(["uv", "pip", "install", "--python", py, "wandb"], check=False)
     return py
+
+
+# the parent neutralizes tilelang's libcudart stub in its OWN site-packages, but the child trains in
+# a separate venv with its own tilelang, and vLLM imports THERE. run the same repair against the
+# child interpreter, after every install that could have (re)written its tilelang.
+#
+# inlined rather than imported: flash is not installed in the child venv (the parent resolves
+# flash-dependent facts and hands the child literals), so `from flash...` would raise ImportError
+# and the repair would silently never happen -- the exact failure this exists to prevent.
+_CHILD_CUDART_FIX = """
+import ctypes, ctypes.util, glob, importlib.util, os
+
+def find_real():
+    def verify(cand):
+        try:
+            lib = ctypes.CDLL(cand)
+        except OSError:
+            return None
+        if not hasattr(lib, "cudaDeviceReset"):
+            return None
+        if os.path.isabs(cand) and os.path.exists(cand):
+            return os.path.realpath(cand)
+        base = os.path.basename(cand)
+        try:
+            with open("/proc/self/maps") as f:
+                for line in f:
+                    if base in line and "/" in line:
+                        p = line[line.index("/"):].rstrip()
+                        if os.path.basename(p).startswith(base) and os.path.exists(p):
+                            return os.path.realpath(p)
+        except OSError:
+            pass
+        return None
+
+    candidates = []
+    try:
+        import nvidia
+        for base in sorted(map(str, getattr(nvidia, "__path__", []) or [])):
+            candidates += sorted(glob.glob(os.path.join(base, "*", "lib", "libcudart.so.*")))
+    except Exception:
+        pass
+    for pat in (
+        "/usr/local/cuda*/lib64/libcudart.so.*",
+        "/usr/local/cuda*/targets/*/lib/libcudart.so.*",
+        "/usr/lib/x86_64-linux-gnu/libcudart.so.*",
+    ):
+        candidates += sorted(glob.glob(pat))
+    found = ctypes.util.find_library("cudart")
+    if found:
+        candidates.append(found)
+    for cand in candidates:
+        real = verify(cand)
+        if real is not None:
+            return real
+    return None
+
+try:
+    spec = importlib.util.find_spec("tilelang")
+except Exception:
+    spec = None
+locs = list(getattr(spec, "submodule_search_locations", None) or []) if spec else []
+if not locs:
+    print("no tilelang in child venv; nothing to neutralize")
+else:
+    stub = os.path.join(locs[0], "lib", "libcudart_stub.so")
+    if not os.path.lexists(stub):
+        print("no libcudart_stub.so in child tilelang")
+    elif os.path.islink(stub) and os.path.exists(stub):
+        print("child stub already repointed")
+    else:
+        # do NOT ctypes.CDLL the stub to probe it: that dlopens it into /proc/self/maps,
+        # which is the crash being prevented.
+        real = find_real()
+        if real is None:
+            print("no real libcudart found in child; left as-is")
+        else:
+            backup = stub + ".orig"
+            if not os.path.exists(backup):
+                os.replace(stub, backup)
+            else:
+                try:
+                    os.remove(stub)
+                except FileNotFoundError:
+                    pass
+            os.symlink(real, stub)
+            print("redirected child tilelang libcudart_stub.so -> " + real)
+"""
+
+
+def _neutralize_child_tilelang_cudart_stub(py: str) -> None:
+    """Repoint the CHILD venv's tilelang libcudart stub at a real libcudart.
+
+    vLLM aborts its import when it finds tilelang's stub (no ``cudaDeviceReset``) in
+    /proc/self/maps. The parent's fix only ever sees the parent's site-packages, so without this
+    the child dies on vLLM import on a paid GPU, after the pod is already rented.
+
+    Fails open: the repair is a best-effort optimization of the child's library layout, and a
+    child that has no tilelang installed needs nothing done. A failure here must not block launch
+    when the child would have imported fine anyway.
+    """
+    try:
+        result = subprocess.run(
+            [py, "-c", _CHILD_CUDART_FIX],
+            check=False,
+            capture_output=True,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"[verl] child libcudart stub neutralize did not run: {error}", flush=True)
+        return
+    for stream in (getattr(result, "stdout", None), getattr(result, "stderr", None)):
+        if not stream:
+            continue
+        if isinstance(stream, bytes):
+            stream = stream.decode("utf-8", "replace")
+        for line in stream.splitlines():
+            if line.strip():
+                print(f"[verl] child cudart: {line}", flush=True)
 
 
 def resolve_verl_loggers(caps: dict) -> list[str]:
