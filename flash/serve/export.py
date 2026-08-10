@@ -16,6 +16,7 @@ import tempfile
 from pathlib import Path
 from typing import BinaryIO
 
+from flash._internal.fileio import reject_duplicate_keys
 from flash._internal.logging import get_logger
 from flash.serve.deploy import ServingError
 
@@ -76,7 +77,7 @@ def _non_lm_tensor_is_live(
 
 
 def _strip_language_model_infix(key: str) -> str:
-    # mirrors _LANGUAGE_MODEL_INFIX namespace semantics in flash/engine/worker/model/lora.py
+    # mirrors the peft `.language_model.` namespace semantics for warm-start vl adapters
     infix = ".language_model."
     index = key.find(infix)
     if index == -1:
@@ -84,13 +85,9 @@ def _strip_language_model_infix(key: str) -> str:
     return key[:index] + "." + key[index + len(infix) :]
 
 
-def _json_object_without_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    value: dict[str, object] = {}
-    for key, item in pairs:
-        if key in value:
-            raise ValueError(f"duplicate safetensors JSON key {key!r}")
-        value[key] = item
-    return value
+_json_object_without_duplicate_keys = reject_duplicate_keys(
+    lambda key: ValueError(f"duplicate safetensors JSON key {key!r}")
+)
 
 
 def _normalize_export_adapter_keys(adapter_dir: Path) -> bool:

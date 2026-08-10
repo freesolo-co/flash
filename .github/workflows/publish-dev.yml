@@ -35,7 +35,8 @@ jobs:
     if: github.repository == 'freesolo-co/flash'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # `write` (not `read`) because the tag step at the end of this job pushes a git tag.
+      contents: write
     env:
       UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
 
@@ -101,6 +102,35 @@ jobs:
         if: steps.decide.outputs.publish == 'false'
         run: echo "freesolo-flash-dev ${{ steps.meta.outputs.version }} is already on PyPI; nothing to publish."
 
+      # See publish.yml: checked before the irreversible upload, not after it.
+      - name: Fail if the dev tag exists on another commit
+        if: steps.decide.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="dev-v${VERSION}"
+          # No `|| true`: `git ls-remote` exits 0 for BOTH "tag present" and "tag absent", and
+          # non-zero only when the lookup itself failed (unreachable remote, auth). Swallowing that
+          # would turn a network blip into "no tag exists" and wave the release through unvalidated,
+          # so a failed lookup must fail the step.
+          # `rc` is captured on the same line: inside `if ! ...`, a later `$?` reports the negation's
+          # result (always 0), not git's.
+          existing="$(git ls-remote --tags origin "refs/tags/${tag}" "refs/tags/${tag}^{}")" && rc=0 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Could not query tags on origin (git ls-remote exit ${rc}). Refusing to continue: a failed lookup is not proof that ${tag} is free."
+            exit 1
+          fi
+          if [ -n "$existing" ]; then
+            peeled="$(printf '%s\n' "$existing" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')"
+            plain="$(printf '%s\n' "$existing" | awk '$2 !~ /\^\{\}$/ {print $1; exit}')"
+            target="${peeled:-$plain}"
+            if [ "$target" != "$GITHUB_SHA" ]; then
+              echo "::error::Tag ${tag} already exists on origin but points at ${target}, not this commit (${GITHUB_SHA}). Refusing to publish ${VERSION}: the dev tag is the only record of which commit shipped in a version, and this one would be false. Resolve the tag by hand."
+              exit 1
+            fi
+          fi
+
       - name: Install uv
         if: steps.decide.outputs.publish == 'true'
         uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
@@ -123,3 +153,62 @@ jobs:
             exit 1
           fi
           uv publish
+
+      # Tag only -- no GitHub release. The dev channel ships several times a day, so a release per
+      # version would bury the prod releases it is meant to sit alongside. The tag is the part that
+      # carries the information: it is the only record of WHICH commit is inside a given
+      # `freesolo-flash-dev` version. Without it, two commits claiming the same version (which is a
+      # thing that happens here -- concurrent PRs bump to the same number, merge without conflict,
+      # and the second silently no-publishes) are indistinguishable after the fact.
+      #
+      # Named `dev-v<version>` so the dev channel shares no namespace with prod's `v<version>`:
+      # both channels use the SAME version number by design (version-parity.yml enforces it), so a
+      # shared prefix would collide on every single release.
+      #
+      # KNOWN LIMITATION -- same non-self-healing shape as publish.yml. If PyPI accepts the upload
+      # and the tag push then fails, re-running does NOT repair it: `Decide whether to publish`
+      # finds the version already on the index and sets publish=false, so this step is skipped
+      # from then on. Repair by hand against the commit that actually shipped:
+      #
+      #   git tag -a dev-v<version> <sha> -m "freesolo-flash-dev <version>" && git push origin dev-v<version>
+      #
+      # Auto-tagging every already-published dev commit would be worse than the gap it closes:
+      # ordinary dev pushes deliberately reuse the current version, so it would tag whichever later
+      # commit happened to run, recording a commit that was never in that version.
+      - name: Tag the released dev version
+        if: steps.decide.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="dev-v${VERSION}"
+          # Re-checked here after the preflight above, to catch a tag that appeared DURING the
+          # publish. It matters more on this channel: the tag is the ONLY record of which commit went
+          # into a given dev version, so one pointing at the wrong commit is a false provenance
+          # record, not a cosmetic problem.
+          # No `|| true`: `git ls-remote` exits 0 for BOTH "tag present" and "tag absent", and
+          # non-zero only when the lookup itself failed (unreachable remote, auth). Swallowing that
+          # would turn a network blip into "no tag exists" and wave the release through unvalidated,
+          # so a failed lookup must fail the step.
+          # `rc` is captured on the same line: inside `if ! ...`, a later `$?` reports the negation's
+          # result (always 0), not git's.
+          existing="$(git ls-remote --tags origin "refs/tags/${tag}" "refs/tags/${tag}^{}")" && rc=0 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Could not query tags on origin (git ls-remote exit ${rc}). Refusing to continue: a failed lookup is not proof that ${tag} is free."
+            exit 1
+          fi
+          if [ -n "$existing" ]; then
+            peeled="$(printf '%s\n' "$existing" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')"
+            plain="$(printf '%s\n' "$existing" | awk '$2 !~ /\^\{\}$/ {print $1; exit}')"
+            target="${peeled:-$plain}"
+            if [ "$target" != "$GITHUB_SHA" ]; then
+              echo "::error::Tag ${tag} already exists on origin but points at ${target}, not this commit (${GITHUB_SHA}). The dev tag is the only record of which commit shipped in a given version; refusing to leave a false one. Resolve the tag by hand."
+              exit 1
+            fi
+            echo "::notice::Tag ${tag} already exists and points at this commit; nothing to do."
+            exit 0
+          fi
+          git config user.name "David Shan"
+          git config user.email "78061174+DavidBShan@users.noreply.github.com"
+          git tag -a "${tag}" -m "freesolo-flash-dev ${VERSION}"
+          git push origin "${tag}"

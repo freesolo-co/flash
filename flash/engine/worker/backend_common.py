@@ -908,6 +908,7 @@ from flash.engine.worker.verl.capabilities import (  # noqa: E402,F401
     resolve_verl_python,
     rollout_resident_overrides,
     rollout_sleep_unsupported,
+    strict_gdn_probe_module,
     trainer_dtype_overrides,
     verl_declares_rollout_field,
     verl_device_capability,

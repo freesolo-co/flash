@@ -8,6 +8,7 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
+from flash._internal.fileio import reject_duplicate_keys
 from flash.adapters.artifacts import ADAPTER_WEIGHT_FILES
 
 OPD_RETRY_CONTRACT_STATUS_KEY = "opd_retry_contract_version"
@@ -235,13 +236,7 @@ def canonical_opd_optimizer_start_json(
     ).encode("utf-8")
 
 
-def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    obj: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in obj:
-            raise ValueError(f"duplicate marker key: {key}")
-        obj[key] = value
-    return obj
+_strict_object = reject_duplicate_keys(lambda key: ValueError(f"duplicate marker key: {key}"))
 
 
 def decode_opd_optimizer_start_json(

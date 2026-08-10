@@ -183,7 +183,11 @@ def parse_max_steps(value: Any) -> int | None:
     return value if value > 0 else None
 
 
-CONTROL_PANEL_URL_ENV = "FLASH_CONTROL_PANEL_URL"
+# this plane's own public origin: the address a gpu worker dials back on to reach the teacher
+# broker. distinct from FLASH_API_URL, which is where an operator's cli dials in from and may be a
+# private address the worker cannot resolve. control-plane-owned, so a caller cannot declare it as
+# a worker env override or an [environment] secret.
+PUBLIC_URL_ENV = "FLASH_PUBLIC_URL"
 TEACHER_CAPABILITY_ENV = "FLASH_TEACHER_CAPABILITY"
 MANAGED_TEACHER_CREDENTIAL_ENV_KEYS = frozenset({"PARASAIL_API_KEY"})
 CONTROL_PLANE_OWNED_ENV_KEYS = frozenset(
@@ -193,7 +197,7 @@ CONTROL_PLANE_OWNED_ENV_KEYS = frozenset(
         "FLASH_ARM",
         "SEED",
         OPD_RESUME_REVISION_ENV,
-        CONTROL_PANEL_URL_ENV,
+        PUBLIC_URL_ENV,
         TEACHER_CAPABILITY_ENV,
         *MANAGED_TEACHER_CREDENTIAL_ENV_KEYS,
     }

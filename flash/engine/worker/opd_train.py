@@ -259,11 +259,11 @@ def run_opd_train(spec=None) -> None:
     # validate the control-panel broker transport before the gpu probe and model prefetch so a malformed
     # attempt fails
     # before any additional paid setup. raw managed-teacher provider credentials never enter the worker.
-    from flash.core.spec import CONTROL_PANEL_URL_ENV, TEACHER_CAPABILITY_ENV
+    from flash.core.spec import PUBLIC_URL_ENV, TEACHER_CAPABILITY_ENV
 
-    control_panel_url = os.environ.get(CONTROL_PANEL_URL_ENV, "").strip()
+    public_url = os.environ.get(PUBLIC_URL_ENV, "").strip()
     capability = os.environ.get(TEACHER_CAPABILITY_ENV, "").strip()
-    if not control_panel_url or not capability:
+    if not public_url or not capability:
         raise RuntimeError(
             "managed teacher control-panel transport is missing from the OPD parent worker"
         )
@@ -272,7 +272,7 @@ def run_opd_train(spec=None) -> None:
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.type if spec else "",
     )
-    teacher = TeacherClient(capability, control_panel_url, knobs.teacher_model)
+    teacher = TeacherClient(capability, public_url, knobs.teacher_model)
     processor = None
     if multimodal:
         from transformers import AutoProcessor

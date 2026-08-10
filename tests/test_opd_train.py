@@ -5407,7 +5407,7 @@ def test_image_token_suppression_is_gated_on_structured_image_blocks():
 
 def test_child_environment_keeps_bridge_but_excludes_teacher_transport(monkeypatch, tmp_path):
     monkeypatch.setenv("PARASAIL_API_KEY", "parasail-secret")
-    monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
+    monkeypatch.setenv("FLASH_PUBLIC_URL", "https://broker.example")
     monkeypatch.setenv("FLASH_TEACHER_CAPABILITY", "capability-secret")
     monkeypatch.setenv("HF_TOKEN", "hub-secret")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
@@ -5440,7 +5440,7 @@ def test_child_environment_keeps_bridge_but_excludes_teacher_transport(monkeypat
     assert child["VERL_USE_EXTERNAL_MODULES"] == "flash_opd_plugin"
     assert child["CUDA_VISIBLE_DEVICES"] == "0,1"
     assert "PARASAIL_API_KEY" not in child
-    assert "FLASH_CONTROL_PANEL_URL" not in child
+    assert "FLASH_PUBLIC_URL" not in child
     assert "FLASH_TEACHER_CAPABILITY" not in child
     assert "HF_TOKEN" not in child
     assert "FLASH_OPD_STRUCTURED_OUTPUTS" not in child
@@ -5752,6 +5752,52 @@ def test_plugin_registers_external_trainer_without_teacher_gpu_pool():
     assert 'params["logprobs"]' not in source
 
 
+def test_plugin_binds_every_bridge_name_before_it_installs_the_verl_extensions():
+    """The bridge re-export must sit ABOVE the `_install_verl_extensions()` call, not below it.
+
+    `_install_verl_extensions` runs at import time and reads module globals that the bridge block
+    binds (`_post_json` is passed into the multi-turn agent loop). Python executes a module top to
+    bottom, so a bridge import placed after the call leaves those names unbound and the child dies
+    with `NameError: name '_post_json' is not defined` -- and because the loss decorator has already
+    registered by then, the retry raises "flash_groupwise_reverse_kl is already registered", which
+    hides the real cause. Nothing in-repo catches it: the test suite imports the module without verl
+    installed, so `find_spec("verl")` is None and the call never runs.
+
+    Asserting on line ORDER rather than on one name keeps this honest as the bridge surface moves.
+    """
+    import ast
+    import inspect
+
+    import flash.engine.worker.train.opd.child.plugin as plugin
+
+    module = ast.parse(inspect.getsource(plugin))
+
+    install_line = None
+    for node in ast.walk(module):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_install_verl_extensions"
+        ):
+            install_line = node.lineno
+    assert install_line is not None, "the plugin no longer installs the verl extensions at import"
+
+    # the names the install path consumes from module scope, taken from the bridge re-export.
+    bridge_imports = [
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.ImportFrom)
+        and node.module in {"flash_opd_bridge", "flash.engine.worker.train.opd.child.bridge"}
+    ]
+    assert bridge_imports, "the plugin no longer re-exports the bridge surface"
+
+    late = sorted(node.lineno for node in bridge_imports if node.lineno > install_line)
+    assert not late, (
+        f"bridge import at line(s) {late} runs AFTER _install_verl_extensions() on line "
+        f"{install_line}; the install path reads those names, so the child raises NameError"
+    )
+
+
 def test_plugin_identifiers_remain_provider_neutral():
     import inspect
 
@@ -5806,7 +5852,7 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
         )
 
     teacher_runtime = {
-        "FLASH_CONTROL_PANEL_URL": "https://broker.example",
+        "FLASH_PUBLIC_URL": "https://broker.example",
         "FLASH_TEACHER_CAPABILITY": "capability-test-value",
     }
     spec = _spec()
@@ -6076,7 +6122,7 @@ def test_opd_missing_managed_teacher_broker_fails_before_the_gpu_probe(monkeypat
     )
     # torch is not installed in this test env; the real seeding is covered in test_training_controls.
     monkeypatch.setattr(opd_mod, "seed_training_rngs", lambda seed: None)
-    monkeypatch.delenv("FLASH_CONTROL_PANEL_URL", raising=False)
+    monkeypatch.delenv("FLASH_PUBLIC_URL", raising=False)
     monkeypatch.delenv("FLASH_TEACHER_CAPABILITY", raising=False)
 
     with pytest.raises(RuntimeError, match="managed teacher control-panel transport is missing"):

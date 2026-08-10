@@ -834,7 +834,7 @@ with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA
 
   **How to check, given the key is managed.** Flash has no command that generates teacher
   rollouts. The control-plane broker owns `PARASAIL_API_KEY`; GPU workers receive only
-  `FLASH_CONTROL_PANEL_URL` and an attempt-scoped `FLASH_TEACHER_CAPABILITY`, never the provider key.
+  `FLASH_PUBLIC_URL` and an attempt-scoped `FLASH_TEACHER_CAPABILITY`, never the provider key.
   The broker scores the student's own
   tokens, so there is nothing to run locally with your Flash credentials alone.
   Two workable routes:

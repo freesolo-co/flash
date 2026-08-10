@@ -13,7 +13,11 @@ ROLLOUT_PROFILE_KINDS = ("grpo", "opd")
 # 3 removes the deleted per-run worker environment map from both profile identity payloads. old
 # cached profiles use a different identity shape, so reject them and re-profile.
 WORKLOAD_PROFILE_SCHEMA_VERSION = 3
-SFT_PACKING_POLICY_VERSION = 1
+# 2 lets a gdn hybrid pack when the installed stack proves it can reset example boundaries, where 1
+# always answered exact-unpacked. the same config therefore resolves to a different packing_mode and
+# examples_per_update, so a profile cached under 1 quotes a step count this policy would not: it has
+# to be a different identity rather than a cache hit.
+SFT_PACKING_POLICY_VERSION = 2
 ROLLOUT_SAMPLE_POLICY_VERSION = 1
 _PROFILE_RUN_PREFIX = "profile-sft-"
 
