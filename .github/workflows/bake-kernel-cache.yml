@@ -60,6 +60,11 @@ jobs:
   # (and `needs: approve`) if you ever want a human checkpoint back.
   bake:
     runs-on: ubuntu-24.04-8core
+    # This job RENTS A GPU, so a wedged run bills for as long as it hangs -- the cap is a spend
+    # bound here, not just a runner-pool courtesy. 47min is the slowest run on record (the rest sit
+    # at 12-23min); 120 absorbs a slow provider allocation without letting a hung bake run for
+    # hours on a paid card.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:

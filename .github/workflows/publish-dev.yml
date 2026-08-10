@@ -34,6 +34,9 @@ jobs:
     # failing run on ordinary development.
     if: github.repository == 'freesolo-co/flash'
     runs-on: ubuntu-latest
+    # See publish.yml: same shape, same reason for the generous cap -- a timeout between the upload
+    # and the tag push leaves a shipped version whose commit is unrecorded.
+    timeout-minutes: 30
     permissions:
       # `write` (not `read`) because the tag step at the end of this job pushes a git tag.
       contents: write
