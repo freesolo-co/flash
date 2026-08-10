@@ -20,7 +20,11 @@ from flash.engine.worker.entry.sft import (
     has_real_target,
     select_sft_examples,
 )
-from flash.engine.worker.model.packing import probe_is_gdn_hybrid, probe_is_pure_attention
+from flash.engine.worker.model.packing import (
+    gdn_packing_contract_available,
+    probe_is_gdn_hybrid,
+    probe_is_pure_attention,
+)
 
 
 @dataclass
@@ -180,7 +184,17 @@ def _packing_mode(
             if probe_is_pure_attention(model_id, revision=revision):
                 architecture_mode, supported = "pure-attention", True
             elif probe_is_gdn_hybrid(model_id, revision=revision):
-                architecture_mode, supported = "gdn-hybrid", False
+                # a gdn hybrid packs only when the stack can reset the linear-attention recurrence
+                # (fla's cu_seq_lens_q) and the causal conv (seq_idx) at example boundaries. without
+                # both, transformers' fallbacks accept the kwargs and DISCARD them, so state bleeds
+                # across examples inside a packed block while looking patched.
+                #
+                # the contract probe is device-independent on purpose: this same function runs in
+                # the cpu-only profile job that freezes the quote AND on the gpu worker, and
+                # sft_train compares the two profiles byte-for-byte. see
+                # gdn_packing_contract_available.
+                supported = gdn_packing_contract_available(model_id, revision=revision)
+                architecture_mode = "gdn-hybrid"
             else:
                 architecture_mode, supported = "unsupported", False
         except Exception as e:
@@ -411,8 +425,9 @@ def prepare_sft_workload(
             f"{untruncated_max_length} to keep every row whole.",
             file=sys.stderr,
         )
-    # GDN boundaries require one example per update because this packed layout has no `seq_idx` or
-    # `cu_seq_lens_q`; otherwise recurrent state crosses examples silently. this CPU-side choice
+    # batch size follows the packing mode: `exact-unpacked` keeps one example per update, which is
+    # what makes an unpacked gdn run boundary-safe (no packed neighbours to contaminate). a `packed`
+    # gdn run has earned that mode through the boundary-reset contract above. this CPU-side choice
     # sets quoted and executed steps. the child probe controls verl layout, not batch size.
     examples_per_update = min(effective_batch, len(rows)) if packing_mode == "packed" else 1
     # packed_blocks is already the optimizer batches verl runs per epoch, so the horizon is one

@@ -2195,8 +2195,9 @@ def test_grpo_and_opd_do_not_launch_into_the_unrunnable_padded_fallback():
     """
     import ast
     import inspect as _inspect
+    import textwrap as _textwrap
 
-    from flash.engine.worker import backend_common, opd_train, rl_train
+    from flash.engine.worker import backend_common, opd_train, rl_train, sft_train
 
     # the gate lives in one shared helper, so the assertions split: the helper must raise, and each
     # affected algorithm must route through it rather than re-deriving a decision of its own.
@@ -2229,6 +2230,100 @@ def test_grpo_and_opd_do_not_launch_into_the_unrunnable_padded_fallback():
             "alongside the use_fused_kernels=True this recipe also sets."
         )
 
+    # sft is conditional where grpo/opd are unconditional, and the condition is the whole point: a
+    # PACKED gdn profile has packed neighbours to contaminate, so it must take the raising gate. the
+    # quote-side gate cannot answer this -- it is device-independent by construction (the profile job
+    # is cpu-only), so it proves the kernels are installed, never that the conv kernel runs on this
+    # card. only the child probe knows. an exact-unpacked run keeps the soft form because
+    # examples_per_update is 1.
+    sft_src = _inspect.getsource(sft_train.run_sft_train)
+    assert "require_gdn_boundary_resets(" in sft_src, (
+        "packed sft no longer routes through the raising gate, so a gdn hybrid whose child cannot "
+        "reset boundaries would train across packed example boundaries while appearing patched: "
+        "transformers' fallbacks ACCEPT cu_seq_lens_q and seq_idx and silently discard them."
+    )
+    assert 'profile.packing_mode == "packed"' in sft_src, (
+        "the sft gate no longer keys on the packed profile. it must stay conditional: raising on "
+        "an exact-unpacked run would fail runs that are already boundary-safe at "
+        "examples_per_update=1, and dropping the condition entirely would let a packed run through."
+    )
+    # the OTHER half of that condition has to come from the frozen profile, not from a re-probe.
+    # `model_is_gdn_hybrid` swallows a failed hub/cache read and answers False, so deriving
+    # `gdn_hybrid` from it alone lets a transient failure turn the gate above into dead code on a
+    # profile that is already packed -- resets skipped, shim not installed, state bleeding across
+    # packed neighbours, and nothing raised. the profile's label was frozen by a raising probe.
+    assert 'profile.architecture_mode == "gdn-hybrid"' in sft_src, (
+        "the sft gdn decision no longer consults the frozen profile.architecture_mode. it must, "
+        "because model_is_gdn_hybrid returns False on a transient config-read failure: that would "
+        "silently skip the packed-boundary reset requirement instead of failing closed."
+    )
+    # the module the shim patches must fail closed too. gdn_model_type answers "qwen3_5" both for a
+    # dense model and for a config it could not read, and Qwen/Qwen3.6-35B-A3B is qwen3_5_moe -- so
+    # the guess patches the WRONG module and reports resets active over unpatched MoE layers.
+    #
+    # assert on the GUARD, not on the call: `strict_gdn_probe_module(` survives inside `if False:`,
+    # so a substring check passes with the fix disabled (observed while mutation-testing this).
+    sft_tree = ast.parse(_textwrap.dedent(sft_src))
+    strict_guards = [
+        node
+        for node in ast.walk(sft_tree)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(c, ast.Call)
+            and isinstance(c.func, ast.Name)
+            and c.func.id == "strict_gdn_probe_module"
+            for c in ast.walk(node)
+        )
+    ]
+    assert strict_guards, (
+        "packed sft no longer resolves its modeling module strictly, so a transient config-read "
+        "failure would fall back to the dense qwen3_5 module and patch the wrong arch on a "
+        "qwen3_5_moe model while logging boundary resets as active."
+    )
+    guard_src = " ".join(ast.unparse(node.test) for node in strict_guards)
+    assert "packing_mode" in guard_src, (
+        "the strict module resolve is no longer guarded by the packed profile (guard is "
+        f"{guard_src!r}). an exact-unpacked run has no boundaries and must not be forced to "
+        "resolve its arch strictly."
+    )
+    assert "examples_per_update" in guard_src, (
+        "the strict module resolve is no longer guarded by the realized batch (guard is "
+        f"{guard_src!r}). it must be reached exactly when the reset gate below fires, or the two "
+        "disagree about which runs need a proven arch."
+    )
+
+    # and the demand must key on the REALIZED batch: min(batch_size, len(rows)) can be 1 under a
+    # `packed` label, and one example per update has no neighbour to contaminate. assert on the
+    # expression that actually feeds `require_gdn_boundary_resets`, since the same literal also
+    # appears at the strict-resolve guard above and would satisfy a substring check on its own.
+    require_guards = [
+        node
+        for node in ast.walk(sft_tree)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(c, ast.Call)
+            and isinstance(c.func, ast.Name)
+            and c.func.id == "require_gdn_boundary_resets"
+            for c in ast.walk(node)
+        )
+    ]
+    assert require_guards, "packed sft no longer calls require_gdn_boundary_resets under any guard."
+    # the guard may name a local (packed_neighbours); resolve any plain assignments to it so the
+    # test reads the CONDITION, not the variable name.
+    assigns = {
+        t.id: ast.unparse(n.value)
+        for n in ast.walk(sft_tree)
+        if isinstance(n, ast.Assign)
+        for t in n.targets
+        if isinstance(t, ast.Name)
+    }
+    require_src = " ".join(ast.unparse(node.test) for node in require_guards)
+    resolved = require_src + " " + " ".join(assigns.get(n, "") for n in assigns if n in require_src)
+    assert "examples_per_update" in resolved, (
+        "the packed sft gate no longer checks examples_per_update (condition resolves to "
+        f"{resolved.strip()!r}), so a packed profile that realized a single-example update would "
+        "hard-fail on a missing child capability despite having no packed neighbours to protect."
+    )
 
 # ---------------------------------------------------------------------------
 # the CHILD venv's tilelang stub. the parent repair only ever sees the parent's site-packages,

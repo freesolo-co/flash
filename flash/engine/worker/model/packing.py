@@ -142,17 +142,28 @@ def _gdn_forward_threads_reset_kwargs(model_id: str | None, revision: str = "") 
 
 
 def gdn_packing_contract_available(model_id: str | None = None, revision: str = "") -> bool:
-    """True when the installed gdn stack exposes the boundary-reset contract without opening cuda."""
+    """True when the installed gdn stack exposes the boundary-reset contract without opening cuda.
+
+    DEVICE-INDEPENDENT by construction, because the two callers of ``prepare_sft_workload`` run on
+    different hardware: the quote is produced by the cpu-only profile job (runner drops the gpu type
+    so it does not rent an H100 to tokenize), and training runs on the gpu worker. ``sft_train``
+    compares the two profiles byte-for-byte and raises "sft workload changed after the quote was
+    frozen" on any difference, so a packing gate that consults ``torch.cuda`` answers False in the
+    quote and True in training and fails EVERY run on the main path.
+
+    So this asks only what both machines can answer identically: does the installed transformers
+    thread the reset kwargs into this arch's GDN forward, and are the kernels importable. Both are
+    properties of the pinned image, which is a fixed input to the job. ``is_*_available()`` is
+    deliberately NOT used -- those open with ``is_torch_cuda_available()`` (see Dockerfile.worker's
+    sanity block), which is exactly the device dependence this must not have.
+
+    The device-dependent half stays where a device exists: ``gdn_packing_available`` smokes the real
+    kernel on the worker and raises rather than silently training across boundaries.
+    """
     try:
         import importlib
 
-        from transformers.utils.import_utils import (
-            is_causal_conv1d_available,
-            is_flash_linear_attention_available,
-        )
-
-        if not (is_flash_linear_attention_available() and is_causal_conv1d_available()):
-            return False
+        importlib.import_module("fla")
         importlib.import_module("causal_conv1d")
         return _gdn_forward_threads_reset_kwargs(model_id, revision=revision)
     except Exception:
