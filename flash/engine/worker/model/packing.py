@@ -31,7 +31,7 @@ def _load_text_config(model_id: str, revision: str):
 
 
 def probe_is_pure_attention(model_id: str, revision: str = "") -> bool:
-    """``model_is_pure_attention`` without the swallow: a failed probe RAISES.
+    """Pure-attention probe that RAISES rather than swallowing a failed config read.
 
     Callers that freeze the answer into a digest must use this. Returning False for "the hub timed
     out" is fine for a runtime gate that only has to avoid packing, but it is a wrong ANSWER, and a
@@ -97,6 +97,56 @@ def gdn_model_type(model_id: str | None, revision: str = "") -> str:
         return getattr(cfg, "model_type", None) or "qwen3_5"
     except Exception:
         return "qwen3_5"
+
+
+def _gdn_forward_threads_reset_kwargs(model_id: str | None, revision: str = "") -> bool:
+    """Check that THIS arch's GDN forward actually accepts cu_seq_lens_q and seq_idx (varies by transformers version)."""
+    try:
+        import importlib
+        import inspect
+
+        model_type = gdn_model_type(model_id, revision=revision)
+        mod = importlib.import_module(f"transformers.models.{model_type}.modeling_{model_type}")
+        gdn_cls = next(
+            (
+                c
+                for n, c in vars(mod).items()
+                if isinstance(c, type) and n.endswith("GatedDeltaNet")
+            ),
+            None,
+        )
+        if gdn_cls is None:
+            return False
+        fwd = inspect.getsource(gdn_cls.forward)
+        return ("cu_seq_lens_q" in fwd) and ("seq_idx" in fwd)
+    except Exception:
+        return False
+
+
+def gdn_packing_contract_available(model_id: str | None = None, revision: str = "") -> bool:
+    """True when the installed gdn stack exposes the boundary-reset contract without opening cuda.
+
+    DEVICE-INDEPENDENT by construction, because the two callers of ``prepare_sft_workload`` run on
+    different hardware: the quote is produced by the cpu-only profile job (runner drops the gpu type
+    so it does not rent an H100 to tokenize), and training runs on the gpu worker. ``sft_train``
+    compares the two profiles byte-for-byte and raises "sft workload changed after the quote was
+    frozen" on any difference, so a packing gate that consults ``torch.cuda`` answers False in the
+    quote and True in training and fails EVERY run on the main path.
+
+    So this asks only what both machines can answer identically: does the installed transformers
+    thread the reset kwargs into this arch's GDN forward, and are the kernels importable. Both are
+    properties of the pinned image, which is a fixed input to the job. ``is_*_available()`` is
+    deliberately NOT used -- those open with ``is_torch_cuda_available()`` (see Dockerfile.worker's
+    sanity block), which is exactly the device dependence this must not have.
+    """
+    try:
+        import importlib
+
+        importlib.import_module("fla")
+        importlib.import_module("causal_conv1d")
+        return _gdn_forward_threads_reset_kwargs(model_id, revision=revision)
+    except Exception:
+        return False
 
 
 def _eos_terminated(texts: list[str], tokenizer) -> list[str]:

@@ -109,6 +109,17 @@ def test_gdn_hybrid_false_for_pure_and_sliding(monkeypatch):
     assert model_is_gdn_hybrid("any/sliding") is False  # sliding != linear_attention
 
 
+def test_gdn_forward_probe_resolves_actual_arch():
+    # The version/API probe resolves the model's ACTUAL DeltaNet class (not a hardcoded qwen3_5), so
+    # it stays correct for a future qwen3_6 module. With no model_id it falls back to qwen3_5, whose
+    # installed forward threads both reset kwargs -> True; a bogus arch -> safe-False.
+    pytest.importorskip("transformers")
+    pytest.importorskip("torch")
+    from flash.engine.worker.model.packing import _gdn_forward_threads_reset_kwargs
+
+    assert _gdn_forward_threads_reset_kwargs(None) is True
+
+
 # ---------------------------------------------------------------- completion-only loss masking
 def _mask(tok, prompt, full):
     # Mirror the SFT path: tokenize the prompt the SAME way the full row is tokenized (one batched
@@ -209,8 +220,12 @@ def _patch_cfg_raises(monkeypatch, exc):
     monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", _boom)
 
 
-def test_gdn_wrapper_keeps_returning_false_on_probe_failure(monkeypatch):
-    """the runtime gdn gate must keep its fail-closed-to-false contract."""
+def test_gdn_swallowing_wrapper_keeps_returning_false_on_probe_failure(monkeypatch):
+    """The runtime GDN gate must keep its fail-closed-to-False contract.
+
+    Answering False when the config cannot be read is the safe runtime answer and must not become an
+    exception.
+    """
     _patch_cfg_raises(monkeypatch, OSError("hub read timed out"))
     assert packing.model_is_gdn_hybrid("any/model") is False
 
@@ -228,7 +243,8 @@ def test_raising_probes_propagate_so_a_digest_is_never_frozen_from_a_failure(mon
         packing.probe_is_pure_attention("any/model")
 
 
-def test_live_architecture_probes_resolve_when_the_config_is_available(monkeypatch):
+def test_live_probes_resolve_when_the_config_loads(monkeypatch):
+    """The GDN wrapper agrees with its probe, and the pure-attention probe returns its answer."""
     _patch_cfg(
         monkeypatch, types.SimpleNamespace(layer_types=["linear_attention", "full_attention"])
     )

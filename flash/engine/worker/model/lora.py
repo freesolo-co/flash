@@ -1,31 +1,10 @@
-"""provide cpu-importable lora-target and vl-checkpoint helpers.
+"""read adapter tensor keys from a downloaded adapter directory, without loading tensor data.
 
-helpers take model ids explicitly and must not import ``flash.engine.worker``. heavy dependencies remain
-lazy so this leaf module has no package cycle or eager gpu stack import.
+helpers must not import ``flash.engine.worker``. heavy dependencies remain lazy so this leaf
+module has no package cycle or eager gpu stack import.
 """
 
 from __future__ import annotations
-
-# Natively-multimodal model types (Qwen3.5/3.6). Their LoRA adapters adapt the FULL module
-# tree — vision tower / projector / MTP head included, like every other linear (on no-image
-# data those get no gradient, so their lora_B stays zero-init). The engine loads and serves
-# the whole VL model (vision tower included); there is no language-only VL adapter path.
-_VL_MODEL_TYPES = ("qwen3_5", "qwen3_5_moe", "qwen3_6")
-# --------------------------------------------------------------------------------------------
-# warm-start vl adapters use the full multimodal model across sft/grpo/opd. the
-# ``_LANGUAGE_MODEL_INFIX`` key signal selects that base without merging or stacking ranks.
-
-_LANGUAGE_MODEL_INFIX = ".language_model."
-
-
-# Substrings that identify a peft LoRA weight key (vs a base-model param). The whole adapter file
-# is LoRA weights, but a wrong-arch / corrupt checkpoint can contain non-LoRA tensors, so we filter.
-_LORA_KEY_MARKERS = (".lora_A.", ".lora_B.", ".lora_embedding_A.", ".lora_embedding_B.", "lora_")
-
-
-def _is_lora_key(key: str) -> bool:
-    return any(m in key for m in _LORA_KEY_MARKERS)
-
 
 # A safetensors header is small even for huge models (a few hundred KB at most); 100 MB is a wildly
 # generous ceiling that still refuses a corrupt/hostile file declaring a multi-GB header length
@@ -72,8 +51,8 @@ def _read_adapter_tensor_keys(adir: str) -> list[str] | None:
                     f"(corrupt or not a safetensors file): {exc}"
                 ) from exc
         # The safetensors header MUST be a JSON object keyed by tensor name. A corrupt/hostile file
-        # could decode to a list/int/str, which would later blow up with a confusing TypeError in
-        # _is_lora_key (substring search on a non-str). (JSON object keys are always str, so only the
+        # could decode to a list/int/str, which would later blow up with a confusing TypeError
+        # downstream (substring search on a non-str). (JSON object keys are always str, so only the
         # container type needs checking.) Reject a non-object header early with a clear message.
         if not isinstance(header, dict):
             raise ValueError(

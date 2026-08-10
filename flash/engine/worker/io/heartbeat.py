@@ -76,8 +76,8 @@ def _is_critical_stage(stage: str) -> bool:
     return stage in _HB_TERMINAL_STAGES or stage.startswith("error_")
 
 
-# Guards throttle bookkeeping; slow HF commit runs outside this lock so trainer callbacks don't
-# block on the network.
+# Guards throttle bookkeeping; slow HF commit runs outside this lock so heartbeat and liveness
+# threads don't block on the network.
 _HB_LOCK = threading.Lock()
 # Serializes HF commits to prevent reorder; each thread uploads its own per-call temp file.
 _HB_UPLOAD_LOCK = threading.Lock()

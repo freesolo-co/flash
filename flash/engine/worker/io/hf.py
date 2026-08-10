@@ -11,8 +11,6 @@ import os
 import shutil
 import threading
 import time
-from collections.abc import Callable
-from dataclasses import dataclass
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.adapters.artifacts import ADAPTER_WEIGHT_FILES, attempt_scoped_artifact_name
@@ -174,8 +172,6 @@ def hf_upload_file(local_path: str, repo_subpath: str, required: bool = False) -
     )
 
 
-_OPTIONAL_UPLOAD_FLUSH_TIMEOUT_S = 300.0
-_REQUIRED_FINAL_UPLOAD_RESERVE_S = 60.0
 _RESUME_CHECKPOINT_UPLOAD_LOCK = threading.Lock()
 
 
@@ -190,174 +186,6 @@ def _resume_checkpoint_upload_slot(timeout_s: float | None = None):
     finally:
         if acquired:
             _RESUME_CHECKPOINT_UPLOAD_LOCK.release()
-
-
-@dataclass(frozen=True)
-class _OptionalUpload:
-    sequence: int
-    label: str
-    staged_dir: str
-    run: Callable[[], None]
-    on_coalesce: Callable[[_OptionalUpload], None] | None = None
-
-
-class _SingleSlotUploader:
-    """run one optional upload at a time with one newest-wins pending slot."""
-
-    def __init__(self) -> None:
-        self._condition = threading.Condition()
-        self._in_flight: _OptionalUpload | None = None
-        self._pending: _OptionalUpload | None = None
-        self._next_sequence = 0
-        self._thread: threading.Thread | None = None
-
-    def enqueue(
-        self,
-        label: str,
-        staged_dir: str,
-        run: Callable[[], None],
-        on_coalesce: Callable[[_OptionalUpload], None] | None = None,
-    ) -> None:
-        replaced: _OptionalUpload | None = None
-        thread: threading.Thread | None = None
-        with self._condition:
-            self._next_sequence += 1
-            task = _OptionalUpload(self._next_sequence, label, staged_dir, run, on_coalesce)
-            replaced, self._pending = self._pending, task
-            if self._thread is None:
-                thread = threading.Thread(
-                    target=self._drain,
-                    name="flash-optional-uploader",
-                    daemon=True,
-                )
-                self._thread = thread
-            self._condition.notify_all()
-        if replaced is not None:
-            print(
-                f"[upload] coalesced optional {replaced.label} into newer {label} "
-                f"(sequence {task.sequence})"
-            )
-            if replaced.on_coalesce is not None:
-                # the coalesce hook takes over cleanup of the replaced staged tree.
-                replaced.on_coalesce(replaced)
-            else:
-                shutil.rmtree(replaced.staged_dir, ignore_errors=True)
-        if thread is not None:
-            thread.start()
-
-    def _drain(self) -> None:
-        while True:
-            with self._condition:
-                if self._pending is None:
-                    self._thread = None
-                    self._condition.notify_all()
-                    return
-                task, self._pending = self._pending, None
-                self._in_flight = task
-            try:
-                task.run()
-            except Exception as e:
-                print(f"optional upload warn ({task.label}): {sanitize_diagnostic(e, limit=500)}")
-            finally:
-                shutil.rmtree(task.staged_dir, ignore_errors=True)
-                with self._condition:
-                    self._in_flight = None
-                    self._condition.notify_all()
-
-    def flush(self, timeout_s: float) -> bool:
-        """wait for the in-flight and newest pending optional uploads to finish."""
-        deadline = time.monotonic() + max(0.0, timeout_s)
-        with self._condition:
-            while self._in_flight is not None or self._pending is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._condition.wait(remaining)
-            return True
-
-
-class _FifoUploader:
-    """run uploads one at a time in FIFO order, never dropping a pending task.
-
-    unlike _SingleSlotUploader this keeps every enqueued upload, so per-step artifacts that must
-    each land (deployable adapters) are not coalesced away by a newer save.
-    """
-
-    def __init__(self) -> None:
-        self._condition = threading.Condition()
-        self._in_flight: _OptionalUpload | None = None
-        self._pending: list[_OptionalUpload] = []
-        self._next_sequence = 0
-        self._thread: threading.Thread | None = None
-
-    def enqueue(self, label: str, staged_dir: str, run: Callable[[], None]) -> None:
-        thread: threading.Thread | None = None
-        with self._condition:
-            self._next_sequence += 1
-            self._pending.append(_OptionalUpload(self._next_sequence, label, staged_dir, run))
-            if self._thread is None:
-                thread = threading.Thread(
-                    target=self._drain, name="flash-deployable-uploader", daemon=True
-                )
-                self._thread = thread
-            self._condition.notify_all()
-        if thread is not None:
-            thread.start()
-
-    def _drain(self) -> None:
-        while True:
-            with self._condition:
-                if not self._pending:
-                    self._thread = None
-                    self._condition.notify_all()
-                    return
-                task = self._pending.pop(0)
-                self._in_flight = task
-            try:
-                task.run()
-            except Exception as e:
-                print(f"deployable upload warn ({task.label}): {sanitize_diagnostic(e, limit=500)}")
-            finally:
-                shutil.rmtree(task.staged_dir, ignore_errors=True)
-                with self._condition:
-                    self._in_flight = None
-                    self._condition.notify_all()
-
-    def flush(self, timeout_s: float) -> bool:
-        """wait for the in-flight and all pending FIFO uploads to finish."""
-        deadline = time.monotonic() + max(0.0, timeout_s)
-        with self._condition:
-            while self._in_flight is not None or self._pending:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._condition.wait(remaining)
-            return True
-
-
-_OPTIONAL_CHECKPOINT_UPLOADER = _SingleSlotUploader()
-_OPTIONAL_AUX_UPLOADER = _SingleSlotUploader()
-_OPTIONAL_DEPLOYABLE_UPLOADER = _FifoUploader()
-
-
-def _bounded_optional_flush_timeout(timeout_s: float) -> float:
-    timeout_s = max(0.0, timeout_s)
-    remaining = _w._remaining_worker_wall_seconds()
-    if remaining is None:
-        return timeout_s
-    return min(timeout_s, max(0.0, remaining - _REQUIRED_FINAL_UPLOAD_RESERVE_S))
-
-
-def flush_optional_uploads(timeout_s: float = _OPTIONAL_UPLOAD_FLUSH_TIMEOUT_S) -> bool:
-    """bounded best-effort flush that preserves time for required terminal artifacts."""
-    timeout_s = _bounded_optional_flush_timeout(timeout_s)
-    started = time.monotonic()
-    checkpoints_flushed = _OPTIONAL_CHECKPOINT_UPLOADER.flush(timeout_s)
-    remaining = max(0.0, timeout_s - (time.monotonic() - started))
-    deployables_flushed = _OPTIONAL_DEPLOYABLE_UPLOADER.flush(remaining)
-    remaining = max(0.0, timeout_s - (time.monotonic() - started))
-    aux_flushed = _OPTIONAL_AUX_UPLOADER.flush(remaining)
-    return checkpoints_flushed and deployables_flushed and aux_flushed
 
 
 def hf_upload_folder(local_dir: str, repo_subpath: str, required: bool = False) -> bool:
@@ -376,7 +204,7 @@ def hf_upload_folder(local_dir: str, repo_subpath: str, required: bool = False) 
 
 
 def hf_resume_checkpoint(fail_closed: bool = False, revision: str | None = None) -> str | None:
-    """Download the latest streamed trainer checkpoint for this run, or return none."""
+    """Download the latest streamed verl checkpoint for this run, or return none."""
     required = bool(revision)
     strict = bool(fail_closed or required)
     if not _w.HF_REPO:
@@ -474,7 +302,7 @@ def publish_deployable_checkpoint(
     _provenance_ready: bool = False,
     _emit_heartbeat: bool = True,
 ) -> str | None:
-    """Mirror a trainer checkpoint's LoRA adapter to a stable per-step path.
+    """Mirror a verl checkpoint's LoRA adapter to a stable per-step path.
 
     Periodic saves remain best-effort. ``required=True`` fails loudly when an exact required save
     cannot be published.
@@ -524,8 +352,8 @@ def publish_deployable_checkpoint(
     return None
 
 
-# Retry/backoff for each synchronous checkpoint upload. `on_save` BLOCKS the training loop on the
-# upload, so a transient HF error is retried until the step lands rather than costing the step.
+# Retry/backoff for each synchronous checkpoint upload. the watcher BLOCKS on the upload, so a
+# transient HF error is retried until the step lands rather than costing the step.
 _CKPT_UPLOAD_RETRIES = 3
 _CKPT_UPLOAD_BACKOFF_S = 5.0
 
@@ -533,15 +361,15 @@ _CKPT_UPLOAD_BACKOFF_S = 5.0
 def _deployable_adapter_on_hf(step: int) -> bool:
     """True when a required step's deployable adapter is durably present on hf.
 
-    Resume credits a required save only after confirming its published adapter exists, so
-    on_train_end verifies the durability guarantee against hf instead of assuming it from the
+    Resume credits a required save only after confirming its published adapter exists, so the
+    final completeness check verifies the durability guarantee against hf instead of assuming it from the
     restored step counter (a pre-resume worker could have advanced past the step without ever
     landing its deployable). publish_deployable_checkpoint uploads the adapter folder in a single
     atomic upload_folder commit, so the config marker's presence implies the whole folder landed.
 
     Raises RetriableInfraError when hf cannot be reached: a transient lookup outage must retry the
     resume, not be misread as a permanently-missing required save. file_exists returns False cleanly
-    for a genuinely absent file (that stays uncredited and fails completeness in on_train_end).
+    for a genuinely absent file (that stays uncredited and fails the final completeness check).
     """
     if not _w.HF_REPO:
         return False

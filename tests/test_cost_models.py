@@ -36,7 +36,6 @@ def test_catalog_dense_active_params_ignore_revision_without_hf_lookup(monkeypat
     def _boom(*_args, **_kwargs):
         raise AssertionError("catalog active params must not query huggingface")
 
-    monkeypatch.setattr(vram, "fetch_hf_params_b", _boom, raising=False)
     monkeypatch.setattr(vram, "_validated_revision_geometry", _boom)
 
     assert active_params_b(model_id, "a" * 40) == pytest.approx(MODELS[model_id].params_b)
@@ -63,7 +62,6 @@ def test_catalog_moe_classification_never_queries_huggingface(monkeypatch, model
     def _boom(*_args, **_kwargs):
         raise AssertionError("catalog moe classification must not query huggingface")
 
-    monkeypatch.setattr(vram, "fetch_hf_params_b", _boom, raising=False)
     monkeypatch.setattr(vram, "_validated_revision_geometry", _boom)
 
     assert _is_moe(model_id) is expected
@@ -96,26 +94,15 @@ def test_download_weight_gb_is_total_params_bf16():
     assert download_weight_gb(nine) == pytest.approx(total_params_b(nine) * 2.0)
 
 
-def test_an_uncataloged_model_is_rejected(monkeypatch):
-    # Fail closed: an id with no catalog entry raises rather than being priced as free. Even with
-    # HF reachable it must not be sized over the network -- a quote is a catalog read, full stop.
-    import flash.engine.plan.vram as vram
-
-    monkeypatch.setattr(vram, "fetch_hf_params_b", lambda *_a, **_k: 8.03, raising=False)
+def test_an_uncataloged_model_is_rejected():
+    # fail closed: an id with no catalog entry raises rather than being priced as free.
     with pytest.raises(ValueError, match="cost estimation supports catalog models only"):
         total_params_b("nobody/never-heard-of-it")
     with pytest.raises(ValueError, match="cost estimation supports catalog models only"):
         active_params_b("nobody/never-heard-of-it")
 
 
-def test_a_catalog_model_is_never_sized_over_the_network(monkeypatch):
-    """Pricing reads the curated entry and nothing else: no quote may depend on hub reachability."""
-    import flash.engine.plan.vram as vram
-
-    def _boom(*_args, **_kwargs):
-        raise AssertionError("a catalog model must be sized from the catalog, with no HF call")
-
-    monkeypatch.setattr(vram, "fetch_hf_params_b", _boom, raising=False)
+def test_a_catalog_model_is_sized_from_the_catalog():
     assert total_params_b("Qwen/Qwen3.5-9B") == pytest.approx(MODELS["Qwen/Qwen3.5-9B"].params_b)
 
 

@@ -36,7 +36,6 @@ from flash.engine.worker.io.heartbeat import (
 from flash.engine.worker.io.hf import (
     _hf_upload,
     error_artifact_name,
-    flush_optional_uploads,
     hf_api,
     hf_prefix,
     hf_resume_checkpoint,
@@ -52,7 +51,6 @@ from flash.engine.worker.io.hf import (
     write_base_model_provenance,
 )
 from flash.engine.worker.io.wandb_log import (
-    wandb_finish,
     wandb_run_name,
 )
 from flash.engine.worker.model.adapter import (
@@ -161,9 +159,6 @@ _HB_FORCE_MIN_INTERVAL_S = 60.0
 _HB_SETUP_LIVENESS_INTERVAL_S = 240.0
 _HB_TERMINAL_ONLY = False
 
-_WANDB_FINISH_WAIT_S = 120.0
-_WANDB_FINISH_FAIL_WAIT_S = 5.0
-
 
 def _remaining_worker_wall_seconds() -> float | None:
     raw_deadline = os.environ.get("FLASH_RUN_DEADLINE_AT")
@@ -228,8 +223,6 @@ THINKING = JOB_SPEC.thinking if JOB_SPEC else False
 
 
 def _finalize(metrics: RunMetrics, *, heartbeat_fields=None):
-    if not flush_optional_uploads():
-        print("optional upload flush timed out before final publication")
     metrics.save("/tmp/metrics.json")
     hf_upload_file("/tmp/metrics.json", "metrics.json", required=True)
     with open("/tmp/DONE", "w") as f:
@@ -331,7 +324,6 @@ def main():
         if RUN_MODE == "profile":
             heartbeat("boot")
             handler()
-            wandb_finish(exit_code=0)
             sys.stdout.flush()
             sys.stderr.flush()
             os._exit(0)
@@ -351,14 +343,11 @@ def main():
         load_mega_cache()
         handler()
         # Hard-exit: colocated vLLM can deadlock on NCCL/CUDA teardown; all artifacts already on HF.
-        wandb_finish(exit_code=0)
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(0)
     except Exception as e:
         tb = sanitize_diagnostic(traceback.format_exc(), limit=16_000)
-        if not flush_optional_uploads():
-            print("optional upload flush timed out on worker error")
         try:
             err_name = error_artifact_name(RUN_MODE, ATTEMPT)
             err_path = f"/tmp/{err_name}"
@@ -403,7 +392,6 @@ def main():
             )
         except Exception:
             heartbeat(f"error_{RUN_MODE}", error=detail, **hb_flags, **_err_metrics)
-        wandb_finish(exit_code=1)
         remaining = _remaining_worker_wall_seconds()
         delay = 10.0 if remaining is None else min(10.0, remaining)
         if delay > 0:
@@ -438,8 +426,6 @@ __all__ = [
     "_HB_TIGHT_LIVENESS_STAGES",
     "_HB_UPLOAD_LIVENESS_STAGES",
     "_HB_UPLOAD_LOCK",
-    "_WANDB_FINISH_FAIL_WAIT_S",
-    "_WANDB_FINISH_WAIT_S",
     "RetriableInfraError",
     "_current_cuda_sm",
     "_download_adapter",
@@ -458,7 +444,6 @@ __all__ = [
     "build_grpo_prompt_dataset",
     # gpu/backend setup
     "error_artifact_name",
-    "flush_optional_uploads",
     "gpu_diagnostics",
     "grad_checkpointing_on",
     "graded_text",
@@ -494,7 +479,6 @@ __all__ = [
     "upload_resume_checkpoint",
     "validate_lora_target_parameters",
     "wait_for_gpu",
-    "wandb_finish",
     "wandb_run_name",
     "write_base_model_provenance",
     "write_train_meta",
