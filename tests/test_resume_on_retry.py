@@ -2,18 +2,12 @@
 
 A crash- or preemption-killed run is relaunched on a fresh worker by the control-plane
 retry loop, and that fresh worker continues training from the latest streamed checkpoint
-rather than restarting from scratch. This file locks in the three load-bearing pieces of
-that path, none of which were covered by ``test_checkpoints.py`` (which only exercises the
-*deployable* per-step adapter snapshots, a separate accumulating path):
+rather than restarting from scratch. This file locks in the two live load-bearing pieces:
 
-  1. WORKER STREAM — ``make_checkpoint_upload_callback`` streams each trainer save's FULL
-     state (optimizer/scheduler/RNG kept, not stripped) to ``<prefix>/checkpoint/checkpoint-<N>``,
-     pruned latest-only via ``delete_patterns`` so a replacement worker finds exactly one.
-  2. WORKER RESUME — ``hf_resume_checkpoint`` pulls that stream and returns the highest-step
-     checkpoint dir (what both SFT and GRPO hand to ``trainer.train(resume_from_checkpoint=...)``).
-  3. CONTROL PLANE — ``_submit_seed_supervised`` relaunches on the SAME run_id + seed for every
-     infra-shaped failure (``stalled``/``no_capacity``/``poll_error``/``job_preempted``), which is
-     the key that lets (2) find (1)'s checkpoint; a genuine worker error fails fast instead.
+  1. worker resume: ``hf_resume_checkpoint`` pulls the stream and returns the highest-step
+     checkpoint directory used by the training backend.
+  2. control plane: ``_submit_seed_supervised`` relaunches on the same run id and seed for every
+     infra-shaped failure; a genuine worker error fails fast instead.
 
 All HF/provider/network boundaries are stubbed; nothing here touches a GPU or the network.
 """
@@ -23,7 +17,6 @@ from __future__ import annotations
 import io
 import os
 import shutil
-from types import SimpleNamespace
 
 import pytest
 
@@ -36,9 +29,6 @@ INFRA_SHAPED = ("stalled", "no_capacity", "poll_error", "job_preempted")
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
 
 
-# ============================================================================================
-# 1. WORKER STREAM — make_checkpoint_upload_callback
-# ============================================================================================
 class _RecordingHfApi:
     def __init__(self, files: list[str] | None = None):
         self.uploads: list[dict] = []
@@ -55,25 +45,6 @@ class _RecordingHfApi:
         self.deleted.append(path_in_repo)
 
 
-class _SyncThread:
-    """Stand-in for threading.Thread that runs the target inline on .start().
-
-    The upload callback fires the HF push on a background daemon thread so the train loop never
-    blocks on the network; running it synchronously makes the unit test deterministic (no join).
-    """
-
-    def __init__(self, target=None, daemon=None, **_):
-        self._target = target
-
-    def start(self):
-        if self._target:
-            self._target()
-
-    def join(self, timeout=None):
-        # quack like Thread: liveness_heartbeat joins its daemon on block exit.
-        return None
-
-
 def _prime_worker(monkeypatch, recorder, *, repo="org/test-runs", run="flash-resume-1"):
     import flash.engine.worker as worker
 
@@ -83,143 +54,11 @@ def _prime_worker(monkeypatch, recorder, *, repo="org/test-runs", run="flash-res
     monkeypatch.setattr(worker, "SEED", 0)
     monkeypatch.setattr(worker, "hf_api", lambda: recorder)
     monkeypatch.setattr(worker, "heartbeat", lambda *a, **k: None)
-    # Run the daemon upload thread inline so the assert sees the push.
-    monkeypatch.setattr(worker.threading, "Thread", _SyncThread)
     return worker
 
 
-def _full_checkpoint(tmp_path, step):
-    """A trainer checkpoint dir carrying the adapter AND optimizer/RNG trainer-state."""
-    ckpt = tmp_path / f"checkpoint-{step}"
-    ckpt.mkdir()
-    (ckpt / "adapter_config.json").write_text("{}")
-    (ckpt / "adapter_model.safetensors").write_bytes(b"weights")
-    (ckpt / "optimizer.pt").write_bytes(b"opt")
-    (ckpt / "rng_state.pth").write_bytes(b"rng")
-    return ckpt
-
-
-@pytest.fixture
-def fake_transformers(monkeypatch):
-    """Inject a minimal ``transformers`` stub (just a ``TrainerCallback`` base) so the checkpoint-upload
-    regression tests RUN in offline CI — which lacks the GPU-only ``transformers`` extra — instead of
-    being ``importorskip``'d away (where they'd silently protect nothing). The upload callback only
-    subclasses ``TrainerCallback`` (imported lazily inside make_checkpoint_upload_callback) and all HF
-    I/O is stubbed via _RecordingHfApi, so a real transformers install is unnecessary; the stub keeps
-    the coverage deterministic everywhere. Mirrors the existing stub in test_worker_dryrun.py."""
-    import sys
-    import types
-
-    mod = types.ModuleType("transformers")
-
-    class TrainerCallback:
-        pass
-
-    mod.TrainerCallback = TrainerCallback
-    monkeypatch.setitem(sys.modules, "transformers", mod)
-    return mod
-
-
-def test_upload_callback_streams_full_state_checkpoint_latest_only(
-    tmp_path, monkeypatch, fake_transformers
-):
-    """on_save streams the resume checkpoint to <prefix>/checkpoint/checkpoint-<N>, pruned latest-only.
-
-    This is the upload a preempted run resumes FROM, so it must (a) keep the trainer state
-    (no ignore_patterns dropping optimizer.pt) and (b) prune older checkpoint dirs AFTER the new one
-    lands so hf_resume_checkpoint never disambiguates (or re-downloads) stale state.
-    """
-    prefix = "rl/flash-resume-1"
-    rec = _RecordingHfApi(
-        files=[
-            f"{prefix}/checkpoint/checkpoint-40/optimizer.pt",  # stale prior step
-            f"{prefix}/checkpoint/checkpoint-60/optimizer.pt",
-        ]
-    )
-    worker = _prime_worker(monkeypatch, rec)
-    _full_checkpoint(tmp_path, 60)
-
-    cb = worker.make_checkpoint_upload_callback()
-    cb.on_save(
-        SimpleNamespace(output_dir=str(tmp_path)),
-        SimpleNamespace(global_step=60),
-        SimpleNamespace(),
-    )
-    assert worker.flush_optional_uploads()
-
-    streams = [u for u in rec.uploads if u["path_in_repo"].endswith("/checkpoint/checkpoint-60")]
-    assert len(streams) == 1, "the resumable full-state checkpoint must be streamed exactly once"
-    up = streams[0]
-    assert up["path_in_repo"] == f"{prefix}/checkpoint/checkpoint-60"
-    assert up["repo_type"] == "dataset"
-    # delete_patterns is matched RELATIVE to path_in_repo (the step dir) so it can't reach sibling step
-    # dirs; the callback prunes them explicitly, AFTER the new one lands (latest-only).
-    assert "delete_patterns" not in up
-    assert rec.deleted == [f"{prefix}/checkpoint/checkpoint-40"]
-    # FULL state: this upload must NOT strip optimizer/RNG — that's what makes the resume true
-    # (Adam moments + LR schedule + RNG continue) rather than re-initializing the optimizer.
-    assert "ignore_patterns" not in up
-
-
-def test_upload_callback_also_publishes_deployable_snapshot(
-    tmp_path, monkeypatch, fake_transformers
-):
-    """Each save additionally mirrors an adapter-only, NON-pruned per-step deployable snapshot.
-
-    The two paths are distinct: the resume stream (above) is full-state + latest-only; the
-    deployable snapshot is adapter-only + accumulating. on_save drives both off one checkpoint.
-    """
-    rec = _RecordingHfApi()
-    worker = _prime_worker(monkeypatch, rec)
-    _full_checkpoint(tmp_path, 60)
-
-    worker.make_checkpoint_upload_callback().on_save(
-        SimpleNamespace(output_dir=str(tmp_path)),
-        SimpleNamespace(global_step=60),
-        SimpleNamespace(),
-    )
-    assert worker.flush_optional_uploads()
-
-    deployable = [
-        u for u in rec.uploads if u["path_in_repo"].endswith("/checkpoints/step-60/adapter")
-    ]
-    assert len(deployable) == 1
-    up = deployable[0]
-    # Adapter-only (trainer state stripped) and accumulating (never pruned).
-    assert "optimizer.pt" in up["ignore_patterns"]
-    assert "delete_patterns" not in up
-
-
-def test_upload_callback_noop_without_repo(tmp_path, monkeypatch, fake_transformers):
-    rec = _RecordingHfApi()
-    worker = _prime_worker(monkeypatch, rec, repo="")  # local/dev run, no artifact repo
-    _full_checkpoint(tmp_path, 10)
-
-    worker.make_checkpoint_upload_callback().on_save(
-        SimpleNamespace(output_dir=str(tmp_path)),
-        SimpleNamespace(global_step=10),
-        SimpleNamespace(),
-    )
-    assert rec.uploads == []
-
-
-def test_upload_callback_skips_when_checkpoint_dir_missing(
-    tmp_path, monkeypatch, fake_transformers
-):
-    """A save event whose checkpoint folder isn't on disk yet must not push a phantom commit."""
-    rec = _RecordingHfApi()
-    worker = _prime_worker(monkeypatch, rec)
-    # No checkpoint-30 dir created under output_dir.
-    worker.make_checkpoint_upload_callback().on_save(
-        SimpleNamespace(output_dir=str(tmp_path)),
-        SimpleNamespace(global_step=30),
-        SimpleNamespace(),
-    )
-    assert rec.uploads == []
-
-
 # ============================================================================================
-# 2. WORKER RESUME — hf_resume_checkpoint
+# worker resume: hf_resume_checkpoint
 # ============================================================================================
 def _fake_snapshot(steps, *, with_weights=True):
     """Stand in for huggingface_hub.snapshot_download: materialize the selected checkpoint dirs.

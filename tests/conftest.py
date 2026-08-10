@@ -29,12 +29,6 @@ def _reset_status_reporter_before_test():
 
 @pytest.fixture(autouse=True)
 def _offline(monkeypatch):
-    # HF param probe -> offline: pinned-revision sizing reads safetensors metadata over the
-    # network, so stub it rather than hitting the Hugging Face API from a unit test.
-    import flash.engine.plan.vram as vram
-
-    monkeypatch.setattr(vram, "fetch_hf_params_b", lambda model_id: None, raising=False)
-
     # RunPod endpoint listing -> offline: the idle-endpoint sweep (deploy-time quota reclaim
     # and the startup/post-run orphan sweep) lists account endpoints. Default to "no endpoints"
     # so a sweep never reaches the real API; sweep tests monkeypatch it after this fixture.
