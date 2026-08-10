@@ -2915,9 +2915,9 @@ def test_a_blocking_environment_hook_cannot_hang_the_submit(monkeypatch):
 
     began = time.monotonic()
     try:
-        finished, value = rp._within(rp._LOCAL_HOOK_DEADLINE_S, _never_returns)
+        outcome = rp._within(rp._LOCAL_HOOK_DEADLINE_S, _never_returns)
         elapsed = time.monotonic() - began
-        assert (finished, value) == (False, None)
+        assert (outcome.completed, outcome.value) == (False, None)
         assert started.is_set(), "the call never actually started"
         # the point of the fix: it came back on the DEADLINE, not when the hook finished.
         assert elapsed < 5.0, f"waited {elapsed:.1f}s, so the deadline did not bound the call"
@@ -2929,12 +2929,19 @@ def test_a_bounded_hook_still_returns_its_value():
     """The deadline must not cost a measurement for every env whose dataset() is merely slow."""
     from flash.cli.commands import rollout_profile as rp
 
-    assert rp._within(30.0, lambda: [{"q": "2+2?"}]) == (True, [{"q": "2+2?"}])
+    ok = rp._within(30.0, lambda: [{"q": "2+2?"}])
+    assert (ok.completed, ok.value, ok.error) == (True, [{"q": "2+2?"}], None)
     # a raising hook is reported as "no measurement", like any other failure on this path -- but it
     # COMPLETED: the user's code ran, so the notice may say so. only a hang reports False.
-    assert rp._within(30.0, lambda: (_ for _ in ()).throw(RuntimeError("boom"))) == (True, None)
+    raised = rp._within(30.0, lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert (raised.completed, raised.value) == (True, None)
+    # the exception itself survives, which is what lets the env load classify an ImportError instead
+    # of failing open silently.
+    assert isinstance(raised.error, RuntimeError)
+    assert "boom" in str(raised.error)
     # a hook that legitimately returns something falsy must not be mistaken for one that hung.
-    assert rp._within(30.0, list) == (True, [])
+    falsy = rp._within(30.0, list)
+    assert (falsy.completed, falsy.value, falsy.error) == (True, [], None)
 
 
 def test_an_environment_that_blocks_at_import_cannot_hold_the_submit(monkeypatch, tmp_path):
@@ -2988,8 +2995,8 @@ def test_environment_params_cannot_collide_with_the_deadline_helper():
     """
     from flash.cli.commands import rollout_profile as rp
 
-    finished, value = rp._within(5.0, lambda **kw: kw, call="x", deadline_s=1)
-    assert (finished, value) == (True, {"call": "x", "deadline_s": 1})
+    outcome = rp._within(5.0, lambda **kw: kw, call="x", deadline_s=1)
+    assert (outcome.completed, outcome.value) == (True, {"call": "x", "deadline_s": 1})
 
 
 def test_a_stalled_package_download_cannot_hold_the_submit(monkeypatch, tmp_path):
@@ -3266,6 +3273,97 @@ def test_a_missing_dependency_in_the_users_env_does_not_blame_the_flash_install(
     assert "your environment.py could not be imported" in caplog.text
     assert "pandas" in caplog.text, "the actual cause has to survive into the warning"
     assert "unavailable in this install" not in caplog.text
+
+
+def test_a_loader_failure_reaches_the_warning_through_the_bounded_call(monkeypatch, caplog):
+    """The two tests above patch `_collect` itself, so their raise never crosses `_within`.
+
+    That is the gap this test closes. `_within` runs the loader on a worker thread and caught every
+    Exception, appending None -- so the load site saw `(True, None)`, indistinguishable from a
+    legitimate None, and returned before `collect_for_submit` could classify anything. Measured on
+    the real path: the loader raised the missing-SDK ImportError and the user got None with ZERO
+    warnings, which is the silent fall back to cap pricing the handler exists to prevent.
+    """
+    from pathlib import Path
+
+    import flash.envs.loader as loader_mod
+    import flash.envs.pull as pull_mod
+    from flash.cli.commands import rollout_profile as rp
+
+    def _extract(_package, dest):
+        root = Path(dest)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "environment.py").write_text("# placeholder\n")
+        return root
+
+    def _no_sdk(*_a, **_k):
+        raise ImportError(f"{rp._MISSING_ENVIRONMENT_TOOLS}: No module named 'freesolo'")
+
+    class _Client:
+        def download_env_package(self, _env_id):
+            return b"archive-bytes"
+
+    monkeypatch.setenv(rollout_sampler.ROLLOUT_SAMPLER_API_KEY_ENV, "k")
+    monkeypatch.setattr(pull_mod, "pull_environment_package_from_archive", _extract)
+    monkeypatch.setattr(loader_mod, "load_freesolo_environment", _no_sdk)
+
+    # model_revision must be empty or `unsamplable_reason` declines before the loader is reached.
+    spec = _spec(model_revision="")
+    with caplog.at_level(logging.WARNING, logger="flash.cli"):
+        assert rp.collect_for_submit(_Client(), spec) is None
+
+    assert "rollout profiling is unavailable in this install" in caplog.text
+    assert "freesolo" in caplog.text
+
+
+def test_the_environment_module_scope_runs_seeded(monkeypatch):
+    """`environment.py` module scope is user code, and it may draw.
+
+    The load used to run BEFORE `_seed_environment_rngs`, so a module that picks data or prompt
+    behaviour at import time drew from this process's ambient rng state. Seeding afterwards cannot
+    undo a value already stored in a module global, so the same `spec.seed` measured a different
+    sample per ambient state while the server binds the profile digest to that seed -- same digest,
+    different sample.
+    """
+    import random
+    from pathlib import Path
+
+    import flash.envs.loader as loader_mod
+    import flash.envs.pull as pull_mod
+    from flash.cli.commands import rollout_profile as rp
+
+    def _extract(_package, dest):
+        root = Path(dest)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "environment.py").write_text("# placeholder\n")
+        return root
+
+    class _Client:
+        def download_env_package(self, _env_id):
+            return b"archive-bytes"
+
+    drawn: list[float] = []
+
+    def _draws_at_module_scope(*_a, **_k):
+        # exactly what `CHOICE = random.random()` at the top of an environment.py does.
+        drawn.append(random.random())
+        raise ImportError("stop here; the draw is what this test measures")
+
+    monkeypatch.setenv(rollout_sampler.ROLLOUT_SAMPLER_API_KEY_ENV, "k")
+    monkeypatch.setattr(pull_mod, "pull_environment_package_from_archive", _extract)
+    monkeypatch.setattr(loader_mod, "load_freesolo_environment", _draws_at_module_scope)
+
+    spec = _spec(model_revision="")
+    for ambient in (11, 22, 33):
+        # a different incidental rng state per run, which is what a real process has.
+        random.seed(ambient)
+        rp.collect_for_submit(_Client(), spec)
+
+    assert len(drawn) == 3
+    assert len(set(drawn)) == 1, (
+        f"module scope drew {drawn} across three ambient states; the sample is not bound to "
+        "spec.seed even though the profile digest claims it is"
+    )
 
 
 def test_the_install_failure_prefix_still_matches_the_loader():

@@ -21,7 +21,7 @@ import tempfile
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from flash._internal.logging import get_logger
 
@@ -207,10 +207,11 @@ def _collect(
         # falling back to the cap-based quote it would have used anyway. bounded at the call site
         # rather than by adding a timeout parameter to the shared client, which is a different
         # subsystem and used by callers that legitimately want the long wait.
-        finished, package = _within(
+        downloaded = _within(
             _LOCAL_HOOK_DEADLINE_S, client.download_env_package, spec.environment.id
         )
-        if not finished or package is None:
+        package = downloaded.value
+        if not downloaded.completed or package is None:
             # `is None` rather than falsy: only "did not finish" and "raised" are failures here,
             # and an empty body is left to the extractor, which is what validates archives.
             return None
@@ -221,13 +222,31 @@ def _collect(
         # bounded like the hooks below it: module scope is user code too, and an environment.py
         # that blocks at import -- waiting on a mount, a client connect, a model download -- never
         # raises, so the outer `except` could not fail open and the submit would hang.
-        finished, environment = _within(
+        # BEFORE the load, because module scope is user code and may draw. an environment.py that
+        # picks data or prompt behaviour at import time would otherwise run off this process's
+        # incidental rng state, and seeding afterwards cannot undo a value already stored in a
+        # module global -- measured, the same spec.seed produced a different draw for every ambient
+        # state, while the server binds the profile digest to spec.seed. same digest, different
+        # sample. the workers have the same shape: they seed before their first environment call.
+        #
+        # dataset() and prompt_messages() below are covered by the same call: it seeds once, here,
+        # and everything the env does afterwards inherits it. seed_host_rngs rather than
+        # seed_training_rngs -- the same split the sft workload profile uses, because this must not
+        # import torch into the cli.
+        _seed_environment_rngs(spec)
+        loaded = _within(
             _LOCAL_HOOK_DEADLINE_S,
             load_freesolo_environment,
             str(entrypoint),
             **(spec.environment.params or {}),
         )
-        if not finished or environment is None:
+        environment = loaded.value
+        if loaded.error is not None:
+            # re-raised so `collect_for_submit` can classify it. the loader distinguishes a missing
+            # SDK from a missing env dependency by the message it re-raises with, and that
+            # diagnostic is the only signal the user gets that profiling silently did not happen.
+            raise loaded.error
+        if not loaded.completed or environment is None:
             return None
         # the user's module has executed by now. every return below this point is a decline, and
         # each one still ran their code -- so the caller is told here, not from the return value.
@@ -237,18 +256,12 @@ def _collect(
             # transcript. one hosted completion is the FIRST turn only, so its token mean
             # undercounts an episode -- and would still pass the trust gate. decline instead.
             return None
-        # the workers seed before their first environment call, and env code may consume python or
-        # numpy randomness while building its dataset. without this the rows measured here depend on
-        # this process's incidental rng state, while the server binds the profile to spec.seed -- so
-        # two runs with different seeds could share a measurement drawn from a different sample.
-        # seed_host_rngs rather than seed_training_rngs: the same split the sft workload profile
-        # uses, because it must not import torch into the cli.
-        _seed_environment_rngs(spec)
         # bounded: dataset() is user code that may block on a download or a stalled mount, and a
         # submit must not hang because the optional sampler happened to be configured. no exception
         # is raised by a hang, so the outer `except` could never regain control.
-        finished, dataset = _within(_LOCAL_HOOK_DEADLINE_S, environment.dataset)
-        if not finished:
+        built = _within(_LOCAL_HOOK_DEADLINE_S, environment.dataset)
+        dataset = built.value
+        if not built.completed:
             # still running at the deadline, so it did NOT run "on a small sample" -- saying it did
             # is the same overclaim the per-stage reporting exists to stop. the thread is a daemon
             # and keeps going, which is exactly why completion has to be reported, not attempted.
@@ -266,8 +279,9 @@ def _collect(
 
         # bounded for the same reason as dataset(): prompt_messages() is user code, called once per
         # row, and a stall in any one of them would hang the submit.
-        finished, prompts = _within(_LOCAL_HOOK_DEADLINE_S, _prompts_from, environment, dataset)
-        if not finished:
+        rendered = _within(_LOCAL_HOOK_DEADLINE_S, _prompts_from, environment, dataset)
+        prompts = rendered.value
+        if not rendered.completed:
             return None
         _ran("prompt_messages", on_environment_loaded)
         if not prompts:
@@ -371,7 +385,20 @@ def _ran(stage: str, report: Callable[[str], None] | None) -> None:
         report(stage)
 
 
-def _within(deadline_s: float, call, /, *args, **kwargs) -> tuple[bool, Any]:
+class _Outcome(NamedTuple):
+    """what a bounded call did: finished or not, what it returned, and what it raised.
+
+    a NamedTuple rather than a bare tuple so each call site names the field it reads. every caller
+    reads ``.completed``/``.value``; only the env load reads ``.error``, because it is the one
+    failure the cli can say something useful about.
+    """
+
+    completed: bool
+    value: Any
+    error: BaseException | None
+
+
+def _within(deadline_s: float, call, /, *args, **kwargs) -> _Outcome:
     """``(completed, value)`` for ``call(*args, **kwargs)``, bounded by ``deadline_s``.
 
     positional-only, because the kwargs are the user's ``[environment.params]``: a param named
@@ -389,24 +416,34 @@ def _within(deadline_s: float, call, /, *args, **kwargs) -> tuple[bool, Any]:
     return a falsy value legitimately. False means only one thing: still running at the deadline. a
     hook that RAISED completed -- the user's code ran and failed -- and the caller reports it as
     having run, because the notice describes what executed on their machine, not what succeeded.
+
+    a raised exception is returned as ``error``, not flattened into a None ``value``. the two are
+    different outcomes and one caller has to tell them apart: the loader raises ImportError to say
+    the SDK or the env's own dependency is missing, and ``collect_for_submit`` exists to turn that
+    into a one-line diagnostic. collapsing it here made that handler unreachable -- measured, a
+    missing-SDK install returned None with no warning at all, which is exactly the silent fall back
+    to cap pricing the handler was written to prevent. returning it does not change any behaviour on
+    its own: a caller that ignores ``error`` still sees the same ``(completed, value)`` it did.
     """
     import threading
 
     box: list = []
+    raised: list[BaseException] = []
 
     def _run() -> None:
         try:
             box.append(call(*args, **kwargs))
-        except Exception:
-            # reported as "no measurement", like any other failure on this path. Exception rather
-            # than BaseException so a KeyboardInterrupt still propagates out of the worker.
+        except Exception as exc:
+            # still "no measurement" for every caller that only reads value. Exception rather than
+            # BaseException so a KeyboardInterrupt still propagates out of the worker.
+            raised.append(exc)
             box.append(None)
 
     worker = threading.Thread(target=_run, daemon=True)
     worker.start()
     worker.join(deadline_s)
     # an append is the only thing that ends _run, so a non-empty box IS "it finished".
-    return (bool(box), box[0] if box else None)
+    return _Outcome(bool(box), box[0] if box else None, raised[0] if raised else None)
 
 
 def _training_population(spec, dataset):
