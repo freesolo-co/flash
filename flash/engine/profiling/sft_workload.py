@@ -246,58 +246,57 @@ def sft_max_length(spec) -> int:
     return int(RECIPE.sft.max_seq_len_thinking if spec.thinking else RECIPE.sft.max_seq_len)
 
 
-def prepare_sft_workload(
+@dataclass(frozen=True)
+class _TokenizedSftRows:
+    row_by_index: dict[int, dict[str, Any]]
+    untruncated_by_index: dict[int, int]
+    sampled_texts: list[str]
+    multiturn_targets: int
+    dropped: int
+
+
+@dataclass(frozen=True)
+class _RetainedSftRows:
+    rows: list[dict[str, Any]]
+    untruncated_lengths: list[int]
+    dropped: int
+
+
+@dataclass(frozen=True)
+class _SftTokenMeasurements:
+    real_tokens: int
+    supervised_tokens: int
+    padded_compute_tokens: int
+    realized_max_length: int
+    untruncated_max_length: int
+    truncated_rows: int
+
+
+@dataclass(frozen=True)
+class _SftStepHorizon:
+    examples_per_update: int
+    packed_blocks: int
+    derived_steps: int
+    authoritative_steps: int
+    authoritative_real_tokens: int
+    authoritative_supervised_tokens: int
+
+
+def _tokenize_prompt_rows(
     spec,
-    env,
+    prompt_rows: list[tuple[Any, list[dict], list[dict]]],
     *,
-    tokenizer_loader: Callable[[str, str], Any],
-    producer_version: str,
-    processor_loader: Callable[[str, str], Any] | None = None,
-    image_dir: str | None = None,
-    allow_packing: bool = True,
-    packing_support: Callable[[str, str], tuple[str, bool]] | None = None,
-) -> PreparedSftWorkload:
-    """Render, tokenize, filter, and pack the exact rows consumed by SFT."""
-    from flash.content.multimodal import (
-        decode_image_descriptors,
-        normalize_prompt_images,
-        record_has_images,
-        text_only_prompt_messages,
-        validate_multimodal_training,
-    )
-
-    train_spec = spec.train
-    max_length = sft_max_length(spec)
-    epochs = int(train_spec.epochs if train_spec.epochs is not None else RECIPE.sft.num_epochs)
-    effective_batch = int(
-        train_spec.batch_size if train_spec.batch_size is not None else RECIPE.sft.effective_batch
-    )
-    max_examples = int(train_spec.max_examples or 0)
-    max_steps = int(train_spec.max_steps or 0)
-
-    source = list(env.dataset())
-    selected = select_sft_examples(source, max_examples, spec.seed)
-    prompt_rows = [
-        (example, env.prompt_messages(example), env.sft_completion(example)) for example in selected
-    ]
-    package_root = getattr(env, "package_root", None)
-    multimodal = any(
-        record_has_images(example, prompt_messages)
-        for example, prompt_messages, _completion in prompt_rows
-    )
-    processor = None
-    if multimodal:
-        validate_multimodal_training(spec.model, "sft")
-        processor = (processor_loader or _default_processor_loader)(
-            spec.model,
-            spec.model_revision,
-        )
-        tokenizer = processor.tokenizer
-    else:
-        tokenizer = tokenizer_loader(spec.model, spec.model_revision)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
+    package_root,
+    tokenizer,
+    processor,
+    max_length: int,
+    image_dir: str | None,
+    decode_image_descriptors: Callable,
+    normalize_prompt_images: Callable,
+    record_has_images: Callable,
+    text_only_prompt_messages: Callable,
+) -> _TokenizedSftRows:
+    """Compute rendered text and token rows before target filtering."""
     row_by_index: dict[int, dict[str, Any]] = {}
     # kept OUT of the row dicts: a row carries exactly the columns the parquet schema declares, and
     # an extra key would be dropped on the way to verl. this is measurement, not training input.
@@ -376,33 +375,48 @@ def prepare_sft_workload(
                 "images": [],
                 "multimodal_inputs": b"",
             }
+    return _TokenizedSftRows(
+        row_by_index=row_by_index,
+        untruncated_by_index=untruncated_by_index,
+        sampled_texts=sampled_texts,
+        multiturn_targets=multiturn_targets,
+        dropped=dropped,
+    )
 
+
+def _filter_retained_rows(tokenized: _TokenizedSftRows, tokenizer) -> _RetainedSftRows:
+    """Compute the ordered rows that retain a real supervised target."""
     special_ids = set(getattr(tokenizer, "all_special_ids", None) or [])
-    unpacked_rows = []
+    rows = []
     retained_untruncated: list[int] = []
-    for row_index in sorted(row_by_index):
-        row = row_by_index[row_index]
+    dropped = tokenized.dropped
+    for row_index in sorted(tokenized.row_by_index):
+        row = tokenized.row_by_index[row_index]
         if has_real_target(row["input_ids"], row["loss_mask"], special_ids):
-            unpacked_rows.append(row)
+            rows.append(row)
             # appended in lockstep with the row it measures, so the truncation counts below describe
             # the rows that are actually trained on rather than the ones that were dropped.
-            retained_untruncated.append(untruncated_by_index[row_index])
+            retained_untruncated.append(tokenized.untruncated_by_index[row_index])
         else:
             dropped += 1
-    if not unpacked_rows:
+    if not rows:
         raise ValueError(
             "every SFT example has an empty completion after sft_max_len truncation "
             "(nothing to train on); increase sft_max_len or shorten the prompts"
         )
-
-    packing_mode, architecture_mode = _packing_mode(
-        spec.model,
-        spec.model_revision,
-        multimodal=multimodal,
-        allow_packing=allow_packing,
-        packing_support=packing_support,
+    return _RetainedSftRows(
+        rows=rows,
+        untruncated_lengths=retained_untruncated,
+        dropped=dropped,
     )
-    rows = unpacked_rows
+
+
+def _measure_sft_tokens(
+    rows: list[dict[str, Any]],
+    untruncated_lengths: list[int],
+    max_length: int,
+) -> _SftTokenMeasurements:
+    """Compute per-epoch token totals and truncation measurements."""
     real_tokens = sum(len(row["input_ids"]) for row in rows)
     supervised_tokens = sum(sum(int(item) for item in row["loss_mask"]) for row in rows)
     padded_compute_tokens = real_tokens
@@ -411,8 +425,8 @@ def prepare_sft_workload(
     # than what the cap allowed. realized_max_length cannot do this: it is taken after the slice,
     # so it saturates at max_length exactly when the cap binds and the censoring becomes invisible.
     # mirrors the rollout profile's truncated_rollouts/truncation_rate reasoning.
-    untruncated_max_length = max(retained_untruncated)
-    truncated_rows = sum(1 for length in retained_untruncated if length > max_length)
+    untruncated_max_length = max(untruncated_lengths)
+    truncated_rows = sum(1 for length in untruncated_lengths if length > max_length)
     if truncated_rows:
         print(
             f"warning: [train] max_context_tokens {max_length} truncated {truncated_rows} of "
@@ -421,6 +435,25 @@ def prepare_sft_workload(
             f"{untruncated_max_length} to keep every row whole.",
             file=sys.stderr,
         )
+    return _SftTokenMeasurements(
+        real_tokens=real_tokens,
+        supervised_tokens=supervised_tokens,
+        padded_compute_tokens=padded_compute_tokens,
+        realized_max_length=realized_max_length,
+        untruncated_max_length=untruncated_max_length,
+        truncated_rows=truncated_rows,
+    )
+
+
+def _resolve_sft_step_horizon(
+    rows: list[dict[str, Any]],
+    *,
+    effective_batch: int,
+    packing_mode: str,
+    epochs: int,
+    max_steps: int,
+) -> _SftStepHorizon:
+    """Compute optimizer updates and exact tokens consumed by the resolved horizon."""
     # batch size follows the packing mode: `exact-unpacked` keeps one example per update, which is
     # what makes an unpacked gdn run boundary-safe (no packed neighbours to contaminate). a `packed`
     # gdn run has earned that mode through the boundary-reset contract above. this CPU-side choice
@@ -448,43 +481,169 @@ def prepare_sft_workload(
         updates=authoritative_steps,
         field="loss_mask",
     )
+    return _SftStepHorizon(
+        examples_per_update=examples_per_update,
+        packed_blocks=packed_blocks,
+        derived_steps=derived_steps,
+        authoritative_steps=authoritative_steps,
+        authoritative_real_tokens=authoritative_real_tokens,
+        authoritative_supervised_tokens=authoritative_supervised_tokens,
+    )
 
-    profile = SftWorkloadProfile(
+
+def _build_sft_profile(
+    spec,
+    *,
+    producer_version: str,
+    source_examples: int,
+    selected_examples: int,
+    retained: _RetainedSftRows,
+    epochs: int,
+    max_length: int,
+    max_examples: int,
+    packing_mode: str,
+    architecture_mode: str,
+    measurements: _SftTokenMeasurements,
+    horizon: _SftStepHorizon,
+) -> SftWorkloadProfile:
+    """Compute the immutable profile from the retained workload measurements."""
+    return SftWorkloadProfile(
         input_digest=spec.workload_profile_input_digest,
         producer_version=producer_version,
         tokenizer_revision=spec.model_revision,
         environment_id=spec.environment.id,
         environment_revision=spec.environment.resolved_sha,
-        source_examples=len(source),
-        selected_examples=len(selected),
-        retained_examples=len(unpacked_rows),
-        dropped_examples=dropped,
+        source_examples=source_examples,
+        selected_examples=selected_examples,
+        retained_examples=len(retained.rows),
+        dropped_examples=retained.dropped,
         epochs=epochs,
         max_length=max_length,
         packing_mode=packing_mode,
         architecture_mode=architecture_mode,
-        packed_blocks=packed_blocks,
-        real_tokens_per_epoch=real_tokens,
-        supervised_tokens_per_epoch=supervised_tokens,
-        padded_compute_tokens_per_epoch=padded_compute_tokens,
-        authoritative_real_tokens=authoritative_real_tokens,
-        authoritative_supervised_tokens=authoritative_supervised_tokens,
-        authoritative_compute_tokens=authoritative_real_tokens,
-        realized_max_length=realized_max_length,
-        untruncated_max_length=untruncated_max_length,
-        truncated_examples=truncated_rows,
-        examples_per_update=examples_per_update,
-        derived_steps=derived_steps,
-        authoritative_steps=authoritative_steps,
-        packing_efficiency=real_tokens / padded_compute_tokens,
+        packed_blocks=horizon.packed_blocks,
+        real_tokens_per_epoch=measurements.real_tokens,
+        supervised_tokens_per_epoch=measurements.supervised_tokens,
+        padded_compute_tokens_per_epoch=measurements.padded_compute_tokens,
+        authoritative_real_tokens=horizon.authoritative_real_tokens,
+        authoritative_supervised_tokens=horizon.authoritative_supervised_tokens,
+        authoritative_compute_tokens=horizon.authoritative_real_tokens,
+        realized_max_length=measurements.realized_max_length,
+        untruncated_max_length=measurements.untruncated_max_length,
+        truncated_examples=measurements.truncated_rows,
+        examples_per_update=horizon.examples_per_update,
+        derived_steps=horizon.derived_steps,
+        authoritative_steps=horizon.authoritative_steps,
+        packing_efficiency=measurements.real_tokens / measurements.padded_compute_tokens,
         sample_policy=sft_sample_policy(max_examples),
     )
+
+
+def prepare_sft_workload(
+    spec,
+    env,
+    *,
+    tokenizer_loader: Callable[[str, str], Any],
+    producer_version: str,
+    processor_loader: Callable[[str, str], Any] | None = None,
+    image_dir: str | None = None,
+    allow_packing: bool = True,
+    packing_support: Callable[[str, str], tuple[str, bool]] | None = None,
+) -> PreparedSftWorkload:
+    """Render, tokenize, filter, and pack the exact rows consumed by SFT."""
+    from flash.content.multimodal import (
+        decode_image_descriptors,
+        normalize_prompt_images,
+        record_has_images,
+        text_only_prompt_messages,
+        validate_multimodal_training,
+    )
+
+    train_spec = spec.train
+    max_length = sft_max_length(spec)
+    epochs = int(train_spec.epochs if train_spec.epochs is not None else RECIPE.sft.num_epochs)
+    effective_batch = int(
+        train_spec.batch_size if train_spec.batch_size is not None else RECIPE.sft.effective_batch
+    )
+    max_examples = int(train_spec.max_examples or 0)
+    max_steps = int(train_spec.max_steps or 0)
+
+    source = list(env.dataset())
+    selected = select_sft_examples(source, max_examples, spec.seed)
+    prompt_rows = [
+        (example, env.prompt_messages(example), env.sft_completion(example)) for example in selected
+    ]
+    package_root = getattr(env, "package_root", None)
+    multimodal = any(
+        record_has_images(example, prompt_messages)
+        for example, prompt_messages, _completion in prompt_rows
+    )
+    processor = None
+    if multimodal:
+        validate_multimodal_training(spec.model, "sft")
+        processor = (processor_loader or _default_processor_loader)(
+            spec.model,
+            spec.model_revision,
+        )
+        tokenizer = processor.tokenizer
+    else:
+        tokenizer = tokenizer_loader(spec.model, spec.model_revision)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    tokenized = _tokenize_prompt_rows(
+        spec,
+        prompt_rows,
+        package_root=package_root,
+        tokenizer=tokenizer,
+        processor=processor,
+        max_length=max_length,
+        image_dir=image_dir,
+        decode_image_descriptors=decode_image_descriptors,
+        normalize_prompt_images=normalize_prompt_images,
+        record_has_images=record_has_images,
+        text_only_prompt_messages=text_only_prompt_messages,
+    )
+    retained = _filter_retained_rows(tokenized, tokenizer)
+    packing_mode, architecture_mode = _packing_mode(
+        spec.model,
+        spec.model_revision,
+        multimodal=multimodal,
+        allow_packing=allow_packing,
+        packing_support=packing_support,
+    )
+    measurements = _measure_sft_tokens(
+        retained.rows,
+        retained.untruncated_lengths,
+        max_length,
+    )
+    horizon = _resolve_sft_step_horizon(
+        retained.rows,
+        effective_batch=effective_batch,
+        packing_mode=packing_mode,
+        epochs=epochs,
+        max_steps=max_steps,
+    )
+    profile = _build_sft_profile(
+        spec,
+        producer_version=producer_version,
+        source_examples=len(source),
+        selected_examples=len(selected),
+        retained=retained,
+        epochs=epochs,
+        max_length=max_length,
+        max_examples=max_examples,
+        packing_mode=packing_mode,
+        architecture_mode=architecture_mode,
+        measurements=measurements,
+        horizon=horizon,
+    )
     return PreparedSftWorkload(
-        rows=rows,
+        rows=retained.rows,
         profile=profile,
         multimodal=multimodal,
         tokenizer=tokenizer,
         processor=processor,
-        sampled_texts=sampled_texts,
-        multiturn_targets=multiturn_targets,
+        sampled_texts=tokenized.sampled_texts,
+        multiturn_targets=tokenized.multiturn_targets,
     )
