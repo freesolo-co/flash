@@ -110,7 +110,17 @@ jobs:
         run: |
           set -euo pipefail
           tag="dev-v${VERSION}"
-          existing="$(git ls-remote --tags origin "refs/tags/${tag}" "refs/tags/${tag}^{}" || true)"
+          # No `|| true`: `git ls-remote` exits 0 for BOTH "tag present" and "tag absent", and
+          # non-zero only when the lookup itself failed (unreachable remote, auth). Swallowing that
+          # would turn a network blip into "no tag exists" and wave the release through unvalidated,
+          # so a failed lookup must fail the step.
+          # `rc` is captured on the same line: inside `if ! ...`, a later `$?` reports the negation's
+          # result (always 0), not git's.
+          existing="$(git ls-remote --tags origin "refs/tags/${tag}" "refs/tags/${tag}^{}")" && rc=0 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Could not query tags on origin (git ls-remote exit ${rc}). Refusing to continue: a failed lookup is not proof that ${tag} is free."
+            exit 1
+          fi
           if [ -n "$existing" ]; then
             peeled="$(printf '%s\n' "$existing" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')"
             plain="$(printf '%s\n' "$existing" | awk '$2 !~ /\^\{\}$/ {print $1; exit}')"
@@ -176,7 +186,17 @@ jobs:
           # publish. It matters more on this channel: the tag is the ONLY record of which commit went
           # into a given dev version, so one pointing at the wrong commit is a false provenance
           # record, not a cosmetic problem.
-          existing="$(git ls-remote --tags origin "refs/tags/${tag}" "refs/tags/${tag}^{}" || true)"
+          # No `|| true`: `git ls-remote` exits 0 for BOTH "tag present" and "tag absent", and
+          # non-zero only when the lookup itself failed (unreachable remote, auth). Swallowing that
+          # would turn a network blip into "no tag exists" and wave the release through unvalidated,
+          # so a failed lookup must fail the step.
+          # `rc` is captured on the same line: inside `if ! ...`, a later `$?` reports the negation's
+          # result (always 0), not git's.
+          existing="$(git ls-remote --tags origin "refs/tags/${tag}" "refs/tags/${tag}^{}")" && rc=0 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Could not query tags on origin (git ls-remote exit ${rc}). Refusing to continue: a failed lookup is not proof that ${tag} is free."
+            exit 1
+          fi
           if [ -n "$existing" ]; then
             peeled="$(printf '%s\n' "$existing" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')"
             plain="$(printf '%s\n' "$existing" | awk '$2 !~ /\^\{\}$/ {print $1; exit}')"
