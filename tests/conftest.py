@@ -28,6 +28,47 @@ def _reset_status_reporter_before_test():
 
 
 @pytest.fixture(autouse=True)
+def _rebind_worker_submodule_attributes():
+    """Repair the ``flash.engine.worker`` package object after a test re-imports it.
+
+    Several tests read module-scope state captured at import (RUN_MODE, JOB_SPEC), so they drop the
+    package from ``sys.modules`` and import it again to re-run that scope. Re-importing a PACKAGE
+    does not rebind its submodule attributes: the submodules stay cached under their own names, so
+    the `import` statements inside the re-executed parent are no-ops that never re-run the
+    attribute assignment the import system does on first load. The replacement package object
+    therefore has no ``.train``/``.io``/``.model`` attributes, and it is the object every later
+    test sees.
+
+    That breaks any later test patching a dotted string target such as
+    ``flash.engine.worker.train.opd.validation._resolve_structured_model_metadata``, because
+    monkeypatch resolves a dotted target by walking getattr from the parent package. Alphabetical
+    file order hides it today -- the re-importing file sorts after its victims -- so the suite is
+    green by accident, and any reordering (``-n`` sharding, ``-p randomly``, a renamed file) turns
+    it into an AttributeError attributed to the innocent test.
+
+    Rebinding is the narrow repair: it fixes the attribute graph while LEAVING the freshly imported
+    object in place, so the re-import those tests want still takes effect. Restoring the original
+    object instead would undo their re-import. Reads only what is already cached -- no import is
+    triggered, and it no-ops when nothing was re-imported.
+    """
+    import sys
+
+    yield
+    package = sys.modules.get("flash.engine.worker")
+    if package is None:
+        return
+    prefix = "flash.engine.worker."
+    for name, module in list(sys.modules.items()):
+        if not name.startswith(prefix):
+            continue
+        child = name[len(prefix) :]
+        if "." in child or module is None:
+            continue
+        if getattr(package, child, None) is not module:
+            setattr(package, child, module)
+
+
+@pytest.fixture(autouse=True)
 def _offline(monkeypatch):
     # RunPod endpoint listing -> offline: the idle-endpoint sweep (deploy-time quota reclaim
     # and the startup/post-run orphan sweep) lists account endpoints. Default to "no endpoints"
