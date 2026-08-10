@@ -1094,12 +1094,22 @@ def test_public_url_requires_a_canonical_worker_reachable_https_origin(url):
     )
 
 
-@pytest.mark.parametrize("url", ["https://plane.example:bad", "https://plane.example:99999"])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://plane.example:bad",
+        "https://plane.example:99999",
+        "https://plane.example:0",
+        "https://plane.example:00",
+    ],
+)
 def test_public_url_rejects_an_unusable_port_before_allocation(url):
     """urlsplit yields a hostname for these, so only forcing .port catches them here.
 
-    the worker reads parsed.port when it opens the broker connection, so without this the
-    ValueError surfaces on the worker after the gpu is allocated.
+    a malformed or out-of-range port raises on attribute access, which without this gate would
+    surface on the worker after the gpu is allocated. a zero port is worse: it is in range, so it
+    parses cleanly, but it is falsy, so the `parsed.port or 443` the worker opens the connection
+    with silently dials 443 instead. that one never fails at all, it just talks to the wrong port.
     """
     with pytest.raises(RuntimeError, match="valid port"):
         teacher_broker.validate_public_url(url)
@@ -1107,6 +1117,8 @@ def test_public_url_rejects_an_unusable_port_before_allocation(url):
     assert teacher_broker.validate_public_url("https://plane.example:8443") == (
         "https://plane.example:8443"
     )
+    # a port-less origin is legitimate and must not be caught by the zero check: .port is None.
+    assert teacher_broker.validate_public_url("https://plane.example") == "https://plane.example"
 
 
 def test_public_url_does_not_fall_back_to_the_cli_api_url(monkeypatch):

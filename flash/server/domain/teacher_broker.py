@@ -87,16 +87,18 @@ class ProviderResponse:
 def validate_public_url(value: str) -> str:
     url = str(value or "").strip().rstrip("/")
     parsed = urllib.parse.urlsplit(url)
-    # urlsplit defers port parsing to attribute access, so a malformed or out-of-range port still
-    # yields a hostname and would pass every check below. force it here: the worker reads
-    # parsed.port when it opens the broker connection, and an unparseable one would otherwise
-    # raise there, after the gpu is already allocated.
+    # urlsplit defers port parsing to attribute access, so a malformed, out-of-range, or zero port
+    # still yields a hostname and would pass every check below. force it here, because the worker
+    # reads parsed.port when it opens the broker connection: an unparseable one raises there, after
+    # the gpu is already allocated, and a zero one is in range but falsy, so the `parsed.port or
+    # 443` at engine/worker/teacher/client.py silently dials 443 instead of the configured port.
+    invalid_port = f"{PUBLIC_URL_ENV} must be a worker-reachable https URL with a valid port"
     try:
-        _ = parsed.port
+        port = parsed.port
     except ValueError as error:
-        raise RuntimeError(
-            f"{PUBLIC_URL_ENV} must be a worker-reachable https URL with a valid port"
-        ) from error
+        raise RuntimeError(invalid_port) from error
+    if port == 0:
+        raise RuntimeError(invalid_port)
     if (
         parsed.scheme != "https"
         or not parsed.hostname
