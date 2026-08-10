@@ -893,3 +893,66 @@ def test_a_missing_environment_id_keeps_the_schema_error_on_the_hosted_plane(mon
         _deps._parse_spec({"spec": raw_spec(environment={})}, run_id="r")
     assert ei.value.status_code == 400
     assert "must set [environment] id" in str(ei.value.detail)
+
+
+def test_standalone_owner_manages_its_own_deployments_without_org_headers(
+    monkeypatch, tmp_path
+) -> None:
+    """`flash models deploy` must work on the plane the operator owns outright.
+
+    Standalone resolves its one operator credential to ``auth_kind == "internal"`` against the
+    key-independent standalone-owner row, so `manageable_run` sent the plane's own run owner down
+    the internal branch, which demands ``X-Freesolo-Org-Id``. The CLI's deploy, poll, and undeploy
+    calls send no such header and a standalone plane has no organization directory to take one
+    from, so deploying a run the caller demonstrably owned answered 404 with no way to succeed.
+    """
+    _deps = _deps_module()
+    from flash.server.platform import db
+
+    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
+    monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key")
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
+
+    key = auth.authenticate("Bearer operator-key")
+    assert key is not None
+    assert key["auth_kind"] == "internal"
+    db.record_run("run-standalone", key["id"])
+
+    sentinel = object()
+    monkeypatch.setattr(_deps, "_load_status", lambda _run_id: sentinel)
+
+    # no org/project headers, exactly as the CLI sends them
+    assert _deps.manageable_run("run-standalone", key) is sentinel
+
+
+def test_standalone_deployment_management_still_refuses_a_run_it_does_not_own(
+    monkeypatch, tmp_path
+) -> None:
+    """The exact-owner path must not become a blanket bypass for the internal key."""
+    _deps = _deps_module()
+    from fastapi import HTTPException
+
+    from flash.server.platform import db
+
+    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
+    monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key")
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
+
+    key = auth.authenticate("Bearer operator-key")
+    assert key is not None
+    # a real second key row, so the run is genuinely owned by someone else
+    other = db.ensure_internal_key("some-other-key")
+    assert other["id"] != key["id"]
+    db.record_run("run-someone-else", other["id"])
+
+    monkeypatch.setattr(
+        _deps,
+        "_load_status",
+        lambda _run_id: (_ for _ in ()).throw(
+            AssertionError("must not load a run this key does not own")
+        ),
+    )
+
+    with pytest.raises(HTTPException) as ei:
+        _deps.manageable_run("run-someone-else", key)
+    assert ei.value.status_code == 404

@@ -505,11 +505,6 @@ def upload_resume_checkpoint(
     return False
 
 
-# the callback implementation resolves parent-module patch seams at call time from its sibling.
-from flash.engine.worker.io.checkpoint_upload import (  # noqa: E402,F401
-    make_checkpoint_upload_callback,
-)
-
 # re-exported so the prefetch surface stays reachable as `hf.<name>`: the tests patch
 # `_shared_weight_cache_dir`, `resolve_cached_model_commit` and `_hf_cache_bytes` here, and the
 # worker entry points import `prefetch_model` from here.

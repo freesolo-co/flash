@@ -117,6 +117,11 @@ class ModelInfo:
     num_attention_layers: int = 0
     num_linear_attention_layers: int = 0
     num_key_value_heads: int = 0
+    # QUERY heads, from the checkpoint's own config. NOT derivable as hidden_size // head_dim: these
+    # models decouple head_dim from that ratio (3.5-4B is hidden 2560 / head_dim 256 but has 16
+    # heads, not 10). verl's ulysses sequence parallelism requires this to divide the gpu count, so
+    # a derived value silently caps runs on a number that is not the constraint.
+    num_attention_heads: int = 0
     head_dim: int = 0
     linear_num_key_heads: int = 0
     linear_num_value_heads: int = 0
@@ -145,6 +150,7 @@ class ModelInfo:
             "num_attention_layers",
             "num_linear_attention_layers",
             "num_key_value_heads",
+            "num_attention_heads",
             "head_dim",
             "linear_num_key_heads",
             "linear_num_value_heads",
@@ -197,6 +203,7 @@ MODELS: dict[str, ModelInfo] = {
         num_attention_layers=6,
         num_linear_attention_layers=18,
         num_key_value_heads=2,
+        num_attention_heads=8,
         head_dim=256,
         linear_num_key_heads=16,
         linear_num_value_heads=16,
@@ -243,6 +250,7 @@ MODELS: dict[str, ModelInfo] = {
         num_attention_layers=6,
         num_linear_attention_layers=18,
         num_key_value_heads=2,
+        num_attention_heads=8,
         head_dim=256,
         linear_num_key_heads=16,
         linear_num_value_heads=16,
@@ -286,6 +294,7 @@ MODELS: dict[str, ModelInfo] = {
         num_attention_layers=8,
         num_linear_attention_layers=24,
         num_key_value_heads=4,
+        num_attention_heads=16,
         head_dim=256,
         linear_num_key_heads=16,
         linear_num_value_heads=32,
@@ -333,6 +342,7 @@ MODELS: dict[str, ModelInfo] = {
         num_attention_layers=8,
         num_linear_attention_layers=24,
         num_key_value_heads=4,
+        num_attention_heads=16,
         head_dim=256,
         linear_num_key_heads=16,
         linear_num_value_heads=32,
@@ -386,6 +396,7 @@ MODELS: dict[str, ModelInfo] = {
         num_attention_layers=16,
         num_linear_attention_layers=48,
         num_key_value_heads=4,
+        num_attention_heads=24,
         head_dim=256,
         linear_num_key_heads=16,
         linear_num_value_heads=48,
@@ -444,6 +455,7 @@ MODELS: dict[str, ModelInfo] = {
         num_attention_layers=10,
         num_linear_attention_layers=30,
         num_key_value_heads=2,
+        num_attention_heads=16,
         head_dim=256,
         linear_num_key_heads=16,
         linear_num_value_heads=32,

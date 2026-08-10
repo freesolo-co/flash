@@ -340,17 +340,24 @@ def _select_candidate(
 ):
     """Pick the next (provider, class) from the cross-provider ranked candidate list.
 
-    Escapes a congested/sick provider cross-provider before walking classes within it.
-    Falls back to cheapest untried class when every provider has already burned a retry.
+    Escapes a congested/sick provider cross-provider before walking classes within it, then takes
+    the allocator's own ranking.
+
+    That third key is the LIST POSITION, not a re-priced one. ``allocate()`` ranks candidates on
+    the dollars one optimizer STEP costs -- rate x how long that hardware takes -- so a faster card
+    wins whenever it finishes soon enough to pay for itself. Re-sorting here on total $/hr answered
+    a different question and silently overrode it: for Qwen3.5-0.8B OPD the allocator ranks the
+    RTX 5090 cheapest per step, while hourly price picks the slower RTX 4090, so the FIRST paid
+    attempt ignored the choice the cost model had just made and ran slower for more money.
+    Preserving the incoming order keeps one owner of the cost policy. ``min`` returns the FIRST
+    minimal element, so dropping the price keys is what preserves it -- no index key needed.
     """
     return min(
         candidates,
         key=lambda c: (
             c.provider in failed_providers,  # 1) escape providers that already failed this run
             _shape_key(c) in tried_classes,  # 2) then prefer a shape not yet tried
-            getattr(c, "gpu_count", 1) * c.hourly_usd,  # 3) then cheapest TOTAL cost
-            getattr(c, "gpu_count", 1),  # 4) fewer cards on ties (less inter-card overhead)
-            c.vram_gb,  # 5) then the smaller card (don't burn a big GPU on a small job)
+            # 3) ties keep the allocator's cheapest-per-step order, via min's first-wins semantics
         ),
     )
 

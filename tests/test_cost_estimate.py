@@ -581,6 +581,8 @@ def test_offline_estimate_applies_the_pinned_revision_geometry_cap(monkeypatch):
         model_revision="a" * 40,
     )
 
+    # four: the pin keeps the unvalidated-revision ceiling, and 3.5-4B's 16 recorded heads divide it,
+    # so the geometry check narrows nothing further.
     with pytest.raises(ValueError, match="across up to 4 cards"):
         _offline_gpu_shape(config)
 

@@ -3391,9 +3391,18 @@ def test_deployment_job_shutdown_closes_producers(monkeypatch):
     app_mod._open_deployment_jobs()
 
 
-def test_recover_deployments_recovers_stale_and_skips_fresh_busy_states_on_startup(
+def test_recover_deployments_recovers_busy_states_on_startup_regardless_of_age(
     monkeypatch,
 ):
+    """Startup recovery fails every busy record whose lock it can take, fresh ones included.
+
+    The per-run flock is the ownership proof: a live lifecycle holds it from the moment the
+    request persists `queued` until the deployment ends, so acquiring it means no owner survived.
+    Recovery used to also require the record to be 30 minutes old, which left a control plane that
+    restarted inside that window with a busy record nothing was working on -- and nothing to
+    revisit it, since recovery only runs at startup -- so every retry got 409 until the clock aged
+    it out.
+    """
     from flash.server.routes import serving
 
     now = time.time()
@@ -3434,12 +3443,17 @@ def test_recover_deployments_recovers_stale_and_skips_fresh_busy_states_on_start
         ),
     )
 
-    assert serving.recover_deployments() == 1
-    assert [run_id for run_id, _deployment in marked] == ["run-smoke_testing"]
+    # both are recovered: the old smoke_testing record AND the just-written reconciling one.
+    assert serving.recover_deployments() == 2
+    assert sorted(run_id for run_id, _deployment in marked) == [
+        "run-reconciling",
+        "run-smoke_testing",
+    ]
     assert all(deployment["state"] == "failed" for _run_id, deployment in marked)
     assert all("control-plane restart" in deployment["error"] for _run_id, deployment in marked)
-    assert [run_id for run_id, _deployment, persisted in reported if persisted] == [
-        "run-smoke_testing"
+    assert sorted(run_id for run_id, _deployment, persisted in reported if persisted) == [
+        "run-reconciling",
+        "run-smoke_testing",
     ]
 
 
