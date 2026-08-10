@@ -17,6 +17,7 @@ from flash.core.spec import (
     GpuSpec,
     JobSpec,
     TrainSpec,
+    WandbSpec,
     parse_seed,
     require_project_id,
 )
@@ -276,9 +277,10 @@ def validate_train_keys(keys: Collection[str]) -> None:
         )
 
 
-def spec_from_dict(
-    raw: dict[str, Any], run_id: str | None = None, *, project_required: bool = False
-) -> JobSpec:
+def _validate_top_level(
+    raw: dict[str, Any], project_required: bool
+) -> tuple[str, str, str, str, bool]:
+    """Validate the top-level config section."""
     unknown = sorted(set(raw) - _TOP_LEVEL_KEYS)
     if unknown:
         hint = ""
@@ -296,8 +298,8 @@ def spec_from_dict(
         model = raw["model"]
     except KeyError as exc:
         raise ConfigError("config must set `model`") from exc
-    # An unhashable model (TOML array / `[model]` table) would TypeError on MODELS.get() downstream,
-    # escaping the callers' ConfigError/ValueError guards -> 500; type-check like the other scalars.
+    # an unhashable model (toml array / `[model]` table) would typeerror on models.get() downstream,
+    # escaping the callers' configerror/valueerror guards -> 500; type-check like the other scalars.
     if not isinstance(model, str) or not model.strip():
         raise ConfigError('config `model` must be a model id string (e.g. "Qwen/Qwen3.5-4B")')
     model_revision_raw = raw.get("model_revision", "")
@@ -326,8 +328,14 @@ def spec_from_dict(
     thinking = raw.get("thinking", False)
     if not isinstance(thinking, bool):
         raise ConfigError("thinking must be a boolean")
+    return model, model_revision, project, algorithm, thinking
 
-    # Use `is None` not `or {}`: a present-but-non-dict value (e.g. `environment = false`) must hit the type check.
+
+def _validate_environment_section(
+    raw: dict[str, Any],
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Validate the environment section."""
+    # use `is none` not `or {}`: a present-but-non-dict value (e.g. `environment = false`) must hit the type check.
     env_raw = raw.get("environment")
     if env_raw is None:
         env_raw = {}
@@ -339,18 +347,36 @@ def spec_from_dict(
             f"[environment] unknown key(s): {', '.join(unknown_env)} "
             f"(allowed: {', '.join(sorted(_ENVIRONMENT_KEYS))})"
         )
-    # validate environment sub-fields before EnvironmentSpec coercion. missing or none keeps the
+    # validate environment sub-fields before environmentspec coercion. missing or none keeps the
     # default; every present non-none value, including false, must have the correct type so malformed
     # input fails clearly instead of becoming {} or an opaque dict conversion error.
     if env_raw.get("params") is not None and not isinstance(env_raw["params"], dict):
         raise ConfigError("[environment] params must be a table")
     environment_secrets = _environment_secrets(env_raw.get("secrets"))
+    return env_raw, environment_secrets
+
+
+def _validate_train_section(raw: dict[str, Any]) -> dict[str, Any]:
+    """Validate the train section."""
     train_raw = raw.get("train")
     if train_raw is None:
         train_raw = {}
     if not isinstance(train_raw, dict):
         raise ConfigError("[train] must be a table")
     validate_train_keys(train_raw)
+    return train_raw
+
+
+def _validate_gpu_section(
+    raw: dict[str, Any],
+    *,
+    model: str,
+    model_revision: str,
+    algorithm: str,
+    train_raw: dict[str, Any],
+    thinking: bool,
+) -> tuple[str, str, dict[str, int]]:
+    """Validate the gpu section."""
     gpu_raw = raw.get("gpu")
     if gpu_raw is None:
         gpu_raw = {}
@@ -401,14 +427,14 @@ def spec_from_dict(
     )
     try:
         # called for its rejection, not its return: it raises when no validated class can hold the
-        # run, which is the parse-time "this is unplaceable" gate. The class it picks is offline
+        # run, which is the parse-time "this is unplaceable" gate. the class it picks is offline
         # sizing/display only -- the allocator re-resolves auto runs at submit time.
         provisional_gpu(
             model,
             algorithm=algorithm,
             train=train_raw,
             thinking=thinking,
-            # sized against the shape the allocator may actually rent. sizing a --gpus N run
+            # sized against the shape the allocator may actually rent. sizing a --gpus n run
             # against one card rejected it here before sharding was ever considered, which made
             # the flag inert for exactly the large runs it exists to serve.
             gpu_count=preflight_gpu_count,
@@ -422,11 +448,11 @@ def spec_from_dict(
                 train=train_raw,
                 thinking=thinking,
             )
-            # required_vram is the WHOLE-RUN floor, so it may only be compared against a single
-            # card's VRAM when the run is confined to a single card. above that the allocator
+            # required_vram is the whole-run floor, so it may only be compared against a single
+            # card's vram when the run is confined to a single card. above that the allocator
             # shards the run across a combination and applies its own multi-card fit test
-            # (allocator.py:181), which this gate must not pre-empt: a pinned 141 GB class with
-            # gpu.count=2 holds 282 GB and is rejected here on a 180 GB floor it clears.
+            # (allocator.py:181), which this gate must not pre-empt: a pinned 141 gb class with
+            # gpu.count=2 holds 282 gb and is rejected here on a 180 gb floor it clears.
             single_card = gpu_count is None or gpu_count <= 1
             if single_card and get_gpu_info(gpu_type).vram_gb < required_vram:
                 raise ConfigError(
@@ -435,6 +461,13 @@ def spec_from_dict(
                 )
     except (UnsupportedGpuError, ValueError) as exc:
         raise ConfigError(str(exc)) from exc
+    return gpu_type, gpu_provider, gpu_options
+
+
+def _validate_algorithm_model_consistency(
+    model: str, algorithm: str, thinking: bool, train_raw: dict[str, Any]
+) -> tuple[str, int, int]:
+    """Validate algorithm and model-info consistency."""
     try:
         info = resolve_model(model, algorithm)
     except ValueError as exc:
@@ -476,8 +509,32 @@ def spec_from_dict(
             f"{max_lora_rank}; lower train.lora_rank or raise the serving cap "
             "after real-GPU validation"
         )
+    return init_from_adapter, lora_rank, lora_alpha
 
-    wandb_spec = _wandb_spec(raw.get("wandb"))
+
+def _validate_wandb_section(raw: dict[str, Any]) -> WandbSpec:
+    """Validate the wandb section."""
+    return _wandb_spec(raw.get("wandb"))
+
+
+def spec_from_dict(
+    raw: dict[str, Any], run_id: str | None = None, *, project_required: bool = False
+) -> JobSpec:
+    model, model_revision, project, algorithm, thinking = _validate_top_level(raw, project_required)
+    env_raw, environment_secrets = _validate_environment_section(raw)
+    train_raw = _validate_train_section(raw)
+    gpu_type, gpu_provider, gpu_options = _validate_gpu_section(
+        raw,
+        model=model,
+        model_revision=model_revision,
+        algorithm=algorithm,
+        train_raw=train_raw,
+        thinking=thinking,
+    )
+    init_from_adapter, lora_rank, lora_alpha = _validate_algorithm_model_consistency(
+        model, algorithm, thinking, train_raw
+    )
+    wandb_spec = _validate_wandb_section(raw)
 
     try:
         train_spec = TrainSpec(

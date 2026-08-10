@@ -909,13 +909,6 @@ from flash.runner.supervise.deploy import (  # noqa: E402,F401
     DeploymentStatePersistenceError,
     attach_run,
     cancel_run,
-    mark_checkpoint_deployed,
-    mark_deployed,
-    mark_deployment_failed,
-    mark_deployment_pending,
-    mark_deployment_revocation_failed,
-    mark_deployment_undeployed,
-    mark_undeployed,
 )
 from flash.runner.supervise.lifecycle import (  # noqa: E402,F401
     _run_job,
@@ -925,6 +918,15 @@ from flash.runner.supervise.lifecycle import (  # noqa: E402,F401
     _submit_seed_supervised,
 )
 from flash.runner.supervise.recovery import _gc_run_endpoints  # noqa: E402,F401
+from flash.runner.supervise.transitions import (  # noqa: E402,F401
+    mark_checkpoint_deployed,
+    mark_deployed,
+    mark_deployment_failed,
+    mark_deployment_pending,
+    mark_deployment_revocation_failed,
+    mark_deployment_undeployed,
+    mark_undeployed,
+)
 from flash.runner.weight_cache import (  # noqa: E402,F401
     _assign_weight_cache_volume,
     _download_gb,

@@ -51,19 +51,16 @@ _REQUIRED_OVERRIDE_KEYS = (
 )
 
 
-def build_opd_overrides(config: dict) -> list[str]:
-    """Render the exact verl 0.8.0 synchronous PPO and distillation config surface."""
-    missing = [key for key in _REQUIRED_OVERRIDE_KEYS if key not in config]
-    if missing:
-        raise KeyError(f"build_opd_overrides missing required config keys: {missing}")
-    # the full sequence length the engine is sized for. the caller derives max_prompt_length by
-    # carving max_response_length out of this same value, so the token budget, the prompt filter,
-    # and the engine always agree.
-    max_tokens = int(config["max_sequence_length"])
-    overrides = [
+def _algorithm_overrides() -> list[str]:
+    return [
         "algorithm.adv_estimator=grpo",
         "algorithm.use_kl_in_reward=false",
         "algorithm.norm_adv_by_std_in_grpo=false",
+    ]
+
+
+def _data_input_overrides(config: dict) -> list[str]:
+    return [
         f"data.train_files={_hydra_val(config['train_files'])}",
         f"data.val_files={_hydra_val(config['val_files'])}",
         f"data.train_batch_size={_hydra_val(config['train_batch_size'])}",
@@ -73,17 +70,20 @@ def build_opd_overrides(config: dict) -> list[str]:
         "data.truncation=error",
         "data.shuffle=false",
         f"data.seed={_hydra_val(config.get('seed', 42))}",
+    ]
+
+
+def _actor_rollout_seed_overrides(config: dict) -> list[str]:
+    return [
         # set the seed through ++actor_rollout_ref.rollout.engine_kwargs.seed: RolloutConfig has no
         # rollout.seed, and engine_kwargs wins after verl's own seed. requests are seeded
         # separately.
         f"++actor_rollout_ref.rollout.engine_kwargs.vllm.seed={_hydra_val(config.get('seed', 42))}",
-        # use fp8 kv where resolved because vram.py sizes against it; bf16 would double the reserved
-        # cache and OOM. gdn and unsupported devices leave this unset.
-        *(
-            ["+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8"]
-            if config.get("fp8_kv")
-            else []
-        ),
+    ]
+
+
+def _data_runtime_overrides(config: dict) -> list[str]:
+    return [
         "data.dataloader_num_workers=0",
         "data.image_key=images",
         "data.return_raw_chat=true",
@@ -93,6 +93,11 @@ def build_opd_overrides(config: dict) -> list[str]:
         "++data.apply_chat_template_kwargs={enable_thinking:"
         + _hydra_val(config.get("thinking", False))
         + "}",
+    ]
+
+
+def _actor_rollout_overrides(config: dict, *, max_tokens: int) -> list[str]:
+    return [
         f"actor_rollout_ref.model.path={_hydra_val(config['model_path'])}",
         "actor_rollout_ref.model.trust_remote_code=true",
         # packing the micro-batch into one row is only safe for a gdn hybrid when the child can
@@ -193,9 +198,19 @@ def build_opd_overrides(config: dict) -> list[str]:
             "actor_rollout_ref.rollout.agent.num_workers="
             f"{agent_loop_workers(int(config['train_batch_size']) * int(config['group_size']))}"
         ),
+    ]
+
+
+def _transfer_queue_overrides() -> list[str]:
+    return [
         # verl force-enables TransferQueue and waits forever for every cpu bundle.
         # one storage unit fits flash's single-node trainer regardless of ray cluster sizing.
         "transfer_queue.backend.SimpleStorage.num_data_storage_units=1",
+    ]
+
+
+def _ray_overrides(config: dict) -> list[str]:
+    return [
         # ray autodetects the HOST's cpu count inside a rented pod and eagerly forks one idle worker
         # per core. on a 1x4090 pod that is 48 forks nothing asked for, which oom-killed the actor
         # that mattered (VERL-123). size the pool to the container instead. this also keeps the
@@ -203,7 +218,15 @@ def build_opd_overrides(config: dict) -> list[str]:
         f"ray_kwargs.ray_init.num_cpus={ray_num_cpus(config['n_gpus_per_node'])}",
         # num_gpus is absent from verl's generated ray_init node, so hydra requires add-key syntax.
         f"+ray_kwargs.ray_init.num_gpus={config['n_gpus_per_node']}",
-        "critic.enable=false",
+    ]
+
+
+def _critic_overrides() -> list[str]:
+    return ["critic.enable=false"]
+
+
+def _reward_overrides(config: dict) -> list[str]:
+    return [
         "reward.reward_model.enable=false",
         # disabling the reward MODEL does not disable reward SCORING. with no custom function the
         # loop still calls the default rule-based scorer, which dispatches on data_source and raises
@@ -214,6 +237,11 @@ def build_opd_overrides(config: dict) -> list[str]:
         "custom_reward_function.name=compute_score",
         f"reward.custom_reward_function.path={_hydra_val(config['reward_path'])}",
         "reward.custom_reward_function.name=compute_score",
+    ]
+
+
+def _distillation_overrides(config: dict) -> list[str]:
+    return [
         "distillation._target_=flash_opd_plugin.FlashRemoteDistillationConfig",
         "distillation.enabled=true",
         "distillation.n_gpus_per_node=0",
@@ -228,6 +256,11 @@ def build_opd_overrides(config: dict) -> list[str]:
         "distillation.distillation_loss.use_policy_gradient=false",
         "distillation.distillation_loss.loss_max_clamp=null",
         "distillation.distillation_loss.log_prob_min_clamp=null",
+    ]
+
+
+def _trainer_overrides(config: dict) -> list[str]:
+    return [
         f"trainer.default_local_dir={_hydra_val(config['local_dir'])}",
         f"trainer.save_freq={_hydra_val(config['save_freq'])}",
         f"trainer.n_gpus_per_node={_hydra_val(config['n_gpus_per_node'])}",
@@ -241,6 +274,37 @@ def build_opd_overrides(config: dict) -> list[str]:
         "trainer.test_freq=-1",
         "trainer.resume_mode=auto",
         "trainer.max_actor_ckpt_to_keep=null",
+    ]
+
+
+def build_opd_overrides(config: dict) -> list[str]:
+    """Render the exact verl 0.8.0 synchronous PPO and distillation config surface."""
+    missing = [key for key in _REQUIRED_OVERRIDE_KEYS if key not in config]
+    if missing:
+        raise KeyError(f"build_opd_overrides missing required config keys: {missing}")
+    # the full sequence length the engine is sized for. the caller derives max_prompt_length by
+    # carving max_response_length out of this same value, so the token budget, the prompt filter,
+    # and the engine always agree.
+    max_tokens = int(config["max_sequence_length"])
+    overrides = [
+        *_algorithm_overrides(),
+        *_data_input_overrides(config),
+        *_actor_rollout_seed_overrides(config),
+        # use fp8 kv where resolved because vram.py sizes against it; bf16 would double the reserved
+        # cache and OOM. gdn and unsupported devices leave this unset.
+        *(
+            ["+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8"]
+            if config.get("fp8_kv")
+            else []
+        ),
+        *_data_runtime_overrides(config),
+        *_actor_rollout_overrides(config, max_tokens=max_tokens),
+        *_transfer_queue_overrides(),
+        *_ray_overrides(config),
+        *_critic_overrides(),
+        *_reward_overrides(config),
+        *_distillation_overrides(config),
+        *_trainer_overrides(config),
     ]
     if config.get("multi_turn"):
         overrides.append(f"actor_rollout_ref.rollout.prompt_length={_hydra_val(max_tokens)}")

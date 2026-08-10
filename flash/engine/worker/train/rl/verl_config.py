@@ -167,14 +167,9 @@ def write_verl_grpo_parquet(rows: list[dict], path: str) -> None:
     Dataset.from_list(rows, features=features).to_parquet(path)
 
 
-def build_verl_overrides(cfg: dict) -> list[str]:
-    """build hydra overrides for verl grpo with lora and vllm.
-
-    preserves flash's dr-grpo objective, kl coefficient, constant lr, seed, top_p, and one ppo epoch.
-    verl samples a fresh rollout per optimizer update.
-    """
-    kl_on = float(cfg["kl_coef"]) > 0
-    o = [
+def _algorithm_overrides(cfg: dict) -> list[str]:
+    """preserve the objective and rollout-correction recipe."""
+    return [
         "algorithm.adv_estimator=grpo",
         # dr-grpo recipe: group-mean-centered advantages with NO std normalization, and a
         # constant-length loss aggregation (no per-response length bias). matches the retired trl path's
@@ -191,6 +186,12 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # when calculate_log_probs is true (agent_loop.py:124,501), and ray_trainer.py:1608 gates
         # correction on that key. without it these overrides silently do nothing, including multi-turn.
         "actor_rollout_ref.rollout.calculate_log_probs=True",
+    ]
+
+
+def _data_overrides(cfg: dict) -> list[str]:
+    """shape parquet loading and prompt rendering for training."""
+    return [
         f"data.train_files={cfg['train_files']}",
         f"data.val_files={cfg['val_files']}",
         f"data.train_batch_size={cfg['prompts_per_step']}",
@@ -229,6 +230,12 @@ def build_verl_overrides(cfg: dict) -> list[str]:
             if cfg.get("multimodal")
             else []
         ),
+    ]
+
+
+def _actor_model_overrides(cfg: dict) -> list[str]:
+    """configure the trainable model and adapter loading."""
+    return [
         f"actor_rollout_ref.model.path={cfg['model_id']}",
         f"actor_rollout_ref.model.lora_rank={cfg['lora_rank']}",
         f"actor_rollout_ref.model.lora_alpha={cfg['lora_alpha']}",
@@ -252,6 +259,12 @@ def build_verl_overrides(cfg: dict) -> list[str]:
             if cfg.get("warmstart_adapter")
             else []
         ),
+    ]
+
+
+def _actor_overrides(cfg: dict) -> list[str]:
+    """configure optimization and distributed actor execution."""
+    return [
         f"actor_rollout_ref.actor.optim.lr={cfg['lr']}",
         # only the lora adapter is trainable; decaying its weights toward zero is not part of grpo.
         "actor_rollout_ref.actor.optim.weight_decay=0.0",
@@ -272,6 +285,12 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         f"actor_rollout_ref.actor.ulysses_sequence_parallel_size={cfg['n_gpus']}",
         # store the frozen base in bf16, not verl's fp32 yaml default. shared with the opd driver.
         *trainer_dtype_overrides(),
+    ]
+
+
+def _rollout_overrides(cfg: dict) -> list[str]:
+    """configure generation, batching, and rollout engine behavior."""
+    return [
         "actor_rollout_ref.rollout.name=vllm",
         f"actor_rollout_ref.rollout.n={cfg['group_size']}",
         # verl 0.8.0 chunks the rollout batch across agent workers with exact divisibility
@@ -319,18 +338,36 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # log-prob pass switches to token budgeting with the actor, never independently.
         "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=true",
         f"actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu={cfg['max_token_len_per_gpu']}",
+    ]
+
+
+def _reward_overrides(cfg: dict) -> list[str]:
+    """route custom scoring into both verl reward entry points."""
+    return [
         f"custom_reward_function.path={cfg['reward_path']}",
         f"custom_reward_function.name={cfg['reward_name']}",
         # verl trainer-v1 reward loop reads reward.custom_reward_function (the legacy top-level key
         # is migrated in the main process but not visible to the RewardLoopWorker actor); emit both.
         f"reward.custom_reward_function.path={cfg['reward_path']}",
         f"reward.custom_reward_function.name={cfg['reward_name']}",
+    ]
+
+
+def _ray_overrides(cfg: dict) -> list[str]:
+    """bound ray resources to the rented container."""
+    return [
         # ray autodetects the HOST's cpu count inside a rented pod and eagerly forks one idle worker
         # per core, which has killed real runs two ways (host-ram oom, and a fatal raylet fork
         # failure that takes every actor with it). size the pool to the container instead.
         f"ray_kwargs.ray_init.num_cpus={ray_num_cpus(cfg['n_gpus'])}",
         # num_gpus is absent from verl's generated ray_init node, so hydra requires add-key syntax.
         f"+ray_kwargs.ray_init.num_gpus={cfg['n_gpus']}",
+    ]
+
+
+def _trainer_overrides(cfg: dict) -> list[str]:
+    """control training horizon, checkpoints, and run metadata."""
+    return [
         f"trainer.n_gpus_per_node={cfg['n_gpus']}",
         "trainer.nnodes=1",
         f"trainer.total_epochs={cfg['total_epochs']}",
@@ -352,6 +389,25 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         f"trainer.experiment_name={_hydra_val(cfg['experiment_name'])}",
         f"trainer.default_local_dir={cfg['local_dir']}",
     ]
+
+
+def build_verl_overrides(cfg: dict) -> list[str]:
+    """build hydra overrides for verl grpo with lora and vllm.
+
+    preserves flash's dr-grpo objective, kl coefficient, constant lr, seed, top_p, and one ppo epoch.
+    verl samples a fresh rollout per optimizer update.
+    """
+    kl_on = float(cfg["kl_coef"]) > 0
+    o = (
+        _algorithm_overrides(cfg)
+        + _data_overrides(cfg)
+        + _actor_model_overrides(cfg)
+        + _actor_overrides(cfg)
+        + _rollout_overrides(cfg)
+        + _reward_overrides(cfg)
+        + _ray_overrides(cfg)
+        + _trainer_overrides(cfg)
+    )
     if kl_on:
         # a reference policy is active -> add the token-level kl loss. the ref worker needs no
         # batching keys of its own: ref.yaml defaults log_prob_use_dynamic_bsz and
