@@ -273,7 +273,7 @@ def parse_strict_json(raw: bytes | bytearray) -> dict[str, Any]:
         )
     except TeacherBrokerError:
         raise
-    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+    except (TypeError, ValueError) as exc:
         raise TeacherBrokerError("invalid_json", status_code=400) from exc
     if not isinstance(value, dict):
         raise TeacherBrokerError("request_must_be_object", status_code=400)
@@ -574,7 +574,7 @@ def _validated_provider_response(
         )
     except TeacherBrokerError as exc:
         raise TeacherBrokerError("provider_contract_error", status_code=502) from exc
-    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+    except (TypeError, ValueError) as exc:
         raise TeacherBrokerError("provider_contract_error", status_code=502) from exc
     if not isinstance(value, dict) or score_items != 1:
         raise TeacherBrokerError("provider_contract_error", status_code=502)
@@ -796,7 +796,7 @@ def _complete_teacher_request(
             status_code=exc.status_code,
             request_id=request_id,
         ) from exc
-    except (TimeoutError, OSError, http.client.HTTPException) as exc:
+    except (OSError, http.client.HTTPException) as exc:
         with contextlib.suppress(Exception):
             db.complete_teacher_request(
                 capability_id,

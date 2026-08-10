@@ -63,7 +63,7 @@ def completed_checkpoint_step(local_dir: str) -> int:
     try:
         with open(tracker) as file:
             return int(file.read().strip())
-    except (FileNotFoundError, OSError, ValueError):
+    except (OSError, ValueError):
         return 0
 
 

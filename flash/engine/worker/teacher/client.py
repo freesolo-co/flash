@@ -595,7 +595,7 @@ class TeacherClient:
                 if not retryable:
                     raise broker_failure from None
                 last_error = broker_failure
-            except (urllib.error.URLError, TimeoutError, OSError) as error:
+            except OSError as error:
                 last_error = TeacherError(
                     f"teacher broker transport error for {request_id} on {path}: "
                     f"{type(error).__name__}"
