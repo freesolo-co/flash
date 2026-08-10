@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from flash.server import envs
+from flash.server.domain import envs
 
 
 def _gnu_longname_bomb(name_len: int) -> bytes:
@@ -225,7 +225,7 @@ def test_publish_does_not_accept_github_pat_alias(monkeypatch):
 
 
 def test_record_published_environment_posts_to_backend(monkeypatch):
-    from flash.server import environment_registry
+    from flash.server.domain import environment_registry
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
@@ -275,7 +275,7 @@ def test_record_published_environment_posts_to_backend(monkeypatch):
 
 def test_record_published_environment_sends_project_id(monkeypatch):
     """A validated project travels to the backend as `projectId`."""
-    from flash.server import environment_registry
+    from flash.server.domain import environment_registry
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
@@ -309,7 +309,7 @@ def test_record_published_environment_sends_project_id(monkeypatch):
 
 
 def test_record_published_environment_rejects_blank_project_id(monkeypatch):
-    from flash.server import environment_registry
+    from flash.server.domain import environment_registry
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
@@ -342,7 +342,7 @@ def test_record_published_environment_rejects_blank_project_id(monkeypatch):
 
 
 def test_record_published_environment_returns_false_without_internal_key(monkeypatch):
-    from flash.server import environment_registry
+    from flash.server.domain import environment_registry
 
     monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
     assert (
@@ -358,7 +358,7 @@ def test_record_published_environment_returns_false_without_internal_key(monkeyp
 
 def _capture_delete_request(monkeypatch):
     """Stub urlopen for record_deleted_environment and return the dict it records into."""
-    from flash.server import environment_registry
+    from flash.server.domain import environment_registry
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
@@ -384,7 +384,7 @@ def _capture_delete_request(monkeypatch):
 
 def test_record_deleted_environment_uses_caller_org_for_internal_key(monkeypatch):
     # The internal key is org-agnostic, so the web UI delete supplies the org explicitly.
-    from flash.server import environment_registry
+    from flash.server.domain import environment_registry
 
     seen = _capture_delete_request(monkeypatch)
     ok = environment_registry.record_deleted_environment(
@@ -405,7 +405,7 @@ def test_record_deleted_environment_uses_caller_org_for_internal_key(monkeypatch
 def test_record_deleted_environment_prefers_key_org_over_supplied(monkeypatch):
     # A user key carries its own org, which must win over any caller-supplied override so a
     # forged header can't drop another org's row.
-    from flash.server import environment_registry
+    from flash.server.domain import environment_registry
 
     seen = _capture_delete_request(monkeypatch)
     ok = environment_registry.record_deleted_environment(
@@ -420,7 +420,7 @@ def test_record_deleted_environment_prefers_key_org_over_supplied(monkeypatch):
 
 def test_record_deleted_environment_without_any_org_is_noop(monkeypatch):
     # No key org and no supplied org: nothing to target, so it must not POST.
-    from flash.server import environment_registry
+    from flash.server.domain import environment_registry
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
     monkeypatch.setattr(
@@ -439,7 +439,7 @@ def test_record_deleted_environment_without_any_org_is_noop(monkeypatch):
 
 
 def test_require_environment_project_posts_strict_validation(monkeypatch):
-    from flash.server import environment_registry
+    from flash.server.domain import environment_registry
 
     seen: dict = {}
 
@@ -491,12 +491,307 @@ def test_require_environment_project_posts_strict_validation(monkeypatch):
     }
 
 
+def test_require_environment_project_repairs_missing_legacy_environment(monkeypatch):
+    import urllib.error
+
+    from flash.server.domain import environment_registry
+
+    requests: list[dict] = []
+    downloads: list[tuple[str, dict]] = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def urlopen(req, timeout=None):
+        body = json.loads(req.data)
+        requests.append({"url": req.full_url, "body": body, "timeout": timeout})
+        if req.full_url.endswith("/validate/internal"):
+            raise urllib.error.HTTPError(
+                req.full_url,
+                404,
+                "not found",
+                {},
+                io.BytesIO(b'{"detail":"flash environment not found"}'),
+            )
+        return Response()
+
+    key = {"org_id": "org-A", "org_slug": "acme", "user_id": "user-A"}
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-secret")
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
+    monkeypatch.setattr(environment_registry.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(
+        envs,
+        "download_package",
+        lambda *, slug, key: downloads.append((slug, key)) or b"package",
+    )
+
+    environment_registry.require_environment_project(
+        slug="acme/example",
+        project_id="11111111-1111-4111-8111-111111111111",
+        key=key,
+        repair_missing=True,
+    )
+
+    assert downloads == [("acme/example", key)]
+    assert [request["url"] for request in requests] == [
+        "https://backend.test/api/flash/environments/validate/internal",
+        "https://backend.test/api/flash/environments/internal",
+    ]
+    assert requests[1]["body"] == {
+        "orgId": "org-A",
+        "slug": "acme/example",
+        "name": "example",
+        "hubRepo": "freesolo-co/environment-hub",
+        "hubRef": "main",
+        "hubPath": "acme/example/environment.py",
+        "publishedByUserId": "user-A",
+        "apiKeyId": None,
+        "projectId": "11111111-1111-4111-8111-111111111111",
+        "metadata": {"source": "flash.env.push"},
+    }
+
+
+def test_require_environment_project_repairs_missing_row_without_error_detail(monkeypatch):
+    import urllib.error
+
+    from flash.server.domain import environment_registry
+
+    error = urllib.error.HTTPError(
+        "https://backend.test/api/flash/environments/validate/internal",
+        404,
+        "not found",
+        {},
+        io.BytesIO(b""),
+    )
+    downloads: list[str] = []
+    records: list[dict] = []
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-secret")
+    monkeypatch.setattr(
+        environment_registry.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+    monkeypatch.setattr(
+        envs,
+        "download_package",
+        lambda *, slug, key: downloads.append(slug) or b"package",
+    )
+    monkeypatch.setattr(
+        environment_registry,
+        "record_published_environment",
+        lambda **kwargs: records.append(kwargs) or True,
+    )
+
+    environment_registry.require_environment_project(
+        slug="acme/example",
+        project_id="11111111-1111-4111-8111-111111111111",
+        key={"org_id": "org-A", "org_slug": "acme"},
+        repair_missing=True,
+    )
+
+    assert downloads == ["acme/example"]
+    assert records[0]["project_id"] == "11111111-1111-4111-8111-111111111111"
+
+
+def test_require_environment_project_missing_package_does_not_backfill(monkeypatch):
+    import urllib.error
+
+    from fastapi import HTTPException
+
+    from flash.server.domain import environment_registry
+
+    error = urllib.error.HTTPError(
+        "https://backend.test/api/flash/environments/validate/internal",
+        404,
+        "not found",
+        {},
+        io.BytesIO(b'{"detail":"flash environment not found"}'),
+    )
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-secret")
+    monkeypatch.setattr(
+        environment_registry.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+    monkeypatch.setattr(
+        envs,
+        "download_package",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            envs.EnvPublishError("environment package not found", status=404)
+        ),
+    )
+    monkeypatch.setattr(
+        environment_registry,
+        "record_published_environment",
+        lambda **_kwargs: pytest.fail("a missing package must not create a mirror row"),
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        environment_registry.require_environment_project(
+            slug="acme/example",
+            project_id="11111111-1111-4111-8111-111111111111",
+            key={"org_id": "org-A", "org_slug": "acme"},
+            repair_missing=True,
+        )
+
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.detail == "environment package not found"
+
+
+def test_require_environment_project_cross_namespace_repair_preserves_404(monkeypatch):
+    import urllib.error
+
+    from fastapi import HTTPException
+
+    from flash.server.domain import environment_registry
+
+    error = urllib.error.HTTPError(
+        "https://backend.test/api/flash/environments/validate/internal",
+        404,
+        "not found",
+        {},
+        io.BytesIO(b'{"detail":"flash environment not found"}'),
+    )
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-secret")
+    monkeypatch.setattr(
+        environment_registry.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+    monkeypatch.setattr(
+        envs,
+        "download_package",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            envs.EnvPublishError(
+                "you can only download environments in your own namespace",
+                status=403,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        environment_registry,
+        "record_published_environment",
+        lambda **_kwargs: pytest.fail("a cross-namespace package must not create a mirror row"),
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        environment_registry.require_environment_project(
+            slug="other-org/example",
+            project_id="11111111-1111-4111-8111-111111111111",
+            key={"org_id": "org-A", "org_slug": "acme"},
+            repair_missing=True,
+        )
+
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.detail == "flash environment not found"
+    assert isinstance(excinfo.value.__cause__, envs.EnvPublishError)
+    assert excinfo.value.__cause__.status == 403
+
+
+@pytest.mark.parametrize("package_exists", [True, False], ids=["exists", "missing"])
+def test_internal_repair_without_org_namespace_preserves_404(monkeypatch, package_exists):
+    import urllib.error
+
+    from fastapi import HTTPException
+
+    from flash.server.domain import environment_registry
+
+    error = urllib.error.HTTPError(
+        "https://backend.test/api/flash/environments/validate/internal",
+        404,
+        "not found",
+        {},
+        io.BytesIO(b'{"detail":"flash environment not found"}'),
+    )
+    downloads: list[str] = []
+    records: list[dict] = []
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-secret")
+    monkeypatch.setattr(
+        environment_registry.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+
+    def download_package(*, slug, key):
+        downloads.append(slug)
+        if package_exists:
+            return b"package"
+        raise envs.EnvPublishError("environment package not found", status=404)
+
+    monkeypatch.setattr(envs, "download_package", download_package)
+    monkeypatch.setattr(
+        environment_registry,
+        "record_published_environment",
+        lambda **kwargs: records.append(kwargs) or True,
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        environment_registry.require_environment_project(
+            slug="foreign-org/example",
+            project_id="11111111-1111-4111-8111-111111111111",
+            key={"auth_kind": "internal", "org_id": "org-caller"},
+            repair_missing=True,
+        )
+
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.detail == "flash environment not found"
+    assert downloads == []
+    assert records == []
+
+
+def test_require_environment_project_backfill_failure_is_502(monkeypatch):
+    import urllib.error
+
+    from fastapi import HTTPException
+
+    from flash.server.domain import environment_registry
+
+    error = urllib.error.HTTPError(
+        "https://backend.test/api/flash/environments/validate/internal",
+        404,
+        "not found",
+        {},
+        io.BytesIO(b'{"detail":"flash environment not found"}'),
+    )
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-secret")
+    monkeypatch.setattr(
+        environment_registry.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+    monkeypatch.setattr(envs, "download_package", lambda **_kwargs: b"package")
+    monkeypatch.setattr(
+        environment_registry,
+        "record_published_environment",
+        lambda **_kwargs: False,
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        environment_registry.require_environment_project(
+            slug="acme/example",
+            project_id="11111111-1111-4111-8111-111111111111",
+            key={"org_id": "org-A", "org_slug": "acme"},
+            repair_missing=True,
+        )
+
+    assert excinfo.value.status_code == 502
+    assert excinfo.value.detail == (
+        "environment package exists, but its project association could not be repaired"
+    )
+
+
 def test_require_environment_project_maps_project_mismatch(monkeypatch):
     import urllib.error
 
     from fastapi import HTTPException
 
-    from flash.server import environment_registry
+    from flash.server.domain import environment_registry
 
     error = urllib.error.HTTPError(
         "https://backend.test/api/flash/environments/validate/internal",
@@ -511,12 +806,18 @@ def test_require_environment_project_maps_project_mismatch(monkeypatch):
         "urlopen",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
     )
+    monkeypatch.setattr(
+        envs,
+        "download_package",
+        lambda **_kwargs: pytest.fail("a project conflict must not download the hub package"),
+    )
 
     with pytest.raises(HTTPException) as excinfo:
         environment_registry.require_environment_project(
             slug="acme/example",
             project_id="22222222-2222-4222-8222-222222222222",
             key={"org_id": "org-A"},
+            repair_missing=True,
         )
 
     assert excinfo.value.status_code == 409
@@ -526,7 +827,7 @@ def test_require_environment_project_maps_project_mismatch(monkeypatch):
 def test_require_environment_project_fails_closed_without_internal_key(monkeypatch):
     from fastapi import HTTPException
 
-    from flash.server import environment_registry
+    from flash.server.domain import environment_registry
 
     monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
 
@@ -542,7 +843,7 @@ def test_require_environment_project_fails_closed_without_internal_key(monkeypat
 
 
 def test_record_environment_use_posts_to_backend(monkeypatch):
-    from flash.server import environment_registry
+    from flash.server.domain import environment_registry
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
@@ -585,7 +886,7 @@ def test_record_environment_use_posts_to_backend(monkeypatch):
 
 def test_record_training_run_posts_to_backend(monkeypatch):
     from flash.runner import RunStatus
-    from flash.server import run_registry
+    from flash.server.domain import run_registry
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
@@ -643,9 +944,9 @@ def test_record_training_run_posts_to_backend(monkeypatch):
 
 def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
     from flash import runner
+    from flash.core.spec import JobSpec
     from flash.runner import RunStatus
-    from flash.server import run_registry
-    from flash.spec import JobSpec
+    from flash.server.domain import run_registry
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
@@ -717,9 +1018,9 @@ def test_record_training_checkpoint_rejects_invalid_persisted_project(
     monkeypatch, persisted_project
 ):
     from flash import runner
+    from flash.core.spec import JobSpec
     from flash.runner import RunStatus
-    from flash.server import run_registry
-    from flash.spec import JobSpec
+    from flash.server.domain import run_registry
 
     spec = JobSpec.from_dict(
         {
@@ -979,6 +1280,46 @@ def test_github_publish_once_commits_pull_rebases_and_pushes(tmp_path, monkeypat
     assert (verify / "ns/env/publish-1/environment.py").read_text() == (
         "def load_environment(**k): pass\n"
     )
+
+
+def test_github_publish_once_pushes_toml_configs(tmp_path, monkeypatch):
+    remote = tmp_path / "training.git"
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git(seed, "init", "--initial-branch", "main")
+    _git(seed, "config", "user.name", "test")
+    _git(seed, "config", "user.email", "test@example.com")
+    (seed / "README.md").write_text("hub\n")
+    _git(seed, "add", "README.md")
+    _git(seed, "commit", "-m", "seed")
+    _git(seed, "init", "--bare", str(remote))
+    _git(seed, "remote", "add", "origin", str(remote))
+    _git(seed, "push", "origin", "main")
+
+    package = tmp_path / "package"
+    configs = package / "configs"
+    configs.mkdir(parents=True)
+    (package / "environment.py").write_text("def load_environment(**k): pass\n")
+    sft_config = "[training]\nalgorithm = 'sft'\n"
+    opd_config = "[teacher]\nthinking = true\n"
+    (configs / "sft.toml").write_text(sft_config)
+    (configs / "opd_thinking.toml").write_text(opd_config)
+
+    monkeypatch.setattr(envs, "_credentialed_repo_url", lambda repo, token: str(remote))
+
+    envs._github_publish_once(
+        dest=package,
+        repo="ignored/repo",
+        token="tok",
+        publish_root="ns/env/publish-1",
+        message="Upload test env",
+    )
+
+    verify = tmp_path / "verify"
+    _git(tmp_path, "clone", "--branch", "main", str(remote), str(verify))
+    published = verify / "ns/env/publish-1/configs"
+    assert (published / "sft.toml").read_text() == sft_config
+    assert (published / "opd_thinking.toml").read_text() == opd_config
 
 
 # ---------------------------------------------------------------------------
@@ -1255,7 +1596,7 @@ def test_github_delete_retries_concurrent_push(monkeypatch):
 
 
 def test_record_deleted_environment_sends_delete(monkeypatch):
-    from flash.server import environment_registry
+    from flash.server.domain import environment_registry
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
@@ -1297,7 +1638,7 @@ def test_record_deleted_environment_sends_delete(monkeypatch):
 
 
 def test_record_deleted_environment_is_best_effort(monkeypatch):
-    from flash.server import environment_registry
+    from flash.server.domain import environment_registry
 
     monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
     assert (

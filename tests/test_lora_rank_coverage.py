@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import flash.lora_rank as lora_rank
+import flash.adapters.lora_rank as lora_rank
 
 
 def test_adapter_config_path_rejects_an_invalid_storage_reference(monkeypatch) -> None:

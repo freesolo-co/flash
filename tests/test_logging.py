@@ -11,7 +11,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def test_import_is_quiet_and_has_nullhandler():
-    import flash._logging as ctlog
+    import flash._internal.logging as ctlog
 
     root = logging.getLogger("flash")
     assert any(isinstance(h, logging.NullHandler) for h in root.handlers)
@@ -21,7 +21,7 @@ def test_import_is_quiet_and_has_nullhandler():
 
 
 def test_configure_logging_sets_level():
-    import flash._logging as ctlog
+    import flash._internal.logging as ctlog
 
     ctlog.configure_logging(verbosity=2)
     assert logging.getLogger("flash").level == logging.DEBUG
@@ -40,7 +40,7 @@ def test_configure_logging_sets_level():
 def test_importing_flash_emits_no_stderr():
     # A fresh interpreter importing flash must produce no output.
     proc = subprocess.run(
-        [sys.executable, "-c", "import flash, flash.runner, flash.providers.runpod.train"],
+        [sys.executable, "-c", "import flash, flash.runner, flash.providers.runpod.serverless"],
         cwd=ROOT,
         text=True,
         capture_output=True,

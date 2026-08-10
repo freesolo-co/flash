@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import flash.server.checkpoints as checkpoints
+import flash.server.domain.checkpoints as checkpoints
 
 
 class _Response:

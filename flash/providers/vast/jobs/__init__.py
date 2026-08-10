@@ -1,20 +1,6 @@
-"""Vast.ai run lifecycle: verified offers -> rented container -> HF-artifact poll -> guaranteed destroy.
-
-The Vast equivalent of ``providers/lambdalabs/jobs/__init__.py``. Vast has no serverless queue and no
-VM to cloud-init: we rent a single-GPU CONTAINER from a VERIFIED-DATACENTER offer (the worker image
-IS the container), ship the shared instance bootstrap as the container command (``build_onstart``),
-and detect completion purely via the worker's HF artifacts (DONE/metrics.json/heartbeat.json) + the
-instance's status — no inbound network to the box is ever needed.
-
-Cost-safety invariant: a rented instance is ALWAYS destroyed — the runner's ``finally``, the
-onstart's self-destroy backstop, the cancel path, and ``sweep_orphans`` (server startup / post-run)
-each independently guarantee it.
-
-The pure dataclasses + builders live in ``.builders`` and are re-exported here so the import path
-``flash.providers.vast.jobs`` is unchanged. The lifecycle functions and the operator-visible
-constants tests monkeypatch (``usable_offers``, ``deploy_and_submit``, ``poll_vast_job``,
-``submit_run_vast``, ``_make_hf_file_reader``, ``RELIABILITY_FLOOR``/``LOAD_TIMEOUT_S``/…) stay in
-this ``__init__`` so a ``monkeypatch.setattr(jobs, …)`` still takes effect.
+"""Run Vast jobs from verified offers through HF-artifact completion and teardown.
+The worker image is the rented container and needs no inbound access. Runner finally, self-destroy,
+cancel, or orphan sweep must destroy every rental. Keep lifecycle symbols here for test seams.
 """
 
 from __future__ import annotations
@@ -27,25 +13,26 @@ import sys
 import time
 from collections.abc import Callable
 
-from flash._logging import get_logger
-from flash.diagnostics import sanitize_diagnostic
-from flash.providers._deadline import (
+from flash._internal.diagnostics import sanitize_diagnostic
+from flash._internal.logging import get_logger
+from flash.providers._lifecycle.deadline import (
     deadline_kwargs,
+    remaining_seconds,
     require_create_allowance,
     require_deadline_at,
 )
-from flash.providers._hf_artifacts import (
-    error_artifact_name,
-    heartbeat_reader_for,
-    make_hf_text_reader,
-)
-from flash.providers._instance_poll import InstancePollAdapter, poll_instance_job
-from flash.providers._poll import (
+from flash.providers._lifecycle.poll import (
     FIRST_LIVENESS_S,
     LOAD_TIMEOUT_S,
     SETUP_GRACE_S,
     STALL_AFTER_S,
     make_say,
+)
+from flash.providers._lifecycle.poll_instance import InstancePollAdapter, poll_instance_job
+from flash.providers.artifacts.hf import (
+    error_artifact_name,
+    heartbeat_reader_for,
+    make_hf_text_reader,
 )
 from flash.providers.base import (
     GPU_INFO,
@@ -74,14 +61,8 @@ logger = get_logger(__name__)
 # host-uptime score: 0.995 (~1-in-200) nearly eliminates mid-run host deaths while keeping supply usable.
 RELIABILITY_FLOOR = 0.995
 MIN_INET_MBPS = 200.0
-# The shared instance-poll timing defaults imported from ``_poll`` above. The staged setup-vs-training
-# grace is the fix for the historical "Vast box dies every ~25-30 min": the old provider used one flat
-# 1500s window that fired mid cold-start and tore down healthy boxes. load_timeout_s is read at call
-# time so ``monkeypatch.setattr(jobs, …)`` takes effect; setup_grace_s / stall_after_s /
-# first_liveness_s are supplied as ``poll_vast_job`` defaults (override by passing the kwarg, not by
-# patching the global).
-# Boards under-report VRAM vs class nominal (L4 23034/24GB, A40 46068/48GB ≈ 0.938). The server-side
-# gpu_ram filter gets this slack; the class gate (vast_gpu_for_offer) stays exact.
+# setup and training use separate poll graces; LOAD_TIMEOUT_S remains a test seam.
+# vast boards under-report VRAM, so search gets slack while vast_gpu_for_offer remains exact.
 _SEARCH_VRAM_SLACK = 0.92
 # Minimum disk every instance is provisioned with (bootstrap + worker + weights need headroom). The
 # offer search MUST use the same floor so a thin-disk offer can't pass search then fail at create.
@@ -103,14 +84,10 @@ def _effective_disk_gb(spec) -> float:
 
 
 def _exact_search_aliases(info) -> tuple[str, ...]:
-    """Vast alias spellings safe to seed an EXACT-class offer search with.
+    """Return Vast aliases safe for an exact-class search.
 
-    An exact pin is attested on the box against the live device name (``verify_gpu`` -> ``canonical_gpu``).
-    Keep only alias spellings that canonicalize back to THIS class, so the search never pulls a board that
-    attestation would then reject: "A100 PCIE" (kept as fungible A100 SXM 40GB capacity for NON-exact runs
-    by ``vast_gpu_for_offer``) names a PCIe board that canonicalizes to the distinct "A100 PCIe" class, so
-    it would be rented then fail an exact A100-SXM-40GB attestation; H100's "H100 PCIE" canonicalizes to
-    "H100" and stays fungible. Ambiguous/unknown spellings (``canonical_gpu`` raises) are dropped.
+    Keep only aliases that canonicalize to the pinned class, or ``verify_gpu`` rejects the rented
+    board. Drop ambiguous and unknown spellings.
     """
     kept: list[str] = []
     for alias in info.vast_aliases:
@@ -122,6 +99,19 @@ def _exact_search_aliases(info) -> tuple[str, ...]:
     return tuple(kept)
 
 
+def _rent_duration_floor(spec, deadline_at: float, *, now: float | None = None) -> float:
+    """Return the minimum offer duration from rent time to the launch deadline.
+
+    Workload profiles may include provisioning allowance beyond the wall grant; using the actual
+    deadline prevents renting a host that expires during boot. Never shorten below the granted wall.
+    """
+    grant = float(getattr(spec.gpu, "max_wall_seconds", 0) or 0)
+    remaining = remaining_seconds(deadline_at, now=now)
+    if not math.isfinite(remaining) or remaining <= 0:
+        return grant
+    return max(grant, remaining)
+
+
 def usable_offers(
     min_vram_gb: int,
     disk_gb: float,
@@ -129,17 +119,12 @@ def usable_offers(
     limit: int = 256,
     max_wall_seconds: float = 0,
     gpu_type: str = "",
+    num_gpus: int = 1,
     deadline_at: float | None = None,
 ) -> list[VastOffer]:
-    """Verified-datacenter offers able to run the job, cheapest first.
-
-    Server-side filters do the heavy lifting; everything load-bearing is re-checked client-side.
-
-    ``limit`` is the price-sorted page size. Callers bucket rows BY GPU CLASS, so the page must span
-    every fitting managed class — 256 comfortably covers the verified-datacenter market (a specific-class
-    caller just filters down further). ``max_wall_seconds`` (>0) also requires offers available for at
-    least ``max(60, max_wall)`` so the search never advertises capacity an offer cannot outlast. Provider
-    provisioning grace is not added to the run's terminal cutoff. 0 = no duration floor.
+    """Return fitting verified-datacenter offers, cheapest first.
+    ``num_gpus`` must match one-machine shape because create has no count parameter. Recheck all
+    load-bearing filters client-side; positive wall time adds an offer-duration floor.
     """
     min_duration = (
         max(60.0, float(max_wall_seconds)) if max_wall_seconds and max_wall_seconds > 0 else 0
@@ -159,12 +144,14 @@ def usable_offers(
     search_kwargs = {"gpu_names": gpu_names} if gpu_names else {}
     if exact_info is not None:
         search_kwargs["max_vram_mb"] = int(exact_info.vram_gb * 1024)
+    cards = max(1, int(num_gpus))
     rows = vast_api.search_offers(
         int(search_vram_gb * 1024 * _SEARCH_VRAM_SLACK),
         min_disk_gb=disk_gb,
         min_reliability=RELIABILITY_FLOOR,
         min_duration_seconds=min_duration,
         limit=int(limit),
+        num_gpus=cards,
         **search_kwargs,
         **deadline_kwargs(vast_api.search_offers, deadline_at),
     )
@@ -189,6 +176,10 @@ def usable_offers(
             or float(r.get("inet_down") or 0) < MIN_INET_MBPS
             or cuda < float(min_cuda_modern(gpu))  # Blackwell needs CUDA-13 drivers
             or dph <= 0
+            # the card count is load-bearing twice over (it sizes the rented box AND divides
+            # dph_total into the per-card rate), so re-check it rather than trusting the server
+            # honoured the num_gpus filter.
+            or int(r.get("num_gpus") or 0) != cards
             or int(r.get("machine_id") or 0) in exclude_machine_ids
         ):
             continue
@@ -198,12 +189,17 @@ def usable_offers(
                 machine_id=int(r.get("machine_id") or 0),
                 gpu=gpu,
                 vram_gb=info.vram_gb,
-                dph_total=dph,
+                # dph_total prices the WHOLE offer (all `cards` GPUs); every consumer of dph_total
+                # treats it as one card's rate, so divide here at the single boundary where the
+                # count is known. Skipping this prices an N-card box N times over and the allocator
+                # would never choose one.
+                dph_total=dph / cards,
                 cuda_max_good=cuda,
                 disk_space=float(r.get("disk_space") or 0),
                 reliability=float(r.get("reliability2") or 0),
                 inet_down=float(r.get("inet_down") or 0),
                 geolocation=str(r.get("geolocation") or ""),
+                gpu_count=cards,
             )
         )
     return sorted(out, key=lambda o: (o.dph_total, o.vram_gb))
@@ -295,7 +291,7 @@ def _reconcile_ambiguous_create(
             machine_id=offer.machine_id,
             label=label,
             gpu=offer.gpu,
-            hourly_usd=offer.dph_total,
+            hourly_usd=offer.dph_total * offer.gpu_count,
             attempt=attempt,
             started_ts=started,
         )
@@ -336,12 +332,12 @@ def deploy_and_submit(
     code_prefix: str | None = None,
     deadline_at: float | None = None,
 ) -> VastJobHandle:
-    """Rent the cheapest offer that will actually take the job; walk on rejection.
+    """Rent the cheapest accepting offer, walking live-market rejections.
 
-    Offers are a live market — between search and rent the cheapest one is often gone. We walk up to
-    5 ranked offers, then refresh the search once (re-excluding the machines we just tried so a fresh
-    market re-search doesn't re-select one that just rejected us).
+    Try five ranked offers, then refresh once while excluding machines already tried.
     """
+    from flash.core.spec import gpu_count_of
+
     say = make_say(log)
     absolute_deadline = require_deadline_at(deadline_at)
 
@@ -413,9 +409,12 @@ def deploy_and_submit(
                             min(o.vram_gb for o in offers),
                             _effective_disk_gb(spec),
                             exclude_machine_ids={o.machine_id for o in tried},
-                            max_wall_seconds=float(getattr(spec.gpu, "max_wall_seconds", 0) or 0),
+                            max_wall_seconds=_rent_duration_floor(spec, absolute_deadline),
                             # the transient attempt spec always carries the concrete allocated class.
                             gpu_type=spec.gpu.type,
+                            # refresh the SHAPE the allocator chose: dropping the count here would
+                            # rent a single-card offer while the worker still starts n ranks.
+                            num_gpus=gpu_count_of(spec),
                             **deadline_kwargs(usable_offers, absolute_deadline),
                         )
                         if o.gpu in allowed
@@ -434,7 +433,11 @@ def deploy_and_submit(
                     machine_id=offer.machine_id,
                     label=label,
                     gpu=offer.gpu,
-                    hourly_usd=offer.dph_total,
+                    # ``dph_total`` was divided down to a PER-CARD rate for allocator ranking; the
+                    # handle's rate is billed against wall-clock once by both the cost stamp and
+                    # realized COGS, so restore the whole-offer price or an n-card box
+                    # under-reports by exactly n.
+                    hourly_usd=offer.dph_total * offer.gpu_count,
                     attempt=attempt,
                     started_ts=time.time(),
                 )
@@ -497,14 +500,10 @@ def poll_vast_job(
     first_liveness_s: float = FIRST_LIVENESS_S,
     deadline_at: float | None = None,
 ) -> PollResult:
-    """Poll instance status + HF artifacts to a terminal state (cf. lambdalabs.jobs.poll_lambda_job).
+    """Poll Vast status and HF artifacts through the shared instance-poll kernel.
 
-    A thin wrapper that builds the Vast :class:`InstancePollAdapter` and defers to the shared
-    ``poll_instance_job`` kernel — Vast IS that kernel's baseline, so its behavior is unchanged. Vast
-    stamps the customer cost from the worker TRAINING wall (metrics.wall_seconds), notes the provider
-    offer + instance wall, reads early-liveness from the container-log API, and — having no host console
-    file — assembles failure detail from HF artifacts + the live instance log tail. ``LOAD_TIMEOUT_S`` is
-    read here (a module global) so ``monkeypatch.setattr(jobs, "LOAD_TIMEOUT_S", ...)`` still bites.
+    Stamp cost from worker training wall, use container logs for liveness, and build failures from
+    HF artifacts plus the instance log. Read ``LOAD_TIMEOUT_S`` here to preserve the test seam.
     """
     absolute_deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
     hf_repo = spec.train.hf_repo
@@ -630,6 +629,8 @@ def submit_run_vast(
         raise vast_api.VastApiError(
             f"submit_run_vast needs a concrete gpu class, got {spec.gpu.type!r}"
         )
+    from flash.core.spec import gpu_count_of
+
     absolute_deadline = require_deadline_at(deadline_at)
     info = GPU_INFO[spec.gpu.type]
     offers = [
@@ -637,9 +638,12 @@ def submit_run_vast(
         for o in usable_offers(
             info.vram_gb,
             _effective_disk_gb(spec),
-            max_wall_seconds=float(getattr(spec.gpu, "max_wall_seconds", 0) or 0),
+            max_wall_seconds=_rent_duration_floor(spec, absolute_deadline),
             # the transient attempt spec always carries the concrete allocated class.
             gpu_type=spec.gpu.type,
+            # rent the SHAPE the allocator chose: the worker spawns gpu.count ranks, so a
+            # single-card offer would oversubscribe one card with n ranks while billing for n.
+            num_gpus=gpu_count_of(spec),
             **deadline_kwargs(usable_offers, absolute_deadline),
         )
         if o.gpu == spec.gpu.type
@@ -689,13 +693,11 @@ def submit_run_vast(
 
 
 def _best_effort_destroy(instance_id, *, context: str) -> bool:
-    """``destroy_instance`` for best-effort teardown paths (submit/poll ``finally``, cancel) that must
-    NOT raise. Returns the confirmation bool and WARNS on an unconfirmed teardown (``success: false`` /
-    breakdown -> may still be billing) for immediate operator visibility. (``VastProvider.destroy`` wraps
-    this and RE-RAISES on failure for its suppress-wrapped callers.)
+    """Best-effort destroy for non-raising teardown paths.
 
-    Pass ``instance_id`` THROUGH unconverted: ``destroy_instance`` does the ``int()`` internally, so
-    converting here would re-introduce a raise in the very ``finally``/``suppress`` paths this quiets."""
+    Warn and return False when billing may continue; ``VastProvider.destroy`` escalates separately.
+    Pass ``instance_id`` through because conversion here could raise inside ``finally`` cleanup.
+    """
     ok = vast_api.destroy_instance(instance_id)
     if not ok:
         logger.warning(
@@ -745,14 +747,10 @@ def destroy_run_instances(run_id: str) -> list[int]:
 
 
 def run_instances_remaining(run_id: str) -> list[int]:
-    """Instance ids that STILL carry ``run_id``'s label right now.
+    """Return instance ids still carrying the run label.
 
-    An empty list is the CONFIRMED-clear signal; a non-empty list means a possibly-live instance
-    survives (an unconfirmed destroy, or a phantom from a non-idempotent create). Unlike
-    ``destroy_run_instances`` this RAISES on a listing failure and uses the STRICT listing (a partial
-    page set raises), so an empty result is a COMPLETE enumeration — never an unseen page hiding a live
-    box. Gates the handle-less recovery resubmit: never launch a second worker while an instance for the
-    run might still be writing its HF artifacts.
+    Empty means confirmed clear. Strict listing raises on incomplete enumeration so handle-less
+    recovery never launches over a possibly live worker still writing HF artifacts.
     """
     if not run_id:
         return []
@@ -781,16 +779,10 @@ def sweep_orphans(
     active_labels: set[str] | Callable[[], set[str]] | None = None,
     known_labels: set[str] | Callable[[], set[str]] | None = None,
 ) -> list[int]:
-    """Destroy Flash-labeled instances that no live run owns; return destroyed ids.
+    """Destroy unclaimed Flash-labeled instances and return their ids.
 
-    Run at server startup (crash recovery) and after runs. Only ``flash-`` prefixed labels are ever
-    touched. ``active_labels`` (raw run ids, or a callable resolved AFTER listing to close the launch
-    race) are the protected live runs; each is passed through ``run_label_prefix``.
-
-    ``known_labels`` (optional) is the universe of runs THIS plane knows: when supplied, an instance is
-    reaped ONLY if its label maps to one — the multi-plane guard so two planes sharing one Vast account
-    never reap each other's boxes. ``None`` = legacy unscoped (reap every non-active ``flash-`` box).
-    Best-effort: never raises.
+    Resolve callable active labels after listing to close the launch race. ``known_labels`` limits
+    cleanup to this plane; None reaps every inactive ``flash-`` label. Never raises.
     """
     try:
         instances = vast_api.list_instances()

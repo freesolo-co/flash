@@ -44,7 +44,7 @@ def _get_provider(key: str) -> Provider:
 
         return PROVIDER
     if key == "lambda":
-        from flash.providers.lambdalabs import PROVIDER
+        from flash.providers.lambda_ import PROVIDER
 
         return PROVIDER
     if key == "vast":

@@ -96,15 +96,15 @@ def make_client(tmp_path, monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
-    # runpod.keys caches the parsed pool on first read; reset so the startup preflight reads THIS
+    # runpod.auth caches the parsed pool on first read; reset so the startup preflight reads THIS
     # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make the fixture self-contained).
-    import flash.providers.runpod.keys as runpod_keys
+    import flash.providers.runpod.auth as runpod_keys
 
     runpod_keys.reset()
 
     import flash.runner as runner
-    import flash.server.auth as auth_mod
-    import flash.server.db as db_mod
+    import flash.server.platform.auth as auth_mod
+    import flash.server.platform.db as db_mod
 
     importlib.reload(runner)
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
@@ -128,10 +128,9 @@ def make_client(tmp_path, monkeypatch):
     # dispatch real sweep_orphans() list calls — and the urllib->TestClient shim below isn't installed
     # until AFTER create_app() runs. Stub the provider set to empty so startup stays hermetic.
     import flash.providers as providers_mod
-    import flash.providers.runpod.train.endpoints as rp_endpoints
-    import flash.server.environment_registry as environment_registry
-    import flash.server.projects as projects_mod
-    import flash.server.run_registry as run_registry
+    import flash.server.domain.environment_registry as environment_registry
+    import flash.server.domain.projects as projects_mod
+    import flash.server.domain.run_registry as run_registry
 
     monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
     monkeypatch.setattr(environment_registry, "require_environment_project", lambda **_kwargs: None)
@@ -139,12 +138,6 @@ def make_client(tmp_path, monkeypatch):
         projects_mod,
         "require_project_access",
         lambda *, project_id, **_kwargs: project_id,
-    )
-    # FREESOLO_INTERNAL_KEY also makes startup run the RunPod slot-store reconcile
-    # (reconcile_endpoint_slots() -> runpod.slots.reconcile() urllib POST) BEFORE the urllib->
-    # TestClient shim below is installed, so it would hit real network. No-op it at the entry.
-    monkeypatch.setattr(
-        rp_endpoints, "reconcile_endpoint_slots", lambda *a, **k: None, raising=False
     )
     # And the same key makes each run-status update best-effort report via run_registry._post(); with
     # the urllib shim that POST would otherwise route into THIS app (no such route) and log a 404 warn

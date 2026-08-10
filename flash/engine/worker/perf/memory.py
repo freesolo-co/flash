@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-from flash.engine.vram import _LIGER_LONG_CTX_TOKENS
+from flash.engine.plan.vram import _LIGER_LONG_CTX_TOKENS
 from flash.engine.worker.perf.liger import _liger_default_for_model
-
-_LONG_CONTEXT_TOKENS = _LIGER_LONG_CTX_TOKENS
 
 
 def _memory_mode(model_id: str, max_length: int = 0, *, revision: str = "") -> bool:
     """True for large models or long contexts; False for small+short (optimize for speed)."""
-    if max_length and max_length >= _LONG_CONTEXT_TOKENS:
+    if max_length and max_length >= _LIGER_LONG_CTX_TOKENS:
         return True
     return _liger_default_for_model(model_id, revision=revision)
 
@@ -45,13 +43,13 @@ def grad_checkpointing_on(
     )
     if not can_consider_gc_off:
         return True
-    from flash.catalog import MODELS
+    from flash.core.catalog import MODELS
 
     info = MODELS.get(model_id)
     params_b = float(getattr(info, "params_b", 0.0) or 0.0) if info else 0.0
     if params_b <= 0:
         return True
-    from flash.engine.vram import sft_grad_checkpoint_can_disable
+    from flash.engine.plan.vram import sft_grad_checkpoint_can_disable
 
     if sft_grad_checkpoint_can_disable(
         params_b,
@@ -76,9 +74,11 @@ def grad_checkpointing_on(
 def _is_gdn_hybrid_family(model_id: str) -> bool:
     """Offline family check for a Qwen3.5/3.6 GatedDeltaNet hybrid (no network/config probe).
 
-    Every curated model is a Qwen3.5/3.6 GDN hybrid; uncataloged non-Qwen open models are not. Kept
-    as a string check so ``grpo_use_reentrant``
-    stays pure and hermetic (callable at config-build time, unit-testable without HF access).
+    Every catalog model is a Qwen3.5/3.6 GDN hybrid today, so this currently answers True for all of
+    them -- but the False branch is deliberately kept for the first non-Qwen entry someone adds when
+    forking to extend the catalog, which is the supported way to add a model. Kept as a string check
+    so ``grpo_use_reentrant`` stays pure and hermetic (callable at config-build time, unit-testable
+    without HF access).
     """
     mid = (model_id or "").lower()
     return any(token in mid for token in ("qwen3.5", "qwen3_5", "qwen3.6", "qwen3_6"))
@@ -98,7 +98,7 @@ def grpo_use_reentrant(model_id: str) -> bool:
       expert-buffer shapes differ (forward expert-dispatch tokens 28192 vs recompute 3524 ==
       group_size x). This is what #429 fixed.
     - GDN hybrids (Qwen3.5/3.6 dense): FlashAttention-2 varlen-unpad on the full-attention layers,
-      the fused GatedDeltaNet chunk-scan on the linear-attention layers, and chalk's fused Triton
+      the fused GatedDeltaNet chunk-scan on the linear-attention layers, and the fused Triton
       kernels each save shape-/data-dependent tensors that the non-reentrant metadata-equality check
       can't positionally reconcile (live-confirmed on Qwen3.5-0.8B GRPO / RTX 4090: forward packed
       varlen ``[1636, ...]`` vs recompute padded ``[1024, ...]``). Same failure mode as MoE.
@@ -106,119 +106,12 @@ def grpo_use_reentrant(model_id: str) -> bool:
     Reentrant checkpointing re-runs the forward inside the same autograd context over the same
     closed-over inputs (mask/position_ids threaded via the ``partial``; ``use_cache=False``) and does
     NOT assert metadata equality, so it tolerates these recomputes and produces correct gradients.
-    Uncataloged non-GDN dense open models keep the faster, lower-overhead non-reentrant path.
+    A non-MoE, non-GDN dense model keeps the faster, lower-overhead non-reentrant path (no catalog
+    entry is one today; see ``_is_gdn_hybrid_family``).
     """
-    from flash.catalog import MODELS
+    from flash.core.catalog import MODELS
 
     info = MODELS.get(model_id)
     if info is not None and info.is_moe:
         return True
     return _is_gdn_hybrid_family(model_id)
-
-
-def enable_multimodal_input_require_grads(model) -> object | None:
-    """Make the vision patch embeddings differentiable for reentrant checkpointing."""
-    if model is None:
-        return None
-
-    existing_handle = getattr(model, "_mm_vision_require_grads_hook", None)
-    if existing_handle is not None:
-        existing_handle.remove()
-        model._mm_vision_require_grads_hook = None
-
-    get_base_model = getattr(model, "get_base_model", None)
-    if callable(get_base_model):
-        base_model = get_base_model()
-    else:
-        peft_base_model = getattr(model, "base_model", None)
-        base_model = getattr(peft_base_model, "model", model)
-
-    for module_path, module in base_model.named_modules():
-        if not module_path.endswith("visual.patch_embed"):
-            continue
-
-        def _require_output_grad(_module, _inputs, output):
-            import torch
-
-            tensor = output[0] if isinstance(output, tuple) and output else output
-            if isinstance(tensor, torch.Tensor) and tensor.is_floating_point():
-                tensor.requires_grad_(True)
-            return
-
-        handle = module.register_forward_hook(_require_output_grad)
-        model._mm_vision_require_grads_hook = handle
-        print(f"[multimodal] vision input gradients enabled at {module_path}")
-        return handle
-
-    return None
-
-
-def make_multimodal_input_require_grads_callback():
-    """Return a trainer callback that installs the vision input-gradient hook at train start."""
-    from transformers import TrainerCallback
-
-    class _MultimodalInputRequireGrads(TrainerCallback):
-        def on_train_begin(self, args, state, control, **kwargs):
-            enable_multimodal_input_require_grads(kwargs.get("model"))
-            return control
-
-    return _MultimodalInputRequireGrads()
-
-
-def grpo_sleep_mode(
-    model_id: str,
-    *,
-    max_length: int = 0,
-    group_size: int = 8,
-    max_tokens: int | None = None,
-    lora_rank: int = 32,
-    thinking: bool = False,
-    card_vram_gb: float = 0.0,
-    fp8_kv: bool = False,
-    revision: str = "",
-) -> bool:
-    """Whether colocated-vLLM GRPO should offload the rollout engine between steps."""
-    from flash.catalog import MODELS
-    from flash.engine.vram import grpo_fits_resident, grpo_rollout_seq_len
-
-    _info = MODELS.get(model_id)
-    _sleep_broken = bool(_info is not None and getattr(_info, "sleep_unsupported", False))
-    seq_len = grpo_rollout_seq_len(max_length, max_tokens, thinking)
-    if not _memory_mode(model_id, seq_len, revision=revision) and not _sleep_broken:
-        return False
-    _fits = None
-    if card_vram_gb and card_vram_gb > 0:
-        try:
-            _fits = grpo_fits_resident(
-                model_id,
-                seq_len=seq_len,
-                max_tokens=max_tokens,
-                lora_rank=lora_rank,
-                group_size=group_size,
-                thinking=thinking,
-                card_vram_gb=card_vram_gb,
-                fp8_kv=fp8_kv,
-                revision=revision,
-            )
-        except Exception as e:
-            print("[rl] grpo sleep-mode resident check skipped:", e)
-    if _fits:
-        return False  # fits resident -> skip the (buggy, slow) sleep/wake cycle
-    if _sleep_broken:
-        # vLLM sleep is NON-FUNCTIONAL for this model (the wake/reload HANGS -- see ModelInfo
-        # .sleep_unsupported). NEVER return True (that would route to the hang). If we positively know
-        # it doesn't fit resident, REJECT with a clear error; if we couldn't check (no card info),
-        # attempt RESIDENT anyway -- a possible OOM beats a guaranteed wake-hang.
-        if _fits is False:
-            raise ValueError(
-                f"{model_id}: GRPO config (engine context ~{seq_len} tok, group={group_size}) does NOT "
-                f"fit RESIDENT on {card_vram_gb:.0f} GB and vLLM sleep mode HANGS this model "
-                f"(resident-only). Reduce [train].max_context_tokens and/or group_size to fit resident."
-            )
-        return False
-    return True
-
-
-def fused_optim_name() -> str:
-    """8-bit paged AdamW: optimizer state paged to host RAM, fits smaller GPUs."""
-    return "paged_adamw_8bit"

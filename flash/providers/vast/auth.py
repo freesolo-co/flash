@@ -6,7 +6,7 @@ shipped to workers (the instance self-destroy backstop uses the injected ``CONTA
 
 from __future__ import annotations
 
-from .._auth import load_provider_key
+from flash.providers._lifecycle.auth import load_provider_key
 
 _ENV_VAR = "VAST_API_KEY"
 

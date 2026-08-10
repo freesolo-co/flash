@@ -23,14 +23,22 @@ concurrency:
 jobs:
   publish-pypi:
     name: Publish flash PyPI package
+    # Upstream only. A fork pushing to its own `main` would otherwise run this and fail on the
+    # absent PYPI_API_TOKEN, showing a red X on work that is fine -- and the job publishes to the
+    # `freesolo-flash` name on PyPI, which is ours, so there is nothing here a fork WANTS to run.
+    # Keyed on the repository rather than `github.event.repository.fork` so a rename or a
+    # clone-and-push (neither of which sets the fork flag) is covered too.
+    if: github.repository == 'freesolo-co/flash'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # `write` (not `read`) because the release steps at the end of this job push a git tag and
+      # create a GitHub release through the default GITHUB_TOKEN.
+      contents: write
     env:
       UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0
 
@@ -39,7 +47,7 @@ jobs:
       # fail on a runner whose default python3 predates 3.11 — so set it up here, not later
       # (the uv step that follows brings its own interpreter, but only after those tomllib steps).
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
 
@@ -148,9 +156,42 @@ jobs:
                   raise
           PY
 
+      # Checked BEFORE the upload, because publishing is irreversible and tagging is not. If the tag
+      # conflict were only caught after `uv publish` (where the tag itself is created), the package
+      # would already be on PyPI when the job failed -- and every later run would then stop at the
+      # gate above, leaving a shipped version whose only tag names a different tree. Failing here
+      # costs nothing: nothing has been uploaded yet.
+      - name: Fail if the release tag exists on another commit
+        if: github.event_name == 'workflow_dispatch' || steps.changes.outputs.package_changed == 'true'
+        env:
+          PACKAGE_VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v${PACKAGE_VERSION}"
+          # No `|| true`: `git ls-remote` exits 0 for BOTH "tag present" and "tag absent", and
+          # non-zero only when the lookup itself failed (unreachable remote, auth). Swallowing that
+          # would turn a network blip into "no tag exists" and wave the release through unvalidated,
+          # so a failed lookup must fail the step.
+          # `rc` is captured on the same line: inside `if ! ...`, a later `$?` reports the negation's
+          # result (always 0), not git's.
+          existing="$(git ls-remote --tags origin "refs/tags/${tag}" "refs/tags/${tag}^{}")" && rc=0 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Could not query tags on origin (git ls-remote exit ${rc}). Refusing to continue: a failed lookup is not proof that ${tag} is free."
+            exit 1
+          fi
+          if [ -n "$existing" ]; then
+            peeled="$(printf '%s\n' "$existing" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')"
+            plain="$(printf '%s\n' "$existing" | awk '$2 !~ /\^\{\}$/ {print $1; exit}')"
+            target="${peeled:-$plain}"
+            if [ "$target" != "$GITHUB_SHA" ]; then
+              echo "::error::Tag ${tag} already exists on origin but points at ${target}, not this commit (${GITHUB_SHA}). Refusing to publish ${PACKAGE_VERSION}: the release would ship one tree while the tag names another. Resolve the tag by hand."
+              exit 1
+            fi
+          fi
+
       - name: Install uv
         if: github.event_name == 'workflow_dispatch' || steps.changes.outputs.package_changed == 'true'
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           python-version: "3.11"
 
@@ -168,6 +209,164 @@ jobs:
             exit 1
           fi
           uv publish
+
+      # Tag + GitHub release come AFTER a successful `uv publish`, deliberately. A tag that exists
+      # for a version PyPI never accepted is worse than no tag: it reads as "this shipped" forever,
+      # and the next run has to reason about which of the two sources is lying. Publishing first
+      # means the tag is only ever created for a version that is genuinely on the index.
+      #
+      # KNOWN LIMITATION -- this ordering is not self-healing. If PyPI accepts the upload and the
+      # runner then dies before the tag or the release lands, re-running this workflow does NOT
+      # repair it: the "Fail if PyPI version already exists" gate above now sees the published
+      # version and aborts the job first, on `workflow_dispatch` too. The package is shipped and
+      # untagged until someone fixes it by hand, which is two commands against the release commit:
+      #
+      #   git tag -a v<version> <sha> -m "freesolo-flash <version>" && git push origin v<version>
+      #   gh release create v<version> --generate-notes --verify-tag
+      #
+      # Making the dispatch path reconcile automatically means changing when that pre-existing gate
+      # is allowed to pass, which is a different subsystem than "record what shipped" -- deliberately
+      # left out of this change rather than widened into it.
+      - name: Tag the released version
+        id: tag
+        if: github.event_name == 'workflow_dispatch' || steps.changes.outputs.package_changed == 'true'
+        env:
+          PACKAGE_VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v${PACKAGE_VERSION}"
+          # Ask for the ref AND its peeled form in one shot: an annotated tag answers both lines
+          # (the tag object, then `^{}` = the commit it points at), a lightweight tag answers only
+          # the first, and an absent tag answers neither.
+          # No `|| true`: `git ls-remote` exits 0 for BOTH "tag present" and "tag absent", and
+          # non-zero only when the lookup itself failed (unreachable remote, auth). Swallowing that
+          # would turn a network blip into "no tag exists" and wave the release through unvalidated,
+          # so a failed lookup must fail the step.
+          # `rc` is captured on the same line: inside `if ! ...`, a later `$?` reports the negation's
+          # result (always 0), not git's.
+          existing="$(git ls-remote --tags origin "refs/tags/${tag}" "refs/tags/${tag}^{}")" && rc=0 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Could not query tags on origin (git ls-remote exit ${rc}). Refusing to continue: a failed lookup is not proof that ${tag} is free."
+            exit 1
+          fi
+          if [ -n "$existing" ]; then
+            # Re-checked here, though the preflight above already rejected a conflicting tag before
+            # the upload. This catches only the narrow race where the tag appeared DURING the
+            # publish. It stays fatal rather than tolerant: at this point the package is on PyPI, so
+            # a mismatch means someone must reconcile it by hand, and saying so loudly beats
+            # recording a release whose tag names a different tree.
+            peeled="$(printf '%s\n' "$existing" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')"
+            plain="$(printf '%s\n' "$existing" | awk '$2 !~ /\^\{\}$/ {print $1; exit}')"
+            target="${peeled:-$plain}"
+            if [ "$target" != "$GITHUB_SHA" ]; then
+              echo "::error::Tag ${tag} already exists on origin but points at ${target}, not this commit (${GITHUB_SHA}). Refusing to publish a release that would misattribute the shipped code. Resolve the tag by hand."
+              exit 1
+            fi
+            echo "::notice::Tag ${tag} already exists and points at this commit; reusing it."
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          else
+            git config user.name "David Shan"
+            git config user.email "78061174+DavidBShan@users.noreply.github.com"
+            # Annotated (not lightweight) so the tag carries its own date and author.
+            git tag -a "${tag}" -m "freesolo-flash ${PACKAGE_VERSION}"
+            git push origin "${tag}"
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        # Gated on the tag EXISTING, not on this run having created it, so that a run which pushed
+        # the tag and then failed at the release can still finish the job when the tag step reuses
+        # the existing tag. (That only helps while the job reaches this far -- see the limitation
+        # noted on the tag step: once PyPI holds the version, a fresh run aborts before either
+        # step.) A skipped tag step leaves this output empty, so this correctly stays skipped on
+        # the no-package-changes path.
+        if: steps.tag.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PACKAGE_NAME: ${{ steps.metadata.outputs.name }}
+          PACKAGE_VERSION: ${{ steps.metadata.outputs.version }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "::notice::Release ${TAG} already exists; nothing to do."
+            exit 0
+          fi
+          # Built with printf into a file rather than an inline multi-line --notes string: the body
+          # spans blank lines, and a continuation line at column 0 inside a `run: |` block ends the
+          # YAML block scalar and parses as a new mapping key.
+          notes="${RUNNER_TEMP}/release-notes.md"
+          printf 'Install: `pip install %s==%s`\n\nPyPI: https://pypi.org/project/%s/%s/\n' \
+            "$PACKAGE_NAME" "$PACKAGE_VERSION" "$PACKAGE_NAME" "$PACKAGE_VERSION" > "$notes"
+          # Pick the changelog baseline explicitly: the highest EARLIER tag in this series. Left to
+          # its own devices GitHub picks the baseline server-side, and this repo would mislead it --
+          # there are no releases at all and the only pre-existing tag (`flash-v0.2.18`, June) is
+          # from an abandoned scheme ~900 commits back, so the very first changelog could span most
+          # of repo history. The `v[0-9]` pattern deliberately excludes both that legacy tag and the
+          # dev channel's `dev-v*` series, whose numbers interleave with these by design.
+          # `-V` is version sort, so v1.0.9 sorts before v1.0.10.
+          #
+          # The lookup is run on its own line, NOT as the head of the filter pipeline. Piping it
+          # would make a failed lookup and a genuinely empty tag series both come out as "", and
+          # the first release would then silently fall back to GitHub's automatic baseline -- the
+          # ~900-commit changelog this block exists to prevent, published permanently. The filter
+          # still needs `|| true` because `grep` legitimately exits 1 when the series is empty
+          # (the real first release), which is exactly why the two cases have to be separated.
+          all_tags="$(git ls-remote --tags origin)" && rc=0 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Could not query tags on origin (git ls-remote exit ${rc}). Refusing to continue: an empty result from a failed lookup is not the same as an empty tag series, and guessing here would publish the wrong changelog permanently."
+            exit 1
+          fi
+          # Candidates are the tags STRICTLY BELOW the one being published, not simply "all tags
+          # except this one". Taking the highest overall would pick a LATER tag whenever an older
+          # version is published after a newer one -- a `workflow_dispatch` re-publishing a skipped
+          # version, or a manually created future tag. That yields a backwards changelog, or fails
+          # release creation outright, and by then PyPI and the tag are already published. Splicing
+          # ${TAG} into the sorted list and cutting at it is what makes "below" mean version order
+          # rather than string order.
+          # `|| true` is REQUIRED here and its absence is fatal, not cosmetic: `grep -Fxv` exits 1
+          # when it emits nothing, which is exactly the first-release case (no earlier `v*` tags).
+          # Under `set -euo pipefail` that exit code propagates and kills the step -- AFTER the
+          # package and tag are already published, and the PyPI gate then blocks every re-run. An
+          # empty candidate list is a legitimate answer here, unlike the `ls-remote` lookup above
+          # where an empty result would mean the query failed; that one must stay fail-closed.
+          candidates="$(printf '%s\n' "$all_tags" \
+            | awk '$2 ~ /^refs\/tags\/v[0-9]/ && $2 !~ /\^\{\}$/ {sub(/^refs\/tags\//,"",$2); print $2}' \
+            | grep -Fxv "${TAG}" \
+            | { cat; printf '%s\n' "${TAG}"; } \
+            | sort -V \
+            | awk -v t="${TAG}" '$0==t{exit} {print}' || true)"
+          # Walk the candidates high-to-low and take the first that is an ancestor of this commit.
+          # A tag on an abandoned or parallel line of history is not a valid baseline: GitHub would
+          # diff against a commit this release does not descend from. Note the two skip reasons are
+          # kept distinct -- "not an ancestor" is a real answer, "object missing" means the local
+          # clone cannot tell, and collapsing them would silently accept an unverified baseline.
+          prev=""
+          while IFS= read -r candidate; do
+            [ -n "$candidate" ] || continue
+            if ! git rev-parse -q --verify "refs/tags/${candidate}^{commit}" >/dev/null 2>&1; then
+              echo "::notice::Skipping baseline candidate ${candidate}: tag object not present locally."
+              continue
+            fi
+            if git merge-base --is-ancestor "refs/tags/${candidate}^{commit}" "$GITHUB_SHA" 2>/dev/null; then
+              prev="$candidate"
+            else
+              echo "::notice::Skipping baseline candidate ${candidate}: not an ancestor of ${GITHUB_SHA}."
+            fi
+          done <<< "$(printf '%s\n' "$candidates")"
+          # --generate-notes fills in the commit/PR list; --notes-file content is PREPENDED to it
+          # (per the REST API contract for generate_release_notes), so the install line leads and
+          # the changelog follows. --verify-tag guards against racing the tag push above.
+          # On the very first release `prev` is empty and the flag is omitted, which is the one case
+          # where the server-side baseline is unavoidable.
+          gh release create "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${TAG}" \
+            --verify-tag \
+            --generate-notes \
+            ${prev:+--notes-start-tag "$prev"} \
+            --notes-file "$notes"
 
       - name: No package changes
         if: github.event_name == 'push' && steps.changes.outputs.package_changed == 'false'

@@ -6,10 +6,10 @@ import hashlib
 import time
 from typing import Any
 
-from flash._logging import get_logger
-from flash.providers._deadline import remaining_seconds
-from flash.providers._http import RestClient, is_not_found
-from flash.providers.runpod import keys as _keys
+from flash._internal.logging import get_logger
+from flash.providers._lifecycle.deadline import remaining_seconds
+from flash.providers._lifecycle.http import RestClient, is_not_found
+from flash.providers.runpod import auth as _keys
 
 logger = get_logger(__name__)
 

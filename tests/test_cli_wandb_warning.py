@@ -9,7 +9,7 @@ logging off, which is only discoverable after the GPU spend, when the curve is g
 from __future__ import annotations
 
 from flash.cli.commands import _warn_if_wandb_requested_without_key
-from flash.spec import JobSpec, WandbSpec
+from flash.core.spec import JobSpec, WandbSpec
 
 
 def _spec(**wandb_fields) -> JobSpec:
@@ -69,7 +69,7 @@ def test_dry_run_does_not_claim_the_run_will_train(capsys):
 
 def test_supported_algorithms_still_get_the_export_remedy(capsys):
     """Every shipped algorithm reaches W&B through its trainer, so a key genuinely fixes its case."""
-    from flash.catalog import ALGORITHMS
+    from flash.core.catalog import ALGORITHMS
 
     for algorithm in ALGORITHMS:
         spec = JobSpec(algorithm=algorithm, wandb=WandbSpec(project="my-project"))
@@ -84,27 +84,36 @@ def test_supported_algorithms_still_get_the_export_remedy(capsys):
 def test_every_shipped_worker_actually_reaches_wandb():
     """Tell users to export a key only while every worker can really use one.
 
-    The remedy has to stay truthful: if an algorithm ships whose worker never calls
-    wandb_report_to(), "Export WANDB_API_KEY" would clear the warning while the paid run still logs
-    nowhere. Assert against the worker modules themselves rather than a hand-maintained list, which
-    is how the previous opsd entry outlived the algorithm it named.
+    The remedy has to stay truthful: if an algorithm ships whose worker never hands verl a wandb
+    logger, "Export WANDB_API_KEY" would clear the warning while the paid run still logs nowhere.
+    Assert against the worker modules themselves rather than a hand-maintained list, which is how
+    the previous opsd entry outlived the algorithm it named.
+
+    every algorithm trains in the verl subprocess, so the run is started by verl's own
+    trainer.logger list rather than an in-process wandb call. resolve_verl_loggers() is what puts
+    "wandb" in that list (gated on the key being set and wandb being importable by the verl
+    interpreter), so it is the call that makes the exported key reach W&B.
     """
     import inspect
     from pathlib import Path
 
-    from flash.catalog import ALGORITHMS
+    from flash.core.catalog import ALGORITHMS
     from flash.engine import worker as worker_pkg
 
     worker_dir = Path(inspect.getfile(worker_pkg)).parent
     without_wandb = set()
     for algorithm in ALGORITHMS:
-        # JobSpec.phase is the algorithm -> worker-module mapping (grpo runs the rl worker)
-        module = worker_dir / f"{JobSpec(algorithm=algorithm).phase}.py"
-        source = module.read_text()
-        # wandb_report_to() is the call that starts the run. wandb_run_info() only reads whichever
-        # run is already live and returns {} when none is, so a worker holding just that one would
-        # still log nowhere -- accepting it as evidence would let the warning lie again.
-        if "wandb_report_to" not in source:
+        # JobSpec.phase is the algorithm -> worker-module mapping (grpo runs the rl worker); the
+        # entry module delegates to its {phase}_train.py, which owns the verl launch.
+        phase = JobSpec(algorithm=algorithm).phase
+        source = "".join(
+            (worker_dir / name).read_text()
+            for name in (f"{phase}.py", f"{phase}_train.py")
+            if (worker_dir / name).exists()
+        )
+        # resolve_verl_loggers() is what adds "wandb" to trainer.logger. metadata readers do not
+        # start a run, so accepting one as evidence would let the warning lie again.
+        if "resolve_verl_loggers" not in source:
             without_wandb.add(algorithm)
 
     # an empty catalog would satisfy the assertion below without having checked anything, so the

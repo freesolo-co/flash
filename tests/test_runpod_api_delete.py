@@ -23,7 +23,7 @@ def _http_error(code: int, body: bytes = b""):
 
 
 def _patch_urlopen(monkeypatch, error):
-    from flash.providers import _http
+    from flash.providers._lifecycle import http as _http
 
     def fake_urlopen(req, timeout=None):
         raise error

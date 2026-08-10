@@ -14,9 +14,9 @@ from pathlib import Path
 
 import pytest
 
-from flash._channel import CLI_NAME
-from flash.cli import envpush
-from flash.cli.envpush import cmd_env_pull
+from flash._internal.channel import CLI_NAME
+from flash.cli.commands.env import push as envpush
+from flash.cli.commands.env.push import cmd_env_pull
 from flash.envs import loader as adapter
 from flash.envs.pull import environment_local_dirname
 
@@ -200,7 +200,7 @@ def test_cmd_env_pull_positional_dir_hint_is_shell_quoted(monkeypatch, tmp_path,
     Asserted as POSIX quoting because the platform is pinned, not assumed: `_quote_shell_token`
     deliberately emits `"--output=into here"` via `list2cmdline` on Windows, so an unconditional
     single-quote assertion would fail a native Windows run on correct output. The Windows shape has
-    its own test (codex).
+    its own test.
     """
     _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
     monkeypatch.setattr(envpush, "_on_windows", lambda: False)
@@ -230,7 +230,7 @@ def _split_as_shell(command: str) -> list[str]:
     `_quote_shell_token` picks its quoting per platform, so the split has to match: a native
     Windows run emits an unquoted `--output=C:\\Users\\...` whenever the path holds no space, and
     POSIX `shlex.split` reads those backslashes as escapes and deletes them -- turning a correct
-    hint into `--output=C:Usersinto-here` and failing the assertion (codex[bot]). Non-POSIX mode
+    hint into `--output=C:Usersinto-here` and failing the assertion. Non-POSIX mode
     keeps them, but also keeps the surrounding quotes `list2cmdline` adds, so strip those back off.
     """
     if not envpush._on_windows():
@@ -355,7 +355,7 @@ def test_windows_quoted_token_survives_the_split_used_to_check_it(monkeypatch, d
 
     `list2cmdline` quotes only when it has to, so an ordinary `C:\\Users\\...` comes back bare;
     reading that with POSIX rules treats each backslash as an escape and deletes it, mangling a
-    correct hint into `C:Usersinto-here` (codex[bot]). The spaced form takes the other branch --
+    correct hint into `C:Usersinto-here`. The spaced form takes the other branch --
     quoted, which POSIX mode would strip correctly but non-POSIX mode leaves in place -- so both
     halves of the split are pinned by the same assertion.
     """
@@ -485,6 +485,28 @@ def test_cmd_env_pull_whole_env(monkeypatch, tmp_path):
     assert rc == 0
     assert (dest / "environment.py").is_file()
     assert (dest / "datasets" / "train.jsonl").is_file()
+
+
+def test_cmd_env_pull_whole_env_preserves_toml_configs(monkeypatch, tmp_path):
+    sft_config = b"[training]\nalgorithm = 'sft'\n"
+    opd_config = b"[teacher]\nthinking = true\n"
+    _patch_client(
+        monkeypatch,
+        _package_tarball(
+            {
+                "environment.py": b"# env\n",
+                "configs/sft.toml": sft_config,
+                "configs/nested/opd.toml": opd_config,
+            }
+        ),
+    )
+    dest = tmp_path / "stuff"
+
+    rc = cmd_env_pull(_margs(output=str(dest)))
+
+    assert rc == 0
+    assert (dest / "configs" / "sft.toml").read_bytes() == sft_config
+    assert (dest / "configs" / "nested" / "opd.toml").read_bytes() == opd_config
 
 
 def test_cmd_env_pull_whole_env_refuses_nonempty_dest_without_force(monkeypatch, tmp_path):
@@ -899,8 +921,7 @@ def test_cmd_env_pull_multi_component_in_env_path_is_not_a_destination(
     Testing `is_dir()` alone treated any local directory positional as a mistaken destination, so
     this real single-file pull was refused -- and because the directory is nonempty, the hint aimed
     a whole-environment `--force` replace at a local ./assets/config the user never named. A
-    destination is written as its own name or absolute; a multi-component relative path is not
-    (cursor).
+    destination is written as its own name or absolute; a multi-component relative path is not.
     """
     _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
     monkeypatch.chdir(tmp_path)
@@ -928,7 +949,7 @@ def test_cmd_env_pull_hint_omits_a_command_powershell_would_mangle(monkeypatch, 
 
     `foo;calc` passed a cmd.exe-only metacharacter set and rendered as `--output=foo;calc`.
     Powershell splits at the semicolon and runs `calc` as its own statement, so the suggested
-    remedy executes something the user never asked for (codex).
+    remedy executes something the user never asked for.
     """
     _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
     monkeypatch.setattr(envpush, "_on_windows", lambda: True)

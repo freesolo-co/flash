@@ -6,7 +6,7 @@ The platform backend accepts a training run via RunCreateRequest
 spec the SDK/agent authored (model / algorithm / [environment] id / [train] params).
 That same config shape is what flash parses into a JobSpec
 (flash/schema/__init__.py spec_from_dict, with field validators in
-flash/schema/fields.py, producing the flash/spec.py JobSpec). If the backend accepts
+flash/schema/fields.py, producing the flash/core/spec.py JobSpec). If the backend accepts
 a config flash rejects (or the two drift on field names), a run the backend admits
 never trains. This test pins that seam.
 
@@ -29,8 +29,8 @@ _BACKEND_ROOT = Path(__file__).resolve().parents[2] / "backend"
 if _BACKEND_ROOT.is_dir() and str(_BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(_BACKEND_ROOT))
 
+from flash.core.spec import JobSpec
 from flash.schema import ConfigError, spec_from_dict
-from flash.spec import JobSpec
 
 
 def _representative_config() -> dict:
@@ -49,6 +49,7 @@ def _representative_config() -> dict:
             "epochs": 2,
             "max_examples": 120,
             "lora_rank": 32,
+            "lora_alpha": 48,
             "learning_rate": 1e-5,
             "group_size": 8,
             "temperature": 0.9,
@@ -72,8 +73,8 @@ def test_backend_run_config_parses_into_valid_jobspec() -> None:
     # unknown [train] key), and it defaults to blank for the control plane to assign per run at
     # submit, so it stays empty here.
     assert spec.train.hf_repo == ""
-    # lora_alpha is derived, not authored: it is fixed at 2x lora_rank.
-    assert spec.train.lora_alpha == 64
+    # an authored lora_alpha survives the boundary verbatim; it need not be 2 x lora_rank.
+    assert spec.train.lora_alpha == 48
     assert spec.train.epochs == 2
     assert spec.train.max_examples == 120
     assert spec.train.group_size == 8

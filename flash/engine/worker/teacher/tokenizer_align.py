@@ -1,0 +1,106 @@
+"""Cross-tokenizer alignment for on-policy distillation (teacher GLM-5.2 -> student Qwen3.5/3.6).
+
+This is the collinear-ai *spider* / Tinker-cookbook realignment (``_build_alignment_groups`` +
+``_compute_groupwise_reverse_kl``), and it uses only the REALIZED-token logprobs on each side -- no
+top-k candidates, no vocabulary projection -- so it is exact across arbitrary tokenizer mismatch and
+covers every student token. No torch/network imports here, so the module is import-safe and
+unit-testable on a CPU box.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class TeacherToken:
+    """One teacher token over the completion string. ``start``/``end`` are character offsets rebased
+    to the completion (0 = first completion char). ``logprob`` is the teacher's log-probability of
+    the realized token."""
+
+    text: str
+    logprob: float
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
+class StudentToken:
+    """One student completion token: its vocab id and character span in the completion string."""
+
+    token_id: int
+    start: int
+    end: int
+
+
+def groupwise_alignment(
+    student_toks: Sequence[StudentToken], teacher_toks: Sequence[TeacherToken]
+) -> list[tuple[list[int], float]]:
+    """Align student & teacher tokens into matching decoded-text spans, for groupwise reverse-KL.
+
+    This is the collinear-ai *spider* / Tinker-cookbook realignment (``_build_alignment_groups`` +
+    ``_compute_groupwise_reverse_kl``): the coarsest common refinement of the two tokenizations -- a
+    group boundary is any character position that starts a token in BOTH tokenizers. OPD's batched
+    loss pairs this with the differentiable ``log P_student(span)`` for reverse-KL.
+    """
+    if not student_toks or not teacher_toks:
+        return []
+    s_starts = {st.start for st in student_toks}
+    t_starts = {tt.start for tt in teacher_toks}
+    begin = min(student_toks[0].start, teacher_toks[0].start)
+    # Group boundaries: char positions that begin a token in both tokenizers (always include the
+    # start, so the first group is anchored even if the two first-token offsets differ).
+    boundaries = sorted((s_starts & t_starts) | {begin})
+    end = max(max(st.end for st in student_toks), max(tt.end for tt in teacher_toks))
+    edges = [*boundaries, end]
+    groups: list[tuple[list[int], float]] = []
+    pending: list[int] = []  # student tokens awaiting a teacher-bearing span
+    # Both are sorted by.start (student_tokens_with_offsets emits non-decreasing starts;
+    # teacher offsets arrive in order) and the boundary intervals [edges[k], edges[k+1]) are
+    # consecutive and ascending, so every token falls in exactly one interval and is visited
+    # once -- O(S+T+B), not the O(C^2) a per-boundary rescan costs once max_tokens raises
+    # completions to thousands of mostly- matching tokens.
+    si = ti = 0
+    for k in range(len(boundaries)):
+        hi = edges[k + 1]
+        s_idx: list[int] = []
+        while si < len(student_toks) and student_toks[si].start < hi:
+            s_idx.append(si)
+            si += 1
+        t_lp: list[float] = []
+        while ti < len(teacher_toks) and teacher_toks[ti].start < hi:
+            t_lp.append(teacher_toks[ti].logprob)
+            ti += 1
+        if t_lp:  # a teacher-bearing span closes the group, absorbing any carried student tokens
+            if pending or s_idx:  # ...but only if there ARE student tokens to carry the signal
+                groups.append((pending + s_idx, float(sum(t_lp))))
+                pending = []
+            # else: a teacher-only span with no student token to supervise -> emit no group (an
+            # empty student-index group would divide-by-zero in the per-span loss coefficient).
+        else:  # student-only span: carry its tokens to the next teacher-bearing span (never dropped)
+            pending += s_idx
+    if pending and groups:  # trailing student-only tokens attach to the last group
+        idx, tsum = groups[-1]
+        groups[-1] = (idx + pending, tsum)
+    return groups
+
+
+def groupwise_coverage(
+    groups: list[tuple[list[int], float]], student_toks: list[StudentToken]
+) -> float:
+    """Fraction of ALIGNABLE student tokens that landed in an alignment group.
+
+    "Alignable" = non-zero-width (has decoded text). Zero-width tokens (special/eos or partial-byte
+    fragments) carry no text to align; they may still ride along inside a group so the span's
+    student logprob sum stays complete, but they are neither numerator nor denominator here --
+    counting them in the numerator (grouped) but not the denominator is what produced coverage >
+    100%.
+    """
+    alignable = {i for i, st in enumerate(student_toks) if st.end > st.start}
+    if not alignable:
+        return 0.0
+    grouped: set[int] = set()
+    for s_idx, _ in groups:
+        grouped.update(s_idx)
+    return len(alignable & grouped) / len(alignable)

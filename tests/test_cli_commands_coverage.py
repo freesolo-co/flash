@@ -261,7 +261,7 @@ def test_chat_treats_a_whitespace_only_stream_as_no_response(monkeypatch, capsys
     """Blank chunks are the same empty answer as no chunks, and must fail the same way.
 
     Counting any chunk as text exited 0 here, so a serving path that stopped applying the run's
-    chat template and emitted only whitespace read as a healthy response (Cursor). Spaces are as
+    chat template and emitted only whitespace read as a healthy response. Spaces are as
     non-empty as the `assistant` label the test below keeps off stdout, so they must not be
     printed either -- the contract is exit 1 with empty stdout.
     """

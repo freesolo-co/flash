@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
-import flash.providers._worker as worker_module
-from flash.providers._worker import WORKER_IMAGE, worker_image_for_gpu
+import flash.providers._lifecycle.worker as worker_module
+from flash.providers._lifecycle.worker import WORKER_IMAGE, worker_image_for_gpu
 
 
 def _clear_image_env(monkeypatch):

@@ -13,9 +13,9 @@ import pytest
 
 def _reset_pool(monkeypatch, value):
     monkeypatch.setenv("RUNPOD_API_KEY", value)
-    from flash.providers.runpod import keys
+    from flash.providers.runpod import auth
 
-    keys.reset()
+    auth.reset()
 
 
 def test_key_fingerprint_is_stable_and_non_revealing():
@@ -78,7 +78,7 @@ def test_fingerprint_helpers_resolve_to_the_owning_key(monkeypatch):
 
 
 def test_submit_status_cancel_and_delete_keep_owning_key_after_rotation(monkeypatch):
-    from flash.providers.runpod import api, keys
+    from flash.providers.runpod import api, auth
 
     _reset_pool(monkeypatch, "secretA,secretB")
     owner = api.key_fingerprint("secretA")
@@ -95,8 +95,8 @@ def test_submit_status_cancel_and_delete_keep_owning_key_after_rotation(monkeypa
         return {}
 
     monkeypatch.setattr(api._CLIENT, "request_with_retries_for_key", request)
-    keys.advance_key()
-    assert keys.active_key() == "secretB"
+    auth.advance_key()
+    assert auth.active_key() == "secretB"
 
     assert (
         api.submit_job(

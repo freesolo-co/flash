@@ -108,8 +108,10 @@ def test_effective_train_tflops_caps_b200_at_h200_class():
     from flash.cost.facts import effective_train_tflops
 
     assert gpu_tflops("B200") == 2250.0  # raw peak unchanged (vram/serving still use gpu_tflops)
-    assert effective_train_tflops("B200") == 990.0
+    # assert the RELATIONSHIP, not a literal: the cap tracks whatever the H200 entry is, and that
+    # entry is anchored to a measured rate that recalibration can move.
     assert effective_train_tflops("B200") == effective_train_tflops("H200")
+    assert effective_train_tflops("B200") < gpu_tflops("B200")
 
 
 def test_effective_train_tflops_is_peak_for_uncapped_classes():
@@ -117,5 +119,307 @@ def test_effective_train_tflops_is_peak_for_uncapped_classes():
 
     for name in ("H100", "H200", "A100 SXM", "RTX 4090", "B200"):
         # only b200 is capped; every other class keeps its peak.
-        expected = 990.0 if name == "B200" else gpu_tflops(name)
+        expected = effective_train_tflops("H200") if name == "B200" else gpu_tflops(name)
         assert effective_train_tflops(name) == expected
+
+
+def test_nvlink_classification_is_by_form_factor():
+    from flash.cost.facts import has_nvlink
+
+    # sxm datacenter parts carry nvlink.
+    assert has_nvlink("A100 SXM")
+    assert has_nvlink("A100 SXM 40GB")
+    assert has_nvlink("H100")
+    # geforce parts do not; the 4090 dropped the nvlink connector entirely. l40s is a pcie board.
+    assert not has_nvlink("RTX 4090")
+    assert not has_nvlink("L40S")
+    # an unclassified class must fall to the conservative side rather than raise.
+    assert not has_nvlink("some-unlisted-gpu")
+
+
+def test_nvlink_classification_tracks_the_provisioned_board():
+    """Classification must follow the pin a MULTI-CARD run actually lands on.
+
+    Multi-card provisioning is runpod-only, and runpod pins H100 to the HBM3 sxm part while
+    negating the pcie/NVL boards in the same pool. Assert against those pins rather than restating
+    the classification, so re-pinning a class to a different board fails here instead of silently
+    pricing it on an interconnect it no longer has.
+    """
+    from flash.cost.facts import has_nvlink
+    from flash.providers.base import GPU_INFO
+    from flash.providers.runpod.gpus import _POOL_MEMBERS_MISSING_FROM_SDK
+
+    assert GPU_INFO["H100"].enum_member == "NVIDIA_H100_80GB_HBM3"  # sxm, not the pcie board
+    assert has_nvlink("H100")
+    # the non-sxm members of the same runpod pool are negated, so a pin cannot land on them.
+    assert _POOL_MEMBERS_MISSING_FROM_SDK["ADA_80_PRO"] == ("NVIDIA H100 PCIe", "NVIDIA H100 NVL")
+
+
+def test_multi_card_speedup_is_interconnect_aware():
+    from flash.cost.analytical import multi_card_speedup
+
+    # MEASURED on runpod with one identical 2-card fsdp benchmark per interconnect:
+    #   nvlink 2x A100-SXM4-80GB 1.7675x, pcie 2x L40S 1.4212x.
+    # the model must land near each measurement, not split the difference with one constant.
+    assert multi_card_speedup(2, "A100 SXM") == pytest.approx(1.7675, abs=0.05)
+    assert multi_card_speedup(2, "RTX 4090") == pytest.approx(1.4212, abs=0.05)
+    # one card is exactly one card on any fabric.
+    for name in ("A100 SXM", "RTX 4090", "unknown"):
+        assert multi_card_speedup(1, name) == 1.0
+
+
+def test_pcie_scaling_is_never_credited_nvlink_bandwidth():
+    """The invariant the measurement exists to protect.
+
+    A pcie pair delivered 1.42x where the old global 0.85 constant claimed 1.70x. Crediting that
+    difference lets a 2-card pcie combination win a ranking on scaling it does not have, and then
+    bills both cards for the longer wall time. Assert the ORDERING, so recalibrating either
+    constant cannot silently reintroduce the inversion.
+    """
+    from flash.cost.analytical import multi_card_speedup
+
+    for n in (2, 3, 4):
+        assert multi_card_speedup(n, "RTX 4090") < multi_card_speedup(n, "A100 SXM")
+        # and neither may ever claim linear scaling, which no fabric delivers.
+        assert multi_card_speedup(n, "A100 SXM") < n
+
+
+def test_multi_card_speedup_never_decreases_with_card_count():
+    """Adding a card must never model as slower.
+
+    The raw geometric curve turns back down below ~0.72 scaling (at the measured pcie 0.71: 3 cards
+    1.512x, 4 cards 1.432x). Left unclamped the allocator would price a 4-card pcie combination as
+    slower than a 3-card one and reject cards that do add throughput. No real fabric loses aggregate
+    throughput when a card is added; the extrapolation flattens, it does not reverse.
+    """
+    from flash.cost.analytical import multi_card_speedup
+
+    for name in ("A100 SXM", "RTX 4090", "H100", "unlisted-class"):
+        vals = [multi_card_speedup(n, name) for n in range(1, 9)]
+        assert vals == sorted(vals), f"{name} speedup decreases: {vals}"
+
+
+def test_sft_shards_by_sequence_not_by_data(monkeypatch):
+    """sft must not borrow the fsdp data-parallel constant.
+
+    Flash pins ulysses_sp_size to the card count and verl derives dp_size = world_size //
+    ulysses_sequence_parallel_size, so a multi-card sft run is dp_size == 1: pure sequence
+    parallelism. grpo/opd run data-parallel. The two pay different collectives (fsdp moves MODEL
+    bytes per layer, ulysses moves ACTIVATION bytes per layer, both directions) and cannot share a
+    scaling constant.
+
+    The shipped sp and dp constants are deliberately equal, so reading the returned value proves
+    nothing about which one was consulted. Perturb the sp constant: sft must move with it and
+    grpo/opd must not.
+    """
+    from flash.cost import analytical
+    from flash.cost.types import RunConfig
+
+    def cfg(method: str) -> RunConfig:
+        return RunConfig(model_id="Qwen/Qwen3.5-9B", method=method, steps=8)
+
+    # 0.95 is well clear of the non-decreasing clamp (which pins anything at or below 0.5 to 1.0x
+    # at 2 cards), so a wrong reading cannot coincidentally land on the right number.
+    monkeypatch.setattr(analytical, "MULTI_CARD_SCALING_SP_PCIE", 0.95)
+    monkeypatch.setattr(analytical, "MULTI_CARD_SCALING_SP_NVLINK", 0.95)
+
+    for card in ("RTX 4090", "A100 SXM"):
+        sft = analytical.method_card_speedup(cfg("sft"), 2, card)
+        assert sft == pytest.approx(2 * 0.95), f"sft on {card} ignored the sp constant: {sft}"
+        for method in ("grpo", "opd"):
+            other = analytical.method_card_speedup(cfg(method), 2, card)
+            assert other == pytest.approx(analytical.multi_card_speedup(2, card)), (
+                f"{method} on {card} was routed through the sequence-parallel constant"
+            )
+
+
+def test_sequence_parallel_speedup_keeps_the_multi_card_invariants():
+    """The sp curve owes the same guarantees the dp curve does.
+
+    A separate constant must not become a hole in the invariants: one card is one card, pcie never
+    borrows nvlink scaling, no fabric delivers linear, and adding a card never models as slower.
+    """
+    from flash.cost.analytical import sequence_parallel_speedup
+
+    for name in ("A100 SXM", "RTX 4090", "unknown"):
+        assert sequence_parallel_speedup(1, name) == 1.0
+    for n in (2, 3, 4):
+        assert sequence_parallel_speedup(n, "RTX 4090") < sequence_parallel_speedup(n, "A100 SXM")
+        assert sequence_parallel_speedup(n, "A100 SXM") < n
+    for name in ("A100 SXM", "RTX 4090", "H100", "unlisted-class"):
+        vals = [sequence_parallel_speedup(n, name) for n in range(1, 9)]
+        assert vals == sorted(vals), f"{name} sp speedup decreases: {vals}"
+
+
+def test_multi_card_sft_quote_moves_with_the_sequence_parallel_constant(monkeypatch):
+    """The seam has to reach the shipped dollar figure, not just the helper.
+
+    A 9B sft run pinned to 2x RTX 4090 is the reachable multi-card sft cell: one 4090 cannot hold
+    it (needs 32 GB), two can, and sft has no step floor so the whole gpu-bound half is the token
+    compute term. That makes the sp constant map straight to the price -- if the quote does not
+    move when it changes, the fix never reached estimate_cost().
+    """
+    from flash.cost import analytical
+    from flash.cost.types import RunConfig
+
+    spec = RunConfig(
+        model_id="Qwen/Qwen3.5-9B",
+        method="sft",
+        steps=64,
+        seq_len=2048,
+        batch_size=8,
+        train_tokens=1_000_000,
+        gpu_type="RTX 4090",
+        gpu_count=2,
+    )
+    before = analytical.estimate_cost(spec)
+    assert before.gpu_count == 2, "the reachable multi-card sft cell collapsed to one card"
+
+    # degrade the realized scaling: the same work must take longer and cost more. 0.6 stays clear
+    # of the non-decreasing clamp, so this exercises the constant rather than the floor under it.
+    monkeypatch.setattr(analytical, "MULTI_CARD_SCALING_SP_PCIE", 0.6)
+    after = analytical.estimate_cost(spec)
+    assert after.train_seconds > before.train_seconds
+    assert after.total_usd > before.total_usd
+
+    # and the grpo constant must not be what is moving it.
+    monkeypatch.setattr(analytical, "MULTI_CARD_SCALING_PCIE", 0.4)
+    unchanged = analytical.estimate_cost(spec)
+    assert unchanged.train_seconds == pytest.approx(after.train_seconds)
+
+
+def test_a_vast_multi_card_run_is_not_credited_with_nvlink_scaling():
+    """Vast sells a canonical class as a market, so its nvlink membership cannot be trusted.
+
+    `providers/base.py` normalizes the explicit pcie aliases into nvlink-classed entries -- `H100
+    PCIE` -> H100 and `A100 PCIE` -> A100 SXM 40GB -- and a Vast offer carries no interconnect
+    field, so a multi-card combination can land on pcie boards while the class says nvlink. Vast
+    does search multi-card (`rentable_gpu_counts` with `num_gpus=count`), so these combinations are
+    real candidates, and crediting them with the measured nvlink curve prices them on bandwidth
+    they may not have.
+    """
+    from flash.cost.analytical import multi_card_speedup, sequence_parallel_speedup
+    from flash.cost.facts import has_nvlink
+
+    for ambiguous in ("H100", "A100 SXM 40GB"):
+        assert has_nvlink(ambiguous, "runpod"), (
+            "runpod pins an exact gpu id per class, so its nvlink classification still holds"
+        )
+        assert not has_nvlink(ambiguous, "vast"), (
+            f"a vast {ambiguous} combination was credited with nvlink scaling, but vast lists the "
+            "pcie board under this same class and its offers carry no topology"
+        )
+        # and the credit is large enough to change a ranking: ~24% at 2 cards, ~80% at 4.
+        assert multi_card_speedup(2, ambiguous, "vast") < multi_card_speedup(2, ambiguous, "runpod")
+        assert multi_card_speedup(4, ambiguous, "vast") < multi_card_speedup(4, ambiguous, "runpod")
+        # sft shards by sequence and reads the same classification, so it must narrow too.
+        assert sequence_parallel_speedup(2, ambiguous, "vast") < sequence_parallel_speedup(
+            2, ambiguous, "runpod"
+        )
+
+    # an unpinned/unknown provider keeps the class answer: this narrows a known-ambiguous market,
+    # it does not downgrade everything that fails to name a provider.
+    assert has_nvlink("H100", "")
+    assert has_nvlink("H100", "lambda"), "lambda has no multi-card path, so nothing to narrow"
+    # and a pcie class is unaffected in either direction.
+    assert not has_nvlink("RTX 4090", "runpod")
+    assert not has_nvlink("RTX 4090", "vast")
+
+
+def test_a_vast_sharded_quote_reads_the_provider_off_the_run_config():
+    """The narrowing is only real if it reaches the quote, not just the classifier.
+
+    `method_card_speedup` is the one point where the card count and the run's provider are both in
+    hand, and every sharded quote goes through it.
+    """
+    from flash.cost.analytical import method_card_speedup
+    from flash.cost.types import RunConfig
+
+    def cfg(provider, method="grpo"):
+        return RunConfig(
+            model_id="Qwen/Qwen3.5-4B", method=method, steps=10, provider=provider, gpu_count=2
+        )
+
+    for method in ("grpo", "sft"):
+        vast = method_card_speedup(cfg("vast", method), 2, "H100")
+        runpod = method_card_speedup(cfg("runpod", method), 2, "H100")
+        assert vast < runpod, (
+            f"a {method} quote on vast still divided by the nvlink multiplier, so a pcie box is "
+            "quoted on scaling it may not deliver and can win the ranking on it"
+        )
+        # `auto` is not a provider; it must not be read as one and must keep the class answer.
+        assert method_card_speedup(cfg("auto", method), 2, "H100") == runpod
+        # an explicit provider argument outranks the config, which is what the ranking and
+        # re-quote paths rely on -- their config carries no provider at all.
+        assert method_card_speedup(cfg("auto", method), 2, "H100", "vast") == vast
+
+
+def test_allocator_ranking_narrows_a_vast_combination_it_is_pricing():
+    """The ranking config carries NO provider, so reading it off the config alone was inert.
+
+    `run_config_for_ranking` builds a bare one-step config -- provider defaults to `auto` -- and the
+    allocator then prices every candidate against it. Before this fix a vast pair was ranked on the
+    nvlink curve, which is precisely the direction the module warns about: it lets a pcie
+    combination win on scaling it does not deliver, then bills both cards for the longer wall.
+    """
+    from flash.providers.allocator import _step_cost_ranker
+    from flash.providers.base import Candidate, run_config_for_ranking
+
+    # the defect's root: the config the allocator ranks with never names a provider.
+    assert run_config_for_ranking("Qwen/Qwen3.5-4B", "grpo").normalized().provider == "auto"
+
+    key = _step_cost_ranker("Qwen/Qwen3.5-4B", "grpo", None, False, "")
+    assert key is not None, "this model must be priceable, or the assertions below prove nothing"
+
+    def at(provider, hourly=2.0):
+        return key(
+            Candidate(provider=provider, gpu="H100", hourly_usd=hourly, vram_gb=80, gpu_count=2)
+        )
+
+    assert at("vast") > at("runpod"), (
+        "a vast pair was ranked on nvlink scaling it may not deliver, so it can win a ranking on "
+        "throughput it cannot reach and then bill both cards for the longer wall"
+    )
+    # a single card has no interconnect, so the narrowing must not touch it: that path is shared
+    # with the preview and estimate, and they must agree exactly whenever one card is enough.
+    single = {
+        p: key(Candidate(provider=p, gpu="H100", hourly_usd=2.0, vram_gb=80, gpu_count=1))
+        for p in ("vast", "runpod")
+    }
+    assert single["vast"] == single["runpod"]
+    # not a blanket penalty: a genuinely cheaper vast pair still wins, it is just priced honestly.
+    assert at("vast", hourly=1.70) < at("runpod", hourly=1.95)
+
+
+def test_a_live_vast_allocation_is_requoted_without_nvlink_credit():
+    """The re-quote before provisioning is what the run is actually billed against.
+
+    `estimate_cost` takes the exact selected candidate, so this is the last point where the wrong
+    interconnect assumption can reach a persisted quote -- and its config is the user's, which for
+    an auto run names no provider.
+    """
+    from types import SimpleNamespace
+
+    from flash.cost.analytical import estimate_cost
+    from flash.cost.types import RunConfig
+
+    config = RunConfig(model_id="Qwen/Qwen3.5-4B", method="grpo", steps=20)
+    assert config.normalized().provider == "auto", "an auto run is the case that was mispriced"
+
+    def quote(provider, gpu_count=2):
+        return estimate_cost(
+            config,
+            allocation=SimpleNamespace(
+                gpu="H100",
+                provider=provider,
+                hourly_usd=2.0,
+                min_vram_gb=80,
+                gpu_count=gpu_count,
+            ),
+        )
+
+    assert quote("vast").train_seconds > quote("runpod").train_seconds, (
+        "a vast allocation was re-quoted on the nvlink curve, so the persisted quote understates "
+        "the wall the run is billed for"
+    )
+    assert quote("vast", gpu_count=1).train_seconds == quote("runpod", gpu_count=1).train_seconds

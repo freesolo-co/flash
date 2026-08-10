@@ -1,16 +1,16 @@
-"""Cost estimator: model-size facts (catalog-only). No network.
+"""Cost estimator: model-size facts. Catalog-only, and never over the network.
 
-The cost model supports the curated catalog only: six dense models plus one MoE, with no
-open-model or unlisted sizing. The numeric size is the catalog's ``params_b`` stat, read directly
-(no parsing of the ``params`` display string). For the MoE the per-token FLOPs/step-time term reads
-the smaller ``active_params_b`` while memory/size terms (VRAM, disk, download) keep total ``params_b``.
+Every trainable model is curated, so a quote is sized from the catalog's ``params_b`` stat, read
+directly (no parsing of the ``params`` display string). For the MoE the per-token FLOPs/step-time
+term reads the smaller ``active_params_b`` while memory/size terms (VRAM, disk, download) keep
+total ``params_b``. An uncataloged id is rejected rather than guessed at.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from flash.catalog import MODELS
+from flash.core.catalog import MODELS
 from flash.cost.facts import active_params_b, download_weight_gb, model_quant, total_params_b
 
 
@@ -26,6 +26,45 @@ def test_active_params_defaults_to_total_for_dense(model_id):
     if info.active_params_b:
         pytest.skip(f"{model_id} is an MoE (active_params_b set)")
     assert active_params_b(model_id) == pytest.approx(info.params_b)
+
+
+def test_catalog_dense_active_params_ignore_revision_without_hf_lookup(monkeypatch):
+    import flash.engine.plan.vram as vram
+
+    model_id = "Qwen/Qwen3.5-4B"
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("catalog active params must not query huggingface")
+
+    monkeypatch.setattr(vram, "_validated_revision_geometry", _boom)
+
+    assert active_params_b(model_id, "a" * 40) == pytest.approx(MODELS[model_id].params_b)
+
+
+@pytest.mark.parametrize(
+    ("model_id", "expected"),
+    [
+        ("Qwen/Qwen3.5-4B", False),
+        ("Qwen/Qwen3.6-35B-A3B", True),
+    ],
+)
+def test_catalog_moe_classification_never_queries_huggingface(monkeypatch, model_id, expected):
+    """MoE routing is curated architecture metadata: a catalog read, never a hub lookup.
+
+    This used to also assert that passing a revision changed nothing. `_is_moe` no longer TAKES a
+    revision -- with uncataloged models rejected, the branch that compared active against total
+    params over HF is unreachable, so "ignores the revision" is now enforced by the signature rather
+    than by a test. What still needs guarding is that classification stays offline.
+    """
+    import flash.engine.plan.vram as vram
+    from flash.cost.analytical import _is_moe
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("catalog moe classification must not query huggingface")
+
+    monkeypatch.setattr(vram, "_validated_revision_geometry", _boom)
+
+    assert _is_moe(model_id) is expected
 
 
 def test_active_params_uses_the_active_count_for_the_moe():
@@ -55,10 +94,73 @@ def test_download_weight_gb_is_total_params_bf16():
     assert download_weight_gb(nine) == pytest.approx(total_params_b(nine) * 2.0)
 
 
-def test_unknown_model_is_rejected():
-    # Catalog-only: an unknown model raises (ValueError, like catalog.get_model) rather than
-    # guessing a size.
-    with pytest.raises(ValueError, match="catalog models only"):
+def test_an_uncataloged_model_is_rejected():
+    # fail closed: an id with no catalog entry raises rather than being priced as free.
+    with pytest.raises(ValueError, match="cost estimation supports catalog models only"):
         total_params_b("nobody/never-heard-of-it")
-    with pytest.raises(ValueError, match="catalog models only"):
+    with pytest.raises(ValueError, match="cost estimation supports catalog models only"):
         active_params_b("nobody/never-heard-of-it")
+
+
+def test_a_catalog_model_is_sized_from_the_catalog():
+    assert total_params_b("Qwen/Qwen3.5-9B") == pytest.approx(MODELS["Qwen/Qwen3.5-9B"].params_b)
+
+
+def _stub_geometry(monkeypatch, model_id: str, calls: list):
+    """Answer the pinned-geometry fetch with the catalog's own numbers, counting each call."""
+    import flash.engine.plan.vram as vram
+
+    info = MODELS[model_id]
+
+    def _counting(_mid, revision="", strict=False):
+        calls.append(revision)
+        return (info.params_b, info.vocab_size, info.hidden_size, info.num_layers)
+
+    monkeypatch.setattr(vram, "fetch_hf_model_geometry", _counting)
+
+
+def test_a_pinned_revision_is_fetched_once_per_quote(monkeypatch):
+    """One quote sizes a pinned model several times; only the FIRST may reach the hub.
+
+    Setup download and required-save serialization both ask total_params_b with the pin, so an
+    uncached lookup turns one quote into repeated HfApi.model_info round trips -- and a transient
+    failure on a later call rejects a run the earlier ones already validated.
+    """
+    from flash.cost import facts
+
+    calls: list = []
+    _stub_geometry(monkeypatch, "Qwen/Qwen3.5-9B", calls)
+    monkeypatch.setattr(facts, "_PINNED_SIZE_MEMO", {})
+
+    rev = "a" * 40
+    first = facts.total_params_b("Qwen/Qwen3.5-9B", rev)
+    assert facts.total_params_b("Qwen/Qwen3.5-9B", rev) == first
+    assert facts.download_weight_gb("Qwen/Qwen3.5-9B", rev) == pytest.approx(first * 2.0)
+    assert len(calls) == 1, f"pinned sizing hit the hub {len(calls)} times in one quote"
+
+
+def test_a_failed_pinned_lookup_is_not_cached(monkeypatch):
+    """A hub blip must not become permanent for the life of the process.
+
+    A failure is a rate limit or an ungranted token, not a fact about the model -- caching it would
+    keep rejecting a valid pin until the plane restarted, indistinguishable from a real defect.
+    """
+    import flash.engine.plan.vram as vram
+    from flash.cost import facts
+
+    monkeypatch.setattr(facts, "_PINNED_SIZE_MEMO", {})
+    rev = "b" * 40
+
+    def _blip(*_a, **_k):
+        raise RuntimeError("transient hub error")
+
+    monkeypatch.setattr(vram, "fetch_hf_model_geometry", _blip)
+    with pytest.raises(RuntimeError):
+        facts.total_params_b("Qwen/Qwen3.5-9B", rev)
+    assert facts._PINNED_SIZE_MEMO == {}
+
+    calls: list = []
+    _stub_geometry(monkeypatch, "Qwen/Qwen3.5-9B", calls)
+    assert facts.total_params_b("Qwen/Qwen3.5-9B", rev) == pytest.approx(
+        MODELS["Qwen/Qwen3.5-9B"].params_b
+    )

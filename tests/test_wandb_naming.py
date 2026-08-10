@@ -8,12 +8,10 @@ the job-spec JSON the worker reads), NOT environment variables; the WANDB_API_KE
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
-from flash.schema import ConfigError, spec_from_dict, spec_from_file
-from flash.spec import JobSpec, WandbSpec
+from flash.core.spec import JobSpec, WandbSpec
+from flash.schema import ConfigError, spec_and_train_keys_from_file, spec_from_dict
 
 
 def _base(**extra: object) -> dict:
@@ -43,13 +41,6 @@ def test_partial_wandb_section():
     spec = spec_from_dict(_base(wandb={"project": "only-proj"}))
     assert spec.wandb.project == "only-proj"
     assert spec.wandb.run_name is None
-
-
-def test_wandb_config_does_not_touch_worker_env():
-    # [wandb] is its own typed field now, NOT folded into the worker_env env-var bag.
-    spec = spec_from_dict(_base(wandb={"project": "p", "run_name": "r"}))
-    assert "WANDB_PROJECT" not in spec.worker_env
-    assert "WANDB_NAME" not in spec.worker_env
 
 
 def test_wandb_values_are_trimmed():
@@ -112,9 +103,9 @@ def _toml(tmp_path) -> str:
 
 def test_set_override_reaches_wandb(tmp_path):
     # The CLI surface: `--set wandb.project=… --set wandb.run_name=…`.
-    spec = spec_from_file(
+    spec = spec_and_train_keys_from_file(
         _toml(tmp_path), overrides=["wandb.project=cli-proj", "wandb.run_name=cli-run"]
-    )
+    )[0]
     assert spec.wandb.project == "cli-proj"
     assert spec.wandb.run_name == "cli-run"
 
@@ -123,7 +114,7 @@ def test_set_override_reaches_wandb(tmp_path):
 def test_set_override_preserves_numeric_looking_wandb_label(tmp_path, label):
     # A numeric- or bool-looking --set wandb.* value is the string label the user intends; it must
     # not be coerced to int/float/bool (which the [wandb] validator rejects).
-    spec = spec_from_file(_toml(tmp_path), overrides=[f"wandb.run_name={label}"])
+    spec = spec_and_train_keys_from_file(_toml(tmp_path), overrides=[f"wandb.run_name={label}"])[0]
     assert spec.wandb.run_name == label
 
 
@@ -144,72 +135,6 @@ def test_worker_run_name_is_toml_only_ignores_env(monkeypatch):
     monkeypatch.setattr(worker, "JOB_SPEC", None)
     monkeypatch.setenv("WANDB_NAME", "should-be-ignored")
     assert worker.wandb_run_name().startswith("flash-")
-
-
-def test_report_to_inits_wandb_from_spec_without_env(monkeypatch):
-    # wandb_report_to initializes the run from the typed [wandb] config via the SDK and sets NO
-    # WANDB_PROJECT env var — the env var is fully gone.
-    import importlib.util
-    import sys
-    import types
-
-    from flash.engine import worker
-
-    calls: dict = {}
-    fake = types.ModuleType("wandb")
-    fake.run = None
-
-    def _init(**kw):
-        calls.update(kw)
-        fake.run = object()
-
-    fake.init = _init
-    monkeypatch.setitem(sys.modules, "wandb", fake)
-    _orig_find = importlib.util.find_spec
-    monkeypatch.setattr(
-        importlib.util,
-        "find_spec",
-        lambda name, *a, **k: object() if name == "wandb" else _orig_find(name, *a, **k),
-    )
-    monkeypatch.setenv("WANDB_API_KEY", "k")
-    monkeypatch.delenv("WANDB_PROJECT", raising=False)
-    monkeypatch.setattr(
-        worker, "JOB_SPEC", JobSpec(wandb=WandbSpec(project="my-proj", run_name="my-run"))
-    )
-
-    assert worker.wandb_report_to() == ["wandb"]
-    assert calls["project"] == "my-proj"  # project from the spec, via wandb.init
-    assert calls["name"] == "my-run"  # run name from the spec
-    assert "WANDB_PROJECT" not in os.environ  # the env var is fully gone
-
-
-def test_report_to_is_best_effort_when_wandb_init_fails(monkeypatch):
-    # W&B logging is optional: a broken wandb install / init failure (auth, network) must NOT
-    # abort training — wandb_report_to falls back to [] instead of propagating the exception.
-    import importlib.util
-    import sys
-    import types
-
-    from flash.engine import worker
-
-    fake = types.ModuleType("wandb")
-    fake.run = None
-
-    def _boom(**kw):
-        raise RuntimeError("wandb backend unreachable")
-
-    fake.init = _boom
-    monkeypatch.setitem(sys.modules, "wandb", fake)
-    _orig_find = importlib.util.find_spec
-    monkeypatch.setattr(
-        importlib.util,
-        "find_spec",
-        lambda name, *a, **k: object() if name == "wandb" else _orig_find(name, *a, **k),
-    )
-    monkeypatch.setenv("WANDB_API_KEY", "k")
-    monkeypatch.setattr(worker, "JOB_SPEC", JobSpec(wandb=WandbSpec(project="p", run_name="r")))
-
-    assert worker.wandb_report_to() == []  # degrades to no W&B logging, no crash
 
 
 def test_runtime_secret_reads_wandb_and_declared_environment_secrets(tmp_path, monkeypatch):
@@ -240,98 +165,3 @@ def test_runtime_secret_reads_wandb_and_declared_environment_secrets(tmp_path, m
     (tmp_path / ".env").write_text("WANDB_API_KEY=wb-from-user-file\n")
     with pytest.raises(ValueError, match="missing declared environment secret"):
         runtime_secrets_from_local_env(cfg, keys=("SERPAPI_API_KEY",))
-
-
-# --------------------------------------------------------------------------------------------
-# wandb_finish: best-effort run finalization before the worker's hard exit (#221 review).
-# --------------------------------------------------------------------------------------------
-
-
-def test_wandb_finish_noop_without_api_key(monkeypatch):
-    """No WANDB_API_KEY -> wandb_finish must do nothing (and never touch importlib/wandb)."""
-    import importlib.util
-
-    from flash.engine.worker import wandb_finish
-
-    monkeypatch.delenv("WANDB_API_KEY", raising=False)
-    # If it tried to probe wandb despite no key, this would blow up the test.
-    monkeypatch.setattr(
-        importlib.util, "find_spec", lambda *a, **k: (_ for _ in ()).throw(AssertionError("probed"))
-    )
-    wandb_finish()  # returns cleanly, no probe
-    wandb_finish(exit_code=1)
-
-
-def test_wandb_finish_noop_when_wandb_absent(monkeypatch):
-    """Key set but wandb not installed (find_spec is None) -> early return, no import attempt."""
-    import importlib.util
-
-    from flash.engine.worker import wandb_finish
-
-    monkeypatch.setenv("WANDB_API_KEY", "k")
-    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
-    wandb_finish()  # no raise, no wandb import
-
-
-def test_wandb_finish_best_effort_when_find_spec_raises(monkeypatch):
-    """find_spec can RAISE when wandb is in sys.modules with a partial __spec__; wandb_finish must
-    stay best-effort (swallow the probe error) and not break the shutdown path (#221)."""
-    import importlib.util
-
-    from flash.engine.worker import wandb_finish
-
-    monkeypatch.setenv("WANDB_API_KEY", "k")
-
-    def _boom(name):
-        raise ValueError("module __spec__ is not set")
-
-    monkeypatch.setattr(importlib.util, "find_spec", _boom)
-    # Falls through to `import wandb`; with no run (or no wandb) the inner try swallows it.
-    wandb_finish()  # must not raise
-
-
-def test_wandb_finish_calls_finish_with_exit_code(monkeypatch):
-    """When a wandb run is live, wandb_finish calls wandb.finish(exit_code=...) and waits for it."""
-    import importlib.util
-    import sys
-    import types
-
-    from flash.engine.worker import wandb_finish
-
-    monkeypatch.setenv("WANDB_API_KEY", "k")
-    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())  # "present"
-
-    calls: list[int] = []
-    fake = types.ModuleType("wandb")
-    fake.run = object()  # a live run
-    fake.finish = lambda exit_code=0: calls.append(exit_code)
-    monkeypatch.setitem(sys.modules, "wandb", fake)
-
-    wandb_finish(exit_code=0)
-    wandb_finish(exit_code=1)
-    assert calls == [0, 1]
-
-
-def test_wandb_finish_slow_finish_does_not_hang(monkeypatch):
-    """A wandb.finish() that overruns is bounded by the wait, not left to hang the hard exit. The
-    FAILURE path uses the short cap so the worker aborts fast even when finish stalls (#221)."""
-    import importlib.util
-    import sys
-    import time as _time
-    import types
-
-    from flash.engine import worker
-
-    monkeypatch.setenv("WANDB_API_KEY", "k")
-    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
-    # Shrink the bounded waits so the test is fast while still exercising the timeout branch.
-    monkeypatch.setattr(worker, "_WANDB_FINISH_FAIL_WAIT_S", 0.05)
-
-    fake = types.ModuleType("wandb")
-    fake.run = object()
-    fake.finish = lambda exit_code=0: _time.sleep(5)  # overruns the bounded wait
-    monkeypatch.setitem(sys.modules, "wandb", fake)
-
-    t0 = _time.time()
-    worker.wandb_finish(exit_code=1)  # FAILURE path -> 0.05s cap; returns promptly, no hang/raise
-    assert _time.time() - t0 < 2.0

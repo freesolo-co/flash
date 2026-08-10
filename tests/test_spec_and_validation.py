@@ -7,21 +7,21 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import fields
+from dataclasses import fields, replace
 
 import pytest
 
+from flash.core.spec import GpuSpec, JobSpec, TrainSpec, load_job_spec_from_env
 from flash.schema import (
     TRAIN_KEY_MIN_VERSIONS,
     TRAIN_SCHEMA_KEYS,
     ConfigError,
     parse_adapter_revision,
+    spec_and_train_keys_from_file,
     spec_from_dict,
-    spec_from_file,
     train_schema_metadata,
     validate_train_keys,
 )
-from flash.spec import GpuSpec, JobSpec, TrainSpec, load_job_spec_from_env
 
 BASE_RAW = {
     "model": "Qwen/Qwen3.5-0.8B",
@@ -66,13 +66,15 @@ def test_parse_adapter_revision_rejects_zero_padded_steps(step):
         # `seeds` is no longer a valid [train] key (multi-seed removed); it's now rejected
         # as an unknown key rather than seed-validated.
         ({"train.seeds": [0]}, "unknown key"),
-        # lora_rank now parses via _train_int(minimum=1), so out-of-range values are rejected at
-        # parse time with the shared ">= 1" message (a non-positive int never reaches the later
-        # "must be positive" guard). lora_alpha is not a user knob (managed, derived as 2 x
-        # lora_rank), so it has no value-validation case here; authoring it is an unknown key.
+        # lora_rank and lora_alpha parse via _train_int(minimum=1), so out-of-range values are
+        # rejected at parse time with the shared ">= 1" message (a non-positive int never reaches
+        # the later "must be positive" guard).
         ({"train.lora_rank": 0}, "lora_rank must be >= 1"),
+        ({"train.lora_alpha": 0}, "lora_alpha must be >= 1"),
+        ({"train.lora_alpha": -8}, "lora_alpha must be >= 1"),
         # bools must be rejected (bool is an int subclass: True would coerce to 1).
         ({"train.lora_rank": True}, "lora_rank must be an integer"),
+        ({"train.lora_alpha": False}, "lora_alpha must be an integer"),
         ({"algorithm": "ppo"}, "unsupported algorithm"),
         # An unhashable model (TOML array / `[model]` table) used to TypeError on MODELS.get() -> 500;
         # it must be a clean ConfigError like every other scalar.
@@ -84,8 +86,6 @@ def test_parse_adapter_revision_rejects_zero_padded_steps(step):
         ({"algorithm": 5}, "algorithm must be a string"),
         ({"algorithm": ["grpo"]}, "algorithm must be a string"),
         ({"algorithm": True}, "algorithm must be a string"),
-        # NOTE: model_policy is no longer a user knob (it's read from the FLASH_MODEL_POLICY env on
-        # the control plane), so a bad user-supplied model_policy is ignored, not rejected here.
         # Unknown config sections/keys are rejected (not silently dropped → 16x-cost defaults).
         # The classic footgun: rollout knobs under a [grpo] table instead of [train].
         ({"grpo.group_size": 4}, "unknown config section"),
@@ -134,6 +134,9 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
     assert TRAIN_KEY_MIN_VERSIONS["save_at_steps"] == "0.2.57"
     assert TRAIN_KEY_MIN_VERSIONS["credit_assignment"] == "1.0.2"
     assert TRAIN_KEY_MIN_VERSIONS["entropy_quantile"] == "1.0.15"
+    # re-introduced as a user knob after being managed-and-derived; gated on the release that
+    # restored it, not on lora_rank's original 0.2.0.
+    assert TRAIN_KEY_MIN_VERSIONS["lora_alpha"] == "1.1.35"
     # opd has no auxiliary eos loss or user-facing eos-loss key.
     assert "opd_eos_loss_coef" not in TRAIN_KEY_MIN_VERSIONS
     assert {
@@ -148,6 +151,7 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
             "save_at_steps",
             "credit_assignment",
             "entropy_quantile",
+            "lora_alpha",
         }
     } == {"0.2.0"}
 
@@ -176,7 +180,7 @@ def test_toml_config_requires_project(tmp_path) -> None:
     )
 
     with pytest.raises(ConfigError, match="project is required and must be nonblank"):
-        spec_from_file(str(config), project_required=True)
+        spec_and_train_keys_from_file(str(config), project_required=True)
 
 
 def test_project_id_is_required_canonicalized_and_roundtrips() -> None:
@@ -270,21 +274,20 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
     }
     baseline = {"epochs", "hf_repo", "max_examples"}
 
-    # the historical snapshots are immutable and still carry opd_eos_loss_coef, hf_repo, and
-    # lora_alpha because those commits did (hf_repo was a user key then and lora_alpha a user knob;
-    # both are now platform-managed and dropped from the user schema - hf_repo assigned server-side,
-    # lora_alpha derived as 2 x lora_rank). current adds save_at_steps, credit_assignment, and the
-    # entropy-control knobs, and removes the legacy opd eos key.
+    # historical snapshots remain exact to their commits, including fields now managed or removed.
+    # current adds save_at_steps, credit_assignment, and entropy_quantile; opd eos is removed.
+    # lora_alpha is in both: authorable then, managed in between, and a user knob again now.
     assert historical_shapes["861571e7"] - {
         "opd_eos_loss_coef",
         "hf_repo",
-        "lora_alpha",
+        "advantage_clip",
     } == TRAIN_SCHEMA_KEYS - {
         "credit_assignment",
         "save_at_steps",
         "entropy_quantile",
     }
     assert "opd_eos_loss_coef" not in TRAIN_SCHEMA_KEYS
+    assert "advantage_clip" not in TRAIN_SCHEMA_KEYS
     assert all(baseline <= shape for shape in historical_shapes.values())
     for key in ("structured_outputs", "teacher_model"):
         rejected_by = {commit for commit, shape in historical_shapes.items() if key not in shape}
@@ -320,6 +323,88 @@ def test_warmstart_rejects_explicit_child_rank(lora_rank) -> None:
         spec_from_dict(
             _raw(**{"train.init_from_adapter": "source-run", "train.lora_rank": lora_rank})
         )
+
+
+@pytest.mark.parametrize(
+    "lora_alpha",
+    [
+        pytest.param(256, id="non-default"),
+        pytest.param(16, id="matching-derived"),
+        pytest.param(None, id="null"),
+        pytest.param(0, id="invalid"),
+    ],
+)
+def test_warmstart_rejects_explicit_child_alpha(lora_alpha) -> None:
+    # the source adapter's alpha is authoritative, so authoring one is rejected rather than
+    # silently overwritten by the inherited value.
+    raw = _raw(**{"train.init_from_adapter": "source-run", "train.lora_alpha": lora_alpha})
+    raw["train"].pop("lora_rank")
+    with pytest.raises(
+        ConfigError,
+        match=(
+            r"train\.lora_alpha cannot be set with train\.init_from_adapter because source adapter "
+            r"alpha metadata is authoritative"
+        ),
+    ):
+        spec_from_dict(raw)
+
+
+@pytest.mark.parametrize(("lora_rank", "expected_alpha"), [(16, 32), (32, 64), (8, 16)])
+def test_lora_alpha_defaults_to_twice_rank(lora_rank, expected_alpha) -> None:
+    spec = spec_from_dict(_raw(**{"train.lora_rank": lora_rank}))
+    assert spec.train.lora_alpha == expected_alpha
+
+
+def test_default_lora_rank_defaults_alpha_to_64() -> None:
+    raw = _raw()
+    raw["train"].pop("lora_rank")
+    spec = spec_from_dict(raw)
+    assert spec.train.lora_rank == 32
+    assert spec.train.lora_alpha == 64
+
+
+def test_directly_constructed_trainspec_derives_alpha_from_rank() -> None:
+    # A library caller building TrainSpec(...) directly must get the same 2 x rank default as the
+    # parsed path. to_dict() no longer strips alpha, so a stale scalar default would be SUBMITTED
+    # and trained with (rank 8 shipping alpha 64 instead of 16) rather than re-derived server-side.
+    assert TrainSpec(lora_rank=8).lora_alpha == 16
+    assert TrainSpec().lora_alpha == 64  # default rank 32
+    assert TrainSpec(lora_rank=8, lora_alpha=48).lora_alpha == 48  # explicit still wins
+
+
+def test_internal_from_dict_round_trips_stored_lora_alpha() -> None:
+    # The internal carrier preserves a stored alpha so an authored value and a warm-start's
+    # inherited parent alpha (which need not equal 2 x rank) survive control-plane -> worker
+    # serialization; alpha falls back to 2 x rank only when the payload omits it.
+    base = {
+        "model": "Qwen/Qwen3.5-0.8B",
+        "algorithm": "grpo",
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
+        "train": {"epochs": 1, "max_examples": 8, "lora_rank": 16, "lora_alpha": 48},
+    }
+    assert JobSpec.from_dict(base).train.lora_alpha == 48  # present -> round-trip
+    absent = {**base, "train": {"epochs": 1, "max_examples": 8, "lora_rank": 16}}
+    assert JobSpec.from_dict(absent).train.lora_alpha == 32  # absent -> derive 2 x rank
+
+
+def test_internal_dict_emits_an_authored_lora_alpha_to_the_worker() -> None:
+    # the EMISSION direction, not just from_dict: to_internal_dict() is what the worker rehydrates
+    # from, so an authored alpha that never reached the internal carrier would silently train at
+    # the derived 2 x rank scaling instead of the value the user wrote.
+    spec = spec_from_dict(_raw(**{"train.lora_rank": 16, "train.lora_alpha": 48}))
+    assert spec.to_internal_dict()["train"]["lora_alpha"] == 48
+    derived = spec_from_dict(_raw(**{"train.lora_rank": 16}))
+    assert derived.to_internal_dict()["train"]["lora_alpha"] == 32
+
+
+def test_authored_lora_alpha_overrides_the_derived_default() -> None:
+    # an authored alpha need not equal 2 x rank, and it survives the public round trip the client
+    # submits and the server re-validates.
+    spec = spec_from_dict(_raw(**{"train.lora_rank": 16, "train.lora_alpha": 48}))
+    assert spec.train.lora_alpha == 48
+    public = spec.to_dict()
+    assert public["train"]["lora_alpha"] == 48
+    assert spec_from_dict(public).train.lora_alpha == 48
 
 
 def test_warmstart_accepts_omitted_child_rank_with_internal_placeholder() -> None:
@@ -393,14 +478,15 @@ def test_sft_epochs_must_be_positive() -> None:
         spec_from_dict(raw)
 
 
-def test_sft_requires_positive_max_examples() -> None:
+def test_sft_max_examples_is_an_optional_prefix_cap() -> None:
+    # an sft quote is backed by a workload profile that materializes and tokenizes the real
+    # dataset, so an omitted or zero cap means "every row" and is measured. requiring a row count
+    # here would only be asking the user to supply the number the profile exists to measure.
     raw = _raw(algorithm="sft")
     raw["train"] = {"epochs": 1, "lora_rank": 8}
-    with pytest.raises(ConfigError, match=r"max_examples.*positive"):
-        spec_from_dict(raw)
+    assert spec_from_dict(raw).train.max_examples is None
     raw["train"]["max_examples"] = 0
-    with pytest.raises(ConfigError, match=r"max_examples.*positive"):
-        spec_from_dict(raw)
+    assert spec_from_dict(raw).train.max_examples == 0
     raw["train"]["max_examples"] = 8
     assert spec_from_dict(raw).train.max_examples == 8
 
@@ -434,9 +520,15 @@ def test_lora_rank_must_fit_small_serving_cap() -> None:
 
 
 def test_lora_rank_must_fit_large_serving_cap() -> None:
-    # The 4B tier serving cap doubled 32 -> 64; rank 65 exceeds it.
-    with pytest.raises(ConfigError, match="serving max_lora_rank=64"):
-        spec_from_dict(_raw(model="Qwen/Qwen3.5-4B", **{"train.lora_rank": 65}))
+    from flash.core.catalog import serving_lora_rank_cap
+
+    # the 27B is the rank-64 tier. this case used the 4B, which was rank-64 when it was written and
+    # is now rank-128 -- leaving it there would have made this a duplicate of the small-cap test
+    # above rather than coverage of the lower cap. derived from the catalog so it tracks the tier.
+    cap = serving_lora_rank_cap("Qwen/Qwen3.6-27B")
+    assert cap is not None
+    with pytest.raises(ConfigError, match=f"serving max_lora_rank={cap}"):
+        spec_from_dict(_raw(model="Qwen/Qwen3.6-27B", **{"train.lora_rank": cap + 1}))
 
 
 def test_bare_environment_id_is_rejected() -> None:
@@ -502,6 +594,125 @@ def test_env_ref_validator_matches_adapter_acceptor() -> None:
         assert schema_accepts(value) is is_freesolo_environment_id(value), value
 
 
+# the flat [train] table is shared by all three algorithms, so a knob a run's algorithm cannot
+# consume used to parse clean and do nothing. (algorithm, knob, value) pairs that must be rejected.
+_INAPPLICABLE_CASES = [
+    ("sft", "group_size", 8),
+    ("sft", "temperature", 0.7),
+    ("sft", "max_completion_tokens", 512),
+    ("sft", "kl_penalty_coef", 0.5),
+    ("sft", "entropy_quantile", 0.5),
+    ("sft", "thinking_length_penalty_coef", 0.1),
+    ("sft", "teacher_model", "glm-5.2"),
+    ("sft", "credit_assignment", "per_turn"),
+    ("sft", "stop_sequences", ["END"]),
+    ("sft", "structured_outputs", '{"type": "object"}'),
+    ("opd", "entropy_quantile", 0.5),
+    ("opd", "thinking_length_penalty_coef", 0.1),
+    ("opd", "credit_assignment", "per_turn"),
+    ("grpo", "teacher_model", "glm-5.2"),
+]
+
+# the same knobs on an algorithm whose worker DOES read them. without this direction a validator
+# that rejected everything everywhere would pass the rejection tests above.
+_APPLICABLE_CASES = [
+    ("grpo", "group_size", 8),
+    ("opd", "group_size", 2),
+    ("grpo", "temperature", 0.7),
+    ("opd", "temperature", 0.7),
+    ("grpo", "max_completion_tokens", 512),
+    ("opd", "max_completion_tokens", 512),
+    ("grpo", "kl_penalty_coef", 0.5),
+    ("opd", "kl_penalty_coef", 0.5),
+    ("grpo", "stop_sequences", ["END"]),
+    ("opd", "stop_sequences", ["END"]),
+    ("grpo", "structured_outputs", '{"type": "object"}'),
+    ("opd", "structured_outputs", '{"type": "object"}'),
+    ("grpo", "entropy_quantile", 0.5),
+    ("grpo", "thinking_length_penalty_coef", 0.1),
+    ("grpo", "credit_assignment", "per_turn"),
+    ("opd", "teacher_model", "glm-5.2"),
+]
+
+
+@pytest.mark.parametrize(("algorithm", "knob", "value"), _INAPPLICABLE_CASES)
+def test_train_knob_rejected_by_algorithms_that_cannot_consume_it(algorithm, knob, value) -> None:
+    raw = _raw(algorithm=algorithm)
+    raw["train"][knob] = value
+    with pytest.raises(ConfigError, match=rf"train\.{knob}"):
+        spec_from_dict(raw)
+
+
+@pytest.mark.parametrize(("algorithm", "knob", "value"), _APPLICABLE_CASES)
+def test_train_knob_accepted_by_algorithms_that_consume_it(algorithm, knob, value) -> None:
+    raw = _raw(algorithm=algorithm)
+    raw["train"][knob] = value
+    assert spec_from_dict(raw).algorithm == algorithm
+
+
+@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+def test_full_public_dict_round_trips_despite_knob_scoping(algorithm) -> None:
+    """Round-trip every serialized TrainSpec field through algorithm scoping.
+
+    Scope on meaningful values, not key presence, because ``to_dict()`` includes unauthored fields.
+    """
+    spec = spec_from_dict(_raw(algorithm=algorithm))
+
+    restored = spec_from_dict(spec.to_dict())
+
+    assert restored.algorithm == algorithm
+    assert restored.train.epochs == spec.train.epochs
+
+
+def test_advantage_clip_is_no_longer_a_config_key() -> None:
+    # parsed, range-validated, and shipped to the worker, which then explicitly did not apply it.
+    raw = _raw(algorithm="grpo")
+    raw["train"]["advantage_clip"] = 1.5
+    with pytest.raises(ConfigError, match=r"unknown key\(s\): advantage_clip"):
+        spec_from_dict(raw)
+
+
+def test_jobspec_drops_advantage_clip_from_persisted_records() -> None:
+    """A run provisioned before #968 still parses; recovery would otherwise fail it and kill its worker."""
+    original = _job_from_dict({})
+    persisted = original.to_internal_dict()
+    persisted["train"]["advantage_clip"] = 1.5
+
+    restored = JobSpec.from_dict(persisted)
+
+    # dropped, not resurrected: the key is gone from the schema and never reaches a worker.
+    assert restored.train == original.train
+    assert not hasattr(restored.train, "advantage_clip")
+
+
+def test_jobspec_still_rejects_train_keys_that_were_never_tolerated() -> None:
+    """The drop set is one key, not an amnesty on every removed field.
+
+    `seeds` has its own rejection contract (test_from_dict_rejects_removed_legacy_train_seeds,
+    #536), so widening the drop set speculatively would silently overturn it.
+    """
+    with pytest.raises(ValueError, match=r"train has unknown key\(s\): seeds"):
+        JobSpec.from_dict({"train": {"seeds": [0, 1]}})
+
+
+def test_environment_pip_is_platform_managed() -> None:
+    raw = _raw()
+    raw["environment"]["pip"] = ["freesolo==1.2.3"]
+    with pytest.raises(ConfigError, match=r"\[environment\] unknown key\(s\): pip"):
+        spec_from_dict(raw)
+
+
+def test_submit_payload_round_trips_without_a_pip_key() -> None:
+    """spec_payload is what the CLI actually sends, and the server re-parses it with this parser."""
+    from flash.client.specs import spec_payload
+
+    spec = spec_from_dict(_raw())
+    payload = spec_payload(spec, authored_train_keys=frozenset({"epochs"}))
+
+    assert "pip" not in payload["environment"]
+    assert spec_from_dict(payload).environment.id == spec.environment.id
+
+
 def test_environment_must_be_a_table() -> None:
     raw = _raw()
     raw["environment"] = "gsm8k"
@@ -542,10 +753,9 @@ def test_gpu_retry_and_wall_are_managed_defaults_not_user_authored() -> None:
 
 
 def test_environment_subfields_reject_wrong_types() -> None:
-    # The [environment] sub-fields are consumed by EnvironmentSpec(...) via dict(... or {}) /
-    # tuple(... or ()): a present-but-wrong-typed value would otherwise crash opaquely
-    # (dict("x") / dict(1)) or silently misbehave (pip = "x" char-split into ('x',)). Each
-    # must fail fast with a clear ConfigError instead.
+    # The [environment] sub-fields are consumed by EnvironmentSpec(...) via dict(... or {}):
+    # a present-but-wrong-typed value would otherwise crash opaquely (dict("x") / dict(1)).
+    # Each must fail fast with a clear ConfigError instead.
     # A falsy non-table (params = false) is rejected too, mirroring the section-level rule that
     # `environment = false` must fail rather than silently coerce to {} and bypass intent.
     for bad in ("notatable", 123, False):
@@ -556,21 +766,6 @@ def test_environment_subfields_reject_wrong_types() -> None:
         }
         with pytest.raises(ConfigError, match=r"\[environment\] params must be a table"):
             spec_from_dict(raw)
-    for bad in ("notalist", 123, False):
-        raw = _raw()
-        raw["environment"] = {
-            "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
-            "pip": bad,
-        }
-        with pytest.raises(ConfigError, match=r"\[environment\] pip must be a list of strings"):
-            spec_from_dict(raw)
-    raw = _raw()
-    raw["environment"] = {
-        "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
-        "pip": ["ok", 123],
-    }
-    with pytest.raises(ConfigError, match=r"\[environment\] pip entries must be strings"):
-        spec_from_dict(raw)
     for bad in ("notalist", 123, False):
         raw = _raw()
         raw["environment"] = {
@@ -602,17 +797,23 @@ def test_environment_subfields_reject_wrong_types() -> None:
         spec_from_dict(raw)
 
 
-def test_grpo_environment_can_declare_fireworks_key() -> None:
+@pytest.mark.parametrize(
+    "key",
+    [
+        "PARASAIL_API_KEY",
+        "FLASH_PUBLIC_URL",
+        "FLASH_TEACHER_CAPABILITY",
+    ],
+)
+def test_environment_cannot_declare_managed_teacher_transport_or_credentials(key) -> None:
     raw = _raw()
     raw["environment"] = {
         "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
-        "secrets": ["FIREWORKS_API_KEY"],
+        "secrets": [key],
     }
 
-    spec = spec_from_dict(raw)
-
-    assert spec.algorithm == "grpo"
-    assert spec.environment.secrets == ("FIREWORKS_API_KEY",)
+    with pytest.raises(ConfigError, match="platform-managed"):
+        spec_from_dict(raw)
 
 
 def test_environment_subfields_accept_valid_and_missing() -> None:
@@ -627,19 +828,18 @@ def test_environment_subfields_accept_valid_and_missing() -> None:
     raw["environment"] = {
         "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
         "params": {"k": "v"},
-        "pip": ["pkg==1.0"],
         "secrets": ["SERPAPI_API_KEY", "OPENAI_API_KEY", "SERPAPI_API_KEY"],
     }
     spec = spec_from_dict(raw)
     assert spec.environment.params == {"k": "v"}
-    assert spec.environment.pip == ("pkg==1.0",)
+    # pip is platform-managed: never authored, so it stays at its default here.
+    assert spec.environment.pip == ()
     assert spec.environment.secrets == ("SERPAPI_API_KEY", "OPENAI_API_KEY")
     # An explicit None (e.g. JSON `null`) is treated as missing -> default, NOT rejected.
     raw = _raw()
     raw["environment"] = {
         "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
         "params": None,
-        "pip": None,
         "secrets": None,
     }
     spec = spec_from_dict(raw)
@@ -862,24 +1062,40 @@ def test_dry_run_submit_get_list_logs_cancel(tmp_path, monkeypatch) -> None:
         orch.get_status("flash-000-nope")
 
 
-def test_programmatic_sft_submit_requires_max_examples(tmp_path, monkeypatch) -> None:
-    from flash.spec import JobSpec
+def test_programmatic_sft_submit_fails_closed_without_a_profilable_environment(
+    tmp_path, monkeypatch
+) -> None:
+    # sft is quoted from a workload profile that tokenizes the real dataset, so a spec with no
+    # environment to profile has no measurable workload. it must fail closed rather than fall back
+    # to an assumed row count -- including on the dry-run preview, which previews a real submit.
+    from flash.core.spec import JobSpec
 
     orch = _fresh_orchestrator(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        orch, "_resolve_model_revision", lambda s, **_kw: replace(s, model_revision="a" * 40)
+    )
     spec = JobSpec(
-        run_id="sft-no-examples",
+        run_id="sft-no-environment",
         model="Qwen/Qwen3.5-0.8B",
         algorithm="sft",
         project="11111111-1111-4111-8111-111111111111",
     )
-    with pytest.raises(ValueError, match=r"max_examples.*positive"):
+    with pytest.raises(orch.WorkloadProfileUnavailable, match="requires an environment id"):
         orch.submit_job(spec, dry_run=True)
+    with pytest.raises(FileNotFoundError):
+        orch.get_status(spec.run_id)
 
 
 def test_programmatic_sft_submit_rejects_adapter_continuation(tmp_path, monkeypatch) -> None:
-    from flash.spec import JobSpec, TrainSpec
+    from flash.core.spec import JobSpec, TrainSpec
 
     orch = _fresh_orchestrator(tmp_path, monkeypatch)
+    # offline: sft requires a resolved model_revision, which calls HfApi().model_info(). Stub it
+    # the same way the sibling test above does, so the adapter-continuation rejection this test is
+    # about is what fails -- not an unrelated network lookup on a disconnected runner.
+    monkeypatch.setattr(
+        orch, "_resolve_model_revision", lambda s, **_kw: replace(s, model_revision="a" * 40)
+    )
     spec = JobSpec(
         run_id="sft-warmstart",
         model="Qwen/Qwen3.5-0.8B",
@@ -912,7 +1128,7 @@ def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None
 
 
 def test_vram_estimate_scales_with_params_and_algorithm() -> None:
-    from flash.engine import vram
+    from flash.engine.plan import vram
 
     sft_small = vram.estimate_vram_gb(0.6, "sft")
     sft_big = vram.estimate_vram_gb(8.0, "sft")
@@ -926,7 +1142,7 @@ def test_vram_sft_per_device_bs_is_managed_default(monkeypatch) -> None:
     # fixed value. A control-plane process-env SFT_PER_DEVICE_BS must NOT move the estimate — sizing
     # a card for a micro-batch the worker never uses would under-route an SFT_PER_DEVICE_BS=1 env to
     # a too-small GPU that then OOMs at the default micro-batch 4.
-    from flash.engine import vram
+    from flash.engine.plan import vram
 
     # Use a tiny vocab so this isolates the managed micro-batch cap rather than the dense-logits
     # per-device cap, which can floor both batch sizes to the same per-device value.
@@ -941,19 +1157,13 @@ def test_vram_sft_per_device_bs_is_managed_default(monkeypatch) -> None:
         assert vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32, vocab=1) == at_cap
 
 
-def test_fetch_hf_params_is_offline_safe(monkeypatch) -> None:
-    from flash.engine import vram
-
-    assert vram.fetch_hf_params_b("any/model") is None
-
-
 # ---------------------------------------------------------------------------
 # _logging: namespace + level resolution
 # ---------------------------------------------------------------------------
 
 
 def test_get_logger_namespacing() -> None:
-    from flash._logging import get_logger
+    from flash._internal.logging import get_logger
 
     assert get_logger().name == "flash"
     assert get_logger("flash").name == "flash"
@@ -962,7 +1172,7 @@ def test_get_logger_namespacing() -> None:
 
 
 def test_configure_logging_verbosity() -> None:
-    from flash import _logging
+    from flash._internal import logging as _logging
 
     _logging.configure_logging(verbosity=0)
     assert logging.getLogger("flash").level == logging.WARNING
@@ -972,59 +1182,113 @@ def test_configure_logging_verbosity() -> None:
     assert logging.getLogger("flash").level == logging.DEBUG
 
 
-# ---------------------------------------------------------------------------
-# [worker_env] secret-key policy — [worker_env] is serialized into job_spec_json
-# (persisted + logged), so secret-bearing keys must be rejected at parse time and set
-# as real env vars instead. These cases pin the _is_secret_key heuristic so it doesn't
-# drift into false positives (legit knobs) or false negatives (real secrets).
-# ---------------------------------------------------------------------------
+def test_removed_worker_environment_table_is_rejected(tmp_path) -> None:
+    # the deleted per-run env override table is now an unknown section, not a silently ignored one:
+    # a config that still carries it must fail loudly rather than train with the overrides dropped.
+    path = tmp_path / "removed-worker-environment.toml"
+    path.write_text(
+        'model = "Qwen/Qwen3.5-0.8B"\nalgorithm = "grpo"\n[worker_env]\nCUSTOM_FLAG = "value"\n'
+    )
+
+    with pytest.raises(ConfigError) as exc_info:
+        spec_and_train_keys_from_file(str(path))
+
+    message = str(exc_info.value)
+    assert "unknown config section(s): worker_env" in message
+    assert "(allowed tables: environment, train, gpu, wandb)" in message
 
 
-@pytest.mark.parametrize(
-    "key",
-    [
-        "HF_TOKEN",  # secret WORD: TOKEN
-        "OPENAI_API_KEY",  # KEY qualified by API
-        "AWS_SECRET_ACCESS_KEY",  # SECRET word + KEY qualified by SECRET/ACCESS
-        "DB_PASSWORD",  # PASSWORD word
-        "GITHUB_TOKEN",
-        "WANDB_API_KEY",
-        "SOME_PRIVATE_KEY",  # KEY qualified by PRIVATE
-        "MY_CREDENTIAL",
-        "AUTH_KEY",  # KEY qualified by AUTH
-        "SSH_KEY",  # KEY qualified by SSH
-        "DEPLOY_KEY",  # KEY qualified by DEPLOY
-        "GITHUB_PAT",  # PAT word (personal access token)
-    ],
-)
-def test_worker_env_rejects_secret_keys(key: str) -> None:
-    with pytest.raises(ConfigError, match="must not contain secret-bearing keys"):
-        spec_from_dict(_raw(worker_env={key: "x"}))
+@pytest.mark.parametrize("stored", [{}, {"CUSTOM_FLAG": "value"}])
+def test_a_run_persisted_before_the_worker_env_removal_still_reloads(stored) -> None:
+    """A record written by the OLD plane must survive the upgrade that drops the field.
+
+    Specs were persisted with asdict, so EVERY record the pre-upgrade plane wrote names worker_env,
+    including the defaulted empty one. Stored records are never rewritten and from_dict is strict, so
+    without the dropped-key tolerance the first reload after deploy raises and a still-running job
+    loses its recovery, deploy, and serving paths.
+    """
+    persisted = {**JobSpec().to_internal_dict(), "worker_env": stored}
+
+    spec = JobSpec.from_dict(persisted)
+
+    # tolerated on read, but genuinely gone: the value must not come back as an attribute.
+    assert not hasattr(spec, "worker_env")
 
 
-@pytest.mark.parametrize(
-    "key",
-    [
-        "RL_VLLM_GPU_UTIL",  # plain knob
-        "SFT_PACKING",
-        "RL_VLLM_MAX_BATCHED_TOKENS",  # word TOKENS, not the secret word TOKEN
-        "SORT_KEY",  # bare KEY without a secret qualifier
-        "WANDB_ENTITY",  # account routing, not a secret
-        "FLASH_MLP_KERNEL",
-        "VLLM_ATTENTION_BACKEND",
-    ],
-)
-def test_worker_env_allows_non_secret_keys(key: str) -> None:
-    spec = spec_from_dict(_raw(worker_env={key: "v"}))
-    assert spec.worker_env[key] == "v"
+def test_the_dropped_worker_env_key_is_tolerated_on_read_only_never_authored() -> None:
+    """Tolerance must not quietly re-open the table as an authorable one.
+
+    from_dict ignores it so old RECORDS load; the schema layer still rejects it so a CONFIG naming it
+    fails loudly rather than training with its overrides silently discarded.
+    """
+    with pytest.raises(ConfigError, match="unknown config section"):
+        spec_from_dict(_raw(worker_env={"CUSTOM_FLAG": "value"}))
 
 
-@pytest.mark.parametrize("name", ["BAD=KEY", "", "BAD KEY", "X\tY"])
-def test_worker_env_rejects_invalid_env_names(name: str) -> None:
-    # Names subprocess.Popen(env=...) would reject on the worker (empty / '=' / whitespace) must
-    # fail at parse time, not after a worker has been provisioned.
-    with pytest.raises(ConfigError, match="invalid environment variable name"):
-        spec_from_dict(_raw(worker_env={name: "v"}))
+def test_an_unknown_top_level_key_is_still_rejected_on_read() -> None:
+    # the tolerance is scoped to keys the spec itself dropped, so it cannot become a general
+    # accept-anything hole in the persisted-spec reader.
+    with pytest.raises(ValueError, match="unknown key"):
+        JobSpec.from_dict({**JobSpec().to_internal_dict(), "not_a_real_key": 1})
+
+
+def test_a_pre_upgrade_run_that_authored_overrides_is_told_they_stopped_applying(caplog) -> None:
+    """Tolerating the key must not make the behavior change silent.
+
+    A run submitted with overrides keeps them in its record forever, but nothing forwards them now,
+    so it trains on managed defaults instead of what was authored. Reloading without a word would
+    make that indistinguishable from a run that never set them -- the operator reading logs after an
+    unexpected result would have nothing pointing at the cause.
+    """
+    persisted = {
+        **JobSpec().to_internal_dict(),
+        "run_id": "run-legacy-1",
+        "worker_env": {"FLASH_VERL_PYTHON": "/custom/verl/bin/python"},
+    }
+
+    with caplog.at_level(logging.WARNING, logger="flash.spec"):
+        JobSpec.from_dict(persisted)
+
+    assert "FLASH_VERL_PYTHON" in caplog.text
+    assert "run-legacy-1" in caplog.text
+    assert "NOT" in caplog.text
+
+
+def test_the_warning_names_the_run_or_is_not_emitted_at_all(caplog) -> None:
+    """An unidentified warning is worse than none: it cannot be acted on, and it duplicates.
+
+    The same stored run is read through both shapes -- the internal worker spec (asdict, keeps
+    run_id) and the public spec (to_dict, pops it). Warning on the public read would emit a second
+    line naming no run, which an operator cannot map back to anything, alongside the identified line
+    the worker-spec read already produced.
+    """
+    spec = JobSpec.from_dict(
+        {**JobSpec().to_internal_dict(), "run_id": "run-legacy-1"},
+    )
+    dropped = {"FLASH_VERL_PYTHON": "/custom/verl/bin/python"}
+
+    with caplog.at_level(logging.WARNING, logger="flash.spec"):
+        JobSpec.from_dict({**spec.to_internal_dict(), "worker_env": dropped})
+    assert "run-legacy-1" in caplog.text
+
+    caplog.clear()
+    # the public shape pops run_id, so this read stays quiet rather than saying "run <unknown>".
+    public = spec.to_dict()
+    assert "run_id" not in public
+    with caplog.at_level(logging.WARNING, logger="flash.spec"):
+        JobSpec.from_dict({**public, "worker_env": dropped})
+    assert caplog.text == ""
+
+
+def test_a_record_without_the_dropped_key_says_nothing(caplog) -> None:
+    # every record the pre-upgrade plane wrote names the key, defaulted-empty included. warning on
+    # the empty ones would fire on effectively every reload and train operators to ignore it.
+    persisted = {**JobSpec().to_internal_dict(), "worker_env": {}}
+
+    with caplog.at_level(logging.WARNING, logger="flash.spec"):
+        JobSpec.from_dict(persisted)
+
+    assert caplog.text == ""
 
 
 @pytest.mark.parametrize(
@@ -1053,7 +1317,7 @@ def test_worker_env_rejects_invalid_env_names(name: str) -> None:
     ],
 )
 def test_coerce_bool(value, expected) -> None:
-    from flash.spec import coerce_bool
+    from flash.core.spec import coerce_bool
 
     assert coerce_bool(value) is expected
 
@@ -1097,7 +1361,7 @@ def test_gpu_spec_direct_construction_rejects_bad_count(bad: object, exc: type) 
 
 
 def test_gpu_count_of_reads_spec_and_defaults() -> None:
-    from flash.spec import gpu_count_of
+    from flash.core.spec import gpu_count_of
 
     assert gpu_count_of(None) == 1  # no spec -> single gpu
     assert (

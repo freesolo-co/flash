@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from flash.engine.vram import _LIGER_MIN_PARAMS_B
+from flash.engine.plan.vram import _LIGER_MIN_PARAMS_B
 
 # 1B-class models measured net-negative on every arch; only pay off on large models.
 _LIGER_MIN_PARAMS = _LIGER_MIN_PARAMS_B * 1e9
@@ -26,7 +26,7 @@ def _liger_default_for_model(model_id: str, revision: str = "") -> bool:
     try:
         from transformers import AutoConfig
 
-        from flash.engine.worker.hf import model_revision_kwargs
+        from flash.engine.worker.io.hf import model_revision_kwargs
 
         cfg = AutoConfig.from_pretrained(
             model_id,
@@ -36,20 +36,4 @@ def _liger_default_for_model(model_id: str, revision: str = "") -> bool:
         return _estimate_params(cfg) >= _LIGER_MIN_PARAMS
     except Exception as e:
         print("liger model-size probe failed (default off):", e)
-        return False
-
-
-def liger_on(default_on: bool) -> bool:
-    """Whether to enable Liger. Requires CUDA and liger_kernel importable — flash[gpu] doesn't ship it."""
-    if not default_on:
-        return False
-    try:
-        import importlib.util
-
-        import torch
-
-        return bool(
-            torch.cuda.is_available() and importlib.util.find_spec("liger_kernel") is not None
-        )
-    except Exception:
         return False
