@@ -156,6 +156,29 @@ jobs:
                   raise
           PY
 
+      # Checked BEFORE the upload, because publishing is irreversible and tagging is not. If the tag
+      # conflict were only caught after `uv publish` (where the tag itself is created), the package
+      # would already be on PyPI when the job failed -- and every later run would then stop at the
+      # gate above, leaving a shipped version whose only tag names a different tree. Failing here
+      # costs nothing: nothing has been uploaded yet.
+      - name: Fail if the release tag exists on another commit
+        if: github.event_name == 'workflow_dispatch' || steps.changes.outputs.package_changed == 'true'
+        env:
+          PACKAGE_VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v${PACKAGE_VERSION}"
+          existing="$(git ls-remote --tags origin "refs/tags/${tag}" "refs/tags/${tag}^{}" || true)"
+          if [ -n "$existing" ]; then
+            peeled="$(printf '%s\n' "$existing" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')"
+            plain="$(printf '%s\n' "$existing" | awk '$2 !~ /\^\{\}$/ {print $1; exit}')"
+            target="${peeled:-$plain}"
+            if [ "$target" != "$GITHUB_SHA" ]; then
+              echo "::error::Tag ${tag} already exists on origin but points at ${target}, not this commit (${GITHUB_SHA}). Refusing to publish ${PACKAGE_VERSION}: the release would ship one tree while the tag names another. Resolve the tag by hand."
+              exit 1
+            fi
+          fi
+
       - name: Install uv
         if: github.event_name == 'workflow_dispatch' || steps.changes.outputs.package_changed == 'true'
         uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
@@ -207,10 +230,11 @@ jobs:
           # the first, and an absent tag answers neither.
           existing="$(git ls-remote --tags origin "refs/tags/${tag}" "refs/tags/${tag}^{}" || true)"
           if [ -n "$existing" ]; then
-            # A tag that already exists must point at THIS commit. Accepting it on name alone would
-            # let a stale or manual `vX` stand as the permanent record of a release whose code is
-            # actually the commit running now -- PyPI would hold one tree and the tag would name
-            # another, which is precisely the misattribution this whole change exists to prevent.
+            # Re-checked here, though the preflight above already rejected a conflicting tag before
+            # the upload. This catches only the narrow race where the tag appeared DURING the
+            # publish. It stays fatal rather than tolerant: at this point the package is on PyPI, so
+            # a mismatch means someone must reconcile it by hand, and saying so loudly beats
+            # recording a release whose tag names a different tree.
             peeled="$(printf '%s\n' "$existing" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')"
             plain="$(printf '%s\n' "$existing" | awk '$2 !~ /\^\{\}$/ {print $1; exit}')"
             target="${peeled:-$plain}"

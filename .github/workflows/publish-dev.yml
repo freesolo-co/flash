@@ -102,6 +102,25 @@ jobs:
         if: steps.decide.outputs.publish == 'false'
         run: echo "freesolo-flash-dev ${{ steps.meta.outputs.version }} is already on PyPI; nothing to publish."
 
+      # See publish.yml: checked before the irreversible upload, not after it.
+      - name: Fail if the dev tag exists on another commit
+        if: steps.decide.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="dev-v${VERSION}"
+          existing="$(git ls-remote --tags origin "refs/tags/${tag}" "refs/tags/${tag}^{}" || true)"
+          if [ -n "$existing" ]; then
+            peeled="$(printf '%s\n' "$existing" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')"
+            plain="$(printf '%s\n' "$existing" | awk '$2 !~ /\^\{\}$/ {print $1; exit}')"
+            target="${peeled:-$plain}"
+            if [ "$target" != "$GITHUB_SHA" ]; then
+              echo "::error::Tag ${tag} already exists on origin but points at ${target}, not this commit (${GITHUB_SHA}). Refusing to publish ${VERSION}: the dev tag is the only record of which commit shipped in a version, and this one would be false. Resolve the tag by hand."
+              exit 1
+            fi
+          fi
+
       - name: Install uv
         if: steps.decide.outputs.publish == 'true'
         uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
@@ -153,10 +172,10 @@ jobs:
         run: |
           set -euo pipefail
           tag="dev-v${VERSION}"
-          # See publish.yml for the peel/verify rationale. It matters more here: this tag is the ONLY
-          # record of which commit went into a given dev version, so a tag left pointing at the wrong
-          # commit is not a cosmetic problem -- it is a false provenance record, and silently
-          # accepting it would defeat the reason this step exists.
+          # Re-checked here after the preflight above, to catch a tag that appeared DURING the
+          # publish. It matters more on this channel: the tag is the ONLY record of which commit went
+          # into a given dev version, so one pointing at the wrong commit is a false provenance
+          # record, not a cosmetic problem.
           existing="$(git ls-remote --tags origin "refs/tags/${tag}" "refs/tags/${tag}^{}" || true)"
           if [ -n "$existing" ]; then
             peeled="$(printf '%s\n' "$existing" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')"
