@@ -64,7 +64,7 @@ def _offline(monkeypatch):
         "LAMBDA_API_KEY",
         "VAST_API_KEY",
         "PARASAIL_API_KEY",
-        "FLASH_CONTROL_PANEL_URL",
+        "FLASH_PUBLIC_URL",
         "FLASH_TEACHER_CAPABILITY",
         "FLASH_STANDALONE",
         "FLASH_HF_NAMESPACE",

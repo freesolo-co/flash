@@ -10,9 +10,9 @@ from io import BytesIO
 from flash._internal.logging import get_logger
 from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 from flash.core.spec import (
-    CONTROL_PANEL_URL_ENV,
     CONTROL_PLANE_OWNED_ENV_KEYS,
     MANAGED_TEACHER_CREDENTIAL_ENV_KEYS,
+    PUBLIC_URL_ENV,
     TEACHER_CAPABILITY_ENV,
     JobSpec,
     require_matching_seed,
@@ -258,14 +258,14 @@ def build_worker_env(
     # attempt-scoped teacher capability.
     for key in MANAGED_TEACHER_CREDENTIAL_ENV_KEYS:
         env.pop(key, None)
-    env.pop(CONTROL_PANEL_URL_ENV, None)
+    env.pop(PUBLIC_URL_ENV, None)
     env.pop(TEACHER_CAPABILITY_ENV, None)
     if str(getattr(spec, "algorithm", "")).lower() == "opd":
-        control_panel_url = str((runtime_secrets or {}).get(CONTROL_PANEL_URL_ENV) or "").strip()
+        public_url = str((runtime_secrets or {}).get(PUBLIC_URL_ENV) or "").strip()
         capability = str((runtime_secrets or {}).get(TEACHER_CAPABILITY_ENV) or "").strip()
-        if not control_panel_url or not capability:
+        if not public_url or not capability:
             raise RuntimeError("managed opd control-panel teacher transport is missing")
-        env[CONTROL_PANEL_URL_ENV] = control_panel_url
+        env[PUBLIC_URL_ENV] = public_url
         env[TEACHER_CAPABILITY_ENV] = capability
     return env
 
