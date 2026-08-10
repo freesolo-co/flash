@@ -11,11 +11,8 @@ import sys
 from typing import NoReturn
 
 from flash import __version__
-from flash._channel import CLI_NAME
-from flash._logging import configure_logging
-from flash._update_check import emit_update_notice, maybe_start_update_check
-from flash.catalog import ALGORITHMS
-from flash.cli import render
+from flash._internal.channel import CLI_NAME
+from flash._internal.logging import configure_logging
 
 # package-level command imports remain available through flash.cli.
 from flash.cli.commands import (  # noqa: F401
@@ -43,24 +40,26 @@ from flash.cli.commands import (  # noqa: F401
     cmd_whoami,
     verify_freesolo_key,
 )
-from flash.cli.env_eval import (
+from flash.cli.commands.env.eval import (
     _MAX_CONCURRENCY,
     bounded_concurrency,
     cmd_env_eval,
     finite_float,
     positive_int,
 )
-from flash.cli.env_setup import cmd_env_setup
-from flash.cli.env_test import cmd_env_test
-from flash.cli.envpush import cmd_env_delete, cmd_env_pull, cmd_env_push
-from flash.cli.traces import (
+from flash.cli.commands.env.push import cmd_env_delete, cmd_env_pull, cmd_env_push
+from flash.cli.commands.env.setup import cmd_env_setup
+from flash.cli.commands.env.test import cmd_env_test
+from flash.cli.commands.traces import (
     DEFAULT_EXPORT_PATH,
     EXPORT_FORMATS,
     RAW_EXPORT_PATH,
     RECORDS_FORMAT,
     cmd_traces_export,
 )
+from flash.cli.ui import render
 from flash.client.config import shadowed_login_warning
+from flash.core.catalog import ALGORITHMS
 
 # Themed `flash --help` catalog. Groups are ordered along the training workflow; each row's
 # summary is the short one-liner the themed grid shows (the verbose per-command text stays on
@@ -152,6 +151,21 @@ def _wait_seconds(value: str) -> float:
     return seconds
 
 
+def _gpu_count_override(value: str) -> str:
+    """Turn `--gpus N` into the `gpu.count=N` override it is sugar for.
+
+    the flag shares --set's dest, so it lands in the same override list and inherits one precedence
+    order (file < --config < --set/--gpus, left to right) and one validator: gpu.count's 1..8 bound
+    lives in JobSpec, so a bad --gpus is rejected by the code that already rejects a bad [gpu] count.
+    converting here rather than in the command keeps an absent flag indistinguishable from no flag,
+    so a multi-gpu count authored in the config file is never silently downgraded.
+    """
+    try:
+        return f"gpu.count={int(value)}"
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number of gpus, got {value!r}") from None
+
+
 def _friendly_message(message: str) -> str:
     """Shorten argparse's verbose ``invalid choice: 'x' (choose from a, b, c, ...)`` into a concise
     ``unknown command 'x' (did you mean 'y'?)`` — the single closest match instead of dumping the
@@ -220,8 +234,40 @@ class _FlashParser(_ThemedParser):
 
 def _build_parser() -> argparse.ArgumentParser:
     """Build the fully-configured root parser. Extracted from main() so tests can introspect the
-    registered subcommands and keep the themed help catalog (_HELP_GROUPS) in lockstep."""
+    registered subcommands and keep the themed help catalog (_HELP_GROUPS) in lockstep.
+
+    Registration is split into one ``_add_*_commands`` helper per command family. The call order
+    below is the order subcommands appear in help, so it is part of the CLI's surface, not an
+    implementation detail. ``models_sub`` is threaded from the models family into the deployment
+    family because `deploy`/`chat`/`export` are `flash models` subcommands registered after the
+    top-level `runs` group.
+    """
     parser = _FlashParser(prog=CLI_NAME, description="Managed LoRA post-training")
+    _add_root_flags(parser)
+    # subparsers theme their usage errors (parser_class=_ThemedParser) but not their help, so
+    # `flash <cmd> --help` keeps the standard layout; only the root parser themes its help (see
+    # _FlashParser). Nested `env` subcommands inherit _ThemedParser automatically (the env parser
+    # is itself a _ThemedParser, so its add_subparsers defaults to the same class).
+    sub = parser.add_subparsers(
+        dest="cmd", required=True, parser_class=_ThemedParser, metavar="<command>"
+    )
+
+    _add_auth_commands(sub)
+    _add_project_commands(sub)
+    models_sub = _add_model_commands(sub)
+    _add_env_commands(sub)
+    _add_traces_commands(sub)
+    _add_train_commands(sub)
+    _add_runs_commands(sub)
+    _add_deployment_commands(models_sub)
+    # The control plane is operator-only and run as a separate one-off service via the
+    # `flash-server` console script (flash.server.__main__:main), not a `flash` subcommand.
+
+    return parser
+
+
+def _add_root_flags(parser: argparse.ArgumentParser) -> None:
+    """Flags on the root parser itself, ahead of any subcommand."""
     parser.add_argument("-V", "--version", action="version", version=f"{CLI_NAME} {__version__}")
     parser.add_argument(
         "--debug",
@@ -235,14 +281,10 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0,
         help="increase log verbosity (-v for info, -vv for debug)",
     )
-    # subparsers theme their usage errors (parser_class=_ThemedParser) but not their help, so
-    # `flash <cmd> --help` keeps the standard layout; only the root parser themes its help (see
-    # _FlashParser). Nested `env` subcommands inherit _ThemedParser automatically (the env parser
-    # is itself a _ThemedParser, so its add_subparsers defaults to the same class).
-    sub = parser.add_subparsers(
-        dest="cmd", required=True, parser_class=_ThemedParser, metavar="<command>"
-    )
 
+
+def _add_auth_commands(sub: argparse._SubParsersAction) -> None:
+    """`version`, `login`, `whoami`: identity and build introspection."""
     version = sub.add_parser("version", help="print the Flash version")
     version.set_defaults(func=cmd_version)
 
@@ -268,6 +310,9 @@ def _build_parser() -> argparse.ArgumentParser:
     whoami = sub.add_parser("whoami", help="show the identity behind your stored key")
     whoami.set_defaults(func=cmd_whoami)
 
+
+def _add_project_commands(sub: argparse._SubParsersAction) -> None:
+    """`projects create` / `projects list`."""
     projects = sub.add_parser("projects", help="manage Freesolo projects")
     projects_sub = projects.add_subparsers(dest="projects_cmd", required=True)
     projects_create = projects_sub.add_parser("create", help="create a Freesolo project")
@@ -277,16 +322,40 @@ def _build_parser() -> argparse.ArgumentParser:
     projects_list = projects_sub.add_parser("list", help="list Freesolo projects and UUIDs")
     projects_list.set_defaults(func=cmd_projects_list)
 
+
+def _add_model_commands(sub: argparse._SubParsersAction) -> argparse._SubParsersAction:
+    """`models list` and `gpus`, returning the `models` subparser action.
+
+    The returned action is what `_add_deployment_commands` hangs `deploy`/`undeploy`/`export`/
+    `deployments`/`chat` off, further down the registration order.
+    """
     models = sub.add_parser("models", help="work with models and deployments")
-    models_sub = models.add_subparsers(dest="models_cmd", required=True)
+    models.set_defaults(func=cmd_models)  # hidden bare `flash models` shim, mirrors `flash runs`
+    models_sub = models.add_subparsers(dest="models_cmd", required=False)
     models_list = models_sub.add_parser("list", help="list supported base models")
     models_list.set_defaults(func=cmd_models)
 
     gpus = sub.add_parser("gpus", help="list managed GPU classes with estimated $/hr")
     gpus.set_defaults(func=cmd_gpus)
+    return models_sub
 
+
+def _add_env_commands(sub: argparse._SubParsersAction) -> None:
+    """`env setup/list/test/eval/push/pull/delete`.
+
+    Split one level further than the other families because `env` carries seven subcommands; the
+    call order here is the order they appear in `flash env --help`.
+    """
     env = sub.add_parser("env", help="manage Freesolo environments")
     env_sub = env.add_subparsers(dest="env_cmd", required=True)
+    _add_env_setup_command(env_sub)
+    _add_env_test_commands(env_sub)
+    _add_env_eval_command(env_sub)
+    _add_env_publish_commands(env_sub)
+
+
+def _add_env_setup_command(env_sub: argparse._SubParsersAction) -> None:
+    """`env setup`: the scaffold generator and its turn-mode / reasoning switches."""
     setup = env_sub.add_parser("setup", help="create a starter Freesolo environment scaffold")
     setup_mode = setup.add_mutually_exclusive_group()
     setup_mode.add_argument(
@@ -334,6 +403,9 @@ def _build_parser() -> argparse.ArgumentParser:
     # apart from "not chosen yet" and, on an interactive terminal, ask instead of assuming.
     setup.set_defaults(func=cmd_env_setup, turn_mode=None, reasoning=None, yes=False)
 
+
+def _add_env_test_commands(env_sub: argparse._SubParsersAction) -> None:
+    """`env list` and `env test`: local inspection before anything is published."""
     env_list = env_sub.add_parser("list", help="list local environment sources")
     env_list.set_defaults(func=cmd_env_list)
 
@@ -379,6 +451,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     env_test.set_defaults(func=cmd_env_test)
 
+
+def _add_env_eval_command(env_sub: argparse._SubParsersAction) -> None:
+    """`env eval`: score a deployed model against its environment's held-out suites."""
     env_eval = env_sub.add_parser(
         "eval",
         help="score a deployed model against its own environment's held-out suites",
@@ -393,9 +468,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="a bare RUN_ID, RUN_ID/step-N, or full immutable adapter revision",
     )
     # the same two knobs `env test` exposes, and for the same reason: an env whose
-    # `load_environment()` requires a difficulty or reads a non-default split cannot be evaluated
-    # at all without them, and a held-out suite scored against a differently-configured
-    # environment than the run trains on is not measuring the run (codex[bot]).
+    # `load_environment()` requires a difficulty or reads a non-default split cannot be evaluated at
+    # all without them, and a held-out suite scored against a differently-configured environment
+    # than the run trains on is not measuring the run.
     env_eval.add_argument(
         "--split",
         default=None,
@@ -445,6 +520,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     env_eval.set_defaults(func=cmd_env_eval)
 
+
+def _add_env_publish_commands(env_sub: argparse._SubParsersAction) -> None:
+    """`env push/pull/delete`: the hub round trip."""
     env_push = env_sub.add_parser("push", help="upload a local Freesolo environment")
     env_push.add_argument(
         "--name",
@@ -498,6 +576,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     env_delete.set_defaults(func=cmd_env_delete)
 
+
+def _add_traces_commands(sub: argparse._SubParsersAction) -> None:
+    """`traces export`."""
     traces = sub.add_parser("traces", help="work with traces recorded by the freesolo SDK")
     traces_sub = traces.add_subparsers(dest="traces_cmd", required=True)
     traces_export = traces_sub.add_parser(
@@ -535,6 +616,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     traces_export.set_defaults(func=cmd_traces_export)
 
+
+def _add_train_commands(sub: argparse._SubParsersAction) -> None:
+    """`train`: config composition, overrides, cost preflight."""
     train = sub.add_parser("train", help="submit a managed training run from a TOML config")
     train.add_argument("config")
     train.add_argument(
@@ -552,6 +636,18 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="key=value",
         help="override a config value; repeatable",
     )
+    train.add_argument(
+        "--gpus",
+        dest="overrides",
+        action="append",
+        type=_gpu_count_override,
+        metavar="N",
+        help=(
+            "most cards to run the job on; sets [gpu] count (1-8). a ceiling, not an exact "
+            "count: allocation still picks one card when one fits the run alone, and only "
+            "rentable counts (1, 2, 4, 8) are ever provisioned"
+        ),
+    )
     train.add_argument("--dry-run", action="store_true")
     train.add_argument(
         "--cost",
@@ -565,6 +661,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     train.set_defaults(func=cmd_train)
 
+
+def _add_runs_commands(sub: argparse._SubParsersAction) -> None:
+    """`runs list/status/log/cancel/checkpoint`."""
     runs = sub.add_parser("runs", help="manage training runs")
     runs.set_defaults(func=cmd_runs)  # hidden bare `flash runs` shim for deployed agents
     runs_sub = runs.add_subparsers(dest="runs_cmd", required=False)
@@ -605,26 +704,9 @@ def _build_parser() -> argparse.ArgumentParser:
     runs_checkpoint.add_argument("run_id")
     runs_checkpoint.set_defaults(func=cmd_checkpoints)
 
-    # deployed freesolo agents still invoke these root run-management forms. keep them callable but
-    # omit them from all help and docs while consumers migrate to `flash runs ...`.
-    legacy_status = sub.add_parser("status", help=argparse.SUPPRESS)
-    legacy_status.add_argument("run_id")
-    legacy_status.add_argument("-f", "--follow", action="store_true")
-    legacy_status.set_defaults(func=cmd_status)
 
-    legacy_log = sub.add_parser("log", help=argparse.SUPPRESS)
-    legacy_log.add_argument("run_id")
-    legacy_log.add_argument("-f", "--follow", action="store_true")
-    legacy_log.set_defaults(func=cmd_log)
-
-    legacy_cancel = sub.add_parser("cancel", help=argparse.SUPPRESS)
-    legacy_cancel.add_argument("run_id")
-    legacy_cancel.set_defaults(func=cmd_cancel)
-
-    legacy_checkpoints = sub.add_parser("checkpoints", help=argparse.SUPPRESS)
-    legacy_checkpoints.add_argument("run_id")
-    legacy_checkpoints.set_defaults(func=cmd_checkpoints)
-
+def _add_deployment_commands(models_sub: argparse._SubParsersAction) -> None:
+    """`models deploy/undeploy/export/deployments/chat`, hung off the `models` subparser."""
     deploy = models_sub.add_parser("deploy", help="deploy a run's adapter to a serving endpoint")
     deploy.add_argument(
         "run_id",
@@ -703,16 +785,6 @@ def _build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--temperature", type=float, default=0.0)
     chat.set_defaults(func=cmd_chat)
 
-    hidden_run_aliases = {"status", "log", "cancel", "checkpoints"}
-    sub._choices_actions[:] = [
-        action for action in sub._choices_actions if action.dest not in hidden_run_aliases
-    ]
-
-    # The control plane is operator-only and run as a separate one-off service via the
-    # `flash-server` console script (flash.server.__main__:main), not a `flash` subcommand.
-
-    return parser
-
 
 # commands that bind work to an organization: either they write to it, or they resolve a project
 # with the ambient key and bake it into local artifacts that later writes inherit. a shadowed login
@@ -747,8 +819,10 @@ def _warn_if_login_shadowed(args) -> None:
     """Surface an ambient FREESOLO_API_KEY that binds a command to another org."""
     if getattr(args, "func", None) not in _ORG_BINDING_COMMANDS:
         return
-    # `train --cost` is catalog-only: it never loads credentials or reaches an organization, so a
-    # warning that names the environment key's org would describe a request this command never makes.
+    # `train --cost` cannot be classified here: the algorithm is only known once the config is
+    # parsed, which happens inside the command. grpo/opd stay catalog-only and must not warn about
+    # an org they never reach; sft authenticates and can start a billed profile run, so it emits
+    # this warning itself (see commands._cmd_train_cost_sft).
     if getattr(args, "cost", False):
         return
     message = shadowed_login_warning()
@@ -763,7 +837,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     configure_logging(verbosity=getattr(args, "verbose", 0))
     debug = getattr(args, "debug", False)
-    update_check = maybe_start_update_check()
     _warn_if_login_shadowed(args)
     try:
         return args.func(args)
@@ -795,5 +868,3 @@ def main(argv: list[str] | None = None) -> int:
         print(render.error(str(exc) or exc.__class__.__name__), file=sys.stderr)
         print(render.arrow(f"run `{cmd}` for the full traceback"), file=sys.stderr)
         return 1
-    finally:
-        emit_update_notice(update_check)

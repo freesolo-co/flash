@@ -110,7 +110,10 @@ def test_stale_generation_cannot_commit_ready_revision(monkeypatch, tmp_path):
     revision = f"{run_id}@final." + "e" * 40
     stale_generation = runner.verified_adapter_revision_generation(run_id)
 
-    assert runner.clear_verified_adapter_revisions(run_id) == stale_generation + 1
+    assert (
+        runner.invalidate_verified_adapter_revisions(run_id, commit=lambda: None)
+        == stale_generation + 1
+    )
     status = runner.mark_checkpoint_deployed(
         run_id,
         {
@@ -206,7 +209,7 @@ def test_verified_revision_ledger_survives_new_process(monkeypatch, tmp_path):
 def test_verified_revision_ledger_fails_closed_without_fcntl(monkeypatch):
     # fcntl is unix-only; on platforms without it the ledger must fail closed
     # rather than silently skip its cross-process lock.
-    from flash.runner import verified_revisions
+    from flash.runner.results import verified_revisions
 
     monkeypatch.setattr(verified_revisions, "fcntl", None)
     with pytest.raises(RuntimeError, match="verified-revision locking is unavailable"):
@@ -219,7 +222,7 @@ def test_cli_import_chain_survives_missing_fcntl():
     # hard-depend on it. blocking fcntl mimics a platform that lacks the module.
     code = (
         "import sys; sys.modules['fcntl'] = None; "
-        "import flash.runner.verified_revisions; "
+        "import flash.runner.results.verified_revisions; "
         "import flash.cli"
     )
     result = subprocess.run(

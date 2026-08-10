@@ -1,6 +1,6 @@
 """Focused hermetic coverage for the shared instance bootstrap (Vast/Lambda worker container).
 
-These target under-covered helpers in ``flash.providers._instance_bootstrap``: payload loading,
+These target under-covered helpers in ``flash.providers._lifecycle.bootstrap``: payload loading,
 code-prefix validation, the Hugging Face transient-retry machinery (status/Retry-After parsing +
 backoff), the HF upload/exists/fetch wrappers, ``run_mode``'s subprocess tee (success + wall-clock
 timeout), the attempt-marker writer, the preload wall-cap watchdog ``_fire`` path, and ``main()``'s
@@ -23,8 +23,8 @@ import types
 
 import pytest
 
-from flash.providers import _instance_bootstrap as b
-from flash.providers._deadline import deadline_kwargs
+from flash.providers._lifecycle import bootstrap as b
+from flash.providers._lifecycle.deadline import deadline_kwargs
 
 CODE_PREFIX = "code/0123456789abcdef0123456789abcdef/flash"
 
@@ -670,6 +670,77 @@ def test_run_mode_success_returns_rc_and_uploads_console(monkeypatch):
     assert "world" in body
 
 
+def test_run_mode_caps_the_worker_at_the_declared_wall_budget(monkeypatch):
+    """Unspent provisioning time must not become extra WORK time.
+
+    The absolute deadline is minted when the box is RENTED, so a job whose deadline deliberately
+    carries a boot allowance on top of its wall budget -- a workload profile does exactly this --
+    would hand a fast-booting box the whole remainder to work in. The plane tightens its own
+    deadline at the first heartbeat, but FLASH_RUN_DEADLINE_AT is absolute and already delivered,
+    so nothing downstream would ever narrow it: a 10-minute profile could work ~30 minutes on a job
+    priced for its wall alone.
+    """
+    _disable_periodic_console_upload(monkeypatch)
+    monkeypatch.setattr(b, "_upload_console_tail_bounded", lambda *a, **k: True)
+    monkeypatch.setattr(b, "hf_upload", lambda *a, **k: None)
+    popen_calls = []
+
+    def popen(*args, **kwargs):
+        popen_calls.append((args, kwargs))
+        return _FakeProc([], rc=0)
+
+    monkeypatch.setattr(b.subprocess, "Popen", popen)
+
+    budget = 600.0
+    # rent + work + a 20-minute provisioning allowance, with the boot having cost almost nothing.
+    deadline = b.time.time() + budget + 20 * 60
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "profile/run",
+        "env": {},
+        "code_prefix": CODE_PREFIX,
+        "run_max_wall_seconds": budget,
+    }
+    assert b.run_mode(payload, {}, "profile", deadline_ts=deadline) == 0
+
+    handed = float(popen_calls[0][1]["env"]["FLASH_RUN_DEADLINE_AT"])
+    assert handed - b.time.time() <= budget, (
+        "the worker was handed more than the run's declared wall budget, so unspent provisioning "
+        "time became extra work time on a job priced for its wall alone"
+    )
+    # and the cap is the ONLY thing that shortened it -- not the cleanup reserves.
+    assert handed < b._worker_execution_deadline(b._upload_cleanup_deadlines(deadline)[0])
+
+
+def test_run_mode_leaves_a_deadline_already_inside_the_budget_alone(monkeypatch):
+    """The cap must not shorten an ordinary run whose deadline is already within its budget."""
+    _disable_periodic_console_upload(monkeypatch)
+    monkeypatch.setattr(b, "_upload_console_tail_bounded", lambda *a, **k: True)
+    monkeypatch.setattr(b, "hf_upload", lambda *a, **k: None)
+    popen_calls = []
+
+    def popen(*args, **kwargs):
+        popen_calls.append((args, kwargs))
+        return _FakeProc([], rc=0)
+
+    monkeypatch.setattr(b.subprocess, "Popen", popen)
+
+    deadline = b.time.time() + 100
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/run",
+        "env": {},
+        "code_prefix": CODE_PREFIX,
+        "run_max_wall_seconds": 3600.0,
+    }
+    assert b.run_mode(payload, {}, "sft", deadline_ts=deadline) == 0
+
+    upload_deadline, _reaping = b._upload_cleanup_deadlines(deadline)
+    assert float(popen_calls[0][1]["env"]["FLASH_RUN_DEADLINE_AT"]) == pytest.approx(
+        b._worker_execution_deadline(upload_deadline)
+    )
+
+
 @pytest.mark.parametrize(
     "wait_error",
     [SystemExit(17), KeyboardInterrupt("interrupted")],
@@ -1111,6 +1182,7 @@ def test_run_mode_reaps_periodic_uploader_before_terminal_marker_reserve(monkeyp
     assert events[-1] == ("marker", marker_started_at, False)
 
 
+@pytest.mark.wallclock
 @pytest.mark.parametrize("_iteration", range(3))
 def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monkeypatch, _iteration):
     stop_timeout = 0.03
@@ -1244,6 +1316,7 @@ def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monke
     assert terminal_markers[0][1] <= reaping_deadline
 
 
+@pytest.mark.wallclock
 def test_stop_upload_process_reaps_real_sleeping_child_before_marker_reserve():
     context = multiprocessing.get_context("spawn")
     process = _InspectableProcess(context.Process(target=_sleeping_upload_child, daemon=True))
@@ -1273,6 +1346,7 @@ def test_stop_upload_process_reaps_real_sleeping_child_before_marker_reserve():
         process.close_real()
 
 
+@pytest.mark.wallclock
 def test_final_upload_reaps_real_sigterm_ignoring_child_before_marker_reserve(monkeypatch):
     context = multiprocessing.get_context("spawn")
     ready = context.Event()

@@ -5,7 +5,7 @@ name: flash worker kernel-cache (per-arch)
 #   1. offloads the warmup to a RunPod GPU of that arch (GH runners have none) -> build/kernel_cache,
 #   2. docker build --build-arg BUILD_KERNEL_CACHE=true -> ghcr.io/freesolo-co/flash-worker:cu128-<sm>,
 #   3. pushes it. The allocator then selects the cu128-<sm> tag per GPU class for baked arches
-#      (see flash/providers/_worker.py).
+#      (see flash/providers/_lifecycle/worker.py).
 #
 # Depends on the base ghcr.io/freesolo-co/flash-worker:cu128 image existing (worker-image.yml) — the
 # warmup runs INSIDE it so the cache matches the image's pinned torch/triton/fla/liger toolchain.
@@ -59,7 +59,25 @@ jobs:
   # second manual approval here would be redundant. Re-add an `approve` job with `environment: gpu-bake`
   # (and `needs: approve`) if you ever want a human checkpoint back.
   bake:
+    # Upstream only -- see publish.yml. "Ungated" above means no human APPROVAL step; it never meant
+    # any repository may start it. This workflow is directly dispatchable (`workflow_dispatch`), so
+    # a fork reaches it without passing auto-rebake's fingerprint gate, and it both requests the
+    # org-only `ubuntu-24.04-8core` runner (a label a fork has no runner for, so the job QUEUES
+    # instead of failing) and creates paid RunPod resources. `workflow_call` from auto-rebake still
+    # satisfies this, because a called workflow evaluates `github.repository` as the CALLER's repo.
+    if: github.repository == 'freesolo-co/flash'
     runs-on: ubuntu-24.04-8core
+    # 47min is the slowest run on record (the rest sit at 12-23min); 120 absorbs a slow provider
+    # allocation without letting a hung bake hold the runner for the 6-hour default.
+    #
+    # This bounds the RUNNER, and only indirectly the spend. The rented pod is released by the
+    # `finally` in docker/bake_kernel_cache.py, so the pod outlives the timeout in exactly the case
+    # the timeout exists for: if the controller is wedged inside a blocking call, GitHub kills it
+    # and that `finally` may never complete, leaving a billed pod with nothing left to terminate it.
+    # Closing that needs a server-side pod lifetime or an out-of-band reaper -- a change to the bake
+    # tooling rather than to this workflow, so it is deliberately NOT bundled here. Until then, read
+    # this cap as "the runner stops waiting", not "the bill stops".
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -126,16 +144,26 @@ jobs:
             *) echo "run=false" >> "$GITHUB_OUTPUT"; echo "skipping ${{ matrix.sm }}" ;;
           esac
 
+      # Downloaded to disk and checksum-verified before extraction, rather than piped straight
+      # into tar: a piped stream is extracted as it arrives, so a corrupted or substituted
+      # artifact is already on PATH by the time anything could notice. Bump the version and the
+      # digest together (the vendor publishes checksums.txt alongside each release).
       - name: Install crane
         if: steps.gate.outputs.run == 'true'
         run: |
-          curl -sSL https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz \
-            | sudo tar -xz -C /usr/local/bin crane
+          set -euo pipefail
+          ver=v0.20.2
+          sha=c14340087103ba9dadf61d45acd20675490fd0ccbd56ac7901fc1b502137f44b
+          curl -fsSL -o /tmp/crane.tar.gz \
+            "https://github.com/google/go-containerregistry/releases/download/${ver}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${sha}  /tmp/crane.tar.gz" | sha256sum -c -
+          sudo tar -xz -C /usr/local/bin -f /tmp/crane.tar.gz crane
+          rm -f /tmp/crane.tar.gz
           crane version
 
       - name: Log in to GHCR
         if: steps.gate.outputs.run == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -167,14 +195,14 @@ jobs:
       # Pin the checkout to the base's source commit so the warmed flash code matches the base exactly
       # (the cache is content-keyed by the code that compiled it). Falls back to the event sha if the
       # base predates the revision label.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         if: steps.gate.outputs.run == 'true'
         with:
           ref: ${{ steps.base.outputs.revision || github.sha }}
 
       - name: Install uv
         if: steps.gate.outputs.run == 'true'
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           # no cache: the post-run cache-prune calls `uv`, but the "Free disk space" step deletes
           # /opt/hostedtoolcache (where setup-uv put uv), so the post step fails ("uv not found") and
@@ -188,8 +216,7 @@ jobs:
       # RUNPOD_API_KEY (the warmup GPU pod) + HF_TOKEN (the temp dataset that ferries code/cache) are
       # native repo Actions secrets, synced from Infisical (prod:/flash-ci) by the github-ci-flash
       # Secret Sync. No Infisical CLI/login at job time -- Infisical stays the source of truth and
-      # rotations propagate via the sync. FLASH_CHALK_SPEC isn't synced, so bake_kernel_cache.py uses
-      # the repo-default DEFAULT_CHALK_SPEC (the value the fingerprint hashed) automatically. BASE_IMAGE
+      # rotations propagate via the sync. BASE_IMAGE
       # is digest-pinned so the warm runs inside the EXACT base the per-arch tag will sit on.
       - name: Warm kernels on a RunPod ${{ matrix.sm }} GPU -> build/kernel_cache
         if: steps.gate.outputs.run == 'true'
@@ -216,7 +243,7 @@ jobs:
           sudo docker image prune -af || true
           df -h /
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
         if: steps.gate.outputs.run == 'true'
 
       # thin layer FROM the SAME base the warmup ran inside -> the cache toolchain always matches the
@@ -224,7 +251,7 @@ jobs:
       # published base and bake a cache that silently won't load). GHCR auth from the login step above.
       - name: Build + push baked per-sm image (thin layer on the warmed base)
         if: steps.gate.outputs.run == 'true'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: docker/Dockerfile.kernelcache

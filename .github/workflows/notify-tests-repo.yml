@@ -16,7 +16,16 @@ permissions:
 
 jobs:
   notify:
+    # Upstream only -- see publish.yml. A fork has no FREESOLO_GITHUB_PAT and nothing to notify,
+    # so it must not run this at all. Skipping the whole JOB (rather than exiting 0 inside the
+    # step) is what lets the step below treat an absent secret as the error it is: with the fork
+    # case handled here, the only way to reach that step without a PAT is a real upstream
+    # misconfiguration.
+    if: github.repository == 'freesolo-co/flash'
     runs-on: ubuntu-latest
+    # One API call. The cap exists so a hung TLS connect releases the runner instead of holding
+    # it for the 6-hour default; every recorded run of this workflow finishes inside a minute.
+    timeout-minutes: 5
     steps:
       - name: Dispatch to freesolo-co/tests
         env:
@@ -24,9 +33,21 @@ jobs:
           SHA: ${{ github.sha }}
           REF: ${{ github.ref_name }}
         run: |
-          if [ -z "$PAT" ]; then
-            echo "No FREESOLO_GITHUB_PAT (likely a fork) — skipping dispatch."
-            exit 0
+          set -euo pipefail
+          # This used to `exit 0` when the PAT was absent, on the theory that only a fork could
+          # hit that branch. It made the guard fail-OPEN: the secret has never existed on this
+          # repository (flash's secrets are HF_TOKEN, PYPI_API_TOKEN, RUNPOD_API_KEY, and the org
+          # holds none), so every push took the skip branch and reported success while
+          # dispatching nothing. The tests repo recorded 0 `flash-merged` events against 100+
+          # `freesolo-merged` ones -- the flash<->backend suites have never gated a flash merge,
+          # and nothing was ever red to say so.
+          #
+          # The fork case now short-circuits at the job's `if:`, so reaching here without a
+          # credential means the upstream repo is misconfigured. Fail loudly: a notifier that
+          # cannot notify is broken, and silence is indistinguishable from success.
+          if [ -z "${PAT:-}" ]; then
+            echo "::error::FREESOLO_GITHUB_PAT is not set on ${GITHUB_REPOSITORY}. The dispatch to freesolo-co/tests cannot be sent, so the cross-repo integration suites will NOT run for this commit. Add the secret to this repository (it is a freesolo-co/tests-scoped PAT; repo, org, and environment scopes are three separate lists)."
+            exit 1
           fi
           curl -fsS -X POST \
             -H "Authorization: Bearer ${PAT}" \

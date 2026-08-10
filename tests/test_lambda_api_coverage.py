@@ -17,7 +17,7 @@ import pytest
 @pytest.fixture(autouse=True)
 def _reset_types_cache():
     """The instance-type cache is a module global; reset it around every test for determinism."""
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     lambda_api._types_cache.update(ts=0.0, data=None)
     yield
@@ -43,7 +43,7 @@ class _FakeResponse:
 def _seed_types(monkeypatch, data):
     """Prime the instance-type cache fresh (ts == now) so list_instance_types serves it without a
     request — lets the capacity/pricing readers run against a fixed catalog."""
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     monkeypatch.setattr(lambda_api.time, "time", lambda: 1000.0)
     lambda_api._types_cache.update(ts=1000.0, data=data)
@@ -54,7 +54,7 @@ def _seed_types(monkeypatch, data):
 # _data envelope unwrap
 # ---------------------------------------------------------------------------
 def test_data_unwraps_only_the_data_envelope():
-    from flash.providers.lambdalabs.api import _data
+    from flash.providers.lambda_.api import _data
 
     # a {"data": ...} envelope is unwrapped to its payload (even a falsy one)
     assert _data({"data": [1, 2]}) == [1, 2]
@@ -69,7 +69,7 @@ def test_data_unwraps_only_the_data_envelope():
 # list_instance_types: cache-hit / force / TTL expiry / bad shape
 # ---------------------------------------------------------------------------
 def test_list_instance_types_caches_forces_and_expires(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     clock = {"t": 1000.0}
     monkeypatch.setattr(lambda_api.time, "time", lambda: clock["t"])
@@ -97,7 +97,7 @@ def test_list_instance_types_caches_forces_and_expires(monkeypatch):
 
 
 def test_list_instance_types_rejects_non_dict_payload(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     monkeypatch.setattr(lambda_api.time, "time", lambda: 1000.0)
     monkeypatch.setattr(
@@ -171,7 +171,7 @@ def test_instance_type_price_usd_hr_variants(monkeypatch):
 # list_ssh_keys / list_filesystems / list_instances: list-or-empty + paths
 # ---------------------------------------------------------------------------
 def test_list_ssh_keys_returns_list_or_empty(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     monkeypatch.setattr(
         lambda_api, "request_with_retries", lambda path, **kw: {"data": [{"name": "jk"}]}
@@ -185,7 +185,7 @@ def test_list_ssh_keys_returns_list_or_empty(monkeypatch):
 
 
 def test_list_filesystems_uses_hyphenated_path_and_list_or_empty(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     seen = {}
 
@@ -201,7 +201,7 @@ def test_list_filesystems_uses_hyphenated_path_and_list_or_empty(monkeypatch):
 
 
 def test_list_instances_returns_list_or_empty(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     monkeypatch.setattr(
         lambda_api, "request_with_retries", lambda path, **kw: {"data": [{"id": "i-1"}]}
@@ -215,7 +215,7 @@ def test_list_instances_returns_list_or_empty(monkeypatch):
 # launch_instance: non-idempotent POST, body shape, missing-id guard
 # ---------------------------------------------------------------------------
 def test_launch_instance_builds_body_and_returns_first_id(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     seen = {}
 
@@ -259,7 +259,7 @@ def test_launch_instance_builds_body_and_returns_first_id(monkeypatch):
 
 
 def test_launch_instance_raises_when_no_instance_id(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     kwargs = {
         "region_name": "us-east-1",
@@ -282,7 +282,7 @@ def test_launch_instance_raises_when_no_instance_id(monkeypatch):
 # filesystem create/delete/ensure (path asymmetry + idempotent ensure)
 # ---------------------------------------------------------------------------
 def test_create_filesystem_posts_to_unhyphenated_path_and_dict_or_empty(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     seen = {}
     deadline_at = 1_000_000_000_000.0
@@ -311,7 +311,7 @@ def test_create_filesystem_posts_to_unhyphenated_path_and_dict_or_empty(monkeypa
 
 
 def test_delete_filesystem_true_on_success_false_on_error(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     seen = {}
 
@@ -332,7 +332,7 @@ def test_delete_filesystem_true_on_success_false_on_error(monkeypatch):
 
 
 def test_ensure_filesystem_reuses_same_name_and_region(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     deadline_at = 1_000_000_000_000.0
     monkeypatch.setattr(
@@ -366,7 +366,7 @@ def test_ensure_filesystem_reuses_same_name_and_region(monkeypatch):
 
 
 def test_ensure_filesystem_creates_when_absent(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     deadline_at = 1_000_000_000_000.0
     monkeypatch.setattr(lambda_api, "list_filesystems", lambda **_kwargs: [])
@@ -391,7 +391,7 @@ def test_ensure_filesystem_creates_when_absent(monkeypatch):
 # get_instance: dict / 404-None / non-404 re-raise / non-dict-None
 # ---------------------------------------------------------------------------
 def test_get_instance_dict_none_on_404_and_reraises_others(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     monkeypatch.setattr(
         lambda_api,
@@ -424,7 +424,7 @@ def test_get_instance_dict_none_on_404_and_reraises_others(monkeypatch):
 # terminate_instances: per-id isolation + falsy filtering + stringify
 # ---------------------------------------------------------------------------
 def test_terminate_instances_isolates_per_id_and_filters(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     bodies = []
 
@@ -443,7 +443,7 @@ def test_terminate_instances_isolates_per_id_and_filters(monkeypatch):
 
 
 def test_terminate_instance_confirmed_requires_acceptance_and_disappearance(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids: list(ids))
     monkeypatch.setattr(lambda_api, "get_instance", lambda iid, *, strict: None)
@@ -464,7 +464,7 @@ def test_terminate_instance_confirmed_requires_acceptance_and_disappearance(monk
 
 
 def test_strict_instance_reads_reject_malformed_success_payloads(monkeypatch):
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     monkeypatch.setattr(lambda_api, "request_with_retries", lambda *a, **k: {"data": {}})
     with pytest.raises(lambda_api.LambdaApiError, match=r"listing.*malformed"):
@@ -481,15 +481,15 @@ def test_strict_instance_reads_reject_malformed_success_payloads(monkeypatch):
 def test_request_with_retries_requires_configured_key():
     # the autouse offline fixture deletes LAMBDA_API_KEY; the real wrapper must surface the
     # control-plane-specific missing-key message before touching the network.
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     with pytest.raises(lambda_api.LambdaApiError, match="LAMBDA_API_KEY not configured"):
         lambda_api.request_with_retries("/instance-types")
 
 
 def test_real_request_sends_user_agent_and_unwraps_envelope(monkeypatch):
-    from flash.providers import _http
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers._lifecycle import http as _http
+    from flash.providers.lambda_ import api as lambda_api
 
     monkeypatch.setenv("LAMBDA_API_KEY", "lk-test")
     monkeypatch.setattr(lambda_api.time, "time", lambda: 1000.0)

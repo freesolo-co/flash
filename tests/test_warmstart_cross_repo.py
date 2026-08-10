@@ -8,7 +8,16 @@ from types import SimpleNamespace
 
 import pytest
 
-import flash.engine.worker as W
+# The LIVE package proxy, not `import flash.engine.worker as W`. The code under test reads its
+# run-scoped globals through this same proxy (see flash/engine/worker/model/adapter.py), which
+# resolves `sys.modules['flash.engine.worker']` on every access. A module-level `import ... as W`
+# binds one package OBJECT at collection time; any earlier test that drops the package from
+# sys.modules and re-imports it (tests/test_worker_stack.py does, to re-run the import scope that
+# captures RUN_MODE/JOB_SPEC) replaces that object, and this alias keeps pointing at the dead one.
+# Patching the stale alias then sets an attribute nothing reads -- `revision` comes back None and
+# the failure is attributed to this file rather than the re-import that caused it. Patching through
+# the proxy targets whatever package the code will actually read.
+from flash.engine.worker.runtime.pkg_proxy import W
 from tests._helpers.runner import provisioned_status
 
 _REVISION = "a" * 40
@@ -160,10 +169,10 @@ def test_mark_warmstart_source_noops_without_a_real_dependency(monkeypatch):
 
 
 def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeypatch):
-    import flash.lora_rank as rank_mod
+    import flash.adapters.lora_rank as rank_mod
     import flash.runner as R
-    import flash.runner.checkpoints as checkpoints
-    from flash.spec import JobSpec
+    import flash.runner.results.checkpoints as checkpoints
+    from flash.core.spec import JobSpec
 
     source = JobSpec.from_dict(
         {
@@ -232,7 +241,7 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
 
 def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
     import flash.runner as R
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     source = JobSpec.from_dict(
         {
@@ -262,11 +271,11 @@ def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
 def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
     import types
 
+    import flash.adapters.lora_rank as rank_mod
     import flash.cost.spec as cost_spec
-    import flash.lora_rank as rank_mod
     import flash.runner as R
-    import flash.runner.checkpoints as checkpoints
-    from flash.spec import JobSpec
+    import flash.runner.results.checkpoints as checkpoints
+    from flash.core.spec import JobSpec
 
     source = JobSpec.from_dict(
         {
@@ -338,7 +347,7 @@ def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
 
 def test_effective_preparation_persists_but_is_not_public(monkeypatch, tmp_path):
     import flash.runner as R
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(R, "RUNS_DIR", str(tmp_path / "runs"))
     public = JobSpec.from_dict(
@@ -469,7 +478,7 @@ def test_public_status_redacts_internal_storage_ref_on_valid_spec(stored_ref, ex
 @pytest.mark.parametrize("snapshot", [None, []])
 def test_persist_effective_warmstart_requires_valid_snapshot(monkeypatch, tmp_path, snapshot):
     import flash.runner as R
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(R, "RUNS_DIR", str(tmp_path / "runs"))
     public = JobSpec.from_dict(
@@ -496,7 +505,7 @@ def test_persist_effective_warmstart_requires_valid_snapshot(monkeypatch, tmp_pa
 def test_selected_gpu_is_persisted_for_handleless_cleanup(monkeypatch, tmp_path):
     import flash.providers as providers
     import flash.runner as R
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(R, "RUNS_DIR", str(tmp_path / "runs"))
     public = JobSpec.from_dict(
@@ -546,16 +555,18 @@ def test_selected_gpu_is_persisted_for_handleless_cleanup(monkeypatch, tmp_path)
             cleaned.append(spec)
 
     monkeypatch.setattr(providers, "get_provider", lambda name: Provider())
-    monkeypatch.setattr(providers, "available_providers", list)
+    # runpod configured: its gc is the one reaping the rN-suffixed endpoints this test is about.
+    # (only runpod is available, so the assertion counts one gc, not three.)
+    monkeypatch.setattr(providers, "available_providers", lambda: ("runpod",))
     R._gc_run_endpoints(public)
 
     assert [spec.gpu.type for spec in cleaned] == ["RTX 5090"]
 
 
 def test_recovery_revalidates_pinned_revision_after_default_branch_moves(monkeypatch):
-    import flash.lora_rank as rank_mod
+    import flash.adapters.lora_rank as rank_mod
     import flash.runner as R
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     public = JobSpec.from_dict(
         {
@@ -625,7 +636,7 @@ def test_effective_snapshot_rejects_tampering(field, value):
     import copy
 
     import flash.runner as R
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     public = JobSpec.from_dict(
         {
@@ -678,7 +689,7 @@ def test_effective_snapshot_rejects_tampering(field, value):
 
 
 def test_worker_metrics_sanitizer_redacts_nested_and_direct_private_refs():
-    from flash.engine.accounting import RunMetrics, sanitize_worker_metrics
+    from flash.engine.result.accounting import RunMetrics, sanitize_worker_metrics
 
     private_ref = "private-owner/private-repo:rl/source-run/checkpoints/step-20"
     payload = {
@@ -705,8 +716,8 @@ def test_worker_metrics_sanitizer_redacts_nested_and_direct_private_refs():
 
 def test_persist_metrics_reports_only_sanitized_worker_metrics(monkeypatch, tmp_path):
     import flash.runner as R
-    import flash.server.run_registry as registry
-    from flash.spec import JobSpec
+    import flash.server.domain.run_registry as registry
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(R, "RESULTS_DIR", str(tmp_path / "results"))
     private_ref = "private-owner/private-repo:rl/source-run"
@@ -745,7 +756,7 @@ def test_persist_metrics_reports_only_sanitized_worker_metrics(monkeypatch, tmp_
 
 def test_legacy_warmstart_status_fails_closed_without_private_snapshot():
     import flash.runner as R
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
 
     public = JobSpec.from_dict(
         {

@@ -2,18 +2,12 @@
 
 A crash- or preemption-killed run is relaunched on a fresh worker by the control-plane
 retry loop, and that fresh worker continues training from the latest streamed checkpoint
-rather than restarting from scratch. This file locks in the three load-bearing pieces of
-that path, none of which were covered by ``test_checkpoints.py`` (which only exercises the
-*deployable* per-step adapter snapshots, a separate accumulating path):
+rather than restarting from scratch. This file locks in the two live load-bearing pieces:
 
-  1. WORKER STREAM — ``make_checkpoint_upload_callback`` streams each trainer save's FULL
-     state (optimizer/scheduler/RNG kept, not stripped) to ``<prefix>/checkpoint/checkpoint-<N>``,
-     pruned latest-only via ``delete_patterns`` so a replacement worker finds exactly one.
-  2. WORKER RESUME — ``hf_resume_checkpoint`` pulls that stream and returns the highest-step
-     checkpoint dir (what both SFT and GRPO hand to ``trainer.train(resume_from_checkpoint=...)``).
-  3. CONTROL PLANE — ``_submit_seed_supervised`` relaunches on the SAME run_id + seed for every
-     infra-shaped failure (``stalled``/``no_capacity``/``poll_error``/``job_preempted``), which is
-     the key that lets (2) find (1)'s checkpoint; a genuine worker error fails fast instead.
+  1. worker resume: ``hf_resume_checkpoint`` pulls the stream and returns the highest-step
+     checkpoint directory used by the training backend.
+  2. control plane: ``_submit_seed_supervised`` relaunches on the same run id and seed for every
+     infra-shaped failure; a genuine worker error fails fast instead.
 
 All HF/provider/network boundaries are stubbed; nothing here touches a GPU or the network.
 """
@@ -23,11 +17,11 @@ from __future__ import annotations
 import io
 import os
 import shutil
-from types import SimpleNamespace
 
 import pytest
 
-from flash.spec import JobSpec
+from flash.core.spec import JobSpec
+from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
 # Infra-shaped failure categories the retry loop resumes on (see lifecycle._submit_seed_supervised).
 # Mirrors the literal tuple in the source; this test is the guard that the set doesn't silently drift.
@@ -35,9 +29,6 @@ INFRA_SHAPED = ("stalled", "no_capacity", "poll_error", "job_preempted")
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
 
 
-# ============================================================================================
-# 1. WORKER STREAM — make_checkpoint_upload_callback
-# ============================================================================================
 class _RecordingHfApi:
     def __init__(self, files: list[str] | None = None):
         self.uploads: list[dict] = []
@@ -54,25 +45,6 @@ class _RecordingHfApi:
         self.deleted.append(path_in_repo)
 
 
-class _SyncThread:
-    """Stand-in for threading.Thread that runs the target inline on .start().
-
-    The upload callback fires the HF push on a background daemon thread so the train loop never
-    blocks on the network; running it synchronously makes the unit test deterministic (no join).
-    """
-
-    def __init__(self, target=None, daemon=None, **_):
-        self._target = target
-
-    def start(self):
-        if self._target:
-            self._target()
-
-    def join(self, timeout=None):
-        # quack like Thread: liveness_heartbeat joins its daemon on block exit.
-        return None
-
-
 def _prime_worker(monkeypatch, recorder, *, repo="org/test-runs", run="flash-resume-1"):
     import flash.engine.worker as worker
 
@@ -82,143 +54,11 @@ def _prime_worker(monkeypatch, recorder, *, repo="org/test-runs", run="flash-res
     monkeypatch.setattr(worker, "SEED", 0)
     monkeypatch.setattr(worker, "hf_api", lambda: recorder)
     monkeypatch.setattr(worker, "heartbeat", lambda *a, **k: None)
-    # Run the daemon upload thread inline so the assert sees the push.
-    monkeypatch.setattr(worker.threading, "Thread", _SyncThread)
     return worker
 
 
-def _full_checkpoint(tmp_path, step):
-    """A trainer checkpoint dir carrying the adapter AND optimizer/RNG trainer-state."""
-    ckpt = tmp_path / f"checkpoint-{step}"
-    ckpt.mkdir()
-    (ckpt / "adapter_config.json").write_text("{}")
-    (ckpt / "adapter_model.safetensors").write_bytes(b"weights")
-    (ckpt / "optimizer.pt").write_bytes(b"opt")
-    (ckpt / "rng_state.pth").write_bytes(b"rng")
-    return ckpt
-
-
-@pytest.fixture
-def fake_transformers(monkeypatch):
-    """Inject a minimal ``transformers`` stub (just a ``TrainerCallback`` base) so the checkpoint-upload
-    regression tests RUN in offline CI — which lacks the GPU-only ``transformers`` extra — instead of
-    being ``importorskip``'d away (where they'd silently protect nothing). The upload callback only
-    subclasses ``TrainerCallback`` (imported lazily inside make_checkpoint_upload_callback) and all HF
-    I/O is stubbed via _RecordingHfApi, so a real transformers install is unnecessary; the stub keeps
-    the coverage deterministic everywhere. Mirrors the existing stub in test_worker_dryrun.py."""
-    import sys
-    import types
-
-    mod = types.ModuleType("transformers")
-
-    class TrainerCallback:
-        pass
-
-    mod.TrainerCallback = TrainerCallback
-    monkeypatch.setitem(sys.modules, "transformers", mod)
-    return mod
-
-
-def test_upload_callback_streams_full_state_checkpoint_latest_only(
-    tmp_path, monkeypatch, fake_transformers
-):
-    """on_save streams the resume checkpoint to <prefix>/checkpoint/checkpoint-<N>, pruned latest-only.
-
-    This is the upload a preempted run resumes FROM, so it must (a) keep the trainer state
-    (no ignore_patterns dropping optimizer.pt) and (b) prune older checkpoint dirs AFTER the new one
-    lands so hf_resume_checkpoint never disambiguates (or re-downloads) stale state.
-    """
-    prefix = "rl/flash-resume-1"
-    rec = _RecordingHfApi(
-        files=[
-            f"{prefix}/checkpoint/checkpoint-40/optimizer.pt",  # stale prior step
-            f"{prefix}/checkpoint/checkpoint-60/optimizer.pt",
-        ]
-    )
-    worker = _prime_worker(monkeypatch, rec)
-    _full_checkpoint(tmp_path, 60)
-
-    cb = worker.make_checkpoint_upload_callback()
-    cb.on_save(
-        SimpleNamespace(output_dir=str(tmp_path)),
-        SimpleNamespace(global_step=60),
-        SimpleNamespace(),
-    )
-    assert worker.flush_optional_uploads()
-
-    streams = [u for u in rec.uploads if u["path_in_repo"].endswith("/checkpoint/checkpoint-60")]
-    assert len(streams) == 1, "the resumable full-state checkpoint must be streamed exactly once"
-    up = streams[0]
-    assert up["path_in_repo"] == f"{prefix}/checkpoint/checkpoint-60"
-    assert up["repo_type"] == "dataset"
-    # delete_patterns is matched RELATIVE to path_in_repo (the step dir) so it can't reach sibling step
-    # dirs; the callback prunes them explicitly, AFTER the new one lands (latest-only).
-    assert "delete_patterns" not in up
-    assert rec.deleted == [f"{prefix}/checkpoint/checkpoint-40"]
-    # FULL state: this upload must NOT strip optimizer/RNG — that's what makes the resume true
-    # (Adam moments + LR schedule + RNG continue) rather than re-initializing the optimizer.
-    assert "ignore_patterns" not in up
-
-
-def test_upload_callback_also_publishes_deployable_snapshot(
-    tmp_path, monkeypatch, fake_transformers
-):
-    """Each save additionally mirrors an adapter-only, NON-pruned per-step deployable snapshot.
-
-    The two paths are distinct: the resume stream (above) is full-state + latest-only; the
-    deployable snapshot is adapter-only + accumulating. on_save drives both off one checkpoint.
-    """
-    rec = _RecordingHfApi()
-    worker = _prime_worker(monkeypatch, rec)
-    _full_checkpoint(tmp_path, 60)
-
-    worker.make_checkpoint_upload_callback().on_save(
-        SimpleNamespace(output_dir=str(tmp_path)),
-        SimpleNamespace(global_step=60),
-        SimpleNamespace(),
-    )
-    assert worker.flush_optional_uploads()
-
-    deployable = [
-        u for u in rec.uploads if u["path_in_repo"].endswith("/checkpoints/step-60/adapter")
-    ]
-    assert len(deployable) == 1
-    up = deployable[0]
-    # Adapter-only (trainer state stripped) and accumulating (never pruned).
-    assert "optimizer.pt" in up["ignore_patterns"]
-    assert "delete_patterns" not in up
-
-
-def test_upload_callback_noop_without_repo(tmp_path, monkeypatch, fake_transformers):
-    rec = _RecordingHfApi()
-    worker = _prime_worker(monkeypatch, rec, repo="")  # local/dev run, no artifact repo
-    _full_checkpoint(tmp_path, 10)
-
-    worker.make_checkpoint_upload_callback().on_save(
-        SimpleNamespace(output_dir=str(tmp_path)),
-        SimpleNamespace(global_step=10),
-        SimpleNamespace(),
-    )
-    assert rec.uploads == []
-
-
-def test_upload_callback_skips_when_checkpoint_dir_missing(
-    tmp_path, monkeypatch, fake_transformers
-):
-    """A save event whose checkpoint folder isn't on disk yet must not push a phantom commit."""
-    rec = _RecordingHfApi()
-    worker = _prime_worker(monkeypatch, rec)
-    # No checkpoint-30 dir created under output_dir.
-    worker.make_checkpoint_upload_callback().on_save(
-        SimpleNamespace(output_dir=str(tmp_path)),
-        SimpleNamespace(global_step=30),
-        SimpleNamespace(),
-    )
-    assert rec.uploads == []
-
-
 # ============================================================================================
-# 2. WORKER RESUME — hf_resume_checkpoint
+# worker resume: hf_resume_checkpoint
 # ============================================================================================
 def _fake_snapshot(steps, *, with_weights=True):
     """Stand in for huggingface_hub.snapshot_download: materialize the selected checkpoint dirs.
@@ -478,17 +318,22 @@ def test_hf_resume_checkpoint_pinned_without_numeric_dir_raises(monkeypatch, res
 def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
     gpu = {"type": "RTX 4090", "max_retries": 2}
     gpu.update(gpu_kw)
-    return JobSpec.from_dict(
+    spec = JobSpec.from_dict(
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "sft",
             # authoritative seed 0 matches the literal seed threaded into _submit_seed_supervised below.
             "seed": 0,
             "run_id": run_id,
-            "train": {"epochs": 1, "hf_repo": "owner/runs"},
+            "train": {"epochs": 1, "max_examples": 1, "hf_repo": "owner/runs"},
             "gpu": gpu,
         }
     )
+    # the relaunch path re-quotes from the spec it holds, and an sft quote reads the workload
+    # profile. these tests start *after* preparation, from the spec a prepared run already carries,
+    # so the profile is attached here rather than driven through submission: from_dict is the public
+    # shape and deliberately cannot carry one.
+    return attach_sft_profile(spec)
 
 
 def _alloc():
@@ -554,6 +399,10 @@ def orch(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
+    # the spec carries a pinned model revision (the profile is keyed on one), which makes the
+    # post-allocation quote refresh resolve revision-specific geometry from the hub. these tests are
+    # about the retry loop, so read the catalog's numbers instead of the network.
+    stub_revision_geometry(monkeypatch)
     # The retry loop tears the prior attempt's endpoint down before relaunching; keep it off-network.
     monkeypatch.setattr(
         runpod_api,
@@ -601,7 +450,7 @@ def test_infra_failure_relaunches_same_run_and_seed(orch, monkeypatch, failure):
 
 
 def test_unconfirmed_instance_teardown_fails_terminal_and_reaps(orch, monkeypatch):
-    """Codex MtzrH: when an instance-provider destroy() RAISES (Vast's unconfirmed DELETE — the old box
+    """When an instance-provider destroy() RAISES (Vast's unconfirmed DELETE — the old box
     may STILL be running and writing this seed's HF artifacts), the retry must NOT launch a second
     worker over it (double-bill + corrupt the shared seed-scoped DONE/metrics). Force-reap the run's
     label (provider.gc, run-scoped / not active-shielded) and FAIL the seed terminally; the handle is
@@ -660,8 +509,8 @@ def test_unconfirmed_instance_teardown_fails_terminal_and_reaps(orch, monkeypatc
 def test_unconfirmed_lambda_teardown_blocks_replacement_and_preserves_handle(orch, monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import Allocation, Candidate, PollResult
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs as lambda_jobs
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs as lambda_jobs
 
     submits = []
     gc_calls = []
@@ -763,7 +612,7 @@ def test_await_runpod_completed_metrics_bounds_pending_poll_to_grace(monkeypatch
     # to ~the grace window measured from first observation, not the run deadline that callers pass in.
     import time as _time
 
-    import flash.runner.lifecycle as lifecycle
+    import flash.runner.supervise.lifecycle as lifecycle
 
     fake_clock = {"now": 1_000.0}
     monkeypatch.setattr(_time, "time", lambda: fake_clock["now"])
@@ -798,7 +647,7 @@ def test_await_runpod_completed_metrics_bounds_pending_poll_to_grace(monkeypatch
 
 
 def test_await_runpod_completed_metrics_checks_cancellation_before_sleep(monkeypatch):
-    import flash.runner.lifecycle as lifecycle
+    import flash.runner.supervise.lifecycle as lifecycle
     from flash.runner import _RunCancelled
 
     monkeypatch.setattr(
@@ -843,7 +692,7 @@ def test_unconfirmed_runpod_teardown_blocks_replacement_and_preserves_handle(
     from flash.providers.base import PollResult
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs as rp_jobs
-    from flash.providers.runpod import train as runpod_train
+    from flash.providers.runpod import serverless as runpod_train
 
     submits = []
     teardown_events = []
@@ -978,7 +827,7 @@ def test_worker_error_fails_fast_without_relaunch(orch, monkeypatch):
 
 
 def test_unreconciled_create_fails_fast_without_relaunch(orch, monkeypatch):
-    """Codex MtbAD: an ambiguous, unreconciled non-idempotent create (Vast's ``PUT /asks`` 5xx with no
+    """An ambiguous, unreconciled non-idempotent create (Vast's ``PUT /asks`` 5xx with no
     instance adoptable) raises ``UnreconciledCreateError`` from submit. The supervisor must classify it
     TERMINAL (job_failed), NOT as the generic ``poll_error`` flake — retrying would rent a SECOND box
     while the phantom from this attempt may still surface and bill under the still-active run."""

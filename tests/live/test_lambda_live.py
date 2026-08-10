@@ -26,7 +26,7 @@ def _require_key():
 def test_lambda_auth_and_list_instance_types():
     """Auth + reachability: listing instance types is a read-only account call."""
     _require_key()
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     types = lambda_api.list_instance_types()
     assert isinstance(types, dict)  # 200 + a dict == authed & reachable
@@ -35,7 +35,7 @@ def test_lambda_auth_and_list_instance_types():
 def test_lambda_list_filesystems_is_reachable():
     """The weight-cache read path (list_filesystems) authenticates and returns a list."""
     _require_key()
-    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambda_ import api as lambda_api
 
     fses = lambda_api.list_filesystems()
     assert isinstance(

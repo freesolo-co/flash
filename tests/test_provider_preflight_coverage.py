@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-import flash.providers.lambdalabs.preflight as lambda_preflight
+import flash.providers.lambda_.preflight as lambda_preflight
 import flash.providers.runpod.preflight as runpod_preflight
 import flash.providers.vast.preflight as vast_preflight
 

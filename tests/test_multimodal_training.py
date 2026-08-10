@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import base64
-import copy
 import io
 import json
-import sys
 import urllib.parse
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 
-from flash import multimodal as mm
+from flash.content import multimodal as mm
+from tests._helpers.profile import attach_sft_profile
+
+# one text row and one image row: the shape a ceiling-based quote cannot describe.
+_MIXED_RECORDS = [
+    {"input": "text", "output": "answer"},
+    {"input": "image", "output": "red", "image": "dataset/red.png"},
+]
 
 
 def _png_bytes(color=(255, 0, 0), size=(2, 2)) -> bytes:
@@ -193,131 +198,23 @@ def test_relative_paths_are_confined_to_packaged_dataset_directory(tmp_path):
         mm.normalize_image_source(outside.resolve().as_uri(), root)
 
 
-def _addrinfo(*addresses):
-    return [
-        (
-            mm.socket.AF_INET6 if ":" in address else mm.socket.AF_INET,
-            mm.socket.SOCK_STREAM,
-            6,
-            "",
-            (address, 80, 0, 0) if ":" in address else (address, 80),
-        )
-        for address in addresses
-    ]
-
-
-def _install_http_response(monkeypatch, *, status=200, data=b"", headers=None):
-    class _Response:
-        def __init__(self):
-            self.status = status
-            self.headers = dict(headers or {})
-
-        def read(self, size):
-            assert size == mm.MAX_IMAGE_SOURCE_BYTES + 1
-            return data
-
-        def close(self):
-            return None
-
-    class _Connection:
-        def __init__(self, address, port, timeout):
-            assert address == "93.184.216.34"
-            assert port == 80
-            assert timeout == mm._REMOTE_TIMEOUT_SECONDS
-
-        def request(self, method, target, headers):
-            assert method == "GET"
-            assert target == "/red.png"
-            assert headers["Host"] == "images.example"
-
-        def getresponse(self):
-            return _Response()
-
-        def close(self):
-            return None
-
-    monkeypatch.setattr(mm.http.client, "HTTPConnection", _Connection)
-
-
-def test_remote_images_are_opt_in_and_bounded(monkeypatch, tmp_path):
-    root, _image = _package(tmp_path)
-    url = "http://images.example/red.png"
-    with pytest.raises(ValueError, match="disabled"):
-        mm.normalize_image_source(url, root)
-
-    monkeypatch.setenv(mm.REMOTE_IMAGE_ENV, "1")
-    monkeypatch.setattr(
-        mm.socket, "getaddrinfo", lambda *args, **kwargs: _addrinfo("93.184.216.34")
-    )
-    _install_http_response(
-        monkeypatch,
-        headers={"Content-Length": str(mm.MAX_IMAGE_SOURCE_BYTES + 1)},
-    )
-    with pytest.raises(ValueError, match="source exceeds"):
-        mm.normalize_image_source(url, root)
-
-    data = _png_bytes()
-    _install_http_response(
-        monkeypatch,
-        data=data,
-        headers={"Content-Length": str(len(data))},
-    )
-    descriptor = mm.normalize_image_source(url, root)
-    assert json.loads(descriptor)["kind"] == "bytes"
-    image, _encoded, _decoded = mm.decode_image_descriptor(descriptor, root)
-    assert image.size == (2, 2)
-
-
-def test_remote_images_are_fetched_once_and_materialized_as_bytes(monkeypatch):
-    data = _png_bytes()
-    url = "https://images.example/red.png"
-    calls = []
-
-    monkeypatch.setenv(mm.REMOTE_IMAGE_ENV, "1")
-    monkeypatch.setattr(mm, "_read_remote", lambda value: calls.append(value) or data)
-
-    descriptor = mm.normalize_image_source(url, None)
-    parsed = json.loads(descriptor)
-
-    assert parsed["kind"] == "bytes"
-    assert base64.b64decode(parsed["value"], validate=True) == data
-    image, _encoded, _decoded = mm.decode_image_descriptor(descriptor, None)
-    assert image.size == (2, 2)
-    assert calls == [url]
-
-
 @pytest.mark.parametrize(
-    "addresses",
-    [
-        ("169.254.169.254",),
-        ("127.0.0.1",),
-        ("10.0.0.7",),
-        ("::1",),
-        ("fe80::1",),
-        ("93.184.216.34", "10.0.0.7"),
-    ],
+    "url",
+    ["http://images.example/red.png", "https://images.example/red.png"],
 )
-def test_remote_images_reject_any_non_global_dns_answer(monkeypatch, addresses):
-    monkeypatch.setenv(mm.REMOTE_IMAGE_ENV, "1")
-    monkeypatch.setattr(mm.socket, "getaddrinfo", lambda *args, **kwargs: _addrinfo(*addresses))
+def test_remote_image_urls_are_always_rejected(monkeypatch, url):
+    """Flash never fetches a user-supplied URL server-side, and nothing can re-enable it.
 
-    with pytest.raises(ValueError, match="globally routable"):
-        mm.normalize_image_source("http://images.example/red.png", None)
+    The rejection is unconditional by construction: there is no env flag, no argument, and no
+    module attribute left to flip, so a dataset carrying a remote URL fails at normalization
+    rather than turning the trainer into an SSRF vector.
+    """
+    with pytest.raises(ValueError, match="remote image URLs are not supported"):
+        mm.normalize_image_source(url, None)
 
-
-def test_remote_images_do_not_follow_redirects_to_private_hosts(monkeypatch):
-    monkeypatch.setenv(mm.REMOTE_IMAGE_ENV, "1")
-    monkeypatch.setattr(
-        mm.socket, "getaddrinfo", lambda *args, **kwargs: _addrinfo("93.184.216.34")
-    )
-    _install_http_response(
-        monkeypatch,
-        status=302,
-        headers={"Location": "http://169.254.169.254/latest/meta-data/"},
-    )
-
-    with pytest.raises(ValueError, match="redirects are not allowed"):
-        mm.normalize_image_source("http://images.example/red.png", None)
+    # the fetch machinery itself is gone, not merely gated
+    for removed in ("_read_remote", "_remote_enabled", "_validate_remote_url", "REMOTE_IMAGE_ENV"):
+        assert not hasattr(mm, removed)
 
 
 def test_malformed_blocks_fail_clearly(tmp_path):
@@ -392,92 +289,41 @@ def test_total_decoded_budget_is_checked_before_any_image_load_or_conversion(mon
     assert decode_calls == []
 
 
-def test_sft_collator_decodes_arrow_safe_images_at_batch_time(tmp_path):
-    root, _image = _package(tmp_path)
-    descriptor = mm.normalize_image_source("dataset/red.png", root)
-    observed = {}
+def test_a_row_whose_completion_truncated_away_is_dropped_not_trained_on():
+    """A row that keeps no unmasked, non-special target token teaches nothing and must be dropped.
 
-    def delegate(rows):
-        observed["rows"] = rows
-        return {"labels": [[-100, 7]]}
+    `sft_max_len` truncates from the right, so a long prompt can leave a row whose completion is
+    gone entirely: every position is either prompt (loss_mask 0) or a structural special token.
+    Training on it is not merely wasted -- the row still contributes its prompt to the batch, so the
+    reported mask ratio and token counts describe a dataset the model never learned from, and a
+    dataset that truncates away *every* completion must abort rather than run to completion having
+    learned nothing.
 
-    collator = mm.ArrowSafeVisionCollator(None, 32, root, delegate=delegate)
-    result = collator([{"prompt": [], "completion": [], "images": [descriptor]}])
+    This was `filter_vlm_sft_rows`, which measured the same thing off the vision collator's labels.
+    verl pre-tokenizes to `input_ids`/`loss_mask` instead, so the check moved to `has_real_target`
+    -- same invariant, different representation, and nothing covered it after the move.
+    """
+    from flash.engine.worker.entry.sft import has_real_target
 
-    assert result == {"labels": [[-100, 7]]}
-    assert observed["rows"][0]["images"][0].size == (2, 2)
-
-
-def test_dataset_transform_decodes_only_when_rows_are_requested(monkeypatch):
-    calls = []
-
-    def fake_decode(values, package_root):
-        calls.append((list(values), package_root))
-        return ["decoded"]
-
-    monkeypatch.setattr(mm, "decode_image_descriptors", fake_decode)
-    transform = mm.lazy_image_dataset_transform("/package")
-    batch = {"prompt": [[{"role": "user", "content": "x"}]], "images": [["descriptor"]]}
-
-    assert calls == []
-    transformed = transform(batch)
-    assert transformed["images"] == [["decoded"]]
-    assert calls == [(["descriptor"], "/package")]
-
-
-def test_vlm_sft_filter_preserves_completion_mask_and_max_context_behavior():
-    rows = [{"id": "kept"}, {"id": "empty"}, {"id": "truncated"}]
-
-    def collator(batch):
-        row = batch[0]
-        if row["id"] == "kept":
-            return {"labels": [[-100, -100, 7, 2]], "attention_mask": [[1, 1, 1, 1]]}
-        if row["id"] == "empty":
-            return {"labels": [[-100, 2]], "attention_mask": [[1, 1]]}
-        return {"labels": [[-100, -100]], "attention_mask": [[1, 1]]}
-
-    kept, dropped, masked, total = mm.filter_vlm_sft_rows(rows, collator, {2})
-    assert kept == [{"id": "kept"}]
-    assert dropped == 2
-    assert masked == 2
-    assert total == 4
-
-
-def test_processor_prompt_count_uses_expanded_vision_tokens(monkeypatch, tmp_path):
-    root, _image = _package(tmp_path)
-    descriptor = mm.normalize_image_source("dataset/red.png", root)
-    observed = {}
-
-    trl_module = ModuleType("trl")
-    data_utils_module = ModuleType("trl.data_utils")
-    data_utils_module.prepare_multimodal_messages = lambda messages, images: [
-        {"role": "user", "content": [{"type": "image", "image": images[0]}]}
-    ]
-    trl_module.data_utils = data_utils_module
-    monkeypatch.setitem(sys.modules, "trl", trl_module)
-    monkeypatch.setitem(sys.modules, "trl.data_utils", data_utils_module)
-
-    class _Processor:
-        def apply_chat_template(self, **kwargs):
-            observed.update(kwargs)
-            return {"input_ids": [[1] * 257]}
-
-    count = mm.processor_prompt_token_count(
-        _Processor(),
-        [{"role": "user", "content": [{"type": "image"}]}],
-        [descriptor],
-        root,
-    )
-    assert count == 257
-    assert observed["tokenize"] is True
-    assert observed["return_dict"] is True
+    eos = 2
+    special = {eos}
+    # a real target: one unmasked token that is not a special.
+    assert has_real_target([9, 9, 7, eos], [0, 0, 1, 1], special)
+    # completion truncated away: every unmasked position is prompt.
+    assert not has_real_target([9, 9, 7, eos], [0, 0, 0, 0], special)
+    # content-free completion: unmasked, but only the structural end token.
+    assert not has_real_target([9, eos], [0, 1], special)
+    # the mask -- not the token -- decides: the same ids masked as prompt are not a target.
+    assert not has_real_target([7, 7], [0, 0], special)
+    # and a special id that is NOT registered special still counts as real content.
+    assert has_real_target([9, eos], [0, 1], set())
 
 
 def test_grpo_rows_retain_arrow_safe_images_and_reward_examples(tmp_path):
     pytest.importorskip("datasets")
     from datasets import Dataset
 
-    from flash.engine.worker.grpo import build_grpo_prompt_dataset
+    from flash.engine.worker.train.rl.config import build_grpo_prompt_dataset
 
     root, _image = _package(tmp_path)
     descriptor = mm.normalize_image_source("dataset/red.png", root)
@@ -510,7 +356,7 @@ def test_single_turn_conversational_completion_keeps_text_reward_semantics():
 
 
 def test_sft_rejects_image_completion_when_prompt_is_text_only():
-    from flash.engine.worker.sft import _reject_image_completion
+    from flash.engine.worker.entry.sft import _reject_image_completion
 
     completion = [
         {
@@ -532,7 +378,7 @@ def test_sft_mixed_text_completion_shapes_are_arrow_safe():
     pytest.importorskip("datasets")
     from datasets import Dataset
 
-    from flash.engine.worker import sft
+    from flash.engine.profiling import sft_workload
 
     completions = [
         [{"role": "assistant", "content": "red"}],
@@ -550,116 +396,12 @@ def test_sft_mixed_text_completion_shapes_are_arrow_safe():
     dataset = Dataset.from_list(rows)
 
     assert [row["completion"][0]["content"] for row in dataset] == ["red", "blue"]
-    assert "completion = text_only_prompt_messages(completion)" in inspect.getsource(sft.run_sft)
-
-
-def test_image_content_key_is_stable_and_pixel_sensitive():
-    image_module = pytest.importorskip("PIL.Image")
-    red = image_module.new("RGB", (2, 2), (255, 0, 0))
-    red_copy = copy.deepcopy(red)
-    blue = image_module.new("RGB", (2, 2), (0, 0, 255))
-    wide_red = image_module.new("RGB", (4, 1), (255, 0, 0))
-
-    assert mm.image_content_key(red) == mm.image_content_key(red_copy)
-    assert mm.image_content_key(red) != mm.image_content_key(blue)
-    assert mm.image_content_key(red) != mm.image_content_key(wide_red)
-
-
-def test_multimodal_prompt_key_and_index_distinguish_image_content(monkeypatch):
-    pytest.importorskip("trl")
-    from trl.data_utils import prepare_multimodal_messages
-
-    image_module = pytest.importorskip("PIL.Image")
-    placeholder = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "what color?"},
-                {"type": "image"},
-            ],
-        }
-    ]
-    red_descriptor = mm.normalize_image_source(image_module.new("RGB", (2, 2), (255, 0, 0)), None)
-    blue_descriptor = mm.normalize_image_source(image_module.new("RGB", (2, 2), (0, 0, 255)), None)
-    red_example = {"answer": "red"}
-    blue_example = {"answer": "blue"}
-    prompts = [
-        {"prompt": placeholder, "images": [red_descriptor], "example": red_example},
-        {"prompt": placeholder, "images": [blue_descriptor], "example": blue_example},
-    ]
-
-    decoded_images = 0
-    real_decode = mm.decode_image_descriptors
-
-    def counted_decode(descriptors, package_root):
-        nonlocal decoded_images
-        decoded_images += len(descriptors)
-        return real_decode(descriptors, package_root)
-
-    monkeypatch.setattr(mm, "decode_image_descriptors", counted_decode)
-    index, collisions = mm.build_multimodal_examples_index(prompts, None)
-    assert len(index) == 2
-    assert collisions == 0
-    assert decoded_images == 2
-
-    red_messages = prepare_multimodal_messages(
-        placeholder,
-        images=mm.decode_image_descriptors([red_descriptor], None),
+    # the normalizer must actually be applied on the training path, not merely importable: a mixed
+    # str/list `content` column makes Arrow infer a struct type and drops one shape at write time.
+    assert (
+        "completion_messages = text_only_prompt_messages(completion_messages)"
+        in inspect.getsource(sft_workload)
     )
-    blue_messages = prepare_multimodal_messages(
-        placeholder,
-        images=mm.decode_image_descriptors([blue_descriptor], None),
-    )
-    assert mm.multimodal_prompt_key(red_messages) != mm.multimodal_prompt_key(blue_messages)
-    assert mm.multimodal_prompt_key(copy.deepcopy(red_messages)) == mm.multimodal_prompt_key(
-        red_messages
-    )
-    assert index[mm.multimodal_prompt_key(red_messages)] is red_example
-    assert index[mm.multimodal_prompt_key(blue_messages)] is blue_example
-
-
-def test_multimodal_prompt_key_preserves_message_metadata_in_index():
-    trl_data_utils = pytest.importorskip("trl.data_utils")
-    prepare_multimodal_messages = trl_data_utils.prepare_multimodal_messages
-    image_module = pytest.importorskip("PIL.Image")
-    descriptor = mm.normalize_image_source(image_module.new("RGB", (1, 1), "red"), None)
-    first_example = {"answer": "first"}
-    second_example = {"answer": "second"}
-    first_prompt = [{"role": "user", "name": "first-viewer", "content": [{"type": "image"}]}]
-    second_prompt = [{"role": "user", "name": "second-viewer", "content": [{"type": "image"}]}]
-    prompts = [
-        {"prompt": first_prompt, "images": [descriptor], "example": first_example},
-        {"prompt": second_prompt, "images": [descriptor], "example": second_example},
-    ]
-
-    index, collisions = mm.build_multimodal_examples_index(prompts, None)
-    images = mm.decode_image_descriptors([descriptor], None)
-    first_messages = prepare_multimodal_messages(first_prompt, images=images)
-    second_messages = prepare_multimodal_messages(second_prompt, images=images)
-    first_key = mm.multimodal_prompt_key(first_messages)
-    second_key = mm.multimodal_prompt_key(second_messages)
-
-    assert first_key != second_key
-    assert collisions == 0
-    assert len(index) == 2
-    assert index[first_key] is first_example
-    assert index[second_key] is second_example
-
-
-def test_multimodal_examples_index_reports_identical_prompt_image_collision():
-    pytest.importorskip("trl")
-    image_module = pytest.importorskip("PIL.Image")
-    placeholder = [{"role": "user", "content": [{"type": "image"}]}]
-    descriptor = mm.normalize_image_source(image_module.new("RGB", (1, 1), "red"), None)
-    prompts = [
-        {"prompt": placeholder, "images": [descriptor], "example": {"answer": "first"}},
-        {"prompt": placeholder, "images": [descriptor], "example": {"answer": "last"}},
-    ]
-
-    index, collisions = mm.build_multimodal_examples_index(prompts, None)
-    assert collisions == 1
-    assert len(index) == 1
-    assert next(iter(index.values())) == {"answer": "last"}
 
 
 def test_image_teacher_prompt_uses_one_media_pad_per_descriptor_in_order():
@@ -722,32 +464,32 @@ def test_text_only_prompt_messages_drops_images_and_preserves_text_order():
     assert messages[1]["content"][1]["image"] is pil
 
 
-def test_multimodal_algorithm_validation_rejects_unsupported_modes():
+def test_multimodal_algorithm_validation_rejects_all_image_opd_after_model_validation():
     mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "sft")
-    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "grpo", multi_turn=False)
-    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "grpo", multi_turn=True)
-    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "opd", multi_turn=False)
-    with pytest.raises(ValueError, match="single-turn"):
-        mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "opd", multi_turn=True)
+    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "grpo")
+    with pytest.raises(ValueError, match="image-bearing opd is not supported"):
+        mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "opd")
     with pytest.raises(ValueError, match="does not support"):
         mm.validate_multimodal_training("meta-llama/Llama-3.2-1B", "opd")
 
 
 def test_native_single_turn_image_grpo_suppresses_image_pad_generation():
+    """An image run must not be able to generate the image-pad token itself. verl generates in its
+    own subprocess, so the ban is injected as a rollout shim rather than a generate kwarg."""
     import inspect
 
-    from flash.engine.worker import rl
+    from flash.engine.worker import rl_train
 
-    source = inspect.getsource(rl.run_rl)
-    guard = "if multimodal and not is_multi_turn:"
-    suppression = '_gen_kwargs["logit_bias"] = {resolve_image_pad_token_id(processor, tok): -100.0}'
+    # the shim's own rendering is covered in test_rl_train.py; what belongs here is the multimodal
+    # wiring -- the pad id comes from the PROCESSOR (a text run resolves none) and reaches the shim.
+    resolver = inspect.getsource(rl_train._resolve_grpo_inputs)
+    assert "image_pad_token_id = resolve_image_pad_token_id(processor, tok)" in resolver
 
-    assert guard in source
-    assert suppression in source
-    assert source.index(guard) < source.index(suppression)
+    entry = inspect.getsource(rl_train._write_rl_shim)
+    assert 'render_image_pad_ban_shim(inp["image_pad_token_id"])' in entry
 
 
-def test_image_opd_preflight_validates_packaged_dataset_before_allocation(tmp_path):
+def test_image_opd_preflight_rejects_packaged_dataset_before_allocation(tmp_path):
     root, _image = _package(tmp_path)
     env_file = root / "environment.py"
     env_file.write_text("def load_environment(**kwargs):\n    return None\n")
@@ -759,55 +501,19 @@ def test_image_opd_preflight_validates_packaged_dataset_before_allocation(tmp_pa
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
         environment=environment,
-        train=SimpleNamespace(teacher_model="kimi-k2.6"),
+        train=SimpleNamespace(teacher_model="kimi-k3"),
     )
-    mm.preflight_validate_image_opd(supported)
+    with pytest.raises(ValueError, match="image-bearing opd is not supported"):
+        mm.preflight_validate_image_opd(supported)
 
     unsupported = SimpleNamespace(
         model="meta-llama/Llama-3.2-1B",
         algorithm="opd",
         environment=environment,
-        train=SimpleNamespace(teacher_model="kimi-k2.6"),
+        train=SimpleNamespace(teacher_model="kimi-k3"),
     )
     with pytest.raises(ValueError, match="does not support image-bearing"):
         mm.preflight_validate_image_opd(unsupported)
-
-
-@pytest.mark.parametrize("teacher_model", ["", "glm-5.2", "deepseek-v4-pro"])
-def test_image_opd_preflight_requires_kimi_vision_teacher(tmp_path, teacher_model):
-    root, _image = _package(tmp_path)
-    env_file = root / "environment.py"
-    env_file.write_text("def load_environment(**kwargs):\n    return None\n")
-    (root / "dataset" / "train.jsonl").write_text(
-        json.dumps({"input": "color?", "output": "red", "image": "dataset/red.png"}) + "\n"
-    )
-    spec = SimpleNamespace(
-        model="Qwen/Qwen3.5-4B",
-        algorithm="opd",
-        environment=SimpleNamespace(id=str(env_file), resolved_sha="", params={}),
-        train=SimpleNamespace(teacher_model=teacher_model),
-    )
-
-    with pytest.raises(ValueError, match=r"requires .*kimi-k2\.6"):
-        mm.preflight_validate_image_opd(spec)
-
-
-def test_image_opd_preflight_preserves_multi_turn_rejection(tmp_path):
-    root, _image = _package(tmp_path)
-    env_file = root / "environment.py"
-    env_file.write_text("def load_environment(**kwargs):\n    return None\n")
-    (root / "dataset" / "train.jsonl").write_text(
-        json.dumps({"input": "color?", "output": "red", "image": "dataset/red.png"}) + "\n"
-    )
-    multi_turn = SimpleNamespace(
-        model="Qwen/Qwen3.5-4B",
-        algorithm="opd",
-        environment=SimpleNamespace(id=str(env_file), resolved_sha="", params={}, multi_turn=True),
-        train=SimpleNamespace(teacher_model="kimi-k2.6"),
-    )
-
-    with pytest.raises(ValueError, match="single-turn"):
-        mm.preflight_validate_image_opd(multi_turn)
 
 
 @pytest.mark.parametrize("record_source", ["inline", "packaged"])
@@ -842,22 +548,22 @@ def test_image_opd_preflight_limits_scan_to_max_examples(tmp_path, record_source
 
 
 @pytest.mark.parametrize("background", [False, True])
-def test_image_opd_submit_preflight_accepts_supported_single_turn_records(
+def test_image_opd_submit_preflight_rejects_supported_single_turn_records(
     monkeypatch, tmp_path, background
 ):
     from flash import runner
-    from flash.spec import JobSpec
-
-    class _ReachedSubmitBoundary(RuntimeError):
-        pass
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
 
-    def reached_submit_boundary(*args, **kwargs):
-        raise _ReachedSubmitBoundary
+    def fail(*args, **kwargs):
+        raise AssertionError("rejected submit must not mutate warm-start state or reach providers")
 
-    monkeypatch.setattr(runner, "_mark_warmstart_source", reached_submit_boundary)
+    monkeypatch.setattr(runner, "_mark_warmstart_source", fail)
+    monkeypatch.setattr(runner, "_run_job", fail)
+    monkeypatch.setattr(runner, "_run_job_background", fail)
+    monkeypatch.setattr(runner.threading, "Thread", fail)
 
     spec = JobSpec.from_dict(
         {
@@ -870,28 +576,23 @@ def test_image_opd_submit_preflight_accepts_supported_single_turn_records(
                     "records": [{"input": "color?", "output": "red", "image": "dataset/red.png"}]
                 },
             },
-            "train": {"epochs": 1, "max_examples": 1, "teacher_model": "kimi-k2.6"},
+            "train": {"epochs": 1, "max_examples": 1, "teacher_model": "kimi-k3"},
         }
     )
 
-    with pytest.raises(_ReachedSubmitBoundary):
+    with pytest.raises(ValueError, match="image-bearing opd is not supported"):
         runner.submit_job(spec, background=background)
     with pytest.raises(FileNotFoundError):
         runner.get_status(spec.run_id)
 
 
-@pytest.mark.parametrize(
-    ("algorithm", "model", "extra_params", "message"),
-    [
-        ("opd", "meta-llama/Llama-3.2-1B", {}, "does not support image-bearing"),
-        ("opd", "Qwen/Qwen3.5-4B", {"multi_turn": True}, "single-turn"),
-    ],
-)
-def test_image_opd_submit_preflight_rejects_unsupported_or_multi_turn_records(
-    monkeypatch, tmp_path, algorithm, model, extra_params, message
-):
+def test_image_opd_submit_preflight_preserves_unsupported_model_precedence(monkeypatch, tmp_path):
     from flash import runner
-    from flash.spec import JobSpec
+    from flash.core.spec import JobSpec
+
+    algorithm = "opd"
+    model = "meta-llama/Llama-3.2-1B"
+    message = "does not support image-bearing"
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
@@ -903,17 +604,14 @@ def test_image_opd_submit_preflight_rejects_unsupported_or_multi_turn_records(
     monkeypatch.setattr(runner, "_run_job", fail)
     monkeypatch.setattr(runner, "_run_job_background", fail)
     monkeypatch.setattr(runner.threading, "Thread", fail)
-    params = {
-        "records": [{"input": "color?", "output": "red", "image": "dataset/red.png"}],
-        **extra_params,
-    }
+    params = {"records": [{"input": "color?", "output": "red", "image": "dataset/red.png"}]}
     spec = JobSpec.from_dict(
         {
             "run_id": f"image-{algorithm}-reject-{model.rsplit('/', 1)[-1]}",
             "model": model,
             "algorithm": algorithm,
             "environment": {"id": "local", "params": params},
-            "train": {"epochs": 1, "max_examples": 1, "teacher_model": "kimi-k2.6"},
+            "train": {"epochs": 1, "max_examples": 1, "teacher_model": "kimi-k3"},
         }
     )
     prepared = runner.PreparedJob(public_spec=spec, worker_spec=spec, estimated_cost_usd=0.0)
@@ -924,27 +622,22 @@ def test_image_opd_submit_preflight_rejects_unsupported_or_multi_turn_records(
         runner.get_status(spec.run_id)
 
 
-def test_cost_specs_price_the_full_context_budget_for_image_and_mixed_rows():
-    from flash.cost.spec import runconfig_from_spec
-    from flash.spec import JobSpec
+def test_grpo_prices_the_full_context_budget_for_image_and_mixed_rows():
+    """An image prompt occupies its context budget, so grpo prices the budget, not the text length.
 
-    mixed_records = [
-        {"input": "text", "output": "answer"},
-        {"input": "image", "output": "red", "image": "dataset/red.png"},
-    ]
-    sft_spec = JobSpec.from_dict(
-        {
-            "model": "Qwen/Qwen3.5-4B",
-            "algorithm": "sft",
-            "environment": {"id": "local", "params": {"records": mixed_records}},
-            "train": {"epochs": 1, "max_examples": 2, "max_context_tokens": 1536},
-        }
-    )
+    sft used to be asserted here against the same ceiling. It no longer prices from the ceiling at
+    all: the workload profile measures the tokens the rows actually produce, which for a mixed
+    dataset is the whole point of measuring. The companion test below holds the multimodal half of
+    that -- an image sft run cannot be quoted from an assumed context.
+    """
+    from flash.core.spec import JobSpec
+    from flash.cost.spec import runconfig_from_spec
+
     grpo_spec = JobSpec.from_dict(
         {
             "model": "Qwen/Qwen3.5-4B",
             "algorithm": "grpo",
-            "environment": {"id": "local", "params": {"records": mixed_records}},
+            "environment": {"id": "local", "params": {"records": _MIXED_RECORDS}},
             "train": {
                 "epochs": 1,
                 "max_examples": 2,
@@ -954,12 +647,39 @@ def test_cost_specs_price_the_full_context_budget_for_image_and_mixed_rows():
         }
     )
 
-    assert runconfig_from_spec(sft_spec).seq_len == 1536
     assert runconfig_from_spec(grpo_spec).seq_len == 2048
 
 
+def test_image_sft_cannot_be_priced_from_an_assumed_context():
+    """The failure mode this replaces: quoting a mixed dataset off max_context_tokens.
+
+    Image rows and text rows produce wildly different token counts, so a ceiling-based quote for a
+    mixed dataset is a guess wearing an exact number. Pricing now requires the profile that
+    tokenized these exact rows, and without one the quote fails rather than defaulting.
+    """
+    from flash.core.spec import JobSpec
+    from flash.cost.spec import runconfig_from_spec
+    from flash.engine.profiling.workload_profile import WorkloadProfileMismatch
+
+    sft_spec = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "sft",
+            "environment": {"id": "local", "params": {"records": _MIXED_RECORDS}},
+            "train": {"epochs": 1, "max_examples": 2, "max_context_tokens": 1536},
+        }
+    )
+
+    with pytest.raises(WorkloadProfileMismatch):
+        runconfig_from_spec(sft_spec)
+
+    # with the measurement attached, the priced length is the profile's, never the config ceiling.
+    priced = runconfig_from_spec(attach_sft_profile(sft_spec))
+    assert priced.seq_len == attach_sft_profile(sft_spec).workload_profile["max_length"]
+
+
 def test_catalog_image_capability_does_not_change_public_rows():
-    from flash.catalog import public_model_rows, supports_image_training
+    from flash.core.catalog import public_model_rows, supports_image_training
 
     assert supports_image_training("Qwen/Qwen3.5-4B")
     assert supports_image_training("Qwen/Qwen3.6-27B")

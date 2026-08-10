@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import importlib
 import inspect
-import sys
-import types
 from types import SimpleNamespace
 
 import pytest
 
-import flash.engine.worker.packing as packing
+import flash.engine.worker.model.packing as packing
 
 
 def test_gdn_hybrid_probe_failure_is_a_safe_false(monkeypatch, capsys) -> None:
@@ -88,63 +86,78 @@ def test_gdn_forward_probe_swallows_import_and_inspection_failures(monkeypatch) 
     assert packing._gdn_forward_threads_reset_kwargs(None) is False
 
 
-def _enable_kernel_probes(monkeypatch) -> None:
-    import transformers.utils.import_utils as import_utils
+def test_the_packing_contract_gate_never_consults_the_device() -> None:
+    """The quote-side gate must decide without a gpu, or every catalog sft run fails.
 
-    monkeypatch.setattr(import_utils, "is_flash_linear_attention_available", lambda: True)
-    monkeypatch.setattr(import_utils, "is_causal_conv1d_available", lambda: True)
+    ``prepare_sft_workload`` runs twice on DIFFERENT hardware: once in the cpu-only profile job
+    that freezes the quote (``runner`` drops the gpu type so it does not rent an H100 to tokenize)
+    and once on the gpu worker. ``sft_train`` then compares the two profiles byte-for-byte and
+    raises "sft workload changed after the quote was frozen" on any difference.
 
+    So a device-dependent packing gate answers False in the quote and True in training, mints two
+    different ``packing_mode``/``examples_per_update`` values, and fails EVERY gdn sft run on the
+    main path. ``is_flash_linear_attention_available`` / ``is_causal_conv1d_available`` are banned
+    here specifically: both open with ``is_torch_cuda_available()``.
 
-def test_gdn_packing_rejects_a_broken_causal_conv_import(monkeypatch) -> None:
-    """A package that is discoverable but ABI-broken at import time must disable packing."""
-    _enable_kernel_probes(monkeypatch)
-    real_import = importlib.import_module
+    """
+    import ast
+    import inspect
 
-    def fake_import(name):
-        if name == "causal_conv1d":
-            raise ImportError("bad abi")
-        return real_import(name)
+    fn = ast.parse(inspect.getsource(packing.gdn_packing_contract_available)).body[0]
+    if fn.body and isinstance(fn.body[0], ast.Expr) and isinstance(fn.body[0].value, ast.Constant):
+        fn.body = fn.body[1:]  # the docstring names these on purpose; only the CODE is the contract
+    code = ast.unparse(fn)
 
-    monkeypatch.setattr(importlib, "import_module", fake_import)
-
-    assert packing.gdn_packing_available() is False
-
-
-def test_gdn_packing_rejects_a_forward_signature_without_resets(monkeypatch) -> None:
-    """Installed kernels are insufficient when the model forward cannot reset sequence state."""
-    _enable_kernel_probes(monkeypatch)
-    monkeypatch.setattr(importlib, "import_module", lambda name: SimpleNamespace())
-    monkeypatch.setattr(packing, "_gdn_forward_threads_reset_kwargs", lambda *a, **k: False)
-
-    assert packing.gdn_packing_available() is False
-
-
-def test_gdn_packing_succeeds_on_cpu_when_all_non_gpu_probes_pass(monkeypatch) -> None:
-    """CPU-only control-plane probing must succeed without attempting a CUDA kernel smoke."""
-    fake_torch = types.ModuleType("torch")
-    fake_torch.cuda = SimpleNamespace(is_available=lambda: False)
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    _enable_kernel_probes(monkeypatch)
-    monkeypatch.setattr(importlib, "import_module", lambda name: SimpleNamespace())
-    monkeypatch.setattr(packing, "_gdn_forward_threads_reset_kwargs", lambda *a, **k: True)
-
-    assert packing.gdn_packing_available("owner/model") is True
+    for banned in (
+        "cuda",
+        "is_flash_linear_attention_available",
+        "is_causal_conv1d_available",
+        "get_device_capability",
+    ):
+        assert banned not in code, (
+            f"gdn_packing_contract_available consults {banned!r}, so the cpu-only profile job and "
+            "the gpu worker can disagree on packing_mode -- which fails the frozen-quote parity "
+            "check in sft_train for every gdn model"
+        )
 
 
-def test_gdn_packing_catches_unexpected_probe_failures(monkeypatch) -> None:
-    """Unexpected reset-probe errors must fail safely rather than aborting worker setup."""
-    _enable_kernel_probes(monkeypatch)
-    monkeypatch.setattr(importlib, "import_module", lambda name: SimpleNamespace())
+def test_the_strict_module_resolver_refuses_to_guess_the_arch(monkeypatch) -> None:
+    """A packed run must abort on an unreadable config, not fall back to the dense module.
+
+    `gdn_model_type` returns "qwen3_5" for a dense model AND for a config it could not read. Same
+    string, different meaning. `Qwen/Qwen3.6-35B-A3B` is `qwen3_5_moe`, so on that model the
+    fallback names a module the model does not use: the child clears it, the shim patches it, the
+    real MoE layers stay unpatched, and packed examples bleed state while the log prints
+    "gdn packed-boundary resets active".
+    """
+    import transformers
+
+    from flash.engine.worker.backend_common import strict_gdn_probe_module
+
     monkeypatch.setattr(
-        packing,
-        "_gdn_forward_threads_reset_kwargs",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("probe failed")),
+        transformers.AutoConfig,
+        "from_pretrained",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("hub read failed")),
     )
+    with pytest.raises(RuntimeError, match="refusing to guess"):
+        strict_gdn_probe_module("Qwen/Qwen3.6-35B-A3B")
 
-    assert packing.gdn_packing_available() is False
+    # a config that loads but declares no model_type is the same ambiguity, not a usable answer.
+    monkeypatch.setattr(
+        transformers.AutoConfig,
+        "from_pretrained",
+        lambda *a, **k: SimpleNamespace(model_type=None),
+    )
+    with pytest.raises(RuntimeError, match="no model_type"):
+        strict_gdn_probe_module("Qwen/Qwen3.6-35B-A3B")
 
-
-def test_pack_token_ids_rejects_nonpositive_capacity() -> None:
-    """The pure bin packer must reject invalid capacities before inspecting token rows."""
-    with pytest.raises(ValueError, match="max_length must be positive"):
-        packing.pack_token_ids([[1, 2]], 0)
+    # and it must return the arch the config actually declares, not the dense default.
+    monkeypatch.setattr(
+        transformers.AutoConfig,
+        "from_pretrained",
+        lambda *a, **k: SimpleNamespace(model_type="qwen3_5_moe"),
+    )
+    assert (
+        strict_gdn_probe_module("Qwen/Qwen3.6-35B-A3B")
+        == "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe"
+    )

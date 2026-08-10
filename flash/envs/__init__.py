@@ -1,7 +1,6 @@
 """Pluggable fine-tune/evaluation environments."""
 
-from .base import BaseEnvironment, Environment
-from .registry import load_environment
+from flash.envs.base import BaseEnvironment, Environment, load_environment
 
 __all__ = [
     "BaseEnvironment",

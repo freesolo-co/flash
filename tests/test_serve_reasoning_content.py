@@ -1,17 +1,8 @@
-"""Serving hands reasoning back in ``reasoning_content``, split out of ``content``.
+"""Serving returns reasoning in ``reasoning_content``, separate from ``content``.
 
-A thinking chat template renders the OPENING ``<think>`` into the prompt, so the model samples only
-the closing tag. Flash folds the two fields back into one balanced string: reading ``content`` alone
-drops the whole reasoning phase, and reading the raw text alone yields a stray ``</think>`` with no
-opener.
-
-Folding is gated on the request's own ``thinking`` flag rather than inferred from the text. Without
-that gate an ordinary answer containing a literal ``</think>`` was rewritten into a synthetic
-reasoning block, on a path that also backs the public non-streaming chat route.
-
-The non-streaming result is the reference shape: it is what the public chat route serves, and what
-``_thinking_answer`` and the deployment smoke were written against. Every payload the streaming path
-can also receive is pinned in ``PARITY_CASES``, where the two must agree.
+Flash restores the prompt-supplied opening ``<think>`` and folds both fields into a balanced string.
+Only the request's ``thinking`` flag enables folding, so literal tags in normal answers stay intact.
+``PARITY_CASES`` requires streaming output to match the non-streaming public route.
 """
 
 from __future__ import annotations
@@ -133,8 +124,9 @@ def test_the_fold_rebuilds_a_balanced_block(message, expected):
 def test_a_non_thinking_response_is_never_rewritten(message):
     # the request's own flag decides, not the shape of the text. inferring reasoning-ness from
     # content rewrote an ordinary answer that merely contains the literal tag -- documentation, a
-    # structured field quoting it -- into a synthetic reasoning block, and `_balance_thinking_
-    # payload` runs on EVERY `chat()` response, including the public non-thinking route.
+    # structured field quoting it -- into a synthetic reasoning block, and
+    # `_balance_thinking_payload` runs on EVERY `chat()` response, including the public
+    # non-thinking route.
     assert _folded(message, thinking=False) == message["content"]
 
 
@@ -168,15 +160,9 @@ PARITY_CASES: dict[str, tuple[dict, str]] = {
         {"content": "</think>", "reasoning_content": "why"},
         "<think>why</think></think>",
     ),
-    # the reasoning repeated inline with NO answer behind it. end of stream is where this is
-    # decidable: nothing more can arrive, so a complete pair whose body is the reasoning is the
-    # repeat. the streaming path used to flush its buffer verbatim and emit both twice.
-    #
-    # an adapter whose answer happens to BE `<think>why</think>` while reasoning about "why" sends
-    # these same bytes, and nothing in the response separates the two. folding to one block is the
-    # deliberate choice: the smoke then rejects the deployment for having no answer, where keeping
-    # both would accept an adapter that answered nothing at all. it fails closed on a shape that is
-    # ambiguous at the source, which is the direction a deployment gate should fail in.
+    # at eof, a complete inline block matching `reasoning_content` is treated as a duplicate. the
+    # same bytes could be a literal answer, but folding to one block fails the deployment smoke closed
+    # instead of accepting a response with no distinguishable answer.
     "terminal-duplicate": (
         {"content": "<think>why</think>", "reasoning_content": "why"},
         "<think>why</think>",

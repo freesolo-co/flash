@@ -1,21 +1,7 @@
 """FastAPI control plane for the managed Flash service.
 
-This is the operator-side component. It holds the provider credentials
-(``RUNPOD_API_KEY``, ``HF_TOKEN``, and environment source tokens) and exposes the
-full run lifecycle to clients that authenticate with their freesolo API key
-(verified against the freesolo backend) — clients never see provider credentials.
-
-Run state truth stays in the runner's JSON files; SQLite (server/db.py) holds
-keys and run ownership. Runs the server owns are recovered on startup by re-attaching
-to their persisted RunPod job handles.
-
-The HTTP routes live in cohesive ``flash.server.routes`` modules; this module wires them
-into the FastAPI app, holds the background lifecycle helpers, and re-exports the service
-symbols that the route handlers (and the test-suite monkeypatches) resolve through it.
-
-Importing this module must stay light: fastapi (the optional ``[server]`` extra) is imported
-only inside ``create_app`` / ``run_server``, which raise ``_SERVER_EXTRAS_HINT`` when it is
-absent. The route and ``_deps`` modules import fastapi, so they too are imported lazily there.
+It owns provider credentials, run recovery, and route wiring. Imports stay light: FastAPI and route
+modules load only inside ``create_app`` and ``run_server`` for the optional server extra.
 """
 
 from __future__ import annotations
@@ -29,7 +15,7 @@ import time
 
 from flash import __version__
 from flash.runner import get_status, prepare_job, submit_job
-from flash.runner.checkpoints import list_checkpoints
+from flash.runner.results.checkpoints import list_checkpoints
 from flash.serve.deploy import (
     adapter_alias_target,
     deploy_adapter,
@@ -39,10 +25,9 @@ from flash.serve.deploy import (
 from flash.serve.deploy import chat as serve_chat
 from flash.serve.deploy import chat_stream as serve_chat_stream
 from flash.serve.export import export_adapter
-
-from . import db
-from ._locks import _DEPLOY_LOCKS, _deploy_lock
-from ._runtime import (
+from flash.server.platform import db
+from flash.server.platform.locks import _DEPLOY_LOCKS, _deploy_lock
+from flash.server.platform.runtime import (
     _RECOVERABLE,
     _charge_retry_loop,
     _charge_retry_startup,
@@ -98,18 +83,15 @@ __all__ = [
 
 
 def _train_endpoint_names(*, include_terminal: bool) -> set[str]:
-    """Training-endpoint names derived from the run registry, in the CANONICAL (bare ``flash-...``)
-    form — the reaper canonicalizes the ``live-flash-...`` names RunPod lists before comparing, so
-    one form per name suffices. Includes both the run's persisted handle name and the name re-derived
-    from its spec, so a run is covered even in the submit -> handle-persisted window.
+    """Return canonical training-endpoint names derived from the run registry.
 
-    ``include_terminal=False`` yields the PROTECTED set (live, non-terminal runs only) — endpoints
-    the reaper must never delete, even when momentarily idle. ``include_terminal=True``
-    yields the KNOWN set (every run this plane has a record of) — used to SCOPE the reaper to this
-    plane's own endpoints (multi-plane safety; see ``_sweep_idle_flash_endpoints``)."""
+    Include persisted and spec-derived names. Non-terminal names are protected; all known names
+    scope
+    reaping to this control plane.
+    """
     from flash.providers.base import canonical_gpu
     from flash.providers.runpod.jobs import canonical_endpoint_name
-    from flash.providers.runpod.train import _run_suffix, endpoint_name
+    from flash.providers.runpod.serverless import _run_suffix, endpoint_name
     from flash.runner import TERMINAL_STATES
 
     names: set[str] = set()
@@ -237,35 +219,18 @@ async def _reap_idle_endpoints_loop() -> None:
             _log.debug("idle-endpoint reaper sweep failed; retrying next cycle", exc_info=True)
 
 
-# Run states that may still OWN a live, billing training instance, so their provider instances must
-# be PROTECTED from the orphan sweep. Deliberately EXCLUDES ``deployed``: a run only reaches
-# ``deployed`` after it went ``done`` (which already tore its training instance down), so a deployed
-# run owns no training worker — keeping it in the protection set would
-# instead SHIELD a genuine leaked instance under its prefix from the sweep (the very thing the sweep
-# exists to reap). Terminal states are excluded for the same reason. This is exactly ``_RECOVERABLE``
-# — a run is recoverable on restart iff it may still have an in-flight worker — so it is ALIASED
-# (one source of truth) to keep the two protection sets from silently drifting apart.
+# states that may still own billed training instances and must be protected from orphan sweeps.
+# alias _RECOVERABLE; deployed and terminal runs own no worker and must not shield leaks.
 _INSTANCE_OWNING_STATES = _RECOVERABLE
 
 
 def _active_run_ids() -> set[str]:
-    """Run ids of every run that may still own a live training instance — the set whose provider
-    instances must be PROTECTED from the periodic orphan sweep below. The instance providers'
-    ``sweep_orphans`` re-derives each instance-label prefix from a run id via ``run_label_prefix``,
-    so it wants raw run ids (unlike ``_protected_train_endpoint_names``, which yields RunPod endpoint
-    *names*).
+    """Return run ids that may still own a live training instance.
 
-    Why this is a safe protection set with no idle grace: a run's status is flipped to an
-    instance-owning state BEFORE its first instance is ever launched (``_run_training`` writes
-    ``running`` ahead of ``_submit_seed_supervised``), and the launched instance is torn down BEFORE
-    the run can leave these states for ``done``/``deployed``/terminal (the provider lifecycle's
-    ``finally``). So a billed instance exists ONLY while its run is in this set — ownership is a
-    deterministic name->run mapping, not the noisy idle signal the RunPod reaper must grace. The
-    sweep passes this function itself (a callable) so the set is read AFTER the provider lists, which
-    closes the launch race — see ``_sweep_orphan_instances_once``. (Startup recovery in
-    ``recover_runs`` deliberately uses a NARROWER set — only handle-backed/resume runs — because it
-    is simultaneously RESUBMITTING handle-less runs and must reap their stale half-rented instances;
-    in-lifetime we instead protect every instance-owning run.)"""
+    Status enters an owning state before launch and leaves only after teardown. Pass this callable
+    so
+    providers read the set after listing instances, closing the concurrent-launch race.
+    """
     ids: set[str] = set()
     for row in db.all_runs():
         try:
@@ -278,39 +243,21 @@ def _active_run_ids() -> set[str]:
 
 
 def _known_run_ids() -> set[str]:
-    """Every run id THIS control plane has a record of, in ANY state — the universe of instances it
-    may attribute to itself. Passed to the instance providers' ``sweep_orphans`` as ``known_labels``
-    so the sweep reaps only boxes whose label maps to one of our own runs.
+    """Return every run id recorded by this control plane, in any state.
 
-    This is the multi-plane safety guard. Two control planes sharing one provider account carry
-    DISJOINT run ids (server-assigned ``flash-<ts>-<rand>``). Without it, each plane's sweep sees the
-    OTHER's live boxes, finds their run ids absent from its ``_active_run_ids``, and reaps them — the
-    two planes mutually execute each other's running training instances every sweep. Scoping the reap
-    to ``known_labels`` makes a plane skip any box whose run id it has never issued. Read straight off
-    the run registry (no ``get_status`` per row needed — only the id matters), and like
-    ``_active_run_ids`` it is passed as a CALLABLE so it is resolved AFTER the provider lists.
-
-    Trade-off (deliberate): a box whose run record this plane has fully LOST (e.g. a wiped state dir)
-    is no longer auto-reaped — it is indistinguishable from another plane's box, so erring toward not
-    destroying it is the safe choice; reclaim such strays out of band. Single-plane production is
-    unaffected: the durable registry holds every run it launched, so every genuine orphan stays
-    reapable."""
+    ``known_labels`` prevents planes sharing a provider account from reaping each other's instances.
+    Lost registry rows are deliberately spared because they are indistinguishable from another
+    plane.
+    """
     return {row["run_id"] for row in db.all_runs()}
 
 
 def _sweep_orphan_instances_once() -> int:
-    """One run-aware sweep of orphaned instance-provider workers — Lambda instances whose run
-    finished or crashed without the per-run ``finally`` tearing them down. Returns the count torn
-    down. Dispatched to every configured provider; RunPod's ``sweep_orphans`` is a no-op (its
-    serverless endpoints carry no standing per-run billing and are handled by the idle reaper).
+    """Run one sweep of orphaned instance-provider workers and return the teardown count.
 
-    ``_active_run_ids`` is passed as a CALLABLE, not a precomputed set, so each instance provider
-    resolves the live-run protection set AFTER it has listed its instances. That ordering closes the
-    launch race: any instance already present in the list had its run's status row committed before
-    the instance was launched, so it is guaranteed to be in the set read post-listing — a run that
-    started a worker concurrently with this sweep can never be mis-reaped as a phantom orphan. (The
-    instance APIs expose no creation timestamp, so this post-listing read — not an age grace — is
-    what makes it airtight.)"""
+    Pass active ids as a callable so providers list first and read protection state afterward;
+    instance APIs expose no creation timestamp for a reliable age grace.
+    """
     from flash.providers import configured_providers
 
     torn = 0
@@ -366,7 +313,7 @@ def create_app():
     try:
         from fastapi import FastAPI
 
-        from flash.server.routes import envs, meta, runs, serving
+        from flash.server.routes import envs, meta, runs, serving, teacher
     except ImportError as exc:
         raise RuntimeError(_SERVER_EXTRAS_HINT) from exc
     from contextlib import asynccontextmanager
@@ -375,10 +322,11 @@ def create_app():
     async def lifespan(app):
         from flash.providers.preflight import check_run_preflight
         from flash.runner import _open_status_reporter
-        from flash.server.billing_retry import charge_retry_enabled
-        from flash.server.reconcile import reconcile_enabled
+        from flash.server.billing.retry import charge_retry_enabled
+        from flash.server.domain.reconcile import reconcile_enabled
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
+        db.recover_teacher_request_ledger()
         _open_deployment_jobs()
         _open_status_reporter()
         recover_runs()
@@ -389,22 +337,12 @@ def create_app():
         startup_report_task = asyncio.create_task(
             asyncio.to_thread(serving.replay_status_reports, startup_report_stop)
         )
-        # Recover completion-time customer charges left pending/failed by a transient blip or a
-        # crash between the `done` write and the charge. recover_runs deliberately excludes terminal
-        # `done`, so those would otherwise leak revenue; this startup sweep catches them promptly.
-        # Idempotent by runId on the backend, so it can't double-charge. Scheduled as a BACKGROUND
-        # task (not awaited before `yield`): with a backlog of pending charges and a slow/down billing
-        # backend, each charge can wait the full billing timeout, so awaiting it inline would delay
-        # accepting traffic by minutes. Best-effort; cancelled cleanly at shutdown below.
+        # retry completion charges missed by transient failure or a crash after done.
+        # run in background so billing timeouts cannot delay startup; backend runId makes it
+        # idempotent.
         startup_charge_task = (
             asyncio.create_task(_charge_retry_startup()) if charge_retry_enabled() else None
         )
-        # Reconcile the shared RunPod endpoint-slot quota against the live endpoint list so a
-        # crash can't leak slots permanently (no-op without an internal key). Best-effort.
-        with contextlib.suppress(Exception):
-            from flash.providers.runpod.train.endpoints import reconcile_endpoint_slots
-
-            reconcile_endpoint_slots()
         # Periodic realized-cost reconciliation (estimator accuracy), only when the operator
         # internal key is configured.
         cost_task = asyncio.create_task(_reconcile_cost_loop()) if reconcile_enabled() else None
@@ -428,10 +366,10 @@ def create_app():
             else None
         )
         # Periodic artifact GC: delete aged (>7d), undeployed run prefixes inside the per-environment
-        # HF repos (Freesolo-Co/flashrun-*) so old runs' checkpoints/adapters don't accumulate against
+        # HF repos (<artifact namespace>/flashrun-*) so old runs' checkpoints/adapters don't pile up against
         # the org's storage quota. Only on a plane with an operator HF_TOKEN (it deletes operator-owned
-        # repos); fails closed on any live-set uncertainty. See flash.server.repo_cleanup.
-        from flash.server.repo_cleanup import repo_cleanup_enabled
+        # repos); fails closed on any live-set uncertainty. See flash.server.domain.repo_cleanup.
+        from flash.server.domain.repo_cleanup import repo_cleanup_enabled
 
         cleanup_task = asyncio.create_task(_repo_cleanup_loop()) if repo_cleanup_enabled() else None
         try:
@@ -468,6 +406,7 @@ def create_app():
     app.include_router(envs.router)
     app.include_router(runs.router)
     app.include_router(serving.router)
+    app.include_router(teacher.router)
     return app
 
 

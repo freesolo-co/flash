@@ -3,7 +3,7 @@
 The published worker image ships DEPS only — the flash code (incl. kernel_warmup.py) is fetched from
 HF at runtime, exactly like a real worker. So this entry:
   1. snapshot_downloads the flash package (code/**) the CI helper uploaded to a temp HF dataset,
-  2. runs flash.engine.worker.kernel_warmup --arch <arch> --out /out on the live GPU,
+  2. runs flash.engine.worker.runtime.kernel_warmup --arch <arch> --out /out on the live GPU,
   3. uploads the produced /out (mega_cache.bin + .json + triton/inductor trees) back under out/,
   4. writes an out/STATUS marker LAST so the helper knows the run finished (and its rc).
 
@@ -28,7 +28,7 @@ def main() -> int:
     arch = os.environ.get("BAKE_ARCH", "")
     api = HfApi(token=token)
 
-    # Upload a STARTED marker FIRST -- before the code download / chalk install / warmup -- so a CI-side
+    # Upload a STARTED marker FIRST -- before the code download / warmup -- so a CI-side
     # timeout can tell whether this entrypoint even ran. Present on a timeout = the warmup started (so it
     # hung or was slow); absent = the pod ran the wrong entrypoint, OR this upload itself failed while
     # the warmup is still running. Retry a few times so a transient HF blip doesn't drop the marker and
@@ -63,16 +63,9 @@ def main() -> int:
         local_dir="/runcode",
         token=token,
     )
-    # match production: install freesolo-chalk so its default gap-filler kernels (rope, lora-delta,
-    # embedding) get warmed too. best-effort — the warmup skips chalk cleanly if this fails, so a
-    # chalk install hiccup just drops back to the validated 4/5 (no-chalk) bake.
-    chalk_spec = os.environ.get("BAKE_CHALK_SPEC", "")
-    if chalk_spec:
-        print(f"[bake] installing chalk: {chalk_spec}", flush=True)
-        subprocess.call([sys.executable, "-m", "pip", "install", "--no-cache-dir", chalk_spec])
 
     env = {**os.environ, "PYTHONPATH": "/runcode/code"}
-    cmd = [sys.executable, "-m", "flash.engine.worker.kernel_warmup", "--out", "/out"]
+    cmd = [sys.executable, "-m", "flash.engine.worker.runtime.kernel_warmup", "--out", "/out"]
     if arch:
         cmd += ["--arch", arch]
     print(f"[bake] running: {' '.join(cmd)}", flush=True)

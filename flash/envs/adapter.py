@@ -11,7 +11,12 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
-from flash.envs.base import BaseEnvironment, RolloutReward
+from flash.envs.base import (
+    REWARD_GROUP_CONCURRENCY,
+    BaseEnvironment,
+    RolloutReward,
+    map_bounded,
+)
 from flash.envs.loader import (
     GitHubEnvironmentRef,
     GitHubRateLimitError,
@@ -22,6 +27,11 @@ from flash.envs.loader import (
     is_managed_environment_slug,
     load_freesolo_environment,
     managed_slug_to_github_ref,
+)
+from flash.teacher.limits import (
+    OPD_DEFAULT_EPISODE_TURNS,
+    OPD_MAX_EPISODE_TURNS,
+    OPD_MIN_EPISODE_TURNS,
 )
 
 _CANONICAL_INPUT_KEY = "input"
@@ -113,9 +123,9 @@ class FreesoloEnvironment(BaseEnvironment):
         """Batch-level turn ceiling: dataset-wide max of per-example budgets, clamped to [8, 64]."""
         if self._max_turns_cache is not None:
             return self._max_turns_cache
-        cap = 8
+        cap = OPD_MIN_EPISODE_TURNS
         if self.multi_turn:
-            cap = 24
+            cap = OPD_DEFAULT_EPISODE_TURNS
             best: int | None = None
             for ex in self.dataset():
                 try:
@@ -125,7 +135,7 @@ class FreesoloEnvironment(BaseEnvironment):
                 if best is None or turns > best:
                     best = turns
             if best is not None:
-                cap = max(8, min(64, best))
+                cap = max(OPD_MIN_EPISODE_TURNS, min(OPD_MAX_EPISODE_TURNS, best))
         self._max_turns_cache = cap
         return cap
 
@@ -247,6 +257,28 @@ class FreesoloEnvironment(BaseEnvironment):
     ) -> dict[str, float]:
         return self._reward_to_breakdown(self._score_one(completion, example, state))
 
+    def scores_breakdown_many(self, items: list[tuple[dict, dict]]) -> list[dict[str, float]]:
+        """Named reward components for many single-turn rollouts, in input order."""
+        if self.multi_turn:
+            raise RuntimeError(
+                "scores_breakdown_many is only available for single-turn environments"
+            )
+        if not self.reward_thread_safe:
+            return [
+                self.scores_breakdown(str(state.get("response_text") or ""), example, state)
+                for example, state in items
+            ]
+        results = self._grouped_results(
+            items,
+            task_of=lambda example, state: self._task_example(example),
+            payload_of=lambda state: _completion_for_scoring(
+                str(state.get("response_text") or ""), state
+            ),
+            scorer=self._env.score_responses,
+            method="score_responses",
+        )
+        return [self._reward_to_breakdown(result) for result in results]
+
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         return float(getattr(self._score_one(completion, example, state), "score", 0.0))
 
@@ -285,12 +317,34 @@ class FreesoloEnvironment(BaseEnvironment):
             grp["idxs"].append(i)
             grp["payloads"].append(payload_of(st))
         out: list = [None] * len(items)
-        for key in order:
+
+        def score_group(key: str) -> tuple[str, list]:
             grp = groups[key]
             rewards = scorer(grp["task"], grp["payloads"])
             if len(rewards) != len(grp["payloads"]):
                 raise RuntimeError(f"Freesolo environment {method} returned the wrong length")
-            for idx, reward in zip(grp["idxs"], rewards, strict=True):
+            return key, rewards
+
+        # groups are scored CONCURRENTLY, not one after another. each call already scores its own
+        # completions concurrently, but a serial loop over groups still serializes the round trips
+        # ACROSS prompts, so a step with N prompts pays N judge latencies end to end while the gpu
+        # idles. the env's own pool is per-instance and sized once (freesolo Environment
+        # `_score_concurrently` / `max_score_concurrency`), so overlapping calls SHARE those workers
+        # and the provider-facing rate stays capped where it already was -- this removes a barrier
+        # rather than raising concurrency.
+        #
+        # on a raise, map_bounded pays for the groups already in flight where the serial loop
+        # stopped at the failing one, and rl_train.py:1001 re-scores the batch serially, so those
+        # calls are billed twice. bounded at one pool width; REWARD_GROUP_CONCURRENCY sets it.
+        scored = map_bounded(
+            order,
+            score_group,
+            cap=REWARD_GROUP_CONCURRENCY,
+            serial=not self.reward_thread_safe,
+        )
+
+        for key, rewards in scored:
+            for idx, reward in zip(groups[key]["idxs"], rewards, strict=True):
                 out[idx] = reward
         return out
 
@@ -308,25 +362,12 @@ class FreesoloEnvironment(BaseEnvironment):
         ]
 
     def reward_many(self, items: list[tuple[dict, dict]]) -> list[float]:
-        """Reward for many ``(example, state)`` rollouts at once, in input order.
+        """Reward many ``(example, state)`` rollouts in input order.
 
-        Rollouts that share a task go through ONE batched scoring call, which the env scores
-        concurrently (``Environment.max_score_concurrency``) — replacing one blocking scoring call
-        per rollout. For a judge / network-reward env (where scoring dominates) this is the analogue
-        of batched generation: a GRPO group's whole completion set overlaps its judge round-trips
-        instead of N serial GPU-idle calls. Multi-turn groups go through ``score_episodes``,
-        single-turn through ``score_responses`` (an episode's reward is just ``score_response`` on
-        its final text, so the two are equivalent for the one-prompt-one-response case). Equals one
-        :meth:`reward` per item: each path scores every rollout independently — ``score_responses``
-        runs ``score_response`` per completion and ``_reward_to_breakdown(...)['total']`` is exactly
-        ``reward.score`` — so batching changes only concurrency, not values.
-
-        Honors ``reward_thread_safe``: an env whose scorer keeps mutable or thread-bound state opts out
-        with ``reward_thread_safe = False`` and MUST NOT be raced. Batching a group's whole completion
-        set into one ``score_responses`` / ``score_episodes`` call hands them to the env's concurrent
-        scorer (``max_score_concurrency``), so for an opted-out env we fall back to the proven serial
-        path — one single-item :meth:`reward` per rollout, in input order — exactly as the pre-batching
-        code did. Same values; only the concurrency is dropped."""
+        Rollouts sharing a task use one ``score_responses`` or ``score_episodes`` batch, changing
+        concurrency but not values. ``reward_thread_safe = False`` must use serial single-item
+        :meth:`reward` calls because the scorer may hold mutable or thread-bound state.
+        """
         if not self.reward_thread_safe:
             # Single-item scoring per rollout (each reward() makes a ONE-element score_responses /
             # score_episodes call, so the env's concurrent scorer never sees a batch to parallelize).
@@ -435,13 +476,13 @@ class FreesoloEnvironment(BaseEnvironment):
         """The assistant turn as the scorer should see it: answer-only, reasoning available.
 
         Both parsers get ``prompt_opens_thinking``, exactly as the single-turn path forwards its
-        own ``_prompt_opens_thinking`` (flash/engine/worker/rl.py). Without it a turn truncated
+        own ``_prompt_opens_thinking`` (flash/engine/worker/entry/rl.py). Without it a turn truncated
         before ``</think>`` is tagless reasoning that ``strip_think`` returns whole as the answer,
         so the rollout can be rewarded for unfinished thinking that single-turn grading scores 0.
         """
         if not self.thinking:
             return content
-        from flash.thinking import strip_think, thinking_text
+        from flash.content.thinking import strip_think, thinking_text
 
         opened = self.prompt_opens_thinking
         answer = strip_think(content, prompt_opened_thinking=opened)
@@ -468,23 +509,9 @@ class FreesoloEnvironment(BaseEnvironment):
             # the env overrode the episode's answer, so it is already the text to grade -- do not
             # strip it. keep the raw view in step with it for any later turn.
             final = str(step.final_response_text)
-            # wrap rather than assign the bare string: a plain str has no .raw/.thinking, so a
-            # thinking-aware score_episode would lose the model's reasoning on exactly the episodes
-            # an env terminates by overriding (the scaffolded StarterMultiTurnEnv does this on a
-            # correct guess). the override text is the answer, so .completion is it; .thinking and
-            # .raw stay the model's own from this turn, which the override replaced but did not
-            # produce.
-            #
-            # .raw is documented as the ORIGINAL RAW MODEL OUTPUT (flash/cli/training_doc.py), so
-            # the override does not belong in it: a scorer reaching for .raw wants the text the
-            # model emitted, and is the one scorer that cannot recover it from anywhere else --
-            # .completion and str() are both the override already. assigning it here also left the
-            # object internally inconsistent, pairing an env-authored .raw with the model's own
-            # .thinking, so .raw did not contain the reasoning .thinking was taken from (codex[bot]).
-            #
-            # `raw` is this turn's model emission: the adapter passed it to step_episode above as
-            # what the model said. state["raw_response_text"] below is deliberately NOT this -- it
-            # carries the override so a later turn steps the env on the answer it substituted.
+            # wrap the override so `.completion` is env-authored while `.raw` and `.thinking` remain
+            # the model's original turn (flash/cli/scaffold/__init__.py). a bare str would discard those
+            # scorer views. `raw_response_text` becomes the override because later turns step on it.
             previous = state.get("response_text")
             state["response_text"] = (
                 _ScoredResponseText(

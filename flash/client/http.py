@@ -13,9 +13,9 @@ import urllib.request
 from collections.abc import Callable, Iterator
 from typing import Any
 
-from flash.spec import require_project_id
-
-from .config import load_credentials_with_source
+from flash.client.config import load_credentials_with_source
+from flash.core.spec import require_project_id
+from flash.serve.urls import is_freesolo_hosted_url
 
 ProgressCallback = Callable[[int, int], None]
 
@@ -29,9 +29,24 @@ class RequestTimeoutError(ClientError):
 
 
 class ApiError(ClientError):
-    def __init__(self, status: int, message: str):
+    """A non-2xx response from a Flash/freesolo endpoint.
+
+    ``detail`` keeps the server's FastAPI ``detail`` as parsed, so a caller can branch on a
+    structured payload (``{"code": ..., ...}``) instead of parsing it back out of a dict's repr.
+    The message is unchanged, so callers that match on ``str(exc)`` behave exactly as before.
+    """
+
+    def __init__(self, status: int, message: str, *, detail: object | None = None):
         super().__init__(message)
         self.status = status
+        self.detail = message if detail is None else detail
+
+    @property
+    def code(self) -> str:
+        """The server's machine-readable error code, or "" for an unstructured detail."""
+        if isinstance(self.detail, dict):
+            return str(self.detail.get("code") or "")
+        return ""
 
 
 DEFAULT_FREESOLO_BASE_URL = "https://api.freesolo.co"
@@ -49,14 +64,67 @@ def freesolo_base_url(override: str | None = None) -> str:
     )
 
 
-def _detail_from_http_error(exc: urllib.error.HTTPError) -> str:
-    """Extract the server's error message from an HTTPError body (FastAPI ``detail``)."""
+def has_freesolo_backend(api_url: str) -> bool:
+    """Whether the calls in this module have a Freesolo backend to reach.
+
+    Lives beside ``freesolo_base_url`` because it answers a question about the same env var: a
+    caller cannot decide whether the hosted API is reachable from the control-plane url alone.
+    Two signals can supply a backend, and the absence of both means there is none:
+
+    - the control-plane url names Freesolo. ``FLASH_STANDALONE`` is server-side and these callers
+      never reach the plane, so the url is the only standalone signal available.
+    - ``FREESOLO_BASE_URL`` names someone else. An operator running their own plane can point it
+      at a Freesolo-compatible backend, which is what these calls resolve through.
+
+    Note the deliberate polarity flip: the plane url qualifies by BEING Freesolo's, the backend
+    url by NOT being. They are different questions -- "is the hosted backend my target" versus
+    "does the operator run their own" -- and honouring a backend url that names Freesolo would
+    send a self-hosted plane's operator key to it.
+
+    The presence of ``FREESOLO_API_KEY`` deliberately does NOT count. It looks like a hosted
+    signal but cannot be one: ``SELF_HOSTING.md`` has self-hosters log in with the
+    plane-controlling ``FREESOLO_INTERNAL_KEY``, and ``cmd_login`` reads that env var as the login
+    key, so its value is as likely to be the operator key as a hosted account key. Nothing marks
+    which, and guessing wrong ships the plane credential to Freesolo. A hosted account reached
+    from a self-hosted plane needs ``FREESOLO_BASE_URL`` set explicitly.
+
+    A false positive is the safe direction: assuming a backend exists yields today's behaviour
+    (an authenticated call that may fail) rather than refusing a deployment that works.
+
+    ``client.resolve_project_id`` and the interactive branch of ``cli.env_setup`` used to decide on
+    the url alone, which answered this question twice and more narrowly: they refused a configured
+    backend this accepts, and skipped the ownership check for one. Both now route through here, so
+    this is the single classifier.
+
+    Takes a plain ``str`` because ``load_credentials`` falls back to ``DEFAULT_API_URL`` and so
+    never yields ``None``; accepting an optional here would invent a state no caller can reach.
+    """
+    if is_freesolo_hosted_url(api_url):
+        return True
+    # an operator-controlled backend is one that is NOT Freesolo's. pointing FREESOLO_BASE_URL at
+    # the hosted service (or leaving it at that default) from a self-hosted plane would send the
+    # plane's operator key to Freesolo as a bearer token -- the leak this guard exists to close.
+    backend = os.environ.get("FREESOLO_BASE_URL", "").strip()
+    return bool(backend) and not is_freesolo_hosted_url(backend)
+
+
+def _detail_from_http_error(exc: urllib.error.HTTPError) -> object:
+    """Extract the server's ``detail`` from an HTTPError body, as parsed.
+
+    A structured detail stays a dict so the caller can read its ``code``; anything else is the
+    string it always was. ``str()`` it for a message, but branch on the object itself.
+    """
     body = exc.read()
     try:
         detail = json.loads(body).get("detail") or body.decode()
     except (ValueError, AttributeError):
         detail = body.decode(errors="replace") if body else str(exc)
-    return str(detail)
+    return detail if isinstance(detail, dict) else str(detail)
+
+
+def _api_error(exc: urllib.error.HTTPError) -> ApiError:
+    detail = _detail_from_http_error(exc)
+    return ApiError(exc.code, str(detail), detail=detail)
 
 
 def _read_capped_response(resp: object, max_bytes: int) -> bytes:
@@ -95,7 +163,7 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
                 "https://freesolo.co/sign-in and pass it with `flash login --api-key` "
                 "(or FREESOLO_API_KEY)"
             ) from exc
-        raise ApiError(exc.code, _detail_from_http_error(exc)) from exc
+        raise _api_error(exc) from exc
     except urllib.error.URLError as exc:
         raise ClientError(
             f"cannot reach the freesolo backend at {base} ({exc.reason}); "
@@ -129,7 +197,7 @@ def _freesolo_request(
                 "freesolo rejected this API key — run `flash login` with a valid key "
                 "(or set FREESOLO_API_KEY)"
             ) from exc
-        raise ApiError(exc.code, _detail_from_http_error(exc)) from exc
+        raise _api_error(exc) from exc
     # a socket timeout surfaces as a bare TimeoutError rather than a URLError, so without this
     # it escapes as an unexpected exception. callers catch ClientError to report a failure
     # without changing their own verdict; a traceback instead would lose that.
@@ -384,8 +452,13 @@ class ApiClient:
             return {"Authorization": f"Bearer {self.api_key}"}
         return {}
 
-    def _auth_error_detail(self, status: int, detail: str) -> str:
+    def _auth_error_detail(self, status: int, detail: object) -> object:
+        # only a plain-text detail is appended to. a structured detail is a machine-readable
+        # payload whose keys the caller branches on, so splicing prose into it would either
+        # corrupt a field or invent one.
         if status not in {401, 403} or self.key_source != "FREESOLO_API_KEY":
+            return detail
+        if isinstance(detail, dict):
             return detail
         return (
             f"{detail}; FREESOLO_API_KEY is set and overrides the key saved by "
@@ -399,7 +472,7 @@ class ApiClient:
             yield
         except urllib.error.HTTPError as exc:
             detail = self._auth_error_detail(exc.code, _detail_from_http_error(exc))
-            raise ApiError(exc.code, detail) from exc
+            raise ApiError(exc.code, str(detail), detail=detail) from exc
         except urllib.error.URLError as exc:
             if isinstance(getattr(exc, "reason", None), TimeoutError):
                 raise RequestTimeoutError(
@@ -479,9 +552,9 @@ class ApiClient:
 
     def _require_chat_step_selector(self) -> None:
         # cached after it first succeeds: this is a property of the control plane, not of the
-        # request. `env eval` sends one chat per case, so re-checking each time doubled the
-        # request count and let a single transient /v1/health blip fail an arbitrary case while
-        # the chat endpoint was healthy (codex[bot]).
+        # request. `env eval` sends one chat per case, so re-checking each time doubled the request
+        # count and let a single transient /v1/health blip fail an arbitrary case while the chat
+        # endpoint was healthy.
         if self._chat_step_selector_available:
             return
         capabilities = self.health().get("capabilities")
@@ -501,7 +574,7 @@ class ApiClient:
         """Settle the step-selector capability now, so concurrent callers inherit the cached answer.
 
         A caller about to run many chats in parallel would otherwise have every worker miss the cold
-        cache at once and fire its own /v1/health (codex[bot]). Only a `RUN/step-N` target needs the
+        cache at once and fire its own /v1/health. Only a `RUN/step-N` target needs the
         capability, so anything else is a no-op. Raises exactly what the per-request check raises.
         """
         if _parse_chat_target(target)[2] is not None:
@@ -578,8 +651,11 @@ class ApiClient:
         if runtime_secrets:
             body["runtime_secrets"] = runtime_secrets
         if dry_run:
-            # Server-side preview: runs the same validation/preflights as a real submit and records a
-            # state=dry_run run, but allocates no GPU and charges nothing. Returns that status.
+            # server-side preview: runs the same validation/preflights as a real submit and records
+            # a state=dry_run run, but allocates no training gpu and charges nothing for training.
+            # returns that status. an sft preview additionally requires an exact workload profile;
+            # on a miss the server starts that separate, separately billed profile run and answers
+            # 409 workload_profile_pending, so a preview is free of training spend, not all spend.
             body["dry_run"] = True
         if client_train_schema is not None:
             body["client_train_schema"] = client_train_schema
@@ -697,7 +773,7 @@ class ApiClient:
         the key owns and loads each one's status before this picks a single record out, so on an
         account with a long run history the poll's cost grows with that history and the wait can
         expire scanning unrelated runs while the requested revision is already ready
-        (chatgpt-codex-connector). `/v1/runs/{run_id}/deploy` resolves the one run directly.
+        `/v1/runs/{run_id}/deploy` resolves the one run directly.
         """
         base_run_id, step = _parse_adapter_target(run_id)
         try:

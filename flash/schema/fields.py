@@ -6,15 +6,15 @@ import json
 import math
 from typing import Any
 
-from flash.engine.structured_outputs import CONSTRAINT_KEYS as _SO_CONSTRAINT_KEYS
-from flash.envs.adapter import is_freesolo_environment_id
-from flash.spec import (
+from flash.content.structured_outputs import CONSTRAINT_KEYS as _SO_CONSTRAINT_KEYS
+from flash.core.spec import (
+    CONTROL_PLANE_OWNED_ENV_KEYS,
     CREDIT_ASSIGNMENTS,
     DEFAULT_CREDIT_ASSIGNMENT,
     CreditAssignment,
     WandbSpec,
-    validate_worker_env_reserved,
 )
+from flash.envs.adapter import is_freesolo_environment_id
 
 
 def _section_int(
@@ -80,9 +80,8 @@ def _train_teacher(train_raw: dict) -> str:
     """Validate [train] teacher_model against the managed OPD teacher allow-list -> ConfigError (400).
 
     Missing/None/blank -> "" (the worker then uses the default GLM 5.2 teacher). A supported value is
-    resolved to its canonical Fireworks model id and stored, so a spaced ("GLM 5.2") or alias form is
-    canonicalized once here and every downstream layer reads one representation; an unsupported teacher
-    is rejected at PARSE time (before a paid GPU is provisioned), listing the allowed aliases."""
+    stored as its canonical friendly alias. Provider and repository identifiers are never accepted as
+    user input. An unsupported teacher is rejected before a paid GPU is provisioned."""
     v = train_raw.get("teacher_model")
     if v is None:
         return ""
@@ -91,16 +90,15 @@ def _train_teacher(train_raw: dict) -> str:
     if not v.strip():
         return ""
     # Imported lazily: recipe is dependency-free, but keep fields.py's import graph minimal.
-    from flash.engine.recipe import resolve_teacher
+    from flash.engine.plan.recipe import resolve_teacher
 
     # resolve_teacher owns the allow-list + its enumeration; reuse its message so the choices are
     # listed in exactly one place (recipe.py).
     try:
-        return resolve_teacher(v).model_id
+        return resolve_teacher(v).alias
     except ValueError as exc:
         raise ConfigError(
-            f"train.{exc}. The teacher is a managed Fireworks model — "
-            f"bring-your-own teachers are not supported."
+            f"train.{exc}. The teacher is platform-managed; bring-your-own teachers are not supported."
         ) from None
 
 
@@ -125,7 +123,7 @@ class ConfigError(ValueError):
 
 
 # vLLM StructuredOutputsParams surface: exactly one constraint field (_SO_CONSTRAINT_KEYS, imported
-# above from flash.engine.structured_outputs as the single source of truth) plus these options.
+# above from flash.content.structured_outputs as the single source of truth) plus these options.
 # vLLM also offers grammar/structural_tag, but Flash does not support them; reject explicitly so a
 # `{"grammar": ...}` table isn't silently swallowed by the bare-JSON-schema fallback below.
 _SO_REMOVED_KEYS = frozenset({"grammar", "structural_tag"})
@@ -305,10 +303,7 @@ _RESERVED_ENVIRONMENT_SECRET_KEYS = frozenset(
         "GITHUB_TOKEN",
         "FREESOLO_API_KEY",
         "FREESOLO_INTERNAL_KEY",
-        "RUN_ID",
-        "HF_REPO",
-        "FLASH_ARM",
-        "SEED",
+        *CONTROL_PLANE_OWNED_ENV_KEYS,
     }
 )
 
@@ -329,65 +324,6 @@ def _environment_secrets(raw: Any) -> tuple[str, ...]:
             f"[environment] secrets must not include platform-managed key(s): {', '.join(reserved)}"
         )
     return secrets
-
-
-def _worker_env(raw: Any) -> dict[str, str]:
-    """Parse the optional [worker_env] table: per-run worker env overrides (string-valued)."""
-    if raw is None:
-        return {}
-    if not isinstance(raw, dict):
-        raise ConfigError("[worker_env] must be a table of string key/values")
-    env = {str(k): str(v) for k, v in raw.items()}
-    _validate_env_var_names(env, "[worker_env]")
-    try:
-        validate_worker_env_reserved(env)
-    except ValueError as exc:
-        raise ConfigError(str(exc)) from exc
-    # [worker_env] is serialized into job_spec_json (persisted + logged) — must not carry secrets.
-    # Match by word components (not substring): KEY only flagged when qualified by a credential context.
-    _secret_words = {
-        "TOKEN",
-        "SECRET",
-        "PASSWORD",
-        "PASSWD",
-        "PASSPHRASE",
-        "CREDENTIAL",
-        "CREDENTIALS",
-        "APIKEY",
-        "PRIVATEKEY",
-        "PAT",
-    }
-    _key_qualifiers = {
-        "API",
-        "SECRET",
-        "PRIVATE",
-        "ACCESS",
-        "INTERNAL",
-        "AUTH",
-        "SIGNING",
-        "ENCRYPTION",
-        "SSH",
-        "DEPLOY",
-        "GPG",
-        "PGP",
-        "RSA",
-        "PEM",
-        "SSL",
-        "TLS",
-    }
-
-    def _is_secret_key(name: str) -> bool:
-        words = set(name.upper().split("_"))
-        return bool(words & _secret_words) or ("KEY" in words and bool(words & _key_qualifiers))
-
-    secrets = sorted(k for k in env if _is_secret_key(k))
-    if secrets:
-        raise ConfigError(
-            f"[worker_env] must not contain secret-bearing keys ({', '.join(secrets)}); these are "
-            "serialized into run artifacts; use provider process env or supported runtime secrets "
-            "instead"
-        )
-    return env
 
 
 _WANDB_KEYS = ("project", "run_name")

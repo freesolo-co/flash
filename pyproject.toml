@@ -1,12 +1,12 @@
 [project]
 name = "freesolo-flash"
-version = "1.0.69"
-description = "Flash — managed LoRA post-training (SFT/GRPO/OPD) for Freesolo environments, driven by the `flash` CLI"
+version = "1.1.40"
+description ="Flash — managed LoRA post-training (SFT/GRPO/OPD) for Freesolo environments, driven by the `flash` CLI"
 readme = "README.md"
 # RunPod Flash supports Python 3.11-3.12 (not 3.13 yet).
 requires-python = ">=3.11,<3.13"
 license = "Apache-2.0"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Freesolo" }]
 keywords = ["llm", "rl", "grpo", "sft", "lora", "fine-tuning", "freesolo"]
 classifiers = [
@@ -25,26 +25,24 @@ dependencies = []
 
 [project.optional-dependencies]
 # heavy deps for running the fine-tuning worker locally (on the gpu worker these are
-# installed by runpod flash from the dependency list in flash/providers/_worker.py).
+# installed by runpod flash from the dependency list in flash/providers/_lifecycle/worker.py).
 gpu = [
     "torch==2.10.0",
     "transformers>=5.6,<5.11",
-    "trl>=1.6,<1.7",
+    "tokenizers>=0.22",
+    "tiktoken>=0.12",
     "peft>=0.19",
     "vllm==0.19.1",
     "bitsandbytes>=0.49",
     "accelerate>=1.4",
+    # resolve_verl_python shells out to `uv` to provision the isolated verl interpreter whenever
+    # FLASH_VERL_PYTHON is unset. sft and opd are verl-only, so that call is unconditional here.
+    "uv>=0.5",
     # Worker runtime: Freesolo environment loading and HF checkpoint I/O.
     "datasets>=2.19",
     "freesolo>=0.4.0",
     "huggingface-hub>=1.2.0",
 ]
-# freesolo-chalk (freesolo's custom triton/cuda kernels) is a worker-side package selected by the
-# submit path, not a control-plane dependency. flash appends the chalk package spec from
-# flash/providers/_worker.py to each worker job's extra_pip, then applies chalk standalone after the
-# trainer builds the live model. it no-ops when unavailable (see flash/engine/chalk_kernels.py).
-# production workers pin an exact public pypi freesolo-chalk release; dev-channel workers install
-# freesolo-chalk-dev with that version as a floor. an explicit install-source override supersedes both.
 # Control-plane / operator deps. runpod-flash (RunPod provider SDK) + huggingface-hub (provider
 # code upload + repo settings) are imported server-side; httpx is the serving client (flash/serve).
 # Keeping runpod-flash out of the base install also stops its `flash` console script shadowing
@@ -85,6 +83,13 @@ dev = [
     "datasets>=2.19",
     "freesolo>=0.4.0",
     "transformers>=5.6,<5.11",
+    "tokenizers>=0.22",
+    "tiktoken>=0.12",
+    # flash/content/multimodal.py imports PIL directly to validate and decode every image source, so the
+    # image tests are not optional coverage: without Pillow they importorskip and CI reports green
+    # on a multimodal path it never executed. test-only, hence dev and not server -- the control
+    # plane does not decode images.
+    "pillow>=11",
 ]
 # NB: there is deliberately no `all` aggregate. `gpu` (the GPU worker) and `server` (the control
 # plane) run on separate machines.
@@ -116,7 +121,7 @@ artifacts = ["flash/py.typed"]
 # auto-published by .github/workflows/publish-dev.yml: a push to `dev` whose version isn't yet on
 # PyPI publishes it; pushes that don't change it find it already published and no-op. So cutting a
 # dev-channel release = bump this (and [project].version) and merge to `dev`.
-version = "1.0.69"
+version = "1.1.40"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -124,6 +129,13 @@ testpaths = ["tests"]
 addopts = "-q"
 markers = [
   "live: hits real provider APIs; opt in with FLASH_LIVE=1 (plus provider creds)",
+  # These assert on REAL elapsed time -- they sleep instead of faking the clock, to prove the
+  # shutdown path actually reserves its cleanup budget before the watchdog deadline. Their margins
+  # are tens of milliseconds, which is smaller than one scheduler preemption, so they fail if
+  # another test process is competing for the core. CI therefore runs the suite with `-n 2` while
+  # DESELECTING this marker, then runs the marked tests alone in a second, serial pass (~5s).
+  # Prefer a fake clock in new tests; add this marker only when real elapsed time IS the assertion.
+  "wallclock: asserts on real elapsed time; must run serially, never alongside another worker",
 ]
 
 [tool.uv]
@@ -139,6 +151,19 @@ dev = [
     # (`--extra server --dev`) gets httpx + huggingface-hub from the `server` extra.
     "datasets>=2.19",
     "freesolo>=0.4.0",
+    "tokenizers>=0.22",
+    "tiktoken>=0.12",
+    # flash/content/multimodal.py imports PIL directly to validate and decode every image source, so the
+    # image tests are not optional coverage: without Pillow they importorskip and CI reports green
+    # on a multimodal path it never executed. test-only, hence dev and not server -- the control
+    # plane does not decode images.
+    "pillow>=11",
+    "pytest-xdist>=3.6",
+    # tests/test_workflow_contracts.py parses .github/workflows/*.yml. PyYAML is already present
+    # transitively (datasets/transformers/huggingface-hub), but a test that imports it directly
+    # must declare it: otherwise dropping one of those unrelated deps turns the workflow contract
+    # tests into a collection error, and the invariants they pin stop being checked.
+    "pyyaml>=6",
 ]
 
 [tool.mypy]
@@ -212,5 +237,3 @@ ignore = [
 # `_ScoredResponseText` subclasses `str` to stay grader-compatible while carrying the structured
 # views as attributes; __slots__ would defeat that.
 "flash/envs/adapter.py" = ["SLOT000"]
-# `_RunLock` is never subclassed, so returning the concrete type from __enter__ is correct.
-"flash/server/_locks.py" = ["PYI034"]

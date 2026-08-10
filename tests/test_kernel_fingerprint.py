@@ -87,7 +87,6 @@ def test_collect_inputs_populates_every_key_and_matches_repo():
         "fla",
         "tilelang",
         "tvm_ffi",
-        "chalk",
         "kernel_warmup_sha256",
     ):
         assert cache_inputs[key], f"cache input {key} not populated"
@@ -108,14 +107,6 @@ def test_collect_inputs_populates_every_key_and_matches_repo():
     assert sha in cache_inputs["fla"]
     # the cache toolchain must NOT leak into the base pip list (else a cache-toolchain bump would fire a re-layer)
     assert not any("liger-kernel" in s or "tilelang" in s for s in base_partial["pip_base"])
-
-
-def test_bake_kernel_cache_uses_chalk_default_source_of_truth():
-    from flash.providers._worker import LATEST_CHALK_MAIN_SHA
-
-    bake_src = (ROOT / "docker" / "bake_kernel_cache.py").read_text()
-    assert "DEFAULT_CHALK_SPEC" in bake_src
-    assert LATEST_CHALK_MAIN_SHA not in bake_src
 
 
 def test_dockerfile_only_change_is_a_free_relayer():
@@ -145,7 +136,7 @@ def test_huggingface_hub_floor_is_in_lockstep():
     """The huggingface_hub floor is declared twice for the worker: Dockerfile.worker bakes it into the
     per-arch image (the default run path) and WORKER_DEPS installs it on the no-image/live-function
     path. They must stay equal so both paths carry the same built-in 429 RateLimit auto-retry floor."""
-    from flash.providers.runpod.train import WORKER_DEPS
+    from flash.providers.runpod.serverless import WORKER_DEPS
 
     dockerfile = (ROOT / "Dockerfile.worker").read_text()
     docker_hf = [s for s in kf._pip_stack_specs(dockerfile) if kf._pkg_name(s) == "huggingface_hub"]
@@ -189,9 +180,9 @@ def test_parse_baked_per_sm_arches_contract():
 
 
 def test_print_baked_arches_cli_exits_before_fingerprint_work(tmp_path):
-    worker_dir = tmp_path / "flash" / "providers"
+    worker_dir = tmp_path / "flash" / "providers" / "_lifecycle"
     worker_dir.mkdir(parents=True)
-    (worker_dir / "_worker.py").write_text('BAKED_PER_SM_ARCHES = frozenset({"sm90", "sm80"})\n')
+    (worker_dir / "worker.py").write_text('BAKED_PER_SM_ARCHES = frozenset({"sm90", "sm80"})\n')
     result = subprocess.run(
         [
             sys.executable,
@@ -209,9 +200,9 @@ def test_print_baked_arches_cli_exits_before_fingerprint_work(tmp_path):
 
 
 def test_baked_arch_workflows_match_canonical_source():
-    from flash.providers._worker import BAKED_PER_SM_ARCHES
+    from flash.providers._lifecycle.worker import BAKED_PER_SM_ARCHES
 
-    worker_source = (ROOT / "flash" / "providers" / "_worker.py").read_text()
+    worker_source = (ROOT / "flash" / "providers" / "_lifecycle" / "worker.py").read_text()
     source_arches = kf.parse_baked_per_sm_arches(worker_source)
     canonical_arches = set(BAKED_PER_SM_ARCHES)
 
