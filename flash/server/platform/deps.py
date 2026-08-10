@@ -103,6 +103,43 @@ def _require_bool(payload: dict, field: str, default: bool) -> bool:
     return value
 
 
+def _require_hosted_environment_form(env_raw: dict) -> None:
+    """On the managed service, an environment id must be a hub slug, not an arbitrary repo.
+
+    The managed hub is the only repo this plane can vouch for: it is the one ``flash env push``
+    writes to, the one whose packages carry a validated project association, and the one whose
+    slugs the submit route canonicalizes. A ``github:``/browser-URL ref names a repo the plane has
+    no relationship with, so accepting it would train against unreviewed code under a Freesolo run.
+
+    A self-hosted plane is the opposite case: its hub repo is Freesolo's and it cannot publish
+    there, so the explicit GitHub forms are its ONLY environment source (a local ``path`` is
+    already rejected above). Gate on ``standalone()`` rather than deleting the grammar, or
+    self-hosting has no way to name an environment at all.
+
+    Enforced here rather than in the schema because ``FLASH_STANDALONE`` lives on the server and
+    the CLI cannot see it -- a client-side check would reject the self-hosted operator's own refs.
+    """
+    if auth.standalone():
+        return
+    env_id = env_raw.get("id")
+    if not isinstance(env_id, str) or not env_id.strip():
+        return  # absent/malformed ids are the schema's error to report, with its own message
+    from flash.envs.adapter import is_managed_environment_slug
+
+    env_id = env_id.strip()
+    if is_managed_environment_slug(env_id):
+        return
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"[environment] id {env_id!r} is not a Freesolo environment id; the managed service "
+            'runs environments from its hub only, addressed as "namespace/name". Publish yours '
+            "with `flash env push --project <project-uuid> --name <name>` and use the returned id. "
+            "Direct GitHub references are supported only on a self-hosted plane."
+        ),
+    )
+
+
 def _parse_spec(payload: dict, run_id: str) -> JobSpec:
     # Use get()+None check, not `or {}` — falsy non-objects must still hit the type check below.
     spec_raw = payload.get("spec")
@@ -123,6 +160,7 @@ def _parse_spec(payload: dict, run_id: str) -> JobSpec:
             "then reference it "
             "by the returned environment id",
         )
+    _require_hosted_environment_form(env_raw)
     try:
         return spec_from_dict(spec_raw, run_id=run_id, project_required=True)
     except (ConfigError, ValueError) as exc:
