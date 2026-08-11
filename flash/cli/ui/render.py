@@ -821,7 +821,9 @@ from flash.cli.ui.heartbeat import (  # noqa: E402,F401
     _humanize_age_seconds,
     _stale_setup_hint,
     _stale_step_hint,
+    _superseded_hint,
     heartbeat_is_current_attempt,
+    heartbeat_is_superseded,
     warmup_message,
 )
 from flash.cli.ui.tables import (  # noqa: E402,F401

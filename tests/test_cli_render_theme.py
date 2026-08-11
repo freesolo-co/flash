@@ -1140,3 +1140,131 @@ def test_quiet_hint_does_not_send_users_to_an_hourly_log(monkeypatch):
     # it has to name the surfaces that do update while the run is live.
     assert "the age above" in out
     assert "hourly" in out
+
+
+def test_a_cleared_remote_does_not_present_a_dead_attempts_region_as_live(monkeypatch):
+    """`remote: null` is the relaunch window, so its attached `dc` is the torn-down worker's.
+
+    `heartbeat_is_current_attempt` answers True here because it cannot prove otherwise from the
+    identity alone: there is no live attempt number to compare against. Reading that True as
+    "current" printed the dead attempt's region unqualified, which corrupts the exact comparison the
+    row exists for -- the replacement may land in a region with a completely different cache state.
+
+    The log-follow spinner already draws this line the same way (`_log_follow_progress`), so this
+    asserts the two surfaces agree rather than inventing a second contract.
+    """
+    import time as _time
+
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    base = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+    }
+    heartbeat = {
+        "stage": "sft_model_load",
+        "attempt": 1,
+        "ts": _time.time() - 1200,
+        "dc": "EU-RO-1",
+    }
+
+    cleared = dict(base, remote=None, last_heartbeat=dict(heartbeat))
+    out = render.run_status(cleared).split("details", 1)[0]
+    assert "EU-RO-1" in out, "the region is still worth showing"
+    assert "previous attempt" in out, "a cleared remote means that worker is already gone"
+
+    # an ABSENT `remote` is a plane that never surfaces the field, not a teardown. it must keep
+    # falling back, or every such plane labels a perfectly live worker as dead.
+    absent = dict(base, last_heartbeat=dict(heartbeat))
+    assert "previous attempt" not in render.run_status(absent).split("details", 1)[0]
+
+
+def test_a_superseded_ping_is_not_called_alive_by_the_quiet_hint(monkeypatch):
+    """The panel must not label a row `previous attempt` and then reassure about that same ping.
+
+    `quiet is not dead` is written about a live worker holding uploads on the throttle. Printed
+    beside a heartbeat whose worker is provably torn down it is simply false, and it is the longer,
+    more reassuring of the two readings, so it wins: a run between attempts reads as healthy.
+    """
+    import time as _time
+
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    base = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+    }
+    # rl_train_start is deliberate: it is in neither hint's stage set, so before this fix nothing
+    # suppressed the quiet hint and the contradiction was reachable.
+    superseded = dict(
+        base,
+        remote={"attempt": 2},
+        last_heartbeat={"stage": "rl_train_start", "attempt": 1, "ts": _time.time() - 400},
+    )
+    out = render.run_status(superseded).split("details", 1)[0]
+    assert "quiet is not dead" not in out, "that ping's worker is gone; quiet IS dead there"
+    # it is replaced, not merely dropped: the silence still needs an explanation, and this one is
+    # true. it must also not send the user to cancel, since the replacement may be provisioning.
+    assert "already gone" in out
+    assert "has not published one yet" in out
+
+    # the control: same age, same stage, live attempt. the ordinary reassurance must survive.
+    live = dict(
+        base,
+        remote={"attempt": 2},
+        last_heartbeat={"stage": "rl_train_start", "attempt": 2, "ts": _time.time() - 400},
+    )
+    live_out = render.run_status(live).split("details", 1)[0]
+    assert "quiet is not dead" in live_out
+    assert "already gone" not in live_out
+
+
+def test_superseded_hint_yields_to_the_more_specific_diagnoses():
+    """It is the fallback, not a replacement: the stage-aware hints say strictly more when they fire.
+
+    Both of those already refuse a superseded ping, so without an explicit order this hint would
+    simply never appear on the stages they cover -- or, wired first, would displace them.
+    """
+    import time as _time
+
+    from flash.cli.ui.heartbeat import _heartbeat_pairs
+
+    def progress(stage: str, **hb) -> str:
+        pairs = _heartbeat_pairs(
+            {
+                "state": "running",
+                "remote": {"attempt": 2},
+                "last_heartbeat": {"stage": stage, "attempt": 1, "ts": _time.time() - 1200, **hb},
+            }
+        )
+        return dict(pairs).get("progress", "")
+
+    # a superseded setup stage: the setup hint declines it, so the fallback is what is left.
+    assert "already gone" in progress("sft_model_load")
+    # a superseded training step: same, and it must not claim the dead worker's step is advancing.
+    assert "already gone" in progress("sft_step", step=455)
+    assert "last one UPLOADED" not in progress("sft_step", step=455)
+
+
+def test_superseded_hint_stays_quiet_when_there_is_no_silence_to_explain():
+    """Below the quiet threshold the label alone is accurate and nothing contradicts it.
+
+    A hint about a stale heartbeat printed next to a 30-second-old one is noise, and noise on the
+    panel is what trained users to ignore it.
+    """
+    from flash.cli.ui.heartbeat import _superseded_hint
+
+    assert _superseded_hint(30.0, running=True, current_attempt=False) is None
+    assert _superseded_hint(1200.0, running=True, current_attempt=False)
+    # terminal runs are not waiting on anything, and a live attempt is the other hints' business.
+    assert _superseded_hint(1200.0, running=False, current_attempt=False) is None
+    assert _superseded_hint(1200.0, running=True, current_attempt=True) is None
+    assert _superseded_hint(None, running=True, current_attempt=False) is None

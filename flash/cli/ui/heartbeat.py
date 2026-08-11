@@ -64,6 +64,20 @@ def heartbeat_is_current_attempt(obj: dict, heartbeat: dict) -> bool:
     return _attempt_int(heartbeat.get("attempt")) == current_attempt
 
 
+def heartbeat_is_superseded(obj: dict, heartbeat: dict) -> bool:
+    """True when this ping's worker is known to be gone -- by attempt identity OR a cleared remote.
+
+    ``heartbeat_is_current_attempt`` answers True for an explicitly null ``remote`` because it
+    cannot prove otherwise from identity alone. But a null ``remote`` (as opposed to an absent one)
+    IS the relaunch window: the plane cleared it at teardown, so the attached ping belongs to a
+    worker that no longer exists. The log-follow spinner already draws that line the same way
+    (`_log_follow_progress`), so the status panel uses one predicate rather than a second contract
+    that disagrees with it about whether a run is between attempts.
+    """
+    remote_cleared = "remote" in obj and obj.get("remote") is None
+    return remote_cleared or not heartbeat_is_current_attempt(obj, heartbeat)
+
+
 def warmup_message(
     stage: object,
     heartbeat_age_seconds: float | None,
@@ -264,6 +278,35 @@ def _stale_step_hint(
     )
 
 
+def _superseded_hint(
+    heartbeat_age_seconds: float | None,
+    *,
+    running: bool,
+    current_attempt: bool,
+) -> str | None:
+    """Explain a quiet heartbeat that belongs to an attempt the plane has already torn down.
+
+    Without this the panel contradicts itself: the datacenter row says ``previous attempt`` while the
+    generic quiet hint beside it says ``quiet is not dead`` about that same ping. Both readings
+    cannot be true, and the reassuring one wins by being longer, so a run whose worker is provably
+    gone reads as healthy.
+
+    Gated at the same age as the hint it replaces, because below that age nothing wrong is printed:
+    the label alone is accurate, and a hint about silence with no silence to explain is noise.
+    """
+    if not running or heartbeat_age_seconds is None:
+        return None
+    if current_attempt:
+        return None
+    if heartbeat_age_seconds <= _HB_QUIET_HINT_AFTER_S:
+        return None
+    return (
+        "this ping is from an attempt that is already gone; the replacement has not published one "
+        "yet, so the age above measures the OLD worker's last ping, not the new one's silence. "
+        "watch for the stage or step to change rather than reading this as a stall"
+    )
+
+
 def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
     """Worker heartbeat rows for the status panel: stage, step, age, and a quiet-is-normal hint."""
     hb = obj.get("last_heartbeat")
@@ -288,7 +331,9 @@ def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
     # row exists to support -- so say whose region it is rather than implying it is the live one.
     heartbeat_age_seconds = _heartbeat_age_seconds(hb.get("ts"))
     running = str(obj.get("state") or "") == "running"
-    from_current_attempt = heartbeat_is_current_attempt(obj, hb)
+    # a cleared `remote` is the same relaunch window as a mismatched attempt: the plane nulls it at
+    # teardown, so the attached ping is just as superseded even though the identity cannot prove it.
+    from_current_attempt = not heartbeat_is_superseded(obj, hb)
     datacenter = hb.get("dc")
     if datacenter:
         label = "datacenter" if from_current_attempt else "datacenter (previous attempt)"
@@ -306,7 +351,17 @@ def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
         running=running,
         current_attempt=from_current_attempt,
     )
-    explained = stale_step or stale_setup
+    # last in the chain: both hints above already return None for a superseded ping, and each says
+    # something more specific than "the worker is gone" when it does fire.
+    explained = (
+        stale_step
+        or stale_setup
+        or _superseded_hint(
+            heartbeat_age_seconds,
+            running=running,
+            current_attempt=from_current_attempt,
+        )
+    )
     # warmup is computed AFTER the hints so a stale setup stage can suppress it. the two windows
     # overlap (rl_initializing stays "fresh" for 1200s but goes silent-unexplained at 900s), and
     # showing both puts "setup is not billed; do not cancel" directly above "the instance may be
