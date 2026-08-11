@@ -893,16 +893,16 @@ from flash.engine.plan.kv_sizing import (  # noqa: E402,F401
     colocate_kv_util,
 )
 
-# Pinned-revision certification lives in `flash.engine.plan.pinned_geometry`, for the same
+# The pinned-commit config probe lives in `flash.engine.plan.model_config_probe`, for the same
 # file-size reason. Re-exported because `from flash.engine.plan.vram import
-# _validated_revision_geometry` must keep working. NOTE that `_PINNED_GEOMETRY_MEMO` is
+# _validated_revision_geometry` must keep working. NOTE that `_CONFIG_PROBE_MEMO` is
 # deliberately NOT re-exported: an alias would be a SECOND name for one dict, and a test that
-# swaps `vram._PINNED_GEOMETRY_MEMO` would leave the module actually reading the original --
+# swaps `vram._CONFIG_PROBE_MEMO` would leave the module actually reading the original --
 # a silently ineffective patch. Reach for it at its defining module.
-from flash.engine.plan.pinned_geometry import (  # noqa: E402,F401
-    _certify_revision_geometry,
-    _geometry_mismatches,
-    _memoized_revision_geometry,
+from flash.engine.plan.model_config_probe import (  # noqa: E402,F401
+    _certify_model_config,
+    _config_mismatches,
+    _memoized_config_probe,
     _validated_revision_geometry,
-    certified_revision_attention_heads,
+    certified_attention_heads,
 )

@@ -206,9 +206,9 @@ def geometry_safe_gpu_cap(
         # row's default-revision geometry -- is what may widen this run. only worth a hub round trip
         # when there is something to widen TO: at or below the uncertified cap, certification
         # cannot raise the ceiling.
-        from flash.engine.plan.vram import certified_revision_attention_heads
+        from flash.engine.plan.vram import certified_attention_heads
 
-        certified = certified_revision_attention_heads(model_id, model_revision)
+        certified = certified_attention_heads(model_id, model_revision)
         if certified > 0:
             heads = certified
         else:

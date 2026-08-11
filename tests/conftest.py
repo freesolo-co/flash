@@ -145,9 +145,9 @@ def _offline(monkeypatch):
     # silently reads the earlier answer. Clear around every test: the memo exists to avoid a round
     # trip, not to freeze one test's stub into the next.
     import flash.cost.facts as _facts
-    import flash.engine.plan.pinned_geometry as _pinned
+    import flash.engine.plan.model_config_probe as _pinned
 
-    _pinned._PINNED_GEOMETRY_MEMO.clear()
+    _pinned._CONFIG_PROBE_MEMO.clear()
     _facts._PINNED_SIZE_MEMO.clear()
 
     # Always-on artifact GC: the control-plane lifespan sweeps ONCE on startup (when an operator
@@ -160,7 +160,7 @@ def _offline(monkeypatch):
     yield
     rp_keys.reset()
     _providers._get_provider.cache_clear()
-    _pinned._PINNED_GEOMETRY_MEMO.clear()
+    _pinned._CONFIG_PROBE_MEMO.clear()
     _facts._PINNED_SIZE_MEMO.clear()
 
 

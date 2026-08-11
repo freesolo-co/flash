@@ -623,14 +623,14 @@ def test_offline_estimate_applies_the_pinned_revision_geometry_cap(monkeypatch):
     code path whose whole contract is that it does no network i/o. Certification belongs on the
     submission path.
     """
-    import flash.engine.plan.pinned_geometry as pinned_geometry
+    import flash.engine.plan.model_config_probe as model_config_probe
     import flash.engine.plan.vram as vram
     from flash.core.catalog import MODELS
     from flash.cost.analytical import _offline_gpu_shape
 
     monkeypatch.setattr("flash.cost.analytical.required_vram_gb", lambda *a, **k: 700)
     monkeypatch.setattr("flash.cost.analytical.total_params_b", lambda *a, **k: 4.7)
-    monkeypatch.setattr(pinned_geometry, "_PINNED_GEOMETRY_MEMO", {})
+    monkeypatch.setattr(model_config_probe, "_CONFIG_PROBE_MEMO", {})
     config = RunConfig(
         "Qwen/Qwen3.5-4B",
         "sft",
@@ -674,7 +674,7 @@ def test_the_offline_probe_sizes_a_pinned_catalog_model_by_its_revision(monkeypa
     revision through rather than quoting default-revision weights -- still holds for a pinned
     catalog model, which is the only way to reach revision-specific sizing at all.)
     """
-    import flash.engine.plan.pinned_geometry as pinned_geometry
+    import flash.engine.plan.model_config_probe as model_config_probe
     import flash.engine.plan.vram as vram
     from flash.core.catalog import MODELS
     from flash.cost.analytical import _offline_gpu_shape
@@ -685,7 +685,7 @@ def test_the_offline_probe_sizes_a_pinned_catalog_model_by_its_revision(monkeypa
     expected_revision = "f" * 40
     seen_revisions = []
 
-    def _pinned_geometry(model_id, revision="", strict=False):
+    def _model_config_probe(model_id, revision="", strict=False):
         assert model_id == model
         seen_revisions.append(revision)
         return (
@@ -696,9 +696,9 @@ def test_the_offline_probe_sizes_a_pinned_catalog_model_by_its_revision(monkeypa
             info.num_attention_heads,
         )
 
-    monkeypatch.setattr(vram, "fetch_hf_model_geometry", _pinned_geometry)
+    monkeypatch.setattr(vram, "fetch_hf_model_geometry", _model_config_probe)
     monkeypatch.setattr("flash.cost.facts._PINNED_SIZE_MEMO", dict(_PINNED_SIZE_MEMO))
-    monkeypatch.setattr(pinned_geometry, "_PINNED_GEOMETRY_MEMO", {})
+    monkeypatch.setattr(model_config_probe, "_CONFIG_PROBE_MEMO", {})
     _PINNED_SIZE_MEMO.pop((model, expected_revision), None)
 
     gpu, count, need, provider, rate = _offline_gpu_shape(
