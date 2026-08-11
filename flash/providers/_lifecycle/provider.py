@@ -104,27 +104,6 @@ class InstanceProvider(abc.ABC):
     def preflight(self, require_hf: bool = True) -> list[str]:
         return self._missing_credentials(require_hf)
 
-    def _private_image_problem(self) -> str:
-        """Why this substrate cannot provision the configured private worker image, if it cannot.
-
-        ``FLASH_WORKER_IMAGE_REGISTRY_AUTH`` is a RunPod provider-side credential id: RunPod
-        attaches it to the endpoint template, while these rent-a-box substrates pull the image on
-        the instance with no registry login at all. The image override itself reaches every
-        provider, so an automatic allocation onto Lambda or Vast rented a box that could never
-        start the worker -- and a never-started worker is classified retriable, so it could repeat
-        across paid attempts.
-        """
-        from flash.providers._lifecycle.worker import worker_image_override
-
-        override = worker_image_override()
-        if not (override and override.registry_auth_id):
-            return ""
-        return (
-            f"a private FLASH_WORKER_IMAGE cannot be provisioned on {self.name}: "
-            f"FLASH_WORKER_IMAGE_REGISTRY_AUTH is a RunPod registry-credential id, and "
-            f"{self.name} pulls the worker image on the instance with no registry login"
-        )
-
     def gpu_classes(self) -> list[GpuClass]:
         from flash.providers import base
 

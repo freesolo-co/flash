@@ -650,11 +650,10 @@ def get_train_endpoint(
         kwargs.update(weight_cache_endpoint_kwargs(spec))
         ep = Endpoint(**kwargs)
         handler = ep(_train_body)
-        from flash.providers.runpod.jobs import apply_disk_gb, apply_image_override_constraints
+        from flash.providers.runpod.jobs import apply_disk_gb
 
         cfg = ep._build_resource_config()
         apply_disk_gb(cfg, disk_gb)
-        apply_image_override_constraints(cfg)
         if cache_handler:
             _ENDPOINT_CACHE[name] = handler
         return handler

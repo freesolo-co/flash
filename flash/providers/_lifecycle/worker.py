@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass
 from io import BytesIO
 
 from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
@@ -81,42 +80,8 @@ WORKER_IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
 BAKED_PER_SM_ARCHES = frozenset({"sm80", "sm86", "sm89", "sm90", "sm120", "sm100"})
 
 
-@dataclass(frozen=True)
-class WorkerImageOverride:
-    """A worker-image override and the registry credential needed to pull it.
-
-    only auth remains here (#906): GPU class encodes the CUDA floor and the runner sizes disk
-    from the model catalog. the credential cannot be derived from the image ref.
-    """
-
-    image: str
-    registry_auth_id: str = ""
-
-
-def worker_image_override() -> WorkerImageOverride | None:
-    """Parse the FLASH_WORKER_IMAGE override and its registry credential.
-
-    The credential cannot be derived from the image ref, so it stays configurable. The image's CUDA
-    and disk floors are NOT configurable: the GPU class floor (min_cuda_modern) already encodes the
-    real constraint, and container disk is platform-managed: ``disk_gb`` is in MANAGED_GPU_KEYS, so
-    it is stripped from the user-facing surface and the runner raises it to the model catalog's
-    ``min_disk_gb`` (_with_model_disk). An image whose disk floor exceeds its model's catalog entry
-    therefore has no override to reach for; raise the catalog floor instead.
-    """
-    image = os.environ.get("FLASH_WORKER_IMAGE", "").strip()
-    if not image:
-        return None
-    return WorkerImageOverride(
-        image=image,
-        registry_auth_id=os.environ.get("FLASH_WORKER_IMAGE_REGISTRY_AUTH", "").strip(),
-    )
-
-
 def worker_image_for_gpu(friendly_gpu: str | None, *, allow_default: bool = True) -> str | None:
-    """Return the worker Docker image for a GPU class (per-SM kernel-cache tag or base), respecting the FLASH_WORKER_IMAGE override."""
-    override = worker_image_override()
-    if override:
-        return override.image
+    """Return the worker Docker image for a GPU class (per-SM kernel-cache tag or base)."""
     if friendly_gpu and allow_default:
         info = get_gpu_info(friendly_gpu)
         # Per-SM baked kernel-cache image is always used for baked arches (skips ~10-15 min
