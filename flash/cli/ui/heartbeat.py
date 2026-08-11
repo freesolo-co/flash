@@ -130,8 +130,22 @@ _LIVENESS_SETUP_STAGES = frozenset(
     }
 )
 # a liveness-backed setup stage pings every 240s, so silence past ~3 missed ticks is the point where
-# "still downloading" stops being the only explanation and a vanished instance becomes as likely.
+# "still working" stops being the only explanation and a vanished instance becomes as likely.
 _SETUP_SILENT_AFTER_S = 900.0
+
+# the subset of the above that pulls weights or checkpoints over the network. only these can be
+# explained by a cold per-datacenter cache, so only these may say so: telling a user that
+# sft_configuring is "downloading tens of GB" sends them looking for a transfer that stage never
+# performs, which is the same misdiagnosis this hint exists to prevent.
+_DOWNLOADING_SETUP_STAGES = frozenset(
+    {
+        "model_prefetching",
+        "checkpoint_prefetching",
+        "sft_model_load",
+        "opd_model_load",
+        "rl_adapter_loading",
+    }
+)
 
 
 def _stale_setup_hint(
@@ -144,11 +158,15 @@ def _stale_setup_hint(
     """Say what a long silence at a liveness-backed setup stage can and cannot mean.
 
     A setup stage holds a liveness thread on a 240s cadence, so a much older heartbeat is not the
-    throttle -- either the worker is inside one long blocking call (a cold per-datacenter weight
-    cache can download tens of GB in a single call) or the instance is gone. The panel cannot tell
-    those apart, and the failure mode is asymmetric: a user who reads a cold download as a hang
-    cancels a healthy paid GPU. Name both, and point at the surface that actually distinguishes
-    them, rather than leaving the generic quiet hint to imply everything is fine.
+    throttle -- either the worker is inside one long blocking call or the instance is gone. The
+    panel cannot tell those apart, and the failure mode is asymmetric: a user who reads a slow but
+    healthy stage as a hang cancels a paid GPU. Name both, and point at the surface that actually
+    distinguishes them, rather than leaving the generic quiet hint to imply everything is fine.
+
+    The blocking call is only described as a download for the stages that actually fetch weights,
+    and the datacenter is only cited when it is on the panel to be read -- an explanation that
+    names the wrong operation, or points at a row that was not rendered, is a fresh wrong turn
+    rather than a resolved ambiguity.
     """
     if not running or heartbeat_age_seconds is None:
         return None
@@ -156,12 +174,18 @@ def _stale_setup_hint(
         return None
     if heartbeat_age_seconds <= _SETUP_SILENT_AFTER_S:
         return None
-    if str(heartbeat.get("stage") or "") not in _LIVENESS_SETUP_STAGES:
+    stage = str(heartbeat.get("stage") or "")
+    if stage not in _LIVENESS_SETUP_STAGES:
         return None
+    if stage in _DOWNLOADING_SETUP_STAGES:
+        blocking = "a cold weight cache downloads tens of GB with no ping"
+        if heartbeat.get("dc"):
+            blocking += ", and the datacenter above is where it landed"
+    else:
+        blocking = "this stage does no download, so a long one is unusual here"
     return (
         "this setup stage pings every ~4 min while the worker is alive, so this gap is longer than "
-        "throttling explains: either it is inside one long blocking call (a cold weight cache "
-        "downloads tens of GB with no ping, and the datacenter above is where it landed) or the "
+        f"throttling explains: either it is inside one long blocking call ({blocking}) or the "
         "instance is gone. a vanished instance is reported as a retry or failure, so check whether "
         "the attempt advances before cancelling"
     )

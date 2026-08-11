@@ -821,6 +821,69 @@ def test_long_silence_at_a_liveness_setup_stage_names_both_causes(monkeypatch):
     assert "last one UPLOADED" in stepping_out
 
 
+def test_setup_hint_does_not_blame_a_download_on_a_stage_that_never_downloads(monkeypatch):
+    """The hint fires for every liveness setup stage, but only some of them fetch weights.
+
+    Telling a user that `sft_configuring` is "downloading tens of GB" sends them hunting for a
+    transfer that stage never performs. A wrong explanation is its own misdiagnosis, which is the
+    failure class this hint was added to remove -- so the download clause has to be conditional.
+    """
+    import time as _time
+
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    base = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+    }
+
+    frozen = dict(base, last_heartbeat={"stage": "sft_configuring", "ts": _time.time() - 1200})
+    out = render.run_status(frozen)
+    # still flagged: the silence is just as unexplained by throttling here.
+    assert "longer than throttling explains" in out
+    assert "instance is gone" in out
+    # but not attributed to a download this stage does not perform.
+    assert "downloads tens of GB" not in out
+
+
+def test_setup_hint_cites_the_datacenter_only_when_the_row_is_rendered(monkeypatch):
+    """`dc` is optional, and the datacenter row is omitted when it is absent.
+
+    The hint says "the datacenter above", so without this the text points at a row that was never
+    rendered. Both read the same heartbeat dict, so the reference must follow the row.
+    """
+    import time as _time
+
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    base = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+    }
+
+    without_dc = dict(base, last_heartbeat={"stage": "sft_model_load", "ts": _time.time() - 1200})
+    out = render.run_status(without_dc)
+    assert "datacenter above" not in out, "cites a row that is not on the panel"
+    # the download itself is still the right explanation for this stage.
+    assert "downloads tens of GB" in out
+
+    with_dc = dict(
+        base,
+        last_heartbeat={"stage": "sft_model_load", "ts": _time.time() - 1200, "dc": "EU-RO-1"},
+    )
+    out_dc = render.run_status(with_dc)
+    assert "datacenter above" in out_dc
+    assert "EU-RO-1" in out_dc
+
+
 def test_status_shows_the_datacenter_the_worker_landed_in(monkeypatch):
     """Base weights come from a per-datacenter cache volume and the allocator does not pin a region.
 
