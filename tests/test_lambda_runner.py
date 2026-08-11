@@ -502,6 +502,55 @@ def test_bootstrap_extra_pip_retries_a_network_interrupted_vcs_clone(monkeypatch
     assert len(calls) == 2  # retried the clone instead of failing the run as a user error
 
 
+def test_bootstrap_extra_pip_retries_a_vcs_clone_rejected_by_an_http_blip(monkeypatch):
+    # a VCS pin fails through git, whose proxy/rate-limit blips carry git's own phrasing and none
+    # of the urllib shapes the rest of the pattern names. Without git's form the classifier reads
+    # a 502 as a bad spec and fails a paid run on a blip the ladder exists to absorb.
+    lb, calls = _wire_pip(
+        monkeypatch,
+        [
+            (
+                (
+                    "  Running command git clone --filter=blob:none -q "
+                    "https://github.com/org/repo\n"
+                    "  fatal: unable to access 'https://github.com/org/repo/': "
+                    "The requested URL returned error: 502\n"
+                    "  error: subprocess-exited-with-error\n"
+                ),
+                1,
+            ),
+            ("Successfully installed some-pkg\n", 0),
+        ],
+    )
+    lb.install_extra_pip(_pip_payload())
+    assert len(calls) == 2
+
+
+def test_bootstrap_extra_pip_vcs_clone_rejected_by_a_404_still_fails_fast(monkeypatch):
+    # the counterpart bound: git reports a missing repo or an unauthorized private pin in the same
+    # sentence as the blip above. Only 429/5xx may retry, or a typo'd pin re-rents a box three
+    # times to fail identically.
+    lb, calls = _wire_pip(
+        monkeypatch,
+        [
+            (
+                (
+                    "  Running command git clone --filter=blob:none -q "
+                    "https://github.com/org/typo\n"
+                    "  fatal: unable to access 'https://github.com/org/typo/': "
+                    "The requested URL returned error: 404\n"
+                    "  error: subprocess-exited-with-error\n"
+                ),
+                1,
+            )
+        ],
+    )
+    with pytest.raises(RuntimeError, match="extra_pip install failed") as exc_info:
+        lb.install_extra_pip(_pip_payload())
+    assert not isinstance(exc_info.value, lb.RetriableBootstrapError)
+    assert len(calls) == 1
+
+
 def test_bootstrap_extra_pip_survives_undecodable_bytes_from_a_build_child(monkeypatch):
     # a build or VCS child can emit bytes invalid under the worker's locale. text=True decodes
     # strictly, so iterating the stream raised UnicodeDecodeError before the exit status was ever

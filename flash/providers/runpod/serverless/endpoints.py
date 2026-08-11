@@ -262,6 +262,10 @@ def _train_body(input_data: dict) -> dict:
                 r"|newconnectionerror|maxretryerror|ssleoferror|service unavailable|bad gateway"
                 r"|gateway time-?out|too many requests|retrying \(retry\("
                 r"|\b(?:429|5\d\d) (?:client|server) error"
+                # a VCS pin fails through git, not urllib, so its blips carry git's own phrasing
+                # and none of the shapes above. Only 429/5xx: a 404 or 403 is a bad pin or a
+                # missing token and must still fail fast rather than burn three backoffs.
+                r"|returned error: (?:429|5\d\d)"
             )
             # Build/resolution failures, reachable only AFTER pip downloaded real content, so they
             # name the cause and outrank a transient warning pip already recovered from in the same

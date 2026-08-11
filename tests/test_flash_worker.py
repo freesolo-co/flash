@@ -746,6 +746,32 @@ def test_train_body_extra_pip_build_failure_outranks_earlier_transient_text(monk
     assert len(calls) == 1  # the build failure names the cause, so no retry ladder
 
 
+def test_train_body_extra_pip_matches_the_bootstrap_on_git_http_blips(monkeypatch):
+    # the two classifiers must agree on what is retriable. A VCS pin fails through git, whose
+    # phrasing carries none of the urllib shapes, so a 502 must retry here exactly as it does on
+    # the instance bootstrap; a 404 is a bad pin and must still fail fast in both.
+    from flash.providers.runpod.serverless import endpoints
+
+    blip = (
+        "  Running command git clone --filter=blob:none -q https://github.com/org/repo\n"
+        "  fatal: unable to access 'https://github.com/org/repo/': "
+        "The requested URL returned error: 502\n"
+        "  error: subprocess-exited-with-error\n"
+    )
+    calls = _wire_train_body_pip(
+        monkeypatch, [(blip, 1), ("Successfully installed some-env-pkg-1.0\n", 0)]
+    )
+    with pytest.raises(ValueError, match="invalid code_prefix"):
+        endpoints._train_body(_extra_pip_input())
+    assert len(calls) == 2
+
+    missing = blip.replace("returned error: 502", "returned error: 404")
+    calls = _wire_train_body_pip(monkeypatch, [(missing, 1)])
+    with pytest.raises(RuntimeError, match="extra_pip install failed"):
+        endpoints._train_body(_extra_pip_input())
+    assert len(calls) == 1
+
+
 def test_train_body_extra_pip_stops_after_the_bounded_retries(monkeypatch):
     from flash.providers.runpod.serverless import endpoints
 

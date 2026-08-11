@@ -32,6 +32,10 @@ _PIP_TRANSIENT_RE = re.compile(
     r"|network is unreachable|remote end closed connection|newconnectionerror|maxretryerror"
     r"|ssleoferror|service unavailable|bad gateway|gateway time-?out|too many requests"
     r"|retrying \(retry\(|\b(?:429|5\d\d) (?:client|server) error"
+    # a VCS pin fails through git, not urllib, so its blips carry git's own phrasing and none of
+    # the shapes above. Only 429/5xx: a 404 or 403 is a bad pin or a missing token and must still
+    # fail fast rather than burn three backoffs on a paid box.
+    r"|returned error: (?:429|5\d\d)"
 )
 _PIP_TERMINAL_RE = re.compile(
     r"(?i)failed building wheel|could not build wheels|metadata-generation-failed"
