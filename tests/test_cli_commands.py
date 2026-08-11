@@ -2051,26 +2051,31 @@ def test_unknown_run_errors_surface_as_nonzero_exit(monkeypatch, capsys) -> None
     assert "unknown run" in capsys.readouterr().err
 
 
-def test_submit_payload_carries_no_pip_and_the_worker_resolves_it(monkeypatch, tmp_path) -> None:
-    """pip is platform-managed: it leaves the wire, and the submit path supplies it instead.
+def test_submit_payload_carries_authored_pip_and_the_worker_appends_it(
+    monkeypatch, tmp_path
+) -> None:
+    """pip is authorable: it travels on the wire, and the submit path adds the worker baseline.
 
-    Both halves matter. Dropping the key from the payload without the provider still resolving it
-    would ship a worker with no Freesolo SDK, and the failure would surface only on a real GPU.
+    Both halves matter. Carrying the key without the provider still supplying the baseline would
+    ship a worker with no Freesolo SDK, and the failure would surface only on a real GPU.
     """
     from flash.client.specs import spec_payload
     from flash.core.spec import EnvironmentSpec, JobSpec
-    from flash.envs.base import worker_pip_for_env
+    from flash.envs.base import worker_pip_with_extras
 
     spec = JobSpec(
         model="Qwen/Qwen3.5-0.8B",
         project="11111111-1111-4111-8111-111111111111",
-        environment=EnvironmentSpec(id="owner/env"),
+        environment=EnvironmentSpec(id="owner/env", pip=("pymongo>=4.6",)),
     )
 
-    # not an unauthorable key the server would reject, and not a duplicated constant on the wire.
-    assert "pip" not in spec_payload(spec)["environment"]
-    # the value the submit paths substitute for it, unchanged.
-    assert worker_pip_for_env(spec.environment.id) == ["freesolo>=0.4.0"]
+    # the author's scorer dependency reaches the server rather than being stripped on the client.
+    assert tuple(spec_payload(spec)["environment"]["pip"]) == ("pymongo>=4.6",)
+    # and the submit paths install it after the worker requirement, not instead of it.
+    assert worker_pip_with_extras(spec.environment.id, spec.environment.pip) == [
+        "freesolo>=0.4.0",
+        "pymongo>=4.6",
+    ]
 
 
 def test_export_uses_api_key_flag_and_forwards_args(fake_client, capsys, monkeypatch) -> None:

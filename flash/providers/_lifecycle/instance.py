@@ -190,7 +190,7 @@ def build_payload(
     bits the instance can't infer (HF prefix for markers, wall cap, attempt, and the substrate
     ``arm`` that the bootstrap stamps as FLASH_ARM + the marker name)."""
     from flash.core.spec import require_matching_seed
-    from flash.envs.base import worker_pip_for_env
+    from flash.envs.base import worker_pip_with_extras
     from flash.providers._lifecycle.worker import (
         build_worker_env,
         strip_runpod_volume_env,
@@ -221,8 +221,9 @@ def build_payload(
         "seed": spec.seed,
         "flash_arm": arm,
         "env": env,
-        # per-run env wheel; the bootstrap pip-installs extra_pip for every job.
-        "extra_pip": list(spec.environment.pip) or worker_pip_for_env(spec.environment.id),
+        # per-run env wheel; the bootstrap pip-installs extra_pip for every job. the author's
+        # [environment] pip is appended to the worker requirement, never substituted for it.
+        "extra_pip": worker_pip_with_extras(spec.environment.id, spec.environment.pip),
         "hf_prefix": f"{spec.phase}/{spec.run_id}",
         "code_prefix": code_prefix or flash_code_prefix(),
         "deadline_at": absolute_deadline,
