@@ -137,6 +137,10 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
     # re-introduced as a user knob after being managed-and-derived; gated on the release that
     # restored it, not on lora_rank's original 0.2.0.
     assert TRAIN_KEY_MIN_VERSIONS["lora_alpha"] == "1.1.35"
+    # the rl half of the optimizer-batch split. batch_size keeps its 0.2.0 gate because sft still
+    # takes it; only the new rl name is gated on the release that introduced the split.
+    assert TRAIN_KEY_MIN_VERSIONS["prompts_per_step"] == "1.1.43"
+    assert TRAIN_KEY_MIN_VERSIONS["batch_size"] == "0.2.0"
     # opd has no auxiliary eos loss or user-facing eos-loss key.
     assert "opd_eos_loss_coef" not in TRAIN_KEY_MIN_VERSIONS
     assert {
@@ -152,6 +156,7 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
             "credit_assignment",
             "entropy_quantile",
             "lora_alpha",
+            "prompts_per_step",
         }
     } == {"0.2.0"}
 
@@ -275,8 +280,10 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
     baseline = {"epochs", "hf_repo", "max_examples"}
 
     # historical snapshots remain exact to their commits, including fields now managed or removed.
-    # current adds save_at_steps, credit_assignment, and entropy_quantile; opd eos is removed.
-    # lora_alpha is in both: authorable then, managed in between, and a user knob again now.
+    # current adds save_at_steps, credit_assignment, entropy_quantile, and prompts_per_step; opd eos
+    # is removed. lora_alpha is in both: authorable then, managed in between, a user knob again now.
+    # prompts_per_step is current-only: the rl half of the optimizer-batch split, which those
+    # snapshots predate because back then batch_size still carried both meanings.
     assert historical_shapes["861571e7"] - {
         "opd_eos_loss_coef",
         "hf_repo",
@@ -285,6 +292,7 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
         "credit_assignment",
         "save_at_steps",
         "entropy_quantile",
+        "prompts_per_step",
     }
     assert "opd_eos_loss_coef" not in TRAIN_SCHEMA_KEYS
     assert "advantage_clip" not in TRAIN_SCHEMA_KEYS
@@ -1752,3 +1760,50 @@ def test_gpu_count_of_reads_spec_and_defaults() -> None:
         gpu_count_of(JobSpec(project="11111111-1111-4111-8111-111111111111", gpu=GpuSpec(count=3)))
         == 3
     )
+
+
+# ---------------------------------------------------------------------------
+# the optimizer batch is a different quantity per algorithm, so it has a different name
+# ---------------------------------------------------------------------------
+
+
+def test_sft_batch_size_is_rejected_on_rl_and_names_the_right_key() -> None:
+    """The trap this split exists to close.
+
+    `batch_size = 1` is the standard sft out-of-memory workaround. Copied into a grpo/opd config it
+    used to parse and silently mean one prompt per optimizer update -- the run trained, logged and
+    billed, and nothing errored. It must now fail at parse and say which key to use instead.
+    """
+    for algorithm in ("grpo", "opd"):
+        with pytest.raises(ConfigError) as excinfo:
+            spec_from_dict(_raw(algorithm=algorithm, **{"train.batch_size": 1}))
+
+        message = str(excinfo.value)
+        assert "batch_size does not apply to" in message
+        assert "prompts_per_step" in message  # the remedy names the key that works
+
+
+def test_rl_prompts_per_step_is_rejected_on_sft_and_names_the_right_key() -> None:
+    with pytest.raises(ConfigError) as excinfo:
+        spec_from_dict(_raw(algorithm="sft", **{"train.prompts_per_step": 8}))
+
+    message = str(excinfo.value)
+    assert "prompts_per_step does not apply to sft" in message
+    assert "batch_size" in message
+
+
+def test_each_algorithm_still_accepts_its_own_optimizer_batch_key() -> None:
+    """The rejection is per-algorithm, not a blanket ban on either name."""
+    assert spec_from_dict(_raw(algorithm="sft", **{"train.batch_size": 4})).train.batch_size == 4
+    for algorithm in ("grpo", "opd"):
+        spec = spec_from_dict(_raw(algorithm=algorithm, **{"train.prompts_per_step": 16}))
+        assert spec.train.prompts_per_step == 16
+        assert spec.train.batch_size is None
+
+
+def test_neither_optimizer_batch_key_is_required() -> None:
+    """Both are optional; an unset key leaves the worker's tuned recipe default in place."""
+    for algorithm in ("sft", "grpo", "opd"):
+        spec = spec_from_dict(_raw(algorithm=algorithm))
+        assert spec.train.batch_size is None
+        assert spec.train.prompts_per_step is None

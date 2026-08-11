@@ -293,7 +293,15 @@ class TrainSpec:
     hf_repo: str = ""
     # None -> worker's tuned recipe default.
     learning_rate: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
+    # sft ONLY. a measured workload profile resolves this against the real tokenized dataset into
+    # examples_per_update (packed) or pins the optimizer batch to 1 (unpacked). grpo/opd have no
+    # profile, so they take prompts_per_step instead and reject this key: the two are not the same
+    # quantity, and accepting one name for both let the standard sft memory workaround
+    # (batch_size = 1) silently mean one prompt per optimizer update on rl.
     batch_size: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
+    # grpo/opd ONLY: the optimizer batch itself, straight through to verl's data.train_batch_size
+    # and ppo_mini_batch_size. no workload profile sits in between.
+    prompts_per_step: int | None = field(default=None, metadata={"introduced_in": "1.1.43"})
     max_context_tokens: int | None = field(default=None, metadata={"introduced_in": "0.2.49"})
     save_every: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     max_steps: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
@@ -644,6 +652,7 @@ class JobSpec:
                 hf_repo=str(train.get("hf_repo") or ""),
                 learning_rate=_opt_float(train.get("learning_rate")),
                 batch_size=_opt_int(train.get("batch_size")),
+                prompts_per_step=_opt_int(train.get("prompts_per_step")),
                 max_context_tokens=_opt_int(train.get("max_context_tokens")),
                 save_every=_opt_int(train.get("save_every")),
                 max_steps=parse_max_steps(train.get("max_steps")),
