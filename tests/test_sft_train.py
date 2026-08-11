@@ -288,6 +288,42 @@ def test_sft_warns_while_the_run_is_live_when_it_leaves_cards_idle(monkeypatch, 
     assert "--nproc-per-node=1" in captured["command"]
 
 
+def test_sft_width_never_drops_a_profiled_row():
+    """The width must divide the ROW count, not just the batch.
+
+    verl builds `DistributedSampler(..., drop_last=True)` (`sft_trainer.py:237`) and Flash's
+    exact-dataloader shim overrides `drop_last` on the LOADER only -- its sampler patch sets
+    `shuffle` and nothing else. So a width that leaves a row remainder drops it from every epoch
+    while the frozen quote still bills it: 11 rows on 2 ranks trains 10, on 4 ranks trains 8.
+
+    This could not fire before Ulysses was pinned off, because `sp = gpu_count` forced `dp_size`
+    to 1. Making multi-rank SFT reachable is what puts this in scope.
+    """
+    from flash.engine.plan.steps import sft_data_parallel_cards
+
+    # 11 rows is prime: no width above 1 divides it, so every extra card would drop rows.
+    assert sft_data_parallel_cards(4, 8, 11) == 1
+    # 12 rows with batch 8 -> 4 divides both.
+    assert sft_data_parallel_cards(4, 8, 12) == 4
+    # rows divide but the batch does not: the batch still binds.
+    assert sft_data_parallel_cards(4, 2, 12) == 2
+    # batch divides but the rows do not: the rows now bind. 8 % 2 == 0, but 10 % 4 != 0.
+    assert sft_data_parallel_cards(4, 8, 10) == 2
+
+    # unknown row count (the cost path quotes before the dataset exists) must not constrain.
+    assert sft_data_parallel_cards(4, 8) == 4
+    assert sft_data_parallel_cards(4, 8, 0) == 4
+
+    # exhaustive: whatever comes back divides BOTH, so no rank is starved and no row is dropped.
+    for cards in range(1, 9):
+        for batch in range(1, 17):
+            for rows in range(1, 25):
+                got = sft_data_parallel_cards(cards, batch, rows)
+                assert 1 <= got <= cards
+                assert batch % got == 0, (cards, batch, rows, got)
+                assert rows % got == 0, (cards, batch, rows, got)
+
+
 def test_sft_idle_card_warning_names_a_remedy_that_can_actually_work():
     """The advice has to move the width it is printed about, and name a shape you can rent.
 
@@ -301,7 +337,7 @@ def test_sft_idle_card_warning_names_a_remedy_that_can_actually_work():
 
     unpacked = io.StringIO()
     with contextlib.redirect_stdout(unpacked):
-        assert _resolve_sft_world_size(2, 1) == 1
+        assert _resolve_sft_world_size(2, 1, 12) == 1
     text = unpacked.getvalue()
     assert "[sft][warn] training on 1 of 2 allocated cards" in text, text
     assert "batch_size" not in text, "raising the batch cannot move an unpacked run off one card"
@@ -310,7 +346,7 @@ def test_sft_idle_card_warning_names_a_remedy_that_can_actually_work():
     # batch 6 on 4 cards resolves to 3 ranks, but 3 is not rentable -- recommend 2.
     odd = io.StringIO()
     with contextlib.redirect_stdout(odd):
-        assert _resolve_sft_world_size(4, 6) == 3
+        assert _resolve_sft_world_size(4, 6, 12) == 3
     text = odd.getvalue()
     assert "training on 3 of 4 allocated cards" in text, text
     assert "allocate 2 card(s)" in text, text
@@ -380,7 +416,10 @@ def test_sft_launches_the_resolved_width_not_the_allocated_cards():
     assert line == 'f"--nproc-per-node={world_size}",', line
     assert '"n_gpus_per_node": world_size,' in src
     # and the width is the RESOLVED one, not the raw allocation.
-    assert "world_size = _resolve_sft_world_size(options.gpu_count, model.train_batch_size)" in src
+    assert (
+        "world_size = _resolve_sft_world_size("
+        "options.gpu_count, model.train_batch_size, len(data.rows))" in src
+    )
 
 
 def test_remove_padding_is_unconditional():

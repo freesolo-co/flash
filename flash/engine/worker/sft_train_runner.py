@@ -349,7 +349,7 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
     )
 
 
-def _resolve_sft_world_size(gpu_count: int, train_batch_size: int) -> int:
+def _resolve_sft_world_size(gpu_count: int, train_batch_size: int, row_count: int) -> int:
     """Ranks to launch, warning when that is fewer than the cards the run is paying for.
 
     SFT shards by DATA, not by sequence: ulysses is pinned to 1 and fsdp splits the batch. verl's
@@ -363,19 +363,27 @@ def _resolve_sft_world_size(gpu_count: int, train_batch_size: int) -> int:
     verl slices that row per rank, so the shapes reaching the GDN kernels stop agreeing and a
     sharded run died on `seq_idx must have shape (batch_size, seqlen)` -- at any batch size,
     including 1, because "remove padding" leaves no batch dimension to keep an example whole.
+
+    The width must also divide the ROW count, or verl's sampler drops the remainder from every
+    epoch while the quote still bills it. See `sft_data_parallel_cards`.
     """
-    world_size = sft_data_parallel_cards(gpu_count, train_batch_size)
+    world_size = sft_data_parallel_cards(gpu_count, train_batch_size, row_count)
     if world_size < gpu_count:
         # the run is BILLED for every allocated card, so a card the batch cannot feed is money
         # spent on an idle gpu. the notes carry it too, but those are read after the fact -- say it
         # while the run is live, and say what would actually use the card.
         #
-        # the remedy is not the same in both cases. an unpacked profile pins the batch to 1
+        # the remedy is not the same in every case. an unpacked profile pins the batch to 1
         # (`sft_workload` sets examples_per_update = 1 for every non-packed mode), so telling the
         # operator to raise [train] batch_size there sends them to a knob that cannot move this
         # width. and only powers of two are rentable, so naming an odd rank count as a card
         # allocation buys the next one DOWN -- "allocate 3" gets 2.
         rentable = largest_rentable_count(world_size)
+        limiter = (
+            f"a batch of {train_batch_size}"
+            if train_batch_size % gpu_count
+            else f"a dataset of {row_count} rows"
+        )
         remedy = (
             f"allocate {rentable} card(s) instead"
             if train_batch_size <= 1
@@ -383,8 +391,8 @@ def _resolve_sft_world_size(gpu_count: int, train_batch_size: int) -> int:
             "card(s) instead"
         )
         print(
-            f"[sft][warn] training on {world_size} of {gpu_count} allocated cards: a batch of "
-            f"{train_batch_size} cannot be split across {gpu_count} ranks without starving one. "
+            f"[sft][warn] training on {world_size} of {gpu_count} allocated cards: {limiter} "
+            f"cannot be split across {gpu_count} ranks without starving one or dropping rows. "
             f"the idle cards are still billed -- {remedy}."
         )
     return world_size
@@ -415,7 +423,7 @@ def _prepare_sft_child(
     # `gdn_reset_arch` is resolved by the caller, inside the configuring liveness wrap, because the
     # probe is part of the setup silence that wrap exists to cover, and because a packed run must
     # take the RAISING gate there rather than the soft form.
-    world_size = _resolve_sft_world_size(options.gpu_count, model.train_batch_size)
+    world_size = _resolve_sft_world_size(options.gpu_count, model.train_batch_size, len(data.rows))
     config = {
         "train_files": data.train_file,
         "train_batch_size": model.train_batch_size,
