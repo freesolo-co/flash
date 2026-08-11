@@ -2212,3 +2212,84 @@ def test_resolve_verl_python_repairs_a_venv_it_provisions():
         "the venv stamp no longer depends on the child libcudart repair, so a failed repair is "
         "recorded as fully provisioned and reused by every later attempt on this pod."
     )
+
+
+def test_worker_image_repairs_its_own_verl_venv_cudart_stub():
+    """The PREBUILT image repairs /opt/verl-venv itself.
+
+    Dockerfile.worker sets FLASH_VERL_PYTHON, and resolve_verl_python returns a preset unchanged
+    (flash does not own a foreign interpreter), so live workers take the early return and the
+    runtime repair above never runs for them. That venv installs tilelang, so without a build-time
+    repair every production worker keeps the exact stub that aborts vLLM's import in the child --
+    the runtime fix would be dead code on the only image that ships.
+    """
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    dockerfile = (root / "Dockerfile.worker").read_text()
+
+    assert "extract_cudart_fix.py" in dockerfile, (
+        "Dockerfile.worker no longer repairs its own /opt/verl-venv tilelang stub, so production "
+        "workers abort on vLLM import in the child after the gpu is already rented."
+    )
+    # the repair must run against the verl venv, not the main interpreter: they have disjoint
+    # site-packages, and the child trains in the verl one.
+    assert re.search(r"/opt/verl-venv/bin/python\s+\S*fix\.py", dockerfile), (
+        "the stub repair must run against /opt/verl-venv/bin/python (FLASH_VERL_PYTHON), not the "
+        "main interpreter, whose site-packages the child never sees."
+    )
+
+    # ordering: after the last install that can (re)write tilelang into the venv, or the repair is
+    # undone by a later layer while still appearing present.
+    repair_at = dockerfile.index("extract_cudart_fix.py")
+    for later in ("causal-conv1d==", '"${spec}"'):
+        assert dockerfile.index(later) < repair_at, (
+            f"{later} installs into the verl venv AFTER the libcudart repair, which can restore "
+            "the stub the repair just replaced."
+        )
+    # and before the layer that imports vLLM there, which is what the stub crashes.
+    assert repair_at < dockerfile.index("from vllm import ModelRegistry"), (
+        "the verl venv imports vLLM before the stub is repaired, so the sanity layer hits the "
+        "crash this repair prevents."
+    )
+
+
+def test_worker_image_cudart_fix_is_extracted_not_duplicated():
+    """The image bakes the SAME script the runtime path runs.
+
+    Two hand-maintained copies of this repair would drift, and a drifted copy fails only on a
+    rented gpu. The extractor reads `_CHILD_CUDART_FIX` itself, so there is one source of truth.
+    """
+    import pathlib
+    import subprocess
+    import sys
+    import tempfile
+
+    from flash.engine.worker.verl.capabilities import _CHILD_CUDART_FIX
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    extractor = root / "docker" / "extract_cudart_fix.py"
+    assert extractor.exists(), "the build-time extractor is missing; the image cannot repair itself"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = pathlib.Path(tmp) / "fix.py"
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(extractor),
+                str(root / "flash" / "engine" / "worker" / "verl" / "capabilities.py"),
+                str(out),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"extractor failed: {result.stderr}"
+        baked = out.read_text()
+
+    # the generated header is comments only; everything below it must be the constant verbatim.
+    body = baked.split("\n", 2)[2]
+    assert body == _CHILD_CUDART_FIX, (
+        "the baked script drifted from _CHILD_CUDART_FIX; the image and the runtime path would "
+        "repair the same venv differently."
+    )
