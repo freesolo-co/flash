@@ -16,6 +16,67 @@ import shutil
 import subprocess
 
 
+class MergeDiskHeadroomError(RuntimeError):
+    """the merged model this export must write does not fit beside the checkpoint it reads."""
+
+
+def _tree_bytes(path: str) -> int:
+    """apparent size of a directory tree, counting each inode once.
+
+    checkpoints are staged with hardlinks, so the same inode appears under several paths; counting
+    it twice would overstate the very number this guard compares against free space.
+    """
+    seen: set[tuple[int, int]] = set()
+    total = 0
+    for root, _dirs, files in os.walk(path, followlinks=False):
+        for name in files:
+            try:
+                stat = os.lstat(os.path.join(root, name))
+            except OSError:
+                continue
+            if stat.st_nlink > 1:
+                key = (stat.st_dev, stat.st_ino)
+                if key in seen:
+                    continue
+                seen.add(key)
+            total += stat.st_size
+    return total
+
+
+def require_merge_headroom(ckpt_actor_dir: str, merge_out: str) -> None:
+    """Fail before `verl.model_merger` runs if its output cannot fit on the container disk.
+
+    `model_merger merge` does NOT write only the small lora adapter. `save_hf_model_and_tokenizer`
+    materializes the full base model and calls `model.save_pretrained(target_dir, state_dict=...)`
+    (verl `model_merger/base_model_merger.py`), so exporting one 35b checkpoint writes ~70 GB into
+    `<adapter>_merge` beside the ~60 GB checkpoint it is reading. That is the single largest
+    transient on the disk, and it recurs on EVERY publish, not just at finalization.
+
+    Without this guard the merger dies partway through `save_pretrained` with ENOSPC, and the run
+    fails after training has already succeeded. Checking first turns a silent late disk death into
+    an actionable error naming the shortfall, while the checkpoint is still intact and resumable.
+
+    The estimate is the checkpoint's own size: a full-state fsdp save holds model + optimizer
+    shards, so it is an upper bound on the bf16 weights the merge writes. No margin is added beyond
+    that headroom, because the number is already conservative.
+    """
+    need = _tree_bytes(ckpt_actor_dir)
+    if need <= 0:
+        return
+    try:
+        free = shutil.disk_usage(os.path.dirname(merge_out.rstrip("/")) or ".").free
+    except OSError:
+        # an unreadable mount is not evidence of exhaustion; let the merger run and report for real.
+        return
+    if free >= need:
+        return
+    raise MergeDiskHeadroomError(
+        f"cannot export the adapter: merging {ckpt_actor_dir} needs about "
+        f"{need / 1e9:.1f} GB beside it but only {free / 1e9:.1f} GB is free. "
+        "raise [gpu] disk_gb, or save fewer checkpoints with a larger save_every."
+    )
+
+
 def resolve_checkpoint_actor_dir(step_dir: str) -> str:
     """return the directory inside ``global_step_N`` that holds the saved model + ``huggingface/``.
 
@@ -126,6 +187,7 @@ def export_peft_adapter(
     os.makedirs(out_adapter_dir, exist_ok=True)
     merge_out = out_adapter_dir.rstrip("/") + "_merge"
     shutil.rmtree(merge_out, ignore_errors=True)
+    require_merge_headroom(ckpt_actor_dir, merge_out)
     merge_env = dict(os.environ)
     # the merger reads only local checkpoint files: strip credentials/tokens from its env (least
     # privilege), and keep it fully offline so it never touches hf's rate-limited api.

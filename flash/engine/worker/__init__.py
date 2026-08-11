@@ -34,6 +34,7 @@ from flash.engine.worker.io.heartbeat import (
     heartbeat,
 )
 from flash.engine.worker.io.hf import (
+    _disable_xet_upload_staging,
     _hf_upload,
     error_artifact_name,
     hf_api,
@@ -241,6 +242,10 @@ def _finalize(metrics: RunMetrics, *, heartbeat_fields=None):
 
 def _run_worker_mode() -> None:
     from flash.engine.worker.entry.profile import run_sft_profile
+
+    # before the first huggingface_hub import below: its constants module captures
+    # HF_HUB_DISABLE_XET at import time, so a later setenv would not be read.
+    _disable_xet_upload_staging()
 
     modes = {
         "sft": run_sft,

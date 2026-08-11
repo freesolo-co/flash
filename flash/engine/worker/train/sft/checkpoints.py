@@ -188,19 +188,32 @@ class _VerlCheckpointWatcher:
             python_bin=self.python_bin,
         )
 
+        published = False
+
         def publish_adapter() -> None:
+            nonlocal published
             _w.publish_deployable_checkpoint(
                 adapter_dir,
                 step,
                 required=step in self.required_steps,
                 _provenance_ready=True,
             )
+            published = True
 
-        uploaded = _w.upload_resume_checkpoint(
-            step,
-            checkpoint_dir,
-            before_upload=publish_adapter,
-        )
+        try:
+            uploaded = _w.upload_resume_checkpoint(
+                step,
+                checkpoint_dir,
+                before_upload=publish_adapter,
+            )
+        finally:
+            # once the adapter is durable on hf the local copy is redundant, and keeping every
+            # step's copy leaves one directory per save on the container disk for the whole run
+            # (the rl path already drops its equivalent). gated on the publish actually happening:
+            # `upload_resume_checkpoint` can return before running `before_upload` at all, and an
+            # unpublished export is the one copy that still matters.
+            if published:
+                shutil.rmtree(adapter_dir, ignore_errors=True)
         if step in self.required_steps and not uploaded:
             raise RuntimeError(f"required save step {step} full-state checkpoint was not published")
         self.processed_steps.add(step)
