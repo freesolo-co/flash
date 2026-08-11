@@ -268,10 +268,11 @@ ignored. Everything in the block above (`epochs`, `max_examples`, `max_steps`, `
 > So on OPD raise it only as far as the GPU allows, and do not expect `group_size` to buy memory
 > back, since it already defaults to 1.
 >
-> What widening costs depends on your horizon. On a derived horizon (`epochs` over a prompt pool) a
-> wider batch means proportionally fewer updates, so it also quotes cheaper. Under a positive
-> `max_steps` the update count is pinned, so a wider batch is pure extra generation: same steps,
-> bigger bill. The warning says which case you are in.
+> What widening costs depends on which knob you widen and on your horizon. Raising `batch_size`
+> against a fixed prompt pool means proportionally fewer updates, so it also quotes cheaper.
+> Raising a `max_examples` cap instead grows the pool, so the run gains passes and quotes dearer.
+> And under a positive `max_steps` the update count is pinned, so a wider batch is pure extra
+> generation: same steps, bigger bill. The warning says which case you are in.
 
 So `credit_assignment` (multi-turn GRPO defaults to one reward per rollout; `"per_turn"` gives
 turn-level credit, needs `per_turn_rewards` metadata, and is unsupported for tool-calling envs —

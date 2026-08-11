@@ -425,6 +425,43 @@ def test_a_thin_but_plural_batch_is_never_described_as_one_prompt(tmp_path, monk
     assert "one prompt" not in err
 
 
+def test_no_pool_cap_is_invented_when_the_config_sets_none(tmp_path, monkeypatch, capsys):
+    """With no `max_examples` in either table there is no pool cap to name.
+
+    `_on_policy_example_count` falls back to the REQUESTED batch when nothing caps the pool, which
+    makes `examples == prompts_per_step` for a reason that has nothing to do with a pool. Reading a
+    bind off that equality invented a `[environment.params] max_examples` cap and told the user to
+    raise a key absent from their config, on the most common uncapped shape there is.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, 1, max_examples=None))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "OPTIMIZER batch" in err  # it still warns
+    assert "max_examples" not in err  # but invents no cap
+    assert "Raise `batch_size`" in err
+
+
+def test_raising_a_binding_pool_is_priced_as_dearer_not_cheaper(tmp_path, monkeypatch, capsys):
+    """Widening a CAP grows the pool, so the run gains passes and the bill goes up.
+
+    The "fewer updates, so cheaper" trade only holds when the batch widens against a FIXED pool.
+    Measured on this shape: at batch 2, lifting `max_examples` 2 -> 8 goes from 1 step at $0.0353
+    to 4 steps at $0.1414. Promising a cheaper quote there is the same class of defect as the
+    fixed-horizon one, in the branch that fix did not cover.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, None, max_examples=2))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "quotes dearer" in err
+    assert "quotes cheaper" not in err
+
+
 def test_a_max_examples_clamp_is_warned_about_even_with_no_batch_size(
     tmp_path, monkeypatch, capsys
 ):

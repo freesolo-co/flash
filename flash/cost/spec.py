@@ -173,14 +173,22 @@ def thin_rl_batch_warning(spec) -> str | None:
         return None
     prompts = "1 prompt" if prompts_per_step == 1 else f"{prompts_per_step} prompts"
     authored = spec.train.batch_size
+    # a cap only exists if one was actually written. with neither table setting it,
+    # `_on_policy_example_count` falls back to the requested batch, which makes `examples` equal
+    # `prompts_per_step` for reasons that have nothing to do with a pool -- reading a bind off that
+    # equality would invent a cap the config does not contain and send the user to a phantom key.
     cap_key = (
-        "[train] max_examples" if spec.train.max_examples else "[environment.params] max_examples"
+        "[train] max_examples"
+        if spec.train.max_examples
+        else "[environment.params] max_examples"
+        if _env_max_examples(spec)
+        else None
     )
     # name every input that is actually holding the batch down, because raising one while another
     # still binds is a no-op the user pays for. the pool caps prompts-per-step, so an authored
     # batch at or above the pool is not the constraint even when the two are equal.
     batch_binds = authored is not None and authored <= examples
-    pool_binds = examples <= prompts_per_step
+    pool_binds = cap_key is not None and examples <= prompts_per_step
     if batch_binds:
         # the sft/rl name collision is only worth explaining when a batch_size was actually written
         lead = (
@@ -225,19 +233,22 @@ def thin_rl_batch_warning(spec) -> str | None:
             f"Your `max_steps` pins the update count, so raising {raise_target} buys that averaging "
             "at strictly more generated work and a higher bill for the same number of updates."
         )
+    elif pool_binds:
+        # raising a CAP grows the prompt pool, so the run gains passes instead of shedding them and
+        # the bill goes UP: at batch 2, lifting max_examples 2 -> 8 goes from 1 step at $0.035 to 4
+        # steps at $0.141. only widening the batch against a FIXED pool trades updates for money.
+        remedy = (
+            f"Raise {raise_target}: growing the prompt pool adds passes rather than removing them, "
+            "so this quotes dearer, not cheaper -- it buys the averaging with a longer run."
+        )
     else:
         # the "buying steps" workflow is about lowering batch_size against a fixed pool. a thin
         # POOL does not buy steps, it just shortens the run, so that caveat would excuse the wrong
         # config -- offer it only when the authored batch is what is holding the batch down.
-        caveat = (
-            " unless you are deliberately buying optimizer steps on a derived horizon "
-            "(see TRAINING.md)"
-            if batch_binds
-            else ""
-        )
         remedy = (
-            f"Raise {raise_target}{caveat}: on this horizon a wider batch means proportionally "
-            "fewer updates, so it also quotes cheaper, not dearer."
+            f"Raise {raise_target} unless you are deliberately buying optimizer steps on a derived "
+            "horizon (see TRAINING.md): against a fixed prompt pool a wider batch means "
+            "proportionally fewer updates, so it also quotes cheaper, not dearer."
         )
     return f"{lead} {consequence} {remedy}"
 
