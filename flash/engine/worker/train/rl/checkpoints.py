@@ -245,7 +245,7 @@ def _restore_verl_resume(local_dir: str, *, world_size: int) -> int:
     """stage this run's streamed resume checkpoint into local_dir; return the step it resumes at.
 
     returns 0 when there is nothing to resume, which is the ordinary fresh-run path, and also when
-    ``world_size`` does not match the shards' writer -- ``stage_verl_resume`` explains why.
+    ``world_size`` does not match the shards' writer (``stage_verl_resume`` explains why).
     """
     resume = _w.hf_resume_checkpoint()
     if not resume:

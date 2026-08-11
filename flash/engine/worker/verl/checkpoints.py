@@ -92,9 +92,9 @@ def unprocessed_checkpoint_dirs(
 
 
 # verl stamps the writing topology next to the shards on every save
-# (`utils/checkpoint/fsdp_checkpoint_manager.py` writes `FSDPConfig(world_size=...)` here, and its
-# own model_merger reads the file back). flash reads that stamp instead of adding a second one: it
-# is already inside every checkpoint on the hub, including the ones written before this guard.
+# (`utils/checkpoint/fsdp_checkpoint_manager.py` writes `FSDPConfig(world_size=...)`, and its own
+# model_merger reads the file back). flash reads verl's stamp rather than writing a second one of
+# its own, because every checkpoint already on the hub carries it.
 VERL_FSDP_CONFIG_FILE = "fsdp_config.json"
 
 # the shards themselves carry the same number: verl saves and loads
