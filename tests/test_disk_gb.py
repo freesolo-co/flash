@@ -139,6 +139,12 @@ def test_worker_image_disk_floor_refuses_a_malformed_value(monkeypatch):
         with pytest.raises(ValueError, match="FLASH_WORKER_IMAGE_DISK_GB"):
             worker_image_disk_floor()
 
+    # the override gate is checked BEFORE the value is parsed, so a stale typo left in the
+    # environment cannot fail runs on the published image -- the floor is not theirs to obey.
+    monkeypatch.delenv("FLASH_WORKER_IMAGE", raising=False)
+    monkeypatch.setenv("FLASH_WORKER_IMAGE_DISK_GB", "200GB")
+    assert worker_image_disk_floor() == 0
+
 
 def test_submit_raises_disk_to_the_worker_image_floor(monkeypatch):
     """A custom worker image larger than the catalog sizing gets a lever (raise-only).
