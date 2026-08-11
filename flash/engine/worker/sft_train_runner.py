@@ -439,8 +439,11 @@ def _prepare_sft_child(
         model_revision=options.model_revision,
         required_steps=options.save_at_steps,
     )
+    # credits durable required saves AND the step this attempt resumed from: the staged resume
+    # checkpoint is already a pending global_step_N on disk, and without the seed the watcher
+    # re-merges it and re-uploads full state hf already has, holding the resume-upload lock.
     watcher.processed_steps.update(
-        _sft_train._durable_required_save_steps(options.save_at_steps, resume_step)
+        _sft_train._processed_resume_steps(options.save_at_steps, resume_step)
     )
     if resume_step >= model.update_horizon:
         missing = sorted(watcher.required_steps - watcher.processed_steps)
