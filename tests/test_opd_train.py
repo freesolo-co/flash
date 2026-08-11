@@ -6124,6 +6124,45 @@ def test_opd_step_heartbeat_omits_stale_truncation_rate(monkeypatch):
     assert "truncation_rate" not in emitted[1][1]
 
 
+def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypatch):
+    """the step-match guard must not silently disable the rate in production.
+
+    on_line gates on verl_step_number, on_step on backend_common's own step_pattern. the two
+    parsers are different, so a shape where they disagree would omit the rate on every heartbeat
+    and leave the feature dead without failing anything. these are the shapes verl actually
+    emits: ray tags worker stdout with a pid prefix, and LocalLogger shares its stream with tqdm,
+    which ends a bar with "]" and no newline so the metric line arrives glued to it.
+    """
+    import re
+
+    import flash.engine.worker.opd_train_runner as opd_runner
+
+    emitted = []
+    monkeypatch.setattr(
+        opd_train._w,
+        "heartbeat",
+        lambda stage, **payload: emitted.append((stage, payload)),
+    )
+    callbacks = opd_runner._build_child_callbacks(
+        SimpleNamespace(raise_if_failed=lambda: None),
+        _OpdProgressState(),
+        _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
+        0,
+    )
+
+    # the step number reaching on_step is the one backend_common parses, not a hand-picked int.
+    step_re = re.compile(r"step:\s*(\d+)")
+    for line in (
+        "(TaskRunner pid=3125) step:1 - actor/distillation/loss:0.5",
+        "Epoch 1/1:  25%|##   | 1/4 [01:21<04:04, 81.49s/it]step:2 - actor/distillation/loss:0.4",
+    ):
+        callbacks.on_line(line)
+        callbacks.on_step(int(step_re.search(line).group(1)))
+
+    assert [payload["step"] for _, payload in emitted] == [1, 2]
+    assert all("truncation_rate" in payload for _, payload in emitted)
+
+
 def test_opd_line_handler_reads_the_loss_through_the_shared_parser():
     """pin the call site, not just the helper: a local float() here would reintroduce the drop."""
     import ast
