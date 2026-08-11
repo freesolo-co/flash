@@ -21,6 +21,9 @@ SECRET_ENV_KEYS_ENV = "FLASH_SECRET_ENV_KEYS"
 
 # multiline secrets may appear only partially in truncated logs. register long component lines as
 # needles, but ignore short common fragments such as ``}`` that would erase innocent diagnostics.
+# the floor applies to the WHOLE value too: a declared secret can carry any value, and a 3-char one
+# used as a global replacement needle would mangle every diagnostic containing those characters.
+# short values stay covered by the keyed credential patterns below.
 _MIN_SECRET_COMPONENT = 8
 
 
@@ -39,7 +42,7 @@ def _configured_secrets() -> tuple[str, ...]:
             or upper.endswith(_SECRET_ENV_SUFFIXES)
         ):
             continue
-        parts = [value]
+        parts = [value] if len(value) >= _MIN_SECRET_COMPONENT else []
         if "\n" in value:
             parts.extend(
                 line

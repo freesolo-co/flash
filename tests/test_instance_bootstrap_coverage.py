@@ -1974,6 +1974,26 @@ def test_safe_detail_keeps_short_components_of_a_multiline_secret_readable():
     assert detail == "parse error near } and abc"
 
 
+def test_safe_detail_keeps_a_very_short_declared_secret_out_of_global_replacement():
+    """a declared secret can carry any value, including a 3-char one. as an unconstrained global
+    replacement needle it would mangle every diagnostic containing those characters, so the same
+    floor the multiline components use applies to the whole value. long values still redact."""
+    assert (
+        b._safe_detail("trainer crashed after validation", secrets={"PIN": "ati"})
+        == "trainer crashed after validation"
+    )
+    assert (
+        b._safe_detail("trainer crashed holding sk-live-abc123456", secrets={"PIN": "ati"})
+        == "trainer crashed holding sk-live-abc123456"
+    )
+    assert (
+        b._safe_detail(
+            "trainer crashed holding sk-live-abc123456", secrets={"PIN": "sk-live-abc123456"}
+        )
+        == "trainer crashed holding <redacted>"
+    )
+
+
 def test_read_console_tail_keeps_a_complete_line_at_the_boundary(tmp_path):
     """the first retained line is dropped only when the byte boundary actually SPLIT it. a boundary
     landing right after a newline starts a complete line, and discarding it would throw away a full

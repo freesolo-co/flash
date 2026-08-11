@@ -97,8 +97,10 @@ def _train_body(input_data: dict) -> dict:
             # a multiline secret (a PEM key) never appears whole in any single call: the child's
             # stdout is sanitized one line at a time below, so only a component line is ever seen.
             # register long component lines as needles too; the length floor keeps a common
-            # fragment such as "}" from erasing innocent diagnostics.
-            parts = [value_str]
+            # fragment such as "}" from erasing innocent diagnostics. it applies to the whole
+            # value too, so a 3-char declared secret cannot mangle every diagnostic containing
+            # those characters; short values stay covered by the keyed patterns below.
+            parts = [value_str] if len(value_str) >= 8 else []
             if "\n" in value_str:
                 parts.extend(
                     line for raw in value_str.splitlines() if len(line := raw.strip()) >= 8

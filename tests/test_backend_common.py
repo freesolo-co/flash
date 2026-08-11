@@ -1848,6 +1848,24 @@ def test_child_tail_redacts_declared_secrets_with_arbitrary_names(monkeypatch):
     assert kept == "botocore.exceptions.ClientError: SignatureDoesNotMatch using <redacted>"
 
 
+def test_sanitize_diagnostic_ignores_a_very_short_declared_secret(monkeypatch):
+    """a declared secret can carry any value, including a 3-char one. as an unconstrained global
+    replacement needle it would mangle every diagnostic containing those characters, so the same
+    floor the multiline components use applies to the whole value. long values still redact."""
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV, sanitize_diagnostic
+
+    monkeypatch.setenv(SECRET_ENV_KEYS_ENV, "PIN")
+    monkeypatch.setenv("PIN", "ati")
+    assert sanitize_diagnostic("trainer crashed after validation") == (
+        "trainer crashed after validation"
+    )
+
+    monkeypatch.setenv("PIN", "sk-live-abc123456")
+    assert sanitize_diagnostic("trainer crashed holding sk-live-abc123456") == (
+        "trainer crashed holding <redacted>"
+    )
+
+
 # ---------------------- child teardown escalates to SIGKILL ----------------------
 # these real-process tests require fork, /proc group membership, and libc subreaper support.
 # guard on those capabilities rather than platform names.

@@ -404,12 +404,26 @@ def build_user_data(payload: dict, *, image: str) -> str:
     The spill decision is BINDING on the final encoded bytes, not on the spec alone: the spec shares
     user_data with runtime secrets (a multiline PEM is a valid one), so a spec under the fast-path
     threshold plus big secrets could otherwise still overflow the provider cap. Render, measure, and
-    spill the spec out whenever the total exceeds the budget."""
+    spill the spec out whenever the total exceeds the budget.
+
+    Spilling only moves the spec, so a non-spec payload (large runtime secrets) that is oversized on
+    its own stays oversized. Re-measure after spilling and fail HERE, naming the component, instead
+    of handing the provider a payload it rejects opaquely after the launch call."""
     payload = _spill_large_spec_to_hf(payload)
     user_data = _render_user_data(payload, image=image)
-    if len(user_data.encode()) <= _USER_DATA_BUDGET or not (payload.get("job_spec_json") or ""):
-        return user_data
-    return _render_user_data(_spill_large_spec_to_hf(payload, force=True), image=image)
+    if len(user_data.encode()) > _USER_DATA_BUDGET and (payload.get("job_spec_json") or ""):
+        payload = _spill_large_spec_to_hf(payload, force=True)
+        user_data = _render_user_data(payload, image=image)
+    size = len(user_data.encode())
+    if size > _USER_DATA_BUDGET:
+        env_bytes = len(json.dumps(payload.get("env") or {}).encode())
+        raise ValueError(
+            f"instance user_data is {size} bytes after spilling the job spec, over the "
+            f"{_USER_DATA_BUDGET}-byte budget ({_USER_DATA_CAP}-byte provider cap less "
+            f"{_USER_DATA_MARGIN} bytes of framing); the runtime secrets and env alone are "
+            f"{env_bytes} bytes. Shrink the run's [environment].secrets values."
+        )
+    return user_data
 
 
 def _render_user_data(payload: dict, *, image: str) -> str:

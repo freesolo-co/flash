@@ -19,7 +19,10 @@ _SECRET_RE = re.compile(
 # a multiline secret (a PEM key) reaches diagnostics one component line at a time -- console tails
 # are truncated and child stdout is sanitized per line -- so the whole value never matches. long
 # component lines are registered as needles too; the floor keeps a common fragment such as ``}``
-# from erasing innocent output. Mirrors flash._internal.diagnostics.
+# from erasing innocent output. the floor applies to the WHOLE value too: a declared secret can
+# carry any value, and a 3-char one used as a global replacement needle would mangle every
+# diagnostic containing those characters. short values stay covered by the keyed patterns.
+# Mirrors flash._internal.diagnostics.
 _MIN_SECRET_COMPONENT = 8
 
 
@@ -73,7 +76,7 @@ def _safe_detail(value: object, limit: int = 1000, secrets: dict | None = None) 
             values.add(str(secret))
     needles: set[str] = set()
     for secret in values:
-        parts = [secret]
+        parts = [secret] if len(secret) >= _MIN_SECRET_COMPONENT else []
         if "\n" in secret:
             parts.extend(
                 line

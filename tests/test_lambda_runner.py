@@ -2567,6 +2567,43 @@ def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
     assert len(heavy) < 64_000 - 2_000
 
 
+def test_build_user_data_rejects_a_payload_that_stays_oversized_after_spilling(monkeypatch):
+    """spilling only moves the SPEC out. when the non-spec payload (large runtime secrets) is
+    oversized on its own, spilling frees nothing and the launch would ship user_data the provider
+    rejects opaquely, after the launch call. fail pre-flight instead, naming the component."""
+    import huggingface_hub
+
+    from flash.providers._lifecycle import instance as inst
+
+    class FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def upload_file(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
+
+    # a tiny spec plus a ~40KB runtime secret: base64 + json escaping put the rendering over the
+    # budget, and no amount of spec spilling brings it back under.
+    payload = {
+        "flash_arm": "lambda",
+        "job_spec_json": "{}",
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/x",
+        "env": {"HF_TOKEN": "t", "DEPLOY_KEY": "k" * 40_000},
+        "attempt": 0,
+    }
+
+    with pytest.raises(ValueError, match="after spilling the job spec") as excinfo:
+        inst.build_user_data(payload, image="img:latest")
+    message = str(excinfo.value)
+    assert "runtime secrets" in message
+    assert str(inst._USER_DATA_CAP) in message
+    # the error names the oversized component's size, not just the total.
+    assert "40" in message
+
+
 def test_build_user_data_starts_no_spec_upload_at_deadline(monkeypatch):
     import huggingface_hub
 

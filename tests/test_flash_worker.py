@@ -342,6 +342,16 @@ def test_the_handlers_inline_redactor_covers_multiline_secret_components():
     assert safe_detail(pem, secrets) == "<redacted>"
     # the length floor keeps short structural fragments readable.
     assert safe_detail("near }", {"B": "{\n}\nlongenoughcomponent"}) == "near }"
+    # and it applies to a whole declared value too: a 3-char secret as a global needle would
+    # mangle unrelated diagnostics. long values still redact.
+    short = {"PIN": "ati", "FLASH_SECRET_ENV_KEYS": "PIN"}
+    assert safe_detail("trainer crashed after validation", short) == (
+        "trainer crashed after validation"
+    )
+    long = {"PIN": "sk-live-abc123456", "FLASH_SECRET_ENV_KEYS": "PIN"}
+    assert safe_detail("trainer crashed holding sk-live-abc123456", long) == (
+        "trainer crashed holding <redacted>"
+    )
 
 
 def test_worker_console_always_uploaded_and_no_flag(monkeypatch):
