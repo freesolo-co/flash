@@ -898,14 +898,12 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
         source = resolved_dataset_path
         # an explicit dataset_path names the rows to train on, and the scaffolded pattern is a
         # class-level `dataset = load_jsonl("dataset/train.jsonl")` that ignores the dataset_path
-        # it is handed. letting that env's dataset win would silently train on the default split
-        # instead of the file the operator named, so the explicit file stays authoritative. only
-        # the default train file keeps env precedence (the documented pattern of filtering the
-        # injected train file remains the headline behavior) -- and only when no side split was
-        # requested alongside it: with dataset_path AND split both explicit, env precedence would
-        # let an env that honors split= deliver the side rows against the file the operator
-        # named, so the codified rule (an explicit dataset_path wins over split) keeps the
-        # explicitly authored path authoritative.
+        # it is handed; letting that env dataset win would silently train on the default split
+        # instead of the named file, so the explicit file stays authoritative. only the default
+        # train file keeps env precedence (filtering the injected train file remains the headline
+        # behavior), and only when no side split was requested alongside it: with dataset_path
+        # AND split both explicit, env precedence would let a split-honoring env deliver the side
+        # rows, so the codified rule (an explicit dataset_path wins over split) holds.
         default_train = _packaged_dataset_file(base_dir, "train")
         source_is_dataset_file = (
             not side_split
