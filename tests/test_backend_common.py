@@ -4196,6 +4196,38 @@ def test_every_verl_backend_repoints_the_stub_in_its_child(backend, tmp_path):
     assert os.path.realpath(stub) == os.path.realpath(str(real))
 
 
+def test_the_child_probe_is_the_parents_own_source_not_a_copy():
+    """The child fragment must SHIP ``perf._find_real_libcudart``, never restate it.
+
+    The bug this whole fragment fixes was parent/child skew: the parent knew how to find libcudart
+    and the child did not. A hand-copied probe recreates that skew on a delay -- the next cuda
+    release moves a wheel path, someone fixes the parent, CI stays green, and the child silently
+    keeps probing the old layout. So assert the rendered fragment carries the parent's real body,
+    and that editing the parent moves the child with it.
+    """
+    from flash.engine.worker.perf import _find_real_libcudart
+
+    rendered = vc.render_tilelang_cudart_shim()
+    parent_body = textwrap.dedent(inspect.getsource(_find_real_libcudart))
+
+    # every non-trivial line of the parent's probe must appear in what the child executes.
+    missing = [
+        line.strip()
+        for line in parent_body.splitlines()
+        if len(line.strip()) > 12 and line.strip() not in rendered
+    ]
+    assert not missing, (
+        "the child fragment no longer ships perf._find_real_libcudart's own source, so the probe "
+        f"can drift from the parent's. lines absent from the fragment: {missing[:5]!r}"
+    )
+
+    # and the fragment must CALL it under its canonical name rather than a local re-implementation.
+    assert "_find_real_libcudart()" in rendered, (
+        "the fragment does not call _find_real_libcudart(); a second probe implementation has crept "
+        "back into the child"
+    )
+
+
 def test_grpo_does_not_enable_tf32_in_the_parent():
     """the grpo parent holds a cuda context (wait_for_gpu touches the device) but runs no matmuls --
     verl does, out of process. a setup_perf_backends() call here sets flags on the wrong process and

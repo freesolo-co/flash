@@ -10,9 +10,13 @@ Split out of `flash.engine.worker.backend_common` to keep that module under the 
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import re
+import textwrap
+
+from flash.engine.worker.perf import _find_real_libcudart
 
 # --------------------------- tf32 matmul (all three verl backends) ---------------------------
 # torch's TF32 flags are per-process, so setting them in the flash parent does not affect the verl
@@ -68,71 +72,28 @@ FLASH_CUDART_STUB_MARKER = "[flash-verl] tilelang libcudart stub repointed"
 def _render_cudart_discovery() -> str:
     """the discovery half of the stub fragment: find a libcudart that exports cudaDeviceReset.
 
-    split from the swap half only to keep each renderer under the function-size limit; the two are
-    concatenated into one ``try`` block and are not independently useful.
+    SHIPS THE PARENT'S OWN SOURCE rather than restating it. ``perf._find_real_libcudart`` is the
+    canonical probe -- nvidia wheel dirs across cuda majors, the -devel toolkit, the system resolver,
+    plus /proc/self/maps resolution for a bare soname -- and a hand-copy here would silently keep the
+    old probe the next time a cuda release moves those paths, which is exactly the parent/child skew
+    this whole fragment exists to fix. ``inspect.getsource`` keeps one definition.
+
+    the function only closes over ``os`` from its module scope (everything else is a builtin or bound
+    inside it), so the fragment re-imports ``os`` under the real name and drops the source in verbatim.
     """
-    return '''
+    probe_src = textwrap.indent(textwrap.dedent(inspect.getsource(_find_real_libcudart)), "    ")
+    # the parent's docstrings carry `\"\"\"`, but they arrive through {probe_src} at runtime, so they
+    # never touch this literal and the delimiter below stays the repo-standard double quote.
+    return f"""
 # --- flash: repoint tilelang's libcudart stub (see child_io.render_tilelang_cudart_shim) ---
+# the probe below is perf._find_real_libcudart's own source, shipped verbatim. edit it THERE.
 try:
-    import ctypes as _flash_cudart_ctypes
-    import ctypes.util as _flash_cudart_ctypes_util
-    import glob as _flash_cudart_glob
     import importlib.util as _flash_cudart_importlib_util
+    import os
     import os as _flash_cudart_os
 
-    def _flash_cudart_verify(cand):
-        """resolved path if cand loads AND exports cudaDeviceReset, else None."""
-        try:
-            _lib = _flash_cudart_ctypes.CDLL(cand)
-        except OSError:
-            return None
-        if not hasattr(_lib, "cudaDeviceReset"):
-            return None
-        if _flash_cudart_os.path.isabs(cand) and _flash_cudart_os.path.exists(cand):
-            return _flash_cudart_os.path.realpath(cand)
-        _base = _flash_cudart_os.path.basename(cand)
-        try:
-            with open("/proc/self/maps") as _maps:
-                for _line in _maps:
-                    if _base in _line and "/" in _line:
-                        _path = _line[_line.index("/"):].rstrip()
-                        if _flash_cudart_os.path.basename(_path).startswith(
-                            _base
-                        ) and _flash_cudart_os.path.exists(_path):
-                            return _flash_cudart_os.path.realpath(_path)
-        except OSError:
-            pass
-        return None
-
-    def _flash_cudart_find_real():
-        """a libcudart that exports cudaDeviceReset, or None. same probe order as the parent."""
-        _candidates = []
-        try:
-            import nvidia as _flash_cudart_nvidia  # namespace pkg; subpackage import may fail
-
-            for _base_dir in sorted(map(str, getattr(_flash_cudart_nvidia, "__path__", []) or [])):
-                _candidates += sorted(
-                    _flash_cudart_glob.glob(
-                        _flash_cudart_os.path.join(_base_dir, "*", "lib", "libcudart.so.*")
-                    )
-                )
-        except Exception:
-            pass
-        for _pattern in (
-            "/usr/local/cuda*/lib64/libcudart.so.*",
-            "/usr/local/cuda*/targets/*/lib/libcudart.so.*",
-            "/usr/lib/x86_64-linux-gnu/libcudart.so.*",
-        ):
-            _candidates += sorted(_flash_cudart_glob.glob(_pattern))
-        _found = _flash_cudart_ctypes_util.find_library("cudart")
-        if _found:
-            _candidates.append(_found)
-        for _cand in _candidates:
-            _real = _flash_cudart_verify(_cand)
-            if _real is not None:
-                return _real
-        return None
-'''
+{probe_src}
+"""
 
 
 def _render_cudart_swap() -> str:
@@ -161,7 +122,7 @@ def _render_cudart_swap() -> str:
             _flash_cudart_os.path.islink(_flash_cudart_stub)
             and _flash_cudart_os.path.exists(_flash_cudart_stub)
         ):
-            _flash_cudart_real = _flash_cudart_find_real()
+            _flash_cudart_real = _find_real_libcudart()
             if _flash_cudart_real is None:
                 print(
                     "[flash-verl] tilelang libcudart stub: no real libcudart found; left as-is",
