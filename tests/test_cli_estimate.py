@@ -393,13 +393,32 @@ def test_thin_batch_warning_counts_the_prompts_not_the_completions(tmp_path, mon
     assert "each update trains on 2 prompts" in err
 
 
+def test_a_thin_but_plural_batch_is_never_described_as_one_prompt(tmp_path, monkeypatch, capsys):
+    """Below the threshold is not the same as 1, and the consequence text has to agree.
+
+    An earlier draft hardcoded the `batch_size = 1` story into the consequence, so a 3-prompt batch
+    read "trains on 3 prompts ... every update follows one prompt's group" in a single sentence.
+    Substring asserts on the healthy parts of the message all passed; only rendering it caught it.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, 3))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "each update trains on 3 prompts" in err
+    assert "one prompt" not in err
+
+
 def test_a_max_examples_clamp_is_warned_about_even_with_no_batch_size(
     tmp_path, monkeypatch, capsys
 ):
     """`max_examples` clamps the batch to the prompt pool, so a thin run can author no batch at all.
 
     `flash env setup` scaffolds exactly this shape, so reading only the authored field would stay
-    silent on the configs this warning exists to protect.
+    silent on the configs this warning exists to protect. When `max_examples` is what binds, the
+    sft/rl name collision is not the user's problem and `batch_size` is not the fix, so the message
+    must neither lecture about the collision nor send them to the wrong knob.
     """
     monkeypatch.setenv("FLASH_STYLE", "0")
 
@@ -407,20 +426,25 @@ def test_a_max_examples_clamp_is_warned_about_even_with_no_batch_size(
     err = capsys.readouterr().err
 
     assert rc == 0
-    assert "OPTIMIZER batch" in err
-    assert "max_examples" in err  # it must name the input that actually caused it
-    assert "each update trains on 2 prompts" in err
+    assert "OPTIMIZER batch is 2 prompts per update" in err
+    assert "Raise `max_examples`" in err
+    assert "memory knob of the same name" not in err  # no batch_size was authored to confuse
 
 
 def test_a_big_batch_clamped_by_max_examples_still_warns(tmp_path, monkeypatch, capsys):
-    """A healthy authored batch is not healthy if the prompt pool cannot fill it."""
+    """A healthy authored batch is not healthy if the prompt pool cannot fill it.
+
+    Raising `batch_size` from 64 would change nothing here, so the remedy has to name the cap.
+    """
     monkeypatch.setenv("FLASH_STYLE", "0")
 
     rc = cmd_train(_grpo_cost_args(tmp_path, 64, max_examples=2))
     err = capsys.readouterr().err
 
     assert rc == 0
-    assert "each update trains on 2 prompts" in err
+    assert "OPTIMIZER batch is 2 prompts per update" in err
+    assert "Raise `max_examples`" in err
+    assert "Raise `batch_size`" not in err
 
 
 def test_opd_warning_does_not_promise_advantages_or_tell_the_user_to_raise_the_batch(
@@ -441,7 +465,9 @@ def test_opd_warning_does_not_promise_advantages_or_tell_the_user_to_raise_the_b
     assert "advantage" not in err
     assert "centred" not in err
     assert "memory lever" in err
-    assert "as far as the gpu allows" in err
+    assert "within what the gpu allows" in err
+    # the grpo line promises a wider batch is free; on opd that would be advice to OOM
+    assert "costs no extra vram" not in err
 
 
 def test_grpo_cost_stays_quiet_when_the_batch_is_a_real_batch(tmp_path, monkeypatch, capsys):

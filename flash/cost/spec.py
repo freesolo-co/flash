@@ -164,36 +164,44 @@ def thin_rl_batch_warning(spec) -> str | None:
         return None
     prompts = "1 prompt" if prompts_per_step == 1 else f"{prompts_per_step} prompts"
     authored = spec.train.batch_size
-    # name whichever input actually produced the thin batch: the authored key, or the max_examples
-    # clamp that overrode (or stood in for) it.
-    source = (
-        f"[train] batch_size = {authored}"
-        if authored is not None and int(authored) == prompts_per_step
-        else f"[train] max_examples caps this {spec.algorithm} run's prompt pool, so its "
-        f"optimizer batch of {prompts_per_step}"
-    )
+    # lead with whichever input actually produced the thin batch. when max_examples is the binding
+    # cap, the sft/rl name collision is not what bit the user, so do not lecture them about it --
+    # and point the remedy at the key that is actually holding the batch down.
+    if authored is not None and authored == prompts_per_step:
+        raise_target = "`batch_size`"
+        lead = (
+            f"`[train] batch_size = {authored}` is the OPTIMIZER batch for {spec.algorithm}, not "
+            "the sft memory knob of the same name: it sets prompts-per-step, so each update trains "
+            f"on {prompts}. Under sft this key picks the per-device micro-batch and the optimizer "
+            "batch comes from the workload profile, so an sft `batch_size = 1` memory workaround "
+            "does not carry over."
+        )
+    else:
+        raise_target = "`max_examples`"
+        lead = (
+            f"This {spec.algorithm} run's OPTIMIZER batch is {prompts} per update: `[train] "
+            "max_examples` caps the prompt pool that small, and prompts-per-step cannot exceed the "
+            "pool."
+        )
     if spec.algorithm == "grpo":
         consequence = (
             "Each prompt's completions are still centred against their own group, so the advantage "
-            "signal survives, but no averaging across prompts does: every update follows one "
-            "prompt's group, so expect much noisier updates at full price. Raise it unless you are "
-            "deliberately buying optimizer steps on a derived horizon (see TRAINING.md)."
+            "signal survives; what a thin batch costs is the averaging ACROSS prompts, so every "
+            "update follows only those few and the gradient is far noisier for the same money. "
+            f"Raise {raise_target} unless you are deliberately buying optimizer steps on a derived "
+            "horizon (see TRAINING.md): under grpo `batch_size` is not a memory lever, so a wider "
+            "batch costs no extra vram."
         )
     else:
         # opd's batch_size is also a real vram lever, so "raise it" is not safe blanket advice.
         consequence = (
             "opd distills against the teacher rather than scoring completions against each other, "
-            "so a thin batch does not break a baseline -- it just makes each update follow very few "
-            "prompts, which is noisier at full price. Unlike grpo, opd's batch_size is ALSO a "
-            "memory lever (it sizes rollout concurrency and the loss microbatch), so raise it only "
-            "as far as the gpu allows."
+            "so a thin batch breaks no baseline: it just makes every update follow very few "
+            f"prompts, which is noisier for the same money. Raise {raise_target} to widen it, but "
+            "unlike grpo opd's `batch_size` is ALSO a memory lever (it sizes rollout concurrency "
+            "and the loss microbatch), so keep the result within what the gpu allows."
         )
-    return (
-        f"{source} is the OPTIMIZER batch for {spec.algorithm}, not the sft memory knob of the same "
-        f"name: it sets prompts-per-step, so each update trains on {prompts}. Under sft this key "
-        "picks the micro-batch and the optimizer batch comes from the workload profile, so an sft "
-        f"`batch_size = 1` memory workaround does not carry over. {consequence}"
-    )
+    return f"{lead} {consequence}"
 
 
 def spec_steps(spec) -> int:
