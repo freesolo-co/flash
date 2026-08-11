@@ -313,10 +313,15 @@ def _train_body(input_data: dict) -> dict:
                             _require_deadline_allowance() - _PIP_RETRY_RESERVE_S,
                         ),
                     )
-                    print(
-                        f"extra_pip install hit a transient index error; retrying in {delay:.0f}s",
-                        flush=True,
-                    )
+                    # best-effort like the tee above: a console that closed between attempts must
+                    # not end the install with a terminal console error, losing the retry this
+                    # line only announces.
+                    with contextlib.suppress(OSError, ValueError):
+                        print(
+                            f"extra_pip install hit a transient index error; "
+                            f"retrying in {delay:.0f}s",
+                            flush=True,
+                        )
                     if delay > 0:
                         time.sleep(delay)
             finally:

@@ -3733,3 +3733,58 @@ def test_failmark_skips_when_worker_marker_exists(monkeypatch):
     # A mismatched canonical deadline is untrusted identity and must not produce a terminal marker.
     payload["run_max_wall_seconds"] = 59.0
     assert run_failmark(exists_seq=(False,)) == []
+
+
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
+def test_ambiguous_reject_keeps_the_guard_armed_when_the_announcement_raises(
+    monkeypatch, interrupt_type
+):
+    """An AMBIGUOUS rejection may have rented a box, so the guard must survive a raising say.
+
+    Standing down before the announcement loses the only handle on an instance that is rented but
+    not yet named: _abort_ambiguous_launch never runs, and an unarmed guard reaches the outer
+    handler with nothing to clean, leaving the box billing until a later orphan sweep."""
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    # a 500 is ambiguous: the create may have been accepted before the response was lost.
+    monkeypatch.setattr(
+        lambda_api,
+        "launch_instance",
+        lambda **_k: (_ for _ in ()).throw(lambda_api.LambdaApiError("POST -> HTTP 500")),
+    )
+
+    def raising_say(_log):
+        def _say(_msg):
+            raise interrupt_type("log stream closed")
+
+        return _say
+
+    monkeypatch.setattr(jobs, "make_say", raising_say)
+    reaped = []
+    monkeypatch.setattr(jobs, "terminate_run_instances", lambda run_id: reaped.append(run_id) or [])
+
+    with pytest.raises(interrupt_type):
+        _launch(jobs, _spec(), seed=0, instances=[_inst()], attempt=0)
+
+    # the guard stayed armed through the raising announcement, so the outer handler still sweeps
+    # the run label - the only thing that can find a box rented but never named.
+    assert reaped == ["flash-1700000000-abcd1234"]
+
+
+def test_bootstrap_extra_pip_retries_when_the_console_closes_between_attempts(monkeypatch):
+    """A console that closes between attempts must not consume the retry it only announces.
+
+    The per-line tee is already best-effort, but the retry announcement runs after it, on the
+    transient path where the next attempt is the whole point. An unguarded print there ends the
+    install with a terminal console error instead of retrying a network failure that would have
+    succeeded."""
+    lb, calls = _wire_pip(monkeypatch, [("connection reset by peer\n", 1), ("", 0)])
+
+    def closed_stream_print(*_a, **_kw):
+        raise ValueError("I/O operation on closed file")
+
+    monkeypatch.setattr("builtins.print", closed_stream_print)
+    lb.install_extra_pip(_pip_payload())  # second attempt exits 0, so the install SUCCEEDS
+    assert len(calls) == 2  # the retry issued despite the dead console

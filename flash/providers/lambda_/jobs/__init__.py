@@ -563,13 +563,19 @@ def launch_and_submit(
                     **deadline_kwargs(lambda_api.launch_instance, absolute_deadline),
                 )
             except lambda_api.LambdaApiError as e:
-                # a clean reject rented nothing, and an ambiguous one is reconciled by
-                # _abort_ambiguous_launch below, so neither owes the outer guard a label reap.
-                reap.disarm()
+                clean = _launch_rejection_is_clean(e)
+                if clean:
+                    # rented nothing: stand down on the first statement, before the diagnostic and
+                    # the say below, either of which can raise while armed and would then reap by
+                    # run label -- killing every other concurrent seed over a rejected request.
+                    reap.disarm()
                 last_err = e
                 detail = sanitize_diagnostic(e, limit=1000)
-                if not _launch_rejection_is_clean(e):
+                if not clean:
                     # ambiguous creates may have billed an instance, so reconcile before any retry.
+                    # The guard stays ARMED across this announcement and the abort: if the say
+                    # raises, reconciliation never runs, and only an armed guard can still find a
+                    # box that is rented but not yet named.
                     say(
                         f"ambiguous launch failure in {inst.region} ({type(e).__name__}); "
                         "attempting cleanup and failing closed"

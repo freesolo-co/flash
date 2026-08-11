@@ -639,8 +639,14 @@ def install_extra_pip(payload: dict) -> None:
                 # announced never issues: the next pass only fails the deadline precheck.
                 remaining = deadline_at - time.time() - _PIP_RETRY_RESERVE_S
                 delay = max(0.0, min(delay, remaining))
-            msg = f"extra_pip install hit a transient index error; retrying in {delay:.0f}s"
-            print(msg, flush=True)
+            # best-effort for the same reason the tee is: a console that closed between attempts
+            # would otherwise raise HERE and end the install with a terminal, non-retriable console
+            # error, losing the retry this line only announces.
+            with contextlib.suppress(OSError, ValueError):
+                print(
+                    f"extra_pip install hit a transient index error; retrying in {delay:.0f}s",
+                    flush=True,
+                )
             if delay > 0:
                 time.sleep(delay)
     finally:
