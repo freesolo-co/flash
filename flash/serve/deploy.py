@@ -56,9 +56,11 @@ THINKING_STRUCTURED_OUTPUTS_CAPABILITY = "thinking_structured_outputs_deferred_v
 REVISION_PROVENANCE_CAPABILITY = "revision_provenance"
 _RETRYABLE_SMOKE_503_CODES = frozenset({"adapter_loading", "engine_unavailable"})
 _INTERNAL_KEY_HEADER = "X-Freesolo-Internal-Key"
-# modal 303-redirects a slow request to an async-result poll url on the same origin; a handful of
-# hops covers that, and a tight cap bounds how far a redirect chain can wander.
-_MAX_REDIRECTS = 5
+# modal 303-redirects a slow request to an async-result poll url on the same origin, once per poll
+# cycle until the result is ready, so the cap must cover a full 30-minute chat window of polls
+# (~150s apart). it guards against redirect loops, not credential leakage: the request hook strips
+# the internal key on every off-origin hop regardless of chain length.
+_MAX_REDIRECTS = 100
 _HTTP_CLIENT: httpx.Client | None = None
 _CHAT_HTTP_CLIENT: httpx.Client | None = None
 _STREAM_HTTP_CLIENT: httpx.Client | None = None
@@ -837,7 +839,7 @@ def chat(
     }
     if stop:
         body["stop"] = [str(value) for value in stop]
-    # follow_redirects: modal 303-redirects slow cold-start requests across a few poll cycles
+    # follow_redirects: modal 303-redirects slow cold-start requests across many poll cycles
     # before the result is ready (bounded by _MAX_REDIRECTS, all on the serving origin).
     headers = _internal_key_header()
     if expected_checkpoint:

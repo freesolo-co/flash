@@ -1475,12 +1475,19 @@ def test_internal_key_survives_same_origin_redirect_polls(monkeypatch):
 
 
 def test_serving_clients_bound_redirect_chains(monkeypatch):
-    """The redirect cap is a handful of poll hops, not a hundred."""
+    """The redirect cap covers the 30-minute chat window of same-origin polls, but is finite.
+
+    modal emits a 303 poll hop roughly every 150s, so the cap must allow at least
+    30 min / 150 s hops or slow cold starts fail with TooManyRedirects short of the
+    configured chat timeout. credential scoping does not rely on this cap: the request
+    hook strips the internal key on every off-origin hop.
+    """
     import httpx
 
     import flash.serve.deploy as d
 
-    assert d._MAX_REDIRECTS == 5
+    # sized for the 30-minute chat timeout at one poll hop per ~150s, with margin.
+    assert d._MAX_REDIRECTS * 150 >= 30 * 60
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
 
