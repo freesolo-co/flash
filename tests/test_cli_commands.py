@@ -799,9 +799,10 @@ def test_training_guide_names_the_self_hosted_opd_broker_settings(monkeypatch, t
     """The "key stays managed" line is hosted-only; a self-hoster runs the broker themselves.
 
     `require_teacher_broker_configuration` (flash/server/domain/teacher_broker.py) demands both
-    `PARASAIL_API_KEY` and a valid `FLASH_PUBLIC_URL` on the control plane, and raises at
-    allocation -- after the submit is accepted. A guide that says there is nothing to declare walks
-    a self-hoster into a run that fails once the GPU is already held.
+    `PARASAIL_API_KEY` and a valid `FLASH_PUBLIC_URL` on the control plane. `_require_opd_configuration`
+    calls it at seed_submission.py:816, one line above the attempt loop that allocates, so a missing
+    one fails the run in seconds at no cost -- but AFTER the submit was accepted, so the guide cannot
+    leave a self-hoster to discover it from a run that dies with no local misconfiguration to see.
     """
     written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
 

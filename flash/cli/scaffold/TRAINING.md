@@ -181,7 +181,8 @@ gate.
 down — that the broker owns `PARASAIL_API_KEY` and there is nothing for you to declare — describes
 the hosted plane. On your own plane _you_ are the broker: export `PARASAIL_API_KEY` and a
 worker-reachable `FLASH_PUBLIC_URL` in the control plane's environment before submitting. Both are
-checked at allocation, so a missing one fails the run rather than the submit. `FLASH_PUBLIC_URL`
+checked after the run record exists but before any GPU is allocated, so a missing one fails the run
+within seconds and bills nothing — the submit itself still succeeds. `FLASH_PUBLIC_URL`
 must be an origin a rented GPU can resolve — not `localhost`, and not a VPN-only name — because the
 worker dials back to it to have the teacher score its tokens.
 
