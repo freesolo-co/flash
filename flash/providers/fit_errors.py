@@ -147,11 +147,23 @@ def vram_fit_error_message(
         # only when the fleet BEHIND it still sells the wider shape; a pin on a Lambda-only plane
         # drops to the same pool and the same rejection, so it gets the configure-a-provider advice
         # exactly like the operator who pinned nothing at all.
-        remedy = (
-            "Drop the provider pin to let the allocator choose"
-            if widenable_without_pin
-            else "Configure a provider that rents card counts directly (RunPod)"
+        #
+        # either way the authored ceiling is ALSO too small -- reaching this branch means
+        # `requested_gpu_count` already failed -- so a remedy naming only the provider costs the
+        # user a second rejection that finally reveals `--gpus N`. name both halves at once.
+        unpinned_width = smallest_fitting_gpu_count(
+            need, max_gpu_count=max_gpu_count, gpu_names=widenable_without_pin or ()
         )
+        if unpinned_width is not None:
+            remedy = (
+                "Drop the provider pin and raise the card ceiling with "
+                f"`--gpus {unpinned_width}` to let the allocator choose"
+            )
+        else:
+            remedy = (
+                "Configure a provider that rents card counts directly (RunPod) and raise the card "
+                "ceiling with `--gpus`"
+            )
         return (
             f"{algorithm} needs >= {need:g} GB VRAM, which fits only on a multi-card shape that "
             "no available provider sells: they offer fixed card counts as distinct instance "

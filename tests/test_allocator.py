@@ -1919,20 +1919,35 @@ def test_unpurchasable_width_names_a_remedy_the_user_can_actually_apply():
         "exact": "",
     }
 
-    def reject(available, unpinned):
+    def reject(available, unpinned, requested=1):
         with pytest.raises(UnsupportedGpuError) as exc:
             _resolved_gpu_count(
                 "Qwen/Qwen3.6-35B-A3B",
                 "grpo",
                 available=available,
                 unpinned=unpinned,
-                **shared,
+                **{**shared, "requested_gpu_count": requested},
             )
         return str(exc.value)
 
     # a pin worth dropping: the fleet behind it carries RunPod, which rents the width freely.
     droppable = reject(("lambda",), ("lambda", "runpod"))
     assert "Drop the provider pin" in droppable
+
+    # reaching this branch means the authored ceiling ALSO failed, so a remedy naming only the
+    # provider buys a second rejection that finally reveals `--gpus N`. both halves, one message.
+    assert "`--gpus 2`" in droppable
+    # and the advice has to actually work: following it verbatim allocates rather than re-rejecting.
+    assert (
+        _resolved_gpu_count(
+            "Qwen/Qwen3.6-35B-A3B",
+            "grpo",
+            available=("lambda", "runpod"),
+            unpinned=None,
+            **{**shared, "requested_gpu_count": 2},
+        )
+        == 2
+    )
 
     # the same pin over a LAMBDA-ONLY fleet. dropping it leaves the identical pool, so the advice
     # would send the user in a circle back to this exact error.
@@ -1944,6 +1959,11 @@ def test_unpurchasable_width_names_a_remedy_the_user_can_actually_apply():
     unpinned = reject(("lambda", "vast"), None)
     assert "Drop the provider pin" not in unpinned
     assert "Configure a provider" in unpinned
+
+    # these two cannot name a width -- no configured provider sells one at any count, so there is
+    # no N to promise -- but the ceiling still has to be named as part of the fix.
+    for message in (futile, unpinned):
+        assert "--gpus" in message
 
     # no message may claim the run exceeds every class -- it fits, it just cannot be bought.
     for message in (droppable, futile, unpinned):
