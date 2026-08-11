@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from contextlib import suppress
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response
@@ -67,27 +66,16 @@ def publish_env(
 
     resolved_key = {**key, "org_id": key.get("org_id") or x_freesolo_org_id}
 
-    # Reject a request that could never be published before doing anything observable -- no
-    # ownership lookup, no backend call, no upload. Otherwise a colliding destination answers a
-    # malformed payload with 409, replacing the deterministic 400/413 the inputs themselves earn.
-    try:
-        envs.validate_publish_inputs(
-            package_b64="" if _pkg is None else _pkg,
-            name="" if _name is None else _name,
-        )
-    except envs.EnvPublishError as exc:
-        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
-
-    # Check ownership BEFORE uploading: publishing replaces the whole `<org-slug>/<name>` hub
+    # Check ownership BEFORE the hub write: publishing replaces the whole `<org-slug>/<name>`
     # directory, so a colliding name would otherwise destroy the other project's package on its
     # way to failing.
     #
-    # Only when the destination slug is knowable up front. Deriving it needs the caller's own org
-    # namespace, which the org-agnostic internal key does not carry -- there, publish_package
-    # resolves the namespace itself and raises its own error. Reporting that error from here
-    # instead would change which failure a caller sees, so a slug we cannot derive skips the
-    # guard; that caller writes no org-namespaced directory, so nothing is at risk.
-    intended_slug = ""
+    # This runs as publish_package's pre-write hook rather than ahead of it, so that a request
+    # which could never publish -- bad base64, a corrupt archive, an unsafe member, no
+    # environment.py -- keeps its own deterministic 400/413 instead of being answered with this
+    # guard's 409. By the time the hook fires the package is fully validated and nothing has been
+    # written yet.
+    #
     # The KEY's org, never the `X-Freesolo-Org-Id` header. For a user key require_project_access
     # validates the project against `key["org_id"]` and ignores that header entirely, so trusting
     # it here would check ownership in an org the caller merely asserted while the hub path stays
@@ -95,10 +83,15 @@ def publish_env(
     # and waves the colliding write through. `resolved_key` keeps the header for the association
     # step below, which is pre-existing behaviour and not an authorization decision.
     org_for_conflict = str(key.get("org_id") or "").strip()
-    with suppress(envs.EnvPublishError):
-        namespace, clean_name = envs.publish_slug_for_name(_name, key)
-        intended_slug = f"{namespace}/{clean_name}"
-    if intended_slug:
+
+    def _guard_destination(intended_slug: str) -> None:
+        if key.get("auth_kind") == "internal":
+            # The internal key is org-agnostic by design: require_project_access validates its
+            # project through the internal endpoint against the explicit `X-Freesolo-Org-Id`, so
+            # ownership is already established for this request and there is no key org to check
+            # against. Refusing it for a missing `key["org_id"]` would break the platform's own
+            # publish path, which is exactly what dev does today and is not this PR's contract.
+            return
         if not org_for_conflict:
             # A user key can carry an org slug (all auth requires) without an org id, and the
             # hub slug is namespaced by the SLUG -- so this request would still overwrite
@@ -131,6 +124,7 @@ def publish_env(
             package_b64="" if _pkg is None else _pkg,
             name="" if _name is None else _name,
             key=key,
+            before_write=_guard_destination,
         )
     except envs.EnvPublishError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc

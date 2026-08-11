@@ -47,6 +47,42 @@ def _env_package_b64() -> str:
 
 ENV_PACKAGE_B64 = _env_package_b64()
 
+
+def stub_publish_package_failing_on_write(message: str, slug: str = "acme/env"):
+    """A `publish_package` stub that runs the pre-write hook and fails only if the write happens.
+
+    Asserting "the guard blocked this" needs the guard to actually run. A stub that raises
+    immediately would pass whether or not the route ever consulted the guard, since it never
+    reaches the hook the guard now lives in.
+    """
+
+    def _publish(*, package_b64, name, key, before_write=None):
+        if before_write is not None:
+            before_write(slug)
+        pytest.fail(message)
+
+    return _publish
+
+
+def stub_publish_package(slug: str, *, record: list | None = None):
+    """A `publish_package` replacement that still honours the pre-write hook.
+
+    The route gates the destination through `before_write`, which the real implementation fires
+    after validating the package and immediately before writing. A stub that ignores the hook
+    silently disables that gate, so a test asserting "the guard blocked this" would pass no
+    matter what the guard did.
+    """
+
+    def _publish(*, package_b64, name, key, before_write=None):
+        if before_write is not None:
+            before_write(slug)
+        if record is not None:
+            record.append({"package_b64": package_b64, "name": name, "key": key})
+        return slug
+
+    return _publish
+
+
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "project": "11111111-1111-4111-8111-111111111111",
@@ -462,7 +498,7 @@ def test_internal_publish_uses_internal_project_validation_endpoint(api, monkeyp
     import flash.server.domain.envs as envs_mod
 
     requests = _install_real_internal_project_validation(monkeypatch)
-    monkeypatch.setattr(envs_mod, "publish_package", lambda **_kwargs: "org-test/env")
+    monkeypatch.setattr(envs_mod, "publish_package", stub_publish_package("org-test/env"))
     monkeypatch.setattr(registry, "record_published_environment", lambda **_kwargs: True)
 
     response = api.post(
@@ -8666,13 +8702,10 @@ def test_publish_env_ignores_legacy_is_new(api, monkeypatch):
 
     import flash.server.domain.envs as envs_mod
 
-    seen: dict = {}
-
-    def fake_publish_package(*, package_b64, name, key):
-        seen.update(package_b64=package_b64, name=name, key=key)
-        return "key-1/e"
-
-    monkeypatch.setattr(envs_mod, "publish_package", fake_publish_package)
+    captured: list = []
+    monkeypatch.setattr(
+        envs_mod, "publish_package", stub_publish_package("key-1/e", record=captured)
+    )
 
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
@@ -8696,6 +8729,8 @@ def test_publish_env_ignores_legacy_is_new(api, monkeypatch):
         },
     )
     assert resp.status_code == 200, resp.text
+    assert len(captured) == 1
+    seen = captured[0]
     assert seen["name"] == "e"
     assert seen["package_b64"] == pkg
     assert seen["key"]["org_slug"].startswith("org-")
@@ -8711,7 +8746,7 @@ def test_publish_env_forwards_project_id_to_registry(api, monkeypatch):
     import flash.server.domain.environment_registry as registry_mod
     import flash.server.domain.envs as envs_mod
 
-    monkeypatch.setattr(envs_mod, "publish_package", lambda *, package_b64, name, key: "key-1/e")
+    monkeypatch.setattr(envs_mod, "publish_package", stub_publish_package("key-1/e"))
 
     recorded: list[dict] = []
     monkeypatch.setattr(
@@ -8878,7 +8913,9 @@ def test_publish_env_reports_a_cross_project_name_conflict_without_uploading(api
     monkeypatch.setattr(
         envs_mod,
         "publish_package",
-        lambda **_kwargs: pytest.fail("a name conflict must not upload over the other project"),
+        stub_publish_package_failing_on_write(
+            "a name conflict must not upload over the other project"
+        ),
     )
 
     response = api.post(
@@ -8915,7 +8952,7 @@ def test_publish_env_refuses_to_upload_when_the_org_cannot_be_resolved(api, monk
     monkeypatch.setattr(
         envs_mod,
         "publish_package",
-        lambda **_kwargs: pytest.fail("an unverifiable org must not reach the hub write"),
+        stub_publish_package_failing_on_write("an unverifiable org must not reach the hub write"),
     )
 
     response = api.post(
@@ -8961,7 +8998,9 @@ def test_publish_env_ignores_the_org_header_for_the_ownership_guard(api, monkeyp
     monkeypatch.setattr(
         envs_mod,
         "publish_package",
-        lambda **_kwargs: pytest.fail("a caller-asserted org must not authorize the hub write"),
+        stub_publish_package_failing_on_write(
+            "a caller-asserted org must not authorize the hub write"
+        ),
     )
 
     response = api.post(
@@ -8973,6 +9012,57 @@ def test_publish_env_ignores_the_org_header_for_the_ownership_guard(api, monkeyp
     assert response.status_code == 400, response.text
     assert "organization could not be resolved" in response.json()["detail"]
     assert checked_orgs == [], f"guard consulted a caller-supplied org: {checked_orgs}"
+
+
+def _b64_targz(members: dict[str, bytes]) -> str:
+    import base64
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for nm, content in members.items():
+            info = tarfile.TarInfo(nm)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+@pytest.mark.parametrize(
+    ("package", "message"),
+    [
+        # decodes as base64 but is not a gzip stream at all
+        ("bm90IGEgdGFyYmFsbCBhdCBhbGw=", "could not be extracted"),
+        # a valid archive that is missing the required entrypoint
+        (_b64_targz({"readme.txt": b"nope"}), "must contain environment.py"),
+    ],
+)
+def test_publish_env_validates_the_archive_before_checking_ownership(
+    api, monkeypatch, package, message
+):
+    """Base64-valid but structurally invalid packages keep their own 400.
+
+    `validate_publish_inputs` only decodes; a payload can survive that and still be a corrupt
+    archive or lack `environment.py`. Those errors live deeper in the publish, so the ownership
+    guard has to run after them -- otherwise a colliding destination answers a package that could
+    never be published with a conflict, and consults the backend to do it.
+    """
+    from flash.server.domain import environment_registry as registry_mod
+
+    def _conflict(**_kwargs):
+        pytest.fail("ownership must not be consulted for a package that cannot be published")
+
+    monkeypatch.setattr(registry_mod, "raise_if_owned_by_another_project", _conflict)
+    monkeypatch.setenv("GITHUB_TOKEN", "token-for-publish-path")
+
+    response = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": "env", "package_b64": package, "project_id": SPEC["project"]},
+    )
+
+    assert response.status_code == 400, response.text
+    assert message in response.json()["detail"]
 
 
 @pytest.mark.parametrize(
@@ -9048,7 +9138,7 @@ def test_publish_env_maps_a_late_ownership_conflict_to_409(api, monkeypatch):
     import flash.server.domain.envs as envs_mod
 
     monkeypatch.setattr(registry, "raise_if_owned_by_another_project", lambda **_kwargs: None)
-    monkeypatch.setattr(envs_mod, "publish_package", lambda **_kwargs: "acme/env")
+    monkeypatch.setattr(envs_mod, "publish_package", stub_publish_package("acme/env"))
 
     def conflict(**_kwargs):
         raise registry.EnvironmentProjectConflict("flash environment belongs to another project")

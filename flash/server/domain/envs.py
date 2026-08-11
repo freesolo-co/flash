@@ -13,6 +13,7 @@ import tarfile
 import tempfile
 import time
 import urllib.parse
+from collections.abc import Callable
 from pathlib import Path
 
 from flash.envs.loader import _github_token
@@ -361,7 +362,13 @@ def _github_publish_once(
             _push_environment_commit(checkout=checkout, token=token)
 
 
-def _github_publish(dest: Path, *, name: str, key: dict) -> str:
+def _github_publish(
+    dest: Path,
+    *,
+    name: str,
+    key: dict,
+    before_write: Callable[[str], None] | None = None,
+) -> str:
     token = _github_token()
     if not token:
         raise EnvPublishError(
@@ -375,6 +382,11 @@ def _github_publish(dest: Path, *, name: str, key: dict) -> str:
         raise EnvPublishError("env package must contain environment.py")
     if not any(path.is_file() for path in dest.rglob("*")):
         raise EnvPublishError("env package contains no files")
+    # Last point before the hub write, and the first at which the package is fully validated. A
+    # caller that needs to gate the write on the destination slug runs here so a request that
+    # could never publish keeps its own error instead of the gate's.
+    if before_write is not None:
+        before_write(f"{ns}/{clean}")
     message = f"Upload Flash environment {ns}/{clean}"
 
     last_error: EnvPublishError | None = None
@@ -433,12 +445,24 @@ def validate_publish_inputs(*, package_b64: object, name: object) -> bytes:
     return tar_bytes
 
 
-def publish_package(*, package_b64: str, name: str, key: dict) -> str:
+def publish_package(
+    *,
+    package_b64: str,
+    name: str,
+    key: dict,
+    before_write: Callable[[str], None] | None = None,
+) -> str:
+    """Publish a package to the hub, optionally gating the write on its destination slug.
+
+    ``before_write`` is called with the resolved ``namespace/name`` once the package is fully
+    validated and immediately before anything is written. Raising from it aborts the publish
+    without touching the hub, so a caller's gate cannot preempt the package's own errors.
+    """
     tar_bytes = validate_publish_inputs(package_b64=package_b64, name=name)
     with tempfile.TemporaryDirectory(prefix="flash-env-publish-") as tmp:
         dest = Path(tmp)
         _safe_extract(tar_bytes, dest)
-        return _github_publish(dest, name=name, key=key)
+        return _github_publish(dest, name=name, key=key, before_write=before_write)
 
 
 _SLUG_SEGMENT_RE = re.compile(r"^[a-z0-9._-]+$")
