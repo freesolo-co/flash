@@ -16,6 +16,86 @@ import shutil
 import subprocess
 
 
+class MergeDiskHeadroomError(RuntimeError):
+    """the merged model this export must write does not fit beside the checkpoint it reads."""
+
+
+def _model_shard_bytes(path: str) -> int:
+    """total size of the fsdp model shards directly in `path`.
+
+    only `model_world_size_*_rank_*.pt` is measured, because only those files become merge output:
+    `_load_and_merge_state_dicts` loads exactly those names, and the merged dict is what
+    `save_pretrained` writes back out. the `optim_*` and `extra_state_*` files sitting beside them
+    are read by resume, never by the merger, so including them would inflate the requirement by the
+    whole optimizer state -- ~7.6 GB of adam moments on a 35b rank-32 run -- and refuse merges that
+    would have fit.
+
+    a flat scan, not a walk, because the merger's read is flat: it opens
+    `Path(local_dir) / f"model_world_size_{W}_rank_{r}.pt"` per rank and never recurses. walking
+    would add up nested files it will never read, which is the same over-estimate in a new form.
+
+    shares `_FSDP_SHARD_RE` with `checkpoint_world_size` rather than matching the name a second way:
+    one definition of what a shard filename is, so a future change to verl's layout cannot leave the
+    two disagreeing about which files a merge reads.
+    """
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return 0
+    total = 0
+    for name in names:
+        if _FSDP_SHARD_RE.fullmatch(name) is None:
+            continue
+        try:
+            total += os.stat(os.path.join(path, name)).st_size
+        except OSError:
+            continue
+    return total
+
+
+def require_merge_headroom(ckpt_actor_dir: str, merge_out: str) -> None:
+    """Fail before `verl.model_merger` runs if its output cannot fit on the container disk.
+
+    `model_merger merge` does NOT write only the small lora adapter. `save_hf_model_and_tokenizer`
+    materializes the full base model and calls `model.save_pretrained(target_dir, state_dict=...)`
+    (verl `model_merger/base_model_merger.py`), so exporting one 35b checkpoint writes ~70 GB into
+    `<adapter>_merge` beside the ~60 GB checkpoint it is reading. That is the single largest
+    transient on the disk, and it recurs on EVERY publish, not just at finalization.
+
+    Without this guard the merger dies partway through `save_pretrained` with ENOSPC, and the run
+    fails after training has already succeeded. Checking first turns a silent late disk death into
+    an actionable error naming the shortfall, while the checkpoint is still intact and resumable.
+
+    The requirement is derived from what the merger actually moves rather than from the checkpoint's
+    total size: it loads the `model_world_size_*_rank_*.pt` shards, casts every tensor to bf16, and
+    writes that same state back out as base model plus adapter (`fsdp_model_merger.py`,
+    `base_model_merger.py`). Shard bytes in, shard bytes out. Sizing the whole directory instead
+    would add the `optim_*` and `extra_state_*` files, which resume reads and the merger never
+    materializes -- on a 35b rank-32 run that is ~7.6 GB of adam moments, enough to refuse a merge
+    that had room.
+
+    The two error directions are not symmetric, which is why no safety margin is added on top.
+    Underestimating leaves the merger to hit ENOSPC exactly as it does today, so the guard is merely
+    absent. Overestimating fails a run that would have completed, which is a regression this guard
+    would have introduced. When in doubt, let the merge proceed.
+    """
+    need = _model_shard_bytes(ckpt_actor_dir)
+    if need <= 0:
+        return
+    try:
+        free = shutil.disk_usage(os.path.dirname(merge_out.rstrip("/")) or ".").free
+    except OSError:
+        # an unreadable mount is not evidence of exhaustion; let the merger run and report for real.
+        return
+    if free >= need:
+        return
+    raise MergeDiskHeadroomError(
+        f"cannot export the adapter: merging {ckpt_actor_dir} needs about "
+        f"{need / 1e9:.1f} GB beside it but only {free / 1e9:.1f} GB is free. "
+        "raise [gpu] disk_gb, or save fewer checkpoints with a larger save_every."
+    )
+
+
 def resolve_checkpoint_actor_dir(step_dir: str) -> str:
     """return the directory inside ``global_step_N`` that holds the saved model + ``huggingface/``.
 
@@ -212,6 +292,7 @@ def export_peft_adapter(
     os.makedirs(out_adapter_dir, exist_ok=True)
     merge_out = out_adapter_dir.rstrip("/") + "_merge"
     shutil.rmtree(merge_out, ignore_errors=True)
+    require_merge_headroom(ckpt_actor_dir, merge_out)
     merge_env = dict(os.environ)
     # the merger reads only local checkpoint files: strip credentials/tokens from its env (least
     # privilege), and keep it fully offline so it never touches hf's rate-limited api.
@@ -221,31 +302,41 @@ def export_peft_adapter(
     merge_env["HF_HUB_OFFLINE"] = "1"
     merge_env["TRANSFORMERS_OFFLINE"] = "1"
     merge_env["HF_HUB_DISABLE_XET"] = "1"
-    subprocess.run(
-        [
-            python_bin,
-            "-m",
-            "verl.model_merger",
-            "merge",
-            "--backend",
-            "fsdp",
-            "--local_dir",
-            ckpt_actor_dir,
-            "--target_dir",
-            merge_out,
-        ],
-        check=True,
-        env=merge_env,
-    )
-    lora_dir = os.path.join(merge_out, "lora_adapter")
-    if not os.path.exists(os.path.join(lora_dir, "adapter_config.json")):
-        raise RuntimeError(
-            f"verl model_merger did not produce a peft adapter at {lora_dir} (no adapter_config.json); "
-            "the merger output layout must be adjusted for this verl version."
+    # the merge tree is this function's to clean up for its whole lifetime, not just on success.
+    # it holds the full merged model -- the largest transient on the disk -- so leaving it behind
+    # when the merger dies or writes an unexpected layout would strand tens of gb on the exact
+    # disk this guard exists to protect, and the next save would inherit less room than this one.
+    try:
+        subprocess.run(
+            [
+                python_bin,
+                "-m",
+                "verl.model_merger",
+                "merge",
+                "--backend",
+                "fsdp",
+                "--local_dir",
+                ckpt_actor_dir,
+                "--target_dir",
+                merge_out,
+            ],
+            check=True,
+            env=merge_env,
         )
-    for name in os.listdir(lora_dir):
-        shutil.copy2(os.path.join(lora_dir, name), os.path.join(out_adapter_dir, name))
-    shutil.rmtree(merge_out, ignore_errors=True)
+        lora_dir = os.path.join(merge_out, "lora_adapter")
+        if not os.path.exists(os.path.join(lora_dir, "adapter_config.json")):
+            raise RuntimeError(
+                f"verl model_merger did not produce a peft adapter at {lora_dir} (no adapter_config.json); "
+                "the merger output layout must be adjusted for this verl version."
+            )
+        # rename rather than copy: every caller builds `out_adapter_dir` and `merge_out` as siblings
+        # in one run workdir, so the two are on one filesystem and `os.replace` is a metadata
+        # operation that moves no bytes. copying would hold a second copy of the adapter beside the
+        # still-undeleted merge tree, a peak this function's own headroom check does not budget for.
+        for name in os.listdir(lora_dir):
+            os.replace(os.path.join(lora_dir, name), os.path.join(out_adapter_dir, name))
+    finally:
+        shutil.rmtree(merge_out, ignore_errors=True)
 
 
 def stamp_adapter_dir_provenance(adapter_dir: str, model_id: str, model_revision: str = "") -> None:
