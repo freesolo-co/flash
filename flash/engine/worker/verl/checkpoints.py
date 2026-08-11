@@ -56,9 +56,12 @@ def require_merge_headroom(ckpt_actor_dir: str, merge_out: str) -> None:
     fails after training has already succeeded. Checking first turns a silent late disk death into
     an actionable error naming the shortfall, while the checkpoint is still intact and resumable.
 
-    The estimate is the checkpoint's own size: a full-state fsdp save holds model + optimizer
-    shards, so it is an upper bound on the bf16 weights the merge writes. No margin is added beyond
-    that headroom, because the number is already conservative.
+    The requirement is estimated as the checkpoint's own size, which is a genuine upper bound rather
+    than a guess: the merger reads only the `model_world_size_*_rank_*.pt` shards
+    (`fsdp_model_merger.py`), while the directory it is sized from also holds the `optim_*` and
+    `extra_state_*` files written beside them. Merge output is therefore strictly smaller than the
+    tree measured here, so the guard errs toward allowing a merge, never toward refusing one that
+    would have fit. No safety margin is added on top, for the same reason.
     """
     need = _tree_bytes(ckpt_actor_dir)
     if need <= 0:
