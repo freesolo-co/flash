@@ -414,11 +414,10 @@ def test_main_source_guard_cannot_be_skipped_into_a_pass():
     check reads green with the human commits still in place. Close-and-reopen is enough to do it --
     this workflow declares no `types:`, so `reopened` is in its trigger set.
 
-    Every event-derived signal has this shape, which is why the exemption cannot be expressed as a
-    condition on the job. `pull_request.user.login` and `head_ref` are immutable for the PR's
-    lifetime (they describe who OPENED it, not what it now CONTAINS), and `github.actor` is the
-    event trigger, which differs between two runs of the same commits. So the invariant is
-    structural: no `if:`, and the exemption lives in the script, keyed on the head COMMIT.
+    Every event-derived signal has this shape, so no condition on the job can be safe:
+    `pull_request.user.login` and `head_ref` are immutable for the PR's lifetime (they describe who
+    OPENED it, not what it now CONTAINS), and `github.actor` is the event trigger, which differs
+    between two runs of the same commits. The invariant is structural -- no `if:` at all.
     """
     job = _jobs(_load(WORKFLOW_DIR / "main-source-guard.yml"))["source-is-dev"]
     assert "if" not in job, (
@@ -427,140 +426,53 @@ def test_main_source_guard_cannot_be_skipped_into_a_pass():
     )
 
 
-def test_main_source_guard_exempts_dependabot_only_by_verified_head_commit():
-    """The dependabot exemption must track the CONTENT of the branch, not who opened the PR.
+def test_main_source_guard_has_no_dependabot_carve_out():
+    """No exemption may be built from commit metadata, because none of it proves bot authorship.
 
-    Dependabot security updates are alert-driven, so they ignore `target-branch: dev` and open
-    against `main` from a `dependabot/...` head that can never be `dev` -- without an exemption the
-    guard is red by construction on exactly the PRs carrying CVE fixes. But the two signals that
-    identify such a PR (author and head ref) are both fixed at open time, so a maintainer who
-    pushes a commit onto a dependabot security PR keeps them and would inherit the exemption for
-    arbitrary human code.
+    An earlier revision of this guard carried a dependabot carve-out on the theory that security
+    updates ignore `target-branch: dev` and open against `main`. That premise was wrong here: all
+    11 dependabot PRs in this repo's history target `dev`, including under alert-driven security
+    updates (which are enabled and unpaused), and this job -- which only triggers on PRs into
+    `main` -- has never once run on a dependabot PR. The carve-out fixed nothing.
 
-    The head commit closes that, but only when author, committer AND signature are read together.
-    Neither identity field works alone, and the real commits on this repo's dependabot branches
-    show why:
+    It could not have been written safely either. GitHub signs whatever a caller hands it, so the
+    signed payload of a real dependabot push carries no bot-specific fact:
 
-        dependabot's own push:  author=dependabot[bot]  committer=web-flow  verified=true
-        human web-UI merge:     author=DavidBShan       committer=web-flow  verified=true
+        author    dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>
+        committer GitHub <noreply@github.com>
 
-    `.committer.login` is `web-flow` in BOTH -- it is GitHub's generic web signer, not an identity
-    specific to the bot -- so a committer-only check exempts any maintainer edit made through the
-    web editor or the contents API. And `.author.login` alone is worthless because it is resolved
-    from the author email header, which whoever pushes sets freely; a signature attests to the
-    COMMITTER, so pairing the author with `verified` checks a forgeable field against somebody
-    else's signature. Requiring the pair separates the two rows above: a human web edit keeps its
-    human author, and a forged author header cannot also produce the signature.
-
-    The script is EXECUTED here (with `gh` stubbed) rather than grepped, because the characters
-    being present proves nothing about which branch they gate.
+    The author line is a caller-supplied header, and the committer is the generic identity behind
+    every web-editor and contents-api commit. A write-capable maintainer calling the contents API
+    with dependabot's noreply address in the `author` object reproduces that tuple exactly. Three
+    successive versions of the carve-out (author+verified, committer+verified, author+committer+
+    verified) were each defeated by that, so this test pins its ABSENCE: if dependabot is ever
+    pointed at `main`, exempt it outside the commit -- a separate workflow keyed on the API's
+    PR-level bot identity, or a ruleset bypass actor -- not by re-reading forgeable fields here.
     """
     job = _jobs(_load(WORKFLOW_DIR / "main-source-guard.yml"))["source-is-dev"]
     step = next(s for s in _steps(job) if "run" in s)
+    script = step["run"]
     env = step.get("env") or {}
 
-    assert env.get("PR_AUTHOR") == "${{ github.event.pull_request.user.login }}", (
-        f"PR_AUTHOR must be the PR opener, which cannot be spoofed to a bracketed login. env: {env!r}"
+    # the commit lookup is the shape of every defeated attempt: resolve the head sha, read identity
+    # fields off it, exit 0 on a match. no token, no sha, no lookup.
+    for token in ("GH_TOKEN", "GITHUB_TOKEN"):
+        assert token not in env, (
+            f"the guard needs no API token; {token} implies a commit lookup was reintroduced. "
+            f"env: {env!r}"
+        )
+    assert "HEAD_SHA" not in env, (
+        f"the guard must not resolve the head commit -- its metadata is forgeable. env: {env!r}"
     )
-    assert env.get("HEAD_SHA") == "${{ github.event.pull_request.head.sha }}", (
-        f"HEAD_SHA must be the head commit under test, not a ref that can move. env: {env!r}"
+    for forgeable in ("author", "committer", "verification", "verified"):
+        assert forgeable not in script, (
+            f"the guard script references {forgeable!r}, which reads commit metadata a contents-api "
+            "caller controls. bot provenance cannot be established from the commit."
+        )
+    assert "dependabot" not in script, (
+        "the guard script names dependabot, so a carve-out was reintroduced. dependabot targets "
+        "`dev` here and this job never runs on its PRs; the exemption is unnecessary and unsafe."
     )
-
-    with tempfile.TemporaryDirectory() as bindir:
-        stub = Path(bindir) / "gh"
-
-        def run(head_repo: str, head_ref: str, author: str, commit: str | None) -> int:
-            # emit exactly what the real `gh api ... --jq` would print, or fail like an
-            # unreachable API.
-            stub.write_text(
-                "#!/bin/bash\n" + (f"echo '{commit}'\n" if commit is not None else "exit 1\n")
-            )
-            stub.chmod(0o755)
-            return subprocess.run(
-                ["bash", "-c", step["run"]],
-                capture_output=True,
-                text=True,
-                env={
-                    "PATH": f"{bindir}:{os.environ.get('PATH', '')}",
-                    "HEAD_REPO": head_repo,
-                    "HEAD_REF": head_ref,
-                    "UPSTREAM_REPO": UPSTREAM_REPOSITORY,
-                    "PR_AUTHOR": author,
-                    "HEAD_SHA": "0" * 40,
-                    "GH_TOKEN": "stub",
-                },
-            ).returncode
-
-        bot = "dependabot[bot]"
-        branch = "dependabot/pip/urllib3-2.5.0"
-        # the stub emits `<author.login> <committer.login> <verified> <reason>` -- what the
-        # script's --jq prints. the first two fixtures are copied from real commits on this repo's
-        # dependabot branches, not invented.
-        dependabot_push = f"{bot} web-flow true valid"
-        dependabot_self_signed = f"{bot} {bot} true valid"
-
-        # the case the exemption exists for. web-flow is the committer on dependabot's real
-        # pushes, so rejecting it would make the exemption dead code and leave the required check
-        # red on every CVE fix.
-        assert run(UPSTREAM_REPOSITORY, branch, bot, dependabot_push) == 0, (
-            "a real dependabot push (author=dependabot[bot], committer=web-flow, signed) must "
-            "pass -- otherwise the required check is red by construction on every CVE fix"
-        )
-        assert run(UPSTREAM_REPOSITORY, branch, bot, dependabot_self_signed) == 0, (
-            "a dependabot commit signed under the bot's own identity must pass too"
-        )
-
-        # THE WEB-EDITOR CASE: a maintainer edits the dependabot branch through GitHub's web UI or
-        # the contents API. PR author and head ref are untouched, and GitHub signs it as
-        # `web-flow` with verified=true -- byte-identical to a real dependabot push on the
-        # committer and signature alone. only the AUTHOR distinguishes them.
-        assert run(UPSTREAM_REPOSITORY, branch, bot, "DavidBShan web-flow true valid") != 0, (
-            "a human web-UI edit on a dependabot branch was exempted -- web-flow is GitHub's "
-            "generic web signer, so the committer cannot tell it apart from a dependabot push. "
-            "the author is the field that can"
-        )
-
-        # THE FORGED-HEADER CASE: a collaborator pushes with dependabot's noreply author email and
-        # signs with their OWN key. `.author.login` resolves to dependabot from the forged header,
-        # so an author-only check reads "dependabot, verified" for human content. the committer is
-        # what distinguishes this one -- the mirror image of the case above.
-        assert run(UPSTREAM_REPOSITORY, branch, bot, f"{bot} DavidBShan true valid") != 0, (
-            "a commit whose author header was forged to dependabot but which is SIGNED BY A HUMAN "
-            "was exempted -- verification binds to the committer, so the committer must be read too"
-        )
-
-        # a human pushed onto that same PR under their own identity, unsigned.
-        assert run(UPSTREAM_REPOSITORY, branch, bot, "DavidBShan DavidBShan false unsigned") != 0, (
-            "human commits pushed onto a dependabot PR inherited the exemption -- the guard must "
-            "key on the head commit, not on who opened the PR"
-        )
-
-        # dependabot's identity on both halves but the signature does not check out.
-        assert run(UPSTREAM_REPOSITORY, branch, bot, f"{bot} web-flow false unverified") != 0, (
-            "an UNVERIFIED commit claiming dependabot's identity was exempted"
-        )
-
-        # verified true under a reason other than `valid`.
-        assert run(UPSTREAM_REPOSITORY, branch, bot, f"{bot} web-flow true unknown_key") != 0, (
-            "a signature reporting verified=true under a non-`valid` reason was exempted -- both "
-            "fields are pinned so a weaker future reason cannot widen the exemption"
-        )
-
-        # the lookup failing is not an exemption.
-        assert run(UPSTREAM_REPOSITORY, branch, bot, None) != 0, (
-            "an unreadable head commit must fail closed, not be treated as a dependabot bump"
-        )
-
-        # a human branch merely NAMED like dependabot's.
-        assert run(UPSTREAM_REPOSITORY, "dependabot/evil", "DavidBShan", dependabot_push) != 0, (
-            "a human-authored branch named `dependabot/...` bypassed the guard"
-        )
-
-        # a fork must never reach the exemption at all: on a fork head the commit and its
-        # signatures are attacker-controlled.
-        assert run("attacker/flash", branch, bot, dependabot_push) != 0, (
-            "a fork PR claimed the dependabot exemption -- it must be rejected as a fork first"
-        )
 
 
 def test_workflows_that_touch_shared_resources_are_upstream_only():
