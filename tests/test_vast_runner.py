@@ -6,6 +6,7 @@ The Vast API and HF readers are mocked; no API key is needed.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import http.client
 import io
 import itertools
@@ -2083,6 +2084,47 @@ def test_a_dry_market_is_not_blamed_on_this_runs_blacklist(monkeypatch):
         vast.forget_dead_machines(spec.run_id)
 
 
+def test_a_fully_blacklisted_first_page_widens_the_search_before_giving_up(monkeypatch):
+    """The row cap is a price-sorted prefix, so an all-dead page is not an exhausted class.
+
+    ``search_offers`` applies its limit server-side and the machine exclusion runs client-side, so a
+    run that burned the cheap boxes sees an empty list while dearer usable capacity sits just past
+    the cap. Concluding exhaustion from that page fails the run with capacity still available.
+    """
+    from flash.providers.vast import jobs as vast
+
+    spec = _spec()
+    vast.forget_dead_machines(spec.run_id)
+    try:
+        _wire_submit(monkeypatch)
+        vast._note_dead_machine(spec.run_id, 10)
+        limits: list[int] = []
+
+        def _paged(*_a, limit=256, **_k):
+            limits.append(int(limit))
+            # the cheap page is entirely this run's own dead host; the wider page reaches a live one.
+            if int(limit) <= 256:
+                return [_offer(machine_id=10)]
+            return [_offer(machine_id=10), _offer(offer_id=2, machine_id=11)]
+
+        seen: list[frozenset[int]] = []
+        monkeypatch.setattr(vast, "usable_offers", _paged)
+        monkeypatch.setattr(
+            vast,
+            "deploy_and_submit",
+            lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None, deadline_at=None: (
+                seen.append(frozenset(o.machine_id for o in offers)) or _handle()
+            ),
+        )
+
+        _submit(vast, spec, seed=0)
+
+        assert limits[-1] > limits[0], f"never widened past the default page: {limits}"
+        assert seen == [frozenset({11})], f"expected the host past the cap, rented {seen}"
+    finally:
+        vast.forget_dead_machines(spec.run_id)
+
+
 def test_gc_frees_the_runs_dead_machine_set(monkeypatch):
     """The blacklist is process-local state, so the run's reap has to release it."""
     from flash.providers.vast import PROVIDER
@@ -2095,6 +2137,30 @@ def test_gc_frees_the_runs_dead_machine_set(monkeypatch):
     PROVIDER.gc(spec)
 
     assert vast.dead_machine_ids(spec.run_id) == frozenset()
+
+
+def test_gc_keeps_the_blacklist_for_a_relaunchable_profile_run(monkeypatch):
+    """A profile id is derived from the workload, so the next attempt reuses it.
+
+    Freeing the blacklist at GC hands the replacement profile a clean slate and lets it re-rent the
+    host that just took the money -- the repeated-rental loop, one lifecycle later.
+    """
+    from flash.engine.profiling.workload_profile import sft_profile_run_id
+    from flash.providers.vast import PROVIDER
+    from flash.providers.vast import jobs as vast
+
+    spec = dataclasses.replace(_spec(), run_id=sft_profile_run_id("a" * 64))
+    vast.forget_dead_machines(spec.run_id)
+    try:
+        vast._note_dead_machine(spec.run_id, 10)
+        monkeypatch.setattr(vast, "destroy_run_instances", lambda _run_id: [])
+
+        PROVIDER.gc(spec)
+
+        assert vast.dead_machine_ids(spec.run_id) == frozenset({10})
+    finally:
+        with vast._dead_machines_lock:
+            vast._run_dead_machines.pop(spec.run_id, None)
 
 
 def test_runner_destroys_on_exception(monkeypatch):

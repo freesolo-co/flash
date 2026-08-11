@@ -95,6 +95,10 @@ _dead_machines_lock = threading.Lock()
 # Bound the per-process footprint of the map above: a long-lived control plane submits unboundedly
 # many runs, and nothing else would ever evict a finished run's entry.
 _DEAD_MACHINE_RUNS_MAX = 512
+# widened row cap for the one re-search that separates "this run burned the cheap page" from "the
+# class is gone". only paid when the default page is entirely blacklisted, which needs a run that
+# already lost that many hosts.
+_EXHAUSTION_RECHECK_LIMIT = 1024
 # The tail of vast's own ``load_timeout_detail`` below. It is what identifies the ONE stall that
 # indicts the host, and interpolating the same constant into both sides is what keeps them from
 # drifting apart.
@@ -134,7 +138,18 @@ def dead_machine_ids(run_id: str) -> frozenset[int]:
 
 
 def forget_dead_machines(run_id: str) -> None:
-    """Drop a finished run's blacklist so the map does not grow for the process's lifetime."""
+    """Drop a finished run's blacklist so the map does not grow for the process's lifetime.
+
+    A profile run id is derived from the workload, not from the attempt, so a spent profile is
+    relaunched under this same id. Dropping its blacklist at GC would hand the replacement a clean
+    slate and let it re-rent the host that just took the money -- the repeated-rental loop this
+    blacklist exists to break, arriving one lifecycle later. Those entries age out through
+    ``_DEAD_MACHINE_RUNS_MAX`` instead.
+    """
+    from flash.engine.profiling.workload_profile import is_profile_run_id
+
+    if is_profile_run_id(run_id):
+        return
     with _dead_machines_lock:
         _run_dead_machines.pop(run_id, None)
 
@@ -722,6 +737,26 @@ def submit_run_vast(
     ]
     excluded = dead_machine_ids(spec.run_id)
     offers = [o for o in market if o.machine_id not in excluded]
+    if market and not offers:
+        # every row of the cheapest page belongs to a host this run already lost. the page is a
+        # price-sorted prefix, not the class: `search_offers` applies its row cap server-side and
+        # the machine exclusion is client-side, so dearer usable capacity can sit just past the
+        # cap. widen once and re-filter before calling the class exhausted -- concluding it from
+        # the first page turns "the cheap boxes are burned" into a false terminal failure.
+        market = [
+            o
+            for o in usable_offers(
+                info.vram_gb,
+                _effective_disk_gb(spec),
+                limit=_EXHAUSTION_RECHECK_LIMIT,
+                max_wall_seconds=_rent_duration_floor(spec, absolute_deadline),
+                gpu_type=spec.gpu.type,
+                num_gpus=gpu_count_of(spec),
+                **deadline_kwargs(usable_offers, absolute_deadline),
+            )
+            if o.gpu == spec.gpu.type
+        ]
+        offers = [o for o in market if o.machine_id not in excluded]
     if market and not offers:
         # the class HAD offers and this run had already lost every one of them. the generic empty-
         # pool error reads as "vast has no capacity" when the truth is "this run has burned all of

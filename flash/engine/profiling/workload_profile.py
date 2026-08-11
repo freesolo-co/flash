@@ -213,6 +213,15 @@ def sft_profile_run_id(input_digest: str) -> str:
     return _profile_run_id(_PROFILE_RUN_PREFIX, input_digest)
 
 
+def is_profile_run_id(run_id: str) -> bool:
+    """True for the deterministic profile ids that a later attempt can reuse.
+
+    A profile id is derived from the workload alone, so a spent profile is relaunched under this
+    exact id. Per-run state keyed by it therefore outlives the run that created it.
+    """
+    return run_id.startswith(_PROFILE_RUN_PREFIX)
+
+
 def _profile_from_dict(cls, raw: object):
     """rebuild a profile and verify its serialized digest.
 
