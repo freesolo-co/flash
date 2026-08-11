@@ -448,9 +448,9 @@ def _wider_shape_remedy(config: RunConfig, need: float, names: tuple[str, ...]) 
         GPU_INFO,
         MAX_COMBINATION_CARDS,
         providers_for,
-        rents_arbitrary_card_counts,
         wider_shape_remedy,
     )
+    from flash.providers.fit_errors import rents_arbitrary_card_counts
 
     def _in_play(gpu: str) -> tuple[str, ...]:
         carriers = providers_for(gpu)
@@ -501,9 +501,8 @@ def _offline_gpu_shape(
         providers_for,
         rentable_gpu_counts,
         smallest_fitting_gpu_count,
-        vram_fit_error_message,
-        vram_knob_advice,
     )
+    from flash.providers.fit_errors import vram_fit_error_message, vram_knob_advice
 
     provider = config.provider if config.provider != "auto" else "auto"
     if config.gpu_type:
@@ -597,6 +596,7 @@ def _offline_gpu_shape(
                 max_gpu_count=auto_cap,
                 gpu_names=names,
                 providers=None if provider == "auto" else (provider,),
+                provider_pinned=provider != "auto",
             )
         )
     _cost, count, _combined, _per_card, gpu, hourly = min(ranked)

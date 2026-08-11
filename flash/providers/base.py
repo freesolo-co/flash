@@ -485,147 +485,6 @@ def smallest_fitting_gpu_count(
     return None
 
 
-def _shape_label(gpu: GpuClass, count: int) -> str:
-    return f"{count}x {gpu.name}" if count > 1 else gpu.name
-
-
-def vram_knob_advice(algorithm: str) -> str:
-    """Return the algorithm knobs that actually reduce its measured vram floor."""
-    algorithm = (algorithm or "").lower()
-    if algorithm == "grpo":
-        return (
-            "lower [train].max_context_tokens / [train].max_completion_tokens / "
-            "[train].lora_rank to fit"
-        )
-    if algorithm == "opd":
-        return (
-            "lower [train].group_size and/or [train].batch_size (rollout concurrency = "
-            "batch_size x group_size; distillation needs no group variance, so group_size=1 is "
-            "fine) and/or [train].max_completion_tokens / [train].max_context_tokens to fit"
-        )
-    return "lower [train].batch_size / [train].max_context_tokens / [train].lora_rank to fit"
-
-
-def rents_arbitrary_card_counts(providers: Iterable[str]) -> bool:
-    """Whether some provider here sells a card count that no live catalog has to confirm.
-
-    Providers differ in KIND on this, as ``AllocationConstraints.max_gpu_count`` records: RunPod
-    takes the count as a launch parameter, so any rentable count is purchasable from the static
-    table alone, while Lambda names it in the instance type and Vast has it baked into the offer,
-    so an N-card shape only exists if their live catalog happens to list one. ``live_capacity`` is
-    the signal that separates the two -- a provider stocking from a live market is exactly the one
-    whose per-count SKUs cannot be confirmed offline. A new provider that sells fixed counts from a
-    static table would need its own flag rather than this proxy.
-
-    Used to decide whether a suggested width can be promised; the same attribute classifies an
-    empty candidate set as retryable capacity in ``allocator._raise_no_candidate_error``.
-    """
-    from flash.providers import get_provider
-
-    return any(not getattr(get_provider(name), "live_capacity", False) for name in providers)
-
-
-def widenable_gpu_names(
-    gpu_names: tuple[str, ...] | None, providers: tuple[str, ...] | None
-) -> tuple[str, ...] | None:
-    """``gpu_names`` reduced to classes a wider shape can actually be BOUGHT for.
-
-    A class survives when some provider still in play rents card counts freely
-    (see ``rents_arbitrary_card_counts``). ``providers`` is the set in play, which a pin narrows:
-    B200 is carried by RunPod and Lambda, but a Lambda-pinned run may not borrow RunPod's freedom
-    to rent any count. ``None`` means no pin, so every carrier of the class counts.
-
-    Separate from the pool that answers "what could hold this run" because the two questions differ:
-    a rejection still names the biggest class it found (``provides at most 180 GB (B200)``) even
-    when no wider shape of it is purchasable.
-    """
-    pool = (
-        gpu_names
-        if gpu_names is not None
-        else tuple(g.name for g in GPU_CLASSES if g.enum_member and g.validated)
-    )
-    return tuple(
-        name
-        for name in pool
-        if rents_arbitrary_card_counts(
-            providers_for(name)
-            if providers is None
-            else tuple(p for p in providers_for(name) if p in providers)
-        )
-    )
-
-
-def vram_fit_error_message(
-    algorithm: str,
-    need: float,
-    *,
-    requested_gpu_count: int | None,
-    effective_gpu_count: int,
-    max_gpu_count: int,
-    gpu_names: tuple[str, ...] | None = None,
-    providers: tuple[str, ...] | None = None,
-) -> str:
-    """Build an actionable pinned-count or terminal vram rejection.
-
-    A ``--gpus N`` suggestion is only offered for a class whose shape at N cards can be purchased;
-    see ``widenable_gpu_names``. Otherwise the run falls through to the terminal message, which
-    states the shortfall without sending the user to buy a shape no provider in play sells.
-    """
-    algorithm = (algorithm or "").lower()
-    widenable = widenable_gpu_names(gpu_names, providers)
-    fitting_count = smallest_fitting_gpu_count(
-        need, max_gpu_count=max_gpu_count, gpu_names=widenable
-    )
-    if requested_gpu_count is not None and fitting_count is not None:
-        provided = gpu_capacity_shape(effective_gpu_count, gpu_names=gpu_names)
-        fitting = gpu_capacity_shape(fitting_count, min_vram_gb=need, gpu_names=widenable)
-        if provided is not None and fitting is not None:
-            provided_gpu, provided_count, provided_vram = provided
-            fitting_gpu, fitting_count, fitting_vram = fitting
-            # `--gpus {n}` is spelled exactly as `wider_shape_remedy` spells it, so the flag a user
-            # copies out of a fit failure is the same string on every path that can reject one.
-            return (
-                f"{algorithm} needs >= {need:g} GB VRAM; gpu.count={requested_gpu_count} provides "
-                f"at most {provided_vram:g} GB ({_shape_label(provided_gpu, provided_count)}). "
-                f"Raise the card ceiling with `--gpus {fitting_count}` "
-                f"({_shape_label(fitting_gpu, fitting_count)} = {fitting_vram:g} GB), or "
-                f"{vram_knob_advice(algorithm)}."
-            )
-
-    # a width that FITS but cannot be bought is not the same failure as a run that exceeds every
-    # class: saying it "needs more than any 8-card combination" would be false, and the knob advice
-    # would send the user to shrink a run that already fits. name the real obstacle instead.
-    if requested_gpu_count is not None and smallest_fitting_gpu_count(
-        need, max_gpu_count=max_gpu_count, gpu_names=gpu_names
-    ):
-        return (
-            f"{algorithm} needs >= {need:g} GB VRAM, which fits only on a multi-card shape that "
-            "the requested provider does not sell: it offers fixed card counts as distinct "
-            "instance types, so a wider shape exists only if its live catalog lists one. Drop the "
-            f"provider pin to let the allocator choose, or {vram_knob_advice(algorithm)}."
-        )
-
-    widest = gpu_capacity_shape(max_gpu_count, gpu_names=gpu_names)
-    widest_count = largest_rentable_count(max_gpu_count)
-    biggest = widest[2] if widest is not None else 0.0
-    shape = (
-        f"any {widest_count}-card validated GPU combination"
-        if widest_count > 1
-        else "any single validated GPU"
-    )
-    if algorithm == "opd":
-        return (
-            f"opd needs >= {need:g} GB VRAM, more than {shape} ({biggest:g} GB max). "
-            "opd is resident-only: the trainer and the colocated vLLM student rollout engine hold "
-            "two model-weight copies plus the rollout KV cache at once. "
-            f"{vram_knob_advice(algorithm).capitalize()}."
-        )
-    return (
-        f"{algorithm} needs >= {need:g} GB VRAM, more than {shape} ({biggest:g} GB max). "
-        f"{vram_knob_advice(algorithm).capitalize()}."
-    )
-
-
 def cheapest_gpu(min_vram_gb: int, *, gpu_count: int = 1, cost_key=None) -> str:
     """Return the cheapest fitting validated GPU class for the card ceiling.
 
@@ -745,6 +604,9 @@ def provisional_gpu(
             ),
         )
     except UnsupportedGpuError as exc:
+        # deferred: fit_errors imports from here, so a module-level import would be circular.
+        from flash.providers.fit_errors import vram_fit_error_message
+
         raise UnsupportedGpuError(
             vram_fit_error_message(
                 algorithm,

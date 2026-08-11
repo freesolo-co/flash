@@ -1897,6 +1897,54 @@ def test_provider_incompatible_pin_reports_the_incompatibility_not_a_fit_remedy(
     assert "--gpus" not in str(exc.value)
 
 
+def test_unpurchasable_width_names_a_remedy_the_user_can_actually_apply():
+    """The remedy must depend on WHY only fixed-count providers are in play.
+
+    A pin the user set is theirs to drop. But a control plane configured with only Lambda/Vast
+    narrows to the same one-or-two-name set with no pin anywhere, and telling that operator to
+    "drop the provider pin" names a knob they never set and cannot use. The provider tuple alone
+    cannot tell the two apart, so the pin has to travel separately from the caller.
+
+    Driven through ``_resolved_gpu_count`` rather than the message builder directly: the pin flag
+    is LOST at that boundary, so a builder-only test would pass against the defect.
+    """
+    from flash.providers.allocator import _resolved_gpu_count
+    from flash.providers.base import UnsupportedGpuError
+
+    shared = {
+        "need": 188.0,
+        "requested_gpu_count": 1,
+        "model_revision": "",
+        "exact": "",
+    }
+    with pytest.raises(UnsupportedGpuError) as pinned:
+        _resolved_gpu_count(
+            "Qwen/Qwen3.6-35B-A3B",
+            "grpo",
+            available=("lambda",),
+            provider_pinned=True,
+            **shared,
+        )
+    assert "Drop the provider pin" in str(pinned.value)
+
+    # same narrow provider set, but nothing was pinned: it is the whole configured fleet, so the
+    # user has no pin to drop and must be told something they can act on.
+    with pytest.raises(UnsupportedGpuError) as unpinned:
+        _resolved_gpu_count(
+            "Qwen/Qwen3.6-35B-A3B",
+            "grpo",
+            available=("lambda", "vast"),
+            provider_pinned=False,
+            **shared,
+        )
+    assert "Drop the provider pin" not in str(unpinned.value)
+    assert "Configure a provider" in str(unpinned.value)
+
+    # neither message may claim the run exceeds every class -- it fits, it just cannot be bought.
+    for message in (str(pinned.value), str(unpinned.value)):
+        assert "more than any" not in message
+
+
 def test_fit_remedy_is_withheld_when_only_fixed_count_sku_providers_remain():
     """A width is only promised when a provider in play rents card counts freely.
 
@@ -1952,7 +2000,7 @@ def test_fit_remedy_is_withheld_when_only_fixed_count_sku_providers_remain():
 
 def test_rents_arbitrary_card_counts_splits_providers_by_how_counts_are_sold():
     """The predicate must track how a count is PURCHASED, not whether the provider is configured."""
-    from flash.providers.base import rents_arbitrary_card_counts
+    from flash.providers.fit_errors import rents_arbitrary_card_counts
 
     assert rents_arbitrary_card_counts(("runpod",)) is True
     assert rents_arbitrary_card_counts(("lambda",)) is False

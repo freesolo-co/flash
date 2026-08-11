@@ -781,7 +781,7 @@ def test_offline_quote_remedy_only_names_widths_a_provider_sells_freely():
         "group_size": 4,
         "lora_rank": 16,
     }
-    with pytest.raises(ValueError, match="does not sell") as lambda_only:
+    with pytest.raises(ValueError, match="no available provider sells") as lambda_only:
         _offline_gpu_shape(RunConfig(gpu_count=1, provider="lambda", **shared))
     assert "--gpus" not in str(lambda_only.value)
     # the run fits; do not tell the user it exceeds every class.
@@ -802,4 +802,4 @@ def test_offline_quote_remedy_only_names_widths_a_provider_sells_freely():
                 **{**shared, "seq_len": 1_000_000},
             )
         )
-    assert "does not sell" not in str(oversized.value)
+    assert "no available provider sells" not in str(oversized.value)

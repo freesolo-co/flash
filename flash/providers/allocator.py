@@ -23,12 +23,11 @@ from flash.providers.base import (
     largest_rentable_count,
     providers_for,
     rentable_gpu_counts,
-    rents_arbitrary_card_counts,
     run_config_for_ranking,
     smallest_fitting_gpu_count,
-    vram_fit_error_message,
     wider_shape_remedy,
 )
+from flash.providers.fit_errors import rents_arbitrary_card_counts, vram_fit_error_message
 
 logger = get_logger(__name__)
 
@@ -268,8 +267,14 @@ def _resolved_gpu_count(
     model_revision: str,
     available: tuple[str, ...],
     exact: str,
+    provider_pinned: bool = False,
 ) -> int:
-    """Resolve auto-size or validate that an authored ceiling can structurally fit."""
+    """Resolve auto-size or validate that an authored ceiling can structurally fit.
+
+    ``provider_pinned`` travels separately from ``available`` because a pin narrows that tuple to
+    one name and so becomes indistinguishable from a plane that only configured one provider; a
+    rejection message has to tell those apart to name a remedy the user can actually apply.
+    """
     auto_cap = geometry_safe_gpu_cap(model_id, MAX_COMBINATION_CARDS, model_revision=model_revision)
     gpu_names = _structural_gpu_names(available, exact)
     if requested_gpu_count is None:
@@ -297,6 +302,7 @@ def _resolved_gpu_count(
             max_gpu_count=auto_cap,
             gpu_names=gpu_names,
             providers=available,
+            provider_pinned=provider_pinned,
         )
     )
 
@@ -480,6 +486,7 @@ def allocate(
         model_revision=model_revision,
         available=available,
         exact=exact,
+        provider_pinned=bool(provider),
     )
 
     constraints = AllocationConstraints(
