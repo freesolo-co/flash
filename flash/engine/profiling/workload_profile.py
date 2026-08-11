@@ -135,20 +135,16 @@ def _digest_mapping(value: object) -> str:
     return _sha256(value if isinstance(value, dict) else {})
 
 
-def _digest_pip(value: object) -> str:
-    """Digest ``[environment] pip`` as an ordered sequence of requirement strings.
+def _digest_sequence(value: object) -> str:
+    """Digest an ordered sequence of strings, mirroring ``_digest_mapping`` for list-shaped fields.
 
-    Part of profile identity because these packages are installed into the worker alongside the
-    training stack: a different dependency set can change tokenization, collation, or scorer cost,
-    so two configs differing only here must not share a measured profile. Order is preserved rather
-    than sorted -- pip resolves earlier entries first, so a reordering is a different install.
-
-    A missing or non-sequence value digests as empty rather than raising: this runs on the quoting
-    path, and an environment carrying no pip is the overwhelmingly common case, not an error.
+    ``[environment] pip`` is part of profile identity because those packages are installed into the
+    worker alongside the training stack: a different dependency set can change tokenization,
+    collation, or scorer cost, so two configs differing only here must not share a measured profile.
+    Order is preserved rather than sorted -- pip resolves earlier entries first, so a reordering is a
+    different install.
     """
-    if not isinstance(value, (list, tuple)):
-        return _sha256([])
-    return _sha256([str(item) for item in value])
+    return _sha256([str(item) for item in value] if isinstance(value, (list, tuple)) else [])
 
 
 def sft_profile_input_payload(
@@ -169,7 +165,7 @@ def sft_profile_input_payload(
             "id": str(environment.id),
             "resolved_sha": str(environment.resolved_sha or ""),
             "params_sha256": _digest_mapping(environment.params),
-            "pip_sha256": _digest_pip(getattr(environment, "pip", ())),
+            "pip_sha256": _digest_sequence(environment.pip),
         },
         "model": {
             "id": str(spec.model),
@@ -434,7 +430,7 @@ def rollout_profile_input_payload(
             "id": str(environment.id),
             "resolved_sha": str(environment.resolved_sha or ""),
             "params_sha256": _digest_mapping(environment.params),
-            "pip_sha256": _digest_pip(getattr(environment, "pip", ())),
+            "pip_sha256": _digest_sequence(environment.pip),
         },
         "model": {
             "id": str(spec.model),

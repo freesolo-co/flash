@@ -33,6 +33,7 @@ from flash.providers.base import (
 from flash.schema.fields import (
     ConfigError,
     _coerce_scalar,
+    _environment_pip,
     _environment_secrets,
     _require_environment_ref,
     _section_int,
@@ -334,8 +335,8 @@ def _validate_top_level(
 
 def _validate_environment_section(
     raw: dict[str, Any],
-) -> tuple[dict[str, Any], tuple[str, ...]]:
-    """Validate the environment section."""
+) -> tuple[dict[str, Any], tuple[str, ...], tuple[str, ...]]:
+    """Validate the environment section, returning it with the parsed pip and secrets tuples."""
     # use `is none` not `or {}`: a present-but-non-dict value (e.g. `environment = false`) must hit the type check.
     env_raw = raw.get("environment")
     if env_raw is None:
@@ -353,67 +354,9 @@ def _validate_environment_section(
     # input fails clearly instead of becoming {} or an opaque dict conversion error.
     if env_raw.get("params") is not None and not isinstance(env_raw["params"], dict):
         raise ConfigError("[environment] params must be a table")
-    _validate_environment_pip(env_raw.get("pip"))
+    environment_pip = _environment_pip(env_raw.get("pip"))
     environment_secrets = _environment_secrets(env_raw.get("secrets"))
-    return env_raw, environment_secrets
-
-
-def _validate_environment_pip(value: Any) -> None:
-    """Reject a [environment] pip that is not a list of non-empty requirement strings.
-
-    A malformed entry would otherwise reach the worker's pip invocation, where it fails mid-install
-    after the GPU is already allocated and billing. A bare string is called out separately: TOML has
-    no implicit one-element list, so `pip = "pymongo"` is the natural first mistake to make here.
-    """
-    if value is None:
-        return
-    if isinstance(value, str):
-        raise ConfigError(
-            f'[environment] pip must be a list of requirement strings, not a string: use ["{value}"]'
-        )
-    # tuple as well as list: to_dict() emits the spec's own tuple, and that payload is re-parsed
-    # here on the submit round trip (mirrors _environment_secrets).
-    if not isinstance(value, (list, tuple)):
-        raise ConfigError("[environment] pip must be a list of requirement strings")
-    for item in value:
-        if not isinstance(item, str) or not item.strip():
-            raise ConfigError(
-                f"[environment] pip entries must be non-empty requirement strings (got: {item!r})"
-            )
-        # entries are spliced straight into `python -m pip install` on the worker, so an option
-        # flag is not just an odd requirement: `--no-deps` or `--target=...` would change how the
-        # mandatory freesolo worker requirement installs, from a field that only names packages.
-        if item.strip().startswith("-"):
-            raise ConfigError(
-                "[environment] pip entries must be requirements, not pip options "
-                f"(got: {item.strip()!r})"
-            )
-        _reject_pip_url_credentials(item.strip())
-
-
-# `scheme://userinfo@host` in a direct or VCS requirement. Anchored on `://` so a bare `pkg@1.2` or
-# a PEP 508 `name @ https://host/x.whl` without userinfo is untouched; `[^/\s]*:[^/\s]*@` requires
-# the colon-separated user:password shape inside a single URL authority.
-_PIP_URL_CREDENTIAL_RE = re.compile(r"://[^/\s]*:[^/\s]*@")
-
-
-def _reject_pip_url_credentials(requirement: str) -> None:
-    """Reject inline credentials in a pip requirement URL.
-
-    A spec is not a secret store: `[environment] pip` is persisted verbatim in ``RunStatus.spec``
-    and uploaded inside the worker's ``metrics.json`` job_spec, so a token embedded in a direct or
-    VCS URL would be written to disk and to the run log in plaintext. Credentials belong in
-    ``[environment] secrets``, whose values travel out-of-band and are never stored in the spec.
-
-    The offending requirement is deliberately NOT echoed: quoting it back would copy the very
-    credential this is here to keep out of logs.
-    """
-    if _PIP_URL_CREDENTIAL_RE.search(requirement):
-        raise ConfigError(
-            "[environment] pip entries must not embed credentials in a URL: the spec is stored and "
-            "uploaded in plaintext. Use [environment] secrets for the credential and an "
-            "unauthenticated requirement URL."
-        )
+    return env_raw, environment_pip, environment_secrets
 
 
 def _validate_train_section(raw: dict[str, Any]) -> dict[str, Any]:
@@ -581,7 +524,7 @@ def spec_from_dict(
     raw: dict[str, Any], run_id: str | None = None, *, project_required: bool = False
 ) -> JobSpec:
     model, model_revision, project, algorithm, thinking = _validate_top_level(raw, project_required)
-    env_raw, environment_secrets = _validate_environment_section(raw)
+    env_raw, environment_pip, environment_secrets = _validate_environment_section(raw)
     train_raw = _validate_train_section(raw)
     gpu_type, gpu_provider, gpu_options = _validate_gpu_section(
         raw,
@@ -635,7 +578,7 @@ def spec_from_dict(
         environment=EnvironmentSpec(
             id=str(env_raw.get("id") or ""),
             params=dict(env_raw.get("params") or {}),
-            pip=tuple(str(p) for p in env_raw.get("pip") or ()),
+            pip=environment_pip,
             secrets=environment_secrets,
         ),
         train=train_spec,

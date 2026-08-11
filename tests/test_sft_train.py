@@ -1236,6 +1236,7 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
             id="owner/env",
             resolved_sha="b" * 40,
             params={},
+            pip=(),
         ),
         gpu=SimpleNamespace(type="RTX 4090", exact_type="", count=2),
         train=SimpleNamespace(

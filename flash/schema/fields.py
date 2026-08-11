@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from typing import Any
 
 from flash.content.structured_outputs import CONSTRAINT_KEYS as _SO_CONSTRAINT_KEYS
@@ -311,6 +312,57 @@ _RESERVED_ENVIRONMENT_SECRET_KEYS = frozenset(
         *CONTROL_PLANE_OWNED_ENV_KEYS,
     }
 )
+
+
+# `scheme://userinfo@host` in a direct or VCS requirement. Anchored on `://` so a bare `pkg@1.2` or
+# a PEP 508 `name @ https://host/x.whl` without userinfo is untouched; `[^/\s]*:[^/\s]*@` requires
+# the colon-separated user:password shape inside a single URL authority.
+_PIP_URL_CREDENTIAL_RE = re.compile(r"://[^/\s]*:[^/\s]*@")
+
+
+def _environment_pip(raw: Any) -> tuple[str, ...]:
+    """Parse [environment].pip as the scorer's own third-party requirements.
+
+    A malformed entry would otherwise reach the worker's pip invocation, where it fails mid-install
+    after the GPU is already allocated and billing. A bare string is called out separately: TOML has
+    no implicit one-element list, so `pip = "pymongo"` is the natural first mistake to make here.
+    """
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        raise ConfigError(
+            f'[environment] pip must be a list of requirement strings, not a string: use ["{raw}"]'
+        )
+    # tuple as well as list: to_dict() emits the spec's own tuple, and that payload is re-parsed
+    # here on the submit round trip (mirrors _environment_secrets).
+    if not isinstance(raw, (list, tuple)):
+        raise ConfigError("[environment] pip must be a list of requirement strings")
+    requirements = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise ConfigError(
+                f"[environment] pip entries must be non-empty requirement strings (got: {item!r})"
+            )
+        requirement = item.strip()
+        # entries are spliced straight into `python -m pip install` on the worker, so an option
+        # flag is not just an odd requirement: `--no-deps` or `--target=...` would change how the
+        # mandatory freesolo worker requirement installs, from a field that only names packages.
+        if requirement.startswith("-"):
+            raise ConfigError(
+                f"[environment] pip entries must be requirements, not pip options (got: {requirement!r})"
+            )
+        # A spec is not a secret store: pip is persisted verbatim in ``RunStatus.spec`` and uploaded
+        # inside the worker's ``metrics.json`` job_spec, so a token embedded in a direct or VCS URL
+        # would be written to disk and to the run log in plaintext. The offending requirement is
+        # deliberately NOT echoed: quoting it back would copy the very credential this keeps out.
+        if _PIP_URL_CREDENTIAL_RE.search(requirement):
+            raise ConfigError(
+                "[environment] pip entries must not embed credentials in a URL: the spec is stored "
+                "and uploaded in plaintext. Use [environment] secrets for the credential and an "
+                "unauthenticated requirement URL."
+            )
+        requirements.append(requirement)
+    return tuple(requirements)
 
 
 def _environment_secrets(raw: Any) -> tuple[str, ...]:

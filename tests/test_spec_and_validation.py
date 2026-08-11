@@ -1118,6 +1118,10 @@ def test_model_revision_auto_does_not_change_pre_existing_preparation_digests() 
             worker_payload.pop(key, None)
     worker_payload.pop("model_revision_auto", None)
     public_payload = unmarked.to_dict()  # to_dict() already strips the marker
+    # the old plane popped `[environment] pip` from every public payload, so its bytes carried no
+    # such key. mirrors _preparation_digest's drop-when-empty for the same reason as the list above.
+    if not public_payload["environment"].get("pip"):
+        public_payload["environment"].pop("pip", None)
 
     payload = json.dumps(
         {
