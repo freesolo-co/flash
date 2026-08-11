@@ -12,6 +12,8 @@ from __future__ import annotations
 import contextlib
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash._internal.logging import get_logger
@@ -90,7 +92,7 @@ def usable_instances(
     capacity, so it drops out here exactly like a sold-out region — the caller never gets an
     unrentable shape back.
     """
-    from flash.providers.lambda_.gpus import instance_type_for
+    from flash.providers.lambda_.gpus import instance_type_disk_gb, instance_type_for
     from flash.providers.lambda_.pricing import hourly_rate
 
     info = GPU_INFO[gpu_class]
@@ -119,6 +121,9 @@ def usable_instances(
         )
         / count
     )
+    # carried on the candidate so the launch gate can refuse an undersized SKU without a second
+    # catalog fetch; None (unreported storage) stays permissive.
+    disk_gb = instance_type_disk_gb(catalog, itype)
     return [
         LambdaInstance(
             gpu=gpu_class,
@@ -127,6 +132,7 @@ def usable_instances(
             vram_gb=info.vram_gb,
             price_usd_hr=rate,
             gpu_count=count,
+            disk_gb=disk_gb,
         )
         for region in lambda_api.regions_with_capacity(
             itype,
@@ -201,6 +207,55 @@ def _build_launch_user_data(
     )
 
 
+def _cleanup_unpublished_instance(run_id: str, instance_id: str, *, context: str) -> bool:
+    """Clean an exact unpublished instance, falling back to its run label only when unconfirmed.
+
+    The window between a successful launch and the returned handle owns a rented box that nothing
+    else can see yet, so cleanup here must survive a ``BaseException`` on either step.
+    """
+    confirmed = False
+    with contextlib.suppress(BaseException):
+        lambda_api.terminate_instance_confirmed(instance_id)
+        confirmed = True
+    if not confirmed:
+        with contextlib.suppress(BaseException):
+            logger.warning(
+                "lambda teardown unconfirmed for instance %s (%s); the box may still be billing, "
+                "falling back to a run-label reap",
+                instance_id,
+                context,
+            )
+        with contextlib.suppress(BaseException):
+            terminate_run_instances(run_id)
+    return confirmed
+
+
+def _require_disk_capable_instances(spec, instances: list[LambdaInstance], say) -> None:
+    """Refuse a Lambda shape whose FIXED disk cannot satisfy the run's ``spec.gpu.disk_gb``.
+
+    Vast sizes the volume at create (``_effective_disk_gb``) and RunPod raises
+    ``containerDiskInGb``; Lambda sells storage with the instance type and takes no disk parameter,
+    so the only way to honour the same contract is to decline the SKU before renting it. A
+    candidate whose catalog entry reported no storage carries ``disk_gb=None`` and is left alone:
+    the gate refuses only what it can prove undersized, never what it merely cannot measure.
+    """
+    required = float(getattr(spec.gpu, "disk_gb", 0) or 0)
+    if required <= 0:
+        return
+    undersized: dict[str, float] = {}
+    for inst in instances:
+        if inst.disk_gb is None or inst.disk_gb >= required:
+            return
+        undersized[inst.instance_type] = inst.disk_gb
+    shapes = ", ".join(f"{itype} ({disk:g} GB)" for itype, disk in sorted(undersized.items()))
+    say(f"refusing lambda launch: {shapes} cannot hold the run's {required:g} GB disk floor")
+    raise UnsupportedGpuError(
+        f"lambda ships a fixed disk per instance type and has no launch-time disk parameter: "
+        f"{shapes} is below the run's required {required:g} GB. Run {spec.gpu.type} on a provider "
+        f"that sizes disk at create (vast, runpod) or lower the run's disk floor."
+    )
+
+
 def _lambda_job_handle(instance_id: str, inst: LambdaInstance, name: str, attempt: int):
     return LambdaJobHandle(
         instance_id=instance_id,
@@ -217,40 +272,58 @@ def _lambda_job_handle(instance_id: str, inst: LambdaInstance, name: str, attemp
     )
 
 
+def _publish_launched_instance(
+    plan: _LaunchPlan, instance_id: str, inst: LambdaInstance, say, message: str
+) -> LambdaJobHandle:
+    """Return the handle for a launched instance, tearing the box down if this window is cut short.
+
+    Between a successful launch and a returned handle the instance is unpublished: no caller,
+    teardown path, or reconciler can name it yet. A raising log stream must not stop the handle
+    from being returned, and any ``BaseException`` (interrupt, SystemExit) must clean up first.
+    """
+    try:
+        with contextlib.suppress(Exception):
+            say(message)
+        return _lambda_job_handle(instance_id, inst, plan.name, plan.attempt)
+    except BaseException:
+        _cleanup_unpublished_instance(
+            plan.spec.run_id, instance_id, context="post-launch handle acquisition"
+        )
+        raise
+
+
 def _retry_launch_without_cache(
-    spec,
-    seed: int,
-    inst: LambdaInstance,
-    ssh_keys: list[str],
-    name: str,
-    cold_user_data: str,
-    attempt: int,
-    absolute_deadline: float,
-    say,
+    plan: _LaunchPlan, inst: LambdaInstance, say
 ) -> tuple[LambdaJobHandle | None, Exception | None]:
     say(f"retrying {inst.region} WITHOUT the weight cache (attach may have caused the reject)")
     try:
-        require_create_allowance(absolute_deadline)
+        require_create_allowance(plan.absolute_deadline)
         instance_id = lambda_api.launch_instance(
             region_name=inst.region,
             instance_type_name=inst.instance_type,
-            ssh_key_names=ssh_keys,
-            name=name,
-            user_data=cold_user_data,
+            ssh_key_names=plan.ssh_keys,
+            name=plan.name,
+            user_data=plan.cold_user_data,
             file_system_names=None,
-            **deadline_kwargs(lambda_api.launch_instance, absolute_deadline),
+            **deadline_kwargs(lambda_api.launch_instance, plan.absolute_deadline),
         )
     except lambda_api.LambdaApiError as error:
         cold_detail = sanitize_diagnostic(error, limit=1000)
         if not _launch_rejection_is_clean(error):
-            _abort_ambiguous_launch(spec.run_id, type(error).__name__)
+            _abort_ambiguous_launch(plan.spec.run_id, type(error).__name__)
         say(f"region {inst.region} also rejected cold: {cold_detail}")
         return None, error
-    say(
-        f"launched lambda instance {instance_id} (cold, cache-less): {inst.gpu} "
-        f"{inst.instance_type} in {inst.region} attempt={attempt} seed={seed}"
+    return (
+        _publish_launched_instance(
+            plan,
+            instance_id,
+            inst,
+            say,
+            f"launched lambda instance {instance_id} (cold, cache-less): {inst.gpu} "
+            f"{inst.instance_type} in {inst.region} attempt={plan.attempt} seed={plan.seed}",
+        ),
+        None,
     )
-    return _lambda_job_handle(instance_id, inst, name, attempt), None
 
 
 def _refresh_launch_candidates(
@@ -282,6 +355,114 @@ def _raise_all_regions_rejected(spec, tried_regions: set[str], last_err: Excepti
     )
 
 
+@dataclass(frozen=True)
+class _LaunchPlan:
+    """One launch walk's fixed inputs: everything every candidate region reuses unchanged."""
+
+    spec: Any
+    seed: int
+    attempt: int
+    runtime_secrets: dict | None
+    code_prefix: str | None
+    absolute_deadline: float
+    mode: str | None
+    models: list | None
+    name: str
+    ssh_keys: list[str]
+    cache_name: str | None
+    cold_user_data: str
+    cache_user_data: str | None
+    default_cache_mount: str
+
+
+def _build_launch_plan(
+    spec,
+    seed: int,
+    attempt: int,
+    runtime_secrets: dict | None,
+    code_prefix: str | None,
+    absolute_deadline: float,
+    mode: str | None,
+    models: list | None,
+) -> _LaunchPlan:
+    """Build the label, SSH key, and both user_data variants once, before any region is tried."""
+    cache_name = getattr(spec.gpu, "network_volume", None)
+    default_cache_mount = f"/lambda/nfs/{cache_name}" if cache_name else ""
+    build_kwargs = (spec, seed, attempt, runtime_secrets, code_prefix, absolute_deadline)
+    return _LaunchPlan(
+        spec=spec,
+        seed=seed,
+        attempt=attempt,
+        runtime_secrets=runtime_secrets,
+        code_prefix=code_prefix,
+        absolute_deadline=absolute_deadline,
+        mode=mode,
+        models=models,
+        name=instance_label(spec.run_id, seed, attempt),
+        ssh_keys=resolve_ssh_key_names(
+            **deadline_kwargs(resolve_ssh_key_names, absolute_deadline),
+        ),
+        cache_name=cache_name,
+        cold_user_data=_build_launch_user_data(*build_kwargs),
+        cache_user_data=(
+            _build_launch_user_data(
+                *build_kwargs,
+                cache_host_mount=default_cache_mount,
+                mode=mode,
+                models=models,
+            )
+            if cache_name
+            else None
+        ),
+        default_cache_mount=default_cache_mount,
+    )
+
+
+def _region_launch_inputs(
+    plan: _LaunchPlan, inst: LambdaInstance, say
+) -> tuple[str | None, list[str] | None, Exception | None]:
+    """Resolve one region's ``(user_data, file_system_names)``, falling back cold on a cache miss.
+
+    Returns ``(None, None, error)`` when the region must be skipped: a preload that trained on a
+    cache-less box would warm nothing, so it walks on instead of falling back.
+    """
+    if not plan.cache_name:
+        return plan.cold_user_data, None, None
+    try:
+        mount_point = lambda_api.ensure_filesystem(
+            plan.cache_name,
+            inst.region,
+            **deadline_kwargs(lambda_api.ensure_filesystem, plan.absolute_deadline),
+        )
+        # Rebuild user_data when the actual mount_point differs from the default (rare).
+        region_user_data = (
+            plan.cache_user_data
+            if mount_point == plan.default_cache_mount
+            else _build_launch_user_data(
+                plan.spec,
+                plan.seed,
+                plan.attempt,
+                plan.runtime_secrets,
+                plan.code_prefix,
+                plan.absolute_deadline,
+                cache_host_mount=mount_point,
+                mode=plan.mode,
+                models=plan.models,
+            )
+        )
+        return region_user_data, [plan.cache_name], None
+    except Exception as e:
+        detail = sanitize_diagnostic(e, limit=1000)
+        # preload must not fall back cold because it would train instead of warming the cache.
+        if plan.mode == "preload":
+            say(
+                f"weight cache unavailable in {inst.region} ({detail}); skipping (preload needs it)"
+            )
+            return None, None, e
+        say(f"weight cache unavailable in {inst.region} ({detail}); launching cold")
+        return plan.cold_user_data, None, e
+
+
 def launch_and_submit(
     spec,
     seed: int,
@@ -294,138 +475,101 @@ def launch_and_submit(
     code_prefix: str | None = None,
     deadline_at: float | None = None,
 ) -> LambdaJobHandle:
-    """Launch the first region that accepts the job; walk regions on a capacity rejection."""
+    """Launch the first region that accepts the job; walk regions on a capacity rejection.
+
+    Every exit taken after a launch request is ``BaseException``-guarded (as on Vast): an interrupt
+    or a raising log line between a successful launch and the returned handle would otherwise leak
+    a rented box that no handle, and therefore no teardown path, can name yet.
+    """
     say = make_say(log)
     absolute_deadline = require_deadline_at(deadline_at)
     if not instances:
         raise lambda_api.LambdaApiError(
             f"no Lambda capacity for {spec.gpu.type} (no region advertises the instance type)"
         )
-    cache_name = getattr(spec.gpu, "network_volume", None)
-    cold_user_data = _build_launch_user_data(
-        spec,
-        seed,
-        attempt,
-        runtime_secrets,
-        code_prefix,
-        absolute_deadline,
-    )
-    default_cache_mount = f"/lambda/nfs/{cache_name}" if cache_name else ""
-    cache_user_data = (
-        _build_launch_user_data(
-            spec,
-            seed,
-            attempt,
-            runtime_secrets,
-            code_prefix,
-            absolute_deadline,
-            cache_host_mount=default_cache_mount,
-            mode=mode,
-            models=models,
-        )
-        if cache_name
-        else None
-    )
-    name = instance_label(spec.run_id, seed, attempt)
-    ssh_keys = resolve_ssh_key_names(
-        **deadline_kwargs(resolve_ssh_key_names, absolute_deadline),
+    _require_disk_capable_instances(spec, instances, say)
+    plan = _build_launch_plan(
+        spec, seed, attempt, runtime_secrets, code_prefix, absolute_deadline, mode, models
     )
 
     tried_regions: set[str] = set()
     candidates = list(instances)
     refreshed = False
     last_err: Exception | None = None
-    while candidates:
-        inst = candidates.pop(0)
-        if inst.region in tried_regions:
-            continue
-        tried_regions.add(inst.region)
-        user_data, fs_names = cold_user_data, None
-        if cache_name:
+    # armed only while a launch request is in flight and no instance id is in hand yet: the
+    # provider may have billed a box nothing can name, so the run label is the only way to reap it.
+    launch_attempted = False
+    try:
+        while candidates:
+            inst = candidates.pop(0)
+            if inst.region in tried_regions:
+                continue
+            tried_regions.add(inst.region)
+            user_data, fs_names, cache_err = _region_launch_inputs(plan, inst, say)
+            last_err = cache_err or last_err
+            if user_data is None:
+                continue
             try:
-                mount_point = lambda_api.ensure_filesystem(
-                    cache_name,
-                    inst.region,
-                    **deadline_kwargs(lambda_api.ensure_filesystem, absolute_deadline),
+                require_create_allowance(absolute_deadline)
+                launch_attempted = True
+                instance_id = lambda_api.launch_instance(
+                    region_name=inst.region,
+                    instance_type_name=inst.instance_type,
+                    ssh_key_names=plan.ssh_keys,
+                    name=plan.name,
+                    user_data=user_data,
+                    file_system_names=fs_names,
+                    **deadline_kwargs(lambda_api.launch_instance, absolute_deadline),
                 )
-                # Rebuild user_data when the actual mount_point differs from the default (rare).
-                region_user_data = (
-                    cache_user_data
-                    if mount_point == default_cache_mount
-                    else _build_launch_user_data(
-                        spec,
-                        seed,
-                        attempt,
-                        runtime_secrets,
-                        code_prefix,
-                        absolute_deadline,
-                        cache_host_mount=mount_point,
-                        mode=mode,
-                        models=models,
-                    )
-                )
-                user_data, fs_names = region_user_data, [cache_name]
-            except Exception as e:
+            except lambda_api.LambdaApiError as e:
+                # a clean reject rented nothing, and an ambiguous one is reconciled by
+                # _abort_ambiguous_launch below, so neither owes the outer guard a label reap.
+                launch_attempted = False
                 last_err = e
                 detail = sanitize_diagnostic(e, limit=1000)
-                # preload must not fall back cold because it would train instead of warming the cache.
-                if mode == "preload":
+                if not _launch_rejection_is_clean(e):
+                    # ambiguous creates may have billed an instance, so reconcile before any retry.
                     say(
-                        f"weight cache unavailable in {inst.region} ({detail}); skipping (preload needs it)"
+                        f"ambiguous launch failure in {inst.region} ({type(e).__name__}); "
+                        "attempting cleanup and failing closed"
                     )
-                    continue
-                say(f"weight cache unavailable in {inst.region} ({detail}); launching cold")
-        try:
-            require_create_allowance(absolute_deadline)
-            instance_id = lambda_api.launch_instance(
-                region_name=inst.region,
-                instance_type_name=inst.instance_type,
-                ssh_key_names=ssh_keys,
-                name=name,
-                user_data=user_data,
-                file_system_names=fs_names,
-                **deadline_kwargs(lambda_api.launch_instance, absolute_deadline),
-            )
-        except lambda_api.LambdaApiError as e:
-            last_err = e
-            detail = sanitize_diagnostic(e, limit=1000)
-            if not _launch_rejection_is_clean(e):
-                # ambiguous creates may have billed an instance, so reconcile before any retry.
-                say(
-                    f"ambiguous launch failure in {inst.region} ({type(e).__name__}); "
-                    "attempting cleanup and failing closed"
+                    _abort_ambiguous_launch(spec.run_id, type(e).__name__)
+                say(f"region {inst.region} ({inst.gpu} {inst.instance_type}) rejected: {detail}")
+                # Filesystem-attach errors: retry once without the cache before walking (clean reject = safe).
+                fs_attach_reject = fs_names and any(
+                    tok in str(e).lower() for tok in ("file_system", "filesystem", "file-system")
                 )
-                _abort_ambiguous_launch(spec.run_id, type(e).__name__)
-            say(f"region {inst.region} ({inst.gpu} {inst.instance_type}) rejected: {detail}")
-            # Filesystem-attach errors: retry once without the cache before walking (clean reject = safe).
-            fs_attach_reject = fs_names and any(
-                tok in str(e).lower() for tok in ("file_system", "filesystem", "file-system")
+                if mode != "preload" and fs_attach_reject:
+                    # the cache-less retry launches too; it cleans its own instance exactly, and
+                    # the flag keeps the outer label reap armed if even that cleanup is cut short.
+                    launch_attempted = True
+                    handle, last_err = _retry_launch_without_cache(plan, inst, say)
+                    # a returned handle publishes the box; None means nothing stayed rented.
+                    launch_attempted = False
+                    if handle is not None:
+                        return handle
+                # Preload must not refresh to a different region (would warm the wrong one).
+                if mode != "preload" and not candidates and not refreshed:
+                    refreshed = True
+                    candidates = _refresh_launch_candidates(inst, tried_regions, absolute_deadline)
+                continue
+            # the box is rented AND its id is known, so _publish_launched_instance owns the exact
+            # cleanup for the rest of this window and the coarse label reap stands down.
+            launch_attempted = False
+            return _publish_launched_instance(
+                plan,
+                instance_id,
+                inst,
+                say,
+                f"launched lambda instance {instance_id}: {inst.gpu} {inst.instance_type} "
+                f"${inst.price_usd_hr:.2f}/hr in {inst.region} attempt={attempt} seed={seed}",
             )
-            if mode != "preload" and fs_attach_reject:
-                handle, last_err = _retry_launch_without_cache(
-                    spec,
-                    seed,
-                    inst,
-                    ssh_keys,
-                    name,
-                    cold_user_data,
-                    attempt,
-                    absolute_deadline,
-                    say,
-                )
-                if handle is not None:
-                    return handle
-            # Preload must not refresh to a different region (would warm the wrong one).
-            if mode != "preload" and not candidates and not refreshed:
-                refreshed = True
-                candidates = _refresh_launch_candidates(inst, tried_regions, absolute_deadline)
-            continue
-        say(
-            f"launched lambda instance {instance_id}: {inst.gpu} {inst.instance_type} "
-            f"${inst.price_usd_hr:.2f}/hr in {inst.region} attempt={attempt} seed={seed}"
-        )
-        return _lambda_job_handle(instance_id, inst, name, attempt)
-    return _raise_all_regions_rejected(spec, tried_regions, last_err)
+        return _raise_all_regions_rejected(spec, tried_regions, last_err)
+    except BaseException:
+        if launch_attempted:
+            with contextlib.suppress(BaseException):
+                terminate_run_instances(spec.run_id)
+        raise
 
 
 # Tests monkeypatch this name so keep it as a module-level alias.

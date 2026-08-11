@@ -57,11 +57,16 @@ def _submit(jobs, *args, **kwargs):
     return jobs.submit_run_lambda(*args, **kwargs)
 
 
-def _inst(gpu="A10", region="us-east-1", itype="gpu_1x_a10", price=1.29):
+def _inst(gpu="A10", region="us-east-1", itype="gpu_1x_a10", price=1.29, disk_gb=None):
     from flash.providers.lambda_.jobs.builders import LambdaInstance
 
     return LambdaInstance(
-        gpu=gpu, instance_type=itype, region=region, vram_gb=24, price_usd_hr=price
+        gpu=gpu,
+        instance_type=itype,
+        region=region,
+        vram_gb=24,
+        price_usd_hr=price,
+        disk_gb=disk_gb,
     )
 
 
@@ -181,7 +186,7 @@ def test_image_per_sm_selects_arch_tag(monkeypatch):
     assert builders.lambda_image("H100") == "ghcr.io/freesolo-co/flash-worker:hotfix"
 
 
-def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True):
+def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True, extra_pip=()):
     from flash.providers._lifecycle import bootstrap as lb
 
     calls: list[str] = []
@@ -198,7 +203,7 @@ def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True):
             "seed": 0,
             "flash_arm": "lambda",
             "env": {},
-            "extra_pip": [],
+            "extra_pip": list(extra_pip),
             "hf_prefix": "sft/x",
             "code_prefix": CODE_PREFIX,
             "deadline_at": created_at + 60.0,
@@ -309,6 +314,42 @@ def test_bootstrap_sets_lambda_arm():
     assert build_payload(_spec(), 0, 0, deadline_at=_deadline_at())["flash_arm"] == "lambda"
 
 
+class _FakePipProc:
+    """Popen stand-in for the extra_pip tee: an output stream plus one exit code."""
+
+    def __init__(self, output: str = "", returncode: int = 0):
+        self.stdout = io.StringIO(output)
+        self._returncode = returncode
+
+    def wait(self) -> int:
+        return self._returncode
+
+
+def _pip_payload(**extra) -> dict:
+    return {
+        "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
+        "extra_pip": ["git+https://github.com/example/some-env-pkg.git@abc123"],
+        **extra,
+    }
+
+
+def _wire_pip(monkeypatch, results):
+    """Patch Popen to replay ``results`` (output, rc) in order; returns the recorded calls."""
+    from flash.providers._lifecycle import bootstrap as lb
+
+    calls = []
+    queue = list(results)
+
+    def fake_popen(cmd, *, env=None, **_kwargs):
+        calls.append({"cmd": cmd, "env": env})
+        output, rc = queue.pop(0) if queue else ("", 0)
+        return _FakePipProc(output, rc)
+
+    monkeypatch.setattr(lb.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(lb.time, "sleep", lambda _s: None)
+    return lb, calls
+
+
 def test_bootstrap_extra_pip_uses_payload_env_credentials_and_cleans(monkeypatch):
     import os
     from pathlib import Path
@@ -318,21 +359,17 @@ def test_bootstrap_extra_pip_uses_payload_env_credentials_and_cleans(monkeypatch
     calls = []
     askpass_paths = []
 
-    def fake_run(cmd, *, check, env=None):
+    def fake_popen(cmd, *, env=None, **_kwargs):
         askpass = Path(env["GIT_ASKPASS"])
         assert askpass.exists()
         assert os.access(askpass, os.X_OK)
         assert "ghp-secret" not in askpass.read_text()
         askpass_paths.append(askpass)
-        calls.append({"cmd": cmd, "check": check, "env": env})
+        calls.append({"cmd": cmd, "env": env})
+        return _FakePipProc()
 
-    monkeypatch.setattr(lb.subprocess, "run", fake_run)
-    lb.install_extra_pip(
-        {
-            "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
-            "extra_pip": ["git+https://github.com/example/some-env-pkg.git@abc123"],
-        }
-    )
+    monkeypatch.setattr(lb.subprocess, "Popen", fake_popen)
+    lb.install_extra_pip(_pip_payload())
 
     assert len(calls) == 1
     env = calls[0]["env"]
@@ -349,8 +386,9 @@ def test_bootstrap_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
 
     askpass_paths = []
 
-    def fake_run(cmd, *, check, env=None):
+    def fake_popen(_cmd, *, env=None, **_kwargs):
         askpass_paths.append(Path(env["GIT_ASKPASS"]))
+        return _FakePipProc()
 
     original_remove = lb.os.remove
 
@@ -359,22 +397,85 @@ def test_bootstrap_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
             raise PermissionError("locked askpass helper")
         return original_remove(path)
 
-    monkeypatch.setattr(lb.subprocess, "run", fake_run)
+    monkeypatch.setattr(lb.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(lb.os, "remove", fake_remove)
 
     try:
-        lb.install_extra_pip(
-            {
-                "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
-                "extra_pip": ["git+https://github.com/example/some-env-pkg.git@abc123"],
-            }
-        )
+        lb.install_extra_pip(_pip_payload())
     finally:
         for askpass in askpass_paths:
             if askpass.exists():
                 original_remove(askpass)
 
     assert askpass_paths
+
+
+def test_bootstrap_extra_pip_retries_a_transient_index_failure(monkeypatch):
+    # A PyPI/network blip is the one pre-worker network step that used to fail a PAID run outright
+    # (the adjacent HF fetches are already retriable). It must retry in place and then succeed.
+    lb, calls = _wire_pip(
+        monkeypatch,
+        [
+            (
+                "WARNING: Retrying (Retry(total=4, connect=None)) after connection broken by ...\n",
+                1,
+            ),
+            ("Successfully installed some-env-pkg-1.0\n", 0),
+        ],
+    )
+    lb.install_extra_pip(_pip_payload())
+    assert len(calls) == 2
+
+
+def test_bootstrap_extra_pip_exhausted_index_failure_is_retriable(monkeypatch):
+    # Still unreachable after the bounded in-place retries: infra-shaped, so the marker must carry
+    # retriable=True (job_preempted -> fresh host) rather than the fail-fast job_failed.
+    transient = ("ERROR: Could not install: HTTPSConnectionPool: Read timed out.\n", 1)
+    lb, calls = _wire_pip(monkeypatch, [transient] * 4)
+    with pytest.raises(lb.RetriableBootstrapError, match="could not reach the package index"):
+        lb.install_extra_pip(_pip_payload())
+    assert len(calls) == 4  # one attempt plus the three bounded retries
+
+
+def test_bootstrap_extra_pip_resolution_error_stays_terminal(monkeypatch):
+    # A bad package spec reaches the index fine and simply has no candidate. Retrying it would
+    # re-rent a box to fail identically, so it must stay a terminal, non-retriable RuntimeError.
+    lb, calls = _wire_pip(
+        monkeypatch,
+        [("ERROR: No matching distribution found for definitely-not-a-package\n", 1)],
+    )
+    with pytest.raises(RuntimeError, match="extra_pip install failed") as exc_info:
+        lb.install_extra_pip(_pip_payload())
+    assert not isinstance(exc_info.value, lb.RetriableBootstrapError)
+    assert len(calls) == 1  # fails fast, never walks the retry ladder
+
+
+def test_main_marks_exhausted_extra_pip_index_failure_retriable(monkeypatch):
+    # End to end through main(): the marker the poller reads must say retriable, so the attempt is
+    # classified job_preempted (walk to a fresh host) instead of job_failed (fail the paid run).
+    lb, calls, markers = _bootstrap_env(monkeypatch, extra_pip=["some-env-pkg"])
+    monkeypatch.setattr(lb.subprocess, "Popen", lambda *_a, **_k: _FakePipProc("read timed out", 1))
+    monkeypatch.setattr(lb.time, "sleep", lambda _s: None)
+    assert lb.main() == 1
+    assert calls == []  # crashed before launching the worker subprocess
+    ok, error, retriable = markers[0]
+    assert not ok
+    assert error.startswith("RetriableBootstrapError: extra_pip install could not reach")
+    assert retriable is True
+
+
+def test_bootstrap_extra_pip_retry_sleep_never_outlives_the_deadline(monkeypatch):
+    lb, _calls = _wire_pip(monkeypatch, [("connection reset by peer\n", 1)] * 4)
+    slept = []
+    monkeypatch.setattr(lb.time, "sleep", slept.append)
+    monkeypatch.setattr(lb.time, "time", lambda: 1_000.0)
+    with pytest.raises(lb.RetriableBootstrapError):
+        lb.install_extra_pip(
+            _pip_payload(deadline_at=1_002.0, run_created_at=1_000.0, run_max_wall_seconds=2.0)
+        )
+    # the ladder is 3/9/27s but only 2s of paid wall remain, so no sleep may exceed it
+    assert slept
+    assert max(slept) <= 2.0
 
 
 def test_bootstrap_promotes_attempt_to_env_for_heartbeat_gating():
@@ -743,6 +844,93 @@ def test_ambiguous_filesystem_create_adopts_single_exact_match(monkeypatch):
     assert mount == "/mnt/adopted-cache"
     assert posts == [True]
     assert listings["count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# gpu.disk_gb: Lambda sells a FIXED disk per instance type (no launch-time parameter)
+# ---------------------------------------------------------------------------
+def test_instance_type_disk_gb_reads_catalog_storage_or_reports_unknown():
+    from flash.providers.lambda_.gpus import instance_type_disk_gb
+
+    catalog = {
+        "gpu_1x_a10": {"instance_type": {"specs": {"gpus": 1, "storage_gib": 512}}},
+        "gpu_1x_a100": {"instance_type": {"specs": {"gpus": 1}}},  # storage not reported
+        "gpu_8x_h100_sxm5": {"instance_type": {}},
+    }
+    assert instance_type_disk_gb(catalog, "gpu_1x_a10") == 512.0
+    # unknown must be None, never 0: a caller may not refuse a shape the catalog cannot measure
+    assert instance_type_disk_gb(catalog, "gpu_1x_a100") is None
+    assert instance_type_disk_gb(catalog, "gpu_8x_h100_sxm5") is None
+    assert instance_type_disk_gb(catalog, "gpu_1x_nope") is None
+    assert instance_type_disk_gb(None, "gpu_1x_a10") is None
+
+
+def test_usable_instances_carries_the_sku_disk(monkeypatch):
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
+
+    monkeypatch.setattr(
+        lambda_api,
+        "list_instance_types",
+        lambda *a, **k: {"gpu_1x_a10": {"instance_type": {"specs": {"storage_gib": 512}}}},
+    )
+    monkeypatch.setattr(lambda_api, "regions_with_capacity", lambda *a, **k: ["us-east-1"])
+    monkeypatch.setattr("flash.providers.lambda_.pricing.hourly_rate", lambda *a, **k: 1.29)
+    assert jobs.usable_instances("A10")[0].disk_gb == 512.0
+
+
+def test_launch_refuses_an_instance_type_below_the_run_disk_floor(monkeypatch):
+    # Vast sizes the volume at create and RunPod raises containerDiskInGb; Lambda can do neither, so
+    # a run whose disk floor exceeds the SKU's fixed disk must be refused BEFORE the box is rented
+    # (it would otherwise be paid for and then die mid-setup).
+    from flash.providers.base import UnsupportedGpuError
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    launched = []
+    monkeypatch.setattr(lambda_api, "launch_instance", lambda **_k: launched.append(True) or "i-1")
+
+    with pytest.raises(UnsupportedGpuError, match=r"gpu_1x_a10 \(512 GB\).*required 800 GB"):
+        _launch(
+            jobs,
+            _spec(disk_gb=800),
+            seed=0,
+            instances=[_inst(disk_gb=512.0)],
+            attempt=0,
+        )
+
+    assert launched == []
+
+
+def test_launch_accepts_a_disk_capable_or_unmeasured_instance_type(monkeypatch):
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(lambda_api, "launch_instance", lambda **_k: "i-1")
+
+    assert _launch(jobs, _spec(disk_gb=200), seed=0, instances=[_inst(disk_gb=512.0)], attempt=0)
+    # an unreported SKU disk is not a proven miss, so it must not block the launch
+    assert _launch(jobs, _spec(disk_gb=800), seed=0, instances=[_inst()], attempt=0)
+
+
+def test_live_candidates_drop_skus_that_cannot_hold_the_run_disk(monkeypatch):
+    from flash.providers.base import AllocationConstraints
+    from flash.providers.lambda_ import PROVIDER, jobs
+    from flash.providers.lambda_ import api as lambda_api
+
+    monkeypatch.setattr(
+        lambda_api,
+        "list_instance_types",
+        lambda *a, **k: {"gpu_1x_a10": {"instance_type": {"specs": {"storage_gib": 512}}}},
+    )
+    monkeypatch.setattr(jobs, "usable_instances", lambda *a, **k: [_inst(disk_gb=512.0)])
+
+    fits = PROVIDER.live_candidates(24, AllocationConstraints(disk_gb=200, gpu_type="A10"))
+    assert [c.gpu for c in fits] == ["A10"]
+    # the allocator must never hand the runner a Lambda class it could not rent for this run
+    assert PROVIDER.live_candidates(24, AllocationConstraints(disk_gb=800, gpu_type="A10")) == []
 
 
 def test_launch_raises_when_no_capacity(monkeypatch):
@@ -2317,6 +2505,133 @@ def test_ambiguous_launch_reconciles_and_stops(monkeypatch):
     assert attempts == ["us-east-1"]  # stopped after the first ambiguous failure (no 2nd launch)
     assert "provider body secret" not in str(exc_info.value)
     assert "provider body secret" not in log.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# post-launch success window: the box is rented but no handle exists yet (mirrors Vast)
+# ---------------------------------------------------------------------------
+def test_launch_success_log_failure_does_not_leak_handle(monkeypatch):
+    # once launch_instance rents the box, a raising success log before the handle return must not
+    # leak it: the handle is what every teardown path (finally, cancel, gc) names.
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(lambda_api, "launch_instance", lambda **_k: "i-4242")
+
+    def raising_say(_log):
+        def _say(_msg):
+            raise OSError("log stream closed")
+
+        return _say
+
+    monkeypatch.setattr(jobs, "make_say", raising_say)
+    h = _launch(jobs, _spec(), seed=0, instances=[_inst()], attempt=0)
+    assert h.instance_id == "i-4242"
+
+
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("terminate_confirmed", [True, False])
+def test_post_launch_baseexception_cleans_and_never_walks_regions(
+    monkeypatch, interrupt_type, terminate_confirmed
+):
+    # submit_run_lambda's finally only exists once launch_and_submit RETURNS a handle, so an
+    # interrupt between a successful launch and that return would strand a paid box. Vast closes
+    # this window with an exact destroy plus a run-label fallback; Lambda must do the same.
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
+
+    spec = _spec()
+    launched = []
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+
+    def fake_launch(*, region_name, **_kwargs):
+        launched.append(region_name)
+        return "i-4242"
+
+    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
+
+    def time_after_launch():
+        # _lambda_job_handle stamps started_ts, so this fires inside the unpublished window
+        if launched:
+            raise interrupt_type("stop")
+        return 100.0
+
+    monkeypatch.setattr(jobs.time, "time", time_after_launch)
+    terminated = []
+
+    def terminate_confirmed_instance(instance_id):
+        terminated.append(instance_id)
+        if not terminate_confirmed:
+            raise lambda_api.LambdaApiError(f"lambda terminate({instance_id}) was not confirmed")
+
+    monkeypatch.setattr(lambda_api, "terminate_instance_confirmed", terminate_confirmed_instance)
+    reaped = []
+    monkeypatch.setattr(jobs, "terminate_run_instances", lambda run_id: reaped.append(run_id) or [])
+
+    with pytest.raises(interrupt_type):
+        _launch(
+            jobs,
+            spec,
+            seed=0,
+            instances=[_inst(region="us-east-1"), _inst(region="us-west-1")],
+            attempt=0,
+        )
+
+    assert launched == ["us-east-1"]  # never walks on to rent a second box
+    assert terminated == ["i-4242"]
+    # an unconfirmed exact terminate escalates to the run-label reap; a confirmed one needs none
+    assert reaped == ([] if terminate_confirmed else [spec.run_id])
+
+
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
+def test_post_launch_preserves_original_baseexception_when_cleanup_raises(
+    monkeypatch, interrupt_type
+):
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
+
+    class ExactCleanupFailure(BaseException):
+        pass
+
+    class LabelCleanupFailure(BaseException):
+        pass
+
+    spec = _spec()
+    launched = []
+    original = interrupt_type("original interruption")
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(
+        lambda_api, "launch_instance", lambda **_k: launched.append(True) or "i-4242"
+    )
+
+    def time_after_launch():
+        if launched:
+            raise original
+        return 100.0
+
+    monkeypatch.setattr(jobs.time, "time", time_after_launch)
+    terminated = []
+    reaped = []
+
+    def terminate_exact(instance_id):
+        terminated.append(instance_id)
+        raise ExactCleanupFailure("exact cleanup failed")
+
+    def terminate_label(run_id):
+        reaped.append(run_id)
+        raise LabelCleanupFailure("label cleanup failed")
+
+    monkeypatch.setattr(lambda_api, "terminate_instance_confirmed", terminate_exact)
+    monkeypatch.setattr(jobs, "terminate_run_instances", terminate_label)
+
+    with pytest.raises(interrupt_type) as exc_info:
+        _launch(jobs, spec, seed=0, instances=[_inst()], attempt=0)
+
+    # a cleanup that itself dies must never replace the interruption the caller has to see
+    assert exc_info.value is original
+    assert terminated == ["i-4242"]
+    assert reaped == [spec.run_id]
 
 
 # ---------------------------------------------------------------------------

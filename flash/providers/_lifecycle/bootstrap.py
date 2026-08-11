@@ -5,6 +5,7 @@ Stdlib + huggingface_hub only — never import flash here. Reads payload from ``
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import json
 import math
@@ -30,6 +31,17 @@ _CONSOLE_UPLOAD_REAP_RESERVE_S = 2 * _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S
 _HF_TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 _HF_RETRY_DELAYS_S = (1.0, 3.0, 8.0, 20.0, 60.0)
 _HF_RETRY_AFTER_MAX_S = 60.0
+_PIP_RETRY_DELAYS_S = (3.0, 9.0, 27.0)
+_PIP_OUTPUT_TAIL_LINES = 400
+# Network/index-shaped pip failures. A resolution failure ("no matching distribution", an unsatisfiable
+# pin) reaches the index fine and carries NONE of these, so a bad package spec stays terminal.
+_PIP_TRANSIENT_RE = re.compile(
+    r"(?i)connection (?:broken|reset|aborted|refused|timed out)|read timed out|proxyerror"
+    r"|temporary failure in name resolution|failed to establish a new connection|incompleteread"
+    r"|network is unreachable|remote end closed connection|newconnectionerror|maxretryerror"
+    r"|ssleoferror|service unavailable|bad gateway|gateway time-?out|too many requests"
+    r"|retrying \(retry\(|\b(?:429|5\d\d) (?:client|server) error"
+)
 _TERMINAL_MARKER_GRACE_S = 0.25
 _TERMINAL_BOOKKEEPING_RESERVE_S = _TERMINAL_MARKER_GRACE_S
 _MAX_ATTEMPT_ID = (1 << 63) - 1
@@ -557,14 +569,48 @@ def _extra_pip_env(payload: dict) -> tuple[dict[str, str], str | None]:
 
 
 def install_extra_pip(payload: dict) -> None:
+    """Install the run's extra requirements; retry an index blip, fail fast on a bad package spec.
+
+    Same precedent as the pre-worker HF fetches: an index blip is infra, not user error, so it
+    retries in place and then surfaces as ``RetriableBootstrapError`` instead of terminally
+    failing a paid run. A resolution error stays a plain ``RuntimeError``.
+    """
     extra_pip = payload.get("extra_pip") or []
     if not extra_pip:
         return
     env, askpass = _extra_pip_env(payload)
+    args = [sys.executable, "-m", "pip", "install", *extra_pip]
     try:
-        if "deadline_at" in payload:
-            require_deadline_at(payload)
-        subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True, env=env)
+        for attempt in range(len(_PIP_RETRY_DELAYS_S) + 1):
+            deadline_at = require_deadline_at(payload) if "deadline_at" in payload else None
+            tail = collections.deque(maxlen=_PIP_OUTPUT_TAIL_LINES)
+            proc = subprocess.Popen(
+                args, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            )
+            with proc.stdout:  # tee so a long install still streams into the box console
+                for line in proc.stdout:
+                    print(line, end="", flush=True)
+                    tail.append(line)
+            rc = proc.wait()
+            if rc == 0:
+                return
+            # only an index/network shape earns a retry; a bad requirement fails fast as before.
+            if not _PIP_TRANSIENT_RE.search("".join(tail)):
+                raise RuntimeError(f"extra_pip install failed: pip exited {rc}")
+            if attempt >= len(_PIP_RETRY_DELAYS_S):
+                raise RetriableBootstrapError(
+                    f"extra_pip install could not reach the package index after {attempt + 1} "
+                    f"attempts (pip exited {rc})"
+                )
+            delay = _PIP_RETRY_DELAYS_S[attempt]
+            if deadline_at is not None:
+                delay = min(delay, max(0.0, deadline_at - time.time()))
+            print(
+                f"extra_pip install hit a transient index error; retrying in {delay:.0f}s",
+                flush=True,
+            )
+            if delay > 0:
+                time.sleep(delay)
     finally:
         if askpass:
             with contextlib.suppress(OSError):

@@ -55,6 +55,7 @@ def _train_body(input_data: dict) -> dict:
 
     All imports must be inside the function body — this handler is serialized standalone.
     """
+    import collections
     import contextlib
     import json
     import math
@@ -201,14 +202,52 @@ def _train_body(input_data: dict) -> dict:
 
         extra_pip = input_data.get("extra_pip") or []
         if extra_pip:
+            # Network/index-shaped pip failures. A resolution failure ("no matching distribution",
+            # an unsatisfiable pin) reaches the index fine and carries NONE of these, so a bad
+            # package spec still fails fast; only a PyPI blip retries (as the instance bootstrap).
+            pip_transient_re = re.compile(
+                r"(?i)connection (?:broken|reset|aborted|refused|timed out)|read timed out"
+                r"|temporary failure in name resolution|failed to establish a new connection"
+                r"|network is unreachable|remote end closed connection|incompleteread|proxyerror"
+                r"|newconnectionerror|maxretryerror|ssleoferror|service unavailable|bad gateway"
+                r"|gateway time-?out|too many requests|retrying \(retry\("
+                r"|\b(?:429|5\d\d) (?:client|server) error"
+            )
+            pip_retry_delays = (3.0, 9.0, 27.0)
             extra_env, askpass = _extra_pip_env()
+            args = [sys.executable, "-m", "pip", "install", *extra_pip]
             try:
-                _require_deadline_allowance()
-                subprocess.run(
-                    [sys.executable, "-m", "pip", "install", *extra_pip],
-                    check=True,
-                    env=extra_env,
-                )
+                for pip_attempt in range(len(pip_retry_delays) + 1):
+                    _require_deadline_allowance()
+                    tail = collections.deque(maxlen=400)
+                    pip_proc = subprocess.Popen(
+                        args,
+                        env=extra_env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                    )
+                    with pip_proc.stdout:  # tee so a long install still streams into the console
+                        for line in pip_proc.stdout:
+                            print(line, end="", flush=True)
+                            tail.append(line)
+                    rc = pip_proc.wait()
+                    if rc == 0:
+                        break
+                    if not pip_transient_re.search("".join(tail)):
+                        raise RuntimeError(f"extra_pip install failed: pip exited {rc}")
+                    if pip_attempt >= len(pip_retry_delays):
+                        raise RuntimeError(
+                            f"extra_pip install could not reach the package index after "
+                            f"{pip_attempt + 1} attempts (pip exited {rc})"
+                        )
+                    delay = min(pip_retry_delays[pip_attempt], _require_deadline_allowance())
+                    print(
+                        f"extra_pip install hit a transient index error; retrying in {delay:.0f}s",
+                        flush=True,
+                    )
+                    if delay > 0:
+                        time.sleep(delay)
             finally:
                 if askpass:
                     with contextlib.suppress(OSError):

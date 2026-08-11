@@ -124,8 +124,11 @@ class LambdaProvider(InstanceProvider):
         """Lambda classes with live regional capacity fitting the VRAM requirement.
 
         A capacity-lookup failure raises ``CapacityLookupError``; ``allocate`` degrades to the other
-        providers, failing the run retryably only if this was the sole fitting source. Lambda's
-        capacity check needs neither disk nor wall, so those constraints are ignored.
+        providers, failing the run retryably only if this was the sole fitting source.
+        ``constraints.max_wall_seconds`` is ignored (Lambda rents open-ended), but
+        ``constraints.disk_gb`` is not: Lambda sells a FIXED disk with the instance type and takes
+        no launch-time disk parameter, so a SKU that cannot hold the run's floor is filtered here
+        exactly as Vast filters thin-disk offers out of its search.
 
         Lambda sells fixed card counts per class as distinct instance types, so each allowed count
         is probed against the live catalog and only the counts with real capacity are reported. The
@@ -139,7 +142,7 @@ class LambdaProvider(InstanceProvider):
         if problem:
             raise UnsupportedGpuError(problem)
         from flash.providers.lambda_ import api as lambda_api
-        from flash.providers.lambda_.gpus import instance_type_for
+        from flash.providers.lambda_.gpus import instance_type_disk_gb, instance_type_for
         from flash.providers.lambda_.jobs import usable_instances
 
         out: list[Candidate] = []
@@ -164,6 +167,15 @@ class LambdaProvider(InstanceProvider):
                     sku = instance_type_for(g.name, count, catalog)
                     if sku not in catalog:
                         continue
+                    # A SKU whose fixed disk cannot hold the run is not capacity at all: renting it
+                    # would pay for a box that dies mid-setup. An unreported disk is left alone.
+                    sku_disk_gb = instance_type_disk_gb(catalog, sku)
+                    if (
+                        constraints.disk_gb
+                        and sku_disk_gb is not None
+                        and sku_disk_gb < constraints.disk_gb
+                    ):
+                        continue
                     structurally_fitting = True
                     live = usable_instances(g.name, gpu_count=count)
                     if live:
@@ -172,10 +184,11 @@ class LambdaProvider(InstanceProvider):
                         )
             if constraints.required_vram_gb and not structurally_fitting:
                 requested = f" {constraints.gpu_type}" if constraints.gpu_type else ""
+                disk = f" with {constraints.disk_gb:g} GB of disk" if constraints.disk_gb else ""
                 raise UnsupportedGpuError(
                     f"lambda does not offer a rentable{requested} shape up to "
                     f"{constraints.max_gpu_count} cards large enough for "
-                    f"{constraints.required_vram_gb} GB"
+                    f"{constraints.required_vram_gb} GB{disk}"
                 )
         except UnsupportedGpuError:
             raise
