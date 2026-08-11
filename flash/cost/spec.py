@@ -154,8 +154,11 @@ def thin_rl_batch_warning(spec) -> str | None:
     (``_on_policy_prompts_per_step``), so a scaffolded ``max_examples = 2`` run trains on 2 prompts
     per update whether or not a ``batch_size`` was ever written. The caps do not override each
     other -- the environment one bounds what ``env.dataset()`` returns and the train one slices
-    that afterwards -- so the pool is the SMALLEST of them. Any of these can bind at once, and
-    raising one while another still binds moves nothing, so the message names every binding knob.
+    that afterwards -- so the pool is the SMALLEST of them. Any of these can be thin at once, and
+    raising one while another is still thin leaves prompts-per-step thin, so the message names
+    every one of them. Note it does NOT claim raising one alone moves nothing: that only holds when
+    the other is the strict minimum, and at ``batch_size = 2`` under ``max_examples = 3`` lifting
+    the batch alone does move the result, to 3.
 
     What the thin batch costs differs by algorithm, so the message does too. grpo keeps a working
     per-prompt baseline at any batch size (verl centres each response against its own prompt's
@@ -219,9 +222,15 @@ def thin_rl_batch_warning(spec) -> str | None:
             "optimizer batch and its step horizon, so an sft memory workaround does not transfer."
         )
         if pool_binds:
+            # deliberately does NOT say the cap holds the pool "below" the batch, or that raising
+            # one alone moves nothing: neither survives a cap ABOVE the batch. at batch 2 behind a
+            # cap of 3 the cap is higher, and lifting the batch alone does move the result, to 3.
+            # what is true for every arrangement is the weaker claim, because prompts-per-step is
+            # min(batch, pool) and both named knobs sit under the threshold: whichever one is
+            # raised, the other is still thin and still the minimum.
             lead += (
-                f" {cap_key} also holds the prompt pool below that, so raising one without the "
-                "other leaves the batch exactly where it is."
+                f" {cap_key} holds the prompt pool under a real batch too, so raising either one "
+                "alone still leaves prompts-per-step thin."
             )
     else:
         caps_verb = "hold" if len(cap_keys) > 1 else "holds"

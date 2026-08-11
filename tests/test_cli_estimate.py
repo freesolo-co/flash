@@ -514,7 +514,7 @@ def test_both_binding_knobs_are_named_when_the_batch_equals_the_pool(tmp_path, m
 
     assert rc == 0
     assert "Raise `batch_size` and `[train] max_examples`" in err
-    assert "raising one without the other" in err
+    assert "raising either one alone still leaves prompts-per-step thin" in err
 
 
 def test_a_thin_pool_is_not_excused_as_buying_optimizer_steps(tmp_path, monkeypatch, capsys):
@@ -739,6 +739,26 @@ def test_staggered_caps_are_both_named_so_one_edit_resolves_it(tmp_path, monkeyp
 
     assert rc == 0
     assert "`[train] max_examples` and `[environment.params] max_examples`" in err
+
+
+def test_a_cap_above_the_batch_is_not_described_as_holding_it_down(tmp_path, monkeypatch, capsys):
+    """`batch_size = 2` under `max_examples = 3`: the cap is ABOVE the batch, not below it.
+
+    Both knobs are thin, so both are still named and the remedy is right. But the lead cannot say
+    the cap holds the pool "below" the batch (3 > 2), nor that raising one alone "leaves the batch
+    exactly where it is": lifting `batch_size` 2 -> 8 against that cap moves prompts-per-step to 3
+    (verified). Only the weaker claim survives every arrangement, because prompts-per-step is
+    min(batch, pool) and both sit under the threshold: raise either and the other is still thin.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, 2, max_examples=3))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "raising either one alone still leaves prompts-per-step thin" in err
+    assert "below that" not in err
+    assert "leaves the batch exactly where it is" not in err
 
 
 def test_a_thin_batch_behind_a_smaller_cap_is_still_named(tmp_path, monkeypatch, capsys):
