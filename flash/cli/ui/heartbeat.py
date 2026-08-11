@@ -140,26 +140,22 @@ _LIVENESS_SETUP_STAGES = frozenset(
 # "still working" stops being the only explanation and a vanished instance becomes as likely.
 _SETUP_SILENT_AFTER_S = 900.0
 
-# the subset of the above that pulls weights or checkpoints over the network. only these can be
-# explained by a cold per-datacenter cache, so only these may say so: telling a user that
-# sft_configuring is "downloading tens of GB" sends them looking for a transfer that stage never
-# performs, which is the same misdiagnosis this hint exists to prevent.
+# what a stage BLOCKS on, so the hint can say what the wait plausibly is instead of guessing. a
+# stage absent from every set below gets no claim about the operation at all -- naming the wrong one
+# is the misdiagnosis this hint exists to prevent, and silence is cheaper than a wrong lead.
 #
-# base weights are already down by the time either model_load stage is emitted (both follow
-# prefetch_model), so neither is the tens-of-GB transfer -- that is model_prefetching. sft_model_load
-# is still here because its span calls _warmstart_adapter_path -> _download_adapter, a real network
-# fetch; opd_model_load only reads the config with local_files_only, so it is not.
-_DOWNLOADING_SETUP_STAGES = frozenset(
-    {
-        "model_prefetching",
-        "checkpoint_prefetching",
-        "sft_model_load",
-        "rl_adapter_loading",
-    }
-)
-# stages that fetch an ADAPTER rather than base weights: same cold-cache cause, but far smaller, so
-# describing them as "tens of GB" overstates what the user should expect to be waiting on.
+# these stages pull base weights or a checkpoint over the network, so a cold per-datacenter cache
+# volume explains a long silent stretch and the datacenter is worth citing.
+_WEIGHT_DOWNLOAD_STAGES = frozenset({"model_prefetching", "checkpoint_prefetching"})
+# these MAY fetch an adapter from the hub, but only conditionally: sft_model_load calls
+# _warmstart_adapter_path, which returns immediately unless train.init_from_adapter is set, so most
+# runs never transfer anything there. hedge the wording rather than assert a transfer that usually
+# is not happening. this is the hub, not the weight volume, so no datacenter clause.
 _ADAPTER_DOWNLOAD_STAGES = frozenset({"sft_model_load", "rl_adapter_loading"})
+# these export and upload the trained adapter. a long blocking stretch is EXPECTED here, so calling
+# it unusual would be actively wrong -- and worst of all after training has already finished, when
+# the only thing between the user and their result is this upload.
+_UPLOAD_STAGES = frozenset({"sft_finalizing", "rl_finalizing", "opd_finalizing"})
 
 
 def _stale_setup_hint(
@@ -192,15 +188,16 @@ def _stale_setup_hint(
     stage = str(heartbeat.get("stage") or "")
     if stage not in _LIVENESS_SETUP_STAGES:
         return None
-    if stage in _DOWNLOADING_SETUP_STAGES:
-        if stage in _ADAPTER_DOWNLOAD_STAGES:
-            blocking = "this stage fetches an adapter, which a cold cache serves slowly"
-        else:
-            blocking = "a cold weight cache downloads tens of GB with no ping"
+    if stage in _WEIGHT_DOWNLOAD_STAGES:
+        blocking = "a cold weight cache downloads tens of GB with no ping"
         if heartbeat.get("dc"):
             blocking += ", and the datacenter above is where it landed"
+    elif stage in _ADAPTER_DOWNLOAD_STAGES:
+        blocking = "this stage fetches an adapter from the hub if the run warm-starts from one"
+    elif stage in _UPLOAD_STAGES:
+        blocking = "this stage exports and uploads the adapter, which is often slow"
     else:
-        blocking = "this stage does no download, so a long one is unusual here"
+        blocking = "no long call is expected at this stage"
     return (
         "this setup stage pings every ~4 min while the worker is alive, so this gap is longer than "
         f"throttling explains: it may be inside one long blocking call ({blocking}), its heartbeat "

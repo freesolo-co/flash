@@ -914,13 +914,47 @@ def test_opd_model_load_is_not_described_as_a_weight_download(monkeypatch):
     opd_out = render.run_status(opd)
     assert "longer than throttling explains" in opd_out
     assert "tens of GB" not in opd_out
-    assert "does no download" in opd_out
+    assert "no long call is expected" in opd_out
 
-    # sft's span DOES fetch an adapter, so it keeps a download reading, sized honestly.
+    # sft's span MAY fetch an adapter, but only when the run warm-starts from one -- most do not,
+    # so the wording has to hedge rather than assert a transfer that usually is not happening.
     sft = dict(base, last_heartbeat={"stage": "sft_model_load", "ts": _time.time() - 1200})
     sft_out = render.run_status(sft)
-    assert "fetches an adapter" in sft_out
+    assert "if the run warm-starts from one" in sft_out
     assert "tens of GB" not in sft_out
+    # the hub pull is not the per-datacenter weight volume, so the region is not the explanation.
+    sft_dc = dict(
+        base,
+        last_heartbeat={"stage": "sft_model_load", "ts": _time.time() - 1200, "dc": "EU-RO-1"},
+    )
+    assert "datacenter above" not in render.run_status(sft_dc)
+
+
+@pytest.mark.parametrize("stage", ["sft_finalizing", "rl_finalizing", "opd_finalizing"])
+def test_finalizing_silence_is_not_called_unusual(stage, monkeypatch):
+    """These export and upload the adapter, so a long blocking stretch is expected, not anomalous.
+
+    They still earn the stale hint (they hold a keepalive wrap on the 240s cadence), but telling a
+    user their silence is unusual is worst here: training is done and only the upload stands between
+    them and their result, so a nudge toward cancelling destroys finished work.
+    """
+    import time as _time
+
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    obj = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+        "last_heartbeat": {"stage": stage, "ts": _time.time() - 1200},
+    }
+    out = render.run_status(obj)
+    assert "longer than throttling explains" in out
+    assert "no long call is expected" not in out, "a slow adapter upload is expected here"
+    assert "exports and uploads the adapter" in out
 
 
 def test_setup_hint_cites_the_datacenter_only_when_the_row_is_rendered(monkeypatch):
