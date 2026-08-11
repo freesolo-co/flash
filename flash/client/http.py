@@ -552,12 +552,18 @@ class ApiClient:
                 path,
                 f"did not return JSON (Content-Type: {content_type or 'unset'})",
             ) from exc
+        # every consumer of this decoder reads an object; a bare list or scalar from a proxy
+        # or wrong service would otherwise surface as an AttributeError several frames later.
+        if not isinstance(payload, dict):
+            raise _unexpected_response(
+                self.api_url,
+                path,
+                f"returned JSON that is not an object ({type(payload).__name__})",
+            )
         bad = [
             key
             for key, expected in (require or {}).items()
-            if not isinstance(payload, dict)
-            or key not in payload
-            or not _matches_require(payload[key], expected)
+            if key not in payload or not _matches_require(payload[key], expected)
         ]
         if bad:
             raise _unexpected_response(
@@ -953,7 +959,10 @@ class ApiClient:
             content_type = resp.headers.get("Content-Type", "")
             if "application/json" in content_type:
                 payload = self._decode_response(
-                    f"/v1/runs/{base_run_id}/chat", resp.read(), content_type
+                    f"/v1/runs/{base_run_id}/chat",
+                    resp.read(),
+                    content_type,
+                    require={"choices": [dict]},
                 )
                 content = ((payload.get("choices") or [{}])[0].get("message") or {}).get("content")
                 if content:

@@ -1096,6 +1096,16 @@ def test_healthy_lists_of_objects_still_pass_the_element_check():
     assert "'offset'" in str(caught.value)
 
 
+def test_non_object_json_is_a_client_error_even_without_requirements():
+    """A proxy or wrong service answering `[]` must not surface as AttributeError downstream."""
+    with (
+        _fixed_2xx_server("application/json", b"[]") as url,
+        pytest.raises(ClientError) as caught,
+    ):
+        ApiClient(url, "fslo-user-test", timeout=5).me()
+    assert "returned JSON that is not an object (list)" in str(caught.value)
+
+
 def test_non_json_2xx_is_a_client_error_not_a_decode_error():
     """A reverse proxy answering 200 text/html must not leak `Expecting value: line 1 column 1`."""
     with _fixed_2xx_server("text/html", b"<html>hi</html>") as url:
