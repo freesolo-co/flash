@@ -337,6 +337,7 @@ def _preparation_digest(
     # omit empty fields so existing version-1 snapshots keep their historical digest.
     for key in (
         "model_revision_auto",
+        "gpu_count_auto",
         "workload_profile_kind",
         "workload_profile_input_digest",
         "workload_profile_producer_version",
@@ -395,6 +396,7 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
         # False while the worker half carries the real value. Comparing them would reject every
         # auto-pinned run here -- the same runs the deploy guard was just relaxed to admit.
         "model_revision_auto",
+        "gpu_count_auto",
         "workload_profile_kind",
         "workload_profile_input_digest",
         "workload_profile_producer_version",
@@ -451,7 +453,16 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
     # persisted for launch.
     effective_count = int(effective_gpu.get("count", 1) or 1)
     public_count = int(public_gpu.get("count", 1) or 1)
-    if 1 <= effective_count <= public_count:
+    # an auto-sized run has NO authored ceiling: its public count is the digest-stable placeholder
+    # 1, so a legitimately auto-sized 2+ card shape would fail the narrowing rule below and be
+    # rejected as an integrity failure at persist time. the real ceiling for that run is the
+    # platform maximum. this branch is still bounded: MAX_COMBINATION_CARDS is the same cap
+    # allocation itself honours, and the count that lands here was produced by a VRAM fit check and
+    # the attention-head geometry cap, so a marker cannot buy a shape those would refuse.
+    from flash.providers.base import MAX_COMBINATION_CARDS
+
+    ceiling = public_count if worker_spec.authored_gpu_count is not None else MAX_COMBINATION_CARDS
+    if 1 <= effective_count <= ceiling:
         effective_gpu["count"] = public_gpu.get("count")
     # disk sizing, the weight-cache volume, and retry/wall-clock lifecycle policy are platform-managed
     # (_runner().MANAGED_GPU_KEYS) and stripped from the public spec, so the reconstructed public spec carries

@@ -389,6 +389,20 @@ def test_35b_expert_lora_shapes_and_multicard_sizing():
     assert provisional_gpu(model_id, "opd", train={"lora_rank": 64}, gpu_count=2) == "B200"
 
 
+def test_grpo_terminal_vram_error_names_only_effective_knobs(monkeypatch):
+    from flash.providers.base import UnsupportedGpuError, provisional_gpu
+
+    monkeypatch.setattr("flash.engine.plan.vram.model_required_vram_gb", lambda *_a, **_k: 2000)
+    with pytest.raises(UnsupportedGpuError) as exc:
+        provisional_gpu("Qwen/Qwen3.6-35B-A3B", "grpo")
+    message = str(exc.value)
+    assert "max_context_tokens" in message
+    assert "max_completion_tokens" in message
+    assert "lora_rank" in message
+    assert "batch_size" not in message
+    assert "group_size" not in message
+
+
 def test_pinned_revision_retains_calibrated_vram_floors(monkeypatch):
     from flash.core.catalog import MODELS
     from flash.engine.plan import vram
