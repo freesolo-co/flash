@@ -46,6 +46,17 @@ FLASH_ATTN_SPEC = (
     "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/"
     "v0.9.0/flash_attn-2.8.3%2Bcu128torch2.10-cp312-cp312-linux_x86_64.whl"
 )
+# sha256 of the wheel above, kept in lockstep with Dockerfile.worker's ARG FLASH_ATTN_SHA256.
+# the wheel is a community rebuild published by an individual, not Dao-AILab, and a github release
+# asset can be deleted and re-uploaded at the same url by whoever holds the account, so the url
+# alone pins nothing, and this interpreter is the one that TRAINS. bump it together with the url.
+FLASH_ATTN_SHA256 = "a58c95a080363606e691c342d47dd173b510f4c013a8c5fcb8744def12e36a0f"
+# what the install actually asks for. uv hashes the downloaded artifact and refuses to install it
+# when the fragment does not match (verified against uv 0.11), so the check happens after the
+# download and before anything is unpacked into the venv, the same order as the sha256sum -c on
+# the infisical .deb in Dockerfile. the spec above stays bare so it keeps matching Dockerfile.worker's
+# ARG default and worker-image.yml's FA2_SPEC, which fetch and verify in two separate steps.
+FLASH_ATTN_INSTALL_SPEC = f"{FLASH_ATTN_SPEC}#sha256={FLASH_ATTN_SHA256}"
 # the wheel above is cp312-ONLY, and flash itself supports 3.11 (pyproject requires-python >=3.11),
 # so a bare `uv venv` on a 3.11 host builds an interpreter the wheel cannot install into -- and that
 # install is required, so the run dies during provisioning instead of training. name the interpreter
@@ -91,8 +102,12 @@ TRANSFORMERS_REQUIREMENT = "transformers>=5.6,<5.13"
 # those venvs instead of re-running the repair on every reuse.
 VERL_VENV_BUILD_REPAIRS = "libcudart-stub-neutralized-v1"
 
+# carries FLASH_ATTN_INSTALL_SPEC (the sha256-fragmented spec), not the bare FLASH_ATTN_SPEC: the
+# digest is part of the venv's identity, not just how it got installed, so bumping or rotating the
+# checksum while the mutable release url stays constant must invalidate a venv stamped under the old
+# digest instead of letting it match forever and reuse an install that was never re-verified.
 VERL_VENV_STAMP = (
-    f"{VERL_REQUIREMENT}\n{FLASH_ATTN_SPEC}\n{FLA_REQUIREMENT}\n{CAUSAL_CONV1D_REQUIREMENT}\n"
+    f"{VERL_REQUIREMENT}\n{FLASH_ATTN_INSTALL_SPEC}\n{FLA_REQUIREMENT}\n{CAUSAL_CONV1D_REQUIREMENT}\n"
     f"{TRANSFORMERS_REQUIREMENT}\n{VERL_VENV_BUILD_REPAIRS}"
 )
 
@@ -111,10 +126,23 @@ def _install_flash_attn(py: str) -> None:
     cannot fail soft. Measured: an arm died on `error sending request ... operation timed out` for
     this exact url, and the identical url served 200 on retry moments later, so "cannot succeed on
     another worker" was simply false.
+
+    The spec carries FLASH_ATTN_SHA256, so a wheel that is not the pinned one is rejected between
+    download and install rather than baked into the training interpreter. A mismatch exits nonzero
+    like any other install failure, so it costs the retry budget and then terminates: noisy, but
+    never silent.
     """
     from flash.engine.worker.perf.lifecycle import RetriableInfraError
 
-    command = ["uv", "pip", "install", "--python", py, "--no-build-isolation", FLASH_ATTN_SPEC]
+    command = [
+        "uv",
+        "pip",
+        "install",
+        "--python",
+        py,
+        "--no-build-isolation",
+        FLASH_ATTN_INSTALL_SPEC,
+    ]
     for attempt in range(FLASH_ATTN_INSTALL_ATTEMPTS):
         try:
             subprocess.run(command, check=True)

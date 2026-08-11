@@ -956,3 +956,51 @@ def test_standalone_deployment_management_still_refuses_a_run_it_does_not_own(
     with pytest.raises(HTTPException) as ei:
         _deps.manageable_run("run-someone-else", key)
     assert ei.value.status_code == 404
+
+
+def test_standalone_deploy_needs_no_org_while_managed_fails_closed(monkeypatch) -> None:
+    """The org fail-closed gate on deploy is a managed-plane rule.
+
+    A standalone plane has no organization directory, so requiring an org there would make every
+    deploy impossible; managed mode is where an org-unscoped adapter registration would hand the
+    serving backend an unowned revision, so THAT is where the deploy must be refused.
+    """
+    pytest.importorskip("fastapi")
+    from fastapi import HTTPException
+
+    from flash.server.routes import serving
+
+    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
+    serving._require_deploy_org("run-1", None)  # single-tenant: nothing to name, no rejection
+
+    monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
+    with pytest.raises(HTTPException) as ei:
+        serving._require_deploy_org("run-1", None)
+    assert ei.value.status_code == 409
+    assert "owning organization" in str(ei.value.detail)
+    serving._require_deploy_org("run-1", "org-1")  # managed with an org still deploys
+
+
+def test_standalone_deployment_listing_stays_exact_key_scoped(monkeypatch) -> None:
+    """Standalone keeps the unscoped exact-key listing its operator CLI sends (no org headers)."""
+    pytest.importorskip("fastapi")
+    from fastapi import HTTPException
+
+    from flash.server.routes import serving
+
+    internal_key = {"id": 1, "auth_kind": "internal"}
+
+    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
+    assert serving._deployment_listing_scope(internal_key, None, None) is None
+
+    # managed mode: the internal key must name its scope; a user key stays key-scoped
+    monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
+    with pytest.raises(HTTPException) as ei:
+        serving._deployment_listing_scope(internal_key, None, None)
+    assert ei.value.status_code == 400
+    project = "11111111-1111-4111-8111-111111111111"
+    assert serving._deployment_listing_scope(internal_key, "org-1", project) == ("org-1", project)
+    assert (
+        serving._deployment_listing_scope({"id": 2, "auth_kind": "freesolo_api_key"}, None, None)
+        is None
+    )
