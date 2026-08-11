@@ -3988,6 +3988,12 @@ def test_the_child_fragment_repoints_the_tilelang_libcudart_stub(tmp_path):
     assert (tmp_path / "tilelang" / "lib" / "libcudart_stub.so.orig").read_bytes() == b"STUB", (
         "the original stub must be preserved verbatim so the change is reversible"
     )
+    # the marker naming the resolved runtime is the only evidence in a run log that the repoint
+    # happened and WHICH libcudart it picked. without it a silently-skipped swap and a successful one
+    # read identically, and the next undefined-symbol crash has nothing to bisect against.
+    assert f"{vc.FLASH_CUDART_STUB_MARKER} -> {real}" in result.stdout, (
+        f"the fragment did not report the repoint it performed: {result.stdout[-1000:]}"
+    )
 
 
 def test_the_child_fragment_leaves_the_stub_alone_without_a_real_libcudart(tmp_path):
@@ -4011,16 +4017,52 @@ def test_the_child_fragment_never_aborts_a_paid_run(tmp_path):
     """An unrepointed stub only kills runs that build a SLEEPING vLLM engine, so a fragment that
     cannot do its job must leave the child starting rather than abort it at sitecustomize time.
 
-    tilelang absent is the ordinary case for a non-GDN venv, and it must not even probe.
+    Two ways to not do the job, and they are NOT the same test. tilelang absent (the ordinary
+    non-GDN venv) never enters the swap at all, so it proves nothing about the error path -- deleting
+    the outer ``except`` entirely still passes that half. The read-only lib dir is the half that
+    matters: the swap genuinely raises PermissionError mid-flight, and only the outer handler keeps
+    that from propagating out of sitecustomize and killing the interpreter before training starts.
     """
-    result = _run_cudart_fragment(
+    absent = _run_cudart_fragment(
         vc.render_tilelang_cudart_shim(),
         tmp_path,  # no tilelang package materialized
         real=None,
         extra="print('FRAGMENT_DONE', flush=True)",
     )
-    assert "FRAGMENT_DONE" in result.stdout, f"fragment aborted the child: {result.stderr[-2000:]}"
-    assert result.returncode == 0
+    assert "FRAGMENT_DONE" in absent.stdout, f"fragment aborted the child: {absent.stderr[-2000:]}"
+    assert absent.returncode == 0
+    assert "repoint failed" not in absent.stdout, (
+        "tilelang absent is the ordinary case; it must not report a failure"
+    )
+
+    # tilelang present and repointable, but the directory holding it refuses writes: link() and
+    # symlink() both raise, from inside the branch that has already decided to swap.
+    pkg, stub = _fake_child_tilelang(tmp_path)
+    real = tmp_path / "libcudart.so.12"
+    real.write_bytes(b"REAL-CUDART")
+    lib = pkg / "lib"
+    lib.chmod(0o555)
+    try:
+        denied = _run_cudart_fragment(
+            vc.render_tilelang_cudart_shim(),
+            tmp_path,
+            real=str(real),
+            extra="print('FRAGMENT_DONE', flush=True)",
+        )
+    finally:
+        lib.chmod(0o755)  # let tmp_path cleanup remove it
+
+    assert denied.returncode == 0, (
+        f"a failed repoint aborted the child instead of importing on: {denied.stderr[-2000:]}"
+    )
+    assert "FRAGMENT_DONE" in denied.stdout, (
+        f"the exception escaped sitecustomize and killed the run: {denied.stderr[-2000:]}"
+    )
+    assert "repoint failed" in denied.stdout, (
+        "a swallowed failure must still say so; a silent one is unbisectable from a log"
+    )
+    assert not stub.is_symlink(), "the stub must be left intact when the swap could not complete"
+    assert stub.read_bytes() == b"STUB", "the failed swap corrupted tilelang's own stub"
 
 
 def test_the_child_fragment_is_idempotent_across_ray_workers(tmp_path):
