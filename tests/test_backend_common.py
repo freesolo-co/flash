@@ -58,9 +58,8 @@ def test_ray_num_cpus_prefers_the_cgroup_quota_over_the_host_core_count():
     # the exact failure that killed both real-gpu arms: a 1x4090 pod on a 48-core host. the quota is
     # the container's truth, so a large affinity mask must NOT win over it.
     #
-    # os.sched_getaffinity is linux-only, so every patch of it here needs create=True to run on a
-    # mac. the mock replaces the call outright, so the sizing under test is identical either way --
-    # only the worker (linux) ever reaches the real syscall.
+    # os.sched_getaffinity is linux-only, so every patch of it in this file needs create=True to
+    # run on a mac. only the worker (linux) ever reaches the real syscall.
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=12),
         mock.patch.object(os, "sched_getaffinity", return_value=set(range(48)), create=True),
@@ -1696,9 +1695,11 @@ def test_run_verl_training_preserves_oom_over_device_unavailable_after_eviction(
     command = [
         "bash",
         "-c",
-        'printf \'%s\\n\' "$FIRST" "$SECOND"; '
-        "for i in $(seq 1 70); do echo filler-$i; done; "
-        "exit 1",
+        (
+            'printf \'%s\\n\' "$FIRST" "$SECOND"; '
+            "for i in $(seq 1 70); do echo filler-$i; done; "
+            "exit 1"
+        ),
     ]
     tail = vc.ChildOutputTail(limit=3)
 
@@ -1872,10 +1873,12 @@ def test_kill_process_group_escalates_to_sigkill_when_sigterm_is_ignored(quick_t
         [
             sys.executable,
             "-c",
-            "import signal, sys, time\n"
-            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-            "print('ready', flush=True)\n"
-            "time.sleep(300)\n",
+            (
+                "import signal, sys, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "print('ready', flush=True)\n"
+                "time.sleep(300)\n"
+            ),
         ],
         stdout=subprocess.PIPE,
         text=True,
