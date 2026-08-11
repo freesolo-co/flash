@@ -197,8 +197,8 @@ def _bin_may_carry_infixed_keys(path: Path) -> bool:
     """Cheap pre-check: does this `.bin` mention the infix at all?
 
     torch stores state-dict keys as uncompressed strings inside the archive, so a raw byte scan
-    answers "could this need rewriting?" without importing torch -- which the control plane does
-    not install (it is a `gpu` extra, not a `server` one). A `.bin` that never mentions the infix
+    answers "could this need rewriting?" without importing torch, which the control plane does not
+    install (it is a `gpu` extra, not a `server` one). A `.bin` that never mentions the infix
     has nothing to strip, so it stays a pass-through instead of failing an export that is fine.
     """
     overlap = len(_LANGUAGE_MODEL_INFIX_BYTES) - 1
@@ -347,10 +347,10 @@ def _normalize_export_adapter_keys(adapter_dir: Path) -> str:
     Returns the resulting namespace: ``"text_only"`` once the ``.language_model.`` infix is gone,
     ``"multimodal"`` for an adapter whose live non-LM weights mean it must keep that namespace.
 
-    Raises rather than warning when normalization was needed and could not be applied. peft does
-    not error on mismatched adapter keys -- it emits a UserWarning and applies NOTHING -- so an
-    export that ships unnormalized weights hands the user a base model they will benchmark as
-    their adapter. A failed export is the only signal that ever reaches them.
+    Raises when normalization is needed and cannot be applied. peft does not error on mismatched
+    adapter keys, it emits a UserWarning and applies nothing, so an export that ships unnormalized
+    weights hands the user a base model they will benchmark as their adapter. A failed export is
+    the only signal that ever reaches them.
     """
     try:
         return _normalize_adapter_key_namespace(adapter_dir)

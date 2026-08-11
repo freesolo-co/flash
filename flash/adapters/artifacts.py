@@ -21,8 +21,8 @@ def is_adapter_weight_filename(filename: str) -> bool:
 
     One predicate for the same reason the filenames above are defined once: serving validation and
     the exporter never share a call stack, and each spelling the shapes for itself makes them agree
-    by coincidence. When they disagree the failure is silent -- validation accepts a shape the
-    exporter skips, so the export ships weights peft loads as a no-op.
+    by coincidence. A disagreement fails silently, because validation accepts a shape the exporter
+    skips and the export then ships weights peft loads as a no-op.
     """
     name = filename.rsplit("/", 1)[-1]
     if name in ADAPTER_WEIGHT_FILES:

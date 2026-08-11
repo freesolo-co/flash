@@ -269,7 +269,7 @@ def test_export_adapter_key_collision_fails_the_export(monkeypatch):
     """A rename that would shadow an existing key cannot be applied, so nothing is uploaded.
 
     Normalization is needed here (the infix is present) and cannot be performed, which is exactly
-    the case that used to ship weights peft loads as a no-op."""
+    the case where shipping the weights hands the user something peft loads as a no-op."""
     uploaded: dict = {}
     infixed = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
     plain = infixed.replace(".language_model.", ".", 1)
@@ -419,7 +419,7 @@ def _install_fake_torch(monkeypatch):
     """Inject a minimal ``torch``: load/save/Tensor, the whole surface the .bin path touches.
 
     torch is a ``gpu`` extra and is not installed alongside the control plane, so faking it is the
-    only way this path runs in CI at all -- and the byte scan that decides whether to import torch
+    only way this path runs in CI at all. The byte scan that decides whether to import torch still
     reads the real file, so the round trip below is a real one.
     """
     fake = types.ModuleType("torch")
@@ -448,8 +448,7 @@ def _write_fake_bin(path: Path, state: dict) -> None:
 def test_export_adapter_normalizes_bin_keys_for_vanilla_peft(tmp_path, monkeypatch):
     """`adapter_model.bin` is a shape the rest of the pipeline accepts, so it gets normalized too.
 
-    It used to skip normalization entirely, exporting a VL adapter whose keys peft binds to
-    nothing."""
+    Skipping it exports a VL adapter whose keys peft binds to nothing."""
     from flash.serve import export
 
     infixed = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
@@ -483,7 +482,7 @@ def test_export_adapter_bin_with_live_vision_weights_keeps_multimodal_namespace(
 
 
 def test_export_adapter_bin_needing_normalization_without_torch_is_refused(tmp_path, monkeypatch):
-    """The failure the audit found invisible: normalization is needed and cannot be applied.
+    """Normalization is needed here and cannot be applied, which fails invisibly if allowed.
 
     peft would warn and apply nothing, so the user benchmarks the base model believing it is their
     adapter. Refuse the export instead of logging a warning nobody sees."""

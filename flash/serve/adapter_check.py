@@ -18,7 +18,7 @@ from flash.adapters.lora_rank import rank_from_adapter_config
 from flash.serve.errors import AdapterConfigMissing, AdapterTensorMissing, ServingError
 
 # The accepted weight-file shapes live beside the filenames themselves so serving validation and
-# `flash.serve.export` cannot drift apart. Kept under this name because `flash.serve.deploy`
+# `flash.serve.export` cannot drift apart. The alias name is load-bearing: `flash.serve.deploy`
 # re-exports it and the serving tests resolve it there.
 _is_adapter_tensor_filename = is_adapter_weight_filename
 
