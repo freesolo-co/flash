@@ -855,11 +855,11 @@ def model_required_vram_gb(
         batch_size_default = _sft_per_device_bs()
         group_size_default = 8
     group_size = _positive_int_or_default(_sizing_value(train, "group_size"), group_size_default)
-    # the optimizer batch is spelled per algorithm: `prompts_per_step` for grpo/opd, `batch_size`
-    # for sft, and the schema now REJECTS the wrong name. reading only `batch_size` would silently
-    # size every rl run on the recipe default no matter what the user authored.
-    batch_key = "prompts_per_step" if _algo in ("grpo", "rl", "opd") else "batch_size"
-    batch_size = _positive_int_or_default(_sizing_value(train, batch_key), batch_size_default)
+    from flash.core.catalog import optimizer_batch_key
+
+    batch_size = _positive_int_or_default(
+        _sizing_value(train, optimizer_batch_key(_algo)), batch_size_default
+    )
 
     from flash.core.catalog import MODELS, vocab_size_for
 

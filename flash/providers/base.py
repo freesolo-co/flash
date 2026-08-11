@@ -335,6 +335,7 @@ def run_config_for_ranking(
     are derived. They are applied last because the profile measured what will actually execute and
     the authored value is only the request.
     """
+    from flash.core.catalog import optimizer_batch_key
     from flash.cost.types import RunConfig
 
     def knob(key):
@@ -362,7 +363,7 @@ def run_config_for_ranking(
         "steps": 1,
         "seq_len": knob("max_context_tokens"),
         "completion_len": knob("max_completion_tokens"),
-        "batch_size": knob("batch_size"),
+        "batch_size": knob(optimizer_batch_key(algorithm)),
         "group_size": knob("group_size"),
         "lora_rank": knob("lora_rank"),
         "thinking": thinking,

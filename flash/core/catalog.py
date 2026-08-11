@@ -39,6 +39,20 @@ def samples_on_policy(algorithm: str) -> bool:
     return algo in _ON_POLICY_ALGORITHMS
 
 
+def optimizer_batch_key(algorithm: str) -> str:
+    """The ``[train]`` key holding the optimizer batch for this algorithm.
+
+    The two names are different quantities and the schema rejects the wrong one, so a reader that
+    guesses finds nothing and silently falls back to the recipe default. Sizing, ranking and the
+    quote must agree on the name or they price and allocate the same job differently.
+
+    Unknown and empty algorithms resolve to the sft name, matching how the sizing paths treat
+    anything that is not recognisably rl.
+    """
+    algo = (algorithm or "").strip().lower()
+    return "prompts_per_step" if algo in ("grpo", "rl", "opd") else "batch_size"
+
+
 def normalize_algorithm(value: str) -> str:
     """Canonical (lowercased, validated) algorithm name."""
     if not value:

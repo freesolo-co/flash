@@ -164,3 +164,50 @@ def test_a_failed_pinned_lookup_is_not_cached(monkeypatch):
     assert facts.total_params_b("Qwen/Qwen3.5-9B", rev) == pytest.approx(
         MODELS["Qwen/Qwen3.5-9B"].params_b
     )
+
+
+def test_ranking_sizing_and_quote_read_the_same_optimizer_batch_key():
+    """The three readers of the optimizer batch must agree on its per-algorithm name.
+
+    `[train] batch_size` is sft-only and the schema REJECTS it for grpo/opd, so a reader that looks
+    for the wrong name finds nothing and falls back to the recipe default -- a plausible number, not
+    an error. That makes disagreement silent: ranking would pick hardware for one batch while
+    sizing and the persisted quote used another.
+
+    Asserted through the real entry points rather than on the helper alone, because the helper
+    keeps returning the right name whether or not a call site actually uses it.
+    """
+    from flash.core.catalog import optimizer_batch_key
+    from flash.engine.plan.vram import model_required_vram_gb
+    from flash.providers.base import run_config_for_ranking
+
+    assert optimizer_batch_key("grpo") == "prompts_per_step"
+    assert optimizer_batch_key("opd") == "prompts_per_step"
+    assert optimizer_batch_key("rl") == "prompts_per_step"  # phase-name alias
+    assert optimizer_batch_key("GRPO") == "prompts_per_step"  # callers pass it unnormalized
+    assert optimizer_batch_key("sft") == "batch_size"
+    # unknown/empty resolves to sft, matching how the sizing paths treat anything not rl
+    assert optimizer_batch_key("") == "batch_size"
+    assert optimizer_batch_key(None) == "batch_size"
+
+    model = "Qwen/Qwen3.5-4B"
+    authored = {"prompts_per_step": 64, "max_completion_tokens": 512}
+
+    # ranking must carry the authored rl batch, not None (which would price the recipe default)
+    ranked = run_config_for_ranking(model, "grpo", train=authored)
+    assert ranked.batch_size == 64
+    # and the quote it emits must spell the knob the way sizing will look it up
+    assert ranked.train_knobs()["prompts_per_step"] == 64
+    assert "batch_size" not in ranked.train_knobs()
+
+    # sizing must move off the recipe default for the same authored value
+    sized = model_required_vram_gb(model, "opd", train=authored)
+    defaulted = model_required_vram_gb(model, "opd", train={"max_completion_tokens": 512})
+    assert sized > defaulted, (
+        f"an authored prompts_per_step must change sizing; got {sized} vs default {defaulted}"
+    )
+
+    # sft keeps its own name end to end
+    sft_ranked = run_config_for_ranking(model, "sft", train={"batch_size": 8})
+    assert sft_ranked.batch_size == 8
+    assert sft_ranked.train_knobs()["batch_size"] == 8

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from flash.core.catalog import normalize_algorithm, samples_on_policy
+from flash.core.catalog import normalize_algorithm, optimizer_batch_key, samples_on_policy
 from flash.core.spec import parse_positive_int_tuple
 from flash.engine.plan.recipe import RECIPE
 from flash.providers import PROVIDER_NAMES
@@ -183,7 +183,7 @@ class RunConfig:
             # `RunConfig.batch_size` is the optimizer batch whatever the algorithm; the TRAIN TABLE
             # spells it per algorithm and sizing reads it by that name, so emit the name sizing
             # will look for or an authored rl batch silently sizes as the recipe default.
-            knobs["batch_size" if self.method == "sft" else "prompts_per_step"] = self.batch_size
+            knobs[optimizer_batch_key(self.method)] = self.batch_size
         if n.seq_len is not None:
             knobs["max_context_tokens"] = n.seq_len
         if n.completion_len is not None:
