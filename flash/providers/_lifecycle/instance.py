@@ -429,42 +429,55 @@ def build_user_data(payload: dict, *, image: str) -> str:
 
 
 def _strip_docstrings(source: str) -> str:
-    """``source`` with every module/class/function docstring removed, still valid Python.
+    """``source`` with every module/class/function docstring replaced by ``pass``.
 
     Only docstrings go: comments stay, since a comment sits next to the line it explains and is
     what a reader debugging ON the box needs. Docstrings are the bulk of the prose and none of the
     behaviour, so dropping them buys user_data budget at no cost to the shipped module.
+
+    What is replaced is the docstring's exact character span, never the LINES it sits on. A
+    docstring can share its line with the ``def`` that owns it (``def f(): "doc"``) or with a
+    statement that follows it (``"doc"; x = 1``), and dropping whole lines in those positions
+    either strands the body's indentation or silently deletes real code -- silently, because what
+    is left still parses. ``pass`` is valid wherever a docstring was, including a body it was the
+    only statement of, so one rule covers every case without a line-position special case.
+
+    The MODULE docstring is the one exception: it is deleted rather than substituted, because
+    ``from __future__ import annotations`` must be the first statement in a file and a ``pass``
+    standing where the docstring was would displace it.
     """
-    tree = ast.parse(source)
-    spans: list[tuple[int, int]] = []
-    for node in ast.walk(tree):
+    # ast reports col_offset in utf-8 BYTES, and this source is not ascii, so the spans are cut in
+    # bytes; slicing the str by those numbers would drift on the first non-ascii character.
+    data = source.encode()
+    starts: list[int] = []
+    offset = 0
+    for line in data.splitlines(keepends=True):
+        starts.append(offset)
+        offset += len(line)
+    spans: list[tuple[int, int, bytes]] = []
+    for node in ast.walk(ast.parse(source)):
         if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         body = getattr(node, "body", None)
-        if not body:
-            continue
-        first = body[0]
         if (
-            isinstance(first, ast.Expr)
+            body
+            and isinstance(first := body[0], ast.Expr)
             and isinstance(first.value, ast.Constant)
             and isinstance(first.value.value, str)
+            and first.end_lineno is not None
+            and first.end_col_offset is not None
         ):
-            # a docstring is the ONLY statement in a body sometimes; leave a pass so it still parses.
-            spans.append((first.lineno, first.end_lineno, len(body) == 1, first.col_offset))
-    lines = source.splitlines(keepends=True)
-    drop: set[int] = set()
-    inserts: dict[int, str] = {}
-    for start, end, sole, col in spans:
-        drop.update(range(start, end + 1))
-        if sole:
-            inserts[start] = " " * col + "pass\n"
-    out = []
-    for number, text in enumerate(lines, start=1):
-        if number in inserts:
-            out.append(inserts[number])
-        if number not in drop:
-            out.append(text)
-    stripped = "".join(out)
+            spans.append(
+                (
+                    starts[first.lineno - 1] + first.col_offset,
+                    starts[first.end_lineno - 1] + first.end_col_offset,
+                    b"" if isinstance(node, ast.Module) else b"pass",
+                )
+            )
+    # latest first, so replacing one span cannot move the offsets of those not yet applied.
+    for start, end, replacement in sorted(spans, reverse=True):
+        data = data[:start] + replacement + data[end:]
+    stripped = data.decode()
     ast.parse(stripped)  # never ship something that will not import on the box
     return stripped
 

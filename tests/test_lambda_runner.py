@@ -2509,6 +2509,47 @@ def test_shipped_bootstrap_secrets_is_stripped_but_behaves_identically():
     assert shipped["_split_margin"]({jwt}) == bootstrap_secrets._split_margin({jwt}) == len(jwt)
 
 
+def test_strip_docstrings_preserves_code_sharing_a_docstrings_line():
+    """A docstring is a character span, not a set of lines.
+
+    It can share its line with the ``def`` that owns it or with a statement that follows it. A
+    line-based stripper strands the indentation in the first case and DELETES the neighbouring
+    statement in the second -- and the result still parses, so nothing catches it before the box
+    imports the shipped module.
+    """
+    from flash.providers._lifecycle import instance as inst
+
+    # a statement sharing the docstring's line must survive.
+    stripped = inst._strip_docstrings('def f():\n    """doc"""; x = 1\n    return x\n')
+    namespace: dict = {}
+    exec(compile(stripped, "<t>", "exec"), namespace)
+    assert namespace["f"]() == 1, "the statement after the docstring was dropped"
+
+    # a docstring on the def/class line itself must leave something parseable behind.
+    for source, name in (('def f(): "doc"\n', "f"), ('class C: "doc"\n', "C")):
+        namespace = {}
+        exec(compile(inst._strip_docstrings(source), "<t>", "exec"), namespace)
+        assert name in namespace
+
+    # ast reports columns in utf-8 bytes: a non-ascii character before a docstring shifts every
+    # later byte offset, and slicing the str by those numbers would cut mid-docstring.
+    stripped = inst._strip_docstrings('s = "café — naïve"\ndef f():\n    """d"""\n    return s\n')
+    namespace = {}
+    exec(compile(stripped, "<t>", "exec"), namespace)
+    assert namespace["f"]() == "café — naïve"
+    assert '"""' not in stripped
+
+    # the module docstring is DELETED, not substituted: `from __future__` must stay the first
+    # statement in the file, and a `pass` standing where the docstring was would displace it.
+    # bootstrap_secrets.py has both, so getting this wrong makes the shipped module unimportable.
+    stripped = inst._strip_docstrings(
+        '"""mod"""\n\nfrom __future__ import annotations\n\ndef f():\n    """d"""\n    return 1\n'
+    )
+    namespace = {}
+    exec(compile(stripped, "<t>", "exec"), namespace)
+    assert namespace["f"]() == 1
+
+
 def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
     """A large job_spec_json must NOT be embedded inline in user_data (it can overflow the
     provider's cloud-init size cap and reject the launch). It is uploaded to HF and replaced by a
