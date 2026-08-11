@@ -246,10 +246,10 @@ def test_the_tests_repo_dispatch_cannot_silently_no_op():
 
 
 def _triggers(document: dict[str, Any]) -> dict[str, Any]:
-    """Return the `on:` block.
+    """return the `on:` block.
 
-    Bare `on` is a YAML 1.1 boolean, so `yaml.safe_load` yields the key `True`, not `"on"`. A
-    workflow quoted as `"on":` yields the string. Looking up only one spelling silently returns
+    bare `on` is a YAML 1.1 boolean, so `yaml.safe_load` yields the key `True`, not `"on"`. a
+    workflow quoted as `"on":` yields the string. looking up only one spelling silently returns
     nothing for the other, and a trigger contract that finds no triggers passes vacuously.
     """
     for key in (True, "on"):
@@ -260,19 +260,17 @@ def _triggers(document: dict[str, Any]) -> dict[str, Any]:
 
 @pytest.mark.parametrize("path", _workflow_paths(), ids=lambda p: p.name)
 def test_no_workflow_is_triggered_by_a_tag_push(path: Path):
-    """Tags in this repo are published BY a workflow; none may be an input to one.
+    """tags in this repo are published BY a workflow; none may be an input to one.
 
-    `publish.yml` used to fire on `on: push: tags: - "flash-v*"` under the pre-1.0 scheme. It now
-    fires on a push to `main` that bumps the version, and creates `v<version>` itself afterwards.
-    A tag trigger reintroduced alongside that is a second route to PyPI which skips the
-    version-bump check, the "already on PyPI" check and the tag-conflict preflight -- every gate
-    the current design relies on.
+    `publish.yml` fires on a push to `main` that bumps the version, and creates `v<version>` itself
+    afterwards. a tag trigger alongside that is a second route to PyPI which skips the version-bump
+    check, the "already on PyPI" check and the tag-conflict preflight, every gate the design relies
+    on.
 
-    The failure that motivated this: pushing the abandoned `flash-v0.2.18` tag on 2026-08-09 ran
-    the June workflow file stored at that tagged commit and failed in `uv publish` (run
-    31330288101). Actions resolves the workflow from the pushed ref, so no edit to the file on
-    `dev` could have stopped it; what this test buys is that the pattern cannot come back on any
-    commit reachable from here.
+    the failure this pins: pushing an abandoned `flash-v*` tag runs whatever publish file is stored
+    at that tagged commit, because Actions resolves the workflow from the pushed ref. no edit on
+    `dev` can stop that for a tag that already exists; what this test buys is that the pattern
+    cannot come back on any commit reachable from here.
     """
     push = _triggers(_load(path)).get("push")
     if not isinstance(push, dict):
@@ -285,25 +283,24 @@ def test_no_workflow_is_triggered_by_a_tag_push(path: Path):
 
 
 def test_main_source_guard_checks_provenance_not_just_the_branch_name():
-    """A branch NAME check is spoofable by anyone with a fork the moment this repo is public.
+    """a branch NAME check is spoofable by anyone with a fork the moment this repo is public.
 
-    The guard used to compare `github.head_ref` to the literal string `dev` and nothing else. For a
-    fork PR that value is the branch name *inside the fork*, so forking the repo, naming a branch
-    `dev` and opening a PR straight into `main` printed "Source branch 'dev' is allowed" and went
-    green -- under a check whose displayed name ("Source branch is dev") is what a reviewer reads
-    in the checks list. The repository of the head ref is the part that cannot be renamed into
-    compliance, so it is what must be compared.
+    for a fork PR, `github.head_ref` is the branch name *inside the fork*, so a guard comparing
+    only that name lets someone fork the repo, name a branch `dev`, open a PR straight into `main`,
+    and go green, under a check whose displayed name ("Source branch is dev") is what a reviewer
+    reads in the checks list. the repository of the head ref is the part that cannot be renamed
+    into compliance, so it is what must be compared.
 
-    The script is EXECUTED rather than grepped, for the same reason as the dispatch test above:
+    the script is EXECUTED rather than grepped, for the same reason as the dispatch test above:
     substring-matching `head.repo.full_name` proves the characters exist, not that they gate
-    anything. The three outcomes are asserted separately, and the two rejection paths must be
-    distinguishable in their messages -- "you targeted main from the wrong branch" and "fork heads
+    anything. each outcome is asserted separately, and the two rejection paths must be
+    distinguishable in their messages: "you targeted main from the wrong branch" and "fork heads
     may never target main" call for different actions from the person reading the log.
     """
     document = _load(WORKFLOW_DIR / "main-source-guard.yml")
     job = _jobs(document)["source-is-dev"]
 
-    # The guard is only meaningful on PRs into `main`; a widened trigger would run it (and pass it)
+    # the guard is only meaningful on PRs into `main`; a widened trigger would run it (and pass it)
     # where it means nothing.
     assert _triggers(document)["pull_request"]["branches"] == ["main"], (
         "main-source-guard must stay scoped to pull requests targeting main"
@@ -314,7 +311,7 @@ def test_main_source_guard_checks_provenance_not_just_the_branch_name():
     step = steps[0]
     script = step["run"]
 
-    # Read the head repository from the `pull_request` payload, not from `github.repository`
+    # read the head repository from the `pull_request` payload, not from `github.repository`
     # (which is the BASE repo on a fork PR and would compare a value to itself) and not from
     # `github.event.pull_request.head.label` (a display string a fork owner influences).
     env = step.get("env") or {}
@@ -339,11 +336,11 @@ def test_main_source_guard_checks_provenance_not_just_the_branch_name():
         )
         return completed.returncode, completed.stdout + completed.stderr
 
-    # 1. The one legitimate promotion.
+    # 1. the one legitimate promotion.
     code, logged = run(UPSTREAM_REPOSITORY, "dev")
     assert code == 0, f"upstream dev -> main must be allowed, got exit {code}: {logged}"
 
-    # 2. The spoof this test exists for: right branch name, wrong repository.
+    # 2. the spoof this test exists for: right branch name, wrong repository.
     code, logged = run("attacker/flash", "dev")
     assert code != 0, (
         "a fork branch named 'dev' was accepted -- the guard is still comparing names only"
@@ -352,7 +349,7 @@ def test_main_source_guard_checks_provenance_not_just_the_branch_name():
         f"the fork rejection must say so, so it is not read as a branch-naming mistake: {logged}"
     )
 
-    # 3. Wrong branch, upstream repository. Distinct message from case 2.
+    # 3. wrong branch, upstream repository. distinct message from case 2.
     code, logged = run(UPSTREAM_REPOSITORY, "feature/thing")
     assert code != 0, "a non-dev upstream branch was accepted"
     assert "fork" not in logged.lower(), (
@@ -360,7 +357,7 @@ def test_main_source_guard_checks_provenance_not_just_the_branch_name():
     )
     assert "dev" in logged, f"the branch rejection must name the required branch: {logged}"
 
-    # 4. Fails closed when the field is absent (deleted fork, or a re-trigger where the payload
+    # 4. fails closed when the field is absent (deleted fork, or a re-trigger where the payload
     # carries no head repo) rather than treating "" as "not a fork".
     code, logged = run("", "dev")
     assert code != 0, (

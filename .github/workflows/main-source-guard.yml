@@ -21,7 +21,7 @@ jobs:
         run: |
           # provenance is checked BEFORE the branch name, because the name alone proves nothing.
           # `github.head_ref` is the branch name inside the HEAD repository, which for a fork PR is
-          # whatever the fork owner called it -- so a name-only check goes green for anyone who
+          # whatever the fork owner called it, so a name-only check goes green for anyone who
           # forks this repo, names a branch `dev`, and opens a PR straight into main. under the
           # documented dev -> main promotion model a cross-repo head is never legitimate, so it is
           # rejected outright rather than compared by name.
