@@ -511,6 +511,59 @@ def _validate_existing_config_projects(project_id: str) -> None:
             )
 
 
+def _warn_if_environment_form_disagrees(configs: tuple[Path, ...], *, can_publish: bool) -> None:
+    """Warn when configs left over from a run against the OTHER plane kind are kept as-is.
+
+    Setup is idempotent: the `_write_*` helpers skip a config that already exists, and
+    `_validate_existing_config_projects` only compares the project uuid. So a rerun in a directory
+    scaffolded against the other plane kind keeps its old `[environment]` block on disk while
+    printing this plane's next step -- guidance the retained file contradicts. Warn rather than
+    refuse or rewrite: refusing would break the idempotent rerun, and every helper here
+    deliberately preserves what the user has edited.
+
+    Classify with the loader's own predicates, not a `github:` prefix test. The loader accepts a
+    plain `https://github.com/OWNER/REPO/...` URL as the same self-hosted form, so a prefix test
+    would warn about an id this plane resolves fine.
+    """
+    from flash.client import ClientError
+    from flash.envs.loader import is_github_environment_ref
+
+    mismatched: list[Path] = []
+    for cfg in configs:
+        if not cfg.exists():
+            continue
+        try:
+            raw = tomllib.loads(cfg.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            raise ClientError(f"cannot read existing {cfg}: {exc}") from exc
+        environment = raw.get("environment")
+        environment_id = environment.get("id") if isinstance(environment, dict) else None
+        env_id = environment_id.strip() if isinstance(environment_id, str) else ""
+        # blank is the hosted branch's own placeholder (`id = ""`), so it reads as hosted, not as
+        # "no opinion" -- it is exactly what a hosted scaffold leaves behind for `env push` to fill.
+        uses_github = is_github_environment_ref(env_id)
+        if uses_github == (not can_publish):
+            continue
+        mismatched.append(cfg)
+
+    if not mismatched:
+        return
+    names = ", ".join(str(cfg) for cfg in mismatched)
+    if can_publish:
+        change = (
+            "use `github:` [environment] ids, but this hosted plane requires managed hub ids; "
+            "keeping the files unchanged. Run `flash env push`, then replace each [environment] "
+            "id with the returned id"
+        )
+    else:
+        change = (
+            "use managed hub [environment] ids, but this self-hosted plane requires `github:` ids; "
+            "keeping the files unchanged. Replace each [environment] id with a "
+            "`github:OWNER/REPO@REF:PATH` form accepted by this plane"
+        )
+    _warn(f"existing {names} {change}")
+
+
 def _existing_reasoning(configs: tuple[Path, ...]) -> bool | None:
     """The `thinking` state the generated configs already agree on, or None if none exist.
 
@@ -800,6 +853,7 @@ def cmd_env_setup(args) -> int:
     reasoning = _resolve_reasoning_mode(args, reasoning_configs)
 
     can_publish = _plane_can_publish_environments()
+    _warn_if_environment_form_disagrees(reasoning_configs, can_publish=can_publish)
     env_py = (_STARTER_ENV_MULTITURN_PY if multi_turn else _STARTER_ENV_PY).replace(
         "PROJECT_UUID", project_id
     )

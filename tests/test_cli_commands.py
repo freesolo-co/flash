@@ -654,6 +654,72 @@ def test_env_setup_keeps_the_push_workflow_on_the_managed_plane(monkeypatch, tmp
     assert "flash env push" in written["environment.py"]
 
 
+def test_env_setup_warns_when_hosted_configs_are_retained_on_a_self_hosted_plane(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    hosted = _scaffold(monkeypatch, tmp_path, "https://flash.freesolo.co")
+    capsys.readouterr()
+
+    retained = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+    warning = capsys.readouterr().err
+
+    assert "self-hosted plane requires `github:` ids" in warning
+    assert "`github:OWNER/REPO@REF:PATH`" in warning
+    for name in ("sft.toml", "rl.toml", "opd.toml"):
+        assert f"configs/{name}" in warning, name
+        assert retained[name] == hosted[name], name
+
+
+def test_env_setup_warns_when_self_hosted_configs_are_retained_on_a_hosted_plane(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    self_hosted = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+    capsys.readouterr()
+
+    retained = _scaffold(monkeypatch, tmp_path, "https://flash.freesolo.co")
+    warning = capsys.readouterr().err
+
+    assert "hosted plane requires managed hub ids" in warning
+    assert "Run `flash env push`" in warning
+    for name in ("sft.toml", "rl.toml", "opd.toml"):
+        assert f"configs/{name}" in warning, name
+        assert retained[name] == self_hosted[name], name
+
+
+@pytest.mark.parametrize("api_url", ["https://flash.freesolo.co", "https://plane.example.test"])
+def test_env_setup_clean_scaffold_has_no_environment_form_warning(
+    monkeypatch, tmp_path, capsys, api_url
+) -> None:
+    _scaffold(monkeypatch, tmp_path, api_url)
+
+    assert capsys.readouterr().err == ""
+
+
+def test_env_setup_accepts_a_browser_url_as_the_self_hosted_form(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A plain github.com URL is the same self-hosted form, so it must not warn.
+
+    The loader's `_parse_github_environment_ref` accepts `https://github.com/OWNER/REPO/...`
+    alongside `github:OWNER/REPO@REF:PATH`, so classifying on the `github:` prefix alone would
+    tell a self-hoster their working id is the wrong kind and to replace it.
+    """
+    _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+    rl = tmp_path / "configs" / "rl.toml"
+    rl.write_text(
+        rl.read_text(encoding="utf-8").replace(
+            'id = "github:OWNER/REPO@main:environment.py"',
+            'id = "https://github.com/owner/repo/blob/main/environment.py"',
+        ),
+        encoding="utf-8",
+    )
+    capsys.readouterr()
+
+    _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+
+    assert capsys.readouterr().err == ""
+
+
 def test_env_setup_treats_an_unset_api_url_as_the_managed_plane(monkeypatch, tmp_path) -> None:
     """No stored api_url means the built-in default, which is Freesolo's plane -- not self-hosted."""
     written = _scaffold(monkeypatch, tmp_path, None)
