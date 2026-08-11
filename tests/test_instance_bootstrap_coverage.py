@@ -670,6 +670,77 @@ def test_run_mode_success_returns_rc_and_uploads_console(monkeypatch):
     assert "world" in body
 
 
+def test_run_mode_sanitizes_the_echoed_child_line_but_not_the_console_file(monkeypatch, capfd):
+    """this process's stdout IS the instance's container log.
+
+    the control plane pulls that log as the failure detail -- vast holds the box after a non-zero
+    exit precisely so it can -- and only this process knows the run's secret VALUES, since the
+    container starts with an empty environment and the credentials arrive in the payload. echoing
+    the child's stdout raw therefore published every runtime secret the worker printed. the console
+    FILE keeps the raw line: its upload path sanitizes the tail, and redacting twice would lose
+    the byte offsets the tail limit is measured in.
+    """
+    secret = "vast-runtime-7c1de9f4b3a20685"
+    _disable_periodic_console_upload(monkeypatch)
+    monkeypatch.setattr(b, "_upload_console_tail_bounded", lambda *a, **k: True)
+    monkeypatch.setattr(b, "hf_upload", lambda *a, **k: None)
+    proc = _FakeProc([f"boto3 auth failed with {secret}\n", "worker exiting\n"], rc=1)
+    monkeypatch.setattr(b.subprocess, "Popen", lambda *a, **k: proc)
+
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/run",
+        "code_prefix": CODE_PREFIX,
+        # AWS_SECRET_ACCESS_KEY matches no suffix heuristic, so this covers the declared channel.
+        "env": {"FLASH_SECRET_ENV_KEYS": "AWS_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY": secret},
+    }
+    b.run_mode(payload, {"E": "1"}, "sft", deadline_ts=b.time.time() + 100)
+
+    echoed = capfd.readouterr().out
+    assert secret not in echoed
+    assert "boto3 auth failed with <redacted>" in echoed
+    # redaction must not eat the surrounding diagnostics, which are the reason for the echo.
+    assert "worker exiting" in echoed
+    with open("/tmp/console_sft.txt") as f:
+        assert f.read() == f"boto3 auth failed with {secret}\nworker exiting\n"
+
+
+def test_run_mode_echoes_the_end_of_an_oversized_child_line(monkeypatch, capfd):
+    """the sanitizing bound must keep the END of a line, which is where the root cause is.
+
+    a native stack, a json blob or a progress stream puts its conclusion last, and the control
+    plane's failure detail reads the PROVIDER's instance log rather than the uploaded console
+    artifact -- so a prefix cut here loses the diagnosis everywhere, not just in one copy.
+    """
+    _disable_periodic_console_upload(monkeypatch)
+    monkeypatch.setattr(b, "_upload_console_tail_bounded", lambda *a, **k: True)
+    monkeypatch.setattr(b, "hf_upload", lambda *a, **k: None)
+    proc = _FakeProc(["x" * 120_000 + "ROOTCAUSE: CUDA OOM\n"], rc=1)
+    monkeypatch.setattr(b.subprocess, "Popen", lambda *a, **k: proc)
+
+    payload = {"hf_repo": "o/r", "hf_prefix": "sft/run", "code_prefix": CODE_PREFIX, "env": {}}
+    b.run_mode(payload, {"E": "1"}, "sft", deadline_ts=b.time.time() + 100)
+
+    echoed = capfd.readouterr().out
+    assert "ROOTCAUSE: CUDA OOM" in echoed
+    # the bound still applies -- this is a cut, not an unbounded echo.
+    assert len(echoed) <= 100_001
+
+
+def test_safe_detail_keeps_the_requested_side_of_an_over_limit_string():
+    """`keep` selects which side survives: a message whose subject comes first keeps its front, a
+    streamed console line keeps its end. redaction runs on the whole text before either cut, so
+    neither can split a credential into a fragment nothing matches."""
+    assert b._safe_detail("abcdef", 3) == "abc"
+    assert b._safe_detail("abcdef", 3, keep="end") == "def"
+    # a secret spanning the cut point is gone either way, not halved.
+    secret = "sk-live-abc123456789"
+    for keep in ("start", "end"):
+        out = b._safe_detail(f"aa{secret}zz", 12, secrets={"K": secret}, keep=keep)
+        assert not any(secret[-n:] in out for n in range(1, len(secret)))
+        assert not any(secret[:n] in out for n in range(8, len(secret)))
+
+
 def test_run_mode_caps_the_worker_at_the_declared_wall_budget(monkeypatch):
     """Unspent provisioning time must not become extra WORK time.
 
@@ -1974,23 +2045,50 @@ def test_safe_detail_keeps_short_components_of_a_multiline_secret_readable():
     assert detail == "parse error near } and abc"
 
 
-def test_safe_detail_keeps_a_very_short_declared_secret_out_of_global_replacement():
-    """a declared secret can carry any value, including a 3-char one. as an unconstrained global
-    replacement needle it would mangle every diagnostic containing those characters, so the same
-    floor the multiline components use applies to the whole value. long values still redact."""
-    assert (
-        b._safe_detail("trainer crashed after validation", secrets={"PIN": "ati"})
-        == "trainer crashed after validation"
+def test_safe_detail_redacts_a_very_short_declared_secret_at_word_boundaries():
+    """a declared secret can carry any value, including a 3-char one, and it must not leak.
+
+    the length floor used to drop such a value from the needle set entirely, so it printed
+    verbatim: nothing else covers it unless the surrounding text happens to have credential shape.
+    it cannot become an unconstrained global needle either -- the value `ati` would rewrite
+    `authentication` -- so it is redacted only where it stands alone.
+    """
+    short = {"PIN": "ati"}
+
+    # the standalone value is the leak the floor used to allow.
+    assert b._safe_detail("worker rejected pin ati", secrets=short) == (
+        "worker rejected pin <redacted>"
     )
-    assert (
-        b._safe_detail("trainer crashed holding sk-live-abc123456", secrets={"PIN": "ati"})
-        == "trainer crashed holding sk-live-abc123456"
+    # ... while the same letters inside a word stay readable.
+    assert b._safe_detail("trainer crashed after validation", secrets=short) == (
+        "trainer crashed after validation"
+    )
+    # an unrelated long value is untouched by a short needle.
+    assert b._safe_detail("trainer crashed holding sk-live-abc123456", secrets=short) == (
+        "trainer crashed holding sk-live-abc123456"
     )
     assert (
         b._safe_detail(
             "trainer crashed holding sk-live-abc123456", secrets={"PIN": "sk-live-abc123456"}
         )
         == "trainer crashed holding <redacted>"
+    )
+
+
+def test_safe_detail_redacts_a_short_secret_in_the_shapes_diagnostics_print():
+    """the boundary form has to fire where a credential actually appears in output: quoted, in a
+    url, as a key=value pair, at the very start and end of the text."""
+    short = {"PIN": "ati", "KEY": "a/b+c"}
+
+    assert b._safe_detail("auth failed: 'ati'", secrets=short) == "auth failed: '<redacted>'"
+    assert b._safe_detail("ati rejected", secrets=short) == "<redacted> rejected"
+    assert b._safe_detail("rejected ati", secrets=short) == "rejected <redacted>"
+    assert b._safe_detail("https://host/ati/repo.git", secrets=short) == (
+        "https://host/<redacted>/repo.git"
+    )
+    # the percent-encoded form of a short value is registered too.
+    assert b._safe_detail("https://host/a%2Fb%2Bc/x", secrets=short) == (
+        "https://host/<redacted>/x"
     )
 
 
@@ -2019,6 +2117,71 @@ def test_read_console_tail_drops_a_split_credential(tmp_path):
 
     assert "secret" not in tail
     assert tail == "next\n"
+
+
+def test_read_console_tail_drops_a_single_unterminated_line(tmp_path, monkeypatch):
+    """A tail holding no newline at all is dropped, even though it costs the only diagnostic.
+
+    Keeping it was tried and reverted. Every bound that would let the line through is measured
+    against the credentials this process KNOWS, and the value at risk is the one it does not: a
+    capability minted at runtime (a presigned url, a token a provider echoed back) is in neither
+    the payload nor the environment, so it contributes no needle. A margin sized from an unrelated
+    configured secret then removes a prefix sized for THAT secret and leaves a long fragment of the
+    runtime one, which full-value redaction can never match. The empty tail never leaked.
+    """
+    from flash.providers._lifecycle import bootstrap_secrets
+
+    for name in [key for key in b.os.environ if bootstrap_secrets._secret_env_name(key)]:
+        monkeypatch.delenv(name, raising=False)
+    # the boundary lands 200 characters INTO a runtime credential, so it is genuinely split: the
+    # part that survives the cut is what no downstream redactor could match.
+    limit, prefix = 64_000, 6_000
+    runtime_secret = "dyn-" + "D" * 400
+    size = limit + prefix + 200
+    body = b"q" * prefix + runtime_secret.encode() + b"q" * (size - prefix - len(runtime_secret))
+    assert prefix < size - limit < prefix + len(runtime_secret), "boundary must split the secret"
+    console = tmp_path / "console.txt"
+    console.write_bytes(body)
+
+    # an unrelated configured credential must not buy the line a pass.
+    assert b._read_console_tail(str(console), limit, secrets={"K": "sk-live-abc123456789"}) == ""
+    assert b._read_console_tail(str(console), limit, secrets={}) == ""
+
+    # a line the boundary did NOT split is still kept: that is the case worth keeping.
+    terminated = tmp_path / "terminated.txt"
+    terminated.write_bytes(b"x" * 70_000 + b"\nROOTCAUSE: cuda oom")
+    assert b._read_console_tail(str(terminated), limit, secrets={}) == "ROOTCAUSE: cuda oom"
+
+
+def test_safe_detail_redacts_a_short_secret_whose_edges_are_not_word_characters():
+    """The word guard is per EDGE, applied only where the needle's own edge is a word character.
+
+    A short value with a punctuation edge already separates itself from neighbouring text.
+    Demanding a non-word character beyond it asks the wrong question: "/a" inside
+    "https://host/a/repo" is preceded by the "t" of "host", so an unconditional left guard fails
+    and the secret prints verbatim. [environment] secrets accepts any value, so a path- or
+    dash-shaped one is not exotic.
+    """
+    for secret, text in (("/a", "https://host/a/repo"), ("a-", "value a- here"), ("-x", "see -x")):
+        out = b._safe_detail(text, 1000, secrets={"S": secret})
+        assert secret not in out, f"{secret!r} leaked from {text!r}"
+        assert "<redacted>" in out
+
+    # the guard that made this necessary still holds: a value that IS a word cannot rewrite a
+    # longer word that merely contains it.
+    assert b._safe_detail("authentication ok", 1000, secrets={"S": "ati"}) == "authentication ok"
+
+
+def test_safe_detail_keep_end_rejects_a_typo_and_honours_a_zero_limit():
+    """``text[-0:]`` is ``text[0:]`` -- the WHOLE string, the exact opposite of a zero bound -- so
+    the zero case is spelled out. An unknown mode raises rather than silently keeping the front,
+    which would cut the side the caller asked to preserve."""
+    assert b._safe_detail("abcdef", 0, keep="end") == ""
+    assert b._safe_detail("abcdef", 0, keep="start") == ""
+    assert b._safe_detail("abcdef", 3, keep="end") == "def"
+    assert b._safe_detail("abcdef", 3, keep="start") == "abc"
+    with pytest.raises(ValueError, match="keep must be"):
+        b._safe_detail("abcdef", 3, keep="edn")
 
 
 def test_safe_detail_redacts_the_percent_encoded_form_of_a_secret():

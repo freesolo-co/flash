@@ -405,6 +405,76 @@ def test_main_source_guard_checks_provenance_not_just_the_branch_name():
     )
 
 
+def test_main_source_guard_cannot_be_skipped_into_a_pass():
+    """`Source branch is dev` is a REQUIRED check, and a skipped required check counts as SUCCESS.
+
+    That makes a job-level `if:` on this job a supersede primitive rather than an exemption. Let
+    the guard run and fail on a human head, then fire an event whose payload takes the `if:` false
+    branch: the run is SKIPPED, the skip supersedes the failure on the same SHA, and the required
+    check reads green with the human commits still in place. Close-and-reopen is enough to do it --
+    this workflow declares no `types:`, so `reopened` is in its trigger set.
+
+    Every event-derived signal has this shape, so no condition on the job can be safe:
+    `pull_request.user.login` and `head_ref` are immutable for the PR's lifetime (they describe who
+    OPENED it, not what it now CONTAINS), and `github.actor` is the event trigger, which differs
+    between two runs of the same commits. The invariant is structural -- no `if:` at all.
+    """
+    job = _jobs(_load(WORKFLOW_DIR / "main-source-guard.yml"))["source-is-dev"]
+    assert "if" not in job, (
+        "source-is-dev must carry no job-level `if:`. it is a required check, so a false condition "
+        f"yields a SKIPPED run that counts as success and can supersede a real failure. got: {job['if']!r}"
+    )
+
+
+def test_main_source_guard_has_no_dependabot_carve_out():
+    """No exemption may be built from commit metadata, because none of it proves bot authorship.
+
+    An earlier revision of this guard carried a dependabot carve-out on the theory that security
+    updates ignore `target-branch: dev` and open against `main`. That premise was wrong here: all
+    11 dependabot PRs in this repo's history target `dev`, including under alert-driven security
+    updates (which are enabled and unpaused), and this job -- which only triggers on PRs into
+    `main` -- has never once run on a dependabot PR. The carve-out fixed nothing.
+
+    It could not have been written safely either. GitHub signs whatever a caller hands it, so the
+    signed payload of a real dependabot push carries no bot-specific fact:
+
+        author    dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>
+        committer GitHub <noreply@github.com>
+
+    The author line is a caller-supplied header, and the committer is the generic identity behind
+    every web-editor and contents-api commit. A write-capable maintainer calling the contents API
+    with dependabot's noreply address in the `author` object reproduces that tuple exactly. Three
+    successive versions of the carve-out (author+verified, committer+verified, author+committer+
+    verified) were each defeated by that, so this test pins its ABSENCE: if dependabot is ever
+    pointed at `main`, exempt it outside the commit -- a separate workflow keyed on the API's
+    PR-level bot identity, or a ruleset bypass actor -- not by re-reading forgeable fields here.
+    """
+    job = _jobs(_load(WORKFLOW_DIR / "main-source-guard.yml"))["source-is-dev"]
+    step = next(s for s in _steps(job) if "run" in s)
+    script = step["run"]
+    env = step.get("env") or {}
+
+    # the commit lookup is the shape of every defeated attempt: resolve the head sha, read identity
+    # fields off it, exit 0 on a match. no token, no sha, no lookup.
+    for token in ("GH_TOKEN", "GITHUB_TOKEN"):
+        assert token not in env, (
+            f"the guard needs no API token; {token} implies a commit lookup was reintroduced. "
+            f"env: {env!r}"
+        )
+    assert "HEAD_SHA" not in env, (
+        f"the guard must not resolve the head commit -- its metadata is forgeable. env: {env!r}"
+    )
+    for forgeable in ("author", "committer", "verification", "verified"):
+        assert forgeable not in script, (
+            f"the guard script references {forgeable!r}, which reads commit metadata a contents-api "
+            "caller controls. bot provenance cannot be established from the commit."
+        )
+    assert "dependabot" not in script, (
+        "the guard script names dependabot, so a carve-out was reintroduced. dependabot targets "
+        "`dev` here and this job never runs on its PRs; the exemption is unnecessary and unsafe."
+    )
+
+
 def test_workflows_that_touch_shared_resources_are_upstream_only():
     """A fork must not run the jobs that publish, push images, or spend GPU money.
 

@@ -22,7 +22,32 @@ def _estimate_params(cfg) -> float:
 
 
 def _liger_default_for_model(model_id: str, revision: str = "") -> bool:
-    """Return True if the model is large enough for Liger's fused-CE to be a net win."""
+    """Return True if the model is large enough for Liger's fused-CE to be a net win.
+
+    A cataloged model answers from its own ``params_b`` rather than the config probe below. The
+    probe reconstructs a parameter count as ``embeddings + 12 h^2 per layer``, which describes a
+    DENSE transformer: it cannot see an expert stack, so it reads Qwen3.6-35B-A3B (35B total) as
+    3.03B -- 1% over this threshold, on a model that clears it 11x over. Nothing about that margin
+    is load-bearing, and it decides gradient checkpointing (``_memory_mode``), so a catalog whose
+    vocab or depth shifted slightly would silently turn GC off on a 35B model.
+
+    The probe is also fail-open for this caller: it returns False on ANY exception, and False here
+    means "small model, no checkpointing needed". A network blip or a rate-limited HF read would
+    therefore disable gradient checkpointing on a 35B model and OOM the run. The catalog is local,
+    exact, and always available, so it answers first; the probe remains for uncataloged models,
+    which is the supported way to fork the catalog and add one.
+
+    Resolved through ``resolve_params_b``, the shared worker/cost accessor, so this gate can never
+    disagree with the size the allocator and the VRAM equations use. Called without a revision on
+    purpose: a pinned commit resolves size by fetching the HF safetensors index, which is the
+    network read this short-circuit exists to avoid, and no cataloged model sits near enough to the
+    3B threshold for the +/-5% revision tolerance to change this answer.
+    """
+    from flash.engine.plan.vram import resolve_params_b
+
+    catalog_params_b = resolve_params_b(model_id)
+    if catalog_params_b is not None:
+        return catalog_params_b >= _LIGER_MIN_PARAMS_B
     try:
         from transformers import AutoConfig
 

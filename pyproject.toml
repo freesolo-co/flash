@@ -1,6 +1,6 @@
 [project]
 name = "freesolo-flash"
-version = "1.1.41"
+version = "1.1.45"
 description ="Flash — managed LoRA post-training (SFT/GRPO/OPD) for Freesolo environments, driven by the `flash` CLI"
 readme = "README.md"
 # RunPod Flash supports Python 3.11-3.12 (not 3.13 yet).
@@ -77,7 +77,11 @@ server = [
 dev = [
     "mypy>=1.13.0",
     "pytest>=9.0.3",
-    "ruff>=0.6",
+    # Upper bound tracks uv.lock (ruff 0.16.x), which is what CI lints with. Without it, an
+    # install that ignores the lockfile (`uv pip install -e '.[dev]'`, plain pip) resolves whatever
+    # ruff is newest, whose added rules fail on a tree CI calls clean. Raise both sites together
+    # with the lockfile, never ahead of it.
+    "ruff>=0.6,<0.17",
     "fastapi",
     "uvicorn",
     "runpod-flash",
@@ -127,7 +131,7 @@ artifacts = ["flash/py.typed"]
 # auto-published by .github/workflows/publish-dev.yml: a push to `dev` whose version isn't yet on
 # PyPI publishes it; pushes that don't change it find it already published and no-op. So cutting a
 # dev-channel release = bump this (and [project].version) and merge to `dev`.
-version = "1.1.41"
+version = "1.1.45"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -152,7 +156,8 @@ package = true
 dev = [
     "mypy>=1.13.0",
     "pytest>=9.0.3",
-    "ruff>=0.6",
+    # Keep in lockstep with the `dev` extra above and with uv.lock.
+    "ruff>=0.6,<0.17",
     # Offline worker/env tests import these without the heavy `gpu` stack; the CI test env
     # (`--extra server --dev`) gets httpx + huggingface-hub from the `server` extra.
     "datasets>=2.19",
