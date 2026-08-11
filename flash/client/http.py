@@ -20,6 +20,25 @@ from flash.serve.urls import is_freesolo_hosted_url
 
 ProgressCallback = Callable[[int, int], None]
 
+# One accepted shape for a required response value: a type, a tuple of accepted types, or a
+# one-element list ``[element_spec]`` meaning "a list whose every element matches element_spec".
+RequireSpec = type | tuple[type, ...] | list[Any]
+
+
+def _matches_require(value: object, expected: RequireSpec) -> bool:
+    """True when a required response value has a shape the caller can actually read.
+
+    ``[dict]`` exists because a bare ``list`` accepts ``{"runs": [null]}``, which then crashes on
+    element access in the caller instead of surfacing as a ``ClientError``. bool subclasses int,
+    so a json true/false would satisfy an int requirement and flow into arithmetic; it counts as
+    malformed unless bool is itself expected.
+    """
+    if isinstance(expected, list):
+        (element,) = expected
+        return isinstance(value, list) and all(_matches_require(item, element) for item in value)
+    wants_bool = expected is bool or (isinstance(expected, tuple) and bool in expected)
+    return isinstance(value, expected) and (wants_bool or not isinstance(value, bool))
+
 
 class ClientError(RuntimeError):
     """Expected client-side errors (no key, unreachable server) — printed cleanly."""
@@ -511,7 +530,7 @@ class ApiClient:
         raw: bytes,
         content_type: str = "",
         *,
-        require: Mapping[str, type | tuple[type, ...]] | None = None,
+        require: Mapping[str, RequireSpec] | None = None,
     ) -> Any:
         """Parse a 2xx body and require the top-level keys, and value types, the caller reads.
 
@@ -521,7 +540,9 @@ class ApiClient:
 
         The type is required alongside the key because a present-but-unusable value is the same
         user state: ``{"logs": "x", "offset": null}`` passes a presence check and then raises a
-        bare ``TypeError`` out of ``int(None)``, which nothing in the CLI translates either.
+        bare ``TypeError`` out of ``int(None)``, which nothing in the CLI translates either. A
+        ``[dict]`` spec extends that one level into a list, because ``{"runs": [null]}`` is the
+        same story one element down.
         """
         try:
             payload = json.loads(raw) if raw else {}
@@ -536,14 +557,7 @@ class ApiClient:
             for key, expected in (require or {}).items()
             if not isinstance(payload, dict)
             or key not in payload
-            or not isinstance(payload[key], expected)
-            # bool subclasses int, so a json true/false would satisfy an int requirement and
-            # then flow into arithmetic; treat it as malformed unless bool is itself expected.
-            or (
-                isinstance(payload[key], bool)
-                and bool is not expected
-                and not (isinstance(expected, tuple) and bool in expected)
-            )
+            or not _matches_require(payload[key], expected)
         ]
         if bad:
             raise _unexpected_response(
@@ -562,7 +576,7 @@ class ApiClient:
         timeout: float | None = None,
         progress: ProgressCallback | None = None,
         extra_headers: dict[str, str] | None = None,
-        require: Mapping[str, type | tuple[type, ...]] | None = None,
+        require: Mapping[str, RequireSpec] | None = None,
     ) -> Any:
         headers = {
             "Content-Type": "application/json",
@@ -730,7 +744,7 @@ class ApiClient:
         return self._request("POST", "/v1/runs", body=body, require={"run_id": str})
 
     def list_runs(self) -> list[dict]:
-        return self._request("GET", "/v1/runs", require={"runs": list})["runs"]
+        return self._request("GET", "/v1/runs", require={"runs": [dict]})["runs"]
 
     def get_run(self, run_id: str) -> dict:
         return self._request("GET", f"/v1/runs/{run_id}")
@@ -794,7 +808,7 @@ class ApiClient:
     def checkpoints(self, run_id: str) -> list[dict]:
         """Deployable per-step RL checkpoints for a run (serve one with `flash models deploy RUN/step-N`)."""
         return self._request(
-            "GET", f"/v1/runs/{run_id}/checkpoints", require={"checkpoints": list}
+            "GET", f"/v1/runs/{run_id}/checkpoints", require={"checkpoints": [dict]}
         )["checkpoints"]
 
     def deploy(
@@ -833,7 +847,7 @@ class ApiClient:
 
     def deployments(self, timeout: float | None = None) -> list[dict]:
         return self._request(
-            "GET", "/v1/deployments", timeout=timeout, require={"deployments": list}
+            "GET", "/v1/deployments", timeout=timeout, require={"deployments": [dict]}
         )["deployments"]
 
     def deployment_for(self, run_id: str, timeout: float | None = None) -> dict | None:

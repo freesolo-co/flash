@@ -1058,6 +1058,34 @@ def test_present_but_unusable_values_are_client_errors_too():
     ):
         ApiClient(url, "fslo-user-test", timeout=5).get_logs("r1")
     assert "'offset'" in str(caught.value)
+
+
+def test_unusable_elements_inside_a_required_list_are_client_errors_too():
+    """A list of the wrong elements passes a bare `list` check and then crashes one level down:
+    `cmd_runs` sorts `{"runs": [null]}` straight into an AttributeError nothing translates."""
+    for body, key, call in [
+        (b'{"runs": [null]}', "runs", lambda c: c.list_runs()),
+        (b'{"runs": [{}, "x"]}', "runs", lambda c: c.list_runs()),
+        (b'{"checkpoints": [null]}', "checkpoints", lambda c: c.checkpoints("r1")),
+        (b'{"deployments": [null]}', "deployments", lambda c: c.deployments()),
+    ]:
+        with (
+            _fixed_2xx_server("application/json", body) as url,
+            pytest.raises(ClientError) as caught,
+        ):
+            call(ApiClient(url, "fslo-user-test", timeout=5))
+        message = str(caught.value)
+        assert "returned an unexpected response shape" in message
+        assert repr(key) in message
+        assert "rather than at a proxy or another service" in message
+
+
+def test_healthy_lists_of_objects_still_pass_the_element_check():
+    """The element check must not reject the shape the plane actually returns, empty included."""
+    with _fixed_2xx_server("application/json", b'{"runs": [{"id": "r1"}]}') as url:
+        assert ApiClient(url, "fslo-user-test", timeout=5).list_runs() == [{"id": "r1"}]
+    with _fixed_2xx_server("application/json", b'{"runs": []}') as url:
+        assert ApiClient(url, "fslo-user-test", timeout=5).list_runs() == []
     # bool subclasses int, so a json true would otherwise satisfy the int requirement and
     # flow into offset arithmetic.
     with (
