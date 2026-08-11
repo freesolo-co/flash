@@ -191,7 +191,7 @@ def capability_limits_for_spec(spec: JobSpec) -> dict[str, int]:
     from flash.engine.plan.vram import opd_completion_len
 
     steps = int(spec_steps(spec))
-    prompts_per_step = int(spec.train.batch_size or RECIPE.opd.prompts_per_step)
+    prompts_per_step = int(spec.train.prompts_per_step or RECIPE.opd.prompts_per_step)
     group_size = int(spec.train.group_size or RECIPE.opd.group_size)
     base_items = steps * max(1, prompts_per_step) * max(1, group_size)
     multi_turn, max_turns = configured_opd_turn_limit(spec.environment)
