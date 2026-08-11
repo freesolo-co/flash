@@ -140,6 +140,11 @@ def _spec_with_gpu(spec: JobSpec, gpu_type: str, gpu_count: int = 0) -> JobSpec:
         return spec
     d = spec.to_internal_dict()
     d["gpu"] = {**d["gpu"], "type": gpu_type, "count": count}
+    # the auto marker is deliberately NOT cleared here. it records that the author omitted
+    # gpu.count, which stays true once a shape is resolved onto the spec, and it is the only
+    # surviving record of that: the public halves of an auto-sized and an authored single-card run
+    # are byte-identical. clearing it made a recovered auto-sized run re-allocate hard-pinned to one
+    # card. consumers that mean "auto-size now" check for an unresolved shape alongside the marker.
     return JobSpec.from_dict(d)
 
 

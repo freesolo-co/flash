@@ -24,6 +24,73 @@ from flash.server.platform import db as _db_mod
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
+
+def _env_package_b64() -> str:
+    """A real base64 `.tar.gz` holding `environment.py`.
+
+    The route validates and decodes the package before it decides anything else, so a publish
+    test cannot pass a placeholder string: stubbing `publish_package` skips the upload, not the
+    input contract. Built here rather than hardcoded so it stays a genuinely valid archive.
+    """
+    import base64
+    import gzip
+    import io
+    import tarfile
+
+    # mtime=0 throughout: gzip embeds a timestamp, so the default makes this bytes-unstable
+    # between processes. Not a test id today, but a payload that differs per xdist worker is a
+    # trap waiting for whoever parametrizes over it.
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as tar:
+        body = b"# test environment\n"
+        info = tarfile.TarInfo("environment.py")
+        info.size = len(body)
+        info.mtime = 0
+        tar.addfile(info, io.BytesIO(body))
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz:
+        gz.write(raw.getvalue())
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+ENV_PACKAGE_B64 = _env_package_b64()
+
+
+def stub_publish_package_failing_on_write(message: str, slug: str = "acme/env"):
+    """A `publish_package` stub that runs the pre-write hook and fails only if the write happens.
+
+    Asserting "the guard blocked this" needs the guard to actually run. A stub that raises
+    immediately would pass whether or not the route ever consulted the guard, since it never
+    reaches the hook the guard now lives in.
+    """
+
+    def _publish(*, package_b64, name, key, before_write=None):
+        if before_write is not None:
+            before_write(slug)
+        pytest.fail(message)
+
+    return _publish
+
+
+def stub_publish_package(slug: str, *, record: list | None = None):
+    """A `publish_package` replacement that still honours the pre-write hook.
+
+    The route gates the destination through `before_write`, which the real implementation fires
+    after validating the package and immediately before writing. A stub that ignores the hook
+    silently disables that gate, so a test asserting "the guard blocked this" would pass no
+    matter what the guard did.
+    """
+
+    def _publish(*, package_b64, name, key, before_write=None):
+        if before_write is not None:
+            before_write(slug)
+        if record is not None:
+            record.append({"package_b64": package_b64, "name": name, "key": key})
+        return slug
+
+    return _publish
+
+
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "project": "11111111-1111-4111-8111-111111111111",
@@ -140,6 +207,16 @@ def api(tmp_path, monkeypatch):
         environment_registry_mod,
         "record_published_environment",
         lambda **_kwargs: True,
+    )
+    # The publish path's pre-upload ownership check is a second network choke-point: it urllib-POSTs
+    # the backend's validate endpoint, and FREESOLO_BASE_URL defaults to the production host. It
+    # swallows OSError by design (an unreachable backend must not block publishing), so a live call
+    # from this suite would pass silently instead of failing -- stub it like the reporters above.
+    monkeypatch.setattr(
+        environment_registry_mod,
+        "raise_if_owned_by_another_project",
+        lambda **_kwargs: None,
+        raising=False,
     )
     with TestClient(app_mod.create_app()) as client:
         yield client
@@ -343,7 +420,7 @@ def test_project_validation_blocks_before_environment_publication(api, monkeypat
         headers=_bearer(_login()),
         json={
             "name": "env",
-            "package_b64": "payload",
+            "package_b64": ENV_PACKAGE_B64,
             "project_id": "11111111-1111-4111-8111-111111111111",
         },
     )
@@ -429,13 +506,13 @@ def test_internal_publish_uses_internal_project_validation_endpoint(api, monkeyp
     import flash.server.domain.envs as envs_mod
 
     requests = _install_real_internal_project_validation(monkeypatch)
-    monkeypatch.setattr(envs_mod, "publish_package", lambda **_kwargs: "org-test/env")
+    monkeypatch.setattr(envs_mod, "publish_package", stub_publish_package("org-test/env"))
     monkeypatch.setattr(registry, "record_published_environment", lambda **_kwargs: True)
 
     response = api.post(
         "/v1/envs",
         headers=_bearer("fslo-internal-test"),
-        json={"name": "env", "package_b64": "payload", "project_id": SPEC["project"]},
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
     )
 
     assert response.status_code == 200, response.text
@@ -6378,6 +6455,40 @@ def test_deploy_ignores_stored_training_gpu(api, monkeypatch):
     assert "gpu_name" not in seen["deploy_kwargs"]
 
 
+def test_deploy_works_the_same_whether_or_not_gpu_count_was_authored(api, monkeypatch):
+    """Deploy must not depend on whether the author wrote gpu.count.
+
+    `gpu_count_auto` was briefly added to the digest-verified set in `effective_spec_from_status`.
+    The digest covers the whole public spec including `gpu.type`, which the allocator legitimately
+    rewrites onto the stored status when a run is provisioned -- so gating on the marker made an
+    ordinary provisioned run fail integrity validation at deploy. An omitted count is the DEFAULT,
+    so that was nearly every run. These two specs differ only in that one authors `gpu.count = 1`.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    def fake_start(target, *args, **kwargs):
+        kwargs["deploy_lock"].release()
+        return False
+
+    monkeypatch.setattr(app_mod, "start_deployment_job", fake_start)
+
+    for gpu_section in ({}, {"count": 1}):
+        key = _login()
+        spec = {**SPEC, "gpu": gpu_section}
+        run_id = api.post(
+            "/v1/runs", json={"spec": spec, "dry_run": True}, headers=_bearer(key)
+        ).json()["run_id"]
+        status = runner.get_status(run_id)
+        status.state = "done"
+        # the allocator writes the class it actually rented onto the public status.
+        status.spec["gpu"]["type"] = "H200"
+        runner._save_status(status)
+
+        resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+        assert resp.status_code == 200, f"gpu={gpu_section!r} deploy failed: {resp.text}"
+
+
 def test_deploy_missing_run_level_adapter_points_at_checkpoint_steps(api, monkeypatch):
     """A run whose finalize never published the run-level <prefix>/adapter (but which streamed
     per-step deployable checkpoints) must not fail run-level deploy with an opaque 502 rank
@@ -8637,13 +8748,10 @@ def test_publish_env_ignores_legacy_is_new(api, monkeypatch):
 
     import flash.server.domain.envs as envs_mod
 
-    seen: dict = {}
-
-    def fake_publish_package(*, package_b64, name, key):
-        seen.update(package_b64=package_b64, name=name, key=key)
-        return "key-1/e"
-
-    monkeypatch.setattr(envs_mod, "publish_package", fake_publish_package)
+    captured: list = []
+    monkeypatch.setattr(
+        envs_mod, "publish_package", stub_publish_package("key-1/e", record=captured)
+    )
 
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
@@ -8667,6 +8775,8 @@ def test_publish_env_ignores_legacy_is_new(api, monkeypatch):
         },
     )
     assert resp.status_code == 200, resp.text
+    assert len(captured) == 1
+    seen = captured[0]
     assert seen["name"] == "e"
     assert seen["package_b64"] == pkg
     assert seen["key"]["org_slug"].startswith("org-")
@@ -8682,7 +8792,7 @@ def test_publish_env_forwards_project_id_to_registry(api, monkeypatch):
     import flash.server.domain.environment_registry as registry_mod
     import flash.server.domain.envs as envs_mod
 
-    monkeypatch.setattr(envs_mod, "publish_package", lambda *, package_b64, name, key: "key-1/e")
+    monkeypatch.setattr(envs_mod, "publish_package", stub_publish_package("key-1/e"))
 
     recorded: list[dict] = []
     monkeypatch.setattr(
@@ -8750,7 +8860,7 @@ def test_publish_env_returns_502_when_association_record_returns_false(api, monk
     response = api.post(
         "/v1/envs",
         headers=_bearer(_login()),
-        json={"name": "env", "package_b64": "payload", "project_id": SPEC["project"]},
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
     )
 
     assert response.status_code == 502
@@ -8784,7 +8894,7 @@ def test_publish_env_returns_502_when_association_record_raises(api, monkeypatch
     response = api.post(
         "/v1/envs",
         headers=_bearer(_login()),
-        json={"name": "env", "package_b64": "payload", "project_id": SPEC["project"]},
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
     )
 
     assert response.status_code == 502
@@ -8816,7 +8926,7 @@ def test_publish_env_retry_repairs_association_after_false_ack(api, monkeypatch)
     )
     request = {
         "headers": _bearer(_login()),
-        "json": {"name": "env", "package_b64": "payload", "project_id": SPEC["project"]},
+        "json": {"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
     }
 
     first = api.post("/v1/envs", **request)
@@ -8826,6 +8936,339 @@ def test_publish_env_retry_repairs_association_after_false_ack(api, monkeypatch)
     assert second.status_code == 200, second.text
     assert second.json() == {"id": "acme/env"}
     assert uploads == ["acme/env", "acme/env"]
+
+
+def test_publish_env_reports_a_cross_project_name_conflict_without_uploading(api, monkeypatch):
+    """A name owned by another project must fail BEFORE the hub write, with the real cause.
+
+    Two defects in one: publishing replaces the whole `<org-slug>/<name>` hub directory, so
+    uploading first would destroy the other project's package on the way to failing; and the
+    old message blamed association *recording* and told the user to retry, which reproduces
+    the failure identically because names are unique per org.
+    """
+    import flash.server.domain.environment_registry as registry
+    import flash.server.domain.envs as envs_mod
+
+    monkeypatch.setattr(
+        registry,
+        "raise_if_owned_by_another_project",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            registry.EnvironmentProjectConflict("flash environment belongs to another project")
+        ),
+    )
+    monkeypatch.setattr(
+        envs_mod,
+        "publish_package",
+        stub_publish_package_failing_on_write(
+            "a name conflict must not upload over the other project"
+        ),
+    )
+
+    response = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
+    )
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert "already belongs to a different project" in detail
+    assert "unique per organization" in detail
+    # the two ways the old message misled: it must not blame recording, nor advise a retry.
+    assert "could not be recorded" not in detail
+    assert "retry" not in detail.lower().replace("retrying will not change this", "")
+
+
+def test_publish_env_refuses_to_upload_when_the_org_cannot_be_resolved(api, monkeypatch):
+    """An org-id-less key must not bypass the guard and overwrite the hub anyway.
+
+    Auth requires only `org_slug`, so a key can authenticate with no `org_id`. The hub path is
+    namespaced by the SLUG, so such a publish still replaces `<org-slug>/<name>` -- while having
+    no org id to check ownership with. Gating the guard on the org id alone would skip it and
+    clobber the other project, then answer with the old misleading 502.
+    """
+    import flash.server.domain.envs as envs_mod
+    import flash.server.platform.deps as deps
+
+    monkeypatch.setitem(
+        api.app.dependency_overrides,
+        deps.require_key,
+        lambda: {"org_slug": "acme", "user_id": "u1", "api_key_id": "k1", "auth_kind": "user"},
+    )
+    monkeypatch.setattr(
+        envs_mod,
+        "publish_package",
+        stub_publish_package_failing_on_write("an unverifiable org must not reach the hub write"),
+    )
+
+    response = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
+    )
+
+    assert response.status_code == 400, response.text
+    detail = response.json()["detail"]
+    assert "organization could not be resolved" in detail
+    # The remedy named must be one that works. The guard reads the KEY's org id and ignores the
+    # header, so advising the caller to "pass the organization" would be another unactionable
+    # instruction -- the same defect (advice that cannot clear the error) this PR exists to remove.
+    assert "flash login" in detail
+    assert "pass the organization" not in detail
+
+
+def test_publish_env_ignores_the_org_header_for_the_ownership_guard(api, monkeypatch):
+    """`X-Freesolo-Org-Id` must not decide WHERE ownership is checked.
+
+    For a user key `require_project_access` validates the project against `key["org_id"]` and
+    ignores this header, so it is caller-asserted. Trusting it in the guard would look the slug
+    up in an org the caller named while the hub path stays namespaced by the key's own slug: a
+    non-matching id finds nothing, the backend answers 404 rather than 409, and the colliding
+    write proceeds -- exactly the clobber this guard exists to stop.
+    """
+    import flash.server.domain.envs as envs_mod
+    import flash.server.platform.deps as deps
+    from flash.server.domain import environment_registry as registry_mod
+
+    monkeypatch.setitem(
+        api.app.dependency_overrides,
+        deps.require_key,
+        lambda: {"org_slug": "acme", "user_id": "u1", "api_key_id": "k1", "auth_kind": "user"},
+    )
+    checked_orgs: list = []
+
+    def _guard(**kwargs):
+        checked_orgs.append(kwargs.get("org_id"))
+
+    monkeypatch.setattr(registry_mod, "raise_if_owned_by_another_project", _guard)
+    monkeypatch.setattr(
+        envs_mod,
+        "publish_package",
+        stub_publish_package_failing_on_write(
+            "a caller-asserted org must not authorize the hub write"
+        ),
+    )
+
+    response = api.post(
+        "/v1/envs",
+        headers={**_bearer(_login()), "X-Freesolo-Org-Id": "org-caller-supplied"},
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
+    )
+
+    assert response.status_code == 400, response.text
+    assert "organization could not be resolved" in response.json()["detail"]
+    assert checked_orgs == [], f"guard consulted a caller-supplied org: {checked_orgs}"
+
+
+def test_publish_env_checks_ownership_for_an_internal_key_using_the_validated_header(
+    api, monkeypatch
+):
+    """The internal key must reach the guard too, using the org header auth already validated.
+
+    The header is caller-asserted for a USER key and deliberately ignored there, but for the
+    internal key `require_project_access` REQUIRES it (400 without) and validates the project
+    against it -- so by the time the guard runs it is established fact, and it is the only org
+    this key has. Skipping the guard for internal keys left the platform's own publish path with
+    the exact destructive behaviour this PR exists to remove: it overwrote the other project's
+    hub directory and only then returned a conflict.
+    """
+    import flash.server.domain.envs as envs_mod
+    import flash.server.platform.deps as deps
+    from flash.server.domain import environment_registry as registry_mod
+    from flash.server.domain import projects as projects_mod
+
+    monkeypatch.setitem(
+        api.app.dependency_overrides,
+        deps.require_key,
+        # No `org_id`: the internal key is org-agnostic, which is why it must use the header.
+        lambda: {"org_slug": "acme", "auth_kind": "internal"},
+    )
+    monkeypatch.setattr(projects_mod, "require_project_access", lambda **_kwargs: SPEC["project"])
+
+    checked_orgs: list = []
+
+    def _guard(**kwargs):
+        checked_orgs.append(kwargs.get("org_id"))
+        raise registry_mod.EnvironmentProjectConflict("owned by another project")
+
+    monkeypatch.setattr(registry_mod, "raise_if_owned_by_another_project", _guard)
+    monkeypatch.setattr(
+        envs_mod,
+        "publish_package",
+        stub_publish_package_failing_on_write(
+            "an internal-key name conflict must not upload over the other project"
+        ),
+    )
+
+    response = api.post(
+        "/v1/envs",
+        headers={**_bearer(_login()), "X-Freesolo-Org-Id": "org-validated"},
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "already belongs to a different project" in response.json()["detail"]
+    assert checked_orgs == ["org-validated"], (
+        f"internal key skipped the guard or used the wrong org: {checked_orgs}"
+    )
+
+
+def _b64_targz(members: dict[str, bytes]) -> str:
+    """Deterministic base64 `.tar.gz`.
+
+    `mtime=0` on both the gzip stream and its members matters: gzip embeds a timestamp, so the
+    default would make this string differ between xdist workers. Since it is a parametrize
+    argument, that lands in the test id and pytest aborts the whole run with "Different tests
+    were collected between gw0 and gw1".
+    """
+    import base64
+    import gzip
+    import io
+    import tarfile
+
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as tar:
+        for nm, content in members.items():
+            info = tarfile.TarInfo(nm)
+            info.size = len(content)
+            info.mtime = 0
+            tar.addfile(info, io.BytesIO(content))
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz:
+        gz.write(raw.getvalue())
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+@pytest.mark.parametrize(
+    ("package", "message"),
+    [
+        # decodes as base64 but is not a gzip stream at all
+        pytest.param("bm90IGEgdGFyYmFsbCBhdCBhbGw=", "could not be extracted", id="not-a-gzip"),
+        # a valid archive that is missing the required entrypoint
+        pytest.param(
+            _b64_targz({"readme.txt": b"nope"}),
+            "must contain environment.py",
+            id="no-entrypoint",
+        ),
+    ],
+)
+def test_publish_env_validates_the_archive_before_checking_ownership(
+    api, monkeypatch, package, message
+):
+    """Base64-valid but structurally invalid packages keep their own 400.
+
+    `validate_publish_inputs` only decodes; a payload can survive that and still be a corrupt
+    archive or lack `environment.py`. Those errors live deeper in the publish, so the ownership
+    guard has to run after them -- otherwise a colliding destination answers a package that could
+    never be published with a conflict, and consults the backend to do it.
+    """
+    from flash.server.domain import environment_registry as registry_mod
+
+    def _conflict(**_kwargs):
+        pytest.fail("ownership must not be consulted for a package that cannot be published")
+
+    monkeypatch.setattr(registry_mod, "raise_if_owned_by_another_project", _conflict)
+    monkeypatch.setenv("GITHUB_TOKEN", "token-for-publish-path")
+
+    response = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": "env", "package_b64": package, "project_id": SPEC["project"]},
+    )
+
+    assert response.status_code == 400, response.text
+    assert message in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "status", "message"),
+    [
+        ("name", "", 400, "missing env name"),
+        ("package_b64", False, 400, "must be a base64 string"),
+        ("package_b64", "!!!!", 400, "not valid base64"),
+        ("package_b64", "", 400, "empty env package"),
+    ],
+)
+def test_publish_env_validates_inputs_before_checking_ownership(
+    api, monkeypatch, field, value, status, message
+):
+    """An unpublishable request keeps its own deterministic error.
+
+    The ownership pre-check runs early enough to preempt the payload checks, so a colliding
+    destination would answer a malformed request with 409 -- replacing the 400/413 the inputs
+    earn -- and would contact the backend for a publish that could never happen.
+    """
+    from flash.server.domain import environment_registry as registry_mod
+
+    def _conflict(**_kwargs):
+        pytest.fail("ownership must not be consulted for a request that cannot be published")
+
+    monkeypatch.setattr(registry_mod, "raise_if_owned_by_another_project", _conflict)
+
+    body = {"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]}
+    body[field] = value
+    response = api.post("/v1/envs", headers=_bearer(_login()), json=body)
+
+    assert response.status_code == status, response.text
+    assert message in response.json()["detail"].lower()
+
+
+def test_publish_env_reports_an_invalid_name_as_a_type_error_not_a_conflict(api, monkeypatch):
+    """A malformed name must not be answered with a conflict about an unrelated environment.
+
+    A non-string name sanitizes to the generic "env", so checking ownership of that slug before
+    validating the type would answer `name=0` with a 409 naming `<org>/env` -- a different
+    environment the caller never asked for -- instead of the deterministic 400.
+    """
+    import flash.server.domain.environment_registry as registry
+
+    # The org owns the sanitized "<ns>/env" slug under a different project. The real
+    # publish_package runs: its type check is what must answer, not this conflict.
+    monkeypatch.setattr(
+        registry,
+        "raise_if_owned_by_another_project",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            registry.EnvironmentProjectConflict("flash environment belongs to another project")
+        ),
+    )
+
+    response = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": 0, "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
+    )
+
+    assert response.status_code == 400, response.text
+    assert "name must be a string" in response.json()["detail"].lower()
+
+
+def test_publish_env_maps_a_late_ownership_conflict_to_409(api, monkeypatch):
+    """Losing the race to a concurrent publish is still an ownership conflict, not a 502.
+
+    The pre-check can pass and the association still be refused (another publish landed in
+    between, or the pre-check could not reach the backend). The cause is unchanged, so the
+    answer must be too -- otherwise the same conflict yields retry advice by timing alone.
+    """
+    import flash.server.domain.environment_registry as registry
+    import flash.server.domain.envs as envs_mod
+
+    monkeypatch.setattr(registry, "raise_if_owned_by_another_project", lambda **_kwargs: None)
+    monkeypatch.setattr(envs_mod, "publish_package", stub_publish_package("acme/env"))
+
+    def conflict(**_kwargs):
+        raise registry.EnvironmentProjectConflict("flash environment belongs to another project")
+
+    monkeypatch.setattr(registry, "record_published_environment", conflict)
+
+    response = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "already belongs to a different project" in response.json()["detail"]
+    assert "could not be recorded" not in response.json()["detail"]
 
 
 def test_publish_env_falsy_non_string_fields_are_not_coerced(api):
