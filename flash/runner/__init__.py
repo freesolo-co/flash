@@ -387,9 +387,17 @@ def _status_guard(run_id: str):
 
 
 def _with_model_disk(spec: JobSpec, info: ModelInfo) -> dict:
-    """Spec dict with gpu.disk_gb raised to the model's catalog min_disk_gb."""
+    """Spec dict with gpu.disk_gb raised to the model's catalog min_disk_gb and the image floor.
+
+    Both floors are raise-only maxima, applied here rather than at any provider so the sized disk is
+    what the quote, the capacity search, and every provider payload all see. The catalog floor sizes
+    the MODEL; the image floor sizes a custom FLASH_WORKER_IMAGE, whose extraction footprint the
+    catalog cannot know and which no user can author around ([gpu] disk_gb is platform-managed).
+    """
+    from flash.providers._lifecycle.worker import worker_image_disk_floor
+
     d = spec.to_internal_dict()
-    need = int(getattr(info, "min_disk_gb", 0) or 0)
+    need = max(int(getattr(info, "min_disk_gb", 0) or 0), worker_image_disk_floor())
     if need > int(d["gpu"].get("disk_gb") or 0):
         d["gpu"] = {**d["gpu"], "disk_gb": need}
     return d

@@ -420,8 +420,15 @@ def _prepared_sft_profile_job(spec: JobSpec, *, input_digest: str) -> PreparedJo
     The profile loads a tokenizer and the pinned environment, then exits. GPU type and provider pins
     are dropped: they describe where the training run must land, and inheriting them would rent an
     H100 to tokenize on cpu.
+
+    The model's disk sizing is dropped for the same reason -- nothing downloads the weights here --
+    but a custom worker image's disk floor is NOT: this job pulls the same FLASH_WORKER_IMAGE the
+    training run would, so an override too large for the default sizing would fail this job during
+    pull and block the sft submission behind it. This path never reaches ``_with_model_disk``, which
+    applies the floor for every other run, so it applies it itself.
     """
     from flash.engine.profiling.workload_profile import SFT_PROFILE_KIND, sft_profile_run_id
+    from flash.providers._lifecycle.worker import worker_image_disk_floor
 
     profile_spec = replace(
         spec,
@@ -431,7 +438,7 @@ def _prepared_sft_profile_job(spec: JobSpec, *, input_digest: str) -> PreparedJo
             type="",
             provider="",
             count=1,
-            disk_gb=_runner().GpuSpec.disk_gb,
+            disk_gb=max(_runner().GpuSpec.disk_gb, worker_image_disk_floor()),
             network_volume=None,
             max_wall_seconds=_runner()._WORKLOAD_PROFILE_WALL_SECONDS,
             max_retries=_runner()._WORKLOAD_PROFILE_MAX_RETRIES,

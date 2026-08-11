@@ -82,23 +82,28 @@ BAKED_PER_SM_ARCHES = frozenset({"sm80", "sm86", "sm89", "sm90", "sm120", "sm100
 
 @dataclass(frozen=True)
 class WorkerImageOverride:
-    """A worker-image override and the registry credential needed to pull it.
+    """A worker-image override, the registry credential needed to pull it, and its disk floor.
 
-    only auth remains here (#906): GPU class encodes the CUDA floor and each run owns
-    ``[gpu] disk_gb``. the credential cannot be derived from the image ref.
+    the CUDA floor is NOT here: the GPU class floor (min_cuda_modern) already encodes it and
+    admission consults it. the credential and the disk floor cannot be derived from the image ref.
     """
 
     image: str
     registry_auth_id: str = ""
+    disk_gb: int = 0
 
 
 def worker_image_override() -> WorkerImageOverride | None:
-    """Parse the FLASH_WORKER_IMAGE override and its registry credential.
+    """Parse the FLASH_WORKER_IMAGE override, its registry credential, and its disk floor.
 
-    The credential cannot be derived from the image ref, so it stays configurable. The image's CUDA
-    and disk floors are NOT configurable: the GPU class floor (min_cuda_modern) already encodes the
-    real constraint, and a run that needs more container disk sets ``[gpu] disk_gb`` in its own
-    spec, where the requirement is recorded with the run.
+    Neither the credential nor the image's on-disk footprint can be derived from the image ref, so
+    both stay configurable. The disk floor exists because the run's own ``[gpu] disk_gb`` cannot
+    carry it: that key is platform-managed (MANAGED_GPU_KEYS), so no user can author it, and the
+    sizing the runner assigns is derived from the CATALOG model, which knows nothing about a custom
+    image's extraction footprint. Without this an override larger than the computed sizing fails
+    during pull or extraction with no lever to raise it.
+
+    The CUDA floor is deliberately absent: the GPU class floor (min_cuda_modern) already encodes it.
     """
     image = os.environ.get("FLASH_WORKER_IMAGE", "").strip()
     if not image:
@@ -106,7 +111,39 @@ def worker_image_override() -> WorkerImageOverride | None:
     return WorkerImageOverride(
         image=image,
         registry_auth_id=os.environ.get("FLASH_WORKER_IMAGE_REGISTRY_AUTH", "").strip(),
+        disk_gb=_worker_image_disk_gb(),
     )
+
+
+def _worker_image_disk_gb() -> int:
+    """The FLASH_WORKER_IMAGE_DISK_GB floor, or 0 when unset.
+
+    A malformed or negative value is REFUSED rather than defaulted away. This knob exists to stop a
+    disk failure mid-pull; silently treating a typo as "no floor" would reinstate exactly the
+    failure the operator set it to prevent, and would do it on a paid box.
+    """
+    raw = os.environ.get("FLASH_WORKER_IMAGE_DISK_GB", "").strip()
+    if not raw:
+        return 0
+    try:
+        disk_gb = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"FLASH_WORKER_IMAGE_DISK_GB must be a non-negative integer, got {raw!r}"
+        ) from None
+    if disk_gb < 0:
+        raise ValueError(f"FLASH_WORKER_IMAGE_DISK_GB must be a non-negative integer, got {raw!r}")
+    return disk_gb
+
+
+def worker_image_disk_floor() -> int:
+    """Container disk GB the configured worker-image override requires, or 0 when there is none.
+
+    Returns 0 when no image override is set: the floor describes the OVERRIDE's footprint, so it
+    must not raise disk for runs on the published image.
+    """
+    override = worker_image_override()
+    return override.disk_gb if override else 0
 
 
 def worker_image_for_gpu(friendly_gpu: str | None, *, allow_default: bool = True) -> str | None:
