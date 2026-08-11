@@ -396,24 +396,30 @@ def _resolve_sft_world_size(gpu_count: int, train_batch_size: int, row_count: in
         #  - an unpacked profile pins the batch to 1 (`sft_workload` sets examples_per_update = 1
         #    for every non-packed mode), so "raise [train] batch_size" names a knob that cannot
         #    move this width at all.
-        #  - when the batch already divides the allocation, the ROWS are what bind, and raising
-        #    the batch again changes nothing.
+        #  - BOTH inputs have to divide the allocation to reach full width, so raising the batch
+        #    only helps when the rows ALREADY divide it. asking whether the batch divides it is the
+        #    wrong question: at 4 cards with a batch of 6 over 10 rows, neither divides, and every
+        #    multiple of 4 the batch could be raised to still resolves to 2 ranks because the 10
+        #    rows cannot be split 4 ways. name the dataset as the limiter there instead.
         #  - only powers of two are rentable, and the resolved width usually is not one. it cannot
         #    simply be re-resolved under a rentable ceiling either: `sft_data_parallel_cards`
         #    searches DOWNWARD for divisibility and lands back off the power-of-two grid, so at 7
         #    cards with a batch of 6 over 6 rows it would advise 3, which no provider sells. the
         #    advised width has to satisfy both constraints at once, so search the rentable shapes
         #    themselves and take the widest that divides the batch and the rows.
-        rows_bind = train_batch_size % gpu_count == 0
+        rows_fit = row_count == 0 or row_count % gpu_count == 0
+        batch_fits = train_batch_size % gpu_count == 0
+        # the batch is only worth naming when fixing it is sufficient, i.e. the rows already fit.
+        batch_helps = rows_fit and not batch_fits and train_batch_size > 1
         rentable = _widest_rentable_width(world_size, train_batch_size, row_count)
         limiter = (
-            f"a dataset of {row_count} rows" if rows_bind else f"a batch of {train_batch_size}"
+            f"a batch of {train_batch_size}" if batch_helps else f"a dataset of {row_count} rows"
         )
         remedy = (
-            f"allocate {rentable} card(s) instead"
-            if train_batch_size <= 1 or rows_bind
-            else f"raise [train] batch_size to a multiple of {gpu_count}, or allocate {rentable} "
-            "card(s) instead"
+            f"raise [train] batch_size to a multiple of {gpu_count}, or allocate {rentable} card(s) "
+            "instead"
+            if batch_helps
+            else f"allocate {rentable} card(s) instead"
         )
         print(
             f"[sft][warn] training on {world_size} of {gpu_count} allocated cards: {limiter} "

@@ -2315,10 +2315,30 @@ def test_sft_idle_card_warning_only_recommends_widths_that_actually_work():
     assert "batch_size" not in text, "rows bind here, so raising the batch cannot help"
     assert "allocate 2 card(s)" in text, text
 
-    # the batch binds, so the batch remedy is legitimate and must still be offered.
-    _, text = warn(4, 3, 9)
+    # the batch binds AND fixing it is sufficient (12 rows already divide 4), so the batch remedy
+    # is legitimate and must still be offered.
+    _, text = warn(4, 3, 12)
     assert "a batch of 3" in text, text
     assert "batch_size" in text, text
+
+    # neither divides: raising the batch cannot reach full width because the rows still will not
+    # split 4 ways, so name the dataset and the lower card count instead.
+    _, text = warn(4, 6, 10)
+    assert "a dataset of 10 rows" in text, text
+    assert "batch_size" not in text, "rows block full width too, so the batch remedy is a dead end"
+
+    # a batch remedy is only ever printed when acting on it actually restores the full allocation.
+    for cards in range(1, 9):
+        for batch in range(1, 17):
+            for rows in range(32):
+                _, text = warn(cards, batch, rows)
+                if "batch_size" not in text:
+                    continue
+                raised = cards * (batch // cards + 1)
+                assert sft_data_parallel_cards(cards, raised, rows) == cards, (
+                    f"advised raising batch to {raised} at {cards}/{batch}/{rows}, which still "
+                    "does not use every card"
+                )
 
     # every width this warning recommends must be BOTH rentable and usable. neither implies the
     # other: the rentable count need not divide the batch (4 cards, batch 3 -> 2, and 3 % 2 != 0),
