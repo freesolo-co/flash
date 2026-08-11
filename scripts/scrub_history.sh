@@ -301,7 +301,22 @@ HOST_CONTENT_ALT="$HOST_CONTENT_ALT|$(printf '%s' "$HOST_PLAIN" | sed 's/[.]/\\\
 #     discusses one is not a leak, and counting it would deadlock the gate forever) but
 #     wrong for these: an address or an internal hostname written into a commit message IS
 #     the leak, wherever in the message it sits.
-LEAK_STRINGS_RE="($ALIAS_ALT)|$HOST_CONTENT_ALT"
+#
+# "Wherever it sits" still means the COMPLETE address, though. An alias may be very short
+# (the test fixtures use "d@d"), and an unanchored alternation finds it inside unrelated
+# third-party addresses -- "todd@dell.com" contains "d@d". Both the blob rewrite and the
+# prose rewrite would then redact a stranger's identity out of historical content, which is
+# a worse outcome than the leak: the scrub would be silently corrupting history it was
+# never pointed at. So every alias match is bounded by characters that cannot continue an
+# address on either side. The bound is spelled twice because the two engines differ: ERE
+# (git --extended-regexp, grep -E) has no lookaround, so the counters consume a boundary
+# character or a line edge, while the Python rewrites use zero-width lookaround so `sub`
+# cannot eat the neighbours. The CLASS is shared, so the two agree on what a complete
+# address is -- and they must, since the counters are the gate over the rewrites: a
+# counter that matched more than the rewrite fixes would block publication forever.
+ALIAS_EDGE_CLASS='A-Za-z0-9._%+@-'
+ALIAS_WORD_ERE="(^|[^$ALIAS_EDGE_CLASS])($ALIAS_ALT)([^$ALIAS_EDGE_CLASS]|\$)"
+LEAK_STRINGS_RE="$ALIAS_WORD_ERE|$HOST_CONTENT_ALT"
 
 count_blob_leaks() {
   # Lines of file content, across every reachable blob, that still carry a scrubbed string.
@@ -413,7 +428,13 @@ export FLASH_SCRUB_HOST_RE="$LEAKED_HOST_RE"
 # the strings that must not survive ANYWHERE in a message, trailer or not. see
 # LEAK_STRINGS_RE: unlike the Claude patterns, these are secrets rather than a common word,
 # so a prose mention is a leak and the gate counts it as one.
-export FLASH_SCRUB_LEAK_STRINGS="$LEAK_STRINGS_RE"
+#
+# The two halves are exported SEPARATELY rather than as the assembled LEAK_STRINGS_RE,
+# because that one is the ERE spelling: its alias bound consumes a neighbouring character,
+# which is harmless for a counter but would make `sub` delete the neighbour along with the
+# address. The callback re-assembles the same meaning with lookaround. See ALIAS_WORD_ERE.
+export FLASH_SCRUB_HOST_CONTENT_ALT="$HOST_CONTENT_ALT"
+export FLASH_SCRUB_ALIAS_EDGE_CLASS="$ALIAS_EDGE_CLASS"
 
 # Blob-level redaction, for the copies of these strings that live in FILE CONTENT rather
 # than in an identity or a message. It is generated at runtime for the same reason the
@@ -423,10 +444,16 @@ export FLASH_SCRUB_LEAK_STRINGS="$LEAK_STRINGS_RE"
 # preserves whatever case a file was written with, and every other test in this script
 # lowercases before comparing. A literal lowercase entry would leave a mixed-case spelling
 # in the tree AND uncounted by the gate below.
+#
+# The alias entries carry the same complete-address bound as everywhere else, spelled with
+# lookaround because filter-repo compiles "regex:" entries with python's re and substitutes
+# them: a consuming bound would delete the neighbouring character out of the blob. Without
+# it a short alias redacts the middle of unrelated addresses in every reachable file.
 REPLACEMENTS="$WORKDIR/flash-scrub-replacements"
 {
   printf '%s' "$MAINTAINER_ALIAS_EMAILS" | tr ' ' '\n' | grep -v '^$' \
-    | sed 's/[][^$.|?*+(){}\]/\\&/g; s|^|regex:(?i)|; s|$|==>REDACTED|'
+    | sed 's/[][^$.|?*+(){}\]/\\&/g' \
+    | sed "s|^|regex:(?i)(?<![$ALIAS_EDGE_CLASS])|; s|\$|(?![$ALIAS_EDGE_CLASS])==>REDACTED|"
   # all three source spellings of the hostname, not just the fragment; see HOST_CONTENT_ALT.
   printf '%s' "$HOST_CONTENT_ALT" | tr '|' '\n' \
     | sed 's|^|regex:(?i)|; s|$|==>REDACTED|'
@@ -447,7 +474,19 @@ _host_re = os.environ["FLASH_SCRUB_HOST_RE"].encode()
 # every alias and every source spelling of the hostname, matched anywhere in the message.
 # applied LAST, so the trailer rewrite below still gets to fold a Co-authored-by line onto
 # the canonical identity rather than having its address redacted out from under it.
-_leak_strings = re.compile(rb"(?i)(?:" + os.environ["FLASH_SCRUB_LEAK_STRINGS"].encode() + rb")")
+#
+# The alias half is bounded to a COMPLETE address: a short alias like "d@d" otherwise
+# matches inside an unrelated "todd@dell.com" and this sub rewrites a third party out of
+# the message. Lookaround rather than the ERE bound the counters use, so the neighbouring
+# characters survive the substitution and so that adjacent aliases both match; the
+# character class is the same one the counters use, passed in, so gate and rewrite
+# cannot drift apart.
+_edge = os.environ["FLASH_SCRUB_ALIAS_EDGE_CLASS"].encode()
+_host_content_alt = os.environ["FLASH_SCRUB_HOST_CONTENT_ALT"].encode()
+_leak_strings = re.compile(
+    rb"(?i)(?:(?<![" + _edge + rb"])(?:" + _alias_alt + rb")(?![" + _edge + rb"])"
+    rb"|(?:" + _host_content_alt + rb"))"
+    )
 # the address must be the WHOLE bracketed value (anchored by "<" and ">"), so a longer
 # address that merely ends with an alias cannot match.
 _alias_trailer = re.compile(
