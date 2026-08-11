@@ -3445,3 +3445,26 @@ def test_login_ignores_the_identity_url_when_the_key_never_goes_there(monkeypatc
 
     warnings = cli.commands._plaintext_login_warnings("https://plane.example", None)
     assert warnings == [], warnings
+
+
+def test_hosted_key_rejection_names_the_url_that_rejected_it(monkeypatch):
+    """A 401 must name the service that answered, not only the key.
+
+    The same 401 is what a perfectly VALID key gets when the request reached the wrong issuer --
+    a stale saved `--api-url`, a leftover localhost from a self-hosted experiment, an overridden
+    FREESOLO_BASE_URL. A message that names only the key accuses the one input the user just
+    copied correctly and never shows the one that was actually wrong.
+    """
+    import urllib.error
+
+    from flash.client.http import ClientError, verify_freesolo_key
+
+    def _reject(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr("urllib.request.urlopen", _reject)
+    monkeypatch.setenv("FREESOLO_BASE_URL", "http://localhost:9999")
+
+    with pytest.raises(ClientError) as exc:
+        verify_freesolo_key("fs-key")
+    assert "localhost:9999" in str(exc.value)
