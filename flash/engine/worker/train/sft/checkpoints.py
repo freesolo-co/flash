@@ -188,20 +188,12 @@ class _VerlCheckpointWatcher:
             python_bin=self.python_bin,
         )
 
-        published = False
-
         def publish_adapter() -> None:
-            nonlocal published
-            # the returned subfolder is the durability signal, not the fact that the call returned:
-            # on an OPTIONAL step a failed upload is swallowed and reported as None, and treating
-            # that as published would delete the only copy of an adapter that never reached hf.
-            published = bool(
-                _w.publish_deployable_checkpoint(
-                    adapter_dir,
-                    step,
-                    required=step in self.required_steps,
-                    _provenance_ready=True,
-                )
+            _w.publish_deployable_checkpoint(
+                adapter_dir,
+                step,
+                required=step in self.required_steps,
+                _provenance_ready=True,
             )
 
         try:
@@ -211,17 +203,23 @@ class _VerlCheckpointWatcher:
                 before_upload=publish_adapter,
             )
         finally:
-            # once the adapter is durable on hf the local copy is redundant, and keeping every
-            # step's copy leaves one directory per save on the container disk for the whole run.
-            # gated on the publish having actually landed: `upload_resume_checkpoint` can also
-            # return before running `before_upload` at all, and an unpublished export is the one
-            # copy that still matters.
+            # the export is always dropped, whether or not it reached hf, because nothing in the sft
+            # path ever reads it again: `step` joins `processed_steps` below, `_pending` filters on
+            # that set, and no sweep or finalization walks `export_root`. keeping an unpublished
+            # adapter would preserve a directory that has no reader, so repeated optional-upload
+            # failures would accumulate one full adapter per save and recreate the disk exhaustion
+            # this class exists to bound.
             #
-            # safe here but NOT in the rl uploader, which keeps its staged adapters deliberately:
-            # `_publish_ready` republishes from `staged_steps` on later sweeps, so an export there
-            # outlives its first publish. sft finishes with the directory inside this one call.
-            if published:
-                shutil.rmtree(adapter_dir, ignore_errors=True)
+            # required steps do not rely on this copy either: `publish_deployable_checkpoint` raises
+            # rather than returning None when `required=True`, so a required step that failed to
+            # publish leaves via the exception path instead of continuing with a retained directory.
+            #
+            # not safe in the two sibling watchers, which keep their exports for a real reader. the
+            # rl uploader republishes from `staged_steps` on later sweeps
+            # (`train/rl/checkpoints.py`), and the opd watcher hands `adapter_dir` to
+            # `_stage_retry_contract` (`train/opd/failures.py`), so in both an export outlives the
+            # call that made it. sft finishes with the directory inside this one call.
+            shutil.rmtree(adapter_dir, ignore_errors=True)
         if step in self.required_steps and not uploaded:
             raise RuntimeError(f"required save step {step} full-state checkpoint was not published")
         self.processed_steps.add(step)

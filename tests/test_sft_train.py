@@ -2224,13 +2224,15 @@ def test_an_explicit_xet_choice_is_not_overridden(monkeypatch):
     assert os.environ["HF_HUB_DISABLE_XET"] == "0"
 
 
-def test_an_unpublished_adapter_is_not_deleted(monkeypatch, tmp_path):
-    """the cleanup must not discard an export that never reached hf.
+def test_an_adapter_is_freed_even_when_before_upload_never_ran(monkeypatch, tmp_path):
+    """the export must not survive a path that skipped the publish callback entirely.
 
-    `upload_resume_checkpoint` can return WITHOUT running `before_upload` -- it bails out early when
-    another upload holds the slot, and again when `skip_upload` says the step is already durable. In
-    that case the local adapter is the only copy, so deleting it unconditionally would throw away
-    the export rather than free a redundant one.
+    `upload_resume_checkpoint` can return WITHOUT running `before_upload`: it bails out early when
+    another upload holds the slot, and again when `skip_upload` says the step is already durable.
+    Retaining the adapter on that path looks protective, but nothing in the sft watcher ever reads
+    `export_root` again -- the step joins `processed_steps` and `_pending` filters it out forever --
+    so the directory would simply accumulate. This is the branch that fires on EVERY step once an
+    upload is slow enough to hold the slot, which is precisely the busy-disk case.
     """
     import flash.engine.worker as worker
     from flash.engine.worker import sft_train
@@ -2261,8 +2263,8 @@ def test_an_unpublished_adapter_is_not_deleted(monkeypatch, tmp_path):
     )
     watcher._publish(5, str(checkpoint_dir))
 
-    assert os.path.isdir(export_root / "step-5"), (
-        "an adapter that was never published was deleted anyway"
+    assert not os.path.exists(export_root / "step-5"), (
+        "an adapter with no reader was left on the container disk"
     )
 
 
@@ -2302,14 +2304,17 @@ def test_importing_the_worker_package_does_not_freeze_the_xet_default(monkeypatc
     assert result.returncode == 0, result.stderr
 
 
-def test_a_swallowed_optional_publish_failure_keeps_the_adapter(monkeypatch, tmp_path):
-    """a publish that silently failed must not count as durable.
+def test_a_swallowed_optional_publish_failure_still_frees_the_adapter(monkeypatch, tmp_path):
+    """the repeated-transient-failure case must not accumulate one adapter per save.
 
     `publish_deployable_checkpoint` raises for a REQUIRED step, but on an optional one it retries,
-    prints a warning, and returns None -- the failure is swallowed. Treating "the call returned" as
-    "the adapter is on hf" would delete the only remaining copy of an export that never landed,
-    which is the exact opposite of what this cleanup is for. The durability signal is the returned
-    subfolder, not control reaching the next line.
+    prints a warning, and returns None -- the failure is swallowed. Retaining the export on that
+    path would be pointless and actively harmful: no sweep, republish, or finalization in the sft
+    path walks `export_root`, so a run whose deployable uploads keep failing transiently would leave
+    a full adapter behind on every save and rebuild the exhaustion this class bounds.
+
+    A required step does not depend on the retained copy either, because `required=True` raises
+    instead of returning None, leaving through the exception path rather than continuing here.
     """
     import flash.engine.worker as worker
     from flash.engine.worker import sft_train
@@ -2344,8 +2349,8 @@ def test_a_swallowed_optional_publish_failure_keeps_the_adapter(monkeypatch, tmp
     )
     watcher._publish(4, str(checkpoint_dir))
 
-    assert os.path.isdir(export_root / "step-4"), (
-        "an adapter whose publish silently failed was deleted as if it were durable"
+    assert not os.path.exists(export_root / "step-4"), (
+        "a swallowed publish failure left a dead adapter on the container disk"
     )
 
 
@@ -2437,3 +2442,84 @@ def test_the_adapter_is_moved_out_of_the_merge_tree_not_copied(monkeypatch, tmp_
         "so both copies were on disk at once"
     )
     assert not merge_out.exists()
+
+
+def test_repeated_swallowed_publish_failures_do_not_accumulate_adapters(monkeypatch, tmp_path):
+    """the accumulation itself, not just the single-step case.
+
+    The disk exhaustion this class exists to bound is a per-save leak, so the property that matters
+    is that N failed saves leave O(1) directories rather than N. A single-step assertion cannot
+    distinguish "freed" from "freed this once": a watcher that retained exports on some steps and
+    not others would still pass it. Publishing every step with a swallowed failure and then counting
+    what remains pins the shape of the leak directly.
+    """
+    import flash.engine.worker as worker
+    from flash.engine.worker import sft_train
+
+    local_dir = tmp_path / "checkpoints"
+    export_root = tmp_path / "exports"
+
+    def fake_export(actor, adapter, **kwargs):
+        os.makedirs(adapter, exist_ok=True)
+        with open(os.path.join(adapter, "adapter_model.safetensors"), "wb") as fh:
+            fh.write(b"w" * 4096)
+
+    monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", fake_export)
+    # every optional publish fails and swallows the error, the worst sustained case.
+    monkeypatch.setattr(
+        worker, "publish_deployable_checkpoint", lambda adapter, step, **kwargs: None
+    )
+    monkeypatch.setattr(
+        worker,
+        "upload_resume_checkpoint",
+        lambda step, ckpt, **kwargs: (kwargs["before_upload"](), True)[1],
+    )
+
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(export_root),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(),
+    )
+
+    for step in range(1, 9):
+        checkpoint_dir = local_dir / f"global_step_{step}"
+        (checkpoint_dir / "huggingface").mkdir(parents=True)
+        watcher._publish(step, str(checkpoint_dir))
+
+    left = sorted(p for p in os.listdir(export_root) if p.startswith("step-"))
+    assert left == [], f"8 failed saves left {len(left)} adapters on disk: {left}"
+
+
+def test_the_rl_and_opd_watchers_still_keep_their_exports():
+    """the sft cleanup must not be generalized to the siblings that have a reader.
+
+    `_OpdVerlCheckpointWatcher` subclasses the sft watcher, so a cleanup placed in a shared method
+    would silently reach it. Both siblings hand their export to something that runs LATER -- rl
+    republishes from `staged_steps` on a subsequent sweep, opd passes `adapter_dir` into
+    `_stage_retry_contract` -- so for them the directory is live state, not garbage. The sft path is
+    safe to clear precisely because it has no such consumer.
+
+    Asserted structurally: the deletion lives in the sft-only `_publish_from`, and opd overrides
+    `_publish` rather than inheriting the path that deletes.
+    """
+    import inspect
+
+    from flash.engine.worker.train.opd import failures as opd_failures
+    from flash.engine.worker.train.sft import checkpoints as sft_checkpoints
+
+    assert "rmtree(adapter_dir" in inspect.getsource(
+        sft_checkpoints._VerlCheckpointWatcher._publish_from
+    )
+
+    opd_publish = inspect.getsource(opd_failures._OpdVerlCheckpointWatcher._publish)
+    assert "_stage_retry_contract" in opd_publish
+    assert "rmtree(adapter_dir" not in opd_publish, (
+        "the opd watcher would delete an adapter its retry contract still points at"
+    )
+    assert (
+        opd_failures._OpdVerlCheckpointWatcher._publish
+        is not sft_checkpoints._VerlCheckpointWatcher._publish
+    ), "opd no longer overrides _publish, so it now inherits the sft deletion"
