@@ -493,7 +493,12 @@ def _prepare_sft_child(
     with open(custom_dataset_path, "w", encoding="utf-8") as file:
         file.write(_render_sft_dataset_module())
 
-    resume_step = _sft_train._restore_verl_resume(options.paths.local_dir)
+    # the RESOLVED width, not the allocated card count: it is what becomes --nproc-per-node below,
+    # so the guard compares the checkpoint against the topology this attempt really launches. sft
+    # shards by data and the width is bounded by the batch and the row count, so the two differ
+    # whenever either fails to divide the allocation -- passing gpu_count here would discard a
+    # checkpoint that matches the run about to start, and keep one that does not.
+    resume_step = _sft_train._restore_verl_resume(options.paths.local_dir, world_size=world_size)
     watcher = _sft_train._VerlCheckpointWatcher(
         local_dir=options.paths.local_dir,
         export_root=options.paths.export_root,
