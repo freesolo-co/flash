@@ -263,6 +263,80 @@ def test_build_worker_env_lists_declared_secret_names_for_the_redactors():
     assert SECRET_ENV_KEYS_ENV not in build_worker_env(_spec(), 0)
 
 
+def test_the_redactor_metadata_name_is_reserved_from_declared_secrets():
+    """build_worker_env sets FLASH_SECRET_ENV_KEYS last, so a job declaring that exact name would
+    have its credential silently overwritten by the generated name list and fail at runtime. it is
+    control-plane-owned, so the declaration is rejected loudly instead."""
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
+    from flash.core.spec import CONTROL_PLANE_OWNED_ENV_KEYS
+    from flash.schema.fields import ConfigError, _environment_secrets
+
+    assert SECRET_ENV_KEYS_ENV in CONTROL_PLANE_OWNED_ENV_KEYS
+    with pytest.raises(ConfigError, match="platform-managed key"):
+        _environment_secrets([SECRET_ENV_KEYS_ENV])
+
+
+def test_declared_secret_names_cannot_contain_the_metadata_delimiter():
+    """the name list travels to every redactor comma-joined, so a name containing a comma arrives
+    as two unrelated names, the real key goes unrecognized, and its value reaches diagnostics
+    verbatim. rejecting the delimiter at declaration keeps that channel unambiguous."""
+    from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
+    from flash.providers.runpod.serverless import build_worker_env
+    from flash.schema.fields import ConfigError, _environment_secrets
+
+    with pytest.raises(ConfigError, match="invalid environment variable name"):
+        _environment_secrets(["FOO,BAR"])
+    # a name-shaped secret is still fine; only the delimiter is refused.
+    assert _environment_secrets(["AWS_SECRET_ACCESS_KEY"]) == ("AWS_SECRET_ACCESS_KEY",)
+
+    # and the metadata builder fails closed rather than emitting an ambiguous list, for a spec
+    # constructed around the parser.
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="grpo",
+        environment=EnvironmentSpec(id="owner/env", secrets=("FOO,BAR",)),
+        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
+        seed=0,
+    )
+    with pytest.raises(RuntimeError, match="delimiter"):
+        build_worker_env(spec, 0, runtime_secrets={"FOO,BAR": "leaky"})
+
+
+def test_the_handlers_inline_redactor_covers_multiline_secret_components():
+    """the handler is source-shipped, so it carries its OWN copy of the redactor rather than
+    importing the shared one. the child's stdout is sanitized one line at a time, so a PEM key
+    never appears whole in any single call and only its component lines can match. extract that
+    copy and exercise it directly, since drift here leaks a credential nothing else catches."""
+    import ast
+    import inspect
+    import os
+    import re
+    import textwrap
+
+    from flash.providers.runpod.serverless import endpoints
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
+    node = next(
+        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_safe_detail"
+    )
+    # os/re come from _train_body's own local imports, which the handler makes at the top of its
+    # body; urllib.parse it imports itself.
+    namespace: dict = {"os": os, "re": re}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
+    safe_detail = namespace["_safe_detail"]
+
+    pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----"
+    # DEPLOY_KEY matches no suffix heuristic, so this also covers the declared-name channel.
+    secrets = {"DEPLOY_KEY": pem, "FLASH_SECRET_ENV_KEYS": "DEPLOY_KEY"}
+
+    assert (
+        safe_detail("ssh auth: MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", secrets) == "ssh auth: <redacted>"
+    )
+    assert safe_detail(pem, secrets) == "<redacted>"
+    # the length floor keeps short structural fragments readable.
+    assert safe_detail("near }", {"B": "{\n}\nlongenoughcomponent"}) == "near }"
+
+
 def test_worker_console_always_uploaded_and_no_flag(monkeypatch):
     """The worker console is ALWAYS uploaded — live (periodic) while the worker runs and once more
     when it exits — so every print reaches `flash runs log`, not just a post-mortem tail on

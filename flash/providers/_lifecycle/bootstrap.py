@@ -21,11 +21,19 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 
 if __package__:
-    from flash.providers._lifecycle.bootstrap_secrets import _payload_secrets, _safe_detail
+    from flash.providers._lifecycle.bootstrap_secrets import (
+        _payload_secrets,
+        _read_console_tail,
+        _safe_detail,
+    )
 else:
     # running as a bare script on the box: the launch scripts ship bootstrap_secrets.py into the
     # same directory, and the script directory leads sys.path.
-    from bootstrap_secrets import _payload_secrets, _safe_detail  # type: ignore[no-redef]
+    from bootstrap_secrets import (  # type: ignore[no-redef]
+        _payload_secrets,
+        _read_console_tail,
+        _safe_detail,
+    )
 
 PAYLOAD_PATH = "/root/flash/payload.json"
 CODE_ROOT = "/runcode"
@@ -247,17 +255,7 @@ def hf_upload(
 def _upload_console_snapshot(payload: dict, console: str, mode: str, extra: str = "") -> None:
     """Upload one console snapshot from an isolated process."""
     tail_path = console + ".tail"
-    with open(console, "rb") as f:
-        f.seek(0, os.SEEK_END)
-        start = max(0, f.tell() - 64_000)
-        f.seek(start)
-        tail = f.read().decode("utf-8", "replace")
-    if start > 0:
-        # the byte boundary can land inside a one-line credential, and a partial value no longer
-        # matches full-value redaction, so the truncated first line is dropped before sanitizing
-        # (all of it, when the whole tail is one unterminated line).
-        cut = tail.find("\n")
-        tail = tail[cut + 1 :] if cut >= 0 else ""
+    tail = _read_console_tail(console, 64_000)
     if extra:
         tail += extra
     with open(tail_path, "w", encoding="utf-8", errors="replace") as f:

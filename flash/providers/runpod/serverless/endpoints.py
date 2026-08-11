@@ -87,14 +87,26 @@ def _train_body(input_data: dict) -> dict:
         needles = set()
         for key, secret in mapping.items():
             upper = str(key).upper()
-            if secret and (
+            if not secret or not (
                 upper in {"AUTHORIZATION", "HF_TOKEN"}
                 or upper in declared
                 or upper.endswith(("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD"))
             ):
-                needles.add(str(secret))
-                encoded = urllib.parse.quote(str(secret), safe="")
-                if encoded != str(secret):
+                continue
+            value_str = str(secret)
+            # a multiline secret (a PEM key) never appears whole in any single call: the child's
+            # stdout is sanitized one line at a time below, so only a component line is ever seen.
+            # register long component lines as needles too; the length floor keeps a common
+            # fragment such as "}" from erasing innocent diagnostics.
+            parts = [value_str]
+            if "\n" in value_str:
+                parts.extend(
+                    line for raw in value_str.splitlines() if len(line := raw.strip()) >= 8
+                )
+            for part in parts:
+                needles.add(part)
+                encoded = urllib.parse.quote(part, safe="")
+                if encoded != part:
                     needles.add(encoded)
         # longest-first so one secret containing another cannot leave a suffix of the longer
         # one behind; encoded forms cover the percent-encoded urls http and git errors print.
@@ -392,14 +404,21 @@ def _train_body(input_data: dict) -> dict:
                 with open(console, "rb") as f:
                     f.seek(0, os.SEEK_END)
                     start = max(0, f.tell() - tail_bytes)
-                    f.seek(start)
-                    tail = f.read().decode("utf-8", "replace")
-                if start > 0:
+                    # over-read one byte so a boundary landing exactly after a newline is
+                    # recognized as starting a COMPLETE line rather than assumed partial.
+                    f.seek(max(0, start - 1))
+                    raw = f.read()
+                if start == 0:
+                    tail = raw.decode("utf-8", "replace")
+                else:
+                    tail = raw[1:].decode("utf-8", "replace")
                     # the byte boundary can land inside a one-line credential, and a partial
-                    # value no longer matches full-value redaction, so the truncated first
-                    # line is dropped before sanitizing.
-                    cut = tail.find("\n")
-                    tail = tail[cut + 1 :] if cut >= 0 else ""
+                    # value no longer matches full-value redaction, so a truncated first line is
+                    # dropped before sanitizing. a line the boundary did not split is kept: it
+                    # may hold the root-cause exception.
+                    if raw[:1] != b"\n":
+                        cut = tail.find("\n")
+                        tail = tail[cut + 1 :] if cut >= 0 else ""
                 with open(console + ".tail", "w", encoding="utf-8", errors="replace") as f:
                     f.write(_safe_detail(tail, env, 64_000))
                 _require_deadline_allowance()

@@ -1945,6 +1945,62 @@ def test_safe_detail_redacts_overlapping_secrets_longest_first():
     assert detail == "rejected: <redacted> and <redacted>"
 
 
+def test_safe_detail_redacts_each_line_of_a_multiline_secret():
+    """a PEM key never reaches a redactor whole: console tails are cut and the child's stdout is
+    sanitized one line at a time, so only a component line is ever seen. the whole value alone as a
+    needle would match nothing and the component would print verbatim."""
+    pem = (
+        "-----BEGIN PRIVATE KEY-----\n"
+        "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n"
+        "KoZIhvcNAQEBBQADggEPADCCAQoCggEB\n"
+        "-----END PRIVATE KEY-----"
+    )
+    secrets = {"DEPLOY_KEY": pem}
+
+    assert (
+        b._safe_detail("ssh failed: MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", secrets=secrets)
+        == "ssh failed: <redacted>"
+    )
+    assert b._safe_detail(pem, secrets=secrets) == "<redacted>"
+
+
+def test_safe_detail_keeps_short_components_of_a_multiline_secret_readable():
+    """the component floor exists so a structural fragment such as `}` in a multiline json
+    credential cannot blank out innocent diagnostics everywhere it appears."""
+    secrets = {"BLOB": "{\n}\nabc\nlongenoughsecretcomponent"}
+
+    detail = b._safe_detail("parse error near } and abc", secrets=secrets)
+
+    assert detail == "parse error near } and abc"
+
+
+def test_read_console_tail_keeps_a_complete_line_at_the_boundary(tmp_path):
+    """the first retained line is dropped only when the byte boundary actually SPLIT it. a boundary
+    landing right after a newline starts a complete line, and discarding it would throw away a full
+    line of diagnostics -- possibly the root-cause exception -- for a split that never happened."""
+    console = tmp_path / "console.txt"
+    console.write_bytes(b"older\nROOTCAUSE: boom\nshutdown\n")
+
+    # 24 bytes = exactly "ROOTCAUSE: boom\nshutdown\n", so the boundary sits on the newline.
+    assert b._read_console_tail(str(console), 25) == "ROOTCAUSE: boom\nshutdown\n"
+    # one byte less splits the line, so it is dropped rather than half-redacted.
+    assert b._read_console_tail(str(console), 24) == "shutdown\n"
+    # no truncation at all keeps everything.
+    assert b._read_console_tail(str(console), 64_000) == "older\nROOTCAUSE: boom\nshutdown\n"
+
+
+def test_read_console_tail_drops_a_split_credential(tmp_path):
+    """the guard's reason for existing: a value cut in half no longer matches full-value
+    redaction, so the partial line must never reach the sanitizer."""
+    console = tmp_path / "console.txt"
+    console.write_bytes(b"token=abc123456789secret\nnext\n")
+
+    tail = b._read_console_tail(str(console), 15)
+
+    assert "secret" not in tail
+    assert tail == "next\n"
+
+
 def test_safe_detail_redacts_the_percent_encoded_form_of_a_secret():
     """http and git errors print encoded request urls, so the encoded form leaks the secret even
     when the configured value never appears literally."""

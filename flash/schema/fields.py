@@ -287,11 +287,16 @@ def _coerce_scalar(value: str):
 
 
 def _validate_env_var_names(names, context: str) -> None:
-    bad_names = sorted(repr(k) for k in names if (not k) or any(c in k for c in "=\0 \t\n\r"))
+    # ',' is rejected because declared secret names travel to every redactor as the comma-joined
+    # FLASH_SECRET_ENV_KEYS list (flash._internal.diagnostics): a name containing a comma is
+    # indistinguishable from two names there, so the real key goes unrecognized and its value
+    # reaches diagnostics verbatim. Rejecting it here keeps that channel unambiguous by
+    # construction rather than needing an escape.
+    bad_names = sorted(repr(k) for k in names if (not k) or any(c in k for c in "=,\0 \t\n\r"))
     if bad_names:
         raise ConfigError(
             f"{context} has invalid environment variable name(s): {', '.join(bad_names)}; an "
-            "env var name must be non-empty and contain no '=', whitespace, or NUL byte"
+            "env var name must be non-empty and contain no '=', ',', whitespace, or NUL byte"
         )
 
 

@@ -16,6 +16,12 @@ _SECRET_RE = re.compile(
     r"(\s*[:=]\s*)(?:bearer\s+)?([^\s,;]+)"
 )
 
+# a multiline secret (a PEM key) reaches diagnostics one component line at a time -- console tails
+# are truncated and child stdout is sanitized per line -- so the whole value never matches. long
+# component lines are registered as needles too; the floor keeps a common fragment such as ``}``
+# from erasing innocent output. Mirrors flash._internal.diagnostics.
+_MIN_SECRET_COMPONENT = 8
+
 
 def _secret_env_name(name: str) -> bool:
     upper = str(name).upper()
@@ -54,7 +60,8 @@ def _safe_detail(value: object, limit: int = 1000, secrets: dict | None = None) 
     entry of the mapping is treated as a secret regardless of its name. replacement handles the
     percent-encoded form of each value (encoded request urls are exactly what http and git errors
     print) and runs longest-first, so one secret that contains another cannot leave a suffix of
-    the longer one behind. Mirrors flash._internal.diagnostics.
+    the longer one behind. a multiline value also registers its long component lines, so a child
+    echoing one line of a PEM key is still redacted. Mirrors flash._internal.diagnostics.
     """
     text = f"{type(value).__name__}: {value}" if isinstance(value, BaseException) else str(value)
     values: set[str] = set()
@@ -66,12 +73,44 @@ def _safe_detail(value: object, limit: int = 1000, secrets: dict | None = None) 
             values.add(str(secret))
     needles: set[str] = set()
     for secret in values:
-        needles.add(secret)
-        encoded = urllib.parse.quote(secret, safe="")
-        if encoded != secret:
-            needles.add(encoded)
+        parts = [secret]
+        if "\n" in secret:
+            parts.extend(
+                line
+                for raw in secret.splitlines()
+                if len(line := raw.strip()) >= _MIN_SECRET_COMPONENT
+            )
+        for part in parts:
+            needles.add(part)
+            encoded = urllib.parse.quote(part, safe="")
+            if encoded != part:
+                needles.add(encoded)
     for needle in sorted(needles, key=len, reverse=True):
         text = text.replace(needle, "<redacted>")
     text = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", text)
     text = _SECRET_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}<redacted>", text)
     return text[:limit]
+
+
+def _read_console_tail(path: str, limit: int) -> str:
+    """Read the last ``limit`` bytes of a file, dropping a leading PARTIAL line.
+
+    the byte boundary can land inside a one-line credential, and a partial value no longer matches
+    full-value redaction, so a truncated first line is dropped before sanitizing (all of it, when
+    the whole tail is one unterminated line). a boundary landing exactly after a newline already
+    starts a complete line, so nothing is dropped there: discarding it would throw away a whole
+    line of diagnostics -- possibly the root-cause exception -- to solve a split that did not
+    happen. one byte before the boundary is over-read to tell the two cases apart.
+    """
+    with open(path, "rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        start = max(0, handle.tell() - limit)
+        handle.seek(max(0, start - 1))
+        raw = handle.read()
+    if start == 0:
+        return raw.decode("utf-8", "replace")
+    tail = raw[1:].decode("utf-8", "replace")
+    if raw[:1] == b"\n":
+        return tail
+    cut = tail.find("\n")
+    return tail[cut + 1 :] if cut >= 0 else ""

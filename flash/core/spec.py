@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Literal
 from uuid import UUID
 
+from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
 from flash.core.catalog import DEFAULT_MODEL, normalize_algorithm
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
@@ -199,6 +200,10 @@ CONTROL_PLANE_OWNED_ENV_KEYS = frozenset(
         OPD_RESUME_REVISION_ENV,
         PUBLIC_URL_ENV,
         TEACHER_CAPABILITY_ENV,
+        # the redactors' own transport: build_worker_env overwrites this with the generated list of
+        # declared secret names, so a job declaring it would have its credential silently replaced
+        # by that list and fail at runtime. control-plane-owned, hence rejected at declaration.
+        SECRET_ENV_KEYS_ENV,
         *MANAGED_TEACHER_CREDENTIAL_ENV_KEYS,
     }
 )
