@@ -256,7 +256,6 @@ def deploy_train_endpoint(
             ep._qb_target = _train_body
             config = ep._build_resource_config()
             _jobs.apply_disk_gb(config, disk_gb)
-            _jobs.apply_image_override_constraints(config)
             rm = ResourceManager()
             if deadline_at is None:
                 resource = _jobs.asyncio.run(rm.get_or_deploy_resource(config))
