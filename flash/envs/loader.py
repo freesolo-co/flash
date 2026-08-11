@@ -197,7 +197,15 @@ def _urlopen(
                 return drain(resp)
         except urllib.error.HTTPError as exc:
             # urllib can raise an HTTPError with fp=None; exc.read() is an AttributeError there.
-            body = exc.read().decode("utf-8", "replace") if exc.fp is not None else ""
+            # the read can also truncate: GitHub can return a 429/5xx and then drop the connection.
+            # that must not propagate -- we are inside this block's own handler, and Python does not
+            # offer an exception raised here to the sibling clause below, so a truncated error body
+            # would escape unretried as an uncaught 500 instead of the classified 429/502. the
+            # status and headers still classify the failure, so an unreadable body just goes empty.
+            try:
+                body = exc.read().decode("utf-8", "replace") if exc.fp is not None else ""
+            except (ConnectionError, http.client.IncompleteRead, OSError):
+                body = ""
             remaining = (exc.headers.get("X-RateLimit-Remaining") if exc.headers else None) or ""
             is_rate_limit = exc.code == 429 or (
                 exc.code == 403 and (remaining.strip() == "0" or "rate limit" in body.lower())

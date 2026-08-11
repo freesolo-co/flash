@@ -236,6 +236,52 @@ def test_a_broken_response_degrades_to_the_reason_line_not_a_traceback(
     assert "Traceback" not in out
 
 
+def test_a_truncated_error_body_degrades_instead_of_raising(monkeypatch, capsys):
+    """A non-2xx whose body drops mid-read must still surface as the status, not a traceback.
+
+    The read happens in `_detail_from_http_error`, called from inside the `except HTTPError` handler.
+    Python does not offer an exception raised inside one handler to that block's sibling clauses, so
+    the IncompleteRead clause added for successful responses cannot catch this one -- it has to be
+    handled at the read itself.
+    """
+    import urllib.error
+
+    from flash.client import ApiClient
+
+    class _TruncatedErrorBody:
+        def read(self, *_a):
+            raise http.client.IncompleteRead(b"partial")
+
+        def close(self):
+            """HTTPError's tempfile teardown calls this; without it the GC raises on collection."""
+
+    def fake_urlopen(*_a, **_k):
+        raise urllib.error.HTTPError(
+            url="https://api.freesolo.co/v1/envs",
+            code=502,
+            msg="Bad Gateway",
+            hdrs={},  # type: ignore[arg-type]
+            fp=_TruncatedErrorBody(),
+        )
+
+    monkeypatch.setattr(
+        commands, "load_credentials", lambda: ("https://api.freesolo.co", "fslo-key")
+    )
+    monkeypatch.setattr(commands, "has_freesolo_backend", lambda _url: True)
+    monkeypatch.setattr(
+        "flash.client.client_from_config",
+        lambda: ApiClient("https://api.freesolo.co", "fslo-key"),
+    )
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    assert commands.cmd_env_list(argparse.Namespace()) == 0
+
+    out = capsys.readouterr().out
+    assert "published environments unavailable" in out
+    assert "Traceback" not in out
+    assert "502" in out, "the status is the useful part and must survive an unreadable body"
+
+
 def test_list_envs_outlasts_the_servers_own_github_retry_budget():
     """The client must not time out before the plane can answer.
 

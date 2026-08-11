@@ -131,8 +131,18 @@ def _detail_from_http_error(exc: urllib.error.HTTPError) -> object:
 
     A structured detail stays a dict so the caller can read its ``code``; anything else is the
     string it always was. ``str()`` it for a message, but branch on the object itself.
+
+    The read itself can fail: a plane that returns a non-2xx status and then drops the connection
+    leaves a truncated body, and ``exc.read()`` raises. That must NOT propagate -- this runs inside
+    ``_translate_http_errors``'s ``except HTTPError`` handler, and Python does not offer an exception
+    raised inside one handler to that block's sibling clauses, so nothing downstream would translate
+    it and the caller would see a raw traceback. The status is the useful part of an error response
+    anyway, so a body we cannot read degrades to a note rather than losing the status with it.
     """
-    body = exc.read()
+    try:
+        body = exc.read()
+    except (ConnectionError, http.client.IncompleteRead, OSError):
+        return f"{exc} (the error body was truncated before it could be read)"
     try:
         detail = json.loads(body).get("detail") or body.decode()
     except (ValueError, AttributeError):
