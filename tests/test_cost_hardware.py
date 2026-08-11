@@ -199,65 +199,48 @@ def test_multi_card_speedup_never_decreases_with_card_count():
         assert vals == sorted(vals), f"{name} speedup decreases: {vals}"
 
 
-def test_sft_shards_by_sequence_not_by_data(monkeypatch):
-    """sft must not borrow the fsdp data-parallel constant.
+def test_sft_shards_by_data_like_grpo_and_opd(monkeypatch):
+    """sft must read the fsdp data-parallel constant, the same one grpo/opd read.
 
-    Flash pins ulysses_sp_size to the card count and verl derives dp_size = world_size //
-    ulysses_sequence_parallel_size, so a multi-card sft run is dp_size == 1: pure sequence
-    parallelism. grpo/opd run data-parallel. The two pay different collectives (fsdp moves MODEL
-    bytes per layer, ulysses moves ACTIVATION bytes per layer, both directions) and cannot share a
-    scaling constant.
-
-    The shipped sp and dp constants are deliberately equal, so reading the returned value proves
-    nothing about which one was consulted. Perturb the sp constant: sft must move with it and
-    grpo/opd must not.
+    sft used to pin ulysses_sp_size to the card count (dp_size == 1: pure sequence parallelism) and
+    carried its own scaling pair for it. Sequence parallelism is wrong for the catalog's GDN
+    hybrids, so `sft_train_runner` pins it off and fsdp splits the batch instead. All three
+    algorithms now pay the same collective, so one constant must drive all three -- a surviving
+    sft-only constant would be a quote nothing executes.
     """
     from flash.cost import analytical
     from flash.cost.types import RunConfig
+
+    assert not hasattr(analytical, "MULTI_CARD_SCALING_SP_PCIE"), (
+        "the sequence-parallel constant outlived the strategy it priced"
+    )
+    assert not hasattr(analytical, "sequence_parallel_speedup"), (
+        "the sequence-parallel curve outlived the strategy it priced"
+    )
 
     def cfg(method: str) -> RunConfig:
         return RunConfig(model_id="Qwen/Qwen3.5-9B", method=method, steps=8)
 
     # 0.95 is well clear of the non-decreasing clamp (which pins anything at or below 0.5 to 1.0x
     # at 2 cards), so a wrong reading cannot coincidentally land on the right number.
-    monkeypatch.setattr(analytical, "MULTI_CARD_SCALING_SP_PCIE", 0.95)
-    monkeypatch.setattr(analytical, "MULTI_CARD_SCALING_SP_NVLINK", 0.95)
+    monkeypatch.setattr(analytical, "MULTI_CARD_SCALING_PCIE", 0.95)
+    monkeypatch.setattr(analytical, "MULTI_CARD_SCALING_NVLINK", 0.95)
 
     for card in ("RTX 4090", "A100 SXM"):
-        sft = analytical.method_card_speedup(cfg("sft"), 2, card)
-        assert sft == pytest.approx(2 * 0.95), f"sft on {card} ignored the sp constant: {sft}"
-        for method in ("grpo", "opd"):
-            other = analytical.method_card_speedup(cfg(method), 2, card)
-            assert other == pytest.approx(analytical.multi_card_speedup(2, card)), (
-                f"{method} on {card} was routed through the sequence-parallel constant"
+        for method in ("sft", "grpo", "opd"):
+            speedup = analytical.method_card_speedup(cfg(method), 2, card)
+            assert speedup == pytest.approx(2 * 0.95), (
+                f"{method} on {card} ignored the data-parallel constant: {speedup}"
             )
 
 
-def test_sequence_parallel_speedup_keeps_the_multi_card_invariants():
-    """The sp curve owes the same guarantees the dp curve does.
-
-    A separate constant must not become a hole in the invariants: one card is one card, pcie never
-    borrows nvlink scaling, no fabric delivers linear, and adding a card never models as slower.
-    """
-    from flash.cost.analytical import sequence_parallel_speedup
-
-    for name in ("A100 SXM", "RTX 4090", "unknown"):
-        assert sequence_parallel_speedup(1, name) == 1.0
-    for n in (2, 3, 4):
-        assert sequence_parallel_speedup(n, "RTX 4090") < sequence_parallel_speedup(n, "A100 SXM")
-        assert sequence_parallel_speedup(n, "A100 SXM") < n
-    for name in ("A100 SXM", "RTX 4090", "H100", "unlisted-class"):
-        vals = [sequence_parallel_speedup(n, name) for n in range(1, 9)]
-        assert vals == sorted(vals), f"{name} sp speedup decreases: {vals}"
-
-
-def test_multi_card_sft_quote_moves_with_the_sequence_parallel_constant(monkeypatch):
+def test_multi_card_sft_quote_moves_with_the_data_parallel_constant(monkeypatch):
     """The seam has to reach the shipped dollar figure, not just the helper.
 
     A 9B sft run pinned to 2x RTX 4090 is the reachable multi-card sft cell: one 4090 cannot hold
     it (needs 32 GB), two can, and sft has no step floor so the whole gpu-bound half is the token
-    compute term. That makes the sp constant map straight to the price -- if the quote does not
-    move when it changes, the fix never reached estimate_cost().
+    compute term. That makes the scaling constant map straight to the price -- if the quote does
+    not move when it changes, the fix never reached estimate_cost().
     """
     from flash.cost import analytical
     from flash.cost.types import RunConfig
@@ -277,15 +260,10 @@ def test_multi_card_sft_quote_moves_with_the_sequence_parallel_constant(monkeypa
 
     # degrade the realized scaling: the same work must take longer and cost more. 0.6 stays clear
     # of the non-decreasing clamp, so this exercises the constant rather than the floor under it.
-    monkeypatch.setattr(analytical, "MULTI_CARD_SCALING_SP_PCIE", 0.6)
+    monkeypatch.setattr(analytical, "MULTI_CARD_SCALING_PCIE", 0.6)
     after = analytical.estimate_cost(spec)
     assert after.train_seconds > before.train_seconds
     assert after.total_usd > before.total_usd
-
-    # and the grpo constant must not be what is moving it.
-    monkeypatch.setattr(analytical, "MULTI_CARD_SCALING_PCIE", 0.4)
-    unchanged = analytical.estimate_cost(spec)
-    assert unchanged.train_seconds == pytest.approx(after.train_seconds)
 
 
 def test_a_vast_multi_card_run_is_not_credited_with_nvlink_scaling():
@@ -298,7 +276,7 @@ def test_a_vast_multi_card_run_is_not_credited_with_nvlink_scaling():
     real candidates, and crediting them with the measured nvlink curve prices them on bandwidth
     they may not have.
     """
-    from flash.cost.analytical import multi_card_speedup, sequence_parallel_speedup
+    from flash.cost.analytical import multi_card_speedup
     from flash.cost.facts import has_nvlink
 
     for ambiguous in ("H100", "A100 SXM 40GB"):
@@ -312,10 +290,6 @@ def test_a_vast_multi_card_run_is_not_credited_with_nvlink_scaling():
         # and the credit is large enough to change a ranking: ~24% at 2 cards, ~80% at 4.
         assert multi_card_speedup(2, ambiguous, "vast") < multi_card_speedup(2, ambiguous, "runpod")
         assert multi_card_speedup(4, ambiguous, "vast") < multi_card_speedup(4, ambiguous, "runpod")
-        # sft shards by sequence and reads the same classification, so it must narrow too.
-        assert sequence_parallel_speedup(2, ambiguous, "vast") < sequence_parallel_speedup(
-            2, ambiguous, "runpod"
-        )
 
     # an unpinned/unknown provider keeps the class answer: this narrows a known-ambiguous market,
     # it does not downgrade everything that fails to name a provider.

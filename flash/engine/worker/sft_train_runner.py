@@ -108,6 +108,9 @@ class _SftChild:
     watcher: object
     child_env: dict[str, str]
     command: list[str]
+    # ranks actually launched, which is the allocated card count only when the batch divides by it.
+    # reported so a reader comparing realized step time against the quote sees the executed width.
+    world_size: int
 
 
 @dataclass
@@ -344,6 +347,32 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
     )
 
 
+def sft_data_parallel_cards(gpu_count: int, train_batch_size: int) -> int:
+    """Cards SFT can actually train on, given verl splits the batch across them.
+
+    SFT runs data-parallel (see `_prepare_sft_child`), so verl derives
+    `train_batch_size_per_dp = train_batch_size // dp_size` and hands that straight to a
+    DataLoader. Two card counts are unusable and both fail loudly rather than train:
+    a count ABOVE the batch floors the per-rank batch to 0, and `DataLoader(batch_size=0)`
+    raises `ValueError`; a count that does not DIVIDE the batch silently changes the global
+    batch, because verl's sampler drops the remainder (`drop_last=True` on both the sampler
+    and the loader).
+
+    So take the largest divisor of the batch that is <= the allocated cards. That keeps the
+    realized global batch exactly `train_batch_size` on every width this returns, which is what
+    makes the card count a pure throughput choice rather than a hyperparameter change.
+
+    Returns 1 for an unpacked run (`examples_per_update` is 1 there), which is correct: one
+    example cannot be split, so extra cards would have nothing to hold.
+    """
+    cards = max(1, int(gpu_count))
+    batch = max(1, int(train_batch_size))
+    for count in range(min(cards, batch), 0, -1):
+        if batch % count == 0:
+            return count
+    return 1
+
+
 def _prepare_sft_child(
     options: _SftOptions,
     data: _SftData,
@@ -369,6 +398,18 @@ def _prepare_sft_child(
     # `gdn_reset_arch` is resolved by the caller, inside the configuring liveness wrap, because the
     # probe is part of the setup silence that wrap exists to cover, and because a packed run must
     # take the RAISING gate there rather than the soft form.
+    #
+    # SFT shards by DATA, not by sequence: ulysses is pinned to 1 and fsdp splits the batch. verl's
+    # ulysses support patches `_flash_attention_forward` and nothing else, but every catalog model
+    # is a GatedDeltaNet hybrid whose layers are mostly LINEAR attention plus a causal conv -- and
+    # both carry recurrent state along the sequence. slicing the sequence across ranks would run
+    # each shard's recurrence and conv as if it were a whole sequence, with no cross-rank state, so
+    # sequence parallelism is not merely unimplemented for this family, it is incorrect for it.
+    # It also crashed outright. remove-padding flattens the batch to one `(1, total_nnz)` row, and
+    # verl slices that row per rank, so the shapes reaching the GDN kernels stop agreeing and a
+    # sharded run died on `seq_idx must have shape (batch_size, seqlen)` -- at any batch size,
+    # including 1, because "remove padding" leaves no batch dimension to keep an example whole.
+    world_size = sft_data_parallel_cards(options.gpu_count, model.train_batch_size)
     config = {
         "train_files": data.train_file,
         "train_batch_size": model.train_batch_size,
@@ -382,7 +423,7 @@ def _prepare_sft_child(
         "target_modules": model.target_modules,
         "target_parameters": _w.lora_target_parameters(options.model_id),
         "lora_adapter_path": model.warmstart_adapter,
-        "ulysses_sp_size": options.gpu_count,
+        "ulysses_sp_size": 1,
         "lr": options.learning_rate,
         "warmup_ratio": RECIPE.sft.warmup_frac,
         "optimizer_impl": _VERL_OPTIMIZER_IMPL,
@@ -390,7 +431,7 @@ def _prepare_sft_child(
         "optimizer_kwargs": None,
         "local_dir": options.paths.local_dir,
         "save_freq": model.save_freq,
-        "n_gpus_per_node": options.gpu_count,
+        "n_gpus_per_node": world_size,
         "seed": _w.backend_seed(_w.SEED),
         "project_name": project_name,
         "experiment_name": experiment_name,
@@ -456,7 +497,9 @@ def _prepare_sft_child(
         "torch.distributed.run",
         "--standalone",
         "--nnodes=1",
-        f"--nproc-per-node={options.gpu_count}",
+        # the RESOLVED width, not the allocated card count: verl splits the global batch across
+        # every rank torchrun starts, so a rank the batch cannot feed is the `batch_size=0` crash.
+        f"--nproc-per-node={world_size}",
         "-m",
         "verl.trainer.sft_trainer",
         *overrides,
@@ -472,6 +515,7 @@ def _prepare_sft_child(
         watcher=watcher,
         child_env=child_env,
         command=command,
+        world_size=world_size,
     )
 
 

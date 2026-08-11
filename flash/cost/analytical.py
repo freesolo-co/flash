@@ -260,29 +260,15 @@ def multi_card_speedup(gpu_count: int, gpu: str, provider: str = "") -> float:
     return max(k * (scaling ** (k - 1)) for k in range(1, n + 1))
 
 
-# --- sft shards by SEQUENCE, not by data ---------------------------------------------------------
-# sft_train.py pins Ulysses sequence parallelism, while grpo/opd use fsdp data parallelism; their
-# collective costs are not interchangeable. no matched multi-card sft arm exists, so these separate
-# constants conservatively reuse the dp values until an sft-specific measurement replaces them.
-# verl reference: workers/engine/fsdp/transformer_impl.py get_data_parallel_size.
-MULTI_CARD_SCALING_SP_NVLINK = 0.88
-MULTI_CARD_SCALING_SP_PCIE = 0.71
-
-
-def sequence_parallel_speedup(gpu_count: int, gpu: str, provider: str = "") -> float:
-    """Return SFT sequence-parallel throughput across cards.
-
-    Keep separate constants from fsdp data parallelism; see MULTI_CARD_SCALING_SP_NVLINK.
-    """
-    n = max(1, int(gpu_count))
-    scaling = (
-        MULTI_CARD_SCALING_SP_NVLINK if has_nvlink(gpu, provider) else MULTI_CARD_SCALING_SP_PCIE
-    )
-    return max(k * (scaling ** (k - 1)) for k in range(1, n + 1))
-
-
 def method_card_speedup(config: RunConfig, gpu_count: int, gpu: str, provider: str = "") -> float:
-    """Return throughput for the run's sequence- or data-parallel strategy.
+    """Return multi-card throughput for the run.
+
+    Every algorithm now shards by DATA. SFT used to pin Ulysses sequence parallelism and therefore
+    carried its own scaling constants, but sequence parallelism is incorrect for the catalog's GDN
+    hybrids (the linear-attention recurrence and causal conv carry state along the sequence, and
+    verl passes no state across ranks), so ``sft_train_runner`` pins it off. One fsdp constant now
+    describes all three -- and the sp pair it replaces was numerically identical to it, so no quote
+    moves. See ``sft_data_parallel_cards``.
 
     ``provider`` must reflect the rented substrate because interconnect changes scaling. Live
     allocation paths learn it after building ``config``; pinned ``config.provider`` is the fallback.
@@ -291,8 +277,6 @@ def method_card_speedup(config: RunConfig, gpu_count: int, gpu: str, provider: s
     resolved = (provider or "").strip().lower()
     if not resolved:
         resolved = n.provider if n.provider != "auto" else ""
-    if n.method == "sft":
-        return sequence_parallel_speedup(gpu_count, gpu, resolved)
     return multi_card_speedup(gpu_count, gpu, resolved)
 
 

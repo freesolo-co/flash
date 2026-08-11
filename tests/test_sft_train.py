@@ -191,6 +191,91 @@ def test_verl_packs_every_batch_so_the_batch_size_is_the_isolation_boundary():
     assert overrides["data.train_batch_size"] == "1"
 
 
+def test_sft_pins_ulysses_off_because_sequence_parallelism_breaks_gdn():
+    """`ulysses_sp_size` must be the literal 1, never the card count.
+
+    Two independent reasons, either sufficient. Correctness: every catalog model is a GDN hybrid
+    whose layers are mostly linear attention plus a short causal conv, and both carry state ALONG
+    the sequence. Pinned verl patches ulysses into `_flash_attention_forward` and slices the Qwen
+    text model's inputs, but passes no recurrent or conv state between ranks -- so a sequence shard
+    would run its recurrence as if it were a whole sequence. Liveness: it also crashed, because
+    remove-padding leaves one `(1, total_nnz)` row and the slice desynchronizes the shapes the GDN
+    kernels are handed (`seq_idx must have shape (batch_size, seqlen)`), at every batch size.
+
+    Read the source: `build_sft_overrides` renders whatever it is given, so a test driving a cfg
+    dict would assert on its own fixture and stay green if the caller went back to `gpu_count`.
+    """
+    import inspect
+
+    from flash.engine.worker import sft_train_runner
+
+    src = inspect.getsource(sft_train_runner._prepare_sft_child)
+    line = next(ln.strip() for ln in src.splitlines() if ln.strip().startswith('"ulysses_sp_size"'))
+
+    assert line == '"ulysses_sp_size": 1,', line
+
+
+def test_sft_card_count_never_starves_a_rank_of_its_batch():
+    """The card count must divide the batch, because verl floor-divides the batch across ranks.
+
+    With ulysses pinned off, `dp_size == world_size`, and verl computes
+    `train_batch_size_per_dp = train_batch_size // dp_size` and hands that straight to a
+    DataLoader. Two widths are unusable: one ABOVE the batch floors to 0, and
+    `DataLoader(batch_size=0)` raises ValueError; one that does not DIVIDE the batch silently
+    shrinks the global batch, because the sampler and loader both drop the remainder.
+
+    The unpacked case is the one that matters most: `examples_per_update` is 1 for every
+    exact-unpacked run, which is exactly what a GDN model without the boundary-reset contract
+    gets -- so a 2-card allocation would otherwise compute 1 // 2 == 0 and die before step 1.
+    """
+    from flash.engine.worker.sft_train_runner import sft_data_parallel_cards
+
+    # unpacked: one example cannot be split, so extra cards have nothing to hold.
+    for cards in (1, 2, 4, 8):
+        assert sft_data_parallel_cards(cards, 1) == 1
+
+    # the batch divides the allocation: use every card.
+    assert sft_data_parallel_cards(2, 32) == 2
+    assert sft_data_parallel_cards(4, 32) == 4
+    assert sft_data_parallel_cards(8, 32) == 8
+
+    # it does not divide: fall to the largest divisor <= the allocation, never a remainder split.
+    assert sft_data_parallel_cards(4, 6) == 3
+    assert sft_data_parallel_cards(8, 12) == 6
+    assert sft_data_parallel_cards(3, 4) == 2
+    assert sft_data_parallel_cards(4, 10) == 2
+
+    # batch smaller than the allocation: bounded by the batch, never 0.
+    assert sft_data_parallel_cards(8, 2) == 2
+    assert sft_data_parallel_cards(8, 3) == 3
+
+    # exhaustive: never 0, never above the allocation, and always an exact divisor of the batch --
+    # the three properties that together mean no rank is starved and the global batch is preserved.
+    for cards in range(1, 9):
+        for batch in range(1, 33):
+            resolved = sft_data_parallel_cards(cards, batch)
+            assert 1 <= resolved <= cards
+            assert batch % resolved == 0, (cards, batch, resolved)
+
+
+def test_sft_launches_the_resolved_width_not_the_allocated_cards():
+    """torchrun must start the RESOLVED rank count.
+
+    `sft_data_parallel_cards` is inert if the child is still launched with `--nproc-per-node` set
+    to the allocated card count: verl would split the batch across every rank torchrun started, so
+    the extra ranks would hit the batch_size=0 crash the resolver exists to prevent.
+    """
+    import inspect
+
+    from flash.engine.worker import sft_train_runner
+
+    src = inspect.getsource(sft_train_runner._prepare_sft_child)
+    line = next(ln.strip() for ln in src.splitlines() if "nproc-per-node" in ln)
+
+    assert line == 'f"--nproc-per-node={world_size}",', line
+    assert '"n_gpus_per_node": world_size,' in src
+
+
 def test_remove_padding_is_unconditional():
     """Nothing may gate `use_remove_padding`: it is the only layout verl's sft_loss can consume.
 
@@ -1394,7 +1479,13 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
     sft_train.run_sft_train(spec)
 
     assert captured["command"][:3] == ["/venv/bin/python", "-m", "torch.distributed.run"]
-    assert "--nproc-per-node=2" in captured["command"]
+    # ONE rank, on a 2-card spec: this fixture's probes answer "not gdn, not pure attention", so
+    # the profile is exact-unpacked and `examples_per_update` is 1. verl would floor-divide that
+    # single example across 2 dp ranks and hand a DataLoader batch_size=0, so the second card is
+    # unusable for this run and must not be launched. See sft_data_parallel_cards.
+    assert "--nproc-per-node=1" in captured["command"]
+    assert "trainer.n_gpus_per_node=1" in captured["command"]
+    assert "engine.ulysses_sequence_parallel_size=1" in captured["command"]
     assert "verl.trainer.sft_trainer" in captured["command"]
     custom_path = next(
         value.split("=", 1)[1]
