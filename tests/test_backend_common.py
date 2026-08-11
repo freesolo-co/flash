@@ -885,6 +885,46 @@ def test_the_shim_patches_the_module_the_caller_actually_receives():
         patch(SimpleNamespace())
 
 
+def test_the_armed_finder_patches_the_module_on_a_real_import(tmp_path, monkeypatch):
+    # the test above calls the patch directly, so the finder and the loader that carry it are the
+    # one part of the fix nothing exercises: if the delegation loop stopped resolving the target,
+    # or wrapped a spec whose loader never ran, every other assertion here still passes while the
+    # shim silently patches nothing. drive a genuine `import` through the armed finder instead.
+    # stand-in modules keep this off transformers, so it runs wherever the suite runs.
+    import importlib
+
+    root = tmp_path / "site"
+    package = root / "transformers" / "models" / "qwen3_5"
+    package.mkdir(parents=True)
+    for parent in (root / "transformers", root / "transformers" / "models", package):
+        (parent / "__init__.py").write_text("")
+    (package / "modeling_qwen3_5.py").write_text(
+        "class Qwen3TextModel:\n    def forward(self, *args, **kwargs):\n        return kwargs\n"
+    )
+    # the patch imports these two names at patch time; supply them so no torch install is needed.
+    (root / "transformers" / "modeling_flash_attention_utils.py").write_text(
+        "def _is_packed_sequence(*args, **kwargs):\n    return False\n\n\n"
+        "def prepare_fa_kwargs_from_position_ids(*args, **kwargs):\n"
+        "    return ((None, None), (None, None))\n"
+    )
+    monkeypatch.syspath_prepend(str(root))
+    for name in [n for n in sys.modules if n.split(".")[0] == "transformers"]:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+
+    saved_meta_path = sys.meta_path[:]
+    try:
+        # the shim is our own render, not external input
+        exec(compile(vc.render_gdn_varlen_shim("qwen3_5"), "<gdn-shim>", "exec"), {})
+        assert type(sys.meta_path[0]).__name__ == "_FlashGdnFinder", "the shim must arm its finder"
+        module = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
+        assert getattr(module.Qwen3TextModel.forward, "_flash_gdn_varlen_patched", False) is True
+        # and it must step back off meta_path once it has fired: leaving it armed would re-wrap
+        # every later import of the same name for the rest of the process.
+        assert not [f for f in sys.meta_path if type(f).__name__ == "_FlashGdnFinder"]
+    finally:
+        sys.meta_path[:] = saved_meta_path
+
+
 def test_the_gate_hands_the_shim_the_arch_it_verified(monkeypatch):
     # derive model_type from the child module so the gate and shim cannot disagree. patch the module
     # object because test cleanup may replace the parent package and break dotted monkeypatch
