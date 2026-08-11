@@ -8,6 +8,10 @@ import tomllib
 from pathlib import Path
 
 from flash.cli.commands import traces
+from flash.cli.commands.env.retained import (
+    _warn_if_environment_form_disagrees,
+    _warn_if_retained_starter_files_describe_another_plane,
+)
 from flash.cli.scaffold import TRAINING_MD
 from flash.cli.ui import render
 from flash.envs.evaluations import _DEFAULT_EVALUATIONS_PATH
@@ -511,93 +515,6 @@ def _validate_existing_config_projects(project_id: str) -> None:
             )
 
 
-def _warn_if_environment_form_disagrees(configs: tuple[Path, ...], *, can_publish: bool) -> None:
-    """Warn when configs left over from a run against the OTHER plane kind are kept as-is.
-
-    Setup is idempotent: the `_write_*` helpers skip a config that already exists, and
-    `_validate_existing_config_projects` only compares the project uuid. So a rerun in a directory
-    scaffolded against the other plane kind keeps its old `[environment]` block on disk while
-    printing this plane's next step -- guidance the retained file contradicts. Warn rather than
-    refuse or rewrite: refusing would break the idempotent rerun, and every helper here
-    deliberately preserves what the user has edited.
-
-    Classify with the loader's own predicates, not a `github:` prefix test. The loader accepts a
-    plain `https://github.com/OWNER/REPO/...` URL as the same self-hosted form, so a prefix test
-    would warn about an id this plane resolves fine.
-
-    Three states, not two. A blank id is neither form: it is the hosted branch's own placeholder
-    (`id = ""`), which `validate_spec` rejects outright. Collapsing it into "not github" would let
-    the self-hosted branch tell an identity-backend operator their blank ids are "already right",
-    which is the one thing they certainly are not.
-    """
-    from flash.client import ClientError
-    from flash.envs.loader import is_github_environment_ref, is_managed_environment_slug
-
-    github: list[Path] = []
-    managed: list[Path] = []
-    unfilled: list[Path] = []
-    for cfg in configs:
-        if not cfg.exists():
-            continue
-        try:
-            raw = tomllib.loads(cfg.read_text(encoding="utf-8"))
-        except (OSError, tomllib.TOMLDecodeError) as exc:
-            raise ClientError(f"cannot read existing {cfg}: {exc}") from exc
-        environment = raw.get("environment")
-        environment_id = environment.get("id") if isinstance(environment, dict) else None
-        env_id = environment_id.strip() if isinstance(environment_id, str) else ""
-        if is_github_environment_ref(env_id):
-            github.append(cfg)
-        elif is_managed_environment_slug(env_id):
-            managed.append(cfg)
-        else:
-            unfilled.append(cfg)
-
-    def _names(paths: list[Path]) -> str:
-        return ", ".join(str(cfg) for cfg in paths)
-
-    if can_publish:
-        # An unfilled id needs no warning here: it is what this branch scaffolds, and the printed
-        # next step is already `flash env push`.
-        if github:
-            _warn(
-                f"existing {_names(github)} use `github:` [environment] ids, but this hosted plane "
-                "requires managed hub ids; keeping the files unchanged. Run `flash env push`, then "
-                "replace each [environment] id with the returned id"
-            )
-        return
-
-    if managed:
-        # hedged, unlike the hosted branch above: which form a self-hosted plane can USE depends on
-        # server-side FLASH_STANDALONE, which the CLI cannot read. An identity-backed plane takes
-        # managed slugs, so a flat "replace it" would be advice to break a working config.
-        #
-        # "cannot resolve", not "rejects": standalone does not reject a slug at validation --
-        # `_require_hosted_environment_form` returns early under `auth.standalone()`, and so does
-        # `require_environment_project`. It fails one layer later, at fetch:
-        # `managed_slug_to_github_ref` maps every slug onto `freesolo-co/environment-hub`, which is
-        # an internal repo an external operator's GITHUB_TOKEN cannot read. Saying "rejects" would
-        # send someone hunting for a validation error that never appears in their logs.
-        _warn(
-            f"existing {_names(managed)} use managed hub [environment] ids, which a standalone "
-            "plane accepts but cannot fetch -- they resolve to Freesolo's internal environment-hub "
-            "repo; keeping the files unchanged. If this plane runs with `FLASH_STANDALONE=1`, "
-            "replace each [environment] id with a `github:OWNER/REPO@REF:PATH` form pointing at a "
-            "repo your plane's GITHUB_TOKEN can read; if it runs against an identity backend, "
-            "managed hub ids are the accepted form and these are already right"
-        )
-    if unfilled:
-        # Unhedged, because no plane accepts a blank id: `validate_spec` fails the submit before the
-        # standalone-vs-identity question is ever reached. Both forms are still named, since which
-        # one to fill in does depend on that server setting.
-        _warn(
-            f"existing {_names(unfilled)} have no usable [environment] id, which fails validation on "
-            "any plane; keeping the files unchanged. Fill each one in -- with a "
-            "`github:OWNER/REPO@REF:PATH` form if this plane runs with `FLASH_STANDALONE=1`, or with "
-            "a managed hub id if it runs against an identity backend"
-        )
-
-
 def _existing_reasoning(configs: tuple[Path, ...]) -> bool | None:
     """The `thinking` state the generated configs already agree on, or None if none exist.
 
@@ -887,7 +804,7 @@ def cmd_env_setup(args) -> int:
     reasoning = _resolve_reasoning_mode(args, reasoning_configs)
 
     can_publish = _plane_can_publish_environments()
-    _warn_if_environment_form_disagrees(reasoning_configs, can_publish=can_publish)
+    _warn_if_environment_form_disagrees(reasoning_configs, can_publish=can_publish, warn=_warn)
     env_py = (_STARTER_ENV_MULTITURN_PY if multi_turn else _STARTER_ENV_PY).replace(
         "PROJECT_UUID", project_id
     )
@@ -907,6 +824,12 @@ def cmd_env_setup(args) -> int:
         f"max_examples = {example_rows}  # rows to train on; "
         f"{'exported from your traces' if traces_jsonl else 'the starter dataset has 2'}"
         f"{'' if traces_jsonl else ' (raise as your dataset grows)'}\n"
+    )
+    _warn_if_retained_starter_files_describe_another_plane(
+        (starter_env, starter_evaluations),
+        can_publish=can_publish,
+        project_id=project_id,
+        warn=_warn,
     )
     if not starter_env_exists:
         starter_env.write_text(env_py)

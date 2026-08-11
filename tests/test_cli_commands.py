@@ -694,6 +694,50 @@ def test_env_setup_warns_when_filled_hub_ids_are_retained_on_a_self_hosted_plane
         assert (tmp_path / "configs" / name).read_text(encoding="utf-8") == filled[name], name
 
 
+def test_env_setup_warns_when_retained_starter_files_describe_the_other_plane(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A rerun against the other plane kind leaves the .py files documenting the old workflow.
+
+    `_for_self_hosted_plane` rewrites the generated docstrings, but the result is written only under
+    `if not starter_env_exists`, and `evaluations.py` is nested one level deeper inside that same
+    guard. So a hosted-then-self-hosted rerun keeps both files telling the operator to run
+    `flash env push` -- a command their plane cannot use -- while the configs and the printed next
+    step describe the new plane. The files are deliberately not rewritten (setup never overwrites a
+    file the user may have edited), so the warning is the whole remedy and has to name them.
+    """
+    hosted = _scaffold(monkeypatch, tmp_path, "https://flash.freesolo.co")
+    assert "flash env push" in hosted["environment.py"]
+    assert "flash env push" in hosted["evaluations.py"]
+    capsys.readouterr()
+
+    retained = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+    warning = capsys.readouterr().err
+
+    assert "still tell you to run `flash env push`, which this plane cannot do" in warning
+    assert "environment.py" in warning
+    assert "evaluations.py" in warning
+    # the premise the warning exists for: the files really are retained unrewritten
+    assert retained["environment.py"] == hosted["environment.py"]
+    assert retained["evaluations.py"] == hosted["evaluations.py"]
+
+
+def test_env_setup_does_not_warn_about_starter_files_that_match_the_plane(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """The detector reads what is on disk, so a same-plane rerun stays silent.
+
+    Guards the obvious failure of the test above: a warning that fired on every rerun would satisfy
+    it while making the idempotent path noisy.
+    """
+    _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+    capsys.readouterr()
+
+    _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+
+    assert "flash env push" not in capsys.readouterr().err
+
+
 def test_managed_slug_fails_at_fetch_not_validation_on_standalone() -> None:
     """Pin the mechanism the managed-slug warning describes, so its wording cannot drift back.
 
