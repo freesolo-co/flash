@@ -212,6 +212,34 @@ def test_sft_profile_input_payload_hashes_environment_params() -> None:
     assert "params_sha256" in encoded
 
 
+def test_sft_profile_identity_separates_configs_by_environment_pip() -> None:
+    """``[environment] pip`` changes the installed worker stack, so it cannot be absent from identity.
+
+    Two configs differing only here would otherwise share a profile digest, and the second would
+    reuse the first's measured quote and step horizon for a different dependency set.
+    """
+    spec = _spec()
+    with_pip = replace(spec, environment=replace(spec.environment, pip=("pymongo>=4.6",)))
+    reordered = replace(
+        spec, environment=replace(spec.environment, pip=("rapidfuzz", "pymongo>=4.6"))
+    )
+    ordered = replace(
+        spec, environment=replace(spec.environment, pip=("pymongo>=4.6", "rapidfuzz"))
+    )
+
+    def identity(job: JobSpec) -> dict:
+        return sft_profile_input_payload(
+            job, tokenizer_revision="tokenizer-a", producer_version="1.2.3"
+        )["environment"]
+
+    assert identity(spec) != identity(with_pip)
+    # pip resolves earlier entries first, so a reordering is a different install, not the same one.
+    assert identity(ordered) != identity(reordered)
+    assert identity(with_pip) == identity(
+        replace(spec, environment=replace(spec.environment, pip=("pymongo>=4.6",)))
+    )
+
+
 def test_sft_profile_contains_only_aggregate_evidence() -> None:
     encoded = json.dumps(_profile().to_dict(), sort_keys=True)
 
