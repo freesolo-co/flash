@@ -1329,12 +1329,14 @@ rank per card with Ulysses sequence parallelism, which keeps the global batch wh
 data instead — sequence parallelism is wrong for the catalog's GatedDeltaNet models, whose linear
 attention and causal conv carry state along the sequence — so its batch is split across ranks.
 
-That gives SFT one thing to watch: `[train] batch_size` has to divide the card count, or some cards
-go unused. A batch verl cannot split evenly would either starve a rank or silently drop the
-remainder, so the worker trains on the largest number of cards that divides the batch and prints
-`[sft][warn] training on N of M allocated cards` when it does. The unused cards are still billed, so
-if you see that line, either raise `batch_size` to a multiple of the card count or allocate fewer
-cards. An unpacked run trains one example per update, so it always resolves to a single card.
+That gives SFT one thing to watch: the card count has to divide `[train] batch_size`, or some cards
+go unused. A batch verl cannot split evenly would starve a rank, so the worker trains on the largest
+number of cards that divides the batch and prints `[sft][warn] training on N of M allocated cards`
+when it does. The unused cards are still billed, so if you see that line, either raise `batch_size`
+to a multiple of the card count or allocate fewer cards. Note the direction: batch 8 on 4 cards uses
+all four, while batch 2 on 4 cards uses two. An unpacked run trains one example per update, so it
+always resolves to a single card whatever `batch_size` says — there, allocate one card rather than
+raising the batch.
 
 OPD has one unsupported combination, and because there is no other backend to fall back to it
 raises at startup: a multi-turn env together with `[train] structured_outputs`. Multi-turn OPD

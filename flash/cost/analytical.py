@@ -23,6 +23,7 @@ from flash.cost.facts import (
     total_params_b,
 )
 from flash.cost.types import CostEstimate, RunConfig
+from flash.engine.plan.steps import sft_data_parallel_cards
 from flash.providers.allocator import geometry_safe_gpu_cap, required_vram_gb, vram_headroom
 from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY, opd_teacher_request_multiplier
 
@@ -272,12 +273,21 @@ def method_card_speedup(config: RunConfig, gpu_count: int, gpu: str, provider: s
 
     ``provider`` must reflect the rented substrate because interconnect changes scaling. Live
     allocation paths learn it after building ``config``; pinned ``config.provider`` is the fallback.
+
+    Credit SFT only the ranks that will actually execute. ``gpu_count`` here is the BILLED shape,
+    and sharding by data bounds the executed width by the batch: an unpacked profile pins
+    ``batch_size`` to 1, so a 2-card rental trains on one rank. Quoting the billed width there would
+    promise throughput the run cannot deliver and understate wall time against the run's cap. The
+    cards are still billed -- that is the point of the ``[sft][warn]`` line the worker prints.
     """
     n = config.normalized()
     resolved = (provider or "").strip().lower()
     if not resolved:
         resolved = n.provider if n.provider != "auto" else ""
-    return multi_card_speedup(gpu_count, gpu, resolved)
+    executed = gpu_count
+    if n.method == "sft":
+        executed = sft_data_parallel_cards(gpu_count, n.batch_size or 1)
+    return multi_card_speedup(executed, gpu, resolved)
 
 
 def sharded_step_seconds(config: RunConfig, gpu: str, gpu_count: int, provider: str = "") -> float:

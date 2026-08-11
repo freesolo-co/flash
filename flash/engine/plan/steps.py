@@ -25,6 +25,33 @@ def sft_update_steps(
     return max(1, math.ceil(training_rows / max(1, int(examples_per_update))) * int(epochs))
 
 
+def sft_data_parallel_cards(gpu_count: int, train_batch_size: int) -> int:
+    """Cards SFT can actually train on, given verl splits the batch across them.
+
+    SFT runs data-parallel (see ``sft_train_runner._prepare_sft_child``), so verl derives
+    ``train_batch_size_per_dp = train_batch_size // dp_size`` and hands that straight to a
+    DataLoader. A count ABOVE the batch floors the per-rank batch to 0, and
+    ``DataLoader(batch_size=0)`` raises ``ValueError`` -- measured, not inferred. A count that does
+    not DIVIDE the batch leaves a remainder that cannot be dealt to every rank equally.
+
+    So take the largest divisor of the batch that is <= the allocated cards. That keeps the
+    realized global batch exactly ``train_batch_size`` on every width this returns, which is what
+    makes the card count a pure throughput choice rather than a hyperparameter change.
+
+    Returns 1 for an unpacked run (``examples_per_update`` is 1 there), which is correct: one
+    example cannot be split, so extra cards would have nothing to hold.
+
+    Lives here rather than beside its caller because the cost path must quote the width that will
+    execute, and ``sft_train_runner`` is not importable from it (it cycles through ``sft_train``).
+    """
+    cards = max(1, int(gpu_count))
+    batch = max(1, int(train_batch_size))
+    for count in range(min(cards, batch), 0, -1):
+        if batch % count == 0:
+            return count
+    return 1
+
+
 def final_save_due(step: int, save_at_steps: tuple[int, ...] | list[int]) -> bool:
     """Preserve the final checkpoint unless exact save steps exclude it."""
     step = int(step)

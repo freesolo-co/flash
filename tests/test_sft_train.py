@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import io
 import os
 import pathlib
 import re
@@ -285,6 +286,59 @@ def test_sft_warns_while_the_run_is_live_when_it_leaves_cards_idle(monkeypatch, 
     assert "[sft][warn] training on 1 of 2 allocated cards" in out, out
     assert "still billed" in out
     assert "--nproc-per-node=1" in captured["command"]
+
+
+def test_sft_idle_card_warning_names_a_remedy_that_can_actually_work():
+    """The advice has to move the width it is printed about, and name a shape you can rent.
+
+    Two ways this line can be confidently wrong. An unpacked profile pins the batch to 1 in
+    `sft_workload` regardless of `[train] batch_size`, so telling that operator to raise the batch
+    points at a knob that cannot change the answer. And only powers of two are rentable, so naming
+    an odd rank count as an allocation buys the next one DOWN -- "allocate 3" gets 2 cards, which
+    can leave a run that only fit on 4 unplaceable.
+    """
+    from flash.engine.worker.sft_train_runner import _resolve_sft_world_size
+
+    unpacked = io.StringIO()
+    with contextlib.redirect_stdout(unpacked):
+        assert _resolve_sft_world_size(2, 1) == 1
+    text = unpacked.getvalue()
+    assert "[sft][warn] training on 1 of 2 allocated cards" in text, text
+    assert "batch_size" not in text, "raising the batch cannot move an unpacked run off one card"
+    assert "allocate 1 card(s)" in text, text
+
+    # batch 6 on 4 cards resolves to 3 ranks, but 3 is not rentable -- recommend 2.
+    odd = io.StringIO()
+    with contextlib.redirect_stdout(odd):
+        assert _resolve_sft_world_size(4, 6) == 3
+    text = odd.getvalue()
+    assert "training on 3 of 4 allocated cards" in text, text
+    assert "allocate 2 card(s)" in text, text
+    assert "allocate 3 card(s)" not in text
+
+
+def test_sft_quote_credits_only_the_ranks_that_will_execute():
+    """A quote must not promise throughput from cards the batch cannot feed.
+
+    `gpu_count` at the quote boundary is the BILLED shape. SFT shards by data, so the executed
+    width is bounded by the batch: an unpacked run on 2 cards trains on one rank. Crediting the
+    billed width there understates wall time against the run's own cap. GRPO and OPD keep Ulysses
+    and do use every card, so the clamp must be SFT-only.
+    """
+    from flash.cost import analytical
+    from flash.cost.types import RunConfig
+
+    def speedup(method: str, batch: int, cards: int) -> float:
+        config = RunConfig(model_id="Qwen/Qwen3.5-4B", method=method, steps=10, batch_size=batch)
+        return analytical.method_card_speedup(config, cards, "H100", "runpod")
+
+    one_card = speedup("sft", 1, 1)
+    # unpacked sft: 2 billed cards, 1 executing rank -> quoted like the single card it is.
+    assert speedup("sft", 1, 2) == one_card
+    # a batch that divides the allocation keeps the full multi-card credit.
+    assert speedup("sft", 8, 2) > one_card
+    # grpo shards by data with ulysses across every card, so it is untouched by the batch.
+    assert speedup("grpo", 1, 2) > speedup("grpo", 1, 1)
 
 
 def test_sft_stays_quiet_when_every_allocated_card_is_used(monkeypatch, capsys):

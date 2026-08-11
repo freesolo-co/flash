@@ -13,7 +13,9 @@ from dataclasses import dataclass
 from functools import reduce
 from math import gcd
 
+from flash.engine.plan.steps import sft_data_parallel_cards
 from flash.engine.worker import sft_train as _sft_train
+from flash.providers.base import largest_rentable_count
 
 RECIPE = _sft_train.RECIPE
 _w = _sft_train._w
@@ -347,32 +349,6 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
     )
 
 
-def sft_data_parallel_cards(gpu_count: int, train_batch_size: int) -> int:
-    """Cards SFT can actually train on, given verl splits the batch across them.
-
-    SFT runs data-parallel (see `_prepare_sft_child`), so verl derives
-    `train_batch_size_per_dp = train_batch_size // dp_size` and hands that straight to a
-    DataLoader. Two card counts are unusable and both fail loudly rather than train:
-    a count ABOVE the batch floors the per-rank batch to 0, and `DataLoader(batch_size=0)`
-    raises `ValueError`; a count that does not DIVIDE the batch silently changes the global
-    batch, because verl's sampler drops the remainder (`drop_last=True` on both the sampler
-    and the loader).
-
-    So take the largest divisor of the batch that is <= the allocated cards. That keeps the
-    realized global batch exactly `train_batch_size` on every width this returns, which is what
-    makes the card count a pure throughput choice rather than a hyperparameter change.
-
-    Returns 1 for an unpacked run (`examples_per_update` is 1 there), which is correct: one
-    example cannot be split, so extra cards would have nothing to hold.
-    """
-    cards = max(1, int(gpu_count))
-    batch = max(1, int(train_batch_size))
-    for count in range(min(cards, batch), 0, -1):
-        if batch % count == 0:
-            return count
-    return 1
-
-
 def _resolve_sft_world_size(gpu_count: int, train_batch_size: int) -> int:
     """Ranks to launch, warning when that is fewer than the cards the run is paying for.
 
@@ -393,11 +369,23 @@ def _resolve_sft_world_size(gpu_count: int, train_batch_size: int) -> int:
         # the run is BILLED for every allocated card, so a card the batch cannot feed is money
         # spent on an idle gpu. the notes carry it too, but those are read after the fact -- say it
         # while the run is live, and say what would actually use the card.
+        #
+        # the remedy is not the same in both cases. an unpacked profile pins the batch to 1
+        # (`sft_workload` sets examples_per_update = 1 for every non-packed mode), so telling the
+        # operator to raise [train] batch_size there sends them to a knob that cannot move this
+        # width. and only powers of two are rentable, so naming an odd rank count as a card
+        # allocation buys the next one DOWN -- "allocate 3" gets 2.
+        rentable = largest_rentable_count(world_size)
+        remedy = (
+            f"allocate {rentable} card(s) instead"
+            if train_batch_size <= 1
+            else f"raise [train] batch_size to a multiple of {gpu_count}, or allocate {rentable} "
+            "card(s) instead"
+        )
         print(
             f"[sft][warn] training on {world_size} of {gpu_count} allocated cards: a batch of "
-            f"{train_batch_size} cannot be split across {gpu_count} ranks without starving one or "
-            "silently dropping the remainder. the idle cards are still billed -- raise [train] "
-            f"batch_size to a multiple of {gpu_count}, or allocate {world_size} card(s)."
+            f"{train_batch_size} cannot be split across {gpu_count} ranks without starving one. "
+            f"the idle cards are still billed -- {remedy}."
         )
     return world_size
 
