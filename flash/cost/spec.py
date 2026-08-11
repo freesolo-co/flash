@@ -109,10 +109,14 @@ def _on_policy_example_count(spec) -> int:
     env_examples = _env_max_examples(spec)
     if env_examples > 0:
         return env_examples
+    # only [train] max_examples is named here. [environment.params] max_examples is still READ
+    # above, because an environment that honours it really does bound the pool -- but it reaches
+    # the environment as an opaque `load_environment(**params)` kwarg, and the starter templates
+    # swallow it into **kwargs and ignore it. Only [train] max_examples is applied by the worker
+    # itself (rl/inputs.py:195, opd_train_runner.py:166), so it is the one this can promise.
     raise UnknownPromptPoolSize(
         f"cannot price {spec.algorithm} without a prompt-pool size: set [train] max_examples to "
-        "the row count the run will train on (or [environment.params] max_examples), or set "
-        "[train] max_steps to state the horizon directly"
+        "the row count the run will train on, or [train] max_steps to state the horizon directly"
     )
 
 
