@@ -33,6 +33,11 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   multi-turn environment whose `step_episode` returns a `final_response_text` has that override
   replace the episode's response before scoring, so the diagnostic named text the grader never
   saw. It now reports what the scorer actually received, captured at the scoring call.
+- An environment that overrode its answer to the empty string had `flash env test` report the
+  replayed turns instead: the captured text was tested for truth, so a graded `""` was
+  indistinguishable from an episode that never reached the scorer. The override propagates on
+  `is not None`, so `""` really is what the grader saw -- and an empty answer explains a zero
+  reward on its own, making it the reading a reader most needs named rather than hidden.
 - A crashed scorer went unreported on an `echo` episode -- a row with no gold answer to replay,
   which is also the case that leaves the GRPO gate with nothing to count. `flash env test` could
   exit `overall: PASS` with every reward coming from a scorer that never ran. The scorer's error is

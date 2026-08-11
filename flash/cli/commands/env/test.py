@@ -163,7 +163,9 @@ def _scored_text(record: dict) -> str:
     Read from the record rather than rebuilt from ``responses``: a multi-turn env whose
     ``step_episode`` returns a ``final_response_text`` has the adapter replace the episode's
     response with that override before scoring, so the replayed turns are not what was graded.
-    Falls back to the replayed turns for a record scored before this was captured.
+    Falls back to the replayed turns only when nothing was captured (``None``) -- an episode that
+    failed before it was scored. An empty capture is a real graded value, not a missing one, and
+    an empty answer is exactly the fault a reader needs named.
 
     Unlike ``_preview`` this preserves whitespace and does not truncate: it is printed with
     ``repr`` beside a zero reward so a trailing newline, a tab, or a wrapper past the preview
@@ -171,7 +173,7 @@ def _scored_text(record: dict) -> str:
     gold answer, so hiding them defeats the diagnostic.
     """
     scored = record.get("scored_text")
-    if scored:
+    if scored is not None:
         return str(scored)
     return "\n".join(str(item) for item in record.get("responses") or ())
 
@@ -211,7 +213,10 @@ def _new_record() -> dict:
         # `responses`: a multi-turn env whose `step_episode` returns `final_response_text` has the
         # adapter replace `state["response_text"]` with that override, and the scorer is fed the
         # replacement -- so printing the replayed turns would label text that was never scored.
-        "scored_text": "",
+        # None, not "": an empty string is a real graded value (an env that overrode the answer to
+        # nothing, a text-free final turn) and the case a reader most needs named, so it must not
+        # read as "never captured" and fall back to the replayed turns.
+        "scored_text": None,
         # the multi-turn rollout state, kept so the per-turn check below can ask about the episode
         # that was actually scored rather than a fresh one. None for single-turn, which has no state
         # and no per-turn vector either.
@@ -340,7 +345,10 @@ def _score_with_error(
     reward_with_error = getattr(env, "reward_with_error", None)
     if callable(reward_with_error):
         reward, error, scored = reward_with_error(completion, example, state)
-        return float(reward), str(error or ""), str(scored or "")
+        # `scored` is not coerced through `or ""`: an empty graded answer is a real value, and the
+        # caller distinguishes "" (captured, empty) from None (never scored) to decide whether to
+        # fall back to the replayed turns.
+        return float(reward), str(error or ""), str(scored)
     return float(env.reward(completion, example, state)), "", completion
 
 

@@ -789,6 +789,63 @@ def test_env_test_reports_the_text_the_scorer_actually_received(monkeypatch, tmp
     assert "scored text: 'RAW_TURN'" not in captured.err
 
 
+def test_env_test_reports_an_empty_override_as_the_scored_text(monkeypatch, tmp_path, capsys):
+    """An env that overrode the answer to nothing graded an empty string, and must say so.
+
+    `step_episode` propagates its override on `is not None` (flash/envs/adapter.py), so `""` really
+    does reach the grader. Treating a captured `""` as "never captured" fell back to the replayed
+    turns and named text the scorer never saw -- and an empty answer is the very fault a reader
+    most needs pointed at, since it explains the zero on its own.
+    """
+    from freesolo.datasets.types import TaskExample
+    from freesolo.environments import (
+        EnvironmentEpisode,
+        EnvironmentMultiTurn,
+        EnvironmentStepResult,
+        RewardResult,
+    )
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    graded: list[str] = []
+
+    class _Env(EnvironmentMultiTurn):
+        dataset: ClassVar[list] = [
+            {"input": "guess", "output": [{"role": "assistant", "content": "RAW_TURN"}]}
+        ]
+
+        def build_prompt_messages(self, example: TaskExample, prompt_text: str):
+            return [{"role": "user", "content": example.input}]
+
+        def start_episode(self, example: TaskExample, prompt_text: str):
+            return [{"role": "user", "content": example.input}]
+
+        def sft_completion(self, example: TaskExample):
+            return list(example.output or [])
+
+        def max_episode_turns(self, example: TaskExample) -> int:
+            return 2
+
+        def step_episode(self, example, messages, assistant_response):
+            # the env discarded the model's turn entirely -- a real override, to empty.
+            return EnvironmentStepResult(done=True, final_response_text="")
+
+        def score_episode(self, example, episode: EnvironmentEpisode) -> RewardResult:
+            graded.append(str(episode.response_text))
+            return RewardResult(score=0.0, threshold=1.0)
+
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, FreesoloEnvironment(_Env(), "env", source=None))
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
+    captured = capsys.readouterr()
+    # the grader really did receive the empty override, so that is what must be reported.
+    assert graded == [""]
+    assert "scored text: ''" in captured.err
+    # the replayed turn was never scored; naming it would send the reader to the wrong place.
+    assert "scored text: 'RAW_TURN'" not in captured.err
+
+
 def test_env_test_surfaces_a_scorer_error_on_an_echo_episode(monkeypatch, tmp_path, capsys):
     """An echo episode has no gold answer, which is exactly when a crash goes unreported.
 
