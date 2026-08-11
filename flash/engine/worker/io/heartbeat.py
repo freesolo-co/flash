@@ -32,6 +32,11 @@ _HB_SETUP_LIVENESS_STAGES = frozenset(
     {
         "model_prefetching",
         "checkpoint_prefetching",
+        # the post-download model setup span (adapter/tokenizer/architecture config reads). it is
+        # emitted as a one-shot transition FIRST and then held open by a liveness wrap, so it has to
+        # be throttled here like the other setup stages or a slow cold mount spends commits on it.
+        "sft_model_load",
+        "opd_model_load",
         "sft_data_loading",
         "rl_data_loading",
         "rl_adapter_loading",

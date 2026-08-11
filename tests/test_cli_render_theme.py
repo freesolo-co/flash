@@ -585,7 +585,11 @@ def test_run_status_omits_warmup_claim_for_stale_heartbeat(monkeypatch, stage: s
 
     assert stage in out
     assert "20m ago" in out
-    assert "quiet is not dead" in out
+    # the silence is still explained, but WHICH explanation depends on the stage: a liveness-backed
+    # setup stage pings every ~4 min, so at 20m the panel says so and names the vanished-instance
+    # possibility, while a one-shot ping like rl_train_start has only the generic throttle hint.
+    # what must hold for both is that the age is accounted for and nothing reassures.
+    assert ("quiet is not dead" in out) or ("longer than throttling explains" in out)
     assert "warming up" not in out
     assert "do not cancel" not in out
 
@@ -753,3 +757,121 @@ def test_stale_training_step_is_labelled_as_reporting_lag(monkeypatch):
     # and so is never absent.
     assert "the age above" in out
     assert "if configured" in out
+
+
+def test_long_silence_at_a_liveness_setup_stage_names_both_causes(monkeypatch):
+    """A frozen setup stage must not read as ordinary throttling (issue 26).
+
+    These stages hold a liveness thread on a ~240s cadence, so a much older heartbeat is NOT the
+    upload throttle. It is either one long blocking call (a cold per-datacenter weight cache) or a
+    vanished instance -- and the panel cannot tell which. The generic quiet hint says "quiet is not
+    dead", which asserts the healthy reading of exactly the ambiguity it cannot resolve.
+    """
+    import time as _time
+
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    base = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+    }
+
+    frozen = dict(base, last_heartbeat={"stage": "sft_model_load", "ts": _time.time() - 1200})
+    out = render.run_status(frozen)
+    assert "longer than throttling explains" in out
+    # both readings, because the panel genuinely cannot distinguish them -- naming only one is how
+    # a user either cancels a healthy download or waits on a box that is already gone.
+    assert "cold weight cache" in out
+    assert "instance is gone" in out
+    # one explanation per silence: the generic hint must not ride along with the specific one.
+    assert render._QUIET_HEARTBEAT_HINT not in out
+
+    # inside the cadence, silence is ordinary and must stay unremarked by this hint.
+    fresh = dict(base, last_heartbeat={"stage": "sft_model_load", "ts": _time.time() - 300})
+    assert "longer than throttling explains" not in render.run_status(fresh)
+
+    # a one-shot ping (no liveness thread) has no 240s cadence to be measured against, so the
+    # generic throttle hint remains the honest reading there.
+    one_shot = dict(base, last_heartbeat={"stage": "rl_train_start", "ts": _time.time() - 1200})
+    assert "longer than throttling explains" not in render.run_status(one_shot)
+
+    # a terminal run is not waiting on anything.
+    done = dict(frozen, state="done")
+    assert "longer than throttling explains" not in render.run_status(done)
+
+    # a superseded attempt's ping describes a worker that is already gone; calling that a possibly
+    # healthy download would hide that the replacement has published nothing at all.
+    superseded = dict(
+        base,
+        remote={"attempt": 2},
+        last_heartbeat={"stage": "sft_model_load", "attempt": 1, "ts": _time.time() - 1200},
+    )
+    assert "longer than throttling explains" not in render.run_status(superseded)
+
+    # a training step is the other hint's job; the two must never both fire.
+    stepping = dict(
+        base, last_heartbeat={"stage": "sft_step", "step": 3, "ts": _time.time() - 1200}
+    )
+    stepping_out = render.run_status(stepping)
+    assert "longer than throttling explains" not in stepping_out
+    assert "last one UPLOADED" in stepping_out
+
+
+def test_status_shows_the_datacenter_the_worker_landed_in(monkeypatch):
+    """Base weights come from a per-datacenter cache volume and the allocator does not pin a region.
+
+    The worker already stamps `dc` on every heartbeat, but nothing rendered it -- so an identical
+    config that relaunched into a cold region looked like an unexplainable freeze.
+    """
+    import time as _time
+
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    base = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+    }
+
+    located = dict(
+        base, last_heartbeat={"stage": "sft_model_load", "ts": _time.time() - 60, "dc": "EU-RO-1"}
+    )
+    assert "EU-RO-1" in render.run_status(located).split("details")[0]
+
+    # absent on providers that do not report one: render nothing rather than an empty row.
+    unlocated = dict(base, last_heartbeat={"stage": "sft_model_load", "ts": _time.time() - 60})
+    assert "datacenter" not in render.run_status(unlocated).split("details")[0]
+
+
+def test_quiet_hint_does_not_send_users_to_an_hourly_log(monkeypatch):
+    """Worker stdout uploads hourly, so `runs log` cannot answer "is it alive?" mid-run.
+
+    The hint used to point there, which is what made a healthy short run look hung.
+    """
+    import time as _time
+
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    quiet = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+        "last_heartbeat": {"stage": "rl_train_start", "ts": _time.time() - 400},
+    }
+    out = render.run_status(quiet).split("details")[0]
+
+    assert render._QUIET_HEARTBEAT_HINT in out
+    assert "runs log" not in out
+    # it has to name the surfaces that do update while the run is live.
+    assert "the age above" in out
+    assert "hourly" in out

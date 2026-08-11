@@ -175,6 +175,33 @@ class _OpdProgressState:
         return snapshot
 
 
+def _load_opd_model(model_id: str, model_revision: str, prompt_state) -> tuple[float, list]:
+    """Pull the base weights and read back the generation EOS ids, reporting progress throughout.
+
+    Weights come AFTER the prompt-budget filter: a dataset whose every prompt is over budget is a
+    deterministic input error, and downloading tens of GB before raising it burns paid worker
+    minutes for a verdict the tokenizer already had. The tokenizer/processor/config loads before
+    this fetch kilobytes, not weights, so they are cheap to run first.
+
+    `opd_model_load` is the stage the provider classifies as setup and TRAINING.md tells users to
+    expect here, but nothing emitted it -- so the documented stage never appeared and this span
+    reported as whatever ping came before it. Emit the transition, then hold it open across the
+    config read, which is minutes of silence on a cold cache mount.
+    """
+    download_seconds = _w.prefetch_model(model_id, revision=model_revision)
+    _w.heartbeat(
+        "opd_model_load",
+        download_seconds=download_seconds,
+        gpu=_w.gpu_diagnostics(include_torch=False),
+    )
+    with liveness_heartbeat("opd_model_load"):
+        # reads the snapshot with local_files_only, so it has to follow the prefetch.
+        eos_token_ids = generation_eos_from_cached_config(
+            model_id, model_revision, prompt_state.tokenizer
+        )
+    return download_seconds, eos_token_ids
+
+
 def run_opd_train(spec=None) -> None:
     """Run flash OPD through verl's native rollout and weight-sync path."""
     from flash.content.multimodal import validate_multimodal_training
@@ -202,13 +229,7 @@ def run_opd_train(spec=None) -> None:
     multi_turn, max_model_len = request.multi_turn, prompt_state.max_model_len
     if not prompt_state.prompts:
         raise RuntimeError("every OPD prompt exceeds the configured prompt budget")
-    # weights come AFTER the budget filter: a dataset whose every prompt is over budget is a deterministic input error, and downloading tens of GB before raising it burns paid worker minutes for a verdict the tokenizer already had.
-    # the tokenizer/processor/config loads above fetch kilobytes, not weights, so they are cheap to run first.
-    download_seconds = _w.prefetch_model(model_id, revision=model_revision)
-    # reads the snapshot with local_files_only, so it has to follow the prefetch.
-    eos_token_ids = generation_eos_from_cached_config(
-        model_id, model_revision, prompt_state.tokenizer
-    )
+    download_seconds, eos_token_ids = _load_opd_model(model_id, model_revision, prompt_state)
     workload = _prepare_workload(request, prompt_state, multimodal)
     update_horizon, prompts_per_step = workload.update_horizon, workload.prompts_per_step
     # same silent boundary the sft path guards: with no prebuilt worker image this builds a venv and installs the training stack, minutes long with nothing to report and no liveness thread running.
