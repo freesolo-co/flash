@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -677,6 +678,57 @@ def test_env_test_still_blames_the_grader_for_plain_gold_answers(monkeypatch, tm
         captured.err
     )
     assert "overall: FAIL" in captured.err
+
+
+def test_env_test_low_reward_warning_names_the_gold_completion_too(monkeypatch, tmp_path, capsys):
+    """The warning must not blame the grader alone for a zero it did not cause.
+
+    A dataset whose `output` is a bare value replays that value as the gold turn, so a grader that
+    requires a wrapper is right to score it zero. Naming only the reward function sends the reader
+    to edit a working scorer; the message names both candidates and prints the text it scored.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(rows=[{"input": "what is 2 + 2?", "output": "4"}], reward=0.0)
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
+    captured = capsys.readouterr()
+    assert "check the reward function or the gold completion it scored" in captured.err
+    # the exact text that scored zero, so a bare `4` is visibly the wrong gold turn.
+    assert "scored gold answer: 4" in captured.err
+
+
+def test_env_test_surfaces_the_scorer_error_behind_a_zero_reward(monkeypatch, tmp_path, capsys):
+    """A crashed scorer and a judged-wrong answer both reach the CLI as 0.0.
+
+    `FreesoloEnvAdapter.reward` keeps only `RewardResult.score`, so a missing runtime dependency is
+    reported as a bare zero. The error string is what names it, so the warning must print it.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(rows=[{"input": "what is 2 + 2?", "output": "4"}], reward=0.0)
+    env.reward_error = lambda completion, example, state=None: (
+        "ModuleNotFoundError: No module named 'pymongo'"
+    )
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
+    captured = capsys.readouterr()
+    assert "scorer error: ModuleNotFoundError: No module named 'pymongo'" in captured.err
+
+
+def test_env_test_omits_the_scorer_error_line_when_the_scorer_reported_none(
+    monkeypatch, tmp_path, capsys
+):
+    # an env that reports no error must not grow an empty `scorer error:` line, which would read as
+    # a crash on every deliberately-zero reward.
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(rows=[{"input": "what is 2 + 2?", "output": "4"}], reward=0.0)
+    env.reward_error = lambda completion, example, state=None: ""
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
+    captured = capsys.readouterr()
+    assert "scorer error:" not in captured.err
 
 
 def test_env_test_negative_reward_scale_is_not_a_zero_reward_grader(monkeypatch, tmp_path, capsys):
@@ -1460,3 +1512,56 @@ def test_env_test_malformed_param_fails_before_loading(monkeypatch, tmp_path, ca
     captured = capsys.readouterr()
     assert "--param must be KEY=VALUE" in captured.err
     assert "overall: FAIL" in captured.err
+
+
+def test_adapter_reward_error_exposes_what_reward_discards():
+    """`reward` keeps only `score`, so the scorer's error needs its own accessor.
+
+    A scorer whose runtime dependency is missing returns the documented 0.0 floor with `error` set.
+    Reading `reward` alone reports that as an ordinary wrong answer; `reward_error` recovers the
+    string that names the real cause.
+    """
+    from freesolo.datasets.types import TaskExample
+    from freesolo.environments import EnvironmentSingleTurn, RewardResult
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    class _Env(EnvironmentSingleTurn):
+        dataset: ClassVar[list] = [{"input": "find user", "output": "alice"}]
+
+        def build_prompt_messages(self, example: TaskExample, prompt_text: str):
+            return [{"role": "user", "content": example.input}]
+
+        def score_response(self, example: TaskExample, response_text: str) -> RewardResult:
+            return RewardResult(
+                score=0.0, threshold=1.0, error="ModuleNotFoundError: No module named 'pymongo'"
+            )
+
+    env = FreesoloEnvironment(_Env(), "env", source=None)
+    example = env.dataset()[0]
+
+    # the reward alone cannot tell a crashed scorer from a judged-wrong answer.
+    assert env.reward("alice", example) == 0.0
+    assert env.reward_error("alice", example) == "ModuleNotFoundError: No module named 'pymongo'"
+
+
+def test_adapter_reward_error_is_empty_when_the_scorer_reported_none():
+    from freesolo.datasets.types import TaskExample
+    from freesolo.environments import EnvironmentSingleTurn, RewardResult
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    class _Env(EnvironmentSingleTurn):
+        dataset: ClassVar[list] = [{"input": "what is 2 + 2?", "output": "4"}]
+
+        def build_prompt_messages(self, example: TaskExample, prompt_text: str):
+            return [{"role": "user", "content": example.input}]
+
+        def score_response(self, example: TaskExample, response_text: str) -> RewardResult:
+            return RewardResult(score=1.0, threshold=1.0, success=True)
+
+    env = FreesoloEnvironment(_Env(), "env", source=None)
+    example = env.dataset()[0]
+
+    assert env.reward("4", example) == 1.0
+    assert env.reward_error("4", example) == ""

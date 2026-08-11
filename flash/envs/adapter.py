@@ -282,6 +282,15 @@ class FreesoloEnvironment(BaseEnvironment):
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         return float(getattr(self._score_one(completion, example, state), "score", 0.0))
 
+    def reward_error(self, completion: str, example: dict, state: dict | None = None) -> str:
+        """The scorer's own ``RewardResult.error`` for this completion, or "" when it reported none.
+
+        ``reward`` above keeps only ``score``, so a scorer that crashed behind the SDK's guard and
+        one that judged the answer wrong both reach training as ``0.0``. Diagnostics that need to
+        tell those apart read the error here rather than reaching into ``_score_one``.
+        """
+        return str(getattr(self._score_one(completion, example, state), "error", "") or "")
+
     @staticmethod
     def _turn_rewards_from_result(result) -> tuple[float, ...] | None:
         metadata = getattr(result, "metadata", None)

@@ -21,5 +21,15 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Fixed
 
+- `flash env test` blamed the reward function for a gold answer that scored zero, when the
+  gold completion is equally likely to be at fault: with no `sft_completion` hook the replayed
+  answer is the dataset row's raw `output`, so a dataset whose `output` is a bare value fails a
+  grader that (correctly) requires a wrapper. The warning now names both candidates and prints
+  the exact text it scored. The scaffolded dataset documents that `output` is also the gold
+  assistant turn SFT trains on, and that per-row scorer state belongs in `metadata`.
+- A scorer that crashed behind the SDK's guard reached `flash env test` as a bare `0.000000`,
+  indistinguishable from a judged-wrong answer, because the adapter kept only
+  `RewardResult.score`. The new `FreesoloEnvironment.reward_error` recovers the discarded error
+  string and the warning prints it, so a missing runtime dependency names itself.
 - Two tests resolved Hugging Face model metadata over the network and passed only on a
   connected runner. They now stub the resolver like their siblings already did.

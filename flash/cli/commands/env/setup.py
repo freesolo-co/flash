@@ -70,6 +70,12 @@ def load_environment(dataset_path: str | None = None, **kwargs) -> StarterEnv:
     return env
 '''
 
+# `output` is both the expected answer and the gold assistant turn SFT trains on: with no
+# `sft_completion` hook, the adapter replays it verbatim (flash/envs/adapter.py). So it has to be
+# the full text the model should emit, not just the value the scorer extracts -- if the scorer
+# requires a wrapper (`\boxed{}`, a json object, a tag), write `output` with that wrapper already
+# on it, or SFT trains the model to emit exactly what the reward punishes. Per-row state the
+# scorer needs but the model must not see belongs in `metadata`, never in `output`.
 _STARTER_DATASET_JSONL = """\
 {"input":"What is 2 + 2?","output":"4"}
 {"input":"What is 3 + 5?","output":"8"}

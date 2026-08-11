@@ -275,6 +275,25 @@ def _scores_gold_no_better_than_junk(env, example: dict, gold_reward: float) -> 
     return junk_reward >= gold_reward
 
 
+def _replay_scorer_error(env, example: dict, record: dict) -> str:
+    """The scorer's own error string for this episode, or "" when it did not report one.
+
+    ``FreesoloEnvAdapter.reward`` returns ``float(result.score)``, so a scorer that crashed behind
+    the SDK's guard and one that deliberately scored zero are indistinguishable by reward alone.
+    ``RewardResult.error`` survives on the result object, so re-score the same text through the
+    breakdown path that keeps it. Advisory only: any failure here leaves the reward authoritative.
+    """
+    reward_error = getattr(env, "reward_error", None)
+    if not callable(reward_error):
+        return ""
+    responses = record.get("responses") or []
+    completion = responses[-1] if responses else ""
+    try:
+        return str(reward_error(completion, example, record.get("state")) or "")
+    except (Exception, SystemExit):
+        return ""
+
+
 def _separates_on_turn_rewards(env, example: dict, state: dict | None) -> bool:
     """Whether per-turn rewards separate an episode whose scalar does not.
 
@@ -724,14 +743,30 @@ def cmd_env_test(args) -> int:
                 if reward == 0.0:
                     replayed_zero.append((example, record["state"]))
             if reward <= 0.0:
+                # two different faults produce this same zero, and naming only the grader sends
+                # readers to edit a scorer that is working. the gold completion is the other
+                # candidate: `sft_completion` defaults to the row's raw `output`
+                # (flash/envs/adapter.py), so a dataset whose `output` is a bare value replays that
+                # value verbatim -- which a grader requiring a wrapper (`\boxed{}`, a json object,
+                # a tag) is right to score zero.
                 message = (
                     f"replay gold answer scored low (reward={reward:.6f}); "
-                    "check the reward function"
+                    "check the reward function or the gold completion it scored"
                 )
                 print(
                     render.warn(message) if render.styled() else f"warning: {message}",
                     file=sys.stderr,
                 )
+                print(
+                    f"  scored gold answer: {_preview(record['responses'])}",
+                    file=sys.stderr,
+                )
+                scorer_error = _replay_scorer_error(env, example, record)
+                if scorer_error:
+                    # a scorer that crashed and a scorer that judged are both reported as 0.0 by
+                    # `FreesoloEnvAdapter.reward`, which keeps only `RewardResult.score`. surfacing
+                    # the discarded `error` names a missing dependency instantly.
+                    print(f"  scorer error: {scorer_error}", file=sys.stderr)
 
     print(f"{passed}/{episode_count} episodes passed contract checks")
     if passed != episode_count:
