@@ -175,13 +175,13 @@ def test_github_token_is_optional_with_warning(clean_env, monkeypatch, caplog):
     assert any("GITHUB_TOKEN" in r.getMessage() for r in caplog.records)
 
 
-def test_warn_false_suppresses_the_advisory_logging(clean_env, monkeypatch, caplog):
-    """`warn=False` drops the advisory phase only, so a second caller can validate silently.
+def test_require_operator_config_does_not_log_the_advisory_summary(clean_env, monkeypatch, caplog):
+    """`require_operator_config` is the refusing half only, so a second caller validates silently.
 
-    Paired against warn=True on the SAME config: without that pair, a test asserting "no records"
-    would also pass if the config simply had nothing to warn about, and the suppression would be
-    unproven. This config warns twice (one RunPod account, no GITHUB_TOKEN) and logs the provider
-    summary, so all three lines are on the table.
+    Paired against the full `check_run_preflight` on the SAME config: without that pair, a test
+    asserting "no records" would also pass if the config simply had nothing to warn about, and the
+    split would be unproven. This config warns twice (one RunPod account, no GITHUB_TOKEN) and logs
+    the provider summary, so all three lines are on the table.
     """
     _minimal_config(monkeypatch)
     _set_runpod(monkeypatch, "only-one")
@@ -193,28 +193,28 @@ def test_warn_false_suppresses_the_advisory_logging(clean_env, monkeypatch, capl
     # record before the root level is ever consulted. Raising only the root passes alone and fails
     # behind that test.
     with caplog.at_level("INFO", logger="flash"):
-        pf.check_run_preflight(warn=False)
+        pf.require_operator_config()
     assert caplog.records == []
 
     with caplog.at_level("INFO", logger="flash"):
-        pf.check_run_preflight(warn=True)
+        pf.check_run_preflight()
     logged = [r.getMessage() for r in caplog.records]
     assert any("RUNPOD_API_KEY" in m for m in logged)
     assert any("GITHUB_TOKEN" in m for m in logged)
     assert any("GPU provider(s) configured" in m for m in logged)
 
 
-def test_warn_false_still_refuses_a_missing_credential(clean_env, monkeypatch):
-    """Silencing the advisory phase must not silence the check itself.
+def test_require_operator_config_still_refuses_a_missing_credential(clean_env, monkeypatch):
+    """Dropping the advisory phase must not drop the check itself.
 
-    `run_server` passes warn=False purely to avoid double-logging what the lifespan copy already
-    prints; if that also skipped validation, the early call would be decoration and the operator
+    `run_server` calls this half purely to avoid double-logging what the lifespan copy already
+    prints; if it also skipped validation, the early call would be decoration and the operator
     would be back to reading a PreflightError out of an ASGI startup traceback.
     """
     _minimal_config(monkeypatch)
     monkeypatch.delenv("HF_TOKEN", raising=False)
     with pytest.raises(pf.PreflightError) as excinfo:
-        pf.check_run_preflight(warn=False)
+        pf.require_operator_config()
     assert "HF_TOKEN" in str(excinfo.value)
 
 

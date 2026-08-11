@@ -207,7 +207,7 @@ def test_run_server_builds_the_app_and_delegates_to_uvicorn(monkeypatch) -> None
     monkeypatch.setattr(app_mod, "create_app", lambda: application)
     # run_server preflights the operator's configuration before starting uvicorn; this test runs
     # with none set, so stub it out -- the preflight behaviour itself is covered separately.
-    monkeypatch.setattr("flash.providers.preflight.check_run_preflight", lambda **_kwargs: None)
+    monkeypatch.setattr("flash.providers.preflight.require_operator_config", lambda: None)
 
     app_mod.run_server(host="0.0.0.0", port=9000)
 
@@ -230,10 +230,10 @@ def test_run_server_preflights_before_starting_uvicorn(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
     monkeypatch.setattr(app_mod, "create_app", lambda: pytest.fail("app built before preflight"))
 
-    def _fail(**_kwargs):
+    def _fail():
         raise PreflightError("HF_TOKEN is required")
 
-    monkeypatch.setattr("flash.providers.preflight.check_run_preflight", _fail)
+    monkeypatch.setattr("flash.providers.preflight.require_operator_config", _fail)
 
     with pytest.raises(PreflightError, match="HF_TOKEN"):
         app_mod.run_server(host="0.0.0.0", port=9000)
@@ -246,16 +246,22 @@ def test_run_server_does_not_repeat_the_advisory_preflight_logging(monkeypatch) 
     GITHUB_TOKEN warning and the `GPU provider(s) configured:` summary twice -- doubling exactly
     the lines SELF_HOSTING.md tells an operator to read, and any alert keyed on them.
     """
-    seen: list[bool] = []
+    seen: list[str] = []
     fake_uvicorn = types.ModuleType("uvicorn")
     fake_uvicorn.run = lambda *_args, **_kwargs: None
     monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
     monkeypatch.setattr(app_mod, "create_app", lambda: object())
     monkeypatch.setattr(
+        "flash.providers.preflight.require_operator_config",
+        lambda: seen.append("require"),
+    )
+    monkeypatch.setattr(
         "flash.providers.preflight.check_run_preflight",
-        lambda *, warn=True: seen.append(warn),
+        lambda: seen.append("check"),
     )
 
     app_mod.run_server(host="0.0.0.0", port=9000)
 
-    assert seen == [False]
+    # the refusing half only: the advisory summary belongs to the lifespan, which this test's
+    # stubbed create_app never builds.
+    assert seen == ["require"]

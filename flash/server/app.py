@@ -415,16 +415,14 @@ def run_server(host: str = "127.0.0.1", port: int = 8080) -> None:
         import uvicorn
     except ImportError as exc:
         raise RuntimeError(_SERVER_EXTRAS_HINT) from exc
-    from flash.providers.preflight import check_run_preflight
+    from flash.providers.preflight import require_operator_config
 
     # Before uvicorn, not just in the lifespan. The lifespan copy stays -- it is what covers a plane
     # built through create_app() by another ASGI server -- but a PreflightError raised there is an
     # unhandled ASGI startup exception, so the operator's actual problem arrives under ~20 lines of
     # starlette/contextlib frames. Running it here lets __main__ print the message on its own.
     #
-    # warn=False because this call is the one that repeats: the validation is pure reads (plus
-    # re-stripping already-stripped env vars), but _warn_degraded logs the GITHUB_TOKEN warning and
-    # the provider summary, and a booted plane should print those once, not twice. The lifespan
-    # call keeps them.
-    check_run_preflight(warn=False)
+    # The refusing half only: this is the call that repeats, and the lifespan is where the advisory
+    # summary belongs, so a booted plane logs it once.
+    require_operator_config()
     uvicorn.run(create_app(), host=host, port=port)
