@@ -329,6 +329,19 @@ def _record_environment_use(
         )
 
 
+def _submit_failure_http_error(exc: Exception) -> HTTPException:
+    """Classify a failed submission as the submitter's fault or the plane's.
+
+    Everything reaching here was a bad request by default, which is right for a spec the user must
+    change and wrong for the half of the managed-teacher gate they cannot act on: an unset
+    plane-side credential is an outage they can only wait out. Calling that a bad request would
+    re-create, one layer up, the very conflation the gate was hoisted to submit time to end.
+    """
+    if isinstance(exc, TeacherBrokerConfigurationError) and exc.plane_fault:
+        return HTTPException(status_code=503, detail=str(exc))
+    return HTTPException(status_code=400, detail=str(exc))
+
+
 @router.post("/v1/runs")
 def create_run(
     payload: dict,
@@ -463,13 +476,7 @@ def create_run(
         db.delete_run(run_id)
         if isinstance(exc, HTTPException):
             raise
-        # the catch-all below reports a client error, which is wrong for the half of the
-        # managed-teacher gate the submitter cannot act on: an unset plane credential is an outage
-        # they can only wait out, and calling it a bad request would re-create, one layer up, the
-        # very conflation this gate was hoisted here to end.
-        if isinstance(exc, TeacherBrokerConfigurationError) and exc.plane_fault:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise _submit_failure_http_error(exc) from exc
     _record_environment_use(
         environment_slug, project_id=project_id, run_id=run_id, reporting_key=reporting_key
     )
