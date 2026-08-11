@@ -1793,6 +1793,39 @@ def test_stall_tail_fields_narrows_to_the_most_recent_lines():
     assert carried[-1] == f"line{vc.STALL_TAIL_LINES + 24}"
 
 
+def test_child_tail_redacts_credentials_before_they_reach_a_heartbeat(monkeypatch):
+    """the retained tail rides to heartbeat.json, the streamed run log and persisted status.
+
+    the worker is the only side that knows the run's secret values, so redaction has to happen
+    here -- the plane-side formatter only neutralizes control characters.
+    """
+    secret = "hf_ZZZchildtailsecretvalue0123456789"
+    monkeypatch.setenv("HF_TOKEN", secret)
+    tail = vc.ChildOutputTail()
+    tail.record(f"requests.HTTPError: 401 Unauthorized for hf.co (token {secret})\n")
+
+    carried = vc.stall_tail_fields(0, tail)["child_tail"]
+
+    assert secret not in carried[0]
+    assert "<redacted>" in carried[0]
+    # the diagnostic itself is what a setup stall is read from; only the credential goes.
+    assert carried[0] == "requests.HTTPError: 401 Unauthorized for hf.co (token <redacted>)"
+
+
+def test_child_tail_redaction_precedes_the_per_line_cap(monkeypatch):
+    """sanitizing after truncation would split a credential across the cut and leak the prefix."""
+    secret = "hf_ZZZstraddlesthelinecap0123456789"
+    monkeypatch.setenv("HF_TOKEN", secret)
+    tail = vc.ChildOutputTail()
+    # the token starts inside the retained window and ends past it.
+    tail.record("x" * (vc._CHILD_TAIL_LINE_CHARS - 10) + secret + "\n")
+
+    kept = tail.tail()[0]
+
+    assert secret[:10] not in kept
+    assert len(kept) <= vc._CHILD_TAIL_LINE_CHARS
+
+
 # ---------------------- child teardown escalates to SIGKILL ----------------------
 # these real-process tests require fork, /proc group membership, and libc subreaper support.
 # guard on those capabilities rather than platform names.

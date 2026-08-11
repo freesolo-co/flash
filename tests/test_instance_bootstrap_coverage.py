@@ -1851,6 +1851,66 @@ def test_run_preload_records_download_failure(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# payload-secret redaction
+# ---------------------------------------------------------------------------
+# The worker container starts with an empty environment: the run's HF_TOKEN, GITHUB_TOKEN and user
+# runtime secrets reach the worker subprocess through payload["env"] only, so the bootstrap's own
+# os.environ value-redacts none of them. Everything the bootstrap uploads has to be redacted against
+# the payload env instead.
+_PAYLOAD_SECRET = "wandb-local-9f3ac1d2e4b5f7a8"
+
+
+def test_console_snapshot_redacts_a_payload_env_secret(tmp_path, monkeypatch):
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    uploads: list[tuple] = []
+    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: uploads.append((path, sub)))
+    console = tmp_path / "console_sft.txt"
+    console.write_text(
+        "Traceback (most recent call last):\n"
+        '  File "train.py", line 7, in <module>\n'
+        f"RuntimeError: wandb login rejected {_PAYLOAD_SECRET}\n"
+    )
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/run",
+        "env": {"WANDB_API_KEY": _PAYLOAD_SECRET},
+    }
+
+    b._upload_console_snapshot(payload, str(console), "sft")
+
+    tail = (tmp_path / "console_sft.txt.tail").read_text()
+    assert _PAYLOAD_SECRET not in tail
+    assert "RuntimeError: wandb login rejected <redacted>" in tail
+    # the surrounding traceback is the whole point of the upload; redaction must not eat it.
+    assert "Traceback (most recent call last):" in tail
+    assert '  File "train.py", line 7, in <module>' in tail
+    assert uploads == [(str(console) + ".tail", "console_sft.txt")]
+
+
+def test_attempt_marker_error_redacts_a_payload_env_secret(monkeypatch):
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub, **kwargs: None)
+    monkeypatch.setattr(b.time, "time", lambda: 100.0)
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "p",
+        "flash_arm": "vast",
+        "attempt": 1,
+        "run_id": "run-marker",
+        "deadline_at": 200.0,
+        "run_created_at": 100.0,
+        "run_max_wall_seconds": 100.0,
+        "env": {"WANDB_API_KEY": _PAYLOAD_SECRET},
+    }
+
+    b.write_attempt_marker(payload, ok=False, error=f"worker died holding {_PAYLOAD_SECRET}")
+
+    with open("/tmp/attempt_marker.json") as f:
+        marker = json.load(f)
+    assert marker["error"] == "worker died holding <redacted>"
+
+
+# ---------------------------------------------------------------------------
 # main(): the preload branch
 # ---------------------------------------------------------------------------
 def _preload_payload(**over):
