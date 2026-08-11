@@ -783,10 +783,14 @@ def test_long_silence_at_a_liveness_setup_stage_names_both_causes(monkeypatch):
     frozen = dict(base, last_heartbeat={"stage": "sft_model_load", "ts": _time.time() - 1200})
     out = render.run_status(frozen)
     assert "longer than throttling explains" in out
-    # both readings, because the panel genuinely cannot distinguish them -- naming only one is how
+    # every reading, because the panel genuinely cannot distinguish them -- naming only one is how
     # a user either cancels a healthy download or waits on a box that is already gone.
     assert "cold weight cache" in out
     assert "instance is gone" in out
+    # heartbeat uploads are best-effort and roll the throttle slot back on failure, so a healthy
+    # worker can keep running while its age grows without bound. presenting only "blocked or dead"
+    # sends that user to wait for an attempt change that is never coming.
+    assert "uploads may be failing" in out
     # one explanation per silence: the generic hint must not ride along with the specific one.
     assert render._QUIET_HEARTBEAT_HINT not in out
 

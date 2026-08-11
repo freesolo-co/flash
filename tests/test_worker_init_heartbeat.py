@@ -1208,6 +1208,46 @@ def test_model_load_is_a_throttled_setup_stage(stage):
     assert stage in ne._HB_THROTTLED_STAGES
 
 
+@pytest.mark.parametrize("stage", ["sft_model_load", "opd_model_load"])
+def test_model_load_transition_commits_even_behind_a_fresh_setup_ping(stage, monkeypatch):
+    """The one-shot transition must land; only the liveness ticks after it may be coalesced.
+
+    Throttling the stage as a whole drops the transition whenever a setup ping committed inside the
+    240s interval -- and the ping right before it is `model_prefetching`, which pings all through the
+    download. So the common case loses the only heartbeat that says the run reached this stage, which
+    is precisely what adding the stage was meant to make visible. Membership assertions cannot catch
+    this; it has to be exercised through `heartbeat()`.
+    """
+    import json
+
+    import flash.engine.worker.io.heartbeat as hb_mod
+    from flash.engine.worker.runtime.pkg_proxy import W as _w
+
+    committed: list[str] = []
+
+    def _fake_upload(local, remote, required=False):
+        with open(local) as f:
+            committed.append(json.load(f)["stage"])
+        return True
+
+    monkeypatch.setattr(_w, "hf_upload_file", _fake_upload)
+    monkeypatch.setattr(_w, "gpu_diagnostics", lambda **k: {})
+    monkeypatch.setattr(_w, "_HB_LAST_UPLOAD", 0.0)
+    monkeypatch.setattr(_w, "_HB_LAST_COMMITTED_STEP", -1)
+    monkeypatch.setattr(_w, "_HB_LAST_FORCED_UPLOAD", 0.0)
+
+    # the download's own liveness ping commits first and arms the throttle window.
+    hb_mod.heartbeat("model_prefetching", liveness=True)
+    hb_mod.heartbeat(stage, download_seconds=12.0)
+    assert stage in committed, "the stage transition was swallowed by the liveness throttle"
+
+    # and the wrap that follows must still be coalesced -- that is what the throttle is for.
+    before = len(committed)
+    for _ in range(6):
+        hb_mod.heartbeat(stage, liveness=True)
+    assert len(committed) == before, "liveness ticks must stay throttled"
+
+
 def test_no_worker_side_stall_watchdog():
     """The worker has no separate stall watchdog: the provider owns kill+retry, and the dump fires on
     liveness give-up. Guard against re-adding the env-tunable faulthandler timer."""

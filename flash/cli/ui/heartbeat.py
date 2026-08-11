@@ -158,10 +158,11 @@ def _stale_setup_hint(
     """Say what a long silence at a liveness-backed setup stage can and cannot mean.
 
     A setup stage holds a liveness thread on a 240s cadence, so a much older heartbeat is not the
-    throttle -- either the worker is inside one long blocking call or the instance is gone. The
-    panel cannot tell those apart, and the failure mode is asymmetric: a user who reads a slow but
-    healthy stage as a hang cancels a paid GPU. Name both, and point at the surface that actually
-    distinguishes them, rather than leaving the generic quiet hint to imply everything is fine.
+    throttle. It can be one long blocking call, a worker whose best-effort heartbeat uploads keep
+    failing while it works on (they roll the throttle slot back, so the age grows unbounded), or a
+    vanished instance. The panel cannot tell those apart, and the failure mode is asymmetric: a user
+    who reads a slow but healthy stage as a hang cancels a paid GPU. Name them and point at the
+    surface that distinguishes them, rather than letting the quiet hint imply everything is fine.
 
     The blocking call is only described as a download for the stages that actually fetch weights,
     and the datacenter is only cited when it is on the panel to be read -- an explanation that
@@ -185,9 +186,10 @@ def _stale_setup_hint(
         blocking = "this stage does no download, so a long one is unusual here"
     return (
         "this setup stage pings every ~4 min while the worker is alive, so this gap is longer than "
-        f"throttling explains: either it is inside one long blocking call ({blocking}) or the "
-        "instance is gone. a vanished instance is reported as a retry or failure, so check whether "
-        "the attempt advances before cancelling"
+        f"throttling explains: it may be inside one long blocking call ({blocking}), its heartbeat "
+        "uploads may be failing while it keeps working, or the instance is gone. a vanished "
+        "instance is reported as a retry or failure, so check whether the attempt advances before "
+        "cancelling"
     )
 
 

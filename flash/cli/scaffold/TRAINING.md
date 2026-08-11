@@ -381,13 +381,23 @@ So treat age as a threshold, not a verdict, and pick the threshold for the algor
   check the provider/attempt state, and your `[wandb]` run if you configured one. A retry that has
   already started will show a new attempt.
 
-**`flash runs log` is not a live feed of worker stdout.** The orchestration lines stream as they
-happen, but the worker's own console output is snapshotted to the artifact repo about **once an
-hour**, plus a final flush when the run ends. So a run shorter than that shows almost no worker
-output until it finishes and then delivers it all at once — a healthy short run can legitimately
-produce a couple of dozen lines that jump straight from `sft_model_load` to a late step. That is
-the upload cadence, not a resumed or skipped run. For progress _while_ a run is live, use the
-`status` panel's heartbeat age and W&B; use `runs log` for the full console and any traceback.
+**`flash runs log` is not a live feed of worker stdout, and it is not the whole log.** The
+orchestration lines stream as they happen, but the worker's own console output is snapshotted to
+the artifact repo about **once an hour**, plus a final flush when the run ends. Each snapshot
+uploads only the **last 64 KB** of console and overwrites the previous one, so a chatty run loses
+its earlier output permanently, including setup.
+
+Two consequences worth knowing before you read a quiet log as a broken run:
+
+- A run shorter than the upload interval shows almost no worker output until it finishes, then
+  delivers a batch at the end. A healthy short run can legitimately produce a couple of dozen
+  lines that jump straight from `sft_model_load` to a late step. That is the upload cadence, not
+  a resumed or skipped run.
+- On a long or verbose run, early lines are simply gone. Their absence is the 64 KB window, not
+  evidence the stage never ran.
+
+For progress _while_ a run is live, use the `status` panel's heartbeat age and W&B. Use
+`runs log` for the most recent console tail and a terminating traceback.
 
 **Exception — startup is exempt from all of the above.** While the run is warming up
 (`status` shows a `warmup` row: initializing the model, vLLM, and training kernels) a long
