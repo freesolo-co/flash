@@ -45,7 +45,11 @@ def test_control_http_client_is_reused_and_all_clients_close(monkeypatch):
         ("GET", "https://serve.example/healthz"),
         ("POST", "https://serve.example/adapters"),
     ]
-    assert created[0].kwargs == {"follow_redirects": True, "max_redirects": 100}
+    assert created[0].kwargs == {
+        "follow_redirects": True,
+        "max_redirects": deploy._MAX_REDIRECTS,
+        "event_hooks": {"request": [deploy._strip_internal_key_off_origin]},
+    }
 
     deploy._close_http_client()
 

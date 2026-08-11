@@ -80,18 +80,30 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
         or worker_spec.workload_profile_input_digest
         or worker_spec.workload_profile
     )
-    if has_workload_profile:
-        if snapshot.get("workload_profile") != (worker_spec.workload_profile or None):
-            raise ValueError("persisted workload profile does not match the worker spec")
-        if not isinstance(stored_digest, str) or stored_digest != runner._preparation_digest(
+    # the auto-pin marker is excluded from the structural compare (the public half always reads
+    # False by construction), so nothing else here would catch a forged worker-half marker. deploy
+    # reads it to decide whether to relax the authored-pin rejection, which makes it a privilege
+    # decision taken on an otherwise unverified value: a plain grpo/opd run reaches neither branch
+    # below, so a forged marker would skip the 400 and deploy against base weights the run never
+    # trained on. binding it to the digest closes that -- the marker is hashed into the digest at
+    # persist time, so a snapshot claiming one cannot reproduce it.
+    if has_workload_profile and snapshot.get("workload_profile") != (
+        worker_spec.workload_profile or None
+    ):
+        raise ValueError("persisted workload profile does not match the worker spec")
+    if (has_workload_profile or worker_spec.model_revision_auto) and (
+        not isinstance(stored_digest, str)
+        or stored_digest
+        != runner._preparation_digest(
             public_spec,
             worker_spec,
             expected,
             legacy_keys=legacy_keys,
             legacy_public_keys=legacy_public_keys,
             legacy_public_alpha=legacy_public_alpha,
-        ):
-            raise ValueError("persisted effective preparation failed integrity validation")
+        )
+    ):
+        raise ValueError("persisted effective preparation failed integrity validation")
     if public_spec.train.init_from_adapter:
         if not isinstance(expected, dict) or not expected.get("digest"):
             raise ValueError(

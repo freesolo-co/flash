@@ -1418,3 +1418,185 @@ def test_chat_stream_accepts_json_fallback(monkeypatch):
     assert list(d.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])) == [
         "full reply"
     ]
+
+
+def _erroring_stream_seams(monkeypatch, resp):
+    """Point the chat_stream seams at a fake client whose stream() yields ``resp``."""
+    import flash.serve.deploy as d
+
+    class _FakeClient:
+        def stream(self, method, url, **kwargs):
+            return resp
+
+    monkeypatch.setattr(d, "_stream_http_client", lambda: _FakeClient())
+    monkeypatch.setattr(d, "serving_openai_base_url", lambda: "https://serve.example/v1")
+
+
+def test_chat_stream_upstream_error_raises_before_first_chunk(monkeypatch):
+    """An upstream 4xx/5xx raises at chat_stream() call time, not during iteration.
+
+    The serving route wraps only the serve_chat_stream CALL in its try/except; by the time
+    the body iterates, the 200 and headers are already flushed. The request and
+    raise_for_status therefore must run inside chat_stream itself, and the upstream response
+    must be closed on the way out.
+    """
+    import httpx
+
+    import flash.serve.deploy as d
+
+    exits = []
+
+    class _ErrorResp:
+        def __init__(self):
+            self.headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            exits.append(exc)
+            return False
+
+        def raise_for_status(self):
+            request = httpx.Request("POST", "https://serve.example/v1/chat/completions")
+            response = httpx.Response(502, request=request)
+            raise httpx.HTTPStatusError("bad gateway", request=request, response=response)
+
+    _erroring_stream_seams(monkeypatch, _ErrorResp())
+
+    with pytest.raises(httpx.HTTPStatusError):
+        d.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])
+    assert len(exits) == 1
+
+
+class _MidstreamFailureResp:
+    def __init__(self):
+        self.exits = []
+        self.headers = {"content-type": "text/event-stream"}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.exits.append(exc)
+        return False
+
+    def raise_for_status(self):
+        return None
+
+    def iter_lines(self):
+        yield 'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}'
+        raise RuntimeError("upstream connection lost")
+
+
+def test_chat_stream_midstream_failure_raises_and_closes_upstream(monkeypatch):
+    """A failure after the first chunk propagates out of the iterator and closes upstream.
+
+    The propagating exception is what makes the serving route abort the chunked body, so the
+    client sees a truncated transfer rather than a clean eof."""
+    import flash.serve.deploy as d
+
+    resp = _MidstreamFailureResp()
+    _erroring_stream_seams(monkeypatch, resp)
+
+    stream = d.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])
+    assert next(stream) == "hi"
+    with pytest.raises(RuntimeError, match="upstream connection lost"):
+        next(stream)
+    assert len(resp.exits) == 1
+
+
+def test_chat_stream_close_without_iterating_closes_upstream(monkeypatch):
+    """Closing the returned iterator before reading any chunk still releases the response.
+
+    chat_stream opens the upstream connection eagerly, so the returned generator must already
+    be running: close() on a never-started generator skips the finally that exits the httpx
+    stream context."""
+    import flash.serve.deploy as d
+
+    resp = _MidstreamFailureResp()
+    _erroring_stream_seams(monkeypatch, resp)
+
+    stream = d.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])
+    stream.close()
+    assert len(resp.exits) == 1
+
+
+def test_internal_key_is_stripped_on_cross_origin_redirect(monkeypatch):
+    """A redirect off the serving origin must not carry the plane credential.
+
+    httpx strips only Authorization and Cookie when a redirect changes origin, so the custom
+    X-Freesolo-Internal-Key header would otherwise be forwarded verbatim to wherever a 302 from
+    the serving host points. The client's request hook has to drop it before the hop is sent.
+    """
+    import httpx
+
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
+
+    seen: list[tuple[str, str | None]] = []
+
+    def handler(request):
+        seen.append((request.url.host, request.headers.get("X-Freesolo-Internal-Key")))
+        if request.url.host == "serve.example":
+            return httpx.Response(302, headers={"Location": "https://attacker.example/capture"})
+        return httpx.Response(200, json={})
+
+    with d._new_serving_client(transport=httpx.MockTransport(handler)) as client:
+        resp = client.get("https://serve.example/v1/adapters", headers=d._internal_key_header())
+
+    assert resp.status_code == 200
+    # first hop (serving origin) carries the key; the redirected hop must not.
+    assert seen == [("serve.example", "secret-internal"), ("attacker.example", None)]
+
+
+def test_internal_key_survives_same_origin_redirect_polls(monkeypatch):
+    """Modal's async-result poll flow (same-origin 303s) must keep working with the key."""
+    import httpx
+
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
+
+    seen: list[tuple[str, str | None]] = []
+
+    def handler(request):
+        seen.append((request.url.path, request.headers.get("X-Freesolo-Internal-Key")))
+        if request.url.path == "/v1/slow":
+            return httpx.Response(303, headers={"Location": "https://serve.example/v1/poll"})
+        return httpx.Response(200, json={})
+
+    with d._new_serving_client(transport=httpx.MockTransport(handler)) as client:
+        resp = client.get("https://serve.example/v1/slow", headers=d._internal_key_header())
+
+    assert resp.status_code == 200
+    assert seen == [("/v1/slow", "secret-internal"), ("/v1/poll", "secret-internal")]
+
+
+def test_serving_clients_bound_redirect_chains(monkeypatch):
+    """The redirect cap covers the 30-minute chat window of same-origin polls, but is finite.
+
+    modal emits a 303 poll hop roughly every 150s, so the cap must allow at least
+    30 min / 150 s hops or slow cold starts fail with TooManyRedirects short of the
+    configured chat timeout. credential scoping does not rely on this cap: the request
+    hook strips the internal key on every off-origin hop.
+    """
+    import httpx
+
+    import flash.serve.deploy as d
+
+    # sized for the 30-minute chat timeout at one poll hop per ~150s, with margin.
+    assert d._MAX_REDIRECTS * 150 >= 30 * 60
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+
+    def handler(request):
+        return httpx.Response(302, headers={"Location": "https://serve.example/v1/again"})
+
+    with d._new_serving_client(transport=httpx.MockTransport(handler)) as client:
+        assert client.max_redirects == d._MAX_REDIRECTS
+        with pytest.raises(httpx.TooManyRedirects):
+            client.get("https://serve.example/v1/loop")
