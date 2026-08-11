@@ -6808,9 +6808,7 @@ def test_the_stdout_loop_verifies_the_marker_set_at_the_first_step_line():
     # and the final verdict.
     entry = " ".join(inspect.getsource(rl_train.run_rl_train).split())
     assert "_reward_observability=_reward_observability, files=files," in entry
-    assert (
-        'rc, state, files["resume_step"], expected_steps, resume_uploader, files=files' in entry
-    )
+    assert 'rc, state, files["resume_step"], expected_steps, resume_uploader, files=files' in entry
 
 
 def test_validate_rl_child_fails_a_run_whose_markers_are_missing(tmp_path):
