@@ -192,13 +192,17 @@ class _VerlCheckpointWatcher:
 
         def publish_adapter() -> None:
             nonlocal published
-            _w.publish_deployable_checkpoint(
-                adapter_dir,
-                step,
-                required=step in self.required_steps,
-                _provenance_ready=True,
+            # the returned subfolder is the durability signal, not the fact that the call returned:
+            # on an OPTIONAL step a failed upload is swallowed and reported as None, and treating
+            # that as published would delete the only copy of an adapter that never reached hf.
+            published = bool(
+                _w.publish_deployable_checkpoint(
+                    adapter_dir,
+                    step,
+                    required=step in self.required_steps,
+                    _provenance_ready=True,
+                )
             )
-            published = True
 
         try:
             uploaded = _w.upload_resume_checkpoint(
@@ -209,9 +213,9 @@ class _VerlCheckpointWatcher:
         finally:
             # once the adapter is durable on hf the local copy is redundant, and keeping every
             # step's copy leaves one directory per save on the container disk for the whole run
-            # (the rl path already drops its equivalent). gated on the publish actually happening:
-            # `upload_resume_checkpoint` can return before running `before_upload` at all, and an
-            # unpublished export is the one copy that still matters.
+            # (the rl path already drops its equivalent). gated on the publish having actually
+            # landed: `upload_resume_checkpoint` can also return before running `before_upload` at
+            # all, and an unpublished export is the one copy that still matters.
             if published:
                 shutil.rmtree(adapter_dir, ignore_errors=True)
         if step in self.required_steps and not uploaded:

@@ -20,16 +20,25 @@ class MergeDiskHeadroomError(RuntimeError):
     """the merged model this export must write does not fit beside the checkpoint it reads."""
 
 
-def _tree_bytes(path: str) -> int:
-    """apparent size of a directory tree, counting each inode once.
+def _model_shard_bytes(path: str) -> int:
+    """apparent size of the fsdp model shards in `path`, counting each inode once.
 
-    checkpoints are staged with hardlinks, so the same inode appears under several paths; counting
+    only `model_world_size_*_rank_*.pt` is measured, because only those files become merge output:
+    `_load_and_merge_state_dicts` loads exactly that glob, and the merged dict is what
+    `save_pretrained` writes back out. the `optim_*` and `extra_state_*` files sitting beside them
+    are read by resume, never by the merger, so including them would inflate the requirement by the
+    whole optimizer state -- ~7.6 GB of adam moments on a 35b rank-32 run -- and refuse merges that
+    would have fit.
+
+    checkpoints are staged with hardlinks, so the same inode can appear under several paths; counting
     it twice would overstate the very number this guard compares against free space.
     """
     seen: set[tuple[int, int]] = set()
     total = 0
     for root, _dirs, files in os.walk(path, followlinks=False):
         for name in files:
+            if not name.startswith("model_world_size_"):
+                continue
             try:
                 stat = os.lstat(os.path.join(root, name))
             except OSError:
@@ -56,14 +65,20 @@ def require_merge_headroom(ckpt_actor_dir: str, merge_out: str) -> None:
     fails after training has already succeeded. Checking first turns a silent late disk death into
     an actionable error naming the shortfall, while the checkpoint is still intact and resumable.
 
-    The requirement is estimated as the checkpoint's own size, which is a genuine upper bound rather
-    than a guess: the merger reads only the `model_world_size_*_rank_*.pt` shards
-    (`fsdp_model_merger.py`), while the directory it is sized from also holds the `optim_*` and
-    `extra_state_*` files written beside them. Merge output is therefore strictly smaller than the
-    tree measured here, so the guard errs toward allowing a merge, never toward refusing one that
-    would have fit. No safety margin is added on top, for the same reason.
+    The requirement is derived from what the merger actually moves rather than from the checkpoint's
+    total size: it loads the `model_world_size_*_rank_*.pt` shards, casts every tensor to bf16, and
+    writes that same state back out as base model plus adapter (`fsdp_model_merger.py`,
+    `base_model_merger.py`). Shard bytes in, shard bytes out. Sizing the whole directory instead
+    would add the `optim_*` and `extra_state_*` files, which resume reads and the merger never
+    materializes -- on a 35b rank-32 run that is ~7.6 GB of adam moments, enough to refuse a merge
+    that had room.
+
+    The two error directions are not symmetric, which is why no safety margin is added on top.
+    Underestimating leaves the merger to hit ENOSPC exactly as it does today, so the guard is merely
+    absent. Overestimating fails a run that would have completed, which is a regression this guard
+    would have introduced. When in doubt, let the merge proceed.
     """
-    need = _tree_bytes(ckpt_actor_dir)
+    need = _model_shard_bytes(ckpt_actor_dir)
     if need <= 0:
         return
     try:

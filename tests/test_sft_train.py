@@ -2025,6 +2025,7 @@ def test_publish_does_not_leave_every_step_adapter_on_the_container_disk(monkeyp
     def fake_publish(adapter, step, **kwargs):
         # the adapter must still be readable AT publish time; it is only redundant afterwards.
         published["existed"] = os.path.isfile(os.path.join(adapter, "adapter_model.safetensors"))
+        return f"step-{step}"
 
     monkeypatch.setattr(worker, "publish_deployable_checkpoint", fake_publish)
     monkeypatch.setattr(
@@ -2069,8 +2070,9 @@ def test_a_failed_upload_still_frees_the_exported_adapter(monkeypatch, tmp_path)
         "_export_checkpoint_adapter",
         lambda actor, adapter, **kwargs: os.makedirs(adapter, exist_ok=True),
     )
+    # a successful publish returns the subfolder it committed to.
     monkeypatch.setattr(
-        worker, "publish_deployable_checkpoint", lambda adapter, step, **kwargs: None
+        worker, "publish_deployable_checkpoint", lambda adapter, step, **kwargs: f"step-{step}"
     )
 
     def boom(step, checkpoint, **kwargs):
@@ -2111,7 +2113,7 @@ def test_merge_is_refused_when_its_output_cannot_fit_beside_the_checkpoint(monke
 
     actor_dir = tmp_path / "global_step_9"
     (actor_dir / "huggingface").mkdir(parents=True)
-    (actor_dir / "model.safetensors").write_bytes(b"x" * 4096)
+    (actor_dir / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 4096)
 
     launched = []
     monkeypatch.setattr(
@@ -2144,10 +2146,10 @@ def test_merge_headroom_counts_a_hardlinked_checkpoint_once(tmp_path):
 
     source = tmp_path / "ckpt"
     source.mkdir()
-    (source / "shard.safetensors").write_bytes(b"x" * 8192)
-    os.link(source / "shard.safetensors", source / "hardlink.safetensors")
+    (source / "model_world_size_2_rank_0.pt").write_bytes(b"x" * 8192)
+    os.link(source / "model_world_size_2_rank_0.pt", source / "staged.pt")
 
-    assert verl_checkpoints._tree_bytes(str(source)) == 8192
+    assert verl_checkpoints._model_shard_bytes(str(source)) == 8192
 
 
 def test_merge_headroom_allows_the_merge_when_there_is_room(monkeypatch, tmp_path):
@@ -2159,7 +2161,7 @@ def test_merge_headroom_allows_the_merge_when_there_is_room(monkeypatch, tmp_pat
 
     actor_dir = tmp_path / "global_step_9"
     (actor_dir / "huggingface").mkdir(parents=True)
-    (actor_dir / "model.safetensors").write_bytes(b"x" * 4096)
+    (actor_dir / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 4096)
 
     launched = []
     monkeypatch.setattr(
@@ -2287,3 +2289,76 @@ def test_importing_the_worker_package_does_not_freeze_the_xet_default(monkeypatc
         cwd=str(pathlib.Path(__file__).resolve().parent.parent),
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_a_swallowed_optional_publish_failure_keeps_the_adapter(monkeypatch, tmp_path):
+    """a publish that silently failed must not count as durable.
+
+    `publish_deployable_checkpoint` raises for a REQUIRED step, but on an optional one it retries,
+    prints a warning, and returns None -- the failure is swallowed. Treating "the call returned" as
+    "the adapter is on hf" would delete the only remaining copy of an export that never landed,
+    which is the exact opposite of what this cleanup is for. The durability signal is the returned
+    subfolder, not control reaching the next line.
+    """
+    import flash.engine.worker as worker
+    from flash.engine.worker import sft_train
+
+    local_dir = tmp_path / "checkpoints"
+    export_root = tmp_path / "exports"
+    checkpoint_dir = local_dir / "global_step_4"
+    (checkpoint_dir / "huggingface").mkdir(parents=True)
+
+    monkeypatch.setattr(
+        sft_train,
+        "_export_checkpoint_adapter",
+        lambda actor, adapter, **kwargs: os.makedirs(adapter, exist_ok=True),
+    )
+    # optional step, upload failed, error swallowed: returns None rather than raising.
+    monkeypatch.setattr(
+        worker, "publish_deployable_checkpoint", lambda adapter, step, **kwargs: None
+    )
+    monkeypatch.setattr(
+        worker,
+        "upload_resume_checkpoint",
+        lambda step, ckpt, **kwargs: (kwargs["before_upload"](), True)[1],
+    )
+
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(export_root),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(),
+    )
+    watcher._publish(4, str(checkpoint_dir))
+
+    assert os.path.isdir(export_root / "step-4"), (
+        "an adapter whose publish silently failed was deleted as if it were durable"
+    )
+
+
+def test_optimizer_state_is_not_counted_against_the_merge(tmp_path):
+    """the estimate must cover what the merger WRITES, not what the checkpoint holds.
+
+    `_load_and_merge_state_dicts` loads only `model_world_size_*_rank_*.pt`, and that merged dict is
+    what `save_pretrained` writes back out. The `optim_*` and `extra_state_*` files beside it are
+    read by resume and never materialized by the merger, so charging them to the merge inflates the
+    requirement by the whole optimizer state -- about 7.6 GB of adam moments on a 35b rank-32 run.
+
+    That direction of error is the dangerous one. Underestimating just lets the merger hit ENOSPC
+    the way it already does today; overestimating fails a run that had room, which is a regression
+    the guard itself would have introduced.
+    """
+    from flash.engine.worker.verl import checkpoints as verl_checkpoints
+
+    source = tmp_path / "global_step_9"
+    source.mkdir()
+    (source / "model_world_size_2_rank_0.pt").write_bytes(b"x" * 4096)
+    (source / "model_world_size_2_rank_1.pt").write_bytes(b"x" * 4096)
+    (source / "optim_world_size_2_rank_0.pt").write_bytes(b"x" * 65536)
+    (source / "extra_state_world_size_2_rank_0.pt").write_bytes(b"x" * 2048)
+
+    assert verl_checkpoints._model_shard_bytes(str(source)) == 8192, (
+        "optimizer or extra state was charged to the merge, which can refuse a merge that fits"
+    )
