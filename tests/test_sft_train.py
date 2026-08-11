@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import json
 import os
 import pathlib
 import re
@@ -1163,7 +1164,9 @@ def test_a_resumed_sft_run_does_not_republish_the_step_it_resumed_from(monkeypat
     local_dir.mkdir()
     resume_dir = tmp_path / "downloaded" / "checkpoint-1"
     (resume_dir / "huggingface").mkdir(parents=True)
-    resume_step = stage_verl_resume(str(resume_dir), str(local_dir), job_label="SFT")
+    # verl stamps every checkpoint with its writer's world size; staging demands a match.
+    (resume_dir / "fsdp_config.json").write_text(json.dumps({"FSDP_version": 2, "world_size": 1}))
+    resume_step = stage_verl_resume(str(resume_dir), str(local_dir), job_label="SFT", world_size=1)
     # a checkpoint this attempt actually trained, which must still be exported and uploaded.
     (local_dir / "global_step_2" / "huggingface").mkdir(parents=True)
     (local_dir / "latest_checkpointed_iteration.txt").write_text("2")
@@ -1208,7 +1211,16 @@ def test_a_resumed_sft_run_does_not_republish_the_step_it_resumed_from(monkeypat
     assert watcher.processed_steps == {1, 2}
 
 
-def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
+def _stub_sft_run(
+    monkeypatch,
+    *,
+    save_at_steps=(),
+    watcher_cls=None,
+    structured_targets=False,
+    structured_singleturn=False,
+    raw_output_fallback=False,
+    missing_output=False,
+):
     """monkeypatch every out-of-process dependency of run_sft_train and return (spec, captured).
 
     the caller supplies its own ``run_verl_training`` fake, which is the only remaining seam.
@@ -1233,6 +1245,7 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
             id="owner/env",
             resolved_sha="b" * 40,
             params={},
+            pip=(),
         ),
         gpu=SimpleNamespace(type="RTX 4090", exact_type="", count=2),
         train=SimpleNamespace(
@@ -1255,13 +1268,69 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
         multi_turn = False
 
         def dataset(self):
-            return [{"prompt": "one"}, {"prompt": "two"}]
+            if structured_targets:
+                trajectory = [
+                    {"role": "assistant", "content": "<think>reason</think>"},
+                    {"role": "assistant", "content": "answer"},
+                ]
+                return [
+                    {"prompt": "one", "output": trajectory},
+                    {"prompt": "two", "output": trajectory},
+                ]
+            if structured_singleturn:
+                # one assistant message, but explicitly structured -- NOT a scalar coercion.
+                single = [{"role": "assistant", "content": "answer"}]
+                return [
+                    {"prompt": "one", "output": single},
+                    {"prompt": "two", "output": {"messages": single}},
+                ]
+            rows = [
+                {"prompt": "one", "output": "answer"},
+                {"prompt": "two", "output": "answer"},
+            ]
+            if missing_output:
+                rows[1].pop("output")
+            return rows
 
         def prompt_messages(self, example):
             return [{"role": "user", "content": example["prompt"]}]
 
         def sft_completion(self, example):
-            return [{"role": "assistant", "content": "answer"}]
+            output = example.get("output")
+            if isinstance(output, list):
+                return output
+            return [{"role": "assistant", "content": "hook answer" if output is None else output}]
+
+    class RawOutputFallbackEnv(Env):
+        def sft_completion_with_provenance(self, example):
+            output = example.get("output")
+            return [{"role": "assistant", "content": "" if output is None else str(output)}], True
+
+        def sft_completion(self, example):
+            messages, _coerced_scalar_output = self.sft_completion_with_provenance(example)
+            return messages
+
+    class StructuredSingleTurnEnv(Env):
+        """One assistant turn per row, reported as structured (not coerced).
+
+        this is what the real adapter now returns for `output: [{...}]` and `{"messages": [...]}`:
+        a single-message target whose provenance says no scalar coercion happened. it is the case
+        the collapse warning must stay quiet for -- the row IS one assistant turn, so only the
+        provenance flag separates it from a bare stringified answer.
+        """
+
+        def sft_completion_with_provenance(self, example):
+            return [{"role": "assistant", "content": "answer"}], False
+
+        def sft_completion(self, example):
+            messages, _coerced_scalar_output = self.sft_completion_with_provenance(example)
+            return messages
+
+    EnvClass = Env
+    if raw_output_fallback:
+        EnvClass = RawOutputFallbackEnv
+    elif structured_singleturn:
+        EnvClass = StructuredSingleTurnEnv
 
     class Tokenizer(_ExactTokenizer):
         pad_token = None
@@ -1296,7 +1365,7 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
     )
     spec.workload_profile = prepare_sft_workload(
         spec,
-        Env(),
+        EnvClass(),
         tokenizer_loader=lambda _model, _revision: Tokenizer(),
         producer_version=_PROFILE_PRODUCER_VERSION,
         allow_packing=False,
@@ -1376,7 +1445,7 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
     monkeypatch.setattr(worker, "RUN_ID", "test-sft-verl-orchestration")
     monkeypatch.setattr(worker, "THINKING", False)
     monkeypatch.setattr(worker, "JOB_SPEC", spec)
-    monkeypatch.setattr(worker, "require_active_env", Env)
+    monkeypatch.setattr(worker, "require_active_env", EnvClass)
     monkeypatch.setattr(
         worker,
         "heartbeat",
@@ -1421,7 +1490,7 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
     # torch is not installed in this test env; the real seeding is covered in test_training_controls.
     monkeypatch.setattr(sft_train, "seed_training_rngs", lambda seed: None)
     monkeypatch.setattr(sft_train, "_cached_model_path", lambda model, revision: model)
-    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir: 1)
+    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir, **_kwargs: 1)
     monkeypatch.setattr(sft_train, "_VerlCheckpointWatcher", Watcher)
     monkeypatch.setattr(sft_train, "_NvidiaSmiPeakSampler", PeakSampler)
     monkeypatch.setattr(
@@ -1440,6 +1509,69 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
     monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", fake_export)
 
     return spec, captured
+
+
+def test_sft_warns_when_every_selected_row_is_a_coerced_singleturn_target(monkeypatch, capsys):
+    from flash.engine.worker import sft_train, sft_train_runner
+
+    spec, _captured = _stub_sft_run(monkeypatch, raw_output_fallback=True)
+    monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
+
+    options = sft_train_runner._resolve_sft_options(spec)
+    sft_train_runner._prepare_sft_data(options)
+
+    output = capsys.readouterr().out
+    assert "[sft][warn] all 2 selected rows use one bare assistant target coerced" in output
+    assert "reasoning blocks or multi-turn structure may have been lost" in output
+
+
+def test_sft_collapse_warning_stays_quiet_when_environment_hook_handles_raw_rows(
+    monkeypatch, capsys
+):
+    from flash.engine.worker import sft_train, sft_train_runner
+
+    spec, _captured = _stub_sft_run(monkeypatch, missing_output=True)
+    monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
+
+    options = sft_train_runner._resolve_sft_options(spec)
+    sft_train_runner._prepare_sft_data(options)
+
+    output = capsys.readouterr().out
+    assert "bare assistant target coerced" not in output
+
+
+def test_sft_collapse_warning_stays_quiet_for_structured_multiturn_targets(monkeypatch, capsys):
+    from flash.engine.worker import sft_train, sft_train_runner
+
+    spec, _captured = _stub_sft_run(monkeypatch, structured_targets=True)
+    monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
+
+    options = sft_train_runner._resolve_sft_options(spec)
+    sft_train_runner._prepare_sft_data(options)
+
+    output = capsys.readouterr().out
+    assert "[sft] multi-turn SFT: 2/2 rows" in output
+    assert "bare assistant target coerced" not in output
+
+
+def test_sft_collapse_warning_stays_quiet_for_structured_singleturn_targets(monkeypatch, capsys):
+    """A structured target is not a coercion even when it is a SINGLE assistant turn.
+
+    the multi-turn case above is separated by length alone, so it cannot catch a provenance flag
+    that marks parsed message lists as coerced. these rows are one assistant turn each, exactly
+    like a stringified scalar, so only provenance keeps the warning quiet -- and firing here would
+    tell users to encode message lists they have already encoded.
+    """
+    from flash.engine.worker import sft_train, sft_train_runner
+
+    spec, _captured = _stub_sft_run(monkeypatch, structured_singleturn=True)
+    monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
+
+    options = sft_train_runner._resolve_sft_options(spec)
+    sft_train_runner._prepare_sft_data(options)
+
+    output = capsys.readouterr().out
+    assert "bare assistant target coerced" not in output
 
 
 def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypatch):
@@ -1542,7 +1674,7 @@ def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatc
     spec, captured = _stub_sft_run(monkeypatch)
     # max_steps is 2, so resuming at 2 means the watcher never runs and finalization is the only
     # path left that can publish the step.
-    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir: 2)
+    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir, *, world_size: 2)
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
         raise AssertionError("a run resumed at its horizon must not start the child")
@@ -1724,7 +1856,7 @@ def test_a_single_step_run_with_no_gradient_is_rejected(monkeypatch):
     spec, _ = _stub_sft_run(monkeypatch, watcher_cls=_TolerantWatcher)
     # a fresh run, not a resume: the guard abstains on a resume because the restored weights carry
     # earlier updates this session never observed.
-    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir: 0)
+    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir, **_kwargs: 0)
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
         on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
@@ -1757,7 +1889,7 @@ def test_a_fresh_run_with_any_real_gradient_still_completes(monkeypatch, grads):
     from flash.engine.worker import sft_train
 
     spec, captured = _stub_sft_run(monkeypatch)
-    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir: 0)
+    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir, **_kwargs: 0)
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
         on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
@@ -1993,3 +2125,743 @@ def test_sft_ships_no_val_file_so_the_child_cannot_validate():
     code = "\n".join(ln for ln in worker.splitlines() if not ln.strip().startswith("#"))
     assert "val.parquet" not in code
     assert "val_file" not in code
+
+
+def test_publish_does_not_leave_every_step_adapter_on_the_container_disk(monkeypatch, tmp_path):
+    """the exported adapter is deleted once it is durable on hf.
+
+    the watcher exports each save to `export_root/step-N` and publishes it. nothing used to remove
+    that directory, so a run kept one adapter per save for its whole lifetime, on the same container
+    disk as the checkpoints. the rl path already drops its equivalent; sft did not.
+
+    asserts the directory is gone AFTER publish rather than counting bytes: the leak is one
+    undeleted directory per save, and its size is a property of the model, not of this bug.
+    """
+    import flash.engine.worker as worker
+    from flash.engine.worker import sft_train
+
+    local_dir = tmp_path / "checkpoints"
+    export_root = tmp_path / "exports"
+    checkpoint_dir = local_dir / "global_step_7"
+    (checkpoint_dir / "huggingface").mkdir(parents=True)
+    (checkpoint_dir / "model.safetensors").write_bytes(b"weights")
+
+    def fake_export(actor, adapter, **kwargs):
+        os.makedirs(adapter, exist_ok=True)
+        pathlib.Path(adapter, "adapter_model.safetensors").write_bytes(b"adapter")
+
+    monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", fake_export)
+
+    published = {}
+
+    def fake_publish(adapter, step, **kwargs):
+        # the adapter must still be readable AT publish time; it is only redundant afterwards.
+        published["existed"] = os.path.isfile(os.path.join(adapter, "adapter_model.safetensors"))
+        return f"step-{step}"
+
+    monkeypatch.setattr(worker, "publish_deployable_checkpoint", fake_publish)
+    monkeypatch.setattr(
+        worker,
+        "upload_resume_checkpoint",
+        lambda step, checkpoint, **kwargs: (kwargs["before_upload"](), True)[1],
+    )
+
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(export_root),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(7,),
+    )
+    watcher._publish(7, str(checkpoint_dir))
+
+    assert published["existed"], "the adapter must exist while it is being published"
+    assert not os.path.exists(export_root / "step-7"), (
+        "the published adapter was left on the container disk"
+    )
+
+
+def test_a_failed_upload_still_frees_the_exported_adapter(monkeypatch, tmp_path):
+    """a raising upload must not strand the adapter directory it exported.
+
+    the disk pressure this cleanup exists to relieve is worst on the failure path -- a run that is
+    retrying uploads is exactly the run that is short on space -- so once the adapter is durable on
+    hf, a LATER failure in the same publish must not strand the now-redundant local copy.
+    """
+    import flash.engine.worker as worker
+    from flash.engine.worker import sft_train
+
+    local_dir = tmp_path / "checkpoints"
+    export_root = tmp_path / "exports"
+    checkpoint_dir = local_dir / "global_step_3"
+    (checkpoint_dir / "huggingface").mkdir(parents=True)
+
+    monkeypatch.setattr(
+        sft_train,
+        "_export_checkpoint_adapter",
+        lambda actor, adapter, **kwargs: os.makedirs(adapter, exist_ok=True),
+    )
+    # a successful publish returns the subfolder it committed to.
+    monkeypatch.setattr(
+        worker, "publish_deployable_checkpoint", lambda adapter, step, **kwargs: f"step-{step}"
+    )
+
+    def boom(step, checkpoint, **kwargs):
+        # the adapter lands on hf, then the full-state upload beside it dies.
+        kwargs["before_upload"]()
+        raise RuntimeError("hf upload failed")
+
+    monkeypatch.setattr(worker, "upload_resume_checkpoint", boom)
+
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(export_root),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(3,),
+    )
+    with pytest.raises(RuntimeError, match="hf upload failed"):
+        watcher._publish(3, str(checkpoint_dir))
+
+    assert not os.path.exists(export_root / "step-3"), (
+        "a failed upload stranded the exported adapter on disk"
+    )
+
+
+def test_merge_is_refused_when_its_output_cannot_fit_beside_the_checkpoint(monkeypatch, tmp_path):
+    """`verl.model_merger merge` writes the FULL model, so it needs room for a second copy.
+
+    `save_hf_model_and_tokenizer` calls `model.save_pretrained(target_dir, state_dict=...)`, so
+    exporting one 35b checkpoint materializes ~70 GB into `<adapter>_merge` beside the ~60 GB
+    checkpoint it reads. When that does not fit, the merger dies partway through with ENOSPC and
+    takes down a run whose training already succeeded.
+
+    Asserts the subprocess is never launched: the value of the guard is failing BEFORE the
+    expensive write, with a message naming the shortfall.
+    """
+    from flash.engine.worker.verl import checkpoints as verl_checkpoints
+
+    actor_dir = tmp_path / "global_step_9"
+    (actor_dir / "huggingface").mkdir(parents=True)
+    (actor_dir / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 4096)
+
+    launched = []
+    monkeypatch.setattr(
+        verl_checkpoints.subprocess, "run", lambda *a, **kw: launched.append(a) or None
+    )
+    monkeypatch.setattr(
+        verl_checkpoints.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=1 << 40, used=1 << 40, free=1024),
+    )
+
+    with pytest.raises(verl_checkpoints.MergeDiskHeadroomError, match=r"only 0\.0 GB is free"):
+        verl_checkpoints.export_peft_adapter(
+            str(actor_dir),
+            str(tmp_path / "adapter"),
+            base_model_id="org/model",
+            python_bin="/verl/python",
+        )
+    assert not launched, "the merger ran even though its output could not fit"
+
+
+def test_merge_sizing_ignores_shards_nested_below_the_checkpoint(tmp_path):
+    """the estimate must count only the shards the merger actually opens.
+
+    `_load_and_merge_state_dicts` reads exact top-level paths -- `Path(local_dir) /
+    f"model_world_size_{W}_rank_{r}.pt"`, one per rank -- and never recurses. A nested directory
+    that happens to hold shard-named files (a staging tree, a partially copied checkpoint) is not
+    merge input, so adding its bytes would inflate the requirement and refuse a merge that fits.
+
+    That is the same over-estimate the optimizer-state exclusion exists to prevent, in a different
+    form, and it matters in the same direction: a guard that refuses a valid merge is a regression
+    this PR would have introduced, whereas one that underestimates merely leaves today's behavior.
+    """
+    from flash.engine.worker.verl import checkpoints as verl_checkpoints
+
+    actor_dir = tmp_path / "ckpt"
+    nested = actor_dir / "staged"
+    nested.mkdir(parents=True)
+    (actor_dir / "model_world_size_2_rank_0.pt").write_bytes(b"x" * 8192)
+    (nested / "model_world_size_2_rank_0.pt").write_bytes(b"x" * 8192)
+
+    assert verl_checkpoints._model_shard_bytes(str(actor_dir)) == 8192
+
+
+def test_merge_headroom_allows_the_merge_when_there_is_room(monkeypatch, tmp_path):
+    """paired control: the guard must not block a merge that fits.
+
+    Without this, a guard that always raised would pass the refusal test above.
+    """
+    from flash.engine.worker.verl import checkpoints as verl_checkpoints
+
+    actor_dir = tmp_path / "global_step_9"
+    (actor_dir / "huggingface").mkdir(parents=True)
+    (actor_dir / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 4096)
+
+    launched = []
+    monkeypatch.setattr(
+        verl_checkpoints.subprocess,
+        "run",
+        lambda *a, **kw: launched.append(a) or SimpleNamespace(returncode=0),
+    )
+    monkeypatch.setattr(
+        verl_checkpoints.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=1 << 40, used=0, free=1 << 40),
+    )
+    # the merger is faked, so it produces no adapter; only reaching that error proves it ran.
+    with pytest.raises(RuntimeError, match="did not produce a peft adapter"):
+        verl_checkpoints.export_peft_adapter(
+            str(actor_dir),
+            str(tmp_path / "adapter"),
+            base_model_id="org/model",
+            python_bin="/verl/python",
+        )
+    assert launched, "the merger was refused even though its output fits"
+
+
+def test_worker_disables_xet_upload_staging_before_importing_hf(monkeypatch):
+    """uploads must stream from the checkpoint, not stage a second copy beside it.
+
+    `hf_xet` is an unconditional dependency of `huggingface-hub` on x86_64, and Xet is selected
+    merely because it imports -- so `upload_folder` chunks through a cache under `HF_XET_CACHE`
+    (default `$HF_HOME/xet`), the same container disk holding the checkpoint. The legacy path
+    streams from the source handle instead. A real 35b run died with ENOSPC under that staging dir.
+    """
+    from flash.engine.worker.io import hf
+
+    monkeypatch.delenv("HF_HUB_DISABLE_XET", raising=False)
+    hf._disable_xet_upload_staging()
+    assert os.environ["HF_HUB_DISABLE_XET"] == "1"
+
+
+def test_an_explicit_xet_choice_is_not_overridden(monkeypatch):
+    """paired control: an operator who deliberately set the variable keeps their value.
+
+    Proves the fix is a default, not a hardcode -- and that the assertion above is reading flash's
+    own write rather than a value that was already there.
+    """
+    from flash.engine.worker.io import hf
+
+    monkeypatch.setenv("HF_HUB_DISABLE_XET", "0")
+    hf._disable_xet_upload_staging()
+    assert os.environ["HF_HUB_DISABLE_XET"] == "0"
+
+
+def test_an_adapter_is_freed_even_when_before_upload_never_ran(monkeypatch, tmp_path):
+    """the export must not survive a path that skipped the publish callback entirely.
+
+    `upload_resume_checkpoint` can return WITHOUT running `before_upload`. Two of its early returns
+    are reachable from this caller: the slot is already held by another upload (returns False), and
+    HF_REPO is unset (returns True). Its third, `skip_upload`, is not -- the sft watcher never passes
+    that argument -- so it is deliberately not claimed here.
+
+    Retaining the adapter on either reachable path looks protective, but nothing in the sft watcher
+    ever reads `export_root` again -- the step joins `processed_steps` and `_pending` filters it out
+    forever -- so the directory would simply accumulate. The busy-slot branch is the one that fires
+    on EVERY step once an upload is slow enough to hold the slot, which is exactly the busy-disk case
+    this PR exists for, so that is the one simulated below.
+    """
+    import flash.engine.worker as worker
+    from flash.engine.worker import sft_train
+
+    local_dir = tmp_path / "checkpoints"
+    export_root = tmp_path / "exports"
+    checkpoint_dir = local_dir / "global_step_5"
+    (checkpoint_dir / "huggingface").mkdir(parents=True)
+
+    monkeypatch.setattr(
+        sft_train,
+        "_export_checkpoint_adapter",
+        lambda actor, adapter, **kwargs: os.makedirs(adapter, exist_ok=True),
+    )
+    monkeypatch.setattr(
+        worker, "publish_deployable_checkpoint", lambda adapter, step, **kwargs: None
+    )
+    # the slot was busy: returns False having never called before_upload.
+    monkeypatch.setattr(worker, "upload_resume_checkpoint", lambda step, ckpt, **kwargs: False)
+
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(export_root),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(),
+    )
+    watcher._publish(5, str(checkpoint_dir))
+
+    assert not os.path.exists(export_root / "step-5"), (
+        "an adapter with no reader was left on the container disk"
+    )
+
+
+def test_importing_the_worker_package_does_not_freeze_the_xet_default(monkeypatch):
+    """the disable must still be able to take effect when the worker starts.
+
+    `huggingface_hub.constants` reads HF_HUB_DISABLE_XET into a module constant at import time, so
+    setting the variable afterwards changes nothing -- `is_xet_available()` keeps returning True and
+    uploads keep staging through the xet cache. That makes this an ORDERING contract, not just a
+    setenv: if anything ever pulls huggingface_hub in at `flash.engine.worker` import time, the fix
+    silently becomes a no-op while every assertion about the env var still passes.
+
+    Asserts the resulting behaviour rather than the call order, so a refactor that moves the call,
+    or adds a module-level hf import above it, fails here instead of in production.
+    """
+    import subprocess
+    import sys
+
+    probe = (
+        "import os, sys\n"
+        "os.environ.pop('HF_HUB_DISABLE_XET', None)\n"
+        "import flash.engine.worker\n"
+        "assert not [m for m in sys.modules if m.startswith('huggingface_hub')], (\n"
+        "    'huggingface_hub was imported during flash.engine.worker import; '\n"
+        "    'the xet default is frozen before the worker can disable it'\n"
+        ")\n"
+        "flash.engine.worker._disable_xet_upload_staging()\n"
+        "from huggingface_hub.utils._runtime import is_xet_available\n"
+        "assert not is_xet_available(), 'xet is still selected for uploads'\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        cwd=str(pathlib.Path(__file__).resolve().parent.parent),
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_optimizer_state_is_not_counted_against_the_merge(tmp_path):
+    """the estimate must cover what the merger WRITES, not what the checkpoint holds.
+
+    `_load_and_merge_state_dicts` loads only `model_world_size_*_rank_*.pt`, and that merged dict is
+    what `save_pretrained` writes back out. The `optim_*` and `extra_state_*` files beside it are
+    read by resume and never materialized by the merger, so charging them to the merge inflates the
+    requirement by the whole optimizer state -- about 7.6 GB of adam moments on a 35b rank-32 run.
+
+    That direction of error is the dangerous one. Underestimating just lets the merger hit ENOSPC
+    the way it already does today; overestimating fails a run that had room, which is a regression
+    the guard itself would have introduced.
+    """
+    from flash.engine.worker.verl import checkpoints as verl_checkpoints
+
+    source = tmp_path / "global_step_9"
+    source.mkdir()
+    (source / "model_world_size_2_rank_0.pt").write_bytes(b"x" * 4096)
+    (source / "model_world_size_2_rank_1.pt").write_bytes(b"x" * 4096)
+    (source / "optim_world_size_2_rank_0.pt").write_bytes(b"x" * 65536)
+    (source / "extra_state_world_size_2_rank_0.pt").write_bytes(b"x" * 2048)
+
+    assert verl_checkpoints._model_shard_bytes(str(source)) == 8192, (
+        "optimizer or extra state was charged to the merge, which can refuse a merge that fits"
+    )
+
+
+def test_the_adapter_is_moved_out_of_the_merge_tree_not_copied(monkeypatch, tmp_path):
+    """the export must never hold two copies of the adapter at once.
+
+    `export_peft_adapter` deletes `<adapter>_merge` only AFTER placing the adapter in its final
+    directory. Copying the files there would put a second copy of every adapter file on the disk
+    while the whole merge tree is still present, and that transient peak is not what
+    `require_merge_headroom` reserved space for -- it is the same class of overshoot the guard
+    exists to prevent.
+
+    Both directories are siblings under one parent, hence one filesystem, so the placement can be a
+    rename that transfers no bytes.
+
+    The assertion has to be made at the moment `rmtree` runs, not after the call returns: by then
+    the merge tree is gone under either implementation, so a post-hoc check cannot tell a move from
+    a copy. What distinguishes them is whether the source files are still occupying space when the
+    final adapter already exists.
+    """
+    from flash.engine.worker.verl import checkpoints as verl_checkpoints
+
+    actor_dir = tmp_path / "global_step_5"
+    (actor_dir / "huggingface").mkdir(parents=True)
+    (actor_dir / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 512)
+    out_adapter = tmp_path / "adapter"
+    merge_out = tmp_path / "adapter_merge"
+    lora_dir = merge_out / "lora_adapter"
+
+    def fake_merge(*args, **kwargs):
+        lora_dir.mkdir(parents=True)
+        (lora_dir / "adapter_config.json").write_text("{}")
+        (lora_dir / "adapter_model.safetensors").write_bytes(b"weights")
+        return SimpleNamespace(returncode=0)
+
+    duplicated: list[str] = []
+    real_rmtree = verl_checkpoints.shutil.rmtree
+
+    def watching_rmtree(path, *args, **kwargs):
+        if str(path) == str(merge_out) and lora_dir.is_dir():
+            duplicated.extend(sorted(os.listdir(lora_dir)))
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(verl_checkpoints.subprocess, "run", fake_merge)
+    monkeypatch.setattr(verl_checkpoints.shutil, "rmtree", watching_rmtree)
+    monkeypatch.setattr(
+        verl_checkpoints.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=1 << 40, used=0, free=1 << 40),
+    )
+
+    verl_checkpoints.export_peft_adapter(
+        str(actor_dir),
+        str(out_adapter),
+        base_model_id="org/model",
+        python_bin="/verl/python",
+    )
+
+    assert (out_adapter / "adapter_model.safetensors").read_bytes() == b"weights"
+    assert (out_adapter / "adapter_config.json").read_text() == "{}"
+    assert duplicated == [], (
+        f"the merge tree still held {duplicated} after the adapter was placed, "
+        "so both copies were on disk at once"
+    )
+    assert not merge_out.exists()
+
+
+def test_repeated_swallowed_publish_failures_do_not_accumulate_adapters(monkeypatch, tmp_path):
+    """the swallowed-failure path, asserted as an accumulation rather than a single free.
+
+    `publish_deployable_checkpoint` raises for a REQUIRED step, but on an optional one it retries,
+    prints a warning, and returns None -- the failure is swallowed. Retaining the export on that
+    path would be pointless and actively harmful: no sweep, republish, or finalization in the sft
+    path walks `export_root`, so a run whose deployable uploads keep failing transiently would leave
+    a full adapter behind on every save and rebuild the exhaustion this class bounds. A required step
+    does not depend on the retained copy either -- `required=True` raises rather than returning None,
+    so it leaves through the exception path instead of continuing here.
+
+    Driven over several steps because the property that matters is that N failed saves leave O(1)
+    directories rather than N. A single-step assertion cannot distinguish "freed" from "freed this
+    once": I mutated the cleanup to skip exactly one step and a single-step version still passed,
+    while this one caught it.
+    """
+    import flash.engine.worker as worker
+    from flash.engine.worker import sft_train
+
+    local_dir = tmp_path / "checkpoints"
+    export_root = tmp_path / "exports"
+
+    def fake_export(actor, adapter, **kwargs):
+        os.makedirs(adapter, exist_ok=True)
+        with open(os.path.join(adapter, "adapter_model.safetensors"), "wb") as fh:
+            fh.write(b"w" * 4096)
+
+    monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", fake_export)
+    # every optional publish fails and swallows the error, the worst sustained case.
+    monkeypatch.setattr(
+        worker, "publish_deployable_checkpoint", lambda adapter, step, **kwargs: None
+    )
+    monkeypatch.setattr(
+        worker,
+        "upload_resume_checkpoint",
+        lambda step, ckpt, **kwargs: (kwargs["before_upload"](), True)[1],
+    )
+
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(export_root),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(),
+    )
+
+    for step in range(1, 9):
+        checkpoint_dir = local_dir / f"global_step_{step}"
+        (checkpoint_dir / "huggingface").mkdir(parents=True)
+        watcher._publish(step, str(checkpoint_dir))
+
+    left = sorted(p for p in os.listdir(export_root) if p.startswith("step-"))
+    assert left == [], f"8 failed saves left {len(left)} adapters on disk: {left}"
+
+
+def test_the_opd_watcher_still_keeps_its_export(monkeypatch, tmp_path):
+    """the sft cleanup must not be generalized to the siblings that have a reader.
+
+    `_OpdVerlCheckpointWatcher` subclasses the sft watcher, so a cleanup placed in a shared method
+    would silently reach it. Both siblings hand their export to something that runs LATER -- rl
+    republishes from `staged_steps` on a subsequent sweep, opd passes `adapter_dir` into
+    `_stage_retry_contract` -- so for them the directory is live state, not garbage. The sft path is
+    safe to clear precisely because it has no such consumer.
+
+    Asserted by running the opd watcher's real `_publish` and looking at the disk afterwards. An
+    earlier version of this test grepped `inspect.getsource` for `"rmtree(adapter_dir"`, which
+    proved nothing: writing the deletion as `rmtree(os.fspath(adapter_dir))` does not match that
+    substring, so the adapter could be destroyed with the assertion still green. Source text is not
+    the contract; the surviving directory is.
+    """
+    from flash.engine.worker.train.opd import failures as opd_failures
+    from flash.engine.worker.train.sft import checkpoints as sft_checkpoints
+
+    assert (
+        opd_failures._OpdVerlCheckpointWatcher._publish
+        is not sft_checkpoints._VerlCheckpointWatcher._publish
+    ), "opd no longer overrides _publish, so it now inherits the sft deletion"
+
+    staged: dict[str, object] = {}
+    monkeypatch.setattr(
+        opd_failures,
+        "_export_checkpoint_adapter",
+        lambda actor, adapter, **kwargs: os.makedirs(adapter, exist_ok=True),
+    )
+    monkeypatch.setattr(
+        opd_failures,
+        "_stage_retry_contract",
+        lambda checkpoint_dir, **kwargs: staged.update(kwargs),
+    )
+    monkeypatch.setattr(
+        opd_failures._w, "publish_deployable_checkpoint", lambda adapter, step, **kw: f"step-{step}"
+    )
+    monkeypatch.setattr(
+        opd_failures._w,
+        "upload_resume_checkpoint",
+        lambda step, ckpt, **kwargs: (kwargs["before_upload"](), True)[1],
+    )
+
+    export_root = tmp_path / "opd-exports"
+    checkpoint_dir = tmp_path / "ckpts" / "global_step_2"
+    (checkpoint_dir / "actor").mkdir(parents=True)
+
+    watcher = opd_failures._OpdVerlCheckpointWatcher(
+        local_dir=str(tmp_path / "ckpts"),
+        export_root=str(export_root),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(2,),
+        seed=0,
+        prompt_pool_fingerprint="fp",
+        prompts_per_step=1,
+        group_size=1,
+        accounting_state=lambda step: None,
+    )
+    watcher._publish(2, str(checkpoint_dir))
+
+    # the retry contract recorded this exact path, so the directory has to still be there.
+    assert staged["adapter_dir"] == str(export_root / "step-2")
+    assert os.path.isdir(export_root / "step-2"), (
+        "the opd watcher deleted an adapter its retry contract still points at"
+    )
+
+
+def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
+    monkeypatch, tmp_path
+):
+    """the rl half of the same contract, driven across the two sweeps that actually span it.
+
+    The rl uploader stages an adapter on the sweep a checkpoint appears and publishes it on a LATER
+    one, once the gradient gate opens -- `staged_steps` carries the path between them. That gap is
+    the whole reason the sft deletion cannot be lifted into shared code.
+
+    The gate is what opens the gap, so the test has to close it. An earlier version passed
+    `had_gradient=lambda: True` and hand-called `_stage_deployable` then `_publish_ready`, which
+    manufactured a two-sweep sequence that production would never produce: with the gate already
+    open, `_run` stages and publishes in ONE iteration, so the window where the adapter must survive
+    on disk unpublished never opened and a cleanup placed there would have stayed green. Bugbot
+    caught that. Here the gate starts shut and the checkpoint is discovered through `_pending`, so
+    the retention window is the real one.
+    """
+    from flash.engine.worker.train.rl import checkpoints as rl_checkpoints
+
+    published: list[str] = []
+
+    def fake_export(actor_dir, adapter_dir, **kwargs):
+        os.makedirs(adapter_dir, exist_ok=True)
+        with open(os.path.join(adapter_dir, "adapter_model.safetensors"), "wb") as fh:
+            fh.write(b"w" * 2048)
+
+    rl_train_module = rl_checkpoints._rl_train()
+    monkeypatch.setattr(rl_train_module, "export_peft_adapter", fake_export)
+    monkeypatch.setattr(
+        rl_train_module, "stamp_adapter_dir_provenance", lambda *a, **kw: None, raising=False
+    )
+    monkeypatch.setattr(rl_checkpoints._w, "write_base_model_provenance", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        rl_checkpoints._w,
+        "publish_deployable_checkpoint",
+        lambda adapter_dir, step, **kw: published.append(adapter_dir),
+    )
+
+    monkeypatch.setattr(rl_checkpoints._w, "upload_resume_checkpoint", lambda *a, **kw: True)
+
+    local_dir = tmp_path / "ckpts"
+    export_root = tmp_path / "rl-exports"
+    checkpoint_dir = local_dir / "global_step_4"
+    (checkpoint_dir / "actor").mkdir(parents=True)
+    # verl advances this marker only after the checkpoint is fully written, so `_pending` finds the
+    # step exactly as it does in a real run.
+    (local_dir / "latest_checkpointed_iteration.txt").write_text("4")
+
+    gate_open = False
+    uploader = rl_checkpoints._VerlResumeUploader(
+        local_dir=str(local_dir),
+        resume_step=0,
+        required_steps=(4,),
+        export_root=str(export_root),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        preprocessor=types.SimpleNamespace(save_pretrained=lambda path: None),
+        had_gradient=lambda: gate_open,
+    )
+
+    # sweep one, gate SHUT: the step is staged because verl may prune its checkpoint at any time,
+    # but nothing may be published yet. this is the window the adapter has to survive.
+    for step, path in uploader._pending():
+        if step in uploader.required_steps and step not in uploader.staged_steps:
+            uploader.staged_steps[step] = uploader._stage_deployable(step, path)
+            uploader._publish_ready()
+        uploader.processed_steps.add(step)
+    uploader._publish_ready()
+
+    adapter_dir = uploader.staged_steps[4]
+    assert published == [], "the gradient gate was shut, so nothing may have been published"
+    assert os.path.exists(os.path.join(adapter_dir, "adapter_model.safetensors")), (
+        "the rl watcher discarded a staged adapter while the gradient gate was still shut"
+    )
+
+    # verl is free to prune its own checkpoint now; only `export_root` carries the step forward.
+    shutil.rmtree(checkpoint_dir)
+
+    # sweep two, gate OPEN: the surviving directory is read back out of `staged_steps` and published.
+    gate_open = True
+    uploader._publish_ready()
+
+    assert published == [adapter_dir], "the staged adapter never reached publication"
+    assert os.path.exists(os.path.join(adapter_dir, "adapter_model.safetensors")), (
+        "the rl watcher lost the adapter weights between staging and publication"
+    )
+
+
+def test_a_failed_merge_does_not_strand_the_merge_tree(monkeypatch, tmp_path):
+    """the largest transient on the disk must not survive its own failure.
+
+    `merge_out` holds the full merged model, tens of gb on a real run. If the merger dies partway
+    through -- or writes a layout this code refuses -- deleting it only on the success path would
+    leave that tree behind on exactly the disk this module exists to protect, and the next save
+    would start with less room than this one had. Cleanup has to cover the resource's whole
+    lifetime, not just the happy path.
+    """
+    import subprocess
+
+    from flash.engine.worker.verl import checkpoints as verl_checkpoints
+
+    actor_dir = tmp_path / "global_step_3"
+    (actor_dir / "huggingface").mkdir(parents=True)
+    (actor_dir / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 512)
+    out_adapter = tmp_path / "adapter"
+    merge_out = tmp_path / "adapter_merge"
+
+    def dying_merge(*args, **kwargs):
+        # the merger writes most of the model, then fails: the exact shape of a disk-full death.
+        (merge_out / "model-00001-of-00002.safetensors").parent.mkdir(parents=True, exist_ok=True)
+        (merge_out / "model-00001-of-00002.safetensors").write_bytes(b"w" * 65536)
+        raise subprocess.CalledProcessError(1, "verl.model_merger")
+
+    monkeypatch.setattr(verl_checkpoints.subprocess, "run", dying_merge)
+    monkeypatch.setattr(
+        verl_checkpoints.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=1 << 40, used=0, free=1 << 40),
+    )
+
+    with pytest.raises(subprocess.CalledProcessError):
+        verl_checkpoints.export_peft_adapter(
+            str(actor_dir),
+            str(out_adapter),
+            base_model_id="org/model",
+            python_bin="/verl/python",
+        )
+
+    assert not merge_out.exists(), "a failed merge left its partial model tree on the disk"
+
+
+def test_a_failed_export_does_not_strand_a_partial_adapter(monkeypatch, tmp_path):
+    """the watcher must free an export that died while being written.
+
+    The cleanup used to begin after `_export_checkpoint_adapter` returned, so an export that raised
+    partway through left its directory behind with no reader and no later sweep to collect it. On a
+    run whose exports keep failing that is one partial adapter per save -- the accumulation this
+    class exists to bound, reached through the failure path instead of the success one.
+    """
+    import flash.engine.worker as worker
+    from flash.engine.worker import sft_train
+
+    local_dir = tmp_path / "checkpoints"
+    export_root = tmp_path / "exports"
+    checkpoint_dir = local_dir / "global_step_7"
+    (checkpoint_dir / "huggingface").mkdir(parents=True)
+
+    def dying_export(actor, adapter, **kwargs):
+        os.makedirs(adapter, exist_ok=True)
+        with open(os.path.join(adapter, "adapter_model.safetensors"), "wb") as fh:
+            fh.write(b"partial")
+        raise RuntimeError("merger died")
+
+    monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", dying_export)
+    monkeypatch.setattr(
+        worker, "publish_deployable_checkpoint", lambda adapter, step, **kwargs: f"step-{step}"
+    )
+    monkeypatch.setattr(worker, "upload_resume_checkpoint", lambda step, ckpt, **kwargs: True)
+
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(export_root),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(),
+    )
+
+    with pytest.raises(RuntimeError, match="merger died"):
+        watcher._publish(7, str(checkpoint_dir))
+
+    assert not os.path.exists(export_root / "step-7"), (
+        "a failed export left a partial adapter on the container disk"
+    )
+
+
+def test_the_worker_disables_xet_as_its_very_first_action():
+    """the startup wiring itself, not just the helper.
+
+    The other xet tests call `_disable_xet_upload_staging()` directly, or assert that importing the
+    worker package does not freeze the default. Neither notices if the CALL is deleted from
+    `_run_worker_mode` -- I verified that by removing it, and all three stayed green.
+
+    Asserted over the AST rather than by running the worker. `_run_worker_mode` performs real boot
+    work (heartbeat, kernel cache, gpu probe) and cannot be driven to a mode handler in a test
+    process, and observing `os.environ` in-process cannot attribute the value anyway: an earlier
+    test in the same session may already have set it.
+
+    What actually has to hold is an ordering property, and ordering is exactly what the AST shows:
+    the disable must be the FIRST executable statement, because `huggingface_hub.constants` captures
+    `HF_HUB_DISABLE_XET` at import time and any import above it would freeze the default first.
+    Matching the call by name also survives the alternate spellings a substring grep would miss.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    import flash.engine.worker as worker
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(worker._run_worker_mode)))
+    body = ast.get_docstring(tree.body[0], clean=False) and tree.body[0].body[1:]
+    first = (body or tree.body[0].body)[0]
+
+    value = first.value if isinstance(first, ast.Expr) else None
+    called = value.func if isinstance(value, ast.Call) else None
+    assert isinstance(called, ast.Name | ast.Attribute), (
+        f"the first statement of _run_worker_mode is {ast.dump(first)[:80]}, not a call; "
+        "xet staging must be disabled before anything else can import huggingface_hub"
+    )
+    name = called.attr if isinstance(called, ast.Attribute) else called.id
+    assert name == "_disable_xet_upload_staging", (
+        f"_run_worker_mode starts by calling {name!r}, not _disable_xet_upload_staging; "
+        "uploads would stage a second copy of every checkpoint through the xet cache"
+    )

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import sys
-import time
 
 from flash._internal.channel import CLI_NAME
 
@@ -510,176 +509,6 @@ def _humanize_ts(value) -> str | None:
     return datetime.datetime.fromtimestamp(value, datetime.UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def _heartbeat_age_seconds(value: object) -> float | None:
-    """Return heartbeat age in seconds, or None for an unusable timestamp."""
-    if not isinstance(value, (int, float)) or value <= 0:
-        return None
-    return max(0.0, time.time() - value)
-
-
-def _humanize_age_seconds(seconds: float | None) -> str | None:
-    if seconds is None:
-        return None
-    if seconds < 90:
-        return f"{int(seconds)}s ago"
-    if seconds < 5400:
-        return f"{int(seconds // 60)}m ago"
-    return f"{seconds / 3600:.1f}h ago"
-
-
-# heartbeat age past which the panel reminds that quiet is normal: worker uploads are throttled
-# (240s quiet phases, up to 900s mid-training), so a frozen ts is usually not a dead worker.
-_HB_QUIET_HINT_AFTER_S = 300.0
-_WARMUP_HEARTBEAT_FRESH_FOR_S = 1200.0
-_WARMUP_STAGES = frozenset({"rl_train_start", "rl_initializing"})
-
-
-def heartbeat_is_current_attempt(obj: dict, heartbeat: dict) -> bool:
-    """False only when the heartbeat provably belongs to a superseded retry attempt.
-
-    Retries reuse the seed's heartbeat path, so a recovered run flips back to ``running`` for the
-    replacement worker while ``last_heartbeat`` can still be the previous attempt's setup ping until
-    the new worker publishes one. ``remote.attempt`` is the live attempt; ``last_heartbeat.attempt``
-    is the one that produced the ping. When the live attempt is known, keep the reassurance only for a
-    heartbeat whose attempt matches it. When it is unknown (e.g. a managed status payload that omits
-    ``remote``), fall back to ``warmup_message``'s age gating rather than suppress, so warmup still
-    reassures on planes that do not surface a live attempt.
-    """
-    # reuse the poller's attempt-identity contract (a bounded nonnegative int, never a bool, string,
-    # or float) so the status display and stall detection agree on what a valid attempt is.
-    from flash.providers._lifecycle.poll import _attempt_int
-
-    remote = obj.get("remote")
-    current_attempt = _attempt_int(remote.get("attempt")) if isinstance(remote, dict) else None
-    if current_attempt is None:
-        return True
-    return _attempt_int(heartbeat.get("attempt")) == current_attempt
-
-
-def warmup_message(
-    stage: object,
-    heartbeat_age_seconds: float | None,
-    from_current_attempt: bool = True,
-) -> str | None:
-    """Explain healthy RL setup stages only while the heartbeat is fresh and from the live attempt."""
-    stage_name = str(stage)
-    if stage_name not in _WARMUP_STAGES:
-        return None
-    if not from_current_attempt:
-        return None
-    if heartbeat_age_seconds is None:
-        return None
-    if heartbeat_age_seconds > _WARMUP_HEARTBEAT_FRESH_FOR_S:
-        return None
-    return (
-        f"warming up (stage={stage_name}): initializing model, vLLM, and training kernels - "
-        "typically several minutes, sometimes 15-20 min; setup is not billed; do not cancel"
-    )
-
-
-# the throttle hint points at `runs log`, which reads the SAME uploaded heartbeats -- so when the
-# step counter itself is what has gone stale, that advice sends you to an equally frozen surface.
-_QUIET_HEARTBEAT_HINT = (
-    "heartbeat uploads are throttled; quiet is not dead - check flash runs log <run-id> -f"
-)
-# a throttled training step is never guaranteed current: the worker holds mid-training commits for
-# up to _HB_MIN_INTERVAL_S (900s), so from upload until the next commit the displayed step lags by
-# an unknown amount. gate on the same age at which the panel already flags the quiet (300s) rather
-# than on 900s -- the incident that motivated this reported 559s and 687s, squarely inside that
-# window, where a 900s gate would stay silent and leave only the dead-end quiet hint.
-_STALE_STEP_AFTER_S = _HB_QUIET_HINT_AFTER_S
-# only the stages the worker actually holds on the 900s upload throttle. opd_step is excluded: its
-# post-update ping is force=True, so it re-commits at the 60s forced floor and an opd_step older
-# than 900s means a long step, failed uploads, or a real stall -- not reporting lag.
-_TRAINING_STEP_STAGES = frozenset({"rl_step", "sft_step"})
-
-
-def _stale_step_hint(
-    heartbeat: dict,
-    heartbeat_age_seconds: float | None,
-    *,
-    running: bool,
-    current_attempt: bool = True,
-) -> str | None:
-    """Say a frozen training step is stale reporting, not a stalled trainer.
-
-    A throttled worker can leave ``step`` pinned at its first training heartbeat for many minutes
-    while the trainer is genuinely progressing. Through the CLI alone that is indistinguishable from
-    a hung run, and the obvious reaction -- cancel and relaunch -- throws away a healthy paid GPU.
-    Only fires for a *training* stage carrying a step, since a setup stage has no step to be stale.
-
-    Supersedes the generic quiet hint at the same age: both explain the same silence, but that one
-    sends you to ``runs log``, which reads the very heartbeats that went stale.
-    """
-    if not running or heartbeat_age_seconds is None:
-        return None
-    # a heartbeat from a superseded attempt describes a dead worker's step; calling that ordinary
-    # throttled progress hides that the replacement has published nothing.
-    if not current_attempt:
-        return None
-    if heartbeat_age_seconds <= _STALE_STEP_AFTER_S:
-        return None
-    if str(heartbeat.get("stage") or "") not in _TRAINING_STEP_STAGES:
-        return None
-    # step 0 is the cold, still-running first step: no optimizer update has landed, so there is no
-    # later hidden step for the reassurance to point at. reuse the shared step-gated predicate
-    # rather than a bare presence check.
-    from flash.providers._lifecycle.poll import is_training_heartbeat
-
-    if not is_training_heartbeat(heartbeat.get("stage"), heartbeat.get("step")):
-        return None
-    # do not suggest `runs log -f`: it shows control-plane logs, and worker output arrives only after
-    # termination (flash/cli/commands/__init__.py cmd_log) on a 3600s upload interval. use heartbeat age against
-    # the 900s throttle, with w&b as the optional live signal.
-    return (
-        "the step above is the last one UPLOADED, not necessarily the one training is on; "
-        "a throttled worker can hold it for many minutes while the trainer advances normally. "
-        "uploads are held up to 15 min, so compare the age above against that "
-        "(and your [wandb] run, if configured) "
-        "before treating this as a stall"
-    )
-
-
-def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
-    """Worker heartbeat rows for the status panel: stage, step, age, and a quiet-is-normal hint."""
-    hb = obj.get("last_heartbeat")
-    if not isinstance(hb, dict) or not hb.get("stage"):
-        return []
-    worker = str(hb["stage"])
-    step = hb.get("step")
-    if step is not None:
-        worker += f" · step {step}"
-    if hb.get("liveness"):
-        worker += " · alive ping"
-    pairs = [("worker", worker)]
-    heartbeat_age_seconds = _heartbeat_age_seconds(hb.get("ts"))
-    running = str(obj.get("state") or "") == "running"
-    if running:
-        warmup = warmup_message(
-            hb.get("stage"),
-            heartbeat_age_seconds,
-            heartbeat_is_current_attempt(obj, hb),
-        )
-        if warmup:
-            pairs.append(("warmup", warmup))
-    stale_step = _stale_step_hint(
-        hb,
-        heartbeat_age_seconds,
-        running=running,
-        current_attempt=heartbeat_is_current_attempt(obj, hb),
-    )
-    age = _humanize_age_seconds(heartbeat_age_seconds)
-    if age:
-        # the progress row already explains this silence, and does it better: the quiet hint sends you
-        # to `runs log`, which reads the same frozen heartbeats. show one or the other, never both.
-        if running and not stale_step and heartbeat_age_seconds > _HB_QUIET_HINT_AFTER_S:
-            age += _dim(f"  ({_QUIET_HEARTBEAT_HINT})")
-        pairs.append(("heartbeat", age))
-    if stale_step:
-        pairs.append(("progress", stale_step))
-    return pairs
-
-
 def run_status(obj: dict) -> str:
     """A curated status panel for `flash runs status`, with the full JSON below for completeness."""
     spec = obj.get("spec") or {}
@@ -897,19 +726,6 @@ def env_setup(paths: list[str], project_id: str, *, can_publish: bool = True) ->
     return _safe(f"{head}\n{tree}\n\n{next_step}")
 
 
-def env_list(local: list[str]) -> str:
-    parts = [header("env list", "local environments")]
-    if local:
-        parts.append(
-            _paint("local sources", _GRAY, "1")
-            + _dim("  (publish with flash env push --project <project-uuid> --name <name> <path>)")
-        )
-        parts.extend(f"  {_paint(_glyph('·', '-'), _FAINT)} {_paint(p, _ACCENT2)}" for p in local)
-    else:
-        parts.append(_dim("  no environments yet — scaffold one with `flash env setup`"))
-    return _safe("\n".join(parts))
-
-
 def chat_label() -> str:
     """Speaker label printed above a styled chat reply."""
     return _paint("assistant", _ACCENT2, "1")
@@ -982,6 +798,30 @@ def help_page(
 # Table layouts live in `flash.cli.ui.tables`, which imports the primitives above. Re-exported
 # here (at the bottom, so those primitives are defined first) because every call site and the
 # render monkeypatches in the CLI tests reach them as `render.<name>`.
+# Heartbeat interpretation lives in `flash.cli.ui.heartbeat` for the same reason and on the same
+# terms: `run_status` above calls `_heartbeat_pairs`, and the CLI tests address every one of these
+# as `render.<name>`, so they have to stay resolvable here.
+# The env list renderer in `flash.cli.ui.env_panels` is re-exported on the same terms.
+from flash.cli.ui.env_panels import env_list as env_list  # noqa: E402
+from flash.cli.ui.heartbeat import (  # noqa: E402,F401
+    _HB_QUIET_HINT_AFTER_S,
+    _LIVENESS_SETUP_STAGES,
+    _QUIET_HEARTBEAT_HINT,
+    _SETUP_SILENT_AFTER_S,
+    _STALE_STEP_AFTER_S,
+    _TRAINING_STEP_STAGES,
+    _WARMUP_HEARTBEAT_FRESH_FOR_S,
+    _WARMUP_STAGES,
+    _heartbeat_age_seconds,
+    _heartbeat_pairs,
+    _humanize_age_seconds,
+    _stale_setup_hint,
+    _stale_step_hint,
+    _superseded_hint,
+    heartbeat_is_current_attempt,
+    heartbeat_is_superseded,
+    warmup_message,
+)
 from flash.cli.ui.tables import (  # noqa: E402,F401
     checkpoints_table,
     deployments_table,

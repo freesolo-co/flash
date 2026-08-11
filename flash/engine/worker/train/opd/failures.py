@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 
 from flash.engine.worker.runtime.pkg_proxy import W as _w
@@ -23,6 +24,12 @@ from flash.engine.worker.sft_train import (
     _VerlCheckpointWatcher,
 )
 from flash.engine.worker.train.opd.bridge import _TeacherAlignmentBridge
+from flash.engine.worker.verl.checkpoints import (
+    checkpoint_world_size,
+    resume_checkpoint_is_loadable,
+    resume_topology_matches,
+)
+from flash.teacher.limits import OPD_NO_SIGNAL_ATTEMPTS
 from flash.teacher.retry_contract import (
     OPD_RESUME_STATE_VERSION,
     validate_opd_resume_state_metadata,
@@ -32,6 +39,33 @@ from flash.teacher.retry_contract import (
 # which the resume state also reads. trl publishes the same condition as
 # alignment_empty, so translate it at the metadata boundary only.
 _CANONICAL_SKIP_REASONS = {"empty_alignment": "alignment_empty"}
+
+
+@dataclass(frozen=True)
+class _TruncationWindow:
+    truncated_rollouts: int
+    samples_seen: int
+    no_signal_skipped_steps: int
+    max_completion: int
+
+    def __post_init__(self) -> None:
+        # in-flight bridge counters can expose truncations before samples_seen catches up. clamp at
+        # the typed boundary so every consumer gets a coherent fraction.
+        object.__setattr__(
+            self,
+            "truncated_rollouts",
+            min(self.samples_seen, self.truncated_rollouts),
+        )
+
+    @property
+    def indicates_completion_cap(self) -> bool:
+        # no-signal batches can also come from teacher failures or empty alignments, so only a strict
+        # majority justifies naming the cap instead of the generic child status.
+        return (
+            self.no_signal_skipped_steps > 0
+            and self.samples_seen > 0
+            and self.truncated_rollouts * 2 > self.samples_seen
+        )
 
 
 def _canonical_skip_reasons(skip_counts: dict) -> dict:
@@ -131,6 +165,8 @@ def _raise_verl_failure(
     cycle_commit_failure: tuple[str, str] | None = None,
     no_signal_failure: tuple[str, str] | None = None,
     score_delivery_failure: tuple[str, str] | None = None,
+    *,
+    truncation_window: _TruncationWindow | None = None,
 ) -> None:
     if return_code == 0:
         return
@@ -165,6 +201,14 @@ def _raise_verl_failure(
         raise _w.RetriableInfraError("transient teacher bridge failure")
     if return_code == _PERMANENT_TEACHER_EXIT:
         raise RuntimeError("permanent teacher bridge failure")
+    if truncation_window is not None and truncation_window.indicates_completion_cap:
+        raise RuntimeError(
+            f"verl OPD subprocess exited with status {return_code}: flash OPD produced no "
+            f"aligned teacher signal after {OPD_NO_SIGNAL_ATTEMPTS} rollout attempts; "
+            f"{truncation_window.truncated_rollouts}/{truncation_window.samples_seen} rollouts were "
+            f"truncated at the configured max_completion_tokens={int(truncation_window.max_completion)}, "
+            "so the completion cap is likely too small"
+        )
     raise RuntimeError(f"verl OPD subprocess exited with status {return_code}")
 
 
@@ -280,8 +324,12 @@ def _restore_verl_resume(
     *,
     prompt_pool_fingerprint: str,
     update_horizon: int,
+    world_size: int,
 ) -> tuple[int, dict | None]:
     revision = _w.OPD_RESUME_REVISION or None
+    # no `prefer`: opd pins an exact commit via OPD_RESUME_REVISION with fail_closed, and
+    # validate_opd_resume_state_metadata is keyed to that checkpoint's step, so silently picking a
+    # different candidate here would violate the retry contract those enforce.
     resume = _w.hf_resume_checkpoint(fail_closed=bool(revision), revision=revision)
     if not resume:
         return 0, None
@@ -289,6 +337,26 @@ def _restore_verl_resume(
     if match is None:
         raise RuntimeError(f"invalid OPD resume checkpoint path {resume!r}")
     step = int(match.group(1))
+    # before the state is read, not after: a checkpoint this attempt's rank count cannot load is
+    # discarded whole, and the loop accounting it carries only describes steps that get redone.
+    if revision:
+        # a pinned revision means a prior attempt crossed optimizer.step(): the control-plane
+        # gate (verify_opd_replacement_safe) authorized this replacement only to continue from
+        # exactly this checkpoint. discarding it and restarting from step 0 would repeat
+        # already-billed teacher work and optimizer steps outside what the gate approved, so a
+        # topology mismatch fails closed here instead of falling through to a fresh run.
+        if not resume_checkpoint_is_loadable(resume, world_size=world_size):
+            written = checkpoint_world_size(resume)
+            raise RuntimeError(
+                f"permanent OPD resume failure: pinned resume revision {revision!r} names "
+                f"checkpoint {os.path.basename(resume)}, whose fsdp shards were written at "
+                f"world size {written if written is not None else 'unknown'} while this "
+                f"attempt runs at world size {world_size}. restarting from step 0 would "
+                "violate the pinned-resume contract, so this attempt refuses to train; "
+                "relaunch the retry at the checkpoint's gpu count."
+            )
+    elif not resume_topology_matches(resume, world_size=world_size, job_label="OPD"):
+        return 0, None
     with open(os.path.join(resume, "opd_state.json"), encoding="utf-8") as file:
         state = validate_opd_resume_state_metadata(
             json.load(file), expected_seed=int(_w.SEED), checkpoint_step=step

@@ -140,6 +140,11 @@ def _spec_with_gpu(spec: JobSpec, gpu_type: str, gpu_count: int = 0) -> JobSpec:
         return spec
     d = spec.to_internal_dict()
     d["gpu"] = {**d["gpu"], "type": gpu_type, "count": count}
+    # the auto marker is deliberately NOT cleared here. it records that the author omitted
+    # gpu.count, which stays true once a shape is resolved onto the spec, and it is the only
+    # surviving record of that: the public halves of an auto-sized and an authored single-card run
+    # are byte-identical. clearing it made a recovered auto-sized run re-allocate hard-pinned to one
+    # card. consumers that mean "auto-size now" check for an unresolved shape alongside the marker.
     return JobSpec.from_dict(d)
 
 
@@ -230,6 +235,23 @@ def _submit_seed_supervised(
     )
 
 
+def _terminal_failure_detail(exc: BaseException) -> str:
+    """Render a run's persisted `error` from the exception that ended it.
+
+    `RunStatus.error` is shown to the submitter, so an arbitrary exception's text is NOT safe to
+    put there: it can carry internal storage paths, provider payloads, and upstream bodies. The
+    default therefore keeps only the type. The exception is the managed-teacher configuration gate,
+    whose messages are authored for exactly this audience -- redacting those made a missing
+    plane-side credential indistinguishable from a bad spec, since both surfaced as a bare
+    `RuntimeError: run failed`.
+    """
+    from flash.server.domain.teacher_broker import TeacherBrokerConfigurationError
+
+    if isinstance(exc, TeacherBrokerConfigurationError):
+        return f"{type(exc).__name__}: {exc}"
+    return f"{type(exc).__name__}: run failed"
+
+
 def _run_job_inner(
     spec: JobSpec,
     log_path: str,
@@ -264,7 +286,7 @@ def _run_job_inner(
         return  # cancel_run already set the terminal state
     except Exception as exc:
         if get_status(spec.run_id).state != "cancelled":
-            _update(spec.run_id, "failed", error=f"{type(exc).__name__}: run failed")
+            _update(spec.run_id, "failed", error=_terminal_failure_detail(exc))
         raise
 
 

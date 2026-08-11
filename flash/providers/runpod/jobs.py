@@ -11,6 +11,7 @@ import os
 import time
 from dataclasses import dataclass
 
+from flash._internal.diagnostics import sanitize_diagnostic
 from flash._internal.logging import get_logger
 from flash.providers._lifecycle.deadline import (
     deadline_kwargs,
@@ -52,6 +53,11 @@ from flash.providers.runpod.serverless import (
 
 endpoint_name = _endpoint_name
 logger = get_logger(__name__)
+
+# Per-part cap for sanitized terminal-failure text. The parts are already provider-bounded; the
+# limit exists so redaction can never silently truncate a tail we chose to surface. It is applied
+# after sanitizing the complete text, keeping the newest bytes.
+FAILURE_TEXT_LIMIT = 64_000
 
 # Re-export for callers that import PollResult from here.
 __all__ = [
@@ -220,13 +226,28 @@ def build_function_input(payload: dict) -> dict:
     }
 
 
+def _safe_failure_text(value: object, limit: int = FAILURE_TEXT_LIMIT) -> str:
+    """Redact credentials out of one part of a user-visible RunPod failure detail.
+
+    Provider errors and worker stdout tails reach the run log verbatim, so a control-plane secret
+    the worker echoed would be printed. The instance providers sanitize every part of their failure
+    detail; this keeps RunPod symmetric with them. The complete text is sanitized before the bound
+    is applied, and the bound keeps the newest bytes: slicing first could cut a credential at the
+    boundary so its surviving part no longer value-matches.
+    """
+    sanitized = sanitize_diagnostic(value, limit=1 << 30)
+    return sanitized[-max(0, int(limit)) :]
+
+
 def decode_output(output) -> dict:
     """Decode a queue-job output into the worker's metrics dict (handles live-function and baked-image shapes)."""
     if isinstance(output, str):
         try:
             output = json.loads(output)
         except json.JSONDecodeError as exc:
-            raise RuntimeError(f"unexpected job output tail: {output[-200:]}") from exc
+            raise RuntimeError(
+                f"unexpected job output tail: {_safe_failure_text(output, 200)}"
+            ) from exc
     if not isinstance(output, dict):
         raise RuntimeError(f"unexpected job output type: {type(output)}")
     if "success" in output or "result" in output:
@@ -238,13 +259,14 @@ def decode_output(output) -> dict:
                 raise RuntimeError(f"flash job returned no metrics: {result!r}")
             return result
         err = output.get("error") or "unknown worker error"
-        stdout_tail = output.get("stdout") or ""
+        stdout_tail = _safe_failure_text(output.get("stdout") or "")
         raise RuntimeError(
-            f"Remote execution failed: {err}\n--- worker stdout tail ---\n{stdout_tail}"
+            f"Remote execution failed: {_safe_failure_text(err)}\n"
+            f"--- worker stdout tail ---\n{stdout_tail}"
         )
     if output.get("error"):
-        stdout_tail = output.get("stdout") or ""
-        msg = f"Remote execution failed: {output['error']}"
+        stdout_tail = _safe_failure_text(output.get("stdout") or "")
+        msg = f"Remote execution failed: {_safe_failure_text(output['error'])}"
         if stdout_tail:
             msg += f"\n--- worker stdout tail ---\n{stdout_tail}"
         raise RuntimeError(msg)
@@ -318,7 +340,7 @@ def submit_run(
     deadline_at: float | None = None,
 ) -> PollResult:
     """Deploy, submit, persist handle via ``on_handle``, and poll to completion."""
-    from flash.envs.base import worker_pip_for_env
+    from flash.envs.base import worker_pip_with_extras
     from flash.providers.runpod.serverless import _run_suffix, build_worker_env
     from flash.runner import flash_code_prefix
 
@@ -331,7 +353,8 @@ def submit_run(
     suffix = _run_suffix(spec.run_id)
     if attempt_id:
         suffix = f"{suffix}r{attempt_id}"
-    extra_pip = list(spec.environment.pip) or worker_pip_for_env(spec.environment.id)
+    # the author's [environment] pip is appended to the worker requirement, never substituted for it.
+    extra_pip = worker_pip_with_extras(spec.environment.id, spec.environment.pip)
     worker_env = build_worker_env(
         spec,
         seed,

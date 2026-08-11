@@ -15,6 +15,7 @@ import threading
 import time
 
 from flash.engine.worker.runtime.pkg_proxy import W as _w
+from flash.engine.worker.verl.checkpoints import resume_checkpoint_is_loadable
 
 # todo: run the two-gpu sft smoke on the exact runpod image and command assembled below.
 _SFT_LORAPLUS_RATIO = 16.0
@@ -95,11 +96,20 @@ def _verl_image_message_content(content) -> str:
     return "".join(parts)
 
 
-def _restore_verl_resume(local_dir: str) -> int:
-    resume = _w.hf_resume_checkpoint()
+def _restore_verl_resume(local_dir: str, *, world_size: int) -> int:
+    """stage this run's streamed resume checkpoint; 0 when there is nothing usable to resume from.
+
+    ``world_size`` is the rank count this attempt launches verl at; a checkpoint written at a
+    different one is discarded rather than staged (see ``resume_topology_matches``). the fetch itself
+    prefers a lower loadable checkpoint over a higher incompatible one, so a repeated discard cannot
+    starve a compatible checkpoint uploaded after the one this attempt already rejected.
+    """
+    resume = _w.hf_resume_checkpoint(
+        prefer=lambda path: resume_checkpoint_is_loadable(path, world_size=world_size)
+    )
     if not resume:
         return 0
-    return stage_verl_resume(resume, local_dir, job_label="SFT")
+    return stage_verl_resume(resume, local_dir, job_label="SFT", world_size=world_size)
 
 
 def _durable_required_save_steps(required_steps: tuple[int, ...], resume_step: int) -> set[int]:

@@ -24,6 +24,73 @@ from flash.server.platform import db as _db_mod
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
+
+def _env_package_b64() -> str:
+    """A real base64 `.tar.gz` holding `environment.py`.
+
+    The route validates and decodes the package before it decides anything else, so a publish
+    test cannot pass a placeholder string: stubbing `publish_package` skips the upload, not the
+    input contract. Built here rather than hardcoded so it stays a genuinely valid archive.
+    """
+    import base64
+    import gzip
+    import io
+    import tarfile
+
+    # mtime=0 throughout: gzip embeds a timestamp, so the default makes this bytes-unstable
+    # between processes. Not a test id today, but a payload that differs per xdist worker is a
+    # trap waiting for whoever parametrizes over it.
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as tar:
+        body = b"# test environment\n"
+        info = tarfile.TarInfo("environment.py")
+        info.size = len(body)
+        info.mtime = 0
+        tar.addfile(info, io.BytesIO(body))
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz:
+        gz.write(raw.getvalue())
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+ENV_PACKAGE_B64 = _env_package_b64()
+
+
+def stub_publish_package_failing_on_write(message: str, slug: str = "acme/env"):
+    """A `publish_package` stub that runs the pre-write hook and fails only if the write happens.
+
+    Asserting "the guard blocked this" needs the guard to actually run. A stub that raises
+    immediately would pass whether or not the route ever consulted the guard, since it never
+    reaches the hook the guard now lives in.
+    """
+
+    def _publish(*, package_b64, name, key, before_write=None):
+        if before_write is not None:
+            before_write(slug)
+        pytest.fail(message)
+
+    return _publish
+
+
+def stub_publish_package(slug: str, *, record: list | None = None):
+    """A `publish_package` replacement that still honours the pre-write hook.
+
+    The route gates the destination through `before_write`, which the real implementation fires
+    after validating the package and immediately before writing. A stub that ignores the hook
+    silently disables that gate, so a test asserting "the guard blocked this" would pass no
+    matter what the guard did.
+    """
+
+    def _publish(*, package_b64, name, key, before_write=None):
+        if before_write is not None:
+            before_write(slug)
+        if record is not None:
+            record.append({"package_b64": package_b64, "name": name, "key": key})
+        return slug
+
+    return _publish
+
+
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "project": "11111111-1111-4111-8111-111111111111",
@@ -140,6 +207,16 @@ def api(tmp_path, monkeypatch):
         environment_registry_mod,
         "record_published_environment",
         lambda **_kwargs: True,
+    )
+    # The publish path's pre-upload ownership check is a second network choke-point: it urllib-POSTs
+    # the backend's validate endpoint, and FREESOLO_BASE_URL defaults to the production host. It
+    # swallows OSError by design (an unreachable backend must not block publishing), so a live call
+    # from this suite would pass silently instead of failing -- stub it like the reporters above.
+    monkeypatch.setattr(
+        environment_registry_mod,
+        "raise_if_owned_by_another_project",
+        lambda **_kwargs: None,
+        raising=False,
     )
     with TestClient(app_mod.create_app()) as client:
         yield client
@@ -343,7 +420,7 @@ def test_project_validation_blocks_before_environment_publication(api, monkeypat
         headers=_bearer(_login()),
         json={
             "name": "env",
-            "package_b64": "payload",
+            "package_b64": ENV_PACKAGE_B64,
             "project_id": "11111111-1111-4111-8111-111111111111",
         },
     )
@@ -429,13 +506,13 @@ def test_internal_publish_uses_internal_project_validation_endpoint(api, monkeyp
     import flash.server.domain.envs as envs_mod
 
     requests = _install_real_internal_project_validation(monkeypatch)
-    monkeypatch.setattr(envs_mod, "publish_package", lambda **_kwargs: "org-test/env")
+    monkeypatch.setattr(envs_mod, "publish_package", stub_publish_package("org-test/env"))
     monkeypatch.setattr(registry, "record_published_environment", lambda **_kwargs: True)
 
     response = api.post(
         "/v1/envs",
         headers=_bearer("fslo-internal-test"),
-        json={"name": "env", "package_b64": "payload", "project_id": SPEC["project"]},
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
     )
 
     assert response.status_code == 200, response.text
@@ -769,7 +846,11 @@ def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
     import flash.envs.loader as envs_loader
     import flash.schema as schema
     import flash.server.routes.runs as runs_route
+    from tests._helpers.teacher import configure_managed_teacher
 
+    # an opd submission is now validated against the plane's managed-teacher configuration before
+    # the run record; this test is about rollout context ordering, so give it a configured plane.
+    configure_managed_teacher(monkeypatch)
     monkeypatch.setattr(schema, "provisional_gpu", lambda *_a, **_k: "B200")
     # offline: the structured-OPD preflight resolves model metadata over the network -- geometry
     # (model_info + a config.json download) and list_repo_files, to detect a mistral tokenizer.
@@ -815,7 +896,7 @@ def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
             # for them). training the routed experts puts this past every single card at any batch
             # size, so the run is pinned to two below; otherwise the valid-context case would fail
             # allocation instead of exercising the ordering this test is about.
-            "batch_size": 4,
+            "prompts_per_step": 4,
             "max_completion_tokens": max_completion_tokens,
             "structured_outputs": {"choice": ["4"]},
         },
@@ -1599,6 +1680,271 @@ def test_create_run_does_not_blame_the_adapter_for_an_unrelated_failure(api, mon
     assert "no configured provider can provision" in detail
     assert "could not be prepared" not in detail
     assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
+
+
+def test_create_run_keeps_ownership_when_submit_fails_after_persisting_status(api, monkeypatch):
+    """A submit that dies after saving status leaves a run the owner can still see and cancel.
+
+    ``submit_job`` persists ``RunStatus`` and then keeps working (dispatch, provisioning), so a
+    failure past that point leaves a real run behind: the charge sweep and recovery both walk the
+    status files, not the db. Deleting the ownership row there would strand it: 404 on status,
+    logs and cancel for the only key entitled to it, while the provider footprint lives on.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.server.platform import db
+
+    submitted = []
+
+    def submit(spec, **_kwargs):
+        submitted.append(spec.run_id)
+        # mirror the real ordering: status lands first, the rest of the launch can still blow up.
+        runner._save_status(
+            runner.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
+        )
+        raise RuntimeError("provisioning died after status was written")
+
+    monkeypatch.setattr(app_mod, "submit_job", submit)
+
+    key = _login()
+    resp = api.post("/v1/runs", headers=_bearer(key), json={"spec": SPEC})
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    # the owner keeps its handle on the run the failed submit left behind.
+    assert db.run_owner(run_id) is not None
+    assert api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).status_code == 200
+    assert api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key)).status_code == 200
+    assert [r["run_id"] for r in api.get("/v1/runs", headers=_bearer(key)).json()["runs"]] == [
+        run_id
+    ]
+    # and can still drive it to a terminal state itself.
+    cancelled = api.post(f"/v1/runs/{run_id}/cancel", headers=_bearer(key))
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["state"] == "cancelled"
+
+
+def test_create_run_deletes_the_row_when_submit_fails_before_persisting_status(api, monkeypatch):
+    # the other half of the guard: no status file means the launch left nothing behind, so the
+    # ownership row is pure debris and must go rather than wedge the id forever.
+    import flash.server.app as app_mod
+    from flash.server.platform import db
+
+    submitted = []
+
+    def submit(spec, **_kwargs):
+        submitted.append(spec.run_id)
+        raise RuntimeError("provisioning died before status was written")
+
+    monkeypatch.setattr(app_mod, "submit_job", submit)
+
+    key = _login()
+    resp = api.post("/v1/runs", headers=_bearer(key), json={"spec": SPEC})
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    assert db.run_owner(run_id) is None
+    assert api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).status_code == 404
+    assert api.get("/v1/runs", headers=_bearer(key)).json()["runs"] == []
+
+
+def _persist_queued_then_raise(app_mod, runner, monkeypatch, submitted):
+    """Monkeypatch submit_job to mirror its real failure ordering: status lands, then it dies."""
+
+    def submit(spec, **_kwargs):
+        submitted.append(spec.run_id)
+        runner._save_status(
+            runner.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
+        )
+        raise RuntimeError("provisioning died after status was written")
+
+    monkeypatch.setattr(app_mod, "submit_job", submit)
+
+
+def _classified_resubmits() -> list[str]:
+    """Run ids startup recovery would resubmit right now."""
+    from flash.server.platform import runtime
+
+    active: set[str] = set()
+    known: set[str] = set()
+    resubmit: list = []
+    runtime._classify_recoverable_runs(active, known, resubmit)
+    return [spec.run_id for spec, _state in resubmit]
+
+
+def test_create_run_dry_run_failure_leaves_no_recoverable_run(api, monkeypatch):
+    """A dry-run submit that dies after persisting `queued` must not be retained.
+
+    submit_job persists the status as `queued` and only later flips it to `dry_run`, so a failure
+    in between leaves a queued record. Retaining its ownership row would hand it to startup
+    recovery, which resubmits every owned queued run as a REAL job - provisioning a gpu the user
+    explicitly asked never to rent. The row is dropped instead, exactly as before the guard.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.server.platform import db
+
+    submitted: list[str] = []
+    _persist_queued_then_raise(app_mod, runner, monkeypatch, submitted)
+
+    key = _login()
+    resp = api.post("/v1/runs", headers=_bearer(key), json={"spec": SPEC, "dry_run": True})
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    assert db.run_owner(run_id) is None
+    assert api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).status_code == 404
+    # recovery walks the ownership rows: with the row gone the queued record is unreachable.
+    assert run_id not in _classified_resubmits()
+
+
+def test_create_run_retained_secretful_run_fails_instead_of_recovering(api, monkeypatch):
+    """A retained run whose runtime secrets were never dispatched must not silently recover.
+
+    the secrets live only in the request and are deliberately excluded from the persisted spec, so
+    recovery would resubmit the run without them: it would train with missing credentials and
+    silently change behavior. the guard fails the run loudly instead; the owner keeps the row and
+    the error, and recovery skips terminal runs.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.server.platform import db
+
+    submitted: list[str] = []
+    _persist_queued_then_raise(app_mod, runner, monkeypatch, submitted)
+
+    key = _login()
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer(key),
+        json={"spec": SPEC, "runtime_secrets": {"WANDB_API_KEY": "user-wandb-key"}},
+    )
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    # the owner keeps the run and a loud, actionable error.
+    assert db.run_owner(run_id) is not None
+    body = api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).json()
+    assert body["state"] == "failed"
+    assert "runtime secrets" in body["error"]
+    # and recovery classifies nothing to resubmit for it.
+    assert run_id not in _classified_resubmits()
+
+
+def test_create_run_secretful_run_dropped_when_terminalization_fails(api, monkeypatch):
+    """If the compensating terminal write RAISES, the ownership row must go.
+
+    that `_update` is the only thing keeping startup recovery away from a queued run whose
+    secrets were never dispatched. a full or read-only status store makes it raise, and
+    swallowing that would leave the run both recoverable and secretless. an orphaned 404 is the
+    lesser harm, so the row is dropped instead.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.server.platform import db
+
+    submitted: list[str] = []
+    _persist_queued_then_raise(app_mod, runner, monkeypatch, submitted)
+
+    def boom(*_args, **_kwargs):
+        raise OSError("[Errno 28] No space left on device")
+
+    monkeypatch.setattr(runner, "_update", boom)
+
+    key = _login()
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer(key),
+        json={"spec": SPEC, "runtime_secrets": {"WANDB_API_KEY": "user-wandb-key"}},
+    )
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    # the queued status record survives on disk, so only the dropped row keeps recovery off it.
+    assert runner.get_status(run_id).state == "queued"
+    assert db.run_owner(run_id) is None
+    assert run_id not in _classified_resubmits()
+
+
+def test_create_run_secretful_run_kept_when_status_read_fails(api, monkeypatch):
+    """A terminal write that returned must not be second-guessed by a failing status read.
+
+    `_update` returning without raising already proves the run is terminal (True applied the write,
+    a sticky False means it was already terminal). a transient read error afterwards says nothing
+    about that, so treating it as a failed terminalization would delete the ownership row of a
+    correctly failed run - orphaning it for its owner and throwing away the error just persisted.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.server.platform import db
+
+    submitted: list[str] = []
+    _persist_queued_then_raise(app_mod, runner, monkeypatch, submitted)
+
+    # break status reads only once the terminal write itself has landed (`_update` reads the record
+    # to apply it), so this is exactly "the write succeeded, the read after it did not".
+    real_get_status, real_update = runner.get_status, runner._update
+    reading_fails = {"on": False}
+
+    def flaky(run_id, *args, **kwargs):
+        if reading_fails["on"]:
+            raise OSError("[Errno 5] Input/output error")
+        return real_get_status(run_id, *args, **kwargs)
+
+    def update_then_break_reads(*args, **kwargs):
+        applied = real_update(*args, **kwargs)
+        reading_fails["on"] = True
+        return applied
+
+    monkeypatch.setattr(runner, "get_status", flaky)
+    monkeypatch.setattr(runner, "_update", update_then_break_reads)
+
+    key = _login()
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer(key),
+        json={"spec": SPEC, "runtime_secrets": {"WANDB_API_KEY": "user-wandb-key"}},
+    )
+    reading_fails["on"] = False
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    # the terminal write landed, so the owner keeps the row and the actionable error.
+    assert db.run_owner(run_id) is not None
+    body = api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).json()
+    assert body["state"] == "failed"
+    assert "runtime secrets" in body["error"]
+    # and the run is terminal, so recovery still has nothing to resubmit.
+    assert run_id not in _classified_resubmits()
+
+
+def test_create_run_retained_run_records_managed_environment_use(api, monkeypatch):
+    # a retained run stays live and can recover into real training, so it must carry the same
+    # managed-environment association a successful submission records.
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    import flash.server.domain.environment_registry as registry
+    from flash.server.platform import db
+
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        registry,
+        "record_environment_use",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+    submitted: list[str] = []
+    _persist_queued_then_raise(app_mod, runner, monkeypatch, submitted)
+    spec = {**SPEC, "environment": {"id": "acme/my-env"}}
+
+    key = _login()
+    resp = api.post("/v1/runs", headers=_bearer(key), json={"spec": spec})
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    assert db.run_owner(run_id) is not None
+    assert calls
+    assert calls[0]["slug"] == "acme/my-env"
+    assert calls[0]["run_id"] == run_id
 
 
 def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
@@ -6109,6 +6455,40 @@ def test_deploy_ignores_stored_training_gpu(api, monkeypatch):
     assert "gpu_name" not in seen["deploy_kwargs"]
 
 
+def test_deploy_works_the_same_whether_or_not_gpu_count_was_authored(api, monkeypatch):
+    """Deploy must not depend on whether the author wrote gpu.count.
+
+    `gpu_count_auto` was briefly added to the digest-verified set in `effective_spec_from_status`.
+    The digest covers the whole public spec including `gpu.type`, which the allocator legitimately
+    rewrites onto the stored status when a run is provisioned -- so gating on the marker made an
+    ordinary provisioned run fail integrity validation at deploy. An omitted count is the DEFAULT,
+    so that was nearly every run. These two specs differ only in that one authors `gpu.count = 1`.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    def fake_start(target, *args, **kwargs):
+        kwargs["deploy_lock"].release()
+        return False
+
+    monkeypatch.setattr(app_mod, "start_deployment_job", fake_start)
+
+    for gpu_section in ({}, {"count": 1}):
+        key = _login()
+        spec = {**SPEC, "gpu": gpu_section}
+        run_id = api.post(
+            "/v1/runs", json={"spec": spec, "dry_run": True}, headers=_bearer(key)
+        ).json()["run_id"]
+        status = runner.get_status(run_id)
+        status.state = "done"
+        # the allocator writes the class it actually rented onto the public status.
+        status.spec["gpu"]["type"] = "H200"
+        runner._save_status(status)
+
+        resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+        assert resp.status_code == 200, f"gpu={gpu_section!r} deploy failed: {resp.text}"
+
+
 def test_deploy_missing_run_level_adapter_points_at_checkpoint_steps(api, monkeypatch):
     """A run whose finalize never published the run-level <prefix>/adapter (but which streamed
     per-step deployable checkpoints) must not fail run-level deploy with an opaque 502 rank
@@ -6242,6 +6622,127 @@ def test_deploy_falls_back_to_platform_context_org(api, monkeypatch):
     resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
     assert resp.status_code == 200, resp.text
     assert seen["org_id"] == "platform-org"
+
+
+def test_deploy_without_any_org_context_is_rejected(api, monkeypatch):
+    """A managed-plane deploy must fail closed when neither the run nor the key names an org.
+
+    Serving authorizes external chat requests against the org that owns the adapter, so silently
+    registering a revision with no org would leave a user's weights' reachability up to whatever
+    the serving backend does with an unowned adapter. auth gates external keys on org_slug only
+    (org_id is a best-effort passthrough), so the orgless-key case is reachable in production.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    import flash.server.platform.auth as auth_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    status.billing_context = None
+    status.platform_context = None
+    runner._save_status(status)
+    # a verified identity without org_id (but with the org_slug that auth requires)
+    monkeypatch.setattr(
+        auth_mod,
+        "_cached_identity",
+        lambda token: {k: v for k, v in _identity_for_token(token).items() if k != "org_id"},
+    )
+    monkeypatch.setattr(
+        app_mod,
+        "deploy_adapter",
+        lambda **_k: pytest.fail("an orgless deploy must be rejected before registration"),
+    )
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+    assert resp.status_code == 409, resp.text
+    assert "owning organization" in resp.json()["detail"]
+
+
+def test_deployments_listing_requires_internal_scope_and_filters_to_it(api):
+    """`/v1/deployments` must not hand the internal key a cross-org listing.
+
+    On a managed plane the internal key is the platform proxy and owns the runs it submitted for
+    every org, so the listing follows `deps.manageable_run`: the internal key must name the org
+    AND project it lists for, and only that scope's rows come back.
+    """
+    import flash.runner as runner
+
+    internal = _bearer("fslo-internal-test")
+    project_beta = "33333333-3333-4333-8333-333333333333"
+    run_ids: dict[str, str] = {}
+    for org, project in (("org-alpha", SPEC["project"]), ("org-beta", project_beta)):
+        run_id = api.post(
+            "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=internal
+        ).json()["run_id"]
+        status = runner.get_status(run_id)
+        status.state = "done"
+        status.billing_context = {"org_id": org}
+        status.platform_context = None
+        status.spec["project"] = project
+        status.deployment = {"state": "ready", "endpoint_name": "https://serve.example"}
+        runner._save_status(status)
+        run_ids[org] = run_id
+
+    # an unscoped (or half-scoped, or malformed) internal-key call gets no listing at all
+    for headers in (
+        {"Authorization": internal["Authorization"]},
+        internal,  # _bearer adds the org header but no project
+        {**internal, "X-Freesolo-Org-Id": "", "X-Freesolo-Project-Id": SPEC["project"]},
+        {**internal, "X-Freesolo-Org-Id": "org-alpha", "X-Freesolo-Project-Id": "not-a-uuid"},
+    ):
+        resp = api.get("/v1/deployments", headers=headers)
+        assert resp.status_code == 400, resp.text
+        assert "must be scoped" in resp.json()["detail"]
+
+    scoped = api.get(
+        "/v1/deployments",
+        headers={
+            **internal,
+            "X-Freesolo-Org-Id": "org-alpha",
+            "X-Freesolo-Project-Id": SPEC["project"],
+        },
+    )
+    assert scoped.status_code == 200, scoped.text
+    assert [d["run_id"] for d in scoped.json()["deployments"]] == [run_ids["org-alpha"]]
+
+    other = api.get(
+        "/v1/deployments",
+        headers={
+            **internal,
+            "X-Freesolo-Org-Id": "org-beta",
+            "X-Freesolo-Project-Id": project_beta,
+        },
+    )
+    assert [d["run_id"] for d in other.json()["deployments"]] == [run_ids["org-beta"]]
+
+    # a matching org with the wrong project matches nothing: project is part of the scope,
+    # exactly as it is for single-run deployment management
+    crossed = api.get(
+        "/v1/deployments",
+        headers={
+            **internal,
+            "X-Freesolo-Org-Id": "org-alpha",
+            "X-Freesolo-Project-Id": project_beta,
+        },
+    )
+    assert crossed.json()["deployments"] == []
+
+    # the headers are honored only for the internal key: a user key naming someone else's org
+    # still sees only its own (here: zero) runs
+    snoop = api.get(
+        "/v1/deployments",
+        headers={
+            **_bearer(_login()),
+            "X-Freesolo-Org-Id": "org-alpha",
+            "X-Freesolo-Project-Id": SPEC["project"],
+        },
+    )
+    assert snoop.status_code == 200, snoop.text
+    assert snoop.json()["deployments"] == []
 
 
 def test_chat_streams_deployed_run(api, monkeypatch):
@@ -8247,13 +8748,10 @@ def test_publish_env_ignores_legacy_is_new(api, monkeypatch):
 
     import flash.server.domain.envs as envs_mod
 
-    seen: dict = {}
-
-    def fake_publish_package(*, package_b64, name, key):
-        seen.update(package_b64=package_b64, name=name, key=key)
-        return "key-1/e"
-
-    monkeypatch.setattr(envs_mod, "publish_package", fake_publish_package)
+    captured: list = []
+    monkeypatch.setattr(
+        envs_mod, "publish_package", stub_publish_package("key-1/e", record=captured)
+    )
 
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
@@ -8277,6 +8775,8 @@ def test_publish_env_ignores_legacy_is_new(api, monkeypatch):
         },
     )
     assert resp.status_code == 200, resp.text
+    assert len(captured) == 1
+    seen = captured[0]
     assert seen["name"] == "e"
     assert seen["package_b64"] == pkg
     assert seen["key"]["org_slug"].startswith("org-")
@@ -8292,7 +8792,7 @@ def test_publish_env_forwards_project_id_to_registry(api, monkeypatch):
     import flash.server.domain.environment_registry as registry_mod
     import flash.server.domain.envs as envs_mod
 
-    monkeypatch.setattr(envs_mod, "publish_package", lambda *, package_b64, name, key: "key-1/e")
+    monkeypatch.setattr(envs_mod, "publish_package", stub_publish_package("key-1/e"))
 
     recorded: list[dict] = []
     monkeypatch.setattr(
@@ -8360,7 +8860,7 @@ def test_publish_env_returns_502_when_association_record_returns_false(api, monk
     response = api.post(
         "/v1/envs",
         headers=_bearer(_login()),
-        json={"name": "env", "package_b64": "payload", "project_id": SPEC["project"]},
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
     )
 
     assert response.status_code == 502
@@ -8394,7 +8894,7 @@ def test_publish_env_returns_502_when_association_record_raises(api, monkeypatch
     response = api.post(
         "/v1/envs",
         headers=_bearer(_login()),
-        json={"name": "env", "package_b64": "payload", "project_id": SPEC["project"]},
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
     )
 
     assert response.status_code == 502
@@ -8426,7 +8926,7 @@ def test_publish_env_retry_repairs_association_after_false_ack(api, monkeypatch)
     )
     request = {
         "headers": _bearer(_login()),
-        "json": {"name": "env", "package_b64": "payload", "project_id": SPEC["project"]},
+        "json": {"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
     }
 
     first = api.post("/v1/envs", **request)
@@ -8436,6 +8936,339 @@ def test_publish_env_retry_repairs_association_after_false_ack(api, monkeypatch)
     assert second.status_code == 200, second.text
     assert second.json() == {"id": "acme/env"}
     assert uploads == ["acme/env", "acme/env"]
+
+
+def test_publish_env_reports_a_cross_project_name_conflict_without_uploading(api, monkeypatch):
+    """A name owned by another project must fail BEFORE the hub write, with the real cause.
+
+    Two defects in one: publishing replaces the whole `<org-slug>/<name>` hub directory, so
+    uploading first would destroy the other project's package on the way to failing; and the
+    old message blamed association *recording* and told the user to retry, which reproduces
+    the failure identically because names are unique per org.
+    """
+    import flash.server.domain.environment_registry as registry
+    import flash.server.domain.envs as envs_mod
+
+    monkeypatch.setattr(
+        registry,
+        "raise_if_owned_by_another_project",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            registry.EnvironmentProjectConflict("flash environment belongs to another project")
+        ),
+    )
+    monkeypatch.setattr(
+        envs_mod,
+        "publish_package",
+        stub_publish_package_failing_on_write(
+            "a name conflict must not upload over the other project"
+        ),
+    )
+
+    response = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
+    )
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert "already belongs to a different project" in detail
+    assert "unique per organization" in detail
+    # the two ways the old message misled: it must not blame recording, nor advise a retry.
+    assert "could not be recorded" not in detail
+    assert "retry" not in detail.lower().replace("retrying will not change this", "")
+
+
+def test_publish_env_refuses_to_upload_when_the_org_cannot_be_resolved(api, monkeypatch):
+    """An org-id-less key must not bypass the guard and overwrite the hub anyway.
+
+    Auth requires only `org_slug`, so a key can authenticate with no `org_id`. The hub path is
+    namespaced by the SLUG, so such a publish still replaces `<org-slug>/<name>` -- while having
+    no org id to check ownership with. Gating the guard on the org id alone would skip it and
+    clobber the other project, then answer with the old misleading 502.
+    """
+    import flash.server.domain.envs as envs_mod
+    import flash.server.platform.deps as deps
+
+    monkeypatch.setitem(
+        api.app.dependency_overrides,
+        deps.require_key,
+        lambda: {"org_slug": "acme", "user_id": "u1", "api_key_id": "k1", "auth_kind": "user"},
+    )
+    monkeypatch.setattr(
+        envs_mod,
+        "publish_package",
+        stub_publish_package_failing_on_write("an unverifiable org must not reach the hub write"),
+    )
+
+    response = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
+    )
+
+    assert response.status_code == 400, response.text
+    detail = response.json()["detail"]
+    assert "organization could not be resolved" in detail
+    # The remedy named must be one that works. The guard reads the KEY's org id and ignores the
+    # header, so advising the caller to "pass the organization" would be another unactionable
+    # instruction -- the same defect (advice that cannot clear the error) this PR exists to remove.
+    assert "flash login" in detail
+    assert "pass the organization" not in detail
+
+
+def test_publish_env_ignores_the_org_header_for_the_ownership_guard(api, monkeypatch):
+    """`X-Freesolo-Org-Id` must not decide WHERE ownership is checked.
+
+    For a user key `require_project_access` validates the project against `key["org_id"]` and
+    ignores this header, so it is caller-asserted. Trusting it in the guard would look the slug
+    up in an org the caller named while the hub path stays namespaced by the key's own slug: a
+    non-matching id finds nothing, the backend answers 404 rather than 409, and the colliding
+    write proceeds -- exactly the clobber this guard exists to stop.
+    """
+    import flash.server.domain.envs as envs_mod
+    import flash.server.platform.deps as deps
+    from flash.server.domain import environment_registry as registry_mod
+
+    monkeypatch.setitem(
+        api.app.dependency_overrides,
+        deps.require_key,
+        lambda: {"org_slug": "acme", "user_id": "u1", "api_key_id": "k1", "auth_kind": "user"},
+    )
+    checked_orgs: list = []
+
+    def _guard(**kwargs):
+        checked_orgs.append(kwargs.get("org_id"))
+
+    monkeypatch.setattr(registry_mod, "raise_if_owned_by_another_project", _guard)
+    monkeypatch.setattr(
+        envs_mod,
+        "publish_package",
+        stub_publish_package_failing_on_write(
+            "a caller-asserted org must not authorize the hub write"
+        ),
+    )
+
+    response = api.post(
+        "/v1/envs",
+        headers={**_bearer(_login()), "X-Freesolo-Org-Id": "org-caller-supplied"},
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
+    )
+
+    assert response.status_code == 400, response.text
+    assert "organization could not be resolved" in response.json()["detail"]
+    assert checked_orgs == [], f"guard consulted a caller-supplied org: {checked_orgs}"
+
+
+def test_publish_env_checks_ownership_for_an_internal_key_using_the_validated_header(
+    api, monkeypatch
+):
+    """The internal key must reach the guard too, using the org header auth already validated.
+
+    The header is caller-asserted for a USER key and deliberately ignored there, but for the
+    internal key `require_project_access` REQUIRES it (400 without) and validates the project
+    against it -- so by the time the guard runs it is established fact, and it is the only org
+    this key has. Skipping the guard for internal keys left the platform's own publish path with
+    the exact destructive behaviour this PR exists to remove: it overwrote the other project's
+    hub directory and only then returned a conflict.
+    """
+    import flash.server.domain.envs as envs_mod
+    import flash.server.platform.deps as deps
+    from flash.server.domain import environment_registry as registry_mod
+    from flash.server.domain import projects as projects_mod
+
+    monkeypatch.setitem(
+        api.app.dependency_overrides,
+        deps.require_key,
+        # No `org_id`: the internal key is org-agnostic, which is why it must use the header.
+        lambda: {"org_slug": "acme", "auth_kind": "internal"},
+    )
+    monkeypatch.setattr(projects_mod, "require_project_access", lambda **_kwargs: SPEC["project"])
+
+    checked_orgs: list = []
+
+    def _guard(**kwargs):
+        checked_orgs.append(kwargs.get("org_id"))
+        raise registry_mod.EnvironmentProjectConflict("owned by another project")
+
+    monkeypatch.setattr(registry_mod, "raise_if_owned_by_another_project", _guard)
+    monkeypatch.setattr(
+        envs_mod,
+        "publish_package",
+        stub_publish_package_failing_on_write(
+            "an internal-key name conflict must not upload over the other project"
+        ),
+    )
+
+    response = api.post(
+        "/v1/envs",
+        headers={**_bearer(_login()), "X-Freesolo-Org-Id": "org-validated"},
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "already belongs to a different project" in response.json()["detail"]
+    assert checked_orgs == ["org-validated"], (
+        f"internal key skipped the guard or used the wrong org: {checked_orgs}"
+    )
+
+
+def _b64_targz(members: dict[str, bytes]) -> str:
+    """Deterministic base64 `.tar.gz`.
+
+    `mtime=0` on both the gzip stream and its members matters: gzip embeds a timestamp, so the
+    default would make this string differ between xdist workers. Since it is a parametrize
+    argument, that lands in the test id and pytest aborts the whole run with "Different tests
+    were collected between gw0 and gw1".
+    """
+    import base64
+    import gzip
+    import io
+    import tarfile
+
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as tar:
+        for nm, content in members.items():
+            info = tarfile.TarInfo(nm)
+            info.size = len(content)
+            info.mtime = 0
+            tar.addfile(info, io.BytesIO(content))
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz:
+        gz.write(raw.getvalue())
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+@pytest.mark.parametrize(
+    ("package", "message"),
+    [
+        # decodes as base64 but is not a gzip stream at all
+        pytest.param("bm90IGEgdGFyYmFsbCBhdCBhbGw=", "could not be extracted", id="not-a-gzip"),
+        # a valid archive that is missing the required entrypoint
+        pytest.param(
+            _b64_targz({"readme.txt": b"nope"}),
+            "must contain environment.py",
+            id="no-entrypoint",
+        ),
+    ],
+)
+def test_publish_env_validates_the_archive_before_checking_ownership(
+    api, monkeypatch, package, message
+):
+    """Base64-valid but structurally invalid packages keep their own 400.
+
+    `validate_publish_inputs` only decodes; a payload can survive that and still be a corrupt
+    archive or lack `environment.py`. Those errors live deeper in the publish, so the ownership
+    guard has to run after them -- otherwise a colliding destination answers a package that could
+    never be published with a conflict, and consults the backend to do it.
+    """
+    from flash.server.domain import environment_registry as registry_mod
+
+    def _conflict(**_kwargs):
+        pytest.fail("ownership must not be consulted for a package that cannot be published")
+
+    monkeypatch.setattr(registry_mod, "raise_if_owned_by_another_project", _conflict)
+    monkeypatch.setenv("GITHUB_TOKEN", "token-for-publish-path")
+
+    response = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": "env", "package_b64": package, "project_id": SPEC["project"]},
+    )
+
+    assert response.status_code == 400, response.text
+    assert message in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "status", "message"),
+    [
+        ("name", "", 400, "missing env name"),
+        ("package_b64", False, 400, "must be a base64 string"),
+        ("package_b64", "!!!!", 400, "not valid base64"),
+        ("package_b64", "", 400, "empty env package"),
+    ],
+)
+def test_publish_env_validates_inputs_before_checking_ownership(
+    api, monkeypatch, field, value, status, message
+):
+    """An unpublishable request keeps its own deterministic error.
+
+    The ownership pre-check runs early enough to preempt the payload checks, so a colliding
+    destination would answer a malformed request with 409 -- replacing the 400/413 the inputs
+    earn -- and would contact the backend for a publish that could never happen.
+    """
+    from flash.server.domain import environment_registry as registry_mod
+
+    def _conflict(**_kwargs):
+        pytest.fail("ownership must not be consulted for a request that cannot be published")
+
+    monkeypatch.setattr(registry_mod, "raise_if_owned_by_another_project", _conflict)
+
+    body = {"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]}
+    body[field] = value
+    response = api.post("/v1/envs", headers=_bearer(_login()), json=body)
+
+    assert response.status_code == status, response.text
+    assert message in response.json()["detail"].lower()
+
+
+def test_publish_env_reports_an_invalid_name_as_a_type_error_not_a_conflict(api, monkeypatch):
+    """A malformed name must not be answered with a conflict about an unrelated environment.
+
+    A non-string name sanitizes to the generic "env", so checking ownership of that slug before
+    validating the type would answer `name=0` with a 409 naming `<org>/env` -- a different
+    environment the caller never asked for -- instead of the deterministic 400.
+    """
+    import flash.server.domain.environment_registry as registry
+
+    # The org owns the sanitized "<ns>/env" slug under a different project. The real
+    # publish_package runs: its type check is what must answer, not this conflict.
+    monkeypatch.setattr(
+        registry,
+        "raise_if_owned_by_another_project",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            registry.EnvironmentProjectConflict("flash environment belongs to another project")
+        ),
+    )
+
+    response = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": 0, "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
+    )
+
+    assert response.status_code == 400, response.text
+    assert "name must be a string" in response.json()["detail"].lower()
+
+
+def test_publish_env_maps_a_late_ownership_conflict_to_409(api, monkeypatch):
+    """Losing the race to a concurrent publish is still an ownership conflict, not a 502.
+
+    The pre-check can pass and the association still be refused (another publish landed in
+    between, or the pre-check could not reach the backend). The cause is unchanged, so the
+    answer must be too -- otherwise the same conflict yields retry advice by timing alone.
+    """
+    import flash.server.domain.environment_registry as registry
+    import flash.server.domain.envs as envs_mod
+
+    monkeypatch.setattr(registry, "raise_if_owned_by_another_project", lambda **_kwargs: None)
+    monkeypatch.setattr(envs_mod, "publish_package", stub_publish_package("acme/env"))
+
+    def conflict(**_kwargs):
+        raise registry.EnvironmentProjectConflict("flash environment belongs to another project")
+
+    monkeypatch.setattr(registry, "record_published_environment", conflict)
+
+    response = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "already belongs to a different project" in response.json()["detail"]
+    assert "could not be recorded" not in response.json()["detail"]
 
 
 def test_publish_env_falsy_non_string_fields_are_not_coerced(api):
@@ -9768,3 +10601,55 @@ def test_record_model_exported_posts_allowlisted_event(monkeypatch):
         is False
     )
     assert posted == {}
+
+
+@pytest.mark.parametrize(
+    ("plane_misconfigured", "status_code"),
+    [
+        # the plane's own credential is unset: nothing the submitter can author fixes it
+        (True, 503),
+        # the submitted shape exceeds the broker's limits: their spec is the fix
+        (False, 400),
+    ],
+)
+def test_managed_teacher_rejection_reports_which_side_is_at_fault(
+    api, monkeypatch, tmp_path, plane_misconfigured, status_code
+) -> None:
+    """A plane outage must not be reported as a bad request.
+
+    The submit path funnels every exception into one 400, which is right for a spec the user must
+    change and wrong for a credential only an operator can set. Reporting both as a client error
+    would re-create, at the HTTP layer, the same "misconfiguration looks like a spec error"
+    conflation that hoisting this gate to submit time exists to end.
+    """
+    import flash.envs.loader as envs_loader
+    from tests._helpers.teacher import configure_managed_teacher
+
+    configure_managed_teacher(monkeypatch)
+    # offline: the image-opd preflight ahead of this gate resolves the environment reference to
+    # inspect its dataset. point it at an empty local dir so no github request is made.
+    offline_env = tmp_path / "offline-env"
+    offline_env.mkdir()
+    (offline_env / "environment.py").write_text("")
+    monkeypatch.setattr(envs_loader, "_resolve_ref_sha", lambda *_a, **_k: "0" * 40)
+    monkeypatch.setattr(
+        envs_loader,
+        "_resolve_environment_reference",
+        lambda *_a, **_k: str(offline_env / "environment.py"),
+    )
+    train = {**SPEC["train"], "teacher_model": "glm-5.2"}
+    if plane_misconfigured:
+        monkeypatch.delenv("PARASAIL_API_KEY", raising=False)
+    else:
+        # a shape whose planned teacher score items exceed the broker ceiling. the multiplier is
+        # 192 (64 turns x 3 no-signal attempts), so this asks for ~9.8M against a 1M limit.
+        train |= {"max_steps": 100, "batch_size": 64, "group_size": 8, "max_examples": 6400}
+    spec = {**SPEC, "algorithm": "opd", "train": train}
+
+    response = api.post("/v1/runs", headers=_bearer(_login()), json={"spec": spec, "dry_run": True})
+
+    assert response.status_code == status_code, response.text
+    detail = str(response.json()["detail"])
+    # the reason has to survive the mapping too: a bare status code still leaves an operator
+    # guessing which of the two plane-side names is unset.
+    assert ("PARASAIL_API_KEY" in detail) is plane_misconfigured, detail
