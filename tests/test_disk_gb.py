@@ -188,6 +188,37 @@ def test_submit_raises_disk_to_the_worker_image_floor(monkeypatch):
         assert status.effective_preparation["worker_spec"]["gpu"]["disk_gb"] == 100
 
 
+def test_lambda_offers_nothing_while_a_disk_floor_it_cannot_honor_is_set(monkeypatch):
+    """Lambda must not rent a paid box it is certain cannot extract the image.
+
+    The floor reaches ``AllocationConstraints.disk_gb``, but Lambda sells fixed instance storage:
+    its capacity probe ignores the disk constraint and its launch path has no disk-sizing field. An
+    operator only sets the floor because the image does NOT fit the default sizing, so allocating
+    here buys an instance that fails during extraction -- and a never-started worker is retriable,
+    so the paid attempt could repeat. RunPod (endpoint template) and Vast (offer search) can both
+    satisfy the floor and stay eligible.
+    """
+    import pytest
+
+    from flash.providers.base import AllocationConstraints, UnsupportedGpuError
+    from flash.providers.lambda_ import LambdaProvider
+    from flash.providers.vast import VastProvider
+
+    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/fat-worker:cu128")
+    monkeypatch.delenv("FLASH_WORKER_IMAGE_REGISTRY_AUTH", raising=False)
+    monkeypatch.setenv("FLASH_WORKER_IMAGE_DISK_GB", "300")
+
+    with pytest.raises(UnsupportedGpuError, match="FLASH_WORKER_IMAGE_DISK_GB"):
+        LambdaProvider().live_candidates(24, AllocationConstraints())
+    # vast searches offers on disk (_effective_disk_gb), so the floor must NOT disqualify it --
+    # the guard is specific to the substrate that cannot size disk, not to the floor existing.
+    assert not hasattr(VastProvider(), "_image_disk_floor_problem")
+
+    # and with no floor set, lambda is eligible again
+    monkeypatch.delenv("FLASH_WORKER_IMAGE_DISK_GB", raising=False)
+    assert LambdaProvider()._image_disk_floor_problem() == ""
+
+
 def test_profile_job_carries_the_worker_image_disk_floor(monkeypatch):
     """The cpu profile job pulls the same override image, so it needs the same floor.
 

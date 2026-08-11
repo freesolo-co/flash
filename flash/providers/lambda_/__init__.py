@@ -118,6 +118,26 @@ class LambdaProvider(InstanceProvider):
 
         return run_instances_remaining(run_id)
 
+    def _image_disk_floor_problem(self) -> str:
+        """Why Lambda cannot honor a configured worker-image disk floor.
+
+        Lambda sells fixed instance storage: there is no disk-sizing field on the launch path, and
+        the capacity probe ignores ``constraints.disk_gb`` entirely. RunPod sizes the endpoint
+        template and Vast searches on disk, so both can satisfy the floor; Lambda can only ignore
+        it. Since an operator sets the floor precisely because the image does not fit the default
+        sizing, renting here produces a paid instance that fails during image extraction -- and a
+        never-started worker is classified retriable, so it could repeat across paid attempts.
+        """
+        from flash.providers._lifecycle.worker import worker_image_disk_floor
+
+        if not worker_image_disk_floor():
+            return ""
+        return (
+            f"FLASH_WORKER_IMAGE_DISK_GB cannot be provisioned on {self.name}: "
+            f"{self.name} sells fixed instance storage with no disk-sizing field, so the "
+            f"worker image's disk floor cannot be guaranteed"
+        )
+
     def live_candidates(
         self, need_vram_gb: int, constraints: AllocationConstraints
     ) -> list[Candidate]:
@@ -132,10 +152,11 @@ class LambdaProvider(InstanceProvider):
         rate stays per-card (``usable_instances`` divides the per-instance price).
 
         Offers nothing at all when a private worker image is configured that this substrate cannot
-        authenticate (see ``_private_image_problem``), so the allocator never rents a box whose
-        image pull is certain to fail.
+        authenticate (see ``_private_image_problem``), or when a worker-image disk floor is set that
+        it cannot provision (see ``_image_disk_floor_problem``), so the allocator never rents a box
+        whose image pull is certain to fail.
         """
-        problem = self._private_image_problem()
+        problem = self._private_image_problem() or self._image_disk_floor_problem()
         if problem:
             raise UnsupportedGpuError(problem)
         from flash.providers.lambda_ import api as lambda_api
