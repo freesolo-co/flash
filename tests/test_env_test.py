@@ -701,7 +701,7 @@ def test_env_test_low_reward_warning_names_the_gold_completion_too(monkeypatch, 
 def test_env_test_surfaces_the_scorer_error_behind_a_zero_reward(monkeypatch, tmp_path, capsys):
     """A crashed scorer and a judged-wrong answer both reach the CLI as 0.0.
 
-    `FreesoloEnvAdapter.reward` keeps only `RewardResult.score`, so a missing runtime dependency is
+    `FreesoloEnvironment.reward` keeps only `RewardResult.score`, so a missing runtime dependency is
     reported as a bare zero. The error string is what names it, so the warning must print it.
     """
     env_dir = _environment_dir(tmp_path)

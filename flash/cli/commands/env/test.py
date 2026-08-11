@@ -278,10 +278,10 @@ def _scores_gold_no_better_than_junk(env, example: dict, gold_reward: float) -> 
 def _replay_scorer_error(env, example: dict, record: dict) -> str:
     """The scorer's own error string for this episode, or "" when it did not report one.
 
-    ``FreesoloEnvAdapter.reward`` returns ``float(result.score)``, so a scorer that crashed behind
+    ``FreesoloEnvironment.reward`` returns ``float(result.score)``, so a scorer that crashed behind
     the SDK's guard and one that deliberately scored zero are indistinguishable by reward alone.
-    ``RewardResult.error`` survives on the result object, so re-score the same text through the
-    breakdown path that keeps it. Advisory only: any failure here leaves the reward authoritative.
+    ``reward_error`` re-scores the same text and keeps ``RewardResult.error`` instead. Advisory
+    only: an env without the hook, or any failure here, leaves the reward authoritative.
     """
     reward_error = getattr(env, "reward_error", None)
     if not callable(reward_error):
@@ -764,7 +764,7 @@ def cmd_env_test(args) -> int:
                 scorer_error = _replay_scorer_error(env, example, record)
                 if scorer_error:
                     # a scorer that crashed and a scorer that judged are both reported as 0.0 by
-                    # `FreesoloEnvAdapter.reward`, which keeps only `RewardResult.score`. surfacing
+                    # `FreesoloEnvironment.reward`, which keeps only `RewardResult.score`. surfacing
                     # the discarded `error` names a missing dependency instantly.
                     print(f"  scorer error: {scorer_error}", file=sys.stderr)
 
