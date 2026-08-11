@@ -1797,7 +1797,7 @@ def test_child_tail_redacts_credentials_before_they_reach_a_heartbeat(monkeypatc
     """the retained tail rides to heartbeat.json, the streamed run log and persisted status.
 
     the worker is the only side that knows the run's secret values, so redaction has to happen
-    here -- the plane-side formatter only neutralizes control characters.
+    here; the plane-side formatter only neutralizes control characters.
     """
     secret = "hf_ZZZchildtailsecretvalue0123456789"
     monkeypatch.setenv("HF_TOKEN", secret)

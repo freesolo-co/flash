@@ -381,9 +381,9 @@ def _classify_terminal_status(
             )
     if status not in _jobs.TERMINAL_FAIL:
         return None
-    # every part is sanitized: this detail reaches the user-readable run log, and a control-plane
-    # secret echoed by the worker would otherwise be printed verbatim (the instance providers
-    # sanitize each part of theirs).
+    # this detail reaches the user-readable run log, so every part of it is sanitized: a
+    # control-plane secret echoed by the worker would otherwise be printed verbatim (the instance
+    # providers sanitize each part of theirs the same way).
     detail = _jobs._safe_failure_text(str(provider_status.get("error") or "")[-1500:], 1500)
     output = provider_status.get("output")
     if isinstance(output, dict) and output.get("stdout"):
