@@ -536,7 +536,7 @@ def test_env_setup_resolves_the_project_locally_on_a_self_hosted_plane(monkeypat
 _SCAFFOLD_PROJECT = "11111111-1111-4111-8111-111111111111"
 
 
-def _scaffold(monkeypatch, tmp_path, api_url: str):
+def _scaffold(monkeypatch, tmp_path, api_url: str, *, turn_mode: str | None = None):
     """Run `flash env setup` in tmp_path against a plane at api_url; return the written files."""
     from argparse import Namespace
 
@@ -544,12 +544,13 @@ def _scaffold(monkeypatch, tmp_path, api_url: str):
 
     monkeypatch.setattr(env_setup, "_require_setup_project", lambda _args: _SCAFFOLD_PROJECT)
     monkeypatch.setattr("flash.client.config.load_credentials", lambda: (api_url, "key"))
+    tmp_path.mkdir(parents=True, exist_ok=True)
     monkeypatch.chdir(tmp_path)
     rc = env_setup.cmd_env_setup(
         Namespace(
             project=_SCAFFOLD_PROJECT,
             yes=True,
-            multi_turn=False,
+            turn_mode=turn_mode,
             reasoning=None,
             from_traces=None,
             trace=None,
@@ -572,9 +573,52 @@ def test_env_setup_scaffolds_the_github_form_on_a_self_hosted_plane(monkeypatch,
     for name in ("sft.toml", "rl.toml", "opd.toml"):
         assert 'id = "github:OWNER/REPO@main:environment.py"' in written[name], name
         assert "flash env push --project" not in written[name], name
+        assert "FLASH_STANDALONE=1" in written[name], name
+        assert "identity backend instead accepts only managed hub ids" in written[name], name
     # the generated .py files carry the same guidance in their docstrings
     for name in ("environment.py", "evaluations.py"):
         assert "flash env push" not in written[name], name
+
+
+def test_env_setup_self_hosted_does_not_offer_managed_only_eval(monkeypatch, tmp_path) -> None:
+    written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+
+    evaluations = written["evaluations.py"]
+    assert "flash env eval TARGET" not in evaluations
+    assert "`flash env eval` currently requires a managed hub environment" in evaluations
+    assert "these suites still document the criteria" in evaluations
+
+
+def test_env_setup_self_hosted_ref_guidance_matches_parser(monkeypatch, tmp_path) -> None:
+    written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+
+    for name in ("sft.toml", "rl.toml", "opd.toml"):
+        assert "REF is a branch/tag name without `/`, or a commit sha" in written[name], name
+        assert "REF is a branch, tag or commit" not in written[name], name
+
+
+def test_env_setup_opd_teacher_setup_matches_plane(monkeypatch, tmp_path) -> None:
+    self_hosted = _scaffold(
+        monkeypatch,
+        tmp_path / "self-hosted",
+        "https://plane.example.test",
+        turn_mode="multi",
+    )
+    self_hosted_opd = self_hosted["opd.toml"]
+    assert "PARASAIL_API_KEY" in self_hosted_opd
+    assert "FLASH_PUBLIC_URL" in self_hosted_opd
+    assert "platform-managed; nothing to set up or export" not in self_hosted_opd
+    assert "PARASAIL_API_KEY and FLASH_PUBLIC_URL" in self_hosted["environment.py"]
+    assert "teacher key is platform-managed" not in self_hosted["environment.py"]
+
+    hosted = _scaffold(monkeypatch, tmp_path / "hosted", "https://flash.freesolo.co")
+    hosted_opd = hosted["opd.toml"]
+    assert (
+        "# the teacher and its parasail key are platform-managed; nothing to set up or export."
+        in hosted_opd
+    )
+    assert "PARASAIL_API_KEY" not in hosted_opd
+    assert "FLASH_PUBLIC_URL" not in hosted_opd
 
 
 def test_scaffolded_self_hosted_id_is_a_form_the_loader_accepts(monkeypatch, tmp_path) -> None:

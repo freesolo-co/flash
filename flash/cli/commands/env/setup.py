@@ -420,9 +420,9 @@ def _for_self_hosted_plane(source: str, project_id: str) -> str:
                 "environment, so `env eval` takes no local path."
             ),
             (
-                "Keep this file beside environment.py in the git repo named by [environment] id,\n"
-                "then run the suites against a model trained on it with `flash env eval TARGET`.\n"
-                "The run names that repo, so `env eval` takes no local path."
+                "Keep this file beside environment.py in the git repo named by [environment] id.\n"
+                "`flash env eval` currently requires a managed hub environment, so it cannot\n"
+                "evaluate a run using a direct `github:` id; these suites still document the criteria."
             ),
         ),
     )
@@ -431,6 +431,10 @@ def _for_self_hosted_plane(source: str, project_id: str) -> str:
     # silent no-op here would ship a file still telling a self-hoster to run `flash env push`.
     for hosted, self_hosted in rewrites:
         source = source.replace(hosted, self_hosted)
+    source = source.replace(
+        "teacher key is platform-managed (nothing to set).",
+        "plane operator must set PARASAIL_API_KEY and FLASH_PUBLIC_URL on the control plane.",
+    )
     if push in source:
         raise AssertionError(
             "a scaffolded file still references `flash env push` after the self-hosted rewrite; "
@@ -462,8 +466,8 @@ def _plane_can_publish_environments() -> bool:
 def _environment_comment(project_id: str, *, can_publish: bool, extra: str = "") -> str:
     """The `[environment]` block for a generated config.
 
-    Self-hosted planes get the `github:` form, which their own env loader resolves directly from
-    a public repo -- the only id form that works without the managed hub.
+    Self-hosted URLs get the `github:` form because the CLI cannot read the server-side standalone
+    setting. The generated comment states which server configuration accepts that form.
     """
     if can_publish:
         head = (
@@ -474,10 +478,12 @@ def _environment_comment(project_id: str, *, can_publish: bool, extra: str = "")
     else:
         head = (
             "# Environment: this plane is self-hosted, so `flash env push` does not apply -- it\n"
-            "# publishes to Freesolo's managed environment hub. Point `id` at a git repo instead:\n"
-            "#   github:OWNER/REPO@REF:PATH   (REF is a branch, tag or commit; PATH is the file, or\n"
-            "#                                 the directory holding environment.py)\n"
-            "# Push this folder to a repo your plane can read, then fill in the id below.\n"
+            "# publishes to Freesolo's managed environment hub. Standalone planes can use a git repo:\n"
+            "#   github:OWNER/REPO@REF:PATH   (REF is a branch/tag name without `/`, or a commit sha;\n"
+            "#                                 PATH is the file, or the directory holding environment.py)\n"
+            "# Direct `github:` ids require server-side `FLASH_STANDALONE=1`; a plane using an\n"
+            "# identity backend instead accepts only managed hub ids. For standalone, push this\n"
+            "# folder to a repo your plane can read, then fill in the id below.\n"
         )
         placeholder = 'id = "github:OWNER/REPO@main:environment.py"\n\n'
     return f"{head}{extra}[environment]\n{placeholder}"
@@ -733,6 +739,11 @@ def _write_opd_config(
             if multi_turn
             else ""
         )
+        opd_environment_note = (
+            "# the teacher and its parasail key are platform-managed; nothing to set up or export.\n"
+            if can_publish
+            else "# the plane operator must set PARASAIL_API_KEY and FLASH_PUBLIC_URL on the control plane for opd.\n"
+        )
         opd.write_text(
             f"{opd_multiturn_note}"
             'model = "Qwen/Qwen3.5-4B"\n'
@@ -743,7 +754,7 @@ def _write_opd_config(
             + _environment_comment(
                 project_id,
                 can_publish=can_publish,
-                extra="# the teacher and its parasail key are platform-managed; nothing to set up or export.\n",
+                extra=opd_environment_note,
             )
             + "[train]\n"
             "epochs = 1\n"
