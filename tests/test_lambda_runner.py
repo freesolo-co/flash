@@ -2494,19 +2494,18 @@ def test_shipped_bootstrap_secrets_is_stripped_but_behaves_identically():
 
     shipped: dict = {}
     exec(compile(stripped, "<shipped>", "exec"), shipped)
-    for name in ("_safe_detail", "_split_margin", "_read_console_tail", "_payload_secrets"):
+    for name in ("_safe_detail", "_read_console_tail", "_payload_secrets"):
         assert name in shipped, f"stripping dropped {name}"
     # the redactors behave exactly as the unstripped module does.
     for text, secrets in (
         ("worker rejected pin ati", {"PIN": "ati"}),
         ("trainer crashed after validation", {"PIN": "ati"}),
+        ("https://host/a/repo", {"S": "/a"}),
         ("boto3 failed with sk-live-abc123456789", {"K": "sk-live-abc123456789"}),
     ):
         assert shipped["_safe_detail"](text, 1000, secrets) == bootstrap_secrets._safe_detail(
             text, 1000, secrets=secrets
         )
-    jwt = "eyJ" + "A" * 900
-    assert shipped["_split_margin"]({jwt}) == bootstrap_secrets._split_margin({jwt}) == len(jwt)
 
 
 def test_strip_docstrings_preserves_code_sharing_a_docstrings_line():

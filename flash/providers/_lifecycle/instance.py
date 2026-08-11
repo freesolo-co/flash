@@ -467,13 +467,17 @@ def _strip_docstrings(source: str) -> str:
             and first.end_lineno is not None
             and first.end_col_offset is not None
         ):
-            spans.append(
-                (
-                    starts[first.lineno - 1] + first.col_offset,
-                    starts[first.end_lineno - 1] + first.end_col_offset,
-                    b"" if isinstance(node, ast.Module) else b"pass",
-                )
-            )
+            start = starts[first.lineno - 1] + first.col_offset
+            end = starts[first.end_lineno - 1] + first.end_col_offset
+            if isinstance(node, ast.Module):
+                # deleted outright rather than replaced: `from __future__` must be the file's first
+                # statement, and a `pass` standing where the docstring was would displace it. a
+                # statement sharing its line (`"doc"; VALUE = 7`) would then be left behind a bare
+                # separator, so the separator goes with it.
+                trailing = len(data[end:]) - len(data[end:].lstrip(b" \t;"))
+                spans.append((start, end + trailing, b""))
+            else:
+                spans.append((start, end, b"pass"))
     # latest first, so replacing one span cannot move the offsets of those not yet applied.
     for start, end, replacement in sorted(spans, reverse=True):
         data = data[:start] + replacement + data[end:]

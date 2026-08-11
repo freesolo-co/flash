@@ -24,6 +24,22 @@ SECRET_ENV_KEYS_ENV = "FLASH_SECRET_ENV_KEYS"
 _MIN_SECRET_COMPONENT = 8
 
 
+def _bounded_pattern(needle: str) -> str:
+    """``needle`` anchored so it cannot match as part of a longer word.
+
+    The guard is applied per EDGE, and only where the needle's own edge is a word character. A
+    value with a punctuation edge already separates itself from neighbouring text, and demanding a
+    non-word character beyond it asks the wrong question: ``/a`` inside ``https://host/a/repo`` is
+    preceded by the ``t`` of ``host``, so an unconditional left guard fails and the secret prints
+    verbatim. ``ati`` keeps both guards and so still cannot rewrite ``authentication``.
+    Mirrors flash.providers._lifecycle.bootstrap_secrets._bounded_pattern.
+    """
+    escaped = re.escape(needle)
+    left = r"(?<!\w)" if needle[:1].isalnum() or needle[:1] == "_" else ""
+    right = r"(?!\w)" if needle[-1:].isalnum() or needle[-1:] == "_" else ""
+    return f"{left}{escaped}{right}"
+
+
 def _configured_secrets() -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Credential values to redact, split by how they may be matched.
 
@@ -73,7 +89,7 @@ def sanitize_diagnostic(value: Any, *, limit: int = 2000) -> str:
     for secret in plain:
         text = text.replace(secret, "<redacted>")
     for secret in bounded:
-        text = re.sub(rf"(?<!\w){re.escape(secret)}(?!\w)", "<redacted>", text)
+        text = re.sub(_bounded_pattern(secret), "<redacted>", text)
     text = _BEARER_RE.sub("Bearer <redacted>", text)
     text = _SECRET_KEY_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}<redacted>", text)
     return text[: max(0, int(limit))]

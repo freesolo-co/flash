@@ -112,18 +112,6 @@ def _train_body(input_data: dict) -> dict:
                         plain.update({line, urllib.parse.quote(line, safe="")})
         return plain, bounded
 
-    def _split_margin(secrets=None):
-        """Leading characters of a split line that could still hold part of a credential.
-
-        a value cut by the read boundary leaves at most len(value)-1 characters of itself at the
-        front of the retained region, and that fragment no longer matches full-value redaction. the
-        bound therefore comes from the LONGEST needle configured: a fixed margin only covers values
-        up to its own size, and a long token straddling the cut left a usable suffix behind.
-        Mirrors flash.providers._lifecycle.bootstrap_secrets._split_margin.
-        """
-        plain, bounded = _needles(secrets)
-        return max((len(needle) for needle in plain | bounded), default=0)
-
     def _safe_detail(value, secrets=None, limit=1000):
         text = (
             f"{type(value).__name__}: {value}" if isinstance(value, BaseException) else str(value)
@@ -134,7 +122,16 @@ def _train_body(input_data: dict) -> dict:
         for needle in sorted(plain, key=len, reverse=True):
             text = text.replace(needle, "<redacted>")
         for needle in sorted(bounded, key=len, reverse=True):
-            text = re.sub(rf"(?<!\w){re.escape(needle)}(?!\w)", "<redacted>", text)
+            # the word guard is applied per EDGE, and only where the needle's own edge is a word
+            # character. a value with a punctuation edge already separates itself from neighbouring
+            # text, and demanding a non-word character beyond it asks the wrong question: "/a"
+            # inside "https://host/a/repo" is preceded by the "t" of "host", so an unconditional
+            # left guard fails and the secret prints verbatim. "ati" keeps both guards and so still
+            # cannot rewrite "authentication".
+            # Mirrors flash.providers._lifecycle.bootstrap_secrets._bounded_pattern.
+            left = r"(?<!\w)" if needle[:1].isalnum() or needle[:1] == "_" else ""
+            right = r"(?!\w)" if needle[-1:].isalnum() or needle[-1:] == "_" else ""
+            text = re.sub(f"{left}{re.escape(needle)}{right}", "<redacted>", text)
         text = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", text)
         text = re.sub(
             r"(?i)(authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)"
@@ -439,40 +436,16 @@ def _train_body(input_data: dict) -> dict:
                     # value no longer matches full-value redaction, so a truncated first line is
                     # dropped before sanitizing. a line the boundary did not split is kept: it
                     # may hold the root-cause exception.
+                    # a tail that is ONE unterminated line is dropped whole. that loses the only
+                    # diagnostic on a crash whose evidence is a single huge line, but any bound
+                    # that would let it through is measured against the credentials this process
+                    # KNOWS, and the value at risk is the one it does not: a capability minted at
+                    # runtime contributes no needle, so a margin sized from an unrelated configured
+                    # secret leaves a long fragment of it behind. an empty tail never leaked.
+                    # mirrors bootstrap_secrets._read_console_tail.
                     if raw[:1] != b"\n":
                         cut = tail.find("\n")
-                        if cut >= 0:
-                            tail = tail[cut + 1 :]
-                        else:
-                            # no newline at all: the whole tail is ONE unterminated line. dropping
-                            # it uploaded an empty console and lost the root cause on exactly the
-                            # crashes that emit a single huge line (a json blob, a native stack).
-                            # keep it, minus the LONGEST configured credential: a value cut by the
-                            # boundary leaves at most len(value)-1 characters of itself at the
-                            # front, and that fragment no longer matches full-value redaction. a
-                            # fixed margin only covers values up to its own size, so a long token
-                            # straddling the cut left a usable suffix behind.
-                            # a POSITIVE bound is required to keep anything. a credential minted at
-                            # runtime (a presigned url, a capability echoed by a provider) is in
-                            # neither the env nor the payload, so it contributes no needle and a
-                            # zero margin would retain it verbatim. with no bound the line is
-                            # dropped: the empty tail never leaked, so it is the safe floor.
-                            # mirrors bootstrap_secrets._read_console_tail.
-                            split_margin = _split_margin(env)
-                            marker = (
-                                "[flash: the console tail is one unterminated line; a leading "
-                                "fragment was dropped so a credential split by the read boundary "
-                                "cannot survive]\n"
-                            )
-                            # the marker is paid for out of the body's FRONT: _safe_detail's bound
-                            # below cuts from the front, so overflowing tail_bytes here would drop
-                            # the end -- the root cause this branch exists to keep.
-                            cut_at = max(split_margin, len(tail) - tail_bytes + len(marker))
-                            tail = (
-                                ""
-                                if not split_margin or split_margin >= len(tail)
-                                else marker + tail[cut_at:]
-                            )
+                        tail = tail[cut + 1 :] if cut >= 0 else ""
                 with open(console + ".tail", "w", encoding="utf-8", errors="replace") as f:
                     f.write(_safe_detail(tail, env, 64_000))
                 _require_deadline_allowance()

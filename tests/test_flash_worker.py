@@ -326,7 +326,7 @@ def test_the_handlers_inline_redactor_covers_multiline_secret_components():
     # os/re come from _train_body's own local imports, which the handler makes at the top of its
     # body; urllib.parse it imports itself.
     namespace: dict = {"os": os, "re": re}
-    for name in ("_needles", "_split_margin", "_safe_detail"):
+    for name in ("_needles", "_safe_detail"):
         node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
         exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
     safe_detail = namespace["_safe_detail"]
@@ -354,12 +354,10 @@ def test_the_handlers_inline_redactor_covers_multiline_secret_components():
     assert safe_detail("trainer crashed holding sk-live-abc123456", long) == (
         "trainer crashed holding <redacted>"
     )
-
-    # the console-tail margin is sized from the LONGEST configured needle, not a constant: a value
-    # split by the read boundary leaves up to len(value)-1 characters behind, and a fixed 512
-    # margin let a 903-char token keep a usable suffix in the uploaded console.
-    jwt = "eyJ" + "A" * 900
-    assert namespace["_split_margin"]({"FLASH_SECRET_ENV_KEYS": "JWT", "JWT": jwt}) >= len(jwt)
+    # the word guard is per EDGE: a value whose own edge is punctuation already separates itself,
+    # and requiring a non-word character beyond it would leak "/a" out of "https://host/a/repo".
+    path_like = {"S": "/a", "FLASH_SECRET_ENV_KEYS": "S"}
+    assert safe_detail("https://host/a/repo", path_like) == "https://host<redacted>/repo"
 
 
 def test_worker_console_always_uploaded_and_no_flag(monkeypatch):
@@ -834,14 +832,13 @@ def test_train_body_uploads_console_on_missing_metrics(
             assert "x" not in uploaded_console
             assert uploaded_console == "torch.cuda.OutOfMemoryError: CUDA OOM\n"
         else:
-            # dropping the partial line here would drop EVERYTHING, uploading an empty console and
-            # losing the root cause on exactly the crash that emits one huge line. the line is kept
-            # minus a leading margin wide enough to carry off a credential split by the boundary.
-            assert uploaded_console.endswith("torch.cuda.OutOfMemoryError: CUDA OOM")
-            assert "one unterminated line" in uploaded_console
-            # the marker is paid for out of the body's front, so the whole upload still fits the
-            # tail bound rather than overflowing it and losing the end to the sanitizer's cut.
-            assert len(uploaded_console) <= 64_000
+            # a tail that is ONE unterminated line is dropped whole, so this uploads nothing. that
+            # costs the root cause on exactly the crash that emits one huge line, and keeping it was
+            # tried and reverted: every bound that would let the line through is measured against
+            # the credentials this process KNOWS, and a value minted at runtime contributes no
+            # needle -- so a margin sized from an unrelated secret leaves a long fragment of it
+            # behind. the empty console never leaked.
+            assert uploaded_console == ""
         assert [call["path_in_repo"] for call in list_calls] == [code_prefix, code_prefix]
         assert [call["filename"] for call in download_calls] == [
             f"{code_prefix}/__init__.py",

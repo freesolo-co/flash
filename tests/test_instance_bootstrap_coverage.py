@@ -2119,116 +2119,69 @@ def test_read_console_tail_drops_a_split_credential(tmp_path):
     assert tail == "next\n"
 
 
-def test_read_console_tail_keeps_a_single_oversized_line(tmp_path):
-    """dropping the partial first line returned NOTHING when the tail holds no newline at all.
+def test_read_console_tail_drops_a_single_unterminated_line(tmp_path, monkeypatch):
+    """A tail holding no newline at all is dropped, even though it costs the only diagnostic.
 
-    that is the worst case available: a crash whose only evidence is one huge line -- a json blob,
-    a native stack, unterminated progress output -- uploaded an empty console and lost the root
-    cause exactly where it was needed. the line is kept minus a leading margin, so the END of it,
-    where the failure actually is, survives.
-    """
-    from flash.providers._lifecycle import bootstrap_secrets
-
-    console = tmp_path / "console.txt"
-    console.write_bytes(b"x" * 70_000 + b"ROOTCAUSE: cuda oom")
-
-    tail = b._read_console_tail(str(console), 64_000, secrets={"K": "sk-live-abc12345"})
-
-    assert tail.endswith("ROOTCAUSE: cuda oom")
-    assert bootstrap_secrets._TRUNCATED_LINE_MARKER in tail
-    # the dropped margin scales with the longest configured credential, and the ambient environment
-    # may carry its own (a developer's real API key), so assert the INVARIANT rather than an exact
-    # length: nearly the whole retained region survives, which is what the empty tail did not.
-    body = tail[len(bootstrap_secrets._TRUNCATED_LINE_MARKER) :]
-    assert 63_000 < len(body) <= 64_000
-
-
-def test_read_console_tail_drops_a_credential_split_into_an_oversized_line(tmp_path):
-    """keeping the oversized line must not reintroduce the split-value leak the whole partial-line
-    rule exists to prevent: a value straddling the byte boundary no longer matches full-value
-    redaction, so the leading margin has to carry it off. no suffix of it may survive either."""
-    secret = "sk-live-" + "z" * 40
-    console, limit = _console_with_secret_on_the_boundary(tmp_path, secret)
-
-    tail = b._read_console_tail(str(console), limit, secrets={"K": secret})
-
-    assert secret not in tail
-    # nor any usable fragment of it: the surviving suffix is what the margin exists to remove.
-    assert "z" not in tail
-
-
-def _console_with_secret_on_the_boundary(tmp_path, secret, prefix=6_000, limit=64_000):
-    """One unterminated line whose read boundary lands 20 characters INTO ``secret``.
-
-    the byte math is the whole point of the fixture: `size - limit` must fall strictly inside the
-    secret, or the value sits wholly within the retained region and full-value redaction catches it
-    normally -- which tests the wrong thing and passes either way.
-    """
-    size = limit + prefix + 20
-    body = b"q" * prefix + secret.encode() + b"q" * (size - prefix - len(secret))
-    assert prefix < size - limit < prefix + len(secret), "boundary must split the secret"
-    console = tmp_path / "console.txt"
-    console.write_bytes(body)
-    return console, limit
-
-
-def test_read_console_tail_margin_covers_a_secret_longer_than_any_fixed_bound(tmp_path):
-    """the dropped fragment is sized from the LONGEST configured credential, not a constant.
-
-    a value cut by the boundary leaves up to len(value)-1 characters of itself at the front of the
-    retained region, and that fragment no longer matches full-value redaction. a fixed margin only
-    covers values up to its own size, so a 903-character service-account token or JWT straddling
-    the cut left a usable suffix in the uploaded console -- and the empty-tail behaviour it
-    replaced did not leak, so an unbounded margin would trade nothing for exposure.
-    """
-    secret = "eyJ" + "A" * 900
-    console, limit = _console_with_secret_on_the_boundary(tmp_path, secret)
-
-    tail = b._safe_detail(
-        b._read_console_tail(str(console), limit, secrets={"JWT": secret}),
-        200_000,
-        secrets={"JWT": secret},
-    )
-
-    # no suffix of the secret survives, at any length.
-    assert not any(secret[-n:] in tail for n in range(1, len(secret)))
-    # and the diagnostics either side of it are still there: the margin scales with the secret,
-    # it does not blank the console.
-    assert len(tail) > limit - len(secret) - 1_000
-
-
-def test_read_console_tail_drops_the_line_when_the_margin_would_consume_it(tmp_path):
-    """with no safe bound left there is nothing to keep: a retained fragment could still hold part
-    of a credential that nothing downstream can match, and the empty tail never leaked."""
-    secret = "sk-live-" + "y" * 200
-    console = tmp_path / "console.txt"
-    console.write_bytes(b"z" * 400 + secret.encode())
-
-    assert b._read_console_tail(str(console), 100, secrets={"K": secret}) == ""
-
-
-def test_read_console_tail_drops_the_line_when_no_secret_bounds_it(tmp_path, monkeypatch):
-    """a POSITIVE bound is required to keep an unterminated line at all.
-
-    the margin can only be measured against values this process knows. a credential minted at
-    runtime -- a presigned url, a broker capability, a token a provider echoed back -- is in
-    neither the payload nor the environment, so it contributes no needle and the margin is zero.
-    trimming nothing then published the straddling value verbatim, which is strictly worse than
-    the empty tail this branch replaced: that never leaked.
+    Keeping it was tried and reverted. Every bound that would let the line through is measured
+    against the credentials this process KNOWS, and the value at risk is the one it does not: a
+    capability minted at runtime (a presigned url, a token a provider echoed back) is in neither
+    the payload nor the environment, so it contributes no needle. A margin sized from an unrelated
+    configured secret then removes a prefix sized for THAT secret and leaves a long fragment of the
+    runtime one, which full-value redaction can never match. The empty tail never leaked.
     """
     from flash.providers._lifecycle import bootstrap_secrets
 
     for name in [key for key in b.os.environ if bootstrap_secrets._secret_env_name(key)]:
         monkeypatch.delenv(name, raising=False)
+    # the boundary lands 200 characters INTO a runtime credential, so it is genuinely split: the
+    # part that survives the cut is what no downstream redactor could match.
+    limit, prefix = 64_000, 6_000
     runtime_secret = "dyn-" + "D" * 400
-    console, limit = _console_with_secret_on_the_boundary(tmp_path, runtime_secret)
+    size = limit + prefix + 200
+    body = b"q" * prefix + runtime_secret.encode() + b"q" * (size - prefix - len(runtime_secret))
+    assert prefix < size - limit < prefix + len(runtime_secret), "boundary must split the secret"
+    console = tmp_path / "console.txt"
+    console.write_bytes(body)
 
-    # nothing configured: the value exists only in the child's output.
+    # an unrelated configured credential must not buy the line a pass.
+    assert b._read_console_tail(str(console), limit, secrets={"K": "sk-live-abc123456789"}) == ""
     assert b._read_console_tail(str(console), limit, secrets={}) == ""
 
-    # a configured credential restores the bound, and the diagnostics come back with it.
-    kept = b._read_console_tail(str(console), limit, secrets={"K": "sk-live-abc123456789"})
-    assert len(kept) > 60_000
+    # a line the boundary did NOT split is still kept: that is the case worth keeping.
+    terminated = tmp_path / "terminated.txt"
+    terminated.write_bytes(b"x" * 70_000 + b"\nROOTCAUSE: cuda oom")
+    assert b._read_console_tail(str(terminated), limit, secrets={}) == "ROOTCAUSE: cuda oom"
+
+
+def test_safe_detail_redacts_a_short_secret_whose_edges_are_not_word_characters():
+    """The word guard is per EDGE, applied only where the needle's own edge is a word character.
+
+    A short value with a punctuation edge already separates itself from neighbouring text.
+    Demanding a non-word character beyond it asks the wrong question: "/a" inside
+    "https://host/a/repo" is preceded by the "t" of "host", so an unconditional left guard fails
+    and the secret prints verbatim. [environment] secrets accepts any value, so a path- or
+    dash-shaped one is not exotic.
+    """
+    for secret, text in (("/a", "https://host/a/repo"), ("a-", "value a- here"), ("-x", "see -x")):
+        out = b._safe_detail(text, 1000, secrets={"S": secret})
+        assert secret not in out, f"{secret!r} leaked from {text!r}"
+        assert "<redacted>" in out
+
+    # the guard that made this necessary still holds: a value that IS a word cannot rewrite a
+    # longer word that merely contains it.
+    assert b._safe_detail("authentication ok", 1000, secrets={"S": "ati"}) == "authentication ok"
+
+
+def test_safe_detail_keep_end_rejects_a_typo_and_honours_a_zero_limit():
+    """``text[-0:]`` is ``text[0:]`` -- the WHOLE string, the exact opposite of a zero bound -- so
+    the zero case is spelled out. An unknown mode raises rather than silently keeping the front,
+    which would cut the side the caller asked to preserve."""
+    assert b._safe_detail("abcdef", 0, keep="end") == ""
+    assert b._safe_detail("abcdef", 0, keep="start") == ""
+    assert b._safe_detail("abcdef", 3, keep="end") == "def"
+    assert b._safe_detail("abcdef", 3, keep="start") == "abc"
+    with pytest.raises(ValueError, match="keep must be"):
+        b._safe_detail("abcdef", 3, keep="edn")
 
 
 def test_safe_detail_redacts_the_percent_encoded_form_of_a_secret():
