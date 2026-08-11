@@ -174,6 +174,78 @@ def test_an_unusable_sha_reaches_the_caller_as_502(monkeypatch):
     assert excinfo.value.status == 502
 
 
+@pytest.mark.parametrize(
+    "bad_type",
+    [None, 123, "", {"kind": "blob"}],
+    ids=["missing", "not-a-string", "empty", "object"],
+)
+def test_a_marker_entry_with_an_unusable_type_raises_instead_of_being_skipped(
+    monkeypatch, bad_type
+):
+    """A `<name>/environment.py` entry we cannot classify must not be silently dropped.
+
+    Same failure class as the namespace-sha case one level down: the marker path IS present, so
+    skipping it reports a shorter list -- or "nothing published" for a single-env org -- which reads
+    as a publish that did nothing. Only a well-formed non-blob (a directory genuinely named
+    environment.py) is a legitimate skip; an unreadable one has to become the controlled 502.
+    """
+    entry = {"path": "my-env/environment.py"}
+    if bad_type is not None:
+        entry["type"] = bad_type
+    _fake_hub(
+        monkeypatch,
+        {
+            "main": _tree(_dir("acme", "sha-acme")),
+            "sha-acme": _tree(_dir("my-env", "sha-my-env"), entry),
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="unusable type"):
+        loader.list_managed_namespace_slugs("acme")
+
+
+def test_a_directory_named_environment_py_is_still_skipped(monkeypatch):
+    """The guard above must not turn a legitimate non-blob into an error.
+
+    A directory named environment.py is well-formed and simply is not the file publish writes, so
+    it stays a quiet skip. Without this the new validation would reject a readable hub response.
+    """
+    _fake_hub(
+        monkeypatch,
+        {
+            "main": _tree(_dir("acme", "sha-acme")),
+            "sha-acme": _tree(
+                _dir("my-env", "sha-my-env"),
+                _dir("my-env/environment.py", "sha-dir"),
+                _dir("real", "sha-real"),
+                _blob("real/environment.py"),
+            ),
+        },
+    )
+
+    assert loader.list_managed_namespace_slugs("acme") == ["acme/real"]
+
+
+def test_a_non_utf8_tree_body_becomes_a_controlled_failure(monkeypatch):
+    """A non-UTF-8 body must not escape as an uncaught 500.
+
+    `json.loads` raises UnicodeDecodeError on undecodable bytes, and that is NOT a JSONDecodeError
+    (it is a sibling under ValueError), so naming only JSONDecodeError let it past both this helper
+    and the domain layer's RuntimeError mapping.
+    """
+    monkeypatch.setattr(
+        loader,
+        "_urlopen",
+        lambda *_a, **_k: b'{"tree": [{"path": "\xff\xfe", "type": "tree"}]}',
+    )
+    ref = loader._parse_github_environment_ref(
+        f"github:{loader._DEFAULT_MANAGED_ENV_REPO}@main:acme/environment.py"
+    )
+
+    with pytest.raises(RuntimeError, match="invalid response"):
+        loader._download_github_json(ref, "https://api.github.com/x/git/trees/main", "tree")
+
+
 def test_absent_namespace_directory_is_an_empty_list(monkeypatch):
     """An org that has published nothing has no hub directory yet; that is empty, not an error."""
     _fake_hub(monkeypatch, {"main": _tree(_dir("other-org", "sha-other"))})

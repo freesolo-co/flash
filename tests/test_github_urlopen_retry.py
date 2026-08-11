@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.client
 import io
 import random
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -176,6 +177,45 @@ def test_urlopen_retries_a_truncated_body_then_succeeds(monkeypatch):
 
     assert _urlopen(urllib.request.Request("https://api.github.com/test")) == b"ok"
     assert len(calls) == 3
+
+
+def test_urlopen_retries_a_tls_read_failure_then_succeeds(monkeypatch):
+    # GitHub can tear down TLS while the body is streaming. `ssl.SSLEOFError` is an OSError but NOT
+    # a ConnectionError, URLError, TimeoutError, or IncompleteRead, so naming only those let it skip
+    # the retry loop entirely and escape as an uncaught 500.
+    calls = []
+
+    class _TlsCutBody(io.BytesIO):
+        def read(self, *_a):
+            raise ssl.SSLEOFError("EOF occurred in violation of protocol")
+
+    def fake_urlopen(req, timeout):
+        calls.append(1)
+        return _TlsCutBody(b"") if len(calls) == 1 else io.BytesIO(b"recovered")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)
+
+    assert _urlopen(urllib.request.Request("https://api.github.com/test")) == b"recovered"
+    assert len(calls) == 2
+
+
+def test_urlopen_persistent_tls_read_failure_becomes_retriable_signal(monkeypatch):
+    # Exhausting retries on a TLS cut must end as the typed retriable error so the domain layer
+    # answers a controlled 502, not a 500.
+    class _TlsCutBody(io.BytesIO):
+        def read(self, *_a):
+            raise ssl.SSLEOFError("EOF occurred in violation of protocol")
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: _TlsCutBody(b""))
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)
+
+    with pytest.raises(GitHubRateLimitError, match="transient network") as excinfo:
+        _urlopen(urllib.request.Request("https://api.github.com/test"))
+    # an upstream transport fault, not throttling: 502 rather than 429.
+    assert excinfo.value.throttled is False
 
 
 def test_urlopen_persistent_truncated_body_becomes_retriable_signal(monkeypatch):

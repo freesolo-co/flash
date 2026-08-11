@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import stat
 import sys
 import tempfile
@@ -296,13 +297,23 @@ def _urlopen(
             raise RuntimeError(
                 f"GitHub environment request failed ({exc.code}): {body[:500]}"
             ) from exc
-        # IncompleteRead is an HTTPException: NOT a URLError, TimeoutError, ConnectionError, or even
-        # an OSError, so without naming it a truncated body escaped this loop unretried -- and,
-        # being no RuntimeError either, escaped every caller's translation as an uncaught 500.
+        # two families escape the obvious clauses, and both do so while a SUCCESSFUL response is
+        # being read, which is why the HTTPError branch above does not see them either:
+        #   - IncompleteRead is an HTTPException: not a URLError, TimeoutError, ConnectionError, or
+        #     even an OSError.
+        #   - a TLS teardown mid-body raises ssl.SSLEOFError, which IS an OSError but is NOT a
+        #     ConnectionError.
+        # Being no RuntimeError, either one escaped every caller's translation as an uncaught 500
+        # rather than the intended retry and controlled 502.
+        #
+        # ssl.SSLError is named rather than its OSError parent deliberately: `drain` writes to the
+        # caller's `out` sink, so a bare OSError clause here would also swallow a disk-full or
+        # closed-file write and retry it five times as though it were a network fault.
         except (
             urllib.error.URLError,
             TimeoutError,
             ConnectionError,
+            ssl.SSLError,
             http.client.IncompleteRead,
         ) as exc:
             if attempt < max_rate_limit_retries:
@@ -404,7 +415,11 @@ def _download_github_json(
     )
     try:
         return json.loads(data)
-    except json.JSONDecodeError as exc:
+    # an undecodable body raises UnicodeDecodeError, which is NOT a JSONDecodeError but a SIBLING of
+    # it under ValueError, so naming only JSONDecodeError let it escape to the caller -- and, being
+    # no RuntimeError, past the domain layer's mapping as an uncaught 500 instead of a 502. both are
+    # the same user state: the bytes GitHub returned are not a payload we can read.
+    except ValueError as exc:
         raise RuntimeError(
             "GitHub environment request failed for "
             f"{ref.repo_full_name}@{ref.ref}:{context}: invalid response"
@@ -545,10 +560,23 @@ def list_managed_namespace_slugs(namespace: str) -> list[str]:
         ref, root_sha, namespace, recursive=True, **_LIST_READ_BUDGET
     ):
         path = entry.get("path")
-        if entry.get("type") != "blob" or not isinstance(path, str):
+        if not isinstance(path, str):
             continue
         parts = path.split("/")
         if len(parts) != 2 or parts[1] != _DEFAULT_ENVIRONMENT_PATH:
+            continue
+        # the path says this IS an environment marker, so decide on its type only once we know the
+        # type is readable. skipping an entry whose type is missing or malformed would shorten the
+        # list -- to "nothing published" for a single-env org -- which is the silent-empty failure
+        # this endpoint exists to remove. a well-formed non-blob (a directory that happens to be
+        # named environment.py) is a legitimate skip and stays quiet.
+        kind = entry.get("type")
+        if not isinstance(kind, str) or not kind:
+            raise RuntimeError(
+                f"GitHub tree entry {path!r} in environment namespace {namespace!r} has an unusable "
+                "type; the hub listing could not be read"
+            )
+        if kind != "blob":
             continue
         if not _is_safe_github_path_parts((parts[0],)):
             continue
