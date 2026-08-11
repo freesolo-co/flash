@@ -1667,6 +1667,118 @@ def test_create_run_deletes_the_row_when_submit_fails_before_persisting_status(a
     assert api.get("/v1/runs", headers=_bearer(key)).json()["runs"] == []
 
 
+def _persist_queued_then_raise(app_mod, runner, monkeypatch, submitted):
+    """Monkeypatch submit_job to mirror its real failure ordering: status lands, then it dies."""
+
+    def submit(spec, **_kwargs):
+        submitted.append(spec.run_id)
+        runner._save_status(
+            runner.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
+        )
+        raise RuntimeError("provisioning died after status was written")
+
+    monkeypatch.setattr(app_mod, "submit_job", submit)
+
+
+def _classified_resubmits() -> list[str]:
+    """Run ids startup recovery would resubmit right now."""
+    from flash.server.platform import runtime
+
+    active: set[str] = set()
+    known: set[str] = set()
+    resubmit: list = []
+    runtime._classify_recoverable_runs(active, known, resubmit)
+    return [spec.run_id for spec, _state in resubmit]
+
+
+def test_create_run_dry_run_failure_leaves_no_recoverable_run(api, monkeypatch):
+    """A dry-run submit that dies after persisting `queued` must not be retained.
+
+    submit_job persists the status as `queued` and only later flips it to `dry_run`, so a failure
+    in between leaves a queued record. Retaining its ownership row would hand it to startup
+    recovery, which resubmits every owned queued run as a REAL job - provisioning a gpu the user
+    explicitly asked never to rent. The row is dropped instead, exactly as before the guard.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.server.platform import db
+
+    submitted: list[str] = []
+    _persist_queued_then_raise(app_mod, runner, monkeypatch, submitted)
+
+    key = _login()
+    resp = api.post("/v1/runs", headers=_bearer(key), json={"spec": SPEC, "dry_run": True})
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    assert db.run_owner(run_id) is None
+    assert api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).status_code == 404
+    # recovery walks the ownership rows: with the row gone the queued record is unreachable.
+    assert run_id not in _classified_resubmits()
+
+
+def test_create_run_retained_secretful_run_fails_instead_of_recovering(api, monkeypatch):
+    """A retained run whose runtime secrets were never dispatched must not silently recover.
+
+    the secrets live only in the request and are deliberately excluded from the persisted spec, so
+    recovery would resubmit the run without them: it would train with missing credentials and
+    silently change behavior. the guard fails the run loudly instead; the owner keeps the row and
+    the error, and recovery skips terminal runs.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.server.platform import db
+
+    submitted: list[str] = []
+    _persist_queued_then_raise(app_mod, runner, monkeypatch, submitted)
+
+    key = _login()
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer(key),
+        json={"spec": SPEC, "runtime_secrets": {"WANDB_API_KEY": "user-wandb-key"}},
+    )
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    # the owner keeps the run and a loud, actionable error.
+    assert db.run_owner(run_id) is not None
+    body = api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).json()
+    assert body["state"] == "failed"
+    assert "runtime secrets" in body["error"]
+    # and recovery classifies nothing to resubmit for it.
+    assert run_id not in _classified_resubmits()
+
+
+def test_create_run_retained_run_records_managed_environment_use(api, monkeypatch):
+    # a retained run stays live and can recover into real training, so it must carry the same
+    # managed-environment association a successful submission records.
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    import flash.server.domain.environment_registry as registry
+    from flash.server.platform import db
+
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        registry,
+        "record_environment_use",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+    submitted: list[str] = []
+    _persist_queued_then_raise(app_mod, runner, monkeypatch, submitted)
+    spec = {**SPEC, "environment": {"id": "acme/my-env"}}
+
+    key = _login()
+    resp = api.post("/v1/runs", headers=_bearer(key), json={"spec": spec})
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    assert db.run_owner(run_id) is not None
+    assert calls
+    assert calls[0]["slug"] == "acme/my-env"
+    assert calls[0]["run_id"] == run_id
+
+
 def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
     # A freesolo key that verifies with the backend but whose db row was disabled (revoked)
     # must be rejected as 401 (authenticate -> None), not raise a 500.
