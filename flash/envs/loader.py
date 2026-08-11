@@ -851,10 +851,10 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
     if split:
         split = _validate_packaged_dataset_split(split)
     if source is None:
-        # a top-level datasets/ (plural) directory is never probed, so packages that use it used
-        # to fall through silently to whatever else resolved (often the wrong rows entirely).
-        # fail loudly and name the expected layout instead. explicit records/dataset_path params
-        # skip this because the user already said what to train on.
+        # a top-level datasets/ (plural) directory is never probed, so a package laid out that way
+        # would otherwise fall through silently to whatever else resolved, often the wrong rows
+        # entirely. explicit records/dataset_path params skip this because the user already said
+        # what to train on.
         if (base_dir / "datasets").is_dir() and not (base_dir / "dataset").is_dir():
             raise ValueError(
                 "environment package has a top-level 'datasets/' directory, which Flash never "

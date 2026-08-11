@@ -620,8 +620,8 @@ def test_freesolo_adapter_split_train_uses_default_dataset(monkeypatch, tmp_path
 
 
 def test_freesolo_adapter_datasets_plural_dir_raises_actionable_error(monkeypatch, tmp_path):
-    """a package with datasets/ (plural) but no dataset/ used to fall through silently to
-    whatever else resolved; it must fail loudly and name the expected directory instead."""
+    """a package with datasets/ (plural) but no dataset/ has no dataset flash can probe, so it
+    must fail loudly and name the expected directory rather than resolve rows from elsewhere."""
     _install_fake_freesolo(monkeypatch)
     env_file = _split_env(
         tmp_path, {"datasets/train.jsonl": '{"id":"legacy","input":"old?","output":"old"}\n'}
