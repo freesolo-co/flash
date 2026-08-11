@@ -58,9 +58,8 @@ def test_ray_num_cpus_prefers_the_cgroup_quota_over_the_host_core_count():
     # the exact failure that killed both real-gpu arms: a 1x4090 pod on a 48-core host. the quota is
     # the container's truth, so a large affinity mask must NOT win over it.
     #
-    # os.sched_getaffinity is linux-only, so every patch of it here needs create=True to run on a
-    # mac. the mock replaces the call outright, so the sizing under test is identical either way --
-    # only the worker (linux) ever reaches the real syscall.
+    # os.sched_getaffinity is linux-only, so every patch of it in this file needs create=True to
+    # run on a mac. only the worker (linux) ever reaches the real syscall.
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=12),
         mock.patch.object(os, "sched_getaffinity", return_value=set(range(48)), create=True),
