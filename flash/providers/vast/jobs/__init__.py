@@ -73,6 +73,53 @@ MIN_DISK_GB = 60.0
 # this poller's no-status fallback, so it needs no ``became_running`` gate.
 _DEAD_STATES = {"exited", "stopped", "offline", "deleted", "frozen"}
 
+# Machines this run has already rented and lost, keyed by run id.
+#
+# ``deploy_and_submit``'s own ``tried`` list is rebuilt per call and only covers offers that
+# REJECTED the create. A machine that accepts the rental and then never boots is the worse case: it
+# is not in ``tried``, it stays in the market at the top of the cheapest-first ranking, and the next
+# attempt rents it again. One profile run rented offer 43982815 eleven times and 43688757 seven
+# times that way, spending its whole retry budget re-renting known-dead boxes.
+#
+# Process-local and best-effort by design. It is an optimisation over the ranking, not a
+# correctness gate: a control plane restart or a second process legitimately starts with an empty
+# set and merely re-learns. Persisting it would put market trivia in the run record and still not
+# be authoritative, since offer ids churn.
+_run_dead_machines: dict[str, set[int]] = {}
+# Failures that indict the HOST rather than the job. ``stalled`` is the observed signature of the
+# loop this exists to stop: the box is rented, never reaches ``running``, emits no heartbeat, and
+# times out its load window.
+#
+# Deliberately narrow. ``poll_error`` is excluded because it covers transient HF read gaps ("DONE
+# without metrics.json") that say nothing about the machine, and ``oom``/``job_failed`` are the
+# run's own doing. Retiring a healthy host for any of those would shrink the pool on every attempt.
+_HOST_FAULT_FAILURES = frozenset({"stalled"})
+# Bound the per-process footprint of the map above: a long-lived control plane submits unboundedly
+# many runs, and nothing else would ever evict a finished run's entry.
+_DEAD_MACHINE_RUNS_MAX = 512
+
+
+def _note_dead_machine(run_id: str, machine_id: int | None) -> None:
+    """Remember that ``machine_id`` took this run's money and did not deliver a worker."""
+    if not run_id or not machine_id or machine_id <= 0:
+        return
+    if run_id not in _run_dead_machines and len(_run_dead_machines) >= _DEAD_MACHINE_RUNS_MAX:
+        # drop the oldest run's set (dicts preserve insertion order) rather than let the map grow
+        # without bound. evicting a live run's set only forfeits the optimisation for that run.
+        with contextlib.suppress(StopIteration):
+            del _run_dead_machines[next(iter(_run_dead_machines))]
+    _run_dead_machines.setdefault(run_id, set()).add(int(machine_id))
+
+
+def dead_machine_ids(run_id: str) -> frozenset[int]:
+    """Machines this run already rented and lost; excluded from further offer searches."""
+    return frozenset(_run_dead_machines.get(run_id, ()))
+
+
+def forget_dead_machines(run_id: str) -> None:
+    """Drop a finished run's blacklist so the map does not grow for the process's lifetime."""
+    _run_dead_machines.pop(run_id, None)
+
 
 def _effective_disk_gb(spec) -> float:
     """The disk size an instance is actually provisioned with (the create-time floor).
@@ -408,7 +455,11 @@ def deploy_and_submit(
                         for o in usable_offers(
                             min(o.vram_gb for o in offers),
                             _effective_disk_gb(spec),
-                            exclude_machine_ids={o.machine_id for o in tried},
+                            # this call's create-rejections AND the machines earlier attempts of
+                            # this run rented and lost. `tried` alone is per-call, so a refresh
+                            # would happily re-offer a box a previous attempt already killed.
+                            exclude_machine_ids={o.machine_id for o in tried}
+                            | dead_machine_ids(spec.run_id),
                             max_wall_seconds=_rent_duration_floor(spec, absolute_deadline),
                             # the transient attempt spec always carries the concrete allocated class.
                             gpu_type=spec.gpu.type,
@@ -633,11 +684,16 @@ def submit_run_vast(
 
     absolute_deadline = require_deadline_at(deadline_at)
     info = GPU_INFO[spec.gpu.type]
+    # machines this run already rented and lost. excluded at SEARCH time rather than filtered after,
+    # so the walk still gets a full ranked list to choose from instead of a list five deep whose
+    # every entry is known dead.
+    excluded = dead_machine_ids(spec.run_id)
     offers = [
         o
         for o in usable_offers(
             info.vram_gb,
             _effective_disk_gb(spec),
+            exclude_machine_ids=excluded,
             max_wall_seconds=_rent_duration_floor(spec, absolute_deadline),
             # the transient attempt spec always carries the concrete allocated class.
             gpu_type=spec.gpu.type,
@@ -648,6 +704,14 @@ def submit_run_vast(
         )
         if o.gpu == spec.gpu.type
     ]
+    if excluded and not offers:
+        # every remaining offer for this class is one this run already lost. say so, because the
+        # generic empty-pool error reads as "vast has no capacity" when the truth is "this run has
+        # burned all of it" -- a different operator fix (different class or provider, not waiting).
+        raise vast_api.VastApiError(
+            f"no usable vast offers for {spec.gpu.type} outside the "
+            f"{len(excluded)} machine(s) this run already rented and lost"
+        )
     handle = None
     try:
         handle = deploy_and_submit(
@@ -666,7 +730,7 @@ def submit_run_vast(
             spec,
             **deadline_kwargs(heartbeat_reader_for, absolute_deadline),
         )
-        return poll_vast_job(
+        result = poll_vast_job(
             handle,
             spec,
             seed,
@@ -674,6 +738,16 @@ def submit_run_vast(
             heartbeat_reader=reader,
             **deadline_kwargs(poll_vast_job, absolute_deadline),
         )
+        if not result.ok and result.failure in _HOST_FAULT_FAILURES:
+            # the machine took the rental and never produced a working worker. blacklist the HOST,
+            # not the offer id: vast relists the same box under a fresh offer id, so an offer-keyed
+            # entry would be stale before the next attempt searched.
+            #
+            # restricted to host-shaped failures on purpose. an `oom` or a genuine `job_failed` is
+            # the run's own doing and would recur anywhere, so retiring a healthy box for it would
+            # shrink the pool for no reason.
+            _note_dead_machine(spec.run_id, getattr(handle, "machine_id", None))
+        return result
     finally:
         if handle is not None:
             confirmed = False

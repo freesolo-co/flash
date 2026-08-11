@@ -551,9 +551,20 @@ def _require_pinned_profile_environment(spec: JobSpec) -> JobSpec:
 def _prepared_sft_profile_job(spec: JobSpec, *, input_digest: str) -> PreparedJob:
     """Prepare the cpu-only profile job that measures ``spec``'s exact sft workload.
 
-    The profile loads a tokenizer and the pinned environment, then exits. GPU type and provider pins
-    are dropped: they describe where the training run must land, and inheriting them would rent an
-    H100 to tokenize on cpu.
+    The profile loads a tokenizer and the pinned environment, then exits, so it needs no training
+    VRAM and gains nothing from a faster card.
+
+    It still INHERITS the run's ``[gpu]`` type and provider pins. Dropping them sized the profile
+    sensibly but removed the only lever the client has over where it lands, and a profile is
+    mandatory before an sft quote while a quote is mandatory before training -- so one broken
+    provider pool blocked the entire sft path with no override, looping until the retry budget ran
+    out. A pin costs a larger card for cpu work; not having one costs the run. The cheapest-card
+    default is unchanged for the unpinned runs that are the common case: an empty pin still lets
+    the allocator rank on rate alone (see ``allocator.profile_required_vram_gb``).
+
+    The pins are deliberately absent from ``sft_profile_input_payload``, so a profile stays keyed on
+    the workload alone: pinning changes where the tokenizing happens, never what it measures, and
+    keying on placement would fragment one shared profile into a copy per provider.
     """
     from flash.engine.profiling.workload_profile import SFT_PROFILE_KIND, sft_profile_run_id
 
@@ -562,8 +573,6 @@ def _prepared_sft_profile_job(spec: JobSpec, *, input_digest: str) -> PreparedJo
         run_id=sft_profile_run_id(input_digest),
         gpu=replace(
             spec.gpu,
-            type="",
-            provider="",
             count=1,
             disk_gb=_runner().GpuSpec.disk_gb,
             network_volume=None,

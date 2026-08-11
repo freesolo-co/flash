@@ -373,6 +373,40 @@ def test_profile_job_prepares_a_real_quote_through_the_unmocked_path(tmp_path, m
         info.hourly_usd for info in GPU_INFO.values() if info.enum_member and info.validated
     )
     assert prepared.estimated_cost_usd == pytest.approx(cheapest * 600 / 3600.0)
+    # unpinned in, unpinned out: the cheapest-card default depends on the profile reaching the
+    # allocator with no class or provider of its own.
+    assert prepared.worker_spec.gpu.type == ""
+    assert prepared.worker_spec.gpu.provider == ""
+
+
+def test_profile_inherits_the_runs_gpu_pins(tmp_path, monkeypatch) -> None:
+    """A pinned run's profile keeps the pin, so a broken provider pool stays escapable.
+
+    A profile is mandatory before an sft quote and a quote is mandatory before training, so
+    blanking the pin here left a user whose cheap pool is failing with no lever at all: the profile
+    relaunched onto the same broken provider until its retry budget ran out and the whole sft path
+    stayed blocked.
+
+    The run id must NOT move: the digest is keyed on the workload, and placement is not part of it.
+    Were the pin to leak into the identity, the same workload would profile once per provider.
+    """
+    runner = fresh_runner(tmp_path, monkeypatch)
+    unpinned = _spec()
+    spec = replace(unpinned, gpu=replace(unpinned.gpu, type="H100", provider="lambda"))
+    monkeypatch.setattr(runner, "_profile_producer_version", lambda: "1.2.3")
+    monkeypatch.setattr(runner, "_resolve_model_revision", lambda spec, **_kwargs: spec)
+
+    with pytest.raises(runner.WorkloadProfilePending) as raised:
+        runner._require_sft_workload_profile(spec)
+
+    prepared = raised.value.prepared_job
+    assert prepared.worker_spec.gpu.type == "H100"
+    assert prepared.worker_spec.gpu.provider == "lambda"
+    # placement is not identity: pinned and unpinned share one profile.
+    assert prepared.worker_spec.run_id == sft_profile_run_id(_input_digest(unpinned))
+    # the pin governs placement only -- the profile is still cpu-only, one card, same short wall.
+    assert prepared.worker_spec.gpu.count == 1
+    assert prepared.worker_spec.gpu.max_wall_seconds == 600
 
 
 def test_profile_allocates_the_cheapest_card_not_the_training_shape(monkeypatch) -> None:

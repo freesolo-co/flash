@@ -1898,6 +1898,106 @@ def test_runner_destroys_on_success(monkeypatch):
     assert destroyed == [9999]  # the rented instance is torn down
 
 
+# ---------------------------------------------------------------------------
+# submit_run_vast: a machine that took the rental and never booted is retired
+# ---------------------------------------------------------------------------
+def _searched_exclusions(monkeypatch, vast) -> list[frozenset[int]]:
+    """Record the ``exclude_machine_ids`` of every offer search ``submit_run_vast`` runs."""
+    seen: list[frozenset[int]] = []
+
+    def spy(*_a, **kwargs):
+        seen.append(frozenset(kwargs.get("exclude_machine_ids") or ()))
+        return [_offer()]
+
+    monkeypatch.setattr(vast, "usable_offers", spy)
+    return seen
+
+
+def test_stalled_machine_is_excluded_from_the_next_attempts_search(monkeypatch):
+    """A box that rents, never boots, and stalls must not be re-rented by the next attempt.
+
+    This is the loop the fix exists to stop: the offer stays in the market at the top of the
+    cheapest-first ranking, so a per-call ``tried`` list (rebuilt on every ``deploy_and_submit``)
+    let one run rent the same dead machine eleven times and burn its whole retry budget.
+    """
+    from flash.providers.base import PollResult
+    from flash.providers.vast import jobs as vast
+
+    spec = _spec()
+    vast.forget_dead_machines(spec.run_id)
+    try:
+        _wire_submit(monkeypatch, poll_result=PollResult(False, failure="stalled", detail="no hb"))
+        searches = _searched_exclusions(monkeypatch, vast)
+
+        first = _submit(vast, spec, seed=0)
+        assert first.failure == "stalled"
+        # the first attempt could not have known: it searched with nothing excluded.
+        assert searches[0] == frozenset()
+        # _handle()'s machine_id -- the HOST is retired, not the offer id, because vast relists the
+        # same box under a fresh offer id.
+        assert vast.dead_machine_ids(spec.run_id) == frozenset({10})
+
+        _submit(vast, spec, seed=0)
+        assert searches[1] == frozenset({10})
+    finally:
+        vast.forget_dead_machines(spec.run_id)
+
+
+def test_a_runs_own_failure_does_not_retire_a_healthy_machine(monkeypatch):
+    """Only host-shaped failures retire a box.
+
+    ``job_failed`` is the run's own doing and would recur on any machine, and ``poll_error`` covers
+    transient HF read gaps that say nothing about the host. Blacklisting on either would shrink the
+    usable pool on every attempt and recreate the starvation from the other direction.
+    """
+    from flash.providers.base import PollResult
+    from flash.providers.vast import jobs as vast
+
+    spec = _spec()
+    for failure in ("job_failed", "poll_error", "oom"):
+        vast.forget_dead_machines(spec.run_id)
+        _wire_submit(monkeypatch, poll_result=PollResult(False, failure=failure, detail="x"))
+        _submit(vast, spec, seed=0)
+        assert vast.dead_machine_ids(spec.run_id) == frozenset(), failure
+    vast.forget_dead_machines(spec.run_id)
+
+
+def test_a_pool_exhausted_by_this_runs_own_dead_machines_says_so(monkeypatch):
+    """The empty-pool error must distinguish "Vast is out" from "this run killed them all".
+
+    The two have different operator fixes -- wait, versus move to another class or provider -- and
+    the generic message only ever suggested the first.
+    """
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    spec = _spec()
+    vast.forget_dead_machines(spec.run_id)
+    try:
+        vast._note_dead_machine(spec.run_id, 10)
+        # the search now returns nothing precisely because the only machine is excluded.
+        monkeypatch.setattr(vast, "usable_offers", lambda *a, **k: [])
+
+        with pytest.raises(vast_api.VastApiError, match="already rented and lost"):
+            _submit(vast, spec, seed=0)
+    finally:
+        vast.forget_dead_machines(spec.run_id)
+
+
+def test_gc_frees_the_runs_dead_machine_set(monkeypatch):
+    """The blacklist is process-local state, so the run's reap has to release it."""
+    from flash.providers.vast import PROVIDER
+    from flash.providers.vast import jobs as vast
+
+    spec = _spec()
+    vast._note_dead_machine(spec.run_id, 10)
+    monkeypatch.setattr(vast, "destroy_run_instances", lambda _run_id: [])
+
+    PROVIDER.gc(spec)
+
+    assert vast.dead_machine_ids(spec.run_id) == frozenset()
+
+
 def test_runner_destroys_on_exception(monkeypatch):
     vast, destroyed = _wire_submit(monkeypatch, poll_raises=KeyboardInterrupt())
     with pytest.raises(KeyboardInterrupt):
