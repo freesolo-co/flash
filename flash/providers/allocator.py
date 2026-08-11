@@ -296,6 +296,7 @@ def _resolved_gpu_count(
             effective_gpu_count=effective_count,
             max_gpu_count=auto_cap,
             gpu_names=gpu_names,
+            providers=available,
         )
     )
 

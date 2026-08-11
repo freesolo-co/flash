@@ -596,6 +596,7 @@ def _offline_gpu_shape(
                 effective_gpu_count=safe_gpu_count,
                 max_gpu_count=auto_cap,
                 gpu_names=names,
+                providers=None if provider == "auto" else (provider,),
             )
         )
     _cost, count, _combined, _per_card, gpu, hourly = min(ranked)

@@ -60,7 +60,10 @@ def displayable_url(url: str) -> str:
         return "(unparseable url)"
     if not host:
         return "(unparseable url)"
-    if port:
+    # `is not None`, not truthiness: port 0 is a real configured value and an invalid endpoint.
+    # dropping it renders `http://localhost:0` as `http://localhost`, which names the DEFAULT port
+    # and hides the setting the reader has to correct.
+    if port is not None:
         host = f"{host}:{port}"
     return f"{scheme}://{host}" if scheme else host
 

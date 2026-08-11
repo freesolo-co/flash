@@ -3518,6 +3518,11 @@ def test_displayable_url_keeps_ipv6_brackets_and_rejects_bad_ports():
     for bad in ("https://identity.example:notaport", "https://host:99999999", "https://[bad::ipv6"):
         assert displayable_url(bad) == "(unparseable url)", bad
 
+    # port 0 is a real configured value and an invalid endpoint. dropping it on truthiness renders
+    # the default port instead, hiding the exact setting the reader has to correct.
+    assert displayable_url("http://localhost:0") == "http://localhost:0"
+    assert displayable_url("http://localhost") == "http://localhost"
+
 
 def test_hosted_key_rejection_does_not_echo_credentials_from_the_base_url(monkeypatch):
     """The URL named in the error must never carry the secret it was configured with.

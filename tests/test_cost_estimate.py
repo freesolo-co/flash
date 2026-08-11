@@ -763,6 +763,10 @@ def test_offline_quote_remedy_only_names_widths_a_provider_sells_freely():
     type, so `--gpus 4` there may name a type that does not exist. `--cost` is consulted precisely
     to avoid a doomed launch, so it withholds the width rather than inventing one; the runpod pool,
     where the count is a launch parameter, still gets its remedy.
+
+    The withheld case must not fall through to "exceeds every GPU class" either: the run FITS, so
+    claiming it needs more than an 8-card combination is false and the knob advice would send the
+    user to shrink a run that is already small enough. It names the unpurchasable width instead.
     """
     from flash.cost.analytical import _offline_gpu_shape
     from flash.cost.types import RunConfig
@@ -777,11 +781,25 @@ def test_offline_quote_remedy_only_names_widths_a_provider_sells_freely():
         "group_size": 4,
         "lora_rank": 16,
     }
-    with pytest.raises(ValueError, match="no GPU class fits") as lambda_only:
+    with pytest.raises(ValueError, match="does not sell") as lambda_only:
         _offline_gpu_shape(RunConfig(gpu_count=1, provider="lambda", **shared))
     assert "--gpus" not in str(lambda_only.value)
+    # the run fits; do not tell the user it exceeds every class.
+    assert "more than any" not in str(lambda_only.value)
 
     # the runpod pool still names its width: the rule is about how counts are sold, not a blanket
     # suppression of the remedy.
     with pytest.raises(ValueError, match=r"--gpus 2"):
         _offline_gpu_shape(RunConfig(gpu_count=1, provider="runpod", **shared))
+
+    # a genuinely oversized run must STILL report exceeding every class, not the provider excuse.
+    with pytest.raises(ValueError, match=r"more than any .*combination") as oversized:
+        _offline_gpu_shape(
+            RunConfig(
+                gpu_count=1,
+                provider="lambda",
+                model_revision="",
+                **{**shared, "seq_len": 1_000_000},
+            )
+        )
+    assert "does not sell" not in str(oversized.value)
