@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from io import BytesIO
 
+from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
 from flash._internal.logging import get_logger
 from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 from flash.core.spec import (
@@ -304,6 +305,23 @@ def build_worker_env(
             raise RuntimeError("managed opd control-panel teacher transport is missing")
         env[PUBLIC_URL_ENV] = public_url
         env[TEACHER_CAPABILITY_ENV] = capability
+    # declared runtime secrets can carry any name, so their names are listed explicitly for the
+    # redactors (flash._internal.diagnostics and the provider bootstraps): the name-shape
+    # heuristic alone would let AWS_SECRET_ACCESS_KEY-style values through. set last so no
+    # runtime secret can clobber it -- SECRET_ENV_KEYS_ENV is control-plane-owned, so a job cannot
+    # declare it as a secret and have its value overwritten by this list.
+    secret_keys = (set(allowed_runtime_secrets) | {TEACHER_CAPABILITY_ENV}) & set(env)
+    # the list is comma-joined, so a name containing a comma would arrive at every redactor as two
+    # unrelated names and its value would never be recognized. [environment] secrets rejects those
+    # names at declaration; this is the fail-closed guard, because emitting a silently ambiguous
+    # list is how a credential reaches diagnostics verbatim.
+    ambiguous = sorted(key for key in secret_keys if "," in key)
+    if ambiguous:
+        raise RuntimeError(
+            f"secret env name(s) contain the {SECRET_ENV_KEYS_ENV} delimiter: {ambiguous}"
+        )
+    if secret_keys:
+        env[SECRET_ENV_KEYS_ENV] = ",".join(sorted(secret_keys))
     return env
 
 
