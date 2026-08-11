@@ -223,15 +223,15 @@ def thin_rl_batch_warning(spec) -> str | None:
     # `prompts_per_step` for reasons that have nothing to do with a pool -- reading a bind off that
     # equality would invent a cap the config does not contain and send the user to a phantom key.
     #
-    # name every cap that is BELOW the healthy threshold, not merely the one at the current
-    # minimum. staggered caps are the trap: with [train] 2 behind [environment.params] 3, naming
-    # only the train cap sends the user to raise it and land on 3, still thin and still warned.
-    # the remedy has to resolve the problem in one edit, so every configured constraint that would
-    # still bind after the others are lifted gets named.
     # only a cap that IS the priced pool. `_on_policy_example_count` reads exactly one of these two
     # keys, so the other is inert here however small it looks: at [train] 4 over an env cap of 1 the
     # pool is 4, and naming the env cap would both contradict the quote beside it and promise that
     # raising `batch_size` alone changes nothing, when it takes prompts-per-step from 1 to 4.
+    #
+    # both keys can still be named at once, and must be: when they hold the SAME value they are
+    # each the priced pool, so raising either alone leaves the other capping the batch where it was.
+    # what this guard drops is the staggered pair -- [train] 2 behind an env 3 names only [train],
+    # the key the bill actually reads.
     cap_keys = [
         key
         for key, value in (
