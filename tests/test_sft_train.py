@@ -1448,7 +1448,16 @@ def test_a_resumed_sft_run_does_not_republish_the_step_it_resumed_from(monkeypat
     assert watcher.processed_steps == {1, 2}
 
 
-def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
+def _stub_sft_run(
+    monkeypatch,
+    *,
+    save_at_steps=(),
+    watcher_cls=None,
+    structured_targets=False,
+    structured_singleturn=False,
+    raw_output_fallback=False,
+    missing_output=False,
+):
     """monkeypatch every out-of-process dependency of run_sft_train and return (spec, captured).
 
     the caller supplies its own ``run_verl_training`` fake, which is the only remaining seam.
@@ -1496,13 +1505,69 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
         multi_turn = False
 
         def dataset(self):
-            return [{"prompt": "one"}, {"prompt": "two"}]
+            if structured_targets:
+                trajectory = [
+                    {"role": "assistant", "content": "<think>reason</think>"},
+                    {"role": "assistant", "content": "answer"},
+                ]
+                return [
+                    {"prompt": "one", "output": trajectory},
+                    {"prompt": "two", "output": trajectory},
+                ]
+            if structured_singleturn:
+                # one assistant message, but explicitly structured -- NOT a scalar coercion.
+                single = [{"role": "assistant", "content": "answer"}]
+                return [
+                    {"prompt": "one", "output": single},
+                    {"prompt": "two", "output": {"messages": single}},
+                ]
+            rows = [
+                {"prompt": "one", "output": "answer"},
+                {"prompt": "two", "output": "answer"},
+            ]
+            if missing_output:
+                rows[1].pop("output")
+            return rows
 
         def prompt_messages(self, example):
             return [{"role": "user", "content": example["prompt"]}]
 
         def sft_completion(self, example):
-            return [{"role": "assistant", "content": "answer"}]
+            output = example.get("output")
+            if isinstance(output, list):
+                return output
+            return [{"role": "assistant", "content": "hook answer" if output is None else output}]
+
+    class RawOutputFallbackEnv(Env):
+        def sft_completion_with_provenance(self, example):
+            output = example.get("output")
+            return [{"role": "assistant", "content": "" if output is None else str(output)}], True
+
+        def sft_completion(self, example):
+            messages, _coerced_scalar_output = self.sft_completion_with_provenance(example)
+            return messages
+
+    class StructuredSingleTurnEnv(Env):
+        """One assistant turn per row, reported as structured (not coerced).
+
+        this is what the real adapter now returns for `output: [{...}]` and `{"messages": [...]}`:
+        a single-message target whose provenance says no scalar coercion happened. it is the case
+        the collapse warning must stay quiet for -- the row IS one assistant turn, so only the
+        provenance flag separates it from a bare stringified answer.
+        """
+
+        def sft_completion_with_provenance(self, example):
+            return [{"role": "assistant", "content": "answer"}], False
+
+        def sft_completion(self, example):
+            messages, _coerced_scalar_output = self.sft_completion_with_provenance(example)
+            return messages
+
+    EnvClass = Env
+    if raw_output_fallback:
+        EnvClass = RawOutputFallbackEnv
+    elif structured_singleturn:
+        EnvClass = StructuredSingleTurnEnv
 
     class Tokenizer(_ExactTokenizer):
         pad_token = None
@@ -1537,7 +1602,7 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
     )
     spec.workload_profile = prepare_sft_workload(
         spec,
-        Env(),
+        EnvClass(),
         tokenizer_loader=lambda _model, _revision: Tokenizer(),
         producer_version=_PROFILE_PRODUCER_VERSION,
         allow_packing=False,
@@ -1617,7 +1682,7 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
     monkeypatch.setattr(worker, "RUN_ID", "test-sft-verl-orchestration")
     monkeypatch.setattr(worker, "THINKING", False)
     monkeypatch.setattr(worker, "JOB_SPEC", spec)
-    monkeypatch.setattr(worker, "require_active_env", Env)
+    monkeypatch.setattr(worker, "require_active_env", EnvClass)
     monkeypatch.setattr(
         worker,
         "heartbeat",
@@ -1681,6 +1746,69 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
     monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", fake_export)
 
     return spec, captured
+
+
+def test_sft_warns_when_every_selected_row_is_a_coerced_singleturn_target(monkeypatch, capsys):
+    from flash.engine.worker import sft_train, sft_train_runner
+
+    spec, _captured = _stub_sft_run(monkeypatch, raw_output_fallback=True)
+    monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
+
+    options = sft_train_runner._resolve_sft_options(spec)
+    sft_train_runner._prepare_sft_data(options)
+
+    output = capsys.readouterr().out
+    assert "[sft][warn] all 2 selected rows use one bare assistant target coerced" in output
+    assert "reasoning blocks or multi-turn structure may have been lost" in output
+
+
+def test_sft_collapse_warning_stays_quiet_when_environment_hook_handles_raw_rows(
+    monkeypatch, capsys
+):
+    from flash.engine.worker import sft_train, sft_train_runner
+
+    spec, _captured = _stub_sft_run(monkeypatch, missing_output=True)
+    monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
+
+    options = sft_train_runner._resolve_sft_options(spec)
+    sft_train_runner._prepare_sft_data(options)
+
+    output = capsys.readouterr().out
+    assert "bare assistant target coerced" not in output
+
+
+def test_sft_collapse_warning_stays_quiet_for_structured_multiturn_targets(monkeypatch, capsys):
+    from flash.engine.worker import sft_train, sft_train_runner
+
+    spec, _captured = _stub_sft_run(monkeypatch, structured_targets=True)
+    monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
+
+    options = sft_train_runner._resolve_sft_options(spec)
+    sft_train_runner._prepare_sft_data(options)
+
+    output = capsys.readouterr().out
+    assert "[sft] multi-turn SFT: 2/2 rows" in output
+    assert "bare assistant target coerced" not in output
+
+
+def test_sft_collapse_warning_stays_quiet_for_structured_singleturn_targets(monkeypatch, capsys):
+    """A structured target is not a coercion even when it is a SINGLE assistant turn.
+
+    the multi-turn case above is separated by length alone, so it cannot catch a provenance flag
+    that marks parsed message lists as coerced. these rows are one assistant turn each, exactly
+    like a stringified scalar, so only provenance keeps the warning quiet -- and firing here would
+    tell users to encode message lists they have already encoded.
+    """
+    from flash.engine.worker import sft_train, sft_train_runner
+
+    spec, _captured = _stub_sft_run(monkeypatch, structured_singleturn=True)
+    monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
+
+    options = sft_train_runner._resolve_sft_options(spec)
+    sft_train_runner._prepare_sft_data(options)
+
+    output = capsys.readouterr().out
+    assert "bare assistant target coerced" not in output
 
 
 def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypatch):
