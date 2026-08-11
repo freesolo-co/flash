@@ -365,15 +365,27 @@ def run_cost(obj: dict) -> tuple[float, bool]:
     training reports 0.0 -- which reads as "this has cost nothing", exactly when the GPU is billing.
     The submit-time quote is already on the record as ``estimated_cost_usd``; prefer it while the
     run is live so current spend is never understated as free.
+
+    A terminal run with a 0.0 charge gets the same treatment, because that zero is not a
+    measurement either. ``cost_usd`` is derived from the WORKER's metrics, so a run whose attempts
+    all failed before producing any never had one written -- and a failed run is the case most
+    likely to have rented hardware repeatedly. One profile run rented 47 instances, could not
+    confirm teardown on 44 of them, and still reported $0.0000 as settled fact.
     """
     settled = float(obj.get("cost_usd") or 0.0)
-    if str(obj.get("state") or "") in SETTLED_COST_STATES:
-        return settled, False
     if settled:
-        # a live run that has already accrued a measured cost: that number beats the submit quote.
-        return settled, True
+        # a measured charge is the best number available, settled or not.
+        return settled, str(obj.get("state") or "") not in SETTLED_COST_STATES
+    # no measured charge. a realized invoice, if one has been reconciled, is authoritative even
+    # when the worker never reported: it comes from the provider, not the run.
+    realized = obj.get("realized_cost_usd")
+    if isinstance(realized, (int, float)) and realized:
+        return float(realized), False
     quote = obj.get("estimated_cost_usd")
     if isinstance(quote, (int, float)):
+        # the quote priced the work, not the failure, so it is not what a dead run cost -- but it
+        # is the only non-zero evidence that money was at stake, and marking it an estimate is
+        # honest where printing a bare $0.0000 was not.
         return float(quote), True
     return settled, False
 

@@ -720,9 +720,26 @@ def _retry_target(
         _lifecycle._shape_key(candidate) in retry_tried for candidate in outcome.candidates
     )
     no_escalation = ", no untried GPU class fits this run" if exhausted else ""
+    # a projected provider this run has ALREADY marked failed is not a failover, it is a clamp back
+    # onto the pool that is failing. `_select_candidate` sorts on `provider in failed_providers`
+    # first, so once every candidate's provider has failed that key is True for all of them and the
+    # escape degrades to the plain cheapest-first order. the line then reads like recovery while the
+    # run loops on the same substrate, which is what made a 46-attempt loop look like progress.
+    # naming it is the difference between "waiting" and "unpin gpu.provider / add another provider".
+    retry_failed_providers = (
+        ctx.failed_providers
+        if first_cache_drop
+        else ctx.failed_providers | {outcome.chosen.provider}
+    )
+    no_escape = (
+        ", which this run has already lost an attempt on -- no other provider currently offers a "
+        "fitting class"
+        if projected.provider in retry_failed_providers
+        else ""
+    )
     return (
         f"expecting to retry on {projected.gpu} @ {projected.provider}"
-        f"{' again' if same else ''}{no_escalation} (resume from last checkpoint; "
+        f"{' again' if same else ''}{no_escalation}{no_escape} (resume from last checkpoint; "
         "reallocated against live capacity, so the class may change)"
     )
 

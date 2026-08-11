@@ -1542,6 +1542,88 @@ def test_no_capacity_retry_message_names_the_class_it_actually_reuses(orch, monk
     assert "the class may change" in action, action
 
 
+def test_retry_message_admits_when_the_projected_provider_already_failed(orch, monkeypatch):
+    """A retry that clamps back onto a provider this run already lost on is not a failover.
+
+    ``_select_candidate`` escapes a failed provider only while some candidate has an unfailed one:
+    the key is ``provider in failed_providers``, so once every candidate's provider has failed it is
+    True for all of them and the escape degrades to plain cheapest-first. The line then reads as
+    recovery while the run loops on the substrate that is failing -- the shape of a 46-attempt
+    profile loop that printed a failover target it never acted on. The operator's fix is another
+    provider, not more waiting, so the message has to say the pool is exhausted.
+    """
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    # one provider, two fitting classes: every candidate's provider fails together.
+    candidates = (
+        Candidate("runpod", "A100 PCIe", 1.2, 40),
+        Candidate("runpod", "A100 SXM", 1.8, 80),
+    )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        on_handle(_runpod_handle("ep1", "j1", attempt))
+        if attempt < 2:
+            return PollResult(False, failure="no_capacity", detail="job stuck IN_QUEUE")
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+    spec = _spec(max_retries=2)
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    orch._submit_seed_supervised(spec, spec.seed, log)
+
+    # attempt 0 fails runpod, and the only other candidate is also runpod, so the "failover" is
+    # back onto the provider that just failed.
+    action = _retry_action_line(log.getvalue(), 0)
+    assert "already lost an attempt on" in action, action
+    assert "no other provider currently offers a fitting class" in action, action
+
+
+def test_a_genuine_cross_provider_failover_is_not_labelled_exhausted(orch, monkeypatch):
+    """The admission must not fire when the retry really does escape to a different provider."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    candidates = (
+        Candidate("runpod", "A100 PCIe", 1.2, 40),
+        Candidate("lambda", "A100 PCIe", 1.5, 40),
+    )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        on_handle(_runpod_handle("ep1", "j1", attempt))
+        return PollResult(False, failure="no_capacity", detail="job stuck IN_QUEUE")
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+    spec = _spec(max_retries=1)
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    with pytest.raises(RuntimeError, match="failed after retries"):
+        orch._submit_seed_supervised(spec, spec.seed, log)
+
+    action = _retry_action_line(log.getvalue(), 0)
+    assert "@ lambda" in action, action
+    assert "already lost an attempt on" not in action, action
+
+
 def test_last_gpu_retry_message_names_the_clamped_back_class_not_the_current_one(orch, monkeypatch):
     """on_last_gpu means no UNTRIED class is left -- NOT that the current class is reused. With two
     fitting classes the walk is PCIe, SXM, then back to the cheaper PCIe, so the message printed on

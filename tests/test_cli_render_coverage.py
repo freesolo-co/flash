@@ -473,6 +473,38 @@ def test_run_cost_without_a_quote_reports_zero_unflagged() -> None:
     assert render.run_cost({"state": "queued", "estimated_cost_usd": None}) == (0.0, False)
 
 
+def test_a_failed_run_that_never_measured_a_charge_is_not_reported_as_settled_zero() -> None:
+    """A terminal 0.0 is the absence of a measurement, not a measurement of zero.
+
+    ``cost_usd`` comes from the worker's metrics, so a run whose every attempt died before the
+    worker produced any never gets one -- and that is exactly the run most likely to have rented
+    hardware over and over. One profile run rented 47 instances, failed to confirm teardown on 44,
+    and printed $0.0000 with no estimate marker, which reads as "this cost nothing".
+    """
+    amount, is_estimate = render.run_cost(
+        {"state": "failed", "cost_usd": 0.0, "estimated_cost_usd": 3.5}
+    )
+    assert (amount, is_estimate) == (3.5, True)
+
+
+def test_a_reconciled_invoice_outranks_the_quote_on_a_failed_run() -> None:
+    """Realized cost comes from the provider, so it is settled fact even with no worker metrics."""
+    amount, is_estimate = render.run_cost(
+        {
+            "state": "failed",
+            "cost_usd": 0.0,
+            "estimated_cost_usd": 3.5,
+            "realized_cost_usd": 1.75,
+        }
+    )
+    assert (amount, is_estimate) == (1.75, False)
+
+
+def test_a_failed_run_with_no_evidence_at_all_still_reports_a_bare_zero() -> None:
+    """Without a quote or an invoice there is nothing to show; do not invent a number."""
+    assert render.run_cost({"state": "failed", "cost_usd": 0.0}) == (0.0, False)
+
+
 def test_run_status_marks_a_live_cost_as_an_estimate(styled_plain) -> None:
     obj = {
         "run_id": "flash-1",
