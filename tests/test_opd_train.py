@@ -2753,6 +2753,9 @@ def test_restore_verl_resume_returns_validated_accounting(monkeypatch, tmp_path)
 
     (resume / "opd_state.json").write_text(json.dumps(state))
     (resume / "payload.bin").write_bytes(b"checkpoint")
+    # this test is about accounting restoration, not topology matching; stamp a world_size that
+    # legitimately matches world_size=1 below rather than relying on unreadable-topology behaviour.
+    (resume / "fsdp_config.json").write_text(json.dumps({"world_size": 1}))
     monkeypatch.setattr(opd_train._w, "OPD_RESUME_REVISION", "revision")
     monkeypatch.setattr(opd_train._w, "SEED", 42)
     monkeypatch.setattr(

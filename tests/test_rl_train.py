@@ -2999,6 +2999,9 @@ def test_restore_verl_resume_stages_the_checkpoint_where_verl_looks(tmp_path, mo
     src = tmp_path / "checkpoint-7"
     (src / "actor").mkdir(parents=True)
     (src / "actor" / "model.safetensors").write_text("weights")
+    # this test is about the staging mechanics, not topology matching; stamp a world_size that
+    # legitimately matches world_size=1 below rather than relying on unreadable-topology behaviour.
+    (src / "actor" / "fsdp_config.json").write_text(json.dumps({"world_size": 1}))
     local_dir = tmp_path / "ckpt"
     local_dir.mkdir()
     monkeypatch.setattr(rl_train._w, "hf_resume_checkpoint", lambda *a, **k: str(src))

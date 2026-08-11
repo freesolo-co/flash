@@ -285,6 +285,9 @@ def _restore_verl_resume(
     world_size: int,
 ) -> tuple[int, dict | None]:
     revision = _w.OPD_RESUME_REVISION or None
+    # no `prefer`: opd pins an exact commit via OPD_RESUME_REVISION with fail_closed, and
+    # validate_opd_resume_state_metadata is keyed to that checkpoint's step, so silently picking a
+    # different candidate here would violate the retry contract those enforce.
     resume = _w.hf_resume_checkpoint(fail_closed=bool(revision), revision=revision)
     if not resume:
         return 0, None

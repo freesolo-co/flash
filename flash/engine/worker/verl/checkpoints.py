@@ -112,9 +112,13 @@ def checkpoint_world_size(step_dir: str) -> int | None:
     actor_dir = resolve_checkpoint_actor_dir(step_dir)
     try:
         with open(os.path.join(actor_dir, VERL_FSDP_CONFIG_FILE), encoding="utf-8") as file:
-            stamped = json.load(file).get("world_size")
+            decoded = json.load(file)
     except (OSError, ValueError):
-        stamped = None
+        decoded = None
+    # decoded json that is null, a list, or a bare scalar is not verl's stamp (a mapping with a
+    # "world_size" key); treat it as unreadable rather than let .get() raise, so the shard-filename
+    # fallback below still runs instead of the exception escaping to the caller.
+    stamped = decoded.get("world_size") if isinstance(decoded, dict) else None
     if isinstance(stamped, int) and not isinstance(stamped, bool) and stamped >= 1:
         return stamped
     try:
@@ -124,6 +128,17 @@ def checkpoint_world_size(step_dir: str) -> int | None:
     widths = {int(m.group(1)) for m in map(_FSDP_SHARD_RE.fullmatch, names) if m is not None}
     # more than one width means a torn or merged directory: not a topology this code can vouch for.
     return widths.pop() if len(widths) == 1 else None
+
+
+def resume_checkpoint_is_loadable(resume_dir: str, *, world_size: int) -> bool:
+    """whether an attempt running ``world_size`` ranks can load ``resume_dir``'s fsdp shards.
+
+    quiet by design (no logging): ``resume_topology_matches`` below is the loud form that explains a
+    discard, but a caller ranking several downloaded candidates (``hf_resume_checkpoint``'s
+    ``prefer``) needs to probe many of them before any discard decision, and thus any discard log
+    line, has been made.
+    """
+    return checkpoint_world_size(resume_dir) == world_size
 
 
 def resume_topology_matches(resume_dir: str, *, world_size: int, job_label: str) -> bool:
@@ -136,13 +151,18 @@ def resume_topology_matches(resume_dir: str, *, world_size: int, job_label: str)
     the supervisor burns another retry on it. discarding instead restarts from step 0, which is
     what a failed resume fetch already does, and costs only the steps since the last save.
 
-    an unreadable topology is treated as a mismatch on a multi-gpu attempt (the shards may or may
-    not fit and being wrong costs the attempt) and as a match on a single-gpu one, where the spec's
-    card count can never have been anything but one.
+    an unreadable topology is always a mismatch, with no single-gpu exemption: ``rentable_gpu_counts``
+    in ``flash/providers/base.py`` walks every power-of-two card count up to a spec's cap, largest
+    first, and the allocator rewrites the retried attempt to whichever count it lands on, so a
+    single-gpu retry can follow a multi-gpu attempt that wrote the checkpoint -- the card count this
+    attempt runs at is no evidence of the count the checkpoint was written at. a directory with no
+    readable topology (no verl stamp, no single consistent shard width) is not one this code can
+    vouch for at any world size, and discarding it costs only the same steps-since-last-save the
+    mismatch path already pays.
     """
-    written = checkpoint_world_size(resume_dir)
-    if written == world_size or (written is None and world_size <= 1):
+    if resume_checkpoint_is_loadable(resume_dir, world_size=world_size):
         return True
+    written = checkpoint_world_size(resume_dir)
     print(
         f"[{job_label}] discarding resume checkpoint {os.path.basename(resume_dir)}: its fsdp "
         f"shards were written at world size {written if written is not None else 'unknown'} but "
