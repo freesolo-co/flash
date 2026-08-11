@@ -103,8 +103,6 @@ def _on_policy_example_count(spec) -> int:
 
     Reading the env value when no train cap is set is pre-existing behavior (#465) and is left
     alone; narrowing it needs a real enforced cap, which is pricing work outside this change.
-    ``thin_rl_batch_warning`` still inspects both, because warning on a thin authored value costs
-    nobody money.
     """
     pinned_examples = int(spec.train.max_examples) if spec.train.max_examples else 0
     if pinned_examples > 0:
@@ -132,16 +130,6 @@ def _env_max_examples(spec) -> int:
     return max(0, value)
 
 
-def _pool_cap_authored(spec) -> bool:
-    """Whether the config names a prompt pool at all, in either table.
-
-    Distinct from "a cap that binds": a cap of 800 authors a pool without being thin. What matters
-    downstream is whether a pool exists INDEPENDENTLY of ``batch_size``, because with neither key
-    set ``_on_policy_example_count`` returns the requested batch and the pool tracks the batch.
-    """
-    return bool(spec.train.max_examples) or _env_max_examples(spec) > 0
-
-
 def _on_policy_requested_prompts_per_step(spec) -> int:
     from flash.engine.plan.recipe import RECIPE
 
@@ -149,254 +137,11 @@ def _on_policy_requested_prompts_per_step(spec) -> int:
     default = (
         RECIPE.rl.prompts_per_step if spec.algorithm == "grpo" else RECIPE.opd.prompts_per_step
     )
-    return max(1, int(t.batch_size) if t.batch_size is not None else default)
+    return max(1, int(t.prompts_per_step) if t.prompts_per_step is not None else default)
 
 
 def _on_policy_prompts_per_step(spec, examples: int) -> int:
-    requested = _on_policy_requested_prompts_per_step(spec)
-    return min(requested, max(1, int(examples)))
-
-
-# the prompts-per-step below which an on-policy step stops being a batch. at 1 the update is a
-# single prompt's group, so nothing averages the prompt-to-prompt spread out of the gradient; the
-# few above it are still thin enough that one unlucky prompt dominates an update. not a hard
-# minimum -- a deliberately tiny batch is a legitimate way to buy optimizer steps on a derived
-# horizon (see TRAINING.md), which is exactly why this warns instead of rejecting.
-RL_THIN_PROMPTS_PER_STEP = 4
-
-
-def thin_rl_batch_warning(spec) -> str | None:
-    """One user-facing line when an rl run's optimizer batch is too thin to be a batch.
-
-    ``batch_size`` reaches the optimizer batch by two different routes. Under sft a measured
-    workload profile sits in between: it resolves the authored value against the real tokenized
-    dataset into ``examples_per_update`` (packed) or pins the batch to 1 (unpacked), and the
-    per-device micro-batch is derived from that result. Under grpo/opd there is no profile: the key
-    IS ``prompts_per_step``, then verl's ``data.train_batch_size`` and ``ppo_mini_batch_size``. So
-    the standard sft memory workaround, ``batch_size = 1``, silently turns an rl run into one
-    prompt per update, and nothing errors.
-
-    Reads configured prompts-per-step, not the authored field: a ``max_examples`` cap clamps the
-    batch to the retained pool, so a scaffolded ``max_examples = 2`` run trains on 2 prompts per
-    update whether or not a ``batch_size`` was written. That is an UPPER BOUND on the runtime batch,
-    since the worker also drops prompts over the token budget before clamping; closing the gap would
-    mean running the user's ``environment.py``, which an offline quote does not do. One-sided on
-    purpose: it misses thin runs rather than crying wolf on healthy ones.
-
-    Every number comes from ``_on_policy_example_count``, the pool the quote prices, and it names
-    only a knob that pool reads. A correctness constraint, not tidiness: an earlier revision took
-    the smallest configured cap for the warning alone and printed "2 prompts per update" above a
-    quote that had derived 64, with a remedy pointing at a key the bill never reads.
-
-    Two claims it avoids. Raising one knob alone moves nothing only when the other is the strict
-    minimum (at ``batch_size = 2`` under a cap of 3, lifting the batch alone reaches 3). And
-    widening a cap adds no updates only up to the requested batch, which is the recipe default when
-    none was authored (grpo 64, opd 8), so on opd a cap of 2 -> 16 goes from 1 update to 2.
-
-    What the thin batch costs differs by algorithm, so the message does too. grpo keeps a working
-    per-prompt baseline at any batch size (verl centres each response against its own prompt's
-    group; dr-grpo, ``norm_adv_by_std_in_grpo=False``) and only loses the averaging ACROSS prompts.
-    opd has no advantages at all -- its objective is groupwise reverse KL against the teacher with
-    ``use_policy_gradient=false`` -- so there is no baseline to reassure anyone about, and unlike
-    grpo its ``batch_size`` genuinely IS a memory lever (it scales rollout concurrency and the loss
-    microbatch in ``estimate_vram_gb``). Telling an opd user to raise it would be advice to OOM.
-
-    The price of widening also flips with the horizon and with WHICH knob is raised, so the message
-    never says "for the same money". On a DERIVED horizon a wider batch means no more updates and
-    usually fewer, so it is cheaper (measured: grpo 9B over 800 prompts quotes $21.88 at 1 and
-    $7.37 at 16). Under a positive ``max_steps`` the update count is pinned, so widening buys
-    averaging at strictly more generation: the same run quotes $0.27 at 1 and $0.51 at 4 for an
-    identical 10 steps. Raising a POOL cap only adds updates while the batch stays pinned (batch 2,
-    cap 2 -> 8: 1 step at $0.035 to 4 steps at $0.141) -- and this message never asks for that in
-    isolation, because a thin batch is named alongside the cap and the two then move together,
-    holding the horizon flat (``ceil(2/2) == ceil(4/4) == 1``). With no authored batch at all,
-    prompts-per-step rises with the cap for the same reason, and the quote is flat at $0.47 across
-    caps 2 through 64 because it prices the recipe's full rollout width rather than the retained
-    pool. So every widening branch except the pinned-``max_steps`` one names the mechanism and
-    sends the user to ``--cost`` instead of promising a direction.
-    """
-    if spec.algorithm not in ("grpo", "opd"):
-        return None
-    # the SAME pool the quote prices, deliberately. an earlier revision took the smallest configured
-    # cap here so a small `[environment.params] max_examples` behind a large `[train]` one would
-    # still warn, and that put two different pools in one breath: the message stated an optimizer
-    # batch of 1 while the quote printed directly above it derived 8. every number here is arithmetic
-    # the user can check against that quote, so it has to come from the same place.
-    #
-    # the env cap is not lost. `_on_policy_example_count` returns it whenever no `[train]` cap is set,
-    # which is the scaffolded shape this warning exists for. what is skipped is both caps set with the
-    # env one smaller -- exactly where flash does not enforce the env value (opaque kwargs to the
-    # user's own environment factory), so claiming a thin batch there would be a guess contradicting
-    # the bill.
-    examples = _on_policy_example_count(spec)
-    prompts_per_step = _on_policy_prompts_per_step(spec, examples)
-    if prompts_per_step >= RL_THIN_PROMPTS_PER_STEP:
-        return None
-    prompts = "1 prompt" if prompts_per_step == 1 else f"{prompts_per_step} prompts"
-    authored = spec.train.batch_size
-    # a cap only exists if one was actually written. with neither table setting it,
-    # `_on_policy_example_count` falls back to the requested batch, which makes `examples` equal
-    # `prompts_per_step` for reasons that have nothing to do with a pool -- reading a bind off that
-    # equality would invent a cap the config does not contain and send the user to a phantom key.
-    #
-    # only a cap that IS the priced pool. `_on_policy_example_count` reads exactly one of these two
-    # keys, so the other is inert here however small it looks: at [train] 4 over an env cap of 1 the
-    # pool is 4, and naming the env cap would both contradict the quote beside it and promise that
-    # raising `batch_size` alone changes nothing, when it takes prompts-per-step from 1 to 4.
-    #
-    # EXACTLY one key, even when both hold the same thin value. an earlier revision named both at
-    # equality, reasoning that each was the priced pool; it is not so. `_on_policy_example_count`
-    # returns `[train]` unconditionally whenever it is set, so at [train] 2 with an env 2, raising
-    # only [train] to 4 takes the pool to 4 and clears this warning -- the env value is never read.
-    # asking for both edits therefore sends the user into opaque kwargs their own environment acts
-    # on, to no effect on the quote this warning sits beside.
-    train_cap = int(spec.train.max_examples or 0)
-    priced_cap = (
-        ("[train] max_examples", train_cap)
-        if train_cap > 0
-        else ("[environment.params] max_examples", _env_max_examples(spec))
-    )
-    cap_key = (
-        f"`{priced_cap[0]}`"
-        if 0 < priced_cap[1] < RL_THIN_PROMPTS_PER_STEP and priced_cap[1] == examples
-        else None
-    )
-    # same rule for the authored batch: it binds if it is itself thin, even when a smaller pool is
-    # what resolves today. raising only the cap would leave `batch_size = 3` capping the batch at 3.
-    batch_binds = authored is not None and authored < RL_THIN_PROMPTS_PER_STEP
-    pool_binds = cap_key is not None
-    if batch_binds:
-        # the sft/rl name collision is only worth explaining when a batch_size was actually written
-        lead = (
-            f"`[train] batch_size = {authored}` is the OPTIMIZER batch for {spec.algorithm}: it "
-            f"sets prompts-per-step, so each update trains on {prompts}. It does NOT mean here what "
-            "it means under sft, where it is the batch a measured workload profile turns into the "
-            "optimizer batch and its step horizon, so an sft memory workaround does not transfer."
-        )
-        if pool_binds:
-            # deliberately does NOT say the cap holds the pool "below" the batch, or that raising
-            # one alone moves nothing: neither survives a cap ABOVE the batch. at batch 2 behind a
-            # cap of 3 the cap is higher, and lifting the batch alone does move the result, to 3.
-            # what is true for every arrangement is the weaker claim, because prompts-per-step is
-            # min(batch, pool) and both named knobs sit under the threshold: whichever one is
-            # raised, the other is still thin and still the minimum.
-            lead += (
-                f" {cap_key} holds the prompt pool under a real batch too, so raising either one "
-                "alone still leaves prompts-per-step thin."
-            )
-    else:
-        # always singular: exactly one key is ever named, the one the quote prices.
-        lead = (
-            f"This {spec.algorithm} run's OPTIMIZER batch is {prompts} per update: {cap_key} "
-            "holds the prompt pool below a real batch, and prompts-per-step cannot exceed "
-            "the pool."
-        )
-    targets = [
-        k for k, binds in (("`batch_size`", batch_binds), (cap_key or "", pool_binds)) if binds
-    ]
-    raise_target = " and ".join(targets)
-    if spec.algorithm == "grpo":
-        consequence = (
-            "Each prompt's completions are still centred against their own group, so the advantage "
-            "signal survives; what a thin batch costs is the averaging ACROSS prompts, so every "
-            "update follows only those few and the gradient is far noisier. Under grpo "
-            "`batch_size` is not a memory lever, so a wider batch costs no extra vram."
-        )
-    else:
-        # opd's batch_size is also a real vram lever, so "raise it" is not safe blanket advice.
-        consequence = (
-            "opd distills against the teacher rather than scoring completions against each other, "
-            "so a thin batch breaks no baseline: it just makes every update follow very few "
-            "prompts, which is noisier. Unlike grpo, opd's `batch_size` is ALSO a memory lever (it "
-            "sizes rollout concurrency and the loss microbatch), so keep any widening within what "
-            "the gpu allows."
-        )
-    remedy = _thin_rl_batch_remedy(
-        spec, raise_target=raise_target, batch_binds=batch_binds, pool_binds=pool_binds
-    )
-    return f"{lead} {consequence} {remedy}"
-
-
-def _thin_rl_batch_remedy(spec, *, raise_target: str, batch_binds: bool, pool_binds: bool) -> str:
-    """The closing sentence: what raising the named knobs actually buys, and at what price.
-
-    Split from ``thin_rl_batch_warning`` to keep it under the function-size limit. It is the one
-    cohesive phase in that message: every branch here answers "what happens if I do what you just
-    told me", and each direction it claims is measured (see the branch comments).
-    """
-    # what widening costs flips with the horizon, so the remedy has to name the right trade.
-    if spec.train.max_steps and int(spec.train.max_steps) > 0 and batch_binds:
-        return (
-            f"Your `max_steps` pins the update count, so raising {raise_target} buys that averaging "
-            "at strictly more generated work and a higher bill for the same number of updates."
-        )
-    if spec.train.max_steps and int(spec.train.max_steps) > 0:
-        # cap-only under a pinned horizon: `runconfig_from_spec` leaves `batch_size=None`, so the
-        # quote normalizes every widened cap to the same recipe batch over the same pinned steps
-        # and caps 2, 4 and 8 all price identically. the generated work does grow, but this quote
-        # will not show it, so promise nothing and say where the number really comes from.
-        return (
-            f"Your `max_steps` pins the update count, so raising {raise_target} buys that averaging "
-            "without adding updates. Re-run `--cost` to see what it does to this quote."
-        )
-    if pool_binds and batch_binds:
-        # both knobs are named here, so they move TOGETHER and the horizon never grows. from an
-        # equal start it is flat -- ceil(2/2) == ceil(4/4) == ceil(8/8) == 1 -- and from an unequal
-        # one it SHRINKS, because the batch catches up to the pool faster than the pool grows:
-        # batch 1 with cap 2 is 2 updates, and lifting both to 4 is 1. "does not add updates" is
-        # therefore the claim that survives every arrangement, while "the horizon does not move"
-        # would be true only of the equal case. "adds passes" describes raising the cap while the
-        # batch stays pinned (batch 2, cap 2 -> 8: 1 step to 4), which is not what this remedy asks
-        # for, so state the no-new-updates effect and price the rest with `--cost`.
-        return (
-            f"Raise {raise_target} together: both hold prompts-per-step down, so lifting them in "
-            "step widens each update rather than adding updates. Re-run `--cost` to see what it "
-            "does to this quote."
-        )
-    if pool_binds:
-        # the pool is the only thin knob, so prompts-per-step rises WITH the cap -- but only up to
-        # the requested batch, and PAST it the extra prompts become extra updates. name that ceiling
-        # by the knob that actually sets it: the authored `batch_size` when there is one (batch 8
-        # over caps 2, 4, 8, 16, 800 gives 1, 1, 1, 2, 100 updates), and otherwise the recipe default
-        # the user never wrote -- opd 8, grpo 64. saying "your batch_size" in that second case points
-        # at a key the config does not contain, and at opd a cap of 2 -> 16 really does go 1 -> 2.
-        ceiling = (
-            "your `batch_size`"
-            if spec.train.batch_size is not None
-            else f"the {spec.algorithm} default of {_on_policy_requested_prompts_per_step(spec)}"
-        )
-        return (
-            f"Raise {raise_target}: prompts-per-step follows the pool up to {ceiling}, so widening "
-            "to there makes each update wider rather than adding updates, and past it the extra "
-            "prompts add updates instead. Re-run `--cost` to see what it does to this quote."
-        )
-    # the "buying steps" workflow is about lowering batch_size against a fixed pool. a thin POOL
-    # does not buy steps, it just shortens the run, so that caveat would excuse the wrong config --
-    # offer it only when the authored batch is what is holding the batch down.
-    #
-    # deliberately claims no direction for the bill, and no strict drop in updates either. the
-    # derived horizon is ``ceil(examples / batch)``, which is non-increasing in batch but plateaus:
-    # at ``max_examples = 5`` both batch 3 and batch 4 resolve to 2 updates, so the extra
-    # generation is pure added cost and takes the quote from $0.0867 to $0.1027. "no more updates"
-    # is the guarantee ceil() actually gives; "fewer" is only the common case, and `--cost` prices
-    # the real answer in the line above this one.
-    # ... and only when a pool actually EXISTS to spread. with neither cap authored,
-    # `_on_policy_example_count` falls back to the requested batch, so the priced pool tracks
-    # `batch_size` instead of standing still: batches 1, 2, 4, 8 and 64 all derive one update.
-    # there are no steps to buy, because nothing is being divided by a wider number -- offering
-    # the caveat here invites the user to keep a thin batch for a benefit this config cannot pay.
-    if not _pool_cap_authored(spec):
-        return (
-            f"Raise {raise_target}: with no `max_examples` set the prompt pool follows the batch, "
-            "so a wider batch makes each update wider without changing how many there are. "
-            "Re-run `--cost` to see what it does to this quote."
-        )
-    return (
-        f"Raise {raise_target} unless you are deliberately buying optimizer steps on a derived "
-        "horizon (see TRAINING.md): against a fixed prompt pool a wider batch spreads the same "
-        "prompts over no more updates than it does now. Re-run `--cost` to see what it does to "
-        "this quote."
-    )
+    return min(_on_policy_requested_prompts_per_step(spec), max(1, int(examples)))
 
 
 def spec_steps(spec) -> int:
@@ -480,7 +225,15 @@ def runconfig_from_spec(spec) -> RunConfig:
         steps=spec_steps(spec),
         seq_len=profile.max_length if profile is not None else t.max_context_tokens,
         completion_len=t.max_completion_tokens if has_rollout else None,
-        batch_size=profile.examples_per_update if profile is not None else t.batch_size,
+        # RunConfig.batch_size is the cost model's own name for "examples per optimizer update", and
+        # each algorithm reaches it by a different key: sft through the measured profile, grpo/opd
+        # straight from prompts_per_step. reading t.batch_size for rl would always find None now and
+        # silently price the recipe default, ignoring an authored batch.
+        batch_size=(
+            profile.examples_per_update
+            if profile is not None
+            else (t.prompts_per_step if has_rollout else t.batch_size)
+        ),
         group_size=t.group_size if has_rollout else None,
         lora_rank=t.lora_rank,
         thinking=spec.thinking,

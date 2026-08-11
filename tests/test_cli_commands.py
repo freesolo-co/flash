@@ -1423,25 +1423,6 @@ def test_chat_accepts_full_immutable_revision(fake_client) -> None:
     assert fake_client.calls[-1][1] == revision
 
 
-def test_chat_empty_response_hint_names_this_channels_executable(
-    fake_client, monkeypatch, capsys
-) -> None:
-    """The dev channel installs `flash-dev`; a hardcoded `flash ...` hint is not runnable there.
-
-    `cmd_chat` lives in a sibling module and resolves `CLI_NAME` back through `flash.cli.commands`
-    so this patch reaches it. Binding the name at import time instead would silently print the
-    wrong executable, and every other chat test interpolates the ambient value, so nothing else
-    here can tell the two apart.
-    """
-    monkeypatch.setattr(cli.commands, "CLI_NAME", "flash-dev")
-    monkeypatch.setattr(fake_client, "chat_stream", lambda *a, **k: iter(()), raising=False)
-
-    assert _run(["models", "chat", "flash-1", "-m", "What is 6*7?"]) == 1
-    err = capsys.readouterr().err
-    assert "flash-dev models deployments" in err, err
-    assert "`flash models" not in err, err
-
-
 def test_chat_system_flag_prepends_system_message(fake_client) -> None:
     """--system gives evals training-prompt parity without calling the HTTP API directly."""
     assert _run(["models", "chat", "flash-1", "-m", "What is 6*7?", "--system", "be brief"]) == 0

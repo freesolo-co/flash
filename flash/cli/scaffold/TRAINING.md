@@ -239,58 +239,24 @@ lora_rank = 32              # lora_alpha defaults to 2 x lora_rank; set it to ov
 **Knobs are scoped by algorithm.** `[train]` is one flat table shared by all three algorithms,
 but a knob the run's algorithm cannot consume is REJECTED at parse time rather than silently
 ignored. Everything in the block above (`epochs`, `max_examples`, `max_steps`, `save_every`,
-`save_at_steps`, `lora_rank`, `lora_alpha`, `learning_rate`, `batch_size`, `max_context_tokens`,
+`save_at_steps`, `lora_rank`, `lora_alpha`, `learning_rate`, `max_context_tokens`,
 `init_from_adapter`) applies everywhere. These do not:
 
 | knob                                                                                                            | sft      | grpo     | opd      |
 | --------------------------------------------------------------------------------------------------------------- | -------- | -------- | -------- |
+| `batch_size`                                                                                                    | yes      | rejected | rejected |
+| `prompts_per_step`                                                                                              | rejected | yes      | yes      |
 | `group_size`, `temperature`, `max_completion_tokens`, `kl_penalty_coef`, `stop_sequences`, `structured_outputs` | rejected | yes      | yes      |
 | `entropy_quantile`, `thinking_length_penalty_coef`, `credit_assignment`                                         | rejected | yes      | rejected |
 | `teacher_model`                                                                                                 | rejected | rejected | yes      |
 
-> **`batch_size` applies everywhere but does not MEAN the same thing everywhere.** Under SFT it is
-> read by the workload profile, which resolves it against the real tokenized dataset: with packing
-> on it becomes the profile's `examples_per_update` (so it does set the optimizer batch, and with
-> it the step horizon), and with packing off the optimizer batch is pinned to 1 regardless of what
-> you set. Either way the value you author is a request the profile answers, and the per-device
-> micro-batch is derived from the result. Under GRPO and OPD there is no profile in between: the
-> same key IS the optimizer batch, becoming prompts-per-step, i.e. verl's `data.train_batch_size`
-> and `ppo_mini_batch_size`. So an SFT out-of-memory workaround of `batch_size = 1` lands
-> differently here: it means one prompt per optimizer update. Nothing errors and the run still
-> learns, but each update follows very few prompts, so the gradient is far noisier. `flash train`
-> warns when the optimizer batch your config implies is below 4, including when a `max_examples`
-> cap is what clamps it, since a small prompt pool caps the batch regardless of what you authored.
-> That check reads your config, not the loaded dataset, so it is one-sided: the worker also drops
-> prompts over the token budget, and a run can still end up thin without being warned here.
->
-> What to do about it differs by algorithm. Under **GRPO** each prompt's completions are still
-> centred against their own group (that is `group_size`'s job, a separate knob), so the advantage
-> signal survives and `batch_size` is not a memory lever at all: raise it freely, and cut memory
-> with `group_size`, `max_completion_tokens` or `max_context_tokens` instead. Under **OPD** there
-> are no advantages to preserve (the objective is reverse KL against the teacher), and `batch_size`
-> **is** one of the strongest memory levers: it sizes rollout concurrency and the loss micro-batch.
-> So on OPD raise it only as far as the GPU allows. `group_size` buys memory back only if you
-> authored one above OPD's default of 1, since rollout concurrency is `batch_size * group_size`;
-> at the default there is nothing left to cut there.
->
-> What widening costs depends on which knob you widen and on your horizon. Raising `batch_size`
-> against a fixed prompt pool spreads the same prompts over no more updates than you have now,
-> which usually means fewer updates and a cheaper quote, but the derived horizon is
-> `ceil(examples / batch)` so the step count plateaus: at `max_examples = 5`, batch 3 and batch 4
-> both resolve to 2 updates and the wider one just generates more. Raising a `max_examples` cap
-> instead grows the pool, and what that buys depends on `batch_size`: with one set and left
-> pinned, the bigger pool is spread over more updates and quotes dearer; with none set, or with
-> both raised together, prompts-per-step follows the pool and the horizon does not grow, but only
-> up to the batch it is following. It can shrink: raising both from an unequal start widens each
-> update faster than the pool grows, so `batch_size = 1` with `max_examples = 2` is 2 updates and
-> lifting both to 4 is 1. Past that ceiling the extra prompts become extra updates again,
-> and with no `batch_size` authored the ceiling is the recipe default you never wrote (GRPO 64,
-> OPD 8), so on OPD a cap of 2 -> 16 goes from 1 update to 2. And under a positive `max_steps` the
-> update count is pinned, so widening never buys a step. With a `batch_size` authored that makes it
-> pure extra generation: same steps, bigger bill. Widening only `max_examples` instead leaves
-> `batch_size` unset, and the quote normalizes every cap to the same recipe batch over the same
-> pinned steps, so caps 2, 4 and 8 all price identically even though the real generated work grows.
-> The warning says which case you are in; re-run `flash train --cost` for the actual number.
+**The optimizer batch has a different name per algorithm because it is a different quantity.**
+Under SFT, `batch_size` is an input to a measured workload profile, which resolves it against the
+real tokenized dataset into the optimizer batch (and pins it to 1 when packing is off). Under
+GRPO/OPD there is no profile: `prompts_per_step` IS the optimizer batch, straight through to verl's
+`data.train_batch_size` and `ppo_mini_batch_size`. They were one key once, which meant the standard
+SFT out-of-memory workaround `batch_size = 1`, copied into an RL config, silently trained one prompt
+per update. Now it is a parse error naming the key you want.
 
 So `credit_assignment` (multi-turn GRPO defaults to one reward per rollout; `"per_turn"` gives
 turn-level credit, needs `per_turn_rewards` metadata, and is unsupported for tool-calling envs —
@@ -1072,7 +1038,7 @@ in a sensible value, so only override with a reason.
 | `kl_penalty_coef`              | Keeps the trained model from drifting too far from the base. Raise it to anchor against entropy collapse; lower it for more freedom to move.                                                                                                                                                                                                                                                                      |
 | `thinking_length_penalty_coef` | Per-reasoning-token reward deduction — curb overthinking, but watch it doesn't push the model into terse degeneracy.                                                                                                                                                                                                                                                                                              |
 | `learning_rate`                | Change it in small steps. Too high destabilizes RL and degrades output quality; if the model is collapsing, lower it.                                                                                                                                                                                                                                                                                             |
-| `batch_size`                   | The effective prompts-per-step, i.e. the OPTIMIZER batch (not the SFT memory knob of the same name). Too small and the reward trend is pure noise; size it so the trend is readable. `flash train` warns below 4, counting the `max_examples` clamp. On OPD it is also a memory lever; on GRPO it is not.                                                                                                         |
+| `prompts_per_step`                   | The effective prompts-per-step. Too small and the reward trend is pure noise; size it so the trend is readable.                                                                                                                                                                                                                                                                                                   |
 | `structured_outputs`           | Guided decoding for every GRPO/OPD rollout: a JSON schema (inline table or JSON string), `regex`, or `choice`. The sampler then _cannot_ emit off-format text, so the reward measures content instead of formatting. Works with `thinking = true`: the grammar is held until the `</think>` boundary (via a reasoning-aware decoding gate), so the model reasons freely first and only its answer is constrained. |
 
 For thinking models, `max_completion_tokens` is shared between `<think>` reasoning and the final
@@ -1080,12 +1046,12 @@ answer or action, so undersizing it can truncate the action and teach the model 
 watch `truncation_rate`, which counts completions not ending in EOS and is not strictly
 `finish_reason=length` when stop sequences or multi-turn rollouts are involved.
 
-> **On a derived horizon, `batch_size` buys optimizer steps cheaply.** `batch_size`
+> **On a derived horizon, `prompts_per_step` buys optimizer steps cheaply.** `prompts_per_step`
 > overrides the tuned prompts-per-step. Total generated tokens are
 > `steps x prompts_per_step x group_size x max_completion_tokens`, so when the step count
-> is _derived_ from the data, lowering `batch_size` raises it and leaves the token bill
+> is _derived_ from the data, lowering `prompts_per_step` raises it and leaves the token bill
 > roughly flat — the spend that buys 5 steps at the default batching buys ~80 at
-> `batch_size = 4`. A single-digit-step run is weak evidence either way: usually too few
+> `prompts_per_step = 4`. A single-digit-step run is weak evidence either way: usually too few
 > updates to show that a setup works, but — as the `temperature` row above notes — not too
 > few to destabilize one. Read a flat result at 5 steps as "not measured yet" rather than
 > "no effect," and check your batching before concluding you are under-funded. When you do
@@ -1095,7 +1061,7 @@ watch `truncation_rate`, which counts completions not ending in EOS and is not s
 >
 > Two things break the flat-cost approximation, so treat it as a hypothesis to check, not a
 > rule. **`[train] max_steps` overrides the derived horizon**: with it set the step count is
-> exactly what you asked for, lowering `batch_size` does not add steps at all, and you
+> exactly what you asked for, lowering `prompts_per_step` does not add steps at all, and you
 > simply train on fewer prompts. And per-step cost is not purely token-proportional —
 > GRPO reward waves and OPD teacher calls add latency per step, so multiplying steps can
 > multiply that overhead into a materially larger GPU bill. Smaller batches also mean
