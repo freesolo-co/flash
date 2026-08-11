@@ -314,7 +314,11 @@ HOST_CONTENT_ALT="$HOST_CONTENT_ALT|$(printf '%s' "$HOST_PLAIN" | sed 's/[.]/\\\
 # cannot eat the neighbours. The CLASS is shared, so the two agree on what a complete
 # address is -- and they must, since the counters are the gate over the rewrites: a
 # counter that matched more than the rewrite fixes would block publication forever.
-ALIAS_EDGE_CLASS='A-Za-z0-9._%+@-'
+# every RFC 5322 atext character plus dot and @: any of these adjacent to an alias means
+# the alias is a fragment of a longer address, not a complete one. the class feeds ERE and
+# python brackets directly; sed consumers must use a delimiter outside this set (comma) and
+# escape & in replacements.
+ALIAS_EDGE_CLASS="A-Za-z0-9._%+!#\$&'*/=?^\`{|}~@-"
 ALIAS_WORD_ERE="(^|[^$ALIAS_EDGE_CLASS])($ALIAS_ALT)([^$ALIAS_EDGE_CLASS]|\$)"
 LEAK_STRINGS_RE="$ALIAS_WORD_ERE|$HOST_CONTENT_ALT"
 
@@ -451,9 +455,12 @@ export FLASH_SCRUB_ALIAS_EDGE_CLASS="$ALIAS_EDGE_CLASS"
 # it a short alias redacts the middle of unrelated addresses in every reachable file.
 REPLACEMENTS="$WORKDIR/flash-scrub-replacements"
 {
+  # comma delimiter: the edge class now contains '|'. the class's own '&' must not expand
+  # to the sed match, so a replacement-safe copy escapes it.
+  _edge_sed="${ALIAS_EDGE_CLASS//&/\\&}"
   printf '%s' "$MAINTAINER_ALIAS_EMAILS" | tr ' ' '\n' | grep -v '^$' \
     | sed 's/[][^$.|?*+(){}\]/\\&/g' \
-    | sed "s|^|regex:(?i)(?<![$ALIAS_EDGE_CLASS])|; s|\$|(?![$ALIAS_EDGE_CLASS])==>REDACTED|"
+    | sed "s,^,regex:(?i)(?<![$_edge_sed]),; s,\$,(?![$_edge_sed])==>REDACTED,"
   # all three source spellings of the hostname, not just the fragment; see HOST_CONTENT_ALT.
   printf '%s' "$HOST_CONTENT_ALT" | tr '|' '\n' \
     | sed 's|^|regex:(?i)|; s|$|==>REDACTED|'
