@@ -497,7 +497,7 @@ def _overrides_cfg(**over):
         "fused_ce_backend": "torch",
         "train_files": "/w/train.parquet",
         "val_files": "/w/val.parquet",
-        "model_id": "Qwen/Qwen3-4B",
+        "model_path": "Qwen/Qwen3-4B",
         "lora_rank": 32,
         "lora_alpha": 64,
         "target_modules": "all-linear",
@@ -669,7 +669,7 @@ def test_build_verl_training_cfg_resolves_expert_targets_from_the_catalog_id():
     )
 
     # the weights still load from the snapshot dir ...
-    assert cfg["model_id"] == snapshot
+    assert cfg["model_path"] == snapshot
     # ... but the fused expert targets resolve from the catalog id.
     assert cfg["target_parameters"] == [
         "mlp.experts.gate_up_proj",
