@@ -420,6 +420,18 @@ class JobSpec:
     thinking: bool = False
     wandb: WandbSpec = field(default_factory=WandbSpec)
     model_revision: str = ""
+    # platform-managed marker: True when the runner resolved model_revision for a spec whose
+    # author left it blank (SFT, where `_resolve_model_revision(required=True)` pins the base so
+    # workload profiling keys on an immutable commit). An AUTHORED pin stays rejected at deploy;
+    # rejecting the auto-assigned one made every SFT run -- and every adapter warm-started from one
+    # -- permanently undeployable, unservable, and unscoreable by `flash env eval`.
+    #
+    # stripped by to_dict() like the other platform-managed carriers: the public spec must stay
+    # re-parseable by the submission schema, which rejects every key outside `_TOP_LEVEL_KEYS`, so
+    # emitting it would break the public-spec resubmission round trip. Deploy reads the provenance
+    # from the internal worker spec under `effective_preparation` instead (see
+    # `_internal_spec_from_status`), which carries it verbatim.
+    model_revision_auto: bool = False
     # platform-managed workload-profile carrier. public configs never author these fields.
     workload_profile_kind: str = ""
     workload_profile_input_digest: str = ""
@@ -437,6 +449,11 @@ class JobSpec:
     def __post_init__(self) -> None:
         object.__setattr__(self, "seed", parse_seed(self.seed))
         object.__setattr__(self, "model_revision", _model_revision(self.model_revision))
+        # the marker qualifies a pin; it cannot outlive one. a spec carrying it with no revision
+        # would let a later edit that clears model_revision leave a True marker behind, and the
+        # deploy guard reads the pair.
+        if self.model_revision_auto and not self.model_revision:
+            object.__setattr__(self, "model_revision_auto", False)
         profile_kind = str(self.workload_profile_kind or "")
         if profile_kind not in {"", "sft"}:
             raise ValueError("unsupported workload profile kind")
@@ -465,6 +482,20 @@ class JobSpec:
         data = asdict(self)
         # server-assigned identity — never authored in a config.
         data.pop("run_id", None)
+        # a runner-assigned pin leaves with its marker: emitting the SHA without the provenance
+        # that labels it would advertise a revision the author never wrote, and resubmitting that
+        # spec reads the bare SHA back as authored (`_resolve_model_revision` derives `authored`
+        # from the marker), so the re-run is stamped user-authored and deploy refuses it -- the
+        # exact rejection this pin marker exists to prevent. dropping both keeps the public spec a
+        # faithful record of what the user asked for, and the re-run gets a fresh runner pin.
+        # cleared, not popped: an unpinned spec emits `model_revision: ""`, and a spec rebuilt from
+        # this output has no marker left to re-trigger the branch -- so popping would make the key
+        # absent at create and present at re-persist, and `_preparation_digest` hashes to_dict()
+        # output. That drift breaks the integrity check on the re-persist path
+        # (`runner.submit` rebuilds public_spec from the stored dict) for the exact runs this PR
+        # exists to keep deployable. "" is also the honest value: nothing was authored.
+        if data.pop("model_revision_auto", None):
+            data["model_revision"] = ""
         data.pop("workload_profile_kind", None)
         data.pop("workload_profile_input_digest", None)
         data.pop("workload_profile_producer_version", None)
@@ -613,6 +644,7 @@ class JobSpec:
             thinking=coerce_bool(data.get("thinking", False)),
             wandb=_coerce_wandb(data.get("wandb")),
             seed=parse_seed(data.get("seed", FIXED_SEED)),
+            model_revision_auto=coerce_bool(data.get("model_revision_auto", False)),
             workload_profile_kind=str(data.get("workload_profile_kind") or ""),
             workload_profile_input_digest=str(data.get("workload_profile_input_digest") or ""),
             workload_profile_producer_version=str(

@@ -19,7 +19,6 @@ from pathlib import Path
 
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.sft_train import (
-    _durable_required_save_steps,
     _export_checkpoint_adapter,
     _VerlCheckpointWatcher,
 )
@@ -332,13 +331,6 @@ def _restore_verl_resume(
     with open(os.path.join(local_dir, "latest_checkpointed_iteration.txt"), "w") as file:
         file.write(str(step))
     return step, state
-
-
-def _processed_resume_steps(required_steps: tuple[int, ...], resume_step: int) -> set[int]:
-    processed = _durable_required_save_steps(required_steps, resume_step)
-    if resume_step and resume_step not in required_steps:
-        processed.add(resume_step)
-    return processed
 
 
 # the teacher exit codes the child uses, defined in the orchestrator. imported at the BOTTOM

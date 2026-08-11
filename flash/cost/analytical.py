@@ -618,8 +618,10 @@ def estimate_profile_cost(config: RunConfig, *, allocation=None) -> CostEstimate
         gpu_count=billed_gpu_count,
         total_usd=wall_s / 3600.0 * hourly * billed_gpu_count,
         notes=(
-            f"workload profile job: billed at most its {_fmt_duration(wall_s)} wall cap "
-            "(no optimizer steps)",
+            (
+                f"workload profile job: billed at most its {_fmt_duration(wall_s)} wall cap "
+                "(no optimizer steps)"
+            ),
         ),
     )
 
