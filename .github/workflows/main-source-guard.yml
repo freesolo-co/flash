@@ -13,12 +13,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Require PRs into main to originate from dev
+      - name: Require PRs into main to originate from this repo's dev branch
         env:
           HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          UPSTREAM_REPO: ${{ github.repository }}
         run: |
-          if [ "$HEAD_REF" != "dev" ]; then
-            echo "::error::PRs into main must come from 'dev' (got '$HEAD_REF'). Merge into dev, then promote dev -> main."
+          # provenance is checked BEFORE the branch name, because the name alone proves nothing.
+          # `github.head_ref` is the branch name inside the HEAD repository, which for a fork PR is
+          # whatever the fork owner called it, so a name-only check goes green for anyone who
+          # forks this repo, names a branch `dev`, and opens a PR straight into main. under the
+          # documented dev -> main promotion model a cross-repo head is never legitimate, so it is
+          # rejected outright rather than compared by name.
+          #
+          # an unset HEAD_REPO (deleted fork, non-pull_request event) is an empty string here and
+          # therefore fails closed.
+          if [ "$HEAD_REPO" != "$UPSTREAM_REPO" ]; then
+            echo "::error::fork source not allowed for main: this PR's head repository is '$HEAD_REPO', not '$UPSTREAM_REPO'. Open contributions against dev; only a dev -> main promotion inside '$UPSTREAM_REPO' may target main."
             exit 1
           fi
-          echo "Source branch '$HEAD_REF' is allowed."
+          if [ "$HEAD_REF" != "dev" ]; then
+            echo "::error::wrong source branch: PRs into main must come from 'dev' (got '$HEAD_REF'). Merge into dev, then promote dev -> main."
+            exit 1
+          fi
+          echo "Source '$HEAD_REPO' branch '$HEAD_REF' is allowed."
