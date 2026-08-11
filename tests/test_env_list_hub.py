@@ -157,6 +157,40 @@ def test_a_namespace_entry_with_an_unusable_sha_raises_instead_of_reporting_empt
         loader.list_managed_namespace_slugs("acme")
 
 
+@pytest.mark.parametrize(
+    "bad_type",
+    [None, 123, "", {"kind": "tree"}],
+    ids=["missing", "not-a-string", "empty", "object"],
+)
+def test_a_namespace_entry_with_an_unusable_type_raises_instead_of_reporting_empty(
+    monkeypatch, bad_type
+):
+    """An unreadable type on the namespace entry must not collapse to "nothing published".
+
+    Same failure as the sha case, one field over: the entry for this namespace IS present, so
+    discarding it lands on the `root is None` branch and answers empty -- indistinguishable from an
+    org that has published nothing.
+    """
+    entry = {"path": "acme", "sha": "sha-acme"}
+    if bad_type is not None:
+        entry["type"] = bad_type
+    _fake_hub(monkeypatch, {"main": _tree(entry, _dir("other-org", "sha-other"))})
+
+    with pytest.raises(RuntimeError, match="unusable type"):
+        loader.list_managed_namespace_slugs("acme")
+
+
+def test_a_namespace_path_that_is_a_file_is_not_an_environment_namespace(monkeypatch):
+    """A well-formed non-tree at the namespace path is a readable answer, so it stays empty.
+
+    `_github_publish` writes a directory; a stray FILE named after the namespace is unambiguously
+    not one. Rejecting it would fail a hub response we can read perfectly well.
+    """
+    _fake_hub(monkeypatch, {"main": _tree(_blob("acme"), _dir("other-org", "sha-other"))})
+
+    assert loader.list_managed_namespace_slugs("acme") == []
+
+
 def test_an_unusable_sha_reaches_the_caller_as_502(monkeypatch):
     """The loud failure must arrive as the controlled gateway error, not an uncaught 500."""
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")

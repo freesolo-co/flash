@@ -509,18 +509,28 @@ def list_managed_namespace_slugs(namespace: str) -> list[str]:
     if ref is None:  # pragma: no cover - the literal above always parses
         raise RuntimeError("could not build a managed environment reference")
 
-    # match on identity only, and validate the sha separately below. folding `isinstance(sha, str)`
-    # into this predicate would make a malformed entry look like a MISSING one, so a broken hub
-    # response would report "nothing published" -- the exact failure this endpoint exists to remove.
+    # match on the PATH only, then validate type and sha below. folding either check into this
+    # predicate would make a malformed entry look like a MISSING one, so a broken hub response would
+    # report "nothing published" -- the exact failure this endpoint exists to remove.
     root = next(
         (
             entry
             for entry in _github_tree_entries(ref, ref.ref, ref.ref, **_LIST_READ_BUDGET)
-            if entry.get("path") == namespace and entry.get("type") == "tree"
+            if entry.get("path") == namespace
         ),
         None,
     )
     if root is None:
+        return []
+    root_type = root.get("type")
+    if not isinstance(root_type, str) or not root_type:
+        raise RuntimeError(
+            f"GitHub tree entry for environment namespace {namespace!r} has an unusable type; "
+            "the hub listing could not be read"
+        )
+    # a well-formed non-tree is a readable answer, not a broken one: `_github_publish` writes a
+    # directory, so a stray file at this path is unambiguously not an environment namespace.
+    if root_type != "tree":
         return []
     root_sha = root.get("sha")
     if not isinstance(root_sha, str) or not root_sha:
