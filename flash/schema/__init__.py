@@ -689,20 +689,30 @@ def _reject_inapplicable_train_knobs(spec: JobSpec) -> None:
 
 
 def _validate_grpo(spec: JobSpec) -> None:
-    """validate the grpo group-size constraint."""
+    """validate the grpo group-size and prompt-budget constraints."""
     if spec.train.group_size is not None and spec.train.group_size < 2:
         raise ConfigError(
             "train.group_size must be >= 2 for GRPO (advantages are group-relative, so a "
             "prompt needs at least two generations to compare against)"
         )
+    _validate_on_policy_prompt_budget(spec, "grpo")
 
 
 def _validate_on_policy_prompt_budget(spec: JobSpec, algorithm: str) -> None:
+    """reject a context that leaves no prompt room once the completion budget is reserved.
+
+    each algorithm resolves its completion length off its own recipe, so read it through the same
+    helper its worker does, since a shared number would reject runs the worker accepts. the worker
+    clamps the requested context down to the model architecture before subtracting
+    (`train/rl/inputs.py`, `opd_train_runner`), and clamping can only shrink the budget, so
+    checking the unclamped value here is never stricter than the worker's own enforcement.
+    """
     if not spec.train.max_context_tokens:
         return
-    from flash.engine.plan.vram import opd_completion_len
+    from flash.engine.plan.vram import grpo_completion_len, opd_completion_len
 
-    max_completion = opd_completion_len(spec.train.max_completion_tokens, spec.thinking)
+    resolve = grpo_completion_len if algorithm == "grpo" else opd_completion_len
+    max_completion = resolve(spec.train.max_completion_tokens, spec.thinking)
     if spec.train.max_context_tokens - max_completion < 1:
         raise ConfigError(
             f"[train] max_context_tokens ({spec.train.max_context_tokens}) leaves no prompt budget "

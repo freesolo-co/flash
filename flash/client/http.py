@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import codecs
 import contextlib
+import http.client
 import json
 import os
 import time
@@ -91,10 +92,10 @@ def has_freesolo_backend(api_url: str) -> bool:
     A false positive is the safe direction: assuming a backend exists yields today's behaviour
     (an authenticated call that may fail) rather than refusing a deployment that works.
 
-    Two older callers still decide on the url alone -- ``client.resolve_project_id`` and the
-    interactive branch of ``cli.env_setup`` -- so they refuse a configured backend this would
-    accept. Routing them through here is a behaviour change to paths this helper was not added
-    for, so it is deliberately left as follow-up rather than folded in silently.
+    ``client.resolve_project_id`` and the interactive branch of ``cli.env_setup`` used to decide on
+    the url alone, which answered this question twice and more narrowly: they refused a configured
+    backend this accepts, and skipped the ownership check for one. Both now route through here, so
+    this is the single classifier.
 
     Takes a plain ``str`` because ``load_credentials`` falls back to ``DEFAULT_API_URL`` and so
     never yields ``None``; accepting an optional here would invent a state no caller can reach.
@@ -868,19 +869,30 @@ class ApiClient:
             read1 = getattr(resp, "read1", None)
             read = read1 if read1 is not None else resp.read
             read_size = 4096 if read1 is not None else 1
-            while raw := read(read_size):
-                state = decoder.getstate()
-                try:
-                    decoded = decoder.decode(raw)
-                except UnicodeDecodeError as exc:
-                    decoder.setstate(state)
-                    prefix_end = max(0, exc.start - len(state[0]))
-                    yield from decoder.decode(raw[:prefix_end])
-                    # bind + re-raise explicitly: the yield above clears the active exception, so a
-                    # bare `raise` here would fail with "No active exception to reraise".
-                    raise exc
-                yield from decoded
-            yield from decoder.decode(b"", final=True)
+            try:
+                while raw := read(read_size):
+                    state = decoder.getstate()
+                    try:
+                        decoded = decoder.decode(raw)
+                    except UnicodeDecodeError as exc:
+                        decoder.setstate(state)
+                        prefix_end = max(0, exc.start - len(state[0]))
+                        yield from decoder.decode(raw[:prefix_end])
+                        # bind + re-raise explicitly: the yield above clears the active
+                        # exception, so a bare `raise` here would fail with "No active
+                        # exception to reraise".
+                        raise exc
+                    yield from decoded
+                yield from decoder.decode(b"", final=True)
+            except (http.client.IncompleteRead, ConnectionError) as exc:
+                # the server aborts the chunked response when the serving backend fails
+                # mid-generation; urllib reports the missing terminating chunk (or reset) here.
+                # translate it so the caller raises instead of treating the truncated text as a
+                # finished answer.
+                raise ClientError(
+                    "chat stream ended unexpectedly before completion; the serving backend "
+                    "likely failed mid-generation, so any partial output is truncated"
+                ) from exc
 
 
 def client_from_config(require_key: bool = True) -> ApiClient:

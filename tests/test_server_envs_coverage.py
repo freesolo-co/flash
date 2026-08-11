@@ -401,13 +401,16 @@ def test_recover_deployments_fails_busy_and_skips_missing(monkeypatch):
     held_lock = _RunLock("r-held")
     assert held_lock.acquire(blocking=False) is True
     try:
-        assert serving.recover_deployments() == 1
+        # r-stale and r-fresh both recover: the lock is the ownership proof, so a busy record whose
+        # lock this pass can take has no live lifecycle whatever its timestamp says. r-held is the
+        # one that must survive -- its lock is genuinely held, so a live owner still has it.
+        assert serving.recover_deployments() == 2
     finally:
         held_lock.release()
-    assert [run_id for run_id, _failed in marked] == ["r-stale"]
+    assert sorted(run_id for run_id, _failed in marked) == ["r-fresh", "r-stale"]
     assert all(failed["state"] == "failed" for _run_id, failed in marked)
     assert all("control-plane restart" in failed["error"] for _run_id, failed in marked)
-    assert [status.run_id for status in reported] == ["r-stale"]
+    assert sorted(status.run_id for status in reported) == ["r-fresh", "r-stale"]
     assert all(status.deployment["state"] == "failed" for status in reported)
 
 

@@ -18,6 +18,7 @@ from flash.providers.base import (
     JobHandle,
     PollResult,
     Provider,
+    UnsupportedGpuError,
     rentable_gpu_counts,
 )
 
@@ -135,7 +136,14 @@ class VastProvider(InstanceProvider):
         cap; the Vast package prices against the SAME effective disk/duration floors the submit path
         provisions with, so a high-disk or long run isn't advertised capacity it couldn't actually rent (an
         impossible attempt a max_retries=0 run never escapes).
+
+        Offers nothing at all when a private worker image is configured that this substrate cannot
+        authenticate (see ``_private_image_problem``), so the allocator never rents a box whose
+        image pull is certain to fail.
         """
+        problem = self._private_image_problem()
+        if problem:
+            raise UnsupportedGpuError(problem)
         from flash.providers.vast.pricing import live_candidate_rates
 
         fitting = [g for g in self.gpu_classes() if g.vram_gb >= need_vram_gb]

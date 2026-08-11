@@ -1103,6 +1103,31 @@ def test_select_candidate_escapes_failed_provider_then_walks_classes():
     assert (chosen.provider, chosen.gpu) == ("runpod", "RTX Pro 6000")
 
 
+def test_select_candidate_keeps_the_allocators_per_step_ranking():
+    """The picker must take the allocator's order, not re-price the list by hourly rate.
+
+    ``allocate()`` ranks on the dollars one optimizer STEP costs, so a faster card can rank first
+    while costing more per hour -- the real Qwen3.5-0.8B OPD case ranks the $0.99/hr RTX 5090 ahead
+    of the $0.69/hr RTX 4090. Re-sorting here on total $/hr overrode that on the FIRST paid attempt,
+    running the slower card for more total money. Ordering is the allocator's job; this picker only
+    demotes failed providers and tried shapes.
+    """
+    from flash.providers.base import Candidate
+    from flash.runner.supervise.lifecycle import _select_candidate
+
+    # as allocate() returns them: cheapest PER STEP first, which is NOT cheapest per hour.
+    ranked = (
+        Candidate("runpod", "RTX 5090", 0.99, 32),
+        Candidate("runpod", "RTX 4090", 0.69, 24),
+    )
+    assert _select_candidate(ranked, set(), set()) is ranked[0]
+
+    # the demotion keys still outrank the allocator's order: once the per-step winner's shape has
+    # been tried, the walk moves on rather than re-picking it.
+    chosen = _select_candidate(ranked, set(), {("runpod", "RTX 5090", 1)})
+    assert chosen.gpu == "RTX 4090"
+
+
 def test_select_candidate_single_provider_walks_classes():
     """With only one provider configured, the picker degrades to the cheapest untried class."""
     from flash.providers.base import Candidate

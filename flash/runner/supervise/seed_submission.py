@@ -350,7 +350,7 @@ def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOut
 def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
     from flash.providers.allocator import allocate
     from flash.providers.base import PollResult, UnsupportedGpuError
-    from flash.runner import get_status
+    from flash.runner import _load_run_deadline_at, get_status
 
     # a cancel can land after _run_training's pre-submit check but while
     # allocation/pricing runs, when no handle exists yet for cancel_run() to
@@ -371,8 +371,14 @@ def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
             # only exists at 60 gb and then can't rent.
             disk_gb=float(getattr(prepared.attempt_spec.gpu, "disk_gb", 0.0) or 0.0),
             # the remaining run-global wall cap, so retries cannot reset the duration budget.
-            max_wall_seconds=float(
-                getattr(prepared.attempt_spec.gpu, "max_wall_seconds", 0.0) or 0.0
+            # searched at the LAUNCH DEADLINE, not the bare work grant: vast's rent-duration floor
+            # widens the offer search to the deadline, and an unarmed profile carries a queue
+            # allowance on top of its grant. Searching on the grant alone advertised classes whose
+            # offers expire before submit's own floor, so the rent then found nothing at the wider
+            # window and the run failed on capacity that was never really there.
+            max_wall_seconds=max(
+                float(getattr(prepared.attempt_spec.gpu, "max_wall_seconds", 0.0) or 0.0),
+                max(0.0, _load_run_deadline_at(ctx.spec.run_id) - _lifecycle.time.time()),
             ),
             provider=getattr(prepared.attempt_spec.gpu, "provider", ""),
             gpu_type=getattr(prepared.attempt_spec.gpu, "type", ""),

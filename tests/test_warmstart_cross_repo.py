@@ -268,6 +268,272 @@ def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
         R._prepare_init_from_adapter(child, token="token")
 
 
+class _ReachedArtifactResolution(Exception):
+    """Sentinel: execution got past the warm-start revision check."""
+
+
+def test_warm_start_inherits_a_runner_assigned_source_revision(monkeypatch):
+    """A GRPO child warm-starting off SFT inherits the parent's auto pin AND its provenance.
+
+    SFT is always force-pinned by the runner, and this check demands the child's revision equal the
+    source's. Before this, satisfying it meant the AUTHOR writing the sha into rl.toml -- which made
+    the child's pin author-supplied, which deploy refuses. So a warm start off SFT could pass this
+    check or be deployable, never both.
+
+    The paired control is `test_prepare_init_adapter_requires_exact_model_revision_match` above: its
+    source pin carries no marker (author-supplied), so nothing is inherited and the mismatch still
+    raises. Only the provenance differs between the two.
+    """
+    import flash.runner as R
+    from flash.core.spec import JobSpec
+
+    source = JobSpec.from_dict(
+        {
+            "run_id": "source-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "model_revision": _REVISION,
+            "model_revision_auto": True,
+            "algorithm": "sft",
+            "train": {"hf_repo": "owner/source-runs"},
+        }
+    )
+    source_status = provisioned_status(R, source, state="done")
+    child = JobSpec.from_dict(
+        {
+            "run_id": "child-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
+            "train": {"init_from_adapter": "source-run"},
+        }
+    )
+    monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
+    monkeypatch.setattr(R, "_internal_spec_from_status", lambda status: source, raising=False)
+
+    # stop right after the revision reconciliation with a sentinel: the artifact and rank
+    # preflights below it need real HF state, and this test is only about which revision the child
+    # ends up carrying. Reaching the sentinel IS the pass condition -- it means execution got past
+    # the equality check, which is what used to raise.
+    monkeypatch.setattr(
+        "flash.adapters.lora_rank.resolve_hf_dataset_revision",
+        lambda *_a, **_kw: "rev",
+    )
+    monkeypatch.setattr(
+        "flash.runner.results.checkpoints.adapter_artifact_exists",
+        lambda *_a, **_kw: (_ for _ in ()).throw(_ReachedArtifactResolution()),
+        raising=False,
+    )
+
+    # `_inner`, not the public wrapper: the wrapper re-raises everything as
+    # WarmStartPreparationError, which would swallow the sentinel and the mismatch alike and leave
+    # this test unable to tell them apart. A bare `raises(Exception)` has the same problem -- it
+    # would pass on the very mismatch this test exists to rule out.
+    with pytest.raises(_ReachedArtifactResolution):
+        R._prepare_init_from_adapter_inner(child, token="token")
+
+
+def test_warm_start_pin_is_inherited_before_the_spec_is_sized_against_it(monkeypatch):
+    """The inherited pin must be on the spec BEFORE `resolve_model` sizes the run.
+
+    Sizing reads the revision: `resolve_model` re-derives params/vocab from the pinned commit and
+    raises `min_disk_gb` to `params_b * 2 + 64`, which for half of today's catalog exceeds the
+    catalog default (Qwen3.5-4B: 0 -> 73). Inheriting inside `_prepare_init_from_adapter`, which
+    runs after `resolve_model`, `_with_model_disk`, and `_assign_weight_cache_volume`, provisions
+    the child as if unpinned while training it pinned, and skips the geometry validation the pin
+    exists to enforce.
+
+    So this asserts the ORDER, not just the final value: what `resolve_model` was handed. The
+    sibling test above covers the value; only this one fails if the inheritance moves back down.
+    """
+    import flash.adapters.lora_rank as rank_mod
+    import flash.cost.spec as cost_spec
+    import flash.runner as R
+    import flash.runner.results.checkpoints as checkpoints
+    from flash.core.spec import JobSpec
+
+    source = JobSpec.from_dict(
+        {
+            "run_id": "source-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "model_revision": _REVISION,
+            "model_revision_auto": True,
+            "algorithm": "sft",
+            "train": {"hf_repo": "owner/source-runs"},
+        }
+    )
+    source_status = provisioned_status(R, source, state="done")
+    child = JobSpec.from_dict(
+        {
+            "run_id": "child-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
+            "train": {"init_from_adapter": "source-run", "lora_rank": 8, "lora_alpha": 16},
+        }
+    )
+    seen_revisions = []
+
+    monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
+    # the resolver would hit the HF API for the sha; the pin is already immutable, so echo it back
+    monkeypatch.setattr(R, "_resolve_model_revision", lambda spec, *, required=False: spec)
+
+    real_resolve = R.resolve_model
+
+    def spy(model_id, algorithm, model_revision=""):
+        seen_revisions.append(model_revision)
+        return real_resolve(model_id, algorithm)  # unpinned: no HF geometry fetch in a unit test
+
+    monkeypatch.setattr(R, "resolve_model", spy)
+    monkeypatch.setattr(rank_mod, "resolve_hf_dataset_revision", lambda repo, token: _REVISION)
+    monkeypatch.setattr(
+        checkpoints, "adapter_artifact_exists", lambda spec, *, step, revision=None: True
+    )
+    monkeypatch.setattr(
+        rank_mod,
+        "load_hf_adapter_config",
+        lambda adapter_ref, token, revision: {
+            "peft_type": "LORA",
+            "task_type": "CAUSAL_LM",
+            "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+            "r": 64,
+            "lora_alpha": 128,
+        },
+    )
+    monkeypatch.setattr(
+        rank_mod,
+        "adapter_artifact_identity",
+        lambda *a, **k: rank_mod.AdapterArtifactIdentity(
+            "digest", "config", "adapter_model.safetensors", "weight:1"
+        ),
+    )
+    monkeypatch.setattr(cost_spec, "estimate_for_spec", lambda spec: SimpleNamespace(total_usd=1.0))
+
+    prepared = R.prepare_job(child)
+
+    assert seen_revisions == [_REVISION], seen_revisions
+    assert prepared.worker_spec.model_revision == _REVISION
+    # and the provenance survives, or deploy refuses the child for a pin it never wrote
+    assert prepared.worker_spec.model_revision_auto is True
+
+
+def _auto_pinned_source(R, *, org_id="org-a"):
+    """A completed, auto-pinned SFT source run owned by ``org_id``."""
+    from flash.core.spec import JobSpec
+
+    source = JobSpec.from_dict(
+        {
+            "run_id": "source-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "model_revision": _REVISION,
+            "model_revision_auto": True,
+            "algorithm": "sft",
+            "train": {"hf_repo": "owner/source-runs"},
+        }
+    )
+    status = provisioned_status(
+        R, source, state="done", billing_context={"org_id": org_id} if org_id else None
+    )
+    return source, status
+
+
+def _unpinned_child():
+    from flash.core.spec import JobSpec
+
+    return JobSpec.from_dict(
+        {
+            "run_id": "child-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
+            "train": {"init_from_adapter": "source-run"},
+        }
+    )
+
+
+def test_revision_inheritance_refuses_a_source_the_submitter_cannot_access(monkeypatch):
+    """Inheritance must authorize the source BEFORE reading its internals.
+
+    The hoisted adoption runs before `_prepare_init_from_adapter`, which is where the same-org
+    check used to gate every read of a source run. Without its own check, a child naming another
+    org's auto-pinned run would adopt that run's internal revision, and `prepare_job` would then
+    do revision-specific `resolve_model` and operator-token HF work against a run the submitter
+    cannot access -- surfacing revision-dependent behaviour as ordinary preparation errors rather
+    than the deliberately redacted warm-start error.
+
+    Not inheriting is the whole assertion: the submission still fails, but through
+    `_prepare_init_from_adapter`'s same-org error, which is the redacted path.
+    """
+    import flash.runner as R
+
+    _, status = _auto_pinned_source(R, org_id="org-a")
+    monkeypatch.setattr(R, "get_status", lambda run_id: status)
+
+    child = _unpinned_child()
+    # same org -> inherited
+    assert R._inherit_warmstart_revision(child, owner_org_id="org-a").model_revision == _REVISION
+    # different org -> untouched, and the pin never reaches sizing
+    foreign = R._inherit_warmstart_revision(child, owner_org_id="org-b")
+    assert foreign.model_revision == ""
+    assert foreign.model_revision_auto is False
+
+
+def test_revision_inheritance_refuses_a_tampered_source_snapshot(monkeypatch):
+    """Inheritance must read through the VALIDATING loader, not the raw internal one.
+
+    `_internal_spec_from_status` returns `snapshot["worker_spec"]` unverified.
+    `effective_spec_from_status` checks public/worker equality and the preparation digest first.
+    Adopting an unverified internal revision would make the child match a tampered source, so the
+    later revision-mismatch guard -- which exists to catch exactly this -- would compare two equal
+    values and pass. The child would then train the source adapter against base weights it was
+    never created for.
+    """
+    import flash.runner as R
+
+    _, status = _auto_pinned_source(R, org_id="org-a")
+    # tamper: the worker half claims a different base commit than the public half
+    status.effective_preparation["worker_spec"]["model_revision"] = "b" * 40
+    monkeypatch.setattr(R, "get_status", lambda run_id: status)
+
+    inherited = R._inherit_warmstart_revision(_unpinned_child(), owner_org_id="org-a")
+
+    assert inherited.model_revision == ""  # nothing adopted from an unverified snapshot
+    assert inherited.model_revision_auto is False
+
+
+def test_warm_start_preparation_refuses_a_tampered_source_snapshot(monkeypatch):
+    """The SECOND adoption site must refuse a tampered source too.
+
+    `_prepare_init_from_adapter_inner` re-runs `_adopted_warmstart_revision` so the equality check
+    below it cannot depend on which entry point was used. That repeat is a second place a revision
+    is copied off the source, and it read the unvalidated `_internal_spec_from_status`. Hardening
+    only the hoisted path leaves this one adopting a tampered worker-half revision, after which the
+    equality check compares the child against the value it just copied -- two equal values, so it
+    passes.
+
+    The sibling `test_revision_inheritance_refuses_a_tampered_source_snapshot` covers the hoisted
+    function and never enters this one, which is exactly why this path needs its own test.
+    """
+    import flash.runner as R
+
+    _, status = _auto_pinned_source(R, org_id="org-a")
+    status.effective_preparation["worker_spec"]["model_revision"] = "b" * 40
+    monkeypatch.setattr(R, "get_status", lambda run_id: status)
+    # would be reached only if the tampered pin were adopted; getting here at all is the failure
+    monkeypatch.setattr(
+        "flash.adapters.lora_rank.resolve_hf_dataset_revision", lambda *_a, **_kw: "rev"
+    )
+    monkeypatch.setattr(
+        "flash.runner.results.checkpoints.adapter_artifact_exists",
+        lambda *_a, **_kw: (_ for _ in ()).throw(_ReachedArtifactResolution()),
+        raising=False,
+    )
+
+    # either guard inside the validating loader is a correct refusal: this source is auto-pinned,
+    # so the digest check now fires before the structural compare can. Matching one specific
+    # message would pin WHICH guard catches it rather than THAT it is caught, so this asserts the
+    # refusal and rules out the sentinel -- reaching artifact resolution means the tampered pin was
+    # adopted, which is the actual regression.
+    with pytest.raises(ValueError, match=r"preparation failed integrity|match the public run"):
+        R._prepare_init_from_adapter_inner(_unpinned_child(), owner_org_id="org-a", token="token")
+
+
 def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
     import types
 

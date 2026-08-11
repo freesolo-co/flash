@@ -386,8 +386,8 @@ def test_total_token_quota_is_reserved_before_dispatch_and_never_overshoots(brok
     assert db.teacher_capability_binding(token)["token_count"] == 74
 
 
-def test_stale_started_request_becomes_outcome_unknown_and_never_redispatches(broker_db):
-    token = _issue()
+def test_stale_started_request_is_readmitted_only_within_the_attempt_bound(broker_db):
+    token = _issue(limits=_limits(max_upstream_attempts=2))
     reservation = db.reserve_teacher_request(
         token=token,
         request_id="request-stale-000001",
@@ -397,7 +397,8 @@ def test_stale_started_request_becomes_outcome_unknown_and_never_redispatches(br
         expected_run_id="run-1",
         expected_attempt=2,
     )
-    db.mark_teacher_request_started(reservation["capability"]["id"], "request-stale-000001")
+    capability_id = reservation["capability"]["id"]
+    db.mark_teacher_request_started(capability_id, "request-stale-000001")
     db.reserve_teacher_request(
         token=token,
         request_id="request-reserved-0001",
@@ -412,7 +413,26 @@ def test_stale_started_request_becomes_outcome_unknown_and_never_redispatches(br
 
     assert recovered == {"retryable": 1, "outcome_unknown": 1}
     assert db.teacher_capability_binding(token)["token_count"] == 128
-    with pytest.raises(db.TeacherLedgerError, match="outcome_unknown"):
+    # the outcome_unknown row is readmitted without charging its token reservation again ...
+    readmitted = db.reserve_teacher_request(
+        token=token,
+        request_id="request-stale-000001",
+        request_fingerprint="a" * 64,
+        request_bytes=10,
+        score_items=1,
+        expected_run_id="run-1",
+        expected_attempt=2,
+    )
+    assert readmitted["request"]["state"] == "reserved"
+    assert db.teacher_capability_binding(token)["token_count"] == 128
+    # ... and the second dispatch spends the last budgeted attempt.
+    db.mark_teacher_request_started(capability_id, "request-stale-000001")
+
+    assert db.recover_teacher_request_ledger() == {"retryable": 0, "outcome_unknown": 1}
+    # the budget is now spent, so readmission itself refuses before touching any counter: the
+    # row must keep its terminal state and held reservation rather than bounce to 'retryable'
+    # and stay readmissible forever.
+    with pytest.raises(db.TeacherLedgerError, match="upstream_attempt_quota_exhausted"):
         db.reserve_teacher_request(
             token=token,
             request_id="request-stale-000001",
@@ -422,6 +442,17 @@ def test_stale_started_request_becomes_outcome_unknown_and_never_redispatches(br
             expected_run_id="run-1",
             expected_attempt=2,
         )
+    connection = sqlite3.connect(broker_db)
+    connection.row_factory = sqlite3.Row
+    row = connection.execute(
+        "SELECT state, upstream_attempt_count FROM teacher_score_requests "
+        "WHERE request_id = 'request-stale-000001'"
+    ).fetchone()
+    in_flight = connection.execute("SELECT in_flight FROM teacher_capabilities").fetchone()[0]
+    connection.close()
+    assert (row["state"], row["upstream_attempt_count"]) == ("outcome_unknown", 2)
+    assert in_flight == 0
+    assert db.teacher_capability_binding(token)["token_count"] == 128
 
 
 def test_closed_parasail_contract_rejects_extra_fields_model_changes_and_batches(broker_db):
@@ -597,19 +628,26 @@ def test_provider_error_body_is_suppressed_from_response_and_sqlite(broker_db, m
     assert token not in dump
 
 
-@pytest.mark.parametrize("status", [429, 500, 503, 400, 404])
-def test_every_provider_reject_is_terminal_for_the_logical_request(broker_db, monkeypatch, status):
-    """a 429 is terminal here, and the ledger is why -- not a classification judgement.
+@pytest.mark.parametrize("status", [408, 429, 500, 502, 503])
+def test_transient_provider_rejects_are_readmitted_and_dispatch_again(
+    broker_db, monkeypatch, status
+):
+    """408, 429 and 5xx are provider-side conditions a retry can outlive.
 
-    MAX_UPSTREAM_ATTEMPTS is 1, so mark_teacher_request_started refuses a second upstream call, and
-    reserve_teacher_request re-admits only rows in state 'retryable'. a completed 'provider_rejected'
-    row cannot be reopened, so calling a 429 retryable would buy the worker a round trip that comes
-    back permanent and drops the score anyway. this pins that contract: recovering shed load is
-    broker lifecycle work (attempt budget above 1 plus re-admission of a 'started' row).
+    the ledger records the rejection with error_class 'transient' so the row stays readmissible,
+    the broker reports it retryable, and a follow-up call with the same request_id dispatches
+    upstream again under the max_upstream_attempts bound, settling and billing exactly once.
     """
     _service_ready(monkeypatch)
-    token = _issue()
-    monkeypatch.setattr(teacher_broker, "_provider_post", lambda *_args: (status, b"upstream"))
+    token = _issue(limits=_limits(max_upstream_attempts=teacher_broker.MAX_UPSTREAM_ATTEMPTS))
+    outcomes = [(status, b"upstream"), (200, _response())]
+    dispatches = []
+
+    def dispatch(*_args):
+        dispatches.append(1)
+        return outcomes[len(dispatches) - 1]
+
+    monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
 
     with pytest.raises(teacher_broker.TeacherBrokerError) as error:
         teacher_broker.complete_teacher_request(
@@ -617,10 +655,116 @@ def test_every_provider_reject_is_terminal_for_the_logical_request(broker_db, mo
             request_id="request-shed-00000001",
             raw_body=_body(),
         )
+    assert error.value.code == "provider_rejected"
+    assert error.value.retryable is True
+    assert error.value.payload()["error"]["classification"] == "transient"
 
+    replayed = teacher_broker.complete_teacher_request(
+        capability_token=token,
+        request_id="request-shed-00000001",
+        raw_body=_body(),
+    )
+
+    assert replayed["choices"]
+    assert len(dispatches) == 2
+    connection = sqlite3.connect(broker_db)
+    row = connection.execute(
+        "SELECT state, upstream_attempt_count, input_tokens, output_tokens "
+        "FROM teacher_score_requests WHERE request_id = 'request-shed-00000001'"
+    ).fetchone()
+    token_count = connection.execute("SELECT token_count FROM teacher_capabilities").fetchone()[0]
+    connection.close()
+    assert row == ("succeeded", 2, 1, 1)
+    # billed once: the token reservation settles to the single succeeded call's actual usage.
+    assert token_count == 2
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 422])
+def test_genuine_4xx_provider_rejects_stay_terminal(broker_db, monkeypatch, status):
+    """a non-429 4xx means the request or credential itself is rejected; retrying cannot help."""
+    _service_ready(monkeypatch)
+    token = _issue(limits=_limits(max_upstream_attempts=teacher_broker.MAX_UPSTREAM_ATTEMPTS))
+    dispatches = []
+
+    def dispatch(*_args):
+        dispatches.append(1)
+        return status, b"upstream"
+
+    monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
+
+    with pytest.raises(teacher_broker.TeacherBrokerError) as error:
+        teacher_broker.complete_teacher_request(
+            capability_token=token,
+            request_id="request-perm-00000001",
+            raw_body=_body(),
+        )
     assert error.value.code == "provider_rejected"
     assert error.value.retryable is False
     assert error.value.payload()["error"]["classification"] == "permanent"
+
+    with pytest.raises(teacher_broker.TeacherBrokerError) as duplicate:
+        teacher_broker.complete_teacher_request(
+            capability_token=token,
+            request_id="request-perm-00000001",
+            raw_body=_body(),
+        )
+    assert duplicate.value.code == "provider_rejected"
+    assert duplicate.value.retryable is False
+    assert len(dispatches) == 1
+
+
+def test_upstream_attempts_are_bounded_even_for_transient_rejects(broker_db, monkeypatch):
+    _service_ready(monkeypatch)
+    token = _issue(limits=_limits(max_upstream_attempts=2))
+    dispatches = []
+
+    def dispatch(*_args):
+        dispatches.append(1)
+        return 503, b"unavailable"
+
+    monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
+
+    for _attempt in range(2):
+        with pytest.raises(teacher_broker.TeacherBrokerError) as error:
+            teacher_broker.complete_teacher_request(
+                capability_token=token,
+                request_id="request-bound-0000001",
+                raw_body=_body(),
+            )
+        assert error.value.code == "provider_rejected"
+        assert error.value.retryable is True
+
+    with pytest.raises(teacher_broker.TeacherBrokerError) as exhausted:
+        teacher_broker.complete_teacher_request(
+            capability_token=token,
+            request_id="request-bound-0000001",
+            raw_body=_body(),
+        )
+    assert exhausted.value.code == "upstream_attempt_quota_exhausted"
+    assert exhausted.value.retryable is False
+    assert len(dispatches) == 2
+
+    # the refusal happens at readmission, so the row keeps its terminal state and its held
+    # reservation instead of bouncing to 'retryable' and staying readmissible forever.
+    with pytest.raises(teacher_broker.TeacherBrokerError) as repeated:
+        teacher_broker.complete_teacher_request(
+            capability_token=token,
+            request_id="request-bound-0000001",
+            raw_body=_body(),
+        )
+    assert repeated.value.code == "upstream_attempt_quota_exhausted"
+    assert len(dispatches) == 2
+    connection = sqlite3.connect(broker_db)
+    connection.row_factory = sqlite3.Row
+    row = connection.execute(
+        "SELECT state, error_class, upstream_attempt_count FROM teacher_score_requests "
+        "WHERE request_id = 'request-bound-0000001'"
+    ).fetchone()
+    in_flight = connection.execute("SELECT in_flight FROM teacher_capabilities").fetchone()[0]
+    connection.close()
+    assert (row["state"], row["error_class"]) == ("provider_rejected", "transient")
+    assert row["upstream_attempt_count"] == 2
+    assert in_flight == 0
 
 
 def test_worker_default_timeout_exceeds_broker_provider_ceiling():
@@ -1362,7 +1506,7 @@ def test_capability_policy_is_run_bounded_and_rejects_excessive_shapes(monkeypat
     limits = teacher_broker.capability_limits_for_spec(spec)
     assert limits["max_score_items"] == 24
     assert limits["max_requests"] == 24
-    assert limits["max_upstream_attempts"] == 1
+    assert limits["max_upstream_attempts"] == 4
     assert limits["max_concurrency"] == teacher_broker.OPD_TEACHER_SCORING_CONCURRENCY
 
     monkeypatch.setattr(teacher_broker, "MAX_TOTAL_SCORE_ITEMS", 4)

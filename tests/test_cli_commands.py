@@ -553,6 +553,7 @@ def test_env_setup_self_hosted_interactive_requires_an_explicit_project(monkeypa
     from flash.cli.commands.env import setup as env_setup
     from flash.client import ClientError
 
+    monkeypatch.delenv("FREESOLO_BASE_URL", raising=False)
     monkeypatch.setattr(
         "flash.client.config.load_credentials", lambda: ("http://127.0.0.1:8080", "operator-key")
     )
@@ -560,12 +561,61 @@ def test_env_setup_self_hosted_interactive_requires_an_explicit_project(monkeypa
     monkeypatch.setattr(
         "flash.client.list_projects",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("a self-hosted plane has no project directory to enumerate")
+            AssertionError("a backend-less plane has no project directory to enumerate")
         ),
     )
 
-    with pytest.raises(ClientError, match=r"--project PROJECT_UUID.*self-hosted plane"):
+    with pytest.raises(ClientError, match=r"--project PROJECT_UUID.*no\s+Freesolo backend"):
         env_setup._require_setup_project(Namespace(project=""))
+
+
+def test_env_setup_interactive_lists_projects_from_an_operator_backend(monkeypatch) -> None:
+    """A self-hosted plane with its own identity backend HAS a directory, so listing must work.
+
+    Classifying on the control-plane url alone made this topology -- the one SELF_HOSTING.md
+    documents for real multi-tenancy: no FLASH_STANDALONE, FREESOLO_BASE_URL pointing at an
+    operator-run backend -- indistinguishable from a backend-less plane, so interactive setup
+    refused to enumerate a directory that was there the whole time.
+    """
+    from argparse import Namespace
+
+    from flash.cli.commands.env import setup as env_setup
+
+    project_id = "11111111-1111-4111-8111-111111111111"
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://identity.operator.example")
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("http://127.0.0.1:8080", "operator-key")
+    )
+    monkeypatch.setattr(env_setup, "_setup_interactive", lambda _args: True)
+    monkeypatch.setattr(
+        "flash.client.list_projects", lambda api_key: [{"id": project_id, "name": "Example"}]
+    )
+    monkeypatch.setattr(env_setup.render, "select_required", lambda _prompt, _options: project_id)
+    monkeypatch.setattr("flash.client.get_project", lambda *_a, **_k: {"id": project_id})
+
+    assert env_setup._require_setup_project(Namespace(project="")) == project_id
+
+
+def test_supplied_project_is_ownership_checked_against_an_operator_backend(monkeypatch) -> None:
+    """An explicit uuid must still be checked for ownership when a backend can answer.
+
+    The url-only branch returned the id after a shape check, so on this topology any well-formed
+    uuid -- including another tenant's -- was accepted, and `env eval` could run every generation
+    before the upload discovered the project was not reachable.
+    """
+    from flash.client import ApiError, ClientError, resolve_project_id
+
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://identity.operator.example")
+
+    def _forbidden(*_args, **_kwargs):
+        raise ApiError(403, "forbidden")
+
+    monkeypatch.setattr("flash.client.get_project", _forbidden)
+
+    with pytest.raises(ClientError, match="not accessible"):
+        resolve_project_id(
+            "11111111-1111-4111-8111-111111111111", "operator-key", "http://127.0.0.1:8080"
+        )
 
 
 def test_env_setup_hosted_interactive_still_selects_a_project(monkeypatch) -> None:
@@ -1174,10 +1224,14 @@ def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys)
         line for line in capsys.readouterr().err.splitlines() if line.startswith("step=")
     ]
     assert metric_lines == [
-        "step=1 reward=0.75 reward_std=0.12 grad_norm=1.5 kl=0.03 entropy=0.82 "
-        "frac_zero_std=0.25 comp_len=48.5 trunc=0.125 max_comp_tokens=256",
-        "step=2 reward=0.8 reward_std=0.1 grad_norm=1.25 entropy=0.79 frac_zero_std=0 "
-        "comp_len=51 trunc=0.25 max_comp_tokens=256",
+        (
+            "step=1 reward=0.75 reward_std=0.12 grad_norm=1.5 kl=0.03 entropy=0.82 "
+            "frac_zero_std=0.25 comp_len=48.5 trunc=0.125 max_comp_tokens=256"
+        ),
+        (
+            "step=2 reward=0.8 reward_std=0.1 grad_norm=1.25 entropy=0.79 frac_zero_std=0 "
+            "comp_len=51 trunc=0.25 max_comp_tokens=256"
+        ),
     ]
 
 
@@ -3251,3 +3305,138 @@ def test_log_follow_progress_shows_a_settled_zero_like_the_other_surfaces() -> N
         )
         assert "cost=$0.0000" in progress, state
         assert "~" not in progress, state
+
+
+@pytest.mark.parametrize(
+    "api_url",
+    [
+        "http://your-plane:8080",
+        "http://10.0.0.5:8080",
+        "http://plane.internal",
+    ],
+)
+def test_login_warns_before_sending_the_key_over_plaintext_http(monkeypatch, capsys, api_url):
+    """The warning must reach the user BEFORE the key is transmitted.
+
+    On a standalone plane FREESOLO_INTERNAL_KEY is the entire authorization boundary and owns every
+    run, and it rides as a bearer header on login and every command after it. SELF_HOSTING.md used
+    to present a plaintext remote URL as fine, so following the quickstart put a root-equivalent
+    credential on the wire in clear text.
+    """
+    warned_before_request = {}
+
+    def _verify(api_key, url):
+        warned_before_request["stderr"] = capsys.readouterr().err
+        return {"email": "operator@example.com"}
+
+    monkeypatch.setattr(cli.commands, "_verify_key_against_plane", _verify)
+    monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
+    monkeypatch.setattr(cli.commands, "_identity_or_none", lambda *a, **k: None)
+    monkeypatch.delenv("FREESOLO_API_KEY", raising=False)
+
+    args = types.SimpleNamespace(api_url=api_url, api_key="operator-key", debug=False)
+    assert cli.commands.cmd_login(args) == 0
+    assert "plaintext HTTP" in warned_before_request["stderr"]
+
+
+@pytest.mark.parametrize(
+    "api_url",
+    [
+        "http://127.0.0.1:8080",
+        "http://localhost:8080",
+        "https://your-plane.example",
+    ],
+)
+def test_login_stays_quiet_for_loopback_and_tls(monkeypatch, capsys, api_url):
+    """Local development over http is the one safe plaintext case, and https is the fix."""
+    monkeypatch.setattr(
+        cli.commands, "_verify_key_against_plane", lambda *a, **k: {"email": "op@example.com"}
+    )
+    monkeypatch.setattr(cli.commands, "verify_freesolo_key", lambda *a, **k: None)
+    monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
+    monkeypatch.setattr(cli.commands, "_identity_or_none", lambda *a, **k: None)
+    monkeypatch.delenv("FREESOLO_API_KEY", raising=False)
+
+    args = types.SimpleNamespace(api_url=api_url, api_key="operator-key", debug=False)
+    assert cli.commands.cmd_login(args) == 0
+    assert "plaintext HTTP" not in capsys.readouterr().err
+
+
+def test_login_warns_about_a_plaintext_freesolo_url_behind_an_https_plane(monkeypatch, capsys):
+    """The identity backend is a SECOND destination for the key, and it must be checked too.
+
+    `cmd_login` sends the key to whichever of the two urls the branch below it selects. Warning only
+    on `api_url` left an https plane paired with an `http://` --freesolo-url completely silent --
+    the configuration where the operator has most reason to believe the key is protected.
+    """
+    warned_before_request = {}
+
+    def _verify(api_key, *, base_url):
+        warned_before_request["stderr"] = capsys.readouterr().err
+
+    monkeypatch.setattr(cli.commands, "verify_freesolo_key", _verify)
+    monkeypatch.setattr(cli.commands, "_verifies_against_freesolo", lambda *a, **k: True)
+    monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
+    monkeypatch.setattr(cli.commands, "_identity_or_none", lambda *a, **k: None)
+    monkeypatch.delenv("FREESOLO_API_KEY", raising=False)
+
+    args = types.SimpleNamespace(
+        api_url="https://your-plane.example",
+        freesolo_url="http://identity.internal:8000",
+        api_key="operator-key",
+        debug=False,
+    )
+    assert cli.commands.cmd_login(args) == 0
+    stderr = warned_before_request["stderr"]
+    assert "plaintext HTTP" in stderr, stderr
+    # it names the offending url, not the https plane that is already fine.
+    assert "identity.internal" in stderr
+    assert "your-plane.example is plaintext" not in stderr
+
+
+def test_login_does_not_warn_twice_for_one_url():
+    """A plane that is also its own identity backend is one destination, so it warns once."""
+    warnings = cli.commands._plaintext_login_warnings(
+        "http://plane.example:8080", "http://plane.example:8080"
+    )
+    assert len(warnings) == 1, warnings
+
+
+def test_login_warns_about_a_plaintext_freesolo_base_url_from_the_environment(monkeypatch, capsys):
+    """The identity url is RESOLVED, not passed, so the env var is a real destination for the key.
+
+    `verify_freesolo_key` calls `freesolo_base_url(override)`, which falls back to
+    FREESOLO_BASE_URL when no --freesolo-url is given. Reading only the CLI arg therefore left the
+    env-var spelling of the exact same destination silent, while the key still went to it.
+    """
+    warned_before_request = {}
+
+    def _verify(api_key, *, base_url):
+        warned_before_request["stderr"] = capsys.readouterr().err
+
+    monkeypatch.setattr(cli.commands, "verify_freesolo_key", _verify)
+    monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
+    monkeypatch.setattr(cli.commands, "_identity_or_none", lambda *a, **k: None)
+    monkeypatch.delenv("FREESOLO_API_KEY", raising=False)
+    monkeypatch.setenv("FREESOLO_BASE_URL", "http://identity.internal.test")
+
+    # a hosted plane, so login really does route the key to the identity backend.
+    args = types.SimpleNamespace(
+        api_url="https://api.freesolo.co", api_key="operator-key", debug=False
+    )
+    assert cli.commands.cmd_login(args) == 0
+    stderr = warned_before_request["stderr"]
+    assert "plaintext HTTP" in stderr, stderr
+    assert "identity.internal.test" in stderr
+
+
+def test_login_ignores_the_identity_url_when_the_key_never_goes_there(monkeypatch):
+    """A self-hosted plane verifies its own key, so an http identity url receives nothing.
+
+    Warning about a destination this login will not contact would train operators to ignore the
+    warning that matters, so the resolution is gated on the same predicate that does the routing.
+    """
+    monkeypatch.setenv("FREESOLO_BASE_URL", "http://identity.internal.test")
+
+    warnings = cli.commands._plaintext_login_warnings("https://plane.example", None)
+    assert warnings == [], warnings
