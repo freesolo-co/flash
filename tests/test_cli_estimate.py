@@ -387,7 +387,19 @@ def test_thin_batch_warning_names_the_configured_group_size(tmp_path, monkeypatc
     err = capsys.readouterr().err
 
     assert rc == 0
-    assert "2 prompt(s) x group_size 4 completions" in err
+    assert "2 prompts x group_size 4 completions" in err
+
+
+def test_thin_batch_warning_reads_naturally_for_a_single_prompt(tmp_path, monkeypatch, capsys):
+    """`batch_size = 1` is the case users actually hit, so it must not render as "1 prompt(s)"."""
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, 1))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "1 prompt x group_size 8 completions" in err
+    assert "prompt(s)" not in err
 
 
 def test_opd_cost_warns_about_a_thin_batch_size_too(tmp_path, monkeypatch, capsys):

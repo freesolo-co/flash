@@ -168,10 +168,11 @@ def thin_rl_batch_warning(spec) -> str | None:
     default_group = RECIPE.rl.group_size if spec.algorithm == "grpo" else RECIPE.opd.group_size
     configured_group = getattr(spec.train, "group_size", None)
     group_size = int(configured_group) if configured_group is not None else int(default_group)
+    prompts = "1 prompt" if prompts_per_step == 1 else f"{prompts_per_step} prompts"
     return (
         f"[train] batch_size = {prompts_per_step} is the OPTIMIZER batch for {spec.algorithm}, not "
-        f"a memory knob: it sets prompts-per-step, so each update trains on {prompts_per_step} "
-        f"prompt(s) x group_size {group_size} completions. Under sft the same key means the "
+        f"a memory knob: it sets prompts-per-step, so each update trains on {prompts} "
+        f"x group_size {group_size} completions. Under sft the same key means the "
         "micro-batch and the optimizer batch comes from the workload profile, so an sft "
         "`batch_size = 1` memory workaround does not carry over. Advantages are still centred "
         "within each prompt's group, but no averaging across prompts survives, so expect much "
