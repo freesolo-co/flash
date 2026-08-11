@@ -1044,6 +1044,90 @@ def test_a_pinned_head_lookup_is_not_repeated_or_cached_on_failure():
         monkey.undo()
 
 
+def test_only_immutable_complete_pin_reads_are_memoized():
+    """The memo may only hold what is genuinely immutable AND complete.
+
+    Two things that look immutable are not, and caching either one strands a valid pin until the
+    plane restarts:
+
+    - A REF is not a commit. `spec_from_dict` passes the AUTHORED `model_revision` through, so
+      `main` or a tag reaches the memo before `_resolve_model_revision` resolves it to a sha. Cached
+      under a moving name, a ref that later advances keeps serving the old geometry forever.
+    - A COMPLETE read is not any read. `params_b` is None when the hub omits `safetensors.total` --
+      hub metadata, not commit-immutable `config.json` geometry. Cached, `_validated_revision_
+      geometry` raises from the memo on every later call and the pin stays rejected.
+    """
+    import flash.engine.plan.vram as vram
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        calls: list[str] = []
+
+        def _answer(params_b):
+            def _fetch(_model_id, revision="", strict=False):
+                calls.append(revision)
+                return (params_b, 248320, 4096, 32, 16)
+
+            return _fetch
+
+        # an incomplete read stays retryable rather than becoming a permanent rejection.
+        monkey.setattr(vram, "_PINNED_GEOMETRY_MEMO", {})
+        monkey.setattr(vram, "fetch_hf_model_geometry", _answer(None))
+        vram._memoized_revision_geometry("M", "a" * 40)
+        vram._memoized_revision_geometry("M", "a" * 40)
+        assert vram._PINNED_GEOMETRY_MEMO == {}, "an incomplete read must not be cached"
+        assert len(calls) == 2, "an incomplete read must stay retryable"
+
+        # a moving ref is re-read every time, because it can point somewhere else tomorrow.
+        calls.clear()
+        monkey.setattr(vram, "fetch_hf_model_geometry", _answer(9.0))
+        vram._memoized_revision_geometry("M", "main")
+        vram._memoized_revision_geometry("M", "main")
+        assert vram._PINNED_GEOMETRY_MEMO == {}, "a moving ref must not be cached"
+        assert len(calls) == 2, "a moving ref must be re-read"
+
+        # a complete sha read IS shared -- that is the whole point of the memo.
+        calls.clear()
+        vram._memoized_revision_geometry("M", "b" * 40)
+        vram._memoized_revision_geometry("M", "b" * 40)
+        assert len(calls) == 1, "a complete sha read must be shared, not repeated"
+        assert list(vram._PINNED_GEOMETRY_MEMO) == [("M", "b" * 40)]
+    finally:
+        monkey.undo()
+
+
+def test_a_low_ceiling_pin_does_not_reach_the_hub():
+    """Parse-time validation must stay offline when certification cannot widen anything.
+
+    `spec_from_dict` calls the cap while parsing a config. At `cap <= 4` the certified head count
+    could not raise the ceiling even if it were read, so a hub round trip there buys nothing and
+    makes otherwise-offline config validation block on hub timeouts.
+    """
+    import flash.engine.plan.vram as vram
+    from flash.providers.allocator import geometry_safe_gpu_cap
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        calls: list[str] = []
+
+        def _fetch(_model_id, revision="", strict=False):
+            calls.append(revision)
+            raise RuntimeError("hub must not be reached")
+
+        monkey.setattr(vram, "_PINNED_GEOMETRY_MEMO", {})
+        monkey.setattr(vram, "fetch_hf_model_geometry", _fetch)
+
+        for ceiling in (1, 2, 3, 4):
+            geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", ceiling, model_revision="a" * 40)
+        assert calls == [], f"parse-time cap reached the hub {len(calls)} times at cap <= 4"
+
+        # above four there IS something to widen to, so the lookup must still happen.
+        geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision="a" * 40)
+        assert len(calls) == 1, "a widenable ceiling must still certify the pin"
+    finally:
+        monkey.undo()
+
+
 def test_a_blip_after_sizing_cannot_narrow_an_already_validated_pin():
     """Sizing and the cap must share one geometry read, or an eight-card run dies mid-allocation.
 
@@ -1108,6 +1192,46 @@ def test_geometry_cap_narrows_a_row_whose_heads_do_not_divide_eight():
         # a row with no recorded head count cannot be certified, so it keeps the safe ceiling.
         patched["Qwen/Fake-Unknown"] = replace(awkward, num_attention_heads=0)
         assert geometry_safe_gpu_cap("Qwen/Fake-Unknown", 8) == 4
+    finally:
+        monkey.undo()
+
+
+def test_an_uncertified_pin_still_narrows_below_the_four_card_ceiling():
+    """The four-card ceiling for an uncertified pin must NARROW the divisor search, not replace it.
+
+    A ceiling is a bound, not a divisibility proof: 4 divides 24 but not 6. Returning the ceiling
+    directly once a pin fails to certify skips the row's own head check, so a row whose heads do not
+    divide 4 gets rented at 4 and aborts in Ulysses init -- the exact failure the cap exists to
+    prevent, reintroduced on the uncertified path.
+
+    No current row exercises this (all six are 8/8/16/16/24/16), so it is proven against a synthetic
+    6-head row rather than left as an invariant that only a future model would discover.
+    """
+    from dataclasses import replace
+
+    from flash.core.catalog import MODELS
+    from flash.providers.allocator import geometry_safe_gpu_cap
+
+    six = replace(MODELS["Qwen/Qwen3.5-9B"], id="Qwen/Fake-6-Head", num_attention_heads=6)
+    patched = dict(MODELS)
+    patched["Qwen/Fake-6-Head"] = six
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        import flash.engine.plan.vram as vram
+
+        monkey.setattr("flash.core.catalog.MODELS", patched)
+        monkey.setattr(vram, "_PINNED_GEOMETRY_MEMO", {})
+
+        def _unreadable(*_a, **_k):
+            raise RuntimeError("transient hub error")
+
+        monkey.setattr(vram, "fetch_hf_model_geometry", _unreadable)
+
+        # 6 % 4 != 0 and 6 % 2 == 0, so an uncertified pin must land on 2, not on the bare ceiling.
+        assert geometry_safe_gpu_cap("Qwen/Fake-6-Head", 8, model_revision="a" * 40) == 2
+        # the unpinned path already checked the row and must be unchanged by this.
+        assert geometry_safe_gpu_cap("Qwen/Fake-6-Head", 8) == 2
     finally:
         monkey.undo()
 

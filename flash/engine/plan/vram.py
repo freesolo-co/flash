@@ -567,26 +567,47 @@ def _geometry_mismatches(info, params_b, vocab, hidden, layers, heads) -> list[s
     return mismatches
 
 
-# A pinned commit's geometry is immutable -- that is what pinning MEANS -- so one successful read
-# serves every consumer for the life of the process. Only SUCCESSES are stored: a hub blip is a fact
-# about the network, not about the model, and caching it would keep rejecting a valid pin until the
-# plane restarted. Sharing matters beyond saving a round trip: `allocate()` sizes the run (which
-# validates this geometry) and THEN asks for the head cap, so an unshared second lookup let a
-# transient failure between the two narrow a valid eight-card run to four and report it as
-# structurally impossible.
+# Why share a read at all: `allocate()` sizes the run (which validates this geometry) and THEN asks
+# for the head cap, so an unshared second lookup let a transient failure between the two narrow a
+# valid eight-card run to four and report it as structurally impossible.
+#
+# What may be stored is narrower than "any success", because two things that look immutable are not:
+#
+#   - A REF is not a commit. `spec_from_dict` passes the AUTHORED `model_revision` straight through,
+#     so `main` or a tag reaches here before `_resolve_model_revision` turns it into a sha. Caching
+#     under a moving name serves stale geometry forever once the ref advances, so only a 40-hex sha
+#     is eligible.
+#   - A COMPLETE read is not any read. `params_b` is None when the hub omits `safetensors.total`,
+#     and that is hub metadata rather than commit-immutable `config.json` geometry -- a transient
+#     incomplete read. Caching it makes `_validated_revision_geometry` raise from the memo forever
+#     and keeps a valid pin rejected until the plane restarts.
+#
+# Failures are likewise never stored: a blip is a fact about the network, not about the model.
 _PINNED_GEOMETRY_MEMO: dict[tuple[str, str], tuple] = {}
+
+_SHA_LENGTH = 40
+
+
+def _is_commit_sha(revision: str) -> bool:
+    """Whether ``revision`` names one immutable commit rather than a ref that can move."""
+    return len(revision) == _SHA_LENGTH and all(c in "0123456789abcdefABCDEF" for c in revision)
 
 
 def _memoized_revision_geometry(model_id: str, revision: str) -> tuple:
-    """``fetch_hf_model_geometry`` for a pinned commit, reusing an earlier success in this process.
+    """``fetch_hf_model_geometry`` for a pinned commit, reusing an earlier COMPLETE sha read.
 
-    Raises exactly like the strict fetch it wraps when nothing has succeeded yet, so callers that
-    must fail closed still do.
+    Raises exactly like the strict fetch it wraps when nothing cacheable has succeeded yet, so
+    callers that must fail closed still do.
     """
     key = (model_id, revision)
-    if key not in _PINNED_GEOMETRY_MEMO:
-        _PINNED_GEOMETRY_MEMO[key] = fetch_hf_model_geometry(model_id, revision, strict=True)
-    return _PINNED_GEOMETRY_MEMO[key]
+    cached = _PINNED_GEOMETRY_MEMO.get(key)
+    if cached is not None:
+        return cached
+    geometry = fetch_hf_model_geometry(model_id, revision, strict=True)
+    # geometry[0] is params_b; None means the hub answered without a parameter count.
+    if _is_commit_sha(revision) and geometry[0] is not None:
+        _PINNED_GEOMETRY_MEMO[key] = geometry
+    return geometry
 
 
 def _validated_revision_geometry(model_id: str, revision: str, info):
