@@ -55,10 +55,64 @@ SMOKE_RETRY_FALLBACK_DELAY_SECONDS = 2.0
 THINKING_STRUCTURED_OUTPUTS_CAPABILITY = "thinking_structured_outputs_deferred_v1"
 REVISION_PROVENANCE_CAPABILITY = "revision_provenance"
 _RETRYABLE_SMOKE_503_CODES = frozenset({"adapter_loading", "engine_unavailable"})
+_INTERNAL_KEY_HEADER = "X-Freesolo-Internal-Key"
+# modal 303-redirects a slow request to an async-result poll url on the same origin, once per poll
+# cycle until the result is ready, so the cap must cover a full 30-minute chat window of polls
+# (~150s apart). it guards against redirect loops, not credential leakage: the request hook strips
+# the internal key on every off-origin hop regardless of chain length.
+_MAX_REDIRECTS = 100
 _HTTP_CLIENT: httpx.Client | None = None
 _CHAT_HTTP_CLIENT: httpx.Client | None = None
 _STREAM_HTTP_CLIENT: httpx.Client | None = None
 _HTTP_CLIENT_LOCK = threading.Lock()
+
+
+def _url_origin(url: httpx.URL) -> tuple[str, str, int | None]:
+    # scheme + host + port identify an origin; httpx normalizes default ports to None.
+    return (url.scheme.lower(), (url.host or "").rstrip(".").lower(), url.port)
+
+
+def _configured_serving_origin() -> tuple[str, str, int | None] | None:
+    """Origin of the configured serving backend, or None when it cannot be parsed.
+
+    Mirrors ``serving_base_url()``'s url resolution without its standalone guard: this runs
+    inside an httpx event hook, so it must never raise, and any request carrying the key was
+    already built from a ``serving_base_url()`` that vetted the configuration.
+    """
+    configured = (os.environ.get("FREESOLO_SERVING_URL") or "").strip()
+    base = serving_control_url(configured or DEFAULT_FREESOLO_SERVING_URL)
+    try:
+        url = httpx.URL(base)
+    except Exception:
+        return None
+    if not url.host:
+        return None
+    return _url_origin(url)
+
+
+def _strip_internal_key_off_origin(request: httpx.Request) -> None:
+    """Drop the plane credential from any request that leaves the serving origin.
+
+    httpx strips only ``Authorization`` and ``Cookie`` when a redirect changes origin; the
+    internal key rides a custom header, so without this hook a single 302 from the serving host
+    would forward the credential that controls this plane to an arbitrary origin. The hook runs
+    once per redirect hop, so same-origin redirects (modal's async-result polls) keep the key.
+    """
+    if _INTERNAL_KEY_HEADER not in request.headers:
+        return
+    origin = _configured_serving_origin()
+    if origin is None or _url_origin(request.url) != origin:
+        del request.headers[_INTERNAL_KEY_HEADER]
+
+
+def _new_serving_client(**kwargs) -> httpx.Client:
+    """An httpx client for the serving backend: bounded redirects, credential-scoping hook."""
+    return httpx.Client(
+        follow_redirects=True,
+        max_redirects=_MAX_REDIRECTS,
+        event_hooks={"request": [_strip_internal_key_off_origin]},
+        **kwargs,
+    )
 
 
 def _http_client() -> httpx.Client:
@@ -66,7 +120,7 @@ def _http_client() -> httpx.Client:
     if _HTTP_CLIENT is None:
         with _HTTP_CLIENT_LOCK:
             if _HTTP_CLIENT is None:
-                _HTTP_CLIENT = httpx.Client(follow_redirects=True, max_redirects=100)
+                _HTTP_CLIENT = _new_serving_client()
     return _HTTP_CLIENT
 
 
@@ -75,9 +129,7 @@ def _chat_http_client() -> httpx.Client:
     if _CHAT_HTTP_CLIENT is None:
         with _HTTP_CLIENT_LOCK:
             if _CHAT_HTTP_CLIENT is None:
-                _CHAT_HTTP_CLIENT = httpx.Client(
-                    follow_redirects=True,
-                    max_redirects=100,
+                _CHAT_HTTP_CLIENT = _new_serving_client(
                     limits=httpx.Limits(max_connections=None, max_keepalive_connections=100),
                 )
     return _CHAT_HTTP_CLIENT
@@ -88,9 +140,7 @@ def _stream_http_client() -> httpx.Client:
     if _STREAM_HTTP_CLIENT is None:
         with _HTTP_CLIENT_LOCK:
             if _STREAM_HTTP_CLIENT is None:
-                _STREAM_HTTP_CLIENT = httpx.Client(
-                    follow_redirects=True,
-                    max_redirects=100,
+                _STREAM_HTTP_CLIENT = _new_serving_client(
                     limits=httpx.Limits(max_connections=None, max_keepalive_connections=100),
                 )
     return _STREAM_HTTP_CLIENT
@@ -789,16 +839,14 @@ def chat(
     }
     if stop:
         body["stop"] = [str(value) for value in stop]
-    # follow_redirects + max_redirects=100: Modal 303-redirects slow cold-start requests across
-    # several poll cycles before the result is ready.
+    # follow_redirects: modal 303-redirects slow cold-start requests across many poll cycles
+    # before the result is ready (bounded by _MAX_REDIRECTS, all on the serving origin).
     headers = _internal_key_header()
     if expected_checkpoint:
         headers["X-Freesolo-Expected-Checkpoint"] = expected_checkpoint
     timeout = 30 * 60.0 if timeout_s is None else max(0.0, float(timeout_s))
     client_context = (
-        httpx.Client(follow_redirects=True, max_redirects=100)
-        if retry_unavailable
-        else contextlib.nullcontext(_chat_http_client())
+        _new_serving_client() if retry_unavailable else contextlib.nullcontext(_chat_http_client())
     )
     with client_context as client:
         resp = client.post(f"{base}/chat/completions", json=body, headers=headers, timeout=timeout)

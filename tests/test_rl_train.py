@@ -3057,7 +3057,7 @@ def test_build_verl_overrides_enables_resume_mode():
 
 def test_restore_verl_resume_is_a_noop_without_a_checkpoint(tmp_path, monkeypatch):
     monkeypatch.setattr(rl_train._w, "hf_resume_checkpoint", lambda *a, **k: None)
-    assert rl_train._restore_verl_resume(str(tmp_path)) == 0
+    assert rl_train._restore_verl_resume(str(tmp_path), world_size=1) == 0
     assert not (tmp_path / "latest_checkpointed_iteration.txt").exists()
 
 
@@ -3065,11 +3065,14 @@ def test_restore_verl_resume_stages_the_checkpoint_where_verl_looks(tmp_path, mo
     src = tmp_path / "checkpoint-7"
     (src / "actor").mkdir(parents=True)
     (src / "actor" / "model.safetensors").write_text("weights")
+    # this test is about the staging mechanics, not topology matching; stamp a world_size that
+    # legitimately matches world_size=1 below rather than relying on unreadable-topology behaviour.
+    (src / "actor" / "fsdp_config.json").write_text(json.dumps({"world_size": 1}))
     local_dir = tmp_path / "ckpt"
     local_dir.mkdir()
     monkeypatch.setattr(rl_train._w, "hf_resume_checkpoint", lambda *a, **k: str(src))
 
-    assert rl_train._restore_verl_resume(str(local_dir)) == 7
+    assert rl_train._restore_verl_resume(str(local_dir), world_size=1) == 7
     # verl discovers the checkpoint through this marker plus the global_step_N layout.
     assert (local_dir / "latest_checkpointed_iteration.txt").read_text().strip() == "7"
     assert (local_dir / "global_step_7" / "actor" / "model.safetensors").read_text() == "weights"
@@ -3080,7 +3083,7 @@ def test_restore_verl_resume_rejects_an_unparseable_checkpoint_path(tmp_path, mo
     bad.mkdir()
     monkeypatch.setattr(rl_train._w, "hf_resume_checkpoint", lambda *a, **k: str(bad))
     with pytest.raises(RuntimeError, match="invalid GRPO resume checkpoint path"):
-        rl_train._restore_verl_resume(str(tmp_path / "ckpt"))
+        rl_train._restore_verl_resume(str(tmp_path / "ckpt"), world_size=1)
 
 
 def _write_step(local_dir, step):

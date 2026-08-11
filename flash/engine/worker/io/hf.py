@@ -11,6 +11,7 @@ import os
 import shutil
 import threading
 import time
+from collections.abc import Callable
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.adapters.artifacts import ADAPTER_WEIGHT_FILES, attempt_scoped_artifact_name
@@ -203,8 +204,35 @@ def hf_upload_folder(local_dir: str, repo_subpath: str, required: bool = False) 
     )
 
 
-def hf_resume_checkpoint(fail_closed: bool = False, revision: str | None = None) -> str | None:
-    """Download the latest streamed verl checkpoint for this run, or return none."""
+def _highest_resume_candidate(
+    base: str, candidates: list[tuple[int, str]], prefer: Callable[[str], bool] | None
+) -> str:
+    """the candidate name hf_resume_checkpoint stages, given the caller's optional ``prefer``.
+
+    every candidate is already staged on local disk by the snapshot_download above, so evaluating
+    ``prefer`` per candidate costs no extra fetch. picks the highest step ``prefer`` accepts and
+    falls back to the highest step overall when none do -- the same answer this returned before
+    ``prefer`` existed, so a caller with nothing to prefer sees no behaviour change, and the caller's
+    own discard log (not this function) is left to explain a restart from zero.
+    """
+    if prefer is not None:
+        for _step, name in sorted(candidates, reverse=True):
+            if prefer(os.path.join(base, name)):
+                return name
+    return max(candidates)[1]
+
+
+def hf_resume_checkpoint(
+    fail_closed: bool = False,
+    revision: str | None = None,
+    *,
+    prefer: Callable[[str], bool] | None = None,
+) -> str | None:
+    """Download the latest streamed verl checkpoint for this run, or return none.
+
+    ``prefer`` selects the highest downloaded candidate it accepts instead of the highest overall;
+    see ``_highest_resume_candidate``. Left unset, behaviour is unchanged from before it existed.
+    """
     required = bool(revision)
     strict = bool(fail_closed or required)
     if not _w.HF_REPO:
@@ -250,7 +278,7 @@ def hf_resume_checkpoint(fail_closed: bool = False, revision: str | None = None)
                 detail = f" at revision {revision}" if revision else ""
                 raise RetriableInfraError(f"required resume checkpoint is missing{detail}")
             return None
-        _, latest = max(candidates)
+        latest = _highest_resume_candidate(base, candidates, prefer)
         path = os.path.join(base, latest)
         print(f"[resume] found streamed checkpoint: {path}")
         return path
