@@ -213,12 +213,18 @@ def _train_body(input_data: dict) -> dict:
                 r"|gateway time-?out|too many requests|retrying \(retry\("
                 r"|\b(?:429|5\d\d) (?:client|server) error"
             )
-            # Build failures, reachable only AFTER pip downloaded real content, so they name the
-            # cause and outrank a transient warning pip already recovered from in the same tail;
-            # without that precedence one early "Retrying (Retry(" makes a deterministic failure
-            # look retriable and this ladder repeats it for nothing. Kept identical to the instance
-            # bootstrap's _PIP_TERMINAL_RE: the two classifiers must agree on what is retriable.
-            pip_terminal_re = re.compile(r"(?i)subprocess-exited-with-error|failed building wheel")
+            # Build/resolution failures, reachable only AFTER pip downloaded real content, so they
+            # name the cause and outrank a transient warning pip already recovered from in the same
+            # tail; without that precedence one early "Retrying (Retry(" makes a deterministic
+            # failure look retriable and this ladder repeats it for nothing. Kept identical to the
+            # instance bootstrap's _PIP_TERMINAL_RE: the two classifiers must agree on what is
+            # retriable, including excluding the bare subprocess-exited-with-error marker that a
+            # network-interrupted VCS `git clone` also prints.
+            pip_terminal_re = re.compile(
+                r"(?i)failed building wheel|metadata-generation-failed|could not build wheels"
+                r"|no matching distribution|could not find a version|resolutionimpossible"
+                r"|invalid requirement"
+            )
             pip_retry_delays = (3.0, 9.0, 27.0)
             extra_env, askpass = _extra_pip_env()
             args = [sys.executable, "-m", "pip", "install", *extra_pip]

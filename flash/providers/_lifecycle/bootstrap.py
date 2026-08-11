@@ -33,8 +33,9 @@ _HF_RETRY_DELAYS_S = (1.0, 3.0, 8.0, 20.0, 60.0)
 _HF_RETRY_AFTER_MAX_S = 60.0
 _PIP_RETRY_DELAYS_S = (3.0, 9.0, 27.0)
 _PIP_OUTPUT_TAIL_LINES = 400
-# Network/index-shaped pip failures. A resolution failure ("no matching distribution", an unsatisfiable
-# pin) reaches the index fine and carries NONE of these, so a bad package spec stays terminal.
+# Network-shaped pip failures (retriable) vs deterministic build/resolution failures (terminal, outranking a transient
+# warning pip already recovered from in the same tail). Bare "subprocess-exited-with-error" is in NEITHER: pip prints it
+# for any child, including a VCS pin's `git clone`, so calling it terminal fails a paid run on a mid-clone reset.
 _PIP_TRANSIENT_RE = re.compile(
     r"(?i)connection (?:broken|reset|aborted|refused|timed out)|read timed out|proxyerror"
     r"|temporary failure in name resolution|failed to establish a new connection|incompleteread"
@@ -42,9 +43,10 @@ _PIP_TRANSIENT_RE = re.compile(
     r"|ssleoferror|service unavailable|bad gateway|gateway time-?out|too many requests"
     r"|retrying \(retry\(|\b(?:429|5\d\d) (?:client|server) error"
 )
-# Build failures, reachable only AFTER pip downloaded real content, so they name the cause and outrank a transient
-# warning pip already recovered from in the same tail. Every failed build/metadata step carries one of these two.
-_PIP_TERMINAL_RE = re.compile(r"(?i)subprocess-exited-with-error|failed building wheel")
+_PIP_TERMINAL_RE = re.compile(
+    r"(?i)failed building wheel|could not build wheels|metadata-generation-failed"
+    r"|no matching distribution|could not find a version|resolutionimpossible|invalid requirement"
+)
 _TERMINAL_MARKER_GRACE_S = 0.25
 _TERMINAL_BOOKKEEPING_RESERVE_S = _TERMINAL_MARKER_GRACE_S
 _MAX_ATTEMPT_ID = (1 << 63) - 1
@@ -574,10 +576,8 @@ def _extra_pip_env(payload: dict) -> tuple[dict[str, str], str | None]:
 def install_extra_pip(payload: dict) -> None:
     """Install the run's extra requirements; retry an index blip, fail fast on a bad package spec.
 
-    Same precedent as the pre-worker HF fetches: an index blip is infra, not user error, so it
-    retries in place and then surfaces as ``RetriableBootstrapError`` instead of terminally
-    failing a paid run. A resolution error stays a plain ``RuntimeError``.
-    """
+    Same precedent as the pre-worker HF fetches: an index blip is infra, not user error, so it retries in place and then
+    surfaces as ``RetriableBootstrapError`` instead of terminally failing a paid run."""
     extra_pip = payload.get("extra_pip") or []
     if not extra_pip:
         return

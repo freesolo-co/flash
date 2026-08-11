@@ -230,23 +230,36 @@ def _cleanup_unpublished_instance(run_id: str, instance_id: str, *, context: str
     return confirmed
 
 
-def _require_disk_capable_instances(spec, instances: list[LambdaInstance], say) -> None:
-    """Refuse a Lambda shape whose FIXED disk cannot satisfy the run's ``spec.gpu.disk_gb``.
+def _disk_capable_instances(spec, instances: list[LambdaInstance], say) -> list[LambdaInstance]:
+    """Drop every Lambda shape whose FIXED disk cannot satisfy the run's ``spec.gpu.disk_gb``.
 
     Vast sizes the volume at create (``_effective_disk_gb``) and RunPod raises
     ``containerDiskInGb``; Lambda sells storage with the instance type and takes no disk parameter,
     so the only way to honour the same contract is to decline the SKU before renting it. A
     candidate whose catalog entry reported no storage carries ``disk_gb=None`` and is left alone:
     the gate refuses only what it can prove undersized, never what it merely cannot measure.
+
+    Returns the survivors rather than merely asserting one exists. The launch loop pops candidates
+    one at a time, so a mixed list that contains a single capable SKU would otherwise still be free
+    to rent an undersized one first; filtering makes the floor bind on the box actually launched,
+    and applies identically to a refreshed candidate list whose catalog disk only became known on
+    the refresh.
     """
     required = float(getattr(spec.gpu, "disk_gb", 0) or 0)
     if required <= 0:
-        return
+        return list(instances)
+    capable: list[LambdaInstance] = []
     undersized: dict[str, float] = {}
     for inst in instances:
         if inst.disk_gb is None or inst.disk_gb >= required:
-            return
+            capable.append(inst)
+            continue
         undersized[inst.instance_type] = inst.disk_gb
+    if capable:
+        if undersized:
+            dropped = ", ".join(f"{i} ({d:g} GB)" for i, d in sorted(undersized.items()))
+            say(f"skipping lambda shapes below the run's {required:g} GB disk floor: {dropped}")
+        return capable
     shapes = ", ".join(f"{itype} ({disk:g} GB)" for itype, disk in sorted(undersized.items()))
     say(f"refusing lambda launch: {shapes} cannot hold the run's {required:g} GB disk floor")
     raise UnsupportedGpuError(
@@ -272,6 +285,22 @@ def _lambda_job_handle(instance_id: str, inst: LambdaInstance, name: str, attemp
     )
 
 
+# Stamped on the propagating exception once some path has terminated the exact instance it rented.
+# The coarse run-label reap must stay armed until exact ownership is taken, and must then stand
+# down: layering terminate_run_instances(run_id) on top of an exact cleanup would also reap every
+# other concurrently-launched seed sharing this run id.
+_EXACT_CLEANUP_ATTR = "_flash_exact_cleanup_done"
+
+
+def _mark_exact_cleanup(error: BaseException) -> None:
+    with contextlib.suppress(BaseException):  # builtin exceptions accept attributes; be safe anyway
+        setattr(error, _EXACT_CLEANUP_ATTR, True)
+
+
+def _exact_cleanup_taken(error: BaseException) -> bool:
+    return bool(getattr(error, _EXACT_CLEANUP_ATTR, False))
+
+
 def _publish_launched_instance(
     plan: _LaunchPlan, instance_id: str, inst: LambdaInstance, say, message: str
 ) -> LambdaJobHandle:
@@ -285,10 +314,12 @@ def _publish_launched_instance(
         with contextlib.suppress(Exception):
             say(message)
         return _lambda_job_handle(instance_id, inst, plan.name, plan.attempt)
-    except BaseException:
+    except BaseException as error:
         _cleanup_unpublished_instance(
             plan.spec.run_id, instance_id, context="post-launch handle acquisition"
         )
+        # this instance is now terminated by id, so the outer coarse reap must not also fire.
+        _mark_exact_cleanup(error)
         raise
 
 
@@ -483,7 +514,7 @@ def launch_and_submit(
         raise lambda_api.LambdaApiError(
             f"no Lambda capacity for {spec.gpu.type} (no region advertises the instance type)"
         )
-    _require_disk_capable_instances(spec, instances, say)
+    instances = _disk_capable_instances(spec, instances, say)
     plan = _build_launch_plan(
         spec, seed, attempt, runtime_secrets, code_prefix, absolute_deadline, mode, models
     )
@@ -536,27 +567,28 @@ def launch_and_submit(
                     tok in str(e).lower() for tok in ("file_system", "filesystem", "file-system")
                 )
                 if mode != "preload" and fs_attach_reject:
-                    # once _retry_launch_without_cache is entered it owns the exact cleanup for
-                    # whatever box it rents internally, so the flag must disarm on EVERY exit from
-                    # it (return or raise); a run-wide reap layered on top of that exact cleanup
-                    # is strictly worse than leaving one instance stranded, which a later orphan
-                    # sweep will catch anyway.
+                    # the cache-less retry rents its own box. The guard stays ARMED across the whole
+                    # call: an interrupt while that request is in flight can leave an instance
+                    # created but unnamed, and only the run-label reap can find it. Disarming on
+                    # every exit (the previous shape) left exactly that window owned by nobody.
+                    # _publish_launched_instance stamps the exception when it terminates the exact
+                    # instance, which is what stands the coarse reap down.
                     launch_attempted = True
-                    try:
-                        handle, last_err = _retry_launch_without_cache(plan, inst, say)
-                    finally:
-                        launch_attempted = False
+                    handle, last_err = _retry_launch_without_cache(plan, inst, say)
                     # a returned handle publishes the box; None means nothing stayed rented.
+                    launch_attempted = False
                     if handle is not None:
                         return handle
                 # Preload must not refresh to a different region (would warm the wrong one).
                 if mode != "preload" and not candidates and not refreshed:
                     refreshed = True
                     candidates = _refresh_launch_candidates(inst, tried_regions, absolute_deadline)
-                    # an empty refresh has nothing to gate; calling the disk check on it would fall
-                    # through unmatched and raise UnsupportedGpuError with an empty shape list.
+                    # an empty refresh has nothing to gate; calling the disk filter on it would fall
+                    # through unmatched and raise UnsupportedGpuError with an empty shape list. A
+                    # refresh can also report catalog disk the first listing left unknown, so the
+                    # filter runs again here rather than trusting the pre-walk pass.
                     if candidates:
-                        _require_disk_capable_instances(spec, candidates, say)
+                        candidates = _disk_capable_instances(spec, candidates, say)
                 continue
             # built before the call so nothing is evaluated between the successful launch_instance
             # and _publish_launched_instance taking ownership of this instance's exact cleanup.
@@ -564,17 +596,19 @@ def launch_and_submit(
                 f"launched lambda instance {instance_id}: {inst.gpu} {inst.instance_type} "
                 f"${inst.price_usd_hr:.2f}/hr in {inst.region} attempt={attempt} seed={seed}"
             )
-            # the flag stays armed through the call and disarms in finally on every exit: once
-            # _publish_launched_instance is entered it owns the exact cleanup for the rest of this
-            # window, so a second coarse label reap after that exact cleanup would be actively
-            # harmful: it would reap every other concurrently-launched seed of this run.
-            try:
-                return _publish_launched_instance(plan, instance_id, inst, say, message)
-            finally:
-                launch_attempted = False
+            # the flag stays armed into the call: the instance is rented and still unnamed, so if
+            # an interrupt lands before _publish_launched_instance takes ownership the coarse reap
+            # is the only thing that can find it. Once that helper terminates the exact instance it
+            # stamps the exception and the outer guard stands down, so the reap never layers on top
+            # of an exact cleanup (which would kill every other concurrent seed of this run).
+            handle = _publish_launched_instance(plan, instance_id, inst, say, message)
+            launch_attempted = False
+            return handle
         return _raise_all_regions_rejected(spec, tried_regions, last_err)
-    except BaseException:
-        if launch_attempted:
+    except BaseException as error:
+        # armed for every window where a box may be rented but unnamed; stands down only once some
+        # inner path proved it already terminated that exact instance.
+        if launch_attempted and not _exact_cleanup_taken(error):
             with contextlib.suppress(BaseException):
                 terminate_run_instances(spec.run_id)
         raise

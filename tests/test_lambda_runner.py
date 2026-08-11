@@ -458,9 +458,12 @@ def test_bootstrap_extra_pip_build_failure_outranks_earlier_transient_text(monke
         monkeypatch,
         [
             (
-                "WARNING: Retrying (Retry(total=4, connect=None)) after connection broken by ...\n"
-                "ERROR: Failed building wheel for some-env-pkg\n"
-                "error: subprocess-exited-with-error\n",
+                (
+                    "WARNING: Retrying (Retry(total=4, connect=None)) after connection broken "
+                    "by ...\n"
+                    "ERROR: Failed building wheel for some-env-pkg\n"
+                    "error: subprocess-exited-with-error\n"
+                ),
                 1,
             ),
         ],
@@ -469,6 +472,32 @@ def test_bootstrap_extra_pip_build_failure_outranks_earlier_transient_text(monke
         lb.install_extra_pip(_pip_payload())
     assert not isinstance(exc_info.value, lb.RetriableBootstrapError)
     assert len(calls) == 1  # fails fast, never walks the retry ladder
+
+
+def test_bootstrap_extra_pip_retries_a_network_interrupted_vcs_clone(monkeypatch):
+    # pip shells out to `git clone` for a VCS requirement and reports ANY child failure with the
+    # generic "subprocess-exited-with-error" marker, so a connection reset mid-clone carries that
+    # marker beside the network shape. Classifying the bare marker terminal would fail a paid run
+    # on exactly the blip this ladder exists to absorb.
+    lb, calls = _wire_pip(
+        monkeypatch,
+        [
+            (
+                (
+                    "Collecting some-pkg from git+https://github.com/org/repo\n"
+                    "  Running command git clone --filter=blob:none -q "
+                    "https://github.com/org/repo\n"
+                    "  fatal: unable to access 'https://github.com/org/repo': "
+                    "Connection reset by peer\n"
+                    "  error: subprocess-exited-with-error\n"
+                ),
+                1,
+            ),
+            ("Successfully installed some-pkg\n", 0),
+        ],
+    )
+    lb.install_extra_pip(_pip_payload())
+    assert len(calls) == 2  # retried the clone instead of failing the run as a user error
 
 
 def test_bootstrap_extra_pip_transient_only_text_still_retries(monkeypatch):
@@ -1002,6 +1031,107 @@ def test_live_candidates_drop_skus_that_cannot_hold_the_run_disk(monkeypatch):
     assert [c.gpu for c in fits] == ["A10"]
     # the allocator must never hand the runner a Lambda class it could not rent for this run
     assert PROVIDER.live_candidates(24, AllocationConstraints(disk_gb=800, gpu_type="A10")) == []
+
+
+def test_launch_never_rents_an_undersized_sku_from_a_mixed_candidate_list(monkeypatch):
+    """A capable SKU elsewhere in the list must not license renting an undersized one.
+
+    The gate used to answer "does SOME candidate fit?" and return on the first capable entry, but
+    the walk pops candidates in order, so an undersized shape ahead of the capable one was still
+    rented -- exactly the paid box the pre-rental floor exists to prevent.
+    """
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    launched: list[str] = []
+
+    def fake_launch(*, region_name, **_kwargs):
+        launched.append(region_name)
+        return "i-1"
+
+    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
+
+    assert _launch(
+        jobs,
+        _spec(disk_gb=800),
+        seed=0,
+        instances=[
+            _inst(region="us-small-1", disk_gb=100.0),  # provably undersized, listed FIRST
+            _inst(region="us-big-1", disk_gb=1024.0),
+        ],
+        attempt=0,
+    )
+    assert launched == ["us-big-1"]  # the undersized region was never rented
+
+
+def test_post_launch_interrupt_does_not_layer_a_run_label_reap_on_exact_cleanup(monkeypatch):
+    """An interrupt after launch terminates that exact instance; the coarse reap must stand down.
+
+    terminate_run_instances(run_id) kills every instance sharing the run label, so firing it on top
+    of an exact cleanup would destroy other concurrently-launched seeds of the same run.
+    """
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(lambda_api, "launch_instance", lambda **_k: "i-1")
+    exact: list[str] = []
+    reaped: list[str] = []
+    monkeypatch.setattr(lambda_api, "terminate_instance_confirmed", lambda i: exact.append(i))
+    monkeypatch.setattr(jobs, "terminate_run_instances", lambda run_id: reaped.append(run_id) or [])
+
+    def interrupt(*_a, **_k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(jobs, "_lambda_job_handle", interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        _launch(jobs, _spec(), seed=0, instances=[_inst()], attempt=0)
+
+    assert exact == ["i-1"]  # the rented box was terminated by id
+    assert reaped == []  # ... so the run-wide reap must NOT also fire
+
+
+def test_interrupt_while_the_cacheless_launch_request_is_in_flight_reaps_by_label(monkeypatch):
+    """The cache-less retry's request can bill a box whose id never came back.
+
+    The guard used to disarm on every exit from that helper, so an interrupt mid-request left the
+    instance owned by nobody: no exact id to terminate, and the coarse reap already stood down.
+    """
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(
+        lambda_api, "ensure_filesystem", lambda n, r, deadline_at=None: f"/lambda/nfs/{n}"
+    )
+    reaped: list[str] = []
+    monkeypatch.setattr(jobs, "terminate_run_instances", lambda run_id: reaped.append(run_id) or [])
+
+    calls: list[str] = []
+
+    def fake_launch(*, file_system_names=None, **_kwargs):
+        calls.append("cold" if file_system_names is None else "cached")
+        if file_system_names is None:
+            raise KeyboardInterrupt  # interrupt with the cache-less create request in flight
+        raise lambda_api.LambdaApiError(
+            "POST /instance-operations/launch -> HTTP 400: file_system_names not attachable"
+        )
+
+    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
+
+    with pytest.raises(KeyboardInterrupt):
+        _launch(
+            jobs,
+            _spec(network_volume="flash-weights"),
+            seed=0,
+            instances=[_inst()],
+            attempt=0,
+        )
+
+    assert calls == ["cached", "cold"]
+    assert reaped == ["flash-1700000000-abcd1234"]  # only the label can name that box
 
 
 def test_launch_raises_when_no_capacity(monkeypatch):

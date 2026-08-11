@@ -606,10 +606,13 @@ def test_train_body_extra_pip_build_failure_outranks_earlier_transient_text(monk
         monkeypatch,
         [
             (
-                "WARNING: Retrying (Retry(total=4)) after connection broken by NewConnectionError\n"
-                "Collecting some-env-pkg\n"
-                "  error: subprocess-exited-with-error\n"
-                "ERROR: Failed building wheel for some-env-pkg\n",
+                (
+                    "WARNING: Retrying (Retry(total=4)) after connection broken by "
+                    "NewConnectionError\n"
+                    "Collecting some-env-pkg\n"
+                    "  error: subprocess-exited-with-error\n"
+                    "ERROR: Failed building wheel for some-env-pkg\n"
+                ),
                 1,
             )
         ],
