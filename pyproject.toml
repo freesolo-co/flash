@@ -71,7 +71,10 @@ server = [
 dev = [
     "mypy>=1.13.0",
     "pytest>=9.0.3",
-    "ruff>=0.6",
+    # Upper bound tracks uv.lock (ruff 0.15.x), which is what CI lints with. Without it, an
+    # install that ignores the lockfile (`uv pip install -e '.[dev]'`, plain pip) resolves a newer
+    # ruff whose new rules fail on a tree CI calls clean. Raise both sites with the lockfile.
+    "ruff>=0.6,<0.16",
     "fastapi",
     "uvicorn",
     "runpod-flash",
@@ -146,7 +149,8 @@ package = true
 dev = [
     "mypy>=1.13.0",
     "pytest>=9.0.3",
-    "ruff>=0.6",
+    # Keep in lockstep with the `dev` extra above and with uv.lock.
+    "ruff>=0.6,<0.16",
     # Offline worker/env tests import these without the heavy `gpu` stack; the CI test env
     # (`--extra server --dev`) gets httpx + huggingface-hub from the `server` extra.
     "datasets>=2.19",
