@@ -236,7 +236,7 @@ def _data_overrides(cfg: dict) -> list[str]:
 def _actor_model_overrides(cfg: dict) -> list[str]:
     """configure the trainable model and adapter loading."""
     return [
-        f"actor_rollout_ref.model.path={cfg['model_id']}",
+        f"actor_rollout_ref.model.path={cfg['model_path']}",
         f"actor_rollout_ref.model.lora_rank={cfg['lora_rank']}",
         f"actor_rollout_ref.model.lora_alpha={cfg['lora_alpha']}",
         f"actor_rollout_ref.model.target_modules={cfg['target_modules']}",
@@ -546,7 +546,9 @@ def _build_verl_training_cfg(
     *,
     train_files: str,
     val_files: str,
-    model_id: str,
+    # the local snapshot dir verl loads weights from, not the hf repo id. anything needing the
+    # catalog id reads inp["model_id"].
+    model_path: str,
     thinking: bool,
     loggers: list[str],
     fp8_kv: bool,
@@ -570,11 +572,14 @@ def _build_verl_training_cfg(
         "fused_ce_backend": ce_backend,
         "train_files": train_files,
         "val_files": val_files,
-        "model_id": model_id,
+        "model_path": model_path,
         "lora_rank": inp["lora_rank"],
         "lora_alpha": inp["lora_alpha"],
         "target_modules": "all-linear",
-        "target_parameters": _w.lora_target_parameters(model_id),
+        # the catalog id, never model_path: lora_target_parameters matches an exact hf repo id, so a
+        # snapshot dir yields None and leaves the fused routed-expert parameters unadapted on a run
+        # that otherwise looks healthy.
+        "target_parameters": _w.lora_target_parameters(inp["model_id"]),
         "multimodal": bool(inp.get("multimodal")),
         "lr": inp["lr"],
         "group_size": inp["group_size"],

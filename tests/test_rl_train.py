@@ -497,7 +497,7 @@ def _overrides_cfg(**over):
         "fused_ce_backend": "torch",
         "train_files": "/w/train.parquet",
         "val_files": "/w/val.parquet",
-        "model_id": "Qwen/Qwen3-4B",
+        "model_path": "Qwen/Qwen3-4B",
         "lora_rank": 32,
         "lora_alpha": 64,
         "target_modules": "all-linear",
@@ -609,6 +609,72 @@ def test_build_verl_overrides_carries_fused_expert_target_parameters():
         "++actor_rollout_ref.model.target_parameters="
         "[mlp.experts.gate_up_proj,mlp.experts.down_proj]"
     ) in o
+
+
+def test_build_verl_training_cfg_resolves_expert_targets_from_the_catalog_id():
+    """The fused-expert lookup must use the catalog id, NOT the local snapshot path.
+
+    The builder is handed a snapshot dir to load weights from, and handing that same string to
+    ``lora_target_parameters`` (which matches an exact hf repo id) resolves to None: PEFT then
+    adapts only ``all-linear`` and the routed-expert parameters are never trained, on a run that
+    completes, checkpoints, and reports healthy metrics. The test above renders already-resolved
+    targets, so it cannot see that; this one goes through the real builder with a path that looks
+    like what ``_cached_model_path`` actually returns.
+    """
+    inp = {**_mem_util_inp(model_id="Qwen/Qwen3.6-35B-A3B", engine_len=8192)}
+    inp.update(
+        {
+            "lora_rank": 32,
+            "lora_alpha": 64,
+            "lr": 1e-5,
+            "prompts_per_step": 16,
+            "mask_truncated_completions": True,
+            "max_prompt_len": 1024,
+            "max_completion": 1024,
+            "max_response_len": 1024,
+            "multi_turn": False,
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "kl_coef": 0.0,
+            "entropy_quantile": None,
+            "stop_sequences": (),
+            "structured_outputs": None,
+            "seed": 42,
+            "ppo_epochs": 1,
+            "steps": 60,
+            "warmstart_adapter": "",
+            "verl_total_epochs": 1,
+            "save_freq": 20,
+            "ckpt_to_keep": 1,
+        }
+    )
+    snapshot = "/cache/models--Qwen--Qwen3.6-35B-A3B/snapshots/deadbeefcafe"
+
+    cfg = rl_train._build_verl_training_cfg(
+        inp,
+        train_files="/w/t.parquet",
+        val_files="/w/v.parquet",
+        model_path=snapshot,
+        thinking=False,
+        loggers=["console"],
+        fp8_kv=False,
+        enforce_eager=False,
+        attention_backend=None,
+        mm_encoder_attn_backend=None,
+        ce_backend="torch",
+        reward_path="/w/r.py",
+        local_dir="/w/ckpt",
+        project_name="p",
+        experiment_name="e",
+    )
+
+    # the weights still load from the snapshot dir ...
+    assert cfg["model_path"] == snapshot
+    # ... but the fused expert targets resolve from the catalog id.
+    assert cfg["target_parameters"] == [
+        "mlp.experts.gate_up_proj",
+        "mlp.experts.down_proj",
+    ]
 
 
 def test_build_verl_overrides_does_not_emit_inert_drop_last_override():
@@ -883,7 +949,7 @@ def test_gpu_mem_util_sizing_reaches_the_launch_config():
         },
         train_files="/w/t.parquet",
         val_files="/w/v.parquet",
-        model_id="Qwen/Qwen3.5-4B",
+        model_path="Qwen/Qwen3.5-4B",
         thinking=False,
         loggers=["console"],
         fp8_kv=False,
@@ -1023,7 +1089,7 @@ def test_sleep_unsupported_models_keep_the_rollout_engine_resident():
             inp,
             train_files="/w/t.parquet",
             val_files="/w/v.parquet",
-            model_id="/w/model",
+            model_path="/w/model",
             thinking=False,
             loggers=["console"],
             fp8_kv=False,
@@ -1087,7 +1153,7 @@ def test_build_verl_training_cfg_derives_engine_len_and_budget():
         "ce_backend": "torch",
         "train_files": "/w/t.parquet",
         "val_files": "/w/v.parquet",
-        "model_id": "Qwen/Qwen3-4B",
+        "model_path": "Qwen/Qwen3-4B",
         "thinking": False,
         "loggers": ["console"],
         "fp8_kv": False,
@@ -1188,7 +1254,7 @@ def test_resolver_clamps_prompt_budget_with_the_engine(monkeypatch):
         ce_backend="torch",
         train_files="/w/train.parquet",
         val_files="/w/val.parquet",
-        model_id=inp["model_id"],
+        model_path=inp["model_id"],
         thinking=False,
         loggers=["console"],
         fp8_kv=False,
@@ -1397,7 +1463,7 @@ def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeyp
         ce_backend="torch",
         train_files="/w/train.parquet",
         val_files="/w/val.parquet",
-        model_id=inp["model_id"],
+        model_path=inp["model_id"],
         thinking=False,
         loggers=["console"],
         fp8_kv=False,
@@ -2977,9 +3043,9 @@ def test_pinned_snapshot_dir_is_what_reaches_verl_model_path():
         and n.func.id == "_build_verl_training_cfg"
     ]
     assert len(calls) == 1
-    model_id = next(k for k in calls[0].keywords if k.arg == "model_id")
-    assert isinstance(model_id.value, ast.Name)
-    assert model_id.value.id == "model_path_for_verl"
+    model_path = next(k for k in calls[0].keywords if k.arg == "model_path")
+    assert isinstance(model_path.value, ast.Name)
+    assert model_path.value.id == "model_path_for_verl"
 
 
 # ------------------------------- resume (VERL-018) -------------------------------
@@ -3899,7 +3965,7 @@ def test_multi_turn_env_resolves_and_selects_the_flash_agent_loop(monkeypatch):
         ce_backend="torch",
         train_files="/w/train.parquet",
         val_files="/w/val.parquet",
-        model_id=inp["model_id"],
+        model_path=inp["model_id"],
         thinking=False,
         loggers=["console"],
         fp8_kv=False,
@@ -5055,7 +5121,7 @@ def test_the_response_width_reaches_verls_config_rather_than_max_completion(monk
         ce_backend="torch",
         train_files="/w/train.parquet",
         val_files="/w/val.parquet",
-        model_id=inp["model_id"],
+        model_path=inp["model_id"],
         thinking=False,
         loggers=["console"],
         fp8_kv=False,
