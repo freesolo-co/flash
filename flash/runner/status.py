@@ -91,7 +91,14 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
         worker_spec.workload_profile or None
     ):
         raise ValueError("persisted workload profile does not match the worker spec")
-    if (has_workload_profile or worker_spec.model_revision_auto) and (
+    # `gpu_count_auto` joins this list for the same reason `model_revision_auto` is on it: the
+    # structural compare excludes it (the public half always reads False by construction), so a
+    # forged worker-half marker would otherwise reach allocation unverified. it is a privilege
+    # decision -- a true marker turns an authored `gpu.count = 1` hard ceiling into
+    # `max_gpu_count=None`, silently widening the user's pin and billing cards they capped. the
+    # marker is hashed into the digest at persist time, so a snapshot claiming one cannot reproduce
+    # it.
+    if (has_workload_profile or worker_spec.model_revision_auto or worker_spec.gpu_count_auto) and (
         not isinstance(stored_digest, str)
         or stored_digest
         != runner._preparation_digest(
@@ -172,6 +179,10 @@ def reallocation_spec_from_status(status: RunStatus, *, verify_source: bool = Fa
     """
     worker_spec = runner.effective_spec_from_status(status, verify_source=verify_source)
     public_gpu = JobSpec.from_dict(status.spec).gpu
+    # `gpu_count_auto` needs no restoring here: it is provenance, so the worker half carries it
+    # verbatim through allocation. The public half cannot supply it -- to_dict strips the marker and
+    # keeps the placeholder count=1, making an auto-sized run's public spec byte-identical to an
+    # authored single-card pin -- which is exactly why the worker half must keep it.
     if worker_spec.gpu.type == public_gpu.type and worker_spec.gpu.count == public_gpu.count:
         return worker_spec
     restored = worker_spec.to_internal_dict()

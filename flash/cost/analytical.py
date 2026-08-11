@@ -479,6 +479,14 @@ def _offline_gpu_shape(
         # precheck - overstated cost against a cheaper shape `allocate()` would really pick. the
         # `providers_for` filter below narrows this pool to the classes the provider can provision.
         names = tuple(info.name for info in GPU_INFO.values() if info.validated)
+    # narrow to what the pinned provider can actually provision BEFORE sizing. the ranking loop
+    # below filters per candidate, which is too late for two decisions taken up front: the
+    # auto-sized count and the no-fit message would both reason over classes this provider cannot
+    # rent. measured: a vast-pinned 119 GB run sized 1 card against another provider's H200, ranked
+    # empty, and reported "more than any 8-card combination (1177.6 GB max)" -- a number larger than
+    # the requirement it claimed could not be met, while 2x80 GB vast cards would have fit.
+    if provider != "auto":
+        names = tuple(name for name in names if provider in providers_for(name))
     auto_cap = geometry_safe_gpu_cap(
         config.model_id, MAX_COMBINATION_CARDS, model_revision=config.model_revision
     )
@@ -529,9 +537,12 @@ def _offline_gpu_shape(
                 )
             )
     if not ranked:
-        if config.gpu_type:
-            # name the pinned class and its own ceiling. the pool-wide message below would report the
-            # widest validated shape, which is not the hardware this quote was ever allowed to use.
+        # a pinned class with NO authored count is blocked by the class itself, so name it and its
+        # own ceiling; the pool-wide message would report the widest validated shape, which is not
+        # hardware this quote was ever allowed to use. an authored count is different: raising it is
+        # a real remedy, and `vram_fit_error_message` already names the count that would fit --
+        # restricted to this class via `gpu_names`, so it never suggests a shape the pin forbids.
+        if config.gpu_type and config.gpu_count is None:
             info = GPU_INFO[canonical_gpu(config.gpu_type)]
             raise ValueError(
                 f"exact GPU {info.name!r} cannot fit this run: it requires at least {need} GB. "

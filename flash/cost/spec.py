@@ -218,7 +218,11 @@ def runconfig_from_spec(spec) -> RunConfig:
         gpu_type=g.type,
         model_revision=spec.model_revision,
         disk_gb=float(getattr(g, "disk_gb", 0.0) or 0.0),
-        gpu_count=None if spec.gpu_count_auto else g.count,
+        # the marker is provenance (the author omitted gpu.count), so it survives allocation. price
+        # an unresolved run by auto-sizing, but once a shape has landed on the spec (count > 1, or a
+        # class was selected) quote THAT shape -- re-auto-sizing a resolved run would bill a
+        # different geometry than the one actually rented.
+        gpu_count=(None if spec.gpu_count_auto and g.count == 1 and not g.type else g.count),
         max_wall_seconds=g.max_wall_seconds,
         environment=spec.environment.id or None,
         save_at_steps=t.save_at_steps,

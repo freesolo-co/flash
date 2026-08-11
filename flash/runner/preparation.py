@@ -446,7 +446,15 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
     # persisted for launch.
     effective_count = int(effective_gpu.get("count", 1) or 1)
     public_count = int(public_gpu.get("count", 1) or 1)
-    if 1 <= effective_count <= public_count:
+    # an auto-sized run has NO authored ceiling: its public count is the digest-stable placeholder
+    # 1, so a legitimately auto-sized 2+ card shape would fail the narrowing rule below and be
+    # rejected as an integrity failure at persist time. the real ceiling for that run is the
+    # platform maximum, and the marker is itself digest-protected (see effective_spec_from_status),
+    # so it cannot be forged to unlock this branch.
+    from flash.providers.base import MAX_COMBINATION_CARDS
+
+    ceiling = MAX_COMBINATION_CARDS if worker_spec.gpu_count_auto else public_count
+    if 1 <= effective_count <= ceiling:
         effective_gpu["count"] = public_gpu.get("count")
     # disk sizing, the weight-cache volume, and retry/wall-clock lifecycle policy are platform-managed
     # (_runner().MANAGED_GPU_KEYS) and stripped from the public spec, so the reconstructed public spec carries

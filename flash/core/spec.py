@@ -463,9 +463,13 @@ class JobSpec:
         # deploy guard reads the pair.
         if self.model_revision_auto and not self.model_revision:
             object.__setattr__(self, "model_revision_auto", False)
-        # the marker qualifies the default integer placeholder and cannot outlive a resolved count.
-        if self.gpu_count_auto and self.gpu.count != 1:
-            object.__setattr__(self, "gpu_count_auto", False)
+        # NOT cleared when gpu.count != 1. the marker records PROVENANCE -- that the author omitted
+        # gpu.count -- which stays true after allocation resolves a shape onto the spec. clearing it
+        # there destroyed the only record distinguishing an auto-sized run from an authored
+        # single-card pin: the public halves are byte-identical (to_dict strips the marker and keeps
+        # the placeholder count=1 for digest stability), so a recovered auto-sized run came back
+        # hard-pinned to one card and could never be re-offered its multi-card shape. consumers that
+        # mean "auto-size NOW" must additionally check that no shape has been resolved yet.
         profile_kind = str(self.workload_profile_kind or "")
         if profile_kind not in {"", "sft"}:
             raise ValueError("unsupported workload profile kind")

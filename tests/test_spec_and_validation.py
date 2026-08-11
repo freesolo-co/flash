@@ -1554,9 +1554,13 @@ def test_unset_gpu_count_keeps_the_digest_stable_integer_placeholder() -> None:
 
     from flash.runner.supervise.lifecycle import _spec_with_gpu
 
+    # the marker is PROVENANCE ("the author omitted gpu.count"), so it survives the resolved shape.
+    # it is the only surviving record of that fact -- the public halves of an auto-sized and an
+    # authored single-card run are byte-identical -- so clearing it here made a recovered
+    # auto-sized run re-allocate hard-pinned to one card.
     resolved = _spec_with_gpu(internal, "H200", 2)
     assert resolved.gpu.count == 2
-    assert resolved.gpu_count_auto is False
+    assert resolved.gpu_count_auto is True
     with pytest.raises(ConfigError, match=r"unknown config key\(s\): gpu_count_auto"):
         spec_from_dict(_raw(gpu_count_auto=True))
 

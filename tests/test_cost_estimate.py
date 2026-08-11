@@ -568,6 +568,36 @@ def test_a_pinned_gpu_class_is_never_auto_widened_by_the_quote():
         estimate_cost(RunConfig("Qwen/Qwen3.5-9B", "grpo", 10, gpu_type="RTX 4090"))
 
 
+def test_auto_sizing_only_considers_cards_the_pinned_provider_can_rent():
+    """A provider pin must narrow the pool BEFORE the count is sized, not just during ranking.
+
+    The ranking loop filters per candidate, which is too late for two decisions taken up front: the
+    auto-sized count and the no-fit message. Measured before this fix, a vast-pinned 119 GB run
+    sized one card against another provider's H200, then ranked empty and reported "more than any
+    8-card validated GPU combination (1177.6 GB max)" -- naming a capacity larger than the
+    requirement it claimed could not be met, while 2x80 GB vast cards would have fit.
+    """
+    from flash.cost.analytical import _offline_gpu_shape
+    from flash.providers.base import providers_for
+
+    gpu, _need, count, _provider, _hourly = _offline_gpu_shape(
+        RunConfig("Qwen/Qwen3.6-35B-A3B", "sft", 10, provider="vast")
+    )
+    assert "vast" in providers_for(gpu), f"quoted {gpu}, which vast cannot provision"
+    assert count >= 2, "a 119 GB run does not fit one vast card"
+
+
+def test_an_authored_count_still_gets_raise_count_advice_on_a_pinned_class():
+    """The pinned-class message must not swallow the remedy when the COUNT is what blocks fit.
+
+    A pinned class with no count is blocked by the class, so naming shrink knobs is right. With an
+    authored count, raising it is a real remedy and `allocate()` says so -- the quote contradicting
+    it would send the user to shrink a run that would fit on one more card.
+    """
+    with pytest.raises(ValueError, match=r"Raise gpu\.count"):
+        estimate_cost(RunConfig("Qwen/Qwen3.6-35B-A3B", "sft", 10, gpu_type="H100", gpu_count=1))
+
+
 def test_offline_estimate_supports_eight_card_only_runs(monkeypatch):
     """`flash train --cost` must price a run that fits eight cards but no four-card shape."""
     monkeypatch.setattr("flash.cost.analytical.required_vram_gb", lambda *a, **k: 700)
