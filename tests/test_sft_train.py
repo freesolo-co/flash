@@ -2491,7 +2491,7 @@ def test_repeated_swallowed_publish_failures_do_not_accumulate_adapters(monkeypa
     assert left == [], f"8 failed saves left {len(left)} adapters on disk: {left}"
 
 
-def test_the_rl_and_opd_watchers_still_keep_their_exports():
+def test_the_rl_and_opd_watchers_still_keep_their_exports(monkeypatch, tmp_path):
     """the sft cleanup must not be generalized to the siblings that have a reader.
 
     `_OpdVerlCheckpointWatcher` subclasses the sft watcher, so a cleanup placed in a shared method
@@ -2500,27 +2500,64 @@ def test_the_rl_and_opd_watchers_still_keep_their_exports():
     `_stage_retry_contract` -- so for them the directory is live state, not garbage. The sft path is
     safe to clear precisely because it has no such consumer.
 
-    Asserted structurally: the deletion lives in the sft-only `_publish_from`, and opd overrides
-    `_publish` rather than inheriting the path that deletes.
+    Asserted by running the opd watcher's real `_publish` and looking at the disk afterwards. An
+    earlier version of this test grepped `inspect.getsource` for `"rmtree(adapter_dir"`, which
+    proved nothing: writing the deletion as `rmtree(os.fspath(adapter_dir))` does not match that
+    substring, so the adapter could be destroyed with the assertion still green. Source text is not
+    the contract; the surviving directory is.
     """
-    import inspect
-
     from flash.engine.worker.train.opd import failures as opd_failures
     from flash.engine.worker.train.sft import checkpoints as sft_checkpoints
 
-    assert "rmtree(adapter_dir" in inspect.getsource(
-        sft_checkpoints._VerlCheckpointWatcher._publish_from
-    )
-
-    opd_publish = inspect.getsource(opd_failures._OpdVerlCheckpointWatcher._publish)
-    assert "_stage_retry_contract" in opd_publish
-    assert "rmtree(adapter_dir" not in opd_publish, (
-        "the opd watcher would delete an adapter its retry contract still points at"
-    )
     assert (
         opd_failures._OpdVerlCheckpointWatcher._publish
         is not sft_checkpoints._VerlCheckpointWatcher._publish
     ), "opd no longer overrides _publish, so it now inherits the sft deletion"
+
+    staged: dict[str, object] = {}
+    monkeypatch.setattr(
+        opd_failures,
+        "_export_checkpoint_adapter",
+        lambda actor, adapter, **kwargs: os.makedirs(adapter, exist_ok=True),
+    )
+    monkeypatch.setattr(
+        opd_failures,
+        "_stage_retry_contract",
+        lambda checkpoint_dir, **kwargs: staged.update(kwargs),
+    )
+    monkeypatch.setattr(
+        opd_failures._w, "publish_deployable_checkpoint", lambda adapter, step, **kw: f"step-{step}"
+    )
+    monkeypatch.setattr(
+        opd_failures._w,
+        "upload_resume_checkpoint",
+        lambda step, ckpt, **kwargs: (kwargs["before_upload"](), True)[1],
+    )
+
+    export_root = tmp_path / "opd-exports"
+    checkpoint_dir = tmp_path / "ckpts" / "global_step_2"
+    (checkpoint_dir / "actor").mkdir(parents=True)
+
+    watcher = opd_failures._OpdVerlCheckpointWatcher(
+        local_dir=str(tmp_path / "ckpts"),
+        export_root=str(export_root),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(2,),
+        seed=0,
+        prompt_pool_fingerprint="fp",
+        prompts_per_step=1,
+        group_size=1,
+        accounting_state=lambda step: None,
+    )
+    watcher._publish(2, str(checkpoint_dir))
+
+    # the retry contract recorded this exact path, so the directory has to still be there.
+    assert staged["adapter_dir"] == str(export_root / "step-2")
+    assert os.path.isdir(export_root / "step-2"), (
+        "the opd watcher deleted an adapter its retry contract still points at"
+    )
 
 
 def test_a_failed_merge_does_not_strand_the_merge_tree(monkeypatch, tmp_path):
@@ -2608,4 +2645,44 @@ def test_a_failed_export_does_not_strand_a_partial_adapter(monkeypatch, tmp_path
 
     assert not os.path.exists(export_root / "step-7"), (
         "a failed export left a partial adapter on the container disk"
+    )
+
+
+def test_the_worker_disables_xet_as_its_very_first_action():
+    """the startup wiring itself, not just the helper.
+
+    The other xet tests call `_disable_xet_upload_staging()` directly, or assert that importing the
+    worker package does not freeze the default. Neither notices if the CALL is deleted from
+    `_run_worker_mode` -- I verified that by removing it, and all three stayed green.
+
+    Asserted over the AST rather than by running the worker. `_run_worker_mode` performs real boot
+    work (heartbeat, kernel cache, gpu probe) and cannot be driven to a mode handler in a test
+    process, and observing `os.environ` in-process cannot attribute the value anyway: an earlier
+    test in the same session may already have set it.
+
+    What actually has to hold is an ordering property, and ordering is exactly what the AST shows:
+    the disable must be the FIRST executable statement, because `huggingface_hub.constants` captures
+    `HF_HUB_DISABLE_XET` at import time and any import above it would freeze the default first.
+    Matching the call by name also survives the alternate spellings a substring grep would miss.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    import flash.engine.worker as worker
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(worker._run_worker_mode)))
+    body = ast.get_docstring(tree.body[0], clean=False) and tree.body[0].body[1:]
+    first = (body or tree.body[0].body)[0]
+
+    value = first.value if isinstance(first, ast.Expr) else None
+    called = value.func if isinstance(value, ast.Call) else None
+    assert isinstance(called, ast.Name | ast.Attribute), (
+        f"the first statement of _run_worker_mode is {ast.dump(first)[:80]}, not a call; "
+        "xet staging must be disabled before anything else can import huggingface_hub"
+    )
+    name = called.attr if isinstance(called, ast.Attribute) else called.id
+    assert name == "_disable_xet_upload_staging", (
+        f"_run_worker_mode starts by calling {name!r}, not _disable_xet_upload_staging; "
+        "uploads would stage a second copy of every checkpoint through the xet cache"
     )
