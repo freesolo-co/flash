@@ -545,7 +545,9 @@ def rentable_gpu_counts(max_gpu_count: int) -> tuple[int, ...]:
     """Return rentable card counts, largest first, up to ``max_gpu_count``.
 
     Use powers of two: providers sell those shapes, and verl requires ``num_attention_heads %
-    sp_size == 0``. Every current catalog head count (8, 8, 16, 16, 24, 16) divides 1, 2, 4, and 8,
+    sp_size == 0`` wherever ulysses runs (grpo and opd; sft pins it off and shards by data, so its
+    width is bounded by the batch instead -- see ``sft_data_parallel_cards``). Every current catalog
+    head count (8, 8, 16, 16, 24, 16) divides 1, 2, 4, and 8,
     so today every rentable shape is legal for every row. That is a property of today's catalog, not
     an invariant: ``allocator.geometry_safe_gpu_cap`` checks each row's own recorded head count so a
     future row with, say, 20 heads is capped rather than rented and failed at Ulysses init. This

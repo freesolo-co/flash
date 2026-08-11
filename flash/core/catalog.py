@@ -119,8 +119,9 @@ class ModelInfo:
     num_key_value_heads: int = 0
     # QUERY heads, from the checkpoint's own config. NOT derivable as hidden_size // head_dim: these
     # models decouple head_dim from that ratio (3.5-4B is hidden 2560 / head_dim 256 but has 16
-    # heads, not 10). verl's ulysses sequence parallelism requires this to divide the gpu count, so
-    # a derived value silently caps runs on a number that is not the constraint.
+    # heads, not 10). verl's ulysses sequence parallelism requires this to divide the gpu count --
+    # grpo and opd use it, sft no longer does -- so a derived value silently caps runs on a number
+    # that is not the constraint.
     num_attention_heads: int = 0
     head_dim: int = 0
     linear_num_key_heads: int = 0
