@@ -444,17 +444,13 @@ def test_no_pool_cap_is_invented_when_the_config_sets_none(tmp_path, monkeypatch
     assert "Raise `batch_size`" in err
 
 
-def test_raising_a_binding_pool_is_priced_as_dearer_not_cheaper(tmp_path, monkeypatch, capsys):
-    """Widening a CAP grows the pool, so the run gains passes and the bill goes up.
+def test_raising_a_binding_pool_is_not_promised_a_cheaper_quote(tmp_path, monkeypatch, capsys):
+    """The "fewer updates, so cheaper" trade only holds when a batch widens against a FIXED pool.
 
-    The "fewer updates, so cheaper" trade only holds when the batch widens against a FIXED pool.
-    Measured on this shape: at batch 2, lifting `max_examples` 2 -> 8 goes from 1 step at $0.0353
-    to 4 steps at $0.1414. Promising a cheaper quote there is the same class of defect as the
-    fixed-horizon one, in the branch that fix did not cover.
-
-    Authors the `batch_size = 2` its evidence is measured at. Passing no batch took the no-pinned-
-    batch branch instead, where prompts-per-step follows the cap and the horizon does not move at
-    all, so this asserted the pinned-batch promise against a case that does not make it.
+    Here both `batch_size` and the cap are thin, so the remedy names both, and raising both is
+    what it asks for. That keeps the horizon flat rather than shrinking it: `ceil(2/2)` and
+    `ceil(4/4)` are both 1 update. So a cheaper quote must not be promised, and neither may the
+    opposite "gains passes" claim, which belongs to raising the cap alone against a pinned batch.
     """
     monkeypatch.setenv("FLASH_STYLE", "0")
 
@@ -462,8 +458,9 @@ def test_raising_a_binding_pool_is_priced_as_dearer_not_cheaper(tmp_path, monkey
     err = capsys.readouterr().err
 
     assert rc == 0
-    assert "quotes dearer" in err
+    assert "widens each update rather than adding updates" in err
     assert "quotes cheaper" not in err
+    assert "adds passes" not in err
 
 
 def test_a_max_examples_clamp_is_warned_about_even_with_no_batch_size(
@@ -709,11 +706,13 @@ def test_a_cap_without_a_batch_size_is_not_told_it_buys_more_passes(tmp_path, mo
     assert "dearer" not in err
 
 
-def test_a_cap_with_a_pinned_batch_size_is_told_it_buys_more_passes(tmp_path, monkeypatch, capsys):
-    """The mirror case: an authored `batch_size` pins prompts-per-step, so the pool adds updates.
+def test_two_thin_knobs_are_told_to_move_together(tmp_path, monkeypatch, capsys):
+    """When the remedy names both knobs, it must describe raising BOTH, not just the cap.
 
-    At batch 2, lifting `max_examples` 2 -> 8 really does go from 1 step to 4, so here the longer
-    run is the correct mechanism and the dearer quote is real.
+    Raising a cap while `batch_size` stays pinned does add updates (batch 2, cap 2 -> 8: 1 step to
+    4). But this remedy asks for both, and moving them in step holds the horizon flat:
+    `ceil(2/2) == ceil(4/4) == ceil(8/8) == 1`. Describing the pinned-batch mechanism here tells
+    the user to expect a longer run from an edit that does not produce one.
     """
     monkeypatch.setenv("FLASH_STYLE", "0")
 
@@ -721,8 +720,9 @@ def test_a_cap_with_a_pinned_batch_size_is_told_it_buys_more_passes(tmp_path, mo
     err = capsys.readouterr().err
 
     assert rc == 0
-    assert "adds passes rather than removing them" in err
-    assert "quotes dearer, not cheaper" in err
+    assert "Raise `batch_size` and `[train] max_examples` together" in err
+    assert "widens each update rather than adding updates" in err
+    assert "longer run" not in err
 
 
 def test_staggered_caps_are_both_named_so_one_edit_resolves_it(tmp_path, monkeypatch, capsys):

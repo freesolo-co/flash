@@ -170,13 +170,14 @@ def thin_rl_batch_warning(spec) -> str | None:
     usually fewer, so it is cheaper (measured: grpo 9B over 800 prompts quotes $21.88 at 1 and
     $7.37 at 16). Under a positive ``max_steps`` the update count is pinned, so widening buys
     averaging at strictly more generation: the same run quotes $0.27 at 1 and $0.51 at 4 for an
-    identical 10 steps. Raising a POOL cap splits again on whether a ``batch_size`` was authored: a
-    pinned batch spreads the bigger pool over more updates and quotes dearer (batch 2, cap 2 -> 8:
-    1 step at $0.035 to 4 steps at $0.141), but with no authored batch the request is the recipe
-    default and prompts-per-step rises with the cap, so the horizon does not move at all (cap 2, 4,
-    ... 64 all derive 1 update) and the quote is flat at $0.47 across every one of them, because it
-    prices the recipe's full rollout width rather than the retained pool. So that branch names the
-    mechanism and sends the user to ``--cost`` instead of promising a direction.
+    identical 10 steps. Raising a POOL cap only adds updates while the batch stays pinned (batch 2,
+    cap 2 -> 8: 1 step at $0.035 to 4 steps at $0.141) -- and this message never asks for that in
+    isolation, because a thin batch is named alongside the cap and the two then move together,
+    holding the horizon flat (``ceil(2/2) == ceil(4/4) == 1``). With no authored batch at all,
+    prompts-per-step rises with the cap for the same reason, and the quote is flat at $0.47 across
+    caps 2 through 64 because it prices the recipe's full rollout width rather than the retained
+    pool. So every widening branch except the pinned-``max_steps`` one names the mechanism and
+    sends the user to ``--cost`` instead of promising a direction.
     """
     if spec.algorithm not in ("grpo", "opd"):
         return None
@@ -278,12 +279,14 @@ def _thin_rl_batch_remedy(spec, *, raise_target: str, batch_binds: bool, pool_bi
             "without adding updates. Re-run `--cost` to see what it does to this quote."
         )
     if pool_binds and batch_binds:
-        # an authored batch pins prompts-per-step, so a bigger pool is spread over MORE updates:
-        # at batch 2, lifting max_examples 2 -> 8 goes from 1 step at $0.035 to 4 steps at $0.141.
+        # both knobs are named here, so they move TOGETHER and the horizon does not grow:
+        # ceil(2/2) == ceil(4/4) == ceil(8/8) == 1. "adds passes" describes raising the cap while
+        # the batch stays pinned (batch 2, cap 2 -> 8: 1 step to 4), which is not what this remedy
+        # asks for, so state the same-horizon, wider-update effect and price it with `--cost`.
         return (
-            f"Raise {raise_target}: with `batch_size` pinning prompts-per-step, a bigger prompt "
-            "pool adds passes rather than removing them, so this quotes dearer, not cheaper -- it "
-            "buys the averaging with a longer run."
+            f"Raise {raise_target} together: both hold prompts-per-step down, so lifting them in "
+            "step widens each update rather than adding updates. Re-run `--cost` to see what it "
+            "does to this quote."
         )
     if pool_binds:
         # with no authored batch the request is the recipe default, so prompts-per-step rises WITH
