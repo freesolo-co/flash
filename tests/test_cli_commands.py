@@ -663,8 +663,13 @@ def test_env_setup_warns_when_hosted_configs_are_retained_on_a_self_hosted_plane
     retained = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
     warning = capsys.readouterr().err
 
-    assert "self-hosted plane requires `github:` ids" in warning
+    assert "which a standalone plane rejects" in warning
     assert "`github:OWNER/REPO@REF:PATH`" in warning
+    # both branches named, because the CLI cannot read server-side FLASH_STANDALONE: telling an
+    # identity-backed operator to switch to `github:` would break a config that is already correct
+    assert "FLASH_STANDALONE=1" in warning
+    assert "identity backend" in warning
+    assert "these are already right" in warning
     for name in ("sft.toml", "rl.toml", "opd.toml"):
         assert f"configs/{name}" in warning, name
         assert retained[name] == hosted[name], name

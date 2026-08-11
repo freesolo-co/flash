@@ -556,10 +556,15 @@ def _warn_if_environment_form_disagrees(configs: tuple[Path, ...], *, can_publis
             "id with the returned id"
         )
     else:
+        # hedged, unlike the hosted branch above: which form a self-hosted plane accepts depends on
+        # server-side FLASH_STANDALONE, which the CLI cannot read. A standalone plane takes only
+        # `github:` ids; an identity-backed one takes only managed slugs -- so a flat "replace it"
+        # here would be advice to break the config on half of all self-hosted planes.
         change = (
-            "use managed hub [environment] ids, but this self-hosted plane requires `github:` ids; "
-            "keeping the files unchanged. Replace each [environment] id with a "
-            "`github:OWNER/REPO@REF:PATH` form accepted by this plane"
+            "use managed hub [environment] ids, which a standalone plane rejects; keeping the "
+            "files unchanged. If this plane runs with `FLASH_STANDALONE=1`, replace each "
+            "[environment] id with a `github:OWNER/REPO@REF:PATH` form; if it runs against an "
+            "identity backend, managed hub ids are the accepted form and these are already right"
         )
     _warn(f"existing {names} {change}")
 
