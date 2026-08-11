@@ -440,8 +440,13 @@ def test_no_pool_cap_is_invented_when_the_config_sets_none(tmp_path, monkeypatch
 
     assert rc == 0
     assert "OPTIMIZER batch" in err  # it still warns
-    assert "max_examples" not in err  # but invents no cap
+    # invents no cap: the remedy may EXPLAIN that no `max_examples` is set (that is why the pool
+    # follows the batch), but must never name one as a knob to raise or claim one is binding.
+    assert "`[train] max_examples`" not in err
+    assert "`[environment.params] max_examples`" not in err
+    assert "holds the prompt pool" not in err
     assert "Raise `batch_size`" in err
+    assert "with no `max_examples` set the prompt pool follows the batch" in err
 
 
 def test_raising_a_binding_pool_is_not_promised_a_cheaper_quote(tmp_path, monkeypatch, capsys):
@@ -648,6 +653,50 @@ def test_an_environment_param_cap_is_named_as_such(tmp_path, monkeypatch, capsys
     assert "`[train] max_examples`" not in err
 
 
+def test_a_non_finite_environment_cap_does_not_abort_the_submit(tmp_path, monkeypatch, capsys):
+    """`max_examples = inf` is valid toml an environment may use to mean "uncapped".
+
+    `int(nan)` raises ValueError, but `int(inf)` raises OverflowError, which an earlier revision
+    did not catch. Since this advisory runs BEFORE `create_run` on every path, that turned a
+    courtesy warning into a traceback that killed the submit. Params are opaque kwargs flash does
+    not define, so an unreadable value means "no cap I can price", never a reason to abort.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(
+        _grpo_cost_args(tmp_path, 1, max_examples=None, env_params={"max_examples": float("inf")})
+    )
+    out, err = capsys.readouterr()
+
+    assert rc == 0  # the run is quoted, not aborted
+    assert "Traceback" not in err
+    assert "OverflowError" not in err
+    assert "OPTIMIZER batch" in err  # and the thin authored batch is still reported
+    assert "[GRPO" in out  # the quote itself still printed
+
+
+def test_an_uncapped_thin_batch_is_not_offered_the_buying_steps_caveat(
+    tmp_path, monkeypatch, capsys
+):
+    """With no pool cap the pool FOLLOWS the batch, so there are no optimizer steps to buy.
+
+    `_on_policy_example_count` falls back to the requested batch when neither table caps the pool,
+    so batches of 1, 2, 4, 8 and 64 every one derive a single update. Offering "unless you are
+    deliberately buying optimizer steps on a derived horizon" here invites the user to keep a thin
+    batch for a benefit this shape cannot pay: nothing is being divided by a wider number.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, 1, max_examples=None))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "with no `max_examples` set the prompt pool follows the batch" in err
+    assert "without changing how many there are" in err
+    assert "buying optimizer steps" not in err
+    assert "fixed prompt pool" not in err
+
+
 def test_the_smaller_of_two_configured_caps_is_the_one_that_binds(tmp_path, monkeypatch, capsys):
     """An unenforced `[environment.params]` cap does not make the warning contradict the quote.
 
@@ -675,16 +724,24 @@ def test_the_smaller_of_two_configured_caps_is_the_one_that_binds(tmp_path, monk
     assert "[GRPO, 13 steps]" in out
 
 
-def test_every_cap_sitting_at_the_pool_is_named(tmp_path, monkeypatch, capsys):
-    """Two caps at the same value both bind, so raising only one moves nothing."""
+def test_only_the_priced_cap_is_named_when_both_hold_the_same_value(tmp_path, monkeypatch, capsys):
+    """Equal caps do NOT make the environment param part of the priced pool.
+
+    An earlier revision named both here, reasoning that at equality each one was the pool. It is
+    not so: `_on_policy_example_count` returns `[train] max_examples` unconditionally whenever it
+    is set, so raising ONLY that key to 4 takes the priced pool to 4 and clears this warning --
+    the environment value is never read. Naming both would send the user to edit opaque kwargs
+    their own environment acts on, for no effect on the quote printed beside this warning.
+    """
     monkeypatch.setenv("FLASH_STYLE", "0")
 
     rc = cmd_train(_grpo_cost_args(tmp_path, None, max_examples=2, env_params={"max_examples": 2}))
     err = capsys.readouterr().err
 
     assert rc == 0
-    assert "`[train] max_examples` and `[environment.params] max_examples`" in err
-    assert "max_examples` hold the prompt pool" in err  # plural subject, plural verb
+    assert "`[train] max_examples` holds the prompt pool" in err  # singular subject and verb
+    assert "`[environment.params] max_examples`" not in err
+    assert " and `[environment.params]" not in err
 
 
 def test_a_cap_without_a_batch_size_is_not_told_it_buys_more_passes(tmp_path, monkeypatch, capsys):

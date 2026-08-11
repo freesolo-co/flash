@@ -121,9 +121,25 @@ def _env_max_examples(spec) -> int:
         return 0
     try:
         value = int(params.get("max_examples") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError is the one that is easy to miss: `int(nan)` raises ValueError but
+        # `int(inf)` raises OverflowError, and `max_examples = inf` is valid toml an environment
+        # may well use to mean "uncapped". params are opaque kwargs flash does not define, so
+        # anything unreadable here means "no cap I can price", never a reason to abort. this
+        # feeds an advisory warning that runs before `create_run`, so raising would turn a
+        # courtesy line into a submit-blocking traceback.
         return 0
     return max(0, value)
+
+
+def _pool_cap_authored(spec) -> bool:
+    """Whether the config names a prompt pool at all, in either table.
+
+    Distinct from "a cap that binds": a cap of 800 authors a pool without being thin. What matters
+    downstream is whether a pool exists INDEPENDENTLY of ``batch_size``, because with neither key
+    set ``_on_policy_example_count`` returns the requested batch and the pool tracks the batch.
+    """
+    return bool(spec.train.max_examples) or _env_max_examples(spec) > 0
 
 
 def _on_policy_requested_prompts_per_step(spec) -> int:
@@ -228,19 +244,23 @@ def thin_rl_batch_warning(spec) -> str | None:
     # pool is 4, and naming the env cap would both contradict the quote beside it and promise that
     # raising `batch_size` alone changes nothing, when it takes prompts-per-step from 1 to 4.
     #
-    # both keys can still be named at once, and must be: when they hold the SAME value they are
-    # each the priced pool, so raising either alone leaves the other capping the batch where it was.
-    # what this guard drops is the staggered pair -- [train] 2 behind an env 3 names only [train],
-    # the key the bill actually reads.
-    cap_keys = [
-        key
-        for key, value in (
-            ("[train] max_examples", int(spec.train.max_examples or 0)),
-            ("[environment.params] max_examples", _env_max_examples(spec)),
-        )
-        if 0 < value < RL_THIN_PROMPTS_PER_STEP and value == examples
-    ]
-    cap_key = " and ".join(f"`{k}`" for k in cap_keys) if cap_keys else None
+    # EXACTLY one key, even when both hold the same thin value. an earlier revision named both at
+    # equality, reasoning that each was the priced pool; it is not so. `_on_policy_example_count`
+    # returns `[train]` unconditionally whenever it is set, so at [train] 2 with an env 2, raising
+    # only [train] to 4 takes the pool to 4 and clears this warning -- the env value is never read.
+    # asking for both edits therefore sends the user into opaque kwargs their own environment acts
+    # on, to no effect on the quote this warning sits beside.
+    train_cap = int(spec.train.max_examples or 0)
+    priced_cap = (
+        ("[train] max_examples", train_cap)
+        if train_cap > 0
+        else ("[environment.params] max_examples", _env_max_examples(spec))
+    )
+    cap_key = (
+        f"`{priced_cap[0]}`"
+        if 0 < priced_cap[1] < RL_THIN_PROMPTS_PER_STEP and priced_cap[1] == examples
+        else None
+    )
     # same rule for the authored batch: it binds if it is itself thin, even when a smaller pool is
     # what resolves today. raising only the cap would leave `batch_size = 3` capping the batch at 3.
     batch_binds = authored is not None and authored < RL_THIN_PROMPTS_PER_STEP
@@ -265,10 +285,10 @@ def thin_rl_batch_warning(spec) -> str | None:
                 "alone still leaves prompts-per-step thin."
             )
     else:
-        caps_verb = "hold" if len(cap_keys) > 1 else "holds"
+        # always singular: exactly one key is ever named, the one the quote prices.
         lead = (
             f"This {spec.algorithm} run's OPTIMIZER batch is {prompts} per update: {cap_key} "
-            f"{caps_verb} the prompt pool below a real batch, and prompts-per-step cannot exceed "
+            "holds the prompt pool below a real batch, and prompts-per-step cannot exceed "
             "the pool."
         )
     targets = [
@@ -360,6 +380,17 @@ def _thin_rl_batch_remedy(spec, *, raise_target: str, batch_binds: bool, pool_bi
     # generation is pure added cost and takes the quote from $0.0867 to $0.1027. "no more updates"
     # is the guarantee ceil() actually gives; "fewer" is only the common case, and `--cost` prices
     # the real answer in the line above this one.
+    # ... and only when a pool actually EXISTS to spread. with neither cap authored,
+    # `_on_policy_example_count` falls back to the requested batch, so the priced pool tracks
+    # `batch_size` instead of standing still: batches 1, 2, 4, 8 and 64 all derive one update.
+    # there are no steps to buy, because nothing is being divided by a wider number -- offering
+    # the caveat here invites the user to keep a thin batch for a benefit this config cannot pay.
+    if not _pool_cap_authored(spec):
+        return (
+            f"Raise {raise_target}: with no `max_examples` set the prompt pool follows the batch, "
+            "so a wider batch makes each update wider without changing how many there are. "
+            "Re-run `--cost` to see what it does to this quote."
+        )
     return (
         f"Raise {raise_target} unless you are deliberately buying optimizer steps on a derived "
         "horizon (see TRAINING.md): against a fixed prompt pool a wider batch spreads the same "

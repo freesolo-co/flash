@@ -286,9 +286,11 @@ ignored. Everything in the block above (`epochs`, `max_examples`, `max_steps`, `
 > lifting both to 4 is 1. Past that ceiling the extra prompts become extra updates again,
 > and with no `batch_size` authored the ceiling is the recipe default you never wrote (GRPO 64,
 > OPD 8), so on OPD a cap of 2 -> 16 goes from 1 update to 2. And under a positive `max_steps` the
-> update count is pinned,
-> so a wider batch is pure extra generation: same steps, bigger bill. The warning says which case
-> you are in; re-run `flash train --cost` for the actual number.
+> update count is pinned, so widening never buys a step. With a `batch_size` authored that makes it
+> pure extra generation: same steps, bigger bill. Widening only `max_examples` instead leaves
+> `batch_size` unset, and the quote normalizes every cap to the same recipe batch over the same
+> pinned steps, so caps 2, 4 and 8 all price identically even though the real generated work grows.
+> The warning says which case you are in; re-run `flash train --cost` for the actual number.
 
 So `credit_assignment` (multi-turn GRPO defaults to one reward per rollout; `"per_turn"` gives
 turn-level credit, needs `per_turn_rewards` metadata, and is unsupported for tool-calling envs —
