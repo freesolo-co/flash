@@ -22,6 +22,10 @@ from flash.runner import (
 from flash.schema import train_schema_metadata
 from flash.serve.preflight import ServingPreflightError
 from flash.server import app as _app
+from flash.server.domain.teacher_broker import (
+    TeacherBrokerConfigurationError,
+    preflight_validate_managed_teacher,
+)
 from flash.server.platform import db
 from flash.server.platform.deps import (
     _parse_spec,
@@ -428,6 +432,10 @@ def create_run(
         # user to top up instead of to the real defect. both are pure and raise ValueError, which the
         # handler below turns into the 400 submit_job would have produced.
         preflight_validate_image_opd(prepared.worker_spec)
+        # the managed-teacher gate belongs with them: it is read-only, and running it only before
+        # allocation meant an opd run the plane cannot serve was quoted, recorded, and charged
+        # against affordability first, then failed seconds later with the reason discarded.
+        preflight_validate_managed_teacher(prepared.worker_spec)
         # run the affordability check for dry runs too. it is verify-only (moves no money), so a
         # `--dry-run` that passes now also proves the org can cover the estimate, instead of the run
         # being validated here and rejected 402 only on real submission.
@@ -455,6 +463,12 @@ def create_run(
         db.delete_run(run_id)
         if isinstance(exc, HTTPException):
             raise
+        # the catch-all below reports a client error, which is wrong for the half of the
+        # managed-teacher gate the submitter cannot act on: an unset plane credential is an outage
+        # they can only wait out, and calling it a bad request would re-create, one layer up, the
+        # very conflation this gate was hoisted here to end.
+        if isinstance(exc, TeacherBrokerConfigurationError) and exc.plane_fault:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     _record_environment_use(
         environment_slug, project_id=project_id, run_id=run_id, reporting_key=reporting_key

@@ -263,8 +263,10 @@ def submit_job(
     worker_spec = prepared.worker_spec
     estimated_cost_usd = prepared.estimated_cost_usd
     from flash.content.multimodal import preflight_validate_image_opd
+    from flash.server.domain.teacher_broker import preflight_validate_managed_teacher
 
     preflight_validate_image_opd(worker_spec)
+    preflight_validate_managed_teacher(worker_spec)
     from flash.providers import INSTANCE_PROVIDERS, available_providers
 
     if not dry_run:
