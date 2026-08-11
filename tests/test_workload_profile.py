@@ -341,3 +341,20 @@ def test_content_revision_prefers_the_environments_own_sha_and_never_serializes(
     spec = replace(_spec(), environment=env)
     assert "content_revision" not in spec.to_internal_dict()["environment"]
     assert "content_revision" not in spec.to_dict().get("environment", {})
+
+
+def test_profile_helper_records_the_same_revision_production_does() -> None:
+    """``tests/_helpers/profile.py`` must not restate the precedence rule.
+
+    That helper fakes a completed profile so unrelated tests clear the mandatory sft gate. It is a
+    stand-in for production, never a check on it, so a copy of the rule there would agree with
+    itself while production drifted and every caller would still see the gate pass. This is the
+    only place the two are compared, so it is what makes reading the property load-bearing.
+    """
+    from tests._helpers.profile import sft_profile_for
+
+    spec = _spec()
+    profile = sft_profile_for(spec, input_digest="d" * 64, producer_version="v1")
+    assert profile.environment_revision == spec.environment.content_revision
+    # and that agreement is not the trivial one: the fallback would have recorded a different sha.
+    assert profile.environment_revision != spec.environment.resolved_sha

@@ -67,7 +67,10 @@ def sft_profile_for(spec: Any, *, input_digest: str, producer_version: str):
         producer_version=producer_version,
         tokenizer_revision=spec.model_revision,
         environment_id=spec.environment.id,
-        environment_revision=spec.environment.content_sha or spec.environment.resolved_sha,
+        # the same property production records, not a restatement of it: this helper fakes a
+        # profile to satisfy the gate, so a copy of the precedence rule here would keep agreeing
+        # with itself while production drifted, and every caller would still see a passing gate.
+        environment_revision=spec.environment.content_revision,
         source_examples=retained,
         selected_examples=retained,
         retained_examples=retained,
