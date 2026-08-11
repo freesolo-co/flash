@@ -5,6 +5,13 @@ name: Publish flash package
 # version (else CI fails), and a version already on PyPI is rejected — so merging dev -> main
 # with a bumped version is all it takes to release. Manual runs are still possible via
 # workflow_dispatch.
+#
+# deliberately NOT tag-triggered, and that absence is load-bearing. tags (`v1.1.40`,
+# `dev-v1.1.40`) are an OUTPUT of the job below, not an input, so any `tags:` pattern here would be
+# a second publish path that bypasses the version-bump and version-already-on-PyPI gates.
+# Actions resolves a workflow from the pushed ref, so pushing an abandoned `flash-v*` tag still
+# runs whatever publish file that old commit carries; nothing in this file can prevent that, only
+# deleting the stray tag can. tests/test_workflow_contracts.py pins the no-tag-trigger invariant.
 on:
   push:
     branches:
@@ -42,7 +49,7 @@ jobs:
       UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
 
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
