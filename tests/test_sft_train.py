@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import json
 import os
 import pathlib
 import re
@@ -1140,6 +1141,74 @@ def test_resume_credits_only_required_saves_that_are_durable(monkeypatch):
     monkeypatch.setattr(worker, "hf_api", Api)
 
     assert sft_train._durable_required_save_steps((3, 5, 9), 5) == {3}
+    # a resume step that is itself a required save is credited only when its adapter is on hf, so
+    # step 5 stays publishable while the already-durable step 3 does not.
+    assert sft_train._processed_resume_steps((3, 5, 9), 5) == {3}
+    # a resume step that is not a required save is always credited: hf already holds its state.
+    assert sft_train._processed_resume_steps((3, 9), 5) == {3, 5}
+
+
+def test_a_resumed_sft_run_does_not_republish_the_step_it_resumed_from(monkeypatch, tmp_path):
+    """the staged resume checkpoint is a pending ``global_step_N``; publishing it again is waste.
+
+    ``stage_verl_resume`` copies the downloaded ``checkpoint-N`` into local_dir and points verl's
+    tracker at it, so an unseeded watcher treats it as new work on its first sweep: it re-runs
+    ``verl.model_merger`` and re-uploads multi-GB state hf already holds, holding the single
+    resume-upload lock while the first genuinely new checkpoint waits behind it.
+    """
+    import flash.engine.worker as worker
+    from flash.engine.worker import sft_train
+    from flash.engine.worker.backend_common import stage_verl_resume
+
+    local_dir = tmp_path / "checkpoints"
+    local_dir.mkdir()
+    resume_dir = tmp_path / "downloaded" / "checkpoint-1"
+    (resume_dir / "huggingface").mkdir(parents=True)
+    # verl stamps every checkpoint with its writer's world size; staging demands a match.
+    (resume_dir / "fsdp_config.json").write_text(json.dumps({"FSDP_version": 2, "world_size": 1}))
+    resume_step = stage_verl_resume(str(resume_dir), str(local_dir), job_label="SFT", world_size=1)
+    # a checkpoint this attempt actually trained, which must still be exported and uploaded.
+    (local_dir / "global_step_2" / "huggingface").mkdir(parents=True)
+    (local_dir / "latest_checkpointed_iteration.txt").write_text("2")
+
+    exported = []
+    published = []
+    uploaded = []
+
+    def fake_export(actor, adapter, **kwargs):
+        exported.append(actor)
+        os.makedirs(adapter, exist_ok=True)
+
+    def fake_upload(step, checkpoint, **kwargs):
+        kwargs["before_upload"]()
+        uploaded.append(step)
+        return True
+
+    monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", fake_export)
+    monkeypatch.setattr(
+        worker,
+        "publish_deployable_checkpoint",
+        lambda adapter, step, **kwargs: published.append(step),
+    )
+    monkeypatch.setattr(worker, "upload_resume_checkpoint", fake_upload)
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(),
+    )
+    watcher.processed_steps.update(sft_train._processed_resume_steps((), resume_step))
+
+    watcher.start()
+    watcher.stop(require_complete=True)
+
+    assert resume_step == 1
+    assert [os.path.basename(path) for path in exported] == ["global_step_2"]
+    assert published == [2]
+    assert uploaded == [2]
+    assert watcher.processed_steps == {1, 2}
 
 
 def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
@@ -1259,6 +1328,7 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
 
     class _DefaultWatcher:
         def __init__(self, **kwargs):
+            self.required_steps = frozenset(kwargs["required_steps"])
             self.processed_steps = set()
 
         def start(self):
@@ -1354,7 +1424,7 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
     # torch is not installed in this test env; the real seeding is covered in test_training_controls.
     monkeypatch.setattr(sft_train, "seed_training_rngs", lambda seed: None)
     monkeypatch.setattr(sft_train, "_cached_model_path", lambda model, revision: model)
-    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir: 1)
+    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir, **_kwargs: 1)
     monkeypatch.setattr(sft_train, "_VerlCheckpointWatcher", Watcher)
     monkeypatch.setattr(sft_train, "_NvidiaSmiPeakSampler", PeakSampler)
     monkeypatch.setattr(
@@ -1423,6 +1493,68 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
         f"data.max_token_len_per_gpu={realized_max_length * notes['per_device_train_batch_size']}"
         in captured["command"]
     )
+
+
+def test_the_sft_runner_seeds_the_watcher_with_the_step_it_resumed_from(monkeypatch):
+    """the seed has to happen in the runner, before the watcher's thread takes its first sweep."""
+    from flash.engine.worker import sft_train
+
+    seeded = {}
+
+    class Watcher:
+        def __init__(self, **kwargs):
+            self.required_steps = frozenset(kwargs["required_steps"])
+            self.processed_steps = set()
+
+        def start(self):
+            seeded["at_start"] = set(self.processed_steps)
+
+        def stop(self, *, require_complete):
+            assert require_complete is True
+
+        def raise_if_failed(self):
+            return None
+
+    spec, captured = _stub_sft_run(monkeypatch, watcher_cls=Watcher)
+
+    def fake_training(command, *, env, on_step, on_line, heartbeat):
+        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
+        on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
+        on_step(2)
+        return 0
+
+    monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
+
+    sft_train.run_sft_train(spec)
+
+    # the stubbed resume lands at step 1 with no exact save steps: unseeded, the watcher would find
+    # the staged global_step_1 pending and re-merge and re-upload the checkpoint it just downloaded.
+    assert seeded["at_start"] == {1}
+    # the new step is still published, so the seed cannot be a blanket skip of everything.
+    assert captured["published"][0][1] == 2
+
+
+def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatch):
+    """the seeded resume step must not suppress the final publish.
+
+    the previous attempt's per-step deployable publish is best-effort (``required=False``) while
+    its resume upload is not, so hf can hold the resumable state without the servable adapter.
+    """
+    from flash.engine.worker import sft_train
+
+    spec, captured = _stub_sft_run(monkeypatch)
+    # max_steps is 2, so resuming at 2 means the watcher never runs and finalization is the only
+    # path left that can publish the step.
+    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir, *, world_size: 2)
+
+    def fake_training(command, *, env, on_step, on_line, heartbeat):
+        raise AssertionError("a run resumed at its horizon must not start the child")
+
+    monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
+
+    sft_train.run_sft_train(spec)
+
+    assert [step for _adapter, step in captured["published"]] == [2]
 
 
 def test_a_workload_that_moved_under_the_frozen_quote_stops_before_training(monkeypatch):
@@ -1595,7 +1727,7 @@ def test_a_single_step_run_with_no_gradient_is_rejected(monkeypatch):
     spec, _ = _stub_sft_run(monkeypatch, watcher_cls=_TolerantWatcher)
     # a fresh run, not a resume: the guard abstains on a resume because the restored weights carry
     # earlier updates this session never observed.
-    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir: 0)
+    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir, **_kwargs: 0)
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
         on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
@@ -1628,7 +1760,7 @@ def test_a_fresh_run_with_any_real_gradient_still_completes(monkeypatch, grads):
     from flash.engine.worker import sft_train
 
     spec, captured = _stub_sft_run(monkeypatch)
-    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir: 0)
+    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir, **_kwargs: 0)
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
         on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")

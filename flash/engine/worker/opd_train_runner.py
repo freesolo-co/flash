@@ -445,6 +445,8 @@ def _materialize_child_files(
         workload.local_dir,
         prompt_pool_fingerprint=workload.prompt_pool_fingerprint,
         update_horizon=workload.update_horizon,
+        # the same count this attempt hands verl as n_gpus_per_node / ulysses width.
+        world_size=gpu_count,
     )
     bridge = _opd_train._TeacherAlignmentBridge(
         prompts=prompt_state.prompts,

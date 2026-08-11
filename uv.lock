@@ -1052,7 +1052,7 @@ wheels = [
 
 [[package]]
 name = "freesolo-flash"
-version = "1.1.40"
+version = "1.1.41"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -1096,6 +1096,7 @@ server = [
     { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "jsonschema" },
+    { name = "pillow" },
     { name = "referencing" },
     { name = "regex" },
     { name = "runpod-flash" },
@@ -1139,6 +1140,7 @@ requires-dist = [
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.13.0" },
     { name = "peft", marker = "extra == 'gpu'", specifier = ">=0.19" },
     { name = "pillow", marker = "extra == 'dev'", specifier = ">=11" },
+    { name = "pillow", marker = "extra == 'server'", specifier = ">=11" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3" },
     { name = "referencing", marker = "extra == 'dev'", specifier = ">=0.28.4" },
     { name = "referencing", marker = "extra == 'server'", specifier = ">=0.28.4" },
@@ -1152,9 +1154,9 @@ requires-dist = [
     { name = "tokenizers", marker = "extra == 'dev'", specifier = ">=0.22" },
     { name = "tokenizers", marker = "extra == 'gpu'", specifier = ">=0.22" },
     { name = "torch", marker = "extra == 'gpu'", specifier = "==2.10.0" },
-    { name = "transformers", marker = "extra == 'dev'", specifier = ">=5.6,<5.11" },
-    { name = "transformers", marker = "extra == 'gpu'", specifier = ">=5.6,<5.11" },
-    { name = "transformers", marker = "extra == 'server'", specifier = ">=5.6,<5.11" },
+    { name = "transformers", marker = "extra == 'dev'", specifier = ">=5.6,<5.13" },
+    { name = "transformers", marker = "extra == 'gpu'", specifier = ">=5.6,<5.13" },
+    { name = "transformers", marker = "extra == 'server'", specifier = ">=5.6,<5.13" },
     { name = "uv", marker = "extra == 'gpu'", specifier = ">=0.5" },
     { name = "uvicorn", marker = "extra == 'dev'" },
     { name = "uvicorn", marker = "extra == 'server'" },

@@ -430,7 +430,11 @@ def _prepare_sft_child(
     with open(custom_dataset_path, "w", encoding="utf-8") as file:
         file.write(_render_sft_dataset_module())
 
-    resume_step = _sft_train._restore_verl_resume(options.paths.local_dir)
+    # the same count that becomes --nproc-per-node below, so the guard compares the checkpoint
+    # against the topology this attempt really launches.
+    resume_step = _sft_train._restore_verl_resume(
+        options.paths.local_dir, world_size=options.gpu_count
+    )
     watcher = _sft_train._VerlCheckpointWatcher(
         local_dir=options.paths.local_dir,
         export_root=options.paths.export_root,
@@ -439,8 +443,11 @@ def _prepare_sft_child(
         model_revision=options.model_revision,
         required_steps=options.save_at_steps,
     )
+    # the staged resume checkpoint is already a pending global_step_N on disk, so an unseeded
+    # watcher re-merges it and re-uploads full state hf already has, holding the resume-upload
+    # lock while the first genuinely new checkpoint waits behind it.
     watcher.processed_steps.update(
-        _sft_train._durable_required_save_steps(options.save_at_steps, resume_step)
+        _sft_train._processed_resume_steps(options.save_at_steps, resume_step)
     )
     if resume_step >= model.update_horizon:
         missing = sorted(watcher.required_steps - watcher.processed_steps)
