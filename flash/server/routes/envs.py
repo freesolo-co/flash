@@ -66,6 +66,18 @@ def publish_env(
     )
 
     resolved_key = {**key, "org_id": key.get("org_id") or x_freesolo_org_id}
+
+    # Reject a request that could never be published before doing anything observable -- no
+    # ownership lookup, no backend call, no upload. Otherwise a colliding destination answers a
+    # malformed payload with 409, replacing the deterministic 400/413 the inputs themselves earn.
+    try:
+        envs.validate_publish_inputs(
+            package_b64="" if _pkg is None else _pkg,
+            name="" if _name is None else _name,
+        )
+    except envs.EnvPublishError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
     # Check ownership BEFORE uploading: publishing replaces the whole `<org-slug>/<name>` hub
     # directory, so a colliding name would otherwise destroy the other project's package on its
     # way to failing.
@@ -76,15 +88,16 @@ def publish_env(
     # instead would change which failure a caller sees, so a slug we cannot derive skips the
     # guard; that caller writes no org-namespaced directory, so nothing is at risk.
     intended_slug = ""
-    org_for_conflict = str(resolved_key.get("org_id") or "").strip()
-    # `isinstance` first: a non-string name (0, False, []) sanitizes to the generic "env", and
-    # guarding on that slug would answer a malformed request with a conflict about an unrelated
-    # environment. An invalid name has to reach publish_package's type check and get its
-    # deterministic 400, so only a real string is worth deriving a slug from.
-    if isinstance(_name, str):
-        with suppress(envs.EnvPublishError):
-            namespace, clean_name = envs.publish_slug_for_name(_name, key)
-            intended_slug = f"{namespace}/{clean_name}"
+    # The KEY's org, never the `X-Freesolo-Org-Id` header. For a user key require_project_access
+    # validates the project against `key["org_id"]` and ignores that header entirely, so trusting
+    # it here would check ownership in an org the caller merely asserted while the hub path stays
+    # namespaced by the key's own slug -- a garbage id finds nothing, returns 404 instead of 409,
+    # and waves the colliding write through. `resolved_key` keeps the header for the association
+    # step below, which is pre-existing behaviour and not an authorization decision.
+    org_for_conflict = str(key.get("org_id") or "").strip()
+    with suppress(envs.EnvPublishError):
+        namespace, clean_name = envs.publish_slug_for_name(_name, key)
+        intended_slug = f"{namespace}/{clean_name}"
     if intended_slug:
         if not org_for_conflict:
             # A user key can carry an org slug (all auth requires) without an org id, and the

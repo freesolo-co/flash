@@ -24,6 +24,29 @@ from flash.server.platform import db as _db_mod
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
+
+def _env_package_b64() -> str:
+    """A real base64 `.tar.gz` holding `environment.py`.
+
+    The route validates and decodes the package before it decides anything else, so a publish
+    test cannot pass a placeholder string: stubbing `publish_package` skips the upload, not the
+    input contract. Built here rather than hardcoded so it stays a genuinely valid archive.
+    """
+    import base64
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        body = b"# test environment\n"
+        info = tarfile.TarInfo("environment.py")
+        info.size = len(body)
+        tar.addfile(info, io.BytesIO(body))
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+ENV_PACKAGE_B64 = _env_package_b64()
+
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "project": "11111111-1111-4111-8111-111111111111",
@@ -353,7 +376,7 @@ def test_project_validation_blocks_before_environment_publication(api, monkeypat
         headers=_bearer(_login()),
         json={
             "name": "env",
-            "package_b64": "payload",
+            "package_b64": ENV_PACKAGE_B64,
             "project_id": "11111111-1111-4111-8111-111111111111",
         },
     )
@@ -445,7 +468,7 @@ def test_internal_publish_uses_internal_project_validation_endpoint(api, monkeyp
     response = api.post(
         "/v1/envs",
         headers=_bearer("fslo-internal-test"),
-        json={"name": "env", "package_b64": "payload", "project_id": SPEC["project"]},
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
     )
 
     assert response.status_code == 200, response.text
@@ -8491,7 +8514,7 @@ def test_publish_env_returns_502_when_association_record_returns_false(api, monk
     response = api.post(
         "/v1/envs",
         headers=_bearer(_login()),
-        json={"name": "env", "package_b64": "payload", "project_id": SPEC["project"]},
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
     )
 
     assert response.status_code == 502
@@ -8525,7 +8548,7 @@ def test_publish_env_returns_502_when_association_record_raises(api, monkeypatch
     response = api.post(
         "/v1/envs",
         headers=_bearer(_login()),
-        json={"name": "env", "package_b64": "payload", "project_id": SPEC["project"]},
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
     )
 
     assert response.status_code == 502
@@ -8557,7 +8580,7 @@ def test_publish_env_retry_repairs_association_after_false_ack(api, monkeypatch)
     )
     request = {
         "headers": _bearer(_login()),
-        "json": {"name": "env", "package_b64": "payload", "project_id": SPEC["project"]},
+        "json": {"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
     }
 
     first = api.post("/v1/envs", **request)
@@ -8596,7 +8619,7 @@ def test_publish_env_reports_a_cross_project_name_conflict_without_uploading(api
     response = api.post(
         "/v1/envs",
         headers=_bearer(_login()),
-        json={"name": "env", "package_b64": "payload", "project_id": SPEC["project"]},
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
     )
 
     assert response.status_code == 409, response.text
@@ -8633,11 +8656,85 @@ def test_publish_env_refuses_to_upload_when_the_org_cannot_be_resolved(api, monk
     response = api.post(
         "/v1/envs",
         headers=_bearer(_login()),
-        json={"name": "env", "package_b64": "payload", "project_id": SPEC["project"]},
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
     )
 
     assert response.status_code == 400, response.text
     assert "organization could not be resolved" in response.json()["detail"]
+
+
+def test_publish_env_ignores_the_org_header_for_the_ownership_guard(api, monkeypatch):
+    """`X-Freesolo-Org-Id` must not decide WHERE ownership is checked.
+
+    For a user key `require_project_access` validates the project against `key["org_id"]` and
+    ignores this header, so it is caller-asserted. Trusting it in the guard would look the slug
+    up in an org the caller named while the hub path stays namespaced by the key's own slug: a
+    non-matching id finds nothing, the backend answers 404 rather than 409, and the colliding
+    write proceeds -- exactly the clobber this guard exists to stop.
+    """
+    import flash.server.domain.envs as envs_mod
+    import flash.server.platform.deps as deps
+    from flash.server.domain import environment_registry as registry_mod
+
+    monkeypatch.setitem(
+        api.app.dependency_overrides,
+        deps.require_key,
+        lambda: {"org_slug": "acme", "user_id": "u1", "api_key_id": "k1", "auth_kind": "user"},
+    )
+    checked_orgs: list = []
+
+    def _guard(**kwargs):
+        checked_orgs.append(kwargs.get("org_id"))
+
+    monkeypatch.setattr(registry_mod, "raise_if_owned_by_another_project", _guard)
+    monkeypatch.setattr(
+        envs_mod,
+        "publish_package",
+        lambda **_kwargs: pytest.fail("a caller-asserted org must not authorize the hub write"),
+    )
+
+    response = api.post(
+        "/v1/envs",
+        headers={**_bearer(_login()), "X-Freesolo-Org-Id": "org-caller-supplied"},
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
+    )
+
+    assert response.status_code == 400, response.text
+    assert "organization could not be resolved" in response.json()["detail"]
+    assert checked_orgs == [], f"guard consulted a caller-supplied org: {checked_orgs}"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "status", "message"),
+    [
+        ("name", "", 400, "missing env name"),
+        ("package_b64", False, 400, "must be a base64 string"),
+        ("package_b64", "!!!!", 400, "not valid base64"),
+        ("package_b64", "", 400, "empty env package"),
+    ],
+)
+def test_publish_env_validates_inputs_before_checking_ownership(
+    api, monkeypatch, field, value, status, message
+):
+    """An unpublishable request keeps its own deterministic error.
+
+    The ownership pre-check runs early enough to preempt the payload checks, so a colliding
+    destination would answer a malformed request with 409 -- replacing the 400/413 the inputs
+    earn -- and would contact the backend for a publish that could never happen.
+    """
+    from flash.server.domain import environment_registry as registry_mod
+
+    def _conflict(**_kwargs):
+        pytest.fail("ownership must not be consulted for a request that cannot be published")
+
+    monkeypatch.setattr(registry_mod, "raise_if_owned_by_another_project", _conflict)
+
+    body = {"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]}
+    body[field] = value
+    response = api.post("/v1/envs", headers=_bearer(_login()), json=body)
+
+    assert response.status_code == status, response.text
+    assert message in response.json()["detail"].lower()
 
 
 def test_publish_env_reports_an_invalid_name_as_a_type_error_not_a_conflict(api, monkeypatch):
@@ -8662,7 +8759,7 @@ def test_publish_env_reports_an_invalid_name_as_a_type_error_not_a_conflict(api,
     response = api.post(
         "/v1/envs",
         headers=_bearer(_login()),
-        json={"name": 0, "package_b64": "payload", "project_id": SPEC["project"]},
+        json={"name": 0, "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
     )
 
     assert response.status_code == 400, response.text
@@ -8690,7 +8787,7 @@ def test_publish_env_maps_a_late_ownership_conflict_to_409(api, monkeypatch):
     response = api.post(
         "/v1/envs",
         headers=_bearer(_login()),
-        json={"name": "env", "package_b64": "payload", "project_id": SPEC["project"]},
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
     )
 
     assert response.status_code == 409, response.text

@@ -399,7 +399,14 @@ def _github_publish(dest: Path, *, name: str, key: dict) -> str:
     raise last_error
 
 
-def publish_package(*, package_b64: str, name: str, key: dict) -> str:
+def validate_publish_inputs(*, package_b64: object, name: object) -> bytes:
+    """Check a publish request's own inputs and return its decoded package.
+
+    Pure and side-effect free, so the route can reject an unpublishable request before doing
+    anything observable — no ownership lookup, no backend call, no upload. Raises the same
+    :class:`EnvPublishError` (400/413) the publish itself would raise, so the failure a caller
+    sees does not depend on when the check ran.
+    """
     if not isinstance(name, str):
         raise EnvPublishError("env name must be a string")
     if not isinstance(package_b64, str):
@@ -423,6 +430,11 @@ def publish_package(*, package_b64: str, name: str, key: dict) -> str:
             f"env package upload is too large (limit {_human_mb(_MAX_UPLOAD_BYTES)} compressed)",
             status=413,
         )
+    return tar_bytes
+
+
+def publish_package(*, package_b64: str, name: str, key: dict) -> str:
+    tar_bytes = validate_publish_inputs(package_b64=package_b64, name=name)
     with tempfile.TemporaryDirectory(prefix="flash-env-publish-") as tmp:
         dest = Path(tmp)
         _safe_extract(tar_bytes, dest)
