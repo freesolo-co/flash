@@ -914,7 +914,7 @@ def test_opd_model_load_is_not_described_as_a_weight_download(monkeypatch):
     opd_out = render.run_status(opd)
     assert "longer than throttling explains" in opd_out
     assert "tens of GB" not in opd_out
-    assert "no long call is expected" in opd_out
+    assert "can block for minutes" in opd_out
 
     # sft's span MAY fetch an adapter, but only when the run warm-starts from one -- most do not,
     # so the wording has to hedge rather than assert a transfer that usually is not happening.
@@ -928,6 +928,28 @@ def test_opd_model_load_is_not_described_as_a_weight_download(monkeypatch):
         last_heartbeat={"stage": "sft_model_load", "ts": _time.time() - 1200, "dc": "EU-RO-1"},
     )
     assert "datacenter above" not in render.run_status(sft_dc)
+
+
+def test_no_stage_clause_contradicts_the_sentence_it_completes():
+    """The clause is a parenthetical inside "it may be inside one long blocking call (...)".
+
+    A clause saying no long call is expected there negates the sentence mid-parenthesis and steers
+    the user away from the healthy reading. Every one of these stages holds a liveness wrap
+    BECAUSE it can block for minutes, so no stage may deny that. Checked across the whole set
+    rather than per-stage: this bug arrived via an else branch that no single-stage test covered.
+    """
+    from flash.cli.ui.heartbeat import _LIVENESS_SETUP_STAGES, _stale_setup_hint
+
+    denials = ("no long call", "does no download", "is unusual here")
+    for stage in sorted(_LIVENESS_SETUP_STAGES):
+        hint = _stale_setup_hint({"stage": stage}, 1200.0, running=True)
+        assert hint, f"{stage} is in the set but produced no hint"
+        clause = hint.split("one long blocking call (", 1)[1].split(")", 1)[0]
+        assert clause, f"{stage} produced an empty clause"
+        for denial in denials:
+            assert denial not in clause, (
+                f"{stage} clause denies the call it is describing: {clause}"
+            )
 
 
 @pytest.mark.parametrize("stage", ["sft_finalizing", "rl_finalizing", "opd_finalizing"])
@@ -953,7 +975,7 @@ def test_finalizing_silence_is_not_called_unusual(stage, monkeypatch):
     }
     out = render.run_status(obj)
     assert "longer than throttling explains" in out
-    assert "no long call is expected" not in out, "a slow adapter upload is expected here"
+    assert "cold mount or a venv install" not in out, "the generic fallback misnames this wait"
     assert "exports and uploads the adapter" in out
 
 

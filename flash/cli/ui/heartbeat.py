@@ -141,8 +141,9 @@ _LIVENESS_SETUP_STAGES = frozenset(
 _SETUP_SILENT_AFTER_S = 900.0
 
 # what a stage BLOCKS on, so the hint can say what the wait plausibly is instead of guessing. a
-# stage absent from every set below gets no claim about the operation at all -- naming the wrong one
-# is the misdiagnosis this hint exists to prevent, and silence is cheaper than a wrong lead.
+# stage absent from every set below is left unnamed rather than described wrongly: EVERY stage here
+# holds a liveness wrap because it can block for minutes (a venv install, a cold config read), so
+# the honest fallback says the operation is unknown, never that no long call is expected.
 #
 # these stages pull base weights or a checkpoint over the network, so a cold per-datacenter cache
 # volume explains a long silent stretch and the datacenter is worth citing.
@@ -197,7 +198,7 @@ def _stale_setup_hint(
     elif stage in _UPLOAD_STAGES:
         blocking = "this stage exports and uploads the adapter, which is often slow"
     else:
-        blocking = "no long call is expected at this stage"
+        blocking = "this stage can block for minutes on a cold mount or a venv install"
     return (
         "this setup stage pings every ~4 min while the worker is alive, so this gap is longer than "
         f"throttling explains: it may be inside one long blocking call ({blocking}), its heartbeat "
