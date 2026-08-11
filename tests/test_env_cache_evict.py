@@ -57,7 +57,10 @@ def test_cache_root_falls_back_to_uid_scoped_tmp_when_homeless(monkeypatch, tmp_
 
     root = adapter._default_cache_root()
 
-    assert root == tmp_path / f"flash-env-cache-{os.getuid()}"
+    # derived the same way production does: os.getuid does not exist on windows, where the
+    # fallback deliberately substitutes uid 0, and collection must not die on the assert.
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    assert root == tmp_path / f"flash-env-cache-{uid}"
 
 
 def test_default_cache_root_falls_back_when_home_not_writable(monkeypatch, tmp_path):
@@ -74,7 +77,26 @@ def test_default_cache_root_falls_back_when_home_not_writable(monkeypatch, tmp_p
 
     root = adapter._default_cache_root()
 
-    assert root == tmp_path / "tmp" / f"flash-env-cache-{os.getuid()}"
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    assert root == tmp_path / "tmp" / f"flash-env-cache-{uid}"
+
+
+def test_default_cache_root_falls_back_when_cache_parent_denies_search(monkeypatch, tmp_path):
+    # write access alone cannot create a child: mkdir also needs search (x) on the parent, as
+    # with an acl that grants write but denies traversal. a W_OK-only probe accepts the home
+    # root anyway and _ensure_cache_root then dies with PermissionError instead of reaching
+    # the temp fallback.
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    home = tmp_path / "home"
+    (home / ".cache").mkdir(parents=True)
+    monkeypatch.setattr(adapter.os.path, "expanduser", lambda _p: str(home))
+    monkeypatch.setattr(adapter.os, "access", lambda _path, mode: not (mode & os.X_OK))
+    monkeypatch.setattr(adapter.tempfile, "gettempdir", lambda: str(tmp_path / "tmp"))
+
+    root = adapter._default_cache_root()
+
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    assert root == tmp_path / "tmp" / f"flash-env-cache-{uid}"
 
 
 @pytest.mark.skipif(not hasattr(os, "getuid"), reason="posix-only uid check")
@@ -215,6 +237,18 @@ def test_discard_untrusted_entry_accepts_a_concurrently_removed_entry(monkeypatc
     assert not entry.exists()
 
 
+def test_discard_untrusted_entry_removes_a_plain_file(tmp_path):
+    # a regular file squatting at a cache-key path is neither a symlink nor a directory, and
+    # handing it to rmtree raises NotADirectoryError -- condemning a key that a simple unlink
+    # inside our own root clears fine, and blocking the fresh download that should follow.
+    entry = tmp_path / "entry"
+    entry.write_text("not a directory")
+
+    cache_security.discard_untrusted_entry(entry)
+
+    assert not entry.exists()
+
+
 def test_ensure_cache_root_refuses_foreign_owner(monkeypatch, tmp_path):
     root = tmp_path / "cache"
     root.mkdir(mode=0o700)
@@ -232,7 +266,22 @@ def test_ensure_cache_root_refuses_group_or_other_writable(monkeypatch, tmp_path
     root.chmod(0o777)
     monkeypatch.setattr(adapter, "_CACHE_ROOT", root)
 
-    with pytest.raises(RuntimeError, match="group/other-writable"):
+    with pytest.raises(RuntimeError, match="accessible to group/other"):
+        adapter._ensure_cache_root()
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="posix-only mode bits")
+def test_ensure_cache_root_refuses_group_traversable_root(monkeypatch, tmp_path):
+    # write bits are not the only hazard: a 0710 (or 0755) root lets same-group accounts
+    # traverse into cached entries, whose contents can legitimately carry group-writable
+    # modes (umask-dependent mkdir parents on the contents-api path, ancient 100664 tree
+    # modes, both preserved by copytree). in-place tampering there keeps the victim's uid,
+    # so the entry ownership vetting still trusts the modified code.
+    root = tmp_path / "cache"
+    root.mkdir(mode=0o710)
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", root)
+
+    with pytest.raises(RuntimeError, match="accessible to group/other"):
         adapter._ensure_cache_root()
 
 
@@ -284,6 +333,28 @@ def test_ensure_cache_root_refuses_foreign_owned_ancestor(monkeypatch, tmp_path)
     with pytest.raises(RuntimeError) as excinfo:
         adapter._ensure_cache_root()
     assert "ancestor" in str(excinfo.value)
+    assert "owned by uid" in str(excinfo.value)
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="posix-only uid check")
+def test_ensure_cache_root_refuses_foreign_owned_symlink_ancestor(monkeypatch, tmp_path):
+    # resolve() erases a symlink component from the ancestor chain, so a validator walking
+    # only the resolved parents never examines the symlink itself. its owner can retarget it
+    # after validation while every later cache operation still traverses the unresolved path,
+    # so a foreign-owned symlink component has to be refused outright.
+    target = tmp_path / "real"
+    target.mkdir(mode=0o700)
+    outer = tmp_path / "outer"
+    outer.mkdir(mode=0o700)
+    link = outer / "link"
+    link.symlink_to(target, target_is_directory=True)
+    root = link / "env-cache"
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", root)
+    _report_foreign_owner(monkeypatch, "lstat", [link])
+
+    with pytest.raises(RuntimeError) as excinfo:
+        adapter._ensure_cache_root()
+    assert "symlink" in str(excinfo.value)
     assert "owned by uid" in str(excinfo.value)
 
 

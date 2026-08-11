@@ -58,6 +58,10 @@ def cache_root_is_creatable(root: Path) -> bool:
     symlinks are followed deliberately; a ``~/.cache`` symlinked onto a volume we own is
     perfectly usable, and the anti-symlink trust checks belong to ``_ensure_cache_root`` and
     ``validate_cache_root_ancestors``, which run against the root that is finally chosen.
+
+    creating a descendant needs write AND search permission on the directory: an owned
+    ``~/.cache`` at mode 0600 (or an ACL granting write but denying traversal) passes a
+    W_OK-only probe and then fails the very ``mkdir`` this check exists to predict.
     """
     for candidate in (root, *root.parents):
         try:
@@ -70,7 +74,7 @@ def cache_root_is_creatable(root: Path) -> bool:
             return False
         if hasattr(os, "getuid") and info.st_uid != os.getuid():
             return False
-        return os.access(candidate, os.W_OK)
+        return os.access(candidate, os.W_OK | os.X_OK)
     return False
 
 
@@ -81,10 +85,17 @@ def validate_cache_root_ancestors(root: Path) -> None:
     e.g. an ``XDG_CACHE_HOME`` pointing somewhere shared -- another local account can own an
     intermediate directory, let this process create a private leaf, then swap that leaf for a
     symlink or attacker tree after the leaf check passes. the later cache-hit path would import
-    the swapped-in ``environment.py`` with no re-validation. resolving first (rather than
-    walking the raw, possibly-symlinked path) means a legitimate system symlink such as
-    macOS's ``/tmp`` -> ``/private/tmp`` is not itself flagged; ``lstat`` on each resolved
-    ancestor still catches an ancestor being replaced by a symlink after resolution.
+    the swapped-in ``environment.py`` with no re-validation.
+
+    BOTH the raw and the resolved chains are walked. the resolved chain is where the
+    directories really live; the raw chain holds any symlink components that ``resolve()``
+    erases. a symlink sitting beneath a foreign-owned directory would otherwise never be
+    examined at all, and its owner can retarget it after validation while every later cache
+    operation still traverses the unresolved path -- so the symlink itself has to be as
+    trustworthy as the directories. a symlink's mode bits are meaningless (always 0777), so
+    for symlink components only ownership is judged; ownership by us or root keeps legitimate
+    system links such as macOS's ``/tmp`` -> ``/private/tmp`` acceptable, and their targets
+    are covered by the resolved walk.
 
     posix-only, like the mode-bit check in ``_ensure_cache_root``: uid and mode bits do not
     carry the same meaning on Windows.
@@ -92,8 +103,16 @@ def validate_cache_root_ancestors(root: Path) -> None:
     if not hasattr(os, "getuid"):
         return
     uid = os.getuid()
-    for ancestor in root.resolve().parents:
+    for ancestor in dict.fromkeys((*root.parents, *root.resolve().parents)):
         info = os.lstat(ancestor)
+        if stat.S_ISLNK(info.st_mode):
+            if info.st_uid not in (uid, 0):
+                raise RuntimeError(
+                    f"env cache root ancestor {ancestor} is a symlink owned by uid "
+                    f"{info.st_uid}, not {uid} or root; refusing to load environment code "
+                    f"from env cache root {root}"
+                )
+            continue
         if not stat.S_ISDIR(info.st_mode):
             raise RuntimeError(
                 f"env cache root ancestor {ancestor} is not a directory; "
@@ -147,13 +166,18 @@ def discard_untrusted_entry(path: Path) -> None:
     success is "the entry is gone", not "the delete call did not raise": a concurrent resolve
     of the same untrusted key can clear it between our check and our delete, which surfaces as
     ``FileNotFoundError`` even though the outcome is exactly the one we wanted.
+
+    dispatch on ``lstat`` rather than symlink-or-rmtree: a plain FILE squatting at the key is
+    neither, and handing it to ``rmtree`` raises ``NotADirectoryError`` -- condemning a cache
+    key that a simple ``unlink`` inside our own root clears fine.
     """
     reason = ""
     try:
-        if path.is_symlink():
-            path.unlink()
-        else:
+        entry_is_dir = stat.S_ISDIR(os.lstat(path).st_mode)
+        if entry_is_dir:
             shutil.rmtree(path)
+        else:
+            path.unlink()
     except OSError as exc:
         reason = f": {exc}"
     if not os.path.lexists(path):

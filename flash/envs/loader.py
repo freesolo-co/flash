@@ -700,12 +700,19 @@ def _ensure_cache_root() -> Path:
             f"env cache root {root} is owned by uid {info.st_uid}, not {uid}; "
             "refusing to load environment code from it -- remove or reassign it"
         )
-    # mode bits mean nothing on windows (mkdir(mode=0o700) does not establish them there, and
-    # a freshly created, perfectly private root commonly reports as group/other-writable), so
-    # this check -- like the ancestor walk above -- is posix-only.
-    if hasattr(os, "getuid") and info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+    # any group/other access on the root is refused, not just the write bits: a 0755/0710
+    # root lets a same-group account traverse into cached entries, and entry CONTENTS can
+    # legitimately carry group-writable modes (the contents-API path mkdirs parents under the
+    # ambient umask, ancient git trees carry 100664 blobs, copytree preserves both), where
+    # in-place tampering keeps the victim's uid and so still passes the entry ownership
+    # vetting. nobody but this user ever needs to look inside the cache. mode bits mean
+    # nothing on windows (mkdir(mode=0o700) does not establish them there, and a freshly
+    # created, perfectly private root commonly reports group/other bits), so this check --
+    # like the ancestor walk above -- is posix-only.
+    if hasattr(os, "getuid") and info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
         raise RuntimeError(
-            f"env cache root {root} is group/other-writable (mode {info.st_mode & 0o777:04o}); "
+            f"env cache root {root} is accessible to group/other "
+            f"(mode {info.st_mode & 0o777:04o}); "
             "refusing to load environment code from it -- chmod 700 it"
         )
     return root
