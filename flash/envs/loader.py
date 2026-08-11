@@ -275,6 +275,9 @@ def _resolve_ref_sha(
 
 
 def _iter_capped_chunks(resp: object, max_bytes: int) -> Iterator[bytes]:
+    # per-attempt accounting is also per-download accounting: _urlopen rewinds and truncates the
+    # sink before every attempt, so the bytes this generator caps are exactly the bytes that
+    # survive on disk. a retried download can never leave more than max_bytes behind.
     total = 0
     while True:
         chunk = resp.read(_DOWNLOAD_CHUNK_BYTES)
@@ -297,7 +300,12 @@ def _urlopen(
     max_bytes: int | None = None,
     out: BinaryIO | None = None,
 ) -> bytes:
-    """Fetch bytes for a GitHub request with jittered retry on rate limits."""
+    """Fetch bytes for a GitHub request with jittered retry on rate limits.
+
+    ``out`` must be seekable: a failure part-way through the body is retried from scratch, and the
+    sink is rewound and truncated first so a partial prefix can never be concatenated with the
+    retry's full body.
+    """
     import random
 
     _RATE_LIMIT_BASE_DELAY = 10.0
@@ -324,13 +332,20 @@ def _urlopen(
             shutil.copyfileobj(resp, out, length=_DOWNLOAD_CHUNK_BYTES)
         return b""
 
+    # every attempt writes the whole body from this offset, so the sink holds one attempt's bytes.
+    sink_start = out.tell() if out is not None else 0
+
     attempt = 0
     while True:
         try:
+            if out is not None:
+                out.seek(sink_start)
+                out.truncate()
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return drain(resp)
         except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", "replace")
+            # urllib can raise an HTTPError with fp=None; exc.read() is an AttributeError there.
+            body = exc.read().decode("utf-8", "replace") if exc.fp is not None else ""
             remaining = (exc.headers.get("X-RateLimit-Remaining") if exc.headers else None) or ""
             is_rate_limit = exc.code == 429 or (
                 exc.code == 403 and (remaining.strip() == "0" or "rate limit" in body.lower())

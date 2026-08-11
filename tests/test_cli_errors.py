@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import sys
 import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -147,3 +150,69 @@ def test_cost_needs_no_live_pricing():
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "TOTAL" in proc.stdout
     assert "live GPU pricing unavailable" not in proc.stderr
+
+
+@contextlib.contextmanager
+def _stub_plane(content_type: str, body: bytes):
+    """Stand in for the control plane, answering every GET 200 with one fixed body.
+
+    `--api-url` is a supported path, so "a reverse proxy or an older plane answered" is a real
+    user state. Neither body below is something the CLI can use.
+    """
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_wrong_shape_plane_response_is_friendly():
+    with (
+        _stub_plane("application/json", b'{"hello": "world"}') as url,
+        tempfile.TemporaryDirectory() as tmp,
+    ):
+        proc = _run(
+            ["runs", "list"],
+            env={
+                **_logged_out_env(tmp),
+                "FLASH_API_URL": url,
+                "FREESOLO_API_KEY": "fslo-user-test",
+            },
+        )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert proc.stderr.startswith("error:")
+    assert f"{url}/v1/runs returned an unexpected response shape" in proc.stderr
+    assert "'runs'" in proc.stderr
+    assert "rather than at a proxy or another service" in proc.stderr
+    assert "Traceback (most recent call last)" not in proc.stderr
+
+
+def test_non_json_login_response_is_friendly():
+    with (
+        _stub_plane("text/html", b"<html>hi</html>") as url,
+        tempfile.TemporaryDirectory() as tmp,
+    ):
+        env = _logged_out_env(tmp)
+        proc = _run(["login", "--api-key", "fslo-user-bogus", "--api-url", url], env=env)
+        saved = os.path.join(env["HOME"], ".flash", "config.json")
+        assert not os.path.exists(saved), "an unverified key must not be saved"
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "login failed" in proc.stderr
+    assert f"{url}/v1/me did not return JSON (Content-Type: text/html)" in proc.stderr
+    assert "rather than at a proxy or another service" in proc.stderr
+    assert "Expecting value" not in proc.stderr
+    assert "Traceback (most recent call last)" not in proc.stderr

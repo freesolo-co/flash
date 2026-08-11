@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 import urllib.request
@@ -730,7 +731,7 @@ def test_cancel_timeout_returns_authoritative_cancelled_status(monkeypatch):
     client = ApiClient("http://flash.example", "fslo-user-test")
     calls: list[tuple[str, str, float | None]] = []
 
-    def request(method, path, body=None, timeout=None, progress=None):
+    def request(method, path, body=None, timeout=None, progress=None, require=()):
         calls.append((method, path, timeout))
         if method == "POST":
             raise RequestTimeoutError("cancel timed out")
@@ -753,7 +754,7 @@ def test_cancel_timeout_returns_authoritative_cancelled_status(monkeypatch):
 def test_cancel_timeout_raises_when_backend_revocation_is_unconfirmed(monkeypatch, run_state):
     client = ApiClient("http://flash.example", "fslo-user-test")
 
-    def request(method, path, body=None, timeout=None, progress=None):
+    def request(method, path, body=None, timeout=None, progress=None, require=()):
         if method == "POST":
             raise RequestTimeoutError("cancel timed out")
         if method == "GET" and path == "/v1/runs/r1":
@@ -790,7 +791,7 @@ def test_cancel_timeout_keeps_polling_nonterminal_revocation_failure(monkeypatch
         ]
     )
 
-    def request(method, path, body=None, timeout=None, progress=None):
+    def request(method, path, body=None, timeout=None, progress=None, require=()):
         if method == "POST":
             raise RequestTimeoutError("cancel timed out")
         if method == "GET" and path == "/v1/runs/r1":
@@ -996,3 +997,128 @@ def test_deployment_for_bounds_the_read(monkeypatch):
 
     assert client.deployment_for("flash-1", timeout=3.0) is None
     assert calls == [("GET", "/v1/runs/flash-1/deploy", 3.0)]
+
+
+@contextlib.contextmanager
+def _fixed_2xx_server(content_type: str, body: bytes):
+    """A server that answers every GET 200 with one fixed body, like a proxy or another service."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_wrong_shape_2xx_names_the_endpoint_and_the_missing_key():
+    """Valid JSON of the wrong shape must not escape as a bare KeyError nothing translates."""
+    with _fixed_2xx_server("application/json", b'{"hello": "world"}') as url:
+        client = ApiClient(url, "fslo-user-test", timeout=5)
+        cases = [
+            (client.list_runs, "/v1/runs", "runs"),
+            (lambda: client.checkpoints("r1"), "/v1/runs/r1/checkpoints", "checkpoints"),
+            (client.deployments, "/v1/deployments", "deployments"),
+            (lambda: client.get_logs("r1"), "/v1/runs/r1/logs?offset=0", "logs"),
+        ]
+        for call, path, key in cases:
+            with pytest.raises(ClientError) as caught:
+                call()
+            message = str(caught.value)
+            assert f"{url}{path} returned an unexpected response shape" in message
+            assert repr(key) in message
+            assert "rather than at a proxy or another service" in message
+
+
+def test_present_but_unusable_values_are_client_errors_too():
+    """A null value passes a presence check and then raises a bare TypeError out of int() or
+    iteration, which nothing in the CLI translates any more than it does a KeyError."""
+    with (
+        _fixed_2xx_server("application/json", b'{"runs": null}') as url,
+        pytest.raises(ClientError) as caught,
+    ):
+        ApiClient(url, "fslo-user-test", timeout=5).list_runs()
+    assert f"{url}/v1/runs returned an unexpected response shape" in str(caught.value)
+    assert "'runs'" in str(caught.value)
+    with (
+        _fixed_2xx_server("application/json", b'{"logs": "x", "offset": null}') as url,
+        pytest.raises(ClientError) as caught,
+    ):
+        ApiClient(url, "fslo-user-test", timeout=5).get_logs("r1")
+    assert "'offset'" in str(caught.value)
+
+
+def test_unusable_elements_inside_a_required_list_are_client_errors_too():
+    """A list of the wrong elements passes a bare `list` check and then crashes one level down:
+    `cmd_runs` sorts `{"runs": [null]}` straight into an AttributeError nothing translates."""
+    for body, key, call in [
+        (b'{"runs": [null]}', "runs", lambda c: c.list_runs()),
+        (b'{"runs": [{}, "x"]}', "runs", lambda c: c.list_runs()),
+        (b'{"checkpoints": [null]}', "checkpoints", lambda c: c.checkpoints("r1")),
+        (b'{"deployments": [null]}', "deployments", lambda c: c.deployments()),
+    ]:
+        with (
+            _fixed_2xx_server("application/json", body) as url,
+            pytest.raises(ClientError) as caught,
+        ):
+            call(ApiClient(url, "fslo-user-test", timeout=5))
+        message = str(caught.value)
+        assert "returned an unexpected response shape" in message
+        assert repr(key) in message
+        assert "rather than at a proxy or another service" in message
+
+
+def test_healthy_lists_of_objects_still_pass_the_element_check():
+    """The element check must not reject the shape the plane actually returns, empty included."""
+    with _fixed_2xx_server("application/json", b'{"runs": [{"id": "r1"}]}') as url:
+        assert ApiClient(url, "fslo-user-test", timeout=5).list_runs() == [{"id": "r1"}]
+    with _fixed_2xx_server("application/json", b'{"runs": []}') as url:
+        assert ApiClient(url, "fslo-user-test", timeout=5).list_runs() == []
+    # bool subclasses int, so a json true would otherwise satisfy the int requirement and
+    # flow into offset arithmetic.
+    with (
+        _fixed_2xx_server("application/json", b'{"logs": "x", "offset": true}') as url,
+        pytest.raises(ClientError) as caught,
+    ):
+        ApiClient(url, "fslo-user-test", timeout=5).get_logs("r1")
+    assert "'offset'" in str(caught.value)
+
+
+def test_non_object_json_is_a_client_error_even_without_requirements():
+    """A proxy or wrong service answering `[]` must not surface as AttributeError downstream."""
+    with (
+        _fixed_2xx_server("application/json", b"[]") as url,
+        pytest.raises(ClientError) as caught,
+    ):
+        ApiClient(url, "fslo-user-test", timeout=5).me()
+    assert "returned JSON that is not an object (list)" in str(caught.value)
+
+
+def test_non_json_2xx_is_a_client_error_not_a_decode_error():
+    """A reverse proxy answering 200 text/html must not leak `Expecting value: line 1 column 1`."""
+    with _fixed_2xx_server("text/html", b"<html>hi</html>") as url:
+        client = ApiClient(url, "fslo-user-test", timeout=5)
+        with pytest.raises(ClientError) as caught:
+            client.me()
+    message = str(caught.value)
+    assert f"{url}/v1/me did not return JSON (Content-Type: text/html)" in message
+    assert "rather than at a proxy or another service" in message
+    assert "Expecting value" not in message
+
+
+def test_empty_2xx_body_still_decodes_to_an_empty_object():
+    """An empty 2xx body decodes to {}, so callers reading a dict from it still get one."""
+    with _fixed_2xx_server("application/json", b"") as url:
+        assert ApiClient(url, "fslo-user-test", timeout=5).me() == {}

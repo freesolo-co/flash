@@ -222,8 +222,10 @@ class _FlashParser(_ThemedParser):
         usage = f"{CLI_NAME} [--debug] [-v] <command> [args]"
         footers = [
             f"new here? run `{CLI_NAME} login`, then `{CLI_NAME} env setup`",
-            f"train after publishing: `{CLI_NAME} env push --project PROJECT_UUID --name my-env .`, "
-            f"then `{CLI_NAME} train configs/sft.toml`",
+            (
+                f"train after publishing: `{CLI_NAME} env push --project PROJECT_UUID --name my-env .`, "
+                f"then `{CLI_NAME} train configs/sft.toml`"
+            ),
             f"any command in depth: `{CLI_NAME} <command> --help`",
             "docs: https://docs.freesolo.co",
         ]
