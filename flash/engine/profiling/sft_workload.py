@@ -13,7 +13,11 @@ from typing import Any
 
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import resolve_update_horizon, sft_update_steps
-from flash.engine.profiling.workload_profile import SftWorkloadProfile, sft_sample_policy
+from flash.engine.profiling.workload_profile import (
+    SftWorkloadProfile,
+    sft_sample_policy,
+    unpacked_batch_warning,
+)
 from flash.engine.worker.entry.sft import (
     _pretokenize_completion_only,
     _reject_image_completion,
@@ -36,6 +40,7 @@ class PreparedSftWorkload:
     processor: Any | None
     sampled_texts: list[str]
     multiturn_targets: int
+    coerced_singleturn_targets: int
 
 
 def _serialize_multimodal_inputs(values: dict) -> bytes:
@@ -252,6 +257,7 @@ class _TokenizedSftRows:
     untruncated_by_index: dict[int, int]
     sampled_texts: list[str]
     multiturn_targets: int
+    coerced_singleturn_targets: int
     dropped: int
 
 
@@ -282,9 +288,16 @@ class _SftStepHorizon:
     authoritative_supervised_tokens: int
 
 
+def _sft_completion_with_provenance(env, example: dict) -> tuple[list[dict], bool]:
+    completion_with_provenance = getattr(env, "sft_completion_with_provenance", None)
+    if callable(completion_with_provenance):
+        return completion_with_provenance(example)
+    return env.sft_completion(example), False
+
+
 def _tokenize_prompt_rows(
     spec,
-    prompt_rows: list[tuple[Any, list[dict], list[dict]]],
+    prompt_rows: list[tuple[Any, list[dict], list[dict], bool]],
     *,
     package_root,
     tokenizer,
@@ -304,10 +317,22 @@ def _tokenize_prompt_rows(
     text_specs: list[dict[str, Any]] = []
     sampled_texts: list[str] = []
     multiturn_targets = 0
-    for row_index, (example, prompt_messages, completion_messages) in enumerate(prompt_rows):
+    coerced_singleturn_targets = 0
+    for row_index, (
+        example,
+        prompt_messages,
+        completion_messages,
+        coerced_scalar_output,
+    ) in enumerate(prompt_rows):
         _reject_image_completion(completion_messages)
         if len(completion_messages) > 1:
             multiturn_targets += 1
+        elif (
+            coerced_scalar_output
+            and len(completion_messages) == 1
+            and completion_messages[0].get("role") == "assistant"
+        ):
+            coerced_singleturn_targets += 1
         if record_has_images(example, prompt_messages):
             if processor is None:
                 raise RuntimeError("multimodal sft row has no processor")
@@ -380,6 +405,7 @@ def _tokenize_prompt_rows(
         untruncated_by_index=untruncated_by_index,
         sampled_texts=sampled_texts,
         multiturn_targets=multiturn_targets,
+        coerced_singleturn_targets=coerced_singleturn_targets,
         dropped=dropped,
     )
 
@@ -570,13 +596,15 @@ def prepare_sft_workload(
 
     source = list(env.dataset())
     selected = select_sft_examples(source, max_examples, spec.seed)
-    prompt_rows = [
-        (example, env.prompt_messages(example), env.sft_completion(example)) for example in selected
-    ]
+    prompt_rows = []
+    for example in selected:
+        prompt_messages = env.prompt_messages(example)
+        completion_messages, coerced_scalar_output = _sft_completion_with_provenance(env, example)
+        prompt_rows.append((example, prompt_messages, completion_messages, coerced_scalar_output))
     package_root = getattr(env, "package_root", None)
     multimodal = any(
         record_has_images(example, prompt_messages)
-        for example, prompt_messages, _completion in prompt_rows
+        for example, prompt_messages, _completion, _used_fallback in prompt_rows
     )
     processor = None
     if multimodal:
@@ -638,6 +666,20 @@ def prepare_sft_workload(
         measurements=measurements,
         horizon=horizon,
     )
+    # one example per update instead of the authored batch is an optimization-semantics change
+    # whose only other trace is `notes["packing"]` in the finished run's metrics, which is not
+    # visible until after the run is paid for. this function runs in the profile job and again on
+    # the training worker, so the warning lands in both logs. pass the authored batch_size rather
+    # than `effective_batch`: the helper resolves None to the same recipe default but keeps the
+    # value's source, so an omitted knob is not reported to the user as one they configured.
+    warning = unpacked_batch_warning(
+        packing_mode=profile.packing_mode,
+        architecture_mode=profile.architecture_mode,
+        examples_per_update=profile.examples_per_update,
+        configured_batch_size=train_spec.batch_size,
+    )
+    if warning:
+        print(f"warning: [train] {warning}", file=sys.stderr)
     return PreparedSftWorkload(
         rows=retained.rows,
         profile=profile,
@@ -646,4 +688,5 @@ def prepare_sft_workload(
         processor=processor,
         sampled_texts=tokenized.sampled_texts,
         multiturn_targets=tokenized.multiturn_targets,
+        coerced_singleturn_targets=tokenized.coerced_singleturn_targets,
     )

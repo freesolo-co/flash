@@ -80,18 +80,41 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
         or worker_spec.workload_profile_input_digest
         or worker_spec.workload_profile
     )
-    if has_workload_profile:
-        if snapshot.get("workload_profile") != (worker_spec.workload_profile or None):
-            raise ValueError("persisted workload profile does not match the worker spec")
-        if not isinstance(stored_digest, str) or stored_digest != runner._preparation_digest(
+    # the auto-pin marker is excluded from the structural compare (the public half always reads
+    # False by construction), so nothing else here would catch a forged worker-half marker. deploy
+    # reads it to decide whether to relax the authored-pin rejection, which makes it a privilege
+    # decision taken on an otherwise unverified value: a plain grpo/opd run reaches neither branch
+    # below, so a forged marker would skip the 400 and deploy against base weights the run never
+    # trained on. binding it to the digest closes that -- the marker is hashed into the digest at
+    # persist time, so a snapshot claiming one cannot reproduce it.
+    if has_workload_profile and snapshot.get("workload_profile") != (
+        worker_spec.workload_profile or None
+    ):
+        raise ValueError("persisted workload profile does not match the worker spec")
+    # `gpu_count_auto` is deliberately NOT a trigger here, unlike `model_revision_auto`. The digest
+    # covers the whole public spec including `gpu.type`, which the allocator legitimately rewrites
+    # onto the stored status when a run is provisioned -- so gating on the marker made the digest
+    # reject ordinary provisioned runs at deploy. Measured: two specs differing only in whether
+    # gpu.count was authored deployed differently, the auto-sized one failing integrity validation
+    # (tests/test_server_api.py::test_deploy_ignores_stored_training_gpu). Since an omitted count is
+    # the DEFAULT, that is nearly every run. The marker's integrity does not need this trigger: it
+    # is bounded by `_validate_effective_spec`, which caps an auto-sized count at
+    # MAX_COMBINATION_CARDS, and unlike `model_revision_auto` it cannot relax a deploy-time
+    # rejection -- a forged marker only widens the allocator's ceiling, which the VRAM fit check and
+    # the geometry cap still constrain.
+    if (has_workload_profile or worker_spec.model_revision_auto) and (
+        not isinstance(stored_digest, str)
+        or stored_digest
+        != runner._preparation_digest(
             public_spec,
             worker_spec,
             expected,
             legacy_keys=legacy_keys,
             legacy_public_keys=legacy_public_keys,
             legacy_public_alpha=legacy_public_alpha,
-        ):
-            raise ValueError("persisted effective preparation failed integrity validation")
+        )
+    ):
+        raise ValueError("persisted effective preparation failed integrity validation")
     if public_spec.train.init_from_adapter:
         if not isinstance(expected, dict) or not expected.get("digest"):
             raise ValueError(
@@ -160,6 +183,10 @@ def reallocation_spec_from_status(status: RunStatus, *, verify_source: bool = Fa
     """
     worker_spec = runner.effective_spec_from_status(status, verify_source=verify_source)
     public_gpu = JobSpec.from_dict(status.spec).gpu
+    # `gpu_count_auto` needs no restoring here: it is provenance, so the worker half carries it
+    # verbatim through allocation. The public half cannot supply it -- to_dict strips the marker and
+    # keeps the placeholder count=1, making an auto-sized run's public spec byte-identical to an
+    # authored single-card pin -- which is exactly why the worker half must keep it.
     if worker_spec.gpu.type == public_gpu.type and worker_spec.gpu.count == public_gpu.count:
         return worker_spec
     restored = worker_spec.to_internal_dict()

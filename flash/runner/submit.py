@@ -44,6 +44,15 @@ def prepare_job(
     owner_key_id: int | None = None,
 ) -> PreparedJob:
     """Prepare all read-only submission inputs before persistence or allocation."""
+    # before _resolve_model_revision, and before every sizing step below: a warm start inherits its
+    # source's runner-assigned pin, and `resolve_model`/`_with_model_disk` size against whatever
+    # revision the spec carries by then.
+    spec = _runner()._inherit_warmstart_revision(
+        spec,
+        owner_org_id=_runner()._context_org_id(billing_context)
+        or _runner()._context_org_id(platform_context),
+        owner_key_id=owner_key_id,
+    )
     spec = _runner()._resolve_model_revision(spec, required=spec.algorithm == "sft")
     _runner()._require_supported_adapter_continuation(spec)
     if spec.algorithm == "sft":
@@ -263,8 +272,10 @@ def submit_job(
     worker_spec = prepared.worker_spec
     estimated_cost_usd = prepared.estimated_cost_usd
     from flash.content.multimodal import preflight_validate_image_opd
+    from flash.server.domain.teacher_broker import preflight_validate_managed_teacher
 
     preflight_validate_image_opd(worker_spec)
+    preflight_validate_managed_teacher(worker_spec)
     from flash.providers import INSTANCE_PROVIDERS, available_providers
 
     if not dry_run:

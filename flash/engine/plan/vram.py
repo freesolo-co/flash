@@ -47,9 +47,9 @@ _LORA_ADAMW_BYTES_PER_PARAM = 16.0
 
 def grpo_completion_len(max_tokens: int | None, thinking: bool) -> int:
     """The completion-token budget a GRPO run uses: an explicit ``max_tokens`` else the RL recipe
-    default (thinking uses the longer ``max_completion_len_thinking``). Single source of truth for the
-    three sites that must resolve the SAME integer — ``_resolve_sequence_lengths``'s worker-side
-    enforcement, ``grpo_rollout_seq_len``, and the spec-parse prompt-budget guard."""
+    default (thinking uses the longer ``max_completion_len_thinking``). Single source of truth for
+    the three sites that must resolve the SAME integer (``_resolve_sequence_lengths``'s worker-side
+    enforcement, ``grpo_rollout_seq_len``, and the spec-parse prompt-budget guard)."""
     from flash.engine.plan.recipe import RECIPE
 
     rl = RECIPE.rl
@@ -422,11 +422,22 @@ def estimate_vram_gb(
     return base + activations + logits
 
 
-# gc-off activation factors are empirical and geometry-specific: dense 65.0 from a live RTX 5090
-# fit, and MoE 18.0 as a conservative unvalidated value. remeasure before widening the >=120 GB
-# dense gate or changing the 35B-A3B MoE factor; the estimate scales with layers*batch*seq*hidden.
+# gc-off activation factors are empirical and geometry-specific; the estimate scales with
+# layers*batch*seq*hidden. dense 65.0 is a live RTX 5090 fit against successful peaks. remeasure
+# before widening the >=120 GB dense gate.
+#
+# the MoE factor was 18.0 -- a guess, carried on the assumption that ~3B active params imply small
+# activations. that is wrong: routing is per-token, so every one of the 40 layers still
+# materializes a full activation set, and the wide expert stack makes each one large. 18.0 called a
+# run that OOMs a fit, on BOTH an H200 and a B200.
+#
+# 196.9 is NOT a measured activation cost: it is the residual that lands this equation's TOTAL on
+# the allocated-at-OOM boundary of a live B200 run. Re-derive it the same way, never by measuring
+# activations alone. The run evidence, the unit trap, and the reason the naive
+# "allocated minus resident" subtraction is wrong all live in the test that pins this boundary,
+# test_moe_activation_constant_matches_the_live_b200_peak.
 _GC_OFF_ACT_K_DENSE = 65.0
-_GC_OFF_ACT_K_MOE = 18.0
+_GC_OFF_ACT_K_MOE = 196.9
 
 
 def sft_gc_off_peak_gb(

@@ -69,7 +69,11 @@ class ChildOutputTail:
             self._cuda_oom_evidence = cuda_oom_message_evidence(line)
         text = line.rstrip("\n")
         if text:
-            self._lines.append(text[:_CHILD_TAIL_LINE_CHARS])
+            # sanitize before the per-line cap, not after: truncating first could split a credential
+            # across the cut and defeat full-value redaction. this is the worker side, where the
+            # run's secret values are known, and every consumer of the retained tail (heartbeat
+            # payload, streamed run log, persisted status) reads it from here.
+            self._lines.append(sanitize_diagnostic(text, limit=_CHILD_TAIL_LINE_CHARS))
             self._written += 1
 
     @property

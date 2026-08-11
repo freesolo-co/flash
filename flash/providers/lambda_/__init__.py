@@ -130,14 +130,7 @@ class LambdaProvider(InstanceProvider):
         Lambda sells fixed card counts per class as distinct instance types, so each allowed count
         is probed against the live catalog and only the counts with real capacity are reported. The
         rate stays per-card (``usable_instances`` divides the per-instance price).
-
-        Offers nothing at all when a private worker image is configured that this substrate cannot
-        authenticate (see ``_private_image_problem``), so the allocator never rents a box whose
-        image pull is certain to fail.
         """
-        problem = self._private_image_problem()
-        if problem:
-            raise UnsupportedGpuError(problem)
         from flash.providers.lambda_ import api as lambda_api
         from flash.providers.lambda_.gpus import instance_type_for
         from flash.providers.lambda_.jobs import usable_instances

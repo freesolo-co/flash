@@ -25,7 +25,7 @@ GRPO_RAW = {
         "epochs": 1,
         "max_examples": 800,
         "group_size": 8,
-        "batch_size": 16,
+        "prompts_per_step": 16,
         "max_completion_tokens": 512,
         "max_context_tokens": 2048,
     },
@@ -176,7 +176,7 @@ def test_partial_reprice_counts_reached_saves_and_drops_future_saves():
 def test_opd_epochs_derive_steps_from_max_examples():
     raw = copy.deepcopy(GRPO_RAW)
     raw["algorithm"] = "opd"
-    raw["train"].update({"epochs": 2, "max_examples": 17, "batch_size": 8, "group_size": 1})
+    raw["train"].update({"epochs": 2, "max_examples": 17, "prompts_per_step": 8, "group_size": 1})
     spec = spec_from_dict(raw)
     assert _spec_steps(spec) == 5  # ceil(17 rows * 2 epochs / batch_size 8)
 
@@ -185,7 +185,7 @@ def test_opd_positive_max_steps_is_authoritative():
     raw = copy.deepcopy(GRPO_RAW)
     raw["algorithm"] = "opd"
     raw["train"].update(
-        {"epochs": 2, "max_examples": 17, "batch_size": 8, "group_size": 1, "max_steps": 31}
+        {"epochs": 2, "max_examples": 17, "prompts_per_step": 8, "group_size": 1, "max_steps": 31}
     )
     assert _spec_steps(spec_from_dict(raw)) == 31
 
@@ -197,7 +197,9 @@ def test_opd_runconfig_carries_selected_teacher_and_prices_it():
         raw = copy.deepcopy(GRPO_RAW)
         raw["model"] = "Qwen/Qwen3.5-4B"
         raw["algorithm"] = "opd"
-        raw["train"].update({"epochs": 1, "max_examples": 40, "batch_size": 8, "group_size": 1})
+        raw["train"].update(
+            {"epochs": 1, "max_examples": 40, "prompts_per_step": 8, "group_size": 1}
+        )
         if teacher is not None:
             raw["train"]["teacher_model"] = teacher
         return spec_from_dict(raw)
@@ -308,7 +310,7 @@ def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):
         "[train]\n"
         "epochs = 1\n"
         "max_examples = 800\n"
-        "batch_size = 16\n"
+        "prompts_per_step = 16\n"
         "[gpu]\n"
         ""
     )
@@ -480,6 +482,90 @@ def test_sft_cost_reports_the_measured_workload_and_no_invented_hardware(
     for invented in ("/hr", "setup", "per-step", "train_seconds"):
         assert invented not in captured.out
     assert "nothing was charged for training" in captured.err
+
+
+UNPACKED_MULTIMODAL_PROFILE = {
+    **EXACT_PROFILE,
+    "packing_mode": "exact-unpacked",
+    "architecture_mode": "multimodal",
+    "examples_per_update": 1,
+}
+
+
+def test_sft_cost_warns_that_an_unpacked_run_ignores_the_configured_batch_size(
+    tmp_path, monkeypatch, capsys
+):
+    """The batch override is a quote-time fact, so the user must hear it before submitting.
+
+    A multimodal run is never packed, so ``batch_size = 8`` in the config buys nothing: verl takes
+    one optimizer step per example.
+    """
+    _use_client(
+        monkeypatch,
+        _QuotingClient(
+            {"estimated_cost_usd": 1.25, "workload_profile": dict(UNPACKED_MULTIMODAL_PROFILE)}
+        ),
+    )
+
+    rc = cmd_train(_sft_args(tmp_path))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "sequence packing is OFF" in err
+    # the reason is the architecture label the packing decision froze on the profile
+    assert "multimodal" in err
+    assert "the configured batch_size 8 no longer groups examples into an update" in err
+    # batch_size is not inert: it still keys the profile and sizes an auto-picked gpu
+    assert "sizes the gpu" in err
+    # max_steps outranks epochs over rows, so the warning must claim no step count
+    assert "per epoch" not in err
+    assert "learning_rate" in err
+
+
+def test_a_real_unpacked_submit_warns_before_the_run_starts(tmp_path, monkeypatch, capsys):
+    """The submit path is the one that spends money, so it cannot be the one that stays quiet.
+
+    ``prepare_sft_workload`` warns too, but only into the remote worker log, and for a foreground
+    submit that is after the training gpu is already allocated.
+    """
+    _use_client(
+        monkeypatch,
+        _QuotingClient(
+            {
+                "run_id": "run-unpacked",
+                "workload_profile": dict(UNPACKED_MULTIMODAL_PROFILE),
+            }
+        ),
+    )
+
+    args = _sft_args(tmp_path)
+    args.cost = False
+    args.background = True
+
+    rc = cmd_train(args)
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "sequence packing is OFF" in err
+
+
+def test_sft_cost_stays_quiet_about_batching_when_the_run_is_packed(tmp_path, monkeypatch, capsys):
+    """A packed run honours ``batch_size``, so the warning must not cry wolf."""
+    _use_client(
+        monkeypatch,
+        _QuotingClient(
+            {
+                "estimated_cost_usd": 1.25,
+                "workload_profile": {**EXACT_PROFILE, "examples_per_update": 8},
+            }
+        ),
+    )
+
+    rc = cmd_train(_sft_args(tmp_path))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "sequence packing is OFF" not in err
 
 
 def test_sft_cost_omits_aggregates_the_profile_did_not_report(tmp_path, monkeypatch, capsys):
@@ -745,7 +831,7 @@ def test_non_sft_cost_stays_offline(tmp_path, monkeypatch, capsys, algorithm):
     monkeypatch.setenv("FLASH_STYLE", "0")
     # group_size 2 is grpo's floor (advantages are group-relative) and is valid for opd too.
     body = SFT_TOML.replace('algorithm = "sft"', f'algorithm = "{algorithm}"').replace(
-        "batch_size = 8\n", "batch_size = 8\nmax_examples = 40\ngroup_size = 2\n"
+        "batch_size = 8\n", "prompts_per_step = 8\nmax_examples = 40\ngroup_size = 2\n"
     )
 
     assert cmd_train(_sft_args(tmp_path, body)) == 0
