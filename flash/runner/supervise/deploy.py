@@ -691,8 +691,8 @@ def _cancellation_billing(
     else:
         # a fresh spec estimate uses offline static rates, which on live-market providers can
         # exceed the accepted quote's rate, so a mid-training cancel is priced from the persisted
-        # quote (prorated by completed steps) to keep a near-complete cancel at or under what the
-        # run would have cost on success.
+        # quote (scaled by the completed share of the estimated work) to keep a near-complete
+        # cancel at or under what the run would have cost on success.
         estimated_charge = cancelled_charge_usd(
             cancel_status,
             effective_spec,

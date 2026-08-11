@@ -75,15 +75,21 @@ def charge_usd_for_spec(spec, *, steps: int | None = None, fallback: float = 0.0
 
 
 def cancelled_charge_usd(status: RunStatus, spec, *, steps: int, fallback: float = 0.0) -> float:
-    """Price a mid-training cancellation from the accepted quote, prorated by completed steps.
+    """Price a mid-training cancellation from the accepted quote, scaled by the completed work.
 
     the persisted quote (``estimated_cost_usd``) carries the exact live rate the user accepted: the
     lifecycle refreshes it from the selected candidate before provisioning. a spec reprice through
     ``estimate_cost`` takes the offline static-rate path, and on live-market providers (vast,
     lambda) those rates differ materially from the accepted one, so pricing a near-complete cancel
-    that way can bill above what the run would have been charged on success. scaling the quote by
-    ``steps / planned steps`` never exceeds the quote by construction. a run with no persisted
-    quote has nothing to clamp to, so it falls back to the spec reprice.
+    that way can bill above what the run would have been charged on success. instead the quote is
+    scaled by the completed share of the estimated billed work: partial and full spec estimates use
+    the same offline rates, so the rate cancels out of their ratio and only the work fraction
+    remains. the fraction, not a bare ``steps / planned`` ratio, is what keeps the charge honest:
+    the one-time compile and each reached save land whole in the partial estimate, unreached saves
+    stay out of it, and a wall-capped plan caps both sides so the fraction is measured against the
+    capped horizon the quote actually paid for rather than the uncapped step count. the fraction is
+    capped at 1 so the charge never exceeds the quote. a run with no persisted quote has nothing to
+    clamp to, so it falls back to the spec reprice.
     """
     n = max(0, int(steps))
     if n == 0:
@@ -92,16 +98,17 @@ def cancelled_charge_usd(status: RunStatus, spec, *, steps: int, fallback: float
     quote = getattr(status, "estimated_cost_usd", None)
     if quote is None:
         return runner.charge_usd_for_spec(spec, steps=n, fallback=fallback)
-    quote = float(quote)
     try:
-        from flash.cost.spec import runconfig_from_spec
-
-        planned = int(runconfig_from_spec(spec).steps or 0)
-    except Exception:
-        planned = 0
-    if planned > 0:
-        return quote * min(n, planned) / planned
-    # planned steps unknown: reprice the spec but never bill a cancel above the accepted quote.
+        quote = float(quote)
+    except (TypeError, ValueError):
+        # a malformed persisted quote is a pricing failure, not a license to reprice: the accepted
+        # rate is unknowable, so the caller's fallback must propagate and settle the run.
+        return float(fallback)
+    partial = runner.charge_usd_for_spec(spec, steps=n, fallback=float("nan"))
+    full = runner.charge_usd_for_spec(spec, fallback=float("nan"))
+    if math.isfinite(partial) and math.isfinite(full) and full > 0:
+        return quote * min(1.0, partial / full)
+    # the work fraction is unpriceable: reprice the spec but never bill a cancel above the quote.
     # a non-finite reprice is a pricing failure and must propagate so the caller records it.
     repriced = runner.charge_usd_for_spec(spec, steps=n, fallback=fallback)
     if not math.isfinite(repriced):

@@ -4,6 +4,8 @@ ran (never above the quote), falling back to a spec reprice only when no quote w
 
 from __future__ import annotations
 
+import math
+
 import flash.runner as runner
 
 SPEC = {
@@ -116,8 +118,9 @@ def test_charge_usd_for_spec_falls_back_when_unpriceable():
 
 
 def test_cancelled_charge_usd_prorates_and_clamps_to_the_quote():
-    # the persisted quote carries the accepted live rate, so a cancel bills a linear share of it
-    # by completed steps and can never exceed it.
+    # the persisted quote carries the accepted live rate, so a cancel bills the completed share of
+    # it and can never exceed it. this plan is uniform (no saves, dense model, no wall cap), so the
+    # work share reduces to the bare step fraction.
     spec = _spec()  # 20 planned steps
     st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=8.0)
     assert runner.cancelled_charge_usd(st, spec, steps=0) == 0.0
@@ -125,6 +128,71 @@ def test_cancelled_charge_usd_prorates_and_clamps_to_the_quote():
     assert runner.cancelled_charge_usd(st, spec, steps=20) == 8.0
     # a step count beyond the plan still caps at the full quote.
     assert runner.cancelled_charge_usd(st, spec, steps=25) == 8.0
+
+
+def test_cancelled_charge_usd_treats_a_malformed_quote_as_a_pricing_failure():
+    # a nonnumeric persisted quote must not raise out of the cancel path, and repricing the spec
+    # instead could bill above the (unknowable) accepted rate, so the fallback propagates and the
+    # caller records a billing failure.
+    spec = _spec()
+    st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd="not-a-number")
+    assert math.isnan(runner.cancelled_charge_usd(st, spec, steps=10, fallback=float("nan")))
+
+
+def _patched_cfg_spec(monkeypatch, cfg):
+    """Route both the partial and full spec estimates through a fixed RunConfig."""
+    from types import SimpleNamespace
+
+    from flash.cost import spec as cost_spec
+
+    monkeypatch.setattr(cost_spec, "runconfig_from_spec", lambda spec: cfg)
+    return SimpleNamespace(workload_profile_kind="")
+
+
+def test_cancelled_charge_usd_prices_against_the_capped_horizon(monkeypatch):
+    # a wall-capped quote pays for cap_s of training, not the uncapped step count, so the first
+    # step of a capped 100k-step plan owes its share of the capped horizon, not 1/100000 of the
+    # quote.
+    from flash.cost.analytical import estimate_cost
+    from flash.cost.types import RunConfig
+
+    cfg = RunConfig("Qwen/Qwen3.5-4B", "grpo", 100_000, max_wall_seconds=3600)
+    assert estimate_cost(cfg).wall_capped
+    spec = _patched_cfg_spec(monkeypatch, cfg)
+    st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=8.0)
+    charge = runner.cancelled_charge_usd(st, spec, steps=1)
+    expected = 8.0 * runner.charge_usd_for_spec(spec, steps=1) / runner.charge_usd_for_spec(spec)
+    assert charge == expected
+    # far above the bare-step fraction, at or under the quote.
+    assert 8.0 / 100_000 < charge <= 8.0
+
+
+def test_cancelled_charge_usd_excludes_unreached_required_saves(monkeypatch):
+    # the quote includes the synchronous save at step 20, but a cancel at step 19 never ran it, so
+    # the charge stays strictly under the bare 19/20 share of the quote.
+    from flash.cost.analytical import required_save_overhead_seconds
+    from flash.cost.types import RunConfig
+
+    cfg = RunConfig("Qwen/Qwen3.5-4B", "grpo", 20, save_at_steps=(20,))
+    assert required_save_overhead_seconds(cfg) > 0
+    spec = _patched_cfg_spec(monkeypatch, cfg)
+    st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=8.0)
+    charge = runner.cancelled_charge_usd(st, spec, steps=19)
+    assert 0 < charge < 8.0 * 19 / 20
+
+
+def test_cancelled_charge_usd_bills_the_one_time_compile_with_the_first_step(monkeypatch):
+    # the moe compile is paid whole during the first step, so cancelling right after it owes more
+    # than the bare 1/1000 step share of the quote.
+    from flash.cost.analytical import compile_seconds
+    from flash.cost.types import RunConfig
+
+    cfg = RunConfig("Qwen/Qwen3.6-35B-A3B", "sft", 1000)
+    assert compile_seconds(cfg, "H100") > 0
+    spec = _patched_cfg_spec(monkeypatch, cfg)
+    st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=8.0)
+    charge = runner.cancelled_charge_usd(st, spec, steps=1)
+    assert 8.0 / 1000 < charge <= 8.0
 
 
 def test_cancelled_charge_usd_falls_back_to_reprice_without_a_quote():
@@ -227,8 +295,9 @@ def test_cancel_near_completion_never_bills_above_the_accepted_quote(monkeypatch
 
     st = runner.get_status("run-1")
     assert st.state == "cancelled"
-    # prorated share of the accepted quote, strictly under both the quote and the static reprice.
-    assert st.cost_usd == accepted_quote * 19 / 20
+    # the completed share of the accepted quote, strictly under both the quote and the static
+    # reprice.
+    assert st.cost_usd == accepted_quote * static_reprice / runner.charge_usd_for_spec(spec)
     assert st.cost_usd < accepted_quote
     assert st.cost_usd < static_reprice
 
@@ -257,6 +326,34 @@ def test_cancel_run_prorates_the_persisted_quote(monkeypatch, tmp_path):
     assert st.state == "cancelled"
     # half the steps -> half the accepted quote.
     assert st.cost_usd == 4.0
+
+
+def test_cancel_run_with_malformed_quote_still_settles_as_a_billing_failure(monkeypatch, tmp_path):
+    # a nonnumeric persisted quote survives the tolerant status loader; the cancel must still reach
+    # the cancelled transition and record the $0 pricing-failure diagnostic instead of raising.
+    from flash.runner.supervise import deploy
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)
+    spec = _spec()
+    runner._save_status(
+        runner.RunStatus(
+            run_id="run-1",
+            state="running",
+            spec=spec.to_dict(),
+            billing_context={"org_id": "o"},
+            billing_state="pending",
+            estimated_cost_usd="not-a-number",
+            last_heartbeat={"stage": "rl_step", "step": 10},
+        )
+    )
+
+    deploy.cancel_run("run-1")
+
+    st = runner.get_status("run-1")
+    assert st.state == "cancelled"
+    assert st.cost_usd == 0.0
+    assert st.billing_state == "failed"
 
 
 def test_cancel_run_before_any_step_is_free(monkeypatch, tmp_path):
