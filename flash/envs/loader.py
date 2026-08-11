@@ -813,6 +813,20 @@ def _packaged_dataset_file(base_dir: Path, name: str) -> Path | None:
     return None
 
 
+def _plural_dataset_file(base_dir: Path, name: str) -> Path | None:
+    """Split `name` as packaged under the top-level ``datasets/`` (plural) directory.
+
+    A package may legitimately carry BOTH directories: ``dataset/`` for the rows Flash reads and
+    ``datasets/`` for raw or eval assets. The plural directory is only a problem when the split
+    the operator asked for is exactly what sits unread inside it.
+    """
+    for rel in (f"datasets/{name}.jsonl", f"datasets/{name}.json"):
+        candidate = base_dir / rel
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def _validate_packaged_dataset_split(split: str) -> str:
     if not _DATASET_SPLIT_RE.fullmatch(split):
         raise ValueError(
@@ -885,10 +899,26 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
             and Path(resolved_dataset_path).resolve() == default_train.resolve()
         )
     datasets_dir_unread = False
+    unread_split_hint = ""
     if source is None:
         wanted = split if split and split != "train" else "train"
         found = _packaged_dataset_file(base_dir, wanted)
-        if found is None and wanted != "train" and _packaged_dataset_file(base_dir, "train"):
+        # the requested split may be sitting unread under datasets/ (plural) while dataset/
+        # holds other splits. that is the layout error below, and it names the actual file, so
+        # it wins over the generic missing-split message.
+        plural = _plural_dataset_file(base_dir, wanted) if found is None else None
+        if plural is not None:
+            unread_split_hint = (
+                f" The {wanted!r} split is packaged at "
+                f"{plural.relative_to(base_dir).as_posix()}, which Flash never reads; it looks "
+                f"for dataset/{wanted}.jsonl or dataset/{wanted}.json."
+            )
+        if (
+            found is None
+            and plural is None
+            and wanted != "train"
+            and _packaged_dataset_file(base_dir, "train")
+        ):
             # A default train.jsonl exists but the requested split file does not: refuse to fall
             # back silently (that trains on the wrong targets); envs with no packaged dataset at
             # all keep the SDK path, which may implement split itself.
@@ -905,10 +935,12 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
         # records/dataset_path params skip it because the user already said what to train on.
         # the verdict is deferred to after load_environment: only an env that cannot supply its
         # own rows actually needs the file this layout hid.
-        datasets_dir_unread = (
-            found is None
-            and (base_dir / "datasets").is_dir()
-            and not (base_dir / "dataset").is_dir()
+        # a singular dataset/ normally makes the plural directory unremarkable -- except when
+        # the split the operator asked for is the file sitting unread inside it, which is the
+        # silent-wrong-rows case this guard exists for.
+        datasets_dir_unread = found is None and (
+            plural is not None
+            or ((base_dir / "datasets").is_dir() and not (base_dir / "dataset").is_dir())
         )
         if found is not None:
             params.setdefault("dataset_path", str(found))
@@ -942,7 +974,7 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
             "environment package has a top-level 'datasets/' directory, which Flash never "
             "reads (it probes dataset/<split>.jsonl or dataset/<split>.json). Rename the "
             "directory to 'dataset/', or set [environment.params] dataset_path to the exact "
-            "file to train on."
+            "file to train on." + unread_split_hint
         )
     return FreesoloEnvironment(
         sdk_env,

@@ -964,6 +964,77 @@ def test_freesolo_adapter_datasets_plural_dir_raises_for_a_requested_side_split(
         load_freesolo_environment(str(env_file), split="oracle", contract_text="c")
 
 
+def test_freesolo_adapter_datasets_plural_split_raises_beside_a_singular_dataset_dir(
+    monkeypatch, tmp_path
+):
+    """a package can hold BOTH directories. when the requested split resolves under neither
+    dataset/ nor a top-level file but is sitting unread in datasets/, the singular directory
+    must not silence the guard: precedence would otherwise hand back the env's own train rows
+    and train on the wrong split. the message names both paths."""
+    sdk_env = _FakeSingleTurnEnv()
+    sdk_env.dataset = [{"id": "built", "input": "2+2?", "output": "4"}]
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+    env_file = _split_env(
+        tmp_path,
+        {
+            "dataset/dev.jsonl": '{"id":"d","input":"dev?","output":"dev"}\n',
+            "datasets/oracle.jsonl": '{"id":"o","input":"o?","output":"o"}\n',
+        },
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    with pytest.raises(ValueError, match="'datasets/' directory") as excinfo:
+        load_freesolo_environment(str(env_file), split="oracle", contract_text="c")
+    message = str(excinfo.value)
+    assert "datasets/oracle.jsonl" in message
+    assert "dataset/oracle.jsonl" in message
+
+
+def test_freesolo_adapter_datasets_plural_split_raises_beside_a_packaged_train_file(
+    monkeypatch, tmp_path
+):
+    """same layout with a default dataset/train.jsonl present: the split is still unread under
+    datasets/, so the layout error (which names the file that exists) replaces the generic
+    missing-split message rather than leaving the operator to guess."""
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path,
+        {
+            "dataset/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n',
+            "datasets/oracle.jsonl": '{"id":"o","input":"o?","output":"o"}\n',
+        },
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    with pytest.raises(ValueError, match="'datasets/' directory") as excinfo:
+        load_freesolo_environment(str(env_file), split="oracle", contract_text="c")
+    message = str(excinfo.value)
+    assert "datasets/oracle.jsonl" in message
+
+
+def test_freesolo_adapter_datasets_plural_dir_allowed_beside_a_probeable_split_dir(
+    monkeypatch, tmp_path
+):
+    """the raw-assets case must stay unaffected: a split that resolves normally under dataset/
+    trains on that file even when a datasets/ directory carries a file of the same name."""
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path,
+        {
+            "dataset/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n',
+            "dataset/oracle.jsonl": '{"id":"o","input":"2+2?","output":"4"}\n',
+            "datasets/oracle.jsonl": '{"id":"raw","input":"raw?","output":"raw"}\n',
+        },
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(str(env_file), split="oracle", contract_text="c")
+    assert env.dataset() == [{"id": "o", "input": "2+2?", "output": "4"}]
+
+
 def test_freesolo_adapter_records_param_wins_over_env_dataset(monkeypatch, tmp_path):
     """explicit [environment.params] records never reach the sdk env, so they keep
     precedence over a hardcoded env dataset."""
