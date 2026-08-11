@@ -501,9 +501,8 @@ def _config_geometry(config: dict) -> tuple[int, int, int, int]:
         int(text.get("vocab_size") or config.get("vocab_size") or 0),
         int(text.get("hidden_size") or config.get("hidden_size") or 0),
         int(text.get("num_hidden_layers") or config.get("num_hidden_layers") or 0),
-        # QUERY heads, read from the pinned commit's own config. verl's ulysses sequence
-        # parallelism requires this to divide the card count, so it is what decides how wide a
-        # pinned run may be rented -- see `allocator.geometry_safe_gpu_cap`.
+        # QUERY heads. verl's ulysses sequence parallelism requires this to divide the card count,
+        # so it decides how wide a pinned run may be -- see `allocator.geometry_safe_gpu_cap`.
         int(text.get("num_attention_heads") or config.get("num_attention_heads") or 0),
     )
 
@@ -548,8 +547,8 @@ def fetch_hf_model_geometry(
 def _geometry_mismatches(info, params_b, vocab, hidden, layers, heads) -> list[str]:
     """Catalog fields a pinned commit's own geometry contradicts.
 
-    Split out so the head-count path can certify a pin against the SAME rules the sizing path uses
-    without a second hub round trip. A zero means "the config did not say", which is not a conflict.
+    Split out so the head-count path certifies a pin against the SAME rules the sizing path uses,
+    without a second hub round trip. A zero means "the config did not say", not a conflict.
     """
     mismatches: list[str] = []
     if info.params_b > 0 and params_b is not None:
@@ -567,45 +566,30 @@ def _geometry_mismatches(info, params_b, vocab, hidden, layers, heads) -> list[s
     return mismatches
 
 
-# Why share a read at all: `allocate()` sizes the run (which validates this geometry) and THEN asks
-# for the head cap, so an unshared second lookup let a transient failure between the two narrow a
-# valid eight-card run to four and report it as structurally impossible.
-#
-# What may be stored is narrower than "any success", because two things that look immutable are not:
-#
-#   - A REF is not a commit. `spec_from_dict` passes the AUTHORED `model_revision` straight through,
-#     so `main` or a tag reaches here before `_resolve_model_revision` turns it into a sha. Caching
-#     under a moving name serves stale geometry forever once the ref advances, so only a 40-hex sha
-#     is eligible.
-#   - A COMPLETE read is not any read. `params_b` is None when the hub omits `safetensors.total`,
-#     and that is hub metadata rather than commit-immutable `config.json` geometry -- a transient
-#     incomplete read. Caching it makes `_validated_revision_geometry` raise from the memo forever
-#     and keeps a valid pin rejected until the plane restarts.
-#
-# Failures are likewise never stored: a blip is a fact about the network, not about the model.
+# Shared because `allocate()` sizes the run (validating this geometry) and THEN asks for the head
+# cap: an unshared second lookup let a blip between the two narrow a valid eight-card run to four.
+# Storable is narrower than "succeeded", since two things that look immutable are not: a REF can move
+# (`spec_from_dict` passes the AUTHORED revision, so `main` arrives unresolved), and a read is
+# incomplete when the hub omits `safetensors.total` -- hub metadata, not commit-immutable config
+# geometry, so caching that None keeps a valid pin rejected until restart. Failures likewise.
 _PINNED_GEOMETRY_MEMO: dict[tuple[str, str], tuple] = {}
-
-_SHA_LENGTH = 40
-
-
-def _is_commit_sha(revision: str) -> bool:
-    """Whether ``revision`` names one immutable commit rather than a ref that can move."""
-    return len(revision) == _SHA_LENGTH and all(c in "0123456789abcdefABCDEF" for c in revision)
 
 
 def _memoized_revision_geometry(model_id: str, revision: str) -> tuple:
-    """``fetch_hf_model_geometry`` for a pinned commit, reusing an earlier COMPLETE sha read.
+    """``fetch_hf_model_geometry`` for a pin, reusing an earlier COMPLETE sha read.
 
     Raises exactly like the strict fetch it wraps when nothing cacheable has succeeded yet, so
     callers that must fail closed still do.
     """
+    from flash.envs.loader import is_commit_sha
+
     key = (model_id, revision)
     cached = _PINNED_GEOMETRY_MEMO.get(key)
     if cached is not None:
         return cached
     geometry = fetch_hf_model_geometry(model_id, revision, strict=True)
     # geometry[0] is params_b; None means the hub answered without a parameter count.
-    if _is_commit_sha(revision) and geometry[0] is not None:
+    if is_commit_sha(revision) and geometry[0] is not None:
         _PINNED_GEOMETRY_MEMO[key] = geometry
     return geometry
 
@@ -634,22 +618,17 @@ def certified_revision_attention_heads(model_id: str, revision: str) -> int:
     """Query-head count of a PINNED commit, or 0 when it cannot be certified.
 
     How wide a pinned run may be rented is a divisibility question about the weights the worker
-    actually loads, so it has to be answered from that commit's own ``config.json`` rather than from
-    the catalog row describing the default revision.
+    actually loads, so it is answered from that commit's own ``config.json``, not the catalog row
+    describing the default revision.
 
     Returns 0 -- "not certified" -- for everything unreadable: an uncataloged model, a hub failure,
-    or a config that omits the field. Never raises. Widening past the conservative ceiling is the
-    only thing this enables, so an unreadable pin has to degrade to that ceiling rather than reject
-    a run the sizing path already accepted.
+    or a config omitting the field. Never raises. Widening past the conservative ceiling is all this
+    enables, so an unreadable pin degrades to that ceiling rather than rejecting a run sizing already
+    accepted. Certified, not merely read: the same catalog cross-check the sizing path applies runs
+    here, so a pin whose geometry has drifted is rejected rather than widened.
 
-    Certified, not merely read: the same catalog cross-check the sizing path applies runs here, so a
-    pin whose geometry has drifted is rejected rather than widened. Widening a run on a config that
-    disagrees with everything else known about the model is the failure this exists to prevent.
-
-    Reads through `_PINNED_GEOMETRY_MEMO`, so once ANY caller has read this pin the cap can no longer
-    be narrowed by a later hub blip. `allocate()` sizes the run before it asks for the cap, and both
-    go through that memo, so a run that was just sized successfully cannot then be declared
-    structurally impossible by a transient failure in between.
+    Reads through `_PINNED_GEOMETRY_MEMO`, so once ANY caller has read this pin the cap cannot be
+    narrowed by a later blip -- `allocate()` sizes before asking for the cap, both via that memo.
     """
     from flash.core.catalog import MODELS
 
