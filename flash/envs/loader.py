@@ -56,7 +56,13 @@ def _default_cache_root() -> Path:
     """
     xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
     if xdg and Path(xdg).is_absolute():
-        return Path(xdg) / "flash" / _CACHE_ROOT_DIR_NAME
+        # vetted exactly like the home branch below: XDG_CACHE_HOME is commonly inherited from
+        # a container image and points at another account's home, which an arbitrary uid cannot
+        # create under. selecting it unconditionally means _ensure_cache_root dies with
+        # PermissionError instead of falling through to the uid-scoped temp root.
+        xdg_root = Path(xdg) / "flash" / _CACHE_ROOT_DIR_NAME
+        if cache_security.cache_root_is_creatable(xdg_root):
+            return xdg_root
     home = Path(os.path.expanduser("~"))
     if home.is_absolute() and home.is_dir():
         # the whole path is vetted, not just `home`: an existing root-owned `~/.cache` makes
@@ -765,7 +771,13 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
     # it and fall through to a fresh download. raises if the entry cannot be removed, which has
     # to happen HERE: continuing would download the environment only for copytree to fail on
     # the entry still sitting there, and the alternative -- using it -- is what is refused.
-    if os.path.lexists(cache_dir) and not cache_security.trust_cache_entry(cache_dir):
+    # a cache entry is a DIRECTORY, whoever owns it: a regular file at the key (manual cache
+    # corruption, an interrupted write) passes the ownership check when we own it, and the
+    # download path's rmtree(ignore_errors=True) then swallows NotADirectoryError and leaves
+    # copytree to fail with FileExistsError on this key forever.
+    if os.path.lexists(cache_dir) and not (
+        cache_security.trust_cache_entry(cache_dir) and cache_dir.is_dir()
+    ):
         cache_security.discard_untrusted_entry(cache_dir)
     env_file = cache_dir / parsed.path
     if env_file.is_dir():

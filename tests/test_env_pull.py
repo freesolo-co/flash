@@ -954,6 +954,29 @@ def test_resolve_github_env_ignores_symlinked_cache_entry(monkeypatch, tmp_path)
     assert second.read_bytes() == b"# refreshed\n"
 
 
+def test_resolve_github_env_replaces_a_file_squatting_at_the_cache_key(monkeypatch, tmp_path):
+    # a cache entry is a directory. a regular FILE at the key (manual corruption, an interrupted
+    # write) is owned by us, so the ownership check trusts it and leaves it in place; the
+    # download path's rmtree(ignore_errors=True) then swallows NotADirectoryError and copytree
+    # dies with FileExistsError on this key on every run.
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **kwargs: "a" * 40)
+    monkeypatch.setattr(
+        adapter, "_download_github_tarball", lambda ref: _github_env_tarball(b"# original\n")
+    )
+    first = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+    cache_dir = first.parent
+    shutil.rmtree(cache_dir)
+    cache_dir.write_bytes(b"not a directory")
+
+    monkeypatch.setattr(
+        adapter, "_download_github_tarball", lambda ref: _github_env_tarball(b"# refreshed\n")
+    )
+    second = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+
+    assert second.read_bytes() == b"# refreshed\n"
+
+
 @pytest.mark.skipif(not hasattr(os, "getuid"), reason="posix-only uid check")
 def test_resolve_github_env_ignores_foreign_owned_cache_entry(monkeypatch, tmp_path):
     # same guessable-cache-key hazard as the symlink case, but the planted entry is a real

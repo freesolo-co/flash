@@ -63,6 +63,35 @@ def test_cache_root_falls_back_to_uid_scoped_tmp_when_homeless(monkeypatch, tmp_
     assert root == tmp_path / f"flash-env-cache-{uid}"
 
 
+def test_default_cache_root_falls_back_when_xdg_hierarchy_not_writable(monkeypatch, tmp_path):
+    # XDG_CACHE_HOME is commonly inherited from a container image (e.g. /home/app/.cache) and
+    # points somewhere an arbitrary-uid worker cannot create under. taking it unconditionally,
+    # unlike the HOME branch, means _ensure_cache_root dies with PermissionError on every
+    # github env resolve instead of reaching the uid-scoped temp fallback.
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+    monkeypatch.setenv("XDG_CACHE_HOME", str(xdg))
+    monkeypatch.setattr(adapter.os.path, "expanduser", lambda _p: "~")
+    monkeypatch.setattr(adapter.os, "access", lambda _path, _mode: False)
+    monkeypatch.setattr(adapter.tempfile, "gettempdir", lambda: str(tmp_path / "tmp"))
+
+    root = adapter._default_cache_root()
+
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    assert root == tmp_path / "tmp" / f"flash-env-cache-{uid}"
+
+
+def test_default_cache_root_uses_a_usable_xdg_hierarchy(monkeypatch, tmp_path):
+    # the other side of that check: a writable XDG_CACHE_HOME we own must still win, so the
+    # new usability probe rejects, never relocates a perfectly good cache root.
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+    monkeypatch.setenv("XDG_CACHE_HOME", str(xdg))
+    monkeypatch.setattr(adapter.tempfile, "gettempdir", lambda: str(tmp_path / "tmp"))
+
+    assert adapter._default_cache_root() == xdg / "flash" / "env-cache"
+
+
 def test_default_cache_root_falls_back_when_home_not_writable(monkeypatch, tmp_path):
     # an arbitrary-uid worker container commonly has HOME pointing at an existing directory
     # (e.g. /root) that home.is_dir() confirms but this process cannot write under; selecting
@@ -192,7 +221,10 @@ def test_ensure_cache_root_creates_private_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(adapter, "_CACHE_ROOT", root)
 
     assert adapter._ensure_cache_root() == root
-    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+    # derived the same way production is gated: mkdir(mode=0o700) does not establish posix mode
+    # bits on windows, where st_mode is synthetic, so only the posix run can assert 0700.
+    if hasattr(os, "getuid"):
+        assert stat.S_IMODE(root.stat().st_mode) == 0o700
     # idempotent on a root that already exists.
     assert adapter._ensure_cache_root() == root
 
@@ -259,6 +291,7 @@ def test_ensure_cache_root_refuses_foreign_owner(monkeypatch, tmp_path):
         adapter._ensure_cache_root()
 
 
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="posix-only mode bits")
 def test_ensure_cache_root_refuses_group_or_other_writable(monkeypatch, tmp_path):
     # a mode check, not an access check, so this holds for root too.
     root = tmp_path / "cache"
@@ -358,6 +391,7 @@ def test_ensure_cache_root_refuses_foreign_owned_symlink_ancestor(monkeypatch, t
     assert "owned by uid" in str(excinfo.value)
 
 
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="posix-only mode bits")
 def test_ensure_cache_root_refuses_world_writable_ancestor_without_sticky_bit(
     monkeypatch, tmp_path
 ):
