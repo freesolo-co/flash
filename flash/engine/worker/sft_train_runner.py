@@ -434,8 +434,8 @@ def _prepare_sft_child(
     # no interaction -- a gdn hybrid needs both, and dropping either is a silent correctness bug.
     core_source = _sft_train._append_exact_sft_dataloader_shim(core_source)
     # every required fragment is wrapped fail-closed (see wrap_shim_fragment): execsitecustomize
-    # would otherwise swallow a fragment's exception and the child would train unpatched -- no
-    # seeding, no exact dataloader order, no lora+, no boundary resets -- while looking healthy.
+    # would otherwise swallow a fragment's exception and the child would train unpatched (no
+    # seeding, no exact dataloader order, no lora+, no boundary resets) while looking healthy.
     # the wandb link shim stays unwrapped: it swallows its own failures by design and a logging
     # link must not be able to abort paid training.
     required_fragments = [("sft-core", core_source)]

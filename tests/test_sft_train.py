@@ -1886,8 +1886,8 @@ def test_sft_ships_no_val_file_so_the_child_cannot_validate():
 
 def test_sft_child_sitecustomize_fails_closed_and_names_its_required_fragments(monkeypatch):
     """the rendered sitecustomize wraps every required fragment (see child_io.wrap_shim_fragment):
-    execsitecustomize swallows a fragment's exception, so an unwrapped failure trains unpatched --
-    no seeding, no exact dataloader order, no lora+ -- while looking healthy."""
+    execsitecustomize swallows a fragment's exception, so an unwrapped failure trains unpatched
+    (no seeding, no exact dataloader order, no lora+) while looking healthy."""
     from flash.engine.worker import sft_train
 
     spec, captured = _stub_sft_run(monkeypatch)

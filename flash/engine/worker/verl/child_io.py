@@ -178,7 +178,7 @@ if not getattr(_flash_gdn_text_model.forward, "_flash_gdn_varlen_patched", False
 
 # --------------------------- fail-closed fragment wrapping (sft + grpo sitecustomize) ---------
 # cpython's site.execsitecustomize catches every Exception raised while sitecustomize imports,
-# prints a two-line note, and starts the interpreter anyway -- so a failing fragment silently
+# prints a two-line note, and starts the interpreter anyway, so a failing fragment silently
 # disables itself AND every fragment concatenated after it, and the child trains unpatched.
 # wrapping gives every required fragment two guarantees: an exception hard-exits the child with
 # this code (os._exit cannot be swallowed by execsitecustomize), and successful application
@@ -211,7 +211,7 @@ def wrap_shim_fragment(name: str, source: str) -> str:
     """wrap one required sitecustomize fragment so it fails closed and proves it applied.
 
     "" stays "": a feature that is off has nothing to prove. requires the prologue above earlier
-    in the same sitecustomize. optional fragments (tf32, the wandb link) stay unwrapped -- they
+    in the same sitecustomize. optional fragments (tf32, the wandb link) stay unwrapped, since they
     swallow their own failures by design and must never be able to kill a paid run.
     """
     if not source:
@@ -251,8 +251,8 @@ def verify_applied_shim_markers(marker_file: str, expected) -> None:
     """raise unless every expected fragment proved it applied in the child.
 
     the wrapped fragments hard-exit the child on failure, so the only way a marker goes missing
-    is the sitecustomize never running at all -- a shadowing sitecustomize on a foreign
-    FLASH_VERL_PYTHON, or a lost PYTHONPATH entry. that child is training with NO flash patch
+    is the sitecustomize never running at all (a shadowing sitecustomize on a foreign
+    FLASH_VERL_PYTHON, or a lost PYTHONPATH entry). that child is training with NO flash patch
     (seeding, kl anchoring, save gating, boundary resets), so the attempt must fail. permanent
     rather than retriable by design: the same interpreter reproduces the same skip on retry.
     """

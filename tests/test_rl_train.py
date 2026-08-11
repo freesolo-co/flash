@@ -6789,8 +6789,8 @@ def test_write_rl_shim_wraps_required_fragments_and_returns_the_expected_marker_
 
 def test_the_gdn_varlen_append_is_wrapped_and_extends_the_expected_marker_set():
     # the gdn shim is appended after python_bin resolution, so it must join the same fail-closed
-    # contract as the fragments _write_rl_shim composed -- an unpatched gdn child trains across
-    # packed example boundaries, the exact silent failure the wrapper exists to prevent.
+    # contract as the fragments _write_rl_shim composed: an unpatched gdn child trains across
+    # packed example boundaries, which is the silent failure the wrapper closes.
     src = inspect.getsource(rl_train._configure_rl_child)
     assert 'wrap_shim_fragment("gdn-varlen", render_gdn_varlen_shim(gdn_reset_arch))' in src
     assert 'files["expected_shims"].append("gdn-varlen")' in src

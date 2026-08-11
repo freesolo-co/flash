@@ -3969,8 +3969,8 @@ def _run_child_with_sitecustomize(shim_dir):
 
 
 def test_execsitecustomize_swallows_an_unwrapped_fragment_failure(tmp_path):
-    """THE defect the wrapper closes: cpython catches every Exception a sitecustomize import
-    raises, prints a note, and starts the interpreter anyway -- so an unwrapped failing fragment
+    """the defect the wrapper closes: cpython catches every Exception a sitecustomize import
+    raises, prints a note, and starts the interpreter anyway, so an unwrapped failing fragment
     silently disables itself and everything after it, and the child trains unpatched."""
     shim_dir = tmp_path / "shim"
     shim_dir.mkdir()

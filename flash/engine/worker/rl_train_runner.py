@@ -353,8 +353,8 @@ def _resolve_training_settings(inp, caps):
     # plain kv tensor and crashes on the hybrid cache ('list' has no zero_) under verl sleep/wake.
     # resolved from the out-of-process capability probe, never by opening cuda in this parent:
     # a context initialized here to answer one question is retained for the process lifetime, on
-    # the same devices the verl child is about to own -- unbudgeted vram against a reserve sized
-    # without it (see fused_ce_backend). an unanswerable probe means conservative bf16 kv.
+    # the same devices the verl child is about to own, which is unbudgeted vram against a reserve
+    # sized without it (see fused_ce_backend). an unanswerable probe means conservative bf16 kv.
     verl_cc = verl_device_capability(caps)
     cc_ok = verl_cc is not None and verl_cc >= (8, 9)
     return expected_steps, loggers, project_name, experiment_name, cc_ok
@@ -522,7 +522,7 @@ def _execute_rl_child(
                 progress["step"] = int(m.group(1))
                 # the first step line is the training-start boundary: sitecustomize import is long
                 # finished by then, so a marker still missing means this child is training with no
-                # flash patch at all -- fail now rather than after the whole run is paid for. not
+                # flash patch at all, so fail now rather than after the whole run is paid for. not
                 # on the first output line: fragments print while later ones are still applying.
                 if not shims_verified:
                     verify_applied_shim_markers(shim_markers, expected_shims)
