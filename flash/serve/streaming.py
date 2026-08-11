@@ -7,6 +7,7 @@ to keep that module under the file-size limit.
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import Iterator
 
 from flash.serve.thinking import (
@@ -196,6 +197,12 @@ def chat_stream(
     """Yield text deltas from the freesolo OpenAI-compatible streaming endpoint.
 
     ``stop`` carries the run's own stop sequences, as in ``chat``.
+
+    Not a generator function: the upstream request is sent and its status validated here, at
+    call time. The caller hands the returned iterator to a ``StreamingResponse``, and a
+    generator would defer the request (and ``raise_for_status``) until iteration, after the
+    200 and headers had been flushed, so an upstream 4xx/5xx could only surface as a
+    truncated success.
     """
     base = serving_openai_base_url()
     body = {
@@ -208,14 +215,36 @@ def chat_stream(
     }
     if stop:
         body["stop"] = [str(value) for value in stop]
-    with _stream_http_client().stream(
+    ctx = _stream_http_client().stream(
         "POST",
         f"{base}/chat/completions",
         json=body,
         headers=_internal_key_header(),
         timeout=30 * 60.0,
-    ) as resp:
+    )
+    resp = ctx.__enter__()
+    try:
         resp.raise_for_status()
+    except BaseException:
+        ctx.__exit__(*sys.exc_info())
+        raise
+    stream = _streamed_body(ctx, resp, thinking=thinking)
+    # advance to the priming yield before handing the generator out: close() on a generator
+    # that was never started skips its finally block, and that block is what releases the
+    # upstream connection when the caller closes without iterating.
+    next(stream)
+    return stream
+
+
+def _streamed_body(ctx, resp, *, thinking: bool) -> Iterator[str]:
+    """Decode the already-validated streaming response, closing it on every exit path.
+
+    ``ctx`` is the entered ``client.stream`` context manager; exiting it closes ``resp``.
+    the leading empty yield is a priming value consumed by ``chat_stream`` so the generator
+    is running before it is handed out (see there).
+    """
+    try:
+        yield ""
         if "application/json" in resp.headers.get("content-type", ""):
             # client.stream() leaves body unread; must call resp.read() before .json().
             resp.read()
@@ -227,3 +256,9 @@ def chat_stream(
                 yield str(content)
             return
         yield from _openai_stream_content(resp.iter_lines(), thinking=thinking)
+    finally:
+        # runs on normal exhaustion, on a mid-stream error, and on close() from a client
+        # disconnect. a mid-stream error keeps propagating, which makes the server abort the
+        # chunked response, so the client sees a truncated-transfer error instead of a clean
+        # eof it would mistake for a finished answer.
+        ctx.__exit__(None, None, None)
