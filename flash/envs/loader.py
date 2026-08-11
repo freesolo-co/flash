@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -37,7 +38,32 @@ from flash.envs.package.unpack import extract_validated_archive_members
 _DEFAULT_GITHUB_REF = "main"
 _DEFAULT_ENVIRONMENT_PATH = "environment.py"
 _DEFAULT_MANAGED_ENV_REPO = "freesolo-co/environment-hub"
-_CACHE_ROOT = Path("/tmp/flash-env-cache")
+_CACHE_ROOT_DIR_NAME = "env-cache"
+
+
+def _default_cache_root() -> Path:
+    """Where the on-disk env cache lives: a directory private to the current user.
+
+    The cache holds code that ``load_environment`` imports and executes, and its keys are
+    fully predictable (a sha of a public repo/ref/path), so a shared world-writable root let
+    any other local account pre-create the tree and plant an ``environment.py`` that the
+    cache-hit path would hand back with no network call and no integrity check. Prefer a
+    home-owned location; worker containers can be homeless, so fall back to a uid-suffixed
+    dir under the temp root rather than a shared name.
+
+    Deliberately not env-tunable -- see ``_ensure_cache_root``.
+    """
+    xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+    if xdg and Path(xdg).is_absolute():
+        return Path(xdg) / "flash" / _CACHE_ROOT_DIR_NAME
+    home = Path(os.path.expanduser("~"))
+    if home.is_absolute() and home.is_dir():
+        return home / ".cache" / "flash" / _CACHE_ROOT_DIR_NAME
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    return Path(tempfile.gettempdir()) / f"flash-env-cache-{uid}"
+
+
+_CACHE_ROOT = _default_cache_root()
 # bound the on-disk env cache so it cannot grow without limit (one subdir per env
 # content-sha, ~30-80 MB each). evicted LRU by dir mtime, which we bump on cache hit.
 _CACHE_MAX_ENTRIES = 32
@@ -646,6 +672,34 @@ def _dir_size_bytes(path: Path) -> int:
     return total
 
 
+def _ensure_cache_root() -> Path:
+    """Create the env cache root 0700 and refuse it if it is not private to this user.
+
+    ``mkdir(exist_ok=True)`` is the race-safe create: whoever wins, the checks below decide
+    whether the winner's directory is trustworthy. ``lstat`` rather than ``stat`` so a
+    pre-created symlink pointing the cache somewhere attacker-controlled is rejected instead
+    of followed. The root stays hardcoded (no ``FLASH_ENV_CACHE_DIR``) on purpose: an ambient
+    var that redirects where executable environment code is read from is the same hazard.
+    """
+    root = _CACHE_ROOT
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    info = os.lstat(root)
+    uid = os.getuid() if hasattr(os, "getuid") else info.st_uid
+    if not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError(f"env cache root {root} is not a directory; refusing to use it")
+    if info.st_uid != uid:
+        raise RuntimeError(
+            f"env cache root {root} is owned by uid {info.st_uid}, not {uid}; "
+            "refusing to load environment code from it -- remove or reassign it"
+        )
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise RuntimeError(
+            f"env cache root {root} is group/other-writable (mode {info.st_mode & 0o777:04o}); "
+            "refusing to load environment code from it -- chmod 700 it"
+        )
+    return root
+
+
 def _evict_env_cache(keep: Path) -> None:
     # evict least-recently-used cache dirs until both the entry count and total
     # size are under their caps. never remove `keep` (just written) or anything
@@ -684,7 +738,7 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
     cache_key = hashlib.sha256(
         f"{cache_scope}:github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}".encode()
     ).hexdigest()[:24]
-    cache_dir = _CACHE_ROOT / cache_key
+    cache_dir = _ensure_cache_root() / cache_key
     env_file = cache_dir / parsed.path
     if env_file.is_dir():
         env_file = env_file / _DEFAULT_ENVIRONMENT_PATH
@@ -717,7 +771,6 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
             raise FileNotFoundError(
                 f"environment archive did not contain required entrypoint {required_entrypoint!r}"
             )
-        cache_dir.parent.mkdir(parents=True, exist_ok=True)
         shutil.rmtree(cache_dir, ignore_errors=True)
         shutil.copytree(extracted, cache_dir)
         _evict_env_cache(keep=cache_dir)
