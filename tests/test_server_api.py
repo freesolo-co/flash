@@ -6236,6 +6236,101 @@ def test_chat_streams_verified_immutable_revision_unchanged(api, monkeypatch):
     assert seen["run_id"] == revision
 
 
+def _deployed_chat_run(api):
+    """A deployed run ready to chat, returned as (key, run_id)."""
+    import flash.runner as runner
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    revision = f"{run_id}@final." + "a" * 40
+    runner.mark_deployed(
+        run_id,
+        {
+            "state": "ready",
+            "endpoint_name": "https://serve.example",
+            "adapter_revision": revision,
+        },
+        verification_generation=runner.verified_adapter_revision_generation(run_id),
+    )
+    return key, run_id
+
+
+def test_chat_stream_upstream_error_before_first_byte_is_502(api, monkeypatch):
+    """The streaming branch returns a real 502 when the upstream request fails at start.
+
+    Drives the REAL chat_stream (only the httpx seams are stubbed): the regression was a lazy
+    generator whose request and raise_for_status only ran once Starlette iterated the body,
+    after the 200 had been flushed, so the route's except could never fire and an upstream
+    502 arrived as an empty success."""
+    import flash.serve.deploy as deploy
+
+    key, run_id = _deployed_chat_run(api)
+
+    class _ErrorResp:
+        def __init__(self):
+            self.headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def raise_for_status(self):
+            request = deploy.httpx.Request("POST", "https://serve.example/v1/chat/completions")
+            response = deploy.httpx.Response(502, request=request)
+            raise deploy.httpx.HTTPStatusError("bad gateway", request=request, response=response)
+
+    class _FakeClient:
+        def stream(self, method, url, **kwargs):
+            return _ErrorResp()
+
+    monkeypatch.setattr(deploy, "_stream_http_client", lambda: _FakeClient())
+    monkeypatch.setattr(deploy, "serving_openai_base_url", lambda: "https://serve.example/v1")
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}], "stream": True},
+        headers=_bearer(key),
+    )
+    assert resp.status_code == 502, resp.text
+    assert "inference failure" in resp.json()["detail"]
+
+
+def test_chat_stream_midstream_failure_aborts_response(api, monkeypatch):
+    """A failure after the first streamed chunk aborts the response, not a clean eof.
+
+    Once bytes are flowing the status is committed, so the only legible signal is an aborted
+    body: the exception must propagate out of the response iterator (uvicorn then drops the
+    connection without the terminating chunk) rather than being swallowed into an eof the
+    client would read as a finished answer."""
+    import flash.server.app as app_mod
+
+    key, run_id = _deployed_chat_run(api)
+
+    def fake_stream(**kwargs):
+        yield "partial "
+        raise RuntimeError("upstream failed mid-generation")
+
+    monkeypatch.setattr(app_mod, "serve_chat_stream", fake_stream)
+
+    with (
+        pytest.raises(RuntimeError, match="upstream failed mid-generation"),
+        api.stream(
+            "POST",
+            f"/v1/runs/{run_id}/chat",
+            json={"messages": [{"role": "user", "content": "hello"}], "stream": True},
+            headers=_bearer(key),
+        ) as resp,
+    ):
+        resp.read()
+
+
 def test_chat_step_selector_prefers_current_revision_for_redeployed_step(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
