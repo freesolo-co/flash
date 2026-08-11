@@ -9,6 +9,7 @@ import types
 import pytest
 
 from flash.cli.commands import cmd_train
+from flash.cost.spec import UnknownPromptPoolSize
 from flash.cost.spec import runconfig_from_spec as _runconfig_from_spec
 from flash.cost.spec import spec_steps as _spec_steps
 from flash.cost.types import RunConfig
@@ -69,9 +70,26 @@ def test_grpo_epochs_derive_steps_from_max_examples():
     assert _spec_steps(spec) == 5  # ceil(33 rows * 2 epochs / batch_size 16)
 
 
-def test_grpo_epochs_need_max_examples_for_cost():
+def test_an_unbounded_prompt_pool_refuses_to_quote_instead_of_pricing_one_step():
+    """No stated row count used to mean "the pool is one step wide", which is never true.
+
+    The worker sizes the horizon from ``len(prompts)`` -- every row the environment yields -- so a
+    config that bounded nothing was quoted at one step regardless of dataset size. Against a
+    1153-row pool at batch 8 that is 145 real steps priced as 1, and the opd teacher capability in
+    ``capability_limits_for_spec`` is sized off the same number. The quote now refuses rather than
+    reporting a horizon nothing stated.
+    """
     spec = _spec(**{"train.max_examples": None, "train.epochs": 2})
-    assert _spec_steps(spec) == 2
+
+    with pytest.raises(UnknownPromptPoolSize, match="without a prompt-pool size"):
+        _spec_steps(spec)
+
+    # the two ways to state it, and the horizon that needs no pool size at all.
+    assert _spec_steps(_spec(**{"train.max_examples": 1153, "train.epochs": 1})) == 73
+    assert _spec_steps(_spec(**{"train.max_examples": None, "train.max_steps": 145})) == 145
+    env_bounded = _spec(**{"train.max_examples": None, "train.epochs": 1})
+    object.__setattr__(env_bounded.environment, "params", {"max_examples": 1153})
+    assert _spec_steps(env_bounded) == 73
 
 
 def test_grpo_positive_max_steps_is_authoritative():

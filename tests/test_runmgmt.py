@@ -100,12 +100,17 @@ def test_list_and_cancel(monkeypatch):
         importlib.reload(runner)
         # fixed constant; redirect to tmp via monkeypatch so it's restored after the test.
         monkeypatch.setattr(runner, "RUNS_DIR", tmp)
-        from flash.core.spec import JobSpec
+        from flash.core.spec import JobSpec, TrainSpec
 
         # two dry-run records
         for rid in ("a", "b"):
             runner.submit_job(
-                JobSpec(run_id=rid, model="Qwen/Qwen3.5-4B", algorithm="grpo"),
+                JobSpec(
+                    run_id=rid,
+                    model="Qwen/Qwen3.5-4B",
+                    algorithm="grpo",
+                    train=TrainSpec(max_examples=8),
+                ),
                 dry_run=True,
             )
         runs = {r.run_id for r in runner.list_runs()}
@@ -423,10 +428,16 @@ def test_finished_at_frozen_at_terminal_survives_later_updated_at_bumps(monkeypa
 
         importlib.reload(runner)
         monkeypatch.setattr(runner, "RUNS_DIR", tmp)
-        from flash.core.spec import JobSpec
+        from flash.core.spec import JobSpec, TrainSpec
 
         runner.submit_job(
-            JobSpec(run_id="fa", model="Qwen/Qwen3.5-4B", algorithm="grpo"), dry_run=True
+            JobSpec(
+                run_id="fa",
+                model="Qwen/Qwen3.5-4B",
+                algorithm="grpo",
+                train=TrainSpec(max_examples=8),
+            ),
+            dry_run=True,
         )
         s = runner.get_status("fa")
         s.state = "running"
@@ -461,10 +472,16 @@ def test_legacy_finished_at_backfill_uses_prior_updated_at_on_same_state_touch(m
 
         importlib.reload(runner)
         monkeypatch.setattr(runner, "RUNS_DIR", tmp)
-        from flash.core.spec import JobSpec
+        from flash.core.spec import JobSpec, TrainSpec
 
         runner.submit_job(
-            JobSpec(run_id="leg", model="Qwen/Qwen3.5-4B", algorithm="grpo"), dry_run=True
+            JobSpec(
+                run_id="leg",
+                model="Qwen/Qwen3.5-4B",
+                algorithm="grpo",
+                train=TrainSpec(max_examples=8),
+            ),
+            dry_run=True,
         )
         # Simulate a legacy record: already `done`, real teardown time in updated_at, no finished_at.
         teardown = 1_000.0
@@ -484,7 +501,13 @@ def test_legacy_finished_at_backfill_uses_prior_updated_at_on_same_state_touch(m
         # Contrast: a genuine non-terminal -> terminal transition stamps finished_at to the NEW
         # updated_at (the real teardown), as before.
         runner.submit_job(
-            JobSpec(run_id="fresh", model="Qwen/Qwen3.5-4B", algorithm="grpo"), dry_run=True
+            JobSpec(
+                run_id="fresh",
+                model="Qwen/Qwen3.5-4B",
+                algorithm="grpo",
+                train=TrainSpec(max_examples=8),
+            ),
+            dry_run=True,
         )
         s2 = runner.get_status("fresh")
         s2.state = "running"

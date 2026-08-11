@@ -20,6 +20,10 @@ from flash.engine.profiling.workload_profile import (
 )
 
 
+class UnknownPromptPoolSize(ValueError):
+    """Raised when a grpo/opd quote has no stated prompt-pool size to derive a horizon from."""
+
+
 def _on_policy_epochs(spec) -> int:
     from flash.engine.plan.recipe import RECIPE
 
@@ -90,6 +94,14 @@ def _rollout_profile(spec):
 
 
 def _on_policy_example_count(spec) -> int:
+    """Retained prompts the run will iterate, from the only two places that state a row count.
+
+    Falling back to one step's worth of prompts is what this raises instead of. The worker sizes
+    the horizon from ``len(prompts)`` -- every row the environment yields -- so a pool the config
+    never bounded derived exactly one step and quoted a full run at one step's price. The error
+    below is the same refusal sft already makes: a horizon nothing measured is not a cheap quote,
+    it is an absent one.
+    """
     t = spec.train
     pinned_examples = int(t.max_examples) if t.max_examples else 0
     if pinned_examples > 0:
@@ -97,7 +109,11 @@ def _on_policy_example_count(spec) -> int:
     env_examples = _env_max_examples(spec)
     if env_examples > 0:
         return env_examples
-    return _on_policy_requested_prompts_per_step(spec)
+    raise UnknownPromptPoolSize(
+        f"cannot price {spec.algorithm} without a prompt-pool size: set [train] max_examples to "
+        "the row count the run will train on (or [environment.params] max_examples), or set "
+        "[train] max_steps to state the horizon directly"
+    )
 
 
 def _env_max_examples(spec) -> int:
@@ -133,9 +149,13 @@ def spec_steps(spec) -> int:
     retained rows, realized batch, and ``max_steps`` against the exact tokenized dataset, so
     re-deriving it here from the config would reintroduce the guess the profile exists to replace.
     grpo/opd still derive passes over retained prompts, and positive ``max_steps`` replaces that
-    derived count.
+    derived count -- so it is read first: a stated horizon needs no pool size to derive one from,
+    and asking for a row count the answer does not depend on would reject a fully specified run.
     """
     if spec.algorithm in ("grpo", "opd"):
+        pinned_horizon = int(spec.train.max_steps or 0)
+        if pinned_horizon > 0:
+            return pinned_horizon
         examples = _on_policy_example_count(spec)
         derived = on_policy_steps(
             epochs=_on_policy_epochs(spec),
