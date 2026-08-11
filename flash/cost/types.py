@@ -228,9 +228,11 @@ class CostEstimate:
         """Multi-line itemized breakdown for CLI output."""
         lines = [
             f"Run        : {self.model_id}  [{self.method.upper()}, {self.steps} steps]",
-            f"GPU        : {f'{self.gpu_count}x ' if self.gpu_count > 1 else ''}{self.gpu} "
-            f"({self.gpu_vram_gb} GB; run needs >= {self.required_vram_gb} GB) "
-            f"@ ${self.gpu_hourly_usd:.2f}/hr{' per card' if self.gpu_count > 1 else ''}",
+            (
+                f"GPU        : {f'{self.gpu_count}x ' if self.gpu_count > 1 else ''}{self.gpu} "
+                f"({self.gpu_vram_gb} GB; run needs >= {self.required_vram_gb} GB) "
+                f"@ ${self.gpu_hourly_usd:.2f}/hr{' per card' if self.gpu_count > 1 else ''}"
+            ),
             f"Setup      : {self.setup_seconds / 60:.1f} min (cold start: boot + deps + model load"
             + (" + vLLM init" if self.method == "grpo" else "")
             + "; not billed)",
