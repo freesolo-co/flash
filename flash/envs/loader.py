@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -26,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
+from flash.envs import cache_security
 from flash.envs.package.limits import (
     ARCHIVE_MEMBER_LIMIT,
     ARCHIVE_SCAN_MEMBER_LIMIT,
@@ -37,7 +39,42 @@ from flash.envs.package.unpack import extract_validated_archive_members
 _DEFAULT_GITHUB_REF = "main"
 _DEFAULT_ENVIRONMENT_PATH = "environment.py"
 _DEFAULT_MANAGED_ENV_REPO = "freesolo-co/environment-hub"
-_CACHE_ROOT = Path("/tmp/flash-env-cache")
+_CACHE_ROOT_DIR_NAME = "env-cache"
+
+
+def _default_cache_root() -> Path:
+    """where the on-disk env cache lives: a directory private to the current user.
+
+    the cache holds code that ``load_environment`` imports and executes, and its keys are
+    fully predictable (a sha of a public repo/ref/path), so a shared world-writable root
+    would let any other local account pre-create the tree and plant an ``environment.py``
+    that the cache-hit path hands back with no network call and no integrity check. prefer a
+    home-owned location; worker containers can be homeless, so fall back to a uid-suffixed
+    dir under the temp root rather than a shared name.
+
+    deliberately not env-tunable, see ``_ensure_cache_root``.
+    """
+    xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+    if xdg and Path(xdg).is_absolute():
+        # vetted exactly like the home branch below: XDG_CACHE_HOME is commonly inherited from
+        # a container image and points at another account's home, which an arbitrary uid cannot
+        # create under. selecting it unconditionally means _ensure_cache_root dies with
+        # PermissionError instead of falling through to the uid-scoped temp root.
+        xdg_root = Path(xdg) / "flash" / _CACHE_ROOT_DIR_NAME
+        if cache_security.cache_root_is_creatable(xdg_root):
+            return xdg_root
+    home = Path(os.path.expanduser("~"))
+    if home.is_absolute() and home.is_dir():
+        # the whole path is vetted, not just `home`: an existing root-owned `~/.cache` makes
+        # the home-based root uncreatable even when home itself is fine.
+        home_root = home / ".cache" / "flash" / _CACHE_ROOT_DIR_NAME
+        if cache_security.cache_root_is_creatable(home_root):
+            return home_root
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    return Path(tempfile.gettempdir()) / f"flash-env-cache-{uid}"
+
+
+_CACHE_ROOT = _default_cache_root()
 # bound the on-disk env cache so it cannot grow without limit (one subdir per env
 # content-sha, ~30-80 MB each). evicted LRU by dir mtime, which we bump on cache hit.
 _CACHE_MAX_ENTRIES = 32
@@ -661,6 +698,47 @@ def _dir_size_bytes(path: Path) -> int:
     return total
 
 
+def _ensure_cache_root() -> Path:
+    """create the env cache root 0700 and refuse it if it is not private to this user.
+
+    creation is per-component and EEXIST-tolerant (``make_private_dir``): the ancestors have to
+    be created 0700 too, or the ancestor walk below rejects the path this call just made, and
+    tolerating EEXIST is the race-safe create -- whoever wins, the checks below decide whether
+    the winner's directory is trustworthy. ``lstat`` rather than ``stat`` so a pre-created
+    symlink pointing the cache somewhere attacker-controlled is rejected instead of followed.
+    the root stays hardcoded (no ``FLASH_ENV_CACHE_DIR``) on purpose: an ambient var that
+    redirects where executable environment code is read from is the same hazard.
+    """
+    root = _CACHE_ROOT
+    cache_security.make_private_dir(root)
+    cache_security.validate_cache_root_ancestors(root)
+    info = os.lstat(root)
+    uid = os.getuid() if hasattr(os, "getuid") else info.st_uid
+    if not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError(f"env cache root {root} is not a directory; refusing to use it")
+    if info.st_uid != uid:
+        raise RuntimeError(
+            f"env cache root {root} is owned by uid {info.st_uid}, not {uid}; "
+            "refusing to load environment code from it -- remove or reassign it"
+        )
+    # any group/other access on the root is refused, not just the write bits: a 0755/0710
+    # root lets a same-group account traverse into cached entries, and entry CONTENTS can
+    # legitimately carry group-writable modes (the contents-API path mkdirs parents under the
+    # ambient umask, ancient git trees carry 100664 blobs, copytree preserves both), where
+    # in-place tampering keeps the victim's uid and so still passes the entry ownership
+    # vetting. nobody but this user ever needs to look inside the cache. mode bits mean
+    # nothing on windows (mkdir(mode=0o700) does not establish them there, and a freshly
+    # created, perfectly private root commonly reports group/other bits), so this check --
+    # like the ancestor walk above -- is posix-only.
+    if hasattr(os, "getuid") and info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise RuntimeError(
+            f"env cache root {root} is accessible to group/other "
+            f"(mode {info.st_mode & 0o777:04o}); "
+            "refusing to load environment code from it -- chmod 700 it"
+        )
+    return root
+
+
 def _evict_env_cache(keep: Path) -> None:
     # evict least-recently-used cache dirs until both the entry count and total
     # size are under their caps. never remove `keep` (just written) or anything
@@ -699,15 +777,34 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
     cache_key = hashlib.sha256(
         f"{cache_scope}:github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}".encode()
     ).hexdigest()[:24]
-    cache_dir = _CACHE_ROOT / cache_key
+    cache_dir = _ensure_cache_root() / cache_key
+    # vet ANY existing entry at this key before looking inside it, not just one that already
+    # holds the expected entrypoint. a foreign-owned directory missing the entrypoint used to
+    # skip these checks entirely and fall straight to the download, which then writes the
+    # environment into a directory another account owns. untrusted here means planted before
+    # the root's permissions were last repaired, or swapped in since: never import it -- clear
+    # it and fall through to a fresh download. raises if the entry cannot be removed, which has
+    # to happen HERE: continuing would download the environment only for copytree to fail on
+    # the entry still sitting there, and the alternative -- using it -- is what is refused.
+    # a cache entry is a DIRECTORY, whoever owns it: a regular file at the key (manual cache
+    # corruption, an interrupted write) passes the ownership check when we own it, and the
+    # download path's rmtree(ignore_errors=True) then swallows NotADirectoryError and leaves
+    # copytree to fail with FileExistsError on this key forever.
+    if os.path.lexists(cache_dir) and not (
+        cache_security.trust_cache_entry(cache_dir) and cache_dir.is_dir()
+    ):
+        cache_security.discard_untrusted_entry(cache_dir)
     env_file = cache_dir / parsed.path
     if env_file.is_dir():
         env_file = env_file / _DEFAULT_ENVIRONMENT_PATH
     if env_file.is_file():
-        # mark as recently used so LRU eviction keeps hot envs.
-        with contextlib.suppress(OSError):
-            os.utime(cache_dir)
-        return env_file
+        if cache_security.trust_cache_entry(env_file):
+            # mark as recently used so LRU eviction keeps hot envs.
+            with contextlib.suppress(OSError):
+                os.utime(cache_dir)
+            return env_file
+        # a foreign file inside our own directory condemns the whole entry, same as above.
+        cache_security.discard_untrusted_entry(cache_dir)
     tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-github-"))
     resolved = GitHubEnvironmentRef(
         parsed.owner,
@@ -732,7 +829,6 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
             raise FileNotFoundError(
                 f"environment archive did not contain required entrypoint {required_entrypoint!r}"
             )
-        cache_dir.parent.mkdir(parents=True, exist_ok=True)
         shutil.rmtree(cache_dir, ignore_errors=True)
         shutil.copytree(extracted, cache_dir)
         _evict_env_cache(keep=cache_dir)

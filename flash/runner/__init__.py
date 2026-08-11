@@ -826,6 +826,7 @@ from flash.runner.costs import (  # noqa: E402,F401
     _gpu_rate,
     _status_estimated_charge,
     actual_steps_run,
+    cancelled_charge_usd,
     charge_usd_for_spec,
     profile_steps_run,
     record_billing_state,
