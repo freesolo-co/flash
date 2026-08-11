@@ -74,17 +74,25 @@ except Exception:
 FLASH_CUDART_STUB_MARKER = "[flash-verl] tilelang libcudart stub repointed"
 
 
-def _render_cudart_discovery() -> str:
-    """the discovery half of the stub fragment: find a libcudart that exports cudaDeviceReset.
+def render_tilelang_cudart_shim() -> str:
+    """child-side sitecustomize fragment that repoints tilelang's libcudart stub at the real runtime.
 
-    SHIPS THE PARENT'S OWN SOURCE rather than restating it. ``perf._find_real_libcudart`` is the
-    canonical probe -- nvidia wheel dirs across cuda majors, the -devel toolkit, the system resolver,
-    plus /proc/self/maps resolution for a bare soname -- and a hand-copy here would silently keep the
+    mirrors ``perf._neutralize_tilelang_cudart_stub`` inside the verl interpreter, and keeps its two
+    load-bearing rules: never ``dlopen`` the stub to test it (that maps the stub into this process,
+    which is the crash being avoided), and leave the stub alone when no real libcudart is found.
+
+    never raises. an unrepointed stub only crashes the runs that build a sleeping vLLM engine, so a
+    fragment that cannot find a runtime must leave the child to start rather than abort it here.
+
+    SHIPS THE PARENT'S OWN PROBE rather than restating it. ``perf._find_real_libcudart`` is the
+    canonical one -- nvidia wheel dirs across cuda majors, the -devel toolkit, the system resolver,
+    plus proc-filesystem resolution for a bare soname -- and a hand-copy here would silently keep the
     old probe the next time a cuda release moves those paths, which is exactly the parent/child skew
     this whole fragment exists to fix. ``inspect.getsource`` keeps one definition.
 
-    the function only closes over ``os`` from its module scope (everything else is a builtin or bound
-    inside it), so the fragment re-imports ``os`` under the real name and drops the source in verbatim.
+    the probe only closes over ``os`` from its module scope (everything else is a builtin or bound
+    inside it), so the fragment imports ``os`` under both the real name -- which the shipped source
+    refers to -- and a private alias the swap below uses, so it cannot be shadowed by child code.
     """
     probe_src = textwrap.indent(textwrap.dedent(inspect.getsource(_find_real_libcudart)), "    ")
     # the parent's docstrings carry `\"\"\"`, but they arrive through {probe_src} at runtime, so they
@@ -98,16 +106,7 @@ try:
     import os as _flash_cudart_os
 
 {probe_src}
-"""
 
-
-def _render_cudart_swap() -> str:
-    """the swap half: locate tilelang's stub and atomically repoint it at the discovered runtime.
-
-    concatenated onto ``_render_cudart_discovery()`` inside the same ``try`` block, so it relies on
-    the names that half binds.
-    """
-    return f"""
     try:
         _flash_cudart_spec = _flash_cudart_importlib_util.find_spec("tilelang")
     except Exception:
@@ -189,22 +188,6 @@ def _render_cudart_swap() -> str:
 except Exception as _flash_cudart_exc:
     print("[flash-verl] tilelang libcudart stub repoint failed: " + repr(_flash_cudart_exc), flush=True)
 """
-
-
-def render_tilelang_cudart_shim() -> str:
-    """child-side sitecustomize fragment that repoints tilelang's libcudart stub at the real runtime.
-
-    mirrors ``perf._neutralize_tilelang_cudart_stub`` inside the verl interpreter, and keeps its two
-    load-bearing rules: never ``dlopen`` the stub to test it (that maps the stub into this process,
-    which is the crash being avoided), and leave the stub alone when no real libcudart is found.
-
-    never raises. an unrepointed stub only crashes the runs that build a sleeping vLLM engine, so a
-    fragment that cannot find a runtime must leave the child to start rather than abort it here.
-
-    the two halves are one ``try`` block split across two renderers purely for the function-size
-    limit; the swap half reads names the discovery half binds, so they are always emitted together.
-    """
-    return _render_cudart_discovery() + _render_cudart_swap()
 
 
 # --------------------------- w&b run link (all three verl backends) ---------------------------
