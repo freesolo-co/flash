@@ -188,11 +188,15 @@ def test_warn_false_suppresses_the_advisory_logging(clean_env, monkeypatch, capl
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     _clear_provider_cache()
 
-    with caplog.at_level("INFO"):
+    # at_level on the "flash" logger, not the root: the provider summary is INFO, and an earlier
+    # test that calls configure_logging leaves this logger pinned at WARNING, which filters the
+    # record before the root level is ever consulted. Raising only the root passes alone and fails
+    # behind that test.
+    with caplog.at_level("INFO", logger="flash"):
         pf.check_run_preflight(warn=False)
     assert caplog.records == []
 
-    with caplog.at_level("INFO"):
+    with caplog.at_level("INFO", logger="flash"):
         pf.check_run_preflight(warn=True)
     logged = [r.getMessage() for r in caplog.records]
     assert any("RUNPOD_API_KEY" in m for m in logged)
