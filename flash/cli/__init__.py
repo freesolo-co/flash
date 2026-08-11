@@ -649,9 +649,9 @@ def _add_train_commands(sub: argparse._SubParsersAction) -> None:
         type=_gpu_count_override,
         metavar="N",
         help=(
-            "most cards to run the job on; sets [gpu] count (1-8). a ceiling, not an exact "
-            "count: allocation still picks one card when one fits the run alone, and only "
-            "rentable counts (1, 2, 4, 8) are ever provisioned"
+            "optional card ceiling; sets [gpu] count (1-8). omit it with an unpinned gpu type to "
+            "auto-size the smallest fitting geometry; an authored value pins the ceiling, and only "
+            "(1, 2, 4, 8) are ever provisioned"
         ),
     )
     train.add_argument("--dry-run", action="store_true")

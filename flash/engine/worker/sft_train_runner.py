@@ -25,6 +25,9 @@ _LORAPLUS_READY_MARKER = _sft_train._LORAPLUS_READY_MARKER
 _VERL_OPTIMIZER_IMPL = _sft_train._VERL_OPTIMIZER_IMPL
 _VERL_OPTIMIZER_NAME = _sft_train._VERL_OPTIMIZER_NAME
 build_sft_overrides = _sft_train.build_sft_overrides
+# taken from the parent like every other name here, so the runner and `sft_train`'s own
+# `sft_data_loading`/`sft_configuring` wraps use one object rather than two imports of it.
+liveness_heartbeat = _sft_train.liveness_heartbeat
 gdn_reset_arch_from_caps = _sft_train.gdn_reset_arch_from_caps
 render_gdn_varlen_shim = _sft_train.render_gdn_varlen_shim
 render_wandb_link_shim = _sft_train.render_wandb_link_shim
@@ -283,15 +286,28 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
         setup_seconds=setup_seconds,
         gpu=_w.gpu_diagnostics(include_torch=False),
     )
-    lora_config = _w.make_lora(options.model_id)
-    lora_rank = int(lora_config.r)
-    target_modules = lora_config.target_modules
-    if isinstance(target_modules, set | frozenset):
-        target_modules = sorted(target_modules)
-    warmstart_adapter = _sft_train._warmstart_adapter_path(
-        options.model_id, options.model_revision, lora_rank
-    )
-    vocab_size = _sft_train._resolve_sft_vocab_size(options.model_id, options.model_revision)
+    # everything below reads adapter/tokenizer/architecture config from the hub or cache, which is
+    # minutes on a cold mount and emits nothing of its own. without this the run's last ping is the
+    # one-shot above, so `runs status` freezes on sft_model_load for the whole span and a healthy
+    # cold cache is indistinguishable from a dead worker -- the exact ambiguity the stage was added
+    # to resolve. same stage name, so the provider's setup-grace classification is unchanged.
+    with liveness_heartbeat("sft_model_load"):
+        lora_config = _w.make_lora(options.model_id)
+        lora_rank = int(lora_config.r)
+        target_modules = lora_config.target_modules
+        if isinstance(target_modules, set | frozenset):
+            target_modules = sorted(target_modules)
+        warmstart_adapter = _sft_train._warmstart_adapter_path(
+            options.model_id, options.model_revision, lora_rank
+        )
+        vocab_size = _sft_train._resolve_sft_vocab_size(options.model_id, options.model_revision)
+        # hoisted into the span: on a PINNED revision this falls through to a live AutoConfig read
+        # with no local_files_only, so it is the same cold-mount/hub stall as the reads above. it
+        # only needs the model id, and everything between here and its old call site is arithmetic
+        # on already-resolved values, so moving it up changes ordering but not results.
+        hidden, layers = _sft_train._model_arch_dims(
+            options.model_id, revision=options.model_revision
+        )
     fused_ce = sft_chunked_nll_enabled(options.model_id)
     per_device_batch, _ = _sft_train._resolve_sft_grad_accum(
         options.effective_batch,
@@ -310,7 +326,6 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
     card_vram_gb = float(options.gpu_probe.get("memory_gb") or 0.0)
     raw_capability = options.gpu_probe.get("capability")
     capability = tuple(raw_capability) if raw_capability else None
-    hidden, layers = _sft_train._model_arch_dims(options.model_id, revision=options.model_revision)
     info = MODELS.get(options.model_id)
     active_params_b = float(getattr(info, "active_params_b", 0.0) or 0.0) or None
     gradient_checkpointing = _sft_train._resolve_sft_gradient_checkpointing(

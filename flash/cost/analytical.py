@@ -451,7 +451,10 @@ def _wider_shape_remedy(config: RunConfig, need: float, names: tuple[str, ...]) 
         ceiling=geometry_safe_gpu_cap(
             config.model_id, MAX_COMBINATION_CARDS, model_revision=config.model_revision
         ),
-        above=config.gpu_count,
+        # `gpu_count` is now optional: none means the author never named a width, so no count has
+        # been "already tried" and the search must exclude nothing. 0 is that empty exclusion --
+        # passing none compares int > none and crashes the quote.
+        above=config.gpu_count or 0,
     )
 
 
@@ -476,10 +479,15 @@ def _offline_gpu_shape(
     )
     from flash.providers.base import (
         GPU_INFO,
+        MAX_COMBINATION_CARDS,
+        authored_gpu_ceiling,
         canonical_gpu,
         combined_vram_gb,
         providers_for,
         rentable_gpu_counts,
+        smallest_fitting_gpu_count,
+        vram_fit_error_message,
+        vram_knob_advice,
     )
 
     provider = config.provider if config.provider != "auto" else "auto"
@@ -499,13 +507,27 @@ def _offline_gpu_shape(
         # precheck - overstated cost against a cheaper shape `allocate()` would really pick. the
         # `providers_for` filter below narrows this pool to the classes the provider can provision.
         names = tuple(info.name for info in GPU_INFO.values() if info.validated)
-    # narrow the pool ONCE, here: the ranking below and the fit-failure remedy must consider the
-    # same classes, and a filter applied inside the loop is invisible to anything after it.
+    # narrow to what the pinned provider can actually provision BEFORE sizing. the ranking loop
+    # below filters per candidate, which is too late for three decisions taken up front: the
+    # auto-sized count, the no-fit message, and the `--gpus` remedy would all reason over classes
+    # this provider cannot rent. measured: a vast-pinned 119 GB run sized 1 card against another
+    # provider's H200, ranked empty, and reported "more than any 8-card combination (1177.6 GB
+    # max)" -- a number larger than the requirement it claimed could not be met, while 2x80 GB vast
+    # cards would have fit.
     if provider != "auto":
-        names = tuple(gpu for gpu in names if provider in providers_for(gpu))
-    safe_gpu_count = geometry_safe_gpu_cap(
-        config.model_id, config.gpu_count, model_revision=config.model_revision
+        names = tuple(name for name in names if provider in providers_for(name))
+    auto_cap = geometry_safe_gpu_cap(
+        config.model_id, MAX_COMBINATION_CARDS, model_revision=config.model_revision
     )
+    ceiling = authored_gpu_ceiling(config.gpu_type, config.gpu_count)
+    if ceiling is None:
+        safe_gpu_count = (
+            smallest_fitting_gpu_count(need, max_gpu_count=auto_cap, gpu_names=names) or auto_cap
+        )
+    else:
+        safe_gpu_count = geometry_safe_gpu_cap(
+            config.model_id, ceiling, model_revision=config.model_revision
+        )
     ranked = []
     for gpu in names:
         info = GPU_INFO[gpu]
@@ -539,15 +561,28 @@ def _offline_gpu_shape(
                 )
             )
     if not ranked:
+        # a pinned class is blocked by the class itself, so name it -- the pool-wide message would
+        # report the widest validated shape, which is not hardware this quote was ever allowed to
+        # use. `_wider_shape_remedy` searches only `names`, already narrowed to the pin, so the
+        # `--gpus N` clause it appends can never name a shape the pin forbids. an unpinned run
+        # falls through to the pool-wide message, which reports the count that would fit.
         remedy = _wider_shape_remedy(config, need, names)
         if config.gpu_type:
             info = GPU_INFO[canonical_gpu(config.gpu_type)]
             raise ValueError(
                 f"exact GPU {info.name!r} cannot fit this run: it requires at least {need} GB"
-                + remedy
+                + (remedy or f". {vram_knob_advice(config.method).capitalize()}.")
             )
-        shape = f" across up to {safe_gpu_count} cards" if safe_gpu_count > 1 else ""
-        raise ValueError(f"no GPU class fits >= {need} GB{shape}{remedy}")
+        raise ValueError(
+            vram_fit_error_message(
+                config.method,
+                need,
+                requested_gpu_count=ceiling,
+                effective_gpu_count=safe_gpu_count,
+                max_gpu_count=auto_cap,
+                gpu_names=names,
+            )
+        )
     _cost, count, _combined, _per_card, gpu, hourly = min(ranked)
     return gpu, need, count, provider, hourly
 

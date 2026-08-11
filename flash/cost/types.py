@@ -46,9 +46,9 @@ class RunConfig:
     # spec gpu.disk_gb, carried so a pinned quote allocates at the run's real disk floor (parity
     # with the launch allocate call), keeping the persisted quote aligned with the pinned hardware.
     disk_gb: float = 0.0
-    # Spec gpu.count: cards the job occupies. total cost scales linearly with it (n cards for the
-    # billed training wall); 1 = the historical single-gpu quote.
-    gpu_count: int = 1
+    # spec gpu.count ceiling. none means the user left it unset, so the offline quote auto-sizes the
+    # same structural shape allocation may rent; an integer is an authored hard ceiling.
+    gpu_count: int | None = None
     supervised_train_tokens: int | None = None
     sft_packing_mode: str = ""
     sft_packed_blocks: int | None = None
@@ -88,14 +88,15 @@ class RunConfig:
         object.__setattr__(self, "model_revision", self.model_revision.strip())
         if self.steps < 1:
             raise ValueError(f"steps must be >= 1, got {self.steps}")
-        if isinstance(self.gpu_count, bool) or not isinstance(self.gpu_count, int):
-            raise TypeError("gpu_count must be an integer")
-        if self.gpu_count < 1:
-            raise ValueError(f"gpu_count must be >= 1, got {self.gpu_count}")
-        # upper bound mirrors GpuSpec's 1..8 so a direct RunConfig(gpu_count=...) cannot price a
-        # count the spec layer would reject.
-        if self.gpu_count > 8:
-            raise ValueError(f"gpu_count must be <= 8, got {self.gpu_count}")
+        if self.gpu_count is not None:
+            if isinstance(self.gpu_count, bool) or not isinstance(self.gpu_count, int):
+                raise TypeError("gpu_count must be an integer or none")
+            if self.gpu_count < 1:
+                raise ValueError(f"gpu_count must be >= 1, got {self.gpu_count}")
+            # upper bound mirrors gpuspec's 1..8 so a direct runconfig cannot price a count the spec
+            # layer would reject.
+            if self.gpu_count > 8:
+                raise ValueError(f"gpu_count must be <= 8, got {self.gpu_count}")
         # Reject 0/negative positive-only knobs (bogus quote). max_wall_seconds is NOT here: the
         # runner floors it to max(60, ...) and estimate_cost mirrors that, so a non-positive cap
         # is accepted (floored to 60s), not rejected.
