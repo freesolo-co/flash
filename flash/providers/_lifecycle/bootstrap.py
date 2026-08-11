@@ -42,6 +42,9 @@ _PIP_TRANSIENT_RE = re.compile(
     r"|ssleoferror|service unavailable|bad gateway|gateway time-?out|too many requests"
     r"|retrying \(retry\(|\b(?:429|5\d\d) (?:client|server) error"
 )
+# Build failures, reachable only AFTER pip downloaded real content, so they name the cause and outrank a transient
+# warning pip already recovered from in the same tail. Every failed build/metadata step carries one of these two.
+_PIP_TERMINAL_RE = re.compile(r"(?i)subprocess-exited-with-error|failed building wheel")
 _TERMINAL_MARKER_GRACE_S = 0.25
 _TERMINAL_BOOKKEEPING_RESERVE_S = _TERMINAL_MARKER_GRACE_S
 _MAX_ATTEMPT_ID = (1 << 63) - 1
@@ -594,8 +597,8 @@ def install_extra_pip(payload: dict) -> None:
             rc = proc.wait()
             if rc == 0:
                 return
-            # only an index/network shape earns a retry; a bad requirement fails fast.
-            if not _PIP_TRANSIENT_RE.search("".join(tail)):
+            output = "".join(tail)  # a build failure outranks it; below that, network shapes retry
+            if _PIP_TERMINAL_RE.search(output) or not _PIP_TRANSIENT_RE.search(output):
                 raise RuntimeError(f"extra_pip install failed: pip exited {rc}")
             if attempt >= len(_PIP_RETRY_DELAYS_S):
                 raise RetriableBootstrapError(

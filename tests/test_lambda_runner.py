@@ -450,6 +450,40 @@ def test_bootstrap_extra_pip_resolution_error_stays_terminal(monkeypatch):
     assert len(calls) == 1  # fails fast, never walks the retry ladder
 
 
+def test_bootstrap_extra_pip_build_failure_outranks_earlier_transient_text(monkeypatch):
+    # a wheel build failure can only happen after pip already reached the index, so it must outrank
+    # an earlier transient warning in the same captured tail -- retrying would just rent another
+    # host to fail identically forever.
+    lb, calls = _wire_pip(
+        monkeypatch,
+        [
+            (
+                "WARNING: Retrying (Retry(total=4, connect=None)) after connection broken by ...\n"
+                "ERROR: Failed building wheel for some-env-pkg\n"
+                "error: subprocess-exited-with-error\n",
+                1,
+            ),
+        ],
+    )
+    with pytest.raises(RuntimeError, match="extra_pip install failed") as exc_info:
+        lb.install_extra_pip(_pip_payload())
+    assert not isinstance(exc_info.value, lb.RetriableBootstrapError)
+    assert len(calls) == 1  # fails fast, never walks the retry ladder
+
+
+def test_bootstrap_extra_pip_transient_only_text_still_retries(monkeypatch):
+    # regression guard: transient text alone (no terminal-shape text anywhere in the tail) must
+    # still walk the full retry ladder and end retriable, unchanged by the terminal-precedence check.
+    transient = (
+        "WARNING: Retrying (Retry(total=4, connect=None)) after connection broken by ...\n",
+        1,
+    )
+    lb, calls = _wire_pip(monkeypatch, [transient] * 4)
+    with pytest.raises(lb.RetriableBootstrapError, match="could not reach the package index"):
+        lb.install_extra_pip(_pip_payload())
+    assert len(calls) == 4  # one attempt plus the three bounded retries
+
+
 def test_main_marks_exhausted_extra_pip_index_failure_retriable(monkeypatch):
     # End to end through main(): the marker the poller reads must say retriable, so the attempt is
     # classified job_preempted (walk to a fresh host) instead of job_failed (fail the paid run).
@@ -913,6 +947,43 @@ def test_launch_accepts_a_disk_capable_or_unmeasured_instance_type(monkeypatch):
     assert _launch(jobs, _spec(disk_gb=200), seed=0, instances=[_inst(disk_gb=512.0)], attempt=0)
     # an unreported SKU disk is not a proven miss, so it must not block the launch
     assert _launch(jobs, _spec(disk_gb=800), seed=0, instances=[_inst()], attempt=0)
+
+
+def test_launch_refuses_a_disk_undersized_refreshed_candidate(monkeypatch):
+    """The disk gate runs once on the initial candidate list before the walk starts; a candidate
+    that only shows up via _refresh_launch_candidates (e.g. an unmeasured SKU whose refreshed
+    catalog entry proves it undersized) must still be refused before it can reach launch_instance."""
+    from flash.providers.base import UnsupportedGpuError
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    launched = []
+
+    def fake_launch(*, region_name, **_kwargs):
+        launched.append(region_name)
+        raise lambda_api.LambdaApiError("PUT /asks/1/ -> HTTP 400: insufficient-capacity")
+
+    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
+    monkeypatch.setattr(
+        jobs,
+        "usable_instances",
+        lambda gpu, force=False, gpu_count=1: [_inst(region="us-fresh-1", disk_gb=100.0)],
+    )
+
+    with pytest.raises(UnsupportedGpuError, match=r"gpu_1x_a10 \(100 GB\).*required 800 GB"):
+        _launch(
+            jobs,
+            _spec(disk_gb=800),
+            seed=0,
+            # unmeasured disk passes the pre-loop gate untouched; only the refresh reveals it undersized.
+            instances=[_inst(region="us-east-1", disk_gb=None)],
+            attempt=0,
+        )
+
+    assert launched == [
+        "us-east-1"
+    ]  # the undersized refreshed candidate never reached launch_instance
 
 
 def test_live_candidates_drop_skus_that_cannot_hold_the_run_disk(monkeypatch):
@@ -2632,6 +2703,93 @@ def test_post_launch_preserves_original_baseexception_when_cleanup_raises(
     assert exc_info.value is original
     assert terminated == ["i-4242"]
     assert reaped == [spec.run_id]
+
+
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
+def test_launch_success_say_baseexception_does_not_trigger_run_wide_reap(
+    monkeypatch, interrupt_type
+):
+    """say() raising a BaseException on the successful-launch route must be handled ONLY by
+    _publish_launched_instance's own exact cleanup; the outer coarse label reap must not also fire,
+    since _publish_launched_instance already owns cleanup for this instance and a run-wide reap on
+    top of it would hit every other concurrently-launched seed of the same multi-seed run."""
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(lambda_api, "launch_instance", lambda **_k: "i-4242")
+
+    def raising_say(_log):
+        def _say(_msg):
+            raise interrupt_type("log stream closed")
+
+        return _say
+
+    monkeypatch.setattr(jobs, "make_say", raising_say)
+    terminated = []
+    monkeypatch.setattr(
+        lambda_api, "terminate_instance_confirmed", lambda iid: terminated.append(iid)
+    )
+    reaped = []
+    monkeypatch.setattr(jobs, "terminate_run_instances", lambda run_id: reaped.append(run_id) or [])
+
+    with pytest.raises(interrupt_type):
+        _launch(jobs, _spec(), seed=0, instances=[_inst()], attempt=0)
+
+    assert terminated == ["i-4242"]  # the helper's own exact cleanup ran
+    assert reaped == []  # the outer coarse label reap must not also fire
+
+
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
+def test_cacheless_retry_success_say_baseexception_does_not_trigger_run_wide_reap(
+    monkeypatch, interrupt_type
+):
+    """The same BaseException-during-say property as the primary success route, but through the
+    cache-less retry (_retry_launch_without_cache): once it is entered it owns the exact cleanup
+    for whatever box it rents internally, so the outer run-wide reap must not also fire."""
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+
+    def fake_launch(*, file_system_names=None, **_kwargs):
+        if file_system_names:  # the cached attempt is rejected for a filesystem-attach reason
+            raise lambda_api.LambdaApiError(
+                "POST /instance-operations/launch -> HTTP 400: file_system_names not attachable"
+            )
+        return "i-cold"  # the cache-less retry succeeds
+
+    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
+    monkeypatch.setattr(
+        lambda_api, "ensure_filesystem", lambda n, r, deadline_at=None: f"/lambda/nfs/{n}"
+    )
+
+    def raising_say(_log):
+        def _say(msg):
+            if "cold, cache-less" in msg:  # only the retry's own success message raises
+                raise interrupt_type("log stream closed")
+
+        return _say
+
+    monkeypatch.setattr(jobs, "make_say", raising_say)
+    terminated = []
+    monkeypatch.setattr(
+        lambda_api, "terminate_instance_confirmed", lambda iid: terminated.append(iid)
+    )
+    reaped = []
+    monkeypatch.setattr(jobs, "terminate_run_instances", lambda run_id: reaped.append(run_id) or [])
+
+    with pytest.raises(interrupt_type):
+        _launch(
+            jobs,
+            _spec(network_volume="flash-weights"),
+            seed=0,
+            instances=[_inst(region="us-east-1")],
+            attempt=0,
+        )
+
+    assert terminated == ["i-cold"]  # the cache-less retry's own exact cleanup ran
+    assert reaped == []  # the outer coarse label reap must not also fire
 
 
 # ---------------------------------------------------------------------------

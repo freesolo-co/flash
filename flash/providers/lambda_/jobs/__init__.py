@@ -313,17 +313,13 @@ def _retry_launch_without_cache(
             _abort_ambiguous_launch(plan.spec.run_id, type(error).__name__)
         say(f"region {inst.region} also rejected cold: {cold_detail}")
         return None, error
-    return (
-        _publish_launched_instance(
-            plan,
-            instance_id,
-            inst,
-            say,
-            f"launched lambda instance {instance_id} (cold, cache-less): {inst.gpu} "
-            f"{inst.instance_type} in {inst.region} attempt={plan.attempt} seed={plan.seed}",
-        ),
-        None,
+    # built before the call so nothing is evaluated between the successful launch_instance and
+    # _publish_launched_instance taking ownership of this instance's exact cleanup.
+    message = (
+        f"launched lambda instance {instance_id} (cold, cache-less): {inst.gpu} "
+        f"{inst.instance_type} in {inst.region} attempt={plan.attempt} seed={plan.seed}"
     )
+    return _publish_launched_instance(plan, instance_id, inst, say, message), None
 
 
 def _refresh_launch_candidates(
@@ -540,30 +536,42 @@ def launch_and_submit(
                     tok in str(e).lower() for tok in ("file_system", "filesystem", "file-system")
                 )
                 if mode != "preload" and fs_attach_reject:
-                    # the cache-less retry launches too; it cleans its own instance exactly, and
-                    # the flag keeps the outer label reap armed if even that cleanup is cut short.
+                    # once _retry_launch_without_cache is entered it owns the exact cleanup for
+                    # whatever box it rents internally, so the flag must disarm on EVERY exit from
+                    # it (return or raise); a run-wide reap layered on top of that exact cleanup
+                    # is strictly worse than leaving one instance stranded, which a later orphan
+                    # sweep will catch anyway.
                     launch_attempted = True
-                    handle, last_err = _retry_launch_without_cache(plan, inst, say)
+                    try:
+                        handle, last_err = _retry_launch_without_cache(plan, inst, say)
+                    finally:
+                        launch_attempted = False
                     # a returned handle publishes the box; None means nothing stayed rented.
-                    launch_attempted = False
                     if handle is not None:
                         return handle
                 # Preload must not refresh to a different region (would warm the wrong one).
                 if mode != "preload" and not candidates and not refreshed:
                     refreshed = True
                     candidates = _refresh_launch_candidates(inst, tried_regions, absolute_deadline)
+                    # an empty refresh has nothing to gate; calling the disk check on it would fall
+                    # through unmatched and raise UnsupportedGpuError with an empty shape list.
+                    if candidates:
+                        _require_disk_capable_instances(spec, candidates, say)
                 continue
-            # the box is rented AND its id is known, so _publish_launched_instance owns the exact
-            # cleanup for the rest of this window and the coarse label reap stands down.
-            launch_attempted = False
-            return _publish_launched_instance(
-                plan,
-                instance_id,
-                inst,
-                say,
+            # built before the call so nothing is evaluated between the successful launch_instance
+            # and _publish_launched_instance taking ownership of this instance's exact cleanup.
+            message = (
                 f"launched lambda instance {instance_id}: {inst.gpu} {inst.instance_type} "
-                f"${inst.price_usd_hr:.2f}/hr in {inst.region} attempt={attempt} seed={seed}",
+                f"${inst.price_usd_hr:.2f}/hr in {inst.region} attempt={attempt} seed={seed}"
             )
+            # the flag stays armed through the call and disarms in finally on every exit: once
+            # _publish_launched_instance is entered it owns the exact cleanup for the rest of this
+            # window, so a second coarse label reap after that exact cleanup would be actively
+            # harmful: it would reap every other concurrently-launched seed of this run.
+            try:
+                return _publish_launched_instance(plan, instance_id, inst, say, message)
+            finally:
+                launch_attempted = False
         return _raise_all_regions_rejected(spec, tried_regions, last_err)
     except BaseException:
         if launch_attempted:

@@ -596,6 +596,29 @@ def test_train_body_extra_pip_resolution_error_stays_terminal(monkeypatch):
     assert len(calls) == 1  # fails fast, never walks the retry ladder
 
 
+def test_train_body_extra_pip_build_failure_outranks_earlier_transient_text(monkeypatch):
+    # pip warns "Retrying (Retry(" on an index blip, recovers, then fails compiling a wheel. Both
+    # lines sit in the same captured tail, so matching transient text alone would call a
+    # deterministic failure infra and repeat it three more times for nothing.
+    from flash.providers.runpod.serverless import endpoints
+
+    calls = _wire_train_body_pip(
+        monkeypatch,
+        [
+            (
+                "WARNING: Retrying (Retry(total=4)) after connection broken by NewConnectionError\n"
+                "Collecting some-env-pkg\n"
+                "  error: subprocess-exited-with-error\n"
+                "ERROR: Failed building wheel for some-env-pkg\n",
+                1,
+            )
+        ],
+    )
+    with pytest.raises(RuntimeError, match="extra_pip install failed"):
+        endpoints._train_body(_extra_pip_input())
+    assert len(calls) == 1  # the build failure names the cause, so no retry ladder
+
+
 def test_train_body_extra_pip_stops_after_the_bounded_retries(monkeypatch):
     from flash.providers.runpod.serverless import endpoints
 
