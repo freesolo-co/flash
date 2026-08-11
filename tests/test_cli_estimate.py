@@ -380,6 +380,8 @@ def test_grpo_cost_warns_that_a_thin_batch_size_is_the_optimizer_batch(
     # grpo keeps a working per-prompt baseline, so the warning must not claim the advantage is gone
     assert "advantage signal survives" in captured.err
     assert "sft" in captured.err
+    # `--cost` returns before the submit path, so the two call sites must not both fire
+    assert captured.err.count("OPTIMIZER batch") == 1
 
 
 def test_thin_batch_warning_counts_the_prompts_not_the_completions(tmp_path, monkeypatch, capsys):
