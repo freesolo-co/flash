@@ -7,7 +7,6 @@ import os
 import sys
 import time
 import uuid
-from pathlib import Path
 
 from flash import __version__
 from flash._internal.channel import CLI_NAME
@@ -352,38 +351,6 @@ def cmd_gpus(args) -> int:
         runpod_rate = runpod_rates.get(info.name)
         print(f"{info.name:<16}{info.vram_gb:>5}G{fmt_rate(runpod_rate):>11}")
     print(f"\n{tip}")
-    return 0
-
-
-def cmd_env_list(args) -> int:
-    paths: list[str] = []
-    if Path("environment.py").is_file():
-        paths.append(".")
-    local = Path("environments")
-    if local.is_dir():
-        for p in local.iterdir():
-            if p.name.startswith("__"):
-                continue
-            if p.is_dir():
-                stem = p.name.replace("-", "_")
-                module = p / f"{stem}.py"
-                canonical = p / "environment.py"
-                if canonical.is_file() or module.is_file():
-                    paths.append(f"environments/{p.name}")
-            elif p.suffix == ".py":
-                paths.append(f"environments/{p.name}")
-    if render.styled():
-        print(render.env_list(sorted(paths)))
-        return 0
-    if paths:
-        print(
-            "local env sources (publish with `flash env push --project <project-uuid> "
-            "--name <name> <path>`):"
-        )
-        for path in sorted(paths):
-            print(f"  {path}")
-    else:
-        print("no environments yet - scaffold one with `flash env setup`")
     return 0
 
 

@@ -719,19 +719,6 @@ def env_setup(paths: list[str], project_id: str) -> str:
     return _safe(f"{head}\n{tree}\n\n{next_step}")
 
 
-def env_list(local: list[str]) -> str:
-    parts = [header("env list", "local environments")]
-    if local:
-        parts.append(
-            _paint("local sources", _GRAY, "1")
-            + _dim("  (publish with flash env push --project <project-uuid> --name <name> <path>)")
-        )
-        parts.extend(f"  {_paint(_glyph('·', '-'), _FAINT)} {_paint(p, _ACCENT2)}" for p in local)
-    else:
-        parts.append(_dim("  no environments yet — scaffold one with `flash env setup`"))
-    return _safe("\n".join(parts))
-
-
 def chat_label() -> str:
     """Speaker label printed above a styled chat reply."""
     return _paint("assistant", _ACCENT2, "1")
@@ -807,6 +794,8 @@ def help_page(
 # Heartbeat interpretation lives in `flash.cli.ui.heartbeat` for the same reason and on the same
 # terms: `run_status` above calls `_heartbeat_pairs`, and the CLI tests address every one of these
 # as `render.<name>`, so they have to stay resolvable here.
+# The env list renderer in `flash.cli.ui.env_panels` is re-exported on the same terms.
+from flash.cli.ui.env_panels import env_list as env_list  # noqa: E402
 from flash.cli.ui.heartbeat import (  # noqa: E402,F401
     _HB_QUIET_HINT_AFTER_S,
     _LIVENESS_SETUP_STAGES,
