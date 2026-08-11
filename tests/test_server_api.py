@@ -9276,6 +9276,59 @@ def test_export_copies_final_adapter_to_user_repo(api, monkeypatch):
     assert seen["base_model"] == SPEC["model"]
 
 
+def test_export_sends_the_runner_assigned_revision_not_the_public_blank(api, monkeypatch):
+    """Export must read the pin from the EFFECTIVE spec, not the public one.
+
+    A runner-assigned pin is stripped from the public spec (it cannot carry the marker that labels
+    it), so `spec.model_revision` reads "" for every auto-pinned SFT run. The worker stamps the real
+    sha into adapter_config.json from its INTERNAL spec, and `export_adapter` refuses a stamped
+    revision that disagrees with the one it is handed:
+
+        if existing_revision and existing_revision != base_model_revision: raise ValueError(...)
+
+    which the route turns into a 404. So passing the public half breaks export for exactly the runs
+    the auto-pin exists to serve -- and for warm starts that inherited the pin.
+
+    Asserting the value rather than just capturing kwargs is the point: the pre-existing export
+    tests captured `base_model_revision` and never checked it, which is why this reached review.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.core.spec import JobSpec
+
+    key = _login()
+    run_id = _finished_run(api, key)
+    status = runner.get_status(run_id)
+    # the shape a real auto-pinned submit persists: worker half carries pin + marker, public half
+    # carries neither. re-digest the way submit does so the snapshot stays internally consistent.
+    snapshot = status.effective_preparation
+    assert not status.spec.get("model_revision"), status.spec
+    snapshot["worker_spec"]["model_revision"] = "a" * 40
+    snapshot["worker_spec"]["model_revision_auto"] = True
+    snapshot["preparation_digest"] = runner._preparation_digest(
+        JobSpec.from_dict(status.spec),
+        JobSpec.from_dict(snapshot["worker_spec"]),
+        snapshot.get("adapter_identity"),
+    )
+    runner._save_status(status)
+
+    seen: dict = {}
+    monkeypatch.setattr(
+        app_mod,
+        "export_adapter",
+        lambda **kwargs: (seen.update(kwargs), "https://huggingface.co/me/adapters")[1],
+    )
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/adapters", "hf_token": "hf_user"},
+        headers=_bearer(key),
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert seen["base_model_revision"] == "a" * 40
+
+
 def test_export_holds_deploy_lock_across_owned_run(api, monkeypatch):
     """The /export handler must take the per-run deploy lock FROM THE VERY TOP — before even the
 

@@ -555,7 +555,13 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 dest_token=hf_token,
                 private=private,
                 base_model=spec.model,
-                base_model_revision=spec.model_revision,
+                # the effective half, not the public one: a runner-assigned pin is stripped from
+                # the public spec (it cannot carry the marker that labels it), so `spec` reads "".
+                # the worker stamps the real sha into adapter_config.json from its internal spec,
+                # and export refuses a stamped revision that disagrees with what it is handed --
+                # so reading the public half here 404s every auto-pinned sft run and every warm
+                # start that inherited its pin.
+                base_model_revision=effective_spec.model_revision,
             )
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
