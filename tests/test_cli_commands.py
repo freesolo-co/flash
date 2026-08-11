@@ -695,6 +695,24 @@ def test_env_setup_clean_scaffold_has_no_environment_form_warning(
     assert capsys.readouterr().err == ""
 
 
+def test_training_guide_ref_guidance_matches_the_parser(monkeypatch, tmp_path) -> None:
+    """The generated guide must carry the same REF constraint as the generated configs.
+
+    TRAINING.md is static prose, so it cannot branch on the plane -- which is exactly how it kept
+    the unrestricted "a branch, tag or commit" wording after the configs were corrected. A ref is
+    validated as ONE path component (`_is_safe_github_path_parts` in flash/envs/loader.py), so
+    `feature/foo` is rejected before submission, and a guide promising any branch sends the user
+    to an id that cannot resolve.
+    """
+    written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+
+    guide = written["TRAINING.md"]
+    assert "REF is a branch/tag name without `/`, or a commit" in guide
+    assert "REF is a branch, tag or commit" not in guide
+    # the guide and the config comments are separate surfaces that drifted once already
+    assert "without `/`" in written["rl.toml"]
+
+
 def test_env_setup_accepts_a_browser_url_as_the_self_hosted_form(
     monkeypatch, tmp_path, capsys
 ) -> None:

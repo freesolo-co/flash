@@ -159,9 +159,13 @@ the git form instead — commit this folder to a repo your plane can read, then 
 
 ```toml
 [environment]
-id = "github:OWNER/REPO@main:environment.py"   # REF is a branch, tag or commit; the path is the
-                                               # file, or a directory holding environment.py
+id = "github:OWNER/REPO@main:environment.py"   # REF is a branch/tag name without `/`, or a commit
+                                               # sha; the path is the file, or a directory holding
+                                               # environment.py
 ```
+
+The ref is validated as a single path component, so a slash-containing branch such as
+`feature/foo` is rejected before submission. Use a `/`-free branch or tag, or the commit sha.
 
 The ref is resolved at submit time, so re-pushing the repo and re-submitting picks up your edits
 the same way `flash env push` does on the managed plane. Pin a commit sha instead of a branch when
