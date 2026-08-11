@@ -10,6 +10,19 @@ concurrency:
 jobs:
   source-is-dev:
     name: Source branch is dev
+    # Dependabot SECURITY updates are alert-driven, not schedule-driven, so they ignore
+    # `target-branch: dev` in .github/dependabot.yml and open against the default branch (main)
+    # from a `dependabot/...` head. That head can never be `dev`, so this guard failed by
+    # construction on every one of them -- a permanently red check on the exact PRs that carry
+    # CVE fixes, while their `lint + offline tests` legs passed in full. The rule this guard
+    # exists to enforce is that a HUMAN cannot sneak a feature branch into main; a bot bump
+    # that GitHub itself targets at main is not that.
+    #
+    # `||`, NOT `&&`: the job must run unless BOTH bot signals hold. With `&&` the job skips when
+    # EITHER holds, so a human could open a feature branch named `dependabot/x` and bypass the
+    # guard outright. github.actor is the authenticated opener and cannot be spoofed to
+    # `dependabot[bot]` (brackets are not legal in a username), so requiring both is safe.
+    if: github.actor != 'dependabot[bot]' || !startsWith(github.head_ref, 'dependabot/')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

@@ -546,7 +546,11 @@ def _build_verl_training_cfg(
     *,
     train_files: str,
     val_files: str,
-    model_id: str,
+    # the LOCAL SNAPSHOT DIR verl loads weights from, not the hf repo id -- it becomes
+    # actor_rollout_ref.model.path below. named model_path because it was previously called
+    # model_id, which invited lora_target_parameters(model_id) and silently matched nothing.
+    # anything that needs the catalog id reads inp["model_id"].
+    model_path: str,
     thinking: bool,
     loggers: list[str],
     fp8_kv: bool,
@@ -570,11 +574,17 @@ def _build_verl_training_cfg(
         "fused_ce_backend": ce_backend,
         "train_files": train_files,
         "val_files": val_files,
-        "model_id": model_id,
+        # keyed "model_id" for the child config's existing contract; the VALUE is the snapshot path
+        # (see actor_rollout_ref.model.path).
+        "model_id": model_path,
         "lora_rank": inp["lora_rank"],
         "lora_alpha": inp["lora_alpha"],
         "target_modules": "all-linear",
-        "target_parameters": _w.lora_target_parameters(model_id),
+        # the CATALOG id, not model_path: lora_target_parameters matches an exact hf repo id, and
+        # model_path is a local snapshot dir (".../models--Qwen--Qwen3.6-35B-A3B/snapshots/<sha>"),
+        # which matches nothing and silently yields None -- leaving the fused routed-expert
+        # parameters unadapted on a run that otherwise looks completely healthy.
+        "target_parameters": _w.lora_target_parameters(inp["model_id"]),
         "multimodal": bool(inp.get("multimodal")),
         "lr": inp["lr"],
         "group_size": inp["group_size"],
