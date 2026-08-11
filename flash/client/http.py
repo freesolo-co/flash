@@ -175,10 +175,16 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
             resp.read()
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
+            # name the URL that rejected it, not just the key: the same 401 is what a VALID key
+            # gets when the request went to the wrong issuer (a stale saved api_url, a leftover
+            # localhost from a self-hosted experiment, an overridden FREESOLO_BASE_URL). Without
+            # the URL the message accuses the one thing the user just copied correctly, and the
+            # actual cause -- which service answered -- is never shown.
             raise ClientError(
-                "freesolo rejected this API key — create or copy a valid key at "
-                "https://freesolo.co/sign-in and pass it with `flash login --api-key` "
-                "(or FREESOLO_API_KEY)"
+                f"{base} rejected this API key — check that this is the right service for the "
+                "key (a stale saved --api-url or FREESOLO_BASE_URL rejects a perfectly valid "
+                "key), then create or copy a valid key at https://freesolo.co/sign-in and pass "
+                "it with `flash login --api-key` (or FREESOLO_API_KEY)"
             ) from exc
         raise _api_error(exc) from exc
     except urllib.error.URLError as exc:

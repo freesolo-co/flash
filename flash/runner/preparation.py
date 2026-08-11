@@ -327,6 +327,13 @@ def _preparation_digest(
 ) -> str:
     worker_payload = worker_spec.to_internal_dict()
     public_payload = public_spec.to_dict()
+    # ``[environment] pip`` became user-authorable, so to_dict() now emits it where it used to be
+    # stripped, and a pre-upgrade snapshot hashed an environment with no pip key at all. Dropping it
+    # when empty reproduces those bytes without needing to know when the run was prepared: absent
+    # and empty are the same install, so they must hash alike. An authored pip is non-empty and
+    # stays bound, so tampering with the persisted value is still caught.
+    if not public_payload["environment"].get("pip"):
+        public_payload["environment"].pop("pip", None)
     # omit empty fields so existing version-1 snapshots keep their historical digest.
     for key in (
         "model_revision_auto",

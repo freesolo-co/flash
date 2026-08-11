@@ -700,3 +700,53 @@ def test_allocator_selected_gpu_count_renders_and_applies_speedup():
 def test_runconfig_rejects_bad_gpu_count(bad, exc):
     with pytest.raises(exc):
         RunConfig("Qwen/Qwen3.5-4B", "grpo", 10, gpu_count=bad)
+
+
+def test_offline_quote_fit_failure_names_the_card_count_that_fixes_it():
+    """`flash train --cost` must name the `--gpus` width when a wider shape would fit.
+
+    A 35B-A3B GRPO run at the default single-card ceiling needs more VRAM than any one card has,
+    but fits on two. Reporting only the shortfall reads as "this run is impossible" for the one
+    case that is actually a one-flag fix, so the remedy is asserted here rather than the bare
+    shortfall. The signature is unchanged by the fix, so this fails on the MESSAGE against
+    unfixed code, not on an import.
+    """
+    from flash.cost.analytical import _offline_gpu_shape
+    from flash.cost.types import RunConfig
+
+    shared = {
+        "model_id": "Qwen/Qwen3.6-35B-A3B",
+        "method": "grpo",
+        "steps": 10,
+        "seq_len": 2048,
+        "completion_len": 512,
+        "batch_size": 8,
+        "group_size": 4,
+        "lora_rank": 16,
+    }
+    with pytest.raises(ValueError, match=r"--gpus 2") as unpinned:
+        _offline_gpu_shape(RunConfig(gpu_count=1, **shared))
+    assert "no GPU class fits" in str(unpinned.value)
+
+    with pytest.raises(ValueError, match=r"--gpus 2") as pinned:
+        _offline_gpu_shape(RunConfig(gpu_count=1, gpu_type="H200", **shared))
+    assert "cannot fit this run" in str(pinned.value)
+
+    # and the suggested width is real: the same run quotes cleanly at it.
+    gpu, _need, count, _provider, _hourly = _offline_gpu_shape(RunConfig(gpu_count=2, **shared))
+    assert count == 2, (gpu, count)
+
+
+def test_offline_quote_fit_failure_omits_the_remedy_when_nothing_fits(monkeypatch):
+    """An unsatisfiable run must not be sent to a second dead end.
+
+    The remedy is searched against the same fit model that rejected the run, so a need no shape
+    can hold produces no suggestion at all.
+    """
+    monkeypatch.setattr("flash.cost.analytical.required_vram_gb", lambda *a, **k: 100_000)
+    from flash.cost.analytical import _offline_gpu_shape
+    from flash.cost.types import RunConfig
+
+    with pytest.raises(ValueError, match="no GPU class fits") as exc:
+        _offline_gpu_shape(RunConfig("Qwen/Qwen3.5-4B", "sft", 1, gpu_count=1))
+    assert "--gpus" not in str(exc.value)

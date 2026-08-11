@@ -340,7 +340,7 @@ def submit_run(
     deadline_at: float | None = None,
 ) -> PollResult:
     """Deploy, submit, persist handle via ``on_handle``, and poll to completion."""
-    from flash.envs.base import worker_pip_for_env
+    from flash.envs.base import worker_pip_with_extras
     from flash.providers.runpod.serverless import _run_suffix, build_worker_env
     from flash.runner import flash_code_prefix
 
@@ -353,7 +353,8 @@ def submit_run(
     suffix = _run_suffix(spec.run_id)
     if attempt_id:
         suffix = f"{suffix}r{attempt_id}"
-    extra_pip = list(spec.environment.pip) or worker_pip_for_env(spec.environment.id)
+    # the author's [environment] pip is appended to the worker requirement, never substituted for it.
+    extra_pip = worker_pip_with_extras(spec.environment.id, spec.environment.pip)
     worker_env = build_worker_env(
         spec,
         seed,
