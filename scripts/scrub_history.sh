@@ -10,6 +10,9 @@
 #     "Co-authored-by:" trailers
 #   - stray local git identities, folded onto the canonical account: some of them
 #     resolve to UNRELATED THIRD PARTIES' accounts once the repo is public
+#   - the same addresses and hostname where they appear in FILE CONTENT: earlier
+#     revisions of this script hardcoded them, and a rewrite that only touches
+#     identities and messages leaves those blobs serving the leak from every branch
 #
 # This rewrites every commit sha. Run it once, on a fresh mirror clone, while the
 # repository is still private. Rewriting after publication is pointless: the old
@@ -78,6 +81,12 @@ fi
 # An address already exported wins over the file's, keeping FLASH_CANONICAL_IDENTITY
 # usable as a one-off override.
 CANONICAL_OVERRIDE="${FLASH_CANONICAL_IDENTITY:-}"
+# The other two have no override semantics, so an inherited value must not be able to
+# stand in for a missing assignment: if the operator's shell already exports one and the
+# file forgets it, sourcing leaves the stale value in place, the nonempty gate below
+# accepts the incomplete file, and a stale alias list or hostname silently drives both the
+# rewrite and the residual check -- certifying the wrong set of identities as clean.
+unset FLASH_ALIAS_EMAILS FLASH_LEAKED_HOST_RE
 # shellcheck source=/dev/null
 . "$IDENTITIES_FILE"
 CANONICAL_IDENTITY="${CANONICAL_OVERRIDE:-${FLASH_CANONICAL_IDENTITY:-}}"
@@ -146,6 +155,20 @@ ASSISTANT_EMAIL_RE='@anthropic[.]com$'
 # prevent. The trailer counter (git --grep --regexp-ignore-case) and the message rewrite
 # ((?i) below) are already case-insensitive; the identity tests must agree with them or
 # the gate and the rewrite disagree.
+#
+# The aliases are LITERAL ADDRESSES, not patterns, so every regex metacharacter in them has
+# to be escaped before they are joined into an alternation. Escaping only dots is not
+# enough: a perfectly ordinary address like "name+old@example.com" carries a "+", which an
+# alternation reads as a quantifier on the preceding character. The awk lookup compares
+# whole strings and still remaps the identity FIELDS, but the trailer rewrite and the
+# residual gate both miss the trailer -- so the script publishes a history whose
+# Co-authored-by lines still credit the alias while reporting it clean, the false-clean
+# certificate this whole file is arranged to prevent. Backslash escaping is read
+# identically by ERE (git --extended-regexp, grep -E) and by python's re.
+alias_alternation() {
+  printf '%s' "$MAINTAINER_ALIAS_EMAILS" | tr ' ' '\n' | grep -v '^$' \
+    | sed 's/[][^$.|?*+(){}\]/\\&/g' | paste -sd'|' -
+}
 
 # Message patterns, shared by the counters and (in spirit) the rewrite callback below.
 # Each is LINE-ANCHORED and trailer-shaped so that counting and removing agree: a commit
@@ -247,8 +270,38 @@ count_identities() {
 # from count_identities, which reads the identity FIELDS: the mailmap fixes the fields but
 # not the message, so without this count the gate would certify a history whose trailers
 # still credit the wrong GitHub accounts.
-ALIAS_TRAILER_RE="^[[:space:]]*Co-authored-by:.*<($(printf '%s' "$MAINTAINER_ALIAS_EMAILS" \
-  | tr ' ' '\n' | grep -v '^$' | sed 's/[.]/[.]/g' | paste -sd'|' -))>[[:space:]]*$"
+ALIAS_ALT="$(alias_alternation)"
+ALIAS_TRAILER_RE="^[[:space:]]*Co-authored-by:.*<($ALIAS_ALT)>[[:space:]]*$"
+
+# The same strings, matched anywhere in FILE CONTENT rather than in a trailer. Earlier
+# revisions of this very script hardcoded the alias addresses and the hostname, so they sit
+# in the tree as ordinary blobs. --mailmap rewrites identity fields and the callback
+# rewrites messages; neither touches a blob. Without the --replace-text pass below, every
+# branch whose history contains those revisions keeps serving the leak from the FILES after
+# the force-push, while the tip looks clean.
+BLOB_LEAK_RE="($ALIAS_ALT)|$LEAKED_HOST_RE"
+
+count_blob_leaks() {
+  # Lines of file content, across every reachable blob, that still carry a scrubbed string.
+  #
+  # Deduped by object id and scanned once: a blob is shared by every commit that kept the
+  # file unchanged, so walking commits instead would re-read the same content thousands of
+  # times. Reachable objects only -- --batch-all-objects would also pick up the pre-rewrite
+  # originals that filter-repo leaves unreferenced, and the gate would never clear.
+  local blobs
+  blobs="$(git rev-list --objects --all \
+    | awk '{print $1}' \
+    | git cat-file --batch-check='%(objectname) %(objecttype)' \
+    | awk '$2 == "blob" { print $1 }' \
+    | sort -u)"
+  if [ -z "$blobs" ]; then
+    echo 0
+    return
+  fi
+  # -a: blobs are arbitrary bytes and grep would otherwise report "binary file matches"
+  # instead of a number. grep exits 1 on no match, having already printed the 0 we want.
+  printf '%s\n' "$blobs" | git cat-file --batch | grep -ac -iE -e "$BLOB_LEAK_RE" || true
+}
 
 report_counts() {
   echo "    total commits:         $(git rev-list --count --all)"
@@ -258,13 +311,14 @@ report_counts() {
   echo "    leaked hostname:       $(count_pattern "$HOSTNAME_RE")"
   echo "    alias co-author lines: $(count_pattern "$ALIAS_TRAILER_RE")"
   echo "    leaking identities:    $(count_identities)"
+  echo "    leaks in file content: $(count_blob_leaks)"
 }
 
 echo "==> before:"
 echo "    branches:              $(git for-each-ref --format='%(refname)' refs/heads | wc -l)"
 report_counts
 
-echo "==> rewriting commit messages and identities"
+echo "==> rewriting commit messages, identities and file content"
 
 # The mailmap is GENERATED from the repository rather than hardcoded: writing the
 # leaked hostname into this file would reintroduce, in the published tree, the exact
@@ -309,17 +363,31 @@ fi
 # Passed through the ENVIRONMENT rather than interpolated into the callback source: the
 # canonical identity is operator-supplied and may legitimately contain quotes, which would
 # otherwise terminate the Python literal and inject arbitrary code into the rewrite.
-ALIAS_ALT="$(printf '%s' "$MAINTAINER_ALIAS_EMAILS" | tr ' ' '\n' | grep -v '^$' \
-  | sed 's/[.]/[.]/g' | paste -sd'|' -)"
 export FLASH_SCRUB_ALIAS_ALT="$ALIAS_ALT"
 export FLASH_SCRUB_CANON="$CANONICAL_IDENTITY"
 # same reason: the hostname fragment is operator-supplied data, not source.
 export FLASH_SCRUB_HOST_RE="$LEAKED_HOST_RE"
 
+# Blob-level redaction, for the copies of these strings that live in FILE CONTENT rather
+# than in an identity or a message. It is generated at runtime for the same reason the
+# mailmap is: a committed replacements file would be one more tracked copy of the leak.
+#
+# Every entry is "regex:", never a literal, so the pattern is case-insensitive: git
+# preserves whatever case a file was written with, and every other test in this script
+# lowercases before comparing. A literal lowercase entry would leave a mixed-case spelling
+# in the tree AND uncounted by the gate below.
+REPLACEMENTS="$WORKDIR/flash-scrub-replacements"
+{
+  printf '%s' "$MAINTAINER_ALIAS_EMAILS" | tr ' ' '\n' | grep -v '^$' \
+    | sed 's/[][^$.|?*+(){}\]/\\&/g; s|^|regex:(?i)|; s|$|==>REDACTED|'
+  printf 'regex:(?i)%s==>REDACTED\n' "$LEAKED_HOST_RE"
+} > "$REPLACEMENTS"
+
 # Drop whole trailer lines. Matching is line-anchored and trailer-shaped, so a commit
 # body that merely mentions Claude in prose is left alone.
 "${FILTER_REPO[@]}" \
   --mailmap "$MAILMAP" \
+  --replace-text "$REPLACEMENTS" \
   --commit-callback '
 import os
 import re
@@ -384,7 +452,7 @@ echo
 echo "    remaining author/committer identities:"
 git log --all --format='%an <%ae>%n%cn <%ce>' | sort -u | sed 's/^/      /'
 
-rm -f "$MAILMAP"
+rm -f "$MAILMAP" "$REPLACEMENTS"
 
 # --- postcondition gate ----------------------------------------------------
 # The counts above are printed for a human, but a human reading past a stray "2" is
@@ -423,6 +491,11 @@ do
   residual=$((residual + n))
 done
 n="$(checked_count identities count_identities)"
+residual=$((residual + n))
+# blobs are gated too, not just reported: a rewrite that fixed every identity and message
+# while leaving the addresses in a historical copy of a tracked file is exactly the
+# half-scrubbed history this gate exists to catch.
+n="$(checked_count blob-content count_blob_leaks)"
 residual=$((residual + n))
 
 if [ "$residual" -ne 0 ]; then
