@@ -211,8 +211,14 @@ def _resolve_exact_gpu(
     provider: str,
     available: tuple[str, ...],
     widest_cap: int = 1,
+    unpinned: tuple[str, ...] | None = None,
 ) -> tuple[str, tuple[str, ...]]:
-    """Validate an explicitly pinned GPU class and narrow ``available`` to providers that offer it."""
+    """Validate an explicitly pinned GPU class and narrow ``available`` to providers that offer it.
+
+    ``unpinned`` is the configured fleet before a provider pin narrowed ``available``, or ``None``
+    when nothing was pinned. A pin can hide the only provider that rents this class at a wider
+    count, and suppressing the remedy entirely would hide a fix the user can actually apply.
+    """
     exact = canonical_gpu(gpu_type)
     exact_info = GPU_INFO.get(exact)
     if exact_info is None or not exact_info.validated:
@@ -230,11 +236,25 @@ def _resolve_exact_gpu(
     # rather than one it rejects after the box is rented. only offered when a provider still in
     # play rents counts freely -- a Lambda/Vast-only pin has no offline proof the wider SKU exists.
     widths = (exact_info.vram_gb,) if rents_arbitrary_card_counts(reachable) else ()
+    # the pin may be the only reason no width is offerable: this class can be carried by a provider
+    # the pin excluded that DOES rent counts freely. saying so beats a bare shortfall the user
+    # cannot act on. computed from the pre-pin fleet, so it stays silent when there is no pin.
+    unpinned_reachable = (
+        tuple(name for name in unpinned if name in exact_providers) if unpinned else ()
+    )
+    pin_hides_width = (
+        not widths and bool(unpinned_reachable) and rents_arbitrary_card_counts(unpinned_reachable)
+    )
+    drop_pin_hint = (
+        f". Drop the provider pin to rent {exact!r} at a wider card count"
+        if pin_hides_width
+        else ""
+    )
     if exact_info.vram_gb < need and max_gpu_count <= 1:
         raise UnsupportedGpuError(
             f"exact GPU {exact!r} has {exact_info.vram_gb} GB VRAM, "
             f"but this run requires at least {need} GB"
-            + wider_shape_remedy(widths, need, ceiling=widest_cap, above=1)
+            + (wider_shape_remedy(widths, need, ceiling=widest_cap, above=1) or drop_pin_hint)
         )
     # the widest shape providers actually rent for this ceiling, not the ceiling itself: a pin
     # that only fits at a non-rentable count (3) must be rejected here with a precise reason
@@ -246,7 +266,7 @@ def _resolve_exact_gpu(
     ):
         raise UnsupportedGpuError(
             f"exact GPU {exact!r} cannot fit this run even as a {cap}-card combination"
-            + wider_shape_remedy(widths, need, ceiling=widest_cap, above=cap)
+            + (wider_shape_remedy(widths, need, ceiling=widest_cap, above=cap) or drop_pin_hint)
         )
     return exact, reachable
 
@@ -489,6 +509,7 @@ def allocate(
             widest_cap=geometry_safe_gpu_cap(
                 model_id, MAX_COMBINATION_CARDS, model_revision=model_revision
             ),
+            unpinned=unpinned,
         )
         if not available:
             raise UnsupportedGpuError(f"exact GPU {exact!r} has no configured active provider")

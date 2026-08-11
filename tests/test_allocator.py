@@ -1919,14 +1919,17 @@ def test_unpurchasable_width_names_a_remedy_the_user_can_actually_apply():
         "exact": "",
     }
 
-    def reject(available, unpinned, requested=1):
+    def reject(available, unpinned, requested=1, need=None):
+        overrides = {"requested_gpu_count": requested}
+        if need is not None:
+            overrides["need"] = need
         with pytest.raises(UnsupportedGpuError) as exc:
             _resolved_gpu_count(
                 "Qwen/Qwen3.6-35B-A3B",
                 "grpo",
                 available=available,
                 unpinned=unpinned,
-                **{**shared, "requested_gpu_count": requested},
+                **{**shared, **overrides},
             )
         return str(exc.value)
 
@@ -1953,21 +1956,72 @@ def test_unpurchasable_width_names_a_remedy_the_user_can_actually_apply():
     # would send the user in a circle back to this exact error.
     futile = reject(("lambda",), ("lambda",))
     assert "Drop the provider pin" not in futile
-    assert "Configure a provider" in futile
+    assert "configure a provider that rents card counts directly (RunPod)" in futile
 
     # nothing pinned: a narrow fleet is simply the whole configured fleet.
     unpinned = reject(("lambda", "vast"), None)
     assert "Drop the provider pin" not in unpinned
-    assert "Configure a provider" in unpinned
+    assert "configure a provider that rents card counts directly (RunPod)" in unpinned
 
-    # these two cannot name a width -- no configured provider sells one at any count, so there is
-    # no N to promise -- but the ceiling still has to be named as part of the fix.
+    # these two have no arbitrary-count provider behind them, so the width can only be OFFERED to
+    # try against the provider's own catalog -- `live_capacity` means "confirm dynamically", not
+    # "the wider SKU is absent". Lambda really does resolve gpu_4x_h100_pcie.
     for message in (futile, unpinned):
-        assert "--gpus" in message
+        assert "`--gpus 2`" in message
+        assert "check it against their catalog" in message
+        # so the message must not assert non-existence it cannot prove offline.
+        assert "no available provider sells" not in message
+
+    # a raise clause may only appear when the ceiling really does have to rise. the unpinned pool
+    # can carry a BIGGER class the pin hid (Vast tops out at 80 GB/card, RunPod has H200/B200), and
+    # then the same width fits and "--gpus 1" would name the ceiling the user already set.
+    # 100 GB: two 80 GB Vast cards, but ONE RunPod H200/B200. the width does not rise.
+    same_width = reject(("vast",), ("runpod", "vast"), need=100.0)
+    assert "Drop the provider pin" in same_width
+    assert "raise the card ceiling" not in same_width
+    assert "--gpus" not in same_width
 
     # no message may claim the run exceeds every class -- it fits, it just cannot be bought.
     for message in (droppable, futile, unpinned):
         assert "more than any" not in message
+
+
+def test_exact_gpu_rejection_reports_a_pin_that_hides_a_wider_count():
+    """A pin can be the only reason an exact class has no offerable width.
+
+    `_resolve_exact_gpu` narrows to providers carrying the class, and offers a `--gpus N` remedy
+    only when one of them rents counts freely. A Lambda pin on a fleet that also has RunPod
+    suppresses that entirely -- yet RunPod carries the very same H100 and rents it at any count, so
+    dropping the pin is a real fix the bare shortfall message hides.
+    """
+    from flash.providers.allocator import _resolve_exact_gpu
+    from flash.providers.base import UnsupportedGpuError
+
+    def reject(provider, available, unpinned):
+        with pytest.raises(UnsupportedGpuError) as exc:
+            _resolve_exact_gpu(
+                "H100",
+                need=188.0,
+                cap=1,
+                max_gpu_count=1,
+                provider=provider,
+                available=available,
+                unpinned=unpinned,
+                widest_cap=8,
+            )
+        return str(exc.value)
+
+    hidden = reject("lambda", ("lambda",), ("runpod", "lambda"))
+    assert "Drop the provider pin" in hidden
+
+    # no pin, and a pin with nothing better behind it, must stay silent rather than invent advice.
+    assert "Drop the provider pin" not in reject("", ("lambda",), None)
+    assert "Drop the provider pin" not in reject("lambda", ("lambda",), ("lambda",))
+
+    # where a width IS offerable the existing remedy stands; the hint must not displace it.
+    runpod = reject("runpod", ("runpod",), None)
+    assert "`--gpus 4`" in runpod
+    assert "Drop the provider pin" not in runpod
 
 
 def test_moved_message_builders_still_import_from_their_original_module():

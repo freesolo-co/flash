@@ -781,7 +781,9 @@ def test_offline_quote_remedy_only_names_widths_a_provider_sells_freely():
         "group_size": 4,
         "lora_rank": 16,
     }
-    with pytest.raises(ValueError, match="no available provider sells") as lambda_only:
+    with pytest.raises(
+        ValueError, match="no available provider is confirmed to sell"
+    ) as lambda_only:
         _offline_gpu_shape(RunConfig(gpu_count=1, provider="lambda", **shared))
     # a width may be named only as part of DROPPING the pin -- on the unpinned pool runpod rents it
     # freely, so the promise is real there. what must never appear is a bare raise-the-ceiling
@@ -807,4 +809,4 @@ def test_offline_quote_remedy_only_names_widths_a_provider_sells_freely():
                 **{**shared, "seq_len": 1_000_000},
             )
         )
-    assert "no available provider sells" not in str(oversized.value)
+    assert "no available provider is confirmed to sell" not in str(oversized.value)
