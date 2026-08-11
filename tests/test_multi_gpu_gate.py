@@ -818,7 +818,7 @@ def test_eight_cards_require_validated_head_geometry(monkeypatch):
     import flash.engine.plan.vram as vram
     from flash.providers.allocator import geometry_safe_gpu_cap
 
-    monkeypatch.setattr(vram, "_PINNED_HEADS_MEMO", {})
+    monkeypatch.setattr(vram, "_PINNED_GEOMETRY_MEMO", {})
 
     def _unreadable(*_a, **_k):
         raise RuntimeError("transient hub error")
@@ -881,7 +881,7 @@ def _stub_pinned_geometry(monkey, info, *, heads=None):
         )
 
     monkey.setattr(vram, "fetch_hf_model_geometry", _pinned)
-    monkey.setattr(vram, "_PINNED_HEADS_MEMO", {})
+    monkey.setattr(vram, "_PINNED_GEOMETRY_MEMO", {})
 
 
 def test_a_certified_pin_reaches_eight_cards():
@@ -952,7 +952,7 @@ def test_a_pin_without_parameter_metadata_certifies_nothing():
 
     monkey = pytest.MonkeyPatch()
     try:
-        monkey.setattr(vram, "_PINNED_HEADS_MEMO", {})
+        monkey.setattr(vram, "_PINNED_GEOMETRY_MEMO", {})
         monkey.setattr(
             vram,
             "fetch_hf_model_geometry",
@@ -1011,7 +1011,7 @@ def test_a_pinned_head_lookup_is_not_repeated_or_cached_on_failure():
 
     monkey = pytest.MonkeyPatch()
     try:
-        monkey.setattr(vram, "_PINNED_HEADS_MEMO", {})
+        monkey.setattr(vram, "_PINNED_GEOMETRY_MEMO", {})
 
         def _blip(*_a, **_k):
             calls.append("fail")
@@ -1020,7 +1020,7 @@ def test_a_pinned_head_lookup_is_not_repeated_or_cached_on_failure():
         monkey.setattr(vram, "fetch_hf_model_geometry", _blip)
         assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision=rev) == 4
         assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision=rev) == 4
-        assert vram._PINNED_HEADS_MEMO == {}, "a hub failure must not be cached"
+        assert vram._PINNED_GEOMETRY_MEMO == {}, "a hub failure must not be cached"
         assert len(calls) == 2, "a failed lookup must stay retryable"
 
         calls.clear()
@@ -1040,6 +1040,44 @@ def test_a_pinned_head_lookup_is_not_repeated_or_cached_on_failure():
         before = len(calls)
         assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision=rev) == 8
         assert len(calls) == before, f"pinned head lookup hit the hub {len(calls)} times"
+    finally:
+        monkey.undo()
+
+
+def test_a_blip_after_sizing_cannot_narrow_an_already_validated_pin():
+    """Sizing and the cap must share one geometry read, or an eight-card run dies mid-allocation.
+
+    `allocate()` sizes the run first (`required_vram_gb` -> `_validated_revision_geometry`, which
+    fetches and validates this exact pin) and only then asks for the head cap. With two independent
+    lookups, a hub blip landing between them narrowed a just-validated pin to four cards -- and for a
+    run that only FITS at eight, `_structurally_fits` then reports it as terminally unplaceable
+    rather than retryable. A pinned commit's geometry is immutable, so one success settles it.
+    """
+    import flash.engine.plan.vram as vram
+    from flash.core.catalog import MODELS
+    from flash.providers.allocator import geometry_safe_gpu_cap
+
+    model = "Qwen/Qwen3.5-9B"
+    info = MODELS[model]
+    rev = "a" * 40
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(vram, "_PINNED_GEOMETRY_MEMO", {})
+        _stub_pinned_geometry(monkey, info)
+        monkey.setattr(vram, "_PINNED_GEOMETRY_MEMO", {})
+
+        # 1. sizing succeeds and validates the pin, exactly as `allocate()` does first.
+        assert vram.model_required_vram_gb(model, "sft", model_revision=rev) > 0
+
+        # 2. the hub dies immediately afterwards.
+        def _blip(*_a, **_k):
+            raise RuntimeError("transient hub error")
+
+        monkey.setattr(vram, "fetch_hf_model_geometry", _blip)
+
+        # 3. the cap must still certify 8 from the geometry step 1 already read and validated.
+        assert geometry_safe_gpu_cap(model, 8, model_revision=rev) == 8
     finally:
         monkey.undo()
 
@@ -1107,7 +1145,7 @@ def test_schema_preflight_applies_the_geometry_cap_to_provisional_sizing():
     monkey = pytest.MonkeyPatch()
     try:
         monkey.setattr("flash.schema.provisional_gpu", _preview)
-        monkey.setattr(vram, "_PINNED_HEADS_MEMO", {})
+        monkey.setattr(vram, "_PINNED_GEOMETRY_MEMO", {})
 
         def _unreadable(*_a, **_k):
             raise RuntimeError("transient hub error")
@@ -1130,7 +1168,7 @@ def test_schema_preflight_applies_the_geometry_cap_to_provisional_sizing():
 
         seen.clear()
         monkey.setattr(vram, "fetch_hf_model_geometry", _readable)
-        monkey.setattr(vram, "_PINNED_HEADS_MEMO", {})
+        monkey.setattr(vram, "_PINNED_GEOMETRY_MEMO", {})
         _spec()
         assert seen == [8]
     finally:

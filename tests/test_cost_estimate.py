@@ -618,6 +618,7 @@ def test_the_offline_probe_sizes_a_pinned_catalog_model_by_its_revision(monkeypa
 
     monkeypatch.setattr(vram, "fetch_hf_model_geometry", _pinned_geometry)
     monkeypatch.setattr("flash.cost.facts._PINNED_SIZE_MEMO", dict(_PINNED_SIZE_MEMO))
+    monkeypatch.setattr(vram, "_PINNED_GEOMETRY_MEMO", {})
     _PINNED_SIZE_MEMO.pop((model, expected_revision), None)
 
     gpu, count, need, provider, rate = _offline_gpu_shape(
@@ -629,14 +630,15 @@ def test_the_offline_probe_sizes_a_pinned_catalog_model_by_its_revision(monkeypa
     assert need > 0
     assert provider
     assert rate > 0
-    # THREE independent sites read a pinned run here -- the fail-closed params check, the VRAM
-    # requirement, and the head-geometry cap that decides how wide it may be rented -- and each must
-    # carry the pin. Asserting only "some call saw the revision" cannot tell them apart: dropping
-    # the pin from any one of them still leaves the others populating the list, so the count is what
-    # makes this test able to fail.
-    assert len(seen_revisions) == 3, (
-        "expected the params check, the VRAM sizing, and the geometry cap to pass the pin, "
-        f"saw {seen_revisions}"
+    # Several independent sites read a pinned run here -- the fail-closed params check, the VRAM
+    # requirement, and the head-geometry cap that decides how wide it may be rented. Each must carry
+    # the pin, and they must SHARE the one lookup: a site that re-fetched independently let a hub
+    # blip between two of them narrow a just-validated pin (see
+    # test_a_blip_after_sizing_cannot_narrow_an_already_validated_pin). One fetch, and the revision
+    # is the one that was asked for -- a site that dropped the pin would fetch the default revision
+    # under a different memo key and push this above one.
+    assert len(seen_revisions) == 1, (
+        f"a pinned quote must reach the hub exactly once, saw {seen_revisions}"
     )
     assert set(seen_revisions) == {expected_revision}
 

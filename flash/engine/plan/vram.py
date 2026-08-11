@@ -567,10 +567,30 @@ def _geometry_mismatches(info, params_b, vocab, hidden, layers, heads) -> list[s
     return mismatches
 
 
+# A pinned commit's geometry is immutable -- that is what pinning MEANS -- so one successful read
+# serves every consumer for the life of the process. Only SUCCESSES are stored: a hub blip is a fact
+# about the network, not about the model, and caching it would keep rejecting a valid pin until the
+# plane restarted. Sharing matters beyond saving a round trip: `allocate()` sizes the run (which
+# validates this geometry) and THEN asks for the head cap, so an unshared second lookup let a
+# transient failure between the two narrow a valid eight-card run to four and report it as
+# structurally impossible.
+_PINNED_GEOMETRY_MEMO: dict[tuple[str, str], tuple] = {}
+
+
+def _memoized_revision_geometry(model_id: str, revision: str) -> tuple:
+    """``fetch_hf_model_geometry`` for a pinned commit, reusing an earlier success in this process.
+
+    Raises exactly like the strict fetch it wraps when nothing has succeeded yet, so callers that
+    must fail closed still do.
+    """
+    key = (model_id, revision)
+    if key not in _PINNED_GEOMETRY_MEMO:
+        _PINNED_GEOMETRY_MEMO[key] = fetch_hf_model_geometry(model_id, revision, strict=True)
+    return _PINNED_GEOMETRY_MEMO[key]
+
+
 def _validated_revision_geometry(model_id: str, revision: str, info):
-    params_b, vocab, hidden, layers, heads = fetch_hf_model_geometry(
-        model_id, revision, strict=True
-    )
+    params_b, vocab, hidden, layers, heads = _memoized_revision_geometry(model_id, revision)
     # Revision-aware sizing is authoritative and must fail closed. When the pinned commit exposes no
     # parameter-count metadata (no safetensors.total), we cannot derive its size; silently reusing the
     # catalog default-revision count would size the exact-GPU preflight on weights the worker never loads,
@@ -589,13 +609,6 @@ def _validated_revision_geometry(model_id: str, revision: str, info):
     return params_b, vocab or info.vocab_size
 
 
-# Same shape and rationale as `cost.facts._PINNED_SIZE_MEMO`: a pinned lookup is a round trip to the
-# hub, and the allocator asks for the same pin several times per quote. Only SUCCESSES are stored --
-# a hub blip is a fact about the network, not about the model, and caching it would pin a run to
-# four cards until the plane restarted.
-_PINNED_HEADS_MEMO: dict[tuple[str, str], int] = {}
-
-
 def certified_revision_attention_heads(model_id: str, revision: str) -> int:
     """Query-head count of a PINNED commit, or 0 when it cannot be certified.
 
@@ -611,29 +624,29 @@ def certified_revision_attention_heads(model_id: str, revision: str) -> int:
     Certified, not merely read: the same catalog cross-check the sizing path applies runs here, so a
     pin whose geometry has drifted is rejected rather than widened. Widening a run on a config that
     disagrees with everything else known about the model is the failure this exists to prevent.
+
+    Reads through `_PINNED_GEOMETRY_MEMO`, so once ANY caller has read this pin the cap can no longer
+    be narrowed by a later hub blip. `allocate()` sizes the run before it asks for the cap, and both
+    go through that memo, so a run that was just sized successfully cannot then be declared
+    structurally impossible by a transient failure in between.
     """
     from flash.core.catalog import MODELS
 
     info = MODELS.get(model_id)
     if info is None or not revision:
         return 0
-    key = (model_id, revision)
-    if key not in _PINNED_HEADS_MEMO:
-        try:
-            params_b, vocab, hidden, layers, heads = fetch_hf_model_geometry(
-                model_id, revision, strict=True
-            )
-        except Exception:
-            return 0
-        # a commit exposing no parameter count is the same fail-closed case the sizing path rejects
-        # outright. checked here too so this function is safe on its own rather than by relying on
-        # sizing having run first -- the schema preflight calls the cap BEFORE it sizes anything.
-        if params_b is None:
-            return 0
-        if _geometry_mismatches(info, params_b, vocab, hidden, layers, heads):
-            return 0
-        _PINNED_HEADS_MEMO[key] = max(int(heads), 0)
-    return _PINNED_HEADS_MEMO[key]
+    try:
+        params_b, vocab, hidden, layers, heads = _memoized_revision_geometry(model_id, revision)
+    except Exception:
+        return 0
+    # a commit exposing no parameter count is the same fail-closed case the sizing path rejects
+    # outright. checked here too so this function is safe on its own rather than by relying on
+    # sizing having run first -- the schema preflight calls the cap BEFORE it sizes anything.
+    if params_b is None:
+        return 0
+    if _geometry_mismatches(info, params_b, vocab, hidden, layers, heads):
+        return 0
+    return max(int(heads), 0)
 
 
 def _sizing_value(obj, key):
