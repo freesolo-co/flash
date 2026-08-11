@@ -104,21 +104,29 @@ ARG FLASH_ATTN_SHA256=a58c95a080363606e691c342d47dd173b510f4c013a8c5fcb8744def12
 # peak compile memory. (A from-source build still needs a big-RAM host; the wheel avoids all of it.)
 # A download fault stays best-effort (SDPA fallback); a hash mismatch never does, it fails the
 # build rather than baking a binary nobody can identify.
+# pip validates a downloaded wheel's filename against {name}-{version}(-{build})?-{python}-{abi}-
+# {platform}.whl and rejects anything else outright ("is not a valid wheel filename"), so the
+# curl target must be the url's own basename, not a fixed name -- percent-decoded, since the
+# default url encodes "+" as %2B and a bare "+" is legal in a wheel version. Landed in a per-install
+# temp dir so an override url's basename can never collide with anything else on the layer.
 RUN set -eu; \
     spec="${FLASH_ATTN_SPEC}"; \
+    workdir=""; \
     case "${spec}" in \
         http*) \
             [ -n "${FLASH_ATTN_SHA256}" ] || { echo "FLASH_ATTN_SHA256 is required for a wheel url" >&2; exit 1; }; \
-            wheel=/tmp/flash_attn.whl; \
+            workdir="$(mktemp -d)"; \
+            wheel_name="$(python3 -c 'import posixpath, sys, urllib.parse as u; print(posixpath.basename(u.unquote(u.urlsplit(sys.argv[1]).path)))' "${spec}")"; \
+            wheel="${workdir}/${wheel_name}"; \
             curl -fsSL -o "${wheel}" "${spec}" \
-                || { rm -f "${wheel}"; echo "flash-attn: wheel download failed, SDPA fallback"; exit 0; }; \
+                || { rm -rf "${workdir}"; echo "flash-attn: wheel download failed, SDPA fallback"; exit 0; }; \
             echo "${FLASH_ATTN_SHA256}  ${wheel}" | sha256sum -c -; \
             spec="${wheel}" ;; \
     esac; \
     TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" MAX_JOBS=4 \
     pip install --no-cache-dir "${spec}" --no-build-isolation \
     && echo "flash-attn: installed (${FLASH_ATTN_SPEC})" || echo "flash-attn: build failed, SDPA fallback"; \
-    rm -f /tmp/flash_attn.whl
+    [ -z "${workdir}" ] || rm -rf "${workdir}"
 
 # FlashAttention-3 (used on Hopper sm90: H100/H200). transformers routes
 # attn_implementation="flash_attention_3" to a LOCAL ``flash_attn_interface`` module (the
@@ -140,15 +148,20 @@ ARG FLASH_ATTN_3_SPEC=https://github.com/windreamer/flash-attention3-wheels/rele
 # verified before install rather than trusted by url. Override it together with FLASH_ATTN_3_SPEC
 # (worker-image.yml exposes both as workflow inputs); a url spec with an empty sha is refused.
 ARG FLASH_ATTN_3_SHA256=13ec39bc8cb37d37b1efd3bff76ee5e994f5cac3ca6a8ce35db6f54b98ca3862
+# Same wheel-filename constraint as FLASH_ATTN_SPEC above: pip rejects a fixed /tmp name outright, so
+# the curl target is the url's own percent-decoded basename, landed in a per-install temp dir.
 RUN if [ -n "${FLASH_ATTN_3_SPEC}" ]; then \
       set -eu; \
       spec="${FLASH_ATTN_3_SPEC}"; \
+      workdir=""; \
       case "${spec}" in \
           http*) \
               [ -n "${FLASH_ATTN_3_SHA256}" ] || { echo "FLASH_ATTN_3_SHA256 is required for a wheel url" >&2; exit 1; }; \
-              wheel=/tmp/flash_attn_3.whl; \
+              workdir="$(mktemp -d)"; \
+              wheel_name="$(python3 -c 'import posixpath, sys, urllib.parse as u; print(posixpath.basename(u.unquote(u.urlsplit(sys.argv[1]).path)))' "${spec}")"; \
+              wheel="${workdir}/${wheel_name}"; \
               curl -fsSL -o "${wheel}" "${spec}" \
-                  || { rm -f "${wheel}"; echo "flash-attn-3: wheel download failed -> SDPA fallback on Hopper"; exit 0; }; \
+                  || { rm -rf "${workdir}"; echo "flash-attn-3: wheel download failed -> SDPA fallback on Hopper"; exit 0; }; \
               echo "${FLASH_ATTN_3_SHA256}  ${wheel}" | sha256sum -c -; \
               spec="${wheel}" ;; \
       esac; \
@@ -157,7 +170,7 @@ RUN if [ -n "${FLASH_ATTN_3_SPEC}" ]; then \
       && python -c "import flash_attn_interface; print('flash_attn_interface: import OK')" \
       && echo "flash-attn-3: installed (${FLASH_ATTN_3_SPEC})" \
       || echo "flash-attn-3: install failed -> SDPA fallback on Hopper"; \
-      rm -f /tmp/flash_attn_3.whl; \
+      [ -z "${workdir}" ] || rm -rf "${workdir}"; \
     else echo "flash-attn-3: skipped (FLASH_ATTN_3_SPEC unset) -> SDPA on Hopper"; fi
 
 # causal_conv1d: the short depthwise causal conv kernel whose ``seq_idx`` arg resets the conv at
@@ -358,8 +371,15 @@ RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers
 # There is no SDPA fallback on that path: without the module the run dies at the first training
 # batch, which the import-only assert below would not catch. Reuses FLASH_ATTN_SPEC so the venv gets
 # the same wheel as the main interpreter instead of a second source build.
+# This is /opt/verl-venv/bin/python -- FLASH_VERL_PYTHON, the interpreter that actually trains -- and
+# a separate network fetch from the verified main-interpreter download above (that wheel is gone by
+# now, --no-cache-dir). uv honours a `#sha256=` url fragment and refuses to install a mismatching
+# artifact, the same mechanism flash/engine/worker/backend_common.py's FLASH_ATTN_INSTALL_SPEC
+# already relies on, so appending it here closes the gap: a replaced release asset is rejected before
+# it lands in the venv that trains, not just in the main interpreter. Unlike that block this install
+# has no `|| echo` fallback, so a mismatch already fails the build outright.
 RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" MAX_JOBS=4 \
-    uv pip install --python /opt/verl-venv/bin/python --no-build-isolation "${FLASH_ATTN_SPEC}" \
+    uv pip install --python /opt/verl-venv/bin/python --no-build-isolation "${FLASH_ATTN_SPEC}#sha256=${FLASH_ATTN_SHA256}" \
     && uv cache clean
 
 # causal_conv1d in the VERL VENV, which is where the model actually trains. The main interpreter's

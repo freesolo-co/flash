@@ -95,8 +95,12 @@ TRANSFORMERS_REQUIREMENT = "transformers>=5.6,<5.13"
 # fla, causal_conv1d, or the transformers range lets an older partial venv match forever; conv1d
 # leaves GRPO/OPD failing ``require_gdn_boundary_resets`` with no rebuild path, and a stale venv
 # resolved before the transformers pin keeps training on an out-of-range transformers indefinitely.
+# carries FLASH_ATTN_INSTALL_SPEC (the sha256-fragmented spec), not the bare FLASH_ATTN_SPEC: the
+# digest is part of the venv's identity, not just how it got installed, so bumping or rotating the
+# checksum while the mutable release url stays constant must invalidate a venv stamped under the old
+# digest instead of letting it match forever and reuse an install that was never re-verified.
 VERL_VENV_STAMP = (
-    f"{VERL_REQUIREMENT}\n{FLASH_ATTN_SPEC}\n{FLA_REQUIREMENT}\n{CAUSAL_CONV1D_REQUIREMENT}\n"
+    f"{VERL_REQUIREMENT}\n{FLASH_ATTN_INSTALL_SPEC}\n{FLA_REQUIREMENT}\n{CAUSAL_CONV1D_REQUIREMENT}\n"
     f"{TRANSFORMERS_REQUIREMENT}"
 )
 

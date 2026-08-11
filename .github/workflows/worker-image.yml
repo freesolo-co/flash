@@ -77,7 +77,10 @@ jobs:
       FA2_SPEC: https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.0/flash_attn-2.8.3%2Bcu128torch2.10-cp312-cp312-linux_x86_64.whl
       FA3_SPEC: ${{ github.event.inputs.flash_attn_3_spec || 'https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.03.19-850211f/flash_attn_3-3.0.0%2B20260318.cu128torch2100cxx11abitrue.8afc61-cp39-abi3-linux_x86_64.whl' }}
       # The wheels are verified against these before install (Dockerfile.worker does the sha256sum
-      # -c). Keep them in sync with Dockerfile.worker's ARG defaults, exactly like the specs.
+      # -c). Keep them in sync with Dockerfile.worker's ARG defaults, exactly like the specs. Also
+      # fingerprint inputs, same as the specs above: a maintainer who rotates a digest after a
+      # release asset was replaced (same url, new sha256) must move fp_base, or auto-rebake would
+      # call every per-arch tag up to date on a base that no longer matches what got baked.
       FA2_SHA256: a58c95a080363606e691c342d47dd173b510f4c013a8c5fcb8744def12e36a0f
       FA3_SHA256: ${{ github.event.inputs.flash_attn_3_sha256 || '13ec39bc8cb37d37b1efd3bff76ee5e994f5cac3ca6a8ce35db6f54b98ca3862' }}
     steps:
@@ -88,7 +91,7 @@ jobs:
       # pin can't be parsed -- a silent miss would let a stale per-arch cache ship as a cold-JIT.
       - name: Compute kernel fingerprints
         id: fp
-        run: python3 docker/kernel_fingerprint.py --format github --fa2-spec "$FA2_SPEC" --fa3-spec "$FA3_SPEC" >> "$GITHUB_OUTPUT"
+        run: python3 docker/kernel_fingerprint.py --format github --fa2-spec "$FA2_SPEC" --fa3-spec "$FA3_SPEC" --fa2-sha256 "$FA2_SHA256" --fa3-sha256 "$FA3_SHA256" >> "$GITHUB_OUTPUT"
 
       - name: Free disk space
         run: |

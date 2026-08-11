@@ -12,6 +12,7 @@ docker/ is not a package, so import the module by path (the repo already does th
 from __future__ import annotations
 
 import importlib.util
+import json
 import re
 import subprocess
 import sys
@@ -93,6 +94,8 @@ def test_collect_inputs_populates_every_key_and_matches_repo():
     for key in (
         "fa2",
         "fa3",
+        "fa2_sha256",
+        "fa3_sha256",
         "causal_conv1d",
         "pip_base",
         "dockerfile_sha256",
@@ -118,6 +121,54 @@ def test_dockerfile_only_change_is_a_free_relayer():
     fc1, fb1, _ = kf.compute_fingerprints(cache_inputs, bumped)
     assert fc1 == fc0, "a Dockerfile-only change must NOT move fp_cache (no GPU re-warm)"
     assert fb1 != fb0, "a Dockerfile-only change MUST move fp_base (free re-layer)"
+
+
+def test_fa_sha256_digest_only_change_moves_fp_base_not_fp_cache():
+    """The exact remediation this fp_base input exists for: a maintainer dispatches worker-image.yml
+    with the SAME wheel url but an UPDATED sha256 (a replaced release asset). A digest rotation must
+    move fp_base (so auto-rebake re-layers every stale per-arch tag) while leaving fp_cache untouched
+    (a wheel digest plays no part in what the Triton/Inductor mega-cache holds, so no GPU re-warm)."""
+    fp_cache0, fp_base0, _, _ = kf.fingerprints(ROOT)
+    fp_cache1, fp_base1, _, _ = kf.fingerprints(ROOT, fa3_sha256="0" * 64)
+    assert fp_cache1 == fp_cache0, "a wheel digest rotation must not invalidate the kernel cache"
+    assert fp_base1 != fp_base0, (
+        "a wheel digest rotation must move fp_base so auto-rebake re-layers"
+    )
+
+    fp_cache2, fp_base2, _, _ = kf.fingerprints(ROOT, fa2_sha256="1" * 64)
+    assert fp_cache2 == fp_cache0
+    assert fp_base2 != fp_base0
+
+
+def test_cli_fa_sha256_override_moves_fp_base():
+    """worker-image.yml invokes the CLI with resolved --fa2-sha256/--fa3-sha256 values (mirroring
+    --fa2-spec/--fa3-spec); prove the argparse wiring actually reaches base_inputs_partial and not
+    just the Python-level collect_inputs kwarg."""
+    baseline = json.loads(
+        subprocess.run(
+            [sys.executable, str(KERNEL_FINGERPRINT_SCRIPT), "--format", "json"],
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout
+    )
+    overridden = json.loads(
+        subprocess.run(
+            [
+                sys.executable,
+                str(KERNEL_FINGERPRINT_SCRIPT),
+                "--format",
+                "json",
+                "--fa3-sha256",
+                "0" * 64,
+            ],
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout
+    )
+    assert overridden["fp_cache"] == baseline["fp_cache"]
+    assert overridden["fp_base"] != baseline["fp_base"]
 
 
 def test_fa3_default_is_in_lockstep():
