@@ -434,6 +434,27 @@ def sft_seconds_for_tokens(config: RunConfig, gpu: str, train_tokens: float) -> 
     return flops / (peak * mfu)
 
 
+def _wider_shape_remedy(config: RunConfig, need: float, names: tuple[str, ...]) -> str:
+    """The `--gpus N` clause this quote's fit failure carries; see ``base.wider_shape_remedy``.
+
+    ``names`` is the pool the quote already ranked, so the remedy is searched over exactly the
+    classes that were considered -- reusing the caller's provider filtering instead of
+    reconstructing it here and risking a suggestion for a class it never had.
+    """
+    from flash.providers.base import GPU_INFO, MAX_COMBINATION_CARDS, wider_shape_remedy
+
+    # the authored ceiling limited the ranking above; the geometry cap at the MAXIMUM rentable
+    # width is what bounds a suggestion.
+    return wider_shape_remedy(
+        (GPU_INFO[gpu].vram_gb for gpu in names),
+        need,
+        ceiling=geometry_safe_gpu_cap(
+            config.model_id, MAX_COMBINATION_CARDS, model_revision=config.model_revision
+        ),
+        above=config.gpu_count,
+    )
+
+
 def _offline_gpu_shape(
     config: RunConfig, *, max_wall_seconds: float = 0.0
 ) -> tuple[str, int, int, str, float]:
@@ -478,14 +499,16 @@ def _offline_gpu_shape(
         # precheck - overstated cost against a cheaper shape `allocate()` would really pick. the
         # `providers_for` filter below narrows this pool to the classes the provider can provision.
         names = tuple(info.name for info in GPU_INFO.values() if info.validated)
+    # narrow the pool ONCE, here: the ranking below and the fit-failure remedy must consider the
+    # same classes, and a filter applied inside the loop is invisible to anything after it.
+    if provider != "auto":
+        names = tuple(gpu for gpu in names if provider in providers_for(gpu))
     safe_gpu_count = geometry_safe_gpu_cap(
         config.model_id, config.gpu_count, model_revision=config.model_revision
     )
     ranked = []
     for gpu in names:
         info = GPU_INFO[gpu]
-        if provider != "auto" and provider not in providers_for(gpu):
-            continue
         for count in rentable_gpu_counts(safe_gpu_count):
             if combined_vram_gb(info.vram_gb, count) < need:
                 continue
@@ -516,13 +539,15 @@ def _offline_gpu_shape(
                 )
             )
     if not ranked:
+        remedy = _wider_shape_remedy(config, need, names)
         if config.gpu_type:
             info = GPU_INFO[canonical_gpu(config.gpu_type)]
             raise ValueError(
                 f"exact GPU {info.name!r} cannot fit this run: it requires at least {need} GB"
+                + remedy
             )
         shape = f" across up to {safe_gpu_count} cards" if safe_gpu_count > 1 else ""
-        raise ValueError(f"no GPU class fits >= {need} GB{shape}")
+        raise ValueError(f"no GPU class fits >= {need} GB{shape}{remedy}")
     _cost, count, _combined, _per_card, gpu, hourly = min(ranked)
     return gpu, need, count, provider, hourly
 

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
 
     from flash.core.spec import JobSpec
 
@@ -577,6 +577,36 @@ def largest_rentable_count(max_gpu_count: int) -> int:
     Only powers of two up to ``MAX_COMBINATION_CARDS`` are offered, so a ceiling of 3 buys 2 cards.
     """
     return rentable_gpu_counts(min(max(1, int(max_gpu_count)), MAX_COMBINATION_CARDS))[0]
+
+
+def wider_shape_remedy(
+    vram_options: Iterable[int], need: float, *, ceiling: int, above: int = 0
+) -> str:
+    """The ``--gpus N`` clause a fit failure carries, or ``""`` when no wider shape would fit.
+
+    A fit failure is only worth reporting as unsatisfiable when NO shape the user can ask for
+    would fix it. `[gpu] count` is a user-authored ceiling, so a run that fails at the authored
+    count but fits at a wider one is a one-flag fix, not a dead end -- and the error is the only
+    place the user learns which flag.
+
+    The width is SEARCHED with ``combined_vram_gb``, the same fit model that rejected the run, so
+    a suggested N is one this function proved rather than one inferred from total VRAM. ``ceiling``
+    must be the caller's ``geometry_safe_gpu_cap`` so the suggestion is never a width verl rejects
+    at Ulysses init after the box is rented, and ``above`` excludes the counts already tried. The
+    smallest fitting count wins: the cheapest shape that works, not the widest on offer.
+
+    Every fit-rejection message routes through here so the remedy cannot drift in wording or in
+    the rule that produces it.
+    """
+    best = 0
+    for vram_gb in vram_options:
+        for count in sorted(rentable_gpu_counts(max(1, int(ceiling)))):
+            if count > above and combined_vram_gb(vram_gb, count) >= need:
+                best = count if best == 0 else min(best, count)
+                break
+    if best == 0:
+        return ""
+    return f"; it fits on {best} cards -- raise the card ceiling with `--gpus {best}`"
 
 
 @dataclass(frozen=True)

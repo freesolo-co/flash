@@ -256,9 +256,9 @@ def parse_positive_int_tuple(value: Any, *, name: str) -> tuple[int, ...]:
 class EnvironmentSpec:
     id: str = ""
     params: dict[str, Any] = field(default_factory=dict)
-    # Pip requirements the GPU worker needs for this environment; empty means "use defaults"
-    # (resolved via worker_pip_for_env in spec_payload / provider submit). An explicit
-    # [environment] pip is the escape hatch.
+    # Third-party requirements this environment's scorer imports, appended to Flash's own worker
+    # requirement at submit (worker_pip_with_extras). Empty means the scorer needs nothing beyond
+    # the worker's baseline; entries here never displace it.
     pip: tuple[str, ...] = ()
     # Names only — values sent out-of-band via runtime_secrets, never stored in spec.
     secrets: tuple[str, ...] = ()
@@ -520,8 +520,9 @@ class JobSpec:
         for managed in MANAGED_GPU_KEYS:
             gpu.pop(managed, None)
         data["environment"].pop("resolved_sha", None)  # resolve-once env ref pin
-        # platform-managed worker requirement list, resolved by worker_pip_for_env at submit.
-        data["environment"].pop("pip", None)
+        # [environment] pip stays in the payload: it is the author's own scorer dependencies, which
+        # only they can declare. The submit paths append it to worker_pip_for_env, so what travels
+        # here is the extra requirements, not the worker's own.
         return data
 
     def to_internal_dict(self) -> dict[str, Any]:
