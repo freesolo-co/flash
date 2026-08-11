@@ -660,3 +660,65 @@ def test_build_grpo_prompt_dataset_survives_dataset_from_list() -> None:
     assert ds.column_names == ["prompt", "example_idx"]
     assert list(ds["example_idx"]) == [0, 1]
     assert [examples[i]["metadata"]["param"] for i in ds["example_idx"]] == [8, "gentle"]
+
+
+def test_grpo_rejects_prompt_budget_at_parse_time_before_provisioning() -> None:
+    """max_context_tokens <= the resolved completion budget leaves no prompt room, and the grpo
+    worker only discovers that in `_resolve_sequence_lengths` ("engine length leaves no room for
+    the completion") after the GPU is provisioned and billed. Reject it at spec-parse time, with
+    the SAME completion resolver the worker uses so the two can never disagree."""
+    from flash.engine.plan.recipe import RECIPE
+
+    def _spec(train_extra, thinking=False):
+        return spec_from_dict(
+            {
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": "grpo",
+                "thinking": thinking,
+                "environment": {"id": "github:owner/repo@main:env/environment.py"},
+                "train": {"epochs": 1, "max_examples": 5, **train_extra},
+            },
+            run_id="grpo-budget",
+        )
+
+    # room left after an explicit max_completion_tokens -> ok.
+    _spec({"max_context_tokens": 2048, "max_completion_tokens": 512})
+    # exactly one prompt token is the boundary the worker accepts (prompt_budget > 0).
+    _spec({"max_context_tokens": 513, "max_completion_tokens": 512})
+    # no prompt budget at all -> the worker would raise, so reject at parse.
+    with pytest.raises(ConfigError, match="prompt budget"):
+        _spec({"max_context_tokens": 512, "max_completion_tokens": 512})
+    with pytest.raises(ConfigError, match="prompt budget"):
+        _spec({"max_context_tokens": 400, "max_completion_tokens": 512})
+    # max_completion_tokens omitted -> the RL recipe default, per thinking, exactly as the worker
+    # resolves it; NOT the opd recipe's.
+    _spec({"max_context_tokens": RECIPE.rl.max_completion_len + 1})
+    with pytest.raises(ConfigError, match="prompt budget"):
+        _spec({"max_context_tokens": RECIPE.rl.max_completion_len})
+    _spec({"max_context_tokens": RECIPE.rl.max_completion_len_thinking + 1}, thinking=True)
+    with pytest.raises(ConfigError, match="prompt budget"):
+        _spec({"max_context_tokens": RECIPE.rl.max_completion_len_thinking}, thinking=True)
+    # an omitted context is the recipe-sized run, which always fits -> nothing to check.
+    _spec({})
+
+
+def test_grpo_prompt_budget_guard_matches_the_worker_resolver() -> None:
+    """The submit guard must never be stricter than the worker: both resolve the completion length
+    through `grpo_completion_len`, and the worker additionally clamps the context down to the model
+    architecture, which can only shrink the prompt budget it checks."""
+    import inspect
+
+    from flash import schema
+    from flash.engine.plan.recipe import RECIPE
+    from flash.engine.plan.vram import grpo_completion_len
+    from flash.engine.worker.train.rl import inputs
+
+    assert grpo_completion_len(None, False) == RECIPE.rl.max_completion_len
+    assert grpo_completion_len(None, True) == RECIPE.rl.max_completion_len_thinking
+    assert grpo_completion_len(4096, True) == 4096
+    # a zero/unset knob falls back to the recipe on both sides.
+    assert grpo_completion_len(0, False) == RECIPE.rl.max_completion_len
+
+    # both enforcement sites must read the shared helper, not re-derive the recipe inline.
+    assert "grpo_completion_len" in inspect.getsource(inputs._resolve_sequence_lengths)
+    assert "grpo_completion_len" in inspect.getsource(schema._validate_on_policy_prompt_budget)
