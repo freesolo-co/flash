@@ -568,8 +568,10 @@ def test_dry_run_rejects_structured_completion_budget_above_serving_capacity(api
         **SPEC,
         "thinking": True,
         "train": {
+            # the context must still leave a prompt budget, or the grpo spec-parse guard rejects it
+            # first and this test would stop covering the serving-capacity message.
             **SPEC["train"],
-            "max_context_tokens": 1024,
+            "max_context_tokens": 32769,
             "max_completion_tokens": 32513,
             "structured_outputs": {"choice": ["4"]},
         },
