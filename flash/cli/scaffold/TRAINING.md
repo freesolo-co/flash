@@ -119,8 +119,9 @@ point Flash calls:
 from freesolo.datasets.types import TaskExample
 from freesolo.environments import EnvironmentSingleTurn, RewardResult
 
+
 class MyEnv(EnvironmentSingleTurn):
-    dataset = load_jsonl("dataset/train.jsonl")   # rows -> TaskExample(input=..., output=...)
+    dataset = load_jsonl("dataset/train.jsonl")  # rows -> TaskExample(input=..., output=...)
 
     def build_prompt_messages(self, example: TaskExample, prompt_text: str):
         return [{"role": "user", "content": example.input}]
@@ -129,6 +130,7 @@ class MyEnv(EnvironmentSingleTurn):
         expected = str(example.output or "").strip()
         score = 1.0 if expected and expected in response_text else 0.0
         return RewardResult(score=score, threshold=1.0)
+
 
 def load_environment(**kwargs) -> MyEnv:
     return MyEnv()
@@ -701,11 +703,12 @@ used for grading but is _not_ logged on its own, so it gives you nothing to judg
 ```python
 from freesolo.environments import RewardResult, RewardMetric
 
+
 def score_response(self, example, response_text) -> RewardResult:
-    score = graded_score(example, response_text)         # shaped 0-1 — what GRPO optimizes
+    score = graded_score(example, response_text)  # shaped 0-1 — what GRPO optimizes
     return RewardResult(
         score=score,
-        threshold=1.0,                                   # success = score >= threshold
+        threshold=1.0,  # success = score >= threshold
         metrics=(RewardMetric(name="success", score=float(score >= 1.0)),),  # logged: judge on this
     )
 ```
@@ -1083,7 +1086,7 @@ assert len(turn_scores) == assistant_turns, (len(turn_scores), assistant_turns)
 assert all(math.isfinite(s) for s in turn_scores)
 
 return RewardResult(
-    score=episode_score,                                  # unchanged episode scalar
+    score=episode_score,  # unchanged episode scalar
     metadata={"per_turn_rewards": [float(s) for s in turn_scores]},
 )
 ```
