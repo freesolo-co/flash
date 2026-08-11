@@ -556,6 +556,48 @@ def test_offline_unpinned_estimate_does_not_bill_the_ceiling():
     assert wide.total_usd == pytest.approx(single.total_usd)
 
 
+def test_a_pinned_gpu_class_is_never_auto_widened_by_the_quote():
+    """Auto-sizing applies only when neither the class nor the count is authored.
+
+    A pinned class with no count is a one-card pin at the parse boundary
+    (`flash/schema/__init__.py`), so quoting it across eight cards would both bill eight cheap cards
+    the author never asked for and name a shape submit rejects. Measured: before this guard, a 24 GB
+    RTX 4090 quoted 8 cards for an 80 GB run instead of raising.
+    """
+    with pytest.raises(ValueError, match=r"exact GPU 'RTX 4090' cannot fit this run"):
+        estimate_cost(RunConfig("Qwen/Qwen3.5-9B", "grpo", 10, gpu_type="RTX 4090"))
+
+
+def test_auto_sizing_only_considers_cards_the_pinned_provider_can_rent():
+    """A provider pin must narrow the pool BEFORE the count is sized, not just during ranking.
+
+    The ranking loop filters per candidate, which is too late for two decisions taken up front: the
+    auto-sized count and the no-fit message. Measured before this fix, a vast-pinned 119 GB run
+    sized one card against another provider's H200, then ranked empty and reported "more than any
+    8-card validated GPU combination (1177.6 GB max)" -- naming a capacity larger than the
+    requirement it claimed could not be met, while 2x80 GB vast cards would have fit.
+    """
+    from flash.cost.analytical import _offline_gpu_shape
+    from flash.providers.base import providers_for
+
+    gpu, _need, count, _provider, _hourly = _offline_gpu_shape(
+        RunConfig("Qwen/Qwen3.6-35B-A3B", "sft", 10, provider="vast")
+    )
+    assert "vast" in providers_for(gpu), f"quoted {gpu}, which vast cannot provision"
+    assert count >= 2, "a 119 GB run does not fit one vast card"
+
+
+def test_an_authored_count_still_gets_raise_count_advice_on_a_pinned_class():
+    """The pinned-class message must not swallow the remedy when the COUNT is what blocks fit.
+
+    A pinned class with no count is blocked by the class, so naming shrink knobs is right. With an
+    authored count, raising it is a real remedy and `allocate()` says so -- the quote contradicting
+    it would send the user to shrink a run that would fit on one more card.
+    """
+    with pytest.raises(ValueError, match=r"--gpus \d"):
+        estimate_cost(RunConfig("Qwen/Qwen3.6-35B-A3B", "sft", 10, gpu_type="H100", gpu_count=1))
+
+
 def test_offline_estimate_supports_eight_card_only_runs(monkeypatch):
     """`flash train --cost` must price a run that fits eight cards but no four-card shape."""
     monkeypatch.setattr("flash.cost.analytical.required_vram_gb", lambda *a, **k: 700)
@@ -563,7 +605,9 @@ def test_offline_estimate_supports_eight_card_only_runs(monkeypatch):
     estimate = estimate_cost(config)
     assert estimate.required_vram_gb == 700
     assert estimate.gpu_count == 8
-    with pytest.raises(ValueError, match="no GPU class fits"):
+    # the pinned four-card ceiling is the reason this fails, so the message must name that ceiling
+    # and the count that would fit -- not just report a generic no-fit.
+    with pytest.raises(ValueError, match=r"gpu\.count=4 provides at most .*`--gpus 8`"):
         estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "sft", 1, gpu_count=4))
 
 
@@ -583,7 +627,7 @@ def test_offline_estimate_applies_the_pinned_revision_geometry_cap(monkeypatch):
 
     # four: the pin keeps the unvalidated-revision ceiling, and 3.5-4B's 16 recorded heads divide it,
     # so the geometry check narrows nothing further.
-    with pytest.raises(ValueError, match="across up to 4 cards"):
+    with pytest.raises(ValueError, match="any 4-card validated GPU combination"):
         _offline_gpu_shape(config)
 
 
@@ -683,7 +727,9 @@ def test_offline_quote_fit_failure_names_the_card_count_that_fixes_it():
     }
     with pytest.raises(ValueError, match=r"--gpus 2") as unpinned:
         _offline_gpu_shape(RunConfig(gpu_count=1, **shared))
-    assert "no GPU class fits" in str(unpinned.value)
+    # the unpinned message names the authored ceiling that fell short, which is strictly more than
+    # "nothing fits" -- the shared contract is that the shortfall is stated and a width is offered.
+    assert "gpu.count=1 provides at most" in str(unpinned.value)
 
     with pytest.raises(ValueError, match=r"--gpus 2") as pinned:
         _offline_gpu_shape(RunConfig(gpu_count=1, gpu_type="H200", **shared))
@@ -704,8 +750,9 @@ def test_offline_quote_fit_failure_omits_the_remedy_when_nothing_fits(monkeypatc
     from flash.cost.analytical import _offline_gpu_shape
     from flash.cost.types import RunConfig
 
-    with pytest.raises(ValueError, match="no GPU class fits") as exc:
+    with pytest.raises(ValueError, match=r"more than any .*combination") as exc:
         _offline_gpu_shape(RunConfig("Qwen/Qwen3.5-4B", "sft", 1, gpu_count=1))
+    # the load-bearing half: no width is suggested, because none would work.
     assert "--gpus" not in str(exc.value)
 
 

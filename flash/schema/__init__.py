@@ -25,10 +25,12 @@ from flash.providers import PROVIDER_NAMES
 from flash.providers.base import (
     GPU_INFO,
     UnsupportedGpuError,
+    authored_gpu_ceiling,
     canonical_gpu,
     get_gpu_info,
     providers_for,
     provisional_gpu,
+    provisional_gpu_count,
 )
 from flash.schema.fields import (
     ConfigError,
@@ -423,26 +425,17 @@ def _validate_gpu_section(
                 f"gpu.provider {gpu_provider!r} cannot provision gpu.type {gpu_type!r}"
             )
 
-    from flash.providers.allocator import geometry_safe_gpu_cap
-
-    preflight_gpu_count = geometry_safe_gpu_cap(
-        model, gpu_count or 1, model_revision=model_revision
+    requested_gpu_count = authored_gpu_ceiling(gpu_type, gpu_count)
+    preflight_gpu_count = provisional_gpu_count(
+        model,
+        algorithm,
+        train=train_raw,
+        thinking=thinking,
+        geometry_model_revision=model_revision,
+        gpu_count=requested_gpu_count,
     )
     try:
-        # called for its rejection, not its return: it raises when no validated class can hold the
-        # run, which is the parse-time "this is unplaceable" gate. the class it picks is offline
-        # sizing/display only -- the allocator re-resolves auto runs at submit time.
-        provisional_gpu(
-            model,
-            algorithm=algorithm,
-            train=train_raw,
-            thinking=thinking,
-            # sized against the shape the allocator may actually rent. sizing a --gpus n run
-            # against one card rejected it here before sharding was ever considered, which made
-            # the flag inert for exactly the large runs it exists to serve.
-            gpu_count=preflight_gpu_count,
-        )
-        if gpu_type and not model_revision:
+        if gpu_type and preflight_gpu_count <= 1 and not model_revision:
             from flash.providers.allocator import required_vram_gb
 
             required_vram = required_vram_gb(
@@ -451,17 +444,23 @@ def _validate_gpu_section(
                 train=train_raw,
                 thinking=thinking,
             )
-            # required_vram is the whole-run floor, so it may only be compared against a single
-            # card's vram when the run is confined to a single card. above that the allocator
-            # shards the run across a combination and applies its own multi-card fit test
-            # (allocator.py:181), which this gate must not pre-empt: a pinned 141 gb class with
-            # gpu.count=2 holds 282 gb and is rejected here on a 180 gb floor it clears.
-            single_card = gpu_count is None or gpu_count <= 1
-            if single_card and get_gpu_info(gpu_type).vram_gb < required_vram:
+            if get_gpu_info(gpu_type).vram_gb < required_vram:
                 raise ConfigError(
                     f"gpu.type {gpu_type!r} has {get_gpu_info(gpu_type).vram_gb} GB VRAM, "
                     f"but this run requires at least {required_vram} GB"
                 )
+        # called for its rejection, not its return: it raises when no validated class can hold the
+        # run, which is the parse-time "this is unplaceable" gate. every count reaches this boundary
+        # after the geometry cap, so an unsafe eight-card width cannot leak into sizing.
+        provisional_gpu(
+            model,
+            algorithm=algorithm,
+            train=train_raw,
+            thinking=thinking,
+            geometry_model_revision=model_revision,
+            gpu_count=preflight_gpu_count,
+            authored_gpu_ceiling=requested_gpu_count,
+        )
     except (UnsupportedGpuError, ValueError) as exc:
         raise ConfigError(str(exc)) from exc
     return gpu_type, gpu_provider, gpu_options
@@ -574,6 +573,7 @@ def spec_from_dict(
     spec = JobSpec(
         model=model,
         model_revision=model_revision,
+        gpu_count_auto=authored_gpu_ceiling(gpu_type, gpu_options.get("count")) is None,
         algorithm=algorithm,
         environment=EnvironmentSpec(
             id=str(env_raw.get("id") or ""),

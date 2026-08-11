@@ -1180,7 +1180,8 @@ def test_model_revision_auto_does_not_change_pre_existing_preparation_digests() 
         if not worker_payload.get(key):
             worker_payload.pop(key, None)
     worker_payload.pop("model_revision_auto", None)
-    public_payload = unmarked.to_dict()  # to_dict() already strips the marker
+    worker_payload.pop("gpu_count_auto", None)
+    public_payload = unmarked.to_dict()  # to_dict() already strips the markers
     # the old plane popped `[environment] pip` from every public payload, so its bytes carried no
     # such key. mirrors _preparation_digest's drop-when-empty for the same reason as the list above.
     if not public_payload["environment"].get("pip"):
@@ -1669,17 +1670,55 @@ def test_coerce_bool(value, expected) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_gpu_count_defaults_to_one() -> None:
-    assert spec_from_dict(_raw()).gpu.count == 1
+def test_unset_gpu_count_keeps_the_digest_stable_integer_placeholder() -> None:
+    parsed = spec_from_dict(_raw())
+    assert parsed.gpu.count == 1
+    assert parsed.gpu_count_auto is True
     assert GpuSpec().count == 1
 
+    # public serialization is part of the preparation digest. keep the historical integer key shape;
+    # only the internal marker may distinguish this placeholder from an authored count=1.
+    assert parsed.to_dict()["gpu"]["count"] == 1
+    assert isinstance(parsed.to_dict()["gpu"]["count"], int)
+    assert "gpu_count_auto" not in parsed.to_dict()
 
-def test_gpu_count_parses_and_roundtrips() -> None:
+    internal = _job_from_dict(parsed.to_internal_dict())
+    assert internal.gpu.count == 1
+    assert internal.gpu_count_auto is True
+    assert JobSpec.from_json(parsed.to_json()).gpu_count_auto is True
+
+    from flash.runner.supervise.lifecycle import _spec_with_gpu
+
+    # the marker is PROVENANCE ("the author omitted gpu.count"), so it survives the resolved shape.
+    # it is the only surviving record of that fact -- the public halves of an auto-sized and an
+    # authored single-card run are byte-identical -- so clearing it here made a recovered
+    # auto-sized run re-allocate hard-pinned to one card.
+    resolved = _spec_with_gpu(internal, "H200", 2)
+    assert resolved.gpu.count == 2
+    assert resolved.gpu_count_auto is True
+    with pytest.raises(ConfigError, match=r"unknown config key\(s\): gpu_count_auto"):
+        spec_from_dict(_raw(gpu_count_auto=True))
+
+
+def test_authored_gpu_count_parses_and_roundtrips() -> None:
     parsed = spec_from_dict(_raw(**{"gpu.count": 4}))
     assert parsed.gpu.count == 4
+    assert parsed.gpu_count_auto is False
     # count survives both serialization hops (asdict-based to_dict / to_json).
     assert _job_from_dict(parsed.to_dict()).gpu.count == 4
     assert JobSpec.from_json(parsed.to_json()).gpu.count == 4
+
+
+def test_explicit_gpu_count_one_is_not_auto() -> None:
+    parsed = spec_from_dict(_raw(**{"gpu.count": 1}))
+    assert parsed.gpu.count == 1
+    assert parsed.gpu_count_auto is False
+
+
+def test_gpu_type_without_count_keeps_the_single_card_pin() -> None:
+    parsed = spec_from_dict(_raw(**{"gpu.type": "B200"}))
+    assert parsed.gpu.count == 1
+    assert parsed.gpu_count_auto is False
 
 
 @pytest.mark.parametrize("good", [1, 8])
