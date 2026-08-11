@@ -268,6 +268,69 @@ def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
         R._prepare_init_from_adapter(child, token="token")
 
 
+class _ReachedArtifactResolution(Exception):
+    """Sentinel: execution got past the warm-start revision check."""
+
+
+def test_warm_start_inherits_a_runner_assigned_source_revision(monkeypatch):
+    """A GRPO child warm-starting off SFT inherits the parent's auto pin AND its provenance.
+
+    SFT is always force-pinned by the runner, and this check demands the child's revision equal the
+    source's. Before this, satisfying it meant the AUTHOR writing the sha into rl.toml -- which made
+    the child's pin author-supplied, which deploy refuses. So a warm start off SFT could pass this
+    check or be deployable, never both.
+
+    The paired control is `test_prepare_init_adapter_requires_exact_model_revision_match` above: its
+    source pin carries no marker (author-supplied), so nothing is inherited and the mismatch still
+    raises. Only the provenance differs between the two.
+    """
+    import flash.runner as R
+    from flash.core.spec import JobSpec
+
+    source = JobSpec.from_dict(
+        {
+            "run_id": "source-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "model_revision": _REVISION,
+            "model_revision_auto": True,
+            "algorithm": "sft",
+            "train": {"hf_repo": "owner/source-runs"},
+        }
+    )
+    source_status = provisioned_status(R, source, state="done")
+    child = JobSpec.from_dict(
+        {
+            "run_id": "child-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
+            "train": {"init_from_adapter": "source-run"},
+        }
+    )
+    monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
+    monkeypatch.setattr(R, "_internal_spec_from_status", lambda status: source, raising=False)
+
+    # stop right after the revision reconciliation with a sentinel: the artifact and rank
+    # preflights below it need real HF state, and this test is only about which revision the child
+    # ends up carrying. Reaching the sentinel IS the pass condition -- it means execution got past
+    # the equality check, which is what used to raise.
+    monkeypatch.setattr(
+        "flash.adapters.lora_rank.resolve_hf_dataset_revision",
+        lambda *_a, **_kw: "rev",
+    )
+    monkeypatch.setattr(
+        "flash.runner.results.checkpoints.adapter_artifact_exists",
+        lambda *_a, **_kw: (_ for _ in ()).throw(_ReachedArtifactResolution()),
+        raising=False,
+    )
+
+    # `_inner`, not the public wrapper: the wrapper re-raises everything as
+    # WarmStartPreparationError, which would swallow the sentinel and the mismatch alike and leave
+    # this test unable to tell them apart. A bare `raises(Exception)` has the same problem -- it
+    # would pass on the very mismatch this test exists to rule out.
+    with pytest.raises(_ReachedArtifactResolution):
+        R._prepare_init_from_adapter_inner(child, token="token")
+
+
 def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
     import types
 

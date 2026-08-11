@@ -125,6 +125,18 @@ def _prepare_init_from_adapter_inner(
             f"train.init_from_adapter source model {src_spec.model!r} does not match target model "
             f"{spec.model!r}"
         )
+    if not spec.model_revision and src_spec.model_revision and src_spec.model_revision_auto:
+        # the source's pin was assigned by the runner, not written by its author (SFT is always
+        # force-pinned). requiring the child to restate it would make the child's pin AUTHORED,
+        # which deploy then refuses -- so a warm start off SFT could satisfy this check or be
+        # deployable, never both. inherit the pin AND its provenance instead: the child trains
+        # against the same immutable base its parent did, and stays deployable for the same reason
+        # the parent is.
+        spec = replace(
+            spec,
+            model_revision=src_spec.model_revision,
+            model_revision_auto=True,
+        )
     if src_spec.model_revision != spec.model_revision:
         raise ValueError(
             "train.init_from_adapter source model_revision "
