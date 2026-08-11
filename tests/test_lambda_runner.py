@@ -3131,6 +3131,79 @@ def test_cacheless_retry_success_say_baseexception_does_not_trigger_run_wide_rea
 
 
 @pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
+def test_interrupt_while_building_the_success_message_terminates_only_this_instance(
+    monkeypatch, interrupt_type
+):
+    """The id exists the moment launch_instance returns, so the guard must hold it from there.
+
+    Between the create returning and _publish_launched_instance taking ownership, the success
+    message is interpolated. An interrupt in that gap used to reach the outer handler with an armed
+    but id-less guard, which reaps by run label and terminates every other concurrent seed of the
+    run over a box this seed can name exactly."""
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(lambda_api, "launch_instance", lambda **_k: "i-4242")
+
+    # interrupt DURING the message interpolation: __format__ runs while the guard is being set
+    class _ExplodingPrice(float):
+        def __format__(self, spec):
+            raise interrupt_type("interrupted while formatting the launch message")
+
+    terminated = []
+    monkeypatch.setattr(
+        lambda_api, "terminate_instance_confirmed", lambda iid: terminated.append(iid)
+    )
+    reaped = []
+    monkeypatch.setattr(jobs, "terminate_run_instances", lambda run_id: reaped.append(run_id) or [])
+
+    with pytest.raises(interrupt_type):
+        _launch(
+            jobs,
+            _spec(),
+            seed=0,
+            instances=[_inst(price=_ExplodingPrice(1.25))],
+            attempt=0,
+        )
+
+    assert terminated == ["i-4242"]  # exact cleanup, by the id the guard already held
+    assert reaped == []  # never the run-wide label sweep
+
+
+def test_launch_rejected_by_the_apis_own_allowance_check_does_not_reap_the_run(monkeypatch):
+    """launch_instance re-checks the create allowance before it issues the POST.
+
+    Near the 60s threshold the caller's check can pass and the API's repeat can fail, raising
+    before any request leaves the process. The guard is already armed at that point, so without
+    the pre-request test the outer handler sweeps this run's label - terminating every concurrent
+    seed - for a create that never happened."""
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+
+    def allowance_exhausted(**_kwargs):
+        raise RuntimeError(
+            "run wall deadline has less than the 60-second minimum provider allowance remaining"
+        )
+
+    monkeypatch.setattr(lambda_api, "launch_instance", allowance_exhausted)
+    terminated = []
+    monkeypatch.setattr(
+        lambda_api, "terminate_instance_confirmed", lambda iid: terminated.append(iid)
+    )
+    reaped = []
+    monkeypatch.setattr(jobs, "terminate_run_instances", lambda run_id: reaped.append(run_id) or [])
+
+    with pytest.raises(RuntimeError, match="provider allowance remaining"):
+        _launch(jobs, _spec(), seed=0, instances=[_inst()], attempt=0)
+
+    assert reaped == []  # nothing was rented, so no seed of this run may be terminated
+    assert terminated == []
+
+
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
 def test_cacheless_clean_reject_say_baseexception_does_not_trigger_run_wide_reap(
     monkeypatch, interrupt_type
 ):

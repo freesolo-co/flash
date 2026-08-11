@@ -326,6 +326,19 @@ class _CoarseReapGuard:
         self.instance_id = None
 
 
+def _launch_failed_before_the_request(error: BaseException) -> bool:
+    """Whether a ``launch_instance`` failure provably happened before the create was issued.
+
+    ``launch_instance`` repeats ``require_create_allowance`` after the caller's own check and
+    before it builds a body or issues the POST, so near the 60-second threshold the caller's check
+    can pass and the API's repeat can fail. That raises a bare ``RuntimeError`` carrying the
+    allowance message, and nothing downstream of the POST raises that type with that text: the
+    request path raises ``LambdaApiError``. Treat it as proof that no box was rented, so the guard
+    stands down instead of sweeping the run label for a create that never left the process.
+    """
+    return type(error) is RuntimeError and "provider allowance remaining" in str(error)
+
+
 def _mark_exact_cleanup(error: BaseException) -> None:
     with contextlib.suppress(BaseException):  # builtin exceptions accept attributes; be safe anyway
         setattr(error, _EXACT_CLEANUP_ATTR, True)
@@ -400,8 +413,10 @@ def _retry_launch_without_cache(
             _abort_ambiguous_launch(plan.spec.run_id, type(error).__name__)
         say(f"region {inst.region} also rejected cold: {cold_detail}")
         return None, error
-    # built before the call so nothing is evaluated between the successful launch_instance and
-    # _publish_launched_instance taking ownership of this instance's exact cleanup.
+    # FIRST statement after the create returns, as on the primary path: the box is rented and named
+    # from here, so the guard takes the id before the message interpolation or the publication call
+    # can raise with an id-less armed guard (which would reap this run's whole label).
+    reap.owns(instance_id)
     message = (
         f"launched lambda instance {instance_id} (cold, cache-less): {inst.gpu} "
         f"{inst.instance_type} in {inst.region} attempt={plan.attempt} seed={plan.seed}"
@@ -629,10 +644,13 @@ def launch_and_submit(
                     # the whole call instead would reap on paths that rented nothing (a deadline
                     # miss in the precheck, a raising preamble) or that already cleaned up exactly.
                     handle, last_err = _retry_launch_without_cache(plan, inst, say, reap)
-                    # a returned handle publishes the box; None means nothing stayed rented.
-                    reap.disarm()
                     if handle is not None:
+                        # the retry's box is rented and owned by exact id; keep the guard holding
+                        # it until the caller has the handle, exactly as the primary path does.
                         return handle
+                    # nothing stayed rented: the retry disarmed on its reject paths, and this
+                    # keeps the walk's next region from inheriting a guard it did not arm.
+                    reap.disarm()
                 # Preload must not refresh to a different region (would warm the wrong one).
                 if mode != "preload" and not candidates and not refreshed:
                     refreshed = True
@@ -644,20 +662,21 @@ def launch_and_submit(
                     if candidates:
                         candidates = _disk_capable_instances(spec, candidates, say)
                 continue
-            # built before the call so nothing is evaluated between the successful launch_instance
-            # and _publish_launched_instance taking ownership of this instance's exact cleanup.
+            # FIRST statement after the create returns: from here the box is rented and named, so
+            # the guard must hold the id before anything else can raise. Interpolating the message
+            # or entering the publication helper are both evaluation, and an interrupt landing in
+            # either with an id-less armed guard reaps by run label, killing every other concurrent
+            # seed of this run.
+            reap.owns(instance_id)
             message = (
                 f"launched lambda instance {instance_id}: {inst.gpu} {inst.instance_type} "
                 f"${inst.price_usd_hr:.2f}/hr in {inst.region} attempt={attempt} seed={seed}"
             )
-            # the guard stays armed into the call: the instance is rented and still unnamed, so if
-            # an interrupt lands before _publish_launched_instance takes ownership the coarse reap
-            # is the only thing that can find it. That helper narrows the guard to this exact id on
-            # entry, so the return-then-disarm window below can no longer reap by run label (which
-            # would kill every other concurrent seed of this run).
-            handle = _publish_launched_instance(plan, instance_id, inst, say, message, reap)
-            reap.disarm()
-            return handle
+            # returned directly: the guard stays armed until the handle is in the caller's hands,
+            # since disarming before the return would leave an interrupt there with nothing to
+            # clean the box, and submit_run's teardown does not exist until it has the handle.
+            # Holding the exact id keeps that window covered by cleanup naming one instance.
+            return _publish_launched_instance(plan, instance_id, inst, say, message, reap)
         return _raise_all_regions_rejected(spec, tried_regions, last_err)
     except BaseException as error:
         # armed for every window where a box may be rented; stands down only once some inner path
@@ -669,7 +688,7 @@ def launch_and_submit(
                 _cleanup_unpublished_instance(
                     spec.run_id, reap.instance_id, context="interrupted launch walk"
                 )
-            else:
+            elif not _launch_failed_before_the_request(error):
                 with contextlib.suppress(BaseException):
                     terminate_run_instances(spec.run_id)
         raise
