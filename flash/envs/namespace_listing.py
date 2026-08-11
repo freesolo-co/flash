@@ -41,6 +41,16 @@ _LISTING_DEADLINE_SECONDS = _LIST_READS * (
     + _LIST_MAX_BACKOFF_PER_READ_SECONDS
 )
 
+# what a RETRY costs on top of the read that provoked it, which narrowing `timeout` and
+# `body_deadline` alone does not bound: `_urlopen` sleeps its backoff and then opens a FRESH window,
+# neither of which consults this deadline. So a read starting with less than this left runs past the
+# ceiling by the difference -- 35s at worst, measured, which broke the 250s bound stated above even
+# though it stayed inside the client's 310s wait. Below this threshold the retry is dropped instead:
+# the read still gets its (shortened) first attempt, and a transient failure with no room left is
+# exactly the case that should surface as the controlled 429/502 rather than be retried past the
+# budget. Only a deep recovery fan-out can reach that state -- both fast-path reads keep their retry.
+_LIST_RETRY_ROOM_SECONDS = 2 * _LIST_SOCKET_TIMEOUT_SECONDS + _LIST_MAX_BACKOFF_PER_READ_SECONDS
+
 
 def _remaining_budget(deadline: float, namespace: str) -> dict:
     """The read budget for the next read, narrowed to what is left of the listing's deadline.
@@ -59,6 +69,8 @@ def _remaining_budget(deadline: float, namespace: str) -> dict:
     budget = dict(loader._LIST_READ_BUDGET)
     budget["timeout"] = min(budget["timeout"], left)
     budget["body_deadline"] = min(budget["body_deadline"], left)
+    if left < _LIST_RETRY_ROOM_SECONDS:
+        budget["max_rate_limit_retries"] = 0
     return budget
 
 

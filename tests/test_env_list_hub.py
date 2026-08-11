@@ -682,6 +682,74 @@ def test_a_listing_that_runs_out_of_budget_fails_instead_of_reading_on(monkeypat
         loader.list_managed_namespace_slugs("acme")
 
 
+def test_a_read_with_no_room_for_a_retry_drops_the_retry(monkeypatch):
+    """Narrowing the windows is not enough: the backoff and the retry's fresh window escape it.
+
+    `_urlopen` sleeps its backoff and then opens a NEW socket window, and neither consults the shared
+    deadline -- so a read starting near the ceiling overshot it by up to 35s (measured), breaking the
+    250s bound the client margin is derived from. Dropping the retry when there is no room for one keeps
+    a transient failure surfacing as the controlled 429/502 instead of being retried past the budget.
+    """
+    from flash.envs import namespace_listing
+
+    budgets: list[dict] = []
+    _fake_hub(
+        monkeypatch,
+        {
+            "main": _tree(_dir("acme", "sha-acme")),
+            "sha-acme": _tree(_blob("my-env/environment.py")),
+        },
+        budgets=budgets,
+    )
+
+    # step the clock per READ, as the sibling test does: the helper reads the clock itself, so a
+    # per-call step would spend the deadline just by being inspected. The first read leaves plenty of
+    # room, the second leaves less than one retry costs.
+    reads = [0]
+    room = namespace_listing._LIST_RETRY_ROOM_SECONDS
+    monkeypatch.setattr(
+        namespace_listing.time,
+        "monotonic",
+        lambda: (namespace_listing._LISTING_DEADLINE_SECONDS - room + 1.0) * reads[0],
+    )
+    real_budget = namespace_listing._remaining_budget
+
+    def counting_budget(deadline, namespace):
+        budget = real_budget(deadline, namespace)
+        reads[0] += 1
+        return budget
+
+    monkeypatch.setattr(namespace_listing, "_remaining_budget", counting_budget)
+
+    assert loader.list_managed_namespace_slugs("acme") == ["acme/my-env"]
+    assert len(budgets) == 2, f"expected two reads, got {len(budgets)}"
+    # the first read has room to spare, so it keeps its retry
+    assert budgets[0]["max_rate_limit_retries"] == 1, budgets
+    # the second cannot afford one: a retry would run past the listing deadline
+    assert budgets[-1]["max_rate_limit_retries"] == 0, (
+        f"a read with no room for a retry must not carry one, got {budgets}"
+    )
+
+
+def test_the_retry_room_covers_what_a_retry_actually_costs():
+    """The threshold has to match `_urlopen`'s real retry cost, not a guessed constant.
+
+    A retry costs one backoff plus a second full socket window on top of the attempt that provoked it.
+    Sizing the room below that would leave exactly the overshoot this guard exists to remove.
+    """
+    from flash.envs import loader as envs_loader
+    from flash.envs import namespace_listing
+
+    assert namespace_listing._LIST_RETRY_ROOM_SECONDS == (
+        2 * namespace_listing._LIST_SOCKET_TIMEOUT_SECONDS
+        + namespace_listing._LIST_MAX_BACKOFF_PER_READ_SECONDS
+    )
+    # the room is expressed in the same socket timeout the reads actually use
+    assert (
+        envs_loader._LIST_READ_BUDGET["timeout"] == namespace_listing._LIST_SOCKET_TIMEOUT_SECONDS
+    )
+
+
 def test_the_server_deadline_stays_below_the_client_wait():
     """The one-directional invariant: the server must give up FIRST.
 
