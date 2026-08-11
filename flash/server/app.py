@@ -421,7 +421,10 @@ def run_server(host: str = "127.0.0.1", port: int = 8080) -> None:
     # built through create_app() by another ASGI server -- but a PreflightError raised there is an
     # unhandled ASGI startup exception, so the operator's actual problem arrives under ~20 lines of
     # starlette/contextlib frames. Running it here lets __main__ print the message on its own.
-    # Safe to run twice: the only side effect is stripping whitespace from operator env vars in
-    # place, which the second call re-applies to already-stripped values.
-    check_run_preflight()
+    #
+    # warn=False because this call is the one that repeats: the validation is pure reads (plus
+    # re-stripping already-stripped env vars), but _warn_degraded logs the GITHUB_TOKEN warning and
+    # the provider summary, and a booted plane should print those once, not twice. The lifespan
+    # call keeps them.
+    check_run_preflight(warn=False)
     uvicorn.run(create_app(), host=host, port=port)

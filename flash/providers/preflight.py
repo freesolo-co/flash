@@ -109,8 +109,13 @@ def _normalize_operator_credentials() -> None:
             logger.warning("%s had surrounding whitespace; using the stripped value.", var)
 
 
-def check_run_preflight() -> None:
-    """Raise PreflightError if the plane cannot run a job; warn on degraded-but-workable config."""
+def check_run_preflight(*, warn: bool = True) -> None:
+    """Raise PreflightError if the plane cannot run a job; warn on degraded-but-workable config.
+
+    ``warn=False`` runs the validation without the advisory logging. ``run_server`` uses it to
+    fail early with a clean message while leaving the lifespan copy to emit the operator-facing
+    summary exactly once -- the checks themselves are pure reads, but ``_warn_degraded`` is not.
+    """
     from flash.providers import available_providers
     from flash.providers.runpod import auth as runpod_keys
     from flash.server.platform.auth import standalone
@@ -173,7 +178,8 @@ def check_run_preflight() -> None:
             + "\n\nSet these on the control-plane host. See SELF_HOSTING.md."
         )
 
-    _warn_degraded(configured, runpod_keys)
+    if warn:
+        _warn_degraded(configured, runpod_keys)
 
 
 def _warn_degraded(configured: tuple[str, ...], runpod_keys) -> None:
