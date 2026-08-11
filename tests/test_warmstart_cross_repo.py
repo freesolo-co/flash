@@ -497,6 +497,38 @@ def test_revision_inheritance_refuses_a_tampered_source_snapshot(monkeypatch):
     assert inherited.model_revision_auto is False
 
 
+def test_warm_start_preparation_refuses_a_tampered_source_snapshot(monkeypatch):
+    """The SECOND adoption site must refuse a tampered source too.
+
+    `_prepare_init_from_adapter_inner` re-runs `_adopted_warmstart_revision` so the equality check
+    below it cannot depend on which entry point was used. That repeat is a second place a revision
+    is copied off the source, and it read the unvalidated `_internal_spec_from_status`. Hardening
+    only the hoisted path leaves this one adopting a tampered worker-half revision, after which the
+    equality check compares the child against the value it just copied -- two equal values, so it
+    passes.
+
+    The sibling `test_revision_inheritance_refuses_a_tampered_source_snapshot` covers the hoisted
+    function and never enters this one, which is exactly why this path needs its own test.
+    """
+    import flash.runner as R
+
+    _, status = _auto_pinned_source(R, org_id="org-a")
+    status.effective_preparation["worker_spec"]["model_revision"] = "b" * 40
+    monkeypatch.setattr(R, "get_status", lambda run_id: status)
+    # would be reached only if the tampered pin were adopted; getting here at all is the failure
+    monkeypatch.setattr(
+        "flash.adapters.lora_rank.resolve_hf_dataset_revision", lambda *_a, **_kw: "rev"
+    )
+    monkeypatch.setattr(
+        "flash.runner.results.checkpoints.adapter_artifact_exists",
+        lambda *_a, **_kw: (_ for _ in ()).throw(_ReachedArtifactResolution()),
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="does not match the public run"):
+        R._prepare_init_from_adapter_inner(_unpinned_child(), owner_org_id="org-a", token="token")
+
+
 def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
     import types
 

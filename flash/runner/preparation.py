@@ -201,9 +201,16 @@ def _prepare_init_from_adapter_inner(
     ):
         raise ValueError("train.init_from_adapter source run must belong to the same Freesolo org")
     # hf_repo is platform-managed and stripped from the source run's public spec; its authoritative
-    # value lives in that run's internal worker spec (see _runner()._internal_spec_from_status), which the
-    # warm-start needs to locate the source adapter artifacts.
-    src_spec = _runner()._internal_spec_from_status(src_status)
+    # value lives in that run's internal worker spec, which the warm-start needs to locate the
+    # source adapter artifacts.
+    #
+    # read through the VALIDATING loader, not `_internal_spec_from_status`: the latter returns
+    # `snapshot["worker_spec"]` unverified, and `_adopted_warmstart_revision` below copies a
+    # revision off it. A tampered worker half would be adopted onto the child, which then EQUALS
+    # it, so the mismatch check below compares two equal values and passes -- the adoption
+    # silences the guard instead of tripping it. `effective_spec_from_status` verifies public/
+    # worker equality and the preparation digest first.
+    src_spec = _runner().effective_spec_from_status(src_status)
     if src_spec.model != spec.model:
         raise ValueError(
             f"train.init_from_adapter source model {src_spec.model!r} does not match target model "
