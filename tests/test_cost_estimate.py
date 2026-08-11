@@ -812,3 +812,53 @@ def test_offline_quote_remedy_only_names_widths_a_provider_sells_freely():
             )
         )
     assert "no available provider is confirmed to sell" not in str(oversized.value)
+
+
+def test_offline_exact_pin_on_a_fixed_count_provider_still_names_a_width_to_check():
+    """An exact offline pin must get the same catalog check its non-exact sibling gets.
+
+    ``_wider_shape_remedy`` drops classes whose providers name the count in the SKU, which left an
+    exact lambda pin with an EMPTY remedy -- so it fell through to knob advice telling the user to
+    shrink a run that already fits at a wider count. The identical run on runpod was told
+    ``--gpus 2``. Same shortfall, opposite advice, decided only by how the provider sells counts.
+    """
+    from flash.cost.analytical import _offline_gpu_shape
+    from flash.cost.types import RunConfig
+
+    shared = {
+        "model_id": "Qwen/Qwen3.6-35B-A3B",
+        "method": "sft",
+        "steps": 10,
+        "seq_len": 4096,
+        "completion_len": 512,
+        "batch_size": 8,
+        "group_size": 4,
+        "lora_rank": 16,
+        "gpu_type": "H100",
+        "gpu_count": 1,
+    }
+
+    with pytest.raises(ValueError, match=r"exact GPU 'H100' cannot fit this run") as pinned:
+        _offline_gpu_shape(RunConfig(provider="lambda", **shared))
+    message = str(pinned.value)
+    assert "`--gpus 2`" in message
+    assert "check it against their catalog" in message
+    # a check, never a promise: nothing offline proved the 2-card SKU is sold.
+    assert "it fits on" not in message
+    # and it must NOT tell the user to shrink a run that fits at a width they can ask for.
+    assert "Lower [train]" not in message
+
+    # runpod keeps the PROVED remedy: the rule is about how counts are sold, not the message.
+    with pytest.raises(ValueError, match=r"it fits on 2 cards"):
+        _offline_gpu_shape(RunConfig(provider="runpod", **shared))
+
+    # beyond every rentable width, knob advice is the honest answer and no width is named.
+    with pytest.raises(ValueError, match=r"cannot fit this run") as unfittable:
+        _offline_gpu_shape(
+            RunConfig(
+                provider="lambda",
+                **{**shared, "seq_len": 262144, "batch_size": 1024, "lora_rank": 512},
+            )
+        )
+    assert "--gpus" not in str(unfittable.value)
+    assert "Lower [train]" in str(unfittable.value)

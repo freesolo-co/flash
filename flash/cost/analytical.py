@@ -473,6 +473,36 @@ def _wider_shape_remedy(config: RunConfig, need: float, names: tuple[str, ...]) 
     )
 
 
+def _catalog_check_remedy(config: RunConfig, need: float, names: tuple[str, ...]) -> str:
+    """The width to ASK a fixed-count provider for, when no width can be promised offline.
+
+    ``_wider_shape_remedy`` drops classes whose providers name the count in the SKU, which leaves a
+    Lambda- or Vast-pinned exact quote with no remedy at all -- so it fell through to knob advice
+    telling the user to shrink a run that already fits at a wider count. `live_capacity` means the
+    count is confirmed dynamically, not that the SKU is absent: Lambda resolves `gpu_4x_h100_pcie`
+    against its own catalog. This mirrors the allocator's ``_catalog_check_hint`` so the same
+    shortfall reads the same whether it surfaced from `--cost` or from submit.
+
+    Still a check and never a promise: nothing offline proved the wider SKU is purchasable.
+    """
+    from flash.providers.base import MAX_COMBINATION_CARDS, smallest_fitting_gpu_count
+
+    width = smallest_fitting_gpu_count(
+        need,
+        max_gpu_count=geometry_safe_gpu_cap(
+            config.model_id, MAX_COMBINATION_CARDS, model_revision=config.model_revision
+        ),
+        gpu_names=names,
+    )
+    if width is None or width <= (config.gpu_count or 0):
+        return ""
+    pinned = names[0] if len(names) == 1 else "multi-card"
+    return (
+        f". Their catalog may list a {width}-card {pinned} instance -- raise the card ceiling "
+        f"with `--gpus {width}` to check it against their catalog"
+    )
+
+
 def _offline_gpu_shape(
     config: RunConfig, *, max_wall_seconds: float = 0.0
 ) -> tuple[str, int, int, str, float]:
@@ -585,7 +615,11 @@ def _offline_gpu_shape(
             info = GPU_INFO[canonical_gpu(config.gpu_type)]
             raise ValueError(
                 f"exact GPU {info.name!r} cannot fit this run: it requires at least {need} GB"
-                + (remedy or f". {vram_knob_advice(config.method).capitalize()}.")
+                + (
+                    remedy
+                    or _catalog_check_remedy(config, need, names)
+                    or f". {vram_knob_advice(config.method).capitalize()}."
+                )
             )
         raise ValueError(
             vram_fit_error_message(

@@ -2594,6 +2594,34 @@ def test_freesolo_request_translates_socket_timeout(monkeypatch) -> None:
     assert "timed out" in str(excinfo.value)
 
 
+def test_timeout_does_not_invent_a_route_the_request_never_used(monkeypatch) -> None:
+    """A reverse-proxy prefix must not be silently dropped from the reported endpoint.
+
+    ``displayable_url`` reduces a base to scheme and host so credentials in the authority cannot
+    leak. Concatenating the path back onto that result rebuilds a URL the client never requested:
+    with ``FREESOLO_BASE_URL=https://host/proxy`` the real request goes to ``/proxy/v1/...`` while
+    the message would read ``https://host/v1/...``, sending an operator to inspect the wrong route.
+    """
+    from flash.client.http import RequestTimeoutError, _freesolo_request
+
+    def _timeout(req, timeout=None):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr("urllib.request.urlopen", _timeout)
+
+    with pytest.raises(RequestTimeoutError) as excinfo:
+        _freesolo_request(
+            "POST", "/v1/eval-runs", "key-1", base_url="https://user:pw@example.test/proxy"
+        )
+    message = str(excinfo.value)
+    # the credential is still gone -- this must not be fixed by printing the raw base back.
+    assert "pw" not in message
+    assert "user:" not in message
+    # and the message must not assert a concatenated route that was never requested.
+    assert "https://example.test/v1/eval-runs" not in message
+    assert "/v1/eval-runs" in message  # the path is still reported, just not glued to the host
+
+
 def test_load_evaluations_receives_the_environment_after_other_positional_parameters(
     tmp_path,
 ) -> None:

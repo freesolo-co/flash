@@ -89,8 +89,13 @@ def _freesolo_request(
     # it escapes as an unexpected exception. callers catch clienterror to report a failure
     # without changing their own verdict; a traceback instead would lose that.
     except TimeoutError as exc:
+        # name the BACKEND, not a reconstructed route: `displayable_url` reduces the base to scheme
+        # and host, so appending `path` to it would print an endpoint that was never requested
+        # whenever FREESOLO_BASE_URL carries a reverse-proxy prefix (`https://host/proxy` requests
+        # `/proxy{path}` but would read as `/…{path}`). the path is this client's own constant, so
+        # naming it separately keeps the operator's real diagnostic without inventing a URL.
         raise RequestTimeoutError(
-            f"request to {displayable_url(base)}{path} timed out after {timeout}s"
+            f"request to {displayable_url(base)} ({path}) timed out after {timeout}s"
         ) from exc
     except urllib.error.URLError as exc:
         raise ClientError(
