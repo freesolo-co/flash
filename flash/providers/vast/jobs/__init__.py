@@ -701,16 +701,14 @@ def submit_run_vast(
 
     absolute_deadline = require_deadline_at(deadline_at)
     info = GPU_INFO[spec.gpu.type]
-    # machines this run already rented and lost. excluded at SEARCH time rather than filtered after,
-    # so the walk still gets a full ranked list to choose from instead of a list five deep whose
-    # every entry is known dead.
-    excluded = dead_machine_ids(spec.run_id)
-    offers = [
+    # the market for this class BEFORE this run's own dead hosts come out. one search answers both
+    # questions -- what to rent, and why the list is empty when it is -- because `usable_offers`
+    # applies `exclude_machine_ids` client-side anyway, so filtering here costs no extra call.
+    market = [
         o
         for o in usable_offers(
             info.vram_gb,
             _effective_disk_gb(spec),
-            exclude_machine_ids=excluded,
             max_wall_seconds=_rent_duration_floor(spec, absolute_deadline),
             # the transient attempt spec always carries the concrete allocated class.
             gpu_type=spec.gpu.type,
@@ -721,13 +719,20 @@ def submit_run_vast(
         )
         if o.gpu == spec.gpu.type
     ]
-    if excluded and not offers:
-        # every remaining offer for this class is one this run already lost. say so, because the
-        # generic empty-pool error reads as "vast has no capacity" when the truth is "this run has
-        # burned all of it" -- a different operator fix (different class or provider, not waiting).
+    excluded = dead_machine_ids(spec.run_id)
+    offers = [o for o in market if o.machine_id not in excluded]
+    if market and not offers:
+        # the class HAD offers and this run had already lost every one of them. the generic empty-
+        # pool error reads as "vast has no capacity" when the truth is "this run has burned all of
+        # it" -- a different operator fix (different class or provider, not waiting).
+        #
+        # gated on `market`, not on `excluded` being non-empty: the blacklist is keyed by run, so it
+        # can hold hosts from a GPU class this attempt already escalated away from, and a dry market
+        # would otherwise be blamed on hosts that were never in it. counting the machines actually
+        # removed here keeps the number honest for the same reason.
         raise vast_api.VastApiError(
             f"no usable vast offers for {spec.gpu.type} outside the "
-            f"{len(excluded)} machine(s) this run already rented and lost"
+            f"{len({o.machine_id for o in market})} machine(s) this run already rented and lost"
         )
     handle = None
     try:

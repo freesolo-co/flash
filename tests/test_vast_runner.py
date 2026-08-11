@@ -1901,15 +1901,24 @@ def test_runner_destroys_on_success(monkeypatch):
 # ---------------------------------------------------------------------------
 # submit_run_vast: a machine that took the rental and never booted is retired
 # ---------------------------------------------------------------------------
-def _searched_exclusions(monkeypatch, vast) -> list[frozenset[int]]:
-    """Record the ``exclude_machine_ids`` of every offer search ``submit_run_vast`` runs."""
+def _offered_machines(monkeypatch, vast, market=None) -> list[frozenset[int]]:
+    """Record which machines actually reached ``deploy_and_submit`` on each attempt.
+
+    Asserts the OUTCOME rather than how it is reached: the search itself is no longer told what to
+    exclude, because the message distinguishing "this run burned the pool" from "the pool is dry"
+    needs the unfiltered market to compare against.
+    """
     seen: list[frozenset[int]] = []
+    rows = list(market) if market is not None else [_offer()]
 
-    def spy(*_a, **kwargs):
-        seen.append(frozenset(kwargs.get("exclude_machine_ids") or ()))
-        return [_offer()]
-
-    monkeypatch.setattr(vast, "usable_offers", spy)
+    monkeypatch.setattr(vast, "usable_offers", lambda *_a, **_k: list(rows))
+    monkeypatch.setattr(
+        vast,
+        "deploy_and_submit",
+        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None, deadline_at=None: (
+            seen.append(frozenset(o.machine_id for o in offers)) or _handle()
+        ),
+    )
     return seen
 
 
@@ -1935,18 +1944,22 @@ def test_stalled_machine_is_excluded_from_the_next_attempts_search(monkeypatch):
             monkeypatch,
             poll_result=PollResult(False, failure="stalled", detail=_never_started(vast)),
         )
-        searches = _searched_exclusions(monkeypatch, vast)
+        # two hosts in the market, so the second attempt still has somewhere to go once 10 is out.
+        offered = _offered_machines(
+            monkeypatch, vast, market=[_offer(), _offer(offer_id=2, machine_id=11)]
+        )
 
         first = _submit(vast, spec, seed=0)
         assert first.failure == "stalled"
-        # the first attempt could not have known: it searched with nothing excluded.
-        assert searches[0] == frozenset()
+        # the first attempt could not have known: both hosts were on the table.
+        assert offered[0] == frozenset({10, 11})
         # _handle()'s machine_id -- the HOST is retired, not the offer id, because vast relists the
         # same box under a fresh offer id.
         assert vast.dead_machine_ids(spec.run_id) == frozenset({10})
 
         _submit(vast, spec, seed=0)
-        assert searches[1] == frozenset({10})
+        # 10 is gone from what the next attempt may rent; 11 is untouched.
+        assert offered[1] == frozenset({11})
     finally:
         vast.forget_dead_machines(spec.run_id)
 
@@ -2034,11 +2047,36 @@ def test_a_pool_exhausted_by_this_runs_own_dead_machines_says_so(monkeypatch):
     vast.forget_dead_machines(spec.run_id)
     try:
         vast._note_dead_machine(spec.run_id, 10)
-        # the search now returns nothing precisely because the only machine is excluded.
-        monkeypatch.setattr(vast, "usable_offers", lambda *a, **k: [])
+        # the class still HAS an offer; this run has simply already lost that host.
+        monkeypatch.setattr(vast, "usable_offers", lambda *a, **k: [_offer(machine_id=10)])
 
         with pytest.raises(vast_api.VastApiError, match="already rented and lost"):
             _submit(vast, spec, seed=0)
+    finally:
+        vast.forget_dead_machines(spec.run_id)
+
+
+def test_a_dry_market_is_not_blamed_on_this_runs_blacklist(monkeypatch):
+    """An empty class must not be reported as self-inflicted just because a blacklist is non-empty.
+
+    The blacklist is keyed by run, not by GPU class, so after an escalation it still holds hosts
+    from the class the run has already moved off. Blaming a genuinely dry market on those points the
+    operator at the wrong fix -- "switch class or provider" when the real answer is "wait" -- and
+    the count it quotes would name machines that were never in this class's pool to begin with.
+    """
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    spec = _spec()
+    vast.forget_dead_machines(spec.run_id)
+    try:
+        # a dead host from an earlier class, and no offers at all for the one being searched now.
+        vast._note_dead_machine(spec.run_id, 777)
+        monkeypatch.setattr(vast, "usable_offers", lambda *a, **k: [])
+
+        with pytest.raises(vast_api.VastApiError) as caught:
+            _submit(vast, spec, seed=0)
+        assert "already rented and lost" not in str(caught.value)
     finally:
         vast.forget_dead_machines(spec.run_id)
 
