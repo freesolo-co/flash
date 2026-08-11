@@ -258,6 +258,57 @@ def test_sft_card_count_never_starves_a_rank_of_its_batch():
             assert batch % resolved == 0, (cards, batch, resolved)
 
 
+def test_sft_warns_while_the_run_is_live_when_it_leaves_cards_idle(monkeypatch, capsys):
+    """An unused card is billed, so the run must say so while it is running.
+
+    Reducing the width keeps the run correct, but it is not free: the allocation is charged whole.
+    The notes record the executed width, and those are read afterwards -- the warning is what makes
+    the waste visible in `flash runs log` in time to cancel and resubmit.
+    """
+    from flash.engine.worker import sft_train
+
+    spec, captured = _stub_sft_run(monkeypatch)
+
+    def fake_training(command, *, env, on_step, on_line, heartbeat):
+        captured["command"] = command
+        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
+        on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
+        on_step(2)
+        heartbeat()
+        return 0
+
+    monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
+    sft_train.run_sft_train(spec)
+
+    # the fixture allocates 2 cards and resolves to 1 (unpacked profile -> batch of 1).
+    out = capsys.readouterr().out
+    assert "[sft][warn] training on 1 of 2 allocated cards" in out, out
+    assert "still billed" in out
+    assert "--nproc-per-node=1" in captured["command"]
+
+
+def test_sft_stays_quiet_when_every_allocated_card_is_used(monkeypatch, capsys):
+    """The warning must not fire on the normal path, or it trains readers to ignore it."""
+    from flash.engine.worker import sft_train
+
+    spec, _ = _stub_sft_run(monkeypatch)
+
+    # one card allocated: the resolved width can only equal it, so there is nothing to warn about.
+    spec.gpu.count = 1
+
+    def fake_training(command, *, env, on_step, on_line, heartbeat):
+        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
+        on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
+        on_step(2)
+        heartbeat()
+        return 0
+
+    monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
+    sft_train.run_sft_train(spec)
+
+    assert "allocated cards" not in capsys.readouterr().out
+
+
 def test_sft_launches_the_resolved_width_not_the_allocated_cards():
     """torchrun must start the RESOLVED rank count.
 

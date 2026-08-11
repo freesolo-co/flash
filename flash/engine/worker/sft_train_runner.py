@@ -410,6 +410,17 @@ def _prepare_sft_child(
     # sharded run died on `seq_idx must have shape (batch_size, seqlen)` -- at any batch size,
     # including 1, because "remove padding" leaves no batch dimension to keep an example whole.
     world_size = sft_data_parallel_cards(options.gpu_count, model.train_batch_size)
+    if world_size < options.gpu_count:
+        # the run is BILLED for every allocated card, so a card the batch cannot feed is money
+        # spent on an idle gpu. the notes carry it too, but those are read after the fact -- say it
+        # while the run is live, and say what would actually use the card.
+        print(
+            f"[sft][warn] training on {world_size} of {options.gpu_count} allocated cards: a batch "
+            f"of {model.train_batch_size} cannot be split across {options.gpu_count} ranks without "
+            "starving one or silently dropping the remainder. the idle cards are still billed -- "
+            f"raise [train] batch_size to a multiple of {options.gpu_count}, or allocate "
+            f"{world_size} card(s)."
+        )
     config = {
         "train_files": data.train_file,
         "train_batch_size": model.train_batch_size,
