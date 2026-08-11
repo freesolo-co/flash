@@ -8925,7 +8925,13 @@ def test_publish_env_refuses_to_upload_when_the_org_cannot_be_resolved(api, monk
     )
 
     assert response.status_code == 400, response.text
-    assert "organization could not be resolved" in response.json()["detail"]
+    detail = response.json()["detail"]
+    assert "organization could not be resolved" in detail
+    # The remedy named must be one that works. The guard reads the KEY's org id and ignores the
+    # header, so advising the caller to "pass the organization" would be another unactionable
+    # instruction -- the same defect (advice that cannot clear the error) this PR exists to remove.
+    assert "flash login" in detail
+    assert "pass the organization" not in detail
 
 
 def test_publish_env_ignores_the_org_header_for_the_ownership_guard(api, monkeypatch):

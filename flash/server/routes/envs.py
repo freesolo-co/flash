@@ -110,7 +110,8 @@ def publish_env(
                 detail=(
                     "organization could not be resolved for this key, so the environment's "
                     "project ownership cannot be verified; re-run `flash login` to refresh the "
-                    "key, or pass the organization explicitly"
+                    "key. Supplying X-Freesolo-Org-Id does not resolve this: the header is "
+                    "caller-asserted and deliberately not trusted for this check."
                 ),
             )
         try:
