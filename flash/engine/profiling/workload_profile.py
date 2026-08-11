@@ -101,7 +101,10 @@ def unpacked_batch_warning(
     reason = _UNPACKED_REASONS.get(
         architecture_mode, f"packing is unavailable for architecture {architecture_mode!r}"
     )
-    authored = f"the configured batch_size {batch}" if batch > 1 else "the configured batch_size"
+    # an omitted batch_size resolved to the recipe default above; calling that "configured"
+    # would send the reader hunting for a knob their toml never set.
+    source = "configured" if configured_batch_size is not None else "default"
+    authored = f"the {source} batch_size {batch}" if batch > 1 else f"the {source} batch_size"
     return (
         f"sequence packing is OFF for this SFT run ({architecture_mode}): {reason}. "
         f"every optimizer update therefore trains exactly 1 example, so {authored} no longer "

@@ -211,7 +211,8 @@ def test_unpacked_warning_names_the_recipe_default_when_batch_size_was_omitted()
     )
 
     assert message is not None
-    assert f"the configured batch_size {RECIPE.sft.effective_batch}" in message
+    # an omitted batch_size is reported as the default, not as something the user configured.
+    assert f"the default batch_size {RECIPE.sft.effective_batch}" in message
 
 
 def test_unpacked_warning_is_silent_when_the_authored_batch_was_already_one() -> None:
