@@ -854,6 +854,7 @@ from flash.runner.preparation import (  # noqa: E402,F401
     _prepare_init_from_adapter,
     _prepare_init_from_adapter_inner,
     _prepared_before_public_alpha,
+    _prepared_before_public_pip,
     _prepared_sft_profile_job,
     _profile_producer_version,
     _require_pinned_profile_environment,

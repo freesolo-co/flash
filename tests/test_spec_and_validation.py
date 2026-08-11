@@ -720,6 +720,19 @@ def test_environment_pip_rejects_malformed_entries() -> None:
         spec_from_dict(raw)
 
 
+def test_environment_pip_rejects_pip_options() -> None:
+    """Entries are spliced into `python -m pip install`, so an option flag is not a requirement.
+
+    `--no-deps` would suppress the dependencies of the mandatory freesolo worker requirement, and
+    `--target` would redirect where it lands -- both reachable from a field that only names packages.
+    """
+    for option in ("--no-deps", "--target=/tmp/deps", "-e ."):
+        raw = _raw()
+        raw["environment"]["pip"] = ["pymongo>=4.6", option]
+        with pytest.raises(ConfigError, match="must be requirements, not pip options"):
+            spec_from_dict(raw)
+
+
 def test_submit_payload_carries_the_pip_key() -> None:
     """spec_payload is what the CLI actually sends, and the server re-parses it with this parser."""
     from flash.client.specs import spec_payload

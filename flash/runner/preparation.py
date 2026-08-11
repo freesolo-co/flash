@@ -316,6 +316,20 @@ def _prepared_before_public_alpha(raw_public: object) -> bool:
     return not train.get("init_from_adapter")
 
 
+def _prepared_before_public_pip(raw_public: object) -> bool:
+    """True when this run's PERSISTED public spec predates ``[environment] pip`` becoming authorable.
+
+    Same discriminator and same reason as ``_prepared_before_public_alpha``: to_dict() used to strip
+    pip, so a snapshot prepared before the change hashed an environment with no pip key at all. This
+    build re-serializes it as an empty tuple, which is different bytes and a failed integrity check
+    on recovery for a run that is still perfectly valid.
+    """
+    if not isinstance(raw_public, dict):
+        return False
+    environment = raw_public.get("environment")
+    return isinstance(environment, dict) and "pip" not in environment
+
+
 def _preparation_digest(
     public_spec: JobSpec,
     worker_spec: JobSpec,
@@ -324,6 +338,7 @@ def _preparation_digest(
     legacy_keys: dict | None = None,
     legacy_public_keys: dict | None = None,
     legacy_public_alpha: bool = False,
+    legacy_public_pip: bool = False,
 ) -> str:
     worker_payload = worker_spec.to_internal_dict()
     public_payload = public_spec.to_dict()
@@ -364,6 +379,11 @@ def _preparation_digest(
     # the only thing that could cover it.
     if legacy_public_alpha:
         public_payload["train"].pop("lora_alpha", None)
+    # ``[environment] pip`` became user-authorable, so to_dict() now emits it where it used to be
+    # stripped. Same treatment as lora_alpha above, and scoped the same way: only snapshots whose
+    # stored bytes show the key was absent drop it, so every digest created from here on binds pip.
+    if legacy_public_pip:
+        public_payload["environment"].pop("pip", None)
     payload = {
         "version": 1,
         "public_spec": public_payload,

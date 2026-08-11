@@ -184,6 +184,7 @@ def _persist_effective_worker_spec(
             adapter_identity,
             legacy_public_keys=legacy_public_keys,
             legacy_public_alpha=_runner()._prepared_before_public_alpha(raw_public),
+            legacy_public_pip=_runner()._prepared_before_public_pip(raw_public),
         ),
         "backend": _runner().TRAINER_BACKEND,
     }

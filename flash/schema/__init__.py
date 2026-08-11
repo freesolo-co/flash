@@ -380,6 +380,14 @@ def _validate_environment_pip(value: Any) -> None:
             raise ConfigError(
                 f"[environment] pip entries must be non-empty requirement strings (got: {item!r})"
             )
+        # entries are spliced straight into `python -m pip install` on the worker, so an option
+        # flag is not just an odd requirement: `--no-deps` or `--target=...` would change how the
+        # mandatory freesolo worker requirement installs, from a field that only names packages.
+        if item.strip().startswith("-"):
+            raise ConfigError(
+                "[environment] pip entries must be requirements, not pip options "
+                f"(got: {item.strip()!r})"
+            )
 
 
 def _validate_train_section(raw: dict[str, Any]) -> dict[str, Any]:
