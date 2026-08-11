@@ -127,6 +127,20 @@ def usable_instances(
         )
         / count
     )
+    regions = lambda_api.regions_with_capacity(
+        itype,
+        force=force,
+        **deadline_kwargs(lambda_api.regions_with_capacity, deadline_at),
+    )
+    if catalog is None and regions:
+        # the capacity call fetches the same catalog, so a first fetch that exhausted its retries
+        # is recovered by the one that just succeeded. Reading it here rather than keeping None
+        # keeps a transient blip from reporting an UNMEASURED disk, which the floor below treats as
+        # permissive and would let it rent a SKU whose fixed storage is provably too small.
+        with contextlib.suppress(Exception):
+            catalog = lambda_api.list_instance_types(
+                **deadline_kwargs(lambda_api.list_instance_types, deadline_at),
+            )
     # carried on the candidate so the launch gate can refuse an undersized SKU without a second
     # catalog fetch; None (unreported storage) stays permissive.
     disk_gb = instance_type_disk_gb(catalog, itype)
@@ -140,11 +154,7 @@ def usable_instances(
             gpu_count=count,
             disk_gb=disk_gb,
         )
-        for region in lambda_api.regions_with_capacity(
-            itype,
-            force=force,
-            **deadline_kwargs(lambda_api.regions_with_capacity, deadline_at),
-        )
+        for region in regions
     ]
 
 

@@ -3788,3 +3788,36 @@ def test_bootstrap_extra_pip_retries_when_the_console_closes_between_attempts(mo
     monkeypatch.setattr("builtins.print", closed_stream_print)
     lb.install_extra_pip(_pip_payload())  # second attempt exits 0, so the install SUCCEEDS
     assert len(calls) == 2  # the retry issued despite the dead console
+
+
+def test_recovered_catalog_restores_disk_metadata_after_a_failed_first_fetch(monkeypatch):
+    """A transient catalog blip must not downgrade a known disk to UNMEASURED.
+
+    ``regions_with_capacity`` fetches the same catalog, so when the first call exhausts its
+    retries and the capacity call succeeds, the storage the SKU reports is available again.
+    Leaving disk_gb=None there is not merely lossy: the floor treats unknown as permissive, so
+    the walk would rent a shape whose fixed disk is provably below the run's requirement."""
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
+
+    catalog = {
+        "gpu_1x_a10": {
+            "instance_type": {"specs": {"storage_gib": 200}},
+            "regions_with_capacity_available": [{"name": "us-east-1"}],
+        }
+    }
+    calls = []
+
+    def flaky_catalog(force=False, **_kwargs):
+        calls.append(force)
+        if len(calls) == 1:
+            raise lambda_api.LambdaApiError("GET /instance-types -> HTTP 503")
+        return catalog
+
+    monkeypatch.setattr(lambda_api, "list_instance_types", flaky_catalog)
+    monkeypatch.setattr(lambda_api, "regions_with_capacity", lambda *_a, **_k: ["us-east-1"])
+    monkeypatch.setattr("flash.providers.lambda_.pricing.hourly_rate", lambda *a, **k: 1.29)
+
+    instances = jobs.usable_instances("A10")
+
+    assert [i.disk_gb for i in instances] == [200.0]  # recovered, not left unmeasured
