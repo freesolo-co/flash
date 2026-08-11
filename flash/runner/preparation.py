@@ -48,6 +48,97 @@ def _require_supported_adapter_continuation(spec: JobSpec) -> None:
         )
 
 
+def _adopted_warmstart_revision(spec: JobSpec, src_spec: JobSpec) -> JobSpec:
+    """Take the warm-start source's pin when the runner, not the author, chose it.
+
+    SFT is always force-pinned by ``_resolve_model_revision(required=True)``, and the warm-start
+    check demands the child's revision equal the source's. Satisfying it meant the AUTHOR writing
+    the sha into rl.toml, which makes the child's pin author-supplied, which deploy refuses. So a
+    warm start off SFT could pass that check or be deployable, never both. Inheriting the pin AND
+    its provenance gives the child the same immutable base its parent trained against and keeps it
+    deployable for the same reason the parent is.
+    """
+    if spec.model_revision or not src_spec.model_revision or not src_spec.model_revision_auto:
+        return spec
+    return replace(spec, model_revision=src_spec.model_revision, model_revision_auto=True)
+
+
+def _warmstart_source_is_authorized(
+    src_status,
+    src_run_id: str,
+    *,
+    owner_org_id: str = "",
+    owner_key_id: int | None = None,
+) -> bool:
+    """Whether the submitter may read the warm-start source run's internals.
+
+    Shared by the two places that read a source run, so neither can drift into a weaker rule than
+    the other. An empty ``owner_org_id`` means the caller has no org context (local/self-hosted
+    submission), which is the pre-existing contract for this check.
+    """
+    owner_org_id = owner_org_id.strip()
+    if not owner_org_id:
+        return True
+    src_org_id = _runner()._status_org_id(src_status)
+    if src_org_id:
+        return src_org_id == owner_org_id
+    return _runner()._source_owned_by_key(src_run_id, owner_key_id)
+
+
+def _inherit_warmstart_revision(
+    spec: JobSpec,
+    *,
+    owner_org_id: str = "",
+    owner_key_id: int | None = None,
+) -> JobSpec:
+    """Adopt a warm-start source's runner-assigned pin BEFORE the spec is sized against it.
+
+    Sizing reads the revision: ``resolve_model`` re-derives params/vocab/disk from the pinned
+    commit's geometry, and ``min_disk_gb`` becomes ``params_b * 2 + 64``, which for half of today's
+    catalog is strictly larger than the catalog default. Adopting the pin only inside
+    ``_prepare_init_from_adapter`` -- which runs after ``resolve_model``, ``_with_model_disk``, and
+    ``_assign_weight_cache_volume`` -- would provision the child as if unpinned while training it
+    pinned, and skip the geometry validation the pin exists to enforce.
+
+    Best-effort by design: every way the source can be unusable (unknown run, wrong org, wrong
+    model, missing artifacts) is diagnosed by ``_prepare_init_from_adapter`` with its own message
+    and its own error type. Raising here would report those as generic submission failures instead,
+    so an unreadable source simply leaves the spec untouched and the real check speaks.
+
+    Two ordering rules this function must not relax, because it now runs BEFORE the code that used
+    to enforce them:
+
+    * authorize before reading. Adopting a pin off a run the submitter cannot access would leak
+      revision-dependent behaviour through ordinary preparation errors and would do operator-token
+      HF work on an unauthorized run's commit.
+    * read through ``effective_spec_from_status``, not ``_internal_spec_from_status``. The latter
+      returns ``snapshot["worker_spec"]`` unverified; the former checks public/worker equality and
+      the preparation digest first. Adopting an unverified internal revision would make the child
+      match a tampered source, which is precisely what the later mismatch guard exists to catch --
+      and inheriting it would silence that guard rather than trip it.
+    """
+    ref = spec.train.init_from_adapter
+    if spec.model_revision or not ref or spec.algorithm == "sft":
+        return spec
+    from flash.schema import parse_checkpoint_ref
+
+    parsed = parse_checkpoint_ref(ref)
+    if parsed is None:
+        return spec
+    try:
+        src_status = _runner().get_status(parsed[0])
+        if not _runner()._warmstart_source_is_authorized(
+            src_status, parsed[0], owner_org_id=owner_org_id, owner_key_id=owner_key_id
+        ):
+            return spec  # _prepare_init_from_adapter raises the same-org error
+        src_spec = _runner().effective_spec_from_status(src_status)
+    except Exception:
+        return spec
+    if src_spec.model != spec.model:
+        return spec  # _prepare_init_from_adapter raises on this with the specific message
+    return _runner()._adopted_warmstart_revision(spec, src_spec)
+
+
 def _prepare_init_from_adapter(
     spec: JobSpec,
     *,
@@ -105,37 +196,36 @@ def _prepare_init_from_adapter_inner(
     except FileNotFoundError:
         raise ValueError(f"train.init_from_adapter references unknown run {src_run_id!r}") from None
     owner_org_id = owner_org_id.strip()
-    if owner_org_id:
-        src_org_id = _runner()._status_org_id(src_status)
-        owner_ok = (
-            src_org_id == owner_org_id
-            if src_org_id
-            else _runner()._source_owned_by_key(src_run_id, owner_key_id)
-        )
-        if not owner_ok:
-            raise ValueError(
-                "train.init_from_adapter source run must belong to the same Freesolo org"
-            )
+    if not _runner()._warmstart_source_is_authorized(
+        src_status, src_run_id, owner_org_id=owner_org_id, owner_key_id=owner_key_id
+    ):
+        raise ValueError("train.init_from_adapter source run must belong to the same Freesolo org")
     # hf_repo is platform-managed and stripped from the source run's public spec; its authoritative
-    # value lives in that run's internal worker spec (see _runner()._internal_spec_from_status), which the
-    # warm-start needs to locate the source adapter artifacts.
-    src_spec = _runner()._internal_spec_from_status(src_status)
+    # value lives in that run's internal worker spec, which the warm-start needs to locate the
+    # source adapter artifacts.
+    #
+    # read through the VALIDATING loader, not `_internal_spec_from_status`: the latter returns
+    # `snapshot["worker_spec"]` unverified, and `_adopted_warmstart_revision` below copies a
+    # revision off it. A tampered worker half would be adopted onto the child, which then EQUALS
+    # it, so the mismatch check below compares two equal values and passes -- the adoption
+    # silences the guard instead of tripping it. `effective_spec_from_status` verifies public/
+    # worker equality and the preparation digest first.
+    src_spec = _runner().effective_spec_from_status(src_status)
     if src_spec.model != spec.model:
         raise ValueError(
             f"train.init_from_adapter source model {src_spec.model!r} does not match target model "
             f"{spec.model!r}"
         )
-    if spec.model_revision:
-        if src_spec.model_revision != spec.model_revision:
-            raise ValueError(
-                "train.init_from_adapter source model_revision "
-                f"{src_spec.model_revision!r} does not match target model_revision "
-                f"{spec.model_revision!r}"
-            )
-    else:
-        # The caller didn't pin one: inherit the source's, so both sides train on the identical
-        # base-model commit without making every warm-start caller copy the SHA by hand.
-        spec = replace(spec, model_revision=src_spec.model_revision)
+    # normally a no-op: `prepare_job` adopts the pin before it sizes anything. this repeats the
+    # decision for callers that reach the warm-start path directly, so the equality check below
+    # cannot depend on which entry point was used.
+    spec = _adopted_warmstart_revision(spec, src_spec)
+    if src_spec.model_revision != spec.model_revision:
+        raise ValueError(
+            "train.init_from_adapter source model_revision "
+            f"{src_spec.model_revision!r} does not match target model_revision "
+            f"{spec.model_revision!r}"
+        )
     if not src_spec.train.hf_repo:
         raise ValueError(
             f"train.init_from_adapter run {src_run_id!r} has no stored adapter artifacts"
@@ -237,8 +327,17 @@ def _preparation_digest(
 ) -> str:
     worker_payload = worker_spec.to_internal_dict()
     public_payload = public_spec.to_dict()
+    # ``[environment] pip`` became user-authorable, so to_dict() now emits it where it used to be
+    # stripped, and a pre-upgrade snapshot hashed an environment with no pip key at all. Dropping it
+    # when empty reproduces those bytes without needing to know when the run was prepared: absent
+    # and empty are the same install, so they must hash alike. An authored pip is non-empty and
+    # stays bound, so tampering with the persisted value is still caught.
+    if not public_payload["environment"].get("pip"):
+        public_payload["environment"].pop("pip", None)
     # omit empty fields so existing version-1 snapshots keep their historical digest.
     for key in (
+        "model_revision_auto",
+        "gpu_count_auto",
         "workload_profile_kind",
         "workload_profile_input_digest",
         "workload_profile_producer_version",
@@ -292,12 +391,26 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
     # worker spec is already keyed by run_id at the persist boundary.
     for managed_top in (
         "run_id",
+        # provenance of a runner-assigned pin: stripped from the public spec (which must stay
+        # re-parseable by the submission schema), so the reconstructed public spec always reads
+        # False while the worker half carries the real value. Comparing them would reject every
+        # auto-pinned run here -- the same runs the deploy guard was just relaxed to admit.
+        "model_revision_auto",
+        "gpu_count_auto",
         "workload_profile_kind",
         "workload_profile_input_digest",
         "workload_profile_producer_version",
         "workload_profile",
     ):
         effective[managed_top] = public.get(managed_top)
+    # the pin VALUE travels with its marker: `to_dict()` drops a runner-assigned revision so the
+    # public spec cannot advertise a SHA it has no way to label, which leaves the halves legitimately
+    # asymmetric. exclude the value only in that case -- an AUTHORED pin is still compared, so a
+    # tampered authored revision keeps failing here. the auto-pinned value is not left unguarded:
+    # it is hashed into the preparation digest, and `effective_spec_from_status` now verifies that
+    # digest whenever the marker is set.
+    if worker_spec.model_revision_auto and not public.get("model_revision"):
+        effective["model_revision"] = public.get("model_revision")
     public_train = dict(public["train"])
     effective_train = dict(effective["train"])
     public_ref = public_train.get("init_from_adapter") or ""
@@ -340,7 +453,16 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
     # persisted for launch.
     effective_count = int(effective_gpu.get("count", 1) or 1)
     public_count = int(public_gpu.get("count", 1) or 1)
-    if 1 <= effective_count <= public_count:
+    # an auto-sized run has NO authored ceiling: its public count is the digest-stable placeholder
+    # 1, so a legitimately auto-sized 2+ card shape would fail the narrowing rule below and be
+    # rejected as an integrity failure at persist time. the real ceiling for that run is the
+    # platform maximum. this branch is still bounded: MAX_COMBINATION_CARDS is the same cap
+    # allocation itself honours, and the count that lands here was produced by a VRAM fit check and
+    # the attention-head geometry cap, so a marker cannot buy a shape those would refuse.
+    from flash.providers.base import MAX_COMBINATION_CARDS
+
+    ceiling = public_count if worker_spec.authored_gpu_count is not None else MAX_COMBINATION_CARDS
+    if 1 <= effective_count <= ceiling:
         effective_gpu["count"] = public_gpu.get("count")
     # disk sizing, the weight-cache volume, and retry/wall-clock lifecycle policy are platform-managed
     # (_runner().MANAGED_GPU_KEYS) and stripped from the public spec, so the reconstructed public spec carries
@@ -379,7 +501,10 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
 
 
 def _resolve_model_revision(spec: JobSpec, *, required: bool = False) -> JobSpec:
-    authored = spec.model_revision
+    # a pin already marked runner-assigned (inherited from a warm-start source) is not authored,
+    # even though it is present. reading presence alone would relabel it as the author's and hand
+    # deploy a pin it refuses -- the exact failure the marker exists to prevent.
+    authored = "" if spec.model_revision_auto else spec.model_revision
     if not authored and not required:
         return spec
     try:
@@ -397,7 +522,11 @@ def _resolve_model_revision(spec: JobSpec, *, required: bool = False) -> JobSpec
             f"could not resolve model_revision for model {spec.model!r}; "
             "verify that the revision exists and the operator token can access it"
         ) from exc
-    return replace(spec, model_revision=resolved)
+    # record WHO chose the pin, not just its value. `authored` is empty exactly when the caller
+    # asked for a pin the user never wrote (SFT, required=True), and that is the only case deploy
+    # may relax: serving resolves the base by name, so an auto pin asks nothing of it, while an
+    # authored one is a request serving cannot honour and must still be refused.
+    return replace(spec, model_revision=resolved, model_revision_auto=not authored)
 
 
 def _profile_producer_version() -> str:

@@ -381,12 +381,16 @@ def _classify_terminal_status(
             )
     if status not in _jobs.TERMINAL_FAIL:
         return None
-    detail = str(provider_status.get("error") or "")[-1500:]
+    # this detail reaches the user-readable run log, so every part of it is sanitized before its
+    # tail is selected: a control-plane secret echoed by the worker would otherwise be printed
+    # verbatim, and slicing first could cut a credential at the boundary so its surviving part no
+    # longer value-matches (the instance providers sanitize each part of theirs the same way).
+    detail = _jobs._safe_failure_text(provider_status.get("error") or "", 1500)
     output = provider_status.get("output")
     if isinstance(output, dict) and output.get("stdout"):
-        detail += "\n--- worker stdout tail ---\n" + str(output["stdout"])
+        detail += "\n--- worker stdout tail ---\n" + _jobs._safe_failure_text(output["stdout"])
     elif not detail:
-        detail = str(output)[-1500:]
+        detail = _jobs._safe_failure_text(output, 1500)
     if status in _jobs.PLATFORM_TERMINATIONS:
         return PollResult(False, failure="job_preempted", detail=f"[{status}] {detail}")
     state.last_hb_key, retriable, oom = _jobs.surfaced_worker_flags(

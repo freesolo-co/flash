@@ -1224,10 +1224,14 @@ def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys)
         line for line in capsys.readouterr().err.splitlines() if line.startswith("step=")
     ]
     assert metric_lines == [
-        "step=1 reward=0.75 reward_std=0.12 grad_norm=1.5 kl=0.03 entropy=0.82 "
-        "frac_zero_std=0.25 comp_len=48.5 trunc=0.125 max_comp_tokens=256",
-        "step=2 reward=0.8 reward_std=0.1 grad_norm=1.25 entropy=0.79 frac_zero_std=0 "
-        "comp_len=51 trunc=0.25 max_comp_tokens=256",
+        (
+            "step=1 reward=0.75 reward_std=0.12 grad_norm=1.5 kl=0.03 entropy=0.82 "
+            "frac_zero_std=0.25 comp_len=48.5 trunc=0.125 max_comp_tokens=256"
+        ),
+        (
+            "step=2 reward=0.8 reward_std=0.1 grad_norm=1.25 entropy=0.79 frac_zero_std=0 "
+            "comp_len=51 trunc=0.25 max_comp_tokens=256"
+        ),
     ]
 
 
@@ -2047,26 +2051,31 @@ def test_unknown_run_errors_surface_as_nonzero_exit(monkeypatch, capsys) -> None
     assert "unknown run" in capsys.readouterr().err
 
 
-def test_submit_payload_carries_no_pip_and_the_worker_resolves_it(monkeypatch, tmp_path) -> None:
-    """pip is platform-managed: it leaves the wire, and the submit path supplies it instead.
+def test_submit_payload_carries_authored_pip_and_the_worker_appends_it(
+    monkeypatch, tmp_path
+) -> None:
+    """pip is authorable: it travels on the wire, and the submit path adds the worker baseline.
 
-    Both halves matter. Dropping the key from the payload without the provider still resolving it
-    would ship a worker with no Freesolo SDK, and the failure would surface only on a real GPU.
+    Both halves matter. Carrying the key without the provider still supplying the baseline would
+    ship a worker with no Freesolo SDK, and the failure would surface only on a real GPU.
     """
     from flash.client.specs import spec_payload
     from flash.core.spec import EnvironmentSpec, JobSpec
-    from flash.envs.base import worker_pip_for_env
+    from flash.envs.base import worker_pip_with_extras
 
     spec = JobSpec(
         model="Qwen/Qwen3.5-0.8B",
         project="11111111-1111-4111-8111-111111111111",
-        environment=EnvironmentSpec(id="owner/env"),
+        environment=EnvironmentSpec(id="owner/env", pip=("pymongo>=4.6",)),
     )
 
-    # not an unauthorable key the server would reject, and not a duplicated constant on the wire.
-    assert "pip" not in spec_payload(spec)["environment"]
-    # the value the submit paths substitute for it, unchanged.
-    assert worker_pip_for_env(spec.environment.id) == ["freesolo>=0.4.0"]
+    # the author's scorer dependency reaches the server rather than being stripped on the client.
+    assert tuple(spec_payload(spec)["environment"]["pip"]) == ("pymongo>=4.6",)
+    # and the submit paths install it after the worker requirement, not instead of it.
+    assert worker_pip_with_extras(spec.environment.id, spec.environment.pip) == [
+        "freesolo>=0.4.0",
+        "pymongo>=4.6",
+    ]
 
 
 def test_export_uses_api_key_flag_and_forwards_args(fake_client, capsys, monkeypatch) -> None:
@@ -3436,3 +3445,26 @@ def test_login_ignores_the_identity_url_when_the_key_never_goes_there(monkeypatc
 
     warnings = cli.commands._plaintext_login_warnings("https://plane.example", None)
     assert warnings == [], warnings
+
+
+def test_hosted_key_rejection_names_the_url_that_rejected_it(monkeypatch):
+    """A 401 must name the service that answered, not only the key.
+
+    The same 401 is what a perfectly VALID key gets when the request reached the wrong issuer --
+    a stale saved `--api-url`, a leftover localhost from a self-hosted experiment, an overridden
+    FREESOLO_BASE_URL. A message that names only the key accuses the one input the user just
+    copied correctly and never shows the one that was actually wrong.
+    """
+    import urllib.error
+
+    from flash.client.http import ClientError, verify_freesolo_key
+
+    def _reject(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr("urllib.request.urlopen", _reject)
+    monkeypatch.setenv("FREESOLO_BASE_URL", "http://localhost:9999")
+
+    with pytest.raises(ClientError) as exc:
+        verify_freesolo_key("fs-key")
+    assert "localhost:9999" in str(exc.value)

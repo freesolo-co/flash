@@ -222,8 +222,10 @@ class _FlashParser(_ThemedParser):
         usage = f"{CLI_NAME} [--debug] [-v] <command> [args]"
         footers = [
             f"new here? run `{CLI_NAME} login`, then `{CLI_NAME} env setup`",
-            f"train after publishing: `{CLI_NAME} env push --project PROJECT_UUID --name my-env .`, "
-            f"then `{CLI_NAME} train configs/sft.toml`",
+            (
+                f"train after publishing: `{CLI_NAME} env push --project PROJECT_UUID --name my-env .`, "
+                f"then `{CLI_NAME} train configs/sft.toml`"
+            ),
             f"any command in depth: `{CLI_NAME} <command> --help`",
             "docs: https://docs.freesolo.co",
         ]
@@ -390,7 +392,11 @@ def _add_env_setup_command(env_sub: argparse._SubParsersAction) -> None:
     setup.add_argument(
         "--project",
         metavar="PROJECT_UUID",
-        help="Freesolo project UUID for all generated configs and environment publication",
+        help=(
+            "Freesolo project UUID for all generated configs and environment publication; "
+            "required with --yes, a redirected stdin, or any other noninteractive run, where "
+            "there is no prompt to choose one"
+        ),
     )
     setup.add_argument(
         "-y",
@@ -643,9 +649,9 @@ def _add_train_commands(sub: argparse._SubParsersAction) -> None:
         type=_gpu_count_override,
         metavar="N",
         help=(
-            "most cards to run the job on; sets [gpu] count (1-8). a ceiling, not an exact "
-            "count: allocation still picks one card when one fits the run alone, and only "
-            "rentable counts (1, 2, 4, 8) are ever provisioned"
+            "optional card ceiling; sets [gpu] count (1-8). omit it with an unpinned gpu type to "
+            "auto-size the smallest fitting geometry; an authored value pins the ceiling, and only "
+            "(1, 2, 4, 8) are ever provisioned"
         ),
     )
     train.add_argument("--dry-run", action="store_true")
