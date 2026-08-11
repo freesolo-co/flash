@@ -576,13 +576,14 @@ def test_offline_estimate_applies_the_pinned_revision_geometry_cap(monkeypatch):
     the two cases genuinely differ here -- quoting four for a certified pin would be the very defect
     this PR removes.
     """
+    import flash.engine.plan.pinned_geometry as pinned_geometry
     import flash.engine.plan.vram as vram
     from flash.core.catalog import MODELS
     from flash.cost.analytical import _offline_gpu_shape
 
     monkeypatch.setattr("flash.cost.analytical.required_vram_gb", lambda *a, **k: 700)
     monkeypatch.setattr("flash.cost.analytical.total_params_b", lambda *a, **k: 4.7)
-    monkeypatch.setattr(vram, "_PINNED_GEOMETRY_MEMO", {})
+    monkeypatch.setattr(pinned_geometry, "_PINNED_GEOMETRY_MEMO", {})
     config = RunConfig(
         "Qwen/Qwen3.5-4B",
         "sft",
@@ -626,6 +627,7 @@ def test_the_offline_probe_sizes_a_pinned_catalog_model_by_its_revision(monkeypa
     revision through rather than quoting default-revision weights -- still holds for a pinned
     catalog model, which is the only way to reach revision-specific sizing at all.)
     """
+    import flash.engine.plan.pinned_geometry as pinned_geometry
     import flash.engine.plan.vram as vram
     from flash.core.catalog import MODELS
     from flash.cost.analytical import _offline_gpu_shape
@@ -649,7 +651,7 @@ def test_the_offline_probe_sizes_a_pinned_catalog_model_by_its_revision(monkeypa
 
     monkeypatch.setattr(vram, "fetch_hf_model_geometry", _pinned_geometry)
     monkeypatch.setattr("flash.cost.facts._PINNED_SIZE_MEMO", dict(_PINNED_SIZE_MEMO))
-    monkeypatch.setattr(vram, "_PINNED_GEOMETRY_MEMO", {})
+    monkeypatch.setattr(pinned_geometry, "_PINNED_GEOMETRY_MEMO", {})
     _PINNED_SIZE_MEMO.pop((model, expected_revision), None)
 
     gpu, count, need, provider, rate = _offline_gpu_shape(

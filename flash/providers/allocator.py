@@ -140,6 +140,14 @@ def _structurally_fits(available, need: int, cap: int) -> bool:
     return False
 
 
+# Widest count safe to rent when a model's true head geometry could not be certified. Named because
+# the guard that skips certification (`cap > _UNCERTIFIED_CAP`) is only correct while it matches the
+# ceiling certification would otherwise apply: raise one without the other and a run either takes a
+# hub round trip that cannot widen it, or skips the round trip that would have. ALLOC-004 tracks
+# validating arbitrary off-catalog head geometry at every width.
+_UNCERTIFIED_CAP = 4
+
+
 def geometry_safe_gpu_cap(model_id: str, max_gpu_count: int, *, model_revision: str = "") -> int:
     """Rentable ceiling whose sequence-parallel divisibility is known before paid allocation.
 
@@ -166,7 +174,6 @@ def geometry_safe_gpu_cap(model_id: str, max_gpu_count: int, *, model_revision: 
     rejected rather than widened) and cap on the real number. An unreadable pin certifies nothing:
     it keeps the four-card ceiling AND falls back to the row's own head count for the divisor
     search, so it can only ever be narrower than the same run unpinned, never wider.
-    ALLOC-004 tracks validating arbitrary off-catalog head geometry at every width.
     """
     from flash.core.catalog import MODELS
 
@@ -175,13 +182,13 @@ def geometry_safe_gpu_cap(model_id: str, max_gpu_count: int, *, model_revision: 
     heads = _query_attention_heads(info) if info is not None else 0
     if info is None:
         # nothing to certify a width against, and nothing to cross-check a pin's own config with.
-        cap = min(cap, 4)
-    elif model_revision and cap > 4:
+        cap = min(cap, _UNCERTIFIED_CAP)
+    elif model_revision and cap > _UNCERTIFIED_CAP:
         # the weights the worker really loads are the pinned commit's, so its config -- not the
         # row's default-revision geometry -- is what may widen this run. only worth a hub round trip
-        # when there is something to widen TO: at cap <= 4 certification cannot raise the ceiling,
-        # and `spec_from_dict` calls this during parsing, where a hub timeout would block config
-        # validation that is otherwise entirely offline.
+        # when there is something to widen TO: at or below the uncertified cap, certification
+        # cannot raise the ceiling, and `spec_from_dict` calls this during parsing, where a hub
+        # timeout would block config validation that is otherwise entirely offline.
         from flash.engine.plan.vram import certified_revision_attention_heads
 
         certified = certified_revision_attention_heads(model_id, model_revision)
@@ -190,12 +197,12 @@ def geometry_safe_gpu_cap(model_id: str, max_gpu_count: int, *, model_revision: 
         else:
             # uncertified: fall back to the ceiling, but keep checking the ROW's heads below. the
             # ceiling narrows the divisor search, it does not replace it, so a row whose heads do
-            # not divide 4 is still narrowed further instead of rented at a width verl rejects.
-            cap = min(cap, 4)
+            # not divide it is still narrowed further instead of rented at a width verl rejects.
+            cap = min(cap, _UNCERTIFIED_CAP)
     if heads <= 0:
         # geometry we cannot read is geometry we cannot certify, so a catalog row that records no
         # head count is treated exactly like an uncertifiable revision rather than trusted for 8.
-        return min(cap, 4)
+        return min(cap, _UNCERTIFIED_CAP)
     for count in rentable_gpu_counts(cap):
         if heads % count == 0:
             return count
