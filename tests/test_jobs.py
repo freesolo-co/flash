@@ -142,6 +142,39 @@ def test_decode_output_client_mode_error_includes_stdout_tail():
     assert "STDOUT-END" in msg
 
 
+def test_decode_output_error_redacts_credentials(monkeypatch):
+    """The decoded error reaches the user-readable run log, so it is sanitized like the
+    instance providers' failure details are."""
+    from flash.providers.runpod.jobs import decode_output
+
+    secret = "hf_ZZZdecodeoutputsecret0123456789"
+    monkeypatch.setenv("HF_TOKEN", secret)
+    with pytest.raises(RuntimeError) as ei:
+        decode_output({"error": f"vllm crashed using {secret}", "stdout": f"401 for {secret}"})
+    msg = str(ei.value)
+    assert secret not in msg
+    assert "vllm crashed using <redacted>" in msg
+    assert "--- worker stdout tail ---\n401 for <redacted>" in msg
+
+
+def test_decode_output_tail_is_sanitized_before_the_bound(monkeypatch):
+    """slicing the raw text first can cut a credential at the boundary, leaving a suffix that no
+    longer value-matches; the complete text is sanitized before the tail is selected."""
+    from flash.providers.runpod.jobs import decode_output
+
+    secret = "hf_ZZZboundarystraddler0123456789abcdef"
+    monkeypatch.setenv("HF_TOKEN", secret)
+    # non-json output whose 200-char boundary lands inside the secret.
+    raw = "x" * 500 + f"auth {secret}" + "y" * 180
+    with pytest.raises(RuntimeError) as ei:
+        decode_output(raw)
+    msg = str(ei.value)
+    assert secret not in msg
+    for fragment_length in range(6, len(secret)):
+        assert secret[-fragment_length:] not in msg
+    assert "<redacted>" in msg
+
+
 # ---------------------------------------------------------------------------
 # poll_job state machine (mocked runpod_api)
 # ---------------------------------------------------------------------------
@@ -273,6 +306,37 @@ def test_poll_job_failure(monkeypatch):
     assert not res.ok
     assert res.failure == "job_failed"
     assert "worker exploded" in res.detail
+
+
+def test_poll_job_failure_detail_redacts_secrets_in_provider_error_and_stdout(monkeypatch):
+    """A control-plane secret echoed by the worker must not reach the run log (Vast/Lambda
+    sanitize every part of their failure detail; RunPod has to match)."""
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    secret = "hf_ZZZterminaldetailsecret0123456789"
+    monkeypatch.setenv("HF_TOKEN", secret)
+    monkeypatch.setattr(
+        runpod_api,
+        "job_status",
+        lambda eid, jid, **_kw: {
+            "status": "FAILED",
+            "error": f"worker exploded while authenticating with {secret}",
+            "output": {"stdout": f"HTTPError: 401 Unauthorized (used {secret})"},
+        },
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=lambda force=False: None,
+    )
+
+    assert not res.ok
+    assert secret not in res.detail
+    assert "worker exploded while authenticating with <redacted>" in res.detail
+    assert "--- worker stdout tail ---\nHTTPError: 401 Unauthorized (used <redacted>)" in res.detail
 
 
 def test_poll_job_failure_surfaces_forced_heartbeat(monkeypatch):
@@ -3687,7 +3751,7 @@ def test_cancel_prices_and_cleans_up_with_effective_warmstart_spec(monkeypatch):
         priced = []
         cleaned = []
 
-        def fake_charge(spec, *, steps=None, fallback=0.0):
+        def fake_charge(spec, *, steps=None, fallback=0.0, provider=None, gpu_type="", gpu_count=0):
             priced.append((spec.train.lora_rank, spec.train.init_from_adapter, steps))
             return 3.25
 
