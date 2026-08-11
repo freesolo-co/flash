@@ -150,6 +150,27 @@ def publish_env(
     return {"id": slug}
 
 
+@router.get("/v1/envs")
+def list_envs(key: Annotated[dict, Depends(require_key)]):
+    """List the published environments the caller's org owns.
+
+    The hub is the source of truth that ``publish_env`` writes and ``download_env_package`` reads,
+    so it is what this enumerates -- not the platform metadata mirror, which is best-effort on both
+    publish and delete and would under-report a package that is genuinely there.
+
+    No project filter: the hub slug is ``<org-slug>/<name>`` and carries no project, so filtering
+    here would require trusting the mirror this deliberately does not read. A caller that wants one
+    project's environments should read the mirror through the web UI.
+    """
+    from flash.server.domain import envs
+
+    try:
+        slugs = envs.list_namespace_slugs(key=key)
+    except envs.EnvPublishError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    return {"environments": [{"id": slug} for slug in slugs]}
+
+
 @router.get("/v1/envs/{env_id:path}/package")
 def download_env_package(env_id: str, key: Annotated[dict, Depends(require_key)]):
     """Download a managed Freesolo environment package from the GitHub-backed hub."""
