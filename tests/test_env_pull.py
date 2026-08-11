@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import shlex
+import shutil
 import stat
 import tarfile
 import urllib.parse
@@ -915,6 +917,254 @@ def test_resolve_github_env_extracts_repo_level_siblings(monkeypatch, tmp_path):
 
     assert env_file.is_file()
     assert (env_file.parents[1] / "datasets" / "train.jsonl").is_file()
+
+
+def _github_env_tarball(content: bytes) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        info = tarfile.TarInfo(name="repo-sha/environment.py")
+        info.size = len(content)
+        tar.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+def test_resolve_github_env_ignores_symlinked_cache_entry(monkeypatch, tmp_path):
+    # a cache root that was previously group/other-writable can still hold a symlink planted
+    # by another local account at this guessable cache key (a sha of the ref) even after the
+    # root's own permissions are repaired; the cache-hit path must never follow it.
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **kwargs: "a" * 40)
+
+    monkeypatch.setattr(
+        adapter, "_download_github_tarball", lambda ref: _github_env_tarball(b"# original\n")
+    )
+    first = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+    assert first.read_bytes() == b"# original\n"
+    cache_dir = first.parent
+
+    # plant a symlink at the now-known cache_dir, standing in for another account's foreign
+    # content (this run's own uid would never have written a symlink there).
+    shutil.rmtree(cache_dir)
+    evil = tmp_path / "evil"
+    evil.mkdir()
+    (evil / "environment.py").write_bytes(b"evil\n")
+    cache_dir.symlink_to(evil, target_is_directory=True)
+
+    monkeypatch.setattr(
+        adapter, "_download_github_tarball", lambda ref: _github_env_tarball(b"# refreshed\n")
+    )
+    second = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+
+    assert second.read_bytes() == b"# refreshed\n"
+
+
+def test_resolve_github_env_replaces_a_file_squatting_at_the_cache_key(monkeypatch, tmp_path):
+    # a cache entry is a directory. a regular FILE at the key (manual corruption, an interrupted
+    # write) is owned by us, so the ownership check trusts it and leaves it in place; the
+    # download path's rmtree(ignore_errors=True) then swallows NotADirectoryError and copytree
+    # dies with FileExistsError on this key on every run.
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **kwargs: "a" * 40)
+    monkeypatch.setattr(
+        adapter, "_download_github_tarball", lambda ref: _github_env_tarball(b"# original\n")
+    )
+    first = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+    cache_dir = first.parent
+    shutil.rmtree(cache_dir)
+    cache_dir.write_bytes(b"not a directory")
+
+    monkeypatch.setattr(
+        adapter, "_download_github_tarball", lambda ref: _github_env_tarball(b"# refreshed\n")
+    )
+    second = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+
+    assert second.read_bytes() == b"# refreshed\n"
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="posix-only uid check")
+def test_resolve_github_env_ignores_foreign_owned_cache_entry(monkeypatch, tmp_path):
+    # same guessable-cache-key hazard as the symlink case, but the planted entry is a real
+    # directory under a different owner rather than a symlink.
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **kwargs: "a" * 40)
+
+    monkeypatch.setattr(
+        adapter, "_download_github_tarball", lambda ref: _github_env_tarball(b"# original\n")
+    )
+    first = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+    cache_dir = first.parent
+    real_lstat = os.lstat
+
+    def fake_lstat(path, *args, **kwargs):
+        result = real_lstat(path, *args, **kwargs)
+        if Path(path) in (cache_dir, first):
+            result = os.stat_result(
+                (
+                    result.st_mode,
+                    result.st_ino,
+                    result.st_dev,
+                    result.st_nlink,
+                    result.st_uid + 1,
+                    result.st_gid,
+                    result.st_size,
+                    result.st_atime,
+                    result.st_mtime,
+                    result.st_ctime,
+                )
+            )
+        return result
+
+    monkeypatch.setattr(adapter.os, "lstat", fake_lstat)
+    monkeypatch.setattr(
+        adapter, "_download_github_tarball", lambda ref: _github_env_tarball(b"# refreshed\n")
+    )
+
+    second = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+
+    assert second.read_bytes() == b"# refreshed\n"
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="posix-only uid check")
+def test_resolve_github_env_refuses_unremovable_foreign_cache_entry(monkeypatch, tmp_path):
+    # the planted entry is foreign-owned AND cannot be deleted by us -- its contents are
+    # readable but not writable, so rmtree fails partway. best-effort removal would swallow
+    # that, download the environment anyway, and then die in copytree on the entry still
+    # sitting there, every single run. refuse the key before the download, and never fall
+    # back to importing what the ownership check just rejected.
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **kwargs: "a" * 40)
+    monkeypatch.setattr(
+        adapter, "_download_github_tarball", lambda ref: _github_env_tarball(b"# original\n")
+    )
+    first = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+    cache_dir = first.parent
+    real_lstat = os.lstat
+
+    def fake_lstat(path, *args, **kwargs):
+        result = real_lstat(path, *args, **kwargs)
+        if Path(path) in (cache_dir, first):
+            fields = list(result)
+            fields[4] = result.st_uid + 1
+            return os.stat_result(tuple(fields))
+        return result
+
+    real_rmtree = shutil.rmtree
+
+    def refuse_rmtree(path, *args, **kwargs):
+        # honours ignore_errors, so the stub reproduces the pre-fix shape too: best-effort
+        # removal returns quietly and leaves the entry behind, rather than reporting failure.
+        if Path(path) == cache_dir:
+            if kwargs.get("ignore_errors"):
+                return None
+            raise PermissionError(13, "Permission denied", str(cache_dir))
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(adapter.os, "lstat", fake_lstat)
+    monkeypatch.setattr(adapter.shutil, "rmtree", refuse_rmtree)
+    downloaded = []
+    monkeypatch.setattr(
+        adapter,
+        "_download_github_tarball",
+        lambda ref: downloaded.append(ref) or _github_env_tarball(b"# refreshed\n"),
+    )
+
+    with pytest.raises(RuntimeError, match="could not be removed"):
+        adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+
+    assert downloaded == []
+    # refused, not trusted: the rejected entry is still there and still never imported.
+    assert (cache_dir / "environment.py").read_bytes() == b"# original\n"
+
+
+def _report_foreign_lstat(monkeypatch, paths):
+    """make os.lstat report `paths` as owned by another uid, leaving every other field alone."""
+    targets = {Path(p) for p in paths}
+    real_lstat = os.lstat
+
+    def fake_lstat(path, *args, **kwargs):
+        result = real_lstat(path, *args, **kwargs)
+        if Path(path) in targets:
+            fields = list(result)
+            fields[4] = result.st_uid + 1
+            return os.stat_result(tuple(fields))
+        return result
+
+    monkeypatch.setattr(adapter.os, "lstat", fake_lstat)
+
+
+def _seed_cache_dir_without_entrypoint(monkeypatch, tmp_path):
+    """resolve once to learn the cache dir, then strip the entrypoint out of it."""
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **kwargs: "a" * 40)
+    monkeypatch.setattr(
+        adapter, "_download_github_tarball", lambda ref: _github_env_tarball(b"# original\n")
+    )
+    first = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+    cache_dir = first.parent
+    (cache_dir / "environment.py").unlink()
+    return cache_dir
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="posix-only uid check")
+def test_resolve_github_env_refuses_unremovable_foreign_cache_entry_without_entrypoint(
+    monkeypatch, tmp_path
+):
+    # gating the ownership checks on the entrypoint being present left the worst case unchecked:
+    # a foreign-owned, unremovable directory at this key with no environment.py inside skipped
+    # trust entirely, so the resolver downloaded and then wrote INTO another account's
+    # directory. an entry is vetted because it exists, not because it looks complete.
+    cache_dir = _seed_cache_dir_without_entrypoint(monkeypatch, tmp_path)
+    _report_foreign_lstat(monkeypatch, [cache_dir])
+    real_rmtree = shutil.rmtree
+
+    def refuse_rmtree(path, *args, **kwargs):
+        if Path(path) == cache_dir:
+            if kwargs.get("ignore_errors"):
+                return None
+            raise PermissionError(13, "Permission denied", str(cache_dir))
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(adapter.shutil, "rmtree", refuse_rmtree)
+    downloaded = []
+    monkeypatch.setattr(
+        adapter,
+        "_download_github_tarball",
+        lambda ref: downloaded.append(ref) or _github_env_tarball(b"# refreshed\n"),
+    )
+
+    # the same actionable error the unremovable-with-entrypoint case raises, before any download.
+    with pytest.raises(RuntimeError, match="could not be removed"):
+        adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+
+    assert downloaded == []
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="posix-only uid check")
+def test_resolve_github_env_discards_removable_foreign_cache_entry_without_entrypoint(
+    monkeypatch, tmp_path
+):
+    # the other half of the same gap: when the foreign entry CAN be removed, the recoverable
+    # path must still work -- and the removal has to happen BEFORE the download, not as the
+    # best-effort rmtree that used to sit after it. that ordering is the whole point: it is what
+    # turns "download into a directory another account owns" into a clean refusal or a clean
+    # refetch, and it is the only observable difference here from the unvetted behavior.
+    cache_dir = _seed_cache_dir_without_entrypoint(monkeypatch, tmp_path)
+    (cache_dir / "planted.py").write_bytes(b"# planted\n")
+    _report_foreign_lstat(monkeypatch, [cache_dir])
+    existed_at_download = []
+    monkeypatch.setattr(
+        adapter,
+        "_download_github_tarball",
+        lambda ref: (
+            existed_at_download.append(cache_dir.exists()) or _github_env_tarball(b"# refreshed\n")
+        ),
+    )
+
+    resolved = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+
+    assert existed_at_download == [False]
+    assert resolved.read_bytes() == b"# refreshed\n"
+    assert not (cache_dir / "planted.py").exists()
 
 
 def test_cmd_env_pull_multi_component_in_env_path_is_not_a_destination(

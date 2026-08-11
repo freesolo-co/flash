@@ -201,10 +201,10 @@ class _Resp:
         # IncompleteRead is an HTTPException, not a ConnectionError -- catching ConnectionError
         # alone would still let this one escape raw.
         (http.client.IncompleteRead(b"partial"), "was interrupted"),
-        # a truncated or non-JSON body: JSONDecodeError is a ValueError.
-        (b"{not json", "malformed response"),
-        # a non-UTF-8 body raises UnicodeDecodeError, a SIBLING of JSONDecodeError.
-        (b'{"environments": "\xff\xfe"}', "undecodable response"),
+        # a truncated or non-JSON body, and a non-UTF-8 one: JSONDecodeError and UnicodeDecodeError
+        # are both ValueError, so `_decode_response` owns these two and words them identically.
+        (b"{not json", "did not return JSON"),
+        (b'{"environments": "\xff\xfe"}', "did not return JSON"),
     ],
     ids=["reset", "hangup", "truncated-read", "non-json", "non-utf8"],
 )

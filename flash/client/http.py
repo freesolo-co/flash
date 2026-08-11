@@ -11,14 +11,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 from flash.client.config import load_credentials_with_source
+from flash.client.shapes import RequireSpec, matches_require
+from flash.client.streaming import ProgressCallback
 from flash.core.spec import require_project_id
 from flash.serve.urls import is_freesolo_hosted_url
-
-ProgressCallback = Callable[[int, int], None]
 
 
 class ClientError(RuntimeError):
@@ -56,7 +56,6 @@ FREESOLO_PROJECTS_PATH = "/api/projects"
 FREESOLO_TRACE_PROJECTS_PATH = "/api/traces/projects"
 FREESOLO_TRACES_EXPORT_PATH = "/api/traces/export"
 FREESOLO_EVAL_RUNS_PATH = "/api/evals/runs"
-_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 # How long the control plane can legitimately spend answering GET /v1/envs before it gives up and
 # returns a controlled 429/502. Mirrors `flash.envs.loader._LIST_READ_BUDGET` applied to the two
@@ -159,21 +158,25 @@ def _api_error(exc: urllib.error.HTTPError) -> ApiError:
     return ApiError(exc.code, str(detail), detail=detail)
 
 
-def _read_capped_response(resp: object, max_bytes: int) -> bytes:
-    chunks: list[bytes] = []
-    total = 0
-    while True:
-        chunk = resp.read(_DOWNLOAD_CHUNK_BYTES)
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > max_bytes:
-            raise ClientError(
-                f"response body exceeded the maximum allowed size ({max_bytes} bytes); "
-                "download aborted"
-            )
-        chunks.append(chunk)
-    return b"".join(chunks)
+def _unexpected_response(api_url: str, path: str, problem: str) -> ClientError:
+    """The one error for a 2xx body this client cannot use.
+
+    A body that is not JSON and valid JSON of the wrong shape are the same user state (something
+    other than a Flash control plane answered), so both carry the hint ``flash login`` already
+    gives, see ``_verify_key_against_plane``. Nothing in the CLI turns a raw
+    ``json.JSONDecodeError`` or ``KeyError`` into an error message, so neither may escape.
+    """
+    return ClientError(
+        f"{api_url}{path} {problem}. Check that --api-url points at your Flash control plane "
+        '(its /v1/health should report "service": "flash") rather than at a proxy or another '
+        "service."
+    )
+
+
+from flash.client.streaming import (  # noqa: E402
+    _ProgressReader,
+    _read_capped_response,
+)
 
 
 def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
@@ -378,91 +381,12 @@ def upload_eval_run(
     return payload
 
 
-class _ProgressReader:
-    """File-like wrapper over in-memory bytes that fires a progress callback on each read()."""
-
-    def __init__(self, data: bytes, progress: ProgressCallback):
-        self._data = data
-        self._total = len(data)
-        self._pos = 0
-        self._progress = progress
-
-    def __len__(self) -> int:
-        return self._total
-
-    def read(self, size: int = -1) -> bytes:
-        if size is None or size < 0:
-            chunk = self._data[self._pos :]
-        else:
-            chunk = self._data[self._pos : self._pos + size]
-        self._pos += len(chunk)
-        # a rendering hiccup must never abort an in-flight upload
-        with contextlib.suppress(Exception):
-            self._progress(self._pos, self._total)
-        return chunk
-
-
-_CHAT_STEP_SELECTOR_CAPABILITY = "chat_step_selector_v1"
-
-
-def _validate_chat_messages(messages: list[dict]) -> None:
-    if not isinstance(messages, list):
-        raise ClientError("chat messages must be a list")
-    for index, message in enumerate(messages):
-        if not isinstance(message, dict):
-            raise ClientError(f"chat messages[{index}] must be an object")
-
-
-def _parse_chat_target(target: str) -> tuple[str, str | None, int | None]:
-    from flash.schema import parse_adapter_revision, parse_checkpoint_ref
-
-    revision = parse_adapter_revision(target)
-    if revision is not None:
-        return revision[0], target.strip(), None
-    parsed = parse_checkpoint_ref(target)
-    if parsed is None:
-        raise ClientError(
-            "invalid run id: expected a bare RUN_ID, RUN_ID/step-N, or a full immutable adapter "
-            "revision"
-        )
-    run_id, step = parsed
-    return run_id, None, step
-
-
-def _prepare_chat_request(
-    target: str,
-    messages: list[dict],
-    temperature: float,
-    max_tokens: int,
-    *,
-    stream: bool = False,
-) -> tuple[str, dict[str, Any]]:
-    base_run_id, adapter_revision, step = _parse_chat_target(target)
-    _validate_chat_messages(messages)
-    body: dict[str, Any] = {
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-    if stream:
-        body["stream"] = True
-    if adapter_revision is not None:
-        body["adapter_revision"] = adapter_revision
-    elif step is not None:
-        body["step"] = step
-    return base_run_id, body
-
-
-def _parse_adapter_target(target: str) -> tuple[str, int | None]:
-    from flash.schema import parse_checkpoint_ref
-
-    parsed = parse_checkpoint_ref(target)
-    if parsed is None:
-        raise ClientError(
-            "invalid adapter id: expected RUN_ID for the final adapter or RUN_ID/step-N "
-            "for a saved checkpoint"
-        )
-    return parsed
+from flash.client.chat_targets import (  # noqa: E402
+    _CHAT_STEP_SELECTOR_CAPABILITY,
+    _parse_adapter_target,
+    _parse_chat_target,
+    _prepare_chat_request,
+)
 
 
 class ApiClient:
@@ -499,11 +423,11 @@ class ApiClient:
 
     @contextlib.contextmanager
     def _translate_http_errors(self) -> Iterator[None]:
-        """Map transport and response-decode errors to ApiError/ClientError; others propagate.
+        """Map transport errors to ApiError/ClientError; other exceptions propagate.
 
-        Covers the whole request, not just the connect: ``resp.read()`` and the ``json.loads`` of the
-        body both run inside this block, so a connection dropped mid-response and a truncated body
-        are transport failures too and must surface as ClientError like the rest.
+        Covers the whole request, not just the connect: ``resp.read()`` runs inside this block, so a
+        connection dropped mid-response is a transport failure too and must surface as ClientError
+        like the rest. Decoding the body is ``_decode_response``'s job, not this block's.
         """
         try:
             yield
@@ -527,20 +451,63 @@ class ApiClient:
             ) from exc
         # a mid-response disconnect does NOT arrive as URLError: `RemoteDisconnected` and
         # `ConnectionResetError` are ConnectionError, and `IncompleteRead` is neither -- so without
-        # these two clauses a dropped connection escaped as a raw traceback instead of the clean
+        # this clause a dropped connection escaped as a raw traceback instead of the clean
         # ClientError every caller here is written to expect.
         except (ConnectionError, http.client.IncompleteRead) as exc:
             raise ClientError(
                 f"connection to the Flash service at {self.api_url} was interrupted ({exc}); "
                 "check your network connection and FLASH_API_URL"
             ) from exc
-        # the JSON decode of a truncated or non-JSON body happens inside this block, and
-        # JSONDecodeError is a ValueError, so it needs naming too.
-        except json.JSONDecodeError as exc:
-            raise ClientError(
-                f"the Flash service at {self.api_url} returned a malformed response "
-                f"({exc}); retry, and check FLASH_API_URL points at a Flash control plane"
+
+    def _decode_response(
+        self,
+        path: str,
+        raw: bytes,
+        content_type: str = "",
+        *,
+        require: Mapping[str, RequireSpec] | None = None,
+    ) -> Any:
+        """Parse a 2xx body and require the top-level keys, and value types, the caller reads.
+
+        Every response body this client reads goes through here, so a proxy answering
+        ``200 text/html`` and a plane answering the wrong shape both surface as the same
+        ``ClientError``. An empty body decodes to ``{}``.
+
+        The type is required alongside the key because a present-but-unusable value is the same
+        user state: ``{"logs": "x", "offset": null}`` passes a presence check and then raises a
+        bare ``TypeError`` out of ``int(None)``, which nothing in the CLI translates either. A
+        ``[dict]`` spec extends that one level into a list, because ``{"runs": [null]}`` is the
+        same story one element down.
+        """
+        try:
+            payload = json.loads(raw) if raw else {}
+        except ValueError as exc:
+            raise _unexpected_response(
+                self.api_url,
+                path,
+                f"did not return JSON (Content-Type: {content_type or 'unset'})",
             ) from exc
+        # every consumer of this decoder reads an object; a bare list or scalar from a proxy
+        # or wrong service would otherwise surface as an AttributeError several frames later.
+        if not isinstance(payload, dict):
+            raise _unexpected_response(
+                self.api_url,
+                path,
+                f"returned JSON that is not an object ({type(payload).__name__})",
+            )
+        bad = [
+            key
+            for key, expected in (require or {}).items()
+            if key not in payload or not matches_require(payload[key], expected)
+        ]
+        if bad:
+            raise _unexpected_response(
+                self.api_url,
+                path,
+                "returned an unexpected response shape "
+                f"(missing or malformed {', '.join(repr(key) for key in bad)})",
+            )
+        return payload
 
     def _request(
         self,
@@ -550,6 +517,7 @@ class ApiClient:
         timeout: float | None = None,
         progress: ProgressCallback | None = None,
         extra_headers: dict[str, str] | None = None,
+        require: Mapping[str, RequireSpec] | None = None,
     ) -> Any:
         headers = {
             "Content-Type": "application/json",
@@ -572,20 +540,9 @@ class ApiClient:
             self._translate_http_errors(),
             urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp,
         ):
-            raw = resp.read()
-            if not raw:
-                return {}
-            try:
-                return json.loads(raw)
-            except UnicodeDecodeError as exc:
-                # a non-UTF-8 body raises UnicodeDecodeError, a SIBLING of JSONDecodeError under
-                # ValueError, so the clause in `_translate_http_errors` does not cover it. it cannot
-                # be added there either: `chat_stream` deliberately propagates UnicodeDecodeError
-                # through that manager to report a mid-stream decode fault.
-                raise ClientError(
-                    f"the Flash service at {self.api_url} returned an undecodable response "
-                    f"({exc}); check FLASH_API_URL points at a Flash control plane"
-                ) from exc
+            return self._decode_response(
+                path, resp.read(), resp.headers.get("Content-Type", ""), require=require
+            )
 
     def _request_bytes(
         self,
@@ -712,6 +669,7 @@ class ApiClient:
             f"/v1/envs/{quoted}",
             timeout=1800.0,
             extra_headers={"X-Freesolo-Project-Id": project_id},
+            require={"deleted": bool},
         )
 
     def download_env_package(self, env_id: str) -> bytes:
@@ -751,16 +709,20 @@ class ApiClient:
             body["dry_run"] = True
         if client_train_schema is not None:
             body["client_train_schema"] = client_train_schema
-        return self._request("POST", "/v1/runs", body=body)
+        return self._request("POST", "/v1/runs", body=body, require={"run_id": str})
 
     def list_runs(self) -> list[dict]:
-        return self._request("GET", "/v1/runs")["runs"]
+        return self._request("GET", "/v1/runs", require={"runs": [dict]})["runs"]
 
     def get_run(self, run_id: str) -> dict:
         return self._request("GET", f"/v1/runs/{run_id}")
 
     def get_logs(self, run_id: str, offset: int = 0) -> dict:
-        return self._request("GET", f"/v1/runs/{run_id}/logs?offset={int(offset)}")
+        return self._request(
+            "GET",
+            f"/v1/runs/{run_id}/logs?offset={int(offset)}",
+            require={"logs": str, "offset": int},
+        )
 
     def get_worker_output(self, run_id: str) -> dict[str, str]:
         try:
@@ -775,7 +737,9 @@ class ApiClient:
         # server may still have accepted the cancel and later persisted a terminal state. Resolve
         # that by polling the authoritative run status instead of surfacing a raw timeout.
         try:
-            return self._request("POST", f"/v1/runs/{run_id}/cancel", timeout=60.0)
+            return self._request(
+                "POST", f"/v1/runs/{run_id}/cancel", timeout=60.0, require={"state": str}
+            )
         except RequestTimeoutError as exc:
             return self._poll_cancel_status(run_id, cause=exc)
 
@@ -811,7 +775,9 @@ class ApiClient:
 
     def checkpoints(self, run_id: str) -> list[dict]:
         """Deployable per-step RL checkpoints for a run (serve one with `flash models deploy RUN/step-N`)."""
-        return self._request("GET", f"/v1/runs/{run_id}/checkpoints")["checkpoints"]
+        return self._request(
+            "GET", f"/v1/runs/{run_id}/checkpoints", require={"checkpoints": [dict]}
+        )["checkpoints"]
 
     def deploy(
         self,
@@ -848,7 +814,9 @@ class ApiClient:
         return self._request("DELETE", f"/v1/runs/{run_id}/deploy")
 
     def deployments(self, timeout: float | None = None) -> list[dict]:
-        return self._request("GET", "/v1/deployments", timeout=timeout)["deployments"]
+        return self._request(
+            "GET", "/v1/deployments", timeout=timeout, require={"deployments": [dict]}
+        )["deployments"]
 
     def deployment_for(self, run_id: str, timeout: float | None = None) -> dict | None:
         """The current deployment record for one run, or None when it is not listed.
@@ -952,7 +920,12 @@ class ApiClient:
         ):
             content_type = resp.headers.get("Content-Type", "")
             if "application/json" in content_type:
-                payload = json.loads(resp.read() or b"{}")
+                payload = self._decode_response(
+                    f"/v1/runs/{base_run_id}/chat",
+                    resp.read(),
+                    content_type,
+                    require={"choices": [dict]},
+                )
                 content = ((payload.get("choices") or [{}])[0].get("message") or {}).get("content")
                 if content:
                     yield str(content)
