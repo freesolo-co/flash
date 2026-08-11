@@ -40,6 +40,152 @@ except Exception:
 """
 
 
+# ----------------------- tilelang libcudart stub (all three verl backends) -----------------------
+# tilelang's bundled libcudart_stub.so does not export cudaDeviceReset. vLLM's CuMemAllocator
+# resolves libcudart out of the loaded-library set and can bind that stub instead of the real
+# runtime, so engine init dies with
+#   AttributeError: .../tilelang/lib/libcudart_stub.so: undefined symbol: cudaDeviceReset
+#   RuntimeError: Engine core initialization failed
+#
+# `perf._neutralize_tilelang_cudart_stub` fixes exactly this, but it runs in the flash PARENT and
+# locates tilelang with `importlib.util.find_spec` THERE. Training runs in a separate interpreter
+# (`FLASH_VERL_PYTHON`, `/opt/verl-venv`) that is built without --system-site-packages and where
+# flash is not installed at all -- and Dockerfile.worker installs tilelang into BOTH (the main
+# interpreter at the fla/Hopper layer, the child venv at its own layer), as does the run-time
+# rebuild in `verl.capabilities.resolve_verl_python`. So the parent fix never reaches the copy the
+# trainer actually loads, and the stub survives into the process that builds the vLLM engine.
+#
+# The allocator is only constructed when rollout sleep mode is on, which is why the one catalog
+# model flagged `sleep_unsupported` (35B-A3B, pinned resident by `rollout_resident_overrides`) got
+# past engine init while every other GRPO model crashed here.
+#
+# This is the same repoint the parent performs, re-expressed as a child fragment so it runs in the
+# interpreter that owns the loaded stub. It must run BEFORE any vLLM/model import, so it is emitted
+# at the top of the generated sitecustomize next to the tf32 fragment.
+FLASH_CUDART_STUB_MARKER = "[flash-verl] tilelang libcudart stub repointed"
+
+
+def render_tilelang_cudart_shim() -> str:
+    """child-side sitecustomize fragment that repoints tilelang's libcudart stub at the real runtime.
+
+    mirrors ``perf._neutralize_tilelang_cudart_stub`` inside the verl interpreter, and keeps its two
+    load-bearing rules: never ``dlopen`` the stub to test it (that maps the stub into this process,
+    which is the crash being avoided), and leave the stub alone when no real libcudart is found.
+
+    never raises. an unrepointed stub only crashes the runs that build a sleeping vLLM engine, so a
+    fragment that cannot find a runtime must leave the child to start rather than abort it here.
+    """
+    return f'''
+# --- flash: repoint tilelang's libcudart stub (see child_io.render_tilelang_cudart_shim) ---
+try:
+    import ctypes as _flash_cudart_ctypes
+    import ctypes.util as _flash_cudart_ctypes_util
+    import glob as _flash_cudart_glob
+    import importlib.util as _flash_cudart_importlib_util
+    import os as _flash_cudart_os
+
+    def _flash_cudart_verify(cand):
+        """resolved path if cand loads AND exports cudaDeviceReset, else None."""
+        try:
+            _lib = _flash_cudart_ctypes.CDLL(cand)
+        except OSError:
+            return None
+        if not hasattr(_lib, "cudaDeviceReset"):
+            return None
+        if _flash_cudart_os.path.isabs(cand) and _flash_cudart_os.path.exists(cand):
+            return _flash_cudart_os.path.realpath(cand)
+        _base = _flash_cudart_os.path.basename(cand)
+        try:
+            with open("/proc/self/maps") as _maps:
+                for _line in _maps:
+                    if _base in _line and "/" in _line:
+                        _path = _line[_line.index("/"):].rstrip()
+                        if _flash_cudart_os.path.basename(_path).startswith(
+                            _base
+                        ) and _flash_cudart_os.path.exists(_path):
+                            return _flash_cudart_os.path.realpath(_path)
+        except OSError:
+            pass
+        return None
+
+    def _flash_cudart_find_real():
+        """a libcudart that exports cudaDeviceReset, or None. same probe order as the parent."""
+        _candidates = []
+        try:
+            import nvidia as _flash_cudart_nvidia  # namespace pkg; subpackage import may fail
+
+            for _base_dir in sorted(map(str, getattr(_flash_cudart_nvidia, "__path__", []) or [])):
+                _candidates += sorted(
+                    _flash_cudart_glob.glob(
+                        _flash_cudart_os.path.join(_base_dir, "*", "lib", "libcudart.so.*")
+                    )
+                )
+        except Exception:
+            pass
+        for _pattern in (
+            "/usr/local/cuda*/lib64/libcudart.so.*",
+            "/usr/local/cuda*/targets/*/lib/libcudart.so.*",
+            "/usr/lib/x86_64-linux-gnu/libcudart.so.*",
+        ):
+            _candidates += sorted(_flash_cudart_glob.glob(_pattern))
+        _found = _flash_cudart_ctypes_util.find_library("cudart")
+        if _found:
+            _candidates.append(_found)
+        for _cand in _candidates:
+            _real = _flash_cudart_verify(_cand)
+            if _real is not None:
+                return _real
+        return None
+
+    try:
+        _flash_cudart_spec = _flash_cudart_importlib_util.find_spec("tilelang")
+    except Exception:
+        _flash_cudart_spec = None
+    _flash_cudart_locs = (
+        list(getattr(_flash_cudart_spec, "submodule_search_locations", None) or [])
+        if _flash_cudart_spec
+        else []
+    )
+    if _flash_cudart_locs:
+        _flash_cudart_stub = _flash_cudart_os.path.join(
+            _flash_cudart_locs[0], "lib", "libcudart_stub.so"
+        )
+        # lexists: a dangling symlink still shadows, and exists() would follow it away.
+        # do NOT probe the stub with CDLL -- that maps it into this process, the exact crash.
+        if _flash_cudart_os.path.lexists(_flash_cudart_stub) and not (
+            _flash_cudart_os.path.islink(_flash_cudart_stub)
+            and _flash_cudart_os.path.exists(_flash_cudart_stub)
+        ):
+            _flash_cudart_real = _flash_cudart_find_real()
+            if _flash_cudart_real is None:
+                print(
+                    "[flash-verl] tilelang libcudart stub: no real libcudart found; left as-is",
+                    flush=True,
+                )
+            else:
+                _flash_cudart_backup = _flash_cudart_stub + ".orig"
+                if not _flash_cudart_os.path.exists(_flash_cudart_backup):
+                    _flash_cudart_os.replace(_flash_cudart_stub, _flash_cudart_backup)
+                else:
+                    try:
+                        _flash_cudart_os.remove(_flash_cudart_stub)
+                    except FileNotFoundError:
+                        pass
+                # ray starts several workers against one venv; losing the race is harmless
+                # because the winner already left the symlink this one wanted.
+                try:
+                    _flash_cudart_os.symlink(_flash_cudart_real, _flash_cudart_stub)
+                except FileExistsError:
+                    pass
+                print(
+                    {FLASH_CUDART_STUB_MARKER!r} + " -> " + _flash_cudart_real,
+                    flush=True,
+                )
+except Exception as _flash_cudart_exc:
+    print("[flash-verl] tilelang libcudart stub repoint failed: " + repr(_flash_cudart_exc), flush=True)
+'''
+
+
 # --------------------------- w&b run link (all three verl backends) ---------------------------
 # verl calls wandb.init INSIDE the training subprocess, so the flash parent's
 # wandb.run is always None and anything read up here would be a silent no-op. the url is not

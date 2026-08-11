@@ -24,6 +24,7 @@ from flash.engine.worker.backend_common import (
     parse_verl_step_metrics,
     parse_wandb_link,
     render_tf32_shim,
+    render_tilelang_cudart_shim,
     render_wandb_link_shim,
 )
 from flash.engine.worker.io.heartbeat import (
@@ -191,6 +192,10 @@ def _write_rl_shim(inp, files) -> None:
             # rest of the child sees the choice. nothing below depends on it, but a later fragment
             # that raised would otherwise cost the whole run its tensor-core throughput.
             render_tf32_shim(),
+            # before anything that can import vllm: the fragment repoints tilelang's libcudart stub
+            # on disk, and vllm's CuMemAllocator binds libcudart the first time a sleeping engine is
+            # built. after the stub is already mapped into this process there is nothing to fix.
+            render_tilelang_cudart_shim(),
             render_reentrant_checkpointing_shim(
                 inp["reentrant_checkpointing"], multimodal=bool(inp["multimodal"])
             ),

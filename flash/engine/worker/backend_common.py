@@ -952,6 +952,7 @@ from flash.engine.worker.verl.checkpoints import (  # noqa: E402,F401
 )
 from flash.engine.worker.verl.child_io import (  # noqa: E402,F401
     _VERL_METRIC_FIELDS,
+    FLASH_CUDART_STUB_MARKER,
     FLASH_GDN_VARLEN_MARKER,
     FLASH_TF32_MARKER,
     FLASH_WANDB_LINK_MARKER,
@@ -961,6 +962,7 @@ from flash.engine.worker.verl.child_io import (  # noqa: E402,F401
     parse_wandb_link,
     render_gdn_varlen_shim,
     render_tf32_shim,
+    render_tilelang_cudart_shim,
     render_wandb_link_shim,
     verl_step_number,
 )
