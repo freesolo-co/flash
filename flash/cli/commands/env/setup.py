@@ -400,22 +400,30 @@ def _for_self_hosted_plane(source: str, project_id: str) -> str:
     rewrites = (
         # environment.py, single-turn and multi-turn: both carry this identical pair of sentences.
         (
-            f"upload with\n{push}.\n\n"
-            f"A managed run should use the returned [environment] id from\n{push}.",
-            "commit it to a git repo your plane can read.\n"
-            "\n"
-            "A managed run names that repo in [environment] id, as\n"
-            "`github:OWNER/REPO@main:environment.py` -- this plane is self-hosted, so publishing\n"
-            "to Freesolo's managed environment hub does not apply.",
+            (
+                f"upload with\n{push}.\n\n"
+                f"A managed run should use the returned [environment] id from\n{push}."
+            ),
+            (
+                "commit it to a git repo your plane can read.\n"
+                "\n"
+                "A managed run names that repo in [environment] id, as\n"
+                "`github:OWNER/REPO@main:environment.py` -- this plane is self-hosted, so publishing\n"
+                "to Freesolo's managed environment hub does not apply."
+            ),
         ),
         # evaluations.py, single-turn and multi-turn: identical opening sentences.
         (
-            f"Publish this file beside environment.py with\n{push}, then run the suites against a\n"
-            "model trained on it with `flash env eval TARGET`. The run names the published\n"
-            "environment, so `env eval` takes no local path.",
-            "Keep this file beside environment.py in the git repo named by [environment] id,\n"
-            "then run the suites against a model trained on it with `flash env eval TARGET`.\n"
-            "The run names that repo, so `env eval` takes no local path.",
+            (
+                f"Publish this file beside environment.py with\n{push}, then run the suites against a\n"
+                "model trained on it with `flash env eval TARGET`. The run names the published\n"
+                "environment, so `env eval` takes no local path."
+            ),
+            (
+                "Keep this file beside environment.py in the git repo named by [environment] id,\n"
+                "then run the suites against a model trained on it with `flash env eval TARGET`.\n"
+                "The run names that repo, so `env eval` takes no local path."
+            ),
         ),
     )
     # Each template matches exactly one of these (environment.py or evaluations.py), so applying
