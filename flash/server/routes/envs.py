@@ -77,9 +77,14 @@ def publish_env(
     # the guard and the conflict is still caught at the association step below.
     intended_slug = ""
     org_for_conflict = str(resolved_key.get("org_id") or "").strip()
-    with suppress(envs.EnvPublishError):
-        namespace, clean_name = envs.publish_slug_for_name("" if _name is None else _name, key)
-        intended_slug = f"{namespace}/{clean_name}"
+    # `isinstance` first: a non-string name (0, False, []) sanitizes to the generic "env", and
+    # guarding on that slug would answer a malformed request with a conflict about an unrelated
+    # environment. An invalid name has to reach publish_package's type check and get its
+    # deterministic 400, so only a real string is worth deriving a slug from.
+    if isinstance(_name, str):
+        with suppress(envs.EnvPublishError):
+            namespace, clean_name = envs.publish_slug_for_name(_name, key)
+            intended_slug = f"{namespace}/{clean_name}"
     if intended_slug and org_for_conflict:
         try:
             raise_if_owned_by_another_project(

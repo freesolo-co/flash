@@ -141,6 +141,16 @@ def api(tmp_path, monkeypatch):
         "record_published_environment",
         lambda **_kwargs: True,
     )
+    # The publish path's pre-upload ownership check is a second network choke-point: it urllib-POSTs
+    # the backend's validate endpoint, and FREESOLO_BASE_URL defaults to the production host. It
+    # swallows OSError by design (an unreachable backend must not block publishing), so a live call
+    # from this suite would pass silently instead of failing -- stub it like the reporters above.
+    monkeypatch.setattr(
+        environment_registry_mod,
+        "raise_if_owned_by_another_project",
+        lambda **_kwargs: None,
+        raising=False,
+    )
     with TestClient(app_mod.create_app()) as client:
         yield client
 
@@ -8596,6 +8606,35 @@ def test_publish_env_reports_a_cross_project_name_conflict_without_uploading(api
     # the two ways the old message misled: it must not blame recording, nor advise a retry.
     assert "could not be recorded" not in detail
     assert "retry" not in detail.lower().replace("retrying will not change this", "")
+
+
+def test_publish_env_reports_an_invalid_name_as_a_type_error_not_a_conflict(api, monkeypatch):
+    """A malformed name must not be answered with a conflict about an unrelated environment.
+
+    A non-string name sanitizes to the generic "env", so checking ownership of that slug before
+    validating the type would answer `name=0` with a 409 naming `<org>/env` -- a different
+    environment the caller never asked for -- instead of the deterministic 400.
+    """
+    import flash.server.domain.environment_registry as registry
+
+    # The org owns the sanitized "<ns>/env" slug under a different project. The real
+    # publish_package runs: its type check is what must answer, not this conflict.
+    monkeypatch.setattr(
+        registry,
+        "raise_if_owned_by_another_project",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            registry.EnvironmentProjectConflict("flash environment belongs to another project")
+        ),
+    )
+
+    response = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": 0, "package_b64": "payload", "project_id": SPEC["project"]},
+    )
+
+    assert response.status_code == 400, response.text
+    assert "name must be a string" in response.json()["detail"].lower()
 
 
 def test_publish_env_maps_a_late_ownership_conflict_to_409(api, monkeypatch):
