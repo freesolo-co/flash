@@ -163,20 +163,31 @@ try:
                     flush=True,
                 )
             else:
+                # ray starts several child interpreters against ONE venv, so every step below has
+                # to be safe under concurrency. no check-then-act: link() and symlink() both fail
+                # with FileExistsError rather than clobbering, which is the serialization.
                 _flash_cudart_backup = _flash_cudart_stub + ".orig"
-                if not _flash_cudart_os.path.exists(_flash_cudart_backup):
-                    _flash_cudart_os.replace(_flash_cudart_stub, _flash_cudart_backup)
-                else:
-                    try:
-                        _flash_cudart_os.remove(_flash_cudart_stub)
-                    except FileNotFoundError:
-                        pass
-                # ray starts several workers against one venv; losing the race is harmless
-                # because the winner already left the symlink this one wanted.
                 try:
-                    _flash_cudart_os.symlink(_flash_cudart_real, _flash_cudart_stub)
+                    # hard link, NOT replace(): the backup is created without unlinking the stub,
+                    # so a worker that loses this race still finds the stub in place. replace()
+                    # would move it and hand the loser FileNotFoundError -- and once .orig exists,
+                    # a second replace() would overwrite the preserved original with the symlink.
+                    _flash_cudart_os.link(_flash_cudart_stub, _flash_cudart_backup)
                 except FileExistsError:
-                    pass
+                    pass  # another worker already preserved it
+                except OSError:
+                    pass  # cross-device or a filesystem without hard links: proceed unbacked
+                # atomic swap through a private temp name: symlink() cannot overwrite, and an
+                # unlink-then-symlink would leave a window where the path does not resolve at all.
+                _flash_cudart_tmp = _flash_cudart_stub + ".flash-" + str(_flash_cudart_os.getpid())
+                try:
+                    _flash_cudart_os.symlink(_flash_cudart_real, _flash_cudart_tmp)
+                    _flash_cudart_os.replace(_flash_cudart_tmp, _flash_cudart_stub)
+                finally:
+                    try:
+                        _flash_cudart_os.remove(_flash_cudart_tmp)
+                    except OSError:
+                        pass
                 print(
                     {FLASH_CUDART_STUB_MARKER!r} + " -> " + _flash_cudart_real,
                     flush=True,

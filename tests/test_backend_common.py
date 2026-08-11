@@ -3968,6 +3968,59 @@ def test_the_child_fragment_is_idempotent_across_ray_workers(tmp_path):
     assert (tmp_path / "tilelang" / "lib" / "libcudart_stub.so.orig").read_bytes() == b"STUB"
 
 
+def test_concurrent_ray_workers_never_lose_the_stub_or_the_original(tmp_path):
+    """Ray starts several child interpreters against ONE venv, genuinely at the same time.
+
+    The sequential idempotency test above cannot see the interleaving: with a check-then-act backup,
+    two workers both observe ``.orig`` absent, one moves the stub and the other gets
+    FileNotFoundError and imports on with the path missing -- or the second overwrites the preserved
+    original with the symlink the first just made. Start the interpreters together and assert BOTH
+    invariants survive: the stub always resolves, and ``.orig`` is still the real stub bytes.
+    """
+    _pkg, stub = _fake_child_tilelang(tmp_path)
+    real = tmp_path / "libcudart.so.12"
+    real.write_bytes(b"REAL-CUDART")
+    source = vc.render_tilelang_cudart_shim()
+
+    workers = 8
+    barrier = threading.Barrier(workers)
+    results: list[subprocess.CompletedProcess] = []
+    lock = threading.Lock()
+
+    def _worker():
+        barrier.wait()  # release them into the critical section together
+        out = _run_cudart_fragment(
+            source, tmp_path, real=str(real), extra="print('FRAGMENT_DONE', flush=True)"
+        )
+        with lock:
+            results.append(out)
+
+    threads = [threading.Thread(target=_worker) for _ in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=180)
+
+    assert len(results) == workers, "a worker never finished"
+    for out in results:
+        assert "FRAGMENT_DONE" in out.stdout, (
+            f"a concurrent worker aborted instead of importing on: {out.stderr[-1500:]}"
+        )
+
+    # the stub must resolve for EVERY worker -- a moved-away stub is the crash, one step later.
+    assert stub.is_symlink()
+    assert os.path.realpath(stub) == os.path.realpath(str(real))
+    backup = tmp_path / "tilelang" / "lib" / "libcudart_stub.so.orig"
+    assert backup.exists(), "the preserved original went missing under concurrent workers"
+    assert not backup.is_symlink(), (
+        "the preserved original was overwritten by a racing worker's symlink"
+    )
+    assert backup.read_bytes() == b"STUB"
+    # no temp links left behind by a worker that died mid-swap.
+    leftovers = list((tmp_path / "tilelang" / "lib").glob("libcudart_stub.so.flash-*"))
+    assert not leftovers, f"temporary swap links leaked: {leftovers}"
+
+
 @pytest.mark.parametrize("backend", ["grpo", "opd", "sft"])
 def test_every_verl_backend_repoints_the_stub_in_its_child(backend, tmp_path):
     """The stub lives in the interpreter that builds the vLLM engine, and all three backends launch
