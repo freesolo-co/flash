@@ -25,6 +25,7 @@ from flash.providers import PROVIDER_NAMES
 from flash.providers.base import (
     GPU_INFO,
     UnsupportedGpuError,
+    authored_gpu_ceiling,
     canonical_gpu,
     get_gpu_info,
     providers_for,
@@ -421,8 +422,7 @@ def _validate_gpu_section(
                 f"gpu.provider {gpu_provider!r} cannot provision gpu.type {gpu_type!r}"
             )
 
-    gpu_count_auto = gpu_count is None and not gpu_type
-    requested_gpu_count = None if gpu_count_auto else (gpu_count or 1)
+    requested_gpu_count = authored_gpu_ceiling(gpu_type, gpu_count)
     preflight_gpu_count = provisional_gpu_count(
         model,
         algorithm,
@@ -456,8 +456,7 @@ def _validate_gpu_section(
             thinking=thinking,
             geometry_model_revision=model_revision,
             gpu_count=preflight_gpu_count,
-            authored_gpu_count=gpu_count,
-            gpu_count_auto=gpu_count_auto,
+            authored_gpu_ceiling=requested_gpu_count,
         )
     except (UnsupportedGpuError, ValueError) as exc:
         raise ConfigError(str(exc)) from exc
@@ -571,7 +570,7 @@ def spec_from_dict(
     spec = JobSpec(
         model=model,
         model_revision=model_revision,
-        gpu_count_auto="count" not in gpu_options and not gpu_type,
+        gpu_count_auto=authored_gpu_ceiling(gpu_type, gpu_options.get("count")) is None,
         algorithm=algorithm,
         environment=EnvironmentSpec(
             id=str(env_raw.get("id") or ""),

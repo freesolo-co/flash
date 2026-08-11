@@ -17,6 +17,7 @@ from flash.providers.base import (
     CapacityLookupError,
     UnsupportedGpuError,
     _run_cost_key,
+    authored_gpu_ceiling,
     canonical_gpu,
     combined_vram_gb,
     largest_rentable_count,
@@ -419,14 +420,10 @@ def allocate(
         )
         if not available:
             raise UnsupportedGpuError(f"exact GPU {exact!r} has no configured active provider")
-        # a pinned class with no authored count is a ONE-CARD pin, matching the parse gate
-        # (flash/schema/__init__.py) and the offline quote (flash/cost/analytical.py). without this,
-        # a direct allocate(gpu_type=...) call auto-sized the pinned class up to eight cards --
-        # measured: a 24 GB RTX 4090 resolved to 8 cards for an 80 GB run, renting hardware the
-        # author never asked for. auto-sizing applies only when neither the class nor the count is
-        # authored.
-        if max_gpu_count is None:
-            max_gpu_count = 1
+    # allocate() is reachable directly, bypassing the parse gate entirely, so it resolves the
+    # author's ceiling from the same shared predicate rather than trusting a caller to have applied
+    # it. see `authored_gpu_ceiling` for what a bare pin means and why.
+    max_gpu_count = authored_gpu_ceiling(gpu_type, max_gpu_count)
     cap = _resolved_gpu_count(
         model_id,
         algorithm,

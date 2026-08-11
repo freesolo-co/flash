@@ -418,6 +418,27 @@ def combined_vram_gb(vram_gb: int, gpu_count: int) -> float:
     )
 
 
+def authored_gpu_ceiling(gpu_type: str, gpu_count: int | None) -> int | None:
+    """Return the author's card ceiling, or ``None`` when the run may be auto-sized.
+
+    THE single definition of "did the author choose a shape?". Flash decides GPU shape at four
+    boundaries that never call each other -- the parse gate (``flash/schema``), the offline
+    ``--cost`` quote (``flash/cost/analytical.py``) and ``allocate()`` (which rents the hardware) --
+    and each one previously re-derived this rule in its own shape. That drifted three times in
+    review: a pinned 24 GB RTX 4090 with no authored count quoted EIGHT cards for an 80 GB run, and
+    ``allocate()`` resolved the same pin to a ceiling of 8. A test at one boundary cannot fail for a
+    bug at another, so the suite stayed green while half the boundaries were wrong.
+
+    A pinned class with no count is a ONE-CARD pin, not an invitation to widen: escalating it would
+    bill hardware the author never asked for. Auto-sizing applies only when NEITHER is authored.
+    ``gpu.count`` is parsed with ``minimum=1``, so a falsy authored count is unreachable rather than
+    silently meaning "one".
+    """
+    if gpu_count is not None:
+        return gpu_count
+    return 1 if gpu_type else None
+
+
 def _eligible_gpu_infos(gpu_names: tuple[str, ...] | None = None) -> tuple[GpuClass, ...]:
     """Return the validated structural pool used by offline sizing."""
     if gpu_names is None:
@@ -598,10 +619,24 @@ def provisional_gpu(
     model_revision: str = "",
     geometry_model_revision: str | None = None,
     gpu_count: int | None = None,
-    authored_gpu_count: int | None = None,
-    gpu_count_auto: bool = False,
+    authored_gpu_ceiling: int | None = None,
 ) -> str:
-    """Return the offline class preview for an authored ceiling or auto-sized run."""
+    """Return the offline class preview for an authored ceiling or auto-sized run.
+
+    Two DIFFERENT numbers, deliberately not folded together:
+
+    ``gpu_count`` is the width to preview a class AT, already through the geometry cap. The class
+    is chosen for the width, so previewing an authored eight on a model the cap holds to four names
+    a class that run never gets.
+
+    ``authored_gpu_ceiling`` is what the author wrote (``None`` when auto-sized) and only steers the
+    rejection's remedy: a ceiling the author chose can be raised, whereas an auto-sized run has
+    already tried every width and must be told to lower its knobs instead. Deriving it from the
+    capped width would report the cap as the author's choice. Callers that pass the author's value
+    straight through as ``gpu_count`` -- for whom the two ARE the same number -- may leave it unset.
+    """
+    if authored_gpu_ceiling is None and gpu_count is not None:
+        authored_gpu_ceiling = gpu_count
     from flash.engine.plan.vram import model_required_vram_gb
     from flash.providers.allocator import geometry_safe_gpu_cap, vram_headroom
 
@@ -643,11 +678,7 @@ def provisional_gpu(
             vram_fit_error_message(
                 algorithm,
                 min_vram,
-                requested_gpu_count=(
-                    None
-                    if gpu_count_auto
-                    else (gpu_count if authored_gpu_count is None else authored_gpu_count)
-                ),
+                requested_gpu_count=authored_gpu_ceiling,
                 effective_gpu_count=effective_count,
                 max_gpu_count=auto_cap,
             )

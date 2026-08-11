@@ -453,6 +453,7 @@ def _offline_gpu_shape(
     from flash.providers.base import (
         GPU_INFO,
         MAX_COMBINATION_CARDS,
+        authored_gpu_ceiling,
         canonical_gpu,
         combined_vram_gb,
         providers_for,
@@ -490,17 +491,14 @@ def _offline_gpu_shape(
     auto_cap = geometry_safe_gpu_cap(
         config.model_id, MAX_COMBINATION_CARDS, model_revision=config.model_revision
     )
-    # auto-size only when NEITHER the class nor the count is authored, matching the parse-time gate
-    # (flash/schema/__init__.py). a pinned class with no count stays one card: escalating it would
-    # quote eight cheap cards for a run the author asked to place on one, and submit rejects that
-    # shape anyway -- the quote would name hardware allocation never provisions.
-    if config.gpu_count is None and not config.gpu_type:
+    ceiling = authored_gpu_ceiling(config.gpu_type, config.gpu_count)
+    if ceiling is None:
         safe_gpu_count = (
             smallest_fitting_gpu_count(need, max_gpu_count=auto_cap, gpu_names=names) or auto_cap
         )
     else:
         safe_gpu_count = geometry_safe_gpu_cap(
-            config.model_id, config.gpu_count or 1, model_revision=config.model_revision
+            config.model_id, ceiling, model_revision=config.model_revision
         )
     ranked = []
     for gpu in names:
@@ -552,7 +550,7 @@ def _offline_gpu_shape(
             vram_fit_error_message(
                 config.method,
                 need,
-                requested_gpu_count=config.gpu_count,
+                requested_gpu_count=ceiling,
                 effective_gpu_count=safe_gpu_count,
                 max_gpu_count=auto_cap,
                 gpu_names=names,

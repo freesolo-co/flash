@@ -1598,6 +1598,25 @@ def test_a_pinned_gpu_type_without_a_count_stays_one_card_in_allocate(monkeypatc
         allocator.allocate("Qwen/Qwen3.5-9B", "grpo", gpu_type="RTX 4090")
 
 
+def test_every_boundary_reads_the_authored_ceiling_from_one_predicate():
+    """The four sizing boundaries must not re-derive "did the author choose a shape?" themselves.
+
+    This rule drifted three times in review because each boundary spelled it differently, and a
+    test at one boundary cannot fail for a bug at another. `authored_gpu_ceiling` is now the single
+    definition; this pins its truth table so a future edit to any one caller cannot quietly
+    reintroduce a fourth dialect.
+    """
+    from flash.providers.base import authored_gpu_ceiling
+
+    # nothing authored -> auto-size (the only case that may widen)
+    assert authored_gpu_ceiling("", None) is None
+    # a bare class pin is a ONE-CARD pin, never an invitation to widen
+    assert authored_gpu_ceiling("RTX 4090", None) == 1
+    # an authored count is a hard ceiling, with or without a class
+    assert authored_gpu_ceiling("", 4) == 4
+    assert authored_gpu_ceiling("RTX 4090", 2) == 2
+
+
 def test_unset_count_quote_prices_the_auto_sized_shape():
     from flash.cost import RunConfig, estimate_cost
 
