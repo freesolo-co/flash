@@ -207,10 +207,11 @@ def _grpo_is_multimodal(train, message_prompts):
 
 
 def _resolve_sequence_lengths(model_id, model_revision, train_spec, rl, gcfg, tok, multi_turn):
-    max_completion = int(
-        gcfg.get("max_tokens")
-        or (rl.max_completion_len_thinking if _w.THINKING else rl.max_completion_len)
-    )
+    # same resolver the spec-parse prompt-budget guard uses, so a run rejected at submit is exactly
+    # the run this would have failed here after the gpu was already paid for.
+    from flash.engine.plan.vram import grpo_completion_len
+
+    max_completion = grpo_completion_len(gcfg.get("max_tokens"), bool(_w.THINKING))
     train_ctx = (
         train_spec.max_context_tokens if (train_spec and train_spec.max_context_tokens) else 0
     )

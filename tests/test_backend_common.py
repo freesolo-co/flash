@@ -1759,9 +1759,11 @@ def test_run_verl_training_preserves_oom_over_device_unavailable_after_eviction(
     command = [
         "bash",
         "-c",
-        'printf \'%s\\n\' "$FIRST" "$SECOND"; '
-        "for i in $(seq 1 70); do echo filler-$i; done; "
-        "exit 1",
+        (
+            'printf \'%s\\n\' "$FIRST" "$SECOND"; '
+            "for i in $(seq 1 70); do echo filler-$i; done; "
+            "exit 1"
+        ),
     ]
     tail = vc.ChildOutputTail(limit=3)
 
@@ -1935,10 +1937,12 @@ def test_kill_process_group_escalates_to_sigkill_when_sigterm_is_ignored(quick_t
         [
             sys.executable,
             "-c",
-            "import signal, sys, time\n"
-            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-            "print('ready', flush=True)\n"
-            "time.sleep(300)\n",
+            (
+                "import signal, sys, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "print('ready', flush=True)\n"
+                "time.sleep(300)\n"
+            ),
         ],
         stdout=subprocess.PIPE,
         text=True,
