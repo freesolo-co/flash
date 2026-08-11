@@ -1230,7 +1230,9 @@ def test_a_blip_after_sizing_cannot_narrow_an_already_validated_pin():
         monkey.setattr(vram, "fetch_hf_model_geometry", _blip)
 
         # 3. the cap must still certify 8 from the geometry step 1 already read and validated.
-        assert geometry_safe_gpu_cap(model, 8, model_revision=rev) == 8
+        # `certify=True` is what makes this test mean anything: without it the cap never consults
+        # the memo, so the blip stub above is dead and a lost memo-reuse regression still passes.
+        assert geometry_safe_gpu_cap(model, 8, model_revision=rev, certify=True) == 8
     finally:
         monkey.undo()
 
