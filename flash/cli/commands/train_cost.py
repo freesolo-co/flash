@@ -63,6 +63,8 @@ def _cmd_train_cost(args) -> int:
         project_required=True,
     )
     preflight_train_context_within_serving(spec)
+    # one call before the sft/offline fork, so a new branch cannot silently lose the warning.
+    _print_thin_rl_batch_warning(spec)
     if spec.algorithm == "sft":
         return _cmd_train_cost_sft(args, spec, authored_train_keys)
     return _cmd_train_cost_offline(spec)
@@ -88,7 +90,6 @@ def _cmd_train_cost_offline(spec) -> int:
         print(render.cost_panel(estimate))
     else:
         print(estimate.breakdown())
-    _print_thin_rl_batch_warning(spec)  # after the payload, so stdout stays parseable
     return 0
 
 
@@ -254,10 +255,11 @@ def _exact_sft_cost_rows(spec, profile: dict) -> list[tuple[str, str | None]]:
 
 
 def _print_thin_rl_batch_warning(spec) -> None:
-    """Warn that a grpo/opd ``batch_size`` is the optimizer batch, before any gpu is allocated.
+    """Warn that a grpo/opd optimizer batch is thin, before the run is created.
 
-    Derived from the spec alone, so unlike the sft packing warning it needs no server response and
-    fires on the offline ``--cost`` quote too.
+    Derived from the spec alone, so unlike the sft packing warning it needs no server response:
+    both callers run it on the parsed spec ahead of any ``create_run``, which is what makes it
+    actionable rather than an epitaph for a run that is already billing.
     """
     message = thin_rl_batch_warning(spec)
     if not message:

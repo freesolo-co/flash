@@ -135,49 +135,64 @@ RL_THIN_PROMPTS_PER_STEP = 4
 
 
 def thin_rl_batch_warning(spec) -> str | None:
-    """One user-facing line when an rl run's ``[train] batch_size`` is too thin to be a batch.
+    """One user-facing line when an rl run's optimizer batch is too thin to be a batch.
 
     ``batch_size`` names two different quantities. Under sft it is a memory knob: the optimizer
     batch comes from the workload profile's ``examples_per_update``, and the authored value only
     picks the per-device micro-batch it is split into. Under grpo/opd the same key IS the optimizer
     batch -- it becomes ``prompts_per_step``, then verl's ``data.train_batch_size`` and
     ``ppo_mini_batch_size``. So the standard sft memory workaround, ``batch_size = 1``, silently
-    turns an rl run into one prompt per update.
+    turns an rl run into one prompt per update, and nothing errors.
 
-    Nothing errors, and the run is not broken: verl centres advantages per prompt over
-    ``group_size`` (dr-grpo, ``norm_adv_by_std_in_grpo=False``), so a group baseline still exists
-    at any batch size. What is lost is the averaging ACROSS prompts -- every update follows one
-    prompt's group, so the gradient is far noisier at full price. Returns None for sft, for a
-    healthy batch, and when nothing was authored (the recipe default is already sane).
+    Reads the EFFECTIVE prompts-per-step, not the authored field: ``max_examples`` clamps the batch
+    to the retained prompt pool (``_on_policy_prompts_per_step``), so a scaffolded ``max_examples =
+    2`` run trains on 2 prompts per update whether or not a ``batch_size`` was ever written.
+
+    What the thin batch costs differs by algorithm, so the message does too. grpo keeps a working
+    per-prompt baseline at any batch size (verl centres each response against its own prompt's
+    group; dr-grpo, ``norm_adv_by_std_in_grpo=False``) and only loses the averaging ACROSS prompts.
+    opd has no advantages at all -- its objective is groupwise reverse KL against the teacher with
+    ``use_policy_gradient=false`` -- so there is no baseline to reassure anyone about, and unlike
+    grpo its ``batch_size`` genuinely IS a memory lever (it scales rollout concurrency and the loss
+    microbatch in ``estimate_vram_gb``). Telling an opd user to raise it would be advice to OOM.
     """
     if spec.algorithm not in ("grpo", "opd"):
         return None
-    authored = getattr(spec.train, "batch_size", None)
-    if authored is None:
-        return None
-    try:
-        prompts_per_step = int(authored)
-    except (TypeError, ValueError):
-        return None
+    examples = _on_policy_example_count(spec)
+    prompts_per_step = _on_policy_prompts_per_step(spec, examples)
     if prompts_per_step >= RL_THIN_PROMPTS_PER_STEP:
         return None
-    # group_size is what still gives the update its baseline, so name the one the run will use
-    # rather than implying the advantage is gone.
-    from flash.engine.plan.recipe import RECIPE
-
-    default_group = RECIPE.rl.group_size if spec.algorithm == "grpo" else RECIPE.opd.group_size
-    configured_group = getattr(spec.train, "group_size", None)
-    group_size = int(configured_group) if configured_group is not None else int(default_group)
     prompts = "1 prompt" if prompts_per_step == 1 else f"{prompts_per_step} prompts"
+    authored = spec.train.batch_size
+    # name whichever input actually produced the thin batch: the authored key, or the max_examples
+    # clamp that overrode (or stood in for) it.
+    source = (
+        f"[train] batch_size = {authored}"
+        if authored is not None and int(authored) == prompts_per_step
+        else f"[train] max_examples caps this {spec.algorithm} run's prompt pool, so its "
+        f"optimizer batch of {prompts_per_step}"
+    )
+    if spec.algorithm == "grpo":
+        consequence = (
+            "Each prompt's completions are still centred against their own group, so the advantage "
+            "signal survives, but no averaging across prompts does: every update follows one "
+            "prompt's group, so expect much noisier updates at full price. Raise it unless you are "
+            "deliberately buying optimizer steps on a derived horizon (see TRAINING.md)."
+        )
+    else:
+        # opd's batch_size is also a real vram lever, so "raise it" is not safe blanket advice.
+        consequence = (
+            "opd distills against the teacher rather than scoring completions against each other, "
+            "so a thin batch does not break a baseline -- it just makes each update follow very few "
+            "prompts, which is noisier at full price. Unlike grpo, opd's batch_size is ALSO a "
+            "memory lever (it sizes rollout concurrency and the loss microbatch), so raise it only "
+            "as far as the gpu allows."
+        )
     return (
-        f"[train] batch_size = {prompts_per_step} is the OPTIMIZER batch for {spec.algorithm}, not "
-        f"a memory knob: it sets prompts-per-step, so each update trains on {prompts} "
-        f"x group_size {group_size} completions. Under sft the same key means the "
-        "micro-batch and the optimizer batch comes from the workload profile, so an sft "
-        "`batch_size = 1` memory workaround does not carry over. Advantages are still centred "
-        "within each prompt's group, but no averaging across prompts survives, so expect much "
-        "noisier updates at full price. Raise it (or lower train.learning_rate) unless you are "
-        "deliberately buying optimizer steps on a derived horizon."
+        f"{source} is the OPTIMIZER batch for {spec.algorithm}, not the sft memory knob of the same "
+        f"name: it sets prompts-per-step, so each update trains on {prompts}. Under sft this key "
+        "picks the micro-batch and the optimizer batch comes from the workload profile, so an sft "
+        f"`batch_size = 1` memory workaround does not carry over. {consequence}"
     )
 
 

@@ -330,8 +330,11 @@ def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):
     assert "GPU" in out  # the breakdown names the chosen (provisional cheapest-fit) class
 
 
-def _grpo_cost_args(tmp_path, batch_size: int, algorithm: str = "grpo", **train):
-    """A `--cost` invocation for an on-policy run with the given optimizer batch."""
+def _grpo_cost_args(tmp_path, batch_size: int | None = None, algorithm: str = "grpo", **train):
+    """A `--cost` invocation for an on-policy run. ``batch_size=None`` authors no batch at all."""
+    train.setdefault("max_examples", 800)
+    if batch_size is not None:
+        train["batch_size"] = batch_size
     rows = "".join(f"{key} = {value}\n" for key, value in train.items())
     cfg = tmp_path / "run.toml"
     cfg.write_text(
@@ -342,8 +345,6 @@ def _grpo_cost_args(tmp_path, batch_size: int, algorithm: str = "grpo", **train)
         'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
         "[train]\n"
         "epochs = 1\n"
-        "max_examples = 800\n"
-        f"batch_size = {batch_size}\n"
         f"{rows}"
         "[gpu]\n"
     )
@@ -374,36 +375,62 @@ def test_grpo_cost_warns_that_a_thin_batch_size_is_the_optimizer_batch(
     assert "TOTAL" in captured.out  # the quote itself still prints
     assert "OPTIMIZER batch" in captured.err
     assert "batch_size = 1" in captured.err
-    # the warning must name the group that still supplies the baseline, not claim there is none
-    assert "group_size 8" in captured.err
+    assert "1 prompt" in captured.err
+    assert "prompt(s)" not in captured.err  # the common case must read naturally
+    # grpo keeps a working per-prompt baseline, so the warning must not claim the advantage is gone
+    assert "advantage signal survives" in captured.err
     assert "sft" in captured.err
 
 
-def test_thin_batch_warning_names_the_configured_group_size(tmp_path, monkeypatch, capsys):
-    """The completions per update are batch x group, so the reported group must be the run's."""
+def test_thin_batch_warning_counts_the_prompts_not_the_completions(tmp_path, monkeypatch, capsys):
+    """The optimizer batch is prompts; group_size multiplies rollouts, not updates."""
     monkeypatch.setenv("FLASH_STYLE", "0")
 
     rc = cmd_train(_grpo_cost_args(tmp_path, 2, group_size=4))
     err = capsys.readouterr().err
 
     assert rc == 0
-    assert "2 prompts x group_size 4 completions" in err
+    assert "each update trains on 2 prompts" in err
 
 
-def test_thin_batch_warning_reads_naturally_for_a_single_prompt(tmp_path, monkeypatch, capsys):
-    """`batch_size = 1` is the case users actually hit, so it must not render as "1 prompt(s)"."""
+def test_a_max_examples_clamp_is_warned_about_even_with_no_batch_size(
+    tmp_path, monkeypatch, capsys
+):
+    """`max_examples` clamps the batch to the prompt pool, so a thin run can author no batch at all.
+
+    `flash env setup` scaffolds exactly this shape, so reading only the authored field would stay
+    silent on the configs this warning exists to protect.
+    """
     monkeypatch.setenv("FLASH_STYLE", "0")
 
-    rc = cmd_train(_grpo_cost_args(tmp_path, 1))
+    rc = cmd_train(_grpo_cost_args(tmp_path, None, max_examples=2))
     err = capsys.readouterr().err
 
     assert rc == 0
-    assert "1 prompt x group_size 8 completions" in err
-    assert "prompt(s)" not in err
+    assert "OPTIMIZER batch" in err
+    assert "max_examples" in err  # it must name the input that actually caused it
+    assert "each update trains on 2 prompts" in err
 
 
-def test_opd_cost_warns_about_a_thin_batch_size_too(tmp_path, monkeypatch, capsys):
-    """opd reads the same key into prompts_per_step, so it carries the same collision."""
+def test_a_big_batch_clamped_by_max_examples_still_warns(tmp_path, monkeypatch, capsys):
+    """A healthy authored batch is not healthy if the prompt pool cannot fill it."""
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, 64, max_examples=2))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "each update trains on 2 prompts" in err
+
+
+def test_opd_warning_does_not_promise_advantages_or_tell_the_user_to_raise_the_batch(
+    tmp_path, monkeypatch, capsys
+):
+    """opd is reverse-KL distillation with use_policy_gradient=false: it has no advantages.
+
+    Its batch_size is also a real vram lever (it sizes rollout concurrency and the loss
+    microbatch), so an unqualified "raise it" is advice to OOM the exact user who lowered it.
+    """
     monkeypatch.setenv("FLASH_STYLE", "0")
 
     rc = cmd_train(_grpo_cost_args(tmp_path, 1, algorithm="opd"))
@@ -411,6 +438,10 @@ def test_opd_cost_warns_about_a_thin_batch_size_too(tmp_path, monkeypatch, capsy
 
     assert rc == 0
     assert "OPTIMIZER batch for opd" in err
+    assert "advantage" not in err
+    assert "centred" not in err
+    assert "memory lever" in err
+    assert "as far as the gpu allows" in err
 
 
 def test_grpo_cost_stays_quiet_when_the_batch_is_a_real_batch(tmp_path, monkeypatch, capsys):
@@ -428,41 +459,65 @@ def test_a_real_thin_batch_submit_warns_before_the_run_starts(tmp_path, monkeypa
     """The submit path is the one that spends the money, so it cannot be the one that stays quiet.
 
     `--cost` is optional; a user who goes straight to `flash train` would otherwise pay for the
-    whole degraded run before anything says the batch is one prompt.
+    whole degraded run before anything says the batch is one prompt. Ordering is the whole point,
+    so this asserts it directly: the client dies inside `create_run`, and the warning has to have
+    been printed already for it to survive. A warning emitted after the run is created reads the
+    same in captured stderr but arrives too late to be worth anything.
     """
-    _use_client(monkeypatch, _QuotingClient({"run_id": "run-thin-batch"}))
+
+    class _DyingClient(_QuotingClient):
+        def create_run(self, *args, **kwargs):
+            super().create_run(*args, **kwargs)
+            raise RuntimeError("run creation reached")
+
+    _use_client(monkeypatch, _DyingClient({"run_id": "run-thin-batch"}))
 
     args = _grpo_cost_args(tmp_path, 1)
     args.cost = False
     args.background = True
 
-    rc = cmd_train(args)
+    with pytest.raises(RuntimeError, match="run creation reached"):
+        cmd_train(args)
     err = capsys.readouterr().err
 
-    assert rc == 0
     assert "OPTIMIZER batch" in err
 
 
 def test_a_thin_batch_dry_run_warns_too(tmp_path, monkeypatch, capsys):
-    """`--dry-run` is the rehearsal for a submit, so it must surface the same fact."""
-    _use_client(monkeypatch, _QuotingClient({"run_id": "run-thin-batch"}))
+    """`--dry-run` is the rehearsal for a submit, so it must surface the same fact.
+
+    Dry-run is the branch a careful user reaches for first, and for sft it can itself start a
+    billed profile run, so the warning has to precede `create_run` here as well.
+    """
+
+    class _DyingClient(_QuotingClient):
+        def create_run(self, *args, **kwargs):
+            super().create_run(*args, **kwargs)
+            raise RuntimeError("run creation reached")
+
+    _use_client(monkeypatch, _DyingClient({"run_id": "run-thin-batch"}))
 
     args = _grpo_cost_args(tmp_path, 1)
     args.cost = False
     args.dry_run = True
 
-    rc = cmd_train(args)
+    with pytest.raises(RuntimeError, match="run creation reached"):
+        cmd_train(args)
     err = capsys.readouterr().err
 
-    assert rc == 0
     assert "OPTIMIZER batch" in err
 
 
 def test_sft_cost_never_warns_about_the_optimizer_batch(tmp_path, monkeypatch, capsys):
-    """Under sft `batch_size` really IS the memory knob, so warning here would be wrong."""
+    """Under sft `batch_size` really IS the memory knob, so warning here would be wrong.
+
+    The config authors `batch_size = 1` deliberately: at the recipe default of 8 this test would
+    pass on the threshold check alone and could not detect the algorithm guard being removed. 1 is
+    below the threshold, so only the sft guard keeps this quiet.
+    """
     _use_client(monkeypatch, _QuotingClient())
 
-    rc = cmd_train(_sft_args(tmp_path))  # SFT_TOML authors batch_size = 8
+    rc = cmd_train(_sft_args(tmp_path, SFT_TOML.replace("batch_size = 8", "batch_size = 1")))
     err = capsys.readouterr().err
 
     assert rc == 0

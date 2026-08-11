@@ -404,6 +404,7 @@ def cmd_train(args) -> int:
         runtime_secrets_from_local_env(args.config, keys=spec.environment.secrets) or None
     )
     _warn_if_wandb_requested_without_key(spec, runtime_secrets, dry_run=bool(args.dry_run))
+    _print_thin_rl_batch_warning(spec)  # before create_run: after it, the spend already happened
     if args.dry_run:
         # dry-run runs submit-time server preflights without allocating a training gpu or charging
         # for training. a rejection surfaces as the server's error with exit status 1. for sft it
@@ -461,7 +462,6 @@ def cmd_train(args) -> int:
             )
         else:
             print(json.dumps(status, indent=2))
-        _print_thin_rl_batch_warning(spec)  # after the payload, so stdout stays parseable
         return 0
     try:
         status = client.create_run(
@@ -476,7 +476,6 @@ def cmd_train(args) -> int:
         _raise_if_workload_profile_pending(client, exc)
         raise
     run_id = status["run_id"]
-    _print_thin_rl_batch_warning(spec)  # a real submit spends the money this warns about
     logger.info(
         "submitted run %s: model=%s algorithm=%s gpu=%s",
         run_id,
