@@ -850,6 +850,14 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
 
     params = dict(kwargs)
     source = params.pop("records", None)
+    # [environment.params] split selects which packaged dataset file Flash trains on. It used to
+    # be forwarded to the SDK only, so SFT (and GRPO problem selection driven off dataset())
+    # SILENTLY trained on the default dataset/train.jsonl even when a side split was requested.
+    split = params.get("split")
+    split = split.strip() if isinstance(split, str) else None
+    if split:
+        split = _validate_packaged_dataset_split(split)
+    side_split = bool(split) and split != "train"
     # true when source is the DEFAULT packaged train file the environment itself received as a
     # param; the env instance's own dataset then takes precedence over re-reading the file (see
     # FreesoloEnvironment.dataset). explicit records never reach the env, so they keep winning.
@@ -864,20 +872,18 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
         # it is handed. letting that env's dataset win would silently train on the default split
         # instead of the file the operator named, so the explicit file stays authoritative. only
         # the default train file keeps env precedence (the documented pattern of filtering the
-        # injected train file remains the headline behavior).
+        # injected train file remains the headline behavior) -- and only when no side split was
+        # requested alongside it: with dataset_path AND split both explicit, env precedence would
+        # let an env that honors split= deliver the side rows against the file the operator
+        # named, so the codified rule (an explicit dataset_path wins over split) keeps the
+        # explicitly authored path authoritative.
         default_train = _packaged_dataset_file(base_dir, "train")
         source_is_dataset_file = (
-            default_train is not None
+            not side_split
+            and default_train is not None
             and isinstance(resolved_dataset_path, str)
             and Path(resolved_dataset_path).resolve() == default_train.resolve()
         )
-    # [environment.params] split selects which packaged dataset file Flash trains on. It used to
-    # be forwarded to the SDK only, so SFT (and GRPO problem selection driven off dataset())
-    # SILENTLY trained on the default dataset/train.jsonl even when a side split was requested.
-    split = params.get("split")
-    split = split.strip() if isinstance(split, str) else None
-    if split:
-        split = _validate_packaged_dataset_split(split)
     datasets_dir_unread = False
     if source is None:
         wanted = split if split and split != "train" else "train"
@@ -927,8 +933,11 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
     # an env that generates or owns every row in load_environment needs no packaged file, and a
     # datasets/ directory is then just raw or eval assets, so it must be able to load. an env
     # whose in-code dataset is empty still needs the file, so it still lands here, where the
-    # message names the layout problem instead of the adapter's generic empty-dataset one.
-    if datasets_dir_unread and not env_dataset_rows(sdk_env):
+    # message names the layout problem instead of the adapter's generic empty-dataset one. an
+    # explicitly requested side split lands here too, env rows or not: the layout hid any
+    # packaged split file, and rows the env supplies in code cannot be verified against the
+    # requested split, so training on them would silently undo the split guarantee.
+    if datasets_dir_unread and (side_split or not env_dataset_rows(sdk_env)):
         raise ValueError(
             "environment package has a top-level 'datasets/' directory, which Flash never "
             "reads (it probes dataset/<split>.jsonl or dataset/<split>.json). Rename the "

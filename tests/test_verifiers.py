@@ -944,6 +944,26 @@ def test_freesolo_adapter_datasets_plural_dir_raises_when_the_env_needs_the_file
             load_freesolo_environment(str(env_file), contract_text="c")
 
 
+def test_freesolo_adapter_datasets_plural_dir_raises_for_a_requested_side_split(
+    monkeypatch, tmp_path
+):
+    """deferring the guard because the env exposes rows must not swallow an explicit side
+    split: the layout hid any packaged split file, and rows the env supplies in code cannot
+    be verified against the requested split, so loading them would silently train on the
+    wrong split -- the exact failure the split rule exists to stop."""
+    sdk_env = _FakeSingleTurnEnv()
+    sdk_env.dataset = [{"id": "built", "input": "2+2?", "output": "4"}]
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+    env_file = _split_env(
+        tmp_path, {"datasets/oracle.jsonl": '{"id":"o","input":"o?","output":"o"}\n'}
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    with pytest.raises(ValueError, match="'datasets/' directory"):
+        load_freesolo_environment(str(env_file), split="oracle", contract_text="c")
+
+
 def test_freesolo_adapter_records_param_wins_over_env_dataset(monkeypatch, tmp_path):
     """explicit [environment.params] records never reach the sdk env, so they keep
     precedence over a hardcoded env dataset."""
@@ -964,6 +984,36 @@ def test_freesolo_adapter_records_param_wins_over_env_dataset(monkeypatch, tmp_p
 
 def test_freesolo_adapter_explicit_dataset_path_wins_over_split(monkeypatch, tmp_path):
     _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path,
+        {
+            "dataset/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n',
+            "dataset/oracle.jsonl": '{"id":"o","input":"2+2?","output":"4"}\n',
+        },
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(
+        str(env_file),
+        dataset_path="dataset/train.jsonl",
+        split="oracle",
+        contract_text="c",
+    )
+    assert env.dataset() == [{"id": "t", "input": "train?", "output": "no"}]
+
+
+def test_freesolo_adapter_explicit_default_train_path_beats_env_rows_under_side_split(
+    monkeypatch, tmp_path
+):
+    """dataset_path naming the default train file normally keeps env precedence (the documented
+    filtering pattern), but combined with an explicit side split that precedence would let an
+    env honoring split= deliver the side rows against the file the operator named. the codified
+    rule -- an explicit dataset_path wins over split -- has to hold even when the env exposes
+    rows, so the explicitly authored path stays authoritative."""
+    sdk_env = _FakeSingleTurnEnv()
+    sdk_env.dataset = [{"id": "o", "input": "2+2?", "output": "4"}]
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
     env_file = _split_env(
         tmp_path,
         {
