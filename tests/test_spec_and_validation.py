@@ -986,6 +986,213 @@ def test_model_revision_strips_round_trips_and_rejects_non_strings() -> None:
             _job_from_dict({"model_revision": value})
 
 
+def test_model_revision_auto_is_platform_managed_and_stripped_from_the_public_spec() -> None:
+    """The marker records WHO pinned the base model, and only the runner may set it.
+
+    `to_dict()` strips it like the other platform-managed carriers, because that output is the
+    public `RunStatus.spec` and has to stay re-parseable by the submission schema -- emitting it
+    would break resubmitting a public spec with `ConfigError: unknown config key(s)`. The internal
+    worker spec keeps it, which is where the deploy guard reads provenance from.
+    """
+    # built through the public parser so the resubmission check below exercises a real config
+    auto = replace(spec_from_dict(_raw(model_revision="c" * 40)), model_revision_auto=True)
+    assert "model_revision_auto" not in auto.to_dict()
+    # the pin VALUE leaves with its marker. the public spec has no way to carry the provenance
+    # (the submission schema rejects the marker key), so emitting the bare SHA would advertise a
+    # revision the author never wrote -- and resubmitting it reads that SHA back as authored,
+    # which is the one shape deploy still refuses. see the resubmission test below.
+    # cleared, NOT removed: the key must still be present, or the digest drifts between the create
+    # and re-persist paths -- see test_stripping_an_auto_pin_keeps_the_preparation_digest_stable.
+    assert auto.to_dict()["model_revision"] == ""
+    # the public spec still resubmits -- emitting the marker here would raise ConfigError
+    assert spec_from_dict(auto.to_dict()).model_revision == ""
+    assert auto.to_internal_dict()["model_revision_auto"] is True
+    assert JobSpec.from_dict(auto.to_internal_dict()).model_revision_auto is True
+    assert JobSpec.from_json(auto.to_json()).model_revision_auto is True
+
+    # a user cannot forge it: it is absent from _TOP_LEVEL_KEYS, so the public parser refuses it
+    with pytest.raises(ConfigError, match=r"unknown config key\(s\): model_revision_auto"):
+        spec_from_dict(_raw(model_revision="c" * 40, model_revision_auto=True))
+
+    # an authored pin, and a spec persisted before the field existed, both read False
+    authored = spec_from_dict(_raw(model_revision="c" * 40))
+    assert authored.model_revision_auto is False
+    assert _job_from_dict({"model": "Qwen/Qwen3.5-9B"}).model_revision_auto is False
+    # and the strip above is scoped to the marker: an AUTHORED pin is the user's own input and
+    # must survive to_dict(), or the public spec would silently drop what they asked for
+    assert authored.to_dict()["model_revision"] == "c" * 40
+
+    # the marker qualifies a pin and cannot outlive one
+    assert replace(auto, model_revision="").model_revision_auto is False
+
+
+def test_model_revision_auto_does_not_change_pre_existing_preparation_digests() -> None:
+    """A snapshot prepared before this field existed must still rehash to its stored digest.
+
+    `_preparation_digest` has to reproduce the bytes that were hashed, not today's serialization,
+    or a still-valid warm-start or workload-profile run fails integrity validation on recovery.
+    """
+    from flash.runner.preparation import _preparation_digest
+
+    unmarked = JobSpec(model="Qwen/Qwen3.5-9B", algorithm="sft", model_revision="c" * 40)
+
+    # rebuild the pre-upgrade bytes: the same payload this build produces, minus the key that did
+    # not exist then. mirrors _preparation_digest's own omission list rather than re-deriving it,
+    # so the control cannot drift from the code under test.
+    worker_payload = unmarked.to_internal_dict()
+    for key in (
+        "workload_profile_kind",
+        "workload_profile_input_digest",
+        "workload_profile_producer_version",
+        "workload_profile",
+    ):
+        if not worker_payload.get(key):
+            worker_payload.pop(key, None)
+    worker_payload.pop("model_revision_auto", None)
+    public_payload = unmarked.to_dict()  # to_dict() already strips the marker
+
+    payload = json.dumps(
+        {
+            "version": 1,
+            "public_spec": public_payload,
+            "worker_spec": worker_payload,
+            "adapter_identity": None,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    import hashlib
+
+    legacy = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    assert _preparation_digest(unmarked, unmarked, None) == legacy
+
+    # a marked run still binds the marker into its digest, so tampering remains detectable
+    marked = replace(unmarked, model_revision_auto=True)
+    assert _preparation_digest(marked, marked, None) != legacy
+
+
+def test_resubmitting_a_public_spec_does_not_relabel_a_runner_pin_as_authored(monkeypatch) -> None:
+    """Round-tripping an auto-pinned run's public spec must not produce an undeployable re-run.
+
+    `_resolve_model_revision` derives "did the user author this pin?" from the marker, and the
+    marker cannot ride on the public spec (the submission schema rejects the key). So if to_dict()
+    emitted the bare SHA, resubmitting `RunStatus.spec` -- what `flash runs get` hands back, and
+    what any retry or clone path replays -- would read that SHA as authored, stamp
+    `model_revision_auto=False`, and deploy would refuse the re-run with the very 400 this marker
+    exists to prevent. Dropping the value with its provenance is what keeps the re-run deployable.
+
+    Paired control: the authored branch below. Same round trip, same resolver, marker absent ->
+    the pin survives and stays authored, so this is not merely asserting that pins vanish.
+    """
+    from flash.runner.preparation import _resolve_model_revision
+
+    resolved_sha = "d" * 40
+
+    class _Api:
+        def __init__(self, *a, **k) -> None: ...
+
+        def model_info(self, model, revision=None):
+            _Api.asked_for = revision
+            # mirror the hub: resolving an already-immutable ref returns that same commit, and a
+            # bare model name resolves to the branch tip. a stub that returned one fixed sha for
+            # both would hide whether the authored pin was honoured or silently discarded.
+            return type("_Info", (), {"sha": revision or resolved_sha})
+
+    monkeypatch.setattr("huggingface_hub.HfApi", _Api)
+
+    # an SFT run the runner pinned: required=True with nothing authored
+    auto = _resolve_model_revision(
+        spec_from_dict(_raw(model="Qwen/Qwen3.5-9B", algorithm="sft")), required=True
+    )
+    assert auto.model_revision == resolved_sha
+    assert auto.model_revision_auto is True
+
+    # replay its PUBLIC spec, the way a retry or clone would
+    rerun = _resolve_model_revision(spec_from_dict(auto.to_dict()), required=True)
+    assert _Api.asked_for is None  # resolved against the branch tip, not the stale SHA
+    assert rerun.model_revision_auto is True, "re-run was relabelled user-authored -> deploy 400s"
+
+    # control: an AUTHORED pin round-trips intact and stays authored
+    authored = _resolve_model_revision(
+        spec_from_dict(_raw(model="Qwen/Qwen3.5-9B", algorithm="sft", model_revision="e" * 40)),
+        required=True,
+    )
+    assert authored.model_revision_auto is False
+    replayed = _resolve_model_revision(spec_from_dict(authored.to_dict()), required=True)
+    assert _Api.asked_for == "e" * 40  # the user's pin is still honoured
+    assert replayed.model_revision_auto is False
+
+
+def test_stripping_an_auto_pin_keeps_the_preparation_digest_stable() -> None:
+    """Clearing the pin must not change which KEYS to_dict() emits, or re-persist breaks.
+
+    `_preparation_digest` hashes `public_spec.to_dict()` bytes, and the two persist sites feed it
+    differently: the create path digests the in-memory public spec, while the re-persist path
+    (`runner.submit`, quote refresh / realloc) rebuilds it from the stored `status.spec`. The
+    rebuilt spec has no marker left, so the strip does not re-fire for it. Popping the key would
+    make it absent at create and `""` on reload -- different bytes, different digest, and the
+    integrity check fails for exactly the auto-pinned runs this PR exists to keep deployable.
+
+    Both halves of that asymmetry are exercised below, since a spec that never carried the marker
+    on its public half was stable either way and would not have caught this.
+    """
+    from flash.runner.preparation import _preparation_digest
+
+    base = spec_from_dict(_raw(model="Qwen/Qwen3.5-9B", algorithm="sft"))
+    worker = replace(base, model_revision="a" * 40, model_revision_auto=True)
+
+    # the marked half is where the strip fires; the unmarked one is the control that was stable
+    # either way, so it proves the assertion below is not vacuous.
+    for public, expected in ((worker, ""), (replace(base, model_revision="a" * 40), "a" * 40)):
+        stored = public.to_dict()
+        # the key stays present -- cleared, not vanishing. that IS the invariant: a popped key
+        # reloads as "" and changes the hashed bytes.
+        assert stored["model_revision"] == expected
+        at_create = _preparation_digest(public, worker, None)
+        at_repersist = _preparation_digest(spec_from_dict(stored), worker, None)
+        assert at_create == at_repersist
+
+
+def test_effective_spec_validation_accepts_the_asymmetric_auto_pin_shape() -> None:
+    """The public/worker structural compare must tolerate the marker living on one half only.
+
+    Submit persists `spec=public_spec.to_dict()`, and to_dict() strips the marker, so a real
+    auto-pinned run is asymmetric by construction: the worker half carries True, and the public
+    half rebuilt from the stored dict reads the False default. `_validate_effective_spec` compares
+    the two structurally, so without an exclusion it raises for every auto-pinned run -- turning
+    the 400 this PR removes into a 409 and leaving those runs exactly as undeployable.
+
+    Built by round-tripping through to_dict() rather than by hand, so the test cannot assert a
+    shape that submit does not actually produce.
+    """
+    from flash.runner.preparation import _validate_effective_spec
+
+    worker = replace(
+        spec_from_dict(_raw(model="Qwen/Qwen3.5-9B", algorithm="sft", model_revision="a" * 40)),
+        model_revision_auto=True,
+    )
+    public = spec_from_dict(worker.to_dict())
+    assert public.model_revision_auto is False  # the strip is what makes this asymmetric
+    assert public.model_revision == ""  # the pin VALUE travels with its marker
+    assert worker.model_revision == "a" * 40
+
+    _validate_effective_spec(public, worker)  # raises if the exclusion is missing
+
+    # the exclusion is narrow. it fires only when the worker half is auto-marked AND the public
+    # half is empty -- the one shape to_dict() actually produces. an AUTHORED pin stays compared,
+    # so swapping the worker's revision under it is still caught, with or without a forged marker.
+    authored_worker = replace(worker, model_revision_auto=False)
+    authored_public = spec_from_dict(authored_worker.to_dict())
+    assert authored_public.model_revision == "a" * 40  # authored pins do survive to_dict()
+    for tampered in (
+        replace(authored_worker, model_revision="b" * 40),
+        replace(authored_worker, model_revision="b" * 40, model_revision_auto=True),
+    ):
+        with pytest.raises(ValueError, match="does not match the public run"):
+            _validate_effective_spec(authored_public, tampered)
+
+
 def test_unknown_top_level_scalar_and_jobspec_gpu_shapes_fail_closed() -> None:
     with pytest.raises(ConfigError, match=r"unknown config key\(s\): model_revison"):
         spec_from_dict(_raw(model_revison="main"))

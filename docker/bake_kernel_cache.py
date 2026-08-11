@@ -30,9 +30,9 @@ import uuid
 ARTIFACT_NAMESPACE = "Freesolo-Co"
 
 # RunPod picks the host at create time, so a create can be rejected simply because the machine it
-# picked has nothing free right now. That is transient placement, not a broken bake: the API takes
+# picked has nothing free right now. that is transient placement, not a broken bake: the API takes
 # no "not this machine" hint, but each create is placed again server-side, so retrying is what moves
-# us to another host. Everything else (auth, quota, an unpullable image) is a real error and must
+# us to another host. everything else (auth, quota, an unpullable image) is a real error and must
 # fail the arch immediately instead of burning attempts and GPU-queue time on it.
 CAPACITY_MARKERS = (
     # "This machine does not have the resources to deploy your pod. Please try a different machine"

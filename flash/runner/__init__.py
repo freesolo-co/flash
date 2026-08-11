@@ -846,6 +846,8 @@ from flash.runner.deadlines import (  # noqa: E402,F401
 # name, so a plain import would read as a redefinition of it.
 from flash.runner.deadlines import _profile_wall_armed_at as _profile_wall_armed_at  # noqa: E402
 from flash.runner.preparation import (  # noqa: E402,F401
+    _adopted_warmstart_revision,
+    _inherit_warmstart_revision,
     _mark_warmstart_source,
     _preparation_digest,
     _prepare_init_from_adapter,
@@ -858,6 +860,7 @@ from flash.runner.preparation import (  # noqa: E402,F401
     _require_supported_adapter_continuation,
     _resolve_model_revision,
     _validate_effective_spec,
+    _warmstart_source_is_authorized,
 )
 from flash.runner.reconciliation import (  # noqa: E402,F401
     _canonical_cleanup_remote,

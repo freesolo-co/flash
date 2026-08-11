@@ -703,7 +703,7 @@ def _validate_on_policy_prompt_budget(spec: JobSpec, algorithm: str) -> None:
     """reject a context that leaves no prompt room once the completion budget is reserved.
 
     each algorithm resolves its completion length off its own recipe, so read it through the same
-    helper its worker does -- a shared number would reject runs the worker accepts. the worker
+    helper its worker does, since a shared number would reject runs the worker accepts. the worker
     clamps the requested context down to the model architecture before subtracting
     (`train/rl/inputs.py`, `opd_train_runner`), and clamping can only shrink the budget, so
     checking the unclamped value here is never stricter than the worker's own enforcement.

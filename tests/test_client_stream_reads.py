@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import codecs
+import http.client
 import io
 from collections.abc import Iterator
 
 import pytest
 
-from flash.client.http import ApiClient
+from flash.client.http import ApiClient, ClientError
 
 
 class _ReadResponse:
@@ -107,3 +108,41 @@ def test_chat_stream_yields_valid_prefix_before_unicode_error(
     actual = _collect_until_unicode_error(ApiClient("http://test").chat_stream("run-a", []))
 
     assert actual == expected == list("visible prefix")
+
+
+class _TruncatedChunkedResponse(_Read1Response):
+    """A chunked body whose connection drops before the terminating chunk arrives.
+
+    http.client raises IncompleteRead when a chunked stream ends without the zero-length
+    terminator, which is what the server produces by aborting the response on a mid-stream
+    upstream failure.
+    """
+
+    def read1(self, size: int = -1) -> bytes:
+        self.calls.append(("read1", size))
+        data = self._stream.read(size)
+        if not data:
+            raise http.client.IncompleteRead(b"")
+        return data
+
+
+def test_chat_stream_truncated_body_raises_client_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An aborted chunked response surfaces as ClientError, never as a clean end of stream.
+
+    the text received before the abort is still yielded (the user has already seen it), but
+    the stream must end by raising so a mid-generation serving failure cannot present as a
+    short, finished answer."""
+    response = _TruncatedChunkedResponse(b"partial answer")
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: response)
+
+    stream = ApiClient("http://test").chat_stream("run-a", [])
+    collected: list[str] = []
+
+    def _drain() -> None:
+        collected.extend(stream)
+
+    with pytest.raises(ClientError, match="ended unexpectedly"):
+        _drain()
+    assert "".join(collected) == "partial answer"
