@@ -846,7 +846,11 @@ def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
     import flash.envs.loader as envs_loader
     import flash.schema as schema
     import flash.server.routes.runs as runs_route
+    from tests._helpers.teacher import configure_managed_teacher
 
+    # an opd submission is now validated against the plane's managed-teacher configuration before
+    # the run record; this test is about rollout context ordering, so give it a configured plane.
+    configure_managed_teacher(monkeypatch)
     monkeypatch.setattr(schema, "provisional_gpu", lambda *_a, **_k: "B200")
     # offline: the structured-OPD preflight resolves model metadata over the network -- geometry
     # (model_info + a config.json download) and list_repo_files, to detect a mistral tokenizer.
@@ -892,7 +896,7 @@ def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
             # for them). training the routed experts puts this past every single card at any batch
             # size, so the run is pinned to two below; otherwise the valid-context case would fail
             # allocation instead of exercising the ordering this test is about.
-            "batch_size": 4,
+            "prompts_per_step": 4,
             "max_completion_tokens": max_completion_tokens,
             "structured_outputs": {"choice": ["4"]},
         },
@@ -10597,3 +10601,55 @@ def test_record_model_exported_posts_allowlisted_event(monkeypatch):
         is False
     )
     assert posted == {}
+
+
+@pytest.mark.parametrize(
+    ("plane_misconfigured", "status_code"),
+    [
+        # the plane's own credential is unset: nothing the submitter can author fixes it
+        (True, 503),
+        # the submitted shape exceeds the broker's limits: their spec is the fix
+        (False, 400),
+    ],
+)
+def test_managed_teacher_rejection_reports_which_side_is_at_fault(
+    api, monkeypatch, tmp_path, plane_misconfigured, status_code
+) -> None:
+    """A plane outage must not be reported as a bad request.
+
+    The submit path funnels every exception into one 400, which is right for a spec the user must
+    change and wrong for a credential only an operator can set. Reporting both as a client error
+    would re-create, at the HTTP layer, the same "misconfiguration looks like a spec error"
+    conflation that hoisting this gate to submit time exists to end.
+    """
+    import flash.envs.loader as envs_loader
+    from tests._helpers.teacher import configure_managed_teacher
+
+    configure_managed_teacher(monkeypatch)
+    # offline: the image-opd preflight ahead of this gate resolves the environment reference to
+    # inspect its dataset. point it at an empty local dir so no github request is made.
+    offline_env = tmp_path / "offline-env"
+    offline_env.mkdir()
+    (offline_env / "environment.py").write_text("")
+    monkeypatch.setattr(envs_loader, "_resolve_ref_sha", lambda *_a, **_k: "0" * 40)
+    monkeypatch.setattr(
+        envs_loader,
+        "_resolve_environment_reference",
+        lambda *_a, **_k: str(offline_env / "environment.py"),
+    )
+    train = {**SPEC["train"], "teacher_model": "glm-5.2"}
+    if plane_misconfigured:
+        monkeypatch.delenv("PARASAIL_API_KEY", raising=False)
+    else:
+        # a shape whose planned teacher score items exceed the broker ceiling. the multiplier is
+        # 192 (64 turns x 3 no-signal attempts), so this asks for ~9.8M against a 1M limit.
+        train |= {"max_steps": 100, "batch_size": 64, "group_size": 8, "max_examples": 6400}
+    spec = {**SPEC, "algorithm": "opd", "train": train}
+
+    response = api.post("/v1/runs", headers=_bearer(_login()), json={"spec": spec, "dry_run": True})
+
+    assert response.status_code == status_code, response.text
+    detail = str(response.json()["detail"])
+    # the reason has to survive the mapping too: a bare status code still leaves an operator
+    # guessing which of the two plane-side names is unset.
+    assert ("PARASAIL_API_KEY" in detail) is plane_misconfigured, detail
