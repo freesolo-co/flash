@@ -1296,6 +1296,55 @@ def test_interrupt_while_the_cacheless_launch_request_is_in_flight_reaps_by_labe
     assert reaped == ["flash-1700000000-abcd1234"]  # only the label can name that box
 
 
+def test_cacheless_ambiguous_reject_keeps_the_guard_armed_through_reconciliation(monkeypatch):
+    """The cache-less leg's own AMBIGUOUS reject must not stand the guard down before it reconciles.
+
+    The main walk splits clean from ambiguous before disarming; this helper is a second, separate
+    handler and needs the same split. Disarming on every rejection here loses the only handle on a
+    box the provider may have billed but never named: if anything between the disarm and
+    _abort_ambiguous_launch raises, the outer handler finds an unarmed guard and the instance bills
+    until a later orphan sweep.
+    """
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(
+        lambda_api, "ensure_filesystem", lambda n, r, deadline_at=None: f"/lambda/nfs/{n}"
+    )
+    calls: list[str] = []
+
+    def fake_launch(*, file_system_names=None, **_kwargs):
+        calls.append("cold" if file_system_names is None else "cached")
+        if file_system_names is None:
+            # a 500 is ambiguous: the create may have been accepted before the response was lost.
+            raise lambda_api.LambdaApiError("POST -> HTTP 500")
+        raise lambda_api.LambdaApiError(
+            "POST /instance-operations/launch -> HTTP 400: file_system_names not attachable"
+        )
+
+    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
+    # reconciliation observes nothing, so it raises UnreconciledCreateError rather than cleaning
+    # up: the guard must still be armed when that reaches the outer handler.
+    monkeypatch.setattr(lambda_api, "list_instances", list)
+    reaped: list[str] = []
+    monkeypatch.setattr(jobs, "terminate_run_instances", lambda run_id: reaped.append(run_id) or [])
+
+    with pytest.raises(jobs.UnreconciledCreateError):
+        _launch(
+            jobs,
+            _spec(network_volume="flash-weights"),
+            seed=0,
+            instances=[_inst()],
+            attempt=0,
+        )
+
+    assert calls == ["cached", "cold"]
+    # the cache-less create is ambiguous, so the guard stayed armed with no id and the outer
+    # handler swept the label -- the only thing that can find a box rented but never named.
+    assert reaped == ["flash-1700000000-abcd1234"]
+
+
 def test_cacheless_retry_that_never_reaches_its_request_does_not_reap_the_run_label(monkeypatch):
     """A deadline miss before the cache-less create rented nothing, so the label must not be reaped.
 
