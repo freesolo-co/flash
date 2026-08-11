@@ -1670,3 +1670,96 @@ def test_sft_default_context_tracks_thinking_mode():
     plain = model_required_vram_gb(mid, "sft", thinking=False)
     thinking = model_required_vram_gb(mid, "sft", thinking=True)
     assert thinking > plain, (plain, thinking)
+
+
+def test_pinned_gpu_fit_failure_names_the_card_count_that_fixes_it():
+    """A pin that fails only at the authored ceiling must name the width that works.
+
+    `[gpu] count` is a user-authored ceiling, so this rejection is one flag from success. Without
+    the remedy the message states the shortfall and stops, and the user cannot tell an
+    unsatisfiable run apart from one that fits on two cards -- the difference between abandoning
+    the run and passing `--gpus 2`.
+    """
+    from flash.providers.allocator import _resolve_exact_gpu
+    from flash.providers.base import GPU_INFO, UnsupportedGpuError
+
+    need = GPU_INFO["H200"].vram_gb + 40  # fits on 2 cards, never on 1
+    with pytest.raises(UnsupportedGpuError, match=r"--gpus 2") as single:
+        _resolve_exact_gpu(
+            "H200",
+            need=need,
+            cap=1,
+            max_gpu_count=1,
+            provider="",
+            available=("runpod",),
+            widest_cap=8,
+        )
+    assert "it fits on 2 cards" in str(single.value)
+
+    # the multi-card rejection carries the same remedy, measured from ITS cap rather than 1.
+    with pytest.raises(UnsupportedGpuError, match=r"--gpus 4") as pair:
+        _resolve_exact_gpu(
+            "H200",
+            need=GPU_INFO["H200"].vram_gb * 3,
+            cap=2,
+            max_gpu_count=2,
+            provider="",
+            available=("runpod",),
+            widest_cap=8,
+        )
+    assert "even as a 2-card combination" in str(pair.value)
+
+
+def test_pinned_gpu_fit_failure_stays_a_dead_end_when_no_width_fits():
+    """A genuinely unsatisfiable run must NOT be told to raise the ceiling.
+
+    The remedy is only useful if it is true. Suggesting `--gpus 8` for a run no shape can hold
+    would trade one dead end for a second, slower one -- so the suggestion is searched, not
+    assumed, and absent when nothing fits.
+    """
+    from flash.providers.allocator import _resolve_exact_gpu
+    from flash.providers.base import UnsupportedGpuError
+
+    with pytest.raises(UnsupportedGpuError) as exc:
+        _resolve_exact_gpu(
+            "H200",
+            need=100_000,
+            cap=1,
+            max_gpu_count=1,
+            provider="",
+            available=("runpod",),
+            widest_cap=8,
+        )
+    assert "--gpus" not in str(exc.value)
+
+
+def test_wider_shape_remedy_is_bounded_by_the_geometry_cap():
+    """A suggested width must be one the model's head geometry allows.
+
+    `geometry_safe_gpu_cap` exists because verl rejects `num_attention_heads % sp_size != 0` at
+    Ulysses init -- AFTER the box is rented. A remedy that ignored it would bill the user for a
+    box that cannot start.
+    """
+    from flash.providers.base import GPU_INFO, wider_shape_remedy
+
+    vram = GPU_INFO["H200"].vram_gb
+    need = vram + 40
+    assert "--gpus 2" in wider_shape_remedy((vram,), need, ceiling=8, above=1)
+    # capped below the fitting width: report no remedy rather than an unrentable one.
+    assert wider_shape_remedy((vram,), need, ceiling=1, above=1) == ""
+    # `above` excludes widths already tried, so a remedy never restates the failing shape: at
+    # above=2 the fitting width 2 is suppressed and the next one that fits is named instead.
+    assert "--gpus 4" in wider_shape_remedy((vram,), need, ceiling=8, above=2)
+    # ...and once no untried width fits, there is nothing to suggest.
+    assert wider_shape_remedy((vram,), need, ceiling=8, above=8) == ""
+
+
+def test_wider_shape_remedy_names_the_cheapest_fitting_width():
+    """The remedy must name the smallest shape that works, not the widest on offer.
+
+    Suggesting 8 cards for a run that fits on 2 would quadruple the bill to fix a fit error.
+    """
+    from flash.providers.base import GPU_INFO, wider_shape_remedy
+
+    vram = GPU_INFO["H200"].vram_gb
+    assert "--gpus 2" in wider_shape_remedy((vram,), vram + 40, ceiling=8, above=1)
