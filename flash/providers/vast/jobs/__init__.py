@@ -38,6 +38,7 @@ from flash.providers.artifacts.hf import (
 from flash.providers.base import (
     GPU_INFO,
     PollResult,
+    RunExhaustedProviderPoolError,
     UnreconciledCreateError,
     UnsupportedGpuError,
     canonical_gpu,
@@ -730,7 +731,10 @@ def submit_run_vast(
         # can hold hosts from a GPU class this attempt already escalated away from, and a dry market
         # would otherwise be blamed on hosts that were never in it. counting the machines actually
         # removed here keeps the number honest for the same reason.
-        raise vast_api.VastApiError(
+        # a dedicated type, not VastApiError: supervision withholds provider exception text from the
+        # run record (it can quote a request that carried a credential), so the one error worth
+        # reading would be reduced to its class name like any other. this message is authored here.
+        raise RunExhaustedProviderPoolError(
             f"no usable vast offers for {spec.gpu.type} outside the "
             f"{len({o.machine_id for o in market})} machine(s) this run already rented and lost"
         )

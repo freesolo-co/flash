@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 from dataclasses import dataclass, field
 
+from flash._internal.diagnostics import sanitize_diagnostic
 from flash.core.spec import JobSpec
 from flash.runner.supervise import lifecycle as _lifecycle
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
@@ -511,7 +512,11 @@ def _submit_provider(
     plan: _CandidatePlan,
 ):
     from flash.providers import get_provider
-    from flash.providers.base import PollResult, UnreconciledCreateError
+    from flash.providers.base import (
+        PollResult,
+        RunExhaustedProviderPoolError,
+        UnreconciledCreateError,
+    )
     from flash.runner import (
         _load_run_deadline_at,
         _TerminalHandleRace,
@@ -554,6 +559,23 @@ def _submit_provider(
                 ),
                 False,
             )
+        if isinstance(exc, RunExhaustedProviderPoolError):
+            # the one submit-side message worth reading, and the only one safe to read: Flash
+            # authors this string, so unlike a provider response body it cannot quote a request
+            # that carried a credential. without this the class name alone would make "this run
+            # burned the whole pool" indistinguishable from "the market is dry", which is exactly
+            # the distinction the error exists to draw. still sanitized and bounded, because the
+            # gpu class it interpolates comes from the spec.
+            return (
+                PollResult(
+                    False,
+                    failure="no_capacity",
+                    detail=sanitize_diagnostic(str(exc), limit=1000),
+                ),
+                True,
+            )
+        # every other provider exception keeps its class name only. the text can quote a request
+        # body, and this detail is persisted into the run record.
         return (
             PollResult(
                 False,

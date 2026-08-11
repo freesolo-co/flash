@@ -2046,3 +2046,120 @@ def test_worker_pip_with_extras_dedupes_and_ignores_blanks() -> None:
     ]
     assert worker_pip_with_extras("e", ["  pymongo  ", ""]) == ["freesolo>=0.4.0", "pymongo"]
     assert worker_pip_with_extras("e", None) == ["freesolo>=0.4.0"]
+
+
+def _submit_failure(provider_obj):
+    """Drive the real ``_submit_provider`` against a provider whose submit raises.
+
+    Stubs only what stands between the call and the ``except`` clause under test: provider lookup,
+    the teacher-secret transport, and the persisted run deadline. The handler itself is untouched.
+    """
+    import contextlib as _contextlib
+
+    import flash.providers as _providers
+    import flash.runner as _runner
+    import flash.server.domain.teacher_broker as _broker
+    from flash.runner.supervise import seed_submission as _ss
+
+    @_contextlib.contextmanager
+    def _no_secrets(*_a, **_kw):
+        yield {}
+
+    saved = (
+        _providers.get_provider,
+        _broker.teacher_attempt_transport,
+        _runner._load_run_deadline_at,
+        _runner._worker_deadline_at,
+    )
+    _providers.get_provider = lambda _name: provider_obj
+    _broker.teacher_attempt_transport = _no_secrets
+    _runner._load_run_deadline_at = lambda _run_id: 1.0e12
+    _runner._worker_deadline_at = lambda _run_id, _spec: 1.0e12
+    try:
+        spec = _spec()
+        ctx = _ss._SubmitContext(
+            spec=spec,
+            seed=spec.seed,
+            log=io.StringIO(),
+            runtime_secrets={},
+            code_prefix="p",
+            attempt_start=0,
+            infra_budget=1,
+            retry_budget=None,
+            started_with_shared_cache=False,
+        )
+        prepared = _ss._PreparedAttempt(
+            local_attempt=0, attempt=0, attempt_spec=spec, runtime_secrets={}
+        )
+        plan = _ss._CandidatePlan(
+            allocation=None,
+            candidates=(),
+            chosen=_Chosen("vast", "RTX 4090"),
+            on_last_gpu=False,
+            effective_spec=spec,
+            run_spec=spec,
+        )
+        return _ss._submit_provider(ctx, prepared, plan)
+    finally:
+        (
+            _providers.get_provider,
+            _broker.teacher_attempt_transport,
+            _runner._load_run_deadline_at,
+            _runner._worker_deadline_at,
+        ) = saved
+
+
+class _Chosen:
+    def __init__(self, provider, gpu):
+        self.provider = provider
+        self.gpu = gpu
+        self.gpu_count = 1
+
+
+def _submit_failure_with_secret(exc):
+    class _Boom:
+        def submit_run(self, *_a, **_kw):
+            raise exc
+
+    return _submit_failure(_Boom())
+
+
+def test_the_pool_exhaustion_message_survives_supervision():
+    """The one submit-side message worth reading has to reach the operator, not just its class.
+
+    Supervision replaced every submit exception with `provider submit failed (<ClassName>)`, which
+    is the same line whether the market is dry or this run has burned every host in the class
+    itself. Those have different operator fixes -- wait, versus another class or provider -- so an
+    error that draws the distinction is worthless if it is discarded one frame later.
+    """
+    from flash.providers.base import RunExhaustedProviderPoolError
+
+    class _Boom:
+        def submit_run(self, *_a, **_kw):
+            raise RunExhaustedProviderPoolError(
+                "no usable vast offers for RTX 4090 outside the 3 machine(s) this run "
+                "already rented and lost"
+            )
+
+    result, retriable = _submit_failure(_Boom())
+
+    assert retriable
+    assert result.failure == "no_capacity"
+    assert "already rented and lost" in result.detail, result.detail
+
+
+def test_generic_provider_exception_text_still_never_reaches_the_run_record():
+    """Only the AUTHORED message is surfaced; provider text keeps its class-name-only treatment.
+
+    A provider exception can quote a request body, and this detail is persisted. `sanitize_diagnostic`
+    would not save it: that redacts CONFIGURED secrets, so arbitrary provider text passes straight
+    through. Surfacing the authored error is safe precisely because Flash writes that string.
+    """
+    from flash.providers.vast.api import VastApiError
+
+    result, _ = _submit_failure_with_secret(
+        VastApiError("create rejected: body echoed a token nobody registered")
+    )
+
+    assert "body echoed a token nobody registered" not in result.detail, result.detail
+    assert result.detail == "provider submit failed (VastApiError)", result.detail

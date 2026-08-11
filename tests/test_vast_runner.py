@@ -2040,7 +2040,7 @@ def test_a_pool_exhausted_by_this_runs_own_dead_machines_says_so(monkeypatch):
     The two have different operator fixes -- wait, versus move to another class or provider -- and
     the generic message only ever suggested the first.
     """
-    from flash.providers.vast import api as vast_api
+    from flash.providers.base import RunExhaustedProviderPoolError
     from flash.providers.vast import jobs as vast
 
     spec = _spec()
@@ -2050,7 +2050,9 @@ def test_a_pool_exhausted_by_this_runs_own_dead_machines_says_so(monkeypatch):
         # the class still HAS an offer; this run has simply already lost that host.
         monkeypatch.setattr(vast, "usable_offers", lambda *a, **k: [_offer(machine_id=10)])
 
-        with pytest.raises(vast_api.VastApiError, match="already rented and lost"):
+        # its own type, not VastApiError: supervision withholds provider exception text from the
+        # run record, so only an authored error survives to the operator.
+        with pytest.raises(RunExhaustedProviderPoolError, match="already rented and lost"):
             _submit(vast, spec, seed=0)
     finally:
         vast.forget_dead_machines(spec.run_id)
