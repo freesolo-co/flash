@@ -22,7 +22,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from jsonschema.validators import validator_for  # noqa: F401
 
-from flash.core.spec import JobSpec
+from flash.core.spec import JobSpec, require_project_id
 from flash.runner import (
     _internal_spec_from_status,
     effective_spec_from_status,
@@ -49,7 +49,7 @@ from flash.serve.deploy import (  # noqa: F401
 )
 from flash.serve.urls import public_deployment
 from flash.server import app as _app
-from flash.server.platform import db
+from flash.server.platform import auth, db
 from flash.server.platform.deps import _require_bool, manageable_run, owned_run, require_key
 from flash.server.platform.internal_client import run_org_id
 
@@ -308,6 +308,29 @@ def _validate_deploy_request(
     return effective_spec, current_deployment
 
 
+def _require_deploy_org(run_id: str, deploy_org_id: str | None) -> None:
+    """Fail closed when a managed-plane deploy would register an adapter with no owning org.
+
+    Serving authorizes external chat requests against the org that owns the adapter (see
+    platform docs), so registering a revision without an org would leave the field's
+    enforcement to whatever the serving backend does with an unowned adapter. A standalone
+    plane is single-tenant by definition and has no organization directory, so it keeps
+    deploying without one (same escape hatch as ``deps.manageable_run``).
+    """
+    if deploy_org_id is not None or auth.standalone():
+        return
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"run {run_id} has no owning organization on record and the caller's key carries "
+            "none; refusing to register an adapter without an org, because serving authorizes "
+            "chat requests against the org that owns it. deploy with a key that belongs to the "
+            "run's organization, or re-submit the run through the platform so it carries an "
+            "org context."
+        ),
+    )
+
+
 @router.post("/v1/runs/{run_id}/deploy")
 def deploy(
     run_id: str,
@@ -349,6 +372,7 @@ def deploy(
         prev_state = status.state
         # Prefer org from the run's own context over the caller's key (operator deploys land on run's owner).
         deploy_org_id = run_org_id(status) or str(key.get("org_id") or "").strip() or None
+        _require_deploy_org(run_id, deploy_org_id)
         previous_deployment = _deployment_predecessor(current_deployment)
         expected_adapter_revision = None
         if not dry_run:
@@ -591,13 +615,62 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
     return result
 
 
+def _deployment_listing_scope(
+    key: dict, org_id: str | None, project_id: str | None
+) -> tuple[str, str] | None:
+    """The (org, project) filter for ``/v1/deployments``, or None for an exact-key listing.
+
+    Mirrors ``deps.manageable_run``: on a managed plane the internal key is the platform proxy
+    and owns the runs it submitted on every org's behalf, so an unscoped listing would cross
+    orgs. It must name the org AND project it lists for, exactly as it must to manage a single
+    deployment. The headers are honored only for the internal key; a user key can only ever see
+    its own runs, and a standalone plane is single-tenant and keeps the exact-key listing.
+    """
+    if key.get("auth_kind") != "internal" or auth.standalone():
+        return None
+    org = str(org_id or "").strip()
+    try:
+        project = require_project_id(project_id)
+    except (TypeError, ValueError):
+        project = None
+    if not org or project is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "an internal-key deployment listing must be scoped: send X-Freesolo-Org-Id "
+                "and X-Freesolo-Project-Id for the org and project being listed"
+            ),
+        )
+    return org, project
+
+
+def _in_deployment_listing_scope(status, org: str, project: str) -> bool:
+    """Whether a run belongs to the requested org AND project (manageable_run's predicate)."""
+    from flash.runner import _status_org_id
+
+    if _status_org_id(status) != org:
+        return False
+    persisted_project = status.spec.get("project") if isinstance(status.spec, dict) else None
+    try:
+        return require_project_id(persisted_project) == project
+    except (TypeError, ValueError):
+        return False
+
+
 @router.get("/v1/deployments")
-def deployments(key: Annotated[dict, Depends(require_key)]):
+def deployments(
+    key: Annotated[dict, Depends(require_key)],
+    x_freesolo_org_id: Annotated[str | None, Header()] = None,
+    x_freesolo_project_id: Annotated[str | None, Header()] = None,
+):
+    scope = _deployment_listing_scope(key, x_freesolo_org_id, x_freesolo_project_id)
     out = []
     for row in db.runs_for_key(key["id"]):
         try:
             status = _app.get_status(row["run_id"])
         except FileNotFoundError:
+            continue
+        if scope is not None and not _in_deployment_listing_scope(status, *scope):
             continue
         if status.deployment and status.deployment.get("state") not in (
             "undeployed",
