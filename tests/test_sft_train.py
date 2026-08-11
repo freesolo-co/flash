@@ -2524,13 +2524,19 @@ def test_the_opd_watcher_still_keeps_its_export(monkeypatch, tmp_path):
 def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
     monkeypatch, tmp_path
 ):
-    """the rl half of the same contract, driven across the two sweeps that span it.
+    """the rl half of the same contract, driven across the two sweeps that actually span it.
 
     The rl uploader stages an adapter on the sweep a checkpoint appears and publishes it on a LATER
     one, once the gradient gate opens -- `staged_steps` carries the path between them. That gap is
-    the whole reason the sft deletion cannot be lifted into shared code, and it is only visible if
-    the two sweeps are driven separately: staging and publishing in one call would still pass with a
-    cleanup wedged in between.
+    the whole reason the sft deletion cannot be lifted into shared code.
+
+    The gate is what opens the gap, so the test has to close it. An earlier version passed
+    `had_gradient=lambda: True` and hand-called `_stage_deployable` then `_publish_ready`, which
+    manufactured a two-sweep sequence that production would never produce: with the gate already
+    open, `_run` stages and publishes in ONE iteration, so the window where the adapter must survive
+    on disk unpublished never opened and a cleanup placed there would have stayed green. Bugbot
+    caught that. Here the gate starts shut and the checkpoint is discovered through `_pending`, so
+    the retention window is the real one.
     """
     from flash.engine.worker.train.rl import checkpoints as rl_checkpoints
 
@@ -2553,12 +2559,19 @@ def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
         lambda adapter_dir, step, **kw: published.append(adapter_dir),
     )
 
-    export_root = tmp_path / "rl-exports"
-    checkpoint_dir = tmp_path / "ckpts" / "global_step_4"
-    (checkpoint_dir / "actor").mkdir(parents=True)
+    monkeypatch.setattr(rl_checkpoints._w, "upload_resume_checkpoint", lambda *a, **kw: True)
 
+    local_dir = tmp_path / "ckpts"
+    export_root = tmp_path / "rl-exports"
+    checkpoint_dir = local_dir / "global_step_4"
+    (checkpoint_dir / "actor").mkdir(parents=True)
+    # verl advances this marker only after the checkpoint is fully written, so `_pending` finds the
+    # step exactly as it does in a real run.
+    (local_dir / "latest_checkpointed_iteration.txt").write_text("4")
+
+    gate_open = False
     uploader = rl_checkpoints._VerlResumeUploader(
-        local_dir=str(tmp_path / "ckpts"),
+        local_dir=str(local_dir),
         resume_step=0,
         required_steps=(4,),
         export_root=str(export_root),
@@ -2566,15 +2579,29 @@ def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
         model_id="org/model",
         model_revision="commit",
         preprocessor=types.SimpleNamespace(save_pretrained=lambda path: None),
-        had_gradient=lambda: True,
+        had_gradient=lambda: gate_open,
     )
 
-    # sweep one: stage only. the checkpoint verl wrote may be pruned after this point.
-    adapter_dir = uploader._stage_deployable(4, str(checkpoint_dir))
-    uploader.staged_steps[4] = adapter_dir
-    assert published == [], "staging must not publish on the same sweep"
+    # sweep one, gate SHUT: the step is staged because verl may prune its checkpoint at any time,
+    # but nothing may be published yet. this is the window the adapter has to survive.
+    for step, path in uploader._pending():
+        if step in uploader.required_steps and step not in uploader.staged_steps:
+            uploader.staged_steps[step] = uploader._stage_deployable(step, path)
+            uploader._publish_ready()
+        uploader.processed_steps.add(step)
+    uploader._publish_ready()
 
-    # sweep two: the gate is open and the staged directory is read back and published.
+    adapter_dir = uploader.staged_steps[4]
+    assert published == [], "the gradient gate was shut, so nothing may have been published"
+    assert os.path.exists(os.path.join(adapter_dir, "adapter_model.safetensors")), (
+        "the rl watcher discarded a staged adapter while the gradient gate was still shut"
+    )
+
+    # verl is free to prune its own checkpoint now; only `export_root` carries the step forward.
+    shutil.rmtree(checkpoint_dir)
+
+    # sweep two, gate OPEN: the surviving directory is read back out of `staged_steps` and published.
+    gate_open = True
     uploader._publish_ready()
 
     assert published == [adapter_dir], "the staged adapter never reached publication"
