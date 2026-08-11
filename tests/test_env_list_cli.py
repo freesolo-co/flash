@@ -239,11 +239,15 @@ def test_a_broken_response_degrades_to_the_reason_line_not_a_traceback(
 def test_list_envs_outlasts_the_servers_own_github_retry_budget():
     """The client must not time out before the plane can answer.
 
-    The server retries a rate-limited or 5xx GitHub up to 5 times on a 10s base backoff, so it can
-    legitimately take ~80s+ to answer with a 429/502. At the 60s default the CLI would disconnect
-    first and report a generic timeout, hiding the diagnosable upstream condition.
+    The server can spend its whole retry window (socket timeouts AND backoff, twice over) before
+    returning a controlled 429/502. If the client gives up first, that diagnosable status is
+    replaced by a generic timeout, which is the failure mode this change exists to remove.
     """
     from flash.client import ApiClient
+    from flash.client.http import (
+        ENV_LIST_CLIENT_TIMEOUT_SECONDS,
+        ENV_LIST_SERVER_BUDGET_SECONDS,
+    )
 
     seen: dict = {}
     client = ApiClient("https://api.freesolo.co", "fslo-key")
@@ -257,5 +261,35 @@ def test_list_envs_outlasts_the_servers_own_github_retry_budget():
     assert seen["method"] == "GET"
     assert seen["path"] == "/v1/envs"
     assert seen["timeout"] is not None, "must pass an explicit timeout, not the shared default"
-    assert seen["timeout"] > 80.0, seen["timeout"]
+    assert seen["timeout"] == ENV_LIST_CLIENT_TIMEOUT_SECONDS
+    assert seen["timeout"] > ENV_LIST_SERVER_BUDGET_SECONDS, "client must lose the race to time out"
     assert seen["timeout"] > client.timeout, "must exceed the shared default, not fall back to it"
+
+
+def test_the_client_budget_matches_the_servers_actual_list_read_budget():
+    """The mirrored arithmetic must not drift from the loader it describes.
+
+    `flash.client` cannot import the loader (it must stay importable without the server extra), so
+    the client's terms are a hand-mirror of `_LIST_READ_BUDGET`. That is exactly the kind of copy
+    that rots silently: if the server's budget grows and this does not, the CLI starts timing out
+    before the plane answers and the 429/502 becomes unreachable again.
+    """
+    import flash.client.http as client_http
+    from flash.envs.loader import _LIST_READ_BUDGET
+
+    assert _LIST_READ_BUDGET["timeout"] == client_http._ENV_LIST_SOCKET_TIMEOUT_SECONDS
+    # the initial attempt is not a retry, hence the +1
+    expected_attempts = _LIST_READ_BUDGET["max_rate_limit_retries"] + 1
+    assert expected_attempts == client_http._ENV_LIST_ATTEMPTS_PER_READ
+
+
+def test_the_list_read_budget_stays_interactive():
+    """A person is waiting at a terminal, so the server's ceiling must stay in minutes.
+
+    On the batch default (6 attempts x 120s socket + 180s backoff, twice) the ceiling is ~30
+    minutes. No interactive caller waits that long, so the controlled 502 the domain layer raises
+    would never actually be seen -- every client would time out first and report something generic.
+    """
+    from flash.client.http import ENV_LIST_SERVER_BUDGET_SECONDS
+
+    assert ENV_LIST_SERVER_BUDGET_SECONDS < 5 * 60, ENV_LIST_SERVER_BUDGET_SECONDS

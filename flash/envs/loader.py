@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import gzip
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -22,7 +23,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Iterator
-from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
@@ -50,8 +50,6 @@ _MAX_CONTENTS_JSON_BYTES = 16 * 1024 * 1024
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = ARCHIVE_MEMBER_LIMIT
 _MAX_ARCHIVE_SCAN_MEMBERS = ARCHIVE_SCAN_MEMBER_LIMIT
-_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
-_GITHUB_SAFE_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _DATASET_SPLIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
@@ -70,174 +68,22 @@ class GitHubRateLimitError(RuntimeError):
         self.throttled = throttled
 
 
-@dataclass(frozen=True)
-class GitHubEnvironmentRef:
-    owner: str
-    repo: str
-    ref: str
-    path: str
-
-    @property
-    def repo_full_name(self) -> str:
-        return f"{self.owner}/{self.repo}"
-
-    def canonical(self) -> str:
-        return f"github:{self.repo_full_name}@{self.ref}:{self.path}"
-
-
-def is_github_environment_ref(value: str) -> bool:
-    return _parse_github_environment_ref(value) is not None
-
-
-def is_managed_environment_slug(value: str) -> bool:
-    return _parse_managed_environment_slug(value) is not None
-
-
-def is_freesolo_environment_id(value: str) -> bool:
-    return is_managed_environment_slug(value) or is_github_environment_ref(value)
-
-
-def managed_slug_to_github_ref(value: str) -> str:
-    parsed = _parse_managed_environment_slug(value)
-    if parsed is None:
-        raise ValueError(f"not a Freesolo environment slug: {value!r}")
-    namespace, name = parsed
-    return (
-        f"github:{_DEFAULT_MANAGED_ENV_REPO}@{_DEFAULT_GITHUB_REF}:"
-        f"{namespace}/{name}/{_DEFAULT_ENVIRONMENT_PATH}"
-    )
-
-
-def canonical_managed_environment_slug(value: str) -> str | None:
-    if _parse_managed_environment_slug(value) is not None:
-        return value
-
-    parsed = _parse_github_environment_ref(value)
-    if parsed is None:
-        if _targets_managed_environment_repo(value):
-            raise ValueError(_managed_environment_ref_error())
-        return None
-    if parsed.repo_full_name.lower() != _DEFAULT_MANAGED_ENV_REPO.lower():
-        return None
-
-    parts = parsed.path.split("/")
-    if (
-        parsed.ref != _DEFAULT_GITHUB_REF
-        or len(parts) != 3
-        or parts[2] != _DEFAULT_ENVIRONMENT_PATH
-        or not _is_safe_github_path_parts(tuple(parts[:2]))
-    ):
-        raise ValueError(_managed_environment_ref_error())
-    return "/".join(parts[:2])
-
-
-def _targets_managed_environment_repo(value: str) -> bool:
-    text = (value or "").strip()
-    if not text.startswith("github:"):
-        return False
-    repo_ref = text[len("github:") :].partition(":")[0]
-    repo = repo_ref.partition("@")[0]
-    return repo.lower() == _DEFAULT_MANAGED_ENV_REPO.lower()
-
-
-def _managed_environment_ref_error() -> str:
-    return (
-        "managed environment GitHub reference must be "
-        f"github:{_DEFAULT_MANAGED_ENV_REPO}@{_DEFAULT_GITHUB_REF}:"
-        f"<namespace>/<name>/{_DEFAULT_ENVIRONMENT_PATH}"
-    )
-
-
-def _parse_managed_environment_slug(value: str) -> tuple[str, str] | None:
-    text = (value or "").strip()
-    if not text or ":" in text:
-        return None
-    parsed = urllib.parse.urlparse(text)
-    if parsed.scheme or parsed.netloc:
-        return None
-    parts = text.split("/")
-    if len(parts) != 2 or not _is_safe_github_path_parts(tuple(parts)):
-        return None
-    return parts[0], parts[1]
-
-
-def _parse_github_environment_ref(value: str) -> GitHubEnvironmentRef | None:
-    text = (value or "").strip()
-    if not text:
-        return None
-    if text.startswith("github:"):
-        body = text[len("github:") :]
-        repo_ref, sep, path = body.partition(":")
-        try:
-            path = _normalize_env_path(path)
-        except ValueError:
-            return None
-        if not sep:
-            path = _DEFAULT_ENVIRONMENT_PATH
-        repo_part, at, ref = repo_ref.partition("@")
-        if not at:
-            ref = _DEFAULT_GITHUB_REF
-        if not ref:
-            return None
-        if not _is_safe_github_path_parts((ref,)):
-            return None
-        owner_repo = repo_part.split("/")
-        if len(owner_repo) == 2 and _is_safe_github_path_parts(owner_repo):
-            return GitHubEnvironmentRef(owner_repo[0], owner_repo[1], ref, path)
-        return None
-
-    parsed = urllib.parse.urlparse(text)
-    if parsed.scheme not in {"http", "https"} or parsed.netloc.lower() != "github.com":
-        return None
-    parts = [urllib.parse.unquote(p) for p in parsed.path.strip("/").split("/") if p]
-    if len(parts) < 2:
-        return None
-    owner, repo = parts[0], parts[1]
-    repo = repo[:-4] if repo.endswith(".git") else repo
-    if not _is_safe_github_path_parts((owner, repo)):
-        return None
-    if len(parts) >= 5 and parts[2] in {"blob", "tree"}:
-        ref = parts[3]
-        if not _is_safe_github_path_parts((ref,)):
-            return None
-        raw_path = "/".join(parts[4:])
-        try:
-            path = _normalize_env_path(raw_path)
-        except ValueError:
-            return None
-        if parts[2] == "tree" and raw_path and not path.endswith(".py"):
-            path = f"{path.rstrip('/')}/{_DEFAULT_ENVIRONMENT_PATH}"
-    elif len(parts) == 2:
-        ref = _DEFAULT_GITHUB_REF
-        path = _DEFAULT_ENVIRONMENT_PATH
-    else:
-        return None
-    return GitHubEnvironmentRef(owner, repo, ref, path)
-
-
-def _normalize_env_path(path: str | None) -> str:
-    if not path:
-        return _DEFAULT_ENVIRONMENT_PATH
-    raw = path.strip()
-    if not raw:
-        return _DEFAULT_ENVIRONMENT_PATH
-    raw = raw.replace("\\", "/")
-    if raw.startswith("/"):
-        raise ValueError(f"unsafe environment path: {path!r}")
-    parts = [part for part in raw.split("/") if part]
-    if not parts:
-        return _DEFAULT_ENVIRONMENT_PATH
-    if any(part == ".." or part == "." for part in parts):
-        raise ValueError(f"unsafe environment path: {path!r}")
-    return "/".join(parts)
-
-
-def _is_safe_github_path_parts(parts: list[str] | tuple[str, ...]) -> bool:
-    if not parts:
-        return False
-    if any(part in {".", "..", ""} for part in parts):
-        return False
-    return all(_GITHUB_SAFE_PART_RE.fullmatch(part) for part in parts)
+# Reference parsing and safety checks live in `flash.envs.refs` (pure syntax, no I/O); they are
+# re-exported here because `flash.envs.loader` -- and `flash.envs.adapter` through it -- is the
+# import site every caller already uses.
+from flash.envs.refs import (  # noqa: E402,F401
+    GitHubEnvironmentRef,
+    _is_safe_github_path_parts,
+    _normalize_env_path,
+    _parse_github_environment_ref,
+    _parse_managed_environment_slug,
+    canonical_managed_environment_slug,
+    is_commit_sha,
+    is_freesolo_environment_id,
+    is_github_environment_ref,
+    is_managed_environment_slug,
+    managed_slug_to_github_ref,
+)
 
 
 def _github_token() -> str | None:
@@ -249,11 +95,6 @@ def _github_token() -> str | None:
     loads fine with no token at all would fail with one that is merely blank.
     """
     return (os.environ.get("GITHUB_TOKEN") or "").strip() or None
-
-
-def is_commit_sha(value: str) -> bool:
-    """True when value is a full 40-hex-char git commit id (an immutable ref)."""
-    return _COMMIT_SHA_RE.fullmatch(value) is not None
 
 
 def _resolve_ref_sha(
@@ -377,7 +218,15 @@ def _urlopen(
             raise RuntimeError(
                 f"GitHub environment request failed ({exc.code}): {body[:500]}"
             ) from exc
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+        # IncompleteRead is an HTTPException: NOT a URLError, TimeoutError, ConnectionError, or even
+        # an OSError, so without naming it a truncated body escaped this loop unretried -- and,
+        # being no RuntimeError either, escaped every caller's translation as an uncaught 500.
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            ConnectionError,
+            http.client.IncompleteRead,
+        ) as exc:
             if attempt < max_rate_limit_retries:
                 time.sleep(backoff_delay(attempt))
                 attempt += 1
@@ -459,11 +308,19 @@ def _safe_contents_path(path: object, root_parts: list[str]) -> str:
     return normalized
 
 
-def _download_github_json(ref: GitHubEnvironmentRef, url: str, context: str) -> object:
+def _download_github_json(
+    ref: GitHubEnvironmentRef,
+    url: str,
+    context: str,
+    *,
+    timeout: float = 120.0,
+    max_rate_limit_retries: int = 5,
+) -> object:
     data = _urlopen(
         urllib.request.Request(url, headers=_github_headers("application/vnd.github+json")),
-        timeout=120.0,
+        timeout=timeout,
         max_bytes=_MAX_CONTENTS_JSON_BYTES,
+        max_rate_limit_retries=max_rate_limit_retries,
     )
     try:
         return json.loads(data)
@@ -483,10 +340,20 @@ def _github_response_message(payload: object) -> str:
 
 
 def _github_tree_entries(
-    ref: GitHubEnvironmentRef, treeish: str, context: str, *, recursive: bool = False
+    ref: GitHubEnvironmentRef,
+    treeish: str,
+    context: str,
+    *,
+    recursive: bool = False,
+    timeout: float = 120.0,
+    max_rate_limit_retries: int = 5,
 ) -> list[dict]:
     payload = _download_github_json(
-        ref, _github_tree_url(ref, treeish, recursive=recursive), context
+        ref,
+        _github_tree_url(ref, treeish, recursive=recursive),
+        context,
+        timeout=timeout,
+        max_rate_limit_retries=max_rate_limit_retries,
     )
     if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
         raise RuntimeError(
@@ -525,6 +392,12 @@ def _resolve_github_directory_tree_sha(ref: GitHubEnvironmentRef, repo_dir: str)
     return treeish
 
 
+# An interactive list must fail fast enough that its 429/502 reaches the caller. Two reads at
+# (1 + 1 attempts) x 20s + one <=45s backoff each is ~2 minutes worst case, versus ~30 minutes on the
+# batch default. `flash.client.http.ENV_LIST_CLIENT_TIMEOUT_SECONDS` is sized to outlast this.
+_LIST_READ_BUDGET = {"timeout": 20.0, "max_rate_limit_retries": 1}
+
+
 def list_managed_namespace_slugs(namespace: str) -> list[str]:
     """List ``namespace/name`` slugs published under one managed-hub namespace, sorted.
 
@@ -536,6 +409,13 @@ def list_managed_namespace_slugs(namespace: str) -> list[str]:
     An absent namespace directory means the org has published nothing yet and returns an empty
     list. Every other failure propagates, because "no environments" must never be how a broken hub
     read looks: that is indistinguishable from a publish that silently did nothing.
+
+    Both reads are deliberately bounded well below the publish path's budget. This serves a person
+    waiting at a terminal, and inheriting the batch default (6 attempts x 120s socket + up to 180s
+    backoff, twice over) would let a hard-down GitHub hold the request ~30 minutes before returning
+    the controlled 502 -- long enough that every caller times out first and sees a generic failure
+    instead of the upstream status. One retry at a 20s socket timeout answers within ~1 minute
+    worst case, which is what makes the 429/502 actually reachable by a client.
     """
     if not _is_safe_github_path_parts((namespace,)):
         raise RuntimeError(f"unsafe managed environment namespace: {namespace!r}")
@@ -549,7 +429,7 @@ def list_managed_namespace_slugs(namespace: str) -> list[str]:
     root = next(
         (
             entry
-            for entry in _github_tree_entries(ref, ref.ref, ref.ref)
+            for entry in _github_tree_entries(ref, ref.ref, ref.ref, **_LIST_READ_BUDGET)
             if entry.get("path") == namespace
             and entry.get("type") == "tree"
             and isinstance(entry.get("sha"), str)
@@ -563,7 +443,9 @@ def list_managed_namespace_slugs(namespace: str) -> list[str]:
     # in a recursive response are relative to the namespace, so `<name>/environment.py` identifies an
     # environment directly and no per-directory read is needed.
     slugs = []
-    for entry in _github_tree_entries(ref, root["sha"], namespace, recursive=True):
+    for entry in _github_tree_entries(
+        ref, root["sha"], namespace, recursive=True, **_LIST_READ_BUDGET
+    ):
         path = entry.get("path")
         if entry.get("type") != "blob" or not isinstance(path, str):
             continue

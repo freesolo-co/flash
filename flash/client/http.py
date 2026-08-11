@@ -58,6 +58,23 @@ FREESOLO_TRACES_EXPORT_PATH = "/api/traces/export"
 FREESOLO_EVAL_RUNS_PATH = "/api/evals/runs"
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
+# How long the control plane can legitimately spend answering GET /v1/envs before it gives up and
+# returns a controlled 429/502. Mirrors `flash.envs.loader._LIST_READ_BUDGET` applied to the two
+# sequential tree reads `list_managed_namespace_slugs` performs. Kept as arithmetic rather than a
+# magic number so a change on the server side is visible here as a changed term, and deliberately
+# NOT imported from the loader: `flash.client` must stay importable without the server extra.
+_ENV_LIST_GITHUB_READS = 2  # namespace lookup, then the recursive namespace subtree
+_ENV_LIST_ATTEMPTS_PER_READ = 2  # one initial attempt + `max_rate_limit_retries` (1)
+_ENV_LIST_SOCKET_TIMEOUT_SECONDS = 20.0  # `_LIST_READ_BUDGET["timeout"]`
+_ENV_LIST_MAX_BACKOFF_PER_READ_SECONDS = 45.0  # one sleep, capped at 45s
+ENV_LIST_SERVER_BUDGET_SECONDS = _ENV_LIST_GITHUB_READS * (
+    _ENV_LIST_ATTEMPTS_PER_READ * _ENV_LIST_SOCKET_TIMEOUT_SECONDS
+    + _ENV_LIST_MAX_BACKOFF_PER_READ_SECONDS
+)
+# a margin over the server's own ceiling: the client must lose the race to time out, so that a real
+# upstream failure arrives as the server's 429/502 rather than as a local disconnect.
+ENV_LIST_CLIENT_TIMEOUT_SECONDS = ENV_LIST_SERVER_BUDGET_SECONDS + 60.0
+
 
 def freesolo_base_url(override: str | None = None) -> str:
     return (override or os.environ.get("FREESOLO_BASE_URL") or DEFAULT_FREESOLO_BASE_URL).rstrip(
@@ -633,14 +650,19 @@ class ApiClient:
     def list_envs(self) -> list[str]:
         """Return the published environment ids the authenticated org owns.
 
-        Two GitHub reads server-side (no clone), so this needs nothing like publish's 1800s. But it
-        must exceed the server's own retry budget: `_urlopen` retries a rate-limited or 5xx GitHub
-        up to 5 times with a 10s base backoff, so the plane can legitimately take ~80s+ before it
-        answers. At the 60s client default the CLI would disconnect first and report a timeout
-        instead of the 429/502 the server was about to send -- turning a diagnosable upstream
-        condition into a generic failure.
+        The timeout has to outlast the server's WHOLE retry window, not just its backoff: the plane
+        makes two sequential GitHub tree reads, each running ``_urlopen``'s full loop of socket
+        timeouts AND backoff sleeps. Any client timeout below that total replaces the controlled
+        429/502 with a generic "timed out", which is the failure mode this change exists to remove.
+
+        The list path bounds those reads (``loader._LIST_READ_BUDGET``) precisely so this stays a
+        sane wait: on the batch default the ceiling would be ~30 minutes, which no interactive
+        caller would sit through, so a fast upstream failure could never actually be reported.
+
+        Sized off ``ENV_LIST_SERVER_BUDGET_SECONDS`` rather than a literal so the two cannot drift:
+        a change to the server's attempt count, socket timeout, or backoff moves this with it.
         """
-        payload = self._request("GET", "/v1/envs", timeout=180.0)
+        payload = self._request("GET", "/v1/envs", timeout=ENV_LIST_CLIENT_TIMEOUT_SECONDS)
         rows = payload.get("environments") if isinstance(payload, dict) else None
         if not isinstance(rows, list):
             raise ClientError("control plane returned a malformed environment list")

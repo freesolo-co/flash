@@ -24,12 +24,16 @@ def _blob(path: str) -> dict:
     return {"path": path, "type": "blob", "sha": f"sha-{path}"}
 
 
-def _fake_hub(monkeypatch, trees: dict[str, dict], *, record: list | None = None):
+def _fake_hub(
+    monkeypatch, trees: dict[str, dict], *, record: list | None = None, budgets: list | None = None
+):
     """Serve canned tree payloads keyed by the treeish in the requested URL."""
 
-    def fake_download_json(ref, url, context):
+    def fake_download_json(ref, url, context, **kwargs):
         if record is not None:
             record.append(url)
+        if budgets is not None:
+            budgets.append(kwargs)
         treeish = url.split("/git/trees/")[1].split("?")[0]
         if treeish not in trees:
             raise AssertionError(f"unexpected tree request for {treeish!r}")
@@ -91,6 +95,43 @@ def test_lists_the_namespace_in_one_recursive_request(monkeypatch):
     assert len(loader.list_managed_namespace_slugs("acme")) == 25
     assert len(seen) == 2, seen
     assert seen[1].endswith("?recursive=1"), seen[1]
+
+
+def test_both_list_reads_are_bounded_for_an_interactive_caller(monkeypatch):
+    """Neither read may inherit the publish path's batch retry budget.
+
+    On the default (6 attempts x 120s socket + up to 180s backoff, per read) a hard-down GitHub
+    holds the request ~30 minutes before the domain layer can return its controlled 502 -- so every
+    caller times out first and the useful status is never delivered.
+    """
+    budgets: list[dict] = []
+    _fake_hub(
+        monkeypatch,
+        {
+            "main": _tree(_dir("acme", "sha-acme")),
+            "sha-acme": _tree(_dir("my-env", "sha-my-env"), _blob("my-env/environment.py")),
+        },
+        budgets=budgets,
+    )
+
+    assert loader.list_managed_namespace_slugs("acme") == ["acme/my-env"]
+    assert len(budgets) == 2, budgets
+    for passed in budgets:
+        assert passed["timeout"] == 20.0, passed
+        assert passed["max_rate_limit_retries"] == 1, passed
+
+
+def test_publish_path_reads_keep_the_batch_budget(monkeypatch):
+    """The bound is scoped to the interactive list; a background download still gets full retries.
+
+    `_download_github_json`'s defaults are what the publish and package paths rely on, so lowering
+    them globally would make a large managed download give up early.
+    """
+    import inspect
+
+    sig = inspect.signature(loader._download_github_json)
+    assert sig.parameters["timeout"].default == 120.0
+    assert sig.parameters["max_rate_limit_retries"].default == 5
 
 
 def test_absent_namespace_directory_is_an_empty_list(monkeypatch):
@@ -257,6 +298,37 @@ def test_a_github_outage_is_502_not_429(monkeypatch):
         with pytest.raises(envs_mod.EnvPublishError) as excinfo:
             envs_mod.list_namespace_slugs(key=_user_key())
         assert excinfo.value.status == 502, message
+
+
+def test_a_truncated_hub_response_is_502_not_an_uncaught_500(monkeypatch):
+    """A truncated GitHub body must reach the caller as a controlled 502.
+
+    `http.client.IncompleteRead` is an HTTPException -- not a URLError, ConnectionError, OSError, or
+    RuntimeError -- so before it was named in `_urlopen`'s retry clause it escaped both the retry
+    loop and this layer's `except RuntimeError`, surfacing as an uncaught HTTP 500.
+    """
+    import http.client
+    import urllib.request
+
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+
+    class _TruncatedBody:
+        def read(self, *_a):
+            raise http.client.IncompleteRead(b"partial")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: _TruncatedBody())
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+
+    with pytest.raises(envs_mod.EnvPublishError) as excinfo:
+        envs_mod.list_namespace_slugs(key=_user_key())
+    assert excinfo.value.status == 502
+    assert excinfo.value.status != 429, "an upstream fault is not the caller being throttled"
 
 
 def test_only_a_real_rate_limit_is_marked_throttled():

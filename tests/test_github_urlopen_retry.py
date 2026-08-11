@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import io
 import random
 import time
@@ -151,6 +152,54 @@ def test_urlopen_retries_transient_url_error_then_succeeds(monkeypatch):
 
     assert _urlopen(urllib.request.Request("https://api.github.com/test")) == b"ok"
     assert len(calls) == 3
+
+
+def test_urlopen_retries_a_truncated_body_then_succeeds(monkeypatch):
+    # GitHub can drop a response after sending only part of a declared body, which surfaces at
+    # `resp.read()` as http.client.IncompleteRead. That is an HTTPException: NOT a URLError,
+    # TimeoutError, ConnectionError, or even an OSError -- so it matched none of the handlers here
+    # and escaped the retry loop entirely. Worse, it is no RuntimeError either, so every caller's
+    # translation missed it too and it surfaced as an uncaught 500 instead of a retry or a 502.
+    calls = []
+
+    class _TruncatedBody(io.BytesIO):
+        def read(self, *_a):
+            raise http.client.IncompleteRead(b"partial")
+
+    def fake_urlopen(req, timeout):
+        calls.append(1)
+        return _TruncatedBody(b"") if len(calls) < 3 else io.BytesIO(b"ok")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)
+
+    assert _urlopen(urllib.request.Request("https://api.github.com/test")) == b"ok"
+    assert len(calls) == 3
+
+
+def test_urlopen_persistent_truncated_body_becomes_retriable_signal(monkeypatch):
+    # A body that truncates on every attempt must end as the typed retriable error, so the domain
+    # layer answers a controlled 502 instead of letting an HTTPException escape as a 500.
+    calls = []
+
+    class _TruncatedBody(io.BytesIO):
+        def read(self, *_a):
+            raise http.client.IncompleteRead(b"partial")
+
+    def fake_urlopen(req, timeout):
+        calls.append(1)
+        return _TruncatedBody(b"")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)
+
+    with pytest.raises(GitHubRateLimitError, match="transient network") as excinfo:
+        _urlopen(urllib.request.Request("https://api.github.com/test"))
+    assert len(calls) == 6  # initial + 5 retries
+    # not throttling: a truncated body is an upstream fault, so it must map to 502 and not 429.
+    assert excinfo.value.throttled is False
 
 
 def test_urlopen_transient_network_becomes_retriable_signal(monkeypatch):
