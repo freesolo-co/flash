@@ -2772,6 +2772,23 @@ def test_opd_progress_truncation_rate_is_per_step_not_cumulative():
     assert progress.checkpoint_state(2, timeout_s=0.1)["truncation_rate"] == 0.0
 
 
+def test_opd_progress_truncation_rate_zero_delta_does_not_reuse_history():
+    progress = _OpdProgressState()
+
+    progress.record_step(
+        1,
+        0.8,
+        _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
+    )
+    progress.record_step(
+        2,
+        0.4,
+        _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
+    )
+
+    assert progress.checkpoint_state(2, timeout_s=0.1)["truncation_rate"] == 0.0
+
+
 def test_opd_progress_truncation_rate_handles_zero_rollouts():
     progress = _OpdProgressState()
 
@@ -6079,6 +6096,32 @@ def test_opd_step_heartbeat_carries_truncation_rate(monkeypatch):
             {"step": 1, "loss": 0.5, "truncation_rate": pytest.approx(0.75)},
         )
     ]
+
+
+def test_opd_step_heartbeat_omits_stale_truncation_rate(monkeypatch):
+    import flash.engine.worker.opd_train_runner as opd_runner
+
+    emitted = []
+    monkeypatch.setattr(
+        opd_train._w,
+        "heartbeat",
+        lambda stage, **payload: emitted.append((stage, payload)),
+    )
+    callbacks = opd_runner._build_child_callbacks(
+        SimpleNamespace(raise_if_failed=lambda: None),
+        _OpdProgressState(),
+        _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
+        0,
+    )
+
+    callbacks.on_line("step:1 - actor/distillation/loss:0.5")
+    callbacks.on_step(1)
+    callbacks.on_line("step:2 - timing/step:1.25")
+    callbacks.on_step(2)
+
+    assert emitted[1][0] == "opd_step"
+    assert emitted[1][1]["step"] == 2
+    assert "truncation_rate" not in emitted[1][1]
 
 
 def test_opd_line_handler_reads_the_loss_through_the_shared_parser():

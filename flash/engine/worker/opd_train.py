@@ -148,18 +148,13 @@ class _OpdProgressState:
             truncated = int(snapshot["truncated_rollouts"])
             samples_seen = int(snapshot["samples_seen"])
             # truncation can change abruptly with prompt mix, so report this step's rollout share
-            # rather than the cumulative average, which would hide a newly saturated completion cap.
+            # rather than the cumulative average. a zero-delta snapshot reports 0.0 because no
+            # rollouts belong to this step, and reusing history would misattribute old truncations.
             d_truncated = truncated - self._prev_truncated
             d_samples_seen = samples_seen - self._prev_samples_seen
             self._prev_truncated, self._prev_samples_seen = truncated, samples_seen
             self._prev_no_signal_skipped_steps = int(snapshot.get("no_signal_skipped_steps", 0))
-            truncation_rate = (
-                d_truncated / d_samples_seen
-                if d_samples_seen > 0
-                else truncated / samples_seen
-                if samples_seen
-                else 0.0
-            )
+            truncation_rate = d_truncated / d_samples_seen if d_samples_seen > 0 else 0.0
             snapshot.update(
                 {
                     "train_wall_seconds": self._train_wall_seconds(),

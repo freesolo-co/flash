@@ -575,7 +575,12 @@ def _build_child_callbacks(
     bridge: Any,
     resume_step: int,
 ) -> _ChildCallbacks:
-    progress = {"step": resume_step, "loss": None, "truncation_rate": None}
+    progress = {
+        "step": resume_step,
+        "loss": None,
+        "truncation_rate": None,
+        "truncation_step": None,
+    }
     wandb_link: dict[str, str | None] = {}
 
     def on_line(line: str) -> None:
@@ -598,13 +603,14 @@ def _build_child_callbacks(
             return
         progress["loss"] = loss
         progress["truncation_rate"] = progress_state.record_step(step_number, loss, bridge)
+        progress["truncation_step"] = step_number
 
     def on_step(step: int) -> None:
         progress["step"] = step
         payload = {"step": step}
         if progress["loss"] is not None:
             payload["loss"] = progress["loss"]
-        if progress["truncation_rate"] is not None:
+        if progress["truncation_step"] == step and progress["truncation_rate"] is not None:
             payload["truncation_rate"] = progress["truncation_rate"]
         _opd_train._w.heartbeat("opd_step", **payload)
 
