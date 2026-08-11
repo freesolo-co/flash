@@ -540,6 +540,26 @@ def test_flash_attn_spec_stays_in_lockstep_with_the_worker_image():
     # the install must actually ask for the digest: a pinned constant nothing hands to uv leaves
     # the fetch as unverified as it was without one.
     assert f"{vc.FLASH_ATTN_SPEC}#sha256={vc.FLASH_ATTN_SHA256}" == vc.FLASH_ATTN_INSTALL_SPEC
+    # and the verl-venv layer must build that fragment CONDITIONALLY. `#sha256=` is url syntax, so
+    # gluing it onto the documented non-url override (FLASH_ATTN_SPEC=flash-attn==X) hands uv a
+    # requirement it cannot parse and fails this REQUIRED layer. pin both halves: the install takes
+    # a shell-resolved spec, and the fragment is added only inside the http* case.
+    install_line = (
+        'uv pip install --python /opt/verl-venv/bin/python --no-build-isolation "${spec}"'
+    )
+    assert install_line in text, (
+        "the verl-venv flash-attn install must install a shell-resolved spec, not the raw ARG"
+    )
+    block = text[text.rindex("\nRUN ", 0, text.index(install_line)) : text.index(install_line)]
+    assert "http*)" in block, (
+        "the verl-venv install must append the sha256 fragment only for an http(s) wheel url"
+    )
+    assert 'spec="${spec}#sha256=${FLASH_ATTN_SHA256}"' in block, (
+        "the verl-venv install must still hash-verify a wheel url"
+    )
+    assert '"${FLASH_ATTN_SPEC}#sha256=' not in text, (
+        "appending the fragment straight onto FLASH_ATTN_SPEC breaks the non-url override"
+    )
 
 
 def test_the_capability_probe_imports_nothing_from_flash():

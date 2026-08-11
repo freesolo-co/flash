@@ -378,8 +378,19 @@ RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers
 # already relies on, so appending it here closes the gap: a replaced release asset is rejected before
 # it lands in the venv that trains, not just in the main interpreter. Unlike that block this install
 # has no `|| echo` fallback, so a mismatch already fails the build outright.
-RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" MAX_JOBS=4 \
-    uv pip install --python /opt/verl-venv/bin/python --no-build-isolation "${FLASH_ATTN_SPEC}#sha256=${FLASH_ATTN_SHA256}" \
+# The fragment is appended ONLY to an http(s) url, mirroring the main-interpreter block's case: a
+# `#sha256=` fragment is url syntax, so gluing it onto the documented non-url override
+# (FLASH_ATTN_SPEC=flash-attn==2.8.3) yields a requirement uv cannot parse and fails this required
+# layer outright. A package pin passes through unchanged and resolves from the index as before.
+RUN set -eu; \
+    spec="${FLASH_ATTN_SPEC}"; \
+    case "${spec}" in \
+        http*) \
+            [ -n "${FLASH_ATTN_SHA256}" ] || { echo "FLASH_ATTN_SHA256 is required for a wheel url" >&2; exit 1; }; \
+            spec="${spec}#sha256=${FLASH_ATTN_SHA256}" ;; \
+    esac; \
+    TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" MAX_JOBS=4 \
+    uv pip install --python /opt/verl-venv/bin/python --no-build-isolation "${spec}" \
     && uv cache clean
 
 # causal_conv1d in the VERL VENV, which is where the model actually trains. The main interpreter's
