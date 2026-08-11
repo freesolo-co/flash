@@ -1042,6 +1042,24 @@ def test_wrong_shape_2xx_names_the_endpoint_and_the_missing_key():
             assert "rather than at a proxy or another service" in message
 
 
+def test_present_but_unusable_values_are_client_errors_too():
+    """A null value passes a presence check and then raises a bare TypeError out of int() or
+    iteration, which nothing in the CLI translates any more than it does a KeyError."""
+    with (
+        _fixed_2xx_server("application/json", b'{"runs": null}') as url,
+        pytest.raises(ClientError) as caught,
+    ):
+        ApiClient(url, "fslo-user-test", timeout=5).list_runs()
+    assert f"{url}/v1/runs returned an unexpected response shape" in str(caught.value)
+    assert "'runs'" in str(caught.value)
+    with (
+        _fixed_2xx_server("application/json", b'{"logs": "x", "offset": null}') as url,
+        pytest.raises(ClientError) as caught,
+    ):
+        ApiClient(url, "fslo-user-test", timeout=5).get_logs("r1")
+    assert "'offset'" in str(caught.value)
+
+
 def test_non_json_2xx_is_a_client_error_not_a_decode_error():
     """A reverse proxy answering 200 text/html must not leak `Expecting value: line 1 column 1`."""
     with _fixed_2xx_server("text/html", b"<html>hi</html>") as url:

@@ -10,7 +10,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from typing import Any
 
 from flash.client.config import load_credentials_with_source
@@ -510,13 +510,17 @@ class ApiClient:
         raw: bytes,
         content_type: str = "",
         *,
-        require: tuple[str, ...] = (),
+        require: Mapping[str, type | tuple[type, ...]] | None = None,
     ) -> Any:
-        """Parse a 2xx body and require the top-level keys the caller is about to read.
+        """Parse a 2xx body and require the top-level keys, and value types, the caller reads.
 
         Every response body this client reads goes through here, so a proxy answering
         ``200 text/html`` and a plane answering the wrong shape both surface as the same
         ``ClientError``. An empty body decodes to ``{}``.
+
+        The type is required alongside the key because a present-but-unusable value is the same
+        user state: ``{"logs": "x", "offset": null}`` passes a presence check and then raises a
+        bare ``TypeError`` out of ``int(None)``, which nothing in the CLI translates either.
         """
         try:
             payload = json.loads(raw) if raw else {}
@@ -526,13 +530,19 @@ class ApiClient:
                 path,
                 f"did not return JSON (Content-Type: {content_type or 'unset'})",
             ) from exc
-        missing = [key for key in require if not isinstance(payload, dict) or key not in payload]
-        if missing:
+        bad = [
+            key
+            for key, expected in (require or {}).items()
+            if not isinstance(payload, dict)
+            or key not in payload
+            or not isinstance(payload[key], expected)
+        ]
+        if bad:
             raise _unexpected_response(
                 self.api_url,
                 path,
                 "returned an unexpected response shape "
-                f"(missing {', '.join(repr(key) for key in missing)})",
+                f"(missing or malformed {', '.join(repr(key) for key in bad)})",
             )
         return payload
 
@@ -544,7 +554,7 @@ class ApiClient:
         timeout: float | None = None,
         progress: ProgressCallback | None = None,
         extra_headers: dict[str, str] | None = None,
-        require: tuple[str, ...] = (),
+        require: Mapping[str, type | tuple[type, ...]] | None = None,
     ) -> Any:
         headers = {
             "Content-Type": "application/json",
@@ -669,7 +679,7 @@ class ApiClient:
             f"/v1/envs/{quoted}",
             timeout=1800.0,
             extra_headers={"X-Freesolo-Project-Id": project_id},
-            require=("deleted",),
+            require={"deleted": bool},
         )
 
     def download_env_package(self, env_id: str) -> bytes:
@@ -709,17 +719,19 @@ class ApiClient:
             body["dry_run"] = True
         if client_train_schema is not None:
             body["client_train_schema"] = client_train_schema
-        return self._request("POST", "/v1/runs", body=body, require=("run_id",))
+        return self._request("POST", "/v1/runs", body=body, require={"run_id": str})
 
     def list_runs(self) -> list[dict]:
-        return self._request("GET", "/v1/runs", require=("runs",))["runs"]
+        return self._request("GET", "/v1/runs", require={"runs": list})["runs"]
 
     def get_run(self, run_id: str) -> dict:
         return self._request("GET", f"/v1/runs/{run_id}")
 
     def get_logs(self, run_id: str, offset: int = 0) -> dict:
         return self._request(
-            "GET", f"/v1/runs/{run_id}/logs?offset={int(offset)}", require=("logs", "offset")
+            "GET",
+            f"/v1/runs/{run_id}/logs?offset={int(offset)}",
+            require={"logs": str, "offset": int},
         )
 
     def get_worker_output(self, run_id: str) -> dict[str, str]:
@@ -736,7 +748,7 @@ class ApiClient:
         # that by polling the authoritative run status instead of surfacing a raw timeout.
         try:
             return self._request(
-                "POST", f"/v1/runs/{run_id}/cancel", timeout=60.0, require=("state",)
+                "POST", f"/v1/runs/{run_id}/cancel", timeout=60.0, require={"state": str}
             )
         except RequestTimeoutError as exc:
             return self._poll_cancel_status(run_id, cause=exc)
@@ -773,9 +785,9 @@ class ApiClient:
 
     def checkpoints(self, run_id: str) -> list[dict]:
         """Deployable per-step RL checkpoints for a run (serve one with `flash models deploy RUN/step-N`)."""
-        return self._request("GET", f"/v1/runs/{run_id}/checkpoints", require=("checkpoints",))[
-            "checkpoints"
-        ]
+        return self._request(
+            "GET", f"/v1/runs/{run_id}/checkpoints", require={"checkpoints": list}
+        )["checkpoints"]
 
     def deploy(
         self,
@@ -812,9 +824,9 @@ class ApiClient:
         return self._request("DELETE", f"/v1/runs/{run_id}/deploy")
 
     def deployments(self, timeout: float | None = None) -> list[dict]:
-        return self._request("GET", "/v1/deployments", timeout=timeout, require=("deployments",))[
-            "deployments"
-        ]
+        return self._request(
+            "GET", "/v1/deployments", timeout=timeout, require={"deployments": list}
+        )["deployments"]
 
     def deployment_for(self, run_id: str, timeout: float | None = None) -> dict | None:
         """The current deployment record for one run, or None when it is not listed.
