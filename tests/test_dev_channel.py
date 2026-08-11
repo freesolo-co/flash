@@ -164,7 +164,7 @@ def test_printed_commands_name_the_executable_the_operator_invoked():
     On the documented `[server]` install, `flash` can be runpod-flash's console script. Printing
     `flash runs cancel <id>` there hands the operator a command that exits 0 without cancelling,
     leaving a billed run alive -- so an operator who reached us via `flash-cli` must be told
-    `flash-cli`. Anything that is not one of our scripts (`python -m flash.cli`, pytest) falls
+    `flash-cli`. Anything that is not one of our scripts (a test runner, a renamed copy) falls
     back to the channel default so the hint stays copy-pasteable.
     """
     import importlib
@@ -183,6 +183,53 @@ def test_printed_commands_name_the_executable_the_operator_invoked():
         with mock.patch.object(sys, "argv", [argv0]):
             resolved = importlib.reload(channel).CLI_NAME
         assert resolved == expected, argv0
+
+    importlib.reload(channel)  # restore the pytest-invoked value for later tests
+
+
+def test_module_invocation_is_named_back_as_itself_not_as_flash():
+    """`python -m flash.cli` must print itself, because it is the escape hatch FROM `flash`.
+
+    README, CONTRIBUTING and SELF_HOSTING all send an operator whose `flash` is shadowed to the
+    `-m` form. Falling back to the channel default there answers that operator with the exact name
+    they were told to stop using.
+
+    Resolution reads `sys.orig_argv`, NOT `sys.argv`: runpy imports the target's parent package --
+    which is what imports channel -- before rewriting `sys.argv`, so `sys.argv[0]` is the bare
+    string `-m` at that moment, for `python -m pytest` just as much as for us. Hence the pytest row
+    below: it is what distinguishes reading the real command line from matching on `-m` alone.
+
+    `sys.argv` is passed per row rather than held fixed because the module's position in
+    `orig_argv` is derived from the length of the trailing script arguments.
+    """
+    import importlib
+    import sys
+    from unittest import mock
+
+    from flash._internal import channel
+
+    py = "/usr/bin/python3"
+    for orig_argv, argv, expected in (
+        ([py, "-m", "flash.cli", "runs", "list"], ["-m", "runs", "list"], "python -m flash.cli"),
+        ([py, "-m", "pytest", "tests/"], ["-m", "tests/"], "flash"),
+        ([py, "-m", "flash.server"], ["-m"], "flash"),
+        # interpreter flags shift the module's index, including one that takes its own value
+        ([py, "-W", "ignore", "-m", "flash.cli", "-v"], ["-m", "-v"], "python -m flash.cli"),
+        # a console script names no module: `-m` in ITS arguments must not read as the flag
+        (
+            [py, "/usr/local/bin/flash-cli", "-m", "flash.cli"],
+            ["/usr/local/bin/flash-cli", "-m", "flash.cli"],
+            "flash-cli",
+        ),
+        ([py, "-m"], ["-m"], "flash"),  # truncated command line must not raise
+        ([], ["-m"], "flash"),  # orig_argv absent (embedded interpreter) must not raise
+    ):
+        with (
+            mock.patch.object(sys, "orig_argv", orig_argv),
+            mock.patch.object(sys, "argv", argv),
+        ):
+            resolved = importlib.reload(channel).CLI_NAME
+        assert resolved == expected, orig_argv
 
     importlib.reload(channel)  # restore the pytest-invoked value for later tests
 
