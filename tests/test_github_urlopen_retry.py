@@ -201,9 +201,9 @@ class _FlakyBody:
 
 @pytest.mark.parametrize("max_bytes", [None, 4096])
 def test_urlopen_truncates_sink_before_retrying_mid_body_failure(monkeypatch, tmp_path, max_bytes):
-    # The regression the other retry tests miss: they all fail BEFORE the first body byte. A reset
-    # part-way through the body used to leave `partial_prefix + full_body_of_retry` on disk, i.e. a
-    # corrupt tarball, or worse a corrupt raw file that still parses.
+    # A reset part-way through the body must not leave `partial_prefix + full_body_of_retry` on
+    # disk, i.e. a corrupt tarball, or worse a corrupt raw file that still parses. The other retry
+    # tests all fail BEFORE the first body byte, so only this one exercises a partial sink.
     payload = b"".join(f"line-{i:04d}\n".encode() for i in range(64))
     bodies = [
         _FlakyBody(payload, fail_after=37),
