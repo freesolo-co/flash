@@ -2251,3 +2251,39 @@ def test_an_unpublished_adapter_is_not_deleted(monkeypatch, tmp_path):
     assert os.path.isdir(export_root / "step-5"), (
         "an adapter that was never published was deleted anyway"
     )
+
+
+def test_importing_the_worker_package_does_not_freeze_the_xet_default(monkeypatch):
+    """the disable must still be able to take effect when the worker starts.
+
+    `huggingface_hub.constants` reads HF_HUB_DISABLE_XET into a module constant at import time, so
+    setting the variable afterwards changes nothing -- `is_xet_available()` keeps returning True and
+    uploads keep staging through the xet cache. That makes this an ORDERING contract, not just a
+    setenv: if anything ever pulls huggingface_hub in at `flash.engine.worker` import time, the fix
+    silently becomes a no-op while every assertion about the env var still passes.
+
+    Asserts the resulting behaviour rather than the call order, so a refactor that moves the call,
+    or adds a module-level hf import above it, fails here instead of in production.
+    """
+    import subprocess
+    import sys
+
+    probe = (
+        "import os, sys\n"
+        "os.environ.pop('HF_HUB_DISABLE_XET', None)\n"
+        "import flash.engine.worker\n"
+        "assert not [m for m in sys.modules if m.startswith('huggingface_hub')], (\n"
+        "    'huggingface_hub was imported during flash.engine.worker import; '\n"
+        "    'the xet default is frozen before the worker can disable it'\n"
+        ")\n"
+        "flash.engine.worker._disable_xet_upload_staging()\n"
+        "from huggingface_hub.utils._runtime import is_xet_available\n"
+        "assert not is_xet_available(), 'xet is still selected for uploads'\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        cwd=str(pathlib.Path(__file__).resolve().parent.parent),
+    )
+    assert result.returncode == 0, result.stderr
