@@ -756,6 +756,55 @@ def test_freesolo_adapter_requested_split_wins_over_a_hardcoded_env_dataset(monk
     assert env.dataset() == [{"id": "o", "input": "2+2?", "output": "4"}]
 
 
+def test_freesolo_adapter_explicit_dataset_path_wins_over_a_hardcoded_env_dataset(
+    monkeypatch, tmp_path
+):
+    """an explicit non-default dataset_path names the rows to train on, and the scaffolded
+    class-level dataset pattern ignores the injected path, so the named file must stay
+    authoritative over the env's default train rows."""
+    sdk_env = _FakeSingleTurnEnv()
+    sdk_env.dataset = [{"id": "t", "input": "train?", "output": "no"}]
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+    env_file = _split_env(
+        tmp_path,
+        {
+            "dataset/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n',
+            "dataset/oracle.jsonl": '{"id":"o","input":"2+2?","output":"4"}\n',
+        },
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(
+        str(env_file), dataset_path="dataset/oracle.jsonl", contract_text="c"
+    )
+    assert env.dataset() == [{"id": "o", "input": "2+2?", "output": "4"}]
+
+
+def test_freesolo_adapter_default_dataset_path_keeps_env_precedence(monkeypatch, tmp_path):
+    """dataset_path naming the default train file is the documented filter-the-injected-file
+    pattern, so the env's (possibly filtered) rows keep winning over re-reading the file."""
+    sdk_env = _FakeSingleTurnEnv()
+    sdk_env.dataset = [{"id": "kept", "input": "2+2?", "output": "4"}]
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+    env_file = _split_env(
+        tmp_path,
+        {
+            "dataset/train.jsonl": (
+                '{"id":"kept","input":"2+2?","output":"4"}\n'
+                '{"id":"dropped","input":"3+3?","output":"6"}\n'
+            )
+        },
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(
+        str(env_file), dataset_path="dataset/train.jsonl", contract_text="c"
+    )
+    assert env.dataset() == [{"id": "kept", "input": "2+2?", "output": "4"}]
+
+
 def test_freesolo_adapter_empty_env_dataset_falls_back_to_the_packaged_file(monkeypatch, tmp_path):
     """an env exposing no rows has nothing to train on, and `examples` must read the same way as
     `dataset` rather than one falling back to the file and the other winning empty."""

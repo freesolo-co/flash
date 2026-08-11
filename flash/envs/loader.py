@@ -833,8 +833,8 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
 
     params = dict(kwargs)
     source = params.pop("records", None)
-    # true when source is a dataset_path file the environment itself received as a param; the
-    # env instance's own dataset then takes precedence over re-reading the file (see
+    # true when source is the DEFAULT packaged train file the environment itself received as a
+    # param; the env instance's own dataset then takes precedence over re-reading the file (see
     # FreesoloEnvironment.dataset). explicit records never reach the env, so they keep winning.
     source_is_dataset_file = False
     dataset_path = params.get("dataset_path")
@@ -842,7 +842,18 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
         resolved_dataset_path = _resolve_path_arg(dataset_path, base_dir)
         params["dataset_path"] = resolved_dataset_path
         source = resolved_dataset_path
-        source_is_dataset_file = True
+        # an explicit dataset_path names the rows to train on, and the scaffolded pattern is a
+        # class-level `dataset = load_jsonl("dataset/train.jsonl")` that ignores the dataset_path
+        # it is handed. letting that env's dataset win would silently train on the default split
+        # instead of the file the operator named, so the explicit file stays authoritative. only
+        # the default train file keeps env precedence (the documented pattern of filtering the
+        # injected train file remains the headline behavior).
+        default_train = _packaged_dataset_file(base_dir, "train")
+        source_is_dataset_file = (
+            default_train is not None
+            and isinstance(resolved_dataset_path, str)
+            and Path(resolved_dataset_path).resolve() == default_train.resolve()
+        )
     # [environment.params] split selects which packaged dataset file Flash trains on. It used to
     # be forwarded to the SDK only, so SFT (and GRPO problem selection driven off dataset())
     # SILENTLY trained on the default dataset/train.jsonl even when a side split was requested.
