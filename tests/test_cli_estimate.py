@@ -684,7 +684,7 @@ def test_every_cap_sitting_at_the_pool_is_named(tmp_path, monkeypatch, capsys):
 
     assert rc == 0
     assert "`[train] max_examples` and `[environment.params] max_examples`" in err
-    assert "max_examples` cap the prompt pool" in err  # plural subject, plural verb
+    assert "max_examples` hold the prompt pool" in err  # plural subject, plural verb
 
 
 def test_a_cap_without_a_batch_size_is_not_told_it_buys_more_passes(tmp_path, monkeypatch, capsys):
@@ -723,6 +723,57 @@ def test_a_cap_with_a_pinned_batch_size_is_told_it_buys_more_passes(tmp_path, mo
     assert rc == 0
     assert "adds passes rather than removing them" in err
     assert "quotes dearer, not cheaper" in err
+
+
+def test_staggered_caps_are_both_named_so_one_edit_resolves_it(tmp_path, monkeypatch, capsys):
+    """`[train] = 2` behind `[environment.params] = 3`: raising only the smaller lands on 3.
+
+    Naming just the constraint at the current minimum makes the remedy a two-round trip that the
+    user pays for: they raise the train cap, get a 3-prompt batch, and are warned again. Every
+    configured cap below the healthy threshold has to be named for one edit to fix it.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, None, max_examples=2, env_params={"max_examples": 3}))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "`[train] max_examples` and `[environment.params] max_examples`" in err
+
+
+def test_a_thin_batch_behind_a_smaller_cap_is_still_named(tmp_path, monkeypatch, capsys):
+    """`batch_size = 3` behind `max_examples = 2`: raising only the cap leaves the batch at 3.
+
+    The pool resolves the batch today, so `batch_size` is not what binds right now, but it is
+    still below a real batch and becomes the constraint the moment the cap is lifted.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, 3, max_examples=2))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "Raise `batch_size` and `[train] max_examples`" in err
+
+
+def test_a_pinned_horizon_with_only_a_cap_is_not_promised_a_higher_bill(
+    tmp_path, monkeypatch, capsys
+):
+    """Under a pinned `max_steps` with no authored batch, widening the cap does not move the quote.
+
+    `runconfig_from_spec` leaves `batch_size=None`, so the estimate normalizes every widened cap
+    to the same recipe batch over the same pinned steps: caps 2, 4 and 8 all price at $4.73. The
+    fixed-horizon "higher bill" promise belongs to the authored-batch case ($0.26 -> $0.48), and
+    is measured there by `test_a_fixed_horizon_is_told_that_widening_costs_more_not_less`.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, None, max_examples=2, max_steps=10))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "without adding updates" in err
+    assert "higher bill" not in err
 
 
 def test_grpo_cost_stays_quiet_when_the_batch_is_a_real_batch(tmp_path, monkeypatch, capsys):

@@ -191,23 +191,24 @@ def thin_rl_batch_warning(spec) -> str | None:
     # `prompts_per_step` for reasons that have nothing to do with a pool -- reading a bind off that
     # equality would invent a cap the config does not contain and send the user to a phantom key.
     #
-    # both tables can cap at once and the effective pool is the smaller, so name every cap sitting
-    # AT it: raising only one of two equal caps moves nothing, and naming only the first would send
-    # the user to raise a key that is not what is holding the pool down.
+    # name every cap that is BELOW the healthy threshold, not merely the one at the current
+    # minimum. staggered caps are the trap: with [train] 2 behind [environment.params] 3, naming
+    # only the train cap sends the user to raise it and land on 3, still thin and still warned.
+    # the remedy has to resolve the problem in one edit, so every configured constraint that would
+    # still bind after the others are lifted gets named.
     cap_keys = [
         key
         for key, value in (
             ("[train] max_examples", int(spec.train.max_examples or 0)),
             ("[environment.params] max_examples", _env_max_examples(spec)),
         )
-        if value == examples
+        if 0 < value < RL_THIN_PROMPTS_PER_STEP
     ]
     cap_key = " and ".join(f"`{k}`" for k in cap_keys) if cap_keys else None
-    # name every input that is actually holding the batch down, because raising one while another
-    # still binds is a no-op the user pays for. the pool caps prompts-per-step, so an authored
-    # batch at or above the pool is not the constraint even when the two are equal.
-    batch_binds = authored is not None and authored <= examples
-    pool_binds = cap_key is not None and examples <= prompts_per_step
+    # same rule for the authored batch: it binds if it is itself thin, even when a smaller pool is
+    # what resolves today. raising only the cap would leave `batch_size = 3` capping the batch at 3.
+    batch_binds = authored is not None and authored < RL_THIN_PROMPTS_PER_STEP
+    pool_binds = cap_key is not None
     if batch_binds:
         # the sft/rl name collision is only worth explaining when a batch_size was actually written
         lead = (
@@ -218,14 +219,15 @@ def thin_rl_batch_warning(spec) -> str | None:
         )
         if pool_binds:
             lead += (
-                f" {cap_key} holds the prompt pool at {examples} as well, so raising one without "
-                "the other leaves the batch exactly where it is."
+                f" {cap_key} also holds the prompt pool below that, so raising one without the "
+                "other leaves the batch exactly where it is."
             )
     else:
-        caps_verb = "cap" if len(cap_keys) > 1 else "caps"
+        caps_verb = "hold" if len(cap_keys) > 1 else "holds"
         lead = (
             f"This {spec.algorithm} run's OPTIMIZER batch is {prompts} per update: {cap_key} "
-            f"{caps_verb} the prompt pool that small, and prompts-per-step cannot exceed the pool."
+            f"{caps_verb} the prompt pool below a real batch, and prompts-per-step cannot exceed "
+            "the pool."
         )
     targets = [
         k for k, binds in (("`batch_size`", batch_binds), (cap_key or "", pool_binds)) if binds
@@ -247,49 +249,69 @@ def thin_rl_batch_warning(spec) -> str | None:
             "sizes rollout concurrency and the loss microbatch), so keep any widening within what "
             "the gpu allows."
         )
+    remedy = _thin_rl_batch_remedy(
+        spec, raise_target=raise_target, batch_binds=batch_binds, pool_binds=pool_binds
+    )
+    return f"{lead} {consequence} {remedy}"
+
+
+def _thin_rl_batch_remedy(spec, *, raise_target: str, batch_binds: bool, pool_binds: bool) -> str:
+    """The closing sentence: what raising the named knobs actually buys, and at what price.
+
+    Split from ``thin_rl_batch_warning`` to keep it under the function-size limit. It is the one
+    cohesive phase in that message: every branch here answers "what happens if I do what you just
+    told me", and each direction it claims is measured (see the branch comments).
+    """
     # what widening costs flips with the horizon, so the remedy has to name the right trade.
-    if spec.train.max_steps and int(spec.train.max_steps) > 0:
-        remedy = (
+    if spec.train.max_steps and int(spec.train.max_steps) > 0 and batch_binds:
+        return (
             f"Your `max_steps` pins the update count, so raising {raise_target} buys that averaging "
             "at strictly more generated work and a higher bill for the same number of updates."
         )
-    elif pool_binds and batch_binds:
+    if spec.train.max_steps and int(spec.train.max_steps) > 0:
+        # cap-only under a pinned horizon: `runconfig_from_spec` leaves `batch_size=None`, so the
+        # quote normalizes every widened cap to the same recipe batch over the same pinned steps
+        # and caps 2, 4 and 8 all price identically. the generated work does grow, but this quote
+        # will not show it, so promise nothing and say where the number really comes from.
+        return (
+            f"Your `max_steps` pins the update count, so raising {raise_target} buys that averaging "
+            "without adding updates. Re-run `--cost` to see what it does to this quote."
+        )
+    if pool_binds and batch_binds:
         # an authored batch pins prompts-per-step, so a bigger pool is spread over MORE updates:
         # at batch 2, lifting max_examples 2 -> 8 goes from 1 step at $0.035 to 4 steps at $0.141.
-        remedy = (
+        return (
             f"Raise {raise_target}: with `batch_size` pinning prompts-per-step, a bigger prompt "
             "pool adds passes rather than removing them, so this quotes dearer, not cheaper -- it "
             "buys the averaging with a longer run."
         )
-    elif pool_binds:
+    if pool_binds:
         # with no authored batch the request is the recipe default, so prompts-per-step rises WITH
         # the cap and the horizon does not move: at max_examples 2, 4, ... 64 the derived horizon
         # stays at 1 update. claim no direction for the bill here -- the quote prices the recipe's
         # full rollout width rather than the retained pool, so it reads $0.47 at every one of those
         # caps, and `--cost` is the honest place to look rather than a promise in this sentence.
-        remedy = (
+        return (
             f"Raise {raise_target}: with no `batch_size` set, prompts-per-step follows the pool, so "
             "this widens each update rather than adding updates. Re-run `--cost` to see what it "
             "does to this quote."
         )
-    else:
-        # the "buying steps" workflow is about lowering batch_size against a fixed pool. a thin
-        # POOL does not buy steps, it just shortens the run, so that caveat would excuse the wrong
-        # config -- offer it only when the authored batch is what is holding the batch down.
-        #
-        # deliberately claims no direction for the bill, and no strict drop in updates either. the
-        # derived horizon is ``ceil(examples / batch)``, which is non-increasing in batch but
-        # plateaus: at ``max_examples = 5`` both batch 3 and batch 4 resolve to 2 updates, so the
-        # extra generation is pure added cost and takes the quote from $0.0867 to $0.1027. "no more
-        # updates" is the guarantee ceil() actually gives; "fewer" is only the common case, and
-        # `--cost` prices the real answer in the line above this one.
-        remedy = (
-            f"Raise {raise_target} unless you are deliberately buying optimizer steps on a derived "
-            "horizon (see TRAINING.md): against a fixed prompt pool a wider batch spreads the same "
-            "prompts over no more updates than it does now. Re-run `--cost` to see what it does to "
-            "this quote."
-        )
-    return f"{lead} {consequence} {remedy}"
+    # the "buying steps" workflow is about lowering batch_size against a fixed pool. a thin POOL
+    # does not buy steps, it just shortens the run, so that caveat would excuse the wrong config --
+    # offer it only when the authored batch is what is holding the batch down.
+    #
+    # deliberately claims no direction for the bill, and no strict drop in updates either. the
+    # derived horizon is ``ceil(examples / batch)``, which is non-increasing in batch but plateaus:
+    # at ``max_examples = 5`` both batch 3 and batch 4 resolve to 2 updates, so the extra
+    # generation is pure added cost and takes the quote from $0.0867 to $0.1027. "no more updates"
+    # is the guarantee ceil() actually gives; "fewer" is only the common case, and `--cost` prices
+    # the real answer in the line above this one.
+    return (
+        f"Raise {raise_target} unless you are deliberately buying optimizer steps on a derived "
+        "horizon (see TRAINING.md): against a fixed prompt pool a wider batch spreads the same "
+        "prompts over no more updates than it does now. Re-run `--cost` to see what it does to "
+        "this quote."
+    )
 
 
 def spec_steps(spec) -> int:
