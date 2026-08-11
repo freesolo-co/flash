@@ -80,6 +80,33 @@ def test_client_rejects_malformed_environment_lists(monkeypatch, payload):
         client.list_envs()
 
 
+@pytest.mark.parametrize("env_id", ["my-env", "acme/env/extra", "acme/../secrets", "acme/my env"])
+def test_client_rejects_noncanonical_environment_ids(monkeypatch, env_id):
+    """A nonblank id that the managed parser would reject must not be advertised as usable.
+
+    These ids are printed for the user to paste into ``[environment]``, so accepting one here means
+    advertising a value that fails later at submit -- with nothing pointing back at the list that
+    supplied it.
+    """
+    client = ApiClient(api_url="https://plane.example", api_key="key")
+    monkeypatch.setattr(
+        ApiClient, "_request", lambda *_args, **_kwargs: {"environments": [{"id": env_id}]}
+    )
+
+    with pytest.raises(ClientError, match="unusable environment id"):
+        client.list_envs()
+
+
+def test_client_accepts_a_canonical_environment_id(monkeypatch):
+    """The guard above must not reject the ids the hub actually publishes."""
+    client = ApiClient(api_url="https://plane.example", api_key="key")
+    monkeypatch.setattr(
+        ApiClient, "_request", lambda *_args, **_kwargs: {"environments": [{"id": "acme/my-env"}]}
+    )
+
+    assert client.list_envs() == ["acme/my-env"]
+
+
 def test_list_route_does_not_shadow_package_route():
     paths = {route.path for route in routes.router.routes}
     assert "/v1/envs" in paths

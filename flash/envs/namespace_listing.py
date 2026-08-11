@@ -52,8 +52,15 @@ def list_managed_namespace_slugs(namespace: str) -> list[str]:
     slugs: set[str] = set()
     for entry in entries:
         path = entry.get("path")
-        if not isinstance(path, str):
-            continue
+        # a missing or non-string path is a fault, not an irrelevant entry. The path is the ONLY
+        # field that decides whether this is a published `<name>/environment.py` marker, so skipping
+        # it silently drops an environment that may well be there -- the same silent-empty answer
+        # this endpoint exists to remove. The namespace read above already raises on an unusable
+        # type; this keeps the recursive read consistent with it.
+        if not isinstance(path, str) or not path:
+            raise RuntimeError(
+                f"GitHub tree entry in environment namespace {namespace!r} has no usable path"
+            )
         parts = path.split("/")
         if len(parts) != 2 or parts[1] != loader._DEFAULT_ENVIRONMENT_PATH:
             continue

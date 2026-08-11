@@ -469,12 +469,24 @@ class ApiClient:
         rows = payload.get("environments") if isinstance(payload, dict) else None
         if not isinstance(rows, list):
             raise ClientError("control plane returned a malformed environment list")
+        # the ids are printed as values the user can paste straight into `[environment]`, so a
+        # nonblank but unusable one (`my-env`, `acme/env/extra`, unsafe path characters) would be
+        # advertised as usable and then fail at submit. Validated with the managed parser itself
+        # rather than a second predicate here, so the two cannot drift apart.
+        from flash.envs.loader import _parse_managed_environment_slug
+
         ids: list[str] = []
         for row in rows:
             env_id = row.get("id") if isinstance(row, dict) else None
             if not isinstance(env_id, str) or not env_id.strip():
                 raise ClientError("control plane returned an environment without an id")
-            ids.append(env_id.strip())
+            env_id = env_id.strip()
+            if _parse_managed_environment_slug(env_id) is None:
+                raise ClientError(
+                    f"control plane returned an unusable environment id {env_id!r}; "
+                    "expected <namespace>/<name>"
+                )
+            ids.append(env_id)
         return ids
 
     def delete_env(self, env_id: str, *, project_id: str) -> dict:

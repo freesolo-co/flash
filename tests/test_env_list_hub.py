@@ -125,6 +125,25 @@ def test_domain_refuses_org_agnostic_internal_key(monkeypatch):
     assert excinfo.value.status == 403
 
 
+def test_malformed_recursive_path_fails_instead_of_hiding_an_env(monkeypatch):
+    """The path is the only field that decides whether an entry is a marker.
+
+    Skipping an entry with a missing or non-string path silently drops an environment that may be
+    published, which is the silent-empty answer this endpoint exists to remove. The namespace read
+    already raises on an unusable type, so the recursive read has to be consistent with it.
+    """
+    _fake_hub(
+        monkeypatch,
+        {
+            "main": _tree(_directory("acme", "sha-acme")),
+            "sha-acme": _tree({"type": "blob", "sha": "sha-x"}),
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="no usable path"):
+        loader.list_managed_namespace_slugs("acme")
+
+
 def test_domain_requires_server_github_token(monkeypatch):
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
 
