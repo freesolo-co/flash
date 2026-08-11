@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import base64
 import hashlib
 import io
@@ -30,10 +31,11 @@ _USER_DATA_BUDGET = _USER_DATA_CAP - _USER_DATA_MARGIN
 # Fast path only: above this, the spec is spilled to HF without rendering a payload that cannot fit.
 # The budget is what is LEFT of the ~64,000-byte provider cap after the fixed framing: this module's
 # template plus every source file it heredocs in (bootstrap.py and bootstrap_secrets.py), which is
-# ~52,000 bytes and grows whenever that bootstrap does. base64 + json escaping inflate the spec
-# ~1.35x on the way in, so this ceiling must stay well under the remaining ~11,800 bytes; shrink it
-# again whenever the embedded sources grow. test_user_data_spills_large_job_spec_to_hf pins the
-# worst case (a spec of exactly this size) against the cap so the two cannot drift apart silently.
+# ~51,000 bytes and grows whenever that bootstrap does (docstrings are stripped on the way in, so
+# only real code counts). base64 + json escaping inflate the spec ~1.35x on the way in, so this
+# ceiling must stay well under the remaining budget; shrink it again whenever the embedded sources
+# grow. test_user_data_spills_large_job_spec_to_hf pins the worst case (a spec of exactly this
+# size) against the cap so the two cannot drift apart silently.
 _SPEC_SPILL_THRESHOLD = 6_000
 
 
@@ -427,12 +429,75 @@ def build_user_data(payload: dict, *, image: str) -> str:
     return user_data
 
 
+def _strip_docstrings(source: str) -> str:
+    """``source`` with every module/class/function docstring replaced by ``pass``.
+
+    Only docstrings go: comments stay, since a comment sits next to the line it explains and is
+    what a reader debugging ON the box needs. Docstrings are the bulk of the prose and none of the
+    behaviour, so dropping them buys user_data budget at no cost to the shipped module.
+
+    What is replaced is the docstring's exact character span, never the LINES it sits on. A
+    docstring can share its line with the ``def`` that owns it (``def f(): "doc"``) or with a
+    statement that follows it (``"doc"; x = 1``), and dropping whole lines in those positions
+    either strands the body's indentation or silently deletes real code -- silently, because what
+    is left still parses. ``pass`` is valid wherever a docstring was, including a body it was the
+    only statement of, so one rule covers every case without a line-position special case.
+
+    The MODULE docstring is the one exception: it is deleted rather than substituted, because
+    ``from __future__ import annotations`` must be the first statement in a file and a ``pass``
+    standing where the docstring was would displace it.
+    """
+    # ast reports col_offset in utf-8 BYTES, and this source is not ascii, so the spans are cut in
+    # bytes; slicing the str by those numbers would drift on the first non-ascii character.
+    data = source.encode()
+    starts: list[int] = []
+    offset = 0
+    for line in data.splitlines(keepends=True):
+        starts.append(offset)
+        offset += len(line)
+    spans: list[tuple[int, int, bytes]] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = getattr(node, "body", None)
+        if (
+            body
+            and isinstance(first := body[0], ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+            and first.end_lineno is not None
+            and first.end_col_offset is not None
+        ):
+            start = starts[first.lineno - 1] + first.col_offset
+            end = starts[first.end_lineno - 1] + first.end_col_offset
+            if isinstance(node, ast.Module):
+                # deleted outright rather than replaced: `from __future__` must be the file's first
+                # statement, and a `pass` standing where the docstring was would displace it. a
+                # statement sharing its line (`"doc"; VALUE = 7`) would then be left behind a bare
+                # separator, so the separator goes with it.
+                trailing = len(data[end:]) - len(data[end:].lstrip(b" \t;"))
+                spans.append((start, end + trailing, b""))
+            else:
+                spans.append((start, end, b"pass"))
+    # latest first, so replacing one span cannot move the offsets of those not yet applied.
+    for start, end, replacement in sorted(spans, reverse=True):
+        data = data[:start] + replacement + data[end:]
+    stripped = data.decode()
+    ast.parse(stripped)  # never ship something that will not import on the box
+    return stripped
+
+
 def _render_user_data(payload: dict, *, image: str) -> str:
     """The user_data text for an already-spill-decided ``payload``."""
     payload_b64 = base64.encodebytes(json.dumps(payload).encode()).decode()
     bootstrap_src = (Path(__file__).parent / "bootstrap.py").read_text()
     # shipped next to bootstrap.py: the bootstrap imports it as a bare sibling module on the box.
-    bootstrap_secrets_src = (Path(__file__).parent / "bootstrap_secrets.py").read_text()
+    # docstrings are stripped on the way in. they are for the reader of the repo, not the box, and
+    # user_data is a hard-capped budget shared with the payload's runtime secrets -- prose that
+    # explains WHY a redactor is shaped a certain way must not be what pushes a launch over the cap.
+    bootstrap_secrets_src = _strip_docstrings(
+        (Path(__file__).parent / "bootstrap_secrets.py").read_text()
+    )
     # Bind the host cache mount into the container at the fixed /weight-cache so prefetch persists; absent -> cold.
     cache_host_mount = payload.get("cache_host_mount")
     cache_bind = (

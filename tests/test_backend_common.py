@@ -1895,14 +1895,20 @@ def test_child_tail_redacts_declared_secrets_with_arbitrary_names(monkeypatch):
     assert kept == "botocore.exceptions.ClientError: SignatureDoesNotMatch using <redacted>"
 
 
-def test_sanitize_diagnostic_ignores_a_very_short_declared_secret(monkeypatch):
-    """a declared secret can carry any value, including a 3-char one. as an unconstrained global
-    replacement needle it would mangle every diagnostic containing those characters, so the same
-    floor the multiline components use applies to the whole value. long values still redact."""
+def test_sanitize_diagnostic_redacts_a_very_short_declared_secret_at_word_boundaries(monkeypatch):
+    """a declared secret can carry any value, including a 3-char one, and it must not leak.
+
+    the length floor used to drop such a value from the needle set entirely, so it printed
+    verbatim. it cannot become an unconstrained global needle either -- the value `ati` would
+    rewrite `authentication` -- so it is redacted only where it stands alone.
+    """
     from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV, sanitize_diagnostic
 
     monkeypatch.setenv(SECRET_ENV_KEYS_ENV, "PIN")
     monkeypatch.setenv("PIN", "ati")
+    # the standalone value is the leak the floor used to allow.
+    assert sanitize_diagnostic("worker rejected pin ati") == "worker rejected pin <redacted>"
+    # ... while the same letters inside a word stay readable.
     assert sanitize_diagnostic("trainer crashed after validation") == (
         "trainer crashed after validation"
     )
