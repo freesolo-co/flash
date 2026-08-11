@@ -223,34 +223,39 @@ class FreesoloEnvironment(BaseEnvironment):
 
     def sft_completion(self, example: dict) -> list[dict]:
         """Target completion messages for one SFT example; falls back to raw record output."""
+        messages, _used_raw_output_fallback = self.sft_completion_with_provenance(example)
+        return messages
+
+    def sft_completion_with_provenance(self, example: dict) -> tuple[list[dict], bool]:
+        """Return completion messages and whether the raw-output fallback produced them."""
         fn = getattr(self._env, "sft_completion", None)
         if callable(fn):
             msgs = fn(self._task_example(example))
             if msgs:
-                return [dict(m) for m in msgs]
+                return [dict(m) for m in msgs], False
+        row_id = example.get("id")
         value = example.get(_CANONICAL_OUTPUT_KEY)
-        if isinstance(value, list):
-            if value and not all(isinstance(message, dict) for message in value):
-                invalid_indexes = [
-                    index for index, message in enumerate(value) if not isinstance(message, dict)
-                ]
+        if isinstance(value, list) and any(isinstance(message, dict) for message in value):
+            invalid_indexes = [
+                index for index, message in enumerate(value) if not isinstance(message, dict)
+            ]
+            if invalid_indexes:
                 raise ValueError(
-                    f"sft output for record {example!r} contains non-object message entries at "
+                    f"sft output for row id {row_id!r} contains non-object message entries at "
                     f"indexes {invalid_indexes}; expected a list of message objects"
                 )
-            if value:
-                return [dict(message) for message in value]
+            return [dict(message) for message in value], True
         if isinstance(value, dict) and "messages" in value:
             sibling_keys = sorted(str(key) for key in value if key != "messages")
             if sibling_keys:
                 raise ValueError(
-                    f"sft output for record {example!r} has 'messages' alongside sibling keys "
+                    f"sft output for row id {row_id!r} has 'messages' alongside sibling keys "
                     f"{sibling_keys}; expected exactly {{'messages': [...]}}"
                 )
             messages = value["messages"]
             if not isinstance(messages, list):
                 raise ValueError(
-                    f"sft output for record {example!r} has a 'messages' value of type "
+                    f"sft output for row id {row_id!r} has a 'messages' value of type "
                     f"{type(messages).__name__}; expected a list of message objects"
                 )
             invalid_indexes = [
@@ -258,11 +263,11 @@ class FreesoloEnvironment(BaseEnvironment):
             ]
             if invalid_indexes:
                 raise ValueError(
-                    f"sft output for record {example!r} contains non-object 'messages' entries at "
+                    f"sft output for row id {row_id!r} contains non-object 'messages' entries at "
                     f"indexes {invalid_indexes}; expected a list of message objects"
                 )
-            return [dict(message) for message in messages]
-        return [{"role": "assistant", "content": "" if value is None else str(value)}]
+            return [dict(message) for message in messages], True
+        return [{"role": "assistant", "content": "" if value is None else str(value)}], True
 
     def _single(self, results, method: str):
         if len(results) != 1:

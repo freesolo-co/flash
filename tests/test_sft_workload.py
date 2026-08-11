@@ -120,7 +120,7 @@ def test_exact_sft_workload_packs_retained_prefix_rows_deterministically() -> No
     assert first.profile.packing_mode == "packed"
     assert first.profile.architecture_mode == "pure-attention"
     assert first.profile.packed_blocks == 1
-    assert first.coerced_singleturn_targets == 3
+    assert first.coerced_singleturn_targets == 0
     assert len(first.rows) == 2
     assert all(len(row["loss_mask"]) == len(row["input_ids"]) for row in first.rows)
     # exactly the columns the parquet schema declares. a row carrying an extra key would be dropped

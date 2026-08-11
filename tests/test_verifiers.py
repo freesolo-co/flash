@@ -402,31 +402,96 @@ def test_freesolo_sft_completion_full_gold_trajectory(monkeypatch):
     assert env.sft_completion({"input": "x", "output": []}) == [
         {"role": "assistant", "content": "[]"}
     ]
+    assert env.sft_completion({"input": "x", "output": ["red", "blue"]}) == [
+        {"role": "assistant", "content": "['red', 'blue']"}
+    ]
 
 
-def test_freesolo_sft_completion_rejects_malformed_message_containers(monkeypatch):
+def test_freesolo_sft_completion_reports_raw_output_fallback_provenance(monkeypatch):
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    class _HookEnv(_FakeSingleTurnEnv):
+        def __init__(self):
+            self.calls = 0
+
+        def sft_completion(self, example):
+            self.calls += 1
+            return [{"role": "assistant", "content": "from hook"}]
+
+    sdk_env = _HookEnv()
+    hook_env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    messages, used_raw_output_fallback = hook_env.sft_completion_with_provenance(
+        {"input": "x", "output": "raw"}
+    )
+
+    assert messages == [{"role": "assistant", "content": "from hook"}]
+    assert used_raw_output_fallback is False
+    assert sdk_env.calls == 1
+
+    fallback_env = FreesoloEnvironment(
+        _FakeSingleTurnEnv(), "owner/env", source=None, contract_text=""
+    )
+    messages, used_raw_output_fallback = fallback_env.sft_completion_with_provenance(
+        {"input": "x", "output": "raw"}
+    )
+
+    assert messages == [{"role": "assistant", "content": "raw"}]
+    assert used_raw_output_fallback is True
+
+
+@pytest.mark.parametrize(
+    ("row_id", "output", "actionable_detail"),
+    [
+        (
+            "extra-key",
+            {"messages": [{"role": "assistant", "content": "4"}], "meta": 1},
+            "sibling keys ['meta']",
+        ),
+        ("not-list", {"messages": "bad"}, "'messages' value of type str"),
+        (
+            "bad-nested-entry",
+            {"messages": [{"role": "assistant", "content": "4"}, "bad"]},
+            "'messages' entries at indexes [1]",
+        ),
+        (
+            "bad-list-entry",
+            [{"role": "assistant", "content": "4"}, "bad"],
+            "message entries at indexes [1]",
+        ),
+    ],
+)
+def test_freesolo_sft_completion_rejects_malformed_message_containers(
+    monkeypatch, row_id, output, actionable_detail
+):
     _install_fake_freesolo(monkeypatch)
 
     from flash.envs.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(_FakeSingleTurnEnv(), "owner/env", source=None, contract_text="")
-    assistant = {"role": "assistant", "content": "4"}
+    embedded_image = "data:image/png;base64," + "A" * 4096
+    record = {"id": row_id, "input": "x", "output": output, "image": embedded_image}
 
-    with pytest.raises(
-        ValueError,
-        match=r"record .*extra-key.*sibling keys \['meta'\]",
-    ):
-        env.sft_completion(
-            {"id": "extra-key", "input": "x", "output": {"messages": [assistant], "meta": 1}}
-        )
-    with pytest.raises(ValueError, match="'messages' value of type str"):
-        env.sft_completion({"id": "not-list", "input": "x", "output": {"messages": "bad"}})
-    with pytest.raises(ValueError, match=r"'messages' entries at indexes \[1\]"):
-        env.sft_completion(
-            {"id": "bad-nested-entry", "input": "x", "output": {"messages": [assistant, "bad"]}}
-        )
-    with pytest.raises(ValueError, match=r"message entries at indexes \[1\]"):
-        env.sft_completion({"id": "bad-list-entry", "input": "x", "output": [assistant, "bad"]})
+    with pytest.raises(ValueError, match="sft output for row id") as exc_info:
+        env.sft_completion(record)
+
+    message = str(exc_info.value)
+    assert f"row id {row_id!r}" in message
+    assert actionable_detail in message
+    assert embedded_image not in message
+    assert "data:image/png;base64" not in message
+
+
+def test_freesolo_sft_completion_error_handles_missing_row_id(monkeypatch):
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(_FakeSingleTurnEnv(), "owner/env", source=None, contract_text="")
+
+    with pytest.raises(ValueError, match=r"row id None.*'messages' value of type str"):
+        env.sft_completion({"input": "x", "output": {"messages": "bad"}})
 
 
 def test_freesolo_multiturn_respects_per_example_budget(monkeypatch):
