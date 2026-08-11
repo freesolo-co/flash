@@ -154,13 +154,18 @@ class _OpdProgressState:
             d_samples_seen = samples_seen - self._prev_samples_seen
             self._prev_truncated, self._prev_samples_seen = truncated, samples_seen
             self._prev_no_signal_skipped_steps = int(snapshot.get("no_signal_skipped_steps", 0))
-            truncation_rate = d_truncated / d_samples_seen if d_samples_seen > 0 else 0.0
+            truncation_rate = (
+                min(1.0, max(0.0, d_truncated / d_samples_seen)) if d_samples_seen > 0 else 0.0
+            )
+            # the rate is returned for the heartbeat and deliberately kept OUT of the snapshot:
+            # this dict is spread verbatim into the persisted opd_state.json resume contract, whose
+            # schema is fail-closed and holds cumulative counters. a per-step display value has no
+            # meaning on resume and nothing reads it back.
             snapshot.update(
                 {
                     "train_wall_seconds": self._train_wall_seconds(),
                     "loss_curve": list(self.loss_curve),
                     "coverage_curve": list(self.coverage_curve),
-                    "truncation_rate": truncation_rate,
                 }
             )
             self._step_states[step] = snapshot
@@ -181,7 +186,8 @@ class _OpdProgressState:
             )
             snapshot["no_signal_skipped_steps"] = max(
                 0,
-                int(snapshot["no_signal_skipped_steps"]) - self._prev_no_signal_skipped_steps,
+                int(snapshot.get("no_signal_skipped_steps", 0))
+                - self._prev_no_signal_skipped_steps,
             )
         return snapshot
 

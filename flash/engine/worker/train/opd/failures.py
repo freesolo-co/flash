@@ -177,7 +177,7 @@ def _raise_verl_failure(
     if accounting is not None and max_completion is not None:
         no_signal_steps = int(accounting.get("no_signal_skipped_steps", 0))
         samples_seen = int(accounting.get("samples_seen", 0))
-        truncated = int(accounting.get("truncated_rollouts", 0))
+        truncated = min(samples_seen, int(accounting.get("truncated_rollouts", 0)))
         # require a strict majority of all scored rollouts before naming the cap. no-signal batches can
         # also come from teacher failures or empty alignments, and a speculative diagnosis is worse
         # than the generic child status when truncation is not the dominant observed outcome.
@@ -186,7 +186,7 @@ def _raise_verl_failure(
                 f"verl OPD subprocess exited with status {return_code}: flash OPD produced no "
                 f"aligned teacher signal after {OPD_NO_SIGNAL_ATTEMPTS} rollout attempts; "
                 f"{truncated}/{samples_seen} rollouts were truncated at the "
-                f"configured max_completion_len={int(max_completion)}, so the completion cap is "
+                f"configured max_completion_tokens={int(max_completion)}, so the completion cap is "
                 "likely too small"
             )
     raise RuntimeError(f"verl OPD subprocess exited with status {return_code}")

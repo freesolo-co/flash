@@ -678,12 +678,17 @@ def _run_child(
     finally:
         watcher.stop(require_complete=training_completed)
     peak_gpu_gb = gpu_sampler.stop_gb()
+    failure_accounting = None
+    max_completion = None
+    if return_code != 0:
+        failure_accounting = progress_state.failure_accounting_snapshot(runtime.bridge)
+        max_completion = request.knobs.max_completion
     _reconcile_child_failures(
         workload,
         runtime.bridge,
         return_code,
-        accounting=progress_state.failure_accounting_snapshot(runtime.bridge),
-        max_completion=request.knobs.max_completion,
+        accounting=failure_accounting,
+        max_completion=max_completion,
     )
     final_accounting = progress_state.final_state(runtime.bridge)
     actor_dir, final_step = _opd_train.latest_global_step_dir(workload.local_dir)
@@ -761,8 +766,8 @@ def _reconcile_child_failures(
     bridge: Any,
     return_code: int,
     *,
-    accounting: dict,
-    max_completion: int,
+    accounting: dict | None,
+    max_completion: int | None,
 ) -> None:
     score_delivery_failure = _opd_train._reconcile_score_delivery_failure(
         bridge,
