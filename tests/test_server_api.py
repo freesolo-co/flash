@@ -33,15 +33,23 @@ def _env_package_b64() -> str:
     input contract. Built here rather than hardcoded so it stays a genuinely valid archive.
     """
     import base64
+    import gzip
     import io
     import tarfile
 
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+    # mtime=0 throughout: gzip embeds a timestamp, so the default makes this bytes-unstable
+    # between processes. Not a test id today, but a payload that differs per xdist worker is a
+    # trap waiting for whoever parametrizes over it.
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as tar:
         body = b"# test environment\n"
         info = tarfile.TarInfo("environment.py")
         info.size = len(body)
+        info.mtime = 0
         tar.addfile(info, io.BytesIO(body))
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz:
+        gz.write(raw.getvalue())
     return base64.b64encode(buf.getvalue()).decode()
 
 
@@ -9015,16 +9023,28 @@ def test_publish_env_ignores_the_org_header_for_the_ownership_guard(api, monkeyp
 
 
 def _b64_targz(members: dict[str, bytes]) -> str:
+    """Deterministic base64 `.tar.gz`.
+
+    `mtime=0` on both the gzip stream and its members matters: gzip embeds a timestamp, so the
+    default would make this string differ between xdist workers. Since it is a parametrize
+    argument, that lands in the test id and pytest aborts the whole run with "Different tests
+    were collected between gw0 and gw1".
+    """
     import base64
+    import gzip
     import io
     import tarfile
 
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as tar:
         for nm, content in members.items():
             info = tarfile.TarInfo(nm)
             info.size = len(content)
+            info.mtime = 0
             tar.addfile(info, io.BytesIO(content))
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz:
+        gz.write(raw.getvalue())
     return base64.b64encode(buf.getvalue()).decode()
 
 
@@ -9032,9 +9052,13 @@ def _b64_targz(members: dict[str, bytes]) -> str:
     ("package", "message"),
     [
         # decodes as base64 but is not a gzip stream at all
-        ("bm90IGEgdGFyYmFsbCBhdCBhbGw=", "could not be extracted"),
+        pytest.param("bm90IGEgdGFyYmFsbCBhdCBhbGw=", "could not be extracted", id="not-a-gzip"),
         # a valid archive that is missing the required entrypoint
-        (_b64_targz({"readme.txt": b"nope"}), "must contain environment.py"),
+        pytest.param(
+            _b64_targz({"readme.txt": b"nope"}),
+            "must contain environment.py",
+            id="no-entrypoint",
+        ),
     ],
 )
 def test_publish_env_validates_the_archive_before_checking_ownership(
