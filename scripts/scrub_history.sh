@@ -45,7 +45,7 @@ fi
 # --- operator-supplied identity data ---------------------------------------
 # The addresses and the internal hostname this scrub targets ARE the leak. Hardcoding
 # them here would republish, in the tree, the exact strings the rewrite exists to
-# remove -- the same reasoning that keeps the mailmap generated rather than committed.
+# remove, the same reasoning that keeps the mailmap generated rather than committed.
 # So they live in an untracked file the operator writes locally (gitignored):
 #
 #   scripts/scrub_identities.env      (override the path with FLASH_SCRUB_IDENTITIES)
@@ -141,7 +141,7 @@ ASSISTANT_EMAIL_RE='@anthropic[.]com$'
 # first. The domain part of an address is case-insensitive and git preserves whatever
 # case was committed, so a mixed-case spelling is the same GitHub account as its
 # lowercase entry. An exact-case test would leave that identity unremapped AND
-# uncounted -- the residual gate would report a clean history while GitHub still
+# uncounted, so the residual gate would report a clean history while GitHub still
 # misattributed the commits, which is the false-clean certificate this script exists to
 # prevent. The trailer counter (git --grep --regexp-ignore-case) and the message rewrite
 # ((?i) below) are already case-insensitive; the identity tests must agree with them or

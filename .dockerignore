@@ -1,6 +1,6 @@
 # the Dockerfile is single-stage (COPY . .), so there is no later stage to drop this
-# again: an ordinary clone would otherwise bake every object and reflog entry -- including
-# any history a scrub was meant to remove -- into an image layer.
+# again: an ordinary clone would otherwise bake every object and reflog entry (including
+# any history a scrub was meant to remove) into an image layer.
 .git
 .venv/
 venv/
