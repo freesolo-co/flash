@@ -167,6 +167,10 @@ id = "github:OWNER/REPO@main:environment.py"   # REF is a branch/tag name withou
 The ref is validated as a single path component, so a slash-containing branch such as
 `feature/foo` is rejected before submission. Use a `/`-free branch or tag, or the commit sha.
 
+Direct `github:` ids need the plane started with `FLASH_STANDALONE=1`. A plane running against an
+identity backend rejects them with a 400 and accepts only managed hub ids, so check your server's
+configuration before pasting one in — the CLI cannot see that setting to check it for you.
+
 The ref is resolved at submit time, so re-pushing the repo and re-submitting picks up your edits
 the same way `flash env push` does on the managed plane. Pin a commit sha instead of a branch when
 you want a run to stay reproducible.

@@ -713,6 +713,23 @@ def test_training_guide_ref_guidance_matches_the_parser(monkeypatch, tmp_path) -
     assert "without `/`" in written["rl.toml"]
 
 
+def test_training_guide_caveats_the_standalone_requirement(monkeypatch, tmp_path) -> None:
+    """The guide must carry the same `FLASH_STANDALONE=1` caveat as the config comments.
+
+    `_require_hosted_environment_form` (flash/server/platform/deps.py) 400s a `github:` id unless
+    the server has `auth.standalone()`, and the CLI cannot read that setting. Presenting the git
+    form as valid for every self-hosted plane sends an identity-backed operator to a config their
+    own plane rejects at submit time.
+    """
+    written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+
+    guide = written["TRAINING.md"]
+    assert "FLASH_STANDALONE=1" in guide
+    assert "identity backend" in guide
+    # same caveat on both surfaces -- they are generated separately and have drifted before
+    assert "FLASH_STANDALONE=1" in written["rl.toml"]
+
+
 def test_env_setup_accepts_a_browser_url_as_the_self_hosted_form(
     monkeypatch, tmp_path, capsys
 ) -> None:
