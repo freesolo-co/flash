@@ -1202,7 +1202,7 @@ def test_opd_oversized_reject_reports_the_rentable_odd_ceiling(monkeypatch):
         provisional_gpu("Qwen/Qwen3.6-35B-A3B", "opd", gpu_count=7)
     msg = str(exc.value)
     assert "gpu.count=7 provides at most 592.8 GB (4x B200)" in msg
-    assert "gpu.count / --gpus to 8" in msg
+    assert "--gpus 8" in msg
     assert "7x" not in msg
 
 

@@ -26,6 +26,7 @@ from flash.providers.base import (
     run_config_for_ranking,
     smallest_fitting_gpu_count,
     vram_fit_error_message,
+    wider_shape_remedy,
 )
 
 logger = get_logger(__name__)
@@ -200,14 +201,40 @@ def _query_attention_heads(info) -> int:
 def _resolve_exact_gpu(
     gpu_type: str,
     *,
+    need: float,
+    cap: int,
+    max_gpu_count: int,
     provider: str,
     available: tuple[str, ...],
+    widest_cap: int = 1,
 ) -> tuple[str, tuple[str, ...]]:
     """Validate an explicitly pinned GPU class and narrow ``available`` to providers that offer it."""
     exact = canonical_gpu(gpu_type)
     exact_info = GPU_INFO.get(exact)
     if exact_info is None or not exact_info.validated:
         raise UnsupportedGpuError(f"exact GPU {exact!r} is not an active validated GPU class")
+    # a card ceiling is the user's own `[gpu] count`, so a pin that fits at a wider rentable shape
+    # is one flag from working; `above` is the width already tried, so the remedy only ever names
+    # a wider one. bounded by the model's geometry cap so the suggestion is a width verl accepts
+    # rather than one it rejects after the box is rented.
+    if exact_info.vram_gb < need and max_gpu_count <= 1:
+        raise UnsupportedGpuError(
+            f"exact GPU {exact!r} has {exact_info.vram_gb} GB VRAM, "
+            f"but this run requires at least {need} GB"
+            + wider_shape_remedy((exact_info.vram_gb,), need, ceiling=widest_cap, above=1)
+        )
+    # the widest shape providers actually rent for this ceiling, not the ceiling itself: a pin
+    # that only fits at a non-rentable count (3) must be rejected here with a precise reason
+    # rather than passing and dying later on a generic no-capacity error.
+    if (
+        exact_info.vram_gb < need
+        and max_gpu_count > 1
+        and combined_vram_gb(exact_info.vram_gb, cap) < need
+    ):
+        raise UnsupportedGpuError(
+            f"exact GPU {exact!r} cannot fit this run even as a {cap}-card combination"
+            + wider_shape_remedy((exact_info.vram_gb,), need, ceiling=widest_cap, above=cap)
+        )
     exact_providers = providers_for(exact)
     if provider and provider not in exact_providers:
         raise UnsupportedGpuError(f"provider {provider!r} cannot provision exact GPU {exact!r}")
@@ -411,19 +438,32 @@ def allocate(
             raise UnsupportedGpuError(f"requested provider {provider!r} is not configured")
         available = (provider,)
 
+    # allocate() is reachable directly, bypassing the parse gate entirely, so it resolves the
+    # author's ceiling from the same shared predicate rather than trusting a caller to have applied
+    # it. this has to precede the pinned-fit checks below, which read the ceiling to decide whether
+    # a wider shape would fix the run. see `authored_gpu_ceiling` for what a bare pin means and why.
+    max_gpu_count = authored_gpu_ceiling(gpu_type, max_gpu_count)
     exact = ""
     if gpu_type:
+        # an auto-sized run has no authored ceiling, so the pinned-fit checks below read the widest
+        # width the platform would ever rent -- the same interpretation `_resolved_gpu_count` gives
+        # `None`. using 1 here would reject a fitting multi-card shape as unsatisfiable.
+        pin_ceiling = MAX_COMBINATION_CARDS if max_gpu_count is None else max_gpu_count
         exact, available = _resolve_exact_gpu(
             gpu_type,
+            need=need,
+            cap=geometry_safe_gpu_cap(model_id, pin_ceiling, model_revision=model_revision),
+            max_gpu_count=pin_ceiling,
             provider=provider,
             available=available,
+            # the ceiling a `--gpus` suggestion may name: the authored count is what rejected this
+            # run, so the remedy has to be searched against the widest width the model allows.
+            widest_cap=geometry_safe_gpu_cap(
+                model_id, MAX_COMBINATION_CARDS, model_revision=model_revision
+            ),
         )
         if not available:
             raise UnsupportedGpuError(f"exact GPU {exact!r} has no configured active provider")
-    # allocate() is reachable directly, bypassing the parse gate entirely, so it resolves the
-    # author's ceiling from the same shared predicate rather than trusting a caller to have applied
-    # it. see `authored_gpu_ceiling` for what a bare pin means and why.
-    max_gpu_count = authored_gpu_ceiling(gpu_type, max_gpu_count)
     cap = _resolved_gpu_count(
         model_id,
         algorithm,

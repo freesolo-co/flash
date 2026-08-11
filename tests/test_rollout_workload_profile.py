@@ -75,6 +75,7 @@ class _Env:
     id = "freesolo-co/autoslm-bench"
     resolved_sha = "env-sha"
     params: ClassVar[dict] = {}
+    pip: ClassVar[tuple[str, ...]] = ()
 
 
 class _Spec:

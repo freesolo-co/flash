@@ -431,6 +431,30 @@ def sft_seconds_for_tokens(config: RunConfig, gpu: str, train_tokens: float) -> 
     return flops / (peak * mfu)
 
 
+def _wider_shape_remedy(config: RunConfig, need: float, names: tuple[str, ...]) -> str:
+    """The `--gpus N` clause this quote's fit failure carries; see ``base.wider_shape_remedy``.
+
+    ``names`` is the pool the quote already ranked, so the remedy is searched over exactly the
+    classes that were considered -- reusing the caller's provider filtering instead of
+    reconstructing it here and risking a suggestion for a class it never had.
+    """
+    from flash.providers.base import GPU_INFO, MAX_COMBINATION_CARDS, wider_shape_remedy
+
+    # the authored ceiling limited the ranking above; the geometry cap at the MAXIMUM rentable
+    # width is what bounds a suggestion.
+    return wider_shape_remedy(
+        (GPU_INFO[gpu].vram_gb for gpu in names),
+        need,
+        ceiling=geometry_safe_gpu_cap(
+            config.model_id, MAX_COMBINATION_CARDS, model_revision=config.model_revision
+        ),
+        # `gpu_count` is now optional: none means the author never named a width, so no count has
+        # been "already tried" and the search must exclude nothing. 0 is that empty exclusion --
+        # passing none compares int > none and crashes the quote.
+        above=config.gpu_count or 0,
+    )
+
+
 def _offline_gpu_shape(
     config: RunConfig, *, max_wall_seconds: float = 0.0
 ) -> tuple[str, int, int, str, float]:
@@ -481,11 +505,12 @@ def _offline_gpu_shape(
         # `providers_for` filter below narrows this pool to the classes the provider can provision.
         names = tuple(info.name for info in GPU_INFO.values() if info.validated)
     # narrow to what the pinned provider can actually provision BEFORE sizing. the ranking loop
-    # below filters per candidate, which is too late for two decisions taken up front: the
-    # auto-sized count and the no-fit message would both reason over classes this provider cannot
-    # rent. measured: a vast-pinned 119 GB run sized 1 card against another provider's H200, ranked
-    # empty, and reported "more than any 8-card combination (1177.6 GB max)" -- a number larger than
-    # the requirement it claimed could not be met, while 2x80 GB vast cards would have fit.
+    # below filters per candidate, which is too late for three decisions taken up front: the
+    # auto-sized count, the no-fit message, and the `--gpus` remedy would all reason over classes
+    # this provider cannot rent. measured: a vast-pinned 119 GB run sized 1 card against another
+    # provider's H200, ranked empty, and reported "more than any 8-card combination (1177.6 GB
+    # max)" -- a number larger than the requirement it claimed could not be met, while 2x80 GB vast
+    # cards would have fit.
     if provider != "auto":
         names = tuple(name for name in names if provider in providers_for(name))
     auto_cap = geometry_safe_gpu_cap(
@@ -503,8 +528,6 @@ def _offline_gpu_shape(
     ranked = []
     for gpu in names:
         info = GPU_INFO[gpu]
-        if provider != "auto" and provider not in providers_for(gpu):
-            continue
         for count in rentable_gpu_counts(safe_gpu_count):
             if combined_vram_gb(info.vram_gb, count) < need:
                 continue
@@ -535,16 +558,17 @@ def _offline_gpu_shape(
                 )
             )
     if not ranked:
-        # a pinned class with NO authored count is blocked by the class itself, so name it and its
-        # own ceiling; the pool-wide message would report the widest validated shape, which is not
-        # hardware this quote was ever allowed to use. an authored count is different: raising it is
-        # a real remedy, and `vram_fit_error_message` already names the count that would fit --
-        # restricted to this class via `gpu_names`, so it never suggests a shape the pin forbids.
-        if config.gpu_type and config.gpu_count is None:
+        # a pinned class is blocked by the class itself, so name it -- the pool-wide message would
+        # report the widest validated shape, which is not hardware this quote was ever allowed to
+        # use. `_wider_shape_remedy` searches only `names`, already narrowed to the pin, so the
+        # `--gpus N` clause it appends can never name a shape the pin forbids. an unpinned run
+        # falls through to the pool-wide message, which reports the count that would fit.
+        remedy = _wider_shape_remedy(config, need, names)
+        if config.gpu_type:
             info = GPU_INFO[canonical_gpu(config.gpu_type)]
             raise ValueError(
-                f"exact GPU {info.name!r} cannot fit this run: it requires at least {need} GB. "
-                f"{vram_knob_advice(config.method).capitalize()}."
+                f"exact GPU {info.name!r} cannot fit this run: it requires at least {need} GB"
+                + (remedy or f". {vram_knob_advice(config.method).capitalize()}.")
             )
         raise ValueError(
             vram_fit_error_message(

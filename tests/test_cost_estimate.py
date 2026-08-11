@@ -594,7 +594,7 @@ def test_an_authored_count_still_gets_raise_count_advice_on_a_pinned_class():
     authored count, raising it is a real remedy and `allocate()` says so -- the quote contradicting
     it would send the user to shrink a run that would fit on one more card.
     """
-    with pytest.raises(ValueError, match=r"Raise gpu\.count"):
+    with pytest.raises(ValueError, match=r"--gpus \d"):
         estimate_cost(RunConfig("Qwen/Qwen3.6-35B-A3B", "sft", 10, gpu_type="H100", gpu_count=1))
 
 
@@ -607,7 +607,7 @@ def test_offline_estimate_supports_eight_card_only_runs(monkeypatch):
     assert estimate.gpu_count == 8
     # the pinned four-card ceiling is the reason this fails, so the message must name that ceiling
     # and the count that would fit -- not just report a generic no-fit.
-    with pytest.raises(ValueError, match=r"gpu\.count=4 provides at most .* Raise gpu\.count"):
+    with pytest.raises(ValueError, match=r"gpu\.count=4 provides at most .*`--gpus 8`"):
         estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "sft", 1, gpu_count=4))
 
 
@@ -701,3 +701,56 @@ def test_allocator_selected_gpu_count_renders_and_applies_speedup():
 def test_runconfig_rejects_bad_gpu_count(bad, exc):
     with pytest.raises(exc):
         RunConfig("Qwen/Qwen3.5-4B", "grpo", 10, gpu_count=bad)
+
+
+def test_offline_quote_fit_failure_names_the_card_count_that_fixes_it():
+    """`flash train --cost` must name the `--gpus` width when a wider shape would fit.
+
+    A 35B-A3B GRPO run at the default single-card ceiling needs more VRAM than any one card has,
+    but fits on two. Reporting only the shortfall reads as "this run is impossible" for the one
+    case that is actually a one-flag fix, so the remedy is asserted here rather than the bare
+    shortfall. The signature is unchanged by the fix, so this fails on the MESSAGE against
+    unfixed code, not on an import.
+    """
+    from flash.cost.analytical import _offline_gpu_shape
+    from flash.cost.types import RunConfig
+
+    shared = {
+        "model_id": "Qwen/Qwen3.6-35B-A3B",
+        "method": "grpo",
+        "steps": 10,
+        "seq_len": 2048,
+        "completion_len": 512,
+        "batch_size": 8,
+        "group_size": 4,
+        "lora_rank": 16,
+    }
+    with pytest.raises(ValueError, match=r"--gpus 2") as unpinned:
+        _offline_gpu_shape(RunConfig(gpu_count=1, **shared))
+    # the unpinned message names the authored ceiling that fell short, which is strictly more than
+    # "nothing fits" -- the shared contract is that the shortfall is stated and a width is offered.
+    assert "gpu.count=1 provides at most" in str(unpinned.value)
+
+    with pytest.raises(ValueError, match=r"--gpus 2") as pinned:
+        _offline_gpu_shape(RunConfig(gpu_count=1, gpu_type="H200", **shared))
+    assert "cannot fit this run" in str(pinned.value)
+
+    # and the suggested width is real: the same run quotes cleanly at it.
+    gpu, _need, count, _provider, _hourly = _offline_gpu_shape(RunConfig(gpu_count=2, **shared))
+    assert count == 2, (gpu, count)
+
+
+def test_offline_quote_fit_failure_omits_the_remedy_when_nothing_fits(monkeypatch):
+    """An unsatisfiable run must not be sent to a second dead end.
+
+    The remedy is searched against the same fit model that rejected the run, so a need no shape
+    can hold produces no suggestion at all.
+    """
+    monkeypatch.setattr("flash.cost.analytical.required_vram_gb", lambda *a, **k: 100_000)
+    from flash.cost.analytical import _offline_gpu_shape
+    from flash.cost.types import RunConfig
+
+    with pytest.raises(ValueError, match=r"more than any .*combination") as exc:
+        _offline_gpu_shape(RunConfig("Qwen/Qwen3.5-4B", "sft", 1, gpu_count=1))
+    # the load-bearing half: no width is suggested, because none would work.
+    assert "--gpus" not in str(exc.value)

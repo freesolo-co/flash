@@ -85,7 +85,7 @@ def test_explicit_one_card_pin_rejects_with_a_fitting_count(tmp_path):
     message = str(exc.value)
     assert "grpo needs >= 229 GB VRAM" in message
     assert "gpu.count=1 provides at most 180 GB (B200)" in message
-    assert "gpu.count / --gpus to 2" in message
+    assert "--gpus 2" in message
     assert "max_context_tokens" in message
     assert "max_completion_tokens" in message
     assert "lora_rank" in message

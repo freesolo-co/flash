@@ -392,7 +392,11 @@ def _add_env_setup_command(env_sub: argparse._SubParsersAction) -> None:
     setup.add_argument(
         "--project",
         metavar="PROJECT_UUID",
-        help="Freesolo project UUID for all generated configs and environment publication",
+        help=(
+            "Freesolo project UUID for all generated configs and environment publication; "
+            "required with --yes, a redirected stdin, or any other noninteractive run, where "
+            "there is no prompt to choose one"
+        ),
     )
     setup.add_argument(
         "-y",
