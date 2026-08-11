@@ -514,7 +514,7 @@ def _build_sft_profile(
         environment_id=spec.environment.id,
         # record the same revision the input digest was keyed on, so the evidence names the exact
         # environment content measured rather than the shared hub tip that moved underneath it.
-        environment_revision=spec.environment.content_sha or spec.environment.resolved_sha,
+        environment_revision=spec.environment.content_revision,
         source_examples=source_examples,
         selected_examples=selected_examples,
         retained_examples=len(retained.rows),

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from flash.core.spec import EnvironmentSpec
 from flash.engine.profiling.sft_workload import _serialize_multimodal_inputs
 from flash.engine.worker.backend_common import parse_verl_metric, verl_step_number
 from flash.engine.worker.entry.sft import _pretokenize_completion_only
@@ -1229,7 +1230,10 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
         workload_profile_input_digest="",
         workload_profile_producer_version=_PROFILE_PRODUCER_VERSION,
         workload_profile={},
-        environment=SimpleNamespace(
+        # the real EnvironmentSpec, not a SimpleNamespace: the profile payload reads
+        # ``content_revision``, a derived property a namespace cannot carry, and stubbing the
+        # answer here would let the precedence rule drift without this test noticing.
+        environment=EnvironmentSpec(
             id="owner/env",
             resolved_sha="b" * 40,
             content_sha="c" * 40,

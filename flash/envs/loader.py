@@ -50,9 +50,10 @@ _MAX_CONTENTS_JSON_BYTES = 16 * 1024 * 1024
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = ARCHIVE_MEMBER_LIMIT
 _MAX_ARCHIVE_SCAN_MEMBERS = ARCHIVE_SCAN_MEMBER_LIMIT
-# bounds for github reads that happen inline on a control-plane request. mirrors what
-# _assign_resolved_env_sha already passes for the commit pin: fail fast and let the caller's gate
-# report it, rather than holding a submit open through a rate-limit backoff.
+# bounds for every github read that happens inline on a control-plane request: the commit pin
+# (_assign_resolved_env_sha) and the package-tree pin (_resolve_environment_content_sha). fail fast
+# and let the caller's gate report it, rather than holding a submit open through a rate-limit
+# backoff. the worker download path keeps the slower module defaults, which would rather wait.
 _CONTROL_PLANE_GITHUB_TIMEOUT_S = 10.0
 _CONTROL_PLANE_GITHUB_RETRIES = 0
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
@@ -572,10 +573,8 @@ def _resolve_environment_content_sha(env_id: str, resolved_sha: str) -> str:
     if not package_root:
         return ""
     pinned = GitHubEnvironmentRef(parsed.owner, parsed.repo, resolved_sha, parsed.path)
-    # this runs synchronously inside submit, so it takes the same fast bounds the commit-pin
-    # lookup above it uses rather than the worker download defaults. a managed slug costs two tree
-    # requests, and at 120s x 5 retries each those would hold a request open long past any
-    # client or server deadline whenever github is slow or rate-limited.
+    # a managed slug costs two tree requests, and at the module defaults (120s x 5 retries EACH)
+    # those would hold a submit open long past any client or server deadline when github is slow.
     content_sha = _resolve_github_directory_tree_sha(
         pinned,
         package_root,

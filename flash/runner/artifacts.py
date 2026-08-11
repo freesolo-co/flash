@@ -86,6 +86,8 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
         return spec
     try:
         from flash.envs.loader import (
+            _CONTROL_PLANE_GITHUB_RETRIES,
+            _CONTROL_PLANE_GITHUB_TIMEOUT_S,
             _parse_github_environment_ref,
             _resolve_ref_sha,
             is_managed_environment_slug,
@@ -98,7 +100,11 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
         parsed = _parse_github_environment_ref(ref_str)
         if parsed is None:
             return spec
-        sha = _resolve_ref_sha(parsed, timeout=10.0, max_rate_limit_retries=0)
+        sha = _resolve_ref_sha(
+            parsed,
+            timeout=_CONTROL_PLANE_GITHUB_TIMEOUT_S,
+            max_rate_limit_retries=_CONTROL_PLANE_GITHUB_RETRIES,
+        )
     except Exception as e:
         logging.getLogger(runner.__name__).warning(
             "resolve-once: could not pin env ref->sha for %r (%s); worker will resolve", env_id, e

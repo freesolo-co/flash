@@ -66,13 +66,46 @@ def test_managed_content_sha_resolves_at_the_already_pinned_commit(monkeypatch) 
         "acme/my-env/environment.py",
     )
     assert seen["repo_dir"] == "acme/my-env"
-    # this lookup runs inline inside submit, so it must take the same fast bounds the commit pin
-    # beside it takes. the worker download defaults (120s x 5 retries, per request) would hold a
-    # control-plane request open for minutes whenever github is rate-limiting.
+    # this lookup runs inline inside submit, so it must take the fast control-plane bounds. the
+    # worker download defaults (120s x 5 retries, PER request) would hold a submit open for
+    # minutes whenever github is rate-limiting, and a managed slug costs two tree requests.
     assert seen["timeout"] == loader._CONTROL_PLANE_GITHUB_TIMEOUT_S
     assert seen["retries"] == loader._CONTROL_PLANE_GITHUB_RETRIES
     assert seen["timeout"] <= 10.0
     assert seen["retries"] == 0
+
+
+def test_control_plane_github_bounds_are_shared_by_both_inline_pins(monkeypatch) -> None:
+    """Both inline pins take the SAME bounds, enforced rather than claimed in a comment.
+
+    The commit pin and the package-tree pin run back to back inside one submit. If either drifts to
+    the worker download defaults a single submit can hang far past any deadline, so they read one
+    shared constant instead of repeating literals that only a comment asserts are in sync.
+    """
+    import flash.envs.loader as loader
+    import flash.runner.artifacts as artifacts
+
+    seen: dict[str, tuple] = {}
+
+    def resolve_ref_sha(parsed, pinned_sha=None, *, timeout, max_rate_limit_retries):
+        seen["commit_pin"] = (timeout, max_rate_limit_retries)
+        return _SHA
+
+    def resolve_tree_sha(ref, repo_dir, *, timeout, max_rate_limit_retries):
+        seen["tree_pin"] = (timeout, max_rate_limit_retries)
+        return _CONTENT_SHA
+
+    monkeypatch.setattr(loader, "_resolve_ref_sha", resolve_ref_sha)
+    monkeypatch.setattr(loader, "_resolve_github_directory_tree_sha", resolve_tree_sha)
+
+    artifacts._assign_resolved_env_sha(_env_spec())
+    loader._resolve_environment_content_sha("acme/my-env", _SHA)
+
+    bounds = (loader._CONTROL_PLANE_GITHUB_TIMEOUT_S, loader._CONTROL_PLANE_GITHUB_RETRIES)
+    assert seen["commit_pin"] == bounds
+    assert seen["tree_pin"] == bounds
+    # and the shared value is genuinely fast, not merely consistent.
+    assert bounds == (10.0, 0)
 
 
 def test_generic_github_ref_has_no_managed_content_override(monkeypatch) -> None:

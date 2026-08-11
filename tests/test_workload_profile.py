@@ -318,3 +318,26 @@ def test_profile_carrier_is_internal_and_round_trips_only_in_worker_specs() -> N
     assert "resolved_sha" not in public["environment"]
     assert "content_sha" not in public["environment"]
     assert JobSpec.from_dict(internal) == spec
+
+
+def test_content_revision_prefers_the_environments_own_sha_and_never_serializes() -> None:
+    """The precedence rule this fix exists to enforce, in one named place.
+
+    Read it rather than repeating ``content_sha or resolved_sha``: a site that gets the order wrong
+    silently re-keys on the shared hub tip and reintroduces the repeated-billing bug. It must stay a
+    derived property -- entering any serialized payload would change a digest.
+    """
+    env = _spec().environment
+    # guard: the two revisions really are distinct, so preferring one is observable.
+    assert env.content_sha
+    assert env.resolved_sha
+    assert env.content_sha != env.resolved_sha
+    assert env.content_revision == env.content_sha
+
+    # a generic github ref has no managed subtree, so the user's own commit pin is already exact.
+    generic = replace(env, content_sha="")
+    assert generic.content_revision == generic.resolved_sha
+
+    spec = replace(_spec(), environment=env)
+    assert "content_revision" not in spec.to_internal_dict()["environment"]
+    assert "content_revision" not in spec.to_dict().get("environment", {})

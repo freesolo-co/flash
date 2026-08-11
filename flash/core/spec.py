@@ -266,6 +266,20 @@ class EnvironmentSpec:
     # generic github refs, which have no managed subtree and are already pinned by the user.
     content_sha: str = ""
 
+    @property
+    def content_revision(self) -> str:
+        """The revision that identifies the code this environment actually loads.
+
+        ``content_sha`` for a managed slug, falling back to ``resolved_sha`` for a generic github
+        ref, which has no managed subtree and is already pinned by the user. Anything keying on
+        WHICH environment content a run measured must read this rather than ``resolved_sha``: that
+        field is the shared hub branch tip and moves whenever any unrelated org publishes.
+
+        A property, not a field: it is derived, and ``asdict`` skips it, so it stays out of every
+        serialized payload and out of the schema's user-authorable key set.
+        """
+        return self.content_sha or self.resolved_sha
+
 
 # internal persisted-record compatibility only, never public config parsing. #968 removed
 # advantage_clip, but already-provisioned strict records still carry the unused key and otherwise fail
