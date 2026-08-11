@@ -568,11 +568,21 @@ def test_offline_estimate_supports_eight_card_only_runs(monkeypatch):
 
 
 def test_offline_estimate_applies_the_pinned_revision_geometry_cap(monkeypatch):
-    """A pinned revision must not receive an eight-card quote allocation will never honor."""
+    """The offline quote must follow the SAME pin-certification rule allocation will apply.
+
+    Both directions matter, and asserting only the narrow one lets the test keep passing for the
+    wrong reason: an uncertifiable pin fails closed at four cards, but a pin whose geometry IS
+    certified gets the width its own head count allows. 3.5-4B records 16 heads, which divide 8, so
+    the two cases genuinely differ here -- quoting four for a certified pin would be the very defect
+    this PR removes.
+    """
+    import flash.engine.plan.vram as vram
+    from flash.core.catalog import MODELS
     from flash.cost.analytical import _offline_gpu_shape
 
     monkeypatch.setattr("flash.cost.analytical.required_vram_gb", lambda *a, **k: 700)
     monkeypatch.setattr("flash.cost.analytical.total_params_b", lambda *a, **k: 4.7)
+    monkeypatch.setattr(vram, "_PINNED_GEOMETRY_MEMO", {})
     config = RunConfig(
         "Qwen/Qwen3.5-4B",
         "sft",
@@ -581,10 +591,31 @@ def test_offline_estimate_applies_the_pinned_revision_geometry_cap(monkeypatch):
         model_revision="a" * 40,
     )
 
-    # four: the pin keeps the unvalidated-revision ceiling, and 3.5-4B's 16 recorded heads divide it,
-    # so the geometry check narrows nothing further.
+    def _unreadable(*_a, **_k):
+        raise RuntimeError("transient hub error")
+
+    # uncertified: the pin keeps the unvalidated-revision ceiling, and 700 GB does not fit four.
+    monkeypatch.setattr(vram, "fetch_hf_model_geometry", _unreadable)
     with pytest.raises(ValueError, match="across up to 4 cards"):
         _offline_gpu_shape(config)
+
+    # certified: the commit's own 16 heads divide 8, so the same quote reaches an eight-card shape.
+    info = MODELS["Qwen/Qwen3.5-4B"]
+    monkeypatch.setattr(
+        vram,
+        "fetch_hf_model_geometry",
+        lambda *_a, **_k: (
+            info.params_b,
+            info.vocab_size,
+            info.hidden_size,
+            info.num_layers,
+            info.num_attention_heads,
+        ),
+    )
+    # note the real order is (gpu, need, count, provider, hourly); the annotation on
+    # `_offline_gpu_shape` says (gpu, count, need, ...) and is wrong, which is pre-existing.
+    _gpu, need, count, _provider, _rate = _offline_gpu_shape(config)
+    assert (need, count) == (700, 8)
 
 
 def test_the_offline_probe_sizes_a_pinned_catalog_model_by_its_revision(monkeypatch):
