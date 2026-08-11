@@ -390,11 +390,43 @@ def test_freesolo_sft_completion_full_gold_trajectory(monkeypatch):
         {"role": "assistant", "content": "done"},
     ]
     assert env.sft_completion({"input": "x", "output": gold}) == gold  # len>1 -> multi-turn
+    assert env.sft_completion({"input": "x", "output": {"messages": gold}}) == gold
     # A scalar `output` is single-turn SFT -> one assistant turn.
     assert env.sft_completion({"input": "x", "output": "4"}) == [
         {"role": "assistant", "content": "4"}
     ]
     assert env.sft_completion({"input": "x"}) == [{"role": "assistant", "content": ""}]
+    assert env.sft_completion({"input": "x", "output": None}) == [
+        {"role": "assistant", "content": ""}
+    ]
+    assert env.sft_completion({"input": "x", "output": []}) == [
+        {"role": "assistant", "content": "[]"}
+    ]
+
+
+def test_freesolo_sft_completion_rejects_malformed_message_containers(monkeypatch):
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(_FakeSingleTurnEnv(), "owner/env", source=None, contract_text="")
+    assistant = {"role": "assistant", "content": "4"}
+
+    with pytest.raises(
+        ValueError,
+        match=r"record .*extra-key.*sibling keys \['meta'\]",
+    ):
+        env.sft_completion(
+            {"id": "extra-key", "input": "x", "output": {"messages": [assistant], "meta": 1}}
+        )
+    with pytest.raises(ValueError, match="'messages' value of type str"):
+        env.sft_completion({"id": "not-list", "input": "x", "output": {"messages": "bad"}})
+    with pytest.raises(ValueError, match=r"'messages' entries at indexes \[1\]"):
+        env.sft_completion(
+            {"id": "bad-nested-entry", "input": "x", "output": {"messages": [assistant, "bad"]}}
+        )
+    with pytest.raises(ValueError, match=r"message entries at indexes \[1\]"):
+        env.sft_completion({"id": "bad-list-entry", "input": "x", "output": [assistant, "bad"]})
 
 
 def test_freesolo_multiturn_respects_per_example_budget(monkeypatch):

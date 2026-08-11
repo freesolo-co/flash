@@ -229,14 +229,39 @@ class FreesoloEnvironment(BaseEnvironment):
             if msgs:
                 return [dict(m) for m in msgs]
         value = example.get(_CANONICAL_OUTPUT_KEY)
-        if isinstance(value, list) and value and all(isinstance(m, dict) for m in value):
-            return [dict(m) for m in value]
-        if (
-            isinstance(value, dict)
-            and list(value) == ["messages"]
-            and isinstance(value["messages"], list)
-        ):
-            return [dict(m) for m in value["messages"]]
+        if isinstance(value, list):
+            if value and not all(isinstance(message, dict) for message in value):
+                invalid_indexes = [
+                    index for index, message in enumerate(value) if not isinstance(message, dict)
+                ]
+                raise ValueError(
+                    f"sft output for record {example!r} contains non-object message entries at "
+                    f"indexes {invalid_indexes}; expected a list of message objects"
+                )
+            if value:
+                return [dict(message) for message in value]
+        if isinstance(value, dict) and "messages" in value:
+            sibling_keys = sorted(str(key) for key in value if key != "messages")
+            if sibling_keys:
+                raise ValueError(
+                    f"sft output for record {example!r} has 'messages' alongside sibling keys "
+                    f"{sibling_keys}; expected exactly {{'messages': [...]}}"
+                )
+            messages = value["messages"]
+            if not isinstance(messages, list):
+                raise ValueError(
+                    f"sft output for record {example!r} has a 'messages' value of type "
+                    f"{type(messages).__name__}; expected a list of message objects"
+                )
+            invalid_indexes = [
+                index for index, message in enumerate(messages) if not isinstance(message, dict)
+            ]
+            if invalid_indexes:
+                raise ValueError(
+                    f"sft output for record {example!r} contains non-object 'messages' entries at "
+                    f"indexes {invalid_indexes}; expected a list of message objects"
+                )
+            return [dict(message) for message in messages]
         return [{"role": "assistant", "content": "" if value is None else str(value)}]
 
     def _single(self, results, method: str):
