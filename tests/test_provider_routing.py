@@ -1586,7 +1586,57 @@ def test_retry_message_admits_when_the_projected_provider_already_failed(orch, m
     # back onto the provider that just failed.
     action = _retry_action_line(log.getvalue(), 0)
     assert "already lost an attempt on" in action, action
-    assert "no other provider currently offers a fitting class" in action, action
+    # every fitting candidate really is runpod here, so denying another provider is true.
+    assert "no other provider offers a fitting class" in action, action
+
+
+def test_retry_message_does_not_deny_a_provider_that_is_in_the_candidate_list(orch, monkeypatch):
+    """Landing on a failed provider proves no UNFAILED one is left, not that none exists.
+
+    With fitting candidates on two providers that have both failed, ``_select_candidate``'s first
+    key is True for either, so the projection lands on a failed provider while another provider sits
+    in the very list the message is derived from. Claiming none offers a fitting class would deny
+    that provider and push the operator toward the wrong remedy -- the answer there is to unpin or
+    wait for one of them to recover, not to go find a provider that is already on the list.
+    """
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    # two providers, both of which this run burns through.
+    candidates = (
+        Candidate("runpod", "A100 PCIe", 1.2, 40),
+        Candidate("vast", "A100 SXM", 1.8, 80),
+    )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        on_handle(_runpod_handle("ep1", "j1", attempt))
+        if attempt < 2:
+            return PollResult(False, failure="no_capacity", detail="job stuck IN_QUEUE")
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+    spec = _spec(max_retries=2)
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    orch._submit_seed_supervised(spec, spec.seed, log)
+
+    # attempt 1 projects back onto a failed provider while the other one is still in the list.
+    action = _retry_action_line(log.getvalue(), 1)
+    assert "already lost an attempt on" in action, action
+    assert "no other provider offers a fitting class" not in action, action
+    assert "has now failed" in action, action
+    # and it names them rather than implying the list is empty.
+    assert "runpod" in action, action
+    assert "vast" in action, action
 
 
 def test_a_genuine_cross_provider_failover_is_not_labelled_exhausted(orch, monkeypatch):

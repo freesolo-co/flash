@@ -731,9 +731,23 @@ def _retry_target(
         if first_cache_drop
         else ctx.failed_providers | {outcome.chosen.provider}
     )
+    # what landing on a failed provider actually proves is that no UNFAILED one is left, not that
+    # this is the only provider with a fitting class. with fitting candidates on two providers that
+    # have both failed, sort key 1 is True for either, so "no other provider offers a fitting class"
+    # would deny a provider sitting right there in the list. read the list instead of inferring from
+    # the sort, and distinguish the two cases: another failed provider is still somewhere to go
+    # (unpin, or wait for it to recover), whereas a single-provider candidate list is not.
+    other_providers = {candidate.provider for candidate in outcome.candidates} - {
+        projected.provider
+    }
     no_escape = (
-        ", which this run has already lost an attempt on -- no other provider currently offers a "
-        "fitting class"
+        (
+            ", which this run has already lost an attempt on -- every provider offering a fitting "
+            f"class ({', '.join(sorted(other_providers | {projected.provider}))}) has now failed"
+            if other_providers
+            else ", which this run has already lost an attempt on -- no other provider offers a "
+            "fitting class"
+        )
         if projected.provider in retry_failed_providers
         else ""
     )
