@@ -670,6 +670,41 @@ def test_run_mode_success_returns_rc_and_uploads_console(monkeypatch):
     assert "world" in body
 
 
+def test_run_mode_sanitizes_the_echoed_child_line_but_not_the_console_file(monkeypatch, capfd):
+    """this process's stdout IS the instance's container log.
+
+    the control plane pulls that log as the failure detail -- vast holds the box after a non-zero
+    exit precisely so it can -- and only this process knows the run's secret VALUES, since the
+    container starts with an empty environment and the credentials arrive in the payload. echoing
+    the child's stdout raw therefore published every runtime secret the worker printed. the console
+    FILE keeps the raw line: its upload path sanitizes the tail, and redacting twice would lose
+    the byte offsets the tail limit is measured in.
+    """
+    secret = "vast-runtime-7c1de9f4b3a20685"
+    _disable_periodic_console_upload(monkeypatch)
+    monkeypatch.setattr(b, "_upload_console_tail_bounded", lambda *a, **k: True)
+    monkeypatch.setattr(b, "hf_upload", lambda *a, **k: None)
+    proc = _FakeProc([f"boto3 auth failed with {secret}\n", "worker exiting\n"], rc=1)
+    monkeypatch.setattr(b.subprocess, "Popen", lambda *a, **k: proc)
+
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/run",
+        "code_prefix": CODE_PREFIX,
+        # AWS_SECRET_ACCESS_KEY matches no suffix heuristic, so this covers the declared channel.
+        "env": {"FLASH_SECRET_ENV_KEYS": "AWS_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY": secret},
+    }
+    b.run_mode(payload, {"E": "1"}, "sft", deadline_ts=b.time.time() + 100)
+
+    echoed = capfd.readouterr().out
+    assert secret not in echoed
+    assert "boto3 auth failed with <redacted>" in echoed
+    # redaction must not eat the surrounding diagnostics, which are the reason for the echo.
+    assert "worker exiting" in echoed
+    with open("/tmp/console_sft.txt") as f:
+        assert f.read() == f"boto3 auth failed with {secret}\nworker exiting\n"
+
+
 def test_run_mode_caps_the_worker_at_the_declared_wall_budget(monkeypatch):
     """Unspent provisioning time must not become extra WORK time.
 
@@ -1974,23 +2009,50 @@ def test_safe_detail_keeps_short_components_of_a_multiline_secret_readable():
     assert detail == "parse error near } and abc"
 
 
-def test_safe_detail_keeps_a_very_short_declared_secret_out_of_global_replacement():
-    """a declared secret can carry any value, including a 3-char one. as an unconstrained global
-    replacement needle it would mangle every diagnostic containing those characters, so the same
-    floor the multiline components use applies to the whole value. long values still redact."""
-    assert (
-        b._safe_detail("trainer crashed after validation", secrets={"PIN": "ati"})
-        == "trainer crashed after validation"
+def test_safe_detail_redacts_a_very_short_declared_secret_at_word_boundaries():
+    """a declared secret can carry any value, including a 3-char one, and it must not leak.
+
+    the length floor used to drop such a value from the needle set entirely, so it printed
+    verbatim: nothing else covers it unless the surrounding text happens to have credential shape.
+    it cannot become an unconstrained global needle either -- the value `ati` would rewrite
+    `authentication` -- so it is redacted only where it stands alone.
+    """
+    short = {"PIN": "ati"}
+
+    # the standalone value is the leak the floor used to allow.
+    assert b._safe_detail("worker rejected pin ati", secrets=short) == (
+        "worker rejected pin <redacted>"
     )
-    assert (
-        b._safe_detail("trainer crashed holding sk-live-abc123456", secrets={"PIN": "ati"})
-        == "trainer crashed holding sk-live-abc123456"
+    # ... while the same letters inside a word stay readable.
+    assert b._safe_detail("trainer crashed after validation", secrets=short) == (
+        "trainer crashed after validation"
+    )
+    # an unrelated long value is untouched by a short needle.
+    assert b._safe_detail("trainer crashed holding sk-live-abc123456", secrets=short) == (
+        "trainer crashed holding sk-live-abc123456"
     )
     assert (
         b._safe_detail(
             "trainer crashed holding sk-live-abc123456", secrets={"PIN": "sk-live-abc123456"}
         )
         == "trainer crashed holding <redacted>"
+    )
+
+
+def test_safe_detail_redacts_a_short_secret_in_the_shapes_diagnostics_print():
+    """the boundary form has to fire where a credential actually appears in output: quoted, in a
+    url, as a key=value pair, at the very start and end of the text."""
+    short = {"PIN": "ati", "KEY": "a/b+c"}
+
+    assert b._safe_detail("auth failed: 'ati'", secrets=short) == "auth failed: '<redacted>'"
+    assert b._safe_detail("ati rejected", secrets=short) == "<redacted> rejected"
+    assert b._safe_detail("rejected ati", secrets=short) == "rejected <redacted>"
+    assert b._safe_detail("https://host/ati/repo.git", secrets=short) == (
+        "https://host/<redacted>/repo.git"
+    )
+    # the percent-encoded form of a short value is registered too.
+    assert b._safe_detail("https://host/a%2Fb%2Bc/x", secrets=short) == (
+        "https://host/<redacted>/x"
     )
 
 
@@ -2019,6 +2081,52 @@ def test_read_console_tail_drops_a_split_credential(tmp_path):
 
     assert "secret" not in tail
     assert tail == "next\n"
+
+
+def test_read_console_tail_keeps_a_single_oversized_line(tmp_path):
+    """dropping the partial first line returned NOTHING when the tail holds no newline at all.
+
+    that is the worst case available: a crash whose only evidence is one huge line -- a json blob,
+    a native stack, unterminated progress output -- uploaded an empty console and lost the root
+    cause exactly where it was needed. the line is kept minus a leading margin, so the END of it,
+    where the failure actually is, survives.
+    """
+    from flash.providers._lifecycle import bootstrap_secrets
+
+    console = tmp_path / "console.txt"
+    console.write_bytes(b"x" * 70_000 + b"ROOTCAUSE: cuda oom")
+
+    tail = b._read_console_tail(str(console), 64_000)
+
+    assert tail.endswith("ROOTCAUSE: cuda oom")
+    assert bootstrap_secrets._TRUNCATED_LINE_MARKER in tail
+    # the retained region is the limit minus the dropped leading margin.
+    assert (
+        len(tail)
+        == len(bootstrap_secrets._TRUNCATED_LINE_MARKER)
+        + 64_000
+        - bootstrap_secrets._SPLIT_VALUE_MARGIN
+    )
+
+
+def test_read_console_tail_drops_a_credential_split_into_an_oversized_line(tmp_path):
+    """keeping the oversized line must not reintroduce the split-value leak the whole partial-line
+    rule exists to prevent: a value straddling the byte boundary no longer matches full-value
+    redaction, so the leading margin has to carry it off. no suffix of it may survive either."""
+    secret = "sk-live-" + "z" * 40
+    limit = 64_000
+    # the read starts at len(body) - limit; size the trailing filler so that boundary lands 20
+    # bytes INTO the secret, which is the case full-value redaction can no longer catch.
+    suffix = limit - len(secret) - 20
+    body = b"q" * 6_000 + secret.encode() + b"q" * suffix
+    console = tmp_path / "console.txt"
+    console.write_bytes(body)
+
+    tail = b._read_console_tail(str(console), limit)
+
+    assert secret not in tail
+    # nor any usable fragment of it: the surviving suffix is what the margin exists to remove.
+    assert "z" not in tail
 
 
 def test_safe_detail_redacts_the_percent_encoded_form_of_a_secret():

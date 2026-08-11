@@ -340,11 +340,14 @@ def test_the_handlers_inline_redactor_covers_multiline_secret_components():
         safe_detail("ssh auth: MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", secrets) == "ssh auth: <redacted>"
     )
     assert safe_detail(pem, secrets) == "<redacted>"
-    # the length floor keeps short structural fragments readable.
+    # the length floor keeps short structural fragments of a MULTILINE value readable: a short
+    # component is punctuation, not a credential.
     assert safe_detail("near }", {"B": "{\n}\nlongenoughcomponent"}) == "near }"
-    # and it applies to a whole declared value too: a 3-char secret as a global needle would
-    # mangle unrelated diagnostics. long values still redact.
+    # a whole declared value below the floor is a credential, though, and must not leak. it is
+    # redacted where it stands alone, and only there: as a global needle `ati` would rewrite
+    # `authentication`.
     short = {"PIN": "ati", "FLASH_SECRET_ENV_KEYS": "PIN"}
+    assert safe_detail("worker rejected pin ati", short) == "worker rejected pin <redacted>"
     assert safe_detail("trainer crashed after validation", short) == (
         "trainer crashed after validation"
     )
@@ -707,7 +710,22 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     assert "create_loraplus_optimizer" in train_src
 
 
-def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("console_lines", "terminated"),
+    [
+        (
+            ["worker booting\n", ("x" * 70_000) + "\n", "torch.cuda.OutOfMemoryError: CUDA OOM\n"],
+            True,
+        ),
+        # the same crash with NO newline anywhere: one huge unterminated line, which is what a json
+        # blob, a native stack or a stream of progress output actually looks like.
+        (["q" * 70_000 + "torch.cuda.OutOfMemoryError: CUDA OOM"], False),
+    ],
+    ids=["oversized-line-then-rootcause", "single-unterminated-line"],
+)
+def test_train_body_uploads_console_on_missing_metrics(
+    monkeypatch, tmp_path, console_lines, terminated
+):
     """The 'crashed before finishing' path (no /tmp/metrics.json) MUST upload the captured console
     even when the worker exited 0 — run_mode only uploads on a non-zero exit, so an OOM/segfault or
     silent early-exit otherwise leaves the failure undebuggable (no metrics, often no error_<phase>,
@@ -770,13 +788,7 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
         # Worker boots, logs an OOM, then the kernel/clean-exit leaves NO metrics.json.
         def __init__(self, *a, **k):
             assert k["cwd"] == "/runcode/code/0123456789abcdef0123456789abcdef"
-            self.stdout = iter(
-                [
-                    "worker booting\n",
-                    ("x" * 70_000) + "\n",
-                    "torch.cuda.OutOfMemoryError: CUDA OOM\n",
-                ]
-            )
+            self.stdout = iter(console_lines)
             self.returncode = 0  # the bug case: exits 0, so run_mode skips the console upload
 
         def wait(self):
@@ -809,13 +821,20 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
         assert console_uploads[0]["path_in_repo"] == "sft/flash-test-run/console_sft.txt"
         with open(console_uploads[0]["path_or_fileobj"], encoding="utf-8") as f:
             uploaded_console = f.read()
-        assert not uploaded_console.startswith("worker booting\n")
-        assert uploaded_console.endswith("torch.cuda.OutOfMemoryError: CUDA OOM\n")
-        # the 64k byte boundary fell inside the giant x-line, so that truncated line is dropped
-        # whole before redaction: a partial line could hold a credential suffix that no longer
-        # value-matches.
-        assert "x" not in uploaded_console
-        assert uploaded_console == "torch.cuda.OutOfMemoryError: CUDA OOM\n"
+        if terminated:
+            assert not uploaded_console.startswith("worker booting\n")
+            # the 64k byte boundary fell inside the giant x-line, so that truncated line is dropped
+            # whole before redaction: a partial line could hold a credential suffix that no longer
+            # value-matches.
+            assert "x" not in uploaded_console
+            assert uploaded_console == "torch.cuda.OutOfMemoryError: CUDA OOM\n"
+        else:
+            # dropping the partial line here would drop EVERYTHING, uploading an empty console and
+            # losing the root cause on exactly the crash that emits one huge line. the line is kept
+            # minus a leading margin wide enough to carry off a credential split by the boundary.
+            assert uploaded_console.endswith("torch.cuda.OutOfMemoryError: CUDA OOM")
+            assert "one unterminated line" in uploaded_console
+            assert len(uploaded_console) < 64_000
         assert [call["path_in_repo"] for call in list_calls] == [code_prefix, code_prefix]
         assert [call["filename"] for call in download_calls] == [
             f"{code_prefix}/__init__.py",

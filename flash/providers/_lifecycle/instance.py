@@ -30,11 +30,12 @@ _USER_DATA_BUDGET = _USER_DATA_CAP - _USER_DATA_MARGIN
 # Fast path only: above this, the spec is spilled to HF without rendering a payload that cannot fit.
 # The budget is what is LEFT of the ~64,000-byte provider cap after the fixed framing: this module's
 # template plus every source file it heredocs in (bootstrap.py and bootstrap_secrets.py), which is
-# ~52,000 bytes and grows whenever that bootstrap does. base64 + json escaping inflate the spec
-# ~1.35x on the way in, so this ceiling must stay well under the remaining ~11,800 bytes; shrink it
-# again whenever the embedded sources grow. test_user_data_spills_large_job_spec_to_hf pins the
-# worst case (a spec of exactly this size) against the cap so the two cannot drift apart silently.
-_SPEC_SPILL_THRESHOLD = 6_000
+# ~54,000 bytes and grows whenever that bootstrap does. base64 + json escaping inflate the spec
+# ~1.35x on the way in, so this ceiling must stay well under the remaining budget; shrink it again
+# whenever the embedded sources grow -- widening the redactors dropped it from 6,000 to 4,800.
+# test_user_data_spills_large_job_spec_to_hf pins the worst case (a spec of exactly this size)
+# against the cap so the two cannot drift apart silently.
+_SPEC_SPILL_THRESHOLD = 4_800
 
 
 def run_label_prefix(run_id: str) -> str:

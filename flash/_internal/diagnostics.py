@@ -21,19 +21,29 @@ SECRET_ENV_KEYS_ENV = "FLASH_SECRET_ENV_KEYS"
 
 # multiline secrets may appear only partially in truncated logs. register long component lines as
 # needles, but ignore short common fragments such as ``}`` that would erase innocent diagnostics.
-# the floor applies to the WHOLE value too: a declared secret can carry any value, and a 3-char one
-# used as a global replacement needle would mangle every diagnostic containing those characters.
-# short values stay covered by the keyed credential patterns below.
 _MIN_SECRET_COMPONENT = 8
 
 
-def _configured_secrets() -> tuple[str, ...]:
+def _configured_secrets() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Credential values to redact, split by how they may be matched.
+
+    The first group is replaced as a plain substring. The second holds values shorter than
+    ``_MIN_SECRET_COMPONENT``, which may only be replaced where they are not adjacent to a word
+    character: a declared secret can carry any value, and a 3-char one used as a global replacement
+    needle would mangle every diagnostic containing those characters (the value ``ati`` rewrites
+    ``authentication``). Dropping them instead -- the previous behaviour -- leaked them verbatim,
+    since the keyed patterns below only fire when the surrounding text has credential shape.
+
+    Component lines of a multiline value keep the floor as a hard skip: a short component is
+    punctuation such as ``}``, not a credential.
+    """
     declared = {
         name.strip().upper()
         for name in os.environ.get(SECRET_ENV_KEYS_ENV, "").split(",")
         if name.strip()
     }
-    values: set[str] = set()
+    plain: set[str] = set()
+    bounded: set[str] = set()
     for key, value in os.environ.items():
         upper = key.upper()
         if not value or not (
@@ -42,28 +52,28 @@ def _configured_secrets() -> tuple[str, ...]:
             or upper.endswith(_SECRET_ENV_SUFFIXES)
         ):
             continue
-        parts = [value] if len(value) >= _MIN_SECRET_COMPONENT else []
+        target = plain if len(value) >= _MIN_SECRET_COMPONENT else bounded
+        target.update({value, urllib.parse.quote(value, safe="")})
         if "\n" in value:
-            parts.extend(
-                line
-                for raw in value.splitlines()
-                if len(line := raw.strip()) >= _MIN_SECRET_COMPONENT
-            )
-        for part in parts:
-            values.add(part)
-            encoded = urllib.parse.quote(part, safe="")
-            if encoded != part:
-                values.add(encoded)
+            for raw in value.splitlines():
+                if len(line := raw.strip()) >= _MIN_SECRET_COMPONENT:
+                    plain.update({line, urllib.parse.quote(line, safe="")})
     # longest first: a component is a substring of the whole value, so replacing the whole value
     # before its parts keeps the redaction count honest instead of leaving `<redacted>` fragments.
-    return tuple(sorted(values, key=len, reverse=True))
+    return (
+        tuple(sorted(plain, key=len, reverse=True)),
+        tuple(sorted(bounded, key=len, reverse=True)),
+    )
 
 
 def sanitize_diagnostic(value: Any, *, limit: int = 2000) -> str:
     """Keep useful failure context while removing credentials and bounding output."""
     text = f"{type(value).__name__}: {value}" if isinstance(value, BaseException) else str(value)
-    for secret in _configured_secrets():
+    plain, bounded = _configured_secrets()
+    for secret in plain:
         text = text.replace(secret, "<redacted>")
+    for secret in bounded:
+        text = re.sub(rf"(?<!\w){re.escape(secret)}(?!\w)", "<redacted>", text)
     text = _BEARER_RE.sub("Bearer <redacted>", text)
     text = _SECRET_KEY_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}<redacted>", text)
     return text[: max(0, int(limit))]

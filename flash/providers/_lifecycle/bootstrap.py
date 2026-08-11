@@ -656,6 +656,8 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         pump_done = threading.Event()
         pump_write_lock = threading.Lock()
         pump_writes_enabled = True
+        # resolved once: the payload does not change, and this runs per child line.
+        pump_secrets = _payload_secrets(payload)
 
         def pump():
             try:
@@ -663,11 +665,18 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
                     with pump_write_lock:
                         if not pump_writes_enabled:
                             return
-                        print(line, end="", flush=True)
+                        # this process's stdout is the instance's container log, which the control
+                        # plane pulls as the failure detail (vast holds the box after a non-zero
+                        # exit precisely so it can). only this process knows the run's secret
+                        # VALUES, so each echoed child line is sanitized here at the source -- the
+                        # control-plane sanitizer downstream cannot value-redact a runtime secret
+                        # whose name it never sees. mirrors the runpod serverless handler. the
+                        # console FILE keeps the raw line; its upload path sanitizes the tail.
+                        print(_safe_detail(line, 100_000, secrets=pump_secrets), end="", flush=True)
                         cf.write(line)
             except BaseException as exc:
                 print(
-                    f"console pump warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}",
+                    f"console pump warn: {_safe_detail(exc, secrets=pump_secrets)}",
                     flush=True,
                 )
             finally:

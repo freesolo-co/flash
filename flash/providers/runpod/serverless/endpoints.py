@@ -84,7 +84,18 @@ def _train_body(input_data: dict) -> dict:
             for name in str(mapping.get("FLASH_SECRET_ENV_KEYS") or "").split(",")
             if name.strip()
         }
-        needles = set()
+        # a value at or above the floor is replaced as a plain substring; a SHORTER one only where
+        # it is not adjacent to a word character. short values used to be dropped outright, which
+        # leaked them verbatim -- [environment] secrets accepts any name and any value. plain
+        # replacement is not the alternative: a 3-char needle corrupts every diagnostic that merely
+        # contains those letters (the value "ati" rewrites "authentication"), so the boundary form
+        # redacts the standalone occurrence and leaves the innocent substring alone.
+        # a multiline secret (a PEM key) never appears whole in any single call: the child's stdout
+        # is sanitized one line at a time below, so only a component line is ever seen. component
+        # lines keep the floor as a hard skip -- a short one is punctuation such as "}", not a
+        # credential, and bounding it would erase every standalone brace in a json diagnostic.
+        # Mirrors flash.providers._lifecycle.bootstrap_secrets._redact_values.
+        plain, bounded = set(), set()
         for key, secret in mapping.items():
             upper = str(key).upper()
             if not secret or not (
@@ -94,26 +105,18 @@ def _train_body(input_data: dict) -> dict:
             ):
                 continue
             value_str = str(secret)
-            # a multiline secret (a PEM key) never appears whole in any single call: the child's
-            # stdout is sanitized one line at a time below, so only a component line is ever seen.
-            # register long component lines as needles too; the length floor keeps a common
-            # fragment such as "}" from erasing innocent diagnostics. it applies to the whole
-            # value too, so a 3-char declared secret cannot mangle every diagnostic containing
-            # those characters; short values stay covered by the keyed patterns below.
-            parts = [value_str] if len(value_str) >= 8 else []
+            target = plain if len(value_str) >= 8 else bounded
+            target.update({value_str, urllib.parse.quote(value_str, safe="")})
             if "\n" in value_str:
-                parts.extend(
-                    line for raw in value_str.splitlines() if len(line := raw.strip()) >= 8
-                )
-            for part in parts:
-                needles.add(part)
-                encoded = urllib.parse.quote(part, safe="")
-                if encoded != part:
-                    needles.add(encoded)
+                for raw in value_str.splitlines():
+                    if len(line := raw.strip()) >= 8:
+                        plain.update({line, urllib.parse.quote(line, safe="")})
         # longest-first so one secret containing another cannot leave a suffix of the longer
         # one behind; encoded forms cover the percent-encoded urls http and git errors print.
-        for needle in sorted(needles, key=len, reverse=True):
+        for needle in sorted(plain, key=len, reverse=True):
             text = text.replace(needle, "<redacted>")
+        for needle in sorted(bounded, key=len, reverse=True):
+            text = re.sub(rf"(?<!\w){re.escape(needle)}(?!\w)", "<redacted>", text)
         text = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", text)
         text = re.sub(
             r"(?i)(authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)"
@@ -420,7 +423,20 @@ def _train_body(input_data: dict) -> dict:
                     # may hold the root-cause exception.
                     if raw[:1] != b"\n":
                         cut = tail.find("\n")
-                        tail = tail[cut + 1 :] if cut >= 0 else ""
+                        if cut >= 0:
+                            tail = tail[cut + 1 :]
+                        else:
+                            # no newline at all: the whole tail is ONE unterminated line. dropping
+                            # it uploaded an empty console and lost the root cause on exactly the
+                            # crashes that emit a single huge line (a json blob, a native stack).
+                            # keep it, minus a leading margin wide enough to carry off a credential
+                            # split by the boundary; _safe_detail below still redacts whole values.
+                            split_margin = 512
+                            tail = (
+                                "[flash: the console tail is one unterminated line; its first "
+                                f"{split_margin} characters were dropped so a credential split by "
+                                "the read boundary cannot survive]\n" + tail[split_margin:]
+                            )
                 with open(console + ".tail", "w", encoding="utf-8", errors="replace") as f:
                     f.write(_safe_detail(tail, env, 64_000))
                 _require_deadline_allowance()
