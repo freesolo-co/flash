@@ -258,6 +258,52 @@ def test_urlopen_still_classifies_a_throttled_429_with_a_truncated_body(monkeypa
     assert excinfo.value.throttled is True
 
 
+def test_urlopen_body_deadline_bounds_a_slow_dripping_response(monkeypatch):
+    # urllib restarts `timeout` on every blocking read, so a peer returning one chunk just inside
+    # each window keeps ONE attempt alive indefinitely -- the per-read timeout is not a per-attempt
+    # bound. `body_deadline` is what actually bounds the attempt, which matters for the interactive
+    # list whose client timeout is sized against that ceiling.
+    clock = [0.0]
+
+    class _SlowBody(io.BytesIO):
+        def read(self, *_a):
+            clock[0] += 5.0  # each chunk arrives inside the socket timeout, but time still passes
+            return b"x" * 1024
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: _SlowBody(b""))
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)
+
+    with pytest.raises(GitHubRateLimitError, match="transient network"):
+        _urlopen(
+            urllib.request.Request("https://api.github.com/test"),
+            max_bytes=16 * 1024 * 1024,
+            body_deadline=20.0,
+            max_rate_limit_retries=1,
+        )
+
+
+def test_urlopen_without_a_body_deadline_still_finishes_a_slow_download(monkeypatch):
+    # background downloads must NOT inherit the bound: finishing a large transfer matters more than
+    # a deadline there, so an unset `body_deadline` has to leave the old behaviour untouched.
+    chunks = [b"x" * 1024, b"x" * 1024, b""]
+    clock = [0.0]
+
+    class _SlowBody(io.BytesIO):
+        def read(self, *_a):
+            clock[0] += 600.0  # far past any deadline the list path would impose
+            return chunks.pop(0)
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: _SlowBody(b""))
+
+    assert (
+        _urlopen(urllib.request.Request("https://api.github.com/test"), max_bytes=16 * 1024 * 1024)
+        == b"x" * 2048
+    )
+
+
 def test_urlopen_transient_network_becomes_retriable_signal(monkeypatch):
     # A persistent transient failure (URLError every attempt, or a read-phase TimeoutError that is
     # NEITHER an HTTPError NOR a URLError) must surface as the typed retriable GitHubRateLimitError

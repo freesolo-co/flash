@@ -336,6 +336,32 @@ def test_the_list_read_budget_stays_interactive():
     minutes. No interactive caller waits that long, so the controlled 502 the domain layer raises
     would never actually be seen -- every client would time out first and report something generic.
     """
-    from flash.client.http import ENV_LIST_SERVER_BUDGET_SECONDS
+    from flash.client.http import (
+        ENV_LIST_CLIENT_TIMEOUT_SECONDS,
+        ENV_LIST_SERVER_BUDGET_SECONDS,
+    )
 
     assert ENV_LIST_SERVER_BUDGET_SECONDS < 5 * 60, ENV_LIST_SERVER_BUDGET_SECONDS
+    # the client wait is what the person actually experiences, so bound it too -- it necessarily
+    # exceeds the server ceiling, and only this assertion keeps that margin from growing unbounded.
+    assert ENV_LIST_CLIENT_TIMEOUT_SECONDS < 6 * 60, ENV_LIST_CLIENT_TIMEOUT_SECONDS
+
+
+def test_the_client_budget_counts_the_body_read_not_just_the_connect():
+    """Each attempt can spend the socket timeout AND the body deadline; counting one halves it.
+
+    urllib restarts `timeout` on every blocking read, so a large tree body streamed in chunks is
+    bounded by `body_deadline`, not by `timeout`. A mirror that omits it understates the server's
+    ceiling and the client goes back to timing out first.
+    """
+    import flash.client.http as client_http
+    from flash.envs.loader import _LIST_READ_BUDGET
+
+    assert _LIST_READ_BUDGET["body_deadline"] == client_http._ENV_LIST_BODY_DEADLINE_SECONDS
+    per_attempt = _LIST_READ_BUDGET["timeout"] + _LIST_READ_BUDGET["body_deadline"]
+    attempts = _LIST_READ_BUDGET["max_rate_limit_retries"] + 1
+    real_ceiling = 2 * (attempts * per_attempt + client_http._ENV_LIST_MAX_BACKOFF_PER_READ_SECONDS)
+    mirrored_budget = client_http.ENV_LIST_SERVER_BUDGET_SECONDS
+    client_timeout = client_http.ENV_LIST_CLIENT_TIMEOUT_SECONDS
+    assert mirrored_budget == real_ceiling
+    assert client_timeout > real_ceiling

@@ -66,9 +66,13 @@ _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 _ENV_LIST_GITHUB_READS = 2  # namespace lookup, then the recursive namespace subtree
 _ENV_LIST_ATTEMPTS_PER_READ = 2  # one initial attempt + `max_rate_limit_retries` (1)
 _ENV_LIST_SOCKET_TIMEOUT_SECONDS = 20.0  # `_LIST_READ_BUDGET["timeout"]`
+# an attempt can spend the socket timeout connecting AND the body deadline streaming the response;
+# counting only the former understates each attempt by half.
+_ENV_LIST_BODY_DEADLINE_SECONDS = 20.0  # `_LIST_READ_BUDGET["body_deadline"]`
 _ENV_LIST_MAX_BACKOFF_PER_READ_SECONDS = 45.0  # one sleep, capped at 45s
 ENV_LIST_SERVER_BUDGET_SECONDS = _ENV_LIST_GITHUB_READS * (
-    _ENV_LIST_ATTEMPTS_PER_READ * _ENV_LIST_SOCKET_TIMEOUT_SECONDS
+    _ENV_LIST_ATTEMPTS_PER_READ
+    * (_ENV_LIST_SOCKET_TIMEOUT_SECONDS + _ENV_LIST_BODY_DEADLINE_SECONDS)
     + _ENV_LIST_MAX_BACKOFF_PER_READ_SECONDS
 )
 # a margin over the server's own ceiling: the client must lose the race to time out, so that a real

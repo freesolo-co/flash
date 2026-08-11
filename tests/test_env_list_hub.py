@@ -134,6 +134,46 @@ def test_publish_path_reads_keep_the_batch_budget(monkeypatch):
     assert sig.parameters["max_rate_limit_retries"].default == 5
 
 
+@pytest.mark.parametrize(
+    "bad_sha",
+    [None, 123, "", {"oid": "abc"}],
+    ids=["missing", "not-a-string", "empty", "object"],
+)
+def test_a_namespace_entry_with_an_unusable_sha_raises_instead_of_reporting_empty(
+    monkeypatch, bad_sha
+):
+    """A malformed entry must NOT look like an absent namespace.
+
+    This is the PR's own bug in miniature: the namespace directory IS there, so answering "nothing
+    published" tells the user their publish did nothing. A hub response we cannot read has to fail
+    loudly and become the controlled 502.
+    """
+    entry = {"path": "acme", "type": "tree"}
+    if bad_sha is not None:
+        entry["sha"] = bad_sha
+    _fake_hub(monkeypatch, {"main": _tree(entry, _dir("other-org", "sha-other"))})
+
+    with pytest.raises(RuntimeError, match="no usable sha"):
+        loader.list_managed_namespace_slugs("acme")
+
+
+def test_an_unusable_sha_reaches_the_caller_as_502(monkeypatch):
+    """The loud failure must arrive as the controlled gateway error, not an uncaught 500."""
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+
+    def boom(namespace):
+        raise RuntimeError(
+            f"GitHub tree entry for environment namespace {namespace!r} has no usable sha; "
+            "the hub listing could not be read"
+        )
+
+    monkeypatch.setattr(loader, "list_managed_namespace_slugs", boom)
+
+    with pytest.raises(envs_mod.EnvPublishError) as excinfo:
+        envs_mod.list_namespace_slugs(key=_user_key())
+    assert excinfo.value.status == 502
+
+
 def test_absent_namespace_directory_is_an_empty_list(monkeypatch):
     """An org that has published nothing has no hub directory yet; that is empty, not an error."""
     _fake_hub(monkeypatch, {"main": _tree(_dir("other-org", "sha-other"))})

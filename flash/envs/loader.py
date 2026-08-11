@@ -126,12 +126,22 @@ def _resolve_ref_sha(
     return sha
 
 
-def _iter_capped_chunks(resp: object, max_bytes: int) -> Iterator[bytes]:
+def _iter_capped_chunks(
+    resp: object, max_bytes: int, deadline: float | None = None
+) -> Iterator[bytes]:
     # per-attempt accounting is also per-download accounting: _urlopen rewinds and truncates the
     # sink before every attempt, so the bytes this generator caps are exactly the bytes that
     # survive on disk. a retried download can never leave more than max_bytes behind.
     total = 0
     while True:
+        # urllib's timeout applies to each blocking socket read, not to the response as a whole, so
+        # a peer that dribbles out one chunk just inside every timeout window keeps a single attempt
+        # alive far past it. `deadline` bounds the wall-clock of the whole body for callers that
+        # promise an overall budget; without it, that promise is only per-read.
+        if deadline is not None and time.monotonic() > deadline:
+            raise TimeoutError(
+                f"GitHub response body exceeded its overall deadline after {total} bytes"
+            )
         chunk = resp.read(_DOWNLOAD_CHUNK_BYTES)
         if not chunk:
             break
@@ -151,12 +161,19 @@ def _urlopen(
     max_rate_limit_retries: int = 5,
     max_bytes: int | None = None,
     out: BinaryIO | None = None,
+    body_deadline: float | None = None,
 ) -> bytes:
     """Fetch bytes for a GitHub request with jittered retry on rate limits.
 
     ``out`` must be seekable: a failure part-way through the body is retried from scratch, and the
     sink is rewound and truncated first so a partial prefix can never be concatenated with the
     retry's full body.
+
+    ``body_deadline`` bounds the wall-clock of one attempt's body read. ``timeout`` alone cannot:
+    urllib applies it per blocking socket operation, so a large body read in many chunks gets a
+    fresh window each time and a slow peer can hold one attempt open indefinitely. Pass it when the
+    caller advertises an overall budget (an interactive request whose client will give up); leave it
+    unset for background downloads, where finishing a large transfer matters more than a deadline.
     """
     import random
 
@@ -174,7 +191,8 @@ def _urlopen(
         Returns ``b""`` whenever ``out`` is given: the bytes went to the file, and also returning
         them would hold the whole download in memory, which is the thing streaming to ``out`` avoids.
         """
-        chunks = _iter_capped_chunks(resp, max_bytes) if max_bytes is not None else None
+        deadline = time.monotonic() + body_deadline if body_deadline is not None else None
+        chunks = _iter_capped_chunks(resp, max_bytes, deadline) if max_bytes is not None else None
         if out is None:
             return b"".join(chunks) if chunks is not None else resp.read()
         if chunks is not None:
@@ -323,12 +341,14 @@ def _download_github_json(
     *,
     timeout: float = 120.0,
     max_rate_limit_retries: int = 5,
+    body_deadline: float | None = None,
 ) -> object:
     data = _urlopen(
         urllib.request.Request(url, headers=_github_headers("application/vnd.github+json")),
         timeout=timeout,
         max_bytes=_MAX_CONTENTS_JSON_BYTES,
         max_rate_limit_retries=max_rate_limit_retries,
+        body_deadline=body_deadline,
     )
     try:
         return json.loads(data)
@@ -355,6 +375,7 @@ def _github_tree_entries(
     recursive: bool = False,
     timeout: float = 120.0,
     max_rate_limit_retries: int = 5,
+    body_deadline: float | None = None,
 ) -> list[dict]:
     payload = _download_github_json(
         ref,
@@ -362,6 +383,7 @@ def _github_tree_entries(
         context,
         timeout=timeout,
         max_rate_limit_retries=max_rate_limit_retries,
+        body_deadline=body_deadline,
     )
     if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
         raise RuntimeError(
@@ -403,7 +425,16 @@ def _resolve_github_directory_tree_sha(ref: GitHubEnvironmentRef, repo_dir: str)
 # An interactive list must fail fast enough that its 429/502 reaches the caller. Two reads at
 # (1 + 1 attempts) x 20s + one <=45s backoff each is ~2 minutes worst case, versus ~30 minutes on the
 # batch default. `flash.client.http.ENV_LIST_CLIENT_TIMEOUT_SECONDS` is sized to outlast this.
-_LIST_READ_BUDGET = {"timeout": 20.0, "max_rate_limit_retries": 1}
+#
+# `body_deadline` is what makes `timeout` an actual per-attempt bound. A recursive namespace tree can
+# be megabytes, read in up to 16 capped chunks, and urllib restarts `timeout` on every blocking read
+# -- so a peer that returns one chunk just inside each window would keep a single attempt alive far
+# past 20s and blow the ceiling the client is sized against.
+_LIST_READ_BUDGET = {
+    "timeout": 20.0,
+    "max_rate_limit_retries": 1,
+    "body_deadline": 20.0,
+}
 
 
 def list_managed_namespace_slugs(namespace: str) -> list[str]:
@@ -434,25 +465,32 @@ def list_managed_namespace_slugs(namespace: str) -> list[str]:
     if ref is None:  # pragma: no cover - the literal above always parses
         raise RuntimeError("could not build a managed environment reference")
 
+    # match on identity only, and validate the sha separately below. folding `isinstance(sha, str)`
+    # into this predicate would make a malformed entry look like a MISSING one, so a broken hub
+    # response would report "nothing published" -- the exact failure this endpoint exists to remove.
     root = next(
         (
             entry
             for entry in _github_tree_entries(ref, ref.ref, ref.ref, **_LIST_READ_BUDGET)
-            if entry.get("path") == namespace
-            and entry.get("type") == "tree"
-            and isinstance(entry.get("sha"), str)
+            if entry.get("path") == namespace and entry.get("type") == "tree"
         ),
         None,
     )
     if root is None:
         return []
+    root_sha = root.get("sha")
+    if not isinstance(root_sha, str) or not root_sha:
+        raise RuntimeError(
+            f"GitHub tree entry for environment namespace {namespace!r} has no usable sha; "
+            "the hub listing could not be read"
+        )
     # ONE recursive fetch of the namespace subtree, not a tree request per environment: an org with
     # 100 envs would otherwise spend 102 calls of the shared GITHUB_TOKEN's budget on a list. Paths
     # in a recursive response are relative to the namespace, so `<name>/environment.py` identifies an
     # environment directly and no per-directory read is needed.
     slugs = []
     for entry in _github_tree_entries(
-        ref, root["sha"], namespace, recursive=True, **_LIST_READ_BUDGET
+        ref, root_sha, namespace, recursive=True, **_LIST_READ_BUDGET
     ):
         path = entry.get("path")
         if entry.get("type") != "blob" or not isinstance(path, str):
