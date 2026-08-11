@@ -462,6 +462,7 @@ def cmd_train(args) -> int:
             )
         else:
             print(json.dumps(status, indent=2))
+        _print_unpacked_batch_warning(status, spec)  # after the payload, so stdout stays parseable
         return 0
     try:
         status = client.create_run(
@@ -476,6 +477,7 @@ def cmd_train(args) -> int:
         _raise_if_workload_profile_pending(client, exc)
         raise
     run_id = status["run_id"]
+    _print_unpacked_batch_warning(status, spec)  # a real submit overrides batch_size the same way
     logger.info(
         "submitted run %s: model=%s algorithm=%s gpu=%s",
         run_id,
@@ -907,59 +909,11 @@ def cmd_deployments(args) -> int:
     return 0
 
 
-def cmd_chat(args) -> int:
-    from flash.schema import parse_adapter_revision, parse_checkpoint_ref
-
-    revision = parse_adapter_revision(args.run_id)
-    parsed = parse_checkpoint_ref(args.run_id) if revision is None else None
-    if revision is None and parsed is None:
-        print(
-            f"invalid chat target {args.run_id!r} "
-            "(expected a bare <run_id>, <run_id>/step-N, or full immutable adapter revision)",
-            file=sys.stderr,
-        )
-        return 1
-    chat_target = args.run_id
-    client = client_from_config()
-    messages = [{"role": "user", "content": args.message}]
-    system = getattr(args, "system", None)
-    if system:
-        messages.insert(0, {"role": "system", "content": system})
-    wrote = False
-    pending: list[str] = []
-    for chunk in client.chat_stream(
-        chat_target,
-        messages=messages,
-        temperature=args.temperature,
-        max_tokens=args.max_tokens,
-    ):
-        # delay the label and blank chunks until real text arrives. otherwise an empty response has
-        # non-empty stdout and cannot serve as a health check. release buffered blanks verbatim;
-        # flash/cli/commands/env/eval.py grades emptiness the same way.
-        if not wrote:
-            pending.append(chunk)
-            if not chunk.strip():
-                continue
-            if render.styled():
-                print(render.chat_label())
-            chunk = "".join(pending)
-            wrote = True
-        print(chunk, end="", flush=True)
-    if not wrote:
-        # the request succeeded at the transport level but carried no assistant text, which is what
-        # a serving path that stopped applying the run's chat template looks like from here. exiting
-        # 0 with an empty stdout makes that indistinguishable from a model that answered nothing, so
-        # this surface cannot be used as a health check -- say what happened and fail.
-        print(
-            f"no response text from {chat_target}: the request succeeded but the model returned "
-            "nothing. the deployment may be unhealthy or still starting; check "
-            f"`{CLI_NAME} models deployments` and retry.",
-            file=sys.stderr,
-        )
-        return 1
-    print()
-    return 0
-
+# re-exported at the bottom rather than imported at the top: `chat` resolves `client_from_config`
+# and `CLI_NAME` back through this package, so a top import would be circular. the parser and the
+# cli tests both address `cmd_chat` as an attribute of `flash.cli.commands`, which is why it stays
+# on it after the move.
+from flash.cli.commands.chat import cmd_chat  # noqa: E402,F401
 
 # re-exported at the bottom rather than imported at the top: `deploy` resolves names back through
 # this package, so a top import would be circular. the parser and the cli tests both address these
@@ -993,6 +947,7 @@ from flash.cli.commands.train_cost import (  # noqa: E402,F401
     _print_exact_sft_cost,
     _print_thin_rl_batch_warning,
     _print_train_schema_compatibility,
+    _print_unpacked_batch_warning,
     _profile_charge,
     _raise_if_workload_profile_pending,
     _warn_if_wandb_requested_without_key,
