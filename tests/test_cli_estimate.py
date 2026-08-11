@@ -590,9 +590,10 @@ def test_a_derived_horizon_states_the_mechanism_without_guaranteeing_a_cheaper_q
 ):
     """The mirror of the fixed-horizon case, but it must not overclaim in the other direction.
 
-    Spreading the same prompts over fewer updates is always true here. "Cheaper" is not: the
-    derived horizon is `ceil(examples / batch)`, so the step count plateaus and an increase inside
-    a plateau adds generation at an unchanged horizon. The message states the mechanism and sends
+    Neither "cheaper" nor "fewer updates" is guaranteed: the derived horizon is
+    `ceil(examples / batch)`, which is non-increasing in batch but plateaus, so an increase inside
+    a plateau adds generation at an unchanged horizon. "No more updates than it does now" is the
+    direction ceil() actually gives for every batch. The message states that mechanism and sends
     the user to `--cost`, which prices the real answer.
     """
     monkeypatch.setenv("FLASH_STYLE", "0")
@@ -601,7 +602,7 @@ def test_a_derived_horizon_states_the_mechanism_without_guaranteeing_a_cheaper_q
     err = capsys.readouterr().err
 
     assert rc == 0
-    assert "spreads the same prompts over fewer updates" in err
+    assert "spreads the same prompts over no more updates than it does now" in err
     assert "higher bill" not in err
     assert "quotes cheaper" not in err
 
@@ -612,6 +613,10 @@ def test_a_ceiling_plateau_is_not_promised_a_cheaper_quote(tmp_path, monkeypatch
     Measured on this exact shape: batch 3 quotes $0.0867 at 2 updates and batch 4 quotes $0.1027
     at the same 2 updates. Any unconditional "raising this quotes cheaper" is false here, which is
     why the derived-horizon remedy claims a mechanism rather than a direction for the bill.
+
+    The update COUNT is the same trap one step in: `ceil()` is non-increasing in batch, not
+    strictly decreasing, so "spreads the same prompts over fewer updates" is also false inside the
+    plateau. Only "no more updates than it does now" holds for every batch.
     """
     monkeypatch.setenv("FLASH_STYLE", "0")
 
@@ -621,6 +626,8 @@ def test_a_ceiling_plateau_is_not_promised_a_cheaper_quote(tmp_path, monkeypatch
     assert rc == 0
     assert "OPTIMIZER batch" in err  # batch 3 is still below the threshold, so it warns
     assert "cheaper" not in err
+    assert "fewer updates" not in err
+    assert "no more updates than it does now" in err
 
 
 def test_an_environment_param_cap_is_named_as_such(tmp_path, monkeypatch, capsys):

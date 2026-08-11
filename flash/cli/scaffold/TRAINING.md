@@ -269,10 +269,10 @@ ignored. Everything in the block above (`epochs`, `max_examples`, `max_steps`, `
 > back, since it already defaults to 1.
 >
 > What widening costs depends on which knob you widen and on your horizon. Raising `batch_size`
-> against a fixed prompt pool spreads the same prompts over fewer updates, which usually quotes
-> cheaper, but the derived horizon is `ceil(examples / batch)` so the step count plateaus: at
-> `max_examples = 5`, batch 3 and batch 4 both resolve to 2 updates and the wider one just
-> generates more. Raising a `max_examples` cap instead grows the pool, so the run gains passes and
+> against a fixed prompt pool spreads the same prompts over no more updates than you have now,
+> which usually means fewer updates and a cheaper quote, but the derived horizon is
+> `ceil(examples / batch)` so the step count plateaus: at `max_examples = 5`, batch 3 and batch 4
+> both resolve to 2 updates and the wider one just generates more. Raising a `max_examples` cap instead grows the pool, so the run gains passes and
 > quotes dearer. And under a positive `max_steps` the update count is pinned, so a wider batch is
 > pure extra generation: same steps, bigger bill. The warning says which case you are in; re-run
 > `flash train --cost` for the actual number.

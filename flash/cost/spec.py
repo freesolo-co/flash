@@ -246,15 +246,17 @@ def thin_rl_batch_warning(spec) -> str | None:
         # POOL does not buy steps, it just shortens the run, so that caveat would excuse the wrong
         # config -- offer it only when the authored batch is what is holding the batch down.
         #
-        # deliberately claims no direction for the bill. the derived horizon is
-        # ``ceil(examples / batch)``, so widening usually sheds updates and quotes cheaper, but the
-        # ceiling plateaus: at ``max_examples = 5`` both batch 3 and batch 4 resolve to 2 updates,
-        # and the extra generation takes the quote from $0.0867 to $0.1027. "cheaper" is the common
-        # case, not a guarantee, and `--cost` prices the real answer in the line above this one.
+        # deliberately claims no direction for the bill, and no strict drop in updates either. the
+        # derived horizon is ``ceil(examples / batch)``, which is non-increasing in batch but
+        # plateaus: at ``max_examples = 5`` both batch 3 and batch 4 resolve to 2 updates, so the
+        # extra generation is pure added cost and takes the quote from $0.0867 to $0.1027. "no more
+        # updates" is the guarantee ceil() actually gives; "fewer" is only the common case, and
+        # `--cost` prices the real answer in the line above this one.
         remedy = (
             f"Raise {raise_target} unless you are deliberately buying optimizer steps on a derived "
             "horizon (see TRAINING.md): against a fixed prompt pool a wider batch spreads the same "
-            "prompts over fewer updates. Re-run `--cost` to see what it does to this quote."
+            "prompts over no more updates than it does now. Re-run `--cost` to see what it does to "
+            "this quote."
         )
     return f"{lead} {consequence} {remedy}"
 
