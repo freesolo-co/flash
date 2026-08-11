@@ -930,6 +930,77 @@ def test_opd_model_load_is_not_described_as_a_weight_download(monkeypatch):
     assert "datacenter above" not in render.run_status(sft_dc)
 
 
+def test_stale_datacenter_is_labelled_as_the_previous_attempt(monkeypatch):
+    """A retry reuses the heartbeat path, so `dc` can belong to the worker that already died.
+
+    This row exists so two runs of the same config are comparable by region. Presenting the dead
+    attempt's region as the live one's corrupts exactly that comparison: the replacement may still
+    be provisioning, or may have landed somewhere with a completely different cache state.
+    """
+    import time as _time
+
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    base = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+    }
+
+    superseded = dict(
+        base,
+        remote={"attempt": 2},
+        last_heartbeat={
+            "stage": "sft_model_load",
+            "attempt": 1,
+            "ts": _time.time() - 1200,
+            "dc": "EU-RO-1",
+        },
+    )
+    out = render.run_status(superseded).split("details", 1)[0]
+    assert "EU-RO-1" in out, "the previous region is still worth showing"
+    assert "previous attempt" in out, "it is presented as the live attempt's region"
+
+    # when the heartbeat IS the live attempt, the row stays unqualified.
+    current = dict(
+        base,
+        remote={"attempt": 2},
+        last_heartbeat={
+            "stage": "sft_model_load",
+            "attempt": 2,
+            "ts": _time.time() - 1200,
+            "dc": "EU-RO-1",
+        },
+    )
+    current_out = render.run_status(current).split("details", 1)[0]
+    assert "EU-RO-1" in current_out
+    assert "previous attempt" not in current_out
+
+
+def test_cadence_is_asserted_as_fact_only_when_a_liveness_ping_proves_it():
+    """Worker code is content-addressed per submission, so a pre-upgrade run still emits one-shot
+    pings while a newer CLI reads them. Claiming "pings every ~4 min" as fact is then false, and
+    every reading built on that premise inherits the error.
+
+    The hint must still FIRE in both cases: a run frozen inside its very first 240s window has no
+    liveness ping either, and that is the primary freeze this hint was written to diagnose. So the
+    distinction belongs in the wording, not in whether the diagnosis appears at all.
+    """
+    from flash.cli.ui.heartbeat import _stale_setup_hint
+
+    proven = _stale_setup_hint({"stage": "sft_model_load", "liveness": True}, 1200.0, running=True)
+    assert "pings every ~4 min" in proven
+    assert "expected to ping" not in proven
+
+    unproven = _stale_setup_hint({"stage": "sft_model_load"}, 1200.0, running=True)
+    assert unproven, "the hint must still fire; a first-window freeze has no liveness ping either"
+    assert "expected to ping" in unproven
+    assert "unless this run predates that" in unproven
+
+
 def test_no_stage_clause_contradicts_the_sentence_it_completes():
     """The clause is a parenthetical inside "it may be inside one long blocking call (...)".
 

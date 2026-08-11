@@ -199,9 +199,19 @@ def _stale_setup_hint(
         blocking = "this stage exports and uploads the adapter, which is often slow"
     else:
         blocking = "this stage can block for minutes on a cold mount or a venv install"
-    return (
+    # worker code is content-addressed per submission, so a run submitted before this stage gained
+    # its liveness wrap keeps emitting a single one-shot ping. asserting "pings every ~4 min" as
+    # fact would then be false, and every reading built on it inherits that. state the cadence as
+    # the expectation it is, and say so outright once a liveness ping has actually been observed.
+    cadence = (
         "this setup stage pings every ~4 min while the worker is alive, so this gap is longer than "
-        f"throttling explains: it may be inside one long blocking call ({blocking}), its heartbeat "
+        "throttling explains"
+        if heartbeat.get("liveness")
+        else "this setup stage is expected to ping every ~4 min while the worker is alive, so "
+        "unless this run predates that, the gap is longer than throttling explains"
+    )
+    return (
+        f"{cadence}: it may be inside one long blocking call ({blocking}), its heartbeat "
         "uploads may be failing while it keeps working, or the instance is gone. a vanished "
         "instance is reported as a retry or failure, so check whether the attempt advances before "
         "cancelling"
@@ -271,23 +281,30 @@ def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
     # an identical config relaunched minutes later can land somewhere cold and spend a long silent
     # stretch downloading. without the region on the panel that is an unexplainable freeze; with it,
     # two runs of the same config are comparable.
-    datacenter = hb.get("dc")
-    if datacenter:
-        pairs.append(("datacenter", str(datacenter)[:64]))
+    #
+    # a retry reuses the heartbeat path, so until the replacement worker publishes its first ping
+    # this `dc` belongs to the attempt that already died. the replacement may still be provisioning
+    # or may land in a different region with a different cache state -- exactly the comparison this
+    # row exists to support -- so say whose region it is rather than implying it is the live one.
     heartbeat_age_seconds = _heartbeat_age_seconds(hb.get("ts"))
     running = str(obj.get("state") or "") == "running"
+    from_current_attempt = heartbeat_is_current_attempt(obj, hb)
+    datacenter = hb.get("dc")
+    if datacenter:
+        label = "datacenter" if from_current_attempt else "datacenter (previous attempt)"
+        pairs.append((label, str(datacenter)[:64]))
     stale_step = _stale_step_hint(
         hb,
         heartbeat_age_seconds,
         running=running,
-        current_attempt=heartbeat_is_current_attempt(obj, hb),
+        current_attempt=from_current_attempt,
     )
     # a setup stage carries no step, so the two hints address disjoint stages and cannot both fire.
     stale_setup = _stale_setup_hint(
         hb,
         heartbeat_age_seconds,
         running=running,
-        current_attempt=heartbeat_is_current_attempt(obj, hb),
+        current_attempt=from_current_attempt,
     )
     explained = stale_step or stale_setup
     # warmup is computed AFTER the hints so a stale setup stage can suppress it. the two windows
@@ -298,7 +315,7 @@ def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
         warmup = warmup_message(
             hb.get("stage"),
             heartbeat_age_seconds,
-            heartbeat_is_current_attempt(obj, hb),
+            from_current_attempt,
         )
         if warmup:
             pairs.append(("warmup", warmup))
