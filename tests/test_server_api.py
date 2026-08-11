@@ -568,8 +568,10 @@ def test_dry_run_rejects_structured_completion_budget_above_serving_capacity(api
         **SPEC,
         "thinking": True,
         "train": {
+            # the context must still leave a prompt budget, or the grpo spec-parse guard rejects it
+            # first and this test would stop covering the serving-capacity message.
             **SPEC["train"],
-            "max_context_tokens": 1024,
+            "max_context_tokens": 32769,
             "max_completion_tokens": 32513,
             "structured_outputs": {"choice": ["4"]},
         },
@@ -1597,6 +1599,271 @@ def test_create_run_does_not_blame_the_adapter_for_an_unrelated_failure(api, mon
     assert "no configured provider can provision" in detail
     assert "could not be prepared" not in detail
     assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
+
+
+def test_create_run_keeps_ownership_when_submit_fails_after_persisting_status(api, monkeypatch):
+    """A submit that dies after saving status leaves a run the owner can still see and cancel.
+
+    ``submit_job`` persists ``RunStatus`` and then keeps working (dispatch, provisioning), so a
+    failure past that point leaves a real run behind: the charge sweep and recovery both walk the
+    status files, not the db. Deleting the ownership row there would strand it: 404 on status,
+    logs and cancel for the only key entitled to it, while the provider footprint lives on.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.server.platform import db
+
+    submitted = []
+
+    def submit(spec, **_kwargs):
+        submitted.append(spec.run_id)
+        # mirror the real ordering: status lands first, the rest of the launch can still blow up.
+        runner._save_status(
+            runner.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
+        )
+        raise RuntimeError("provisioning died after status was written")
+
+    monkeypatch.setattr(app_mod, "submit_job", submit)
+
+    key = _login()
+    resp = api.post("/v1/runs", headers=_bearer(key), json={"spec": SPEC})
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    # the owner keeps its handle on the run the failed submit left behind.
+    assert db.run_owner(run_id) is not None
+    assert api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).status_code == 200
+    assert api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key)).status_code == 200
+    assert [r["run_id"] for r in api.get("/v1/runs", headers=_bearer(key)).json()["runs"]] == [
+        run_id
+    ]
+    # and can still drive it to a terminal state itself.
+    cancelled = api.post(f"/v1/runs/{run_id}/cancel", headers=_bearer(key))
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["state"] == "cancelled"
+
+
+def test_create_run_deletes_the_row_when_submit_fails_before_persisting_status(api, monkeypatch):
+    # the other half of the guard: no status file means the launch left nothing behind, so the
+    # ownership row is pure debris and must go rather than wedge the id forever.
+    import flash.server.app as app_mod
+    from flash.server.platform import db
+
+    submitted = []
+
+    def submit(spec, **_kwargs):
+        submitted.append(spec.run_id)
+        raise RuntimeError("provisioning died before status was written")
+
+    monkeypatch.setattr(app_mod, "submit_job", submit)
+
+    key = _login()
+    resp = api.post("/v1/runs", headers=_bearer(key), json={"spec": SPEC})
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    assert db.run_owner(run_id) is None
+    assert api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).status_code == 404
+    assert api.get("/v1/runs", headers=_bearer(key)).json()["runs"] == []
+
+
+def _persist_queued_then_raise(app_mod, runner, monkeypatch, submitted):
+    """Monkeypatch submit_job to mirror its real failure ordering: status lands, then it dies."""
+
+    def submit(spec, **_kwargs):
+        submitted.append(spec.run_id)
+        runner._save_status(
+            runner.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
+        )
+        raise RuntimeError("provisioning died after status was written")
+
+    monkeypatch.setattr(app_mod, "submit_job", submit)
+
+
+def _classified_resubmits() -> list[str]:
+    """Run ids startup recovery would resubmit right now."""
+    from flash.server.platform import runtime
+
+    active: set[str] = set()
+    known: set[str] = set()
+    resubmit: list = []
+    runtime._classify_recoverable_runs(active, known, resubmit)
+    return [spec.run_id for spec, _state in resubmit]
+
+
+def test_create_run_dry_run_failure_leaves_no_recoverable_run(api, monkeypatch):
+    """A dry-run submit that dies after persisting `queued` must not be retained.
+
+    submit_job persists the status as `queued` and only later flips it to `dry_run`, so a failure
+    in between leaves a queued record. Retaining its ownership row would hand it to startup
+    recovery, which resubmits every owned queued run as a REAL job - provisioning a gpu the user
+    explicitly asked never to rent. The row is dropped instead, exactly as before the guard.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.server.platform import db
+
+    submitted: list[str] = []
+    _persist_queued_then_raise(app_mod, runner, monkeypatch, submitted)
+
+    key = _login()
+    resp = api.post("/v1/runs", headers=_bearer(key), json={"spec": SPEC, "dry_run": True})
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    assert db.run_owner(run_id) is None
+    assert api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).status_code == 404
+    # recovery walks the ownership rows: with the row gone the queued record is unreachable.
+    assert run_id not in _classified_resubmits()
+
+
+def test_create_run_retained_secretful_run_fails_instead_of_recovering(api, monkeypatch):
+    """A retained run whose runtime secrets were never dispatched must not silently recover.
+
+    the secrets live only in the request and are deliberately excluded from the persisted spec, so
+    recovery would resubmit the run without them: it would train with missing credentials and
+    silently change behavior. the guard fails the run loudly instead; the owner keeps the row and
+    the error, and recovery skips terminal runs.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.server.platform import db
+
+    submitted: list[str] = []
+    _persist_queued_then_raise(app_mod, runner, monkeypatch, submitted)
+
+    key = _login()
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer(key),
+        json={"spec": SPEC, "runtime_secrets": {"WANDB_API_KEY": "user-wandb-key"}},
+    )
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    # the owner keeps the run and a loud, actionable error.
+    assert db.run_owner(run_id) is not None
+    body = api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).json()
+    assert body["state"] == "failed"
+    assert "runtime secrets" in body["error"]
+    # and recovery classifies nothing to resubmit for it.
+    assert run_id not in _classified_resubmits()
+
+
+def test_create_run_secretful_run_dropped_when_terminalization_fails(api, monkeypatch):
+    """If the compensating terminal write RAISES, the ownership row must go.
+
+    that `_update` is the only thing keeping startup recovery away from a queued run whose
+    secrets were never dispatched. a full or read-only status store makes it raise, and
+    swallowing that would leave the run both recoverable and secretless. an orphaned 404 is the
+    lesser harm, so the row is dropped instead.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.server.platform import db
+
+    submitted: list[str] = []
+    _persist_queued_then_raise(app_mod, runner, monkeypatch, submitted)
+
+    def boom(*_args, **_kwargs):
+        raise OSError("[Errno 28] No space left on device")
+
+    monkeypatch.setattr(runner, "_update", boom)
+
+    key = _login()
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer(key),
+        json={"spec": SPEC, "runtime_secrets": {"WANDB_API_KEY": "user-wandb-key"}},
+    )
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    # the queued status record survives on disk, so only the dropped row keeps recovery off it.
+    assert runner.get_status(run_id).state == "queued"
+    assert db.run_owner(run_id) is None
+    assert run_id not in _classified_resubmits()
+
+
+def test_create_run_secretful_run_kept_when_status_read_fails(api, monkeypatch):
+    """A terminal write that returned must not be second-guessed by a failing status read.
+
+    `_update` returning without raising already proves the run is terminal (True applied the write,
+    a sticky False means it was already terminal). a transient read error afterwards says nothing
+    about that, so treating it as a failed terminalization would delete the ownership row of a
+    correctly failed run - orphaning it for its owner and throwing away the error just persisted.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.server.platform import db
+
+    submitted: list[str] = []
+    _persist_queued_then_raise(app_mod, runner, monkeypatch, submitted)
+
+    # break status reads only once the terminal write itself has landed (`_update` reads the record
+    # to apply it), so this is exactly "the write succeeded, the read after it did not".
+    real_get_status, real_update = runner.get_status, runner._update
+    reading_fails = {"on": False}
+
+    def flaky(run_id, *args, **kwargs):
+        if reading_fails["on"]:
+            raise OSError("[Errno 5] Input/output error")
+        return real_get_status(run_id, *args, **kwargs)
+
+    def update_then_break_reads(*args, **kwargs):
+        applied = real_update(*args, **kwargs)
+        reading_fails["on"] = True
+        return applied
+
+    monkeypatch.setattr(runner, "get_status", flaky)
+    monkeypatch.setattr(runner, "_update", update_then_break_reads)
+
+    key = _login()
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer(key),
+        json={"spec": SPEC, "runtime_secrets": {"WANDB_API_KEY": "user-wandb-key"}},
+    )
+    reading_fails["on"] = False
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    # the terminal write landed, so the owner keeps the row and the actionable error.
+    assert db.run_owner(run_id) is not None
+    body = api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).json()
+    assert body["state"] == "failed"
+    assert "runtime secrets" in body["error"]
+    # and the run is terminal, so recovery still has nothing to resubmit.
+    assert run_id not in _classified_resubmits()
+
+
+def test_create_run_retained_run_records_managed_environment_use(api, monkeypatch):
+    # a retained run stays live and can recover into real training, so it must carry the same
+    # managed-environment association a successful submission records.
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    import flash.server.domain.environment_registry as registry
+    from flash.server.platform import db
+
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        registry,
+        "record_environment_use",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+    submitted: list[str] = []
+    _persist_queued_then_raise(app_mod, runner, monkeypatch, submitted)
+    spec = {**SPEC, "environment": {"id": "acme/my-env"}}
+
+    key = _login()
+    resp = api.post("/v1/runs", headers=_bearer(key), json={"spec": spec})
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    assert db.run_owner(run_id) is not None
+    assert calls
+    assert calls[0]["slug"] == "acme/my-env"
+    assert calls[0]["run_id"] == run_id
 
 
 def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
@@ -3006,6 +3273,105 @@ def test_deploy_rejects_revision_pinned_base_model(api):
 
     assert response.status_code == 400
     assert "does not support revision-pinned base models" in response.json()["detail"]
+
+
+def test_deploy_allows_runner_assigned_revision_pin(api):
+    """An SFT run pinned BY THE RUNNER stays deployable.
+
+    `runner.submit.prepare_job` calls `_resolve_model_revision(required=True)` for every SFT run,
+    so its stored spec always carries a revision the user never authored and cannot opt out of.
+    Rejecting it made every SFT run -- and every adapter warm-started from one -- permanently
+    undeployable, which also blocks `flash models chat` and `flash env eval`.
+
+    The paired control is `test_deploy_rejects_revision_pinned_base_model` above: same route, same
+    revision value, marker absent -> still 400. Only the marker differs, so a pass here with a pass
+    there isolates the change to who chose the pin.
+    """
+    import flash.runner as runner
+    from flash.core.spec import JobSpec
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    # reproduce the shape a REAL auto-pinned submit persists, which is asymmetric: submit stores
+    # `spec=public_spec.to_dict()`, and to_dict() strips a runner-assigned pin along with its
+    # marker, so the public half carries neither and only the worker half does. Writing either onto
+    # status.spec would be a shape production cannot produce, and it would paper over
+    # `_validate_effective_spec` rejecting the real one -- a 409 that leaves auto-pinned runs just
+    # as undeployable as the 400 did.
+    assert "model_revision_auto" not in status.spec, status.spec
+    assert not status.spec.get("model_revision"), status.spec
+    snapshot = status.effective_preparation
+    assert isinstance(snapshot, dict), snapshot
+    snapshot["worker_spec"]["model_revision"] = "a" * 40
+    snapshot["worker_spec"]["model_revision_auto"] = True
+    # re-digest the way submit does. the marker is a privilege input the deploy guard reads, so it
+    # is bound to the digest; a fixture that skipped this would be forging one, which is what
+    # `test_deploy_rejects_a_forged_auto_pin_marker` covers.
+    snapshot["preparation_digest"] = runner._preparation_digest(
+        JobSpec.from_dict(status.spec),
+        JobSpec.from_dict(snapshot["worker_spec"]),
+        snapshot.get("adapter_identity"),
+    )
+    runner._save_status(status)
+
+    response = api.post(
+        f"/v1/runs/{run_id}/deploy",
+        json={"dry_run": True},
+        headers=_bearer(key),
+    )
+
+    # a coherent auto-pinned run deploys, so assert the success itself rather than the absence of
+    # one particular rejection
+    assert response.status_code == 200, response.json()
+    assert "revision-pinned" not in json.dumps(response.json())
+
+
+def test_deploy_rejects_a_forged_auto_pin_marker(api):
+    """A marker written into the snapshot without re-digesting must not buy deploy privileges.
+
+    The marker is excluded from `_validate_effective_spec`'s structural compare (the public half
+    reads False by construction), so nothing there can catch a forged one. Deploy reads it to
+    decide whether to waive the authored-pin rejection, which makes it a privilege decision taken
+    on an otherwise unverified value -- and the waiver is not the only cost: a run pinned to a
+    revision it never trained on deploys against those base weights.
+
+    The paired control is `test_deploy_allows_runner_assigned_revision_pin` above. Same forged
+    marker, same snapshot surface; the only difference is that the control re-digests the way
+    submit does. It passes, so this test is not merely rejecting everything -- it isolates the
+    forgery from the auto-pin shape itself.
+
+    The revision is written to BOTH halves here so the structural compare cannot be what rejects
+    it: equal values pass that check, and the marker is excluded from it. Verified against the
+    unfixed head -- without the digest check in `effective_spec_from_status` this deploy returns
+    200. That is also the pre-fix on-disk shape, when to_dict() still emitted a runner pin.
+    """
+    import flash.runner as runner
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    snapshot = status.effective_preparation
+    assert isinstance(snapshot, dict), snapshot
+    digest_before = snapshot["preparation_digest"]
+    status.spec["model_revision"] = "a" * 40
+    snapshot["worker_spec"]["model_revision"] = "a" * 40
+    snapshot["worker_spec"]["model_revision_auto"] = True
+    assert snapshot["preparation_digest"] == digest_before  # forged: no re-digest
+    runner._save_status(status)
+
+    response = api.post(
+        f"/v1/runs/{run_id}/deploy",
+        json={"dry_run": True},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 409, response.json()
+    assert "integrity validation" in response.json()["detail"]
 
 
 def test_deploy_dry_run_does_not_reconcile_unknown_alias(api, monkeypatch):
@@ -6143,6 +6509,127 @@ def test_deploy_falls_back_to_platform_context_org(api, monkeypatch):
     assert seen["org_id"] == "platform-org"
 
 
+def test_deploy_without_any_org_context_is_rejected(api, monkeypatch):
+    """A managed-plane deploy must fail closed when neither the run nor the key names an org.
+
+    Serving authorizes external chat requests against the org that owns the adapter, so silently
+    registering a revision with no org would leave a user's weights' reachability up to whatever
+    the serving backend does with an unowned adapter. auth gates external keys on org_slug only
+    (org_id is a best-effort passthrough), so the orgless-key case is reachable in production.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    import flash.server.platform.auth as auth_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    status.billing_context = None
+    status.platform_context = None
+    runner._save_status(status)
+    # a verified identity without org_id (but with the org_slug that auth requires)
+    monkeypatch.setattr(
+        auth_mod,
+        "_cached_identity",
+        lambda token: {k: v for k, v in _identity_for_token(token).items() if k != "org_id"},
+    )
+    monkeypatch.setattr(
+        app_mod,
+        "deploy_adapter",
+        lambda **_k: pytest.fail("an orgless deploy must be rejected before registration"),
+    )
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+    assert resp.status_code == 409, resp.text
+    assert "owning organization" in resp.json()["detail"]
+
+
+def test_deployments_listing_requires_internal_scope_and_filters_to_it(api):
+    """`/v1/deployments` must not hand the internal key a cross-org listing.
+
+    On a managed plane the internal key is the platform proxy and owns the runs it submitted for
+    every org, so the listing follows `deps.manageable_run`: the internal key must name the org
+    AND project it lists for, and only that scope's rows come back.
+    """
+    import flash.runner as runner
+
+    internal = _bearer("fslo-internal-test")
+    project_beta = "33333333-3333-4333-8333-333333333333"
+    run_ids: dict[str, str] = {}
+    for org, project in (("org-alpha", SPEC["project"]), ("org-beta", project_beta)):
+        run_id = api.post(
+            "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=internal
+        ).json()["run_id"]
+        status = runner.get_status(run_id)
+        status.state = "done"
+        status.billing_context = {"org_id": org}
+        status.platform_context = None
+        status.spec["project"] = project
+        status.deployment = {"state": "ready", "endpoint_name": "https://serve.example"}
+        runner._save_status(status)
+        run_ids[org] = run_id
+
+    # an unscoped (or half-scoped, or malformed) internal-key call gets no listing at all
+    for headers in (
+        {"Authorization": internal["Authorization"]},
+        internal,  # _bearer adds the org header but no project
+        {**internal, "X-Freesolo-Org-Id": "", "X-Freesolo-Project-Id": SPEC["project"]},
+        {**internal, "X-Freesolo-Org-Id": "org-alpha", "X-Freesolo-Project-Id": "not-a-uuid"},
+    ):
+        resp = api.get("/v1/deployments", headers=headers)
+        assert resp.status_code == 400, resp.text
+        assert "must be scoped" in resp.json()["detail"]
+
+    scoped = api.get(
+        "/v1/deployments",
+        headers={
+            **internal,
+            "X-Freesolo-Org-Id": "org-alpha",
+            "X-Freesolo-Project-Id": SPEC["project"],
+        },
+    )
+    assert scoped.status_code == 200, scoped.text
+    assert [d["run_id"] for d in scoped.json()["deployments"]] == [run_ids["org-alpha"]]
+
+    other = api.get(
+        "/v1/deployments",
+        headers={
+            **internal,
+            "X-Freesolo-Org-Id": "org-beta",
+            "X-Freesolo-Project-Id": project_beta,
+        },
+    )
+    assert [d["run_id"] for d in other.json()["deployments"]] == [run_ids["org-beta"]]
+
+    # a matching org with the wrong project matches nothing: project is part of the scope,
+    # exactly as it is for single-run deployment management
+    crossed = api.get(
+        "/v1/deployments",
+        headers={
+            **internal,
+            "X-Freesolo-Org-Id": "org-alpha",
+            "X-Freesolo-Project-Id": project_beta,
+        },
+    )
+    assert crossed.json()["deployments"] == []
+
+    # the headers are honored only for the internal key: a user key naming someone else's org
+    # still sees only its own (here: zero) runs
+    snoop = api.get(
+        "/v1/deployments",
+        headers={
+            **_bearer(_login()),
+            "X-Freesolo-Org-Id": "org-alpha",
+            "X-Freesolo-Project-Id": SPEC["project"],
+        },
+    )
+    assert snoop.status_code == 200, snoop.text
+    assert snoop.json()["deployments"] == []
+
+
 def test_chat_streams_deployed_run(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
@@ -6234,6 +6721,101 @@ def test_chat_streams_verified_immutable_revision_unchanged(api, monkeypatch):
     assert response.status_code == 200, text
     assert text == "verified"
     assert seen["run_id"] == revision
+
+
+def _deployed_chat_run(api):
+    """A deployed run ready to chat, returned as (key, run_id)."""
+    import flash.runner as runner
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    revision = f"{run_id}@final." + "a" * 40
+    runner.mark_deployed(
+        run_id,
+        {
+            "state": "ready",
+            "endpoint_name": "https://serve.example",
+            "adapter_revision": revision,
+        },
+        verification_generation=runner.verified_adapter_revision_generation(run_id),
+    )
+    return key, run_id
+
+
+def test_chat_stream_upstream_error_before_first_byte_is_502(api, monkeypatch):
+    """The streaming branch returns a real 502 when the upstream request fails at start.
+
+    Drives the REAL chat_stream (only the httpx seams are stubbed): a lazy generator whose
+    request and raise_for_status run only once Starlette iterates the body does so after the
+    200 has been flushed, so the route's except can never fire and an upstream 502 arrives as
+    an empty success."""
+    import flash.serve.deploy as deploy
+
+    key, run_id = _deployed_chat_run(api)
+
+    class _ErrorResp:
+        def __init__(self):
+            self.headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def raise_for_status(self):
+            request = deploy.httpx.Request("POST", "https://serve.example/v1/chat/completions")
+            response = deploy.httpx.Response(502, request=request)
+            raise deploy.httpx.HTTPStatusError("bad gateway", request=request, response=response)
+
+    class _FakeClient:
+        def stream(self, method, url, **kwargs):
+            return _ErrorResp()
+
+    monkeypatch.setattr(deploy, "_stream_http_client", lambda: _FakeClient())
+    monkeypatch.setattr(deploy, "serving_openai_base_url", lambda: "https://serve.example/v1")
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}], "stream": True},
+        headers=_bearer(key),
+    )
+    assert resp.status_code == 502, resp.text
+    assert "inference failure" in resp.json()["detail"]
+
+
+def test_chat_stream_midstream_failure_aborts_response(api, monkeypatch):
+    """A failure after the first streamed chunk aborts the response, not a clean eof.
+
+    Once bytes are flowing the status is committed, so the only legible signal is an aborted
+    body: the exception must propagate out of the response iterator (uvicorn then drops the
+    connection without the terminating chunk) rather than being swallowed into an eof the
+    client would read as a finished answer."""
+    import flash.server.app as app_mod
+
+    key, run_id = _deployed_chat_run(api)
+
+    def fake_stream(**kwargs):
+        yield "partial "
+        raise RuntimeError("upstream failed mid-generation")
+
+    monkeypatch.setattr(app_mod, "serve_chat_stream", fake_stream)
+
+    with (
+        pytest.raises(RuntimeError, match="upstream failed mid-generation"),
+        api.stream(
+            "POST",
+            f"/v1/runs/{run_id}/chat",
+            json={"messages": [{"role": "user", "content": "hello"}], "stream": True},
+            headers=_bearer(key),
+        ) as resp,
+    ):
+        resp.read()
 
 
 def test_chat_step_selector_prefers_current_revision_for_redeployed_step(api, monkeypatch):
@@ -9173,6 +9755,59 @@ def test_export_copies_final_adapter_to_user_repo(api, monkeypatch):
     assert seen["dest_token"] == "hf_user"
     assert seen["private"] is True  # private by default
     assert seen["base_model"] == SPEC["model"]
+
+
+def test_export_sends_the_runner_assigned_revision_not_the_public_blank(api, monkeypatch):
+    """Export must read the pin from the EFFECTIVE spec, not the public one.
+
+    A runner-assigned pin is stripped from the public spec (it cannot carry the marker that labels
+    it), so `spec.model_revision` reads "" for every auto-pinned SFT run. The worker stamps the real
+    sha into adapter_config.json from its INTERNAL spec, and `export_adapter` refuses a stamped
+    revision that disagrees with the one it is handed:
+
+        if existing_revision and existing_revision != base_model_revision: raise ValueError(...)
+
+    which the route turns into a 404. So passing the public half breaks export for exactly the runs
+    the auto-pin exists to serve -- and for warm starts that inherited the pin.
+
+    Asserting the value rather than just capturing kwargs is the point: the pre-existing export
+    tests captured `base_model_revision` and never checked it, which is why this reached review.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.core.spec import JobSpec
+
+    key = _login()
+    run_id = _finished_run(api, key)
+    status = runner.get_status(run_id)
+    # the shape a real auto-pinned submit persists: worker half carries pin + marker, public half
+    # carries neither. re-digest the way submit does so the snapshot stays internally consistent.
+    snapshot = status.effective_preparation
+    assert not status.spec.get("model_revision"), status.spec
+    snapshot["worker_spec"]["model_revision"] = "a" * 40
+    snapshot["worker_spec"]["model_revision_auto"] = True
+    snapshot["preparation_digest"] = runner._preparation_digest(
+        JobSpec.from_dict(status.spec),
+        JobSpec.from_dict(snapshot["worker_spec"]),
+        snapshot.get("adapter_identity"),
+    )
+    runner._save_status(status)
+
+    seen: dict = {}
+    monkeypatch.setattr(
+        app_mod,
+        "export_adapter",
+        lambda **kwargs: (seen.update(kwargs), "https://huggingface.co/me/adapters")[1],
+    )
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/adapters", "hf_token": "hf_user"},
+        headers=_bearer(key),
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert seen["base_model_revision"] == "a" * 40
 
 
 def test_export_holds_deploy_lock_across_owned_run(api, monkeypatch):

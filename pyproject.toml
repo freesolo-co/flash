@@ -1,6 +1,6 @@
 [project]
 name = "freesolo-flash"
-version = "1.1.40"
+version = "1.1.41"
 description ="Flash — managed LoRA post-training (SFT/GRPO/OPD) for Freesolo environments, driven by the `flash` CLI"
 readme = "README.md"
 # RunPod Flash supports Python 3.11-3.12 (not 3.13 yet).
@@ -28,7 +28,7 @@ dependencies = []
 # installed by runpod flash from the dependency list in flash/providers/_lifecycle/worker.py).
 gpu = [
     "torch==2.10.0",
-    "transformers>=5.6,<5.11",
+    "transformers>=5.6,<5.13",
     "tokenizers>=0.22",
     "tiktoken>=0.12",
     "peft>=0.19",
@@ -65,7 +65,13 @@ server = [
     "huggingface-hub>=1.2.0",
     "datasets>=2.19",
     "freesolo>=0.4.0",
-    "transformers>=5.6,<5.11",
+    "transformers>=5.6,<5.13",
+    # the control plane decodes images: flash/server/routes/runs.py imports
+    # preflight_validate_image_opd at module load, and flash/content/multimodal.py opens every image
+    # source with PIL to validate it. without Pillow a self-hoster on [server] gets
+    # `RuntimeError: Pillow is required for multimodal image training` at preflight on any
+    # multimodal opd run. the gpu extra gets Pillow transitively via vllm; server does not.
+    "pillow>=11",
 ]
 # CI compatibility: some workflows use `uv sync --extra dev` rather than `--group dev`.
 dev = [
@@ -82,13 +88,13 @@ dev = [
     "huggingface-hub>=1.2.0",
     "datasets>=2.19",
     "freesolo>=0.4.0",
-    "transformers>=5.6,<5.11",
+    "transformers>=5.6,<5.13",
     "tokenizers>=0.22",
     "tiktoken>=0.12",
     # flash/content/multimodal.py imports PIL directly to validate and decode every image source, so the
     # image tests are not optional coverage: without Pillow they importorskip and CI reports green
-    # on a multimodal path it never executed. test-only, hence dev and not server -- the control
-    # plane does not decode images.
+    # on a multimodal path it never executed. the control plane decodes images too, so `server`
+    # declares Pillow as well; this entry keeps the tests runnable without that extra.
     "pillow>=11",
 ]
 # NB: there is deliberately no `all` aggregate. `gpu` (the GPU worker) and `server` (the control
@@ -121,7 +127,7 @@ artifacts = ["flash/py.typed"]
 # auto-published by .github/workflows/publish-dev.yml: a push to `dev` whose version isn't yet on
 # PyPI publishes it; pushes that don't change it find it already published and no-op. So cutting a
 # dev-channel release = bump this (and [project].version) and merge to `dev`.
-version = "1.1.40"
+version = "1.1.41"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -155,8 +161,8 @@ dev = [
     "tiktoken>=0.12",
     # flash/content/multimodal.py imports PIL directly to validate and decode every image source, so the
     # image tests are not optional coverage: without Pillow they importorskip and CI reports green
-    # on a multimodal path it never executed. test-only, hence dev and not server -- the control
-    # plane does not decode images.
+    # on a multimodal path it never executed. the control plane decodes images too, so `server`
+    # declares Pillow as well; this entry keeps the tests runnable without that extra.
     "pillow>=11",
     "pytest-xdist>=3.6",
     # tests/test_workflow_contracts.py parses .github/workflows/*.yml. PyYAML is already present

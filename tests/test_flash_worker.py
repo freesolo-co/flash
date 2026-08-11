@@ -236,6 +236,124 @@ def test_build_worker_env_forwards_declared_environment_runtime_secrets():
     assert "UNDECLARED_API_KEY" not in env
 
 
+def test_build_worker_env_lists_declared_secret_names_for_the_redactors():
+    """declared runtime secrets can carry any name (AWS_SECRET_ACCESS_KEY, ...), so the redactors
+    cannot rely on the name-shape heuristic; the env carries the applied names explicitly."""
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
+    from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
+    from flash.providers.runpod.serverless import build_worker_env
+
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="grpo",
+        environment=EnvironmentSpec(id="owner/env", secrets=("AWS_SECRET_ACCESS_KEY",)),
+        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
+        seed=0,
+    )
+
+    env = build_worker_env(
+        spec,
+        0,
+        runtime_secrets={"AWS_SECRET_ACCESS_KEY": "aws-user", "WANDB_API_KEY": "user-wb"},
+    )
+
+    listed = set(env[SECRET_ENV_KEYS_ENV].split(","))
+    assert listed == {"AWS_SECRET_ACCESS_KEY", "WANDB_API_KEY"}
+    # a run with no applied secrets carries no list at all.
+    assert SECRET_ENV_KEYS_ENV not in build_worker_env(_spec(), 0)
+
+
+def test_the_redactor_metadata_name_is_reserved_from_declared_secrets():
+    """build_worker_env sets FLASH_SECRET_ENV_KEYS last, so a job declaring that exact name would
+    have its credential silently overwritten by the generated name list and fail at runtime. it is
+    control-plane-owned, so the declaration is rejected loudly instead."""
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
+    from flash.core.spec import CONTROL_PLANE_OWNED_ENV_KEYS
+    from flash.schema.fields import ConfigError, _environment_secrets
+
+    assert SECRET_ENV_KEYS_ENV in CONTROL_PLANE_OWNED_ENV_KEYS
+    with pytest.raises(ConfigError, match="platform-managed key"):
+        _environment_secrets([SECRET_ENV_KEYS_ENV])
+    # a case variant is a distinct linux env name but not a distinct DECLARATION: build_worker_env
+    # tests ownership on the uppercased name, so accepting it here would drop the secret from the
+    # worker env without a word and launch the job missing a credential it declared as required.
+    # every reserved name is refused across its whole case-space for that reason.
+    for variant in (SECRET_ENV_KEYS_ENV.lower(), "Hf_Token", "runpod_api_key"):
+        with pytest.raises(ConfigError, match="platform-managed key"):
+            _environment_secrets([variant])
+
+
+def test_declared_secret_names_cannot_contain_the_metadata_delimiter():
+    """the name list travels to every redactor comma-joined, so a name containing a comma arrives
+    as two unrelated names, the real key goes unrecognized, and its value reaches diagnostics
+    verbatim. rejecting the delimiter at declaration keeps that channel unambiguous."""
+    from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
+    from flash.providers.runpod.serverless import build_worker_env
+    from flash.schema.fields import ConfigError, _environment_secrets
+
+    with pytest.raises(ConfigError, match="invalid environment variable name"):
+        _environment_secrets(["FOO,BAR"])
+    # a name-shaped secret is still fine; only the delimiter is refused.
+    assert _environment_secrets(["AWS_SECRET_ACCESS_KEY"]) == ("AWS_SECRET_ACCESS_KEY",)
+
+    # and the metadata builder fails closed rather than emitting an ambiguous list, for a spec
+    # constructed around the parser.
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="grpo",
+        environment=EnvironmentSpec(id="owner/env", secrets=("FOO,BAR",)),
+        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
+        seed=0,
+    )
+    with pytest.raises(RuntimeError, match="delimiter"):
+        build_worker_env(spec, 0, runtime_secrets={"FOO,BAR": "leaky"})
+
+
+def test_the_handlers_inline_redactor_covers_multiline_secret_components():
+    """the handler is source-shipped, so it carries its OWN copy of the redactor rather than
+    importing the shared one. the child's stdout is sanitized one line at a time, so a PEM key
+    never appears whole in any single call and only its component lines can match. extract that
+    copy and exercise it directly, since drift here leaks a credential nothing else catches."""
+    import ast
+    import inspect
+    import os
+    import re
+    import textwrap
+
+    from flash.providers.runpod.serverless import endpoints
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
+    node = next(
+        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_safe_detail"
+    )
+    # os/re come from _train_body's own local imports, which the handler makes at the top of its
+    # body; urllib.parse it imports itself.
+    namespace: dict = {"os": os, "re": re}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
+    safe_detail = namespace["_safe_detail"]
+
+    pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----"
+    # DEPLOY_KEY matches no suffix heuristic, so this also covers the declared-name channel.
+    secrets = {"DEPLOY_KEY": pem, "FLASH_SECRET_ENV_KEYS": "DEPLOY_KEY"}
+
+    assert (
+        safe_detail("ssh auth: MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", secrets) == "ssh auth: <redacted>"
+    )
+    assert safe_detail(pem, secrets) == "<redacted>"
+    # the length floor keeps short structural fragments readable.
+    assert safe_detail("near }", {"B": "{\n}\nlongenoughcomponent"}) == "near }"
+    # and it applies to a whole declared value too: a 3-char secret as a global needle would
+    # mangle unrelated diagnostics. long values still redact.
+    short = {"PIN": "ati", "FLASH_SECRET_ENV_KEYS": "PIN"}
+    assert safe_detail("trainer crashed after validation", short) == (
+        "trainer crashed after validation"
+    )
+    long = {"PIN": "sk-live-abc123456", "FLASH_SECRET_ENV_KEYS": "PIN"}
+    assert safe_detail("trainer crashed holding sk-live-abc123456", long) == (
+        "trainer crashed holding <redacted>"
+    )
+
+
 def test_worker_console_always_uploaded_and_no_flag(monkeypatch):
     """The worker console is ALWAYS uploaded — live (periodic) while the worker runs and once more
     when it exits — so every print reaches `flash runs log`, not just a post-mortem tail on
@@ -783,7 +901,11 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
             uploaded_console = f.read()
         assert not uploaded_console.startswith("worker booting\n")
         assert uploaded_console.endswith("torch.cuda.OutOfMemoryError: CUDA OOM\n")
-        assert len(uploaded_console) == 64_000
+        # the 64k byte boundary fell inside the giant x-line, so that truncated line is dropped
+        # whole before redaction: a partial line could hold a credential suffix that no longer
+        # value-matches.
+        assert "x" not in uploaded_console
+        assert uploaded_console == "torch.cuda.OutOfMemoryError: CUDA OOM\n"
         assert [call["path_in_repo"] for call in list_calls] == [code_prefix, code_prefix]
         assert [call["filename"] for call in download_calls] == [
             f"{code_prefix}/__init__.py",

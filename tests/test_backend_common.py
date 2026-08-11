@@ -12,6 +12,7 @@ import inspect
 import json
 import os
 import pathlib
+import re
 import signal
 import subprocess
 import sys
@@ -57,16 +58,19 @@ def test_agent_loop_workers_rejects_a_nonpositive_batch():
 def test_ray_num_cpus_prefers_the_cgroup_quota_over_the_host_core_count():
     # the exact failure that killed both real-gpu arms: a 1x4090 pod on a 48-core host. the quota is
     # the container's truth, so a large affinity mask must NOT win over it.
+    #
+    # os.sched_getaffinity is linux-only, so every patch of it in this file needs create=True to
+    # run on a mac. only the worker (linux) ever reaches the real syscall.
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=12),
-        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48))),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48)), create=True),
     ):
         assert vc.ray_num_cpus() == 12
     # a quota BELOW verl's placement-group demand is the one case the quota must not win outright:
     # honouring it exactly would schedule nothing and hang. see the floor test below.
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=4),
-        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48))),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48)), create=True),
     ):
         assert vc.ray_num_cpus() == vc.verl_cpu_demand(1)
 
@@ -74,7 +78,7 @@ def test_ray_num_cpus_prefers_the_cgroup_quota_over_the_host_core_count():
 def test_ray_num_cpus_falls_back_to_affinity_when_no_quota_is_set():
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=None),
-        mock.patch.object(os, "sched_getaffinity", return_value=set(range(6))),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(6)), create=True),
     ):
         assert vc.ray_num_cpus() == 6
 
@@ -84,7 +88,7 @@ def test_ray_num_cpus_caps_an_unconstrained_host():
     # is exactly the case that forked 48 idle workers. the cap is what makes that survivable.
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=None),
-        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48))),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48)), create=True),
     ):
         assert vc.ray_num_cpus() == 16
         # the cap tightens the pool but cannot push it under verl's placement-group demand, which
@@ -99,7 +103,7 @@ def test_ray_num_cpus_never_returns_zero():
             assert vc.ray_num_cpus() >= 1
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=None),
-        mock.patch.object(os, "sched_getaffinity", side_effect=OSError("boom")),
+        mock.patch.object(os, "sched_getaffinity", side_effect=OSError("boom"), create=True),
         mock.patch.object(os, "cpu_count", return_value=None),
     ):
         assert vc.ray_num_cpus() >= 1
@@ -154,7 +158,7 @@ def test_ray_cpu_floor_clears_what_verl_actually_reserves():
     assert vc.verl_cpu_demand(1) == verl_peak_cpu_demand
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=None),
-        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48))),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48)), create=True),
     ):
         assert vc.ray_num_cpus() >= verl_peak_cpu_demand
 
@@ -176,7 +180,7 @@ def test_the_cpu_pool_scales_with_gpu_count():
     assert vc.verl_cpu_demand(8) == 8 * 3 + 2
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=None),
-        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48))),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48)), create=True),
     ):
         for gpus in range(1, 9):
             assert vc.ray_num_cpus(gpus) >= vc.verl_cpu_demand(gpus), gpus
@@ -393,7 +397,7 @@ def _flaky_wheel_install(calls, sleeps, *, failures: int):
             return
         # key on the SPEC, not on --no-build-isolation: causal_conv1d passes that flag too, and this
         # helper models a flaky flash-attn download specifically.
-        if vc.FLASH_ATTN_SPEC not in command:
+        if vc.FLASH_ATTN_INSTALL_SPEC not in command:
             return
         attempts["n"] += 1
         if attempts["n"] <= failures:
@@ -513,12 +517,12 @@ def test_provisioned_venv_gets_flash_attn_for_the_remove_padding_path(monkeypatc
     vc.resolve_verl_python(str(tmp_path))
 
     flat = [arg for command in calls for arg in command]
-    assert vc.FLASH_ATTN_SPEC in flat, (
+    assert vc.FLASH_ATTN_INSTALL_SPEC in flat, (
         "verl's remove-padding path imports flash_attn unguarded; the provisioned venv must hold it"
     )
     # the wheel is prebuilt, so it must skip build isolation exactly as the image install does --
     # a source build here would compile for minutes on a paid pod.
-    install = next(c for c in calls if vc.FLASH_ATTN_SPEC in c)
+    install = next(c for c in calls if vc.FLASH_ATTN_INSTALL_SPEC in c)
     assert "--no-build-isolation" in install
 
 
@@ -526,8 +530,38 @@ def test_flash_attn_spec_stays_in_lockstep_with_the_worker_image():
     # the fallback venv and /opt/verl-venv must resolve the same wheel: a run that lands on the
     # no-image path otherwise trains against a different flash_attn than every baked-image run.
     dockerfile = pathlib.Path(__file__).resolve().parents[1] / "Dockerfile.worker"
-    assert f"ARG FLASH_ATTN_SPEC={vc.FLASH_ATTN_SPEC}" in dockerfile.read_text(), (
+    text = dockerfile.read_text()
+    assert f"ARG FLASH_ATTN_SPEC={vc.FLASH_ATTN_SPEC}" in text, (
         "Dockerfile.worker's FLASH_ATTN_SPEC default drifted from backend_common.FLASH_ATTN_SPEC"
+    )
+    # and so must the checksum: the wheel comes from an individual's github release repo, where the
+    # asset behind a fixed url can be replaced. two fetch sites verifying different digests would
+    # mean the no-image path and the image no longer agree on which bytes are the pinned wheel.
+    assert f"ARG FLASH_ATTN_SHA256={vc.FLASH_ATTN_SHA256}" in text, (
+        "Dockerfile.worker's FLASH_ATTN_SHA256 default drifted from backend_common.FLASH_ATTN_SHA256"
+    )
+    # the install must actually ask for the digest: a pinned constant nothing hands to uv leaves
+    # the fetch as unverified as it was without one.
+    assert f"{vc.FLASH_ATTN_SPEC}#sha256={vc.FLASH_ATTN_SHA256}" == vc.FLASH_ATTN_INSTALL_SPEC
+    # and the verl-venv layer must build that fragment CONDITIONALLY. `#sha256=` is url syntax, so
+    # gluing it onto the documented non-url override (FLASH_ATTN_SPEC=flash-attn==X) hands uv a
+    # requirement it cannot parse and fails this REQUIRED layer. pin both halves: the install takes
+    # a shell-resolved spec, and the fragment is added only inside the http* case.
+    install_line = (
+        'uv pip install --python /opt/verl-venv/bin/python --no-build-isolation "${spec}"'
+    )
+    assert install_line in text, (
+        "the verl-venv flash-attn install must install a shell-resolved spec, not the raw ARG"
+    )
+    block = text[text.rindex("\nRUN ", 0, text.index(install_line)) : text.index(install_line)]
+    assert "http*)" in block, (
+        "the verl-venv install must append the sha256 fragment only for an http(s) wheel url"
+    )
+    assert 'spec="${spec}#sha256=${FLASH_ATTN_SHA256}"' in block, (
+        "the verl-venv install must still hash-verify a wheel url"
+    )
+    assert '"${FLASH_ATTN_SPEC}#sha256=' not in text, (
+        "appending the fragment straight onto FLASH_ATTN_SPEC breaks the non-url override"
     )
 
 
@@ -1173,7 +1207,8 @@ def test_transformers_pin_stays_in_lockstep_with_the_worker_image():
     # same argument as VERL_SPEC lockstep: the image bakes its own pin, this path resolves its own.
     # if they drift, the interpreter that TRAINS runs a different transformers depending on whether
     # an image supplied it -- and transformers owns the gdn modelling code the shim patches.
-    dockerfile = pathlib.Path(__file__).resolve().parents[1] / "Dockerfile.worker"
+    root = pathlib.Path(__file__).resolve().parents[1]
+    dockerfile = root / "Dockerfile.worker"
     text = dockerfile.read_text()
     quoted = f'"{vc.TRANSFORMERS_REQUIREMENT}"'
     assert quoted in text, (
@@ -1181,6 +1216,21 @@ def test_transformers_pin_stays_in_lockstep_with_the_worker_image():
     )
     # and specifically in the verl venv's override file, not only the main interpreter's install.
     assert f'"{vc.TRANSFORMERS_REQUIREMENT}" > /tmp/verl-overrides.txt' in text
+
+    # pyproject declares the same range for the gpu/server/dev extras, and a lower ceiling there
+    # puts anyone installing the package (local worker, self-hosted plane) on a transformers line
+    # the image never runs.
+    pyproject = (root / "pyproject.toml").read_text()
+    declared = set(re.findall(r'"(transformers>=[^"]+)"', pyproject))
+    assert declared == {vc.TRANSFORMERS_REQUIREMENT}, (
+        f"pyproject.toml transformers ranges {sorted(declared)} drifted from "
+        f"backend_common.TRANSFORMERS_REQUIREMENT ({vc.TRANSFORMERS_REQUIREMENT!r}); every extra "
+        "must declare the range the worker image is built and tested against"
+    )
+    # and every extra that names transformers at all must name it (three today: gpu, server, dev).
+    assert pyproject.count(f'"{vc.TRANSFORMERS_REQUIREMENT}"') == 3, (
+        "expected the transformers range in exactly the gpu, server and dev extras"
+    )
 
 
 def test_the_venv_stamp_covers_the_transformers_pin_so_a_prepin_venv_is_rebuilt():
@@ -1239,7 +1289,7 @@ def test_the_stamp_identifies_flash_attn_so_a_prefix_venv_is_not_reused(monkeypa
     vc.resolve_verl_python(str(tmp_path))
 
     assert calls, "a venv stamped before flash-attn was installed must be rebuilt"
-    assert any(vc.FLASH_ATTN_SPEC in call for call in calls)
+    assert any(vc.FLASH_ATTN_INSTALL_SPEC in call for call in calls)
 
 
 def test_resolve_verl_python_reuses_a_venv_built_from_the_current_pin(monkeypatch, tmp_path):
@@ -1692,9 +1742,11 @@ def test_run_verl_training_preserves_oom_over_device_unavailable_after_eviction(
     command = [
         "bash",
         "-c",
-        'printf \'%s\\n\' "$FIRST" "$SECOND"; '
-        "for i in $(seq 1 70); do echo filler-$i; done; "
-        "exit 1",
+        (
+            'printf \'%s\\n\' "$FIRST" "$SECOND"; '
+            "for i in $(seq 1 70); do echo filler-$i; done; "
+            "exit 1"
+        ),
     ]
     tail = vc.ChildOutputTail(limit=3)
 
@@ -1793,6 +1845,74 @@ def test_stall_tail_fields_narrows_to_the_most_recent_lines():
     assert carried[-1] == f"line{vc.STALL_TAIL_LINES + 24}"
 
 
+def test_child_tail_redacts_credentials_before_they_reach_a_heartbeat(monkeypatch):
+    """the retained tail rides to heartbeat.json, the streamed run log and persisted status.
+
+    the worker is the only side that knows the run's secret values, so redaction has to happen
+    here; the plane-side formatter only neutralizes control characters.
+    """
+    secret = "hf_ZZZchildtailsecretvalue0123456789"
+    monkeypatch.setenv("HF_TOKEN", secret)
+    tail = vc.ChildOutputTail()
+    tail.record(f"requests.HTTPError: 401 Unauthorized for hf.co (token {secret})\n")
+
+    carried = vc.stall_tail_fields(0, tail)["child_tail"]
+
+    assert secret not in carried[0]
+    assert "<redacted>" in carried[0]
+    # the diagnostic itself is what a setup stall is read from; only the credential goes.
+    assert carried[0] == "requests.HTTPError: 401 Unauthorized for hf.co (token <redacted>)"
+
+
+def test_child_tail_redaction_precedes_the_per_line_cap(monkeypatch):
+    """sanitizing after truncation would split a credential across the cut and leak the prefix."""
+    secret = "hf_ZZZstraddlesthelinecap0123456789"
+    monkeypatch.setenv("HF_TOKEN", secret)
+    tail = vc.ChildOutputTail()
+    # the token starts inside the retained window and ends past it.
+    tail.record("x" * (vc._CHILD_TAIL_LINE_CHARS - 10) + secret + "\n")
+
+    kept = tail.tail()[0]
+
+    assert secret[:10] not in kept
+    assert len(kept) <= vc._CHILD_TAIL_LINE_CHARS
+
+
+def test_child_tail_redacts_declared_secrets_with_arbitrary_names(monkeypatch):
+    """[environment] secrets accepts any env name; FLASH_SECRET_ENV_KEYS is what lets the worker
+    redact values whose names the suffix heuristic misses."""
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
+
+    secret = "aws-declared-childtail-0123456789abcdef"
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", secret)
+    monkeypatch.setenv(SECRET_ENV_KEYS_ENV, "AWS_SECRET_ACCESS_KEY")
+    tail = vc.ChildOutputTail()
+    tail.record(f"botocore.exceptions.ClientError: SignatureDoesNotMatch using {secret}\n")
+
+    kept = tail.tail()[0]
+
+    assert secret not in kept
+    assert kept == "botocore.exceptions.ClientError: SignatureDoesNotMatch using <redacted>"
+
+
+def test_sanitize_diagnostic_ignores_a_very_short_declared_secret(monkeypatch):
+    """a declared secret can carry any value, including a 3-char one. as an unconstrained global
+    replacement needle it would mangle every diagnostic containing those characters, so the same
+    floor the multiline components use applies to the whole value. long values still redact."""
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV, sanitize_diagnostic
+
+    monkeypatch.setenv(SECRET_ENV_KEYS_ENV, "PIN")
+    monkeypatch.setenv("PIN", "ati")
+    assert sanitize_diagnostic("trainer crashed after validation") == (
+        "trainer crashed after validation"
+    )
+
+    monkeypatch.setenv("PIN", "sk-live-abc123456")
+    assert sanitize_diagnostic("trainer crashed holding sk-live-abc123456") == (
+        "trainer crashed holding <redacted>"
+    )
+
+
 # ---------------------- child teardown escalates to SIGKILL ----------------------
 # these real-process tests require fork, /proc group membership, and libc subreaper support.
 # guard on those capabilities rather than platform names.
@@ -1868,10 +1988,12 @@ def test_kill_process_group_escalates_to_sigkill_when_sigterm_is_ignored(quick_t
         [
             sys.executable,
             "-c",
-            "import signal, sys, time\n"
-            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-            "print('ready', flush=True)\n"
-            "time.sleep(300)\n",
+            (
+                "import signal, sys, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "print('ready', flush=True)\n"
+                "time.sleep(300)\n"
+            ),
         ],
         stdout=subprocess.PIPE,
         text=True,

@@ -712,7 +712,7 @@ def _save_status(
     *,
     _run_deadline_at: float | object = _PRIVATE_VALUE_UNSET,
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
-    _cleanup_remotes: list[dict] | None | object = _PRIVATE_VALUE_UNSET,
+    _cleanup_remotes: list[dict] | object | None = _PRIVATE_VALUE_UNSET,
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
     _profile_wall_armed_at: float | object = _PRIVATE_VALUE_UNSET,
     _profile_attempt_floor: int | object = _PRIVATE_VALUE_UNSET,
@@ -754,7 +754,7 @@ def _save_status_unlocked(
     *,
     _run_deadline_at: float | object = _PRIVATE_VALUE_UNSET,
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
-    _cleanup_remotes: list[dict] | None | object = _PRIVATE_VALUE_UNSET,
+    _cleanup_remotes: list[dict] | object | None = _PRIVATE_VALUE_UNSET,
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
     _profile_wall_armed_at: float | object = _PRIVATE_VALUE_UNSET,
     _profile_attempt_floor: int | object = _PRIVATE_VALUE_UNSET,
@@ -826,6 +826,7 @@ from flash.runner.costs import (  # noqa: E402,F401
     _gpu_rate,
     _status_estimated_charge,
     actual_steps_run,
+    cancelled_charge_usd,
     charge_usd_for_spec,
     profile_steps_run,
     record_billing_state,
@@ -846,6 +847,8 @@ from flash.runner.deadlines import (  # noqa: E402,F401
 # name, so a plain import would read as a redefinition of it.
 from flash.runner.deadlines import _profile_wall_armed_at as _profile_wall_armed_at  # noqa: E402
 from flash.runner.preparation import (  # noqa: E402,F401
+    _adopted_warmstart_revision,
+    _inherit_warmstart_revision,
     _mark_warmstart_source,
     _preparation_digest,
     _prepare_init_from_adapter,
@@ -858,6 +861,7 @@ from flash.runner.preparation import (  # noqa: E402,F401
     _require_supported_adapter_continuation,
     _resolve_model_revision,
     _validate_effective_spec,
+    _warmstart_source_is_authorized,
 )
 from flash.runner.reconciliation import (  # noqa: E402,F401
     _canonical_cleanup_remote,

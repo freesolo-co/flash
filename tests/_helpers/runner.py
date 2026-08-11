@@ -43,6 +43,21 @@ def provisioned_status(runner, spec, *, state="running", **kwargs):
     but stay overridable through ``kwargs`` for the rare fixture that needs to.
     """
     kwargs.setdefault("run_id", spec.run_id)
-    kwargs.setdefault("spec", spec.to_dict())
-    kwargs.setdefault("effective_preparation", {"worker_spec": spec.to_internal_dict()})
+    public = spec.to_dict()
+    kwargs.setdefault("spec", public)
+    # both production writers (``_persist_effective_worker_spec`` and the create path in
+    # ``runner.submit``) always store a ``preparation_digest`` alongside the worker spec, and the
+    # validating loader now requires one for any auto-pinned or profiled run. A fixture without it
+    # is a shape production cannot produce, so omitting it would fail those runs here for a reason
+    # no real run can hit -- and, worse, would let a test "detect tampering" via the missing digest
+    # rather than via the tampering itself.
+    kwargs.setdefault(
+        "effective_preparation",
+        {
+            "worker_spec": spec.to_internal_dict(),
+            "preparation_digest": runner._preparation_digest(
+                runner.JobSpec.from_dict(public), spec, None
+            ),
+        },
+    )
     return runner.RunStatus(state=state, **kwargs)

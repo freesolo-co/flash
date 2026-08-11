@@ -1,6 +1,7 @@
 """Bootstrap shared by instance-based providers (e.g. Lambda). Runs inside the worker container.
 
 Stdlib + huggingface_hub only — never import flash here. Reads payload from ``/root/flash/payload.json``.
+Launch scripts must ship ``bootstrap_secrets.py`` (credential redaction) next to this file.
 """
 
 from __future__ import annotations
@@ -11,7 +12,6 @@ import json
 import math
 import multiprocessing
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -21,6 +21,21 @@ import time
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from subprocess import PIPE, STDOUT
+
+if __package__:
+    from flash.providers._lifecycle.bootstrap_secrets import (
+        _payload_secrets,
+        _read_console_tail,
+        _safe_detail,
+    )
+else:
+    # running as a bare script on the box: the launch scripts ship bootstrap_secrets.py into the
+    # same directory, and the script directory leads sys.path.
+    from bootstrap_secrets import (  # type: ignore[no-redef]
+        _payload_secrets,
+        _read_console_tail,
+        _safe_detail,
+    )
 
 PAYLOAD_PATH = "/root/flash/payload.json"
 CODE_ROOT = "/runcode"
@@ -51,24 +66,6 @@ _PIP_TERMINAL_RE = re.compile(
 _TERMINAL_MARKER_GRACE_S = 0.25
 _TERMINAL_BOOKKEEPING_RESERVE_S = _TERMINAL_MARKER_GRACE_S
 _MAX_ATTEMPT_ID = (1 << 63) - 1
-_SECRET_RE = re.compile(
-    r"(?i)(authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)"
-    r"(\s*[:=]\s*)(?:bearer\s+)?([^\s,;]+)"
-)
-
-
-def _safe_detail(value: object, limit: int = 1000) -> str:
-    text = f"{type(value).__name__}: {value}" if isinstance(value, BaseException) else str(value)
-    for key, secret in os.environ.items():
-        upper = key.upper()
-        if secret and (
-            upper in {"AUTHORIZATION", "HF_TOKEN"}
-            or upper.endswith(("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD"))
-        ):
-            text = text.replace(secret, "<redacted>")
-    text = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", text)
-    text = _SECRET_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}<redacted>", text)
-    return text[:limit]
 
 
 class RetriableBootstrapError(RuntimeError):
@@ -215,7 +212,9 @@ def _hf_retry_after(exc: BaseException) -> float | None:
     return min(_HF_RETRY_AFTER_MAX_S, max(0.0, seconds))
 
 
-def _hf_call(call, label: str, *, deadline_at: float | None = None):
+def _hf_call(call, label: str, *, deadline_at: float | None = None, secrets: dict | None = None):
+    """``secrets`` must carry the run's payload secrets whenever the wrapped call takes a payload
+    credential (the retried error message can echo it, and it is absent from ``os.environ``)."""
     for attempt in range(len(_HF_RETRY_DELAYS_S) + 1):
         if deadline_at is not None:
             remaining = deadline_at - _finite_positive_number(time.time(), "current clock")
@@ -237,7 +236,7 @@ def _hf_call(call, label: str, *, deadline_at: float | None = None):
                 delay = min(delay, remaining)
             print(
                 f"{label} transient Hugging Face error; retrying in {delay:.0f}s: "
-                f"{_safe_detail(exc, 500)}",
+                f"{_safe_detail(exc, 500, secrets=secrets)}",
                 flush=True,
             )
             if delay > 0:
@@ -265,20 +264,20 @@ def hf_upload(
             repo_type="dataset",
         )
     except Exception as exc:
-        print(f"hf upload warn ({repo_subpath}): {_safe_detail(exc)}", flush=True)
+        print(
+            f"hf upload warn ({repo_subpath}): {_safe_detail(exc, secrets=_payload_secrets(payload))}",
+            flush=True,
+        )
 
 
 def _upload_console_snapshot(payload: dict, console: str, mode: str, extra: str = "") -> None:
     """Upload one console snapshot from an isolated process."""
     tail_path = console + ".tail"
-    with open(console, "rb") as f:
-        f.seek(0, os.SEEK_END)
-        f.seek(max(0, f.tell() - 64_000))
-        tail = f.read().decode("utf-8", "replace")
+    tail = _read_console_tail(console, 64_000)
     if extra:
         tail += extra
     with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
-        f.write(_safe_detail(tail, 64_000))
+        f.write(_safe_detail(tail, 64_000, secrets=_payload_secrets(payload)))
     hf_upload(payload, tail_path, f"console_{mode}.txt")
 
 
@@ -293,7 +292,10 @@ def _console_upload_loop(
         try:
             _upload_console_snapshot(payload, console, mode)
         except Exception as exc:
-            print(f"console upload warn: {_safe_detail(exc)}", flush=True)
+            print(
+                f"console upload warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}",
+                flush=True,
+            )
 
 
 def _upload_cleanup_deadlines(deadline_at: float) -> tuple[float, float]:
@@ -494,7 +496,10 @@ def remote_completion_confirmed(payload: dict) -> bool:
         return hf_file_exists(payload, "DONE") and hf_file_exists(payload, "metrics.json")
     except Exception as exc:
         # read errors are infra-shaped and leave completion unconfirmed.
-        print(f"remote-completion check warn: {_safe_detail(exc)}", flush=True)
+        print(
+            f"remote-completion check warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}",
+            flush=True,
+        )
         return False
 
 
@@ -512,6 +517,7 @@ def fetch_spec_from_hf(payload: dict) -> str:
         ),
         "download spilled job spec",
         deadline_at=deadline_at,
+        secrets=_payload_secrets(payload),
     )
     with open(local) as f:
         return f.read()
@@ -643,6 +649,7 @@ def fetch_code(payload: dict) -> None:
             ),
             f"list flash code under {payload['hf_repo']}:{prefix}",
             deadline_at=deadline_at,
+            secrets=_payload_secrets(payload),
         )
         if getattr(entry, "path", None) and getattr(entry, "size", None) is not None
     ]
@@ -659,6 +666,7 @@ def fetch_code(payload: dict) -> None:
             ),
             f"download flash code file {payload['hf_repo']}:{filename}",
             deadline_at=deadline_at,
+            secrets=_payload_secrets(payload),
         )
 
 
@@ -705,7 +713,10 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
                         print(line, end="", flush=True)
                         cf.write(line)
             except BaseException as exc:
-                print(f"console pump warn: {_safe_detail(exc)}", flush=True)
+                print(
+                    f"console pump warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}",
+                    flush=True,
+                )
             finally:
                 pump_done.set()
 
@@ -766,7 +777,10 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         ):
             print("final console upload exceeded its allowance", flush=True)
     except Exception as exc:
-        print(f"console upload warn: {_safe_detail(exc)}", flush=True)
+        print(
+            f"console upload warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}",
+            flush=True,
+        )
     if timed_out:
         raise TimeoutError(f"worker mode '{mode}' exceeded the wall-clock cap")
     return proc.returncode
@@ -792,7 +806,7 @@ def write_attempt_marker(payload: dict, ok: bool, error: str = "", retriable: bo
     now = _finite_positive_number(time.time(), "current clock")
     marker = {
         "attempt": attempt,
-        "error": _safe_detail(error, 2000),
+        "error": _safe_detail(error, 2000, secrets=_payload_secrets(payload)),
         "ok": ok,
         "retriable": retriable,
         "run_id": run_id,
@@ -883,8 +897,8 @@ def run_preload(payload: dict) -> dict:
             done.append(repo_id)
             print(f"preload: {repo_id} -> {cache_dir} (downloaded)", flush=True)
         except Exception as exc:
-            failed[repo_id] = _safe_detail(exc)
-            print(f"preload FAILED {repo_id}: {_safe_detail(exc)}", flush=True)
+            failed[repo_id] = _safe_detail(exc, secrets=_payload_secrets(payload))
+            print(f"preload FAILED {repo_id}: {failed[repo_id]}", flush=True)
     return {"preloaded": done, "already_cached": already, "failed": failed}
 
 
@@ -921,7 +935,8 @@ def main() -> int:
                     confirmed = hf_file_exists(payload, "preload_result.json")
                 except Exception as exc:
                     print(
-                        f"preload_result.json upload confirm warn: {_safe_detail(exc)}",
+                        f"preload_result.json upload confirm warn: "
+                        f"{_safe_detail(exc, secrets=_payload_secrets(payload))}",
                         flush=True,
                     )
                 if confirmed:
@@ -982,7 +997,7 @@ def main() -> int:
         ok = True
     except BaseException as exc:  # incl. SIGTERM's SystemExit / KeyboardInterrupt
         retriable = isinstance(exc, RetriableBootstrapError)
-        detail = _safe_detail(exc, 1800)
+        detail = _safe_detail(exc, 1800, secrets=_payload_secrets(payload))
         error = f"run wall deadline exceeded: {detail}" if isinstance(exc, TimeoutError) else detail
         print(f"bootstrap failed: {error}", flush=True)
     finally:

@@ -19,6 +19,7 @@ from flash.client import ApiClient, ApiError, ClientError
 from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
 from flash.cost.spec import runconfig_from_spec
+from flash.engine.profiling.workload_profile import unpacked_batch_warning
 from flash.schema import spec_and_train_keys_from_file, train_schema_metadata
 
 
@@ -153,9 +154,11 @@ def _raise_if_workload_profile_pending(client: ApiClient, exc: ApiError) -> None
     charge = _profile_charge(client, profile_run_id) if owned and launched else None
     if owned and launched:
         lines = [
-            "no exact workload profile exists for this config yet, so there is no training quote "
-            "to print. the server started a separate profile run that loads your environment and "
-            "tokenizes the exact dataset this training would consume.",
+            (
+                "no exact workload profile exists for this config yet, so there is no training quote "
+                "to print. the server started a separate profile run that loads your environment and "
+                "tokenizes the exact dataset this training would consume."
+            ),
             "that profile run is real work and is billed on its own"
             + (f" (estimated ${charge:.2f})" if charge is not None else "")
             + "; no training run was created, no training gpu was allocated, and nothing was "
@@ -167,9 +170,11 @@ def _raise_if_workload_profile_pending(client: ApiClient, exc: ApiError) -> None
         ]
     elif owned:
         lines = [
-            "no exact workload profile exists for this config yet, so there is no training quote "
-            f"to print. the profile run you already started is still {state}; this command "
-            "launched nothing and charged nothing.",
+            (
+                "no exact workload profile exists for this config yet, so there is no training quote "
+                f"to print. the profile run you already started is still {state}; this command "
+                "launched nothing and charged nothing."
+            ),
             f"follow it with `{_commands().CLI_NAME} runs status {profile_run_id}`, then re-run this command "
             "once it reports done."
             if profile_run_id
@@ -177,9 +182,11 @@ def _raise_if_workload_profile_pending(client: ApiClient, exc: ApiError) -> None
         ]
     else:
         lines = [
-            "no exact workload profile exists for this config yet, so there is no training quote "
-            "to print. one is already being measured for this exact config and will be reused, so "
-            "nothing was started or charged here.",
+            (
+                "no exact workload profile exists for this config yet, so there is no training quote "
+                "to print. one is already being measured for this exact config and will be reused, so "
+                "nothing was started or charged here."
+            ),
             "re-run this command in a few minutes.",
         ]
     for line in lines:
@@ -246,6 +253,30 @@ def _exact_sft_cost_rows(spec, profile: dict) -> list[tuple[str, str | None]]:
     ]
 
 
+def _print_unpacked_batch_warning(status: object, spec) -> None:
+    """Warn that an unpacked SFT run trains 1 example per update, ignoring `batch_size`.
+
+    The quote/dry-run response already carries the frozen packing decision, so the override is
+    knowable before any training GPU is allocated. The reason travels on the profile's
+    `architecture_mode`, which is what the packing decision froze.
+    """
+    profile = status.get("workload_profile") if isinstance(status, dict) else None
+    if not isinstance(profile, dict):
+        return
+    examples_per_update = profile.get("examples_per_update")
+    if isinstance(examples_per_update, bool) or not isinstance(examples_per_update, int):
+        return
+    message = unpacked_batch_warning(
+        packing_mode=str(profile.get("packing_mode") or ""),
+        architecture_mode=str(profile.get("architecture_mode") or ""),
+        examples_per_update=examples_per_update,
+        configured_batch_size=getattr(spec.train, "batch_size", None),
+    )
+    if not message:
+        return
+    print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
+
+
 def _print_exact_sft_cost(status: dict, spec) -> None:
     total = status.get("estimated_cost_usd") if isinstance(status, dict) else None
     if not isinstance(total, (int, float)) or isinstance(total, bool):
@@ -267,6 +298,7 @@ def _print_exact_sft_cost(status: dict, spec) -> None:
         "allocated and nothing was charged for training.",
         file=sys.stderr,
     )
+    _print_unpacked_batch_warning(status, spec)
 
 
 def _legacy_train_key_rejection_detail(
