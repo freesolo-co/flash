@@ -1224,10 +1224,14 @@ def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys)
         line for line in capsys.readouterr().err.splitlines() if line.startswith("step=")
     ]
     assert metric_lines == [
-        "step=1 reward=0.75 reward_std=0.12 grad_norm=1.5 kl=0.03 entropy=0.82 "
-        "frac_zero_std=0.25 comp_len=48.5 trunc=0.125 max_comp_tokens=256",
-        "step=2 reward=0.8 reward_std=0.1 grad_norm=1.25 entropy=0.79 frac_zero_std=0 "
-        "comp_len=51 trunc=0.25 max_comp_tokens=256",
+        (
+            "step=1 reward=0.75 reward_std=0.12 grad_norm=1.5 kl=0.03 entropy=0.82 "
+            "frac_zero_std=0.25 comp_len=48.5 trunc=0.125 max_comp_tokens=256"
+        ),
+        (
+            "step=2 reward=0.8 reward_std=0.1 grad_norm=1.25 entropy=0.79 frac_zero_std=0 "
+            "comp_len=51 trunc=0.25 max_comp_tokens=256"
+        ),
     ]
 
 
