@@ -733,20 +733,20 @@ def test_environment_pip_rejects_pip_options() -> None:
             spec_from_dict(raw)
 
 
-def test_environment_pip_rejects_space_separated_entries() -> None:
-    """One entry is one requirement, so embedded whitespace is a typo pip only reports on the GPU.
+def test_environment_pip_accepts_spaced_requirements() -> None:
+    """Whitespace inside an entry is not a defect: both install paths pass one entry as one argv.
 
-    ``pymongo >= 4.6`` splits into three operands and ``not a req`` into three package names, both
-    failing mid-install after the card is allocated and billing.
+    ``subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip])`` never goes through a
+    shell, so a spaced PEP 508 requirement arrives at pip as a single operand and installs. Version
+    specs, parenthesized clauses, spaced extras, markers and direct references all rely on this.
     """
-    for entry in ("pymongo >= 4.6", "not a req ???", "rapidfuzz pymongo"):
-        raw = _raw()
-        raw["environment"]["pip"] = [entry]
-        with pytest.raises(ConfigError, match="must be one requirement each"):
-            spec_from_dict(raw)
-
-    # the two requirement forms that legitimately contain spaces stay usable.
-    for entry in ('pkg; python_version < "3.12"', "pkg @ https://host/a-1.0.whl"):
+    for entry in (
+        "pymongo >= 4.6",
+        "pkg (>=1.0)",
+        "pkg [extra1, extra2] >=1.0",
+        'pkg; python_version < "3.12"',
+        "pkg @ https://host/a-1.0.whl",
+    ):
         raw = _raw()
         raw["environment"]["pip"] = [entry]
         assert spec_from_dict(raw).environment.pip == (entry,)

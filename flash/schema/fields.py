@@ -368,15 +368,6 @@ def _environment_pip(raw: Any) -> tuple[str, ...]:
                 "and uploaded in plaintext. Use [environment] secrets for the credential and an "
                 "unauthenticated requirement URL without a query string."
             )
-        # whitespace inside a bare requirement is almost always a typo (`pymongo >= 4.6` splits into
-        # three operands, `not a req` into three names), and pip would only report it after the GPU
-        # is allocated. a PEP 508 direct reference (`pkg @ https://host/x.whl`) and an environment
-        # marker (`pkg; python_version < "3.12"`) legitimately contain spaces, so both are exempt.
-        if " " in requirement and "@" not in requirement and ";" not in requirement:
-            raise ConfigError(
-                "[environment] pip entries must be one requirement each, without spaces "
-                f"(got: {requirement!r})"
-            )
         requirements.append(requirement)
     return tuple(requirements)
 
