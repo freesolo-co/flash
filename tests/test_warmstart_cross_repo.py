@@ -414,6 +414,89 @@ def test_warm_start_pin_is_inherited_before_the_spec_is_sized_against_it(monkeyp
     assert prepared.worker_spec.model_revision_auto is True
 
 
+def _auto_pinned_source(R, *, org_id="org-a"):
+    """A completed, auto-pinned SFT source run owned by ``org_id``."""
+    from flash.core.spec import JobSpec
+
+    source = JobSpec.from_dict(
+        {
+            "run_id": "source-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "model_revision": _REVISION,
+            "model_revision_auto": True,
+            "algorithm": "sft",
+            "train": {"hf_repo": "owner/source-runs"},
+        }
+    )
+    status = provisioned_status(
+        R, source, state="done", billing_context={"org_id": org_id} if org_id else None
+    )
+    return source, status
+
+
+def _unpinned_child():
+    from flash.core.spec import JobSpec
+
+    return JobSpec.from_dict(
+        {
+            "run_id": "child-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
+            "train": {"init_from_adapter": "source-run"},
+        }
+    )
+
+
+def test_revision_inheritance_refuses_a_source_the_submitter_cannot_access(monkeypatch):
+    """Inheritance must authorize the source BEFORE reading its internals.
+
+    The hoisted adoption runs before `_prepare_init_from_adapter`, which is where the same-org
+    check used to gate every read of a source run. Without its own check, a child naming another
+    org's auto-pinned run would adopt that run's internal revision, and `prepare_job` would then
+    do revision-specific `resolve_model` and operator-token HF work against a run the submitter
+    cannot access -- surfacing revision-dependent behaviour as ordinary preparation errors rather
+    than the deliberately redacted warm-start error.
+
+    Not inheriting is the whole assertion: the submission still fails, but through
+    `_prepare_init_from_adapter`'s same-org error, which is the redacted path.
+    """
+    import flash.runner as R
+
+    _, status = _auto_pinned_source(R, org_id="org-a")
+    monkeypatch.setattr(R, "get_status", lambda run_id: status)
+
+    child = _unpinned_child()
+    # same org -> inherited
+    assert R._inherit_warmstart_revision(child, owner_org_id="org-a").model_revision == _REVISION
+    # different org -> untouched, and the pin never reaches sizing
+    foreign = R._inherit_warmstart_revision(child, owner_org_id="org-b")
+    assert foreign.model_revision == ""
+    assert foreign.model_revision_auto is False
+
+
+def test_revision_inheritance_refuses_a_tampered_source_snapshot(monkeypatch):
+    """Inheritance must read through the VALIDATING loader, not the raw internal one.
+
+    `_internal_spec_from_status` returns `snapshot["worker_spec"]` unverified.
+    `effective_spec_from_status` checks public/worker equality and the preparation digest first.
+    Adopting an unverified internal revision would make the child match a tampered source, so the
+    later revision-mismatch guard -- which exists to catch exactly this -- would compare two equal
+    values and pass. The child would then train the source adapter against base weights it was
+    never created for.
+    """
+    import flash.runner as R
+
+    _, status = _auto_pinned_source(R, org_id="org-a")
+    # tamper: the worker half claims a different base commit than the public half
+    status.effective_preparation["worker_spec"]["model_revision"] = "b" * 40
+    monkeypatch.setattr(R, "get_status", lambda run_id: status)
+
+    inherited = R._inherit_warmstart_revision(_unpinned_child(), owner_org_id="org-a")
+
+    assert inherited.model_revision == ""  # nothing adopted from an unverified snapshot
+    assert inherited.model_revision_auto is False
+
+
 def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
     import types
 

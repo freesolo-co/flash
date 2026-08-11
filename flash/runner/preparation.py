@@ -63,7 +63,34 @@ def _adopted_warmstart_revision(spec: JobSpec, src_spec: JobSpec) -> JobSpec:
     return replace(spec, model_revision=src_spec.model_revision, model_revision_auto=True)
 
 
-def _inherit_warmstart_revision(spec: JobSpec) -> JobSpec:
+def _warmstart_source_is_authorized(
+    src_status,
+    src_run_id: str,
+    *,
+    owner_org_id: str = "",
+    owner_key_id: int | None = None,
+) -> bool:
+    """Whether the submitter may read the warm-start source run's internals.
+
+    Shared by the two places that read a source run, so neither can drift into a weaker rule than
+    the other. An empty ``owner_org_id`` means the caller has no org context (local/self-hosted
+    submission), which is the pre-existing contract for this check.
+    """
+    owner_org_id = owner_org_id.strip()
+    if not owner_org_id:
+        return True
+    src_org_id = _runner()._status_org_id(src_status)
+    if src_org_id:
+        return src_org_id == owner_org_id
+    return _runner()._source_owned_by_key(src_run_id, owner_key_id)
+
+
+def _inherit_warmstart_revision(
+    spec: JobSpec,
+    *,
+    owner_org_id: str = "",
+    owner_key_id: int | None = None,
+) -> JobSpec:
     """Adopt a warm-start source's runner-assigned pin BEFORE the spec is sized against it.
 
     Sizing reads the revision: ``resolve_model`` re-derives params/vocab/disk from the pinned
@@ -77,6 +104,18 @@ def _inherit_warmstart_revision(spec: JobSpec) -> JobSpec:
     model, missing artifacts) is diagnosed by ``_prepare_init_from_adapter`` with its own message
     and its own error type. Raising here would report those as generic submission failures instead,
     so an unreadable source simply leaves the spec untouched and the real check speaks.
+
+    Two ordering rules this function must not relax, because it now runs BEFORE the code that used
+    to enforce them:
+
+    * authorize before reading. Adopting a pin off a run the submitter cannot access would leak
+      revision-dependent behaviour through ordinary preparation errors and would do operator-token
+      HF work on an unauthorized run's commit.
+    * read through ``effective_spec_from_status``, not ``_internal_spec_from_status``. The latter
+      returns ``snapshot["worker_spec"]`` unverified; the former checks public/worker equality and
+      the preparation digest first. Adopting an unverified internal revision would make the child
+      match a tampered source, which is precisely what the later mismatch guard exists to catch --
+      and inheriting it would silence that guard rather than trip it.
     """
     ref = spec.train.init_from_adapter
     if spec.model_revision or not ref or spec.algorithm == "sft":
@@ -88,7 +127,11 @@ def _inherit_warmstart_revision(spec: JobSpec) -> JobSpec:
         return spec
     try:
         src_status = _runner().get_status(parsed[0])
-        src_spec = _runner()._internal_spec_from_status(src_status)
+        if not _runner()._warmstart_source_is_authorized(
+            src_status, parsed[0], owner_org_id=owner_org_id, owner_key_id=owner_key_id
+        ):
+            return spec  # _prepare_init_from_adapter raises the same-org error
+        src_spec = _runner().effective_spec_from_status(src_status)
     except Exception:
         return spec
     if src_spec.model != spec.model:
@@ -153,17 +196,10 @@ def _prepare_init_from_adapter_inner(
     except FileNotFoundError:
         raise ValueError(f"train.init_from_adapter references unknown run {src_run_id!r}") from None
     owner_org_id = owner_org_id.strip()
-    if owner_org_id:
-        src_org_id = _runner()._status_org_id(src_status)
-        owner_ok = (
-            src_org_id == owner_org_id
-            if src_org_id
-            else _runner()._source_owned_by_key(src_run_id, owner_key_id)
-        )
-        if not owner_ok:
-            raise ValueError(
-                "train.init_from_adapter source run must belong to the same Freesolo org"
-            )
+    if not _runner()._warmstart_source_is_authorized(
+        src_status, src_run_id, owner_org_id=owner_org_id, owner_key_id=owner_key_id
+    ):
+        raise ValueError("train.init_from_adapter source run must belong to the same Freesolo org")
     # hf_repo is platform-managed and stripped from the source run's public spec; its authoritative
     # value lives in that run's internal worker spec (see _runner()._internal_spec_from_status), which the
     # warm-start needs to locate the source adapter artifacts.
