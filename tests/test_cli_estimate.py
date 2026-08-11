@@ -507,6 +507,90 @@ def test_sft_cost_reports_the_measured_workload_and_no_invented_hardware(
     assert "nothing was charged for training" in captured.err
 
 
+UNPACKED_MULTIMODAL_PROFILE = {
+    **EXACT_PROFILE,
+    "packing_mode": "exact-unpacked",
+    "architecture_mode": "multimodal",
+    "examples_per_update": 1,
+}
+
+
+def test_sft_cost_warns_that_an_unpacked_run_ignores_the_configured_batch_size(
+    tmp_path, monkeypatch, capsys
+):
+    """The batch override is a quote-time fact, so the user must hear it before submitting.
+
+    A multimodal run is never packed, so ``batch_size = 8`` in the config buys nothing: verl takes
+    one optimizer step per example.
+    """
+    _use_client(
+        monkeypatch,
+        _QuotingClient(
+            {"estimated_cost_usd": 1.25, "workload_profile": dict(UNPACKED_MULTIMODAL_PROFILE)}
+        ),
+    )
+
+    rc = cmd_train(_sft_args(tmp_path))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "sequence packing is OFF" in err
+    # the reason is the architecture label the packing decision froze on the profile
+    assert "multimodal" in err
+    assert "the configured batch_size 8 no longer groups examples into an update" in err
+    # batch_size is not inert: it still keys the profile and sizes an auto-picked gpu
+    assert "sizes the gpu" in err
+    # max_steps outranks epochs over rows, so the warning must claim no step count
+    assert "per epoch" not in err
+    assert "learning_rate" in err
+
+
+def test_a_real_unpacked_submit_warns_before_the_run_starts(tmp_path, monkeypatch, capsys):
+    """The submit path is the one that spends money, so it cannot be the one that stays quiet.
+
+    ``prepare_sft_workload`` warns too, but only into the remote worker log, and for a foreground
+    submit that is after the training gpu is already allocated.
+    """
+    _use_client(
+        monkeypatch,
+        _QuotingClient(
+            {
+                "run_id": "run-unpacked",
+                "workload_profile": dict(UNPACKED_MULTIMODAL_PROFILE),
+            }
+        ),
+    )
+
+    args = _sft_args(tmp_path)
+    args.cost = False
+    args.background = True
+
+    rc = cmd_train(args)
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "sequence packing is OFF" in err
+
+
+def test_sft_cost_stays_quiet_about_batching_when_the_run_is_packed(tmp_path, monkeypatch, capsys):
+    """A packed run honours ``batch_size``, so the warning must not cry wolf."""
+    _use_client(
+        monkeypatch,
+        _QuotingClient(
+            {
+                "estimated_cost_usd": 1.25,
+                "workload_profile": {**EXACT_PROFILE, "examples_per_update": 8},
+            }
+        ),
+    )
+
+    rc = cmd_train(_sft_args(tmp_path))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "sequence packing is OFF" not in err
+
+
 def test_sft_cost_omits_aggregates_the_profile_did_not_report(tmp_path, monkeypatch, capsys):
     """A partial profile drops rows rather than defaulting them to zero."""
     _use_client(

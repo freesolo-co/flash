@@ -42,3 +42,8 @@ uv-cache/
 
 # Local agent/assistant tooling: developer-specific, not part of the project
 .claude/
+
+# Operator-supplied input to scripts/scrub_history.sh: the addresses and internal
+# hostname that scrub removes. Committing it would republish exactly what the scrub
+# exists to delete, so it must stay untracked.
+scripts/scrub_identities.env
