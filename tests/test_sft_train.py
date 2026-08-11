@@ -2452,7 +2452,7 @@ def test_repeated_swallowed_publish_failures_do_not_accumulate_adapters(monkeypa
     assert left == [], f"8 failed saves left {len(left)} adapters on disk: {left}"
 
 
-def test_the_rl_and_opd_watchers_still_keep_their_exports(monkeypatch, tmp_path):
+def test_the_opd_watcher_still_keeps_its_export(monkeypatch, tmp_path):
     """the sft cleanup must not be generalized to the siblings that have a reader.
 
     `_OpdVerlCheckpointWatcher` subclasses the sft watcher, so a cleanup placed in a shared method
@@ -2518,6 +2518,68 @@ def test_the_rl_and_opd_watchers_still_keep_their_exports(monkeypatch, tmp_path)
     assert staged["adapter_dir"] == str(export_root / "step-2")
     assert os.path.isdir(export_root / "step-2"), (
         "the opd watcher deleted an adapter its retry contract still points at"
+    )
+
+
+def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
+    monkeypatch, tmp_path
+):
+    """the rl half of the same contract, driven across the two sweeps that span it.
+
+    The rl uploader stages an adapter on the sweep a checkpoint appears and publishes it on a LATER
+    one, once the gradient gate opens -- `staged_steps` carries the path between them. That gap is
+    the whole reason the sft deletion cannot be lifted into shared code, and it is only visible if
+    the two sweeps are driven separately: staging and publishing in one call would still pass with a
+    cleanup wedged in between.
+    """
+    from flash.engine.worker.train.rl import checkpoints as rl_checkpoints
+
+    published: list[str] = []
+
+    def fake_export(actor_dir, adapter_dir, **kwargs):
+        os.makedirs(adapter_dir, exist_ok=True)
+        with open(os.path.join(adapter_dir, "adapter_model.safetensors"), "wb") as fh:
+            fh.write(b"w" * 2048)
+
+    rl_train_module = rl_checkpoints._rl_train()
+    monkeypatch.setattr(rl_train_module, "export_peft_adapter", fake_export)
+    monkeypatch.setattr(
+        rl_train_module, "stamp_adapter_dir_provenance", lambda *a, **kw: None, raising=False
+    )
+    monkeypatch.setattr(rl_checkpoints._w, "write_base_model_provenance", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        rl_checkpoints._w,
+        "publish_deployable_checkpoint",
+        lambda adapter_dir, step, **kw: published.append(adapter_dir),
+    )
+
+    export_root = tmp_path / "rl-exports"
+    checkpoint_dir = tmp_path / "ckpts" / "global_step_4"
+    (checkpoint_dir / "actor").mkdir(parents=True)
+
+    uploader = rl_checkpoints._VerlResumeUploader(
+        local_dir=str(tmp_path / "ckpts"),
+        resume_step=0,
+        required_steps=(4,),
+        export_root=str(export_root),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        preprocessor=types.SimpleNamespace(save_pretrained=lambda path: None),
+        had_gradient=lambda: True,
+    )
+
+    # sweep one: stage only. the checkpoint verl wrote may be pruned after this point.
+    adapter_dir = uploader._stage_deployable(4, str(checkpoint_dir))
+    uploader.staged_steps[4] = adapter_dir
+    assert published == [], "staging must not publish on the same sweep"
+
+    # sweep two: the gate is open and the staged directory is read back and published.
+    uploader._publish_ready()
+
+    assert published == [adapter_dir], "the staged adapter never reached publication"
+    assert os.path.exists(os.path.join(adapter_dir, "adapter_model.safetensors")), (
+        "the rl watcher lost the adapter weights between staging and publication"
     )
 
 
