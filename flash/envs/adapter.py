@@ -49,6 +49,24 @@ def _json_safe(value: Any) -> Any:
         return str(value)
 
 
+def _copied_message_list(value: Any, *, row_id: Any, source: str) -> list[dict]:
+    """Copy `value` as a chat message list, naming the offending row and entries on a bad shape."""
+    if not isinstance(value, list):
+        raise ValueError(
+            f"sft output for row id {row_id!r} has a {source} value of type "
+            f"{type(value).__name__}; expected a list of message objects"
+        )
+    invalid_indexes = [
+        index for index, message in enumerate(value) if not isinstance(message, dict)
+    ]
+    if invalid_indexes:
+        raise ValueError(
+            f"sft output for row id {row_id!r} contains non-object {source} entries at "
+            f"indexes {invalid_indexes}; expected a list of message objects"
+        )
+    return [dict(message) for message in value]
+
+
 class _ScoredResponseText(str):
     """String-compatible response passed to SDK scorers.
 
@@ -280,21 +298,37 @@ class FreesoloEnvironment(BaseEnvironment):
 
     def sft_completion(self, example: dict) -> list[dict]:
         """Target completion messages for one SFT example; falls back to raw record output."""
+        messages, _coerced_scalar_output = self.sft_completion_with_provenance(example)
+        return messages
+
+    def sft_completion_with_provenance(self, example: dict) -> tuple[list[dict], bool]:
+        """Return completion messages and whether a scalar output was coerced into one turn.
+
+        the flag marks ONLY the final ``str(value)`` coercion. an explicitly structured target --
+        the env's own hook, a message list, or a ``{"messages": [...]}`` container -- is not
+        coerced, so a dataset that already encodes real trajectories never trips the collapse
+        warning.
+        """
         fn = getattr(self._env, "sft_completion", None)
         if callable(fn):
             msgs = fn(self._task_example(example))
             if msgs:
-                return [dict(m) for m in msgs]
+                return [dict(m) for m in msgs], False
+        row_id = example.get("id")
         value = example.get(_CANONICAL_OUTPUT_KEY)
-        if isinstance(value, list) and value and all(isinstance(m, dict) for m in value):
-            return [dict(m) for m in value]
-        if (
-            isinstance(value, dict)
-            and list(value) == ["messages"]
-            and isinstance(value["messages"], list)
-        ):
-            return [dict(m) for m in value["messages"]]
-        return [{"role": "assistant", "content": "" if value is None else str(value)}]
+        if isinstance(value, list) and any(isinstance(message, dict) for message in value):
+            return _copied_message_list(value, row_id=row_id, source="output"), False
+        if isinstance(value, dict) and "messages" in value:
+            sibling_keys = sorted(str(key) for key in value if key != "messages")
+            if sibling_keys:
+                raise ValueError(
+                    f"sft output for row id {row_id!r} has 'messages' alongside sibling keys "
+                    f"{sibling_keys}; expected exactly {{'messages': [...]}}"
+                )
+            return _copied_message_list(
+                value["messages"], row_id=row_id, source="'messages'"
+            ), False
+        return [{"role": "assistant", "content": "" if value is None else str(value)}], True
 
     def _single(self, results, method: str):
         if len(results) != 1:
