@@ -1303,12 +1303,13 @@ def test_cacheless_retry_that_never_reaches_its_request_does_not_reap_the_run_la
 def test_interrupt_after_publication_returns_terminates_only_this_instance(
     monkeypatch, interrupt_type
 ):
-    """An interrupt landing AFTER _publish_launched_instance returns must not reap the run label.
+    """An interrupt landing AFTER the rent helper returns must not reap the run label.
 
-    Ownership transfer spans two statements (the helper returns, then the caller disarms). An
-    interrupt in between used to leave the guard armed with no id, so the outer handler reaped by
-    run label and terminated every other concurrently-launched seed sharing it. The guard now
-    holds the id from publication onward, so this window cleans up exactly one instance.
+    Handing the box over spans a statement boundary: _rent_instance returns, and only then does
+    the caller hold a handle any teardown path can name. An interrupt in between used to leave the
+    guard armed with no id, so the outer handler reaped by run label and terminated every other
+    concurrently-launched seed sharing it. The guard now holds the id from the create onward, so
+    this window cleans up exactly one instance.
     """
     from flash.providers.lambda_ import api as lambda_api
     from flash.providers.lambda_ import jobs
@@ -1316,17 +1317,17 @@ def test_interrupt_after_publication_returns_terminates_only_this_instance(
     monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
     monkeypatch.setattr(lambda_api, "launch_instance", lambda **_kwargs: "i-4242")
 
-    # fire in the gap the finding names: the helper has RETURNED (so its own guarded frame is
-    # gone and nothing stamped exact cleanup) but the caller's disarm has not run yet. Wrapping
-    # the helper reproduces exactly that statement boundary; raising inside it would instead be
-    # caught by its own handler, which is a different, already-covered window.
-    real_publish = jobs._publish_launched_instance
+    # fire in the gap the finding names: the helper has RETURNED (so its own guarded frame is gone
+    # and nothing stamped exact cleanup) but the caller does not hold the handle yet. Wrapping the
+    # helper reproduces exactly that statement boundary; raising inside it would instead be caught
+    # by its own handler, which is a different, already-covered window.
+    real_rent = jobs._rent_instance
 
-    def interrupt_after_publication(*args, **kwargs):
-        real_publish(*args, **kwargs)
-        raise interrupt_type("interrupted after publication returned")
+    def interrupt_after_rent(*args, **kwargs):
+        real_rent(*args, **kwargs)
+        raise interrupt_type("interrupted after the rent helper returned")
 
-    monkeypatch.setattr(jobs, "_publish_launched_instance", interrupt_after_publication)
+    monkeypatch.setattr(jobs, "_rent_instance", interrupt_after_rent)
 
     terminated: list[str] = []
     monkeypatch.setattr(
@@ -3048,9 +3049,9 @@ def test_launch_success_say_baseexception_does_not_trigger_run_wide_reap(
     monkeypatch, interrupt_type
 ):
     """say() raising a BaseException on the successful-launch route must be handled ONLY by
-    _publish_launched_instance's own exact cleanup; the outer coarse label reap must not also fire,
-    since _publish_launched_instance already owns cleanup for this instance and a run-wide reap on
-    top of it would hit every other concurrently-launched seed of the same multi-seed run."""
+    _rent_instance's own exact cleanup; the outer coarse label reap must not also fire, since
+    _rent_instance already owns cleanup for this instance and a run-wide reap on top of it would
+    hit every other concurrently-launched seed of the same multi-seed run."""
     from flash.providers.lambda_ import api as lambda_api
     from flash.providers.lambda_ import jobs
 
@@ -3136,10 +3137,10 @@ def test_interrupt_while_building_the_success_message_terminates_only_this_insta
 ):
     """The id exists the moment launch_instance returns, so the guard must hold it from there.
 
-    Between the create returning and _publish_launched_instance taking ownership, the success
-    message is interpolated. An interrupt in that gap used to reach the outer handler with an armed
-    but id-less guard, which reaps by run label and terminates every other concurrent seed of the
-    run over a box this seed can name exactly."""
+    Between the create returning and the guard taking ownership, the success message is
+    interpolated. An interrupt in that gap used to reach the outer handler with an armed but
+    id-less guard, which reaps by run label and terminates every other concurrent seed of the run
+    over a box this seed can name exactly."""
     from flash.providers.lambda_ import api as lambda_api
     from flash.providers.lambda_ import jobs
 

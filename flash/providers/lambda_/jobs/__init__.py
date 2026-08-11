@@ -301,23 +301,51 @@ def _lambda_job_handle(instance_id: str, inst: LambdaInstance, name: str, attemp
     )
 
 
-def _publish_launched_instance(
-    plan: _LaunchPlan, instance_id: str, inst: LambdaInstance, say, message: str, reap
+def _rent_instance(
+    plan: _LaunchPlan,
+    inst: LambdaInstance,
+    say,
+    reap,
+    *,
+    user_data: str,
+    file_system_names: list[str] | None,
+    describe,
 ) -> LambdaJobHandle:
-    """Return the handle for a launched instance, tearing the box down if this window is cut short.
+    """Rent one box and return its handle, owing nothing rented behind on any exit.
 
-    Between a successful launch and a returned handle the instance is unpublished: no caller,
-    teardown path, or reconciler can name it yet. A raising log stream must not stop the handle
-    from being returned, and any ``BaseException`` (interrupt, SystemExit) must clean up first.
+    The whole rent-to-handle window lives here because its ORDER is the correctness argument, and
+    both call sites (the region walk and its cache-less retry) need exactly the same order:
 
-    ``reap`` takes exact ownership here rather than in the caller: an id now exists, so the caller
-    returning and only then disarming would leave an interrupt in between reaping by run label
-    and killing every other concurrent seed.
+    - ``arm`` immediately before the request and only then. A deadline miss in the precheck rents
+      nothing, and an armed guard there would reap by run label, killing every other concurrent
+      seed of this run.
+    - ``owns`` as the FIRST statement after the create returns. From there the box is rented and
+      named, so anything that can raise -- interpolating the message, building the handle -- must
+      find the guard already holding the exact id rather than the run label.
+    - the guard stays armed through the return: disarming first would leave an interrupt in the
+      gap with nothing able to name the box, and the caller's teardown does not exist until it
+      holds the handle.
+
+    ``describe`` builds the log line from the id; it is a callable so the message is not
+    interpolated before the guard owns the box.
     """
+    require_create_allowance(plan.absolute_deadline)
+    reap.arm()
+    instance_id = lambda_api.launch_instance(
+        region_name=inst.region,
+        instance_type_name=inst.instance_type,
+        ssh_key_names=plan.ssh_keys,
+        name=plan.name,
+        user_data=user_data,
+        file_system_names=file_system_names,
+        **deadline_kwargs(lambda_api.launch_instance, plan.absolute_deadline),
+    )
     reap.owns(instance_id)
     try:
+        # a raising log stream must not stop the handle from being returned; any BaseException
+        # (interrupt, SystemExit) tears the still-unpublished box down first.
         with contextlib.suppress(Exception):
-            say(message)
+            say(describe(instance_id))
         return _lambda_job_handle(instance_id, inst, plan.name, plan.attempt)
     except BaseException as error:
         _cleanup_unpublished_instance(
@@ -331,50 +359,41 @@ def _publish_launched_instance(
 def _retry_launch_without_cache(
     plan: _LaunchPlan, inst: LambdaInstance, say, reap
 ) -> tuple[LambdaJobHandle | None, Exception | None]:
-    """Rent a cache-less box for this region, arming the caller's coarse reap around the request.
+    """Rent a cache-less box for this region; return ``(handle, None)`` or ``(None, rejection)``.
 
-    ``reap.arm()`` is called immediately before the launch request and only then: everything else
-    here (the preamble ``say``, the deadline precheck, an ambiguous reject that already reconciled)
-    rents nothing this seed owes a run-label reap for, and reaping on those paths would terminate
-    every other concurrent seed sharing the run id. Once the request returns an id, publication
-    narrows the guard to that exact instance.
+    The arm/own/return ordering lives in ``_rent_instance``. What is specific here is the
+    rejection policy, which mirrors the main walk's: a CLEAN reject rented nothing and stands the
+    guard down before anything below can raise, while an AMBIGUOUS one may have billed a box and
+    keeps the guard armed across reconciliation.
     """
     say(f"retrying {inst.region} WITHOUT the weight cache (attach may have caused the reject)")
     try:
-        require_create_allowance(plan.absolute_deadline)
-        reap.arm()
-        instance_id = lambda_api.launch_instance(
-            region_name=inst.region,
-            instance_type_name=inst.instance_type,
-            ssh_key_names=plan.ssh_keys,
-            name=plan.name,
+        return _rent_instance(
+            plan,
+            inst,
+            say,
+            reap,
             user_data=plan.cold_user_data,
             file_system_names=None,
-            **deadline_kwargs(lambda_api.launch_instance, plan.absolute_deadline),
-        )
+            describe=lambda instance_id: (
+                f"launched lambda instance {instance_id} (cold, cache-less): {inst.gpu} "
+                f"{inst.instance_type} in {inst.region} attempt={plan.attempt} seed={plan.seed}"
+            ),
+        ), None
     except lambda_api.LambdaApiError as error:
-        # a clean reject rented nothing and an ambiguous one is reconciled by
-        # _abort_ambiguous_launch, which sweeps this run's label itself; neither leaves an unnamed
-        # box for the caller's coarse reap. Stand down on the FIRST statement rather than by
-        # returning (as the main walk's handler does): everything below can raise -- a closed log
-        # stream fails the say, and _abort_ambiguous_launch always raises -- and an armed guard on
-        # any of those paths reaps by run label, terminating every other concurrent seed of this
-        # run over a request that rented nothing or that was already reconciled.
-        reap.disarm()
+        clean = _launch_rejection_is_clean(error)
+        if clean:
+            # rented nothing: stand down on the FIRST statement, before the diagnostic and the say
+            # below, either of which can raise while armed and would then reap by run label,
+            # killing every other concurrent seed over a request that rented nothing.
+            reap.disarm()
         cold_detail = sanitize_diagnostic(error, limit=1000)
-        if not _launch_rejection_is_clean(error):
+        if not clean:
+            # may have billed a box: the guard stays ARMED across reconciliation, which always
+            # raises, so an unnamed instance still has something able to find it.
             _abort_ambiguous_launch(plan.spec.run_id, type(error).__name__)
         say(f"region {inst.region} also rejected cold: {cold_detail}")
         return None, error
-    # FIRST statement after the create returns, as on the primary path: the box is rented and named
-    # from here, so the guard takes the id before the message interpolation or the publication call
-    # can raise with an id-less armed guard (which would reap this run's whole label).
-    reap.owns(instance_id)
-    message = (
-        f"launched lambda instance {instance_id} (cold, cache-less): {inst.gpu} "
-        f"{inst.instance_type} in {inst.region} attempt={plan.attempt} seed={plan.seed}"
-    )
-    return _publish_launched_instance(plan, instance_id, inst, say, message, reap), None
 
 
 def _refresh_launch_candidates(
@@ -561,16 +580,21 @@ def launch_and_submit(
             if user_data is None:
                 continue
             try:
-                require_create_allowance(absolute_deadline)
-                reap.arm()
-                instance_id = lambda_api.launch_instance(
-                    region_name=inst.region,
-                    instance_type_name=inst.instance_type,
-                    ssh_key_names=plan.ssh_keys,
-                    name=plan.name,
+                return _rent_instance(
+                    plan,
+                    inst,
+                    say,
+                    reap,
                     user_data=user_data,
                     file_system_names=fs_names,
-                    **deadline_kwargs(lambda_api.launch_instance, absolute_deadline),
+                    # bound rather than closed over: this runs inside the region loop, and a
+                    # closure over the loop variable would describe whichever region the walk had
+                    # reached by call time rather than the one actually rented.
+                    describe=lambda instance_id, inst=inst: (
+                        f"launched lambda instance {instance_id}: {inst.gpu} {inst.instance_type} "
+                        f"${inst.price_usd_hr:.2f}/hr in {inst.region} "
+                        f"attempt={attempt} seed={seed}"
+                    ),
                 )
             except lambda_api.LambdaApiError as e:
                 clean = _launch_rejection_is_clean(e)
@@ -621,21 +645,6 @@ def launch_and_submit(
                     if candidates:
                         candidates = _disk_capable_instances(spec, candidates, say)
                 continue
-            # FIRST statement after the create returns: from here the box is rented and named, so
-            # the guard must hold the id before anything else can raise. Interpolating the message
-            # or entering the publication helper are both evaluation, and an interrupt landing in
-            # either with an id-less armed guard reaps by run label, killing every other concurrent
-            # seed of this run.
-            reap.owns(instance_id)
-            message = (
-                f"launched lambda instance {instance_id}: {inst.gpu} {inst.instance_type} "
-                f"${inst.price_usd_hr:.2f}/hr in {inst.region} attempt={attempt} seed={seed}"
-            )
-            # returned directly: the guard stays armed until the handle is in the caller's hands,
-            # since disarming before the return would leave an interrupt there with nothing to
-            # clean the box, and submit_run's teardown does not exist until it has the handle.
-            # Holding the exact id keeps that window covered by cleanup naming one instance.
-            return _publish_launched_instance(plan, instance_id, inst, say, message, reap)
         return _raise_all_regions_rejected(spec, tried_regions, last_err)
     except BaseException as error:
         # armed for every window where a box may be rented; stands down only once some inner path
