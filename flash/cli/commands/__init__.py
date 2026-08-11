@@ -7,7 +7,6 @@ import os
 import sys
 import time
 import uuid
-from pathlib import Path
 
 from flash import __version__
 from flash._internal.channel import CLI_NAME
@@ -355,38 +354,6 @@ def cmd_gpus(args) -> int:
     return 0
 
 
-def cmd_env_list(args) -> int:
-    paths: list[str] = []
-    if Path("environment.py").is_file():
-        paths.append(".")
-    local = Path("environments")
-    if local.is_dir():
-        for p in local.iterdir():
-            if p.name.startswith("__"):
-                continue
-            if p.is_dir():
-                stem = p.name.replace("-", "_")
-                module = p / f"{stem}.py"
-                canonical = p / "environment.py"
-                if canonical.is_file() or module.is_file():
-                    paths.append(f"environments/{p.name}")
-            elif p.suffix == ".py":
-                paths.append(f"environments/{p.name}")
-    if render.styled():
-        print(render.env_list(sorted(paths)))
-        return 0
-    if paths:
-        print(
-            "local env sources (publish with `flash env push --project <project-uuid> "
-            "--name <name> <path>`):"
-        )
-        for path in sorted(paths):
-            print(f"  {path}")
-    else:
-        print("no environments yet - scaffold one with `flash env setup`")
-    return 0
-
-
 def cmd_train(args) -> int:
     if getattr(args, "cost", False):
         return _cmd_train_cost(args)
@@ -461,6 +428,7 @@ def cmd_train(args) -> int:
             )
         else:
             print(json.dumps(status, indent=2))
+        _print_unpacked_batch_warning(status, spec)  # after the payload, so stdout stays parseable
         return 0
     try:
         status = client.create_run(
@@ -475,6 +443,7 @@ def cmd_train(args) -> int:
         _raise_if_workload_profile_pending(client, exc)
         raise
     run_id = status["run_id"]
+    _print_unpacked_batch_warning(status, spec)  # a real submit overrides batch_size the same way
     logger.info(
         "submitted run %s: model=%s algorithm=%s gpu=%s",
         run_id,
@@ -529,10 +498,10 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
         # relaunch window, and the ping is just as superseded there: the worker that produced it has
         # already been torn down. `heartbeat_is_current_attempt` answers True because it cannot
         # prove otherwise from the identity alone, so the qualifier has to come from the clear
-        # itself or `step=455` reads as the replacement's progress.
-        stale_heartbeat = remote_cleared or not render.heartbeat_is_current_attempt(
-            status, heartbeat
-        )
+        # itself or `step=455` reads as the replacement's progress. `heartbeat_is_superseded` is
+        # exactly that pair of conditions, shared with the status panel so the two surfaces cannot
+        # disagree about whether a run is between attempts.
+        stale_heartbeat = render.heartbeat_is_superseded(status, heartbeat)
         stage = heartbeat.get("stage")
         if stage:
             parts.append(f"stage={stage}")
@@ -991,6 +960,7 @@ from flash.cli.commands.train_cost import (  # noqa: E402,F401
     _legacy_train_key_rejection_detail,
     _print_exact_sft_cost,
     _print_train_schema_compatibility,
+    _print_unpacked_batch_warning,
     _profile_charge,
     _raise_if_workload_profile_pending,
     _warn_if_wandb_requested_without_key,
