@@ -908,11 +908,14 @@ def test_the_armed_finder_patches_the_module_on_a_real_import(tmp_path, monkeypa
         "    return ((None, None), (None, None))\n"
     )
     monkeypatch.syspath_prepend(str(root))
-    for name in [n for n in sys.modules if n.split(".")[0] == "transformers"]:
-        monkeypatch.delitem(sys.modules, name, raising=False)
-
+    # snapshot the whole `transformers` subtree rather than deleting the keys that happen to exist
+    # now: the import below CREATES stand-in entries, and a rollback that only restores pre-existing
+    # keys leaves an empty stub `transformers` package shadowing the real one for every later test.
+    saved_modules = {n: m for n, m in sys.modules.items() if n.split(".")[0] == "transformers"}
     saved_meta_path = sys.meta_path[:]
     try:
+        for name in saved_modules:
+            del sys.modules[name]
         # the shim is our own render, not external input
         exec(compile(vc.render_gdn_varlen_shim("qwen3_5"), "<gdn-shim>", "exec"), {})
         assert type(sys.meta_path[0]).__name__ == "_FlashGdnFinder", "the shim must arm its finder"
@@ -923,6 +926,9 @@ def test_the_armed_finder_patches_the_module_on_a_real_import(tmp_path, monkeypa
         assert not [f for f in sys.meta_path if type(f).__name__ == "_FlashGdnFinder"]
     finally:
         sys.meta_path[:] = saved_meta_path
+        for name in [n for n in sys.modules if n.split(".")[0] == "transformers"]:
+            del sys.modules[name]
+        sys.modules.update(saved_modules)
 
 
 def test_the_gate_hands_the_shim_the_arch_it_verified(monkeypatch):
