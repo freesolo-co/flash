@@ -568,13 +568,16 @@ def test_offline_estimate_supports_eight_card_only_runs(monkeypatch):
 
 
 def test_offline_estimate_applies_the_pinned_revision_geometry_cap(monkeypatch):
-    """The offline quote must follow the SAME pin-certification rule allocation will apply.
+    """The offline quote stays OFFLINE: it caps on the catalog row and never reaches the hub.
 
-    Both directions matter, and asserting only the narrow one lets the test keep passing for the
-    wrong reason: an uncertifiable pin fails closed at four cards, but a pin whose geometry IS
-    certified gets the width its own head count allows. 3.5-4B records 16 heads, which divide 8, so
-    the two cases genuinely differ here -- quoting four for a certified pin would be the very defect
-    this PR removes.
+    `_offline_gpu_shape` is documented as structural preparation that must not consume live
+    failures, so it does not certify the pin. 3.5-4B records 16 heads, which divide 8, so the quote
+    reaches an eight-card shape whether or not the hub is reachable.
+
+    Asserting both hub states is the point: certifying here would let a transient hub error convert
+    a quotable eight-card run into a hard "does not fit across up to 4 cards" ValueError, from a
+    code path whose whole contract is that it does no network i/o. Certification belongs on the
+    submission path.
     """
     import flash.engine.plan.pinned_geometry as pinned_geometry
     import flash.engine.plan.vram as vram
@@ -595,12 +598,12 @@ def test_offline_estimate_applies_the_pinned_revision_geometry_cap(monkeypatch):
     def _unreadable(*_a, **_k):
         raise RuntimeError("transient hub error")
 
-    # uncertified: the pin keeps the unvalidated-revision ceiling, and 700 GB does not fit four.
+    # hub down: the offline quote never calls it, so the row's 16 heads still reach eight cards.
     monkeypatch.setattr(vram, "fetch_hf_model_geometry", _unreadable)
-    with pytest.raises(ValueError, match="across up to 4 cards"):
-        _offline_gpu_shape(config)
+    _gpu_d, _need_d, count_down, _provider_d, _rate_d = _offline_gpu_shape(config)
+    assert count_down == 8, "a hub outage must not narrow an offline quote"
 
-    # certified: the commit's own 16 heads divide 8, so the same quote reaches an eight-card shape.
+    # hub healthy: identical answer, proving the quote does not depend on hub reachability.
     info = MODELS["Qwen/Qwen3.5-4B"]
     monkeypatch.setattr(
         vram,

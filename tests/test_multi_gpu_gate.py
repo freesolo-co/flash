@@ -827,9 +827,9 @@ def test_eight_cards_require_validated_head_geometry(monkeypatch):
     monkeypatch.setattr(vram, "fetch_hf_model_geometry", _unreadable)
 
     assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8) == 8
-    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision="a" * 40) == 4
+    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision="a" * 40, certify=True) == 4
     # odd ceilings still normalize through the shared rentable-count helper.
-    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 3, model_revision="a" * 40) == 2
+    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 3, model_revision="a" * 40, certify=True) == 2
 
 
 def test_geometry_cap_follows_each_models_own_head_count():
@@ -903,7 +903,7 @@ def test_a_certified_pin_reaches_eight_cards():
         for model_id, info in MODELS.items():
             _stub_pinned_geometry(monkey, info)
             heads = info.num_attention_heads
-            capped = geometry_safe_gpu_cap(model_id, 8, model_revision="a" * 40)
+            capped = geometry_safe_gpu_cap(model_id, 8, model_revision="a" * 40, certify=True)
             # the real invariant is divisibility; every current row happens to divide 8.
             assert heads % capped == 0, model_id
             assert capped == 8, model_id
@@ -932,10 +932,14 @@ def test_a_pin_that_contradicts_the_catalog_certifies_nothing():
         # a drifted head count is REJECTED by the catalog cross-check, so it certifies nothing and
         # keeps the conservative ceiling rather than widening on a config nothing else agrees with.
         _stub_pinned_geometry(monkey, info, heads=20)
-        assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision="a" * 40) == 4
+        assert (
+            geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision="a" * 40, certify=True) == 4
+        )
         # a pin that omits the field entirely certifies nothing either.
         _stub_pinned_geometry(monkey, info, heads=0)
-        assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision="a" * 40) == 4
+        assert (
+            geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision="a" * 40, certify=True) == 4
+        )
     finally:
         monkey.undo()
 
@@ -968,7 +972,9 @@ def test_a_pin_without_parameter_metadata_certifies_nothing():
                 info.num_attention_heads,
             ),
         )
-        assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision="a" * 40) == 4
+        assert (
+            geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision="a" * 40, certify=True) == 4
+        )
     finally:
         monkey.undo()
 
@@ -1022,8 +1028,8 @@ def test_a_pinned_head_lookup_is_not_repeated_or_cached_on_failure():
             raise RuntimeError("transient hub error")
 
         monkey.setattr(vram, "fetch_hf_model_geometry", _blip)
-        assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision=rev) == 4
-        assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision=rev) == 4
+        assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision=rev, certify=True) == 4
+        assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision=rev, certify=True) == 4
         assert pinned_geometry._PINNED_GEOMETRY_MEMO == {}, "a hub failure must not be cached"
         assert len(calls) == 2, "a failed lookup must stay retryable"
 
@@ -1040,9 +1046,9 @@ def test_a_pinned_head_lookup_is_not_repeated_or_cached_on_failure():
             )
 
         monkey.setattr(vram, "fetch_hf_model_geometry", _ok)
-        assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision=rev) == 8
+        assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision=rev, certify=True) == 8
         before = len(calls)
-        assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision=rev) == 8
+        assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision=rev, certify=True) == 8
         assert len(calls) == before, f"pinned head lookup hit the hub {len(calls)} times"
     finally:
         monkey.undo()
@@ -1101,12 +1107,65 @@ def test_only_immutable_complete_pin_reads_are_memoized():
         monkey.undo()
 
 
-def test_a_low_ceiling_pin_does_not_reach_the_hub():
-    """Parse-time validation must stay offline when certification cannot widen anything.
+def test_only_the_submission_path_certifies_a_pin():
+    """Every OFFLINE caller of the cap must leave `certify` off, so a hub blip cannot narrow a run.
 
-    `spec_from_dict` calls the cap while parsing a config. At `cap <= 4` the certified head count
-    could not raise the ceiling even if it were read, so a hub round trip there buys nothing and
-    makes otherwise-offline config validation block on hub timeouts.
+    Certification is network i/o whose failure degrades to the four-card ceiling. That is a safe
+    answer at submission, which already does i/o and can retry. It is not safe on the offline paths:
+    `spec_from_dict` feeds this cap to `provisional_gpu`, which RAISES to reject an unplaceable run,
+    and `_offline_gpu_shape` is contractually structural. On either, a transient hub error would turn
+    a 35B that genuinely needs eight cards into a terminal "does not fit" rejection.
+
+    Asserted by reading the call sites, because the defect is a keyword argument at a call site: a
+    behavioral test of the submit path passes just as well when an offline path also certifies.
+    """
+    import ast
+    import inspect
+
+    import flash.cost.analytical as analytical
+    import flash.providers.allocator as allocator
+    import flash.schema as schema
+
+    def _certifying_calls(module) -> list[bool]:
+        tree = ast.parse(inspect.getsource(module))
+        found = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
+            if name != "geometry_safe_gpu_cap":
+                continue
+            found.append(
+                any(
+                    kw.arg == "certify" and getattr(kw.value, "value", False) is True
+                    for kw in node.keywords
+                )
+            )
+        return found
+
+    offline = _certifying_calls(schema) + _certifying_calls(analytical)
+    assert offline, "expected to find the offline geometry-cap call sites"
+    assert not any(offline), (
+        "an offline path opted into pin certification: a hub outage there rejects a run that fits"
+    )
+
+    submit = _certifying_calls(allocator)
+    assert submit, "expected to find the allocator's geometry-cap call sites"
+    assert all(submit), "the submission path must certify the pin; that is where widening happens"
+
+
+def test_a_low_ceiling_pin_does_not_reach_the_hub():
+    """Parse-time validation stays offline at EVERY ceiling, not just where widening is impossible.
+
+    `spec_from_dict` calls the cap while parsing a config, so certification is opt-in and parse time
+    does not opt in. An earlier version skipped the hub only at `cap <= 4` (where a certified head
+    count could not raise the ceiling anyway); that left the widenable case reaching the network from
+    an otherwise-offline path, where a hub timeout blocks config validation and a transient failure
+    narrows the run to four and gets it rejected as unplaceable.
+
+    Certification still happens where it belongs, under `certify=True`, which is asserted at the end
+    here and covered in ``test_only_the_submission_path_certifies_a_pin``.
     """
     import flash.engine.plan.pinned_geometry as pinned_geometry
     import flash.engine.plan.vram as vram
@@ -1123,13 +1182,16 @@ def test_a_low_ceiling_pin_does_not_reach_the_hub():
         monkey.setattr(pinned_geometry, "_PINNED_GEOMETRY_MEMO", {})
         monkey.setattr(vram, "fetch_hf_model_geometry", _fetch)
 
-        for ceiling in (1, 2, 3, 4):
+        # every ceiling, including the widenable ones -- an offline caller never reaches the hub.
+        for ceiling in (1, 2, 3, 4, 8):
             geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", ceiling, model_revision="a" * 40)
-        assert calls == [], f"parse-time cap reached the hub {len(calls)} times at cap <= 4"
+        assert calls == [], f"parse-time cap reached the hub {len(calls)} times"
 
-        # above four there IS something to widen to, so the lookup must still happen.
-        geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision="a" * 40)
-        assert len(calls) == 1, "a widenable ceiling must still certify the pin"
+        # opting in is what permits the round trip, and only above the uncertified ceiling.
+        geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 4, model_revision="a" * 40, certify=True)
+        assert calls == [], "certification cannot widen at or below the uncertified cap"
+        geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision="a" * 40, certify=True)
+        assert len(calls) == 1, "a widenable ceiling must certify the pin when asked to"
     finally:
         monkey.undo()
 
@@ -1245,12 +1307,18 @@ def test_an_uncertified_pin_still_narrows_below_the_four_card_ceiling():
 
 
 def test_schema_preflight_applies_the_geometry_cap_to_provisional_sizing():
-    """Schema preview must size a pinned run on the same count the allocator will really rent.
+    """Schema preview sizes a pinned run WITHOUT reaching the hub, in either hub state.
 
     The provisional class is chosen FOR the ceiling, so previewing a width the cap would not allow
-    quotes a class the run never gets. The two branches have to agree with `geometry_safe_gpu_cap`
-    in both directions: an uncertifiable pin previews at four, and a certified 8-head pin previews
-    at the eight the allocator now offers it.
+    quotes a class the run never gets. Parse-time preview is offline, so it does not certify: it
+    previews on the catalog row's own head count and a hub outage cannot change the answer.
+
+    That the two branches agree is the point. `provisional_gpu` RAISES to reject an unplaceable run,
+    so if a transient hub error narrowed the preview to four, a 35B that genuinely needs eight cards
+    would be rejected as unplaceable during config parsing that is otherwise entirely offline --
+    a network blip turned into a terminal, wrong, user-facing rejection. Certification (which can
+    legitimately narrow to four) belongs on the submission path, where a healthy retry exists; see
+    ``test_only_the_submission_path_certifies_a_pin``.
     """
     import flash.engine.plan.pinned_geometry as pinned_geometry
     import flash.engine.plan.vram as vram
@@ -1285,7 +1353,8 @@ def test_schema_preflight_applies_the_geometry_cap_to_provisional_sizing():
 
         monkey.setattr(vram, "fetch_hf_model_geometry", _unreadable)
         _spec()
-        assert seen == [4]
+        # the 0.8B row records 8 heads, so an offline preview reaches 8 even while the hub is down.
+        assert seen == [8], "a hub outage must not narrow an offline parse-time preview"
 
         info = MODELS["Qwen/Qwen3.5-0.8B"]
         assert info.num_attention_heads == 8

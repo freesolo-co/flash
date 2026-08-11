@@ -150,7 +150,9 @@ def _structurally_fits(available, need: int, cap: int) -> bool:
 _UNCERTIFIED_CAP = 4
 
 
-def geometry_safe_gpu_cap(model_id: str, max_gpu_count: int, *, model_revision: str = "") -> int:
+def geometry_safe_gpu_cap(
+    model_id: str, max_gpu_count: int, *, model_revision: str = "", certify: bool = False
+) -> int:
     """Rentable ceiling whose sequence-parallel divisibility is known before paid allocation.
 
     The width becomes ``ulysses_sequence_parallel_size``, and verl requires
@@ -176,6 +178,17 @@ def geometry_safe_gpu_cap(model_id: str, max_gpu_count: int, *, model_revision: 
     rejected rather than widened) and cap on the real number. An unreadable pin certifies nothing:
     it keeps the four-card ceiling AND falls back to the row's own head count for the divisor
     search, so it can only ever be narrower than the same run unpinned, never wider.
+
+    ``certify`` is what permits the hub round trip, and ONLY the submission path passes it. Reading a
+    pinned commit's config is network i/o, so a transient hub failure returns the uncertified
+    four-card ceiling. On the submit path that is a safe conservative answer the allocator can still
+    act on. On an OFFLINE path it is not: `spec_from_dict` feeds this cap to `provisional_gpu`, whose
+    job is to REJECT an unplaceable run, so a blip would narrow a 35B that genuinely needs eight
+    cards down to four and reject it as unplaceable during config parsing that is otherwise entirely
+    offline -- turning a transient network error into a terminal, and wrong, user-facing rejection.
+    The cost quote has the same shape (`_offline_gpu_shape` is documented as structural and must not
+    consume live failures). Both keep the default and stay offline; certification belongs where a
+    healthy retry and a real allocation decision live.
     """
     from flash.core.catalog import MODELS
 
@@ -185,12 +198,11 @@ def geometry_safe_gpu_cap(model_id: str, max_gpu_count: int, *, model_revision: 
     if info is None:
         # nothing to certify a width against, and nothing to cross-check a pin's own config with.
         cap = min(cap, _UNCERTIFIED_CAP)
-    elif model_revision and cap > _UNCERTIFIED_CAP:
+    elif certify and model_revision and cap > _UNCERTIFIED_CAP:
         # the weights the worker really loads are the pinned commit's, so its config -- not the
         # row's default-revision geometry -- is what may widen this run. only worth a hub round trip
         # when there is something to widen TO: at or below the uncertified cap, certification
-        # cannot raise the ceiling, and `spec_from_dict` calls this during parsing, where a hub
-        # timeout would block config validation that is otherwise entirely offline.
+        # cannot raise the ceiling.
         from flash.engine.plan.vram import certified_revision_attention_heads
 
         certified = certified_revision_attention_heads(model_id, model_revision)
@@ -413,7 +425,12 @@ def allocate(
             raise UnsupportedGpuError(f"requested provider {provider!r} is not configured")
         available = (provider,)
 
-    cap = geometry_safe_gpu_cap(model_id, max_gpu_count, model_revision=model_revision)
+    # the submission path is where certification belongs: it is already doing network i/o, a hub
+    # failure here degrades to the conservative ceiling rather than a terminal rejection, and this is
+    # the cap the run is actually rented against.
+    cap = geometry_safe_gpu_cap(
+        model_id, max_gpu_count, model_revision=model_revision, certify=True
+    )
     exact = ""
     if gpu_type:
         exact, available = _resolve_exact_gpu(
@@ -426,7 +443,7 @@ def allocate(
             # the ceiling a `--gpus` suggestion may name: the authored count is what rejected this
             # run, so the remedy has to be searched against the widest width the model allows.
             widest_cap=geometry_safe_gpu_cap(
-                model_id, MAX_COMBINATION_CARDS, model_revision=model_revision
+                model_id, MAX_COMBINATION_CARDS, model_revision=model_revision, certify=True
             ),
         )
 
