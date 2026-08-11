@@ -124,13 +124,22 @@ class LambdaProvider(InstanceProvider):
         Lambda sells fixed instance storage: there is no disk-sizing field on the launch path, and
         the capacity probe ignores ``constraints.disk_gb`` entirely. RunPod sizes the endpoint
         template and Vast searches on disk, so both can satisfy the floor; Lambda can only ignore
-        it. Since an operator sets the floor precisely because the image does not fit the default
-        sizing, renting here produces a paid instance that fails during image extraction -- and a
-        never-started worker is classified retriable, so it could repeat across paid attempts.
+        it. Renting here for a floor above what a run would get anyway produces a paid instance
+        that fails during image extraction -- and a never-started worker is classified retriable,
+        so it could repeat across paid attempts.
+
+        Keyed on whether the floor actually RAISES anything, not on it being set. ``_with_model_disk``
+        applies it as a raise-only maximum, so a floor at or below the platform default asks for no
+        more disk than an ordinary run already gets; refusing those would cost real Lambda capacity
+        on an automatic allocation, and fail a Lambda-pinned run as unsupported, to prevent nothing.
+        The catalog floor is deliberately NOT consulted: it is per-model, and this method answers
+        for the substrate before a model is in hand -- so the comparison is against the default that
+        every run receives, which is the largest bound that holds for every run.
         """
+        from flash.core.spec import GpuSpec
         from flash.providers._lifecycle.worker import worker_image_disk_floor
 
-        if not worker_image_disk_floor():
+        if worker_image_disk_floor() <= GpuSpec.disk_gb:
             return ""
         return (
             f"FLASH_WORKER_IMAGE_DISK_GB cannot be provisioned on {self.name}: "

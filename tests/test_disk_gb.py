@@ -219,6 +219,28 @@ def test_lambda_offers_nothing_while_a_disk_floor_it_cannot_honor_is_set(monkeyp
     assert LambdaProvider()._image_disk_floor_problem() == ""
 
 
+def test_lambda_stays_eligible_for_a_floor_that_raises_nothing(monkeypatch):
+    """The refusal keys on the floor RAISING disk, not on it being set.
+
+    ``_with_model_disk`` applies the floor as a raise-only maximum, so a value at or below the
+    platform default asks for no more disk than an ordinary run already gets. Refusing those would
+    drop real Lambda capacity on an automatic allocation, and fail a Lambda-pinned run as
+    unsupported, while preventing nothing.
+    """
+    from flash.core.spec import GpuSpec
+    from flash.providers.lambda_ import LambdaProvider
+
+    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/worker:cu128")
+
+    for benign in (1, GpuSpec.disk_gb - 1, GpuSpec.disk_gb):
+        monkeypatch.setenv("FLASH_WORKER_IMAGE_DISK_GB", str(benign))
+        assert LambdaProvider()._image_disk_floor_problem() == "", benign
+
+    # one GB above the default is the first value that actually asks for more disk
+    monkeypatch.setenv("FLASH_WORKER_IMAGE_DISK_GB", str(GpuSpec.disk_gb + 1))
+    assert "FLASH_WORKER_IMAGE_DISK_GB" in LambdaProvider()._image_disk_floor_problem()
+
+
 def test_profile_job_carries_the_worker_image_disk_floor(monkeypatch):
     """The cpu profile job pulls the same override image, so it needs the same floor.
 
