@@ -330,12 +330,24 @@ def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):
     assert "GPU" in out  # the breakdown names the chosen (provisional cheapest-fit) class
 
 
-def _grpo_cost_args(tmp_path, batch_size: int | None = None, algorithm: str = "grpo", **train):
-    """A `--cost` invocation for an on-policy run. ``batch_size=None`` authors no batch at all."""
+def _grpo_cost_args(
+    tmp_path,
+    batch_size: int | None = None,
+    algorithm: str = "grpo",
+    env_params: dict | None = None,
+    **train,
+):
+    """A `--cost` invocation for an on-policy run.
+
+    ``batch_size=None`` authors no batch at all, and any train key passed as None is left out of
+    the config entirely rather than written as a literal, so a test can author the absence of a
+    key as easily as its value.
+    """
     train.setdefault("max_examples", 800)
     if batch_size is not None:
         train["batch_size"] = batch_size
-    rows = "".join(f"{key} = {value}\n" for key, value in train.items())
+    rows = "".join(f"{key} = {value}\n" for key, value in train.items() if value is not None)
+    params = "".join(f"{key} = {value}\n" for key, value in (env_params or {}).items())
     cfg = tmp_path / "run.toml"
     cfg.write_text(
         'model = "Qwen/Qwen3.5-9B"\n'
@@ -343,6 +355,7 @@ def _grpo_cost_args(tmp_path, batch_size: int | None = None, algorithm: str = "g
         f'algorithm = "{algorithm}"\n'
         "[environment]\n"
         'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
+        f"{'[environment.params]' + chr(10) + params if params else ''}"
         "[train]\n"
         "epochs = 1\n"
         f"{rows}"
@@ -429,7 +442,7 @@ def test_a_max_examples_clamp_is_warned_about_even_with_no_batch_size(
 
     assert rc == 0
     assert "OPTIMIZER batch is 2 prompts per update" in err
-    assert "Raise `max_examples`" in err
+    assert "Raise `[train] max_examples`" in err
     assert "memory knob of the same name" not in err  # no batch_size was authored to confuse
 
 
@@ -445,7 +458,7 @@ def test_a_big_batch_clamped_by_max_examples_still_warns(tmp_path, monkeypatch, 
 
     assert rc == 0
     assert "OPTIMIZER batch is 2 prompts per update" in err
-    assert "Raise `max_examples`" in err
+    assert "Raise `[train] max_examples`" in err
     assert "Raise `batch_size`" not in err
 
 
@@ -470,6 +483,55 @@ def test_opd_warning_does_not_promise_advantages_or_tell_the_user_to_raise_the_b
     assert "within what the gpu allows" in err
     # the grpo line promises a wider batch is free; on opd that would be advice to OOM
     assert "costs no extra vram" not in err
+
+
+def test_a_fixed_horizon_is_told_that_widening_costs_more_not_less(tmp_path, monkeypatch, capsys):
+    """`max_steps` pins the update count, which inverts what raising the batch costs.
+
+    On a derived horizon a wider batch means proportionally fewer updates, so it quotes cheaper.
+    Under a positive `max_steps` the steps are fixed, so the extra prompts are pure added
+    generation: the estimator prices this exact 10-step grpo run at $0.27 for batch 1 and $0.51
+    for batch 4. Telling that user the thin batch was "noisier at full price" and to raise it
+    would be an unpriced bill increase.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, 1, max_steps=10))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "pins the update count" in err
+    assert "higher bill" in err
+    assert "quotes cheaper" not in err
+
+
+def test_a_derived_horizon_is_not_told_that_widening_raises_the_bill(tmp_path, monkeypatch, capsys):
+    """The mirror of the fixed-horizon case: here a wider batch really is cheaper."""
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, 1))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "quotes cheaper" in err
+    assert "higher bill" not in err
+
+
+def test_an_environment_param_cap_is_named_as_such(tmp_path, monkeypatch, capsys):
+    """`_on_policy_example_count` honours `[environment.params] max_examples` when train has none.
+
+    Naming `[train] max_examples` there sends the user to a key their config does not contain.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(
+        _grpo_cost_args(tmp_path, None, max_examples=None, env_params={"max_examples": 2})
+    )
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "`[environment.params] max_examples`" in err
+    assert "`[train] max_examples`" not in err
 
 
 def test_grpo_cost_stays_quiet_when_the_batch_is_a_real_batch(tmp_path, monkeypatch, capsys):

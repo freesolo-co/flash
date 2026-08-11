@@ -155,6 +155,12 @@ def thin_rl_batch_warning(spec) -> str | None:
     ``use_policy_gradient=false`` -- so there is no baseline to reassure anyone about, and unlike
     grpo its ``batch_size`` genuinely IS a memory lever (it scales rollout concurrency and the loss
     microbatch in ``estimate_vram_gb``). Telling an opd user to raise it would be advice to OOM.
+
+    The price of widening also flips with the horizon, so the message never says "for the same
+    money". On a DERIVED horizon a wider batch means proportionally fewer updates, so it is cheaper
+    (measured: grpo 9B over 800 prompts quotes $21.88 at 1 and $7.37 at 16). Under a positive
+    ``max_steps`` the update count is pinned, so widening buys averaging at strictly more
+    generation: the same run quotes $0.27 at 1 and $0.51 at 4 for an identical 10 steps.
     """
     if spec.algorithm not in ("grpo", "opd"):
         return None
@@ -164,44 +170,58 @@ def thin_rl_batch_warning(spec) -> str | None:
         return None
     prompts = "1 prompt" if prompts_per_step == 1 else f"{prompts_per_step} prompts"
     authored = spec.train.batch_size
-    # lead with whichever input actually produced the thin batch. when max_examples is the binding
-    # cap, the sft/rl name collision is not what bit the user, so do not lecture them about it --
-    # and point the remedy at the key that is actually holding the batch down.
+    # lead with whichever input actually produced the thin batch. when a max_examples cap is the
+    # binding one, the sft/rl name collision is not what bit the user, so do not lecture them about
+    # it -- and point the remedy at the key that is actually holding the batch down. the cap can
+    # come from either table, and naming the wrong one sends them to a key their config lacks.
     if authored is not None and authored == prompts_per_step:
         raise_target = "`batch_size`"
         lead = (
-            f"`[train] batch_size = {authored}` is the OPTIMIZER batch for {spec.algorithm}, not "
-            "the sft memory knob of the same name: it sets prompts-per-step, so each update trains "
-            f"on {prompts}. Under sft this key picks the per-device micro-batch and the optimizer "
-            "batch comes from the workload profile, so an sft `batch_size = 1` memory workaround "
-            "does not carry over."
+            f"`[train] batch_size = {authored}` is the OPTIMIZER batch for {spec.algorithm}: it "
+            f"sets prompts-per-step, so each update trains on {prompts}. It does NOT mean here what "
+            "it means under sft, where it is the batch a measured workload profile turns into the "
+            "optimizer batch and its step horizon, so an sft memory workaround does not transfer."
         )
     else:
-        raise_target = "`max_examples`"
+        cap_key = (
+            "[train] max_examples"
+            if spec.train.max_examples
+            else "[environment.params] max_examples"
+        )
+        raise_target = f"`{cap_key}`"
         lead = (
-            f"This {spec.algorithm} run's OPTIMIZER batch is {prompts} per update: `[train] "
-            "max_examples` caps the prompt pool that small, and prompts-per-step cannot exceed the "
-            "pool."
+            f"This {spec.algorithm} run's OPTIMIZER batch is {prompts} per update: `{cap_key}` "
+            "caps the prompt pool that small, and prompts-per-step cannot exceed the pool."
         )
     if spec.algorithm == "grpo":
         consequence = (
             "Each prompt's completions are still centred against their own group, so the advantage "
             "signal survives; what a thin batch costs is the averaging ACROSS prompts, so every "
-            "update follows only those few and the gradient is far noisier for the same money. "
-            f"Raise {raise_target} unless you are deliberately buying optimizer steps on a derived "
-            "horizon (see TRAINING.md): under grpo `batch_size` is not a memory lever, so a wider "
-            "batch costs no extra vram."
+            "update follows only those few and the gradient is far noisier. Under grpo "
+            "`batch_size` is not a memory lever, so a wider batch costs no extra vram."
         )
     else:
         # opd's batch_size is also a real vram lever, so "raise it" is not safe blanket advice.
         consequence = (
             "opd distills against the teacher rather than scoring completions against each other, "
             "so a thin batch breaks no baseline: it just makes every update follow very few "
-            f"prompts, which is noisier for the same money. Raise {raise_target} to widen it, but "
-            "unlike grpo opd's `batch_size` is ALSO a memory lever (it sizes rollout concurrency "
-            "and the loss microbatch), so keep the result within what the gpu allows."
+            "prompts, which is noisier. Unlike grpo, opd's `batch_size` is ALSO a memory lever (it "
+            "sizes rollout concurrency and the loss microbatch), so keep any widening within what "
+            "the gpu allows."
         )
-    return f"{lead} {consequence}"
+    # what widening costs flips with the horizon, so the remedy has to name the right trade.
+    if spec.train.max_steps and int(spec.train.max_steps) > 0:
+        remedy = (
+            f"Your `max_steps` pins the update count, so raising {raise_target} buys that averaging "
+            "at strictly more generated work and a higher bill for the same number of updates."
+        )
+    else:
+        remedy = (
+            f"Raise {raise_target} unless you are deliberately buying optimizer steps on a derived "
+            "horizon (see TRAINING.md): on this horizon a wider batch means proportionally fewer "
+            "updates, so it also quotes cheaper, not dearer."
+        )
+    return f"{lead} {consequence} {remedy}"
 
 
 def spec_steps(spec) -> int:

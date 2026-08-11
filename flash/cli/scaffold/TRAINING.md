@@ -247,15 +247,17 @@ ignored. Everything in the block above (`epochs`, `max_examples`, `max_steps`, `
 | `teacher_model`                                                                                                 | rejected | rejected | yes      |
 
 > **`batch_size` applies everywhere but does not MEAN the same thing everywhere.** Under SFT it is
-> a memory knob: the optimizer batch is the workload profile's measured `examples_per_update`, and
-> the authored value only picks the per-device micro-batch it is split into (and with packing off,
-> the optimizer batch is pinned to 1 regardless of what you set). Under GRPO and OPD the same key
-> IS the optimizer batch: it becomes prompts-per-step, i.e. verl's `data.train_batch_size` and
-> `ppo_mini_batch_size`. So the usual SFT out-of-memory workaround, `batch_size = 1`, does not
-> carry over: in an RL config it means one prompt per optimizer update. Nothing errors and the run
-> still learns, but each update follows very few prompts, so it is far noisier for the same money.
-> `flash train` warns when the effective optimizer batch is below 4, including when `max_examples`
-> is what clamps it, since a small prompt pool caps the batch regardless of what you authored.
+> read by the workload profile, which resolves it against the real tokenized dataset: with packing
+> on it becomes the profile's `examples_per_update` (so it does set the optimizer batch, and with
+> it the step horizon), and with packing off the optimizer batch is pinned to 1 regardless of what
+> you set. Either way the value you author is a request the profile answers, and the per-device
+> micro-batch is derived from the result. Under GRPO and OPD there is no profile in between: the
+> same key IS the optimizer batch, becoming prompts-per-step, i.e. verl's `data.train_batch_size`
+> and `ppo_mini_batch_size`. So an SFT out-of-memory workaround of `batch_size = 1` lands
+> differently here: it means one prompt per optimizer update. Nothing errors and the run still
+> learns, but each update follows very few prompts, so the gradient is far noisier. `flash train`
+> warns when the effective optimizer batch is below 4, including when a `max_examples` cap is what
+> clamps it, since a small prompt pool caps the batch regardless of what you authored.
 >
 > What to do about it differs by algorithm. Under **GRPO** each prompt's completions are still
 > centred against their own group (that is `group_size`'s job, a separate knob), so the advantage
@@ -265,6 +267,11 @@ ignored. Everything in the block above (`epochs`, `max_examples`, `max_steps`, `
 > **is** one of the strongest memory levers: it sizes rollout concurrency and the loss micro-batch.
 > So on OPD raise it only as far as the GPU allows, and do not expect `group_size` to buy memory
 > back, since it already defaults to 1.
+>
+> What widening costs depends on your horizon. On a derived horizon (`epochs` over a prompt pool) a
+> wider batch means proportionally fewer updates, so it also quotes cheaper. Under a positive
+> `max_steps` the update count is pinned, so a wider batch is pure extra generation: same steps,
+> bigger bill. The warning says which case you are in.
 
 So `credit_assignment` (multi-turn GRPO defaults to one reward per rollout; `"per_turn"` gives
 turn-level credit, needs `per_turn_rewards` metadata, and is unsupported for tool-calling envs —
