@@ -215,13 +215,15 @@ def _urlopen(
             min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)),
         )
 
-    def drain(resp) -> bytes:
+    def drain(resp, deadline: float | None) -> bytes:
         """Consume the response, honouring the byte cap and the caller's sink.
 
         Returns ``b""`` whenever ``out`` is given: the bytes went to the file, and also returning
         them would hold the whole download in memory, which is the thing streaming to ``out`` avoids.
+
+        ``deadline`` is passed in rather than computed here: it has to start before ``urlopen``, or
+        DNS, the connect, and header parsing all fall outside the bound this function advertises.
         """
-        deadline = time.monotonic() + body_deadline if body_deadline is not None else None
         chunks = _iter_capped_chunks(resp, max_bytes, deadline) if max_bytes is not None else None
         if out is None:
             return b"".join(chunks) if chunks is not None else resp.read()
@@ -237,12 +239,18 @@ def _urlopen(
 
     attempt = 0
     while True:
+        # started before the attempt, not inside `drain`: DNS, the connect, the TLS handshake and
+        # header parsing all happen inside `urlopen`, and a peer that makes progress inside every
+        # socket window can hold it there indefinitely. a deadline that only began once headers had
+        # arrived left that whole stretch unbounded, so the caller could still time out locally
+        # while this attempt was nominally within budget.
+        deadline = time.monotonic() + body_deadline if body_deadline is not None else None
         try:
             if out is not None:
                 out.seek(sink_start)
                 out.truncate()
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return drain(resp)
+                return drain(resp, deadline)
         except urllib.error.HTTPError as exc:
             # urllib can raise an HTTPError with fp=None; exc.read() is an AttributeError there.
             # the read can also truncate: GitHub can return a 429/5xx and then drop the connection.

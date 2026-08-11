@@ -404,6 +404,37 @@ def test_urlopen_body_deadline_bounds_a_slow_dripping_response(monkeypatch):
         )
 
 
+def test_urlopen_body_deadline_covers_the_connect_not_just_the_body(monkeypatch):
+    """The deadline has to start BEFORE `urlopen`, or the connect is outside the bound.
+
+    DNS, the TCP connect, the TLS handshake and header parsing all happen inside `urlopen`, and a
+    peer making progress inside every socket window can hold it there. A deadline that only began
+    once headers had arrived left that whole stretch unbounded, so the server could still be waiting
+    when the client hit its own fixed timeout -- replacing the controlled 429/502 with a local
+    timeout, which is the failure the budget exists to prevent.
+    """
+    clock = [0.0]
+
+    def slow_connect(req, timeout):
+        clock[0] += 25.0  # headers take longer than the whole body deadline
+        return io.BytesIO(b"payload")
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(urllib.request, "urlopen", slow_connect)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)
+
+    # the connect alone has already outlived the 20s budget, so the first body read must fail rather
+    # than treat the attempt as fresh. exhausting the one retry lands on the retriable signal.
+    with pytest.raises(GitHubRateLimitError, match="transient network"):
+        _urlopen(
+            urllib.request.Request("https://api.github.com/test"),
+            max_bytes=16 * 1024 * 1024,
+            body_deadline=20.0,
+            max_rate_limit_retries=1,
+        )
+
+
 def test_urlopen_without_a_body_deadline_still_finishes_a_slow_download(monkeypatch):
     # background downloads must NOT inherit the bound: finishing a large transfer matters more than
     # a deadline there, so an unset `body_deadline` has to leave the old behaviour untouched.
