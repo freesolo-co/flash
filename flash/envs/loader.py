@@ -46,6 +46,15 @@ from flash.envs.dataset_selection import (
 # filesystem to hold still. re-exported because loader is the import site callers already use,
 # and the underscored names are reached as ``loader._name`` by pull and by test monkeypatches.
 from flash.envs.env_ref import (
+    _DEFAULT_ENVIRONMENT_PATH as _DEFAULT_ENVIRONMENT_PATH,
+)
+from flash.envs.env_ref import (
+    _DEFAULT_GITHUB_REF as _DEFAULT_GITHUB_REF,
+)
+from flash.envs.env_ref import (
+    _DEFAULT_MANAGED_ENV_REPO as _DEFAULT_MANAGED_ENV_REPO,
+)
+from flash.envs.env_ref import (
     GitHubEnvironmentRef as GitHubEnvironmentRef,
 )
 from flash.envs.env_ref import (
@@ -92,9 +101,6 @@ from flash.envs.package.limits import (
 )
 from flash.envs.package.unpack import extract_validated_archive_members
 
-_DEFAULT_GITHUB_REF = "main"
-_DEFAULT_ENVIRONMENT_PATH = "environment.py"
-_DEFAULT_MANAGED_ENV_REPO = "freesolo-co/environment-hub"
 _CACHE_ROOT_DIR_NAME = "env-cache"
 
 
