@@ -4017,33 +4017,42 @@ def test_the_child_fragment_never_aborts_a_paid_run(tmp_path):
     """An unrepointed stub only kills runs that build a SLEEPING vLLM engine, so a fragment that
     cannot do its job must leave the child starting rather than abort it at sitecustomize time.
 
-    Two ways to not do the job, and they are NOT the same test. tilelang absent (the ordinary
-    non-GDN venv) never enters the swap at all, so it proves nothing about the error path -- deleting
-    the outer ``except`` entirely still passes that half. The read-only lib dir is the half that
-    matters: the swap genuinely raises PermissionError mid-flight, and only the outer handler keeps
-    that from propagating out of sitecustomize and killing the interpreter before training starts.
+    tilelang absent is the ordinary case for a non-GDN venv, and it must not even probe. Note this
+    half never enters the swap, so on its own it says nothing about the error path -- the outer
+    ``except`` could be deleted outright and this would still pass. That is what the read-only
+    sibling test below covers.
     """
-    absent = _run_cudart_fragment(
+    result = _run_cudart_fragment(
         vc.render_tilelang_cudart_shim(),
         tmp_path,  # no tilelang package materialized
         real=None,
         extra="print('FRAGMENT_DONE', flush=True)",
     )
-    assert "FRAGMENT_DONE" in absent.stdout, f"fragment aborted the child: {absent.stderr[-2000:]}"
-    assert absent.returncode == 0
-    assert "repoint failed" not in absent.stdout, (
+    assert "FRAGMENT_DONE" in result.stdout, f"fragment aborted the child: {result.stderr[-2000:]}"
+    assert result.returncode == 0
+    assert "repoint failed" not in result.stdout, (
         "tilelang absent is the ordinary case; it must not report a failure"
     )
 
-    # tilelang present and repointable, but the directory holding it refuses writes: link() and
-    # symlink() both raise, from inside the branch that has already decided to swap.
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root bypasses dir perms")
+def test_a_failed_repoint_still_lets_the_child_start(tmp_path):
+    """The half of never-abort that actually exercises the handler: tilelang is present and a real
+    runtime was found, but the directory holding the stub refuses writes, so ``link()``/``symlink()``
+    raise from inside the branch that already decided to swap.
+
+    Only the outer ``except`` keeps that PermissionError from propagating out of sitecustomize and
+    killing the interpreter before training starts. It must also SAY it failed: a silent swallow and
+    a successful repoint read identically in a run log, leaving the next undefined-symbol crash with
+    nothing to bisect against.
+    """
     pkg, stub = _fake_child_tilelang(tmp_path)
     real = tmp_path / "libcudart.so.12"
     real.write_bytes(b"REAL-CUDART")
     lib = pkg / "lib"
     lib.chmod(0o555)
     try:
-        denied = _run_cudart_fragment(
+        result = _run_cudart_fragment(
             vc.render_tilelang_cudart_shim(),
             tmp_path,
             real=str(real),
@@ -4052,13 +4061,13 @@ def test_the_child_fragment_never_aborts_a_paid_run(tmp_path):
     finally:
         lib.chmod(0o755)  # let tmp_path cleanup remove it
 
-    assert denied.returncode == 0, (
-        f"a failed repoint aborted the child instead of importing on: {denied.stderr[-2000:]}"
+    assert result.returncode == 0, (
+        f"a failed repoint aborted the child instead of importing on: {result.stderr[-2000:]}"
     )
-    assert "FRAGMENT_DONE" in denied.stdout, (
-        f"the exception escaped sitecustomize and killed the run: {denied.stderr[-2000:]}"
+    assert "FRAGMENT_DONE" in result.stdout, (
+        f"the exception escaped sitecustomize and killed the run: {result.stderr[-2000:]}"
     )
-    assert "repoint failed" in denied.stdout, (
+    assert "repoint failed" in result.stdout, (
         "a swallowed failure must still say so; a silent one is unbisectable from a log"
     )
     assert not stub.is_symlink(), "the stub must be left intact when the swap could not complete"
