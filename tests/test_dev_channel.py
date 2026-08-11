@@ -134,6 +134,47 @@ def test_rewrite_channel_requires_exactly_one_prod_marker():
         build.rewrite_channel('CHANNEL = "dev"\n')  # already flipped -> zero matches
 
 
+def _real_console_scripts() -> dict[str, str]:
+    """The checked-in [project.scripts] table, not a synthetic stand-in."""
+    import tomllib
+
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    return dict(data["project"]["scripts"])
+
+
+def test_flash_cli_alias_reaches_the_same_entry_point():
+    """`flash-cli` must exist and be the same entry point as `flash`.
+
+    The `server` and `dev` extras install runpod-flash, which declares its own `flash` console
+    script. Whichever distribution is installed last wins, so on a control-plane host `flash` can
+    silently belong to runpod-flash -- it exits 0 without doing anything. `flash-cli` is the name
+    nothing else claims, so it is what SELF_HOSTING.md points operators at.
+    """
+    scripts = _real_console_scripts()
+    assert scripts.get("flash") == "flash.cli:main"
+    assert scripts.get("flash-cli") == scripts["flash"], (
+        "flash-cli must stay an alias of flash. SELF_HOSTING.md tells self-hosters to use it "
+        "when runpod-flash's console script shadows `flash`."
+    )
+
+
+def test_every_console_script_has_a_dev_rename():
+    """A script key missing from SCRIPT_RENAMES ships unrenamed in the dev distribution.
+
+    rewrite_pyproject only renames keys present in SCRIPT_RENAMES and passes everything else
+    through, so a new console script added to pyproject without a matching entry would collide
+    with the prod package on a side-by-side install.
+    """
+    build = _load_build_module()
+    missing = sorted(set(_real_console_scripts()) - set(build.SCRIPT_RENAMES))
+    assert not missing, (
+        "console script(s) with no SCRIPT_RENAMES entry: "
+        + ", ".join(missing)
+        + ". scripts/build_dev_dist.py passes unknown keys through unrenamed, so the dev "
+        "distribution would install a script that collides with freesolo-flash."
+    )
+
+
 def test_rewrite_pyproject_retargets_only_the_project_table():
     build = _load_build_module()
     src = (
@@ -145,6 +186,7 @@ def test_rewrite_pyproject_retargets_only_the_project_table():
         "[project.scripts]\n"
         'flash = "flash.cli.main:main"\n'
         "# Operator-only console script.\n"
+        'flash-cli = "flash.cli.main:main"\n'
         'flash-server = "flash.server.__main__:main"\n'
         "\n"
         "[tool.flash-dev]\n"
@@ -155,7 +197,11 @@ def test_rewrite_pyproject_retargets_only_the_project_table():
     # Package + scripts renamed for a side-by-side dev install.
     assert 'name = "freesolo-flash-dev"' in out
     assert 'flash-dev = "flash.cli.main:main"' in out
+    assert 'flash-dev-cli = "flash.cli.main:main"' in out
     assert 'flash-dev-server = "flash.server.__main__:main"' in out
+    # No un-renamed script key survives: each would collide with the prod package.
+    assert "\nflash = " not in out
+    assert "\nflash-cli = " not in out
     # The console-script *values* (import targets) are untouched.
     assert '"flash.cli.main:main"' in out
     # The prod version is replaced by the dev version, and the identically-valued

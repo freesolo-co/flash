@@ -11,6 +11,14 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ## Unreleased
 
+### Added
+
+- A `flash-cli` console script, the same entry point as `flash` under a name nothing else
+  claims. The `server` and `dev` extras install `runpod-flash`, which declares its own `flash`
+  script; whichever distribution is installed last wins, so on a control-plane host
+  `pip install 'freesolo-flash[server]'` could leave `flash` running RunPod's CLI, which exits 0
+  and does nothing. `flash` is unchanged and remains correct on a base (client-only) install.
+
 ### Changed
 
 - CI runs the offline test suite on both supported interpreters (3.11 and 3.12) rather than

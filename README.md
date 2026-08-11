@@ -200,7 +200,11 @@ uv run python -m flash.cli --help
 
 The `--dev` group installs `runpod-flash`, which also declares a `flash` console script,
 so `uv run flash` in this environment may launch RunPod's CLI instead of this one.
-`python -m flash.cli` is unambiguous. Installed users are unaffected.
+`python -m flash.cli` is unambiguous.
+
+This is not only a dev-checkout problem: the `server` extra installs `runpod-flash` too, so
+`pip install 'freesolo-flash[server]'` can leave `flash` pointing at RunPod's CLI on a plane
+host. Use `flash-cli`, which is the same entry point under a name nothing else claims.
 
 Formatting is not enforced repo-wide yet, so run `ruff format` on the files you touched
 rather than the whole tree. See [CONTRIBUTING.md](CONTRIBUTING.md) for the branching
@@ -239,6 +243,8 @@ involved. **[SELF_HOSTING.md](SELF_HOSTING.md) is the full guide**; the short ve
 
 ```bash
 pip install 'freesolo-flash[server]'   # the base install is client-only
+# The server extra pulls in runpod-flash, which declares its own `flash` command and may take
+# precedence. On a plane host use `flash-cli` — same CLI, name nothing else claims.
 
 export FLASH_STANDALONE=1
 export FREESOLO_INTERNAL_KEY=$(openssl rand -hex 32)
