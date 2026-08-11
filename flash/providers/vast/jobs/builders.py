@@ -161,10 +161,11 @@ def build_onstart(payload: dict) -> str:
     # base64 payload and can blow Vast's onstart length limit, failing the rent. Idempotent.
     payload = _spill_large_spec_to_hf(payload)
     payload_b64 = base64.encodebytes(json.dumps(payload).encode()).decode()
-    # Ship the SHARED instance bootstrap (providers/_lifecycle/bootstrap.py).
-    bootstrap_src = (
-        Path(__file__).parent.parent.parent / "_lifecycle" / "bootstrap.py"
-    ).read_text()
+    # Ship the SHARED instance bootstrap (providers/_lifecycle/bootstrap.py) plus its redaction
+    # sibling, which the bootstrap imports as a bare module from its own directory.
+    lifecycle_dir = Path(__file__).parent.parent.parent / "_lifecycle"
+    bootstrap_src = (lifecycle_dir / "bootstrap.py").read_text()
+    bootstrap_secrets_src = (lifecycle_dir / "bootstrap_secrets.py").read_text()
     # Vast's args-mode wrapper resets PATH, so `python3` can resolve to the OS python (PEP 668
     # externally-managed), not the image's stack python. Prefer the image's baked interpreter
     # (conda / /usr/local) where torch + huggingface_hub live; fall back to python3.
@@ -190,6 +191,9 @@ base64 -d /root/flash/payload.b64 > /root/flash/payload.json
 cat > /root/flash/bootstrap.py <<'FLASH_BOOTSTRAP_EOF'
 {bootstrap_src}
 FLASH_BOOTSTRAP_EOF
+cat > /root/flash/bootstrap_secrets.py <<'FLASH_BOOTSTRAP_SECRETS_EOF'
+{bootstrap_secrets_src}
+FLASH_BOOTSTRAP_SECRETS_EOF
 "$PYBIN" /root/flash/bootstrap.py
 FLASH_RC=$?
 # On failure, hold the box for 10 min so the control plane can pull the container log tail via the
