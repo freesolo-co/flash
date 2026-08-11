@@ -1058,6 +1058,14 @@ def test_present_but_unusable_values_are_client_errors_too():
     ):
         ApiClient(url, "fslo-user-test", timeout=5).get_logs("r1")
     assert "'offset'" in str(caught.value)
+    # bool subclasses int, so a json true would otherwise satisfy the int requirement and
+    # flow into offset arithmetic.
+    with (
+        _fixed_2xx_server("application/json", b'{"logs": "x", "offset": true}') as url,
+        pytest.raises(ClientError) as caught,
+    ):
+        ApiClient(url, "fslo-user-test", timeout=5).get_logs("r1")
+    assert "'offset'" in str(caught.value)
 
 
 def test_non_json_2xx_is_a_client_error_not_a_decode_error():

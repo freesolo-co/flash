@@ -537,6 +537,13 @@ class ApiClient:
             if not isinstance(payload, dict)
             or key not in payload
             or not isinstance(payload[key], expected)
+            # bool subclasses int, so a json true/false would satisfy an int requirement and
+            # then flow into arithmetic; treat it as malformed unless bool is itself expected.
+            or (
+                isinstance(payload[key], bool)
+                and bool is not expected
+                and not (isinstance(expected, tuple) and bool in expected)
+            )
         ]
         if bad:
             raise _unexpected_response(
