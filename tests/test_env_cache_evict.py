@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -11,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from flash.envs import cache_security
 from flash.envs import loader as adapter
 
 
@@ -171,6 +173,46 @@ def test_ensure_cache_root_creates_private_dir(monkeypatch, tmp_path):
     assert stat.S_IMODE(root.stat().st_mode) == 0o700
     # idempotent on a root that already exists.
     assert adapter._ensure_cache_root() == root
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="posix-only mode bits")
+def test_ensure_cache_root_creates_private_ancestors_under_group_writable_umask(
+    monkeypatch, tmp_path
+):
+    # mkdir(parents=True, mode=0o700) sets the mode on the LEAF only, so under umask 0002 the
+    # ancestors it creates land at 0775 and the ancestor walk refuses the root that same call
+    # just created. every github env resolve would fail on first use wherever private user
+    # groups are the default.
+    root = tmp_path / "outer" / "flash" / "env-cache"
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", root)
+    previous_umask = os.umask(0o002)
+    try:
+        assert adapter._ensure_cache_root() == root
+    finally:
+        os.umask(previous_umask)
+
+    for created in (root, root.parent, root.parent.parent):
+        assert stat.S_IMODE(created.stat().st_mode) == 0o700, created
+
+
+def test_discard_untrusted_entry_accepts_a_concurrently_removed_entry(monkeypatch, tmp_path):
+    # a concurrent resolve of the same untrusted key can clear the entry between our trust check
+    # and our delete, so rmtree raises FileNotFoundError for the outcome we actually wanted.
+    # success is "the entry is gone", not "the delete call did not raise" -- judging by the
+    # exception fails both resolves on a cache key that is now perfectly safe to refetch.
+    entry = tmp_path / "entry"
+    entry.mkdir()
+    real_rmtree = shutil.rmtree
+
+    def racing_rmtree(path, *args, **kwargs):
+        real_rmtree(path, *args, **kwargs)
+        raise FileNotFoundError(2, "No such file or directory", str(path))
+
+    monkeypatch.setattr(cache_security.shutil, "rmtree", racing_rmtree)
+
+    cache_security.discard_untrusted_entry(entry)
+
+    assert not entry.exists()
 
 
 def test_ensure_cache_root_refuses_foreign_owner(monkeypatch, tmp_path):

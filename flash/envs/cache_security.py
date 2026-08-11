@@ -1,9 +1,9 @@
 """Filesystem trust checks for the on-disk env cache.
 
 Split out of ``flash.envs.loader`` (which owns cache layout, keying, and orchestration) to
-keep that module under the file-size gate. These are checks over stat results with no
-knowledge of the cache's directory structure -- the loader tells each one which path to look
-at and what to do with the answer.
+keep that module under the file-size gate. These are permission-level operations over a
+single path, with no knowledge of the cache's directory structure -- the loader tells each
+one which path to look at and what to do with the answer.
 """
 
 from __future__ import annotations
@@ -12,6 +12,29 @@ import os
 import shutil
 import stat
 from pathlib import Path
+
+
+def make_private_dir(path: Path) -> None:
+    """create ``path`` and every missing ancestor of it with mode 0700.
+
+    ``Path.mkdir(parents=True, mode=0o700)`` applies ``mode`` to the LEAF ONLY; the ancestors
+    it creates on the way get the default ``0o777 & ~umask``. under a group-writable umask
+    (0002, the default wherever private user groups are used) a first run therefore leaves a
+    freshly created ``~/.cache`` or ``.../flash`` at 0775, and ``validate_cache_root_ancestors``
+    immediately refuses the root it was just asked to create -- a self-inflicted denial of
+    service on every environment resolve. so create each missing component explicitly.
+
+    the umask still applies to each component, but it can only withhold bits, never add them,
+    so 0700 stays at most 0700 under any umask. ``FileExistsError`` is tolerated per component
+    because another process racing us to the same ancestor is normal; whoever wins, the trust
+    checks the loader runs afterwards decide whether the result is acceptable. a component
+    that exists as a non-directory is left for those same checks to reject.
+    """
+    for component in (*reversed(path.parents), path):
+        try:
+            component.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
 
 
 def cache_root_is_creatable(root: Path) -> bool:
@@ -120,6 +143,10 @@ def discard_untrusted_entry(path: Path) -> None:
     so removal is VERIFIED and a failure raises here, before the download. the one thing this
     must never do is fall back to using the entry: it is foreign-owned content at a guessable
     key, and the caller's next step is to import it as python.
+
+    success is "the entry is gone", not "the delete call did not raise": a concurrent resolve
+    of the same untrusted key can clear it between our check and our delete, which surfaces as
+    ``FileNotFoundError`` even though the outcome is exactly the one we wanted.
     """
     reason = ""
     try:
@@ -129,7 +156,7 @@ def discard_untrusted_entry(path: Path) -> None:
             shutil.rmtree(path)
     except OSError as exc:
         reason = f": {exc}"
-    if not reason and not os.path.lexists(path):
+    if not os.path.lexists(path):
         return
     raise RuntimeError(
         f"env cache entry {path} is not owned by this user and could not be removed{reason}; "

@@ -680,14 +680,16 @@ def _dir_size_bytes(path: Path) -> int:
 def _ensure_cache_root() -> Path:
     """create the env cache root 0700 and refuse it if it is not private to this user.
 
-    ``mkdir(exist_ok=True)`` is the race-safe create: whoever wins, the checks below decide
-    whether the winner's directory is trustworthy. ``lstat`` rather than ``stat`` so a
-    pre-created symlink pointing the cache somewhere attacker-controlled is rejected instead
-    of followed. the root stays hardcoded (no ``FLASH_ENV_CACHE_DIR``) on purpose: an ambient
-    var that redirects where executable environment code is read from is the same hazard.
+    creation is per-component and EEXIST-tolerant (``make_private_dir``): the ancestors have to
+    be created 0700 too, or the ancestor walk below rejects the path this call just made, and
+    tolerating EEXIST is the race-safe create -- whoever wins, the checks below decide whether
+    the winner's directory is trustworthy. ``lstat`` rather than ``stat`` so a pre-created
+    symlink pointing the cache somewhere attacker-controlled is rejected instead of followed.
+    the root stays hardcoded (no ``FLASH_ENV_CACHE_DIR``) on purpose: an ambient var that
+    redirects where executable environment code is read from is the same hazard.
     """
     root = _CACHE_ROOT
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    cache_security.make_private_dir(root)
     cache_security.validate_cache_root_ancestors(root)
     info = os.lstat(root)
     uid = os.getuid() if hasattr(os, "getuid") else info.st_uid
@@ -748,22 +750,26 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
         f"{cache_scope}:github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}".encode()
     ).hexdigest()[:24]
     cache_dir = _ensure_cache_root() / cache_key
+    # vet ANY existing entry at this key before looking inside it, not just one that already
+    # holds the expected entrypoint. a foreign-owned directory missing the entrypoint used to
+    # skip these checks entirely and fall straight to the download, which then writes the
+    # environment into a directory another account owns. untrusted here means planted before
+    # the root's permissions were last repaired, or swapped in since: never import it -- clear
+    # it and fall through to a fresh download. raises if the entry cannot be removed, which has
+    # to happen HERE: continuing would download the environment only for copytree to fail on
+    # the entry still sitting there, and the alternative -- using it -- is what is refused.
+    if os.path.lexists(cache_dir) and not cache_security.trust_cache_entry(cache_dir):
+        cache_security.discard_untrusted_entry(cache_dir)
     env_file = cache_dir / parsed.path
     if env_file.is_dir():
         env_file = env_file / _DEFAULT_ENVIRONMENT_PATH
     if env_file.is_file():
-        if cache_security.trust_cache_entry(cache_dir) and cache_security.trust_cache_entry(
-            env_file
-        ):
+        if cache_security.trust_cache_entry(env_file):
             # mark as recently used so LRU eviction keeps hot envs.
             with contextlib.suppress(OSError):
                 os.utime(cache_dir)
             return env_file
-        # untrusted entry at this cache key (planted before the root's permissions were last
-        # repaired, or swapped in since): never import it -- clear it and fall through to a
-        # fresh download. raises if the entry cannot be removed, which has to happen HERE:
-        # continuing would download the environment only for copytree to fail on the entry
-        # still sitting there, and the alternative -- using it -- is the thing being refused.
+        # a foreign file inside our own directory condemns the whole entry, same as above.
         cache_security.discard_untrusted_entry(cache_dir)
     tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-github-"))
     resolved = GitHubEnvironmentRef(

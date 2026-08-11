@@ -1049,6 +1049,97 @@ def test_resolve_github_env_refuses_unremovable_foreign_cache_entry(monkeypatch,
     assert (cache_dir / "environment.py").read_bytes() == b"# original\n"
 
 
+def _report_foreign_lstat(monkeypatch, paths):
+    """make os.lstat report `paths` as owned by another uid, leaving every other field alone."""
+    targets = {Path(p) for p in paths}
+    real_lstat = os.lstat
+
+    def fake_lstat(path, *args, **kwargs):
+        result = real_lstat(path, *args, **kwargs)
+        if Path(path) in targets:
+            fields = list(result)
+            fields[4] = result.st_uid + 1
+            return os.stat_result(tuple(fields))
+        return result
+
+    monkeypatch.setattr(adapter.os, "lstat", fake_lstat)
+
+
+def _seed_cache_dir_without_entrypoint(monkeypatch, tmp_path):
+    """resolve once to learn the cache dir, then strip the entrypoint out of it."""
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **kwargs: "a" * 40)
+    monkeypatch.setattr(
+        adapter, "_download_github_tarball", lambda ref: _github_env_tarball(b"# original\n")
+    )
+    first = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+    cache_dir = first.parent
+    (cache_dir / "environment.py").unlink()
+    return cache_dir
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="posix-only uid check")
+def test_resolve_github_env_refuses_unremovable_foreign_cache_entry_without_entrypoint(
+    monkeypatch, tmp_path
+):
+    # gating the ownership checks on the entrypoint being present left the worst case unchecked:
+    # a foreign-owned, unremovable directory at this key with no environment.py inside skipped
+    # trust entirely, so the resolver downloaded and then wrote INTO another account's
+    # directory. an entry is vetted because it exists, not because it looks complete.
+    cache_dir = _seed_cache_dir_without_entrypoint(monkeypatch, tmp_path)
+    _report_foreign_lstat(monkeypatch, [cache_dir])
+    real_rmtree = shutil.rmtree
+
+    def refuse_rmtree(path, *args, **kwargs):
+        if Path(path) == cache_dir:
+            if kwargs.get("ignore_errors"):
+                return None
+            raise PermissionError(13, "Permission denied", str(cache_dir))
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(adapter.shutil, "rmtree", refuse_rmtree)
+    downloaded = []
+    monkeypatch.setattr(
+        adapter,
+        "_download_github_tarball",
+        lambda ref: downloaded.append(ref) or _github_env_tarball(b"# refreshed\n"),
+    )
+
+    # the same actionable error the unremovable-with-entrypoint case raises, before any download.
+    with pytest.raises(RuntimeError, match="could not be removed"):
+        adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+
+    assert downloaded == []
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="posix-only uid check")
+def test_resolve_github_env_discards_removable_foreign_cache_entry_without_entrypoint(
+    monkeypatch, tmp_path
+):
+    # the other half of the same gap: when the foreign entry CAN be removed, the recoverable
+    # path must still work -- and the removal has to happen BEFORE the download, not as the
+    # best-effort rmtree that used to sit after it. that ordering is the whole point: it is what
+    # turns "download into a directory another account owns" into a clean refusal or a clean
+    # refetch, and it is the only observable difference here from the unvetted behavior.
+    cache_dir = _seed_cache_dir_without_entrypoint(monkeypatch, tmp_path)
+    (cache_dir / "planted.py").write_bytes(b"# planted\n")
+    _report_foreign_lstat(monkeypatch, [cache_dir])
+    existed_at_download = []
+    monkeypatch.setattr(
+        adapter,
+        "_download_github_tarball",
+        lambda ref: (
+            existed_at_download.append(cache_dir.exists()) or _github_env_tarball(b"# refreshed\n")
+        ),
+    )
+
+    resolved = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+
+    assert existed_at_download == [False]
+    assert resolved.read_bytes() == b"# refreshed\n"
+    assert not (cache_dir / "planted.py").exists()
+
+
 def test_cmd_env_pull_multi_component_in_env_path_is_not_a_destination(
     monkeypatch, tmp_path, capsys
 ):
