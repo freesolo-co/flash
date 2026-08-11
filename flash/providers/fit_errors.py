@@ -1,8 +1,6 @@
 """How a VRAM fit failure is explained to the user.
 
 Split from ``base`` as one cohesive group: these build the REJECTION MESSAGE, not the fit decision.
-``base`` re-exports every public name here, so ``from flash.providers.base import ...`` keeps
-working; ``base`` imports this module lazily because this module imports ``base``.
 """
 
 from __future__ import annotations
@@ -173,14 +171,12 @@ def vram_fit_error_message(
             catalog_width = smallest_fitting_gpu_count(
                 need, max_gpu_count=max_gpu_count, gpu_names=gpu_names
             )
-            raise_clause = (
-                f"Raise the card ceiling with `--gpus {catalog_width}` to check it against their "
-                "catalog"
-                if catalog_width is not None and catalog_width > requested_gpu_count
-                else "Raise the card ceiling with `--gpus`"
-            )
+            # the identical fit check guarding this block guarantees a catalog width is present.
             remedy = (
-                f"{raise_clause}, or configure a provider that rents card counts directly (RunPod)"
+                f"Raise the card ceiling with `--gpus {catalog_width}` to check it against their "
+                "catalog, or configure a provider that rents card counts directly (RunPod)"
+                if catalog_width > requested_gpu_count
+                else "Configure a provider that rents card counts directly (RunPod)"
             )
         return (
             f"{algorithm} needs >= {need:g} GB VRAM, which fits only on a multi-card shape that "

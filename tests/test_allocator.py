@@ -2033,30 +2033,6 @@ def test_exact_gpu_rejection_reports_a_pin_that_hides_a_wider_count():
     assert "Drop the provider pin" not in runpod
 
 
-def test_moved_message_builders_still_import_from_their_original_module():
-    """The names that moved to ``fit_errors`` stay reachable through ``base``.
-
-    They were public in ``base`` until it crossed the file-size cap, so an out-of-tree consumer's
-    ``from flash.providers.base import vram_fit_error_message`` must not break on a patch release.
-    Every in-repo call site imports from ``fit_errors`` directly, so nothing else pins this.
-    """
-    import flash.providers.base as base
-    from flash.providers import fit_errors
-
-    moved = (
-        "rents_arbitrary_card_counts",
-        "vram_fit_error_message",
-        "vram_knob_advice",
-        "widenable_gpu_names",
-    )
-    for name in moved:
-        assert getattr(base, name) is getattr(fit_errors, name)
-
-    # the forwarding must not turn every typo into a live attribute.
-    with pytest.raises(AttributeError):
-        getattr(base, "definitely_not_a_real_name")  # noqa: B009
-
-
 def test_fit_remedy_is_withheld_when_only_fixed_count_sku_providers_remain():
     """A width is only PROMISED when a provider in play rents card counts freely.
 

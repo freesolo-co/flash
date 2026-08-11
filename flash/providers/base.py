@@ -851,26 +851,3 @@ class Provider(Protocol):
         limits cleanup to this plane in shared accounts; None keeps single-plane behavior.
         """
         ...
-
-
-# --- fit-error message builders (moved to flash.providers.fit_errors) ---------------------------
-# these lived here until this module crossed the 1000-line cap. `fit_errors` imports FROM here, so
-# a module-level import back would be circular; PEP 562 module `__getattr__` resolves the name on
-# first access instead, which is late enough for the cycle to be closed. Existing
-# `from flash.providers.base import vram_fit_error_message` imports keep working unchanged.
-_FIT_ERROR_NAMES = frozenset(
-    {
-        "rents_arbitrary_card_counts",
-        "vram_fit_error_message",
-        "vram_knob_advice",
-        "widenable_gpu_names",
-    }
-)
-
-
-def __getattr__(name: str):
-    if name in _FIT_ERROR_NAMES:
-        from flash.providers import fit_errors
-
-        return getattr(fit_errors, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
