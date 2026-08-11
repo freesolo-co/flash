@@ -454,7 +454,7 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
     # the attention-head geometry cap, so a marker cannot buy a shape those would refuse.
     from flash.providers.base import MAX_COMBINATION_CARDS
 
-    ceiling = MAX_COMBINATION_CARDS if worker_spec.gpu_count_auto else public_count
+    ceiling = public_count if worker_spec.authored_gpu_count is not None else MAX_COMBINATION_CARDS
     if 1 <= effective_count <= ceiling:
         effective_gpu["count"] = public_gpu.get("count")
     # disk sizing, the weight-cache volume, and retry/wall-clock lifecycle policy are platform-managed

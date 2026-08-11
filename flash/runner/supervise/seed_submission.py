@@ -8,7 +8,7 @@ from __future__ import annotations
 import contextlib
 from dataclasses import dataclass, field
 
-from flash.core.spec import JobSpec, gpu_count_of
+from flash.core.spec import JobSpec
 from flash.runner.supervise import lifecycle as _lifecycle
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
@@ -386,11 +386,7 @@ def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
             # an authored gpu.count is a hard ceiling. the digest-stable integer 1 on an unpinned
             # spec is only a placeholder, so the marker must reach allocation as none or auto-sizing
             # silently collapses back to one card after the preparation round trips.
-            max_gpu_count=(
-                None
-                if prepared.attempt_spec.gpu_count_auto
-                else gpu_count_of(prepared.attempt_spec)
-            ),
+            max_gpu_count=prepared.attempt_spec.authored_gpu_count,
             # a profile job tokenizes on cpu and exits before weights load, so it allocates the
             # cheapest rentable card rather than the training shape it is measuring.
             workload_profile=bool(prepared.attempt_spec.workload_profile_kind),

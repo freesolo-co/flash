@@ -16,7 +16,7 @@ def spec_payload(
     # the server read an auto-sized run as an authored one-card pin and reject it at the pinned-count
     # preflight before a run existed. dropping the key here restores the author's intent over the
     # wire without touching the digest, which is computed server-side from the reparsed spec.
-    if spec.gpu_count_auto and out.get("gpu", {}).get("count") == 1:
+    if spec.authored_gpu_count is None:
         out["gpu"] = {key: value for key, value in out["gpu"].items() if key != "count"}
     # [environment] pip is platform-managed and no longer travels in the payload: both provider
     # submit paths already resolve it from worker_pip_for_env when the spec carries none, so

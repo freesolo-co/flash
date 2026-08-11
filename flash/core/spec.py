@@ -489,6 +489,19 @@ class JobSpec:
             return "profile"
         return "rl" if self.algorithm == "grpo" else self.algorithm
 
+    @property
+    def authored_gpu_count(self) -> int | None:
+        """The author's card ceiling: ``None`` when they omitted ``gpu.count``.
+
+        THE single reading of "is the stored count real, or the placeholder?". `gpu_count_auto` and
+        `gpu.count` are one value -- an optional ceiling -- split across two fields only because
+        `to_dict` must keep a digest-stable integer in the public spec. Every consumer that wants
+        the ceiling had to rejoin them by hand, and the hand-written guards disagreed: one checked
+        `count == 1`, another `count == 1 and not type`, two checked neither. Rejoin them here so a
+        consumer cannot invent a fifth spelling.
+        """
+        return None if self.gpu_count_auto else gpu_count_of(self)
+
     def to_dict(self) -> dict[str, Any]:
         """return the public user-authorable job specification.
 
