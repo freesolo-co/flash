@@ -568,16 +568,23 @@ def _warn_if_environment_form_disagrees(configs: tuple[Path, ...], *, can_publis
         return
 
     if managed:
-        # hedged, unlike the hosted branch above: which form a self-hosted plane accepts depends on
-        # server-side FLASH_STANDALONE, which the CLI cannot read. A standalone plane takes only
-        # `github:` ids; an identity-backed one takes only managed slugs -- so a flat "replace it"
-        # here would be advice to break the config on half of all self-hosted planes.
+        # hedged, unlike the hosted branch above: which form a self-hosted plane can USE depends on
+        # server-side FLASH_STANDALONE, which the CLI cannot read. An identity-backed plane takes
+        # managed slugs, so a flat "replace it" would be advice to break a working config.
+        #
+        # "cannot resolve", not "rejects": standalone does not reject a slug at validation --
+        # `_require_hosted_environment_form` returns early under `auth.standalone()`, and so does
+        # `require_environment_project`. It fails one layer later, at fetch:
+        # `managed_slug_to_github_ref` maps every slug onto `freesolo-co/environment-hub`, which is
+        # an internal repo an external operator's GITHUB_TOKEN cannot read. Saying "rejects" would
+        # send someone hunting for a validation error that never appears in their logs.
         _warn(
             f"existing {_names(managed)} use managed hub [environment] ids, which a standalone "
-            "plane rejects; keeping the files unchanged. If this plane runs with "
-            "`FLASH_STANDALONE=1`, replace each [environment] id with a `github:OWNER/REPO@REF:PATH` "
-            "form; if it runs against an identity backend, managed hub ids are the accepted form "
-            "and these are already right"
+            "plane accepts but cannot fetch -- they resolve to Freesolo's internal environment-hub "
+            "repo; keeping the files unchanged. If this plane runs with `FLASH_STANDALONE=1`, "
+            "replace each [environment] id with a `github:OWNER/REPO@REF:PATH` form pointing at a "
+            "repo your plane's GITHUB_TOKEN can read; if it runs against an identity backend, "
+            "managed hub ids are the accepted form and these are already right"
         )
     if unfilled:
         # Unhedged, because no plane accepts a blank id: `validate_spec` fails the submit before the

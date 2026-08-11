@@ -676,7 +676,13 @@ def test_env_setup_warns_when_filled_hub_ids_are_retained_on_a_self_hosted_plane
     _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
     warning = capsys.readouterr().err
 
-    assert "which a standalone plane rejects" in warning
+    # "accepts but cannot fetch", not "rejects": both server-side gates return early under
+    # auth.standalone(), so the slug passes validation and fails at fetch instead -- it resolves to
+    # freesolo-co/environment-hub, which is internal. Naming the wrong layer sends the operator
+    # looking for a validation error their logs will never contain.
+    assert "accepts but cannot fetch" in warning
+    assert "rejects" not in warning
+    assert "internal environment-hub repo" in warning
     assert "`github:OWNER/REPO@REF:PATH`" in warning
     # both branches named, because the CLI cannot read server-side FLASH_STANDALONE: telling an
     # identity-backed operator to switch to `github:` would break a config that is already correct
@@ -686,6 +692,36 @@ def test_env_setup_warns_when_filled_hub_ids_are_retained_on_a_self_hosted_plane
     for name in ("sft.toml", "rl.toml", "opd.toml"):
         assert f"configs/{name}" in warning, name
         assert (tmp_path / "configs" / name).read_text(encoding="utf-8") == filled[name], name
+
+
+def test_managed_slug_fails_at_fetch_not_validation_on_standalone() -> None:
+    """Pin the mechanism the managed-slug warning describes, so its wording cannot drift back.
+
+    The warning used to say a standalone plane "rejects" managed slugs. It does not: both
+    server-side gates return early under `auth.standalone()`, so the slug validates fine and fails
+    one layer later, at fetch, because every slug maps onto Freesolo's internal environment-hub.
+    That distinction is the whole value of the warning -- an operator told "rejects" searches for a
+    validation error that is never logged.
+    """
+    import inspect
+
+    from flash.envs.loader import managed_slug_to_github_ref
+    from flash.server.domain import environment_registry
+    from flash.server.platform import deps
+
+    # both gates bypass on standalone, so validation is NOT where a managed slug fails
+    for func in (
+        deps._require_hosted_environment_form,
+        environment_registry.require_environment_project,
+    ):
+        source = inspect.getsource(func)
+        assert "standalone()" in source, func.__name__
+        assert "return" in source, func.__name__
+
+    # and the slug resolves to the repo an external operator cannot read
+    assert managed_slug_to_github_ref("acme/my-env").startswith(
+        "github:freesolo-co/environment-hub@"
+    )
 
 
 def test_env_setup_warns_that_unfilled_ids_are_valid_nowhere(monkeypatch, tmp_path, capsys) -> None:
