@@ -1,4 +1,4 @@
-"""Unit tests for the bounded, user-private on-disk env cache."""
+"""unit tests for the bounded, user-private on-disk env cache."""
 
 from __future__ import annotations
 

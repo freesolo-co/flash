@@ -42,16 +42,16 @@ _CACHE_ROOT_DIR_NAME = "env-cache"
 
 
 def _default_cache_root() -> Path:
-    """Where the on-disk env cache lives: a directory private to the current user.
+    """where the on-disk env cache lives: a directory private to the current user.
 
-    The cache holds code that ``load_environment`` imports and executes, and its keys are
-    fully predictable (a sha of a public repo/ref/path), so a shared world-writable root let
-    any other local account pre-create the tree and plant an ``environment.py`` that the
-    cache-hit path would hand back with no network call and no integrity check. Prefer a
+    the cache holds code that ``load_environment`` imports and executes, and its keys are
+    fully predictable (a sha of a public repo/ref/path), so a shared world-writable root
+    would let any other local account pre-create the tree and plant an ``environment.py``
+    that the cache-hit path hands back with no network call and no integrity check. prefer a
     home-owned location; worker containers can be homeless, so fall back to a uid-suffixed
     dir under the temp root rather than a shared name.
 
-    Deliberately not env-tunable -- see ``_ensure_cache_root``.
+    deliberately not env-tunable, see ``_ensure_cache_root``.
     """
     xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
     if xdg and Path(xdg).is_absolute():
@@ -673,12 +673,12 @@ def _dir_size_bytes(path: Path) -> int:
 
 
 def _ensure_cache_root() -> Path:
-    """Create the env cache root 0700 and refuse it if it is not private to this user.
+    """create the env cache root 0700 and refuse it if it is not private to this user.
 
     ``mkdir(exist_ok=True)`` is the race-safe create: whoever wins, the checks below decide
     whether the winner's directory is trustworthy. ``lstat`` rather than ``stat`` so a
     pre-created symlink pointing the cache somewhere attacker-controlled is rejected instead
-    of followed. The root stays hardcoded (no ``FLASH_ENV_CACHE_DIR``) on purpose: an ambient
+    of followed. the root stays hardcoded (no ``FLASH_ENV_CACHE_DIR``) on purpose: an ambient
     var that redirects where executable environment code is read from is the same hazard.
     """
     root = _CACHE_ROOT
