@@ -879,17 +879,17 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
 
     params = dict(kwargs)
     source = params.pop("records", None)
-    # [environment.params] split selects which packaged dataset file Flash trains on. It used to
-    # be forwarded to the SDK only, so SFT (and GRPO problem selection driven off dataset())
-    # SILENTLY trained on the default dataset/train.jsonl even when a side split was requested.
+    # [environment.params] split selects which packaged dataset file Flash trains on. it used to
+    # be sdk-forwarded only, so training silently used train.jsonl even with a side split.
     split = params.get("split")
     split = split.strip() if isinstance(split, str) else None
     if split:
         split = _validate_packaged_dataset_split(split)
+    if isinstance(params.get("split"), str):
+        params["split"] = split or ""  # the sdk sees the validated name, not the raw padding
     side_split = bool(split) and split != "train"
-    # true when source is the DEFAULT packaged train file the environment itself received as a
-    # param; the env instance's own dataset then takes precedence over re-reading the file (see
-    # FreesoloEnvironment.dataset). explicit records never reach the env, so they keep winning.
+    # true when source is the default packaged train file the env received as a param; its own
+    # dataset then wins over re-reading the file. explicit records never reach the env.
     source_is_dataset_file = False
     dataset_path = params.get("dataset_path")
     if source is None and dataset_path:

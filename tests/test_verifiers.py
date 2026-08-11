@@ -583,6 +583,27 @@ def test_freesolo_adapter_split_param_selects_split_dataset(monkeypatch, tmp_pat
     assert env.dataset() == [{"id": "o", "input": "2+2?", "output": "4"}]
 
 
+def test_freesolo_adapter_forwards_the_normalized_split_to_the_env(monkeypatch, tmp_path):
+    """a padded split name selects the right file locally; the env must see the same name."""
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path,
+        {
+            "dataset/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n',
+            "dataset/oracle.jsonl": '{"id":"o","input":"2+2?","output":"4"}\n',
+        },
+    )
+    env_file.write_text(
+        "def load_environment(**kwargs):\n"
+        "    assert kwargs.get('split') == 'oracle', repr(kwargs.get('split'))\n"
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(str(env_file), split=" oracle ", contract_text="c")
+    assert env.dataset() == [{"id": "o", "input": "2+2?", "output": "4"}]
+
+
 def test_freesolo_adapter_missing_split_file_refuses_silent_train_fallback(monkeypatch, tmp_path):
     _install_fake_freesolo(monkeypatch)
     env_file = _split_env(
