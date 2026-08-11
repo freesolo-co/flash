@@ -132,8 +132,8 @@ def _processed_resume_steps(required_steps: tuple[int, ...], resume_step: int) -
     the staged resume checkpoint lands in local_dir as ``global_step_N`` with the tracker pointing
     at it, so an unseeded watcher sees it as pending on its first sweep and re-runs the merger and
     the multi-GB resume upload for state hf already holds. the resume artifact only exists because a
-    previous attempt published its deployable first (``before_upload``), so crediting the step is
-    safe. a resume step that IS a required save is credited only when
+    previous attempt published its deployable first (``before_upload``), so the step's deployable is
+    already on hf. a resume step that IS a required save is credited only when
     ``_durable_required_save_steps`` finds its adapter on hf, leaving it to be staged otherwise.
     """
     processed = _durable_required_save_steps(required_steps, resume_step)

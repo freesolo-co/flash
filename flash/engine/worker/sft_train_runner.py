@@ -439,9 +439,9 @@ def _prepare_sft_child(
         model_revision=options.model_revision,
         required_steps=options.save_at_steps,
     )
-    # credits durable required saves AND the step this attempt resumed from: the staged resume
-    # checkpoint is already a pending global_step_N on disk, and without the seed the watcher
-    # re-merges it and re-uploads full state hf already has, holding the resume-upload lock.
+    # the staged resume checkpoint is already a pending global_step_N on disk, so an unseeded
+    # watcher re-merges it and re-uploads full state hf already has, holding the resume-upload
+    # lock while the first genuinely new checkpoint waits behind it.
     watcher.processed_steps.update(
         _sft_train._processed_resume_steps(options.save_at_steps, resume_step)
     )
