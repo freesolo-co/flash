@@ -228,6 +228,30 @@ def test_unpacked_warning_is_silent_when_the_authored_batch_was_already_one() ->
     )
 
 
+@pytest.mark.parametrize("authored", [True, False])
+def test_worker_unpacked_warning_names_the_batch_source_truthfully(capsys, authored: bool) -> None:
+    """The worker path resolves batch_size to the recipe default before it warns, so handing the
+    resolved number to the helper made an omitted knob read as one the user configured -- the
+    opposite of what the cli says about the same run.
+    """
+    from flash.engine.plan.recipe import RECIPE
+
+    spec = _spec()
+    spec = _rebuild_digest(
+        replace(spec, train=replace(spec.train, batch_size=2 if authored else None))
+    )
+
+    _prepare(spec, packed=False)
+
+    warning = capsys.readouterr().err
+    expected = (
+        "the configured batch_size 2"
+        if authored
+        else f"the default batch_size {RECIPE.sft.effective_batch}"
+    )
+    assert expected in warning
+
+
 def _rebuild_digest(spec: JobSpec) -> JobSpec:
     digest = sft_profile_input_digest(
         spec,
