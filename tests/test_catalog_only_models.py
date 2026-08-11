@@ -113,13 +113,20 @@ def test_a_pre_upgrade_snapshot_still_passes_its_integrity_digest(tmp_path, monk
     hashed_worker = {
         k: v
         for k, v in old_worker.items()
-        if v
-        or k
-        not in (
-            "workload_profile_kind",
-            "workload_profile_input_digest",
-            "workload_profile_producer_version",
-            "workload_profile",
+        # `model_revision_auto` postdates this snapshot: the old plane had no such field, so its
+        # bytes carried no such key. today's to_internal_dict() always emits it, so the
+        # reconstruction has to drop it for the same reason it ADDS model_policy above -- reproduce
+        # the bytes that were hashed, not today's serialization.
+        if k != "model_revision_auto"
+        and (
+            v
+            or k
+            not in (
+                "workload_profile_kind",
+                "workload_profile_input_digest",
+                "workload_profile_producer_version",
+                "workload_profile",
+            )
         )
     }
     payload = {
@@ -184,13 +191,20 @@ def test_a_pre_upgrade_worker_env_snapshot_still_passes_its_integrity_digest(tmp
     hashed_worker = {
         k: v
         for k, v in old_worker.items()
-        if v
-        or k
-        not in (
-            "workload_profile_kind",
-            "workload_profile_input_digest",
-            "workload_profile_producer_version",
-            "workload_profile",
+        # `model_revision_auto` postdates this snapshot: the old plane had no such field, so its
+        # bytes carried no such key. today's to_internal_dict() always emits it, so the
+        # reconstruction has to drop it for the same reason it ADDS model_policy above -- reproduce
+        # the bytes that were hashed, not today's serialization.
+        if k != "model_revision_auto"
+        and (
+            v
+            or k
+            not in (
+                "workload_profile_kind",
+                "workload_profile_input_digest",
+                "workload_profile_producer_version",
+                "workload_profile",
+            )
         )
     }
     payload = {
