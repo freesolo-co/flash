@@ -1898,15 +1898,16 @@ def test_provider_incompatible_pin_reports_the_incompatibility_not_a_fit_remedy(
 
 
 def test_unpurchasable_width_names_a_remedy_the_user_can_actually_apply():
-    """The remedy must depend on WHY only fixed-count providers are in play.
+    """The remedy must depend on whether dropping the pin would actually change the pool.
 
-    A pin the user set is theirs to drop. But a control plane configured with only Lambda/Vast
-    narrows to the same one-or-two-name set with no pin anywhere, and telling that operator to
-    "drop the provider pin" names a knob they never set and cannot use. The provider tuple alone
-    cannot tell the two apart, so the pin has to travel separately from the caller.
+    Three cases collapse to the same narrow ``available`` tuple and must not get the same advice:
+    a pin over a fleet that also has RunPod (dropping it really does buy the wider shape), a pin
+    over a Lambda-only fleet (dropping it lands on the identical pool and the identical rejection),
+    and no pin at all (a knob the operator never set). ``available`` cannot separate them, so the
+    pre-pin fleet has to travel with it.
 
-    Driven through ``_resolved_gpu_count`` rather than the message builder directly: the pin flag
-    is LOST at that boundary, so a builder-only test would pass against the defect.
+    Driven through ``_resolved_gpu_count`` rather than the message builder directly: the pin
+    context is LOST at that boundary, so a builder-only test would pass against the defect.
     """
     from flash.providers.allocator import _resolved_gpu_count
     from flash.providers.base import UnsupportedGpuError
@@ -1917,32 +1918,60 @@ def test_unpurchasable_width_names_a_remedy_the_user_can_actually_apply():
         "model_revision": "",
         "exact": "",
     }
-    with pytest.raises(UnsupportedGpuError) as pinned:
-        _resolved_gpu_count(
-            "Qwen/Qwen3.6-35B-A3B",
-            "grpo",
-            available=("lambda",),
-            provider_pinned=True,
-            **shared,
-        )
-    assert "Drop the provider pin" in str(pinned.value)
 
-    # same narrow provider set, but nothing was pinned: it is the whole configured fleet, so the
-    # user has no pin to drop and must be told something they can act on.
-    with pytest.raises(UnsupportedGpuError) as unpinned:
-        _resolved_gpu_count(
-            "Qwen/Qwen3.6-35B-A3B",
-            "grpo",
-            available=("lambda", "vast"),
-            provider_pinned=False,
-            **shared,
-        )
-    assert "Drop the provider pin" not in str(unpinned.value)
-    assert "Configure a provider" in str(unpinned.value)
+    def reject(available, unpinned):
+        with pytest.raises(UnsupportedGpuError) as exc:
+            _resolved_gpu_count(
+                "Qwen/Qwen3.6-35B-A3B",
+                "grpo",
+                available=available,
+                unpinned=unpinned,
+                **shared,
+            )
+        return str(exc.value)
 
-    # neither message may claim the run exceeds every class -- it fits, it just cannot be bought.
-    for message in (str(pinned.value), str(unpinned.value)):
+    # a pin worth dropping: the fleet behind it carries RunPod, which rents the width freely.
+    droppable = reject(("lambda",), ("lambda", "runpod"))
+    assert "Drop the provider pin" in droppable
+
+    # the same pin over a LAMBDA-ONLY fleet. dropping it leaves the identical pool, so the advice
+    # would send the user in a circle back to this exact error.
+    futile = reject(("lambda",), ("lambda",))
+    assert "Drop the provider pin" not in futile
+    assert "Configure a provider" in futile
+
+    # nothing pinned: a narrow fleet is simply the whole configured fleet.
+    unpinned = reject(("lambda", "vast"), None)
+    assert "Drop the provider pin" not in unpinned
+    assert "Configure a provider" in unpinned
+
+    # no message may claim the run exceeds every class -- it fits, it just cannot be bought.
+    for message in (droppable, futile, unpinned):
         assert "more than any" not in message
+
+
+def test_moved_message_builders_still_import_from_their_original_module():
+    """The names that moved to ``fit_errors`` stay reachable through ``base``.
+
+    They were public in ``base`` until it crossed the file-size cap, so an out-of-tree consumer's
+    ``from flash.providers.base import vram_fit_error_message`` must not break on a patch release.
+    Every in-repo call site imports from ``fit_errors`` directly, so nothing else pins this.
+    """
+    import flash.providers.base as base
+    from flash.providers import fit_errors
+
+    moved = (
+        "rents_arbitrary_card_counts",
+        "vram_fit_error_message",
+        "vram_knob_advice",
+        "widenable_gpu_names",
+    )
+    for name in moved:
+        assert getattr(base, name) is getattr(fit_errors, name)
+
+    # the forwarding must not turn every typo into a live attribute.
+    with pytest.raises(AttributeError):
+        getattr(base, "definitely_not_a_real_name")  # noqa: B009
 
 
 def test_fit_remedy_is_withheld_when_only_fixed_count_sku_providers_remain():

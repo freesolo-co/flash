@@ -502,7 +502,11 @@ def _offline_gpu_shape(
         rentable_gpu_counts,
         smallest_fitting_gpu_count,
     )
-    from flash.providers.fit_errors import vram_fit_error_message, vram_knob_advice
+    from flash.providers.fit_errors import (
+        vram_fit_error_message,
+        vram_knob_advice,
+        widenable_gpu_names,
+    )
 
     provider = config.provider if config.provider != "auto" else "auto"
     if config.gpu_type:
@@ -596,7 +600,11 @@ def _offline_gpu_shape(
                 max_gpu_count=auto_cap,
                 gpu_names=names,
                 providers=None if provider == "auto" else (provider,),
-                provider_pinned=provider != "auto",
+                # `None` (no pin) means every carrier is already in play, so there is no pin to
+                # drop; otherwise ask what the unpinned catalog would still buy a wider shape on.
+                widenable_without_pin=(
+                    None if provider == "auto" else widenable_gpu_names(None, None)
+                ),
             )
         )
     _cost, count, _combined, _per_card, gpu, hourly = min(ranked)

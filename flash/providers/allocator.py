@@ -27,7 +27,11 @@ from flash.providers.base import (
     smallest_fitting_gpu_count,
     wider_shape_remedy,
 )
-from flash.providers.fit_errors import rents_arbitrary_card_counts, vram_fit_error_message
+from flash.providers.fit_errors import (
+    rents_arbitrary_card_counts,
+    vram_fit_error_message,
+    widenable_gpu_names,
+)
 
 logger = get_logger(__name__)
 
@@ -267,13 +271,14 @@ def _resolved_gpu_count(
     model_revision: str,
     available: tuple[str, ...],
     exact: str,
-    provider_pinned: bool = False,
+    unpinned: tuple[str, ...] | None = None,
 ) -> int:
     """Resolve auto-size or validate that an authored ceiling can structurally fit.
 
-    ``provider_pinned`` travels separately from ``available`` because a pin narrows that tuple to
-    one name and so becomes indistinguishable from a plane that only configured one provider; a
-    rejection message has to tell those apart to name a remedy the user can actually apply.
+    ``unpinned`` is the configured fleet before a provider pin narrowed ``available``, or ``None``
+    when nothing was pinned. A rejection needs it to decide whether dropping the pin is a remedy:
+    ``available`` alone cannot tell a pin from a plane that only ever configured one provider, and
+    a pin on such a plane drops to the same pool and the same failure.
     """
     auto_cap = geometry_safe_gpu_cap(model_id, MAX_COMBINATION_CARDS, model_revision=model_revision)
     gpu_names = _structural_gpu_names(available, exact)
@@ -302,7 +307,13 @@ def _resolved_gpu_count(
             max_gpu_count=auto_cap,
             gpu_names=gpu_names,
             providers=available,
-            provider_pinned=provider_pinned,
+            # the pin is worth dropping only if the fleet behind it still buys a wider shape, so
+            # ask the same question of the unpinned pool that the pinned one just failed.
+            widenable_without_pin=(
+                None
+                if unpinned is None
+                else widenable_gpu_names(_structural_gpu_names(unpinned, exact), unpinned)
+            ),
         )
     )
 
@@ -447,9 +458,12 @@ def allocate(
             f"unknown provider {provider!r}; known providers: {', '.join(PROVIDER_NAMES)}"
         )
     available = available_providers()
+    # kept across the narrowing below so a rejection can ask what dropping the pin would restore.
+    unpinned = None
     if provider:
         if provider not in available:
             raise UnsupportedGpuError(f"requested provider {provider!r} is not configured")
+        unpinned = available
         available = (provider,)
 
     # allocate() is reachable directly, bypassing the parse gate entirely, so it resolves the
@@ -486,7 +500,7 @@ def allocate(
         model_revision=model_revision,
         available=available,
         exact=exact,
-        provider_pinned=bool(provider),
+        unpinned=unpinned,
     )
 
     constraints = AllocationConstraints(

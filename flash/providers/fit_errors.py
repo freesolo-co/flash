@@ -1,7 +1,8 @@
 """How a VRAM fit failure is explained to the user.
 
 Split from ``base`` as one cohesive group: these build the REJECTION MESSAGE, not the fit decision.
-Everything here is re-exported from ``base``, so importers keep their existing import.
+``base`` re-exports every public name here, so ``from flash.providers.base import ...`` keeps
+working; ``base`` imports this module lazily because this module imports ``base``.
 """
 
 from __future__ import annotations
@@ -100,7 +101,7 @@ def vram_fit_error_message(
     max_gpu_count: int,
     gpu_names: tuple[str, ...] | None = None,
     providers: tuple[str, ...] | None = None,
-    provider_pinned: bool = False,
+    widenable_without_pin: tuple[str, ...] | None = None,
 ) -> str:
     """Build an actionable pinned-count or terminal vram rejection.
 
@@ -108,10 +109,12 @@ def vram_fit_error_message(
     see ``widenable_gpu_names``. Otherwise the run falls through to the terminal message, which
     states the shortfall without sending the user to buy a shape no provider in play sells.
 
-    ``providers`` alone cannot say WHY the set is what it is: a one-provider set is a pin on some
-    planes and the entire configured fleet on others, and only the caller knows which. So
-    ``provider_pinned`` is passed separately -- telling an operator whose plane only has Lambda to
-    "drop the provider pin" names a knob they never set and could not use.
+    ``widenable_without_pin`` is what the pool would widen to if the provider pin were dropped
+    (``widenable_gpu_names`` over the unpinned fleet), or ``None`` when nothing was pinned. It
+    decides whether "drop the pin" is a remedy at all, which ``providers`` cannot answer: a
+    one-provider set is a pin on some planes and the entire configured fleet on others, and a pin
+    on a plane that only ever had Lambda drops to the same pool and the same rejection. Only a
+    caller that kept the unpinned fleet knows the difference.
     """
     algorithm = (algorithm or "").lower()
     widenable = widenable_gpu_names(gpu_names, providers)
@@ -140,12 +143,13 @@ def vram_fit_error_message(
     if requested_gpu_count is not None and smallest_fitting_gpu_count(
         need, max_gpu_count=max_gpu_count, gpu_names=gpu_names
     ):
-        # the remedy differs by WHY only fixed-count providers are in play. a pin the user set is
-        # theirs to drop; a plane configured with only Lambda/Vast has no such knob, so pointing at
-        # one would name a setting that does not exist for them.
+        # the remedy differs by WHY only fixed-count providers are in play. dropping a pin helps
+        # only when the fleet BEHIND it still sells the wider shape; a pin on a Lambda-only plane
+        # drops to the same pool and the same rejection, so it gets the configure-a-provider advice
+        # exactly like the operator who pinned nothing at all.
         remedy = (
             "Drop the provider pin to let the allocator choose"
-            if provider_pinned
+            if widenable_without_pin
             else "Configure a provider that rents card counts directly (RunPod)"
         )
         return (
