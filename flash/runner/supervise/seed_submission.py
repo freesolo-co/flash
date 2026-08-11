@@ -380,6 +380,25 @@ def _ranking_train_knobs(attempt_spec):
     return train
 
 
+def _ranking_retained_examples(attempt_spec) -> int | None:
+    """Profiled row count for hardware ranking, or None when it cannot be read.
+
+    The executed width is bounded by the rows as well as the batch (verl's sampler drops the
+    remainder), so ranking without this credits a width the worker will not launch. Read from the
+    same digest-validated profile the quote uses; None on any failure, which leaves ranking exactly
+    as unconstrained as it was before rather than failing the submission.
+    """
+    if getattr(attempt_spec, "algorithm", "") != "sft":
+        return None
+    try:
+        from flash.cost.spec import _sft_profile
+
+        rows = int(_sft_profile(attempt_spec).retained_examples)
+    except Exception:
+        return None
+    return rows if rows > 0 else None
+
+
 def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
     from flash.providers.allocator import allocate
     from flash.providers.base import PollResult, UnsupportedGpuError
@@ -398,6 +417,7 @@ def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
             prepared.attempt_spec.model,
             prepared.attempt_spec.algorithm,
             train=_ranking_train_knobs(prepared.attempt_spec),
+            sft_retained_examples=_ranking_retained_examples(prepared.attempt_spec),
             thinking=prepared.attempt_spec.thinking,
             # the run's requested disk, so the vast capacity check searches at the same effective
             # floor submit provisions with — else a high-disk run is advertised vast capacity that

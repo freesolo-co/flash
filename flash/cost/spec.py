@@ -227,6 +227,7 @@ def runconfig_from_spec(spec) -> RunConfig:
         ),
         sft_packing_mode=profile.packing_mode if profile is not None else "",
         sft_packed_blocks=profile.packed_blocks if profile is not None else None,
+        sft_retained_examples=profile.retained_examples if profile is not None else None,
         measured_completion_tokens=(
             rollout.completion_tokens_mean if rollout is not None else None
         ),

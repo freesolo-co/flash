@@ -373,20 +373,28 @@ def _resolve_sft_world_size(gpu_count: int, train_batch_size: int, row_count: in
         # spent on an idle gpu. the notes carry it too, but those are read after the fact -- say it
         # while the run is live, and say what would actually use the card.
         #
-        # the remedy is not the same in every case. an unpacked profile pins the batch to 1
-        # (`sft_workload` sets examples_per_update = 1 for every non-packed mode), so telling the
-        # operator to raise [train] batch_size there sends them to a knob that cannot move this
-        # width. and only powers of two are rentable, so naming an odd rank count as a card
-        # allocation buys the next one DOWN -- "allocate 3" gets 2.
-        rentable = largest_rentable_count(world_size)
+        # the remedy differs by which input is binding, and a remedy that cannot be acted on is
+        # worse than none. three ways to get it wrong:
+        #
+        #  - an unpacked profile pins the batch to 1 (`sft_workload` sets examples_per_update = 1
+        #    for every non-packed mode), so "raise [train] batch_size" names a knob that cannot
+        #    move this width at all.
+        #  - when the batch already divides the allocation, the ROWS are what bind, and raising
+        #    the batch again changes nothing.
+        #  - only powers of two are rentable, and the next one down need not divide the batch or
+        #    the rows either: at 4 cards with a batch of 3, `largest_rentable_count(3)` is 2, and
+        #    2 does not divide 3. so re-resolve at the rentable count and name a width that is
+        #    actually usable.
+        rows_bind = train_batch_size % gpu_count == 0
+        rentable = sft_data_parallel_cards(
+            largest_rentable_count(world_size), train_batch_size, row_count
+        )
         limiter = (
-            f"a batch of {train_batch_size}"
-            if train_batch_size % gpu_count
-            else f"a dataset of {row_count} rows"
+            f"a dataset of {row_count} rows" if rows_bind else f"a batch of {train_batch_size}"
         )
         remedy = (
             f"allocate {rentable} card(s) instead"
-            if train_batch_size <= 1
+            if train_batch_size <= 1 or rows_bind
             else f"raise [train] batch_size to a multiple of {gpu_count}, or allocate {rentable} "
             "card(s) instead"
         )

@@ -323,11 +323,18 @@ def run_config_for_ranking(
     train=None,
     thinking: bool = False,
     model_revision: str = "",
+    sft_retained_examples: int | None = None,
 ):
     """Build the one-step RunConfig shared by every hardware-ranking path.
 
     Ranking is per step, so run length is irrelevant. Import lazily because the cost model imports
     this module.
+
+    ``sft_retained_examples`` is the profiled row count. Ranking prices candidates through
+    ``sharded_step_seconds``, which credits SFT only the ranks that will execute, and that width is
+    bounded by the rows as well as the batch. Omitting it credits a width the worker will not
+    launch, so ranking and the persisted quote disagree. It is not a ``train`` knob -- it comes
+    from the frozen workload profile -- so it is passed explicitly.
     """
     from flash.cost.types import RunConfig
 
@@ -361,6 +368,7 @@ def run_config_for_ranking(
         lora_rank=knob("lora_rank"),
         thinking=thinking,
         model_revision=model_revision,
+        sft_retained_examples=sft_retained_examples,
     )
 
 

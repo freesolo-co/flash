@@ -2267,3 +2267,91 @@ def test_sft_hardware_ranking_prices_the_profiled_batch_not_the_authored_one(mon
 
     monkeypatch.setattr(cost_spec, "_sft_profile", boom)
     assert seed_submission._ranking_train_knobs(spec).batch_size == 8
+
+
+def test_sft_idle_card_warning_only_recommends_widths_that_actually_work():
+    """A remedy that cannot be acted on is worse than no remedy.
+
+    Two ways the earlier wording failed. It routed the card advice through
+    `largest_rentable_count(world_size)`, which is the next power of two DOWN and need not divide
+    the batch or the rows either -- at 4 cards with a batch of 3 it named 2, and 2 does not divide
+    3. And it advised raising `batch_size` whenever the batch was above 1, including when the batch
+    already divided the allocation and the ROWS were what bound the width, where raising the batch
+    changes nothing.
+    """
+    import contextlib
+    import io
+    import re
+
+    from flash.engine.plan.steps import sft_data_parallel_cards
+    from flash.engine.worker.sft_train_runner import _resolve_sft_world_size
+
+    def warn(cards, batch, rows):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            width = _resolve_sft_world_size(cards, batch, rows)
+        return width, buf.getvalue()
+
+    # rows bind (8 divides 4 cards cleanly), so raising the batch is not the remedy.
+    width, text = warn(4, 8, 10)
+    assert width == 2
+    assert "a dataset of 10 rows" in text, text
+    assert "batch_size" not in text, "rows bind here, so raising the batch cannot help"
+    assert "allocate 2 card(s)" in text, text
+
+    # the batch binds, so the batch remedy is legitimate and must still be offered.
+    _, text = warn(4, 3, 9)
+    assert "a batch of 3" in text, text
+    assert "batch_size" in text, text
+
+    # every width this warning recommends must divide both the batch and the rows -- the rentable
+    # count alone does not (4 cards, batch 3 -> largest_rentable_count(3) == 2, and 3 % 2 != 0).
+    for cards in range(1, 9):
+        for batch in range(1, 17):
+            for rows in range(1, 32):
+                width, text = warn(cards, batch, rows)
+                if width >= cards:
+                    assert text == "", "must stay quiet when every allocated card is used"
+                    continue
+                found = re.search(r"allocate (\d+) card", text)
+                assert found, text
+                advised = int(found.group(1))
+                assert batch % advised == 0, (cards, batch, rows, advised)
+                assert rows % advised == 0, (cards, batch, rows, advised)
+                assert advised == sft_data_parallel_cards(advised, batch, rows)
+
+
+def test_sft_quote_credits_the_width_the_rows_allow_not_just_the_batch():
+    """Pricing must clamp on the rows too, or it re-opens the gap the batch clamp closed.
+
+    A packed profile can leave a row count that narrows the width below what the batch alone
+    permits: batch 8 with 10 retained rows on 4 cards launches 2 ranks, not 4. Crediting 4 there
+    understates wall time and cost exactly as the authored-batch bug did.
+
+    The row count must be carried explicitly rather than derived from `sft_packed_blocks`, which is
+    `ceil(rows / examples_per_update)` and reconstructs those 10 rows as 16 -- an OVER-credit, i.e.
+    the very failure this clamp exists to prevent.
+    """
+    from flash.cost import analytical
+    from flash.cost.types import RunConfig
+    from flash.engine.plan.steps import sft_data_parallel_cards
+
+    def speedup(rows):
+        config = RunConfig(
+            model_id="Qwen/Qwen3.5-4B",
+            method="sft",
+            steps=10,
+            batch_size=8,
+            sft_retained_examples=rows,
+        )
+        return analytical.method_card_speedup(config, 4, "H100", "runpod")
+
+    # the worker would launch 2 ranks on 10 rows and 4 on 16; the quote must agree with both.
+    assert sft_data_parallel_cards(4, 8, 10) == 2
+    assert sft_data_parallel_cards(4, 8, 16) == 4
+    assert speedup(10) < speedup(16)
+    assert speedup(10) == speedup(2 * 5)
+
+    # an unknown row count must not constrain: the quote is built before the dataset exists on some
+    # paths, and inventing a bound there would misprice every one of them.
+    assert speedup(None) == speedup(16)

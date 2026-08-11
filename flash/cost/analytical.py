@@ -275,10 +275,17 @@ def method_card_speedup(config: RunConfig, gpu_count: int, gpu: str, provider: s
     allocation paths learn it after building ``config``; pinned ``config.provider`` is the fallback.
 
     Credit SFT only the ranks that will actually execute. ``gpu_count`` here is the BILLED shape,
-    and sharding by data bounds the executed width by the batch: an unpacked profile pins
-    ``batch_size`` to 1, so a 2-card rental trains on one rank. Quoting the billed width there would
-    promise throughput the run cannot deliver and understate wall time against the run's cap. The
-    cards are still billed -- that is the point of the ``[sft][warn]`` line the worker prints.
+    and sharding by data bounds the executed width by BOTH the batch and the row count: an unpacked
+    profile pins ``batch_size`` to 1, so a 2-card rental trains on one rank, and a batch-compatible
+    width that does not divide the rows is narrowed again so the sampler cannot drop the remainder.
+    Quoting the billed width would promise throughput the run cannot deliver and understate wall
+    time against the run's cap. The cards are still billed -- that is the point of the
+    ``[sft][warn]`` line the worker prints.
+
+    ``sft_retained_examples`` is the rows the trainer iterates. It must be carried explicitly
+    rather than derived from ``sft_packed_blocks``, which is ``ceil(rows / examples_per_update)``
+    and reconstructs 10 rows at a batch of 8 as 16 -- an over-credit, i.e. the failure this clamp
+    exists to prevent.
     """
     n = config.normalized()
     resolved = (provider or "").strip().lower()
@@ -286,7 +293,9 @@ def method_card_speedup(config: RunConfig, gpu_count: int, gpu: str, provider: s
         resolved = n.provider if n.provider != "auto" else ""
     executed = gpu_count
     if n.method == "sft":
-        executed = sft_data_parallel_cards(gpu_count, n.batch_size or 1)
+        executed = sft_data_parallel_cards(
+            gpu_count, n.batch_size or 1, n.sft_retained_examples or 0
+        )
     return multi_card_speedup(executed, gpu, resolved)
 
 
