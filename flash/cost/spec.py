@@ -160,24 +160,22 @@ def thin_rl_batch_warning(spec) -> str | None:
     the standard sft memory workaround, ``batch_size = 1``, silently turns an rl run into one
     prompt per update, and nothing errors.
 
-    Reads the configured prompts-per-step rather than the authored field. That is an UPPER BOUND on
-    the runtime batch, not the resolved one: the worker filters prompts over the token budget before
-    clamping (``_build_grpo_prompts`` then ``resolve_grpo_prompts_per_step``), so an uncapped config
-    can still resolve thin and go unwarned. Closing that gap would mean importing and running the
-    user's ``environment.py``, which an offline quote deliberately does not do. The bound is
-    one-sided on purpose: everything it warns about is genuinely thin, and what it misses is a false
-    negative rather than a false alarm on a healthy run.
+    Reads configured prompts-per-step, not the authored field: a ``max_examples`` cap clamps the
+    batch to the retained pool, so a scaffolded ``max_examples = 2`` run trains on 2 prompts per
+    update whether or not a ``batch_size`` was written. That is an UPPER BOUND on the runtime batch,
+    since the worker also drops prompts over the token budget before clamping; closing the gap would
+    mean running the user's ``environment.py``, which an offline quote does not do. One-sided on
+    purpose: it misses thin runs rather than crying wolf on healthy ones.
 
-    Within that bound it still beats the authored field, because a ``max_examples`` cap (from
-    either ``[train]`` or ``[environment.params]``) clamps the batch to the retained prompt pool
-    (``_on_policy_prompts_per_step``), so a scaffolded ``max_examples = 2`` run trains on 2 prompts
-    per update whether or not a ``batch_size`` was ever written. The caps do not override each
-    other -- the environment one bounds what ``env.dataset()`` returns and the train one slices
-    that afterwards -- so the pool is the SMALLEST of them. Any of these can be thin at once, and
-    raising one while another is still thin leaves prompts-per-step thin, so the message names
-    every one of them. Note it does NOT claim raising one alone moves nothing: that only holds when
-    the other is the strict minimum, and at ``batch_size = 2`` under ``max_examples = 3`` lifting
-    the batch alone does move the result, to 3.
+    Every number comes from ``_on_policy_example_count``, the pool the quote prices, and it names
+    only a knob that pool reads. A correctness constraint, not tidiness: an earlier revision took
+    the smallest configured cap for the warning alone and printed "2 prompts per update" above a
+    quote that had derived 64, with a remedy pointing at a key the bill never reads.
+
+    Two claims it avoids. Raising one knob alone moves nothing only when the other is the strict
+    minimum (at ``batch_size = 2`` under a cap of 3, lifting the batch alone reaches 3). And
+    widening a cap adds no updates only up to the requested batch, which is the recipe default when
+    none was authored (grpo 64, opd 8), so on opd a cap of 2 -> 16 goes from 1 update to 2.
 
     What the thin batch costs differs by algorithm, so the message does too. grpo keeps a working
     per-prompt baseline at any batch size (verl centres each response against its own prompt's
@@ -203,16 +201,18 @@ def thin_rl_batch_warning(spec) -> str | None:
     """
     if spec.algorithm not in ("grpo", "opd"):
         return None
-    # the SMALLEST configured cap, which is deliberately not what `_on_policy_example_count` prices.
-    # that function must not read `[environment.params] max_examples` down over an enforced `[train]`
-    # cap, because params are opaque kwargs to the user's own environment and a run billed off the
-    # smaller number would underquote if the environment ignores the key. warning on it is the
-    # opposite trade: if the environment DOES honor it, the pool really is 2 and the user wants to
-    # know, and if it does not, they have read one accurate sentence about a knob they wrote.
-    examples = min(
-        [c for c in (int(spec.train.max_examples or 0), _env_max_examples(spec)) if c > 0],
-        default=_on_policy_requested_prompts_per_step(spec),
-    )
+    # the SAME pool the quote prices, deliberately. an earlier revision took the smallest configured
+    # cap here so a small `[environment.params] max_examples` behind a large `[train]` one would
+    # still warn, and that put two different pools in one breath: the message stated an optimizer
+    # batch of 1 while the quote printed directly above it derived 8. every number here is arithmetic
+    # the user can check against that quote, so it has to come from the same place.
+    #
+    # the env cap is not lost. `_on_policy_example_count` returns it whenever no `[train]` cap is set,
+    # which is the scaffolded shape this warning exists for. what is skipped is both caps set with the
+    # env one smaller -- exactly where flash does not enforce the env value (opaque kwargs to the
+    # user's own environment factory), so claiming a thin batch there would be a guess contradicting
+    # the bill.
+    examples = _on_policy_example_count(spec)
     prompts_per_step = _on_policy_prompts_per_step(spec, examples)
     if prompts_per_step >= RL_THIN_PROMPTS_PER_STEP:
         return None
@@ -228,13 +228,17 @@ def thin_rl_batch_warning(spec) -> str | None:
     # only the train cap sends the user to raise it and land on 3, still thin and still warned.
     # the remedy has to resolve the problem in one edit, so every configured constraint that would
     # still bind after the others are lifted gets named.
+    # only a cap that IS the priced pool. `_on_policy_example_count` reads exactly one of these two
+    # keys, so the other is inert here however small it looks: at [train] 4 over an env cap of 1 the
+    # pool is 4, and naming the env cap would both contradict the quote beside it and promise that
+    # raising `batch_size` alone changes nothing, when it takes prompts-per-step from 1 to 4.
     cap_keys = [
         key
         for key, value in (
             ("[train] max_examples", int(spec.train.max_examples or 0)),
             ("[environment.params] max_examples", _env_max_examples(spec)),
         )
-        if 0 < value < RL_THIN_PROMPTS_PER_STEP
+        if 0 < value < RL_THIN_PROMPTS_PER_STEP and value == examples
     ]
     cap_key = " and ".join(f"`{k}`" for k in cap_keys) if cap_keys else None
     # same rule for the authored batch: it binds if it is itself thin, even when a smaller pool is
@@ -327,15 +331,20 @@ def _thin_rl_batch_remedy(spec, *, raise_target: str, batch_binds: bool, pool_bi
         )
     if pool_binds:
         # the pool is the only thin knob, so prompts-per-step rises WITH the cap -- but only up to
-        # the requested batch, which is the recipe default when none was authored and the authored
-        # value otherwise. this branch is reachable with a HEALTHY batch_size (8 is not thin, so it
-        # is not named), and there the widening stops at that ceiling: batch 8 over caps 2, 4, 8,
-        # 16, 800 gives 1, 1, 1, 2, 100 updates. so promise the widening only "until it reaches
-        # your batch_size" rather than claiming the horizon never moves, and let `--cost` price it.
+        # the requested batch, and PAST it the extra prompts become extra updates. name that ceiling
+        # by the knob that actually sets it: the authored `batch_size` when there is one (batch 8
+        # over caps 2, 4, 8, 16, 800 gives 1, 1, 1, 2, 100 updates), and otherwise the recipe default
+        # the user never wrote -- opd 8, grpo 64. saying "your batch_size" in that second case points
+        # at a key the config does not contain, and at opd a cap of 2 -> 16 really does go 1 -> 2.
+        ceiling = (
+            "your `batch_size`"
+            if spec.train.batch_size is not None
+            else f"the {spec.algorithm} default of {_on_policy_requested_prompts_per_step(spec)}"
+        )
         return (
-            f"Raise {raise_target}: prompts-per-step follows the pool until it reaches your "
-            "`batch_size`, so this widens each update rather than adding updates. Re-run `--cost` "
-            "to see what it does to this quote."
+            f"Raise {raise_target}: prompts-per-step follows the pool up to {ceiling}, so widening "
+            "to there makes each update wider rather than adding updates, and past it the extra "
+            "prompts add updates instead. Re-run `--cost` to see what it does to this quote."
         )
     # the "buying steps" workflow is about lowering batch_size against a fixed pool. a thin POOL
     # does not buy steps, it just shortens the run, so that caveat would excuse the wrong config --

@@ -277,8 +277,11 @@ ignored. Everything in the block above (`epochs`, `max_examples`, `max_steps`, `
 > both resolve to 2 updates and the wider one just generates more. Raising a `max_examples` cap
 > instead grows the pool, and what that buys depends on `batch_size`: with one set and left
 > pinned, the bigger pool is spread over more updates and quotes dearer; with none set, or with
-> both raised together, prompts-per-step follows the pool, so the horizon does not move at all and
-> you have only widened each update. And under a positive `max_steps` the update count is pinned,
+> both raised together, prompts-per-step follows the pool and the horizon does not move, but only
+> up to the batch it is following. Past that ceiling the extra prompts become extra updates again,
+> and with no `batch_size` authored the ceiling is the recipe default you never wrote (GRPO 64,
+> OPD 8), so on OPD a cap of 2 -> 16 goes from 1 update to 2. And under a positive `max_steps` the
+> update count is pinned,
 > so a wider batch is pure extra generation: same steps, bigger bill. The warning says which case
 > you are in; re-run `flash train --cost` for the actual number.
 

@@ -649,18 +649,18 @@ def test_an_environment_param_cap_is_named_as_such(tmp_path, monkeypatch, capsys
 
 
 def test_the_smaller_of_two_configured_caps_is_the_one_that_binds(tmp_path, monkeypatch, capsys):
-    """A large `[train]` cap must not hide a small `[environment.params]` one -- in the WARNING.
+    """An unenforced `[environment.params]` cap does not make the warning contradict the quote.
 
-    The warning takes the smallest configured cap, so a `[train] = 800` sitting over an
-    `[environment.params] = 2` still gets flagged and names the environment key, which is the one
-    that could be holding the pool down.
+    `[environment.params]` is an opaque kwarg map handed to the user's own environment factory:
+    neither flash nor the freesolo sdk applies `max_examples` to a dataset, so an environment is
+    free to ignore it and return every row. `[train] max_examples` is the cap the worker really
+    enforces (`train[:max_examples]`), so with `[train] = 800` the priced pool is 800 and
+    prompts-per-step is the recipe's 64. That is not thin, so there is nothing to warn about.
 
-    The QUOTE deliberately does not follow it there. `[environment.params]` is an opaque kwarg map
-    handed to the user's own environment factory, and neither flash nor the freesolo sdk applies
-    `max_examples` to a dataset, so an environment that ignores the key returns every row. Since a
-    completed run is billed from the persisted quote, pricing the smaller number would underquote
-    real training; `[train] max_examples` is the cap the worker actually enforces. Asserted here
-    together so the warning cannot be widened into the billed step count by accident.
+    An earlier revision took the smallest configured cap for the warning only, which printed "2
+    prompts per update" directly above a quote that had derived 64 -- two different pools in one
+    breath, and a remedy pointing at a key the bill does not read. Silence is the honest output:
+    every number the warning states has to be arithmetic the user can check against the quote.
     """
     monkeypatch.setenv("FLASH_STYLE", "0")
 
@@ -670,11 +670,8 @@ def test_the_smaller_of_two_configured_caps_is_the_one_that_binds(tmp_path, monk
     out, err = capsys.readouterr()
 
     assert rc == 0
-    assert "OPTIMIZER batch is 2 prompts per update" in err
-    # the environment cap is the one that could be holding the pool down, so it is the one to raise
-    assert "`[environment.params] max_examples`" in err
-    assert "`[train] max_examples`" not in err
-    # ... but the quote still prices the enforced [train] cap: 800 prompts, not 2.
+    assert "OPTIMIZER batch" not in err
+    # and the quote prices the enforced [train] cap, unchanged by the environment param
     assert "[GRPO, 13 steps]" in out
 
 
@@ -706,7 +703,11 @@ def test_a_cap_without_a_batch_size_is_not_told_it_buys_more_passes(tmp_path, mo
     err = capsys.readouterr().err
 
     assert rc == 0
-    assert "widens each update rather than adding updates" in err
+    assert "makes each update wider rather than adding updates" in err
+    # with no batch_size authored the ceiling is the recipe default, a number the user never wrote,
+    # so it has to be stated rather than called "your batch_size"
+    assert "up to the grpo default of 64" in err
+    assert "your `batch_size`" not in err
     assert "adds passes" not in err
     assert "longer run" not in err
     assert "dearer" not in err
@@ -732,11 +733,15 @@ def test_two_thin_knobs_are_told_to_move_together(tmp_path, monkeypatch, capsys)
 
 
 def test_staggered_caps_are_both_named_so_one_edit_resolves_it(tmp_path, monkeypatch, capsys):
-    """`[train] = 2` behind `[environment.params] = 3`: raising only the smaller lands on 3.
+    """`[train] = 2` behind `[environment.params] = 3`: only the enforced cap is named.
 
-    Naming just the constraint at the current minimum makes the remedy a two-round trip that the
-    user pays for: they raise the train cap, get a 3-prompt batch, and are warned again. Every
-    configured cap below the healthy threshold has to be named for one edit to fix it.
+    The quote reads `[train] max_examples` and derives a 2-prompt pool from it; the environment
+    param is an opaque kwarg the bill never reads. Naming both would tell the user to edit a key
+    that cannot move this quote, so the remedy names the one that can.
+
+    The environment cap is not silently ignored either -- it is simply not this warning's business
+    unless it IS the priced pool, which happens whenever no `[train]` cap is set (the scaffolded
+    shape, covered by `test_an_environment_param_cap_is_named_as_such`).
     """
     monkeypatch.setenv("FLASH_STYLE", "0")
 
@@ -744,7 +749,8 @@ def test_staggered_caps_are_both_named_so_one_edit_resolves_it(tmp_path, monkeyp
     err = capsys.readouterr().err
 
     assert rc == 0
-    assert "`[train] max_examples` and `[environment.params] max_examples`" in err
+    assert "`[train] max_examples`" in err
+    assert "`[environment.params] max_examples`" not in err
 
 
 def test_a_healthy_batch_size_bounds_how_far_the_pool_can_widen(tmp_path, monkeypatch, capsys):
@@ -762,8 +768,31 @@ def test_a_healthy_batch_size_bounds_how_far_the_pool_can_widen(tmp_path, monkey
     err = capsys.readouterr().err
 
     assert rc == 0
-    assert "follows the pool until it reaches your `batch_size`" in err
+    assert "follows the pool up to your `batch_size`" in err
+    assert "past it the extra prompts add updates instead" in err
     assert "with no `batch_size` set" not in err
+
+
+def test_the_recipe_ceiling_is_named_by_algorithm_not_as_your_batch_size(
+    tmp_path, monkeypatch, capsys
+):
+    """OPD with no authored batch: the ceiling is the recipe's 8, not a `batch_size` that exists.
+
+    Prompts-per-step follows the pool only up to the REQUESTED batch, which with nothing authored
+    is the recipe default -- 8 under opd, 64 under grpo. Past it the extra prompts become extra
+    updates: caps 2, 4, 8, 16, 32 derive 1, 1, 1, 2 and 4 updates (verified). Promising an
+    unqualified widening there is false, and pointing at "your `batch_size`" names a key the config
+    does not contain.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, None, algorithm="opd", max_examples=2))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "up to the opd default of 8" in err
+    assert "past it the extra prompts add updates instead" in err
+    assert "your `batch_size`" not in err
 
 
 def test_a_cap_above_the_batch_is_not_described_as_holding_it_down(tmp_path, monkeypatch, capsys):
