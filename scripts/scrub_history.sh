@@ -6,10 +6,10 @@
 #   - "Co-Authored-By: Claude ..." trailers
 #   - "Claude-Session: https://claude.ai/..." trailers
 #   - "Generated with ... Claude Code" attribution lines
-#   - the build-box identity (a *.internal.cloudapp.net address) leaked into the
-#     author/committer fields and into "Co-authored-by:" trailers
-#   - the maintainer's stray local git identities, folded onto the GitHub account
-#     (see MAINTAINER_ALIAS_EMAILS): two of them resolve to OTHER PEOPLE's accounts
+#   - a leaked internal build-box hostname, in the author/committer fields and in
+#     "Co-authored-by:" trailers
+#   - stray local git identities, folded onto the canonical account: some of them
+#     resolve to UNRELATED THIRD PARTIES' accounts once the repo is public
 #
 # This rewrites every commit sha. Run it once, on a fresh mirror clone, while the
 # repository is still private. Rewriting after publication is pointless: the old
@@ -18,6 +18,9 @@
 # The script re-reports the leak counts before and after, and REFUSES to print
 # publication instructions unless every after-count is zero. A half-scrubbed
 # repository that looks finished is the one outcome worth failing loudly over.
+#
+# The identities and the hostname to scrub are themselves the data being removed, so
+# they are NOT stored here: see the identity-file block below.
 #
 # Usage:
 #   ./scripts/scrub_history.sh /tmp/flash-scrub
@@ -39,11 +42,65 @@ if [ -e "$WORKDIR" ]; then
   exit 2
 fi
 
+# --- operator-supplied identity data ---------------------------------------
+# The addresses and the internal hostname this scrub targets ARE the leak. Hardcoding
+# them here would republish, in the tree, the exact strings the rewrite exists to
+# remove -- the same reasoning that keeps the mailmap generated rather than committed.
+# So they live in an untracked file the operator writes locally (gitignored):
+#
+#   scripts/scrub_identities.env      (override the path with FLASH_SCRUB_IDENTITIES)
+#
+# It is sourced as shell, and must set all three of:
+#
+#   # the identity every leaking author/committer is folded onto, "Name <email>"
+#   FLASH_CANONICAL_IDENTITY='Some Name <id+user@users.noreply.github.com>'
+#   # space-separated LOWERCASE addresses to fold onto it, never a name prefix
+#   FLASH_ALIAS_EMAILS='one@example.com two@example.test'
+#   # the leaked internal hostname, as a regex fragment
+#   FLASH_LEAKED_HOST_RE='build[.]internal[.]example[.]net'
+#
+# Write literal dots as "[.]": that spelling is read identically by awk, by git's
+# --extended-regexp, and by python's re, so the one fragment drives every counter and
+# the rewrite callback without per-engine escaping.
+IDENTITIES_FILE="${FLASH_SCRUB_IDENTITIES:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scrub_identities.env}"
+if [ ! -f "$IDENTITIES_FILE" ]; then
+  cat >&2 <<EOF
+error: identity file not found: $IDENTITIES_FILE
+
+  This script deliberately ships with no identities in it. Create that file (it is
+  gitignored, and must stay untracked) defining FLASH_CANONICAL_IDENTITY,
+  FLASH_ALIAS_EMAILS and FLASH_LEAKED_HOST_RE. See the comment at the top of
+  $0 for the exact shape.
+EOF
+  exit 2
+fi
+
+# An address already exported wins over the file's, keeping FLASH_CANONICAL_IDENTITY
+# usable as a one-off override.
+CANONICAL_OVERRIDE="${FLASH_CANONICAL_IDENTITY:-}"
+# shellcheck source=/dev/null
+. "$IDENTITIES_FILE"
+CANONICAL_IDENTITY="${CANONICAL_OVERRIDE:-${FLASH_CANONICAL_IDENTITY:-}}"
+MAINTAINER_ALIAS_EMAILS="${FLASH_ALIAS_EMAILS:-}"
+LEAKED_HOST_RE="${FLASH_LEAKED_HOST_RE:-}"
+
+# A missing value must be fatal, never an empty pattern: an empty alias list would
+# match nothing and an empty hostname fragment would match EVERY identity, and either
+# way the residual gate would certify a history it never checked.
+missing=""
+[ -n "$CANONICAL_IDENTITY" ] || missing="$missing FLASH_CANONICAL_IDENTITY"
+[ -n "$MAINTAINER_ALIAS_EMAILS" ] || missing="$missing FLASH_ALIAS_EMAILS"
+[ -n "$LEAKED_HOST_RE" ] || missing="$missing FLASH_LEAKED_HOST_RE"
+if [ -n "$missing" ]; then
+  echo "error: $IDENTITIES_FILE does not set:$missing" >&2
+  exit 2
+fi
+
 # --- identities to rewrite -------------------------------------------------
 # Two problems in the author/committer fields:
 #
-#  1. A build box committed as "Ubuntu <...@...internal.cloudapp.net>", leaking an
-#     internal hostname into the identity.
+#  1. A build box committed under an address on an internal hostname, leaking that
+#     hostname into the identity.
 #  2. Some commits are authored by an AI assistant identity outright.
 #
 # Both are the maintainer's own work, so both map onto CANONICAL_IDENTITY.
@@ -61,40 +118,34 @@ fi
 # address, never under the assistant's noreply domain.
 ASSISTANT_NAMES_RE='^(Claude|Claude Code|Claude Bot|claude)$'
 ASSISTANT_EMAIL_RE='@anthropic[.]com$'
-# "." as a wildcard is harmless here (it only widens the match to a near-identical
-# string) and keeps the pattern usable verbatim in both awk and git --grep, which
-# disagree about how to escape a literal dot inside a shell-passed variable.
-LEAKED_EMAIL_RE='internal[.]cloudapp[.]net'
 
-# The maintainer committed under several local git identities over the repo's life. Folding
-# them onto the GitHub account is not cosmetic: GitHub resolves a commit's author from its
-# EMAIL, so on a public repo two of these credit somebody else entirely.
+# Notes on FLASH_ALIAS_EMAILS, the alias list loaded above.
 #
-#   david@clado.ai   -> renders as the unrelated account "CladoTest"
-#   d@d              -> renders as "dimas1", a stranger's account registered in 2013
-#   david@freesolo.co-> no linked account; renders as inert plain text
+# Folding stray local identities onto the canonical account is not cosmetic: GitHub
+# resolves a commit's author from its EMAIL, so on a public repo an alias can credit
+# an unrelated account that merely happens to have registered that address.
 #
-# Verify with: gh api repos/<owner>/<repo>/commits/<sha> --jq .author.login
+# Check what an address renders as with:
+#   gh api repos/<owner>/<repo>/commits/<sha> --jq .author.login
 #
-# This is an EXPLICIT ADDRESS LIST, never a name-prefix test. "DavidBShan" as a name match
-# would be both too narrow (it misses "David", "davidbshan", "d") and far too dangerous:
-# the same rewrite applied by name would sweep up any future contributor whose name
-# collides. Addresses are unambiguous and reviewable, and every other identity in this
-# history (tomzheng1012@gmail.com, git@r0h.in) belongs to a REAL contributor whose
-# attribution must survive untouched.
+# It must be an EXPLICIT ADDRESS LIST, never a name-prefix test. A name match is both
+# too narrow (it misses shortened and lowercased spellings) and far too dangerous: the
+# same rewrite applied by name would sweep up any future contributor whose name
+# collides. Addresses are unambiguous and reviewable, and every identity NOT on the
+# list belongs to a real contributor whose attribution must survive untouched.
 #
-# The canonical noreply address is deliberately ABSENT: it is already correct, and listing
+# The canonical address itself belongs OFF the list: it is already correct, and listing
 # it would make the mailmap map an identity onto itself.
 #
-# Listed in LOWERCASE, and every comparison against this list lowercases its input first.
-# The domain part of an address is case-insensitive and git preserves whatever case was
-# committed, so "DavidBShan@Gmail.com" is the same GitHub account as the entry below. An
-# exact-case test would leave that identity unremapped AND uncounted -- the residual gate
-# would report a clean history while GitHub still misattributed the commits, which is the
-# false-clean certificate this script exists to prevent. The trailer counter (git --grep
-# --regexp-ignore-case) and the message rewrite ((?i) below) are already case-insensitive;
-# the identity tests must agree with them or the gate and the rewrite disagree.
-MAINTAINER_ALIAS_EMAILS='davidbshan@gmail.com david@freesolo.co david@clado.ai d@d'
+# List entries in LOWERCASE; every comparison against the list lowercases its input
+# first. The domain part of an address is case-insensitive and git preserves whatever
+# case was committed, so a mixed-case spelling is the same GitHub account as its
+# lowercase entry. An exact-case test would leave that identity unremapped AND
+# uncounted -- the residual gate would report a clean history while GitHub still
+# misattributed the commits, which is the false-clean certificate this script exists to
+# prevent. The trailer counter (git --grep --regexp-ignore-case) and the message rewrite
+# ((?i) below) are already case-insensitive; the identity tests must agree with them or
+# the gate and the rewrite disagree.
 
 # Message patterns, shared by the counters and (in spirit) the rewrite callback below.
 # Each is LINE-ANCHORED and trailer-shaped so that counting and removing agree: a commit
@@ -120,9 +171,7 @@ GENERATED_RE='^[[:space:]]*[^[:alnum:]]*[[:space:]]*Generated with .*Claude Code
 # the bare hostname: a commit discussing the hostname in prose is not a trailer leak.
 # (The same hostname in an author/committer FIELD is caught by count_identities, which
 # reads the identity fields directly and is unaffected by this message-level pattern.)
-HOSTNAME_RE='^[[:space:]]*Co-authored-by:.*internal[.]cloudapp[.]net'
-
-CANONICAL_IDENTITY="${FLASH_CANONICAL_IDENTITY:-David Shan <78061174+DavidBShan@users.noreply.github.com>}"
+HOSTNAME_RE="^[[:space:]]*Co-authored-by:.*$LEAKED_HOST_RE"
 
 # A malformed override silently produces a mailmap git reads differently, which can
 # leave the leak in place while reporting success. Require the "Name <email>" shape.
@@ -180,7 +229,7 @@ count_identities() {
   # looser thing (say, any identity containing "claude") would flag a real contributor
   # named Claude as an unscrubbed leak and block publication over nothing.
   git log --all --format='%H%x09%an <%ae>%x09%cn <%ce>' \
-    | awk -F'\t' -v names_re="$ASSISTANT_NAMES_RE" -v mail_re="$LEAKED_EMAIL_RE" \
+    | awk -F'\t' -v names_re="$ASSISTANT_NAMES_RE" -v mail_re="$LEAKED_HOST_RE" \
           -v bot_mail_re="$ASSISTANT_EMAIL_RE" -v alias_list="$MAINTAINER_ALIAS_EMAILS" '
         BEGIN { split(alias_list, a, " "); for (i in a) if (a[i] != "") alias[tolower(a[i])] = 1 }
         function leaks(ident,   name, email) {
@@ -227,7 +276,7 @@ echo "==> rewriting commit messages and identities"
 MAILMAP="$WORKDIR/flash-scrub-mailmap"
 git log --all --format='%an <%ae>%n%cn <%ce>' \
   | sort -u \
-  | awk -v canon="$CANONICAL_IDENTITY" -v names_re="$ASSISTANT_NAMES_RE" -v mail_re="$LEAKED_EMAIL_RE" \
+  | awk -v canon="$CANONICAL_IDENTITY" -v names_re="$ASSISTANT_NAMES_RE" -v mail_re="$LEAKED_HOST_RE" \
         -v bot_mail_re="$ASSISTANT_EMAIL_RE" -v alias_list="$MAINTAINER_ALIAS_EMAILS" '
       BEGIN { split(alias_list, a, " "); for (i in a) if (a[i] != "") alias[tolower(a[i])] = 1 }
       {
@@ -250,9 +299,9 @@ fi
 
 # --mailmap rewrites author/committer/tagger FIELDS only; it does not touch message
 # trailers. The stray addresses also appear inside "Co-authored-by:" lines, so without the
-# rewrite below those trailers keep crediting CladoTest and dimas1 on a public repo.
+# rewrite below those trailers keep crediting the wrong accounts on a public repo.
 #
-# These trailers are REWRITTEN onto the canonical identity, not deleted. The maintainer
+# These trailers are REWRITTEN onto the canonical identity, not deleted. Someone
 # co-authoring with their own second identity is still a real co-authorship record;
 # correcting the address fixes the misattribution without discarding history. (The Claude
 # trailers above are deleted instead because there is no correct identity to point them at.)
@@ -264,6 +313,8 @@ ALIAS_ALT="$(printf '%s' "$MAINTAINER_ALIAS_EMAILS" | tr ' ' '\n' | grep -v '^$'
   | sed 's/[.]/[.]/g' | paste -sd'|' -)"
 export FLASH_SCRUB_ALIAS_ALT="$ALIAS_ALT"
 export FLASH_SCRUB_CANON="$CANONICAL_IDENTITY"
+# same reason: the hostname fragment is operator-supplied data, not source.
+export FLASH_SCRUB_HOST_RE="$LEAKED_HOST_RE"
 
 # Drop whole trailer lines. Matching is line-anchored and trailer-shaped, so a commit
 # body that merely mentions Claude in prose is left alone.
@@ -275,6 +326,7 @@ import re
 
 _alias_alt = os.environ["FLASH_SCRUB_ALIAS_ALT"].encode()
 _canon = os.environ["FLASH_SCRUB_CANON"].encode()
+_host_re = os.environ["FLASH_SCRUB_HOST_RE"].encode()
 # the address must be the WHOLE bracketed value (anchored by "<" and ">"), so a longer
 # address that merely ends with an alias cannot match.
 _alias_trailer = re.compile(
@@ -286,7 +338,7 @@ patterns = [
     # above. Kept in sync with it: if the strip is wider than the gate, a human named
     # Claude loses credit; if narrower, the gate blocks publication forever.
     rb"(?im)^[ \t]*Co-Authored-By:[ \t]*Claude(?:[ \t]+(?:Code|Bot|Opus|Sonnet|Haiku|Fable)[^<\n]*)?[ \t]*<[^\n]*\n?",
-    rb"(?im)^[ \t]*Co-authored-by:[^\n]*internal\.cloudapp\.net[^\n]*\n?",
+    rb"(?im)^[ \t]*Co-authored-by:[^\n]*" + _host_re + rb"[^\n]*\n?",
     rb"(?im)^[ \t]*Claude-Session:[^\n]*\n?",
     # the generated-with footer, anchored to its own line and to "Claude Code", so
     # ordinary prose mentioning both words survives. the leading class allows any
