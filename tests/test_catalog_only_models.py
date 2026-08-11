@@ -108,7 +108,12 @@ def test_a_pre_upgrade_snapshot_still_passes_its_integrity_digest(tmp_path, monk
     # Recompute the digest exactly as the OLD plane did: its worker payload carried model_policy,
     # it dropped empty workload_profile_* keys (the version-1 omission rule) before hashing, and its
     # public spec had no lora_alpha (alpha was managed-and-derived, so to_dict() stripped it).
-    public = {**public, "train": {k: v for k, v in public["train"].items() if k != "lora_alpha"}}
+    # ...and no [environment] pip, which to_dict() popped as platform-managed back then.
+    public = {
+        **public,
+        "train": {k: v for k, v in public["train"].items() if k != "lora_alpha"},
+        "environment": {k: v for k, v in public["environment"].items() if k != "pip"},
+    }
     old_worker = {**worker, "model_policy": "catalog"}
     hashed_worker = {
         k: v
@@ -187,6 +192,8 @@ def test_a_pre_upgrade_worker_env_snapshot_still_passes_its_integrity_digest(tmp
         **public,
         "worker_env": {},
         "train": {k: v for k, v in public["train"].items() if k != "lora_alpha"},
+        # ...and no [environment] pip, which to_dict() popped as platform-managed back then.
+        "environment": {k: v for k, v in public["environment"].items() if k != "pip"},
     }
     hashed_worker = {
         k: v
@@ -235,6 +242,86 @@ def test_a_pre_upgrade_worker_env_snapshot_still_passes_its_integrity_digest(tmp
     # a quote refresh or realloc REWRITES the digest, but never status.spec -- so the write path has
     # to hash the legacy public keys exactly as the read path restores them. otherwise the run
     # survives the upgrade, gets re-persisted, and only then becomes permanently unrecoverable.
+    runner._persist_effective_worker_spec(spec, estimated_cost_usd=1.23)
+
+    reloaded = runner.effective_spec_from_status(runner.get_status(spec.run_id))
+    assert reloaded.model == "Qwen/Qwen3.5-4B"
+
+
+def test_a_pre_upgrade_environment_pip_snapshot_still_passes_its_integrity_digest(
+    tmp_path, monkeypatch
+):
+    """The same replay for ``[environment] pip``, which to_dict() used to strip.
+
+    A snapshot prepared before pip became authorable hashed an environment with NO pip key. This
+    build re-serializes it as an empty tuple, so a still-valid workload-profile run would rehash to
+    different bytes and fail "persisted effective preparation failed integrity validation" on
+    recovery -- blocking deploy and serving for a run that never did anything wrong.
+    """
+    import hashlib
+    import json
+
+    monkeypatch.setenv("FLASH_HOME", str(tmp_path))
+    import flash.runner as runner
+
+    spec = spec_from_dict(_raw(model="Qwen/Qwen3.5-4B"))
+    spec = type(spec).from_dict(
+        {
+            **spec.to_internal_dict(),
+            "workload_profile_kind": "sft",
+            "workload_profile": {"steps": 10},
+        }
+    )
+    worker = spec.to_internal_dict()
+    # the OLD plane's public bytes: to_dict() stripped pip entirely, and alpha was still managed.
+    old_public = spec.to_dict()
+    old_public = {
+        **old_public,
+        "train": {k: v for k, v in old_public["train"].items() if k != "lora_alpha"},
+        "environment": {k: v for k, v in old_public["environment"].items() if k != "pip"},
+    }
+    hashed_worker = {
+        k: v
+        for k, v in worker.items()
+        # the version-1 omission rule drops every empty one of these before hashing, so the replay
+        # has to drop them too -- reproduce the bytes that were hashed, not today's serialization.
+        if v
+        or k
+        not in (
+            "model_revision_auto",
+            "workload_profile_kind",
+            "workload_profile_input_digest",
+            "workload_profile_producer_version",
+            "workload_profile",
+        )
+    }
+    payload = {
+        "version": 1,
+        "public_spec": old_public,
+        "worker_spec": hashed_worker,
+        "adapter_identity": None,
+    }
+    old_digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=old_public,
+            effective_preparation={
+                "worker_spec": worker,
+                "workload_profile": {"steps": 10},
+                "preparation_digest": old_digest,
+            },
+        )
+    )
+    loaded = runner.effective_spec_from_status(runner.get_status(spec.run_id))
+    assert loaded.model == "Qwen/Qwen3.5-4B"
+
+    # same re-persist trap as above: the write path must hash pip out for this snapshot too, or the
+    # run survives the upgrade and becomes unrecoverable the first time its quote is refreshed.
     runner._persist_effective_worker_spec(spec, estimated_cost_usd=1.23)
 
     reloaded = runner.effective_spec_from_status(runner.get_status(spec.run_id))

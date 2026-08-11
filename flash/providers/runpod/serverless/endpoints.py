@@ -70,12 +70,22 @@ def _train_body(input_data: dict) -> dict:
 
     from huggingface_hub import snapshot_download
 
-    def _safe_detail(value, secrets=None, limit=1000):
+    def _needles(secrets=None):
+        """The (plain, bounded) credential needle sets for os.environ plus ``secrets``.
+
+        a value at or above the floor is a plain needle, replaced as a substring; a SHORTER one is
+        bounded, matched only where it is not adjacent to a word character. short values used to be
+        dropped outright, which leaked them verbatim -- [environment] secrets accepts any name and
+        any value. plain replacement is not the alternative: a 3-char needle corrupts every
+        diagnostic that merely contains those letters (the value "ati" rewrites "authentication").
+
+        a multiline secret (a PEM key) never appears whole in any single call: the child's stdout is
+        sanitized one line at a time, so only a component line is ever seen. component lines keep
+        the floor as a hard skip -- a short one is punctuation such as "}", not a credential.
+        Mirrors flash.providers._lifecycle.bootstrap_secrets._needles.
+        """
         import urllib.parse
 
-        text = (
-            f"{type(value).__name__}: {value}" if isinstance(value, BaseException) else str(value)
-        )
         mapping = {**os.environ, **(secrets or {})}
         # declared runtime secrets can carry any name, so the control plane lists them in
         # FLASH_SECRET_ENV_KEYS; the name-shape rule stays as the fail-closed fallback.
@@ -84,7 +94,7 @@ def _train_body(input_data: dict) -> dict:
             for name in str(mapping.get("FLASH_SECRET_ENV_KEYS") or "").split(",")
             if name.strip()
         }
-        needles = set()
+        plain, bounded = set(), set()
         for key, secret in mapping.items():
             upper = str(key).upper()
             if not secret or not (
@@ -94,26 +104,34 @@ def _train_body(input_data: dict) -> dict:
             ):
                 continue
             value_str = str(secret)
-            # a multiline secret (a PEM key) never appears whole in any single call: the child's
-            # stdout is sanitized one line at a time below, so only a component line is ever seen.
-            # register long component lines as needles too; the length floor keeps a common
-            # fragment such as "}" from erasing innocent diagnostics. it applies to the whole
-            # value too, so a 3-char declared secret cannot mangle every diagnostic containing
-            # those characters; short values stay covered by the keyed patterns below.
-            parts = [value_str] if len(value_str) >= 8 else []
+            target = plain if len(value_str) >= 8 else bounded
+            target.update({value_str, urllib.parse.quote(value_str, safe="")})
             if "\n" in value_str:
-                parts.extend(
-                    line for raw in value_str.splitlines() if len(line := raw.strip()) >= 8
-                )
-            for part in parts:
-                needles.add(part)
-                encoded = urllib.parse.quote(part, safe="")
-                if encoded != part:
-                    needles.add(encoded)
+                for raw in value_str.splitlines():
+                    if len(line := raw.strip()) >= 8:
+                        plain.update({line, urllib.parse.quote(line, safe="")})
+        return plain, bounded
+
+    def _safe_detail(value, secrets=None, limit=1000):
+        text = (
+            f"{type(value).__name__}: {value}" if isinstance(value, BaseException) else str(value)
+        )
+        plain, bounded = _needles(secrets)
         # longest-first so one secret containing another cannot leave a suffix of the longer
         # one behind; encoded forms cover the percent-encoded urls http and git errors print.
-        for needle in sorted(needles, key=len, reverse=True):
+        for needle in sorted(plain, key=len, reverse=True):
             text = text.replace(needle, "<redacted>")
+        for needle in sorted(bounded, key=len, reverse=True):
+            # the word guard is applied per EDGE, and only where the needle's own edge is a word
+            # character. a value with a punctuation edge already separates itself from neighbouring
+            # text, and demanding a non-word character beyond it asks the wrong question: "/a"
+            # inside "https://host/a/repo" is preceded by the "t" of "host", so an unconditional
+            # left guard fails and the secret prints verbatim. "ati" keeps both guards and so still
+            # cannot rewrite "authentication".
+            # Mirrors flash.providers._lifecycle.bootstrap_secrets._bounded_pattern.
+            left = r"(?<!\w)" if needle[:1].isalnum() or needle[:1] == "_" else ""
+            right = r"(?!\w)" if needle[-1:].isalnum() or needle[-1:] == "_" else ""
+            text = re.sub(f"{left}{re.escape(needle)}{right}", "<redacted>", text)
         text = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", text)
         text = re.sub(
             r"(?i)(authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)"
@@ -418,6 +436,13 @@ def _train_body(input_data: dict) -> dict:
                     # value no longer matches full-value redaction, so a truncated first line is
                     # dropped before sanitizing. a line the boundary did not split is kept: it
                     # may hold the root-cause exception.
+                    # a tail that is ONE unterminated line is dropped whole. that loses the only
+                    # diagnostic on a crash whose evidence is a single huge line, but any bound
+                    # that would let it through is measured against the credentials this process
+                    # KNOWS, and the value at risk is the one it does not: a capability minted at
+                    # runtime contributes no needle, so a margin sized from an unrelated configured
+                    # secret leaves a long fragment of it behind. an empty tail never leaked.
+                    # mirrors bootstrap_secrets._read_console_tail.
                     if raw[:1] != b"\n":
                         cut = tail.find("\n")
                         tail = tail[cut + 1 :] if cut >= 0 else ""

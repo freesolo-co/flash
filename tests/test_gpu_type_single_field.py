@@ -137,3 +137,59 @@ def test_reallocation_spec_restores_the_authored_card_ceiling_for_a_pinned_run(m
             "the pinned early return handed back the snapshot with its narrowed count, so a "
             "recovered 4-card run re-allocates against a ceiling of 2"
         )
+
+
+def test_reallocation_preserves_auto_count_provenance(monkeypatch):
+    """An auto-sized run must recover as auto-sized, not as an authored one-card pin.
+
+    The public half stores the digest-stable placeholder `count = 1` for an omitted gpu.count and
+    cannot carry the marker (to_dict strips it). Restoring the public ceiling alone therefore reads
+    an auto-sized run back as an authored single-card pin: allocation receives `max_gpu_count=1`
+    instead of None, and a run that needs two or more cards can never be re-offered its shape after
+    a control-plane restart. The snapshot is written at creation -- before allocation resolves a
+    shape and clears the marker -- so the stored worker half still knows the count was unauthored.
+    """
+    from tests._helpers.runner import fresh_runner
+
+    with tempfile.TemporaryDirectory() as tmp:
+        runner = fresh_runner(tmp, monkeypatch)
+        public = JobSpec(
+            run_id="realloc-auto-marker",
+            model="Qwen/Qwen3.5-0.8B",
+            algorithm="grpo",
+            train=TrainSpec(epochs=1, max_examples=1),
+            gpu=GpuSpec(type=""),
+            gpu_count_auto=True,
+        )
+        assert public.to_dict()["gpu"]["count"] == 1
+        assert "gpu_count_auto" not in public.to_dict()
+        stored = _persist_effective(runner, public, effective_type="H200", effective_count=2)
+
+        recovered = runner.reallocation_spec_from_status(stored)
+        assert recovered.gpu_count_auto is True, (
+            "the auto marker was dropped on restore, so recovery hard-pins an auto-sized run to "
+            "the placeholder count of 1 and can never re-offer it a multi-card shape"
+        )
+
+
+def test_reallocation_keeps_an_authored_single_card_pin_hard(monkeypatch):
+    """The converse: an authored `gpu.count = 1` must never recover as auto-sized.
+
+    Widening it would bill cards the user explicitly capped.
+    """
+    from tests._helpers.runner import fresh_runner
+
+    with tempfile.TemporaryDirectory() as tmp:
+        runner = fresh_runner(tmp, monkeypatch)
+        public = JobSpec(
+            run_id="realloc-authored-one",
+            model="Qwen/Qwen3.5-0.8B",
+            algorithm="grpo",
+            train=TrainSpec(epochs=1, max_examples=1),
+            gpu=GpuSpec(type="", count=1),
+        )
+        stored = _persist_effective(runner, public, effective_type="H100")
+
+        recovered = runner.reallocation_spec_from_status(stored)
+        assert recovered.gpu_count_auto is False
+        assert recovered.gpu.count == 1
