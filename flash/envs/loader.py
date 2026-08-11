@@ -28,6 +28,21 @@ from pathlib import Path
 from typing import BinaryIO
 
 from flash.envs import cache_security
+
+# the underscored names are re-exports: tests and content.multimodal reach them via loader.
+from flash.envs.dataset_selection import (
+    _packaged_dataset_file as _packaged_dataset_file,
+)
+from flash.envs.dataset_selection import (
+    _plural_dataset_file as _plural_dataset_file,
+)
+from flash.envs.dataset_selection import (
+    _validate_packaged_dataset_split as _validate_packaged_dataset_split,
+)
+from flash.envs.dataset_selection import (
+    env_dataset_rows,
+    select_dataset_source,
+)
 from flash.envs.package.limits import (
     ARCHIVE_MEMBER_LIMIT,
     ARCHIVE_SCAN_MEMBER_LIMIT,
@@ -900,33 +915,6 @@ def _import_freesolo_environment_tools():
         ) from exc
 
 
-def _packaged_dataset_file(base_dir: Path, name: str) -> Path | None:
-    """First existing packaged dataset file for split `name`.
-
-    ``dataset/`` is canonical for new environments because a top-level ``datasets/``
-    directory shadows the Hugging Face ``datasets`` package in local scripts.
-    """
-    for rel in (
-        f"dataset/{name}.jsonl",
-        f"dataset/{name}.json",
-        f"{name}.jsonl",
-        f"{name}.json",
-    ):
-        candidate = base_dir / rel
-        if candidate.is_file():
-            return candidate
-    return None
-
-
-def _validate_packaged_dataset_split(split: str) -> str:
-    if not _DATASET_SPLIT_RE.fullmatch(split):
-        raise ValueError(
-            "[environment.params] split must be a simple dataset name "
-            "(letters, numbers, '.', '_', '-' only; no slashes or traversal)"
-        )
-    return split
-
-
 def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **kwargs):
     # pinned_sha is positional-only so user [environment.params] named "pinned_sha" goes to **kwargs, not here.
     from flash.envs.adapter import FreesoloEnvironment
@@ -938,34 +926,8 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
 
     params = dict(kwargs)
     source = params.pop("records", None)
-    dataset_path = params.get("dataset_path")
-    if source is None and dataset_path:
-        resolved_dataset_path = _resolve_path_arg(dataset_path, base_dir)
-        params["dataset_path"] = resolved_dataset_path
-        source = resolved_dataset_path
-    # [environment.params] split selects which packaged dataset file Flash trains on. It used to
-    # be forwarded to the SDK only, so SFT (and GRPO problem selection driven off dataset())
-    # SILENTLY trained on the default dataset/train.jsonl even when a side split was requested.
-    split = params.get("split")
-    split = split.strip() if isinstance(split, str) else None
-    if split:
-        split = _validate_packaged_dataset_split(split)
-    if source is None:
-        wanted = split if split and split != "train" else "train"
-        found = _packaged_dataset_file(base_dir, wanted)
-        if found is None and wanted != "train" and _packaged_dataset_file(base_dir, "train"):
-            # A default train.jsonl exists but the requested split file does not: refuse to fall
-            # back silently (that trains on the wrong targets); envs with no packaged dataset at
-            # all keep the SDK path, which may implement split itself.
-            raise ValueError(
-                f"[environment.params] split={split!r} was requested but no "
-                f"dataset/{split}.jsonl or {split}.json exists in the environment; "
-                "refusing to fall back to the default train split. Package the split file "
-                "or drop the split param."
-            )
-        if found is not None:
-            params.setdefault("dataset_path", str(found))
-            source = str(found)
+    selection = select_dataset_source(params, base_dir, source, _resolve_path_arg)
+    source = selection.source
 
     contract_path = _resolve_path_arg(params.get("contract_path"), base_dir)
     if isinstance(contract_path, str):
@@ -977,10 +939,25 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
     )
 
     sdk_env = tools["load_environment"](reference, **params)
+    # an env that generates or owns every row in load_environment needs no packaged file, and a
+    # datasets/ directory is then just raw or eval assets, so it must be able to load. an env
+    # whose in-code dataset is empty still needs the file, so it still lands here, where the
+    # message names the layout problem instead of the adapter's generic empty-dataset one. an
+    # explicitly requested side split lands here too, env rows or not: the layout hid any
+    # packaged split file, and rows the env supplies in code cannot be verified against the
+    # requested split, so training on them would silently undo the split guarantee.
+    if selection.datasets_dir_unread and (selection.side_split or not env_dataset_rows(sdk_env)):
+        raise ValueError(
+            "environment package has a top-level 'datasets/' directory, which Flash never "
+            "reads (it probes dataset/<split>.jsonl or dataset/<split>.json). Rename the "
+            "directory to 'dataset/', or set [environment.params] dataset_path to the exact "
+            "file to train on." + selection.unread_split_hint
+        )
     return FreesoloEnvironment(
         sdk_env,
         env_id,
         source=source,
+        prefer_env_dataset=selection.source_is_dataset_file,
         contract_text=contract_text,
         package_root=base_dir,
     )

@@ -122,8 +122,10 @@ def test_user_data_ships_payload_and_runs_worker_image(monkeypatch):
     # payload travels base64-encoded inside a quoted heredoc, byte-exact
     b64 = script.split("FLASH_PAYLOAD_EOF")[1].strip()
     assert json.loads(base64.b64decode(b64)) == payload
-    # the self-contained bootstrap is embedded
+    # the self-contained bootstrap is embedded, with its redaction sibling next to it
     assert "FLASH_BOOTSTRAP_EOF" in script
+    assert "FLASH_BOOTSTRAP_SECRETS_EOF" in script
+    assert "/opt/flash/bootstrap_secrets.py" in script
     assert "metrics.json" in script
     # runs the prebuilt WORKER_IMAGE via Docker with the GPU + the bootstrap as the command
     from flash.providers.runpod.serverless import WORKER_IMAGE
@@ -2531,6 +2533,75 @@ def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
     assert emb2["job_spec_json"] == "{}"
     assert "job_spec_in_hf" not in emb2
     assert uploaded == {}
+
+    # The threshold is only as good as the framing it was chosen against, and that framing grows
+    # every time the heredoc'd bootstrap sources do (embedding bootstrap_secrets.py alone added
+    # ~5,900 bytes). Pin the WORST inline case - a spec of exactly the threshold size - against the
+    # cap, so a future bootstrap that grows past the remaining budget fails here instead of at a
+    # provider's launch call. The margin is asserted too: the real payload also carries env,
+    # deadline, and cache fields this minimal one does not.
+    uploaded.clear()
+    worst = inst.build_user_data(
+        {**payload, "job_spec_json": "x" * inst._SPEC_SPILL_THRESHOLD}, image="img:latest"
+    )
+    assert uploaded == {}
+    assert len(worst) < 64_000 - 2_000
+
+    # The spec does not ride alone: runtime secrets (a multiline PEM is a valid one) share the same
+    # user_data. A spec UNDER the threshold plus a big secret must still spill, because the binding
+    # check is the complete encoded payload rather than the spec component.
+    uploaded.clear()
+    pem = "-----BEGIN PRIVATE KEY-----\n" + "k" * 4_000 + "\n-----END PRIVATE KEY-----"
+    heavy = inst.build_user_data(
+        {
+            **payload,
+            "job_spec_json": "x" * (inst._SPEC_SPILL_THRESHOLD - 1),
+            "env": {"HF_TOKEN": "t", "DEPLOY_KEY": pem},
+        },
+        image="img:latest",
+    )
+    assert uploaded["path"] == "sft/x/job_spec.json"
+    emb3 = json.loads(base64.b64decode(heavy.split("FLASH_PAYLOAD_EOF")[1].strip()))
+    assert emb3["job_spec_in_hf"] is True
+    assert emb3["job_spec_json"] == ""
+    assert len(heavy) < 64_000 - 2_000
+
+
+def test_build_user_data_rejects_a_payload_that_stays_oversized_after_spilling(monkeypatch):
+    """spilling only moves the SPEC out. when the non-spec payload (large runtime secrets) is
+    oversized on its own, spilling frees nothing and the launch would ship user_data the provider
+    rejects opaquely, after the launch call. fail pre-flight instead, naming the component."""
+    import huggingface_hub
+
+    from flash.providers._lifecycle import instance as inst
+
+    class FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def upload_file(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
+
+    # a tiny spec plus a ~40KB runtime secret: base64 + json escaping put the rendering over the
+    # budget, and no amount of spec spilling brings it back under.
+    payload = {
+        "flash_arm": "lambda",
+        "job_spec_json": "{}",
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/x",
+        "env": {"HF_TOKEN": "t", "DEPLOY_KEY": "k" * 40_000},
+        "attempt": 0,
+    }
+
+    with pytest.raises(ValueError, match="after spilling the job spec") as excinfo:
+        inst.build_user_data(payload, image="img:latest")
+    message = str(excinfo.value)
+    assert "runtime secrets" in message
+    assert str(inst._USER_DATA_CAP) in message
+    # the error names the oversized component's size, not just the total.
+    assert "40" in message
 
 
 def test_build_user_data_starts_no_spec_upload_at_deadline(monkeypatch):
