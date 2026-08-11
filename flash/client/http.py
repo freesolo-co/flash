@@ -17,7 +17,7 @@ from typing import Any
 
 from flash.client.config import load_credentials_with_source
 from flash.client.shapes import RequireSpec, matches_require
-from flash.client.streaming import ProgressCallback
+from flash.client.streaming import ProgressCallback, _read_error_body
 from flash.core.spec import require_project_id
 from flash.serve.urls import is_freesolo_hosted_url
 
@@ -142,9 +142,15 @@ def _detail_from_http_error(exc: urllib.error.HTTPError) -> object:
     raised inside one handler to that block's sibling clauses, so nothing downstream would translate
     it and the caller would see a raw traceback. The status is the useful part of an error response
     anyway, so a body we cannot read degrades to a note rather than losing the status with it.
+
+    The read is bounded in bytes and wall-clock for the same reason the server bounds its own error
+    bodies: a bare ``exc.read()`` is an unbounded read, so a plane (or a proxy in front of it) that
+    drip-feeds a non-2xx body keeps this handler alive while the CLI is trying to REPORT that very
+    failure -- turning a controlled 429/502 into a hang, or into an arbitrarily large allocation. Only
+    the first few hundred characters are ever shown, so a cap costs nothing that is used.
     """
     try:
-        body = exc.read()
+        body = _read_error_body(exc)
     except (OSError, http.client.HTTPException):
         # OSError covers ConnectionError and the TLS teardowns; HTTPException covers the framing
         # faults, which are not OSErrors. A bare OSError clause is safe HERE, unlike in the

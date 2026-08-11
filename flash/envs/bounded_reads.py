@@ -16,6 +16,12 @@ import urllib.error
 from collections.abc import Iterator
 
 _MAX_ERROR_BODY_BYTES = 64 * 1024
+# the read size used only when a deadline is in force, and only if it is SMALLER than the caller's
+# configured chunk size -- a caller that already reads in smaller pieces keeps its own. Not folded
+# into `_DOWNLOAD_CHUNK_BYTES`: that constant is the download granularity for the whole
+# no-deadline path, and shrinking it would slow every large tarball fetch to buy a bound those
+# callers never asked for.
+_DEADLINE_CHUNK_BYTES = 8 * 1024
 
 
 def _chunk_bytes() -> int:
@@ -53,7 +59,13 @@ def _read_error_body(exc: urllib.error.HTTPError, body_deadline: float | None) -
     while total < _MAX_ERROR_BODY_BYTES:
         if deadline is not None and time.monotonic() > deadline:
             break
-        chunk = exc.read(min(_chunk_bytes(), _MAX_ERROR_BODY_BYTES - total))
+        # bounded by the same reasoning as `_iter_capped_chunks` below, and for the same reason it is
+        # only applied when a deadline is in force: without one there is nothing for a small read to
+        # buy. The remaining-bytes term still applies, so the cap is never overshot either way.
+        read_size = min(_chunk_bytes(), _MAX_ERROR_BODY_BYTES - total)
+        if deadline is not None:
+            read_size = min(read_size, _DEADLINE_CHUNK_BYTES)
+        chunk = exc.read(read_size)
         if not chunk:
             break
         chunks.append(chunk)
@@ -68,16 +80,25 @@ def _iter_capped_chunks(
     # sink before every attempt, so the bytes this generator caps are exactly the bytes that
     # survive on disk. a retried download can never leave more than max_bytes behind.
     total = 0
+    # the deadline can only be checked BETWEEN reads, so the read size is what bounds how far one
+    # blocked read can overshoot it. A single `HTTPResponse.read(n)` performs many socket receives
+    # internally and urllib's timeout applies per receive, not per call, so a peer that stays inside
+    # every window keeps one read blocked far past the deadline: with a 1 MiB size that is thousands
+    # of receives before control returns here. A deadline-bearing read therefore uses a smaller size,
+    # so the check runs often enough for the bound to mean something.
+    #
+    # This NARROWS the overshoot; it does not eliminate it. The residual is "however long one read's
+    # worth takes to arrive", which a slow enough peer still stretches -- bounding that properly needs
+    # an interruptible read (a thread or async), which this blocking client has no way to express. The
+    # socket timeout stays the real backstop against a peer that stalls outright, and the caller's own
+    # fixed timeout bounds what the user ever waits.
+    read_size = _chunk_bytes() if deadline is None else min(_chunk_bytes(), _DEADLINE_CHUNK_BYTES)
     while True:
-        # urllib's timeout applies to each blocking socket read, not to the response as a whole, so
-        # a peer that dribbles out one chunk just inside every timeout window keeps a single attempt
-        # alive far past it. `deadline` bounds the wall-clock of the whole body for callers that
-        # promise an overall budget; without it, that promise is only per-read.
         if deadline is not None and time.monotonic() > deadline:
             raise TimeoutError(
                 f"GitHub response body exceeded its overall deadline after {total} bytes"
             )
-        chunk = resp.read(_chunk_bytes())
+        chunk = resp.read(read_size)
         if not chunk:
             break
         if total + len(chunk) > max_bytes:

@@ -363,6 +363,145 @@ def test_an_unreadable_error_body_degrades_instead_of_raising(monkeypatch, capsy
     assert "502" in out, "the status is the useful part and must survive an unreadable body"
 
 
+def test_the_error_body_read_asks_for_a_bounded_amount():
+    """A drip-fed non-2xx body must not stall the code path that REPORTS the failure.
+
+    `exc.read()` with no argument is an unbounded read: `HTTPResponse.read(None)` streams a chunked
+    body until it ends, so a plane that keeps dribbling a 502 body holds this handler open while the
+    CLI is trying to say the list is unavailable. Asserted on the size ARGUMENT rather than by timing:
+    `exc.read()` delegates one call to the fp, so an in-memory stub can never reproduce the endless
+    stream itself, and `-1`/`None` is exactly the unbounded request being ruled out.
+    """
+    import urllib.error
+
+    from flash.client.streaming import _MAX_ERROR_BODY_BYTES, _read_error_body
+
+    sizes: list[object] = []
+
+    class _RecordingBody:
+        def __init__(self):
+            self._left = 3
+
+        def read(self, size=-1):
+            sizes.append(size)
+            self._left -= 1
+            return b"x" * 16 if self._left > 0 else b""
+
+        def close(self):
+            """HTTPError's tempfile teardown calls this."""
+
+    exc = urllib.error.HTTPError(
+        url="https://api.freesolo.co/v1/envs",
+        code=502,
+        msg="Bad Gateway",
+        hdrs={},  # type: ignore[arg-type]
+        fp=_RecordingBody(),
+    )
+    body = _read_error_body(exc)
+
+    assert body == b"x" * 32
+    assert sizes, "the body must actually be read"
+    unbounded = [s for s in sizes if not isinstance(s, int) or s <= 0]
+    assert not unbounded, f"every read must request a positive byte count, got {sizes}"
+    assert all(s <= _MAX_ERROR_BODY_BYTES for s in sizes)
+
+
+def test_the_call_site_asks_for_a_bounded_error_body_not_just_the_helper():
+    """`_detail_from_http_error` must USE the bounded reader, not merely have one available.
+
+    Deliberately routed through the real call site rather than `_read_error_body` directly: a test
+    that only exercises the helper passes unchanged when the call site still says `exc.read()`, which
+    is exactly the unbounded read being removed. Asserting on the size argument is what pins it --
+    `-1`/`None` is the unbounded request, and only the call site chooses which is sent.
+    """
+    import urllib.error
+
+    from flash.client.http import _detail_from_http_error
+
+    sizes: list[object] = []
+
+    class _RecordingBody:
+        def __init__(self):
+            self._left = 2
+
+        def read(self, size=-1):
+            sizes.append(size)
+            self._left -= 1
+            return b'{"detail": "boom"}' if self._left > 0 else b""
+
+        def close(self):
+            """HTTPError's tempfile teardown calls this."""
+
+    exc = urllib.error.HTTPError(
+        url="https://api.freesolo.co/v1/envs",
+        code=502,
+        msg="Bad Gateway",
+        hdrs={},  # type: ignore[arg-type]
+        fp=_RecordingBody(),
+    )
+
+    assert _detail_from_http_error(exc) == "boom", "the detail must still be extracted"
+    assert sizes, "the body must actually be read"
+    unbounded = [s for s in sizes if not isinstance(s, int) or s <= 0]
+    assert not unbounded, f"the call site must request a bounded amount, got {sizes}"
+
+
+def test_the_error_body_read_stops_at_its_cap():
+    """A body that never ends is truncated at the cap rather than read forever."""
+    from flash.client.streaming import _MAX_ERROR_BODY_BYTES, _read_error_body
+
+    class _EndlessBody:
+        def read(self, size=-1):
+            return b"x" * size
+
+        def close(self):
+            """HTTPError's tempfile teardown calls this."""
+
+    import urllib.error
+
+    exc = urllib.error.HTTPError(
+        url="https://api.freesolo.co/v1/envs",
+        code=502,
+        msg="Bad Gateway",
+        hdrs={},  # type: ignore[arg-type]
+        fp=_EndlessBody(),
+    )
+
+    assert len(_read_error_body(exc)) == _MAX_ERROR_BODY_BYTES
+
+
+def test_the_error_body_read_stops_at_its_deadline(monkeypatch):
+    """An endless body that stays inside the cap is still bounded by wall-clock."""
+    import time as time_mod
+    import urllib.error
+
+    from flash.client.streaming import _read_error_body
+
+    clock = [0.0]
+
+    class _SlowBody:
+        def read(self, size=-1):
+            clock[0] += 5.0  # each read lands inside any socket window, but time accumulates
+            return b"x" * 16
+
+        def close(self):
+            """HTTPError's tempfile teardown calls this."""
+
+    monkeypatch.setattr(time_mod, "monotonic", lambda: clock[0])
+    exc = urllib.error.HTTPError(
+        url="https://api.freesolo.co/v1/envs",
+        code=502,
+        msg="Bad Gateway",
+        hdrs={},  # type: ignore[arg-type]
+        fp=_SlowBody(),
+    )
+
+    body = _read_error_body(exc, deadline_seconds=20.0)
+
+    # stopped on the deadline, far short of the byte cap: 20s of budget at 5s per read.
+    assert 0 < len(body) <= 5 * 16
+
+
 def test_list_envs_outlasts_the_servers_own_github_retry_budget():
     """The client must not time out before the plane can answer.
 

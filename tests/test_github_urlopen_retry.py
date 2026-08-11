@@ -591,6 +591,139 @@ def test_urlopen_open_timeout_never_exceeds_the_remaining_deadline(monkeypatch):
     assert seen == [20.0], "a 60s socket window would outlive the 20s attempt budget"
 
 
+def test_a_deadline_bearing_read_uses_a_smaller_chunk_so_the_check_can_run(monkeypatch):
+    """The deadline is only checked BETWEEN reads, so the read size bounds the overshoot.
+
+    One `HTTPResponse.read(n)` performs many socket receives internally, and urllib's timeout applies
+    per receive rather than per call -- verified empirically: a single `read(8192)` against a peer
+    sending 256 B every 100 ms took 3.10 s with a 0.5 s socket timeout and raised nothing. So a 1 MiB
+    read is thousands of receives during which the deadline check cannot run at all. A
+    deadline-bearing read therefore asks for less.
+
+    This narrows the window rather than closing it: the residual is however long one read's worth
+    takes to arrive. Closing it properly needs an interruptible read, which a blocking urllib client
+    cannot express, so the socket timeout remains the backstop for a peer that stalls outright.
+    """
+    from flash.envs import bounded_reads
+
+    sizes: list[int] = []
+
+    class _RecordingBody(io.BytesIO):
+        def read(self, size=-1):
+            sizes.append(size)
+            return super().read(size)
+
+    monkeypatch.setattr(time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: _RecordingBody(b"x" * 100))
+
+    _urlopen(
+        urllib.request.Request("https://api.github.com/test"),
+        max_bytes=16 * 1024 * 1024,
+        body_deadline=20.0,
+    )
+
+    assert sizes, "the body must actually be read"
+    assert all(s <= bounded_reads._DEADLINE_CHUNK_BYTES for s in sizes), (
+        f"a deadline-bearing read must not ask for a full download chunk, got {sizes}"
+    )
+
+
+def test_a_deadline_bearing_error_body_read_is_bounded_the_same_way(monkeypatch):
+    """The sibling helper reads a body too, so it needs the same read size or the hole survives.
+
+    ``_read_error_body`` runs on the interactive list path with the same deadline, and its own cap
+    (64 KiB) is far larger than one deadline-check interval should be. Fixing only the download
+    generator would leave the identical between-reads gap on the path that is actually latency
+    sensitive -- the one reporting a 429 while the user waits.
+    """
+    from flash.envs import bounded_reads
+
+    sizes: list[int] = []
+
+    class _RecordingBody(io.BytesIO):
+        def read(self, size=-1):
+            sizes.append(size)
+            return super().read(size)
+
+    exc = urllib.error.HTTPError(
+        url="https://api.github.com/test",
+        code=503,
+        msg="Service Unavailable",
+        hdrs={},  # type: ignore[arg-type]
+        fp=_RecordingBody(b"x" * 100),
+    )
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: (_ for _ in ()).throw(exc))
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)
+
+    with pytest.raises(GitHubRateLimitError, match="503"):
+        _urlopen(
+            urllib.request.Request("https://api.github.com/test"),
+            max_rate_limit_retries=0,
+            body_deadline=20.0,
+        )
+
+    assert sizes, "the error body must actually be read"
+    assert all(s <= bounded_reads._DEADLINE_CHUNK_BYTES for s in sizes), (
+        f"a deadline-bearing error-body read must not ask for the full cap, got {sizes}"
+    )
+
+
+def test_an_error_body_read_without_a_deadline_keeps_its_larger_chunk(monkeypatch):
+    # the counterpart to the test above: with no deadline there is nothing a smaller read buys, so
+    # the background path must keep reading in the caller's configured size.
+    from flash.envs import bounded_reads, loader
+
+    sizes: list[int] = []
+
+    class _RecordingBody(io.BytesIO):
+        def read(self, size=-1):
+            sizes.append(size)
+            return super().read(size)
+
+    exc = urllib.error.HTTPError(
+        url="https://api.github.com/test",
+        code=503,
+        msg="Service Unavailable",
+        hdrs={},  # type: ignore[arg-type]
+        fp=_RecordingBody(b"x" * 100),
+    )
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: (_ for _ in ()).throw(exc))
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)
+
+    with pytest.raises(GitHubRateLimitError, match="503"):
+        _urlopen(urllib.request.Request("https://api.github.com/test"), max_rate_limit_retries=0)
+
+    assert sizes, "the error body must actually be read"
+    assert max(sizes) > bounded_reads._DEADLINE_CHUNK_BYTES, (
+        f"a read with no deadline must keep the larger size, got {sizes}"
+    )
+    assert max(sizes) <= loader._DOWNLOAD_CHUNK_BYTES
+
+
+def test_a_read_without_a_deadline_keeps_the_full_download_chunk(monkeypatch):
+    """No deadline means no reason to shrink: large fetches keep their download granularity.
+
+    The smaller size buys a bound that background downloads never asked for, and paying it there
+    would slow every large tarball fetch for nothing.
+    """
+    from flash.envs import loader
+
+    sizes: list[int] = []
+
+    class _RecordingBody(io.BytesIO):
+        def read(self, size=-1):
+            sizes.append(size)
+            return super().read(size)
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: _RecordingBody(b"x" * 100))
+
+    _urlopen(urllib.request.Request("https://api.github.com/test"), max_bytes=16 * 1024 * 1024)
+
+    assert sizes == [loader._DOWNLOAD_CHUNK_BYTES, loader._DOWNLOAD_CHUNK_BYTES]
+
+
 def test_urlopen_without_a_body_deadline_keeps_its_full_socket_timeout(monkeypatch):
     """No deadline means no cap: the background path must keep the socket window it asked for."""
     seen: list[float] = []
