@@ -1997,11 +1997,11 @@ def test_exact_gpu_rejection_reports_a_pin_that_hides_a_wider_count():
     from flash.providers.allocator import _resolve_exact_gpu
     from flash.providers.base import UnsupportedGpuError
 
-    def reject(provider, available, unpinned):
+    def reject(provider, available, unpinned, need=188.0):
         with pytest.raises(UnsupportedGpuError) as exc:
             _resolve_exact_gpu(
                 "H100",
-                need=188.0,
+                need=need,
                 cap=1,
                 max_gpu_count=1,
                 provider=provider,
@@ -2013,6 +2013,15 @@ def test_exact_gpu_rejection_reports_a_pin_that_hides_a_wider_count():
 
     hidden = reject("lambda", ("lambda",), ("runpod", "lambda"))
     assert "Drop the provider pin" in hidden
+    # the authored ceiling already failed too, so the pin clause alone would buy a second
+    # rejection. both halves, as the sibling `vram_fit_error_message` path does.
+    assert "`--gpus 4`" in hidden
+
+    # an OVERSIZED pin gets no hint at all: 8x H100 is 497.6 GB, so dropping the pin cannot help
+    # and promising it would be false. routed through `wider_shape_remedy`, which proves the width.
+    oversized = reject("lambda", ("lambda",), ("runpod", "lambda"), need=900.0)
+    assert "Drop the provider pin" not in oversized
+    assert "--gpus" not in oversized
 
     # no pin, and a pin with nothing better behind it, must stay silent rather than invent advice.
     assert "Drop the provider pin" not in reject("", ("lambda",), None)

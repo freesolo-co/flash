@@ -242,19 +242,32 @@ def _resolve_exact_gpu(
     unpinned_reachable = (
         tuple(name for name in unpinned if name in exact_providers) if unpinned else ()
     )
-    pin_hides_width = (
-        not widths and bool(unpinned_reachable) and rents_arbitrary_card_counts(unpinned_reachable)
+    unpinned_widths = (
+        (exact_info.vram_gb,)
+        if not widths and unpinned_reachable and rents_arbitrary_card_counts(unpinned_reachable)
+        else ()
     )
-    drop_pin_hint = (
-        f". Drop the provider pin to rent {exact!r} at a wider card count"
-        if pin_hides_width
-        else ""
-    )
+
+    def _drop_pin_hint(above: int) -> str:
+        """Name dropping the pin AND the width it unlocks, or nothing if no width fits.
+
+        Routed through ``wider_shape_remedy`` so this shares the sibling path's two rules: a width
+        is only named once PROVED to fit (an oversized pin gets no hint at all, since dropping the
+        pin cannot help), and the ceiling is named alongside the pin -- reaching here means the
+        authored count already failed, so advice omitting it just buys a second rejection.
+        """
+        remedy = wider_shape_remedy(unpinned_widths, need, ceiling=widest_cap, above=above)
+        if not remedy:
+            return ""
+        # the shared helper opens with "; it fits on N cards -- ...", so splice the pin clause in
+        # front of its body rather than concatenating two separately punctuated sentences.
+        return f". Drop the provider pin to rent {exact!r}:{remedy.removeprefix(';')}"
+
     if exact_info.vram_gb < need and max_gpu_count <= 1:
         raise UnsupportedGpuError(
             f"exact GPU {exact!r} has {exact_info.vram_gb} GB VRAM, "
             f"but this run requires at least {need} GB"
-            + (wider_shape_remedy(widths, need, ceiling=widest_cap, above=1) or drop_pin_hint)
+            + (wider_shape_remedy(widths, need, ceiling=widest_cap, above=1) or _drop_pin_hint(1))
         )
     # the widest shape providers actually rent for this ceiling, not the ceiling itself: a pin
     # that only fits at a non-rentable count (3) must be rejected here with a precise reason
@@ -266,7 +279,10 @@ def _resolve_exact_gpu(
     ):
         raise UnsupportedGpuError(
             f"exact GPU {exact!r} cannot fit this run even as a {cap}-card combination"
-            + (wider_shape_remedy(widths, need, ceiling=widest_cap, above=cap) or drop_pin_hint)
+            + (
+                wider_shape_remedy(widths, need, ceiling=widest_cap, above=cap)
+                or _drop_pin_hint(cap)
+            )
         )
     return exact, reachable
 
