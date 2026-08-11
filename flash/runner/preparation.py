@@ -449,8 +449,9 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
     # an auto-sized run has NO authored ceiling: its public count is the digest-stable placeholder
     # 1, so a legitimately auto-sized 2+ card shape would fail the narrowing rule below and be
     # rejected as an integrity failure at persist time. the real ceiling for that run is the
-    # platform maximum, and the marker is itself digest-protected (see effective_spec_from_status),
-    # so it cannot be forged to unlock this branch.
+    # platform maximum. this branch is still bounded: MAX_COMBINATION_CARDS is the same cap
+    # allocation itself honours, and the count that lands here was produced by a VRAM fit check and
+    # the attention-head geometry cap, so a marker cannot buy a shape those would refuse.
     from flash.providers.base import MAX_COMBINATION_CARDS
 
     ceiling = MAX_COMBINATION_CARDS if worker_spec.gpu_count_auto else public_count

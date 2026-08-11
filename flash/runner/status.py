@@ -91,14 +91,18 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
         worker_spec.workload_profile or None
     ):
         raise ValueError("persisted workload profile does not match the worker spec")
-    # `gpu_count_auto` joins this list for the same reason `model_revision_auto` is on it: the
-    # structural compare excludes it (the public half always reads False by construction), so a
-    # forged worker-half marker would otherwise reach allocation unverified. it is a privilege
-    # decision -- a true marker turns an authored `gpu.count = 1` hard ceiling into
-    # `max_gpu_count=None`, silently widening the user's pin and billing cards they capped. the
-    # marker is hashed into the digest at persist time, so a snapshot claiming one cannot reproduce
-    # it.
-    if (has_workload_profile or worker_spec.model_revision_auto or worker_spec.gpu_count_auto) and (
+    # `gpu_count_auto` is deliberately NOT a trigger here, unlike `model_revision_auto`. The digest
+    # covers the whole public spec including `gpu.type`, which the allocator legitimately rewrites
+    # onto the stored status when a run is provisioned -- so gating on the marker made the digest
+    # reject ordinary provisioned runs at deploy. Measured: two specs differing only in whether
+    # gpu.count was authored deployed differently, the auto-sized one failing integrity validation
+    # (tests/test_server_api.py::test_deploy_ignores_stored_training_gpu). Since an omitted count is
+    # the DEFAULT, that is nearly every run. The marker's integrity does not need this trigger: it
+    # is bounded by `_validate_effective_spec`, which caps an auto-sized count at
+    # MAX_COMBINATION_CARDS, and unlike `model_revision_auto` it cannot relax a deploy-time
+    # rejection -- a forged marker only widens the allocator's ceiling, which the VRAM fit check and
+    # the geometry cap still constrain.
+    if (has_workload_profile or worker_spec.model_revision_auto) and (
         not isinstance(stored_digest, str)
         or stored_digest
         != runner._preparation_digest(
