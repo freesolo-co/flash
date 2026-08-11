@@ -92,26 +92,8 @@ except Exception:
 FLASH_GDN_VARLEN_MARKER = "[flash-verl] gdn packed-boundary resets active"
 
 
-def render_gdn_varlen_shim(model_type: str) -> str:
-    """child-side sitecustomize fragment that resets GDN state at packed example boundaries.
-
-    patch the checkpoint's exact ``model_type`` because ``qwen3_5`` and ``qwen3_5_moe`` use different
-    modules; model names are not authoritative. patch the text-model forward so one derivation reaches
-    every GDN layer, and use transformers' own boundary helper to match attention segmentation.
-
-    keep padded input inert, preserve explicit kwargs, and fail closed because silent boundary
-    contamination is worse than refusing to start.
-
-    defer every import to the moment the child imports the modeling module itself. sitecustomize
-    runs at INTERPRETER STARTUP, and ray starts each actor's interpreter before it narrows that
-    actor's ``CUDA_VISIBLE_DEVICES`` to its own card -- so an import here runs while the process
-    still sees every gpu. importing the modeling module transitively calls transformers'
-    ``is_flash_linear_attention_available``/``is_causal_conv1d_available``, both of which call
-    ``torch.cuda.is_available()``, and fla queries device capability at import. that initializes
-    cuda against the FULL device list, and a later env-only change cannot rebuild the device map,
-    so every rank keeps device 0 and nccl aborts with ``Duplicate GPU detected``. a meta_path
-    finder carries no import cost and fires after ray has pinned the actor.
-    """
+def _gdn_varlen_patch_source(model_type: str) -> str:
+    """the shim's import-time-free half: the target, the seq_idx helper, and the patch itself."""
     return f'''
 # --- flash: reset gdn state at packed example boundaries (backend_common.render_gdn_varlen_shim) ---
 import sys as _flash_gdn_sys
@@ -179,7 +161,12 @@ def _flash_patch_gdn_varlen(modeling):
     forward._flash_gdn_varlen_patched = True
     text_model.forward = forward
     print({FLASH_GDN_VARLEN_MARKER!r}, "{model_type}", flush=True)
+'''
 
+
+# the arming half. kept separate only so neither piece runs past the repo's function-length limit;
+# the two are concatenated verbatim and must stay in this order.
+_GDN_VARLEN_ARM_SOURCE = '''
 
 class _FlashGdnLoader:
     """wrap the real loader so the patch lands once the module is fully executed.
@@ -243,6 +230,29 @@ if _flash_gdn_loaded is not None:
 else:
     _flash_gdn_sys.meta_path.insert(0, _FlashGdnFinder())
 '''
+
+
+def render_gdn_varlen_shim(model_type: str) -> str:
+    """child-side sitecustomize fragment that resets GDN state at packed example boundaries.
+
+    patch the checkpoint's exact ``model_type`` because ``qwen3_5`` and ``qwen3_5_moe`` use different
+    modules; model names are not authoritative. patch the text-model forward so one derivation reaches
+    every GDN layer, and use transformers' own boundary helper to match attention segmentation.
+
+    keep padded input inert, preserve explicit kwargs, and fail closed because silent boundary
+    contamination is worse than refusing to start.
+
+    defer every import to the moment the child imports the modeling module itself. sitecustomize
+    runs at INTERPRETER STARTUP, and ray starts each actor's interpreter before it narrows that
+    actor's ``CUDA_VISIBLE_DEVICES`` to its own card -- so an import here runs while the process
+    still sees every gpu. importing the modeling module transitively calls transformers'
+    ``is_flash_linear_attention_available``/``is_causal_conv1d_available``, both of which call
+    ``torch.cuda.is_available()``, and fla queries device capability at import. that initializes
+    cuda against the FULL device list, and a later env-only change cannot rebuild the device map,
+    so every rank keeps device 0 and nccl aborts with ``Duplicate GPU detected``. a meta_path
+    finder carries no import cost and fires after ray has pinned the actor.
+    """
+    return _gdn_varlen_patch_source(model_type) + _GDN_VARLEN_ARM_SOURCE
 
 
 def parse_wandb_link(line: str) -> dict | None:
