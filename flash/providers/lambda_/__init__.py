@@ -118,35 +118,6 @@ class LambdaProvider(InstanceProvider):
 
         return run_instances_remaining(run_id)
 
-    def _image_disk_floor_problem(self) -> str:
-        """Why Lambda cannot honor a configured worker-image disk floor.
-
-        Lambda sells fixed instance storage: there is no disk-sizing field on the launch path, and
-        the capacity probe ignores ``constraints.disk_gb`` entirely. RunPod sizes the endpoint
-        template and Vast searches on disk, so both can satisfy the floor; Lambda can only ignore
-        it. Renting here for a floor above what a run would get anyway produces a paid instance
-        that fails during image extraction -- and a never-started worker is classified retriable,
-        so it could repeat across paid attempts.
-
-        Keyed on whether the floor actually RAISES anything, not on it being set. ``_with_model_disk``
-        applies it as a raise-only maximum, so a floor at or below the platform default asks for no
-        more disk than an ordinary run already gets; refusing those would cost real Lambda capacity
-        on an automatic allocation, and fail a Lambda-pinned run as unsupported, to prevent nothing.
-        The catalog floor is deliberately NOT consulted: it is per-model, and this method answers
-        for the substrate before a model is in hand -- so the comparison is against the default that
-        every run receives, which is the largest bound that holds for every run.
-        """
-        from flash.core.spec import GpuSpec
-        from flash.providers._lifecycle.worker import worker_image_disk_floor
-
-        if worker_image_disk_floor() <= GpuSpec.disk_gb:
-            return ""
-        return (
-            f"FLASH_WORKER_IMAGE_DISK_GB cannot be provisioned on {self.name}: "
-            f"{self.name} sells fixed instance storage with no disk-sizing field, so the "
-            f"worker image's disk floor cannot be guaranteed"
-        )
-
     def live_candidates(
         self, need_vram_gb: int, constraints: AllocationConstraints
     ) -> list[Candidate]:
@@ -161,11 +132,10 @@ class LambdaProvider(InstanceProvider):
         rate stays per-card (``usable_instances`` divides the per-instance price).
 
         Offers nothing at all when a private worker image is configured that this substrate cannot
-        authenticate (see ``_private_image_problem``), or when a worker-image disk floor is set that
-        it cannot provision (see ``_image_disk_floor_problem``), so the allocator never rents a box
-        whose image pull is certain to fail.
+        authenticate (see ``_private_image_problem``), so the allocator never rents a box whose
+        image pull is certain to fail.
         """
-        problem = self._private_image_problem() or self._image_disk_floor_problem()
+        problem = self._private_image_problem()
         if problem:
             raise UnsupportedGpuError(problem)
         from flash.providers.lambda_ import api as lambda_api

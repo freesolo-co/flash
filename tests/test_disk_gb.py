@@ -188,57 +188,31 @@ def test_submit_raises_disk_to_the_worker_image_floor(monkeypatch):
         assert status.effective_preparation["worker_spec"]["gpu"]["disk_gb"] == 100
 
 
-def test_lambda_offers_nothing_while_a_disk_floor_it_cannot_honor_is_set(monkeypatch):
-    """Lambda must not rent a paid box it is certain cannot extract the image.
+def test_no_provider_is_disqualified_by_the_image_disk_floor(monkeypatch):
+    """The floor sizes disk; it must not change which substrates are eligible.
 
-    The floor reaches ``AllocationConstraints.disk_gb``, but Lambda sells fixed instance storage:
-    its capacity probe ignores the disk constraint and its launch path has no disk-sizing field. An
-    operator only sets the floor because the image does NOT fit the default sizing, so allocating
-    here buys an instance that fails during extraction -- and a never-started worker is retriable,
-    so the paid attempt could repeat. RunPod (endpoint template) and Vast (offer search) can both
-    satisfy the floor and stay eligible.
+    Lambda cannot honor ANY disk floor -- ``live_candidates`` never reads ``constraints.disk_gb``
+    and says so -- but that is true of the catalog floor too, and a 200 GB catalog model already
+    allocates there today. Refusing Lambda for the image floor alone would single out the smaller
+    of two identical requests, dropping real capacity and failing a Lambda-pinned run to prevent
+    nothing the platform prevents already.
+
+    A guard here also cannot be written correctly: ``constraints.disk_gb`` arrives POST-max (see
+    ``seed_submission``, which passes the already-raised ``attempt_spec.gpu.disk_gb``), so the
+    floor can never exceed it and any such comparison is dead code. Honoring disk on Lambda is a
+    pre-existing gap for the catalog floor and belongs with it, not on this knob.
     """
-    import pytest
-
-    from flash.providers.base import AllocationConstraints, UnsupportedGpuError
     from flash.providers.lambda_ import LambdaProvider
+    from flash.providers.runpod import RunpodProvider
     from flash.providers.vast import VastProvider
 
     monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/fat-worker:cu128")
     monkeypatch.delenv("FLASH_WORKER_IMAGE_REGISTRY_AUTH", raising=False)
     monkeypatch.setenv("FLASH_WORKER_IMAGE_DISK_GB", "300")
 
-    with pytest.raises(UnsupportedGpuError, match="FLASH_WORKER_IMAGE_DISK_GB"):
-        LambdaProvider().live_candidates(24, AllocationConstraints())
-    # vast searches offers on disk (_effective_disk_gb), so the floor must NOT disqualify it --
-    # the guard is specific to the substrate that cannot size disk, not to the floor existing.
-    assert not hasattr(VastProvider(), "_image_disk_floor_problem")
-
-    # and with no floor set, lambda is eligible again
-    monkeypatch.delenv("FLASH_WORKER_IMAGE_DISK_GB", raising=False)
-    assert LambdaProvider()._image_disk_floor_problem() == ""
-
-
-def test_lambda_stays_eligible_for_a_floor_that_raises_nothing(monkeypatch):
-    """The refusal keys on the floor RAISING disk, not on it being set.
-
-    ``_with_model_disk`` applies the floor as a raise-only maximum, so a value at or below the
-    platform default asks for no more disk than an ordinary run already gets. Refusing those would
-    drop real Lambda capacity on an automatic allocation, and fail a Lambda-pinned run as
-    unsupported, while preventing nothing.
-    """
-    from flash.core.spec import GpuSpec
-    from flash.providers.lambda_ import LambdaProvider
-
-    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/worker:cu128")
-
-    for benign in (1, GpuSpec.disk_gb - 1, GpuSpec.disk_gb):
-        monkeypatch.setenv("FLASH_WORKER_IMAGE_DISK_GB", str(benign))
-        assert LambdaProvider()._image_disk_floor_problem() == "", benign
-
-    # one GB above the default is the first value that actually asks for more disk
-    monkeypatch.setenv("FLASH_WORKER_IMAGE_DISK_GB", str(GpuSpec.disk_gb + 1))
-    assert "FLASH_WORKER_IMAGE_DISK_GB" in LambdaProvider()._image_disk_floor_problem()
+    # no provider gained a disk-floor eligibility gate: the knob sizes disk, it does not veto
+    for provider in (LambdaProvider(), VastProvider(), RunpodProvider()):
+        assert not hasattr(provider, "_image_disk_floor_problem"), provider.name
 
 
 def test_profile_job_carries_the_worker_image_disk_floor(monkeypatch):
