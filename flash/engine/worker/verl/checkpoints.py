@@ -327,8 +327,12 @@ def export_peft_adapter(
             f"verl model_merger did not produce a peft adapter at {lora_dir} (no adapter_config.json); "
             "the merger output layout must be adjusted for this verl version."
         )
+    # rename rather than copy: `merge_out` is `out_adapter_dir + "_merge"`, so both sit in the same
+    # parent and therefore the same filesystem, and `os.replace` is a metadata operation that moves
+    # no bytes. copying instead would hold a second copy of the adapter beside the still-undeleted
+    # merge tree, which is a peak this function's own headroom check does not budget for.
     for name in os.listdir(lora_dir):
-        shutil.copy2(os.path.join(lora_dir, name), os.path.join(out_adapter_dir, name))
+        os.replace(os.path.join(lora_dir, name), os.path.join(out_adapter_dir, name))
     shutil.rmtree(merge_out, ignore_errors=True)
 
 

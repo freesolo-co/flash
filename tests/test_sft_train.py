@@ -2373,3 +2373,67 @@ def test_optimizer_state_is_not_counted_against_the_merge(tmp_path):
     assert verl_checkpoints._model_shard_bytes(str(source)) == 8192, (
         "optimizer or extra state was charged to the merge, which can refuse a merge that fits"
     )
+
+
+def test_the_adapter_is_moved_out_of_the_merge_tree_not_copied(monkeypatch, tmp_path):
+    """the export must never hold two copies of the adapter at once.
+
+    `export_peft_adapter` deletes `<adapter>_merge` only AFTER placing the adapter in its final
+    directory. Copying the files there would put a second copy of every adapter file on the disk
+    while the whole merge tree is still present, and that transient peak is not what
+    `require_merge_headroom` reserved space for -- it is the same class of overshoot the guard
+    exists to prevent.
+
+    Both directories are siblings under one parent, hence one filesystem, so the placement can be a
+    rename that transfers no bytes.
+
+    The assertion has to be made at the moment `rmtree` runs, not after the call returns: by then
+    the merge tree is gone under either implementation, so a post-hoc check cannot tell a move from
+    a copy. What distinguishes them is whether the source files are still occupying space when the
+    final adapter already exists.
+    """
+    from flash.engine.worker.verl import checkpoints as verl_checkpoints
+
+    actor_dir = tmp_path / "global_step_5"
+    (actor_dir / "huggingface").mkdir(parents=True)
+    (actor_dir / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 512)
+    out_adapter = tmp_path / "adapter"
+    merge_out = tmp_path / "adapter_merge"
+    lora_dir = merge_out / "lora_adapter"
+
+    def fake_merge(*args, **kwargs):
+        lora_dir.mkdir(parents=True)
+        (lora_dir / "adapter_config.json").write_text("{}")
+        (lora_dir / "adapter_model.safetensors").write_bytes(b"weights")
+        return SimpleNamespace(returncode=0)
+
+    duplicated: list[str] = []
+    real_rmtree = verl_checkpoints.shutil.rmtree
+
+    def watching_rmtree(path, *args, **kwargs):
+        if str(path) == str(merge_out) and lora_dir.is_dir():
+            duplicated.extend(sorted(os.listdir(lora_dir)))
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(verl_checkpoints.subprocess, "run", fake_merge)
+    monkeypatch.setattr(verl_checkpoints.shutil, "rmtree", watching_rmtree)
+    monkeypatch.setattr(
+        verl_checkpoints.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=1 << 40, used=0, free=1 << 40),
+    )
+
+    verl_checkpoints.export_peft_adapter(
+        str(actor_dir),
+        str(out_adapter),
+        base_model_id="org/model",
+        python_bin="/verl/python",
+    )
+
+    assert (out_adapter / "adapter_model.safetensors").read_bytes() == b"weights"
+    assert (out_adapter / "adapter_config.json").read_text() == "{}"
+    assert duplicated == [], (
+        f"the merge tree still held {duplicated} after the adapter was placed, "
+        "so both copies were on disk at once"
+    )
+    assert not merge_out.exists()
