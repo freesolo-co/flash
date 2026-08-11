@@ -19,6 +19,7 @@ from flash.client import ApiClient, ApiError, ClientError
 from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
 from flash.cost.spec import runconfig_from_spec
+from flash.engine.profiling.workload_profile import unpacked_batch_warning
 from flash.schema import spec_and_train_keys_from_file, train_schema_metadata
 
 
@@ -246,6 +247,30 @@ def _exact_sft_cost_rows(spec, profile: dict) -> list[tuple[str, str | None]]:
     ]
 
 
+def _print_unpacked_batch_warning(status: object, spec) -> None:
+    """Say out loud that an unpacked SFT run trains 1 example per update, ignoring `batch_size`.
+
+    The earliest point a user can see this: the quote/dry-run response already carries the frozen
+    packing decision, so the override is knowable before any training GPU is allocated. The reason
+    travels on the profile's `architecture_mode`, which is what the packing decision froze.
+    """
+    profile = status.get("workload_profile") if isinstance(status, dict) else None
+    if not isinstance(profile, dict):
+        return
+    examples_per_update = profile.get("examples_per_update")
+    if isinstance(examples_per_update, bool) or not isinstance(examples_per_update, int):
+        return
+    message = unpacked_batch_warning(
+        packing_mode=str(profile.get("packing_mode") or ""),
+        architecture_mode=str(profile.get("architecture_mode") or ""),
+        examples_per_update=examples_per_update,
+        configured_batch_size=getattr(spec.train, "batch_size", None),
+    )
+    if not message:
+        return
+    print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
+
+
 def _print_exact_sft_cost(status: dict, spec) -> None:
     total = status.get("estimated_cost_usd") if isinstance(status, dict) else None
     if not isinstance(total, (int, float)) or isinstance(total, bool):
@@ -267,6 +292,7 @@ def _print_exact_sft_cost(status: dict, spec) -> None:
         "allocated and nothing was charged for training.",
         file=sys.stderr,
     )
+    _print_unpacked_batch_warning(status, spec)
 
 
 def _legacy_train_key_rejection_detail(

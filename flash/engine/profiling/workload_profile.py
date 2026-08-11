@@ -51,6 +51,56 @@ def sft_sample_policy(max_examples: object) -> str:
     return SFT_SAMPLE_POLICY_PREFIX if cap > 0 else SFT_SAMPLE_POLICY_FULL
 
 
+# why a run resolved to `exact-unpacked`, keyed by the architecture label the packing decision
+# froze alongside the mode (`sft_workload._packing_mode`). the label is the only part of that
+# decision that survives into the profile, so the message is derived from it rather than from a
+# generic string or a second guess at the same question.
+_UNPACKED_REASONS = {
+    "multimodal": "this run is multimodal, and image rows are never packed",
+    "gdn-hybrid": (
+        "this model is a gated-delta-net hybrid and the installed stack cannot reset the "
+        "linear-attention recurrence at example boundaries, so packed examples would bleed state"
+    ),
+    "unsupported": "this model architecture has no boundary-safe packing path in flash",
+    "pure-attention": "packing was disabled for this run",
+}
+
+
+def unpacked_batch_warning(
+    *,
+    packing_mode: str,
+    architecture_mode: str,
+    examples_per_update: int,
+    configured_batch_size: object = None,
+) -> str | None:
+    """One user-facing line for an sft run whose packing mode pins the optimizer batch to 1.
+
+    ``exact-unpacked`` is the deliberate boundary-safe design (see
+    ``sft_workload._resolve_sft_step_horizon``); this only makes the resulting override of the
+    authored ``batch_size`` audible. Returns None when packing is on, or when nothing was
+    overridden because the authored batch was already 1.
+    """
+    if packing_mode == "packed" or examples_per_update > 1:
+        return None
+    try:
+        batch = int(configured_batch_size) if configured_batch_size is not None else 0
+    except (TypeError, ValueError):
+        batch = 0
+    if batch == 1:
+        return None
+    reason = _UNPACKED_REASONS.get(
+        architecture_mode, f"packing is unavailable for architecture {architecture_mode!r}"
+    )
+    authored = f"the configured batch_size {batch}" if batch > 1 else "the configured batch_size"
+    return (
+        f"sequence packing is OFF for this SFT run ({architecture_mode}): {reason}. "
+        f"every optimizer update therefore trains exactly 1 example and {authored} is ignored, "
+        "so the run takes one step per example per epoch. the default learning rate is tuned for "
+        "a batched update: expect noisier steps, and lower train.learning_rate if you are "
+        "comparing against a packed run."
+    )
+
+
 def _canonical_json(value: object) -> str:
     return json.dumps(
         value,

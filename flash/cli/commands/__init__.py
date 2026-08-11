@@ -461,6 +461,7 @@ def cmd_train(args) -> int:
             )
         else:
             print(json.dumps(status, indent=2))
+        _print_unpacked_batch_warning(status, spec)  # last, and on stderr: see its docstring
         return 0
     try:
         status = client.create_run(
@@ -991,6 +992,7 @@ from flash.cli.commands.train_cost import (  # noqa: E402,F401
     _legacy_train_key_rejection_detail,
     _print_exact_sft_cost,
     _print_train_schema_compatibility,
+    _print_unpacked_batch_warning,
     _profile_charge,
     _raise_if_workload_profile_pending,
     _warn_if_wandb_requested_without_key,

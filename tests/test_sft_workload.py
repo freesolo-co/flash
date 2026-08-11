@@ -7,7 +7,10 @@ import pytest
 
 from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
 from flash.engine.profiling.sft_workload import prepare_sft_workload, sft_tokens_for_updates
-from flash.engine.profiling.workload_profile import sft_profile_input_digest
+from flash.engine.profiling.workload_profile import (
+    sft_profile_input_digest,
+    unpacked_batch_warning,
+)
 
 
 class FakeTokenizer:
@@ -151,6 +154,60 @@ def test_exact_unpacked_mode_trains_one_example_per_update() -> None:
     assert prepared.rows == packed.rows
     assert prepared.profile.real_tokens_per_epoch == packed.profile.real_tokens_per_epoch
     assert prepared.profile.derived_steps > packed.profile.derived_steps
+
+
+def test_unpacked_run_warns_that_the_configured_batch_size_is_ignored(capsys) -> None:
+    """The one-example-per-update override has to be audible, not only present in train meta."""
+    _prepare(_spec(), packed=False)
+    err = capsys.readouterr().err
+
+    assert "sequence packing is OFF" in err
+    assert "the configured batch_size 2 is ignored" in err
+    assert "learning_rate" in err
+
+
+def test_packed_run_does_not_warn_about_the_batch_size(capsys) -> None:
+    packed = _prepare(_spec(), packed=True)
+    err = capsys.readouterr().err
+
+    assert packed.profile.examples_per_update == 2
+    assert "sequence packing is OFF" not in err
+
+
+@pytest.mark.parametrize(
+    ("architecture_mode", "expected"),
+    [
+        ("multimodal", "multimodal"),
+        ("gdn-hybrid", "linear-attention recurrence"),
+        ("unsupported", "no boundary-safe packing path"),
+    ],
+)
+def test_unpacked_warning_names_the_reason_the_packing_decision_froze(
+    architecture_mode: str, expected: str
+) -> None:
+    """The reason comes from the architecture label the packing decision recorded on the profile."""
+    message = unpacked_batch_warning(
+        packing_mode="exact-unpacked",
+        architecture_mode=architecture_mode,
+        examples_per_update=1,
+        configured_batch_size=32,
+    )
+
+    assert message is not None
+    assert expected in message
+
+
+def test_unpacked_warning_is_silent_when_the_authored_batch_was_already_one() -> None:
+    """Nothing was overridden, so there is nothing to warn about."""
+    assert (
+        unpacked_batch_warning(
+            packing_mode="exact-unpacked",
+            architecture_mode="multimodal",
+            examples_per_update=1,
+            configured_batch_size=1,
+        )
+        is None
+    )
 
 
 def _rebuild_digest(spec: JobSpec) -> JobSpec:

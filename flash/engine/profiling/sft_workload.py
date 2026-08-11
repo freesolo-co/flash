@@ -13,7 +13,11 @@ from typing import Any
 
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import resolve_update_horizon, sft_update_steps
-from flash.engine.profiling.workload_profile import SftWorkloadProfile, sft_sample_policy
+from flash.engine.profiling.workload_profile import (
+    SftWorkloadProfile,
+    sft_sample_policy,
+    unpacked_batch_warning,
+)
 from flash.engine.worker.entry.sft import (
     _pretokenize_completion_only,
     _reject_image_completion,
@@ -638,6 +642,19 @@ def prepare_sft_workload(
         measurements=measurements,
         horizon=horizon,
     )
+    # the batch override is a large optimization-semantics change (one example per update instead
+    # of the authored batch) and its only other trace is `notes["packing"]` in the finished run's
+    # metrics, which nobody reads before paying for the run. say it out loud on the same stderr
+    # channel the truncation warning above uses; this runs in the profile job and again on the
+    # training worker, so both logs carry it.
+    warning = unpacked_batch_warning(
+        packing_mode=profile.packing_mode,
+        architecture_mode=profile.architecture_mode,
+        examples_per_update=profile.examples_per_update,
+        configured_batch_size=effective_batch,
+    )
+    if warning:
+        print(f"warning: [train] {warning}", file=sys.stderr)
     return PreparedSftWorkload(
         rows=retained.rows,
         profile=profile,
