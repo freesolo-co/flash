@@ -695,7 +695,7 @@ def test_env_test_low_reward_warning_names_the_gold_completion_too(monkeypatch, 
     captured = capsys.readouterr()
     assert "check the reward function or the gold completion it scored" in captured.err
     # the exact text that scored zero, so a bare `4` is visibly the wrong gold turn.
-    assert "scored gold answer: '4'" in captured.err
+    assert "scored text: '4'" in captured.err
 
 
 def test_env_test_surfaces_the_scorer_error_behind_a_zero_reward(monkeypatch, tmp_path, capsys):
@@ -709,6 +709,7 @@ def test_env_test_surfaces_the_scorer_error_behind_a_zero_reward(monkeypatch, tm
     env.reward_with_error = lambda completion, example, state=None: (
         0.0,
         "ModuleNotFoundError: No module named 'pymongo'",
+        completion,
     )
     _patch_loader(monkeypatch, env)
 
@@ -724,12 +725,91 @@ def test_env_test_omits_the_scorer_error_line_when_the_scorer_reported_none(
     # a crash on every deliberately-zero reward.
     env_dir = _environment_dir(tmp_path)
     env = _SingleTurnEnv(rows=[{"input": "what is 2 + 2?", "output": "4"}], reward=0.0)
-    env.reward_with_error = lambda completion, example, state=None: (0.0, "")
+    env.reward_with_error = lambda completion, example, state=None: (0.0, "", completion)
     _patch_loader(monkeypatch, env)
 
     assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
     captured = capsys.readouterr()
     assert "scorer error:" not in captured.err
+
+
+def test_env_test_reports_the_text_the_scorer_actually_received(monkeypatch, tmp_path, capsys):
+    """A multi-turn env may override the answer, and the diagnostic must follow it.
+
+    When `step_episode` returns a `final_response_text`, the adapter replaces the episode's
+    `response_text` with it and the scorer grades the replacement, not the replayed turns. Printing
+    the replayed turns labelled that text as the one that scored zero, sending the reader to edit a
+    dataset row the grader never saw. Driven through the real adapter, since the override lives
+    there.
+    """
+    from freesolo.datasets.types import TaskExample
+    from freesolo.environments import (
+        EnvironmentEpisode,
+        EnvironmentMultiTurn,
+        EnvironmentStepResult,
+        RewardResult,
+    )
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    graded: list[str] = []
+
+    class _Env(EnvironmentMultiTurn):
+        dataset: ClassVar[list] = [
+            {"input": "guess", "output": [{"role": "assistant", "content": "RAW_TURN"}]}
+        ]
+
+        def build_prompt_messages(self, example: TaskExample, prompt_text: str):
+            return [{"role": "user", "content": example.input}]
+
+        def start_episode(self, example: TaskExample, prompt_text: str):
+            return [{"role": "user", "content": example.input}]
+
+        def sft_completion(self, example: TaskExample):
+            return list(example.output or [])
+
+        def max_episode_turns(self, example: TaskExample) -> int:
+            return 2
+
+        def step_episode(self, example, messages, assistant_response):
+            return EnvironmentStepResult(done=True, final_response_text="ENV_OVERRODE")
+
+        def score_episode(self, example, episode: EnvironmentEpisode) -> RewardResult:
+            graded.append(str(episode.response_text))
+            return RewardResult(score=0.0, threshold=1.0)
+
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, FreesoloEnvironment(_Env(), "env", source=None))
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
+    captured = capsys.readouterr()
+    # the scorer really did receive the override, so that is the only honest thing to print.
+    assert graded == ["ENV_OVERRODE"]
+    assert "scored text: 'ENV_OVERRODE'" in captured.err
+    assert "scored text: 'RAW_TURN'" not in captured.err
+
+
+def test_env_test_surfaces_a_scorer_error_on_an_echo_episode(monkeypatch, tmp_path, capsys):
+    """An echo episode has no gold answer, which is exactly when a crash goes unreported.
+
+    With no reference to replay the policy is `echo`, so the replay-only warning never fires and
+    `replayed` stays zero, which also disables the grpo gate. A scorer crashing behind the SDK's
+    guard then reached `overall: PASS` with nothing on stderr naming the cause.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(rows=[{"input": "solve", "output": ""}], reward=0.0)
+    env.reward_with_error = lambda completion, example, state=None: (
+        0.0,
+        "ModuleNotFoundError: No module named 'pymongo'",
+        completion,
+    )
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    captured = capsys.readouterr()
+    # the policy really is echo: this is the path where nothing else would have spoken up.
+    assert "policy=echo" in captured.out
+    assert "scorer error: ModuleNotFoundError: No module named 'pymongo'" in captured.err
 
 
 def test_env_test_negative_reward_scale_is_not_a_zero_reward_grader(monkeypatch, tmp_path, capsys):
@@ -1546,6 +1626,7 @@ def test_adapter_reward_with_error_exposes_what_reward_discards():
     assert env.reward_with_error("alice", example) == (
         0.0,
         "ModuleNotFoundError: No module named 'pymongo'",
+        "alice",
     )
 
 
@@ -1568,7 +1649,7 @@ def test_adapter_reward_with_error_is_empty_when_the_scorer_reported_none():
     example = env.dataset()[0]
 
     assert env.reward("4", example) == 1.0
-    assert env.reward_with_error("4", example) == (1.0, "")
+    assert env.reward_with_error("4", example) == (1.0, "", "4")
 
 
 def test_env_test_scores_each_episode_exactly_once():
@@ -1601,7 +1682,7 @@ def test_env_test_scores_each_episode_exactly_once():
     env = FreesoloEnvironment(_Env(), "env", source=None)
     example = env.dataset()[0]
 
-    reward, error = env.reward_with_error("a", example)
+    reward, error, _scored = env.reward_with_error("a", example)
     assert len(calls) == 1, f"scored {len(calls)} times; a re-score would lose the real error"
     assert reward == 0.0
     # the error belongs to the call that produced this reward, not to a later, different one.
@@ -1623,7 +1704,7 @@ def test_env_test_prints_the_scored_text_without_collapsing_it(monkeypatch, tmp_
     assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
     captured = capsys.readouterr()
     # repr, so the newline and tab that a collapsing preview would erase stay visible.
-    assert "scored gold answer: 'answer\\n\\t42 '" in captured.err
+    assert "scored text: 'answer\\n\\t42 '" in captured.err
 
 
 def test_env_test_shows_a_wrapper_past_the_preview_cutoff(monkeypatch, tmp_path, capsys):

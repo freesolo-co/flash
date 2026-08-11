@@ -29,6 +29,14 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   preview that hid the formatting faults it exists to reveal. The scaffolded `environment.py`
   documents that `output` is also the gold assistant turn SFT trains on, and that per-row scorer
   state belongs in `metadata`.
+- `flash env test` labelled the replayed dataset turns as the text that scored zero, but a
+  multi-turn environment whose `step_episode` returns a `final_response_text` has that override
+  replace the episode's response before scoring, so the diagnostic named text the grader never
+  saw. It now reports what the scorer actually received, captured at the scoring call.
+- A crashed scorer went unreported on an `echo` episode -- a row with no gold answer to replay,
+  which is also the case that leaves the GRPO gate with nothing to count. `flash env test` could
+  exit `overall: PASS` with every reward coming from a scorer that never ran. The scorer's error is
+  now surfaced for any policy.
 - A scorer that crashed behind the SDK's guard reached `flash env test` as a bare `0.000000`,
   indistinguishable from a judged-wrong answer, because the adapter kept only
   `RewardResult.score`. The new `FreesoloEnvironment.reward_with_error` returns the reward and the
