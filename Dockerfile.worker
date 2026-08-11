@@ -93,17 +93,17 @@ RUN pip install --no-cache-dir \
 ARG FLASH_ATTN_SPEC=https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.0/flash_attn-2.8.3%2Bcu128torch2.10-cp312-cp312-linux_x86_64.whl
 # sha256 of the wheel FLASH_ATTN_SPEC defaults to, kept in lockstep with backend_common's
 # FLASH_ATTN_SHA256. The wheel is a community rebuild published by an individual, not Dao-AILab, and
-# a github release asset can be deleted and re-uploaded at the same url by whoever holds the account
-# -- so the url alone pins nothing, and this is the interpreter that trains. Same discipline as the
-# infisical .deb in Dockerfile: download, verify, THEN install. Bump it together with the url (and
+# a github release asset can be deleted and re-uploaded at the same url by whoever holds the account,
+# so the url alone pins nothing, and this is the interpreter that trains. Same discipline as the
+# infisical .deb in Dockerfile: download, verify, then install. Bump it together with the url (and
 # worker-image.yml's FA2_SPEC). A url spec with an empty sha is refused, not installed unverified.
 ARG FLASH_ATTN_SHA256=a58c95a080363606e691c342d47dd173b510f4c013a8c5fcb8744def12e36a0f
 # Source-build only (ignored when FLASH_ATTN_SPEC is a wheel, i.e. by default): bound the compile so it
 # doesn't OOM. TORCH_CUDA_ARCH_LIST restricts to the catalog's arches — Ampere (8.0 A100 / 8.6
 # 3090/A40), Ada (8.9 4090), Hopper (9.0 H100), Blackwell datacenter (10.0 B200; sm100) + workstation (12.0 RTX 5090/Pro 6000; sm120); MAX_JOBS bounds
 # peak compile memory. (A from-source build still needs a big-RAM host; the wheel avoids all of it.)
-# A download fault keeps the pre-existing best-effort semantics (SDPA fallback); a HASH MISMATCH
-# never does -- it fails the build, because the whole point is to not bake an unknown binary.
+# A download fault stays best-effort (SDPA fallback); a hash mismatch never does, it fails the
+# build rather than baking a binary nobody can identify.
 RUN set -eu; \
     spec="${FLASH_ATTN_SPEC}"; \
     case "${spec}" in \

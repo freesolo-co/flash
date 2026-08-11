@@ -537,8 +537,8 @@ def test_flash_attn_spec_stays_in_lockstep_with_the_worker_image():
     assert f"ARG FLASH_ATTN_SHA256={vc.FLASH_ATTN_SHA256}" in text, (
         "Dockerfile.worker's FLASH_ATTN_SHA256 default drifted from backend_common.FLASH_ATTN_SHA256"
     )
-    # the install must actually ASK for the digest -- a pinned constant nothing passes to uv is
-    # exactly the unverified fetch this pin exists to close.
+    # the install must actually ask for the digest: a pinned constant nothing hands to uv leaves
+    # the fetch as unverified as it was without one.
     assert f"{vc.FLASH_ATTN_SPEC}#sha256={vc.FLASH_ATTN_SHA256}" == vc.FLASH_ATTN_INSTALL_SPEC
 
 
@@ -1194,9 +1194,9 @@ def test_transformers_pin_stays_in_lockstep_with_the_worker_image():
     # and specifically in the verl venv's override file, not only the main interpreter's install.
     assert f'"{vc.TRANSFORMERS_REQUIREMENT}" > /tmp/verl-overrides.txt' in text
 
-    # pyproject declares the same range for the gpu/server/dev extras. it used to be excluded from
-    # this check and drifted to a lower ceiling unnoticed, which put anyone installing the package
-    # (local worker, self-hosted plane) on a transformers line the image never runs.
+    # pyproject declares the same range for the gpu/server/dev extras, and a lower ceiling there
+    # puts anyone installing the package (local worker, self-hosted plane) on a transformers line
+    # the image never runs.
     pyproject = (root / "pyproject.toml").read_text()
     declared = set(re.findall(r'"(transformers>=[^"]+)"', pyproject))
     assert declared == {vc.TRANSFORMERS_REQUIREMENT}, (

@@ -137,7 +137,7 @@ def test_the_flash_attn_wheel_digests_are_in_lockstep():
 
     Dockerfile.worker carries the ARG defaults it verifies against; worker-image.yml passes the same
     values as build-args. A drifted pair means the build verifies against a digest nobody reviewed
-    alongside the url -- which is the unverified fetch again, wearing a checksum.
+    alongside the url, which leaves the fetch effectively unverified.
     """
     dockerfile = (ROOT / "Dockerfile.worker").read_text()
     yml = (ROOT / ".github" / "workflows" / "worker-image.yml").read_text()

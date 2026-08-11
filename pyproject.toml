@@ -66,7 +66,7 @@ server = [
     "datasets>=2.19",
     "freesolo>=0.4.0",
     "transformers>=5.6,<5.13",
-    # the control plane DOES decode images: flash/server/routes/runs.py imports
+    # the control plane decodes images: flash/server/routes/runs.py imports
     # preflight_validate_image_opd at module load, and flash/content/multimodal.py opens every image
     # source with PIL to validate it. without Pillow a self-hoster on [server] gets
     # `RuntimeError: Pillow is required for multimodal image training` at preflight on any
@@ -93,8 +93,8 @@ dev = [
     "tiktoken>=0.12",
     # flash/content/multimodal.py imports PIL directly to validate and decode every image source, so the
     # image tests are not optional coverage: without Pillow they importorskip and CI reports green
-    # on a multimodal path it never executed. NOT test-only: the control plane decodes images too,
-    # so `server` declares it as well -- this entry keeps the tests runnable without that extra.
+    # on a multimodal path it never executed. the control plane decodes images too, so `server`
+    # declares Pillow as well; this entry keeps the tests runnable without that extra.
     "pillow>=11",
 ]
 # NB: there is deliberately no `all` aggregate. `gpu` (the GPU worker) and `server` (the control
@@ -161,8 +161,8 @@ dev = [
     "tiktoken>=0.12",
     # flash/content/multimodal.py imports PIL directly to validate and decode every image source, so the
     # image tests are not optional coverage: without Pillow they importorskip and CI reports green
-    # on a multimodal path it never executed. NOT test-only: the control plane decodes images too,
-    # so `server` declares it as well -- this entry keeps the tests runnable without that extra.
+    # on a multimodal path it never executed. the control plane decodes images too, so `server`
+    # declares Pillow as well; this entry keeps the tests runnable without that extra.
     "pillow>=11",
     "pytest-xdist>=3.6",
     # tests/test_workflow_contracts.py parses .github/workflows/*.yml. PyYAML is already present

@@ -48,12 +48,12 @@ FLASH_ATTN_SPEC = (
 )
 # sha256 of the wheel above, kept in lockstep with Dockerfile.worker's ARG FLASH_ATTN_SHA256.
 # the wheel is a community rebuild published by an individual, not Dao-AILab, and a github release
-# asset can be deleted and re-uploaded at the same url by whoever holds the account -- so the url
+# asset can be deleted and re-uploaded at the same url by whoever holds the account, so the url
 # alone pins nothing, and this interpreter is the one that TRAINS. bump it together with the url.
 FLASH_ATTN_SHA256 = "a58c95a080363606e691c342d47dd173b510f4c013a8c5fcb8744def12e36a0f"
 # what the install actually asks for. uv hashes the downloaded artifact and refuses to install it
 # when the fragment does not match (verified against uv 0.11), so the check happens after the
-# download and before anything is unpacked into the venv -- the same order as the sha256sum -c on
+# download and before anything is unpacked into the venv, the same order as the sha256sum -c on
 # the infisical .deb in Dockerfile. the spec above stays bare so it keeps matching Dockerfile.worker's
 # ARG default and worker-image.yml's FA2_SPEC, which fetch and verify in two separate steps.
 FLASH_ATTN_INSTALL_SPEC = f"{FLASH_ATTN_SPEC}#sha256={FLASH_ATTN_SHA256}"
@@ -118,8 +118,8 @@ def _install_flash_attn(py: str) -> None:
 
     The spec carries FLASH_ATTN_SHA256, so a wheel that is not the pinned one is rejected between
     download and install rather than baked into the training interpreter. A mismatch exits nonzero
-    like any other install failure, so it costs the retry budget and then terminates -- noisy, but
-    never silent, which is the whole point.
+    like any other install failure, so it costs the retry budget and then terminates: noisy, but
+    never silent.
     """
     from flash.engine.worker.perf.lifecycle import RetriableInfraError
 
