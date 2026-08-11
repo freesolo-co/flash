@@ -1913,6 +1913,11 @@ def _searched_exclusions(monkeypatch, vast) -> list[frozenset[int]]:
     return seen
 
 
+def _never_started(vast) -> str:
+    """The detail vast's own ``load_timeout_detail`` emits for a box that never booted."""
+    return f"instance stuck in 'loading' for 900s ({vast._NEVER_STARTED_MARKER})"
+
+
 def test_stalled_machine_is_excluded_from_the_next_attempts_search(monkeypatch):
     """A box that rents, never boots, and stalls must not be re-rented by the next attempt.
 
@@ -1926,7 +1931,10 @@ def test_stalled_machine_is_excluded_from_the_next_attempts_search(monkeypatch):
     spec = _spec()
     vast.forget_dead_machines(spec.run_id)
     try:
-        _wire_submit(monkeypatch, poll_result=PollResult(False, failure="stalled", detail="no hb"))
+        _wire_submit(
+            monkeypatch,
+            poll_result=PollResult(False, failure="stalled", detail=_never_started(vast)),
+        )
         searches = _searched_exclusions(monkeypatch, vast)
 
         first = _submit(vast, spec, seed=0)
@@ -1960,6 +1968,57 @@ def test_a_runs_own_failure_does_not_retire_a_healthy_machine(monkeypatch):
         _submit(vast, spec, seed=0)
         assert vast.dead_machine_ids(spec.run_id) == frozenset(), failure
     vast.forget_dead_machines(spec.run_id)
+
+
+def test_a_stall_after_the_box_booted_does_not_retire_it(monkeypatch):
+    """``stalled`` alone is not a host fault -- four conditions report that name.
+
+    Only the pre-boot load timeout indicts the machine. A mid-TRAINING progress stall, a
+    post-running liveness stall, and the client-side wall deadline all describe a box that booted
+    and ran, so the failure would recur anywhere. Retiring a working host for one of those shrinks
+    the pool every attempt and, with a small pool, makes the next resumable attempt hit the
+    "already rented and lost" error instead of reusing the only machine there is.
+    """
+    from flash.providers.base import PollResult
+    from flash.providers.vast import jobs as vast
+
+    spec = _spec()
+    booted_stalls = (
+        "no worker progress for 3600s during training (instance status running, limit 3600s)",
+        (
+            "no worker heartbeat AND no container-log output for 900s after the container "
+            "started (worker never came up; limit 900s)"
+        ),
+        "client-side deadline exceeded",
+    )
+    for detail in booted_stalls:
+        vast.forget_dead_machines(spec.run_id)
+        _wire_submit(monkeypatch, poll_result=PollResult(False, failure="stalled", detail=detail))
+        _submit(vast, spec, seed=0)
+        assert vast.dead_machine_ids(spec.run_id) == frozenset(), detail
+    vast.forget_dead_machines(spec.run_id)
+
+
+def test_the_never_started_marker_is_the_one_vast_actually_emits(monkeypatch):
+    """The discriminator must match vast's real ``load_timeout_detail``, not a guess at it.
+
+    The blacklist reads a substring out of the poll detail, so a reworded detail string would
+    silently stop retiring dead hosts and quietly restore the re-rent loop. Interpolating the same
+    constant into both sides is what prevents that; this pins that they stayed together.
+    """
+    from flash.providers.vast import jobs as vast
+
+    captured = {}
+
+    def fake_poll_instance_job(adapter, **kw):
+        captured["detail"] = adapter.load_timeout_detail("loading", 900.0)
+        raise AssertionError("stop after capturing the adapter")
+
+    monkeypatch.setattr(vast, "poll_instance_job", fake_poll_instance_job)
+    with pytest.raises(AssertionError, match="stop after capturing"):
+        vast.poll_vast_job(_handle(), _spec(), 0, deadline_at=time.time() + 3600)
+
+    assert vast._NEVER_STARTED_MARKER in captured["detail"]
 
 
 def test_a_pool_exhausted_by_this_runs_own_dead_machines_says_so(monkeypatch):

@@ -487,9 +487,15 @@ def test_a_failed_run_that_never_measured_a_charge_is_not_reported_as_settled_ze
     assert (amount, is_estimate) == (3.5, True)
 
 
-def test_a_reconciled_invoice_outranks_the_quote_on_a_failed_run() -> None:
-    """Realized cost comes from the provider, so it is settled fact even with no worker metrics."""
-    amount, is_estimate = render.run_cost(
+def test_realized_cogs_is_never_shown_as_the_customers_cost() -> None:
+    """``realized_cost_usd`` is provider COGS, not what the customer is charged.
+
+    ``runner.RunStatus`` says so directly: it is pulled from the provider's billing API by
+    reconciliation and is "distinct from ``cost_usd`` (the flash.cost ESTIMATE we charge the
+    customer)". Promoting it into the cost slot would bill the user our internal spend, and
+    ``run_status`` already prints it on its own dedicated ``realized`` row.
+    """
+    amount, _ = render.run_cost(
         {
             "state": "failed",
             "cost_usd": 0.0,
@@ -497,12 +503,41 @@ def test_a_reconciled_invoice_outranks_the_quote_on_a_failed_run() -> None:
             "realized_cost_usd": 1.75,
         }
     )
-    assert (amount, is_estimate) == (1.75, False)
+    assert amount == 3.5
 
 
 def test_a_failed_run_with_no_evidence_at_all_still_reports_a_bare_zero() -> None:
-    """Without a quote or an invoice there is nothing to show; do not invent a number."""
+    """Without a quote there is nothing to show; do not invent a number."""
     assert render.run_cost({"state": "failed", "cost_usd": 0.0}) == (0.0, False)
+
+
+def test_a_settled_zero_that_is_not_a_failure_keeps_its_zero() -> None:
+    """Only ``failed`` has an unmeasured zero. The other settled states earn theirs.
+
+    A ``dry_run`` rents nothing and a ``cancelled``/``done`` run with no charge went through the
+    normal accounting path, so resurfacing the submit quote for them would invent a charge nobody
+    incurred -- the mirror image of the bug this fix is for.
+    """
+    for state in ("dry_run", "cancelled", "done", "deployed"):
+        assert render.run_cost({"state": state, "cost_usd": 0.0, "estimated_cost_usd": 3.5}) == (
+            0.0,
+            False,
+        ), state
+
+
+def test_a_terminal_estimate_is_not_labelled_run_in_progress(styled_plain) -> None:
+    """The failed-run quote is flagged, but the run is over -- do not claim it is still running."""
+    out = render.run_status(
+        {
+            "run_id": "flash-1",
+            "state": "failed",
+            "cost_usd": 0.0,
+            "estimated_cost_usd": 3.5,
+            "spec": {"model": "m", "algorithm": "sft"},
+        }
+    )
+    assert "estimate, not measured" in out
+    assert "run in progress" not in out
 
 
 def test_run_status_marks_a_live_cost_as_an_estimate(styled_plain) -> None:

@@ -10,6 +10,7 @@ import http.client
 import json
 import math
 import sys
+import threading
 import time
 from collections.abc import Callable
 
@@ -86,39 +87,55 @@ _DEAD_STATES = {"exited", "stopped", "offline", "deleted", "frozen"}
 # set and merely re-learns. Persisting it would put market trivia in the run record and still not
 # be authoritative, since offer ids churn.
 _run_dead_machines: dict[str, set[int]] = {}
-# Failures that indict the HOST rather than the job. ``stalled`` is the observed signature of the
-# loop this exists to stop: the box is rented, never reaches ``running``, emits no heartbeat, and
-# times out its load window.
-#
-# Deliberately narrow. ``poll_error`` is excluded because it covers transient HF read gaps ("DONE
-# without metrics.json") that say nothing about the machine, and ``oom``/``job_failed`` are the
-# run's own doing. Retiring a healthy host for any of those would shrink the pool on every attempt.
-_HOST_FAULT_FAILURES = frozenset({"stalled"})
+# Supervision runs on background threads (flash/server/app.py, supervise/attach.py), so two runs can
+# reach the map at once. Its mutations are read-modify-write (size check then evict; setdefault then
+# add), which is not atomic under the GIL.
+_dead_machines_lock = threading.Lock()
 # Bound the per-process footprint of the map above: a long-lived control plane submits unboundedly
 # many runs, and nothing else would ever evict a finished run's entry.
 _DEAD_MACHINE_RUNS_MAX = 512
+# The tail of vast's own ``load_timeout_detail`` below. It is what identifies the ONE stall that
+# indicts the host, and interpolating the same constant into both sides is what keeps them from
+# drifting apart.
+#
+# Keying on ``failure == "stalled"`` alone was wrong: four different conditions report that name,
+# and only this one is the pre-boot load timeout (``_classify_load_timeout``, gated on ``not
+# state.became_running``). The others -- a mid-TRAINING progress stall, a post-running liveness
+# stall, and the client-side wall deadline -- all describe a box that booted and worked. Retiring a
+# healthy host for one of those shrinks the pool on every attempt and, with a small pool, makes the
+# next resumable attempt hit the "already rented and lost" error instead of reusing the only machine
+# available: the same starvation this fix exists to stop, arriving from the other direction.
+_NEVER_STARTED_MARKER = "never started; image pull / host issue"
+
+
+def _is_never_started_stall(result: PollResult) -> bool:
+    """True only for the pre-boot load timeout: rented, never ran, never sent a heartbeat."""
+    return result.failure == "stalled" and _NEVER_STARTED_MARKER in (result.detail or "")
 
 
 def _note_dead_machine(run_id: str, machine_id: int | None) -> None:
     """Remember that ``machine_id`` took this run's money and did not deliver a worker."""
     if not run_id or not machine_id or machine_id <= 0:
         return
-    if run_id not in _run_dead_machines and len(_run_dead_machines) >= _DEAD_MACHINE_RUNS_MAX:
-        # drop the oldest run's set (dicts preserve insertion order) rather than let the map grow
-        # without bound. evicting a live run's set only forfeits the optimisation for that run.
-        with contextlib.suppress(StopIteration):
-            del _run_dead_machines[next(iter(_run_dead_machines))]
-    _run_dead_machines.setdefault(run_id, set()).add(int(machine_id))
+    with _dead_machines_lock:
+        if run_id not in _run_dead_machines and len(_run_dead_machines) >= _DEAD_MACHINE_RUNS_MAX:
+            # drop the oldest run's set (dicts preserve insertion order) rather than let the map
+            # grow without bound. evicting a live run's set only forfeits the optimisation for it.
+            with contextlib.suppress(StopIteration):
+                _run_dead_machines.pop(next(iter(_run_dead_machines)), None)
+        _run_dead_machines.setdefault(run_id, set()).add(int(machine_id))
 
 
 def dead_machine_ids(run_id: str) -> frozenset[int]:
     """Machines this run already rented and lost; excluded from further offer searches."""
-    return frozenset(_run_dead_machines.get(run_id, ()))
+    with _dead_machines_lock:
+        return frozenset(_run_dead_machines.get(run_id, ()))
 
 
 def forget_dead_machines(run_id: str) -> None:
     """Drop a finished run's blacklist so the map does not grow for the process's lifetime."""
-    _run_dead_machines.pop(run_id, None)
+    with _dead_machines_lock:
+        _run_dead_machines.pop(run_id, None)
 
 
 def _effective_disk_gb(spec) -> float:
@@ -638,7 +655,7 @@ def poll_vast_job(
             hf_repo, prefix, spec.phase, marker, handle.instance_id, attempt=handle.attempt
         ),
         load_timeout_detail=lambda status, elapsed: (
-            f"instance stuck in '{status}' for {int(elapsed)}s (never started; image pull / host issue)"
+            f"instance stuck in '{status}' for {int(elapsed)}s ({_NEVER_STARTED_MARKER})"
         ),
         first_liveness_detail=lambda elapsed, fl: (
             f"no worker heartbeat AND no container-log output for {int(elapsed)}s after the container "
@@ -738,14 +755,14 @@ def submit_run_vast(
             heartbeat_reader=reader,
             **deadline_kwargs(poll_vast_job, absolute_deadline),
         )
-        if not result.ok and result.failure in _HOST_FAULT_FAILURES:
+        if not result.ok and _is_never_started_stall(result):
             # the machine took the rental and never produced a working worker. blacklist the HOST,
             # not the offer id: vast relists the same box under a fresh offer id, so an offer-keyed
             # entry would be stale before the next attempt searched.
             #
-            # restricted to host-shaped failures on purpose. an `oom` or a genuine `job_failed` is
-            # the run's own doing and would recur anywhere, so retiring a healthy box for it would
-            # shrink the pool for no reason.
+            # only the pre-boot load timeout qualifies (see `_NEVER_STARTED_MARKER`). a box that
+            # booted and then stalled mid-training is not indicted: that failure would recur
+            # anywhere, and retiring a working host for it starves the pool.
             _note_dead_machine(spec.run_id, getattr(handle, "machine_id", None))
         return result
     finally:

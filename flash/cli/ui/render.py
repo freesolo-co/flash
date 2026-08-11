@@ -366,28 +366,40 @@ def run_cost(obj: dict) -> tuple[float, bool]:
     The submit-time quote is already on the record as ``estimated_cost_usd``; prefer it while the
     run is live so current spend is never understated as free.
 
-    A terminal run with a 0.0 charge gets the same treatment, because that zero is not a
-    measurement either. ``cost_usd`` is derived from the WORKER's metrics, so a run whose attempts
-    all failed before producing any never had one written -- and a failed run is the case most
-    likely to have rented hardware repeatedly. One profile run rented 47 instances, could not
-    confirm teardown on 44 of them, and still reported $0.0000 as settled fact.
+    A FAILED run reporting 0.0 is the one terminal case where that zero is not a measurement
+    either. ``cost_usd`` is derived from the WORKER's metrics, so a run whose attempts all died
+    before producing any never had one written -- and a failed run is the case most likely to have
+    rented hardware repeatedly. One profile run rented 47 instances, could not confirm teardown on
+    44 of them, and still reported $0.0000 as settled fact.
+
+    Only ``failed`` gets that treatment. The other settled states earn their zero: ``dry_run``
+    never rents anything, and a ``cancelled``/``done`` run with no charge went through the normal
+    accounting path. Showing them a quote would invent a charge nobody incurred.
     """
     settled = float(obj.get("cost_usd") or 0.0)
     if settled:
         # a measured charge is the best number available, settled or not.
         return settled, str(obj.get("state") or "") not in SETTLED_COST_STATES
-    # no measured charge. a realized invoice, if one has been reconciled, is authoritative even
-    # when the worker never reported: it comes from the provider, not the run.
-    realized = obj.get("realized_cost_usd")
-    if isinstance(realized, (int, float)) and realized:
-        return float(realized), False
     quote = obj.get("estimated_cost_usd")
-    if isinstance(quote, (int, float)):
+    if isinstance(quote, (int, float)) and (
+        str(obj.get("state") or "") not in SETTLED_COST_STATES or _spent_without_measuring(obj)
+    ):
         # the quote priced the work, not the failure, so it is not what a dead run cost -- but it
-        # is the only non-zero evidence that money was at stake, and marking it an estimate is
+        # is the only non-zero evidence that money was at stake, and flagging it as unmeasured is
         # honest where printing a bare $0.0000 was not.
         return float(quote), True
     return settled, False
+
+
+def _spent_without_measuring(obj: dict) -> bool:
+    """A failed run that rented hardware but never produced a measured charge.
+
+    ``realized_cost_usd`` is deliberately NOT used as the number to show: it is provider COGS
+    pulled by reconciliation (see ``runner.RunStatus``), distinct from the ``cost_usd`` estimate
+    the customer is charged. Presenting our internal spend as their bill would be wrong, and
+    ``run_status`` already prints it on its own ``realized`` row.
+    """
+    return str(obj.get("state") or "") == "failed"
 
 
 def _kv(pairs: list[tuple[str, str | None]], indent: int = 2) -> str:
@@ -526,9 +538,18 @@ def run_status(obj: dict) -> str:
     spec = obj.get("spec") or {}
     where = gpu_label(spec, obj.get("remote") or {}) or None
     amount, is_estimate = run_cost(obj)
-    cost = (
-        f"{money(amount)} {_dim('(estimate, run in progress)')}" if is_estimate else money(amount)
-    )
+    if is_estimate:
+        # a settled state with a flagged amount is the failed-run case: the run is over and the
+        # quote stands in for a charge the worker never measured. saying "run in progress" there
+        # would be false, and the reason the number is soft is different, so say which it is.
+        why = (
+            "estimate, not measured"
+            if str(obj.get("state") or "") in SETTLED_COST_STATES
+            else "estimate, run in progress"
+        )
+        cost = f"{money(amount)} {_dim(f'({why})')}"
+    else:
+        cost = money(amount)
     pairs = [
         ("run id", _paint(obj.get("run_id", ""), _ACCENT2)),
         ("model", spec.get("model")),
