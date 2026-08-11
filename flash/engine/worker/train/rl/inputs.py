@@ -127,8 +127,8 @@ def _resolve_grpo_options(train_spec, rl, multi_turn):
         )
     gcfg = _w.grpo_overrides()
     prompts_per_step = int(
-        train_spec.batch_size
-        if train_spec and train_spec.batch_size is not None
+        train_spec.prompts_per_step
+        if train_spec and train_spec.prompts_per_step is not None
         else rl.prompts_per_step
     )
     group_size = int(gcfg.get("group_size") or rl.group_size)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import sys
 import tomllib
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import fields as dataclass_fields
 from typing import Any
 
@@ -281,6 +281,42 @@ def validate_train_keys(keys: Collection[str]) -> None:
         )
 
 
+# the optimizer batch has a different name per algorithm because it is a different quantity, and one
+# name for both was a silent trap: under sft a measured workload profile turns `batch_size` into
+# examples_per_update, while under grpo/opd the key IS prompts-per-step. so the standard sft
+# out-of-memory workaround, `batch_size = 1`, copied into an rl config meant one prompt per optimizer
+# update -- the run trained, logged and billed, and nothing errored. rejecting the wrong name makes
+# that copy a parse error naming the right key instead of a quiet, expensive misconfiguration.
+_ALGORITHM_ONLY_TRAIN_KEYS = {
+    "batch_size": ("sft",),
+    "prompts_per_step": ("grpo", "opd"),
+}
+
+
+def validate_train_keys_for_algorithm(train_raw: Mapping[str, Any], algorithm: str) -> None:
+    """reject [train] keys that carry an AUTHORED value not applicable to this algorithm.
+
+    Keyed on the value, not the key's presence. ``to_dict()`` emits the full field surface, so a
+    grpo spec round-trips carrying ``batch_size: null``; rejecting on presence alone would make
+    every spec fail to reparse its own output and break resubmit, warm-start and server reparse.
+    A null is the absence of an authored value, which is exactly what the user is being asked for.
+    """
+    for key, allowed in _ALGORITHM_ONLY_TRAIN_KEYS.items():
+        if train_raw.get(key) is None or algorithm in allowed:
+            continue
+        counterpart = next(
+            other
+            for other, other_allowed in _ALGORITHM_ONLY_TRAIN_KEYS.items()
+            if algorithm in other_allowed
+        )
+        raise ConfigError(
+            f"[train] {key} does not apply to {algorithm}: use {counterpart} instead. "
+            f"{key} is {'/'.join(allowed)}-only, and the two are different quantities -- "
+            f"{counterpart} is the optimizer batch itself, so copying an sft batch_size here "
+            "would change how many prompts each update trains on."
+        )
+
+
 def _validate_top_level(
     raw: dict[str, Any], project_required: bool
 ) -> tuple[str, str, str, str, bool]:
@@ -361,7 +397,7 @@ def _validate_environment_section(
     return env_raw, environment_pip, environment_secrets
 
 
-def _validate_train_section(raw: dict[str, Any]) -> dict[str, Any]:
+def _validate_train_section(raw: dict[str, Any], algorithm: str) -> dict[str, Any]:
     """Validate the train section."""
     train_raw = raw.get("train")
     if train_raw is None:
@@ -369,6 +405,7 @@ def _validate_train_section(raw: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(train_raw, dict):
         raise ConfigError("[train] must be a table")
     validate_train_keys(train_raw)
+    validate_train_keys_for_algorithm(train_raw, algorithm)
     return train_raw
 
 
@@ -524,7 +561,7 @@ def spec_from_dict(
 ) -> JobSpec:
     model, model_revision, project, algorithm, thinking = _validate_top_level(raw, project_required)
     env_raw, environment_pip, environment_secrets = _validate_environment_section(raw)
-    train_raw = _validate_train_section(raw)
+    train_raw = _validate_train_section(raw, algorithm)
     gpu_type, gpu_provider, gpu_options = _validate_gpu_section(
         raw,
         model=model,
@@ -547,6 +584,7 @@ def spec_from_dict(
             hf_repo="",  # assigned server-side; see submit_job._assign_managed_hf_repo
             learning_rate=_train_float(train_raw, "learning_rate", minimum=0.0, exclusive=True),
             batch_size=_train_int(train_raw, "batch_size", minimum=1),
+            prompts_per_step=_train_int(train_raw, "prompts_per_step", minimum=1),
             max_context_tokens=_train_int(train_raw, "max_context_tokens", minimum=1),
             save_every=_train_int(train_raw, "save_every", minimum=1),
             group_size=_train_int(train_raw, "group_size", minimum=1),
