@@ -695,22 +695,45 @@ def test_jobspec_still_rejects_train_keys_that_were_never_tolerated() -> None:
         JobSpec.from_dict({"train": {"seeds": [0, 1]}})
 
 
-def test_environment_pip_is_platform_managed() -> None:
+def test_environment_pip_is_authorable() -> None:
+    """A scorer's third-party imports have no other declaration path onto the worker."""
     raw = _raw()
-    raw["environment"]["pip"] = ["freesolo==1.2.3"]
-    with pytest.raises(ConfigError, match=r"\[environment\] unknown key\(s\): pip"):
+    raw["environment"]["pip"] = ["pymongo>=4.6", "rapidfuzz"]
+    assert spec_from_dict(raw).environment.pip == ("pymongo>=4.6", "rapidfuzz")
+
+
+def test_environment_pip_rejects_malformed_entries() -> None:
+    """Malformed requirements must fail at parse, not mid-install with the GPU already billing."""
+    raw = _raw()
+    raw["environment"]["pip"] = "pymongo"
+    with pytest.raises(ConfigError, match=r"not a string: use \[\"pymongo\"\]"):
+        spec_from_dict(raw)
+
+    raw = _raw()
+    raw["environment"]["pip"] = ["pymongo", 7]
+    with pytest.raises(ConfigError, match="non-empty requirement strings"):
+        spec_from_dict(raw)
+
+    raw = _raw()
+    raw["environment"]["pip"] = ["pymongo", "   "]
+    with pytest.raises(ConfigError, match="non-empty requirement strings"):
         spec_from_dict(raw)
 
 
-def test_submit_payload_round_trips_without_a_pip_key() -> None:
+def test_submit_payload_carries_the_pip_key() -> None:
     """spec_payload is what the CLI actually sends, and the server re-parses it with this parser."""
     from flash.client.specs import spec_payload
 
-    spec = spec_from_dict(_raw())
+    raw = _raw()
+    raw["environment"]["pip"] = ["pymongo>=4.6"]
+    spec = spec_from_dict(raw)
     payload = spec_payload(spec, authored_train_keys=frozenset({"epochs"}))
 
-    assert "pip" not in payload["environment"]
-    assert spec_from_dict(payload).environment.id == spec.environment.id
+    # dropping it here would strand the requirement on the client: the worker installs from payload.
+    # a tuple in memory, a JSON array on the wire, exactly as the sibling `secrets` field travels.
+    assert tuple(payload["environment"]["pip"]) == ("pymongo>=4.6",)
+    assert json.loads(json.dumps(payload))["environment"]["pip"] == ["pymongo>=4.6"]
+    assert spec_from_dict(payload).environment.pip == ("pymongo>=4.6",)
 
 
 def test_environment_must_be_a_table() -> None:
@@ -832,7 +855,7 @@ def test_environment_subfields_accept_valid_and_missing() -> None:
     }
     spec = spec_from_dict(raw)
     assert spec.environment.params == {"k": "v"}
-    # pip is platform-managed: never authored, so it stays at its default here.
+    # pip is authorable but omitted here, so it stays at its default.
     assert spec.environment.pip == ()
     assert spec.environment.secrets == ("SERPAPI_API_KEY", "OPENAI_API_KEY")
     # An explicit None (e.g. JSON `null`) is treated as missing -> default, NOT rejected.

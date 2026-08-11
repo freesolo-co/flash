@@ -247,10 +247,11 @@ _TOP_LEVEL_KEYS = frozenset(
 _GPU_KEYS = frozenset(item.name for item in dataclass_fields(GpuSpec)) - MANAGED_GPU_KEYS
 # [environment] user-authorable keys, derived from EnvironmentSpec (mirrors _GPU_KEYS) so a new field
 # is accepted automatically; resolved_sha is control-plane-pinned (see _assign_resolved_env_sha).
-# pip is platform-managed: worker_pip_for_env ignores the env id and returns one constant worker
-# requirement, so an override only ever selected the same list or a broken one. EnvironmentSpec still
-# carries the field, and spec_payload/provider submit keep populating it from worker_pip_for_env.
-_ENV_MANAGED_KEYS = frozenset({"resolved_sha", "pip"})
+# pip is authorable: worker_pip_for_env returns only Flash's own worker requirement, so a scorer that
+# imports a third-party dependency has no other way to get it onto the worker, and the missing import
+# surfaces as a zero reward at training time. The submit paths append these to worker_pip_for_env
+# rather than replacing it, so the worker requirement cannot be displaced by an override.
+_ENV_MANAGED_KEYS = frozenset({"resolved_sha"})
 _ENVIRONMENT_KEYS = (
     frozenset(item.name for item in dataclass_fields(EnvironmentSpec)) - _ENV_MANAGED_KEYS
 )
@@ -352,8 +353,33 @@ def _validate_environment_section(
     # input fails clearly instead of becoming {} or an opaque dict conversion error.
     if env_raw.get("params") is not None and not isinstance(env_raw["params"], dict):
         raise ConfigError("[environment] params must be a table")
+    _validate_environment_pip(env_raw.get("pip"))
     environment_secrets = _environment_secrets(env_raw.get("secrets"))
     return env_raw, environment_secrets
+
+
+def _validate_environment_pip(value: Any) -> None:
+    """Reject a [environment] pip that is not a list of non-empty requirement strings.
+
+    A malformed entry would otherwise reach the worker's pip invocation, where it fails mid-install
+    after the GPU is already allocated and billing. A bare string is called out separately: TOML has
+    no implicit one-element list, so `pip = "pymongo"` is the natural first mistake to make here.
+    """
+    if value is None:
+        return
+    if isinstance(value, str):
+        raise ConfigError(
+            f'[environment] pip must be a list of requirement strings, not a string: use ["{value}"]'
+        )
+    # tuple as well as list: to_dict() emits the spec's own tuple, and that payload is re-parsed
+    # here on the submit round trip (mirrors _environment_secrets).
+    if not isinstance(value, (list, tuple)):
+        raise ConfigError("[environment] pip must be a list of requirement strings")
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ConfigError(
+                f"[environment] pip entries must be non-empty requirement strings (got: {item!r})"
+            )
 
 
 def _validate_train_section(raw: dict[str, Any]) -> dict[str, Any]:
