@@ -204,7 +204,7 @@ def preflight_validate_managed_teacher(spec: JobSpec) -> None:
     record this runs ahead of. `capability_limits_for_spec` already rejects a `gpu.max_wall_seconds`
     over the capability lifetime, so the only gap is the queue allowance, which is not knowable yet.
     """
-    if getattr(spec, "algorithm", "") != "opd":
+    if spec.algorithm != "opd":
         return
     require_teacher_broker_configuration(spec)
 
