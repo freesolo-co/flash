@@ -707,3 +707,34 @@ def test_offline_quote_fit_failure_omits_the_remedy_when_nothing_fits(monkeypatc
     with pytest.raises(ValueError, match="no GPU class fits") as exc:
         _offline_gpu_shape(RunConfig("Qwen/Qwen3.5-4B", "sft", 1, gpu_count=1))
     assert "--gpus" not in str(exc.value)
+
+
+def test_offline_quote_remedy_only_names_widths_a_provider_sells_freely():
+    """An offline quote cannot promise a width whose SKU only a live catalog could confirm.
+
+    A lambda-pinned quote ranks lambda's pool, but lambda names the card count in the instance
+    type, so `--gpus 4` there may name a type that does not exist. `--cost` is consulted precisely
+    to avoid a doomed launch, so it withholds the width rather than inventing one; the runpod pool,
+    where the count is a launch parameter, still gets its remedy.
+    """
+    from flash.cost.analytical import _offline_gpu_shape
+    from flash.cost.types import RunConfig
+
+    shared = {
+        "model_id": "Qwen/Qwen3.6-35B-A3B",
+        "method": "grpo",
+        "steps": 10,
+        "seq_len": 2048,
+        "completion_len": 512,
+        "batch_size": 8,
+        "group_size": 4,
+        "lora_rank": 16,
+    }
+    with pytest.raises(ValueError, match="no GPU class fits") as lambda_only:
+        _offline_gpu_shape(RunConfig(gpu_count=1, provider="lambda", **shared))
+    assert "--gpus" not in str(lambda_only.value)
+
+    # the runpod pool still names its width: the rule is about how counts are sold, not a blanket
+    # suppression of the remedy.
+    with pytest.raises(ValueError, match=r"--gpus 2"):
+        _offline_gpu_shape(RunConfig(gpu_count=1, provider="runpod", **shared))

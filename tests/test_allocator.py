@@ -1763,3 +1763,95 @@ def test_wider_shape_remedy_names_the_cheapest_fitting_width():
 
     vram = GPU_INFO["H200"].vram_gb
     assert "--gpus 2" in wider_shape_remedy((vram,), vram + 40, ceiling=8, above=1)
+
+
+def test_provider_incompatible_pin_reports_the_incompatibility_not_a_fit_remedy():
+    """A class the pinned provider does not carry is a provider error at EVERY width.
+
+    H200 is RunPod-only, so a Lambda-pinned H200 that also misses on VRAM must report the pairing.
+    Checking fit first made the message name `--gpus 2` -- a flag that cannot help, because no
+    Lambda H200 exists at any count. The user would raise the ceiling and fail identically.
+    """
+    from flash.providers.allocator import _resolve_exact_gpu
+    from flash.providers.base import GPU_INFO, UnsupportedGpuError, providers_for
+
+    assert "lambda" not in providers_for("H200")
+    need = GPU_INFO["H200"].vram_gb + 40  # would fit on 2 cards, were they purchasable
+    with pytest.raises(UnsupportedGpuError) as exc:
+        _resolve_exact_gpu(
+            "H200",
+            need=need,
+            cap=1,
+            max_gpu_count=1,
+            provider="lambda",
+            available=("lambda",),
+            widest_cap=8,
+        )
+    assert "cannot provision exact GPU 'H200'" in str(exc.value)
+    assert "--gpus" not in str(exc.value)
+
+
+def test_fit_remedy_is_withheld_when_only_fixed_count_sku_providers_remain():
+    """A width is only promised when a provider in play rents card counts freely.
+
+    Lambda names the count in the instance type and Vast bakes it into the offer, so a wider shape
+    exists only if their live catalog lists one -- unknowable here. RunPod takes the count as a
+    launch parameter, so its remedy stays. Suggesting an unpurchasable SKU sends the user to retry
+    a shape that cannot be bought, which is worse than reporting the shortfall alone.
+    """
+    from flash.providers.allocator import _resolve_exact_gpu
+    from flash.providers.base import GPU_INFO, UnsupportedGpuError, providers_for
+
+    assert {"lambda", "vast"} <= set(providers_for("H100"))
+    need = GPU_INFO["H100"].vram_gb + 40  # fits on 2 H100s
+
+    with pytest.raises(UnsupportedGpuError) as lambda_only:
+        _resolve_exact_gpu(
+            "H100",
+            need=need,
+            cap=1,
+            max_gpu_count=1,
+            provider="lambda",
+            available=("lambda",),
+            widest_cap=8,
+        )
+    assert "--gpus" not in str(lambda_only.value)
+    assert f"{GPU_INFO['H100'].vram_gb} GB VRAM" in str(lambda_only.value)
+
+    # the SAME pin on runpod keeps the remedy: withholding it everywhere would trade a wrong
+    # suggestion for a missing one.
+    with pytest.raises(UnsupportedGpuError, match=r"--gpus 2"):
+        _resolve_exact_gpu(
+            "H100",
+            need=need,
+            cap=1,
+            max_gpu_count=1,
+            provider="runpod",
+            available=("runpod",),
+            widest_cap=8,
+        )
+
+    # a mixed pool still counts as purchasable: runpod alone can sell the wider shape.
+    with pytest.raises(UnsupportedGpuError, match=r"--gpus 2"):
+        _resolve_exact_gpu(
+            "H100",
+            need=need,
+            cap=1,
+            max_gpu_count=1,
+            provider="",
+            available=("lambda", "runpod"),
+            widest_cap=8,
+        )
+
+
+def test_rents_arbitrary_card_counts_splits_providers_by_how_counts_are_sold():
+    """The predicate must track how a count is PURCHASED, not whether the provider is configured."""
+    from flash.providers.base import rents_arbitrary_card_counts
+
+    assert rents_arbitrary_card_counts(("runpod",)) is True
+    assert rents_arbitrary_card_counts(("lambda",)) is False
+    assert rents_arbitrary_card_counts(("vast",)) is False
+    assert rents_arbitrary_card_counts(("lambda", "vast")) is False
+    assert rents_arbitrary_card_counts(("lambda", "runpod")) is True
+    # no provider left in play cannot promise a width either.
+    assert rents_arbitrary_card_counts(()) is False

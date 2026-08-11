@@ -437,13 +437,31 @@ def _wider_shape_remedy(config: RunConfig, need: float, names: tuple[str, ...]) 
     ``names`` is the pool the quote already ranked, so the remedy is searched over exactly the
     classes that were considered -- reusing the caller's provider filtering instead of
     reconstructing it here and risking a suggestion for a class it never had.
+
+    A class is dropped when every provider that would serve it here names the card count in the
+    SKU, since this path is offline by contract and cannot confirm such a shape is sold. Quoting an
+    unverifiable width is worse than a bare dead end: `--cost` is consulted precisely to avoid a
+    doomed launch. A pinned provider narrows that question to itself -- H100 is on RunPod, but a
+    lambda-pinned quote may not borrow RunPod's freedom to rent any count.
     """
-    from flash.providers.base import GPU_INFO, MAX_COMBINATION_CARDS, wider_shape_remedy
+    from flash.providers.base import (
+        GPU_INFO,
+        MAX_COMBINATION_CARDS,
+        providers_for,
+        rents_arbitrary_card_counts,
+        wider_shape_remedy,
+    )
+
+    def _in_play(gpu: str) -> tuple[str, ...]:
+        carriers = providers_for(gpu)
+        if config.provider == "auto":
+            return carriers
+        return tuple(name for name in carriers if name == config.provider)
 
     # the authored ceiling limited the ranking above; the geometry cap at the MAXIMUM rentable
     # width is what bounds a suggestion.
     return wider_shape_remedy(
-        (GPU_INFO[gpu].vram_gb for gpu in names),
+        (GPU_INFO[gpu].vram_gb for gpu in names if rents_arbitrary_card_counts(_in_play(gpu))),
         need,
         ceiling=geometry_safe_gpu_cap(
             config.model_id, MAX_COMBINATION_CARDS, model_revision=config.model_revision

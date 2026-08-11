@@ -30,6 +30,30 @@ def is_freesolo_hosted_url(value: str) -> bool:
     return host == FREESOLO_HOSTED_DOMAIN or host.endswith("." + FREESOLO_HOSTED_DOMAIN)
 
 
+def displayable_url(url: str) -> str:
+    """``url`` reduced to scheme and host, safe to print in an error or log line.
+
+    A base URL is user-supplied and may carry credentials in its authority
+    (``https://user:token@host``) or a secret in its query. Naming the service that answered is
+    worth doing, but only scheme and host carry that meaning, so everything else is dropped rather
+    than pattern-matched: an allowlist of two fields cannot be outgrown by a new secret-bearing one.
+    A value too malformed to parse is reported as a placeholder, never echoed back.
+
+    Sits beside ``is_freesolo_hosted_url`` because both answer questions about a URL's authority
+    and must agree on how one is parsed.
+    """
+    try:
+        parsed = urlsplit(url)
+    except ValueError:  # malformed authority (e.g. a bad ipv6 literal)
+        return "(unparseable url)"
+    host = parsed.hostname or ""
+    if not host:
+        return "(unparseable url)"
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    return f"{parsed.scheme}://{host}" if parsed.scheme else host
+
+
 def serving_control_url(value: str) -> str:
     """Return the serving control root without a terminal OpenAI ``/v1`` path."""
     url = str(value or "").rstrip("/")

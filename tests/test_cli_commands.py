@@ -3451,9 +3451,14 @@ def test_hosted_key_rejection_names_the_url_that_rejected_it(monkeypatch):
     """A 401 must name the service that answered, not only the key.
 
     The same 401 is what a perfectly VALID key gets when the request reached the wrong issuer --
-    a stale saved `--api-url`, a leftover localhost from a self-hosted experiment, an overridden
-    FREESOLO_BASE_URL. A message that names only the key accuses the one input the user just
-    copied correctly and never shows the one that was actually wrong.
+    a leftover localhost from a self-hosted experiment, an overridden FREESOLO_BASE_URL. A message
+    that names only the key accuses the one input the user just copied correctly and never shows
+    the one that was actually wrong.
+
+    The remedy must name the knobs this URL is actually read from. ``verify_freesolo_key`` resolves
+    through ``freesolo_base_url`` (--freesolo-url / FREESOLO_BASE_URL); --api-url selects the Flash
+    control plane and cannot change who answered here, so naming it sends the user to a flag that
+    does nothing.
     """
     import urllib.error
 
@@ -3468,3 +3473,52 @@ def test_hosted_key_rejection_names_the_url_that_rejected_it(monkeypatch):
     with pytest.raises(ClientError) as exc:
         verify_freesolo_key("fs-key")
     assert "localhost:9999" in str(exc.value)
+    assert "--freesolo-url" in str(exc.value)
+    assert "--api-url" not in str(exc.value)
+
+
+def test_hosted_key_rejection_does_not_echo_credentials_from_the_base_url(monkeypatch):
+    """The URL named in the error must never carry the secret it was configured with.
+
+    A base URL is user-supplied and can hold credentials in its authority or a token in its query.
+    This message is printed to stderr and pasted into bug reports, so echoing the configured URL
+    verbatim turns a login failure into credential disclosure.
+    """
+    import urllib.error
+
+    from flash.client.http import ClientError, verify_freesolo_key
+
+    def _reject(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr("urllib.request.urlopen", _reject)
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://admin:hunter2@api.example.co/?token=t0ps3cret")
+
+    with pytest.raises(ClientError) as exc:
+        verify_freesolo_key("fs-key")
+    message = str(exc.value)
+    assert "api.example.co" in message  # the service that answered is still named
+    for secret in ("hunter2", "admin", "t0ps3cret"):
+        assert secret not in message, message
+
+
+def test_unreachable_backend_error_does_not_echo_credentials_from_the_base_url(monkeypatch):
+    """The connection-failure path prints the same URL and needs the same redaction.
+
+    Fixing only the 401 leaves the secret to escape through whichever error the user actually hits;
+    an unreachable host is the more common one.
+    """
+    import urllib.error
+
+    from flash.client.http import ClientError, verify_freesolo_key
+
+    def _unreachable(req, timeout=None):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr("urllib.request.urlopen", _unreachable)
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://admin:hunter2@api.example.co")
+
+    with pytest.raises(ClientError) as exc:
+        verify_freesolo_key("fs-key")
+    assert "api.example.co" in str(exc.value)
+    assert "hunter2" not in str(exc.value)

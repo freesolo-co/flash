@@ -22,6 +22,7 @@ from flash.providers.base import (
     largest_rentable_count,
     providers_for,
     rentable_gpu_counts,
+    rents_arbitrary_card_counts,
     run_config_for_ranking,
     wider_shape_remedy,
 )
@@ -210,15 +211,24 @@ def _resolve_exact_gpu(
     exact_info = GPU_INFO.get(exact)
     if exact_info is None or not exact_info.validated:
         raise UnsupportedGpuError(f"exact GPU {exact!r} is not an active validated GPU class")
+    # provider compatibility decides FIRST: a class the requested provider does not carry cannot be
+    # rented at any width, so reporting a fit failure (and a `--gpus N` remedy) for it would send
+    # the user to widen a shape that will never exist. the real defect is the pin/provider pair.
+    exact_providers = providers_for(exact)
+    if provider and provider not in exact_providers:
+        raise UnsupportedGpuError(f"provider {provider!r} cannot provision exact GPU {exact!r}")
+    reachable = tuple(name for name in available if name in exact_providers)
     # a card ceiling is the user's own `[gpu] count`, so a pin that fits at a wider rentable shape
     # is one flag from working; `above` is the width already tried, so the remedy only ever names
     # a wider one. bounded by the model's geometry cap so the suggestion is a width verl accepts
-    # rather than one it rejects after the box is rented.
+    # rather than one it rejects after the box is rented. only offered when a provider still in
+    # play rents counts freely -- a Lambda/Vast-only pin has no offline proof the wider SKU exists.
+    widths = (exact_info.vram_gb,) if rents_arbitrary_card_counts(reachable) else ()
     if exact_info.vram_gb < need and max_gpu_count <= 1:
         raise UnsupportedGpuError(
             f"exact GPU {exact!r} has {exact_info.vram_gb} GB VRAM, "
             f"but this run requires at least {need} GB"
-            + wider_shape_remedy((exact_info.vram_gb,), need, ceiling=widest_cap, above=1)
+            + wider_shape_remedy(widths, need, ceiling=widest_cap, above=1)
         )
     # the widest shape providers actually rent for this ceiling, not the ceiling itself: a pin
     # that only fits at a non-rentable count (3) must be rejected here with a precise reason
@@ -230,12 +240,9 @@ def _resolve_exact_gpu(
     ):
         raise UnsupportedGpuError(
             f"exact GPU {exact!r} cannot fit this run even as a {cap}-card combination"
-            + wider_shape_remedy((exact_info.vram_gb,), need, ceiling=widest_cap, above=cap)
+            + wider_shape_remedy(widths, need, ceiling=widest_cap, above=cap)
         )
-    exact_providers = providers_for(exact)
-    if provider and provider not in exact_providers:
-        raise UnsupportedGpuError(f"provider {provider!r} cannot provision exact GPU {exact!r}")
-    return exact, tuple(name for name in available if name in exact_providers)
+    return exact, reachable
 
 
 def _gather_candidates(

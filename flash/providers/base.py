@@ -567,6 +567,25 @@ def largest_rentable_count(max_gpu_count: int) -> int:
     return rentable_gpu_counts(min(max(1, int(max_gpu_count)), MAX_COMBINATION_CARDS))[0]
 
 
+def rents_arbitrary_card_counts(providers: Iterable[str]) -> bool:
+    """Whether some provider here sells a card count that no live catalog has to confirm.
+
+    Providers differ in KIND on this, as ``AllocationConstraints.max_gpu_count`` records: RunPod
+    takes the count as a launch parameter, so any rentable count is purchasable from the static
+    table alone, while Lambda names it in the instance type and Vast has it baked into the offer,
+    so an N-card shape only exists if their live catalog happens to list one. ``live_capacity`` is
+    the signal that separates the two -- a provider stocking from a live market is exactly the one
+    whose per-count SKUs cannot be confirmed offline. A new provider that sells fixed counts from a
+    static table would need its own flag rather than this proxy.
+
+    Used to decide whether a suggested width can be promised; the same attribute classifies an
+    empty candidate set as retryable capacity in ``allocator._raise_no_candidate_error``.
+    """
+    from flash.providers import get_provider
+
+    return any(not getattr(get_provider(name), "live_capacity", False) for name in providers)
+
+
 def wider_shape_remedy(
     vram_options: Iterable[int], need: float, *, ceiling: int, above: int = 0
 ) -> str:
@@ -582,6 +601,10 @@ def wider_shape_remedy(
     must be the caller's ``geometry_safe_gpu_cap`` so the suggestion is never a width verl rejects
     at Ulysses init after the box is rented, and ``above`` excludes the counts already tried. The
     smallest fitting count wins: the cheapest shape that works, not the widest on offer.
+
+    ``vram_options`` carries only classes a provider in play will actually rent at a wider count
+    (see ``rents_arbitrary_card_counts``); passing none leaves the failure a bare dead end, which
+    is the honest answer when no offline check can confirm the wider SKU exists.
 
     Every fit-rejection message routes through here so the remedy cannot drift in wording or in
     the rule that produces it.

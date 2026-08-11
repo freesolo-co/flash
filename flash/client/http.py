@@ -17,7 +17,7 @@ from typing import Any
 from flash.client.config import load_credentials_with_source
 from flash.client.shapes import RequireSpec, matches_require
 from flash.core.spec import require_project_id
-from flash.serve.urls import is_freesolo_hosted_url
+from flash.serve.urls import displayable_url, is_freesolo_hosted_url
 
 ProgressCallback = Callable[[int, int], None]
 
@@ -176,20 +176,22 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
             # name the URL that rejected it, not just the key: the same 401 is what a VALID key
-            # gets when the request went to the wrong issuer (a stale saved api_url, a leftover
-            # localhost from a self-hosted experiment, an overridden FREESOLO_BASE_URL). Without
-            # the URL the message accuses the one thing the user just copied correctly, and the
-            # actual cause -- which service answered -- is never shown.
+            # gets when the request went to the wrong issuer (a leftover localhost from a
+            # self-hosted experiment, an overridden FREESOLO_BASE_URL). Without the URL the message
+            # accuses the one thing the user just copied correctly, and the actual cause -- which
+            # service answered -- is never shown. name the knobs THIS url came from
+            # (``freesolo_base_url``); --api-url points at the control plane and is not read here.
             raise ClientError(
-                f"{base} rejected this API key — check that this is the right service for the "
-                "key (a stale saved --api-url or FREESOLO_BASE_URL rejects a perfectly valid "
-                "key), then create or copy a valid key at https://freesolo.co/sign-in and pass "
-                "it with `flash login --api-key` (or FREESOLO_API_KEY)"
+                f"{displayable_url(base)} rejected this API key: check that this is the right "
+                "service for the key (a stale --freesolo-url or FREESOLO_BASE_URL rejects a "
+                "perfectly valid key), then create or copy a valid key at "
+                "https://freesolo.co/sign-in and pass it with `flash login --api-key` "
+                "(or FREESOLO_API_KEY)"
             ) from exc
         raise _api_error(exc) from exc
     except urllib.error.URLError as exc:
         raise ClientError(
-            f"cannot reach the freesolo backend at {base} ({exc.reason}); "
+            f"cannot reach the freesolo backend at {displayable_url(base)} ({exc.reason}); "
             "check your network connection and FREESOLO_BASE_URL"
         ) from exc
 
