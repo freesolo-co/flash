@@ -38,14 +38,22 @@ def _warn_if_retained_starter_files_describe_another_plane(
     files the user is expected to edit, and setup has never overwritten one.
     """
     push_marker = f"`flash env push --project {project_id} --name my-env .`"
-    # the self-hosted rewrite's own replacement text, so a same-plane rerun stays silent
-    self_hosted_marker = "this plane is self-hosted, so publishing"
-    stale = "hosted" if can_publish else "self-hosted"
-    looking_for = self_hosted_marker if can_publish else push_marker
+    # `_for_self_hosted_plane` writes DIFFERENT replacement text into each file, so the reverse
+    # direction needs both markers: matching only environment.py's would warn about that file while
+    # silently keeping a stale evaluations.py beside it.
+    self_hosted_markers = (
+        "this plane is self-hosted, so publishing",  # environment.py
+        "`flash env eval` currently requires a managed hub environment",  # evaluations.py
+    )
     mismatched = [
         path
         for path in starter_files
-        if path.exists() and looking_for in path.read_text(encoding="utf-8")
+        if path.exists()
+        and (
+            any(marker in path.read_text(encoding="utf-8") for marker in self_hosted_markers)
+            if can_publish
+            else push_marker in path.read_text(encoding="utf-8")
+        )
     ]
     if not mismatched:
         return
@@ -57,10 +65,15 @@ def _warn_if_retained_starter_files_describe_another_plane(
             "git repo does not apply here -- run `flash env push` and use the returned id instead"
         )
         return
+    # hedged the same way the config warning below is, and for the same reason: what replaces the
+    # `env push` workflow depends on server-side FLASH_STANDALONE, which the CLI cannot read. Only a
+    # standalone plane takes a direct `github:` id, so a flat "commit it and name the repo" would be
+    # wrong advice on an identity-backed self-hosted plane.
     warn(
         f"existing {names} still tell you to run `flash env push`, which this plane cannot do; "
-        f"keeping the files unchanged. Ignore that {stale} guidance: commit the environment to a "
-        "git repo your plane can read and name it in [environment] id"
+        "keeping the files unchanged. If this plane runs with `FLASH_STANDALONE=1`, commit the "
+        "environment to a git repo your plane can read and name it in [environment] id; if it runs "
+        "against an identity backend, use the managed hub id its operator publishes for you"
     )
 
 

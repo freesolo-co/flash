@@ -717,9 +717,37 @@ def test_env_setup_warns_when_retained_starter_files_describe_the_other_plane(
     assert "still tell you to run `flash env push`, which this plane cannot do" in warning
     assert "environment.py" in warning
     assert "evaluations.py" in warning
+    # hedged like the config warning: only a standalone plane takes a direct `github:` id, and the
+    # CLI cannot read server-side FLASH_STANDALONE, so a flat "commit it and name the repo" would be
+    # wrong on an identity-backed self-hosted plane
+    assert "FLASH_STANDALONE=1" in warning
+    assert "identity backend" in warning
     # the premise the warning exists for: the files really are retained unrewritten
     assert retained["environment.py"] == hosted["environment.py"]
     assert retained["evaluations.py"] == hosted["evaluations.py"]
+
+
+def test_env_setup_warns_about_both_retained_files_switching_back_to_hosted(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """The reverse direction has to name evaluations.py too, which carries different rewritten text.
+
+    `_for_self_hosted_plane` writes a distinct replacement into each file: environment.py gets "this
+    plane is self-hosted, so publishing", evaluations.py gets the `env eval` caveat. Detecting only
+    the first would warn about environment.py while silently leaving a stale evaluations.py beside
+    it -- the same half-fix this warning exists to prevent in the other direction.
+    """
+    self_hosted = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+    assert "this plane is self-hosted, so publishing" in self_hosted["environment.py"]
+    assert "this plane is self-hosted, so publishing" not in self_hosted["evaluations.py"]
+    capsys.readouterr()
+
+    _scaffold(monkeypatch, tmp_path, "https://flash.freesolo.co")
+    warning = capsys.readouterr().err
+
+    assert "document a self-hosted plane" in warning
+    assert "environment.py" in warning
+    assert "evaluations.py" in warning
 
 
 def test_env_setup_does_not_warn_about_starter_files_that_match_the_plane(
