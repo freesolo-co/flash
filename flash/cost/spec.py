@@ -137,16 +137,19 @@ RL_THIN_PROMPTS_PER_STEP = 4
 def thin_rl_batch_warning(spec) -> str | None:
     """One user-facing line when an rl run's optimizer batch is too thin to be a batch.
 
-    ``batch_size`` names two different quantities. Under sft it is a memory knob: the optimizer
-    batch comes from the workload profile's ``examples_per_update``, and the authored value only
-    picks the per-device micro-batch it is split into. Under grpo/opd the same key IS the optimizer
-    batch -- it becomes ``prompts_per_step``, then verl's ``data.train_batch_size`` and
-    ``ppo_mini_batch_size``. So the standard sft memory workaround, ``batch_size = 1``, silently
-    turns an rl run into one prompt per update, and nothing errors.
+    ``batch_size`` reaches the optimizer batch by two different routes. Under sft a measured
+    workload profile sits in between: it resolves the authored value against the real tokenized
+    dataset into ``examples_per_update`` (packed) or pins the batch to 1 (unpacked), and the
+    per-device micro-batch is derived from that result. Under grpo/opd there is no profile: the key
+    IS ``prompts_per_step``, then verl's ``data.train_batch_size`` and ``ppo_mini_batch_size``. So
+    the standard sft memory workaround, ``batch_size = 1``, silently turns an rl run into one
+    prompt per update, and nothing errors.
 
-    Reads the EFFECTIVE prompts-per-step, not the authored field: ``max_examples`` clamps the batch
-    to the retained prompt pool (``_on_policy_prompts_per_step``), so a scaffolded ``max_examples =
-    2`` run trains on 2 prompts per update whether or not a ``batch_size`` was ever written.
+    Reads the EFFECTIVE prompts-per-step, not the authored field: a ``max_examples`` cap (from
+    either ``[train]`` or ``[environment.params]``) clamps the batch to the retained prompt pool
+    (``_on_policy_prompts_per_step``), so a scaffolded ``max_examples = 2`` run trains on 2 prompts
+    per update whether or not a ``batch_size`` was ever written. Both can bind at once, and raising
+    one while the other still binds moves nothing, so the message names every binding knob.
 
     What the thin batch costs differs by algorithm, so the message does too. grpo keeps a working
     per-prompt baseline at any batch size (verl centres each response against its own prompt's
@@ -170,29 +173,36 @@ def thin_rl_batch_warning(spec) -> str | None:
         return None
     prompts = "1 prompt" if prompts_per_step == 1 else f"{prompts_per_step} prompts"
     authored = spec.train.batch_size
-    # lead with whichever input actually produced the thin batch. when a max_examples cap is the
-    # binding one, the sft/rl name collision is not what bit the user, so do not lecture them about
-    # it -- and point the remedy at the key that is actually holding the batch down. the cap can
-    # come from either table, and naming the wrong one sends them to a key their config lacks.
-    if authored is not None and authored == prompts_per_step:
-        raise_target = "`batch_size`"
+    cap_key = (
+        "[train] max_examples" if spec.train.max_examples else "[environment.params] max_examples"
+    )
+    # name every input that is actually holding the batch down, because raising one while another
+    # still binds is a no-op the user pays for. the pool caps prompts-per-step, so an authored
+    # batch at or above the pool is not the constraint even when the two are equal.
+    batch_binds = authored is not None and authored <= examples
+    pool_binds = examples <= prompts_per_step
+    if batch_binds:
+        # the sft/rl name collision is only worth explaining when a batch_size was actually written
         lead = (
             f"`[train] batch_size = {authored}` is the OPTIMIZER batch for {spec.algorithm}: it "
             f"sets prompts-per-step, so each update trains on {prompts}. It does NOT mean here what "
             "it means under sft, where it is the batch a measured workload profile turns into the "
             "optimizer batch and its step horizon, so an sft memory workaround does not transfer."
         )
+        if pool_binds:
+            lead += (
+                f" `{cap_key}` holds the prompt pool at {examples} as well, so raising one without "
+                "the other leaves the batch exactly where it is."
+            )
     else:
-        cap_key = (
-            "[train] max_examples"
-            if spec.train.max_examples
-            else "[environment.params] max_examples"
-        )
-        raise_target = f"`{cap_key}`"
         lead = (
             f"This {spec.algorithm} run's OPTIMIZER batch is {prompts} per update: `{cap_key}` "
             "caps the prompt pool that small, and prompts-per-step cannot exceed the pool."
         )
+    targets = [
+        k for k, binds in (("`batch_size`", batch_binds), (f"`{cap_key}`", pool_binds)) if binds
+    ]
+    raise_target = " and ".join(targets)
     if spec.algorithm == "grpo":
         consequence = (
             "Each prompt's completions are still centred against their own group, so the advantage "
@@ -216,10 +226,18 @@ def thin_rl_batch_warning(spec) -> str | None:
             "at strictly more generated work and a higher bill for the same number of updates."
         )
     else:
+        # the "buying steps" workflow is about lowering batch_size against a fixed pool. a thin
+        # POOL does not buy steps, it just shortens the run, so that caveat would excuse the wrong
+        # config -- offer it only when the authored batch is what is holding the batch down.
+        caveat = (
+            " unless you are deliberately buying optimizer steps on a derived horizon "
+            "(see TRAINING.md)"
+            if batch_binds
+            else ""
+        )
         remedy = (
-            f"Raise {raise_target} unless you are deliberately buying optimizer steps on a derived "
-            "horizon (see TRAINING.md): on this horizon a wider batch means proportionally fewer "
-            "updates, so it also quotes cheaper, not dearer."
+            f"Raise {raise_target}{caveat}: on this horizon a wider batch means proportionally "
+            "fewer updates, so it also quotes cheaper, not dearer."
         )
     return f"{lead} {consequence} {remedy}"
 

@@ -462,6 +462,49 @@ def test_a_big_batch_clamped_by_max_examples_still_warns(tmp_path, monkeypatch, 
     assert "Raise `batch_size`" not in err
 
 
+def test_both_binding_knobs_are_named_when_the_batch_equals_the_pool(tmp_path, monkeypatch, capsys):
+    """`batch_size = 2` with `max_examples = 2` is two constraints at the same value.
+
+    Raising either one alone is a verified no-op: prompts-per-step is `min(batch_size, pool)`, so
+    at `batch_size = 8, max_examples = 2` it stays 2. Naming only the authored key would send the
+    user to a change they pay for and that moves nothing.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, 2, max_examples=2))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "Raise `batch_size` and `[train] max_examples`" in err
+    assert "raising one without the other" in err
+
+
+def test_a_thin_pool_is_not_excused_as_buying_optimizer_steps(tmp_path, monkeypatch, capsys):
+    """The "buying steps" workflow is about lowering `batch_size` against a full pool.
+
+    A thin `max_examples` does not buy steps, it shortens the run, so offering that caveat when the
+    pool is the only binding knob hands the user a wrong reason to dismiss the warning.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, None, max_examples=2))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "buying optimizer steps" not in err
+
+
+def test_a_thin_authored_batch_still_offers_the_deliberate_workflow(tmp_path, monkeypatch, capsys):
+    """The mirror: lowering `batch_size` against a full pool IS the documented workflow."""
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, 1))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "buying optimizer steps" in err
+
+
 def test_opd_warning_does_not_promise_advantages_or_tell_the_user_to_raise_the_batch(
     tmp_path, monkeypatch, capsys
 ):
