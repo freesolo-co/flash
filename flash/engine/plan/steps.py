@@ -59,10 +59,23 @@ def sft_data_parallel_cards(gpu_count: int, train_batch_size: int, row_count: in
     """
     cards = max(1, int(gpu_count))
     batch = max(1, int(train_batch_size))
+    return widest_usable_sft_width(range(min(cards, batch), 0, -1), batch, row_count)
+
+
+def widest_usable_sft_width(candidates, train_batch_size: int, row_count: int) -> int:
+    """First candidate that divides the batch and the rows, or 1 when none does.
+
+    ``candidates`` must be ordered widest-first; the caller owns which shapes are eligible.
+    ``sft_data_parallel_cards`` searches every count up to the allocation because it answers "what
+    will verl actually run", while the worker's idle-card warning searches only the power-of-two
+    shapes providers rent because it answers "what should you allocate instead". Same predicate,
+    different candidate sets -- the divisibility rule itself lives here once.
+    """
+    batch = max(1, int(train_batch_size))
     rows = max(0, int(row_count))
-    for count in range(min(cards, batch), 0, -1):
+    for count in candidates:
         if batch % count == 0 and (rows == 0 or rows % count == 0):
-            return count
+            return int(count)
     return 1
 
 

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from functools import reduce
 from math import gcd
 
-from flash.engine.plan.steps import sft_data_parallel_cards
+from flash.engine.plan.steps import sft_data_parallel_cards, widest_usable_sft_width
 from flash.engine.worker import sft_train as _sft_train
 from flash.providers.base import rentable_gpu_counts
 
@@ -358,12 +358,49 @@ def _widest_rentable_width(max_cards: int, train_batch_size: int, row_count: int
     than clamping a resolved width -- `sft_data_parallel_cards` walks downward to find a divisor and
     happily returns 3 or 5, which are not shapes anyone can allocate. 1 always qualifies.
     """
-    batch = max(1, int(train_batch_size))
-    rows = max(0, int(row_count))
-    for count in rentable_gpu_counts(max_cards):
-        if batch % count == 0 and (rows == 0 or rows % count == 0):
-            return count
-    return 1
+    return widest_usable_sft_width(rentable_gpu_counts(max_cards), train_batch_size, row_count)
+
+
+def _idle_card_warning(
+    world_size: int, gpu_count: int, train_batch_size: int, row_count: int
+) -> str:
+    """The live `[sft][warn]` line naming the binding input and a remedy that can actually work.
+
+    The run is BILLED for every allocated card, so a card the batch cannot feed is money spent on an
+    idle gpu. The notes carry the width too, but those are read after the fact -- say it while the
+    run is live, and say what would actually use the card.
+
+    The remedy differs by which input is binding, and a remedy that cannot be acted on is worse than
+    none. Three ways to get it wrong:
+
+     - an unpacked profile pins the batch to 1 (`sft_workload` sets examples_per_update = 1 for
+       every non-packed mode), so "raise [train] batch_size" names a knob that cannot move this
+       width at all.
+     - BOTH inputs have to divide the allocation to reach full width, so raising the batch only
+       helps when the rows ALREADY divide it. Asking whether the batch divides it is the wrong
+       question: at 4 cards with a batch of 6 over 10 rows, neither divides, and every multiple of 4
+       the batch could be raised to still resolves to 2 ranks because the 10 rows cannot be split 4
+       ways. Name the dataset as the limiter there instead.
+     - only powers of two are rentable, and the resolved width usually is not one -- see
+       `_widest_rentable_width` for why clamping cannot produce one.
+    """
+    rows_fit = row_count == 0 or row_count % gpu_count == 0
+    batch_fits = train_batch_size % gpu_count == 0
+    # the batch is only worth naming when fixing it is sufficient, i.e. the rows already fit.
+    batch_helps = rows_fit and not batch_fits and train_batch_size > 1
+    rentable = _widest_rentable_width(world_size, train_batch_size, row_count)
+    limiter = f"a batch of {train_batch_size}" if batch_helps else f"a dataset of {row_count} rows"
+    remedy = (
+        f"raise [train] batch_size to a multiple of {gpu_count}, or allocate {rentable} card(s) "
+        "instead"
+        if batch_helps
+        else f"allocate {rentable} card(s) instead"
+    )
+    return (
+        f"[sft][warn] training on {world_size} of {gpu_count} allocated cards: {limiter} "
+        f"cannot be split across {gpu_count} ranks without starving one or dropping rows. "
+        f"the idle cards are still billed -- {remedy}."
+    )
 
 
 def _resolve_sft_world_size(gpu_count: int, train_batch_size: int, row_count: int) -> int:
@@ -386,46 +423,7 @@ def _resolve_sft_world_size(gpu_count: int, train_batch_size: int, row_count: in
     """
     world_size = sft_data_parallel_cards(gpu_count, train_batch_size, row_count)
     if world_size < gpu_count:
-        # the run is BILLED for every allocated card, so a card the batch cannot feed is money
-        # spent on an idle gpu. the notes carry it too, but those are read after the fact -- say it
-        # while the run is live, and say what would actually use the card.
-        #
-        # the remedy differs by which input is binding, and a remedy that cannot be acted on is
-        # worse than none. three ways to get it wrong:
-        #
-        #  - an unpacked profile pins the batch to 1 (`sft_workload` sets examples_per_update = 1
-        #    for every non-packed mode), so "raise [train] batch_size" names a knob that cannot
-        #    move this width at all.
-        #  - BOTH inputs have to divide the allocation to reach full width, so raising the batch
-        #    only helps when the rows ALREADY divide it. asking whether the batch divides it is the
-        #    wrong question: at 4 cards with a batch of 6 over 10 rows, neither divides, and every
-        #    multiple of 4 the batch could be raised to still resolves to 2 ranks because the 10
-        #    rows cannot be split 4 ways. name the dataset as the limiter there instead.
-        #  - only powers of two are rentable, and the resolved width usually is not one. it cannot
-        #    simply be re-resolved under a rentable ceiling either: `sft_data_parallel_cards`
-        #    searches DOWNWARD for divisibility and lands back off the power-of-two grid, so at 7
-        #    cards with a batch of 6 over 6 rows it would advise 3, which no provider sells. the
-        #    advised width has to satisfy both constraints at once, so search the rentable shapes
-        #    themselves and take the widest that divides the batch and the rows.
-        rows_fit = row_count == 0 or row_count % gpu_count == 0
-        batch_fits = train_batch_size % gpu_count == 0
-        # the batch is only worth naming when fixing it is sufficient, i.e. the rows already fit.
-        batch_helps = rows_fit and not batch_fits and train_batch_size > 1
-        rentable = _widest_rentable_width(world_size, train_batch_size, row_count)
-        limiter = (
-            f"a batch of {train_batch_size}" if batch_helps else f"a dataset of {row_count} rows"
-        )
-        remedy = (
-            f"raise [train] batch_size to a multiple of {gpu_count}, or allocate {rentable} card(s) "
-            "instead"
-            if batch_helps
-            else f"allocate {rentable} card(s) instead"
-        )
-        print(
-            f"[sft][warn] training on {world_size} of {gpu_count} allocated cards: {limiter} "
-            f"cannot be split across {gpu_count} ranks without starving one or dropping rows. "
-            f"the idle cards are still billed -- {remedy}."
-        )
+        print(_idle_card_warning(world_size, gpu_count, train_batch_size, row_count))
     return world_size
 
 

@@ -72,9 +72,7 @@ def _profile_cost_ranker():
     return lambda candidate: candidate.total_hourly_usd
 
 
-def _step_cost_ranker(
-    model_id, algorithm, train, thinking, model_revision="", sft_retained_examples=None
-):
+def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision="", overrides=None):
     """``candidate -> dollars for one optimizer step``, or None when the run cannot be priced.
 
     Wraps the shared per-step cost key with the multi-card speedup, which is the one thing the
@@ -82,7 +80,12 @@ def _step_cost_ranker(
     bills every card but only the gpu-bound half of a step is divided among them.
     """
     cost_key = _run_cost_key(
-        model_id, algorithm, train=train, thinking=thinking, model_revision=model_revision
+        model_id,
+        algorithm,
+        train=train,
+        thinking=thinking,
+        model_revision=model_revision,
+        overrides=overrides,
     )
     if cost_key is None:
         logger.debug("total-cost ranking unavailable; ranking on $/hr")
@@ -91,14 +94,14 @@ def _step_cost_ranker(
     from flash.cost.analytical import sharded_step_seconds
 
     # the same one-step config the cost key was built from, so the single- and multi-card branches
-    # below cannot price a run off different knobs.
+    # below cannot price a run off different knobs -- including the profile `overrides`.
     config = run_config_for_ranking(
         model_id,
         algorithm,
         train=train,
         thinking=thinking,
         model_revision=model_revision,
-        sft_retained_examples=sft_retained_examples,
+        overrides=overrides,
     )
 
     def cost_per_step(candidate: Candidate) -> float:
@@ -350,7 +353,7 @@ def allocate(
     model_revision: str = "",
     max_gpu_count: int = 1,
     workload_profile: bool = False,
-    sft_retained_examples: int | None = None,
+    overrides: dict | None = None,
 ) -> Allocation:
     """Pick the cheapest fitting combination of (provider, GPU class, count) able to run the job.
 
@@ -438,9 +441,7 @@ def allocate(
     cost_per_step = (
         _profile_cost_ranker()
         if workload_profile
-        else _step_cost_ranker(
-            model_id, algorithm, train, thinking, model_revision, sft_retained_examples
-        )
+        else _step_cost_ranker(model_id, algorithm, train, thinking, model_revision, overrides)
     )
     primary = cost_per_step if cost_per_step is not None else (lambda c: c.total_hourly_usd)
     ranked = sorted(

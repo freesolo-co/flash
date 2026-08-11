@@ -6,7 +6,7 @@ Split out of ``flash.runner.supervise.lifecycle`` to keep that module under the 
 from __future__ import annotations
 
 import contextlib
-from dataclasses import dataclass, field, is_dataclass, replace
+from dataclasses import dataclass, field
 
 from flash.core.spec import JobSpec, gpu_count_of
 from flash.runner.supervise import lifecycle as _lifecycle
@@ -347,58 +347,6 @@ def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOut
     )
 
 
-def _ranking_train_knobs(attempt_spec):
-    """Train knobs for hardware ranking, with SFT's batch taken from the profile.
-
-    Ranking prices candidate shapes through `sharded_step_seconds`, which credits SFT only the
-    ranks that will execute (`sft_data_parallel_cards`). That clamp reads `batch_size`, and the
-    AUTHORED batch is not what the run executes: the workload profile reduces it to
-    `examples_per_update`, which every exact-unpacked run pins to 1. Ranking off the authored
-    number would credit a 4-card candidate four ranks the worker will never launch, and pick a
-    wider, costlier shape than the run can use -- while the persisted quote, which does read the
-    profile, disagrees with it.
-
-    Falls back to the authored knobs whenever the profile is absent or unreadable: ranking must
-    never be the thing that fails a submission, and a missing profile is caught by the quote path
-    that validates the digest.
-    """
-    train = attempt_spec.train
-    if getattr(attempt_spec, "algorithm", "") != "sft":
-        return train
-    try:
-        from flash.cost.spec import _sft_profile
-
-        examples = int(_sft_profile(attempt_spec).examples_per_update)
-    except Exception:
-        return train
-    if examples < 1:
-        return train
-    if isinstance(train, dict):
-        return {**train, "batch_size": examples}
-    if is_dataclass(train):
-        return replace(train, batch_size=examples)
-    return train
-
-
-def _ranking_retained_examples(attempt_spec) -> int | None:
-    """Profiled row count for hardware ranking, or None when it cannot be read.
-
-    The executed width is bounded by the rows as well as the batch (verl's sampler drops the
-    remainder), so ranking without this credits a width the worker will not launch. Read from the
-    same digest-validated profile the quote uses; None on any failure, which leaves ranking exactly
-    as unconstrained as it was before rather than failing the submission.
-    """
-    if getattr(attempt_spec, "algorithm", "") != "sft":
-        return None
-    try:
-        from flash.cost.spec import _sft_profile
-
-        rows = int(_sft_profile(attempt_spec).retained_examples)
-    except Exception:
-        return None
-    return rows if rows > 0 else None
-
-
 def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
     from flash.providers.allocator import allocate
     from flash.providers.base import PollResult, UnsupportedGpuError
@@ -412,12 +360,16 @@ def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
     with contextlib.suppress(FileNotFoundError):
         if get_status(ctx.spec.run_id).state == "cancelled":
             raise ctx.cancel()
+    from flash.cost.spec import sft_ranking_overrides
+
     try:
         allocation = allocate(
             prepared.attempt_spec.model,
             prepared.attempt_spec.algorithm,
-            train=_ranking_train_knobs(prepared.attempt_spec),
-            sft_retained_examples=_ranking_retained_examples(prepared.attempt_spec),
+            train=prepared.attempt_spec.train,
+            # profile-derived knobs (executed batch, row count, measured length): ranking must price
+            # the work that will run, not the authored request. see `sft_ranking_overrides`.
+            overrides=sft_ranking_overrides(prepared.attempt_spec),
             thinking=prepared.attempt_spec.thinking,
             # the run's requested disk, so the vast capacity check searches at the same effective
             # floor submit provisions with — else a high-disk run is advertised vast capacity that

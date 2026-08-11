@@ -2255,27 +2255,52 @@ def test_sft_hardware_ranking_prices_the_profiled_batch_not_the_authored_one(mon
     # a profile that reduces the authored batch of 8 to a single example per update.
     import flash.cost.spec as cost_spec
     from flash.core.spec import TrainSpec
-    from flash.runner.supervise import seed_submission
+    from flash.providers.base import run_config_for_ranking
 
     monkeypatch.setattr(
         cost_spec,
         "_sft_profile",
-        lambda spec: types.SimpleNamespace(examples_per_update=1),
+        lambda spec: types.SimpleNamespace(
+            examples_per_update=1, retained_examples=10, max_length=1404
+        ),
     )
 
     spec = types.SimpleNamespace(algorithm="sft", train=TrainSpec(batch_size=8))
-    assert seed_submission._ranking_train_knobs(spec).batch_size == 1
+    overrides = cost_spec.sft_ranking_overrides(spec)
+    assert overrides["batch_size"] == 1
+
+    # the row count binds the width too, and the MEASURED length is what a step is priced on --
+    # ranking that reads the authored context length prices work the run will not do.
+    assert overrides["sft_retained_examples"] == 10
+    assert overrides["seq_len"] == 1404
+
+    # the overrides must actually reach the config ranking prices, not just be computed.
+    config = run_config_for_ranking(
+        "Qwen/Qwen3.5-4B",
+        "sft",
+        train={"batch_size": 8, "max_context_tokens": 4096},
+        overrides=overrides,
+    )
+    assert (config.batch_size, config.sft_retained_examples, config.seq_len) == (1, 10, 1404)
 
     # a non-sft run has no profile clamp and must pass its knobs through untouched.
     grpo = types.SimpleNamespace(algorithm="grpo", train=TrainSpec(batch_size=8))
-    assert seed_submission._ranking_train_knobs(grpo).batch_size == 8
+    assert cost_spec.sft_ranking_overrides(grpo) == {}
 
-    # an unreadable profile must not fail the submission -- fall back to the authored knobs.
+    # an unreadable profile must not fail the submission -- rank on the authored knobs instead.
+    # ranking runs BEFORE the quote, so raising here would fail a submission the quote would catch.
     def boom(spec):
         raise ValueError("digest mismatch")
 
     monkeypatch.setattr(cost_spec, "_sft_profile", boom)
-    assert seed_submission._ranking_train_knobs(spec).batch_size == 8
+    assert cost_spec.sft_ranking_overrides(spec) == {}
+    fallback = run_config_for_ranking(
+        "Qwen/Qwen3.5-4B",
+        "sft",
+        train={"batch_size": 8},
+        overrides=cost_spec.sft_ranking_overrides(spec),
+    )
+    assert fallback.batch_size == 8
 
 
 def test_sft_idle_card_warning_only_recommends_widths_that_actually_work():
