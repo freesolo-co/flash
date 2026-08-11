@@ -851,17 +851,6 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
     if split:
         split = _validate_packaged_dataset_split(split)
     if source is None:
-        # a top-level datasets/ (plural) directory is never probed, so a package laid out that way
-        # would otherwise fall through silently to whatever else resolved, often the wrong rows
-        # entirely. explicit records/dataset_path params skip this because the user already said
-        # what to train on.
-        if (base_dir / "datasets").is_dir() and not (base_dir / "dataset").is_dir():
-            raise ValueError(
-                "environment package has a top-level 'datasets/' directory, which Flash never "
-                "reads (it probes dataset/<split>.jsonl or dataset/<split>.json). Rename the "
-                "directory to 'dataset/', or set [environment.params] dataset_path to the exact "
-                "file to train on."
-            )
         wanted = split if split and split != "train" else "train"
         found = _packaged_dataset_file(base_dir, wanted)
         if found is None and wanted != "train" and _packaged_dataset_file(base_dir, "train"):
@@ -874,10 +863,31 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
                 "refusing to fall back to the default train split. Package the split file "
                 "or drop the split param."
             )
+        # a top-level datasets/ (plural) directory is never probed, so a package laid out that way
+        # would otherwise fall through silently to whatever else resolved, often the wrong rows
+        # entirely. only when the probe found nothing: a package may legitimately carry datasets/
+        # for eval or other assets alongside a supported top-level <split>.jsonl. explicit
+        # records/dataset_path params skip it because the user already said what to train on.
+        if (
+            found is None
+            and (base_dir / "datasets").is_dir()
+            and not (base_dir / "dataset").is_dir()
+        ):
+            raise ValueError(
+                "environment package has a top-level 'datasets/' directory, which Flash never "
+                "reads (it probes dataset/<split>.jsonl or dataset/<split>.json). Rename the "
+                "directory to 'dataset/', or set [environment.params] dataset_path to the exact "
+                "file to train on."
+            )
         if found is not None:
             params.setdefault("dataset_path", str(found))
             source = str(found)
-            source_is_dataset_file = True
+            # an explicitly requested side split names the rows to train on, and the scaffolded
+            # pattern is a CLASS-level `dataset = load_jsonl("dataset/train.jsonl")` that ignores
+            # the dataset_path it is handed. letting that env's dataset win would silently train
+            # on the default split -- the exact failure the split probe exists to stop -- so the
+            # probed split file stays authoritative. the default train split keeps env precedence.
+            source_is_dataset_file = wanted == "train"
 
     contract_path = _resolve_path_arg(params.get("contract_path"), base_dir)
     if isinstance(contract_path, str):

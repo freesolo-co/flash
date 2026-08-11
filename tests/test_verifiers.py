@@ -651,6 +651,26 @@ def test_freesolo_adapter_datasets_plural_dir_allowed_with_explicit_dataset_path
     assert env.dataset() == [{"id": "t", "input": "x", "output": "y"}]
 
 
+def test_freesolo_adapter_datasets_plural_dir_allowed_beside_a_probeable_split(
+    monkeypatch, tmp_path
+):
+    """datasets/ next to a supported top-level <split>.jsonl is a package carrying other assets,
+    not the ambiguous layout: the probe resolves rows, so the guard must stay quiet."""
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path,
+        {
+            "train.jsonl": '{"id":"t","input":"2+2?","output":"4"}\n',
+            "datasets/eval.jsonl": '{"id":"e","input":"held?","output":"out"}\n',
+        },
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(str(env_file), contract_text="c")
+    assert env.dataset() == [{"id": "t", "input": "2+2?", "output": "4"}]
+
+
 def test_freesolo_adapter_env_built_dataset_wins_over_packaged_file(monkeypatch, tmp_path, capsys):
     """an env that filters/subsamples its dataset in load_environment (the documented
     single-turn.mdx pattern) is what flash trains on; the packaged train.jsonl is only a
@@ -677,6 +697,30 @@ def test_freesolo_adapter_env_built_dataset_wins_over_packaged_file(monkeypatch,
     assert "(2 rows)" in logged
 
 
+def test_freesolo_adapter_skips_the_row_count_of_a_large_json_file(monkeypatch, tmp_path, capsys):
+    """the override diagnostic has to parse a whole .json file to count it, and the env has
+    already replaced it: past the cap it gives the count up instead of materializing the file."""
+    from flash.envs import adapter as adapter_module
+
+    monkeypatch.setattr(adapter_module, "_MAX_ROW_COUNT_JSON_BYTES", 8)
+    sdk_env = _FakeSingleTurnEnv()
+    sdk_env.dataset = [{"id": "kept", "input": "2+2?", "output": "4"}]
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+    env_file = _split_env(
+        tmp_path,
+        {
+            "dataset/train.json": (
+                '[{"id":"kept","input":"2+2?","output":"4"},'
+                '{"id":"dropped","input":"3+3?","output":"6"}]'
+            )
+        },
+    )
+
+    env = adapter_module.load_freesolo_environment(str(env_file), contract_text="c")
+    assert env.dataset() == [{"id": "kept", "input": "2+2?", "output": "4"}]
+    assert "environment's own dataset" not in capsys.readouterr().out
+
+
 def test_freesolo_adapter_env_dataset_matching_file_logs_nothing(monkeypatch, tmp_path, capsys):
     sdk_env = _FakeSingleTurnEnv()
     sdk_env.dataset = [{"id": "t", "input": "2+2?", "output": "4"}]
@@ -690,6 +734,44 @@ def test_freesolo_adapter_env_dataset_matching_file_logs_nothing(monkeypatch, tm
     env = load_freesolo_environment(str(env_file), contract_text="c")
     assert env.dataset() == [{"id": "t", "input": "2+2?", "output": "4"}]
     assert "environment's own dataset" not in capsys.readouterr().out
+
+
+def test_freesolo_adapter_requested_split_wins_over_a_hardcoded_env_dataset(monkeypatch, tmp_path):
+    """the scaffolded pattern is a class-level dataset pinned to dataset/train.jsonl that ignores
+    the dataset_path it is handed, so an explicitly requested split must stay authoritative."""
+    sdk_env = _FakeSingleTurnEnv()
+    sdk_env.dataset = [{"id": "t", "input": "train?", "output": "no"}]
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+    env_file = _split_env(
+        tmp_path,
+        {
+            "dataset/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n',
+            "dataset/oracle.jsonl": '{"id":"o","input":"2+2?","output":"4"}\n',
+        },
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(str(env_file), split="oracle", contract_text="c")
+    assert env.dataset() == [{"id": "o", "input": "2+2?", "output": "4"}]
+
+
+def test_freesolo_adapter_empty_env_dataset_falls_back_to_the_packaged_file(monkeypatch, tmp_path):
+    """an env exposing no rows has nothing to train on, and `examples` must read the same way as
+    `dataset` rather than one falling back to the file and the other winning empty."""
+    from flash.envs.adapter import load_freesolo_environment
+
+    rows = '{"id":"t","input":"2+2?","output":"4"}\n'
+    for attribute in ("dataset", "examples"):
+        sdk_env = _FakeSingleTurnEnv()
+        setattr(sdk_env, attribute, [])
+        _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+        root = tmp_path / attribute
+        root.mkdir()
+        env_file = _split_env(root, {"dataset/train.jsonl": rows})
+
+        env = load_freesolo_environment(str(env_file), contract_text="c")
+        assert env.dataset() == [{"id": "t", "input": "2+2?", "output": "4"}]
 
 
 def test_freesolo_adapter_records_param_wins_over_env_dataset(monkeypatch, tmp_path):

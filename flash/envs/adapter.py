@@ -36,6 +36,8 @@ from flash.teacher.limits import (
 
 _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
+# ceiling on a .json dataset file the override diagnostic is willing to parse just to count rows.
+_MAX_ROW_COUNT_JSON_BYTES = 16 * 1024 * 1024
 
 
 def _json_safe(value: Any) -> Any:
@@ -200,6 +202,11 @@ class FreesoloEnvironment(BaseEnvironment):
             if path.suffix == ".jsonl":
                 with path.open(encoding="utf-8") as f:
                     return sum(1 for line in f if line.strip())
+            # a .json dataset can only be counted by parsing all of it, and the env has already
+            # replaced it. give the diagnostic up rather than let it be the allocation that runs
+            # the worker out of memory on a file nothing else in this path reads.
+            if path.stat().st_size > _MAX_ROW_COUNT_JSON_BYTES:
+                return None
             loaded = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return None
@@ -218,7 +225,9 @@ class FreesoloEnvironment(BaseEnvironment):
         # fallback for envs with no in-code dataset. explicit [environment.params] records
         # never reach the env, so they keep precedence over a hardcoded env dataset.
         env_rows = getattr(self._env, "dataset", None) or getattr(self._env, "examples", None)
-        use_env_rows = env_rows is not None and (self._source is None or self._prefer_env_dataset)
+        # bool, not `is not None`: an env whose dataset is empty has nothing to train on, so it
+        # reads as "no in-code dataset" for both attributes rather than one each way.
+        use_env_rows = bool(env_rows) and (self._source is None or self._prefer_env_dataset)
         if use_env_rows:
             examples = self._load_task_examples(env_rows)
         elif self._source is not None:
