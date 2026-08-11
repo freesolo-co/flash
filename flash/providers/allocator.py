@@ -263,11 +263,36 @@ def _resolve_exact_gpu(
         # front of its body rather than concatenating two separately punctuated sentences.
         return f". Drop the provider pin to rent {exact!r}:{remedy.removeprefix(';')}"
 
+    def _catalog_check_hint(above: int) -> str:
+        """Name the width to ASK a fixed-count provider for, when no offline width can be proved.
+
+        `live_capacity` means the count must be confirmed dynamically -- not that the wider SKU is
+        absent. Lambda really does resolve `gpu_4x_h100_pcie` against its catalog and rejects a
+        shape it does not sell with its own precise error, so naming the width to try beats a bare
+        shortfall the user cannot act on. Withheld once the class is oversized at every rentable
+        width, where no count would help and the honest answer is the shortfall alone.
+        """
+        if widths or unpinned_widths:
+            return ""
+        width = smallest_fitting_gpu_count(
+            need, max_gpu_count=widest_cap, gpu_names=(exact,) if exact_info.validated else ()
+        )
+        if width is None or width <= above:
+            return ""
+        return (
+            f". Their catalog may list a {width}-card {exact} instance -- raise the card ceiling "
+            f"with `--gpus {width}` to check it against their catalog"
+        )
+
     if exact_info.vram_gb < need and max_gpu_count <= 1:
         raise UnsupportedGpuError(
             f"exact GPU {exact!r} has {exact_info.vram_gb} GB VRAM, "
             f"but this run requires at least {need} GB"
-            + (wider_shape_remedy(widths, need, ceiling=widest_cap, above=1) or _drop_pin_hint(1))
+            + (
+                wider_shape_remedy(widths, need, ceiling=widest_cap, above=1)
+                or _drop_pin_hint(1)
+                or _catalog_check_hint(1)
+            )
         )
     # the widest shape providers actually rent for this ceiling, not the ceiling itself: a pin
     # that only fits at a non-rentable count (3) must be rejected here with a precise reason
@@ -282,6 +307,7 @@ def _resolve_exact_gpu(
             + (
                 wider_shape_remedy(widths, need, ceiling=widest_cap, above=cap)
                 or _drop_pin_hint(cap)
+                or _catalog_check_hint(cap)
             )
         )
     return exact, reachable

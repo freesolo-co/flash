@@ -2058,12 +2058,14 @@ def test_moved_message_builders_still_import_from_their_original_module():
 
 
 def test_fit_remedy_is_withheld_when_only_fixed_count_sku_providers_remain():
-    """A width is only promised when a provider in play rents card counts freely.
+    """A width is only PROMISED when a provider in play rents card counts freely.
 
     Lambda names the count in the instance type and Vast bakes it into the offer, so a wider shape
     exists only if their live catalog lists one -- unknowable here. RunPod takes the count as a
-    launch parameter, so its remedy stays. Suggesting an unpurchasable SKU sends the user to retry
-    a shape that cannot be bought, which is worse than reporting the shortfall alone.
+    launch parameter, so its remedy stays. The distinction is what the message CLAIMS: RunPod gets
+    "it fits on N cards" because the fit was proved offline, while a fixed-count provider is only
+    offered the width to ask its catalog for. Naming a width to check beats a bare shortfall the
+    user cannot act on; asserting one exists would send them to buy a shape that may not be sold.
     """
     from flash.providers.allocator import _resolve_exact_gpu
     from flash.providers.base import GPU_INFO, UnsupportedGpuError, providers_for
@@ -2081,8 +2083,26 @@ def test_fit_remedy_is_withheld_when_only_fixed_count_sku_providers_remain():
             available=("lambda",),
             widest_cap=8,
         )
-    assert "--gpus" not in str(lambda_only.value)
-    assert f"{GPU_INFO['H100'].vram_gb} GB VRAM" in str(lambda_only.value)
+    lambda_message = str(lambda_only.value)
+    assert f"{GPU_INFO['H100'].vram_gb} GB VRAM" in lambda_message
+    # the width may be named, but only ever as a catalog check -- never as a proved fit.
+    assert "it fits on" not in lambda_message
+    if "--gpus" in lambda_message:
+        assert "check it against their catalog" in lambda_message
+
+    # an oversized pin gets NO width at any tier: no rentable count would help, so the honest
+    # answer is the shortfall alone rather than a catalog check that cannot succeed.
+    with pytest.raises(UnsupportedGpuError) as oversized:
+        _resolve_exact_gpu(
+            "H100",
+            need=float(GPU_INFO["H100"].vram_gb) * 100,
+            cap=1,
+            max_gpu_count=1,
+            provider="lambda",
+            available=("lambda",),
+            widest_cap=8,
+        )
+    assert "--gpus" not in str(oversized.value)
 
     # the SAME pin on runpod keeps the remedy: withholding it everywhere would trade a wrong
     # suggestion for a missing one.
@@ -2108,6 +2128,53 @@ def test_fit_remedy_is_withheld_when_only_fixed_count_sku_providers_remain():
             available=("lambda", "runpod"),
             widest_cap=8,
         )
+
+
+def test_exact_pin_on_a_fixed_count_provider_still_names_a_width_to_check():
+    """The exact-GPU path must not withhold the catalog check its non-exact sibling gives.
+
+    An exact Lambda H100 pin that needs more than one card previously died on a bare shortfall,
+    while the same run without the exact pin was told which width to try. `live_capacity` means
+    the count is confirmed dynamically, not that the SKU is absent -- Lambda resolves
+    `gpu_4x_h100_pcie` against its own catalog and rejects what it does not sell with a precise
+    error. Naming the width to try is one flag from working; the bare shortfall is a dead end.
+    """
+    from flash.providers.allocator import _resolve_exact_gpu
+    from flash.providers.base import GPU_INFO, UnsupportedGpuError
+
+    need = GPU_INFO["H100"].vram_gb * 2.35  # 188 GB: needs 4 cards, not 2
+
+    with pytest.raises(UnsupportedGpuError) as pinned:
+        _resolve_exact_gpu(
+            "H100",
+            need=need,
+            cap=1,
+            max_gpu_count=1,
+            provider="lambda",
+            available=("lambda",),
+            widest_cap=8,
+            unpinned=("lambda",),
+        )
+    message = str(pinned.value)
+    # the width is SEARCHED, not guessed: 2 cards is 160 GB and does not fit, so 4 is the answer.
+    assert "`--gpus 4`" in message
+    assert "check it against their catalog" in message
+    # still a catalog check, never a promise -- nothing here proved the SKU is purchasable.
+    assert "it fits on" not in message
+
+    # the same shortfall reached through the multi-card branch names a width above the tried cap.
+    with pytest.raises(UnsupportedGpuError) as combo:
+        _resolve_exact_gpu(
+            "H100",
+            need=need,
+            cap=2,
+            max_gpu_count=4,
+            provider="lambda",
+            available=("lambda",),
+            widest_cap=8,
+            unpinned=("lambda",),
+        )
+    assert "`--gpus 4`" in str(combo.value)
 
 
 def test_rents_arbitrary_card_counts_splits_providers_by_how_counts_are_sold():
