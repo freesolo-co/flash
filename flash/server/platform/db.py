@@ -604,6 +604,80 @@ def revoke_teacher_capabilities_for_run(run_id: str, *, now: float | None = None
         raise
 
 
+def _readmit_teacher_request(conn, capability, existing, *, admitted_at, charge_tokens) -> dict:
+    """Re-open one existing ledger row as 'reserved' inside the caller's transaction.
+
+    ``charge_tokens`` is True only for 'retryable' rows, whose token reservation was released
+    before dispatch. Transient terminal rows completed after dispatch, so their reservation is
+    still held and only in_flight is re-acquired.
+    """
+    if capability["in_flight"] >= capability["max_concurrency"]:
+        raise TeacherLedgerError("broker_busy", retryable=True)
+    token_delta = 0
+    if charge_tokens:
+        token_delta = existing["score_items"] * capability["max_request_tokens"]
+        if capability["token_count"] + token_delta > capability["max_total_tokens"]:
+            raise TeacherLedgerError("token_quota_exhausted")
+    conn.execute(
+        "UPDATE teacher_score_requests SET state = 'reserved', updated_at = ?, "
+        "provider_status = NULL, error_class = NULL WHERE id = ?",
+        (admitted_at, existing["id"]),
+    )
+    conn.execute(
+        "UPDATE teacher_capabilities SET in_flight = in_flight + 1, "
+        "token_count = token_count + ? WHERE id = ?",
+        (token_delta, capability["id"]),
+    )
+    conn.commit()
+    return {
+        "capability": dict(capability),
+        "request": {
+            **dict(existing),
+            "state": "reserved",
+            "updated_at": admitted_at,
+        },
+    }
+
+
+def _resume_existing_teacher_request(conn, capability, existing, *, admitted_at) -> dict:
+    """Resolve one already-known request_id: readmit, replay, or refuse."""
+    state = existing["state"]
+    if state == "retryable":
+        return _readmit_teacher_request(
+            conn, capability, existing, admitted_at=admitted_at, charge_tokens=True
+        )
+    if state in {"reserved", "started"}:
+        raise TeacherLedgerError("request_in_progress", retryable=True)
+    # transient terminal states are readmitted for another bounded upstream attempt. a
+    # 'provider_rejected' row is readmitted only when the broker classified the provider
+    # status as transient (429 or 5xx, recorded as error_class); genuine 4xx rejections
+    # stay terminal. an 'outcome_unknown' row is always readmitted: the same request_id
+    # is re-dispatched, and billed usage is recorded only on the single terminal
+    # 'succeeded' completion, so the logical request is never billed twice.
+    # mark_teacher_request_started bounds total upstream attempts per request.
+    if state == "outcome_unknown" or (
+        state == "provider_rejected" and existing["error_class"] == "transient"
+    ):
+        return _readmit_teacher_request(
+            conn, capability, existing, admitted_at=admitted_at, charge_tokens=False
+        )
+    if state == "succeeded":
+        response_body = existing["response_body"]
+        if (
+            not isinstance(response_body, bytes)
+            or not response_body
+            or len(response_body) > capability["max_response_bytes"]
+        ):
+            raise TeacherLedgerError("replay_unavailable")
+        conn.commit()
+        return {
+            "capability": dict(capability),
+            "request": dict(existing),
+            "response_body": response_body,
+        }
+    raise TeacherLedgerError(state)
+
+
 def reserve_teacher_request(
     *,
     token: str,
@@ -638,49 +712,9 @@ def reserve_teacher_request(
         if existing is not None:
             if existing["request_fingerprint"] != request_fingerprint:
                 raise TeacherLedgerError("request_body_changed")
-            state = existing["state"]
-            if state == "retryable":
-                if capability["in_flight"] >= capability["max_concurrency"]:
-                    raise TeacherLedgerError("broker_busy", retryable=True)
-                request_token_limit = existing["score_items"] * capability["max_request_tokens"]
-                if capability["token_count"] + request_token_limit > capability["max_total_tokens"]:
-                    raise TeacherLedgerError("token_quota_exhausted")
-                conn.execute(
-                    "UPDATE teacher_score_requests SET state = 'reserved', updated_at = ?, "
-                    "provider_status = NULL, error_class = NULL WHERE id = ?",
-                    (admitted_at, existing["id"]),
-                )
-                conn.execute(
-                    "UPDATE teacher_capabilities SET in_flight = in_flight + 1, "
-                    "token_count = token_count + ? WHERE id = ?",
-                    (request_token_limit, capability["id"]),
-                )
-                conn.commit()
-                return {
-                    "capability": dict(capability),
-                    "request": {
-                        **dict(existing),
-                        "state": "reserved",
-                        "updated_at": admitted_at,
-                    },
-                }
-            if state in {"reserved", "started"}:
-                raise TeacherLedgerError("request_in_progress", retryable=True)
-            if state == "succeeded":
-                response_body = existing["response_body"]
-                if (
-                    not isinstance(response_body, bytes)
-                    or not response_body
-                    or len(response_body) > capability["max_response_bytes"]
-                ):
-                    raise TeacherLedgerError("replay_unavailable")
-                conn.commit()
-                return {
-                    "capability": dict(capability),
-                    "request": dict(existing),
-                    "response_body": response_body,
-                }
-            raise TeacherLedgerError(state)
+            return _resume_existing_teacher_request(
+                conn, capability, existing, admitted_at=admitted_at
+            )
         if request_bytes > capability["max_request_bytes"]:
             raise TeacherLedgerError("request_too_large")
         request_token_limit = int(score_items) * capability["max_request_tokens"]
