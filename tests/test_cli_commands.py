@@ -533,6 +533,91 @@ def test_env_setup_resolves_the_project_locally_on_a_self_hosted_plane(monkeypat
     assert resolved == "11111111-1111-4111-8111-111111111111"
 
 
+_SCAFFOLD_PROJECT = "11111111-1111-4111-8111-111111111111"
+
+
+def _scaffold(monkeypatch, tmp_path, api_url: str):
+    """Run `flash env setup` in tmp_path against a plane at api_url; return the written files."""
+    from argparse import Namespace
+
+    from flash.cli.commands.env import setup as env_setup
+
+    monkeypatch.setattr(env_setup, "_require_setup_project", lambda _args: _SCAFFOLD_PROJECT)
+    monkeypatch.setattr("flash.client.config.load_credentials", lambda: (api_url, "key"))
+    monkeypatch.chdir(tmp_path)
+    rc = env_setup.cmd_env_setup(
+        Namespace(
+            project=_SCAFFOLD_PROJECT,
+            yes=True,
+            multi_turn=False,
+            reasoning=None,
+            from_traces=None,
+            trace=None,
+            force=False,
+        )
+    )
+    assert rc == 0
+    return {p.name: p.read_text(encoding="utf-8") for p in tmp_path.rglob("*") if p.is_file()}
+
+
+def test_env_setup_scaffolds_the_github_form_on_a_self_hosted_plane(monkeypatch, tmp_path) -> None:
+    """`flash env push` publishes to Freesolo's managed hub, which a self-hosted plane cannot write.
+
+    The scaffold used to emit `id = ""` plus instructions to run that command regardless of plane,
+    so a self-hoster following SELF_HOSTING.md got a config that fails validation and a next step
+    that cannot work. `github:owner/repo@ref:path` is the id form their own plane resolves.
+    """
+    written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+
+    for name in ("sft.toml", "rl.toml", "opd.toml"):
+        assert 'id = "github:OWNER/REPO@main:environment.py"' in written[name], name
+        assert "flash env push --project" not in written[name], name
+    # the generated .py files carry the same guidance in their docstrings
+    for name in ("environment.py", "evaluations.py"):
+        assert "flash env push" not in written[name], name
+
+
+def test_scaffolded_self_hosted_id_is_a_form_the_loader_accepts(monkeypatch, tmp_path) -> None:
+    """The placeholder must PARSE, or it just trades one unusable id for another.
+
+    `github:OWNER/REPO@main:.` reads naturally and is rejected -- `_normalize_env_path` refuses
+    "." as an unsafe path -- so the scaffold would still hand a self-hoster a config that fails
+    before the run starts. Asserting on the substring alone would not have caught that.
+    """
+    import tomllib
+
+    from flash.envs.loader import _parse_github_environment_ref
+
+    written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+
+    for name in ("sft.toml", "rl.toml", "opd.toml"):
+        env_id = tomllib.loads(written[name])["environment"]["id"]
+        assert _parse_github_environment_ref(env_id) is not None, (
+            f"{name} scaffolds {env_id!r}, which the environment loader cannot parse"
+        )
+
+
+def test_env_setup_keeps_the_push_workflow_on_the_managed_plane(monkeypatch, tmp_path) -> None:
+    """The hosted path is the common one and must be untouched by the self-hosted branch."""
+    written = _scaffold(monkeypatch, tmp_path, "https://flash.freesolo.co")
+
+    for name in ("sft.toml", "rl.toml", "opd.toml"):
+        assert f"flash env push --project {_SCAFFOLD_PROJECT} --name my-env ." in written[name], (
+            name
+        )
+        assert 'id = ""' in written[name], name
+        assert "github:OWNER" not in written[name], name
+    assert "flash env push" in written["environment.py"]
+
+
+def test_env_setup_treats_an_unset_api_url_as_the_managed_plane(monkeypatch, tmp_path) -> None:
+    """No stored api_url means the built-in default, which is Freesolo's plane -- not self-hosted."""
+    written = _scaffold(monkeypatch, tmp_path, None)
+
+    assert 'id = ""' in written["sft.toml"]
+    assert "github:OWNER" not in written["sft.toml"]
+
+
 def test_env_setup_still_rejects_a_malformed_project_when_self_hosted(monkeypatch) -> None:
     """Skipping the ownership lookup must not skip the shape check that stands in for it."""
     from argparse import Namespace

@@ -387,6 +387,94 @@ def _require_setup_project(args) -> str:
     return resolve_project_id(selected, api_key, api_url)
 
 
+def _for_self_hosted_plane(source: str, project_id: str) -> str:
+    """Rewrite generated-file docstrings that instruct the user to run `flash env push`.
+
+    The scaffolded .py files carry the same hosted-only guidance the configs do. Leaving them
+    alone would fix the config an operator edits and keep misdirecting the one they read.
+
+    Takes project_id because it runs AFTER the PROJECT_UUID substitution, so the text to match
+    already carries the real uuid.
+    """
+    push = f"`flash env push --project {project_id} --name my-env .`"
+    rewrites = (
+        # environment.py, single-turn and multi-turn: both carry this identical pair of sentences.
+        (
+            f"upload with\n{push}.\n\n"
+            f"A managed run should use the returned [environment] id from\n{push}.",
+            "commit it to a git repo your plane can read.\n"
+            "\n"
+            "A managed run names that repo in [environment] id, as\n"
+            "`github:OWNER/REPO@main:environment.py` -- this plane is self-hosted, so publishing\n"
+            "to Freesolo's managed environment hub does not apply.",
+        ),
+        # evaluations.py, single-turn and multi-turn: identical opening sentences.
+        (
+            f"Publish this file beside environment.py with\n{push}, then run the suites against a\n"
+            "model trained on it with `flash env eval TARGET`. The run names the published\n"
+            "environment, so `env eval` takes no local path.",
+            "Keep this file beside environment.py in the git repo named by [environment] id,\n"
+            "then run the suites against a model trained on it with `flash env eval TARGET`.\n"
+            "The run names that repo, so `env eval` takes no local path.",
+        ),
+    )
+    # Each template matches exactly one of these (environment.py or evaluations.py), so applying
+    # every rewrite and requiring that one landed is the check that catches template drift -- a
+    # silent no-op here would ship a file still telling a self-hoster to run `flash env push`.
+    for hosted, self_hosted in rewrites:
+        source = source.replace(hosted, self_hosted)
+    if push in source:
+        raise AssertionError(
+            "a scaffolded file still references `flash env push` after the self-hosted rewrite; "
+            "update _for_self_hosted_plane alongside the starter templates"
+        )
+    return source
+
+
+def _plane_can_publish_environments() -> bool:
+    """Whether `flash env push` can actually publish for the logged-in plane.
+
+    Publishing uploads to the plane, which commits into the managed environment hub
+    (`freesolo-co/environment-hub`, hardcoded in flash/server/domain/envs.py). A self-hosted
+    operator cannot write there whatever GITHUB_TOKEN they set, so scaffolding `flash env push`
+    at them leaves an unusable empty `id` that fails config validation.
+
+    Classified on the PLANE, not on `has_freesolo_backend`: a self-hosted plane pointed at an
+    operator-run Freesolo-compatible backend has a project directory (which is what that helper
+    answers) but still cannot publish to the hub.
+    """
+    from flash.client.config import load_credentials
+    from flash.serve.urls import is_freesolo_hosted_url
+
+    api_url, _ = load_credentials()
+    # Unset means the built-in default, which is the managed plane.
+    return api_url is None or is_freesolo_hosted_url(api_url)
+
+
+def _environment_comment(project_id: str, *, can_publish: bool, extra: str = "") -> str:
+    """The `[environment]` block for a generated config.
+
+    Self-hosted planes get the `github:` form, which their own env loader resolves directly from
+    a public repo -- the only id form that works without the managed hub.
+    """
+    if can_publish:
+        head = (
+            "# Environment: upload this project folder with\n"
+            f"# `flash env push --project {project_id} --name my-env .`, then paste the returned id below.\n"
+        )
+        placeholder = 'id = ""\n\n'
+    else:
+        head = (
+            "# Environment: this plane is self-hosted, so `flash env push` does not apply -- it\n"
+            "# publishes to Freesolo's managed environment hub. Point `id` at a git repo instead:\n"
+            "#   github:OWNER/REPO@REF:PATH   (REF is a branch, tag or commit; PATH is the file, or\n"
+            "#                                 the directory holding environment.py)\n"
+            "# Push this folder to a repo your plane can read, then fill in the id below.\n"
+        )
+        placeholder = 'id = "github:OWNER/REPO@main:environment.py"\n\n'
+    return f"{head}{extra}[environment]\n{placeholder}"
+
+
 def _validate_existing_config_projects(project_id: str) -> None:
     """Reject projectless or conflicting generated configs without rewriting them."""
     from flash.client import ClientError
@@ -623,6 +711,8 @@ def _write_opd_config(
     project_id: str,
     thinking_line: str,
     max_examples_line: str,
+    *,
+    can_publish: bool = True,
 ) -> None:
     """write the opd config-file phase."""
     if not opd.exists():
@@ -642,12 +732,12 @@ def _write_opd_config(
             'algorithm = "opd"   # on-policy distillation from a managed parasail teacher (default glm 5.2)\n'
             f"{thinking_line}"
             "\n"
-            "# Environment: upload this project folder with\n"
-            f"# `flash env push --project {project_id} --name my-env .`, then paste the returned id below.\n"
-            "# the teacher and its parasail key are platform-managed; nothing to set up or export.\n"
-            "[environment]\n"
-            'id = ""\n\n'
-            "[train]\n"
+            + _environment_comment(
+                project_id,
+                can_publish=can_publish,
+                extra="# the teacher and its parasail key are platform-managed; nothing to set up or export.\n",
+            )
+            + "[train]\n"
             "epochs = 1\n"
             f"{max_examples_line}"
             "lora_rank = 32\n"
@@ -690,9 +780,12 @@ def cmd_env_setup(args) -> int:
     reasoning_configs = (rl, opd, sft)
     reasoning = _resolve_reasoning_mode(args, reasoning_configs)
 
+    can_publish = _plane_can_publish_environments()
     env_py = (_STARTER_ENV_MULTITURN_PY if multi_turn else _STARTER_ENV_PY).replace(
         "PROJECT_UUID", project_id
     )
+    if not can_publish:
+        env_py = _for_self_hosted_plane(env_py, project_id)
     dataset_jsonl = traces_jsonl or (
         _STARTER_DATASET_MULTITURN_JSONL if multi_turn else _STARTER_DATASET_JSONL
     )
@@ -717,16 +810,21 @@ def cmd_env_setup(args) -> int:
             evaluations_py = (
                 _STARTER_EVALUATIONS_MULTITURN_PY if multi_turn else _STARTER_EVALUATIONS_PY
             )
-            starter_evaluations.write_text(evaluations_py.replace("PROJECT_UUID", project_id))
+            rendered_evaluations = evaluations_py.replace("PROJECT_UUID", project_id)
+            if not can_publish:
+                rendered_evaluations = _for_self_hosted_plane(rendered_evaluations, project_id)
+            starter_evaluations.write_text(rendered_evaluations)
     project_line = f"project = {json.dumps(project_id)}\n"
     env_comment = (
-        "# Environment: upload this project folder with\n"
-        f"# `flash env push --project {project_id} --name my-env .`, then paste the returned id below.\n"
-        "# If the environment reads secrets with os.environ, list only the env var names here.\n"
-        "# Values are read from your shell or .env at submit time and are not stored in the spec.\n"
-        "[environment]\n"
-        'id = ""\n\n'
-        '# secrets = ["SERPAPI_API_KEY"]\n\n'
+        _environment_comment(
+            project_id,
+            can_publish=can_publish,
+            extra=(
+                "# If the environment reads secrets with os.environ, list only the env var names here.\n"
+                "# Values are read from your shell or .env at submit time and are not stored in the spec.\n"
+            ),
+        )
+        + '# secrets = ["SERPAPI_API_KEY"]\n\n'
     )
     # `thinking=true` is algorithm-agnostic. only GRPO needs a generated completion increase;
     # OPD raises its own via `opd_completion_len`, and SFT does not generate. empty strings preserve
@@ -760,7 +858,15 @@ def cmd_env_setup(args) -> int:
         sft_reasoning_note,
     )
     opd = Path("configs/opd.toml")
-    _write_opd_config(opd, multi_turn, project_line, project_id, thinking_line, max_examples_line)
+    _write_opd_config(
+        opd,
+        multi_turn,
+        project_line,
+        project_id,
+        thinking_line,
+        max_examples_line,
+        can_publish=can_publish,
+    )
     training = Path("TRAINING.md")
     _write_training_guide(training, project_id)
     scaffolded = [
@@ -773,8 +879,11 @@ def cmd_env_setup(args) -> int:
         "TRAINING.md",
     ]
     if render.styled():
-        print(render.env_setup(scaffolded, project_id))
+        print(render.env_setup(scaffolded, project_id, can_publish=can_publish))
         return 0
     print(f"ensured {', '.join(scaffolded)}")
-    print(f"next: flash env push --project {project_id} --name my-env .")
+    if can_publish:
+        print(f"next: flash env push --project {project_id} --name my-env .")
+    else:
+        print("next: push this folder to a git repo, then set [environment] id to its github: form")
     return 0
