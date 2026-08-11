@@ -1122,3 +1122,36 @@ def test_empty_2xx_body_still_decodes_to_an_empty_object():
     """An empty 2xx body decodes to {}, so callers reading a dict from it still get one."""
     with _fixed_2xx_server("application/json", b"") as url:
         assert ApiClient(url, "fslo-user-test", timeout=5).me() == {}
+
+
+def test_spec_payload_sends_an_omitted_gpu_count_as_omitted() -> None:
+    """The server re-derives "auto-size" from the ABSENCE of gpu.count, so the placeholder must go.
+
+    `to_dict()` keeps `count: 1` for preparation-digest stability and strips the provenance marker.
+    Sending that verbatim made the server reparse an auto-sized run as an authored one-card pin and
+    reject it at the pinned-count preflight before a run was ever created -- so managed submit never
+    auto-sized at all. Each authored form must still arrive as a hard pin.
+    """
+    base = {
+        "model": "Qwen/Qwen3.5-4B",
+        "project": "11111111-1111-4111-8111-111111111111",
+        "algorithm": "grpo",
+        "environment": {"id": "owner/env"},
+        "train": {"max_steps": 10},
+    }
+
+    omitted = spec_from_dict(base)
+    assert omitted.gpu_count_auto is True
+    payload = spec_payload(omitted)
+    assert "count" not in payload["gpu"]
+    assert spec_from_dict(payload).gpu_count_auto is True
+
+    for authored, expected_count in (
+        ({"count": 1}, 1),
+        ({"count": 4}, 4),
+        ({"type": "B200"}, 1),
+    ):
+        pinned = spec_from_dict({**base, "gpu": authored})
+        reparsed = spec_from_dict(spec_payload(pinned))
+        assert reparsed.gpu_count_auto is False, f"{authored} must stay a hard pin"
+        assert reparsed.gpu.count == expected_count

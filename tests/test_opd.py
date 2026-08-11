@@ -1199,7 +1199,7 @@ def test_opd_worker_fp8_kv_flag_matches_the_sizing_assumption():
     assert 'if config.get("fp8_kv")' in inspect.getsource(opd_train.build_opd_overrides)
 
 
-def test_opd_oversized_reject_names_the_knobs_to_shrink():
+def test_opd_oversized_reject_names_the_knobs_to_shrink(monkeypatch):
     """When even the biggest GPU can't hold an OPD run, the reject must be actionable: it names that
     OPD is resident-only (trainer + colocated vLLM student = two weight copies + rollout KV) and the
     knobs that shrink it, not the opaque 'no GPU that big' message the raw cheapest_gpu emits."""
@@ -1211,6 +1211,7 @@ def test_opd_oversized_reject_names_the_knobs_to_shrink():
         "batch_size": 8,
         "group_size": 4,
     }
+    monkeypatch.setattr("flash.engine.plan.vram.model_required_vram_gb", lambda *_a, **_k: 2000)
     with pytest.raises(UnsupportedGpuError) as exc:
         provisional_gpu("Qwen/Qwen3.6-35B-A3B", "opd", train=train)
     msg = str(exc.value)
@@ -1228,9 +1229,9 @@ def test_opd_oversized_reject_reports_the_rentable_odd_ceiling(monkeypatch):
     with pytest.raises(UnsupportedGpuError) as exc:
         provisional_gpu("Qwen/Qwen3.6-35B-A3B", "opd", gpu_count=7)
     msg = str(exc.value)
-    assert "any 4-card validated GPU combination" in msg
-    assert "7-card" not in msg
-    assert "592.8 GB max" in msg
+    assert "gpu.count=7 provides at most 592.8 GB (4x B200)" in msg
+    assert "--gpus 8" in msg
+    assert "7x" not in msg
 
 
 def test_opd_vram_keeps_chunked_text_peak_when_it_exceeds_dense_image_peak():

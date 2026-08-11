@@ -912,17 +912,21 @@ def test_schema_preflight_applies_the_geometry_cap_to_provisional_sizing():
     monkey = pytest.MonkeyPatch()
     try:
         monkey.setattr("flash.schema.provisional_gpu", _preview)
-        spec_from_dict(
-            {
-                "model": "Qwen/Qwen3.5-0.8B",
-                "model_revision": "a" * 40,
-                "algorithm": "sft",
-                "environment": {"id": "owner/env"},
-                "train": {"max_examples": 1},
-                "gpu": {"count": 8},
-            }
-        )
-        assert seen == [4]
+        raw = {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "model_revision": "a" * 40,
+            "algorithm": "sft",
+            "environment": {"id": "owner/env"},
+            "train": {"max_examples": 1},
+            "gpu": {"count": 8},
+        }
+        spec_from_dict(raw)
+
+        # an unset count must cross the same boundary already capped. force a floor that would need
+        # eight cards without the unvalidated-revision cap; the schema may still preview only four.
+        monkey.setattr("flash.engine.plan.vram.model_required_vram_gb", lambda *_a, **_k: 700)
+        spec_from_dict({**raw, "gpu": {}})
+        assert seen == [4, 4]
     finally:
         monkey.undo()
 

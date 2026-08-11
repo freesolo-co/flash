@@ -108,6 +108,9 @@ class _OpdProgressState:
         self.base_train_wall_seconds = float(state.get("train_wall_seconds", 0.0))
         self._prev_aligned = int(state.get("aligned_sequences", state.get("granularity_n", 0)))
         self._prev_cov_sum = float(state.get("coverage_sum", state.get("granularity_sum", 0.0)))
+        self._prev_truncated = int(state.get("truncated_rollouts", 0))
+        self._prev_samples_seen = int(state.get("samples_seen", 0))
+        self._prev_no_signal_skipped_steps = int(state.get("no_signal_skipped_steps", 0))
         self._train_started_at: float | None = None
         self._step_states: dict[int, dict] = {}
         if resume_state is not None:
@@ -122,7 +125,7 @@ class _OpdProgressState:
             elapsed = max(0.0, time.time() - self._train_started_at)
         return self.base_train_wall_seconds + elapsed
 
-    def record_step(self, step: int, loss: float, bridge: _TeacherAlignmentBridge) -> None:
+    def record_step(self, step: int, loss: float, bridge: _TeacherAlignmentBridge) -> float:
         with self._condition:
             expected_step = len(self.loss_curve) + 1
             if step != expected_step:
@@ -142,6 +145,22 @@ class _OpdProgressState:
                 (d_cov / d_aligned) if d_aligned > 0 else (cov_sum / aligned if aligned else 0.0)
             )
             self.coverage_curve.append(coverage)
+            truncated = int(snapshot["truncated_rollouts"])
+            samples_seen = int(snapshot["samples_seen"])
+            # truncation can change abruptly with prompt mix, so report this step's rollout share
+            # rather than the cumulative average. a zero-delta snapshot reports 0.0 because no
+            # rollouts belong to this step, and reusing history would misattribute old truncations.
+            d_truncated = truncated - self._prev_truncated
+            d_samples_seen = samples_seen - self._prev_samples_seen
+            self._prev_truncated, self._prev_samples_seen = truncated, samples_seen
+            self._prev_no_signal_skipped_steps = int(snapshot.get("no_signal_skipped_steps", 0))
+            truncation_rate = (
+                min(1.0, max(0.0, d_truncated / d_samples_seen)) if d_samples_seen > 0 else 0.0
+            )
+            # the rate is returned for the heartbeat and deliberately kept OUT of the snapshot:
+            # this dict is spread verbatim into the persisted opd_state.json resume contract, whose
+            # schema is fail-closed and holds cumulative counters. a per-step display value has no
+            # meaning on resume and nothing reads it back.
             snapshot.update(
                 {
                     "train_wall_seconds": self._train_wall_seconds(),
@@ -151,6 +170,30 @@ class _OpdProgressState:
             )
             self._step_states[step] = snapshot
             self._condition.notify_all()
+            return truncation_rate
+
+    def truncation_window(
+        self,
+        bridge: _TeacherAlignmentBridge,
+        max_completion: int,
+    ) -> _TruncationWindow:
+        snapshot = bridge.accounting_snapshot()
+        with self._condition:
+            # the fatal no-signal diagnosis must describe the attempts after the last completed step.
+            # cumulative rollout history can otherwise blame an old truncation spike for a current
+            # empty-alignment failure.
+            return _TruncationWindow(
+                truncated_rollouts=max(
+                    0, int(snapshot["truncated_rollouts"]) - self._prev_truncated
+                ),
+                samples_seen=max(0, int(snapshot["samples_seen"]) - self._prev_samples_seen),
+                no_signal_skipped_steps=max(
+                    0,
+                    int(snapshot.get("no_signal_skipped_steps", 0))
+                    - self._prev_no_signal_skipped_steps,
+                ),
+                max_completion=max_completion,
+            )
 
     def checkpoint_state(self, step: int, *, timeout_s: float = 300.0) -> dict:
         deadline = time.monotonic() + timeout_s
@@ -195,6 +238,33 @@ def _validate_multimodal_opd(request, spec, model_id: str) -> None:
         raise ValueError("multi-turn image-bearing opd is not supported")
 
 
+def _load_opd_model(model_id: str, model_revision: str, prompt_state) -> tuple[float, list]:
+    """Pull the base weights and read back the generation EOS ids, reporting progress throughout.
+
+    Weights come AFTER the prompt-budget filter: a dataset whose every prompt is over budget is a
+    deterministic input error, and downloading tens of GB before raising it burns paid worker
+    minutes for a verdict the tokenizer already had. The tokenizer/processor/config loads before
+    this fetch kilobytes, not weights, so they are cheap to run first.
+
+    `opd_model_load` is the stage the provider classifies as setup and TRAINING.md tells users to
+    expect here, but nothing emitted it -- so the documented stage never appeared and this span
+    reported as whatever ping came before it. Emit the transition, then hold it open across the
+    config read, which is minutes of silence on a cold cache mount.
+    """
+    download_seconds = _w.prefetch_model(model_id, revision=model_revision)
+    _w.heartbeat(
+        "opd_model_load",
+        download_seconds=download_seconds,
+        gpu=_w.gpu_diagnostics(include_torch=False),
+    )
+    with liveness_heartbeat("opd_model_load"):
+        # reads the snapshot with local_files_only, so it has to follow the prefetch.
+        eos_token_ids = generation_eos_from_cached_config(
+            model_id, model_revision, prompt_state.tokenizer
+        )
+    return download_seconds, eos_token_ids
+
+
 def run_opd_train(spec=None) -> None:
     """Run flash OPD through verl's native rollout and weight-sync path."""
     from flash.engine.worker.train.opd.validation import validate_opd_structured_outputs
@@ -221,13 +291,7 @@ def run_opd_train(spec=None) -> None:
     multi_turn, max_model_len = request.multi_turn, prompt_state.max_model_len
     if not prompt_state.prompts:
         raise RuntimeError("every OPD prompt exceeds the configured prompt budget")
-    # weights come AFTER the budget filter: a dataset whose every prompt is over budget is a deterministic input error, and downloading tens of GB before raising it burns paid worker minutes for a verdict the tokenizer already had.
-    # the tokenizer/processor/config loads above fetch kilobytes, not weights, so they are cheap to run first.
-    download_seconds = _w.prefetch_model(model_id, revision=model_revision)
-    # reads the snapshot with local_files_only, so it has to follow the prefetch.
-    eos_token_ids = generation_eos_from_cached_config(
-        model_id, model_revision, prompt_state.tokenizer
-    )
+    download_seconds, eos_token_ids = _load_opd_model(model_id, model_revision, prompt_state)
     workload = _prepare_workload(request, prompt_state, multimodal)
     update_horizon, prompts_per_step = workload.update_horizon, workload.prompts_per_step
     # same silent boundary the sft path guards: with no prebuilt worker image this builds a venv and installs the training stack, minutes long with nothing to report and no liveness thread running.
@@ -396,6 +460,7 @@ from flash.engine.worker.train.opd.failures import (  # noqa: E402,F401
     _reconcile_score_delivery_failure,
     _restore_verl_resume,
     _stage_retry_contract,
+    _TruncationWindow,
 )
 
 # hydra overrides, child env, and parquet writing, implemented in `.train.opd.overrides`.

@@ -2,7 +2,7 @@
 
 GC recomputes the forward in the backward (~+33% compute) to save activation memory. For a big MoE
 with a cheap ~3B active backbone + fused CE (Liger FLCE drops the [B,T,vocab] logit spike), the
-no-recompute activations FIT a 141 GB H200 / 180 GB B200 with margin — so GC is pure tax and we turn
+no-recompute activations were assumed to FIT an H200 / B200 with margin — so GC is pure tax and we turn
 it OFF. The gate is conservative: it only fires with the SFT signals (``allow_disable=True``), keeps
 GC on for the 80 GB H100 / long context / unknown dims, and never touches the colocated GRPO trainer.
 """
@@ -12,8 +12,29 @@ from __future__ import annotations
 from flash.engine.plan.vram import sft_gc_off_peak_gb, sft_grad_checkpoint_can_disable
 from flash.engine.worker.perf.memory import grad_checkpointing_on
 
+
+def _moe_info():
+    """The catalog entry production passes as ``model_info``.
+
+    Without it ``_lora_memory_gb`` falls back to the legacy floor, which understates the adapter by
+    59 GB at rank 64 (1.68 vs 61.00) because it cannot see the two fused routed-expert tensors.
+    The production path (``grad_checkpointing_on`` -> ``sft_grad_checkpoint_can_disable``) always
+    forwards it, so a fixture that omits it is sizing a model this platform never trains.
+    """
+    from flash.core.catalog import MODELS
+
+    return MODELS["Qwen/Qwen3.6-35B-A3B"]
+
+
 # Qwen3.6-35B-A3B real architecture dims (from its config.json text_config).
-_MOE = {"active_params_b": 3.0, "hidden": 2048, "num_layers": 40, "batch": 4, "lora_rank": 16}
+_MOE = {
+    "active_params_b": 3.0,
+    "hidden": 2048,
+    "num_layers": 40,
+    "batch": 4,
+    "lora_rank": 16,
+    "model_info": _moe_info(),
+}
 
 
 def test_active_params_resolution_is_null_safe():
@@ -39,26 +60,26 @@ def test_gc_off_gate_is_lora_rank_aware():
     # the GC-off gate must size on the run's REAL LoRA rank, not the default 32. A higher rank grows
     # the LoRA optimizer/adapter memory, so on a borderline card a high-rank run that the
     # default-rank estimate would have disabled GC for (then OOM'd) must KEEP GC on.
-    p32 = sft_gc_off_peak_gb(35.0, seq_len=2368, **{**_MOE, "lora_rank": 32})
-    p512 = sft_gc_off_peak_gb(35.0, seq_len=2368, **{**_MOE, "lora_rank": 512})
+    p32 = sft_gc_off_peak_gb(35.0, seq_len=711, **{**_MOE, "batch": 1, "lora_rank": 32})
+    p512 = sft_gc_off_peak_gb(35.0, seq_len=711, **{**_MOE, "batch": 1, "lora_rank": 512})
     assert p512 > p32  # the peak grows with rank
-    # end-to-end through grad_checkpointing_on: at a 180 GB card the default rank disables GC (returns
-    # False) but rank 512 keeps it on (returns True) -> the configured rank changes the decision.
-    # the card moved up from 125 GB with the routed experts: below ~170 GB the GC-off peak no longer
-    # fits at ANY rank, so both ranks would keep GC on and the rank contrast would vanish.
+    # end-to-end through grad_checkpointing_on at the measured 1404-token step, on a B200 (torch
+    # reports 178.35 GiB as ~191.5 decimal GB, which is the expression that feeds card_vram_gb):
+    # rank 8 disables GC, rank 64 keeps it on. this IS the rank-8 escape -- the same workload OOM'd
+    # at rank 64 and trained at rank 8, because rank drives ~53 GB of Adam state, not activations.
     kw = {
         "model_id": "Qwen/Qwen3.6-35B-A3B",
-        "max_length": 2368,
+        "max_length": 1404,
         "allow_disable": True,
         "active_params_b": 3.0,
         "hidden": 2048,
         "num_layers": 40,
         "fused_ce": True,
-        "per_device_bs": 4,
+        "per_device_bs": 1,
         "capability": (9, 0),
     }
-    assert grad_checkpointing_on(card_vram_gb=180.0, lora_rank=32, **kw) is False  # GC off (fits)
-    assert grad_checkpointing_on(card_vram_gb=180.0, lora_rank=512, **kw) is True  # GC kept on
+    assert grad_checkpointing_on(card_vram_gb=191.5, lora_rank=8, **kw) is False  # GC off (fits)
+    assert grad_checkpointing_on(card_vram_gb=191.5, lora_rank=64, **kw) is True  # GC kept on
 
 
 def test_gc_off_peak_scales_linearly_with_seq():
@@ -97,24 +118,69 @@ def test_dense_activation_constant_matches_the_live_rtx5090_peak():
 
 
 def test_dense_and_moe_activation_constants_are_separate():
-    """One constant cannot describe both geometries.
+    """One constant cannot describe both geometries -- and the MoE is the EXPENSIVE one.
 
-    K is the per-layer activation cost relative to hidden, and a dense FFN intermediate (4 x 2048)
-    stores far more of it than the MoE's active 8 x 512. Sharing the dense 65.0 would flip the
-    35B-A3B -- the only model whose truthy ``active_params_b`` reaches this gate -- from GC-off to
-    GC-on at seq >= 2048 and pay ~+33% compute per step on evidence from a different architecture.
+    The old 18.0 encoded the intuition that ~3B active params imply small activations. Routing is
+    per-token, so all 40 layers still materialize activations and the wide expert stack makes each
+    one large: measured, the MoE's per-layer cost is ~3x the dense fit, not a third of it. The two
+    constants stay separate because they are separate measurements, on separate hardware.
     """
     from flash.engine.plan.vram import _GC_OFF_ACT_K_DENSE, _GC_OFF_ACT_K_MOE
 
-    assert _GC_OFF_ACT_K_DENSE > _GC_OFF_ACT_K_MOE
-    # same geometry, same params: only the MoE signal differs -> the dense estimate must be larger.
+    assert _GC_OFF_ACT_K_MOE > _GC_OFF_ACT_K_DENSE
+    # same geometry, same params: only the MoE signal differs -> the MoE estimate must be larger.
     geom = {"hidden": 2048, "num_layers": 40, "batch": 4, "lora_rank": 16, "seq_len": 2368}
     as_moe = sft_gc_off_peak_gb(35.0, active_params_b=3.0, **geom)
     as_dense = sft_gc_off_peak_gb(35.0, active_params_b=None, **geom)
-    assert as_dense > as_moe
-    # the MoE decision on its real card is UNCHANGED by introducing the dense constant.
-    assert sft_grad_checkpoint_can_disable(35.0, seq_len=2368, card_vram_gb=141.0, **_MOE) is True
-    assert sft_grad_checkpoint_can_disable(35.0, seq_len=8192, card_vram_gb=141.0, **_MOE) is False
+    assert as_moe > as_dense
+
+
+def test_moe_activation_constant_matches_the_live_b200_peak():
+    """The MoE K is calibrated to a live OOM boundary, and must reject the run that hit it.
+
+    Run ``flash-1786414384-2273e8d6``, 1x B200, Qwen3.6-35B-A3B, LoRA rank 64, fused CE, at the
+    SMALLEST step this platform can express (micro_batch=1, max_token_len_per_gpu=1404):
+
+        torch.OutOfMemoryError ... Of the allocated memory 167.91 GiB is allocated by PyTorch
+
+    167.91 GiB is 180.3 decimal GB, and this estimator predicts in decimal GB: the card reports
+    178.35 GiB == 191.5 GB via ``torch.cuda.get_device_properties(0).total_memory / 1e9``, the exact
+    expression that feeds ``card_vram_gb``. Because the run DIED there, 180.3 GB is a lower bound on
+    what the step needed, not a peak it achieved -- so the estimator's TOTAL is pinned to it as a
+    fit-gate boundary, and the gate must call this configuration a NON-fit. At 18.0 it predicted
+    139.1 GB, declared "GC-off peak fits", and the run died at step 0.
+
+    Do NOT re-derive this from "allocated minus After-FSDP": that baseline is logged before the
+    optimizer exists and in GiB despite its "(GB)" label, so the subtraction mixes units and counts
+    optimizer state as activation. See the note on ``_GC_OFF_ACT_K_MOE``.
+    """
+    moe64 = {**_MOE, "batch": 1, "lora_rank": 64}
+    peak = sft_gc_off_peak_gb(35.0, seq_len=1404, **moe64)
+    assert 178.0 < peak < 183.0, f"estimate {peak:.1f} GB drifted from the 180.3 GB OOM boundary"
+    # the decisive assertion: this exact configuration must NOT be allowed to run GC-off.
+    assert sft_grad_checkpoint_can_disable(35.0, seq_len=1404, card_vram_gb=191.5, **moe64) is False
+    # and the H200 it was first scheduled onto (139.80 GiB == 150.1 GB) is rejected too.
+    assert sft_grad_checkpoint_can_disable(35.0, seq_len=1404, card_vram_gb=150.1, **moe64) is False
+    # shrinking the batch must NOT restore false confidence -- every reachable step stays rejected.
+    for batch in (1, 2, 4):
+        assert (
+            sft_grad_checkpoint_can_disable(
+                35.0, seq_len=1404, card_vram_gb=191.5, **{**_MOE, "batch": batch, "lora_rank": 64}
+            )
+            is False
+        )
+
+
+def test_rank8_single_card_run_still_disables_gc():
+    """The rank-8 escape must survive the recalibration.
+
+    ``flash-1786422649-0d04e8e9`` trained on ONE B200 at rank 8 with GC off (dataset max row 711
+    tokens). Rank 8 frees ~53 GB of Adam state versus rank 64, which is what made the same
+    activations fit. A constant tuned only to reject the OOM would be free to reject this too;
+    pinning the working run keeps the fix from degenerating into "always checkpoint".
+    """
+    moe8 = {**_MOE, "batch": 1, "lora_rank": 8}
+    assert sft_grad_checkpoint_can_disable(35.0, seq_len=711, card_vram_gb=191.5, **moe8) is True
 
 
 def test_gc_off_unknown_dims_is_inf():
@@ -126,51 +192,75 @@ def test_gc_off_unknown_dims_is_inf():
     ) == float("inf")
 
 
-def test_can_disable_fits_h200_not_h100_at_default_ctx():
-    # 141 GB H200: the 35B-A3B GC-off peak (~102 GB at seq 2368) + margin fits -> can disable.
-    assert sft_grad_checkpoint_can_disable(35.0, seq_len=2368, card_vram_gb=141.0, **_MOE) is True
+def test_can_disable_needs_a_short_step_not_just_a_big_card():
+    # at the measured MoE cost a 2368-token step at micro-batch 4 does not fit ANY card we rent:
+    # the H200 (150 GB) and the B200 (191.5 GB) both keep GC on. card size alone is not the lever.
+    assert sft_grad_checkpoint_can_disable(35.0, seq_len=2368, card_vram_gb=150.1, **_MOE) is False
+    assert sft_grad_checkpoint_can_disable(35.0, seq_len=2368, card_vram_gb=191.5, **_MOE) is False
     # 80 GB H100: 70 GB weights leave no room for the no-recompute activations -> keep GC on.
     assert sft_grad_checkpoint_can_disable(35.0, seq_len=2368, card_vram_gb=80.0, **_MOE) is False
+    # a short step on a big card still legitimately disables GC (the rank-8 regime).
+    short = {**_MOE, "batch": 1, "lora_rank": 8}
+    assert sft_grad_checkpoint_can_disable(35.0, seq_len=711, card_vram_gb=191.5, **short) is True
 
 
 def test_can_disable_keeps_gc_at_long_context():
     # A long (8k) SFT context pushes the no-recompute activations past the H200 -> keep GC on.
-    assert sft_grad_checkpoint_can_disable(35.0, seq_len=8192, card_vram_gb=141.0, **_MOE) is False
+    assert sft_grad_checkpoint_can_disable(35.0, seq_len=8192, card_vram_gb=150.1, **_MOE) is False
 
 
 def test_can_disable_conservative_on_unknown_card_or_dims():
     assert sft_grad_checkpoint_can_disable(35.0, seq_len=2368, card_vram_gb=0.0, **_MOE) is False
     bad = {**_MOE, "hidden": 0}
-    assert sft_grad_checkpoint_can_disable(35.0, seq_len=2368, card_vram_gb=141.0, **bad) is False
+    assert sft_grad_checkpoint_can_disable(35.0, seq_len=2368, card_vram_gb=150.1, **bad) is False
 
 
 def test_gate_turns_gc_off_for_35b_on_b200():
-    # training the routed experts grew the adapter/optimizer term, so the GC-off peak no longer fits
-    # the 141 GB H200 -- the speed win now starts at the 180 GB B200. the 141 GB case is covered by
-    # test_gate_keeps_gc_on_for_35b_on_h200 below.
+    # the speed win survives, but only for a step that actually fits: rank 8, micro-batch 1, and
+    # this dataset's real 711-token rows -- the configuration that trained to step 150 on one B200.
     off = grad_checkpointing_on(
         "Qwen/Qwen3.6-35B-A3B",
-        2368,
+        711,
         allow_disable=True,
-        card_vram_gb=180.0,
+        card_vram_gb=191.5,
         capability=(9, 0),
         active_params_b=3.0,
         hidden=2048,
         num_layers=40,
         fused_ce=True,
-        per_device_bs=4,
+        per_device_bs=1,
+        lora_rank=8,
     )
     assert off is False  # GC OFF (the speed win)
 
 
+def test_gate_keeps_gc_on_for_the_step_that_oomed_the_b200():
+    # the regression this whole change exists for: rank 64, micro-batch 1, 1404 tokens on a B200.
+    # the gate previously printed "GC-off peak fits" and the run died at step 0.
+    on = grad_checkpointing_on(
+        "Qwen/Qwen3.6-35B-A3B",
+        1404,
+        allow_disable=True,
+        card_vram_gb=191.5,
+        capability=(9, 0),
+        active_params_b=3.0,
+        hidden=2048,
+        num_layers=40,
+        fused_ce=True,
+        per_device_bs=1,
+        lora_rank=64,
+    )
+    assert on is True
+
+
 def test_gate_keeps_gc_on_for_35b_on_h200():
-    # the 141 GB H200 can no longer hold the GC-off peak once the experts are trained, so the gate
+    # the 150.1 GB H200 (139.80 GiB) can no longer hold the GC-off peak once the experts are trained, so the gate
     # must keep gradient checkpointing ON there rather than disabling it into an OOM.
     on = grad_checkpointing_on(
         "Qwen/Qwen3.6-35B-A3B",
         2368,
         allow_disable=True,
-        card_vram_gb=141.0,
+        card_vram_gb=150.1,
         capability=(9, 0),
         active_params_b=3.0,
         hidden=2048,
@@ -203,7 +293,7 @@ def test_gate_keeps_gc_on_when_fused_ce_off():
         "Qwen/Qwen3.6-35B-A3B",
         2368,
         allow_disable=True,
-        card_vram_gb=141.0,
+        card_vram_gb=150.1,
         capability=(9, 0),
         active_params_b=3.0,
         hidden=2048,
@@ -220,7 +310,7 @@ def test_gate_unchanged_without_disable_signal():
     # Even passing GPU signals positionally-free: without allow_disable they're ignored.
     assert (
         grad_checkpointing_on(
-            "Qwen/Qwen3.6-35B-A3B", 2368, card_vram_gb=141.0, capability=(9, 0), fused_ce=True
+            "Qwen/Qwen3.6-35B-A3B", 2368, card_vram_gb=150.1, capability=(9, 0), fused_ce=True
         )
         is True
     )
@@ -268,3 +358,64 @@ def test_is_moe_property():
     assert MODELS["Qwen/Qwen3.6-35B-A3B"].is_moe is True
     # every dense entry: active_params_b defaults to 0.0
     assert all(m.is_moe is False for m in MODELS.values() if m.active_params_b == 0.0)
+
+
+def test_size_gate_reads_the_catalog_not_a_dense_param_estimate():
+    """The GC/liger size gate must not size a MoE with a dense parameter formula.
+
+    ``_estimate_params`` reconstructs ``embeddings + 12 h^2 per layer``, which has no term for an
+    expert stack. For Qwen3.6-35B-A3B (2048 hidden, 40 layers, 248320 vocab, untied) that is
+    3.03B against a real 35B -- an 11.5x under-count that lands 1% above the 3.0B threshold. The
+    gate's answer was therefore correct by luck, on a model that clears the bar 11x over, and a
+    small catalog change (a narrower vocab, fewer layers) would silently flip it to "small model,
+    no gradient checkpointing needed" on a 35B MoE.
+
+    This test only characterizes the formula -- every assertion below holds with or without the
+    fix. ``test_size_gate_is_offline_and_fail_safe_for_cataloged_models`` owns the behavior.
+    """
+    from flash.core.catalog import MODELS
+    from flash.engine.worker.perf.liger import _LIGER_MIN_PARAMS, _estimate_params
+
+    class _Cfg:
+        hidden_size = 2048
+        vocab_size = 248_320
+        num_hidden_layers = 40
+        tie_word_embeddings = False
+
+    estimate = _estimate_params(_Cfg())
+    assert estimate < 3.1e9, "dense formula no longer under-counts the MoE; revisit this test"
+    assert MODELS["Qwen/Qwen3.6-35B-A3B"].params_b == 35.0
+    # the margin the old path depended on: 1% of the threshold, on an 11.5x-larger model.
+    assert 1.0 < estimate / _LIGER_MIN_PARAMS < 1.02
+
+
+def test_size_gate_is_offline_and_fail_safe_for_cataloged_models(monkeypatch):
+    """A cataloged model must not need a network probe to decide gradient checkpointing.
+
+    ``_liger_default_for_model`` returns False on ANY exception, and False means "small model" ->
+    ``_memory_mode`` False -> gradient checkpointing OFF. So a rate-limited or offline HF read used
+    to disable checkpointing on a 35B model. The catalog is local and exact, so it answers first.
+
+    The failure is injected at ``AutoConfig.from_pretrained`` rather than at ``_estimate_params``:
+    that call IS the network boundary, and it runs first. Patching the estimator instead would let
+    a regressed short-circuit reach the real HF read before hitting anything this test controls.
+    """
+    import sys
+    import types
+
+    import flash.engine.worker.perf.liger as liger_mod
+    from flash.engine.worker.perf.memory import _memory_mode
+
+    def _explode(*a, **k):
+        raise AssertionError("cataloged model fell through to the HF config probe")
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoConfig = types.SimpleNamespace(from_pretrained=_explode)
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    # every cataloged model answers from params_b, with the probe guaranteed to fail if consulted.
+    assert liger_mod._liger_default_for_model("Qwen/Qwen3.6-35B-A3B") is True
+    assert liger_mod._liger_default_for_model("Qwen/Qwen3.6-27B") is True
+    assert liger_mod._liger_default_for_model("Qwen/Qwen3.5-2B") is False  # 2.3B, genuinely small
+    # and the decision that matters: a short-context 35B step keeps gradient checkpointing ON.
+    assert _memory_mode("Qwen/Qwen3.6-35B-A3B", 711) is True

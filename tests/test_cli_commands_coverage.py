@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import flash.cli.commands as commands
+import flash.cli.commands.env.list as env_list_commands
 
 
 class _Client:
@@ -49,12 +50,15 @@ def test_env_list_filters_non_environments_and_uses_styled_renderer(
     (environments / "empty").mkdir()
     monkeypatch.chdir(tmp_path)
     seen = []
-    monkeypatch.setattr(commands.render, "styled", lambda: True)
+    monkeypatch.setattr(env_list_commands.render, "styled", lambda: True)
     monkeypatch.setattr(
-        commands.render, "env_list", lambda paths: seen.extend(paths) or "styled-envs"
+        env_list_commands.render,
+        "env_list",
+        lambda paths, *, published, unavailable: seen.extend(paths) or "styled-envs",
     )
+    monkeypatch.setattr(env_list_commands, "_published_envs", lambda: ([], None))
 
-    assert commands.cmd_env_list(SimpleNamespace()) == 0
+    assert env_list_commands.cmd_env_list(SimpleNamespace()) == 0
 
     assert capsys.readouterr().out == "styled-envs\n"
     assert seen == [
