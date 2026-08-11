@@ -21,6 +21,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests._helpers.profile import satisfy_sft_profile
+from tests._helpers.teacher import configure_managed_teacher
 
 _PROVIDERS = ("runpod", "lambda", "vast")
 # the only managed class all three providers stock. a parity test needs one class every provider can
@@ -137,6 +138,7 @@ def test_submit_accepts_multi_gpu_on_every_provider(
         monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
         spec = _submittable(algorithm, count=4, provider=provider)
         satisfy_sft_profile(runner, monkeypatch, spec)
+        configure_managed_teacher(monkeypatch, spec)
         status = runner.submit_job(spec, dry_run=True)
         assert status is not None
 
@@ -753,6 +755,7 @@ def test_submit_records_the_resolved_backend(monkeypatch, algorithm):
         monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
         spec = _submittable(algorithm)
         satisfy_sft_profile(runner, monkeypatch, spec)
+        configure_managed_teacher(monkeypatch, spec)
         status = runner.submit_job(spec, dry_run=True)
         assert (status.effective_preparation or {}).get("backend") == expected
 

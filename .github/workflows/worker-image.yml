@@ -2,9 +2,9 @@ name: flash worker image
 
 # builds the prebuilt flash worker image (full training stack + flash-attn baked in) and
 # pushes it to ghcr, so runpod/vast/lambda training cold-start skips the per-host dependency
-# install (the dominant cold-start cost). training providers select the pinned image and operator
-# override through flash/providers/_lifecycle/worker.py. serving has no consumer for this training-worker
-# image or override.
+# install (the dominant cold-start cost). training providers select the pinned image through
+# flash/providers/_lifecycle/worker.py; there is no override, so a new build means bumping the
+# WORKER_IMAGE constant. serving has no consumer for this training-worker image.
 #
 # Triggered automatically on flash/** changes (worker training code is baked in; skipping a
 # rebuild leaves GPU workers running stale code) and manually for Dockerfile/dep changes.
