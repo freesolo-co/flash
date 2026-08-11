@@ -271,10 +271,31 @@ def test_no_workflow_is_triggered_by_a_tag_push(path: Path):
     at that tagged commit, because Actions resolves the workflow from the pushed ref. no edit on
     `dev` can stop that for a tag that already exists; what this test buys is that the pattern
     cannot come back on any commit reachable from here.
+
+    a literal `tags:` key is not the only way in: per actions semantics, `on.push` with NEITHER
+    `branches` NOR `tags` runs on every pushed ref, tags included. `on: push` (the bare shorthand)
+    loads as `push is None`, and `push: {paths: [...]}` with no `branches` key loads as a dict with
+    no `tags` key either -- both used to return early or pass the old `"tags" not in push` check
+    while still triggering on a tag push, so deleting the `branches:` filter from `publish.yml`
+    would have restored the tag-triggered release path this test claims to prevent, and stayed
+    green. the fix is to require a POSITIVE branch restriction (`branches` or `branches-ignore`)
+    on every push trigger rather than merely forbidding the `tags` key. `tags-ignore` covering every
+    tag would also close the hole, but is not accepted here to keep the rule a single simple check
+    rather than one that has to reason about ignore-glob coverage.
     """
     push = _triggers(_load(path)).get("push")
-    if not isinstance(push, dict):
+    if push is None:
         return
+    assert isinstance(push, dict), (
+        f"{path.name} declares `on: push` (the bare shorthand, with no `branches` filter at all). "
+        "that runs on every pushed ref, tags included, which is exactly the tag-triggered publish "
+        "path this contract exists to prevent."
+    )
+    assert "branches" in push or "branches-ignore" in push, (
+        f"{path.name} declares an `on.push` trigger with no `branches` or `branches-ignore` key "
+        f"({push!r}). without a positive branch restriction the trigger also fires on tag pushes, "
+        "which bypasses the version-bump and already-on-PyPI gates that publish.yml relies on."
+    )
     assert "tags" not in push, (
         f"{path.name} declares an `on.push.tags` trigger ({push['tags']!r}). Tags are produced by "
         "publish.yml, not consumed: a tag-triggered publish bypasses the version-bump and "
@@ -314,12 +335,31 @@ def test_main_source_guard_checks_provenance_not_just_the_branch_name():
     # read the head repository from the `pull_request` payload, not from `github.repository`
     # (which is the BASE repo on a fork PR and would compare a value to itself) and not from
     # `github.event.pull_request.head.label` (a display string a fork owner influences).
+    #
+    # this checks the exact env MAPPING, not merely that the right-hand expression appears
+    # somewhere in the step -- and it runs before the script is ever executed. the run() helper
+    # below feeds HEAD_REPO/HEAD_REF/UPSTREAM_REPO to the script directly, so every assertion past
+    # this point exercises the script's logic in isolation from the workflow file. that gap used to
+    # be the whole test: an `any(... in str(value) ...)` over env.values() proves the expression is
+    # present SOMEWHERE, not that it is wired to the name the script reads. `HEAD_REPO` rewired to
+    # `github.repository` -- with the correct expression parked under an unused env key, or with
+    # both HEAD_REPO and UPSTREAM_REPO bound to the head-repo expression so the script compares a
+    # value to itself -- passed every assertion below while the live guard would accept a fork
+    # branch named `dev`. asserting the mapping itself is what closes that.
     env = step.get("env") or {}
-    assert any(
-        "github.event.pull_request.head.repo.full_name" in str(value) for value in env.values()
-    ), (
-        "the guard must read github.event.pull_request.head.repo.full_name; that is the only value "
-        f"a fork cannot set. Its env is {env!r}"
+    assert env.get("HEAD_REPO") == "${{ github.event.pull_request.head.repo.full_name }}", (
+        "HEAD_REPO must be wired to github.event.pull_request.head.repo.full_name -- that is the "
+        f"only value a fork owner cannot set. its env is {env!r}"
+    )
+    assert env.get("UPSTREAM_REPO") == "${{ github.repository }}", (
+        f"UPSTREAM_REPO must be wired to github.repository (the base repo). its env is {env!r}"
+    )
+    assert env.get("UPSTREAM_REPO") != env.get("HEAD_REPO"), (
+        "UPSTREAM_REPO and HEAD_REPO must not resolve to the same expression -- that would compare "
+        f"the base repo to itself and accept any head. its env is {env!r}"
+    )
+    assert env.get("HEAD_REF") == "${{ github.head_ref }}", (
+        f"HEAD_REF must be wired to github.head_ref. its env is {env!r}"
     )
 
     def run(head_repo: str, head_ref: str) -> tuple[int, str]:
