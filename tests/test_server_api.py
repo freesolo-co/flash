@@ -8339,6 +8339,74 @@ def test_publish_env_retry_repairs_association_after_false_ack(api, monkeypatch)
     assert uploads == ["acme/env", "acme/env"]
 
 
+def test_publish_env_reports_a_cross_project_name_conflict_without_uploading(api, monkeypatch):
+    """A name owned by another project must fail BEFORE the hub write, with the real cause.
+
+    Two defects in one: publishing replaces the whole `<org-slug>/<name>` hub directory, so
+    uploading first would destroy the other project's package on the way to failing; and the
+    old message blamed association *recording* and told the user to retry, which reproduces
+    the failure identically because names are unique per org.
+    """
+    import flash.server.domain.environment_registry as registry
+    import flash.server.domain.envs as envs_mod
+
+    monkeypatch.setattr(
+        registry,
+        "raise_if_owned_by_another_project",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            registry.EnvironmentProjectConflict("flash environment belongs to another project")
+        ),
+    )
+    monkeypatch.setattr(
+        envs_mod,
+        "publish_package",
+        lambda **_kwargs: pytest.fail("a name conflict must not upload over the other project"),
+    )
+
+    response = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": "env", "package_b64": "payload", "project_id": SPEC["project"]},
+    )
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert "already belongs to a different project" in detail
+    assert "unique per organization" in detail
+    # the two ways the old message misled: it must not blame recording, nor advise a retry.
+    assert "could not be recorded" not in detail
+    assert "retry" not in detail.lower().replace("retrying will not change this", "")
+
+
+def test_publish_env_maps_a_late_ownership_conflict_to_409(api, monkeypatch):
+    """Losing the race to a concurrent publish is still an ownership conflict, not a 502.
+
+    The pre-check can pass and the association still be refused (another publish landed in
+    between, or the pre-check could not reach the backend). The cause is unchanged, so the
+    answer must be too -- otherwise the same conflict yields retry advice by timing alone.
+    """
+    import flash.server.domain.environment_registry as registry
+    import flash.server.domain.envs as envs_mod
+
+    monkeypatch.setattr(registry, "raise_if_owned_by_another_project", lambda **_kwargs: None)
+    monkeypatch.setattr(envs_mod, "publish_package", lambda **_kwargs: "acme/env")
+
+    def conflict(**_kwargs):
+        raise registry.EnvironmentProjectConflict("flash environment belongs to another project")
+
+    monkeypatch.setattr(registry, "record_published_environment", conflict)
+
+    response = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": "env", "package_b64": "payload", "project_id": SPEC["project"]},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "already belongs to a different project" in response.json()["detail"]
+    assert "could not be recorded" not in response.json()["detail"]
+
+
 def test_publish_env_falsy_non_string_fields_are_not_coerced(api):
     """Regression: a present-but-falsy non-string `name`/`package_b64` (e.g. 0, False, []) must
     reach publish_package's type check and yield the *type* 400 — not be `or ""`-coerced to an

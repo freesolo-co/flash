@@ -82,7 +82,12 @@ def _sanitize_name(name: str) -> str:
     return normalize_env_name_segment(name) or "env"
 
 
-def _publish_slug_for_name(name: str, key: dict) -> tuple[str, str]:
+def publish_slug_for_name(name: str, key: dict) -> tuple[str, str]:
+    """The ``(namespace, name)`` a publish of ``name`` by ``key`` would write.
+
+    Pure and side-effect free, so the publish route can resolve the destination slug and check
+    its ownership before uploading anything.
+    """
     caller_namespace = namespace_for(key)
     raw = str(name or "").strip()
     if "/" not in raw:
@@ -364,7 +369,7 @@ def _github_publish(dest: Path, *, name: str, key: dict) -> str:
             status=503,
         )
     repo = _DEFAULT_GITHUB_REPO
-    ns, clean = _publish_slug_for_name(name, key)
+    ns, clean = publish_slug_for_name(name, key)
     publish_root = f"{ns}/{clean}"
     if not (dest / _DEFAULT_ENVIRONMENT_FILE).is_file():
         raise EnvPublishError("env package must contain environment.py")

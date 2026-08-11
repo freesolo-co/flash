@@ -70,9 +70,9 @@ def test_is_retryable_git_publish_error_classifies_markers():
 def test_publish_slug_and_input_validation(monkeypatch):
     # A namespaced name must be exactly two non-empty segments.
     with pytest.raises(envs.EnvPublishError, match="namespace/name"):
-        envs._publish_slug_for_name("a/b/c", {"org_slug": "acme"})
+        envs.publish_slug_for_name("a/b/c", {"org_slug": "acme"})
     with pytest.raises(envs.EnvPublishError, match="namespace/name"):
-        envs._publish_slug_for_name("acme/", {"org_slug": "acme"})
+        envs.publish_slug_for_name("acme/", {"org_slug": "acme"})
 
     # publish_package validates argument TYPES before touching storage.
     monkeypatch.setattr(envs, "_github_publish_once", lambda **_k: None)

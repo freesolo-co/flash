@@ -13,6 +13,7 @@ from flash.core.spec import require_project_id
 from flash.server.platform.auth import standalone
 from flash.server.platform.internal_client import (
     DEFAULT_TIMEOUT_S,
+    InternalRequestError,
     build_internal_request,
     delete_internal_json,
     internal_key,
@@ -31,18 +32,33 @@ _REPAIR_FAILURE_DETAIL = (
 )
 
 
-def _post(path: str, body: dict, *, subject: str) -> bool:
+class EnvironmentProjectConflict(Exception):
+    """An environment name is already owned by a different project in the same org.
+
+    Names are unique per ORG, not per project: the hub slug is ``<org-slug>/<name>`` with no
+    project component. So this is a permanent verdict, and it is the one failure on the publish
+    path that a retry can never clear -- which is exactly why it needs its own type rather than
+    joining the transient failures behind a bool.
+    """
+
+
+def _post(path: str, body: dict, *, subject: str, raise_for: frozenset[int] | None = None) -> bool:
     return post_internal_json(
         path,
         body,
         subject=subject,
         logger=_LOG,
         urlopen=urllib.request.urlopen,
+        raise_for=raise_for,
     )
 
 
 def record_published_environment(*, slug: str, name: str, key: dict, project_id: str) -> bool:
-    """Persist the published environment under its validated project."""
+    """Persist the published environment under its validated project.
+
+    Raises :class:`EnvironmentProjectConflict` when the name already belongs to another project
+    in this org; returns the usual best-effort bool for every other outcome.
+    """
     try:
         resolved_project_id = require_project_id(project_id)
     except (TypeError, ValueError) as exc:
@@ -63,7 +79,15 @@ def record_published_environment(*, slug: str, name: str, key: dict, project_id:
         "projectId": resolved_project_id,
         "metadata": {"source": "flash.env.push"},
     }
-    return _post(_PATH, body, subject=f"record published environment {slug}")
+    try:
+        return _post(
+            _PATH,
+            body,
+            subject=f"record published environment {slug}",
+            raise_for=frozenset({409}),
+        )
+    except InternalRequestError as exc:
+        raise EnvironmentProjectConflict(exc.detail) from exc
 
 
 def _validation_error_detail(exc: urllib.error.HTTPError) -> str:
@@ -75,6 +99,43 @@ def _validation_error_detail(exc: urllib.error.HTTPError) -> str:
         return ""
     detail = payload.get("detail") or payload.get("error")
     return str(detail).strip() if detail else ""
+
+
+def raise_if_owned_by_another_project(
+    *, slug: str, project_id: str, key: dict, org_id: str
+) -> None:
+    """Raise :class:`EnvironmentProjectConflict` if ``slug`` already belongs to another project.
+
+    Called BEFORE the hub upload. Publishing writes ``<org-slug>/<name>`` by deleting that
+    directory and re-copying it, so without this check a colliding name overwrites the other
+    project's environment package and only then fails to record the association -- destroying
+    the other project's environment as a side effect of an error.
+
+    Every non-conflict outcome returns normally and lets the publish proceed: a 404 is the
+    ordinary first publish of a new name, and a backend that is unreachable or unconfigured must
+    not block publishing (the association step afterwards still reports that failure). This is a
+    guard against a specific destructive case, not a new availability dependency.
+    """
+    if standalone():
+        # No Freesolo mirror here, so there are no cross-project rows to collide with.
+        return
+    token = internal_key()
+    if not token:
+        return
+    request = build_internal_request(
+        _VALIDATE_PATH,
+        {"orgId": org_id, "projectId": project_id, "slug": slug},
+        token=token,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=DEFAULT_TIMEOUT_S):
+            return
+    except urllib.error.HTTPError as exc:
+        if exc.code == 409:
+            raise EnvironmentProjectConflict(_validation_error_detail(exc)) from exc
+        return
+    except OSError:
+        return
 
 
 def require_environment_project(

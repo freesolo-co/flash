@@ -76,6 +76,41 @@ def build_internal_request(
 UrlOpen = Callable[..., Any]
 
 
+class InternalRequestError(Exception):
+    """An internal-backend response the caller asked to see instead of a flat ``False``.
+
+    The bool contract below is deliberately lossy: every failure collapses to ``False`` so
+    best-effort reporters (billing, run mirroring) can never break the operation they annotate.
+    But some statuses are a permanent verdict on the request itself, not a transient hiccup, and
+    a caller that renders an error to a user has to tell those apart — otherwise it advises a
+    retry for a request that can never succeed. ``raise_for`` opts a single call site into
+    receiving those statuses as this exception; every other caller keeps the bool.
+    """
+
+    def __init__(self, *, status: int, detail: str) -> None:
+        super().__init__(detail or f"internal request failed with HTTP {status}")
+        self.status = status
+        self.detail = detail
+
+
+def _error_detail(exc: urllib.error.HTTPError) -> str:
+    """The backend's own message for ``exc``, or ``""``.
+
+    Reads the body once (it is not re-readable) and unwraps the ``detail``/``error`` envelope
+    FastAPI and the Next.js routes both use, falling back to the raw text.
+    """
+    raw = ""
+    with suppress(Exception):
+        raw = exc.read().decode("utf-8", "replace")[:500]
+    with suppress(Exception):
+        payload = json.loads(raw)
+        if isinstance(payload, dict):
+            message = payload.get("detail") or payload.get("error")
+            if message:
+                return str(message).strip()
+    return raw.strip()
+
+
 def request_internal_json(
     path: str,
     body: dict[str, Any],
@@ -84,8 +119,13 @@ def request_internal_json(
     subject: str,
     logger: Logger,
     urlopen: UrlOpen = urllib.request.urlopen,
+    raise_for: frozenset[int] | set[int] | None = None,
 ) -> bool:
-    """Best-effort internal JSON request; returns True on 2xx, False when disabled or failed."""
+    """Best-effort internal JSON request; returns True on 2xx, False when disabled or failed.
+
+    ``raise_for`` names status codes to surface as :class:`InternalRequestError` rather than
+    fold into ``False``. Defaults to none, so the best-effort contract is unchanged.
+    """
     key = internal_key()
     if not key:
         return False
@@ -94,10 +134,10 @@ def request_internal_json(
         with urlopen(req, timeout=DEFAULT_TIMEOUT_S) as resp:
             return 200 <= resp.status < 300
     except urllib.error.HTTPError as exc:
-        detail = ""
-        with suppress(Exception):
-            detail = exc.read().decode("utf-8", "replace")[:500]
+        detail = _error_detail(exc)
         logger.warning("failed to %s: HTTP %s %s", subject, exc.code, detail)
+        if raise_for and exc.code in raise_for:
+            raise InternalRequestError(status=exc.code, detail=detail) from exc
     except OSError as exc:
         logger.warning("failed to %s: %s", subject, exc)
     return False
@@ -110,6 +150,7 @@ def post_internal_json(
     subject: str,
     logger: Logger,
     urlopen: UrlOpen = urllib.request.urlopen,
+    raise_for: frozenset[int] | set[int] | None = None,
 ) -> bool:
     return request_internal_json(
         path,
@@ -118,6 +159,7 @@ def post_internal_json(
         subject=subject,
         logger=logger,
         urlopen=urlopen,
+        raise_for=raise_for,
     )
 
 

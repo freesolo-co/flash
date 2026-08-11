@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response
@@ -16,6 +17,23 @@ _PUBLISH_ASSOCIATION_FAILURE = (
     "environment package may already be uploaded, but its project association could not be "
     "recorded; retry the same publish to repair the association"
 )
+
+
+def _name_conflict_detail(slug: str) -> str:
+    """Explain a cross-project name collision and how to actually resolve it.
+
+    Deliberately says none of what the old shared message said: the association was not
+    "not recorded", it was refused; and a retry reproduces this identically, so advising one
+    sends the user in a loop. The backend reports the conflict without naming the owning
+    project, so this points at the place that does show it rather than guessing.
+    """
+    return (
+        f"environment name '{slug}' already belongs to a different project in this organization. "
+        "Environment names are unique per organization, not per project, so the same name cannot "
+        "be published under two projects and retrying will not change this. Publish under a "
+        "different name, or move the existing environment to this project from its environment "
+        "page in the Freesolo dashboard (which shows the project that currently owns it)."
+    )
 
 
 @router.post("/v1/envs")
@@ -41,6 +59,40 @@ def publish_env(
     # Use `if x is None` not `x or ""` so non-string falsy values reach publish_package's type checks.
     _pkg = payload.get("package_b64")
     _name = payload.get("name")
+    from flash.server.domain.environment_registry import (
+        EnvironmentProjectConflict,
+        raise_if_owned_by_another_project,
+        record_published_environment,
+    )
+
+    resolved_key = {**key, "org_id": key.get("org_id") or x_freesolo_org_id}
+    # Check ownership BEFORE uploading: publishing replaces the whole `<org-slug>/<name>` hub
+    # directory, so a colliding name would otherwise destroy the other project's package on its
+    # way to failing.
+    #
+    # Only when the destination slug is knowable up front. Deriving it needs the caller's own org
+    # namespace, which the org-agnostic internal key does not carry -- there, publish_package
+    # resolves the namespace itself and raises its own error. Reporting that error from here
+    # instead would change which failure a caller sees, so a slug we cannot derive simply skips
+    # the guard and the conflict is still caught at the association step below.
+    intended_slug = ""
+    org_for_conflict = str(resolved_key.get("org_id") or "").strip()
+    with suppress(envs.EnvPublishError):
+        namespace, clean_name = envs.publish_slug_for_name("" if _name is None else _name, key)
+        intended_slug = f"{namespace}/{clean_name}"
+    if intended_slug and org_for_conflict:
+        try:
+            raise_if_owned_by_another_project(
+                slug=intended_slug,
+                project_id=project_id,
+                key=key,
+                org_id=org_for_conflict,
+            )
+        except EnvironmentProjectConflict as exc:
+            raise HTTPException(
+                status_code=409, detail=_name_conflict_detail(intended_slug)
+            ) from exc
+
     try:
         slug = envs.publish_package(
             package_b64="" if _pkg is None else _pkg,
@@ -49,15 +101,19 @@ def publish_env(
         )
     except envs.EnvPublishError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
-    from flash.server.domain.environment_registry import record_published_environment
 
     try:
         recorded = record_published_environment(
             slug=slug,
             name="" if _name is None else _name,
-            key={**key, "org_id": key.get("org_id") or x_freesolo_org_id},
+            key=resolved_key,
             project_id=project_id,
         )
+    except EnvironmentProjectConflict as exc:
+        # Lost a race with a concurrent publish, or the pre-check could not run. Either way the
+        # cause is ownership, so it must not be reported as an unrecorded association.
+        logger.warning("environment %s belongs to another project: %s", slug, exc)
+        raise HTTPException(status_code=409, detail=_name_conflict_detail(slug)) from exc
     except Exception as exc:
         logger.warning(
             "record_published_environment failed after package upload: %s", exc, exc_info=True
