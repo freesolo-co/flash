@@ -126,6 +126,22 @@ def _durable_required_save_steps(required_steps: tuple[int, ...], resume_step: i
     return durable
 
 
+def _processed_resume_steps(required_steps: tuple[int, ...], resume_step: int) -> set[int]:
+    """steps a resumed watcher must not publish again, for seeding ``processed_steps``.
+
+    the staged resume checkpoint lands in local_dir as ``global_step_N`` with the tracker pointing
+    at it, so an unseeded watcher sees it as pending on its first sweep and re-runs the merger and
+    the multi-GB resume upload for state hf already holds. the resume artifact only exists because a
+    previous attempt published its deployable first (``before_upload``), so the step's deployable is
+    already on hf. a resume step that IS a required save is credited only when
+    ``_durable_required_save_steps`` finds its adapter on hf, leaving it to be staged otherwise.
+    """
+    processed = _durable_required_save_steps(required_steps, resume_step)
+    if resume_step and resume_step not in required_steps:
+        processed.add(resume_step)
+    return processed
+
+
 _CHILD_ENV_EXACT = frozenset(
     {
         "PATH",
@@ -584,9 +600,12 @@ def run_sft_train(spec=None) -> None:
             python_bin=child.python_bin,
         )
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-        if (
-            final_save_due(final_step, options.save_at_steps)
-            and final_step not in child.watcher.processed_steps
+        # only a step this session's watcher actually published may suppress the final publish.
+        # the seeded resume step is excluded: the prior attempt's deployable publish is best-effort
+        # (`required=False`) while its resume upload is not, so hf can hold the resumable state
+        # without the servable adapter. re-publishing is an idempotent upload to the same path.
+        if final_save_due(final_step, options.save_at_steps) and final_step not in (
+            child.watcher.processed_steps - {child.resume_step}
         ):
             _w.publish_deployable_checkpoint(adapter_dir, final_step)
         outputs = _SftOutputs(adapter_dir, train_wall, device_peak_gpu_gb)
