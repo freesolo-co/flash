@@ -195,7 +195,7 @@ jobs:
       # Pin the checkout to the base's source commit so the warmed flash code matches the base exactly
       # (the cache is content-keyed by the code that compiled it). Falls back to the event sha if the
       # base predates the revision label.
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.gate.outputs.run == 'true'
         with:
           ref: ${{ steps.base.outputs.revision || github.sha }}
