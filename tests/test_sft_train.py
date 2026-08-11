@@ -2225,12 +2225,16 @@ def test_an_explicit_xet_choice_is_not_overridden(monkeypatch):
 def test_an_adapter_is_freed_even_when_before_upload_never_ran(monkeypatch, tmp_path):
     """the export must not survive a path that skipped the publish callback entirely.
 
-    `upload_resume_checkpoint` can return WITHOUT running `before_upload`: it bails out early when
-    another upload holds the slot, and again when `skip_upload` says the step is already durable.
-    Retaining the adapter on that path looks protective, but nothing in the sft watcher ever reads
-    `export_root` again -- the step joins `processed_steps` and `_pending` filters it out forever --
-    so the directory would simply accumulate. This is the branch that fires on EVERY step once an
-    upload is slow enough to hold the slot, which is precisely the busy-disk case.
+    `upload_resume_checkpoint` can return WITHOUT running `before_upload`. Two of its early returns
+    are reachable from this caller: the slot is already held by another upload (returns False), and
+    HF_REPO is unset (returns True). Its third, `skip_upload`, is not -- the sft watcher never passes
+    that argument -- so it is deliberately not claimed here.
+
+    Retaining the adapter on either reachable path looks protective, but nothing in the sft watcher
+    ever reads `export_root` again -- the step joins `processed_steps` and `_pending` filters it out
+    forever -- so the directory would simply accumulate. The busy-slot branch is the one that fires
+    on EVERY step once an upload is slow enough to hold the slot, which is exactly the busy-disk case
+    this PR exists for, so that is the one simulated below.
     """
     import flash.engine.worker as worker
     from flash.engine.worker import sft_train
@@ -2300,56 +2304,6 @@ def test_importing_the_worker_package_does_not_freeze_the_xet_default(monkeypatc
         cwd=str(pathlib.Path(__file__).resolve().parent.parent),
     )
     assert result.returncode == 0, result.stderr
-
-
-def test_a_swallowed_optional_publish_failure_still_frees_the_adapter(monkeypatch, tmp_path):
-    """the repeated-transient-failure case must not accumulate one adapter per save.
-
-    `publish_deployable_checkpoint` raises for a REQUIRED step, but on an optional one it retries,
-    prints a warning, and returns None -- the failure is swallowed. Retaining the export on that
-    path would be pointless and actively harmful: no sweep, republish, or finalization in the sft
-    path walks `export_root`, so a run whose deployable uploads keep failing transiently would leave
-    a full adapter behind on every save and rebuild the exhaustion this class bounds.
-
-    A required step does not depend on the retained copy either, because `required=True` raises
-    instead of returning None, leaving through the exception path rather than continuing here.
-    """
-    import flash.engine.worker as worker
-    from flash.engine.worker import sft_train
-
-    local_dir = tmp_path / "checkpoints"
-    export_root = tmp_path / "exports"
-    checkpoint_dir = local_dir / "global_step_4"
-    (checkpoint_dir / "huggingface").mkdir(parents=True)
-
-    monkeypatch.setattr(
-        sft_train,
-        "_export_checkpoint_adapter",
-        lambda actor, adapter, **kwargs: os.makedirs(adapter, exist_ok=True),
-    )
-    # optional step, upload failed, error swallowed: returns None rather than raising.
-    monkeypatch.setattr(
-        worker, "publish_deployable_checkpoint", lambda adapter, step, **kwargs: None
-    )
-    monkeypatch.setattr(
-        worker,
-        "upload_resume_checkpoint",
-        lambda step, ckpt, **kwargs: (kwargs["before_upload"](), True)[1],
-    )
-
-    watcher = sft_train._VerlCheckpointWatcher(
-        local_dir=str(local_dir),
-        export_root=str(export_root),
-        python_bin="/verl/python",
-        model_id="org/model",
-        model_revision="commit",
-        required_steps=(),
-    )
-    watcher._publish(4, str(checkpoint_dir))
-
-    assert not os.path.exists(export_root / "step-4"), (
-        "a swallowed publish failure left a dead adapter on the container disk"
-    )
 
 
 def test_optimizer_state_is_not_counted_against_the_merge(tmp_path):
@@ -2443,13 +2397,20 @@ def test_the_adapter_is_moved_out_of_the_merge_tree_not_copied(monkeypatch, tmp_
 
 
 def test_repeated_swallowed_publish_failures_do_not_accumulate_adapters(monkeypatch, tmp_path):
-    """the accumulation itself, not just the single-step case.
+    """the swallowed-failure path, asserted as an accumulation rather than a single free.
 
-    The disk exhaustion this class exists to bound is a per-save leak, so the property that matters
-    is that N failed saves leave O(1) directories rather than N. A single-step assertion cannot
-    distinguish "freed" from "freed this once": a watcher that retained exports on some steps and
-    not others would still pass it. Publishing every step with a swallowed failure and then counting
-    what remains pins the shape of the leak directly.
+    `publish_deployable_checkpoint` raises for a REQUIRED step, but on an optional one it retries,
+    prints a warning, and returns None -- the failure is swallowed. Retaining the export on that
+    path would be pointless and actively harmful: no sweep, republish, or finalization in the sft
+    path walks `export_root`, so a run whose deployable uploads keep failing transiently would leave
+    a full adapter behind on every save and rebuild the exhaustion this class bounds. A required step
+    does not depend on the retained copy either -- `required=True` raises rather than returning None,
+    so it leaves through the exception path instead of continuing here.
+
+    Driven over several steps because the property that matters is that N failed saves leave O(1)
+    directories rather than N. A single-step assertion cannot distinguish "freed" from "freed this
+    once": I mutated the cleanup to skip exactly one step and a single-step version still passed,
+    while this one caught it.
     """
     import flash.engine.worker as worker
     from flash.engine.worker import sft_train
