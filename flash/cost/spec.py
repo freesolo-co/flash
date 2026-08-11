@@ -90,17 +90,28 @@ def _rollout_profile(spec):
 
 
 def _on_policy_example_count(spec) -> int:
-    """Prompts the run actually retains, which is the SMALLEST explicit cap, not the first one.
+    """Prompts this quote prices, preferring the cap flash actually enforces.
 
-    The two caps act at different points and do not override each other. ``[environment.params]
-    max_examples`` is passed to ``load_environment``, so it bounds what ``env.dataset()`` returns
-    at all; ``[train] max_examples`` only slices that result afterwards
-    (``flash/engine/worker/train/rl/inputs.py``). Preferring the train cap therefore reported 800
-    prompts for a config whose environment hands back 2, and ``train[:800]`` is a no-op on 2 rows.
+    Deliberately NOT ``min()`` of the two caps. ``[train] max_examples`` is a validated ``TrainSpec``
+    field the worker enforces unconditionally as ``train[:max_examples]``, so it is a real ceiling on
+    the retained pool. ``[environment.params] max_examples`` is not a flash contract at all: params
+    are opaque kwargs forwarded to the user's own environment factory, and neither flash nor the
+    freesolo sdk applies the name to a dataset. An environment free to ignore it can return every
+    row while the key says 2, and since a completed run is billed from this persisted quote, taking
+    the smaller value would underquote real training. The train cap can overquote when the
+    environment returns fewer rows, which is the safe direction.
+
+    Reading the env value when no train cap is set is pre-existing behavior (#465) and is left
+    alone; narrowing it needs a real enforced cap, which is pricing work outside this change.
+    ``thin_rl_batch_warning`` still inspects both, because warning on a thin authored value costs
+    nobody money.
     """
-    caps = [c for c in (int(spec.train.max_examples or 0), _env_max_examples(spec)) if c > 0]
-    if caps:
-        return min(caps)
+    pinned_examples = int(spec.train.max_examples) if spec.train.max_examples else 0
+    if pinned_examples > 0:
+        return pinned_examples
+    env_examples = _env_max_examples(spec)
+    if env_examples > 0:
+        return env_examples
     return _on_policy_requested_prompts_per_step(spec)
 
 
@@ -192,7 +203,16 @@ def thin_rl_batch_warning(spec) -> str | None:
     """
     if spec.algorithm not in ("grpo", "opd"):
         return None
-    examples = _on_policy_example_count(spec)
+    # the SMALLEST configured cap, which is deliberately not what `_on_policy_example_count` prices.
+    # that function must not read `[environment.params] max_examples` down over an enforced `[train]`
+    # cap, because params are opaque kwargs to the user's own environment and a run billed off the
+    # smaller number would underquote if the environment ignores the key. warning on it is the
+    # opposite trade: if the environment DOES honor it, the pool really is 2 and the user wants to
+    # know, and if it does not, they have read one accurate sentence about a knob they wrote.
+    examples = min(
+        [c for c in (int(spec.train.max_examples or 0), _env_max_examples(spec)) if c > 0],
+        default=_on_policy_requested_prompts_per_step(spec),
+    )
     prompts_per_step = _on_policy_prompts_per_step(spec, examples)
     if prompts_per_step >= RL_THIN_PROMPTS_PER_STEP:
         return None
@@ -306,15 +326,16 @@ def _thin_rl_batch_remedy(spec, *, raise_target: str, batch_binds: bool, pool_bi
             "does to this quote."
         )
     if pool_binds:
-        # with no authored batch the request is the recipe default, so prompts-per-step rises WITH
-        # the cap and the horizon does not move: at max_examples 2, 4, ... 64 the derived horizon
-        # stays at 1 update. claim no direction for the bill here -- the quote prices the recipe's
-        # full rollout width rather than the retained pool, so it reads $0.47 at every one of those
-        # caps, and `--cost` is the honest place to look rather than a promise in this sentence.
+        # the pool is the only thin knob, so prompts-per-step rises WITH the cap -- but only up to
+        # the requested batch, which is the recipe default when none was authored and the authored
+        # value otherwise. this branch is reachable with a HEALTHY batch_size (8 is not thin, so it
+        # is not named), and there the widening stops at that ceiling: batch 8 over caps 2, 4, 8,
+        # 16, 800 gives 1, 1, 1, 2, 100 updates. so promise the widening only "until it reaches
+        # your batch_size" rather than claiming the horizon never moves, and let `--cost` price it.
         return (
-            f"Raise {raise_target}: with no `batch_size` set, prompts-per-step follows the pool, so "
-            "this widens each update rather than adding updates. Re-run `--cost` to see what it "
-            "does to this quote."
+            f"Raise {raise_target}: prompts-per-step follows the pool until it reaches your "
+            "`batch_size`, so this widens each update rather than adding updates. Re-run `--cost` "
+            "to see what it does to this quote."
         )
     # the "buying steps" workflow is about lowering batch_size against a fixed pool. a thin POOL
     # does not buy steps, it just shortens the run, so that caveat would excuse the wrong config --

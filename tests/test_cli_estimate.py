@@ -649,27 +649,33 @@ def test_an_environment_param_cap_is_named_as_such(tmp_path, monkeypatch, capsys
 
 
 def test_the_smaller_of_two_configured_caps_is_the_one_that_binds(tmp_path, monkeypatch, capsys):
-    """A large `[train]` cap must not hide a small `[environment.params]` one.
+    """A large `[train]` cap must not hide a small `[environment.params]` one -- in the WARNING.
 
-    The caps act at different points and neither overrides the other: the environment param is
-    passed to `load_environment`, so it bounds what `env.dataset()` returns at all, and `[train]
-    max_examples` only slices that result afterwards. With `[train] = 800` over an environment
-    handing back 2 rows, `train[:800]` is a no-op and the run really does train on 2 prompts per
-    update. Reading the train cap first reported a pool of 800 and stayed silent on exactly the
-    config that needed the warning.
+    The warning takes the smallest configured cap, so a `[train] = 800` sitting over an
+    `[environment.params] = 2` still gets flagged and names the environment key, which is the one
+    that could be holding the pool down.
+
+    The QUOTE deliberately does not follow it there. `[environment.params]` is an opaque kwarg map
+    handed to the user's own environment factory, and neither flash nor the freesolo sdk applies
+    `max_examples` to a dataset, so an environment that ignores the key returns every row. Since a
+    completed run is billed from the persisted quote, pricing the smaller number would underquote
+    real training; `[train] max_examples` is the cap the worker actually enforces. Asserted here
+    together so the warning cannot be widened into the billed step count by accident.
     """
     monkeypatch.setenv("FLASH_STYLE", "0")
 
     rc = cmd_train(
         _grpo_cost_args(tmp_path, None, max_examples=800, env_params={"max_examples": 2})
     )
-    err = capsys.readouterr().err
+    out, err = capsys.readouterr()
 
     assert rc == 0
     assert "OPTIMIZER batch is 2 prompts per update" in err
-    # the environment cap is the one holding the pool down, so it is the one to raise
+    # the environment cap is the one that could be holding the pool down, so it is the one to raise
     assert "`[environment.params] max_examples`" in err
     assert "`[train] max_examples`" not in err
+    # ... but the quote still prices the enforced [train] cap: 800 prompts, not 2.
+    assert "[GRPO, 13 steps]" in out
 
 
 def test_every_cap_sitting_at_the_pool_is_named(tmp_path, monkeypatch, capsys):
@@ -739,6 +745,25 @@ def test_staggered_caps_are_both_named_so_one_edit_resolves_it(tmp_path, monkeyp
 
     assert rc == 0
     assert "`[train] max_examples` and `[environment.params] max_examples`" in err
+
+
+def test_a_healthy_batch_size_bounds_how_far_the_pool_can_widen(tmp_path, monkeypatch, capsys):
+    """`batch_size = 8` over `max_examples = 2`: the pool is thin but the authored batch is not.
+
+    Only thin knobs get named, so `batch_size` is absent from the remedy here -- but it is still
+    the ceiling prompts-per-step rises to. Saying the widening "does not add updates" is only true
+    below it: at batch 8 the caps 2, 4, 8, 16, 800 give 1, 1, 1, 2 and 100 updates (verified), so
+    the sentence has to stop the promise at the batch. It also must not claim no `batch_size` is
+    set, which is what this branch used to say on exactly this reachable config.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, 8, max_examples=2))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "follows the pool until it reaches your `batch_size`" in err
+    assert "with no `batch_size` set" not in err
 
 
 def test_a_cap_above_the_batch_is_not_described_as_holding_it_down(tmp_path, monkeypatch, capsys):
