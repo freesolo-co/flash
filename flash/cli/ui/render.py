@@ -871,6 +871,25 @@ def project_created(project_id: str, name: str) -> str:
     )
 
 
+def env_setup(paths: list[str], project_id: str) -> str:
+    """Confirmation + file tree for `flash env setup`."""
+    labels = {
+        "environment.py": "env entrypoint — edit the reward + prompt",
+        "dataset/train.jsonl": "starter training rows",
+        "configs/sft.toml": "SFT run config",
+        "configs/rl.toml": "GRPO run config",
+        "configs/opd.toml": "OPD (distillation) run config",
+        "TRAINING.md": "how to train well — read this first",
+    }
+    keyw = max(len(p) for p in paths)
+    tree = "\n".join(
+        f"  {_paint(p.ljust(keyw), _ACCENT2)}  {_dim(labels.get(p, ''))}" for p in paths
+    )
+    head = f"{header('env setup', 'starter Freesolo environment')}\n{ok('scaffold ready')}\n"
+    next_step = arrow(f"publish it: flash env push --project {project_id} --name my-env .")
+    return _safe(f"{head}\n{tree}\n\n{next_step}")
+
+
 def chat_label() -> str:
     """Speaker label printed above a styled chat reply."""
     return _paint("assistant", _ACCENT2, "1")
@@ -882,6 +901,21 @@ def log_section(name: str) -> str:
     keeps the plain ``----- name -----`` divider that scripts and tests match on."""
     rule = _paint(_glyph("─", "-") * 3, _FAINT)
     return _safe(f"{rule} {_paint(name, _ACCENT2, '1')} {rule}")
+
+
+def env_published(slug: str) -> str:
+    snippet = f'[environment]\nid = "{slug}"'
+    body = "\n".join(f"  {_paint(line, _ACCENT2)}" for line in snippet.splitlines())
+    return _safe(
+        f"{ok(f'published {_bold(slug)}')}\n\n{_dim('reference it in your config:')}\n{body}"
+    )
+
+
+def env_pulled(dest: str, detail: str = "") -> str:
+    line = ok(f"pulled {_bold(dest)}")
+    if detail:
+        line += f"\n{_dim(f'  {detail}')}"
+    return _safe(line)
 
 
 def help_page(
@@ -925,15 +959,9 @@ def help_page(
     return _safe(f"{banner}\n{_rule()}\n{usage_line}\n\n{body}\n\n{foot}\n")
 
 
-# Table layouts live in `flash.cli.ui.tables`, which imports the primitives above. Re-exported
-# here (at the bottom, so those primitives are defined first) because every call site and the
-# render monkeypatches in the CLI tests reach them as `render.<name>`.
-from flash.cli.ui.env_panels import (  # noqa: E402,F401
-    env_list,
-    env_published,
-    env_pulled,
-    env_setup,
-)
+# table layouts and the extracted env list renderer import the primitives above. re-export them
+# here so existing call sites and monkeypatches continue to resolve through `render.<name>`.
+from flash.cli.ui.env_panels import env_list as env_list  # noqa: E402
 from flash.cli.ui.tables import (  # noqa: E402,F401
     checkpoints_table,
     deployments_table,

@@ -1,7 +1,7 @@
 """`flash env install` (and its local manifest) was removed.
 
-Only setup/list/push remain under `flash env`. `flash env list` reports local environment sources
-alongside the org's published ids, and has no "installed" manifest section.
+Only setup/list/push remain under `flash env`. The list reports published environments and local
+sources, with no "installed" manifest section.
 """
 
 from __future__ import annotations
@@ -10,18 +10,13 @@ import argparse
 
 import pytest
 
-import flash.cli.commands.env.list as commands
+import flash.cli.commands.env.list as env_list_commands
 from flash.cli import _build_parser
 from flash.cli.commands.env.list import cmd_env_list
 
 
 def _no_published(monkeypatch):
-    """Pin the published half so these local-source cases can't reach the network.
-
-    Without this they read the ambient ``~/.flash/config.json``: on a logged-in machine they would
-    call the control plane, and the assertions below would depend on what that org has published.
-    """
-    monkeypatch.setattr(commands, "_published_envs", lambda: ([], None))
+    monkeypatch.setattr(env_list_commands, "_published_envs", lambda: ([], None))
 
 
 def test_env_install_subcommand_is_gone():

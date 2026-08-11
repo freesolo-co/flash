@@ -1,15 +1,4 @@
-"""Calls to the Freesolo backend: key verification, projects, traces, and eval runs.
-
-Split out of ``flash.client.http`` to keep that module under the file-size gate. These are the
-requests that go to the Freesolo API rather than to the Flash control plane -- a different host, a
-different auth header, and no ``ApiClient`` instance -- so they form a group with no dependency on
-the client class beside them.
-
-``http`` re-exports every public name, because the CLI modules import them from there and tests patch
-them on those CLI modules. The shared error types and url helpers are resolved from ``http`` at call
-time rather than imported here: they live beside ``ApiClient`` and importing them at module scope
-would be a cycle.
-"""
+"""Calls to the Freesolo backend extracted to keep ``http.py`` under 1000 lines."""
 
 from __future__ import annotations
 
@@ -47,10 +36,16 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
             resp.read()
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
+            # name the url that rejected it, not just the key: the same 401 is what a valid key
+            # gets when the request went to the wrong issuer (a stale saved api_url, a leftover
+            # localhost from a self-hosted experiment, an overridden freesolo_base_url). without
+            # the url the message accuses the one thing the user just copied correctly, and the
+            # actual cause -- which service answered -- is never shown.
             raise ClientError(
-                "freesolo rejected this API key — create or copy a valid key at "
-                "https://freesolo.co/sign-in and pass it with `flash login --api-key` "
-                "(or FREESOLO_API_KEY)"
+                f"{base} rejected this API key — check that this is the right service for the "
+                "key (a stale saved --api-url or FREESOLO_BASE_URL rejects a perfectly valid "
+                "key), then create or copy a valid key at https://freesolo.co/sign-in and pass "
+                "it with `flash login --api-key` (or FREESOLO_API_KEY)"
             ) from exc
         raise _api_error(exc) from exc
     except urllib.error.URLError as exc:
@@ -87,8 +82,8 @@ def _freesolo_request(
                 "(or set FREESOLO_API_KEY)"
             ) from exc
         raise _api_error(exc) from exc
-    # a socket timeout surfaces as a bare TimeoutError rather than a URLError, so without this
-    # it escapes as an unexpected exception. callers catch ClientError to report a failure
+    # a socket timeout surfaces as a bare timeouterror rather than a urlerror, so without this
+    # it escapes as an unexpected exception. callers catch clienterror to report a failure
     # without changing their own verdict; a traceback instead would lose that.
     except TimeoutError as exc:
         raise RequestTimeoutError(f"request to {base}{path} timed out after {timeout}s") from exc

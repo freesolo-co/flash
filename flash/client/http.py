@@ -7,7 +7,6 @@ import contextlib
 import http.client
 import json
 import os
-import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -17,7 +16,13 @@ from typing import Any
 
 from flash.client.config import load_credentials_with_source
 from flash.client.shapes import RequireSpec, matches_require
-from flash.client.streaming import ProgressCallback, _read_error_body
+from flash.client.streaming import (
+    ProgressCallback,
+    _capped_timeout,
+    _ProgressReader,
+    _read_capped_response,
+    _read_response_body,
+)
 from flash.core.spec import require_project_id
 from flash.serve.urls import is_freesolo_hosted_url
 
@@ -58,31 +63,17 @@ FREESOLO_TRACE_PROJECTS_PATH = "/api/traces/projects"
 FREESOLO_TRACES_EXPORT_PATH = "/api/traces/export"
 FREESOLO_EVAL_RUNS_PATH = "/api/evals/runs"
 
-# How long the control plane can legitimately spend answering GET /v1/envs before it gives up and
-# returns a controlled 429/502. Mirrors `flash.envs.loader._LIST_READ_BUDGET` applied to the two
-# sequential tree reads `list_managed_namespace_slugs` performs. Kept as arithmetic rather than a
-# magic number so a change on the server side is visible here as a changed term, and deliberately
-# NOT imported from the loader: `flash.client` must stay importable without the server extra.
-_ENV_LIST_GITHUB_READS = 2  # namespace lookup, then the recursive namespace subtree
-# NOT multiplied by the truncation-recovery fan-out, even though that path can issue more reads: the
-# server caps its whole listing at this same total (`namespace_listing._LISTING_DEADLINE_SECONDS`) and
-# each read draws from the remainder, so extra reads make the reads shorter rather than the request
-# longer. Widening this to cover the fan-out instead would mean a ~24 minute interactive wait, which
-# would defeat the bound below -- a fast upstream failure has to stay reportable.
-_ENV_LIST_ATTEMPTS_PER_READ = 2  # one initial attempt + `max_rate_limit_retries` (1)
-_ENV_LIST_SOCKET_TIMEOUT_SECONDS = 20.0  # `_LIST_READ_BUDGET["timeout"]`
-# an attempt can spend the socket timeout connecting AND the body deadline streaming the response;
-# counting only the former understates each attempt by half.
-_ENV_LIST_BODY_DEADLINE_SECONDS = 20.0  # `_LIST_READ_BUDGET["body_deadline"]`
-_ENV_LIST_MAX_BACKOFF_PER_READ_SECONDS = 45.0  # one sleep, capped at 45s
+# the server performs two github reads with one retry and one bounded backoff per read.
+_ENV_LIST_GITHUB_READS = 2
+_ENV_LIST_ATTEMPTS_PER_READ = 2
+_ENV_LIST_SOCKET_TIMEOUT_SECONDS = 20.0
+_ENV_LIST_MAX_BACKOFF_PER_READ_SECONDS = 45.0
 ENV_LIST_SERVER_BUDGET_SECONDS = _ENV_LIST_GITHUB_READS * (
-    _ENV_LIST_ATTEMPTS_PER_READ
-    * (_ENV_LIST_SOCKET_TIMEOUT_SECONDS + _ENV_LIST_BODY_DEADLINE_SECONDS)
+    _ENV_LIST_ATTEMPTS_PER_READ * _ENV_LIST_SOCKET_TIMEOUT_SECONDS
     + _ENV_LIST_MAX_BACKOFF_PER_READ_SECONDS
 )
-# a margin over the server's own ceiling: the client must lose the race to time out, so that a real
-# upstream failure arrives as the server's 429/502 rather than as a local disconnect.
 ENV_LIST_CLIENT_TIMEOUT_SECONDS = ENV_LIST_SERVER_BUDGET_SECONDS + 60.0
+ENV_LIST_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 
 
 def freesolo_base_url(override: str | None = None) -> str:
@@ -140,27 +131,8 @@ def _detail_from_http_error(exc: urllib.error.HTTPError) -> object:
 
     A structured detail stays a dict so the caller can read its ``code``; anything else is the
     string it always was. ``str()`` it for a message, but branch on the object itself.
-
-    The read itself can fail: a plane that returns a non-2xx status and then drops the connection
-    leaves a truncated body, and ``exc.read()`` raises. That must NOT propagate -- this runs inside
-    ``_translate_http_errors``'s ``except HTTPError`` handler, and Python does not offer an exception
-    raised inside one handler to that block's sibling clauses, so nothing downstream would translate
-    it and the caller would see a raw traceback. The status is the useful part of an error response
-    anyway, so a body we cannot read degrades to a note rather than losing the status with it.
-
-    The read is bounded in bytes and wall-clock for the same reason the server bounds its own error
-    bodies: a bare ``exc.read()`` is an unbounded read, so a plane (or a proxy in front of it) that
-    drip-feeds a non-2xx body keeps this handler alive while the CLI is trying to REPORT that very
-    failure -- turning a controlled 429/502 into a hang, or into an arbitrarily large allocation. Only
-    the first few hundred characters are ever shown, so a cap costs nothing that is used.
     """
-    try:
-        body = _read_error_body(exc)
-    except (OSError, http.client.HTTPException):
-        # OSError covers ConnectionError and the TLS teardowns; HTTPException covers the framing
-        # faults, which are not OSErrors. A bare OSError clause is safe HERE, unlike in the
-        # translation block below: the only thing being read is the server's own error body.
-        return f"{exc} (the error body was truncated before it could be read)"
+    body = exc.read()
     try:
         detail = json.loads(body).get("detail") or body.decode()
     except (ValueError, AttributeError):
@@ -188,49 +160,78 @@ def _unexpected_response(api_url: str, path: str, problem: str) -> ClientError:
     )
 
 
-from flash.client.chat_targets import (  # noqa: E402
-    _CHAT_STEP_SELECTOR_CAPABILITY,
-    _parse_adapter_target,
-    _parse_chat_target,
-    _prepare_chat_request,
-)
+# re-export the extracted freesolo helpers from their established import location.
+from flash.client.freesolo_api import _freesolo_get as _freesolo_get  # noqa: E402
+from flash.client.freesolo_api import _freesolo_request as _freesolo_request  # noqa: E402
+from flash.client.freesolo_api import create_project as create_project  # noqa: E402
+from flash.client.freesolo_api import export_trace_records as export_trace_records  # noqa: E402
+from flash.client.freesolo_api import get_project as get_project  # noqa: E402
+from flash.client.freesolo_api import list_projects as list_projects  # noqa: E402
+from flash.client.freesolo_api import list_trace_projects as list_trace_projects  # noqa: E402
+from flash.client.freesolo_api import upload_eval_run as upload_eval_run  # noqa: E402
+from flash.client.freesolo_api import verify_freesolo_key as verify_freesolo_key  # noqa: E402
 
-# re-exported, not merely imported: the CLI modules import these names from `http`, and tests patch
-# them on those CLI modules. Imported here at the bottom because that module imports the error types
-# and url helpers defined ABOVE from this one, so the names have to exist before it loads.
-from flash.client.freesolo_api import (  # noqa: E402
-    _freesolo_get as _freesolo_get,
-)
-from flash.client.freesolo_api import (  # noqa: E402
-    _freesolo_request as _freesolo_request,
-)
-from flash.client.freesolo_api import (  # noqa: E402
-    create_project as create_project,
-)
-from flash.client.freesolo_api import (  # noqa: E402
-    export_trace_records as export_trace_records,
-)
-from flash.client.freesolo_api import (  # noqa: E402
-    get_project as get_project,
-)
-from flash.client.freesolo_api import (  # noqa: E402
-    list_projects as list_projects,
-)
-from flash.client.freesolo_api import (  # noqa: E402
-    list_trace_projects as list_trace_projects,
-)
-from flash.client.freesolo_api import (  # noqa: E402
-    upload_eval_run as upload_eval_run,
-)
-from flash.client.freesolo_api import (  # noqa: E402
-    verify_freesolo_key as verify_freesolo_key,
-)
-from flash.client.streaming import (  # noqa: E402
-    _capped_timeout,
-    _ProgressReader,
-    _read_capped_response,
-    _read_response_body,
-)
+_CHAT_STEP_SELECTOR_CAPABILITY = "chat_step_selector_v1"
+
+
+def _validate_chat_messages(messages: list[dict]) -> None:
+    if not isinstance(messages, list):
+        raise ClientError("chat messages must be a list")
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise ClientError(f"chat messages[{index}] must be an object")
+
+
+def _parse_chat_target(target: str) -> tuple[str, str | None, int | None]:
+    from flash.schema import parse_adapter_revision, parse_checkpoint_ref
+
+    revision = parse_adapter_revision(target)
+    if revision is not None:
+        return revision[0], target.strip(), None
+    parsed = parse_checkpoint_ref(target)
+    if parsed is None:
+        raise ClientError(
+            "invalid run id: expected a bare RUN_ID, RUN_ID/step-N, or a full immutable adapter "
+            "revision"
+        )
+    run_id, step = parsed
+    return run_id, None, step
+
+
+def _prepare_chat_request(
+    target: str,
+    messages: list[dict],
+    temperature: float,
+    max_tokens: int,
+    *,
+    stream: bool = False,
+) -> tuple[str, dict[str, Any]]:
+    base_run_id, adapter_revision, step = _parse_chat_target(target)
+    _validate_chat_messages(messages)
+    body: dict[str, Any] = {
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if stream:
+        body["stream"] = True
+    if adapter_revision is not None:
+        body["adapter_revision"] = adapter_revision
+    elif step is not None:
+        body["step"] = step
+    return base_run_id, body
+
+
+def _parse_adapter_target(target: str) -> tuple[str, int | None]:
+    from flash.schema import parse_checkpoint_ref
+
+    parsed = parse_checkpoint_ref(target)
+    if parsed is None:
+        raise ClientError(
+            "invalid adapter id: expected RUN_ID for the final adapter or RUN_ID/step-N "
+            "for a saved checkpoint"
+        )
+    return parsed
 
 
 class ApiClient:
@@ -267,12 +268,7 @@ class ApiClient:
 
     @contextlib.contextmanager
     def _translate_http_errors(self) -> Iterator[None]:
-        """Map transport errors to ApiError/ClientError; other exceptions propagate.
-
-        Covers the whole request, not just the connect: ``resp.read()`` runs inside this block, so a
-        connection dropped mid-response is a transport failure too and must surface as ClientError
-        like the rest. Decoding the body is ``_decode_response``'s job, not this block's.
-        """
+        """Map urllib transport errors to ApiError/ClientError; other exceptions propagate."""
         try:
             yield
         except urllib.error.HTTPError as exc:
@@ -291,28 +287,6 @@ class ApiClient:
         except TimeoutError as exc:
             raise RequestTimeoutError(
                 f"request to the Flash service at {self.api_url} timed out; "
-                "check your network connection and FLASH_API_URL"
-            ) from exc
-        # a response that breaks mid-flight does NOT arrive as URLError, and no single base covers the
-        # shapes it takes: `RemoteDisconnected` and `ConnectionResetError` are ConnectionError, a TLS
-        # teardown is `ssl.SSLEOFError` -- an OSError that is not a ConnectionError and is not wrapped
-        # in URLError on the read path -- and every framing fault is an `http.client.HTTPException`.
-        # Without all three named, a broken response escaped as a raw traceback instead of the clean
-        # ClientError every caller here is written to expect.
-        #
-        # HTTPException rather than only its `IncompleteRead` member: `BadStatusLine` (a garbled
-        # status line from a proxy) and `LineTooLong` (an overlong chunk-size line) are siblings of
-        # IncompleteRead, not subclasses, so naming just that one left them escaping. The whole
-        # subtree is HTTP protocol failures, and its only OSError member is RemoteDisconnected, which
-        # is already a ConnectionError -- so widening here cannot swallow a caller's file or disk
-        # fault the way a bare OSError clause would.
-        #
-        # ssl.SSLError rather than its OSError parent, for that same reason: OSError here would also
-        # swallow faults from the caller's own file handles, which are bugs to surface, not transport
-        # failures to retitle.
-        except (ConnectionError, ssl.SSLError, http.client.HTTPException) as exc:
-            raise ClientError(
-                f"connection to the Flash service at {self.api_url} was interrupted ({exc}); "
                 "check your network connection and FLASH_API_URL"
             ) from exc
 
@@ -395,11 +369,6 @@ class ApiClient:
             data=data,
             headers=headers,
         )
-        # the deadline starts BEFORE the open, not at the first body read: DNS, the TCP connect, the
-        # TLS handshake and header parsing all happen inside `urlopen`, and urllib restarts its socket
-        # window on every receive -- so a peer that drip-feeds headers holds this open indefinitely
-        # without any single operation exceeding `timeout`. Bounding only the body would leave the
-        # whole setup phase unbounded, which is the same defect the hub reads already fixed.
         deadline = time.monotonic() + body_deadline if body_deadline is not None else None
         with (
             self._translate_http_errors(),
@@ -489,34 +458,18 @@ class ApiClient:
         return self._request("POST", "/v1/envs", body=body, timeout=1800.0, progress=progress)
 
     def list_envs(self) -> list[str]:
-        """Return the published environment ids the authenticated org owns.
-
-        The timeout has to outlast the server's WHOLE retry window, not just its backoff: the plane
-        makes two sequential GitHub tree reads, each running ``_urlopen``'s full loop of socket
-        timeouts AND backoff sleeps. Any client timeout below that total replaces the controlled
-        429/502 with a generic "timed out", which is the failure mode this change exists to remove.
-
-        The list path bounds those reads (``loader._LIST_READ_BUDGET``) precisely so this stays a
-        sane wait: on the batch default the ceiling would be ~30 minutes, which no interactive
-        caller would sit through, so a fast upstream failure could never actually be reported.
-
-        Sized off ``ENV_LIST_SERVER_BUDGET_SECONDS`` rather than a literal so the two cannot drift:
-        a change to the server's attempt count, socket timeout, or backoff moves this with it.
-
-        The body is read under that same ceiling, which ``timeout`` alone would not deliver -- see
-        ``_read_response_body``. Without it the caller waits forever for a list it was promised in
-        bounded time, which is this change's whole point: the command has local sources to print.
-        """
+        """Return the published environment ids owned by the authenticated organization."""
         payload = self._request(
             "GET",
             "/v1/envs",
             timeout=ENV_LIST_CLIENT_TIMEOUT_SECONDS,
+            max_bytes=ENV_LIST_MAX_RESPONSE_BYTES,
             body_deadline=ENV_LIST_CLIENT_TIMEOUT_SECONDS,
         )
         rows = payload.get("environments") if isinstance(payload, dict) else None
         if not isinstance(rows, list):
             raise ClientError("control plane returned a malformed environment list")
-        ids = []
+        ids: list[str] = []
         for row in rows:
             env_id = row.get("id") if isinstance(row, dict) else None
             if not isinstance(env_id, str) or not env_id.strip():
@@ -827,16 +780,11 @@ class ApiClient:
                         raise exc
                     yield from decoded
                 yield from decoder.decode(b"", final=True)
-            except (http.client.HTTPException, ConnectionError, ssl.SSLError) as exc:
+            except (http.client.IncompleteRead, ConnectionError) as exc:
                 # the server aborts the chunked response when the serving backend fails
                 # mid-generation; urllib reports the missing terminating chunk (or reset) here.
                 # translate it so the caller raises instead of treating the truncated text as a
-                # finished answer. ssl.SSLError covers the same abort arriving as a TLS teardown,
-                # which is an OSError but not a ConnectionError, and HTTPException covers every
-                # framing shape rather than IncompleteRead alone -- `LineTooLong` on an overlong
-                # chunk-size line is a sibling of it, not a subclass. The stakes are higher here than
-                # on the other read paths, because an untranslated cut would surface as a partial
-                # answer that looks complete.
+                # finished answer.
                 raise ClientError(
                     "chat stream ended unexpectedly before completion; the serving backend "
                     "likely failed mid-generation, so any partial output is truncated"

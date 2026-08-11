@@ -47,14 +47,14 @@ def _published_envs() -> tuple[list[str], str | None]:
     _, api_key = load_credentials()
     if not api_key:
         return [], f"not logged in - run `{CLI_NAME} login` to list published environments"
-    # deliberately NOT gated on `has_freesolo_backend(api_url)`. Unlike the other callers of that
-    # helper, this request goes to the control PLANE, and the plane is what owns the hub: it derives
-    # the namespace from the authenticated key and reads GitHub with its own server-side
-    # GITHUB_TOKEN. A self-hosted plane configured with both is a perfectly valid list target, but
-    # its api-url is not under freesolo.co and its FREESOLO_BASE_URL lives in the SERVER's
+    # deliberately not gated on `has_freesolo_backend(api_url)`. unlike the other callers of that
+    # helper, this request goes to the control plane, and the plane is what owns the hub: it derives
+    # the namespace from the authenticated key and reads github with its own server-side
+    # github_token. a self-hosted plane configured with both is a perfectly valid list target, but
+    # its api-url is not under freesolo.co and its freesolo_base_url lives in the server's
     # environment, so a client-side check sees neither signal and answers "no hub" for a plane that
-    # has one. The plane already reports the real answer -- 403 for an org-agnostic internal key,
-    # 503 when GITHUB_TOKEN is unset -- and those reasons are more accurate than anything decidable
+    # has one. the plane already reports the real answer -- 403 for an org-agnostic internal key,
+    # 503 when github_token is unset -- and those reasons are more accurate than anything decidable
     # here, so ask and report what comes back.
     from flash.client import client_from_config
 

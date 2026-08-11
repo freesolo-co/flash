@@ -11,12 +11,10 @@ from __future__ import annotations
 import contextlib
 import gzip
 import hashlib
-import http.client
 import json
 import os
 import re
 import shutil
-import ssl
 import stat
 import sys
 import tempfile
@@ -24,6 +22,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
@@ -102,40 +102,182 @@ _MAX_CONTENTS_JSON_BYTES = 16 * 1024 * 1024
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = ARCHIVE_MEMBER_LIMIT
 _MAX_ARCHIVE_SCAN_MEMBERS = ARCHIVE_SCAN_MEMBER_LIMIT
-_DATASET_SPLIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+_GITHUB_SAFE_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 class GitHubRateLimitError(RuntimeError):
-    """Persistent transient GitHub failure; worker stamps retriable=True for rescheduling.
-
-    Raised for three distinct causes that are all worth retrying: a real rate limit, a persistent
-    5xx, and a network failure. ``throttled`` says which -- True only for an actual rate limit --
-    so a caller mapping this onto an HTTP status can answer 429 for throttling and 502 for an
-    upstream outage instead of blaming the caller for GitHub being down. The retry semantics every
-    existing handler relies on are unchanged.
-    """
-
-    def __init__(self, *args, throttled: bool = False):
-        super().__init__(*args)
-        self.throttled = throttled
+    """Persistent GitHub rate-limit; worker handler stamps retriable=True for rescheduling."""
 
 
-# Reference parsing and safety checks live in `flash.envs.refs` (pure syntax, no I/O); they are
-# re-exported here because `flash.envs.loader` -- and `flash.envs.adapter` through it -- is the
-# import site every caller already uses.
-from flash.envs.refs import (  # noqa: E402,F401
-    GitHubEnvironmentRef,
-    _is_safe_github_path_parts,
-    _normalize_env_path,
-    _parse_github_environment_ref,
-    _parse_managed_environment_slug,
-    canonical_managed_environment_slug,
-    is_commit_sha,
-    is_freesolo_environment_id,
-    is_github_environment_ref,
-    is_managed_environment_slug,
-    managed_slug_to_github_ref,
-)
+@dataclass(frozen=True)
+class GitHubEnvironmentRef:
+    owner: str
+    repo: str
+    ref: str
+    path: str
+
+    @property
+    def repo_full_name(self) -> str:
+        return f"{self.owner}/{self.repo}"
+
+    def canonical(self) -> str:
+        return f"github:{self.repo_full_name}@{self.ref}:{self.path}"
+
+
+def is_github_environment_ref(value: str) -> bool:
+    return _parse_github_environment_ref(value) is not None
+
+
+def is_managed_environment_slug(value: str) -> bool:
+    return _parse_managed_environment_slug(value) is not None
+
+
+def is_freesolo_environment_id(value: str) -> bool:
+    return is_managed_environment_slug(value) or is_github_environment_ref(value)
+
+
+def managed_slug_to_github_ref(value: str) -> str:
+    parsed = _parse_managed_environment_slug(value)
+    if parsed is None:
+        raise ValueError(f"not a Freesolo environment slug: {value!r}")
+    namespace, name = parsed
+    return (
+        f"github:{_DEFAULT_MANAGED_ENV_REPO}@{_DEFAULT_GITHUB_REF}:"
+        f"{namespace}/{name}/{_DEFAULT_ENVIRONMENT_PATH}"
+    )
+
+
+def canonical_managed_environment_slug(value: str) -> str | None:
+    if _parse_managed_environment_slug(value) is not None:
+        return value
+
+    parsed = _parse_github_environment_ref(value)
+    if parsed is None:
+        if _targets_managed_environment_repo(value):
+            raise ValueError(_managed_environment_ref_error())
+        return None
+    if parsed.repo_full_name.lower() != _DEFAULT_MANAGED_ENV_REPO.lower():
+        return None
+
+    parts = parsed.path.split("/")
+    if (
+        parsed.ref != _DEFAULT_GITHUB_REF
+        or len(parts) != 3
+        or parts[2] != _DEFAULT_ENVIRONMENT_PATH
+        or not _is_safe_github_path_parts(tuple(parts[:2]))
+    ):
+        raise ValueError(_managed_environment_ref_error())
+    return "/".join(parts[:2])
+
+
+def _targets_managed_environment_repo(value: str) -> bool:
+    text = (value or "").strip()
+    if not text.startswith("github:"):
+        return False
+    repo_ref = text[len("github:") :].partition(":")[0]
+    repo = repo_ref.partition("@")[0]
+    return repo.lower() == _DEFAULT_MANAGED_ENV_REPO.lower()
+
+
+def _managed_environment_ref_error() -> str:
+    return (
+        "managed environment GitHub reference must be "
+        f"github:{_DEFAULT_MANAGED_ENV_REPO}@{_DEFAULT_GITHUB_REF}:"
+        f"<namespace>/<name>/{_DEFAULT_ENVIRONMENT_PATH}"
+    )
+
+
+def _parse_managed_environment_slug(value: str) -> tuple[str, str] | None:
+    text = (value or "").strip()
+    if not text or ":" in text:
+        return None
+    parsed = urllib.parse.urlparse(text)
+    if parsed.scheme or parsed.netloc:
+        return None
+    parts = text.split("/")
+    if len(parts) != 2 or not _is_safe_github_path_parts(tuple(parts)):
+        return None
+    return parts[0], parts[1]
+
+
+def _parse_github_environment_ref(value: str) -> GitHubEnvironmentRef | None:
+    text = (value or "").strip()
+    if not text:
+        return None
+    if text.startswith("github:"):
+        body = text[len("github:") :]
+        repo_ref, sep, path = body.partition(":")
+        try:
+            path = _normalize_env_path(path)
+        except ValueError:
+            return None
+        if not sep:
+            path = _DEFAULT_ENVIRONMENT_PATH
+        repo_part, at, ref = repo_ref.partition("@")
+        if not at:
+            ref = _DEFAULT_GITHUB_REF
+        if not ref:
+            return None
+        if not _is_safe_github_path_parts((ref,)):
+            return None
+        owner_repo = repo_part.split("/")
+        if len(owner_repo) == 2 and _is_safe_github_path_parts(owner_repo):
+            return GitHubEnvironmentRef(owner_repo[0], owner_repo[1], ref, path)
+        return None
+
+    parsed = urllib.parse.urlparse(text)
+    if parsed.scheme not in {"http", "https"} or parsed.netloc.lower() != "github.com":
+        return None
+    parts = [urllib.parse.unquote(p) for p in parsed.path.strip("/").split("/") if p]
+    if len(parts) < 2:
+        return None
+    owner, repo = parts[0], parts[1]
+    repo = repo[:-4] if repo.endswith(".git") else repo
+    if not _is_safe_github_path_parts((owner, repo)):
+        return None
+    if len(parts) >= 5 and parts[2] in {"blob", "tree"}:
+        ref = parts[3]
+        if not _is_safe_github_path_parts((ref,)):
+            return None
+        raw_path = "/".join(parts[4:])
+        try:
+            path = _normalize_env_path(raw_path)
+        except ValueError:
+            return None
+        if parts[2] == "tree" and raw_path and not path.endswith(".py"):
+            path = f"{path.rstrip('/')}/{_DEFAULT_ENVIRONMENT_PATH}"
+    elif len(parts) == 2:
+        ref = _DEFAULT_GITHUB_REF
+        path = _DEFAULT_ENVIRONMENT_PATH
+    else:
+        return None
+    return GitHubEnvironmentRef(owner, repo, ref, path)
+
+
+def _normalize_env_path(path: str | None) -> str:
+    if not path:
+        return _DEFAULT_ENVIRONMENT_PATH
+    raw = path.strip()
+    if not raw:
+        return _DEFAULT_ENVIRONMENT_PATH
+    raw = raw.replace("\\", "/")
+    if raw.startswith("/"):
+        raise ValueError(f"unsafe environment path: {path!r}")
+    parts = [part for part in raw.split("/") if part]
+    if not parts:
+        return _DEFAULT_ENVIRONMENT_PATH
+    if any(part == ".." or part == "." for part in parts):
+        raise ValueError(f"unsafe environment path: {path!r}")
+    return "/".join(parts)
+
+
+def _is_safe_github_path_parts(parts: list[str] | tuple[str, ...]) -> bool:
+    if not parts:
+        return False
+    if any(part in {".", "..", ""} for part in parts):
+        return False
+    return all(_GITHUB_SAFE_PART_RE.fullmatch(part) for part in parts)
 
 
 def _github_token() -> str | None:
@@ -147,6 +289,11 @@ def _github_token() -> str | None:
     loads fine with no token at all would fail with one that is merely blank.
     """
     return (os.environ.get("GITHUB_TOKEN") or "").strip() or None
+
+
+def is_commit_sha(value: str) -> bool:
+    """True when value is a full 40-hex-char git commit id (an immutable ref)."""
+    return _COMMIT_SHA_RE.fullmatch(value) is not None
 
 
 def _resolve_ref_sha(
@@ -178,70 +325,22 @@ def _resolve_ref_sha(
     return sha
 
 
-from flash.envs.bounded_reads import (  # noqa: E402
-    _iter_capped_chunks,
-    _read_error_body,
-)
-
-# re-exported, not merely imported: `loader` is the import site every caller and test already uses,
-# so these have to keep resolving as `loader.<name>`.
-from flash.envs.github_urls import (  # noqa: E402
-    _github_contents_url,
-    _github_response_message,
-    _github_tree_url,
-    _managed_hub_package_root,
-    _safe_contents_path,
-)
-
-# imported at the BOTTOM of the module's import block for the same reason as the two above: this one
-# calls back into `loader` for every GitHub helper it uses, so it must not be imported before the
-# names it reaches for exist. It resolves them lazily (inside each function), so the cycle is fine.
-from flash.envs.namespace_listing import (  # noqa: E402
-    list_managed_namespace_slugs as list_managed_namespace_slugs,
-)
-
-
-def _classify_github_http_error(
-    exc: urllib.error.HTTPError,
-    body_deadline: float | None,
-    attempt: int,
-    max_rate_limit_retries: int,
-) -> bool:
-    """Whether this non-2xx should be retried; raises the classified failure when it should not.
-
-    Returns ``True`` for a transient status with retries left. Otherwise it raises rather than
-    returning, so the decision and the terminal exception cannot drift apart: a rate limit and a 5xx
-    become ``GitHubRateLimitError`` (the retriable signal a caller maps to 429/502), and anything else
-    a plain ``RuntimeError``. ``throttled`` separates real throttling from an upstream outage.
-    """
-    # urllib can raise an HTTPError with fp=None; exc.read() is an AttributeError there. the read can
-    # also truncate: GitHub can return a 429/5xx and then drop the connection. that must not propagate
-    # -- the caller is inside its own `except HTTPError` handler, and Python does not offer an
-    # exception raised there to that block's sibling clause, so a truncated error body would escape
-    # unretried as an uncaught 500 instead of the classified 429/502. the status and headers still
-    # classify the failure, so an unreadable body just goes empty.
-    try:
-        body = _read_error_body(exc, body_deadline)
-    except (OSError, http.client.HTTPException):
-        # OSError covers ConnectionError and the TLS teardowns; HTTPException covers the framing
-        # faults, which are not OSErrors. A bare OSError clause is safe HERE, unlike in `_urlopen`'s
-        # transient clause: this reads GitHub's error body, never the caller's sink.
-        body = ""
-    remaining = (exc.headers.get("X-RateLimit-Remaining") if exc.headers else None) or ""
-    is_rate_limit = exc.code == 429 or (
-        exc.code == 403 and (remaining.strip() == "0" or "rate limit" in body.lower())
-    )
-    if (is_rate_limit or exc.code >= 500) and attempt < max_rate_limit_retries:
-        return True
-    if is_rate_limit:
-        raise GitHubRateLimitError(
-            f"GitHub API rate limit exceeded ({exc.code}): {body[:300]}", throttled=True
-        ) from exc
-    if exc.code >= 500:
-        raise GitHubRateLimitError(
-            f"GitHub server error ({exc.code}, transient) after {attempt} retries: {body[:300]}"
-        ) from exc
-    raise RuntimeError(f"GitHub environment request failed ({exc.code}): {body[:500]}") from exc
+def _iter_capped_chunks(resp: object, max_bytes: int) -> Iterator[bytes]:
+    # per-attempt accounting is also per-download accounting: _urlopen rewinds and truncates the
+    # sink before every attempt, so the bytes this generator caps are exactly the bytes that
+    # survive on disk. a retried download can never leave more than max_bytes behind.
+    total = 0
+    while True:
+        chunk = resp.read(_DOWNLOAD_CHUNK_BYTES)
+        if not chunk:
+            break
+        if total + len(chunk) > max_bytes:
+            raise RuntimeError(
+                f"GitHub response body exceeded the maximum allowed size ({max_bytes} bytes); "
+                "download aborted"
+            )
+        total += len(chunk)
+        yield chunk
 
 
 def _urlopen(
@@ -251,21 +350,12 @@ def _urlopen(
     max_rate_limit_retries: int = 5,
     max_bytes: int | None = None,
     out: BinaryIO | None = None,
-    body_deadline: float | None = None,
 ) -> bytes:
     """Fetch bytes for a GitHub request with jittered retry on rate limits.
 
     ``out`` must be seekable: a failure part-way through the body is retried from scratch, and the
     sink is rewound and truncated first so a partial prefix can never be concatenated with the
     retry's full body.
-
-    ``body_deadline`` bounds the wall-clock of one whole attempt -- the open AND the body read, not
-    just the body its name suggests. ``timeout`` alone cannot: urllib applies it per blocking socket
-    operation, so both a many-chunk body and a drip-fed set of response headers get a fresh window
-    each time, and a peer that stays inside every window holds one attempt open indefinitely. Pass it
-    when the caller advertises an overall budget (an interactive request whose client will give up);
-    leave it unset for background downloads, where finishing a large transfer matters more than a
-    deadline.
     """
     import random
 
@@ -277,16 +367,13 @@ def _urlopen(
             min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)),
         )
 
-    def drain(resp, deadline: float | None) -> bytes:
+    def drain(resp) -> bytes:
         """Consume the response, honouring the byte cap and the caller's sink.
 
         Returns ``b""`` whenever ``out`` is given: the bytes went to the file, and also returning
         them would hold the whole download in memory, which is the thing streaming to ``out`` avoids.
-
-        ``deadline`` is passed in rather than computed here: it has to start before ``urlopen``, or
-        DNS, the connect, and header parsing all fall outside the bound this function advertises.
         """
-        chunks = _iter_capped_chunks(resp, max_bytes, deadline) if max_bytes is not None else None
+        chunks = _iter_capped_chunks(resp, max_bytes) if max_bytes is not None else None
         if out is None:
             return b"".join(chunks) if chunks is not None else resp.read()
         if chunks is not None:
@@ -301,70 +388,36 @@ def _urlopen(
 
     attempt = 0
     while True:
-        # started before the attempt, not inside `drain`: DNS, the connect, the TLS handshake and
-        # header parsing all happen inside `urlopen`, and a peer that makes progress inside every
-        # socket window can hold it there indefinitely. a deadline that only began once headers had
-        # arrived left that whole stretch unbounded, so the caller could still time out locally
-        # while this attempt was nominally within budget.
-        deadline = time.monotonic() + body_deadline if body_deadline is not None else None
         try:
             if out is not None:
                 out.seek(sink_start)
                 out.truncate()
-            # `timeout` is capped by what is left of the deadline, so the open phase cannot be given a
-            # longer socket window than the attempt's whole remaining budget. That is necessary but
-            # not sufficient: urllib restarts the window on EVERY blocking socket read, so a peer that
-            # drip-feeds headers -- each read landing inside the window -- still walks past the
-            # deadline without any single read exceeding it. Hence the explicit check below.
-            open_timeout = (
-                timeout if deadline is None else min(timeout, max(0.0, deadline - time.monotonic()))
-            )
-            with urllib.request.urlopen(req, timeout=open_timeout) as resp:
-                # checked here rather than left to `drain`: a slow open consumes the same budget the
-                # body does, and `_iter_capped_chunks` only looks at the deadline once it is already
-                # draining -- which a `max_bytes`-less caller never reaches at all. Without this, an
-                # attempt whose headers alone outlived the budget proceeded as though it were fresh,
-                # and the client hit its own fixed timeout instead of receiving the controlled
-                # 429/502 the budget exists to produce.
-                if deadline is not None and time.monotonic() > deadline:
-                    raise TimeoutError(
-                        "GitHub response headers exceeded the attempt's overall deadline"
-                    )
-                return drain(resp, deadline)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return drain(resp)
         except urllib.error.HTTPError as exc:
-            # the classification and the terminal exception both live in the helper: splitting them
-            # would let a caller retry on one rule and raise by another. It returns True only when
-            # this attempt should be retried, and otherwise raises the classified failure itself --
-            # so a bare `raise` here would surface the raw HTTPError instead, which is exactly the
-            # uncaught-500 shape the classification exists to prevent.
-            if _classify_github_http_error(exc, body_deadline, attempt, max_rate_limit_retries):
+            # urllib can raise an HTTPError with fp=None; exc.read() is an AttributeError there.
+            body = exc.read().decode("utf-8", "replace") if exc.fp is not None else ""
+            remaining = (exc.headers.get("X-RateLimit-Remaining") if exc.headers else None) or ""
+            is_rate_limit = exc.code == 429 or (
+                exc.code == 403 and (remaining.strip() == "0" or "rate limit" in body.lower())
+            )
+            is_transient = is_rate_limit or exc.code >= 500
+            if is_transient and attempt < max_rate_limit_retries:
                 time.sleep(backoff_delay(attempt))
                 attempt += 1
                 continue
-        # two families escape the obvious clauses, and both do so while a SUCCESSFUL response is
-        # being read, which is why the HTTPError branch above does not see them either:
-        #   - every framing fault is an `http.client.HTTPException`: not a URLError, TimeoutError,
-        #     ConnectionError, or even an OSError. `IncompleteRead` (a body cut short) is the
-        #     familiar one, but `BadStatusLine` (a garbled status line from a proxy) and
-        #     `LineTooLong` (an overlong chunk-size line) are its SIBLINGS, not its subclasses, so
-        #     naming only IncompleteRead left those escaping.
-        #   - a TLS teardown mid-body raises ssl.SSLEOFError, which IS an OSError but is NOT a
-        #     ConnectionError.
-        # Being no RuntimeError, any of them escaped every caller's translation as an uncaught 500
-        # rather than the intended retry and controlled 502.
-        #
-        # HTTPException is safe to name whole where a bare OSError is not: its only OSError member is
-        # RemoteDisconnected, already covered by ConnectionError, so it cannot reach a disk fault.
-        # ssl.SSLError is named rather than its OSError parent for exactly that reason -- `drain`
-        # writes to the caller's `out` sink, so a bare OSError clause here would also swallow a
-        # disk-full or closed-file write and retry it five times as though it were a network fault.
-        except (
-            urllib.error.URLError,
-            TimeoutError,
-            ConnectionError,
-            ssl.SSLError,
-            http.client.HTTPException,
-        ) as exc:
+            if is_rate_limit:
+                raise GitHubRateLimitError(
+                    f"GitHub API rate limit exceeded ({exc.code}): {body[:300]}"
+                ) from exc
+            if exc.code >= 500:
+                raise GitHubRateLimitError(
+                    f"GitHub server error ({exc.code}, transient) after {attempt} retries: {body[:300]}"
+                ) from exc
+            raise RuntimeError(
+                f"GitHub environment request failed ({exc.code}): {body[:500]}"
+            ) from exc
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
             if attempt < max_rate_limit_retries:
                 time.sleep(backoff_delay(attempt))
                 attempt += 1
@@ -398,12 +451,52 @@ def _download_github_tarball(ref: GitHubEnvironmentRef) -> Path:
     return tar_path
 
 
+def _managed_hub_package_root(ref: GitHubEnvironmentRef) -> str:
+    if ref.repo_full_name.lower() != _DEFAULT_MANAGED_ENV_REPO.lower():
+        return ""
+    parts = [part for part in ref.path.split("/") if part]
+    if len(parts) < 2 or not _is_safe_github_path_parts(tuple(parts[:2])):
+        return ""
+    return "/".join(parts[:2])
+
+
+def _github_contents_url(ref: GitHubEnvironmentRef, path: str) -> str:
+    quoted_path = "/".join(urllib.parse.quote(part, safe="") for part in path.split("/") if part)
+    return (
+        f"https://api.github.com/repos/{ref.repo_full_name}/contents/{quoted_path}"
+        f"?ref={urllib.parse.quote(ref.ref, safe='')}"
+    )
+
+
+def _github_tree_url(ref: GitHubEnvironmentRef, treeish: str, *, recursive: bool = False) -> str:
+    url = (
+        f"https://api.github.com/repos/{ref.repo_full_name}/git/trees/"
+        f"{urllib.parse.quote(treeish, safe='')}"
+    )
+    if recursive:
+        url = f"{url}?recursive=1"
+    return url
+
+
 def _github_headers(accept: str) -> dict[str, str]:
     headers = {"Accept": accept, "User-Agent": "freesolo-flash"}
     token = _github_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return headers
+
+
+def _safe_contents_path(path: object, root_parts: list[str]) -> str:
+    if not isinstance(path, str):
+        raise RuntimeError("GitHub contents response did not include a path")
+    try:
+        normalized = _normalize_env_path(path)
+    except ValueError as exc:
+        raise RuntimeError(f"unsafe path in environment contents: {path!r}") from exc
+    parts = normalized.split("/")
+    if parts[: len(root_parts)] != root_parts:
+        raise RuntimeError(f"unexpected path in environment contents: {path!r}")
+    return normalized
 
 
 def _download_github_json(
@@ -413,61 +506,29 @@ def _download_github_json(
     *,
     timeout: float = 120.0,
     max_rate_limit_retries: int = 5,
-    body_deadline: float | None = None,
 ) -> object:
+    request_options = {"timeout": timeout, "max_bytes": _MAX_CONTENTS_JSON_BYTES}
+    if max_rate_limit_retries != 5:
+        request_options["max_rate_limit_retries"] = max_rate_limit_retries
     data = _urlopen(
         urllib.request.Request(url, headers=_github_headers("application/vnd.github+json")),
-        timeout=timeout,
-        max_bytes=_MAX_CONTENTS_JSON_BYTES,
-        max_rate_limit_retries=max_rate_limit_retries,
-        body_deadline=body_deadline,
+        **request_options,
     )
     try:
         return json.loads(data)
-    # an undecodable body raises UnicodeDecodeError, which is NOT a JSONDecodeError but a SIBLING of
-    # it under ValueError, so naming only JSONDecodeError let it escape to the caller -- and, being
-    # no RuntimeError, past the domain layer's mapping as an uncaught 500 instead of a 502. both are
-    # the same user state: the bytes GitHub returned are not a payload we can read.
-    except ValueError as exc:
+    except json.JSONDecodeError as exc:
         raise RuntimeError(
             "GitHub environment request failed for "
             f"{ref.repo_full_name}@{ref.ref}:{context}: invalid response"
         ) from exc
 
 
-def _github_tree_entries_allowing_truncation(
-    ref: GitHubEnvironmentRef,
-    treeish: str,
-    context: str,
-    *,
-    recursive: bool = False,
-    timeout: float = 120.0,
-    max_rate_limit_retries: int = 5,
-    body_deadline: float | None = None,
-) -> tuple[list[dict], bool]:
-    """The entries plus GitHub's own ``truncated`` flag, for callers that can still answer.
-
-    Separate from ``_github_tree_entries`` so that treating a truncated tree as usable is an explicit
-    choice at the call site. Every caller that needs the WHOLE tree must keep raising: a short tree
-    silently drops environments, which is the silent-empty failure this endpoint exists to remove.
-    """
-    payload = _download_github_json(
-        ref,
-        _github_tree_url(ref, treeish, recursive=recursive),
-        context,
-        timeout=timeout,
-        max_rate_limit_retries=max_rate_limit_retries,
-        body_deadline=body_deadline,
-    )
-    if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
-        raise RuntimeError(
-            f"GitHub path {context!r} is not an environment directory"
-            f"{_github_response_message(payload)}"
-        )
-    entries = payload["tree"]
-    if not all(isinstance(entry, dict) for entry in entries):
-        raise RuntimeError("GitHub tree response included an invalid entry")
-    return entries, bool(payload.get("truncated"))
+def _github_response_message(payload: object) -> str:
+    if isinstance(payload, dict):
+        message = payload.get("message")
+        if isinstance(message, str) and message:
+            return f" ({message})"
+    return ""
 
 
 def _github_tree_entries(
@@ -478,21 +539,26 @@ def _github_tree_entries(
     recursive: bool = False,
     timeout: float = 120.0,
     max_rate_limit_retries: int = 5,
-    body_deadline: float | None = None,
 ) -> list[dict]:
-    entries, truncated = _github_tree_entries_allowing_truncation(
+    payload = _download_github_json(
         ref,
-        treeish,
+        _github_tree_url(ref, treeish, recursive=recursive),
         context,
-        recursive=recursive,
         timeout=timeout,
         max_rate_limit_retries=max_rate_limit_retries,
-        body_deadline=body_deadline,
     )
-    if truncated:
+    if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
+        raise RuntimeError(
+            f"GitHub path {context!r} is not an environment directory"
+            f"{_github_response_message(payload)}"
+        )
+    if payload.get("truncated"):
         raise RuntimeError(
             f"GitHub tree response for environment directory {context!r} was truncated"
         )
+    entries = payload["tree"]
+    if not all(isinstance(entry, dict) for entry in entries):
+        raise RuntimeError("GitHub tree response included an invalid entry")
     return entries
 
 
@@ -516,21 +582,6 @@ def _resolve_github_directory_tree_sha(ref: GitHubEnvironmentRef, repo_dir: str)
             raise RuntimeError(f"GitHub path {repo_dir!r} is not an environment directory")
         treeish = match["sha"]
     return treeish
-
-
-# An interactive list must fail fast enough that its 429/502 reaches the caller. Two reads at
-# (1 + 1 attempts) x 20s + one <=45s backoff each is ~2 minutes worst case, versus ~30 minutes on the
-# batch default. `flash.client.http.ENV_LIST_CLIENT_TIMEOUT_SECONDS` is sized to outlast this.
-#
-# `body_deadline` is what makes `timeout` an actual per-attempt bound. A recursive namespace tree can
-# be megabytes, read in up to 16 capped chunks, and urllib restarts `timeout` on every blocking read
-# -- so a peer that returns one chunk just inside each window would keep a single attempt alive far
-# past 20s and blow the ceiling the client is sized against.
-_LIST_READ_BUDGET = {
-    "timeout": 20.0,
-    "max_rate_limit_retries": 1,
-    "body_deadline": 20.0,
-}
 
 
 def _download_github_directory(ref: GitHubEnvironmentRef, repo_dir: str, dest: Path) -> Path:
@@ -938,3 +989,8 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
         contract_text=contract_text,
         package_root=base_dir,
     )
+
+
+from flash.envs.namespace_listing import (  # noqa: E402
+    list_managed_namespace_slugs as list_managed_namespace_slugs,
+)

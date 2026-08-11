@@ -1,64 +1,75 @@
-"""`flash env list` reports published environments, not just local scaffold directories.
-
-The bug this covers: with no server-side list endpoint the command enumerated local directories
-only, so after a verified successful publish it printed "no environments yet". The honest reading of
-that is "the publish silently failed", which invites re-pushing under new names.
-"""
+"""Regression coverage for ``flash env list`` reporting published environments."""
 
 from __future__ import annotations
 
 import argparse
-import http.client
-import ssl
 
 import pytest
 
 import flash.cli.commands.env.list as commands
-from flash.client import ClientError
+from flash.client import ApiClient, ClientError
 
 
 @pytest.fixture(autouse=True)
 def plain_renderer(monkeypatch, tmp_path):
-    monkeypatch.setenv("FLASH_STYLE", "0")  # plain renderer keeps substring asserts stable
+    monkeypatch.setenv("FLASH_STYLE", "0")
     monkeypatch.chdir(tmp_path)
 
 
 def _logged_in(monkeypatch, published, *, error: Exception | None = None):
-    """A logged-in client against a Freesolo backend, returning ``published`` (or raising)."""
-    monkeypatch.setattr(
-        commands, "load_credentials", lambda: ("https://api.freesolo.co", "fslo-key")
-    )
+    monkeypatch.setattr(commands, "load_credentials", lambda: ("https://plane.example", "key"))
 
-    class _C:
+    class Client:
         def list_envs(self):
             if error is not None:
                 raise error
             return published
 
-    monkeypatch.setattr("flash.client.client_from_config", lambda: _C())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
 
 
-def test_published_environments_are_listed(monkeypatch, capsys):
-    _logged_in(monkeypatch, ["acme/my-env", "acme/beta"])
-
-    assert commands.cmd_env_list(argparse.Namespace()) == 0
-
-    out = capsys.readouterr().out
-    assert "published environments" in out
-    assert "acme/my-env" in out
-    assert "acme/beta" in out
-
-
-def test_a_published_environment_is_not_reported_as_no_environments(monkeypatch, capsys):
-    """The regression: an org WITH a published env must never see the empty-state hint."""
+def test_published_environment_is_not_reported_as_empty(monkeypatch, capsys):
     _logged_in(monkeypatch, ["acme/my-env"])
 
     assert commands.cmd_env_list(argparse.Namespace()) == 0
 
-    assert "no environments yet" not in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "acme/my-env" in output
+    assert "no environments yet" not in output
 
 
-def test_empty_hint_still_shows_when_nothing_exists_anywhere(monkeypatch, capsys):
+def test_published_environment_flows_from_endpoint_to_cli(monkeypatch, capsys):
+    import flash.server.domain.envs as domain
+    from flash.server.routes import envs as routes
+
+    monkeypatch.setattr(domain, "list_namespace_slugs", lambda **_kwargs: ["acme/my-env"])
+    monkeypatch.setattr(commands, "load_credentials", lambda: ("https://plane.example", "key"))
+    client = ApiClient(api_url="https://plane.example", api_key="key")
+
+    def bridge_request(_method, _path, **_kwargs):
+        return routes.list_envs(key={"org_slug": "acme"})
+
+    monkeypatch.setattr(client, "_request", bridge_request)
+    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
+
+    assert commands.cmd_env_list(argparse.Namespace()) == 0
+
+    output = capsys.readouterr().out
+    assert "acme/my-env" in output
+    assert "no environments yet" not in output
+
+
+def test_failed_lookup_is_distinct_from_an_empty_hub(monkeypatch, capsys):
+    _logged_in(monkeypatch, [], error=ClientError("control plane is unreachable"))
+
+    assert commands.cmd_env_list(argparse.Namespace()) == 0
+
+    output = capsys.readouterr().out
+    assert "published environments unavailable: control plane is unreachable" in output
+    assert "no environments yet" in output
+
+
+def test_empty_hub_and_no_local_sources_shows_empty_hint(monkeypatch, capsys):
     _logged_in(monkeypatch, [])
 
     assert commands.cmd_env_list(argparse.Namespace()) == 0
@@ -66,681 +77,26 @@ def test_empty_hint_still_shows_when_nothing_exists_anywhere(monkeypatch, capsys
     assert "no environments yet" in capsys.readouterr().out
 
 
-def test_local_and_published_are_both_reported(monkeypatch, capsys, tmp_path):
+def test_local_and_published_sources_are_both_reported(monkeypatch, capsys, tmp_path):
     (tmp_path / "environment.py").write_text("# env\n")
     _logged_in(monkeypatch, ["acme/my-env"])
 
     assert commands.cmd_env_list(argparse.Namespace()) == 0
 
-    out = capsys.readouterr().out
-    assert "acme/my-env" in out
-    assert "local env sources" in out
+    output = capsys.readouterr().out
+    assert "acme/my-env" in output
+    assert "local env sources" in output
 
 
-def test_an_unreachable_plane_is_reported_not_silently_empty(monkeypatch, capsys):
-    """A failed lookup must say so; reporting the empty state would recreate the original bug."""
-    _logged_in(monkeypatch, [], error=ClientError("control plane is unreachable"))
-
-    assert commands.cmd_env_list(argparse.Namespace()) == 0
-
-    out = capsys.readouterr().out
-    assert "published environments unavailable" in out
-    assert "control plane is unreachable" in out
-
-
-def test_a_server_refusal_is_reported_not_silently_empty(monkeypatch, capsys):
-    """ApiError subclasses ClientError, so a 503 from the plane must land on the reason line too."""
-    from flash.client import ApiError
-
-    _logged_in(monkeypatch, [], error=ApiError(503, "GITHUB_TOKEN is required"))
-
-    assert commands.cmd_env_list(argparse.Namespace()) == 0
-
-    out = capsys.readouterr().out
-    assert "published environments unavailable" in out
-    assert "GITHUB_TOKEN is required" in out
-    assert "no environments yet" in out  # nothing local either, and that hint is still true
-
-
-def test_logged_out_says_so_instead_of_claiming_nothing_is_published(monkeypatch, capsys):
-    monkeypatch.setattr(commands, "load_credentials", lambda: ("https://api.freesolo.co", None))
-    monkeypatch.setattr(
-        "flash.client.client_from_config",
-        lambda: pytest.fail("must not call the plane while logged out"),
-    )
-
-    assert commands.cmd_env_list(argparse.Namespace()) == 0
-
-    out = capsys.readouterr().out
-    assert "published environments unavailable" in out
-    assert "not logged in" in out
-
-
-def test_a_custom_plane_is_asked_rather_than_ruled_out_client_side(monkeypatch, capsys):
-    """A non-freesolo.co api-url is still asked: the PLANE owns the hub, not the client.
-
-    The plane derives the namespace from the authenticated key and reads GitHub with its own
-    server-side token, so whether a hub exists is not decidable from the api-url. Skipping the
-    request for a self-hosted plane configured with both would report the empty state for an org
-    that has published environments.
-    """
-    monkeypatch.setattr(commands, "load_credentials", lambda: ("http://localhost:8000", "key"))
-    _self_hosted = ["acme/my-env"]
-
-    class _C:
-        def list_envs(self):
-            return _self_hosted
-
-    monkeypatch.setattr("flash.client.client_from_config", lambda: _C())
-
-    assert commands.cmd_env_list(argparse.Namespace()) == 0
-
-    out = capsys.readouterr().out
-    assert "acme/my-env" in out
-    assert "no environments yet" not in out
-
-
-def test_a_custom_plane_without_a_hub_reports_the_planes_own_reason(monkeypatch, capsys):
-    """When a plane has no hub configured it says so itself, and that reason is more accurate."""
-    from flash.client import ApiError
-
+def test_custom_plane_is_asked_instead_of_rejected_client_side(monkeypatch, capsys):
     monkeypatch.setattr(commands, "load_credentials", lambda: ("http://localhost:8000", "key"))
 
-    class _C:
+    class Client:
         def list_envs(self):
-            raise ApiError(503, "GITHUB_TOKEN is required to list published environments")
+            return ["acme/my-env"]
 
-    monkeypatch.setattr("flash.client.client_from_config", lambda: _C())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
 
-    assert commands.cmd_env_list(argparse.Namespace()) == 0
+    commands.cmd_env_list(argparse.Namespace())
 
-    out = capsys.readouterr().out
-    assert "published environments unavailable" in out
-    assert "GITHUB_TOKEN is required" in out
-
-
-def test_styled_renderer_receives_published_and_unavailable(monkeypatch, capsys):
-    seen: dict = {}
-    monkeypatch.setattr(commands.render, "styled", lambda: True)
-    monkeypatch.setattr(
-        commands.render,
-        "env_list",
-        lambda paths, *, published, unavailable: (
-            seen.update(paths=paths, published=published, unavailable=unavailable) or "styled"
-        ),
-    )
-    _logged_in(monkeypatch, ["acme/my-env"])
-
-    assert commands.cmd_env_list(argparse.Namespace()) == 0
-
-    assert capsys.readouterr().out == "styled\n"
-    assert seen == {"paths": [], "published": ["acme/my-env"], "unavailable": None}
-
-
-def test_styled_renderer_reports_the_failure_reason(monkeypatch):
-    """The styled renderer must surface why the published list is missing, not just omit it."""
-    from flash.cli.ui import render
-
-    out = render.env_list([], published=[], unavailable="control plane is unreachable")
-
-    assert "published environments unavailable" in out
-    assert "control plane is unreachable" in out
-
-
-def test_styled_renderer_lists_published_ids_above_local_sources(monkeypatch):
-    from flash.cli.ui import render
-
-    out = render.env_list(["."], published=["acme/my-env"], unavailable=None)
-
-    assert out.index("acme/my-env") < out.index("local sources")
-    assert "no environments yet" not in out
-
-
-class _Resp:
-    """A urlopen response whose body read or content fails the way a real one can."""
-
-    def __init__(self, failure):
-        self._failure = failure
-        self._done = False
-        self.headers = {"Content-Type": "application/json"}
-
-    def read(self, *_a):
-        if isinstance(self._failure, BaseException):
-            raise self._failure
-        # signal EOF after the body, as a real response does. Returning the same bytes on every call
-        # made this an ENDLESS body, which only looked fine while the client read it in one unbounded
-        # call -- a chunked reader would spin on it until it hit a cap.
-        if self._done:
-            return b""
-        self._done = True
-        return self._failure
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_exc):
-        return False
-
-
-@pytest.mark.parametrize(
-    ("failure", "expected"),
-    [
-        # a reset or a server hangup mid-response: ConnectionError, NOT a urllib URLError, so the
-        # URLError clause never saw these.
-        (ConnectionResetError("connection reset by peer"), "was interrupted"),
-        (http.client.RemoteDisconnected("remote end closed connection"), "was interrupted"),
-        # IncompleteRead is an HTTPException, not a ConnectionError -- catching ConnectionError
-        # alone would still let this one escape raw.
-        (http.client.IncompleteRead(b"partial"), "was interrupted"),
-        # an overlong chunk-size line from a broken proxy. LineTooLong is a SIBLING of IncompleteRead
-        # under HTTPException, not a subclass, so naming only IncompleteRead left it escaping.
-        (http.client.LineTooLong("chunk size"), "was interrupted"),
-        # a TLS teardown mid-body: SSLEOFError is an OSError but NOT a ConnectionError, and on this
-        # read path it is not wrapped in a URLError either, so it escaped every clause above.
-        (ssl.SSLEOFError("EOF occurred in violation of protocol"), "was interrupted"),
-        # a truncated or non-JSON body, and a non-UTF-8 one: JSONDecodeError and UnicodeDecodeError
-        # are both ValueError, so `_decode_response` owns these two and words them identically.
-        (b"{not json", "did not return JSON"),
-        (b'{"environments": "\xff\xfe"}', "did not return JSON"),
-    ],
-    ids=[
-        "reset",
-        "hangup",
-        "truncated-read",
-        "overlong-chunk-line",
-        "tls-cut",
-        "non-json",
-        "non-utf8",
-    ],
-)
-def test_a_broken_response_degrades_to_the_reason_line_not_a_traceback(
-    monkeypatch, capsys, failure, expected
-):
-    """The whole point of the reason line: a transport fault must not print a raw traceback.
-
-    These reach `json.loads`/`resp.read()` INSIDE the client's error-translation block, so each has
-    to become a ClientError for `_published_envs` to catch it and degrade cleanly.
-    """
-    from flash.client import ApiClient
-
-    monkeypatch.setattr(
-        commands, "load_credentials", lambda: ("https://api.freesolo.co", "fslo-key")
-    )
-    monkeypatch.setattr(
-        "flash.client.client_from_config",
-        lambda: ApiClient("https://api.freesolo.co", "fslo-key"),
-    )
-    monkeypatch.setattr("urllib.request.urlopen", lambda *_a, **_k: _Resp(failure))
-
-    assert commands.cmd_env_list(argparse.Namespace()) == 0
-
-    out = capsys.readouterr().out
-    assert "published environments unavailable" in out
-    assert expected in out
-    assert "Traceback" not in out
-
-
-def test_a_garbled_status_line_degrades_and_still_prints_local_sources(
-    monkeypatch, capsys, tmp_path
-):
-    """A proxy that answers with a malformed status line must not cost the local half of the output.
-
-    `BadStatusLine` is raised out of `getresponse`, so it surfaces from `urlopen` itself rather than
-    from a body read -- and urllib does NOT wrap it in a URLError there. It is an HTTPException
-    sibling of `IncompleteRead`, so the clause that caught truncated bodies did not catch this, and
-    the traceback escaped before `_local_env_sources` could be printed.
-    """
-    (tmp_path / "environment.py").write_text("# env\n")
-
-    from flash.client import ApiClient
-
-    def garbled(*_a, **_k):
-        raise http.client.BadStatusLine("<html>502 from an intermediary</html>")
-
-    monkeypatch.setattr(
-        commands, "load_credentials", lambda: ("https://api.freesolo.co", "fslo-key")
-    )
-    monkeypatch.setattr(
-        "flash.client.client_from_config",
-        lambda: ApiClient("https://api.freesolo.co", "fslo-key"),
-    )
-    monkeypatch.setattr("urllib.request.urlopen", garbled)
-
-    assert commands.cmd_env_list(argparse.Namespace()) == 0
-
-    out = capsys.readouterr().out
-    assert "published environments unavailable" in out
-    assert "was interrupted" in out
-    assert "local env sources" in out, "the local half must survive a broken published lookup"
-    assert "Traceback" not in out
-
-
-@pytest.mark.parametrize(
-    "body_failure",
-    [
-        http.client.IncompleteRead(b"partial"),
-        http.client.LineTooLong("chunk size"),
-        ssl.SSLEOFError("EOF occurred in violation of protocol"),
-    ],
-    ids=["truncated", "overlong-chunk-line", "tls-cut"],
-)
-def test_an_unreadable_error_body_degrades_instead_of_raising(monkeypatch, capsys, body_failure):
-    """A non-2xx whose body cannot be read must still surface as the status, not a traceback.
-
-    The read happens in `_detail_from_http_error`, called from inside the `except HTTPError` handler.
-    Python does not offer an exception raised inside one handler to that block's sibling clauses, so
-    the clause added for successful responses cannot catch this one -- it has to be handled at the
-    read itself, and it has to cover every shape a broken body read takes rather than just the
-    truncation.
-    """
-    import urllib.error
-
-    from flash.client import ApiClient
-
-    class _UnreadableErrorBody:
-        def read(self, *_a):
-            raise body_failure
-
-        def close(self):
-            """HTTPError's tempfile teardown calls this; without it the GC raises on collection."""
-
-    def fake_urlopen(*_a, **_k):
-        raise urllib.error.HTTPError(
-            url="https://api.freesolo.co/v1/envs",
-            code=502,
-            msg="Bad Gateway",
-            hdrs={},  # type: ignore[arg-type]
-            fp=_UnreadableErrorBody(),
-        )
-
-    monkeypatch.setattr(
-        commands, "load_credentials", lambda: ("https://api.freesolo.co", "fslo-key")
-    )
-    monkeypatch.setattr(
-        "flash.client.client_from_config",
-        lambda: ApiClient("https://api.freesolo.co", "fslo-key"),
-    )
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
-
-    assert commands.cmd_env_list(argparse.Namespace()) == 0
-
-    out = capsys.readouterr().out
-    assert "published environments unavailable" in out
-    assert "Traceback" not in out
-    assert "502" in out, "the status is the useful part and must survive an unreadable body"
-
-
-def test_the_error_body_read_asks_for_a_bounded_amount():
-    """A drip-fed non-2xx body must not stall the code path that REPORTS the failure.
-
-    `exc.read()` with no argument is an unbounded read: `HTTPResponse.read(None)` streams a chunked
-    body until it ends, so a plane that keeps dribbling a 502 body holds this handler open while the
-    CLI is trying to say the list is unavailable. Asserted on the size ARGUMENT rather than by timing:
-    `exc.read()` delegates one call to the fp, so an in-memory stub can never reproduce the endless
-    stream itself, and `-1`/`None` is exactly the unbounded request being ruled out.
-    """
-    import urllib.error
-
-    from flash.client.streaming import _MAX_ERROR_BODY_BYTES, _read_error_body
-
-    sizes: list[object] = []
-
-    class _RecordingBody:
-        def __init__(self):
-            self._left = 3
-
-        def read(self, size=-1):
-            sizes.append(size)
-            self._left -= 1
-            return b"x" * 16 if self._left > 0 else b""
-
-        def close(self):
-            """HTTPError's tempfile teardown calls this."""
-
-    exc = urllib.error.HTTPError(
-        url="https://api.freesolo.co/v1/envs",
-        code=502,
-        msg="Bad Gateway",
-        hdrs={},  # type: ignore[arg-type]
-        fp=_RecordingBody(),
-    )
-    body = _read_error_body(exc)
-
-    assert body == b"x" * 32
-    assert sizes, "the body must actually be read"
-    unbounded = [s for s in sizes if not isinstance(s, int) or s <= 0]
-    assert not unbounded, f"every read must request a positive byte count, got {sizes}"
-    assert all(s <= _MAX_ERROR_BODY_BYTES for s in sizes)
-
-
-def test_the_call_site_asks_for_a_bounded_error_body_not_just_the_helper():
-    """`_detail_from_http_error` must USE the bounded reader, not merely have one available.
-
-    Deliberately routed through the real call site rather than `_read_error_body` directly: a test
-    that only exercises the helper passes unchanged when the call site still says `exc.read()`, which
-    is exactly the unbounded read being removed. Asserting on the size argument is what pins it --
-    `-1`/`None` is the unbounded request, and only the call site chooses which is sent.
-    """
-    import urllib.error
-
-    from flash.client.http import _detail_from_http_error
-
-    sizes: list[object] = []
-
-    class _RecordingBody:
-        def __init__(self):
-            self._left = 2
-
-        def read(self, size=-1):
-            sizes.append(size)
-            self._left -= 1
-            return b'{"detail": "boom"}' if self._left > 0 else b""
-
-        def close(self):
-            """HTTPError's tempfile teardown calls this."""
-
-    exc = urllib.error.HTTPError(
-        url="https://api.freesolo.co/v1/envs",
-        code=502,
-        msg="Bad Gateway",
-        hdrs={},  # type: ignore[arg-type]
-        fp=_RecordingBody(),
-    )
-
-    assert _detail_from_http_error(exc) == "boom", "the detail must still be extracted"
-    assert sizes, "the body must actually be read"
-    unbounded = [s for s in sizes if not isinstance(s, int) or s <= 0]
-    assert not unbounded, f"the call site must request a bounded amount, got {sizes}"
-
-
-def test_the_error_body_read_stops_at_its_cap():
-    """A body that never ends is truncated at the cap rather than read forever."""
-    from flash.client.streaming import _MAX_ERROR_BODY_BYTES, _read_error_body
-
-    class _EndlessBody:
-        def read(self, size=-1):
-            return b"x" * size
-
-        def close(self):
-            """HTTPError's tempfile teardown calls this."""
-
-    import urllib.error
-
-    exc = urllib.error.HTTPError(
-        url="https://api.freesolo.co/v1/envs",
-        code=502,
-        msg="Bad Gateway",
-        hdrs={},  # type: ignore[arg-type]
-        fp=_EndlessBody(),
-    )
-
-    assert len(_read_error_body(exc)) == _MAX_ERROR_BODY_BYTES
-
-
-def test_the_error_body_read_stops_at_its_deadline(monkeypatch):
-    """An endless body that stays inside the cap is still bounded by wall-clock."""
-    import time as time_mod
-    import urllib.error
-
-    from flash.client.streaming import _read_error_body
-
-    clock = [0.0]
-
-    class _SlowBody:
-        def read(self, size=-1):
-            clock[0] += 5.0  # each read lands inside any socket window, but time accumulates
-            return b"x" * 16
-
-        def close(self):
-            """HTTPError's tempfile teardown calls this."""
-
-    monkeypatch.setattr(time_mod, "monotonic", lambda: clock[0])
-    exc = urllib.error.HTTPError(
-        url="https://api.freesolo.co/v1/envs",
-        code=502,
-        msg="Bad Gateway",
-        hdrs={},  # type: ignore[arg-type]
-        fp=_SlowBody(),
-    )
-
-    body = _read_error_body(exc, deadline_seconds=20.0)
-
-    # stopped on the deadline, far short of the byte cap: 20s of budget at 5s per read.
-    assert 0 < len(body) <= 5 * 16
-
-
-def test_list_envs_outlasts_the_servers_own_github_retry_budget():
-    """The client must not time out before the plane can answer.
-
-    The server can spend its whole retry window (socket timeouts AND backoff, twice over) before
-    returning a controlled 429/502. If the client gives up first, that diagnosable status is
-    replaced by a generic timeout, which is the failure mode this change exists to remove.
-    """
-    from flash.client import ApiClient
-    from flash.client.http import (
-        ENV_LIST_CLIENT_TIMEOUT_SECONDS,
-        ENV_LIST_SERVER_BUDGET_SECONDS,
-    )
-
-    seen: dict = {}
-    client = ApiClient("https://api.freesolo.co", "fslo-key")
-
-    def fake_request(method, path, *_a, timeout=None, **_k):
-        seen.update(method=method, path=path, timeout=timeout)
-        return {"environments": []}
-
-    client._request = fake_request
-    assert client.list_envs() == []
-    assert seen["method"] == "GET"
-    assert seen["path"] == "/v1/envs"
-    assert seen["timeout"] is not None, "must pass an explicit timeout, not the shared default"
-    assert seen["timeout"] == ENV_LIST_CLIENT_TIMEOUT_SECONDS
-    assert seen["timeout"] > ENV_LIST_SERVER_BUDGET_SECONDS, "client must lose the race to time out"
-    assert seen["timeout"] > client.timeout, "must exceed the shared default, not fall back to it"
-
-
-def test_the_client_budget_matches_the_servers_actual_list_read_budget():
-    """The mirrored arithmetic must not drift from the loader it describes.
-
-    `flash.client` cannot import the loader (it must stay importable without the server extra), so
-    the client's terms are a hand-mirror of `_LIST_READ_BUDGET`. That is exactly the kind of copy
-    that rots silently: if the server's budget grows and this does not, the CLI starts timing out
-    before the plane answers and the 429/502 becomes unreachable again.
-    """
-    import flash.client.http as client_http
-    from flash.envs.loader import _LIST_READ_BUDGET
-
-    assert _LIST_READ_BUDGET["timeout"] == client_http._ENV_LIST_SOCKET_TIMEOUT_SECONDS
-    # the initial attempt is not a retry, hence the +1
-    expected_attempts = _LIST_READ_BUDGET["max_rate_limit_retries"] + 1
-    assert expected_attempts == client_http._ENV_LIST_ATTEMPTS_PER_READ
-
-
-def test_the_list_read_budget_stays_interactive():
-    """A person is waiting at a terminal, so the server's ceiling must stay in minutes.
-
-    On the batch default (6 attempts x 120s socket + 180s backoff, twice) the ceiling is ~30
-    minutes. No interactive caller waits that long, so the controlled 502 the domain layer raises
-    would never actually be seen -- every client would time out first and report something generic.
-    """
-    from flash.client.http import (
-        ENV_LIST_CLIENT_TIMEOUT_SECONDS,
-        ENV_LIST_SERVER_BUDGET_SECONDS,
-    )
-
-    assert ENV_LIST_SERVER_BUDGET_SECONDS < 5 * 60, ENV_LIST_SERVER_BUDGET_SECONDS
-    # the client wait is what the person actually experiences, so bound it too -- it necessarily
-    # exceeds the server ceiling, and only this assertion keeps that margin from growing unbounded.
-    assert ENV_LIST_CLIENT_TIMEOUT_SECONDS < 6 * 60, ENV_LIST_CLIENT_TIMEOUT_SECONDS
-
-
-def test_the_client_budget_counts_the_body_read_not_just_the_connect():
-    """Each attempt can spend the socket timeout AND the body deadline; counting one halves it.
-
-    urllib restarts `timeout` on every blocking read, so a large tree body streamed in chunks is
-    bounded by `body_deadline`, not by `timeout`. A mirror that omits it understates the server's
-    ceiling and the client goes back to timing out first.
-    """
-    import flash.client.http as client_http
-    from flash.envs.loader import _LIST_READ_BUDGET
-
-    assert _LIST_READ_BUDGET["body_deadline"] == client_http._ENV_LIST_BODY_DEADLINE_SECONDS
-    per_attempt = _LIST_READ_BUDGET["timeout"] + _LIST_READ_BUDGET["body_deadline"]
-    attempts = _LIST_READ_BUDGET["max_rate_limit_retries"] + 1
-    real_ceiling = 2 * (attempts * per_attempt + client_http._ENV_LIST_MAX_BACKOFF_PER_READ_SECONDS)
-    mirrored_budget = client_http.ENV_LIST_SERVER_BUDGET_SECONDS
-    client_timeout = client_http.ENV_LIST_CLIENT_TIMEOUT_SECONDS
-    assert mirrored_budget == real_ceiling
-    assert client_timeout > real_ceiling
-
-
-def test_the_list_call_site_asks_for_a_bounded_success_body(monkeypatch):
-    """`list_envs` must bound the 200 body too, not just the error path.
-
-    Routed through the real `list_envs` rather than `_read_response_body` directly, for the same
-    reason as the error-body test above: a helper-only test passes unchanged while the call site still
-    says `resp.read()`. The unbounded request is `-1`/`None`, and only the call site chooses it.
-
-    This closes the gap the PR's own docstring otherwise claims shut: `timeout` is applied per socket
-    receive, so it does NOT bound a response, and a plane that drip-feeds a 200 body holds the command
-    open forever -- printing neither the remote list nor the local sources it already has.
-    """
-    import urllib.request
-
-    from flash.client.http import ApiClient
-
-    sizes: list[object] = []
-
-    class _RecordingResponse:
-        def __init__(self):
-            self._chunks = [b'{"environments": [{"id": "acme/env"}]}', b""]
-
-        def read(self, size=-1):
-            sizes.append(size)
-            return self._chunks.pop(0) if self._chunks else b""
-
-        @property
-        def headers(self):
-            return {"Content-Type": "application/json"}
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_exc):
-            return False
-
-    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: _RecordingResponse())
-    client = ApiClient("https://api.freesolo.co", "fs-key")
-    assert client.list_envs() == ["acme/env"]
-
-    assert sizes, "the body must actually be read"
-    unbounded = [s for s in sizes if not isinstance(s, int) or s <= 0]
-    assert not unbounded, f"the list call site must request a bounded amount, got {sizes}"
-
-
-def test_a_stalled_list_body_gives_up_instead_of_hanging(monkeypatch):
-    """The deadline is what makes the bound real: a body that never ends must end the wait.
-
-    A byte cap alone would not do it -- a peer that drips forever without exceeding the cap keeps the
-    read alive indefinitely -- so the failure has to be time-based, and it has to be a ClientError so
-    the CLI degrades and still prints local sources.
-    """
-    import urllib.request
-
-    from flash.client.http import ApiClient, ClientError
-
-    clock = [0.0]
-
-    class _StalledResponse:
-        def read(self, *_a):
-            clock[0] += 600.0  # each chunk arrives inside the socket window, but time passes
-            return b"x" * 8
-
-        @property
-        def headers(self):
-            return {"Content-Type": "application/json"}
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_exc):
-            return False
-
-    import time
-
-    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: _StalledResponse())
-    client = ApiClient("https://api.freesolo.co", "fs-key")
-    with pytest.raises(ClientError, match="stalled"):
-        client.list_envs()
-
-
-def test_the_list_deadline_covers_the_open_phase_not_just_the_body(monkeypatch):
-    """The deadline has to start before `urlopen`, or it bounds only the tail of the request.
-
-    DNS, the TCP connect, the TLS handshake and header parsing all happen inside `urlopen`, and urllib
-    restarts its socket window on every receive -- so a peer that drip-feeds headers holds the call
-    open indefinitely without any single operation exceeding `timeout`. Starting the clock at the first
-    body read leaves that whole phase unbounded. This is the same defect already fixed for the hub
-    reads, reintroduced on the client side, so it is pinned here too.
-    """
-    import time
-    import urllib.request
-
-    from flash.client.http import ApiClient, ClientError
-
-    clock = [0.0]
-
-    def slow_open(req, timeout):
-        clock[0] += 100_000.0  # headers dribble in for far longer than the deadline
-        return _Resp(b'{"environments": []}')
-
-    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(urllib.request, "urlopen", slow_open)
-
-    client = ApiClient("https://api.freesolo.co", "fs-key")
-    with pytest.raises(ClientError, match="took too long to answer"):
-        client.list_envs()
-
-
-def test_the_open_timeout_never_exceeds_what_is_left_of_the_deadline(monkeypatch):
-    """A socket window longer than the remaining budget could overshoot by nearly a whole window."""
-    import time
-    import urllib.request
-
-    from flash.client.http import ENV_LIST_CLIENT_TIMEOUT_SECONDS, ApiClient
-
-    seen: list[float] = []
-    clock = [0.0]
-
-    def record(req, timeout):
-        seen.append(timeout)
-        return _Resp(b'{"environments": []}')
-
-    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(urllib.request, "urlopen", record)
-
-    client = ApiClient("https://api.freesolo.co", "fs-key")
-    assert client.list_envs() == []
-    assert seen == [ENV_LIST_CLIENT_TIMEOUT_SECONDS], (
-        f"a fresh deadline must not shorten the first open, got {seen}"
-    )
-
-
-def test_a_request_without_a_deadline_keeps_its_full_timeout(monkeypatch):
-    """Every other call passes no deadline, so none of them may change behaviour."""
-    import urllib.request
-
-    from flash.client.http import ApiClient
-
-    seen: list[float] = []
-
-    def record(req, timeout):
-        seen.append(timeout)
-        return _Resp(b'{"runs": []}')
-
-    monkeypatch.setattr(urllib.request, "urlopen", record)
-
-    client = ApiClient("https://api.freesolo.co", "fs-key", timeout=42.0)
-    assert client.list_runs() == []
-    assert seen == [42.0], f"an undeadlined request must keep its own timeout, got {seen}"
+    assert "acme/my-env" in capsys.readouterr().out

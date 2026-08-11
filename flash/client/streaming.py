@@ -1,13 +1,4 @@
-"""Body-streaming mechanics for the control-plane client: capped reads and upload progress.
-
-Split out of ``flash.client.http`` to keep that module under the file-size gate. Both halves are
-about moving a body in bounded pieces rather than one slurp -- one for a response we read, one for a
-request we send -- so they belong together and neither touches client state.
-
-``http`` re-exports both. That matters for ``_ProgressReader`` specifically: tests patch it as
-``http._ProgressReader`` and ``_request`` looks it up as a module global, so the re-export is what
-keeps that seam live after the move.
-"""
+"""Bounded response reads and upload progress for the control-plane client."""
 
 from __future__ import annotations
 
@@ -15,68 +6,15 @@ import contextlib
 import time
 from collections.abc import Callable
 
-# the single definition. `http` re-exports it, because `cli.commands.env.push` imports the name from
-# there; defining it in both places instead would leave two aliases free to drift apart.
 ProgressCallback = Callable[[int, int], None]
 
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
-
-# an error body is read only to be shown: the caller uses the first few hundred characters as a
-# message. Capping it costs nothing that is used, and leaving it uncapped means a drip-fed non-2xx
-# body can stall the very code path that exists to REPORT the failure.
-_MAX_ERROR_BODY_BYTES = 64 * 1024
-_ERROR_BODY_DEADLINE_SECONDS = 20.0
-# deliberately smaller than `_DOWNLOAD_CHUNK_BYTES`: the deadline can only be checked BETWEEN reads,
-# so the read size is what bounds how long one blocked read can overshoot it. A single
-# `HTTPResponse.read(n)` performs many socket receives internally, and urllib's timeout applies to
-# each receive rather than to the call, so a peer that stays inside every window keeps one read
-# blocked for far longer than the deadline. A smaller size narrows that window; it cannot close it,
-# which is why the socket timeout remains the real backstop against a stalled peer.
-_ERROR_BODY_CHUNK_BYTES = 8 * 1024
-
-# a cap for JSON responses read under a deadline. Generous next to any list the plane returns -- it is
-# a backstop against an unbounded allocation, not a size policy -- and it applies only to the callers
-# that opt in, so no existing response can start failing on size.
+_DEADLINE_CHUNK_BYTES = 8 * 1024
 _MAX_JSON_RESPONSE_BYTES = 32 * 1024 * 1024
 
 
-def _read_error_body(exc: object, deadline_seconds: float = _ERROR_BODY_DEADLINE_SECONDS) -> bytes:
-    """Read a non-2xx body for display, bounded in bytes AND wall-clock.
-
-    Lenient by design, mirroring the server-side helper of the same name: hitting the cap or the
-    deadline truncates the body rather than raising. Losing the tail of an error body must never cost
-    the status that classifies the failure -- the status is the useful part.
-
-    A read that FAILS still raises, so the caller can distinguish "unreadable" from "truncated here"
-    and say so.
-    """
-
-    fp = getattr(exc, "fp", None)
-    if fp is None:
-        return b""
-    read = exc.read  # type: ignore[attr-defined]
-    deadline = time.monotonic() + deadline_seconds
-    chunks: list[bytes] = []
-    total = 0
-    while total < _MAX_ERROR_BODY_BYTES:
-        if time.monotonic() > deadline:
-            break
-        chunk = read(min(_ERROR_BODY_CHUNK_BYTES, _MAX_ERROR_BODY_BYTES - total))
-        if not chunk:
-            break
-        chunks.append(chunk)
-        total += len(chunk)
-    return b"".join(chunks)
-
-
 def _capped_timeout(timeout: float, deadline: float | None) -> float:
-    """``timeout``, shortened to whatever is left of ``deadline``.
-
-    Without this the socket window could outlast the overall budget: a single blocking operation would
-    be allowed its full ``timeout`` even when the deadline expires part-way through it, so the caller
-    could overshoot by nearly a whole window on the very last read.
-    """
-
+    """Shorten a socket timeout to the time remaining before a deadline."""
     if deadline is None:
         return timeout
     return min(timeout, max(0.0, deadline - time.monotonic()))
@@ -89,27 +27,15 @@ def _read_response_body(
     deadline: float | None = None,
     path: str = "",
 ) -> bytes:
-    """Read a 2xx body, bounded only if the caller asked for a bound.
-
-    ``resp.read()`` with no cap is an unbounded read, and urllib's ``timeout`` is per socket receive
-    rather than per response -- so a plane (or a proxy) that drip-feeds a 200 body inside every window
-    holds the read open past any deadline the caller believes it set. The bound is opt-in because only
-    a caller on an interactive path, with a ceiling it has promised the user, has a reason to abandon
-    a body it could still finish reading.
-
-    ``deadline`` is an absolute ``time.monotonic()`` instant rather than a duration, because the caller
-    starts it before ``urlopen``: the connect and header phases have to spend from the same budget, or
-    the bound covers only the tail of the request. An already-expired deadline therefore fails here
-    even if the body would have been readable -- the wait the caller promised is already over.
-    """
+    """Read a response body with optional byte and wall-clock bounds."""
     if max_bytes is None and deadline is None:
         return resp.read()  # type: ignore[attr-defined]
     if deadline is not None and time.monotonic() > deadline:
         from flash.client.http import ClientError
 
+        target = f" {path}" if path else ""
         raise ClientError(
-            f"the control plane took too long to answer{f' {path}' if path else ''} "
-            "and exceeded its overall deadline"
+            f"the control plane took too long to answer{target} and exceeded its overall deadline"
         )
     return _read_capped_response(
         resp,
@@ -119,22 +45,10 @@ def _read_response_body(
 
 
 def _read_capped_response(resp: object, max_bytes: int, deadline: float | None = None) -> bytes:
-    """Read a 2xx body under a byte cap, and optionally under a wall-clock deadline too.
-
-    ``deadline`` is an absolute ``time.monotonic()`` instant, not a duration: it is started by the
-    caller before the request is opened so that connect and header time count against it.
-
-    The deadline is opt-in because the two callers want opposite things. A package download should
-    finish even if it is slow -- there is nothing better to do with a half-fetched archive. An
-    interactive response the user is waiting on must instead come back within a bounded time, so the
-    command can report what it does know; without a deadline urllib's per-receive timeout lets a
-    peer that stays inside every window hold the read open indefinitely.
-    """
+    """Read a response body under a byte cap and optional absolute deadline."""
     from flash.client.http import ClientError
 
-    # see `_ERROR_BODY_CHUNK_BYTES`: the deadline is only checked between reads, so a deadline-bearing
-    # read asks for less in order to regain control often enough for the bound to mean anything.
-    read_size = _DOWNLOAD_CHUNK_BYTES if deadline is None else _ERROR_BODY_CHUNK_BYTES
+    read_size = _DOWNLOAD_CHUNK_BYTES if deadline is None else _DEADLINE_CHUNK_BYTES
     chunks: list[bytes] = []
     total = 0
     while True:
@@ -143,7 +57,7 @@ def _read_capped_response(resp: object, max_bytes: int, deadline: float | None =
                 f"the control plane's response body stalled after {total} bytes "
                 "and exceeded its overall deadline"
             )
-        chunk = resp.read(read_size)
+        chunk = resp.read(read_size)  # type: ignore[attr-defined]
         if not chunk:
             break
         total += len(chunk)
@@ -157,7 +71,7 @@ def _read_capped_response(resp: object, max_bytes: int, deadline: float | None =
 
 
 class _ProgressReader:
-    """File-like wrapper over in-memory bytes that fires a progress callback on each read()."""
+    """File-like bytes wrapper that reports upload progress after each read."""
 
     def __init__(self, data: bytes, progress: ProgressCallback):
         self._data = data
@@ -174,7 +88,7 @@ class _ProgressReader:
         else:
             chunk = self._data[self._pos : self._pos + size]
         self._pos += len(chunk)
-        # a rendering hiccup must never abort an in-flight upload
+        # a rendering failure must not abort an in-flight upload
         with contextlib.suppress(Exception):
             self._progress(self._pos, self._total)
         return chunk
