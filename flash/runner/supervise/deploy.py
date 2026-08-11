@@ -689,10 +689,10 @@ def _cancellation_billing(
             fallback=float("nan"),
         )
     else:
-        # a mid-training cancel is priced FROM the persisted quote (prorated by completed steps),
-        # not by repricing the spec: a fresh estimate uses offline static rates, which on
-        # live-market providers can exceed the accepted quote's rate and bill a near-complete
-        # cancel above what the run would have cost on success.
+        # a fresh spec estimate uses offline static rates, which on live-market providers can
+        # exceed the accepted quote's rate, so a mid-training cancel is priced from the persisted
+        # quote (prorated by completed steps) to keep a near-complete cancel at or under what the
+        # run would have cost on success.
         estimated_charge = cancelled_charge_usd(
             cancel_status,
             effective_spec,

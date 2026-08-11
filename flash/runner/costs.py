@@ -78,13 +78,12 @@ def cancelled_charge_usd(status: RunStatus, spec, *, steps: int, fallback: float
     """Price a mid-training cancellation from the accepted quote, prorated by completed steps.
 
     the persisted quote (``estimated_cost_usd``) carries the exact live rate the user accepted: the
-    lifecycle refreshes it from the selected candidate before provisioning. repricing the spec with
-    ``estimate_cost`` instead takes the offline static-rate path, and on live-market providers
-    (vast, lambda) those rates differ materially from the accepted one, so a cancel near completion
-    could bill above the quote the run would have been charged on success. so the cancel charge is
-    the quote scaled linearly by ``steps / planned steps``, which by construction never exceeds the
-    quote. a run with no persisted quote falls back to the spec reprice, clamped to nothing here
-    because there is no quote to clamp to.
+    lifecycle refreshes it from the selected candidate before provisioning. a spec reprice through
+    ``estimate_cost`` takes the offline static-rate path, and on live-market providers (vast,
+    lambda) those rates differ materially from the accepted one, so pricing a near-complete cancel
+    that way can bill above what the run would have been charged on success. scaling the quote by
+    ``steps / planned steps`` never exceeds the quote by construction. a run with no persisted
+    quote has nothing to clamp to, so it falls back to the spec reprice.
     """
     n = max(0, int(steps))
     if n == 0:

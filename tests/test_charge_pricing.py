@@ -210,7 +210,7 @@ def test_cancel_near_completion_never_bills_above_the_accepted_quote(monkeypatch
     static_reprice = runner.charge_usd_for_spec(spec, steps=19)
     # the user accepted a live-market quote at half the static rate for the full run.
     accepted_quote = runner.charge_usd_for_spec(spec) / 2
-    assert static_reprice > accepted_quote  # the overbilling hazard this fix removes
+    assert static_reprice > accepted_quote  # the overbilling hazard the proration guards against
     runner._save_status(
         runner.RunStatus(
             run_id="run-1",
