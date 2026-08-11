@@ -154,9 +154,11 @@ def _raise_if_workload_profile_pending(client: ApiClient, exc: ApiError) -> None
     charge = _profile_charge(client, profile_run_id) if owned and launched else None
     if owned and launched:
         lines = [
-            "no exact workload profile exists for this config yet, so there is no training quote "
-            "to print. the server started a separate profile run that loads your environment and "
-            "tokenizes the exact dataset this training would consume.",
+            (
+                "no exact workload profile exists for this config yet, so there is no training quote "
+                "to print. the server started a separate profile run that loads your environment and "
+                "tokenizes the exact dataset this training would consume."
+            ),
             "that profile run is real work and is billed on its own"
             + (f" (estimated ${charge:.2f})" if charge is not None else "")
             + "; no training run was created, no training gpu was allocated, and nothing was "
@@ -168,9 +170,11 @@ def _raise_if_workload_profile_pending(client: ApiClient, exc: ApiError) -> None
         ]
     elif owned:
         lines = [
-            "no exact workload profile exists for this config yet, so there is no training quote "
-            f"to print. the profile run you already started is still {state}; this command "
-            "launched nothing and charged nothing.",
+            (
+                "no exact workload profile exists for this config yet, so there is no training quote "
+                f"to print. the profile run you already started is still {state}; this command "
+                "launched nothing and charged nothing."
+            ),
             f"follow it with `{_commands().CLI_NAME} runs status {profile_run_id}`, then re-run this command "
             "once it reports done."
             if profile_run_id
@@ -178,9 +182,11 @@ def _raise_if_workload_profile_pending(client: ApiClient, exc: ApiError) -> None
         ]
     else:
         lines = [
-            "no exact workload profile exists for this config yet, so there is no training quote "
-            "to print. one is already being measured for this exact config and will be reused, so "
-            "nothing was started or charged here.",
+            (
+                "no exact workload profile exists for this config yet, so there is no training quote "
+                "to print. one is already being measured for this exact config and will be reused, so "
+                "nothing was started or charged here."
+            ),
             "re-run this command in a few minutes.",
         ]
     for line in lines:
