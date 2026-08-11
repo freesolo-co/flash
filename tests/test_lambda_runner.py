@@ -587,6 +587,73 @@ def test_bootstrap_extra_pip_retry_sleep_never_outlives_the_deadline(monkeypatch
     assert max(slept) <= 2.0
 
 
+def test_bootstrap_extra_pip_survives_an_unwritable_console(monkeypatch):
+    """A closed console must not end the install: pip's own exit status decides the outcome.
+
+    The tee replaced an inherited-stdio ``subprocess.run``, which never made the install depend on
+    replaying each line. If a broken log collector can raise out of the drain, the function exits
+    without waiting for pip, deletes the askpass helper while that child is still authenticating,
+    and reports the console failure as a terminal install error on a paid box."""
+    waited = []
+
+    class _ClosedConsoleProc(_FakePipProc):
+        def wait(self) -> int:
+            waited.append(True)
+            return super().wait()
+
+    from flash.providers._lifecycle import bootstrap as lb
+
+    queue = [("Collecting some-env-pkg\n", 0)]
+
+    def fake_popen(cmd, *, env=None, **_kwargs):
+        output, rc = queue.pop(0)
+        return _ClosedConsoleProc(output, rc)
+
+    monkeypatch.setattr(lb.subprocess, "Popen", fake_popen)
+
+    def closed_stream_print(*_a, **_kw):
+        raise ValueError("I/O operation on closed file")
+
+    monkeypatch.setattr("builtins.print", closed_stream_print)
+    lb.install_extra_pip(_pip_payload())  # pip exited 0, so the install SUCCEEDED
+    assert waited == [True]  # and pip was reaped, not left running behind the failed console
+
+
+def test_bootstrap_extra_pip_unwritable_console_still_reports_pip_status(monkeypatch):
+    """Same broken console, failing pip: the error names pip's status, not the console's."""
+    from flash.providers._lifecycle import bootstrap as lb
+
+    queue = [("ERROR: No matching distribution found for some-env-pkg\n", 1)]
+    monkeypatch.setattr(
+        lb.subprocess, "Popen", lambda cmd, *, env=None, **_k: _FakePipProc(*queue.pop(0))
+    )
+    monkeypatch.setattr(
+        "builtins.print", lambda *_a, **_kw: (_ for _ in ()).throw(BrokenPipeError("closed"))
+    )
+    with pytest.raises(RuntimeError, match="extra_pip install failed: pip exited 1"):
+        lb.install_extra_pip(_pip_payload())
+
+
+def test_bootstrap_extra_pip_backoff_leaves_time_to_run_the_retry(monkeypatch):
+    """A clamped backoff must reserve a slice for the attempt it just announced.
+
+    Clamping only to the remaining wall sleeps the entire window, so the retry that was announced
+    never issues: the next iteration fails ``require_deadline_at`` (or the watchdog kills the
+    process) with the ladder's remaining rungs unused on a run that was still payable."""
+    lb, _calls = _wire_pip(monkeypatch, [("connection reset by peer\n", 1)] * 4)
+    slept = []
+    monkeypatch.setattr(lb.time, "sleep", slept.append)
+    monkeypatch.setattr(lb.time, "time", lambda: 1_000.0)
+    with pytest.raises(lb.RetriableBootstrapError):
+        lb.install_extra_pip(
+            _pip_payload(deadline_at=1_008.0, run_created_at=1_000.0, run_max_wall_seconds=8.0)
+        )
+    # 8s of wall against the 3/9/27s ladder: the 9s and 27s rungs clamp, and each must leave
+    # nonzero wall behind for the attempt that follows it.
+    assert slept
+    assert max(slept) < 8.0
+
+
 def test_bootstrap_promotes_attempt_to_env_for_heartbeat_gating():
     # The instance bootstrap must stamp ATTEMPT into the worker env (RunPod does it in jobs.py) — the
     # worker reads it into every heartbeat, and the poller's stale-heartbeat rejection is dead without
@@ -3061,6 +3128,64 @@ def test_cacheless_retry_success_say_baseexception_does_not_trigger_run_wide_rea
 
     assert terminated == ["i-cold"]  # the cache-less retry's own exact cleanup ran
     assert reaped == []  # the outer coarse label reap must not also fire
+
+
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
+def test_cacheless_clean_reject_say_baseexception_does_not_trigger_run_wide_reap(
+    monkeypatch, interrupt_type
+):
+    """A CLEAN cold rejection rents nothing, so a raising diagnostic on that path must not reap.
+
+    The cache-less retry arms the coarse guard around its own launch request. When that request is
+    cleanly rejected the guard has to stand down BEFORE the rejection is logged: the log stream can
+    be closed, and an armed guard on that path sweeps the run label and terminates every other
+    concurrent seed sharing it over a request that rented nothing."""
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+
+    def fake_launch(*, file_system_names=None, **_kwargs):
+        if file_system_names:  # the cached attempt is rejected for a filesystem-attach reason
+            raise lambda_api.LambdaApiError(
+                "POST /instance-operations/launch -> HTTP 400: file_system_names not attachable"
+            )
+        # the cache-less retry is CLEANLY rejected too: HTTP 4xx, nothing rented
+        raise lambda_api.LambdaApiError(
+            "POST /instance-operations/launch -> HTTP 400: no capacity in region"
+        )
+
+    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
+    monkeypatch.setattr(
+        lambda_api, "ensure_filesystem", lambda n, r, deadline_at=None: f"/lambda/nfs/{n}"
+    )
+
+    def raising_say(_log):
+        def _say(msg):
+            if "also rejected cold" in msg:  # only the cold-rejection diagnostic raises
+                raise interrupt_type("log stream closed")
+
+        return _say
+
+    monkeypatch.setattr(jobs, "make_say", raising_say)
+    terminated = []
+    monkeypatch.setattr(
+        lambda_api, "terminate_instance_confirmed", lambda iid: terminated.append(iid)
+    )
+    reaped = []
+    monkeypatch.setattr(jobs, "terminate_run_instances", lambda run_id: reaped.append(run_id) or [])
+
+    with pytest.raises(interrupt_type):
+        _launch(
+            jobs,
+            _spec(network_volume="flash-weights"),
+            seed=0,
+            instances=[_inst(region="us-east-1")],
+            attempt=0,
+        )
+
+    assert reaped == []  # nothing was rented, so no run-label sweep may fire
+    assert terminated == []
 
 
 # ---------------------------------------------------------------------------

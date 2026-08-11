@@ -12,6 +12,7 @@ import json
 import math
 import multiprocessing
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -49,6 +50,7 @@ _HF_RETRY_DELAYS_S = (1.0, 3.0, 8.0, 20.0, 60.0)
 _HF_RETRY_AFTER_MAX_S = 60.0
 _PIP_RETRY_DELAYS_S = (3.0, 9.0, 27.0)
 _PIP_OUTPUT_TAIL_LINES = 400
+_PIP_RETRY_RESERVE_S = 1.0  # kept back from a clamped backoff so the next attempt can run
 # Network-shaped pip failures (retriable) vs deterministic build/resolution failures (terminal, outranking a transient
 # warning pip already recovered from in the same tail). Bare "subprocess-exited-with-error" is in NEITHER: pip prints it
 # for any child, including a VCS pin's `git clone`, so calling it terminal fails a paid run on a mid-clone reset.
@@ -580,6 +582,26 @@ def _extra_pip_env(payload: dict) -> tuple[dict[str, str], str | None]:
     return env, askpass
 
 
+def _drain_pip(proc, tail) -> int:
+    """Tee pip's output into ``tail`` and the console; return its exit status.
+
+    The console write is best-effort: a closed log stream must not end the drain, or pip is left
+    running while the caller deletes its askpass helper and the console error is reported in place
+    of pip's own status. What does escape kills the child rather than orphaning it on a paid box.
+    """
+    try:
+        with proc.stdout:
+            for line in proc.stdout:
+                tail.append(line)
+                with contextlib.suppress(OSError, ValueError):
+                    print(line, end="", flush=True)
+        return proc.wait()
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+
+
 def install_extra_pip(payload: dict) -> None:
     """Install the run's extra requirements; retry an index blip, fail fast on a bad package spec.
 
@@ -600,11 +622,7 @@ def install_extra_pip(payload: dict) -> None:
             proc = subprocess.Popen(
                 args, env=env, stdout=PIPE, stderr=STDOUT, text=True, errors="replace"
             )
-            with proc.stdout:  # tee so a long install still streams into the box console
-                for line in proc.stdout:
-                    print(line, end="", flush=True)
-                    tail.append(line)
-            rc = proc.wait()
+            rc = _drain_pip(proc, tail)
             if rc == 0:
                 return
             output = "".join(tail)  # a build failure outranks it; below that, network shapes retry
@@ -617,7 +635,10 @@ def install_extra_pip(payload: dict) -> None:
                 )
             delay = _PIP_RETRY_DELAYS_S[attempt]
             if deadline_at is not None:
-                delay = min(delay, max(0.0, deadline_at - time.time()))
+                # clamping to the remaining wall alone sleeps the whole window, so the retry just
+                # announced never issues: the next pass only fails the deadline precheck.
+                remaining = deadline_at - time.time() - _PIP_RETRY_RESERVE_S
+                delay = max(0.0, min(delay, remaining))
             msg = f"extra_pip install hit a transient index error; retrying in {delay:.0f}s"
             print(msg, flush=True)
             if delay > 0:

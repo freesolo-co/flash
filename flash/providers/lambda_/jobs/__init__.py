@@ -387,8 +387,14 @@ def _retry_launch_without_cache(
             **deadline_kwargs(lambda_api.launch_instance, plan.absolute_deadline),
         )
     except lambda_api.LambdaApiError as error:
-        # a clean reject rented nothing and an ambiguous one is reconciled here, so neither leaves
-        # an unnamed box for the caller's coarse reap; it is disarmed on both paths by returning.
+        # a clean reject rented nothing and an ambiguous one is reconciled by
+        # _abort_ambiguous_launch, which sweeps this run's label itself; neither leaves an unnamed
+        # box for the caller's coarse reap. Stand down on the FIRST statement rather than by
+        # returning (as the main walk's handler does): everything below can raise -- a closed log
+        # stream fails the say, and _abort_ambiguous_launch always raises -- and an armed guard on
+        # any of those paths reaps by run label, terminating every other concurrent seed of this
+        # run over a request that rented nothing or that was already reconciled.
+        reap.disarm()
         cold_detail = sanitize_diagnostic(error, limit=1000)
         if not _launch_rejection_is_clean(error):
             _abort_ambiguous_launch(plan.spec.run_id, type(error).__name__)

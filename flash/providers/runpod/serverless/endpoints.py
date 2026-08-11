@@ -258,6 +258,8 @@ def _train_body(input_data: dict) -> dict:
                 r"|invalid requirement"
             )
             pip_retry_delays = (3.0, 9.0, 27.0)
+            # held back from a deadline-clamped backoff so the retry it precedes has wall to run in
+            _PIP_RETRY_RESERVE_S = 1.0
             extra_env, askpass = _extra_pip_env()
             args = [sys.executable, "-m", "pip", "install", *extra_pip]
             try:
@@ -275,11 +277,20 @@ def _train_body(input_data: dict) -> dict:
                         text=True,
                         errors="replace",
                     )
-                    with pip_proc.stdout:  # tee so a long install still streams into the console
-                        for line in pip_proc.stdout:
-                            print(line, end="", flush=True)
-                            tail.append(line)
-                    rc = pip_proc.wait()
+                    try:
+                        with pip_proc.stdout:  # tee so a long install streams into the console
+                            for line in pip_proc.stdout:
+                                tail.append(line)
+                                # best-effort: a closed console must not end the drain, or pip is
+                                # left running while the askpass helper below is deleted and the
+                                # console error is reported in place of pip's own exit status.
+                                with contextlib.suppress(OSError, ValueError):
+                                    print(line, end="", flush=True)
+                        rc = pip_proc.wait()
+                    except BaseException:  # never orphan a running pip on a paid box
+                        pip_proc.kill()
+                        pip_proc.wait()
+                        raise
                     if rc == 0:
                         break
                     pip_output = "".join(tail)
@@ -292,7 +303,16 @@ def _train_body(input_data: dict) -> dict:
                             f"extra_pip install could not reach the package index after "
                             f"{pip_attempt + 1} attempts (pip exited {rc})"
                         )
-                    delay = min(pip_retry_delays[pip_attempt], _require_deadline_allowance())
+                    # reserve a slice for the attempt this backoff precedes: clamping to the
+                    # remaining wall alone sleeps the whole window, so the retry just announced
+                    # never issues and the next pass only fails the deadline precheck.
+                    delay = max(
+                        0.0,
+                        min(
+                            pip_retry_delays[pip_attempt],
+                            _require_deadline_allowance() - _PIP_RETRY_RESERVE_S,
+                        ),
+                    )
                     print(
                         f"extra_pip install hit a transient index error; retrying in {delay:.0f}s",
                         flush=True,
