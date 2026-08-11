@@ -58,6 +58,60 @@ def test_cache_root_falls_back_to_uid_scoped_tmp_when_homeless(monkeypatch, tmp_
     assert root == tmp_path / f"flash-env-cache-{os.getuid()}"
 
 
+def test_default_cache_root_falls_back_when_home_not_writable(monkeypatch, tmp_path):
+    # an arbitrary-uid worker container commonly has HOME pointing at an existing directory
+    # (e.g. /root) that home.is_dir() confirms but this process cannot write under; selecting
+    # it anyway means _ensure_cache_root dies with PermissionError instead of reaching the
+    # uid-scoped temp fallback that exists precisely to keep those containers working.
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(adapter.os.path, "expanduser", lambda _p: str(home))
+    monkeypatch.setattr(adapter.os, "access", lambda _path, _mode: False)
+    monkeypatch.setattr(adapter.tempfile, "gettempdir", lambda: str(tmp_path / "tmp"))
+
+    root = adapter._default_cache_root()
+
+    assert root == tmp_path / "tmp" / f"flash-env-cache-{os.getuid()}"
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="posix-only uid check")
+def test_default_cache_root_falls_back_when_home_foreign_owned(monkeypatch, tmp_path):
+    # same fallback, triggered by ownership rather than the write-bit: a home directory this
+    # process happens to have write access to but does not own is just as untrustworthy.
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(adapter.os.path, "expanduser", lambda _p: str(home))
+    real_stat = os.stat
+
+    def fake_stat(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if Path(path) == home:
+            result = os.stat_result(
+                (
+                    result.st_mode,
+                    result.st_ino,
+                    result.st_dev,
+                    result.st_nlink,
+                    result.st_uid + 1,
+                    result.st_gid,
+                    result.st_size,
+                    result.st_atime,
+                    result.st_mtime,
+                    result.st_ctime,
+                )
+            )
+        return result
+
+    monkeypatch.setattr(adapter.os, "stat", fake_stat)
+    monkeypatch.setattr(adapter.tempfile, "gettempdir", lambda: str(tmp_path / "tmp"))
+
+    root = adapter._default_cache_root()
+
+    assert root == tmp_path / "tmp" / f"flash-env-cache-{os.getuid()}"
+
+
 def test_ensure_cache_root_creates_private_dir(monkeypatch, tmp_path):
     root = tmp_path / "cache" / "env-cache"
     monkeypatch.setattr(adapter, "_CACHE_ROOT", root)
@@ -98,6 +152,94 @@ def test_ensure_cache_root_refuses_symlinked_root(monkeypatch, tmp_path):
 
     with pytest.raises(RuntimeError, match="not a directory"):
         adapter._ensure_cache_root()
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="posix-only uid check")
+def test_ensure_cache_root_refuses_foreign_owned_ancestor(monkeypatch, tmp_path):
+    # the leaf-only check misses a shared parent (e.g. a shared XDG_CACHE_HOME): another local
+    # account can own an intermediate directory, let us create a private leaf under it, then
+    # swap the leaf for a symlink or attacker tree after the leaf check passes.
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    root = outer / "flash" / "env-cache"
+    root.mkdir(parents=True, mode=0o700)
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", root)
+    resolved_outer = outer.resolve()
+    real_lstat = os.lstat
+
+    def fake_lstat(path, *args, **kwargs):
+        result = real_lstat(path, *args, **kwargs)
+        if Path(path) == resolved_outer:
+            result = os.stat_result(
+                (
+                    result.st_mode,
+                    result.st_ino,
+                    result.st_dev,
+                    result.st_nlink,
+                    result.st_uid + 1,
+                    result.st_gid,
+                    result.st_size,
+                    result.st_atime,
+                    result.st_mtime,
+                    result.st_ctime,
+                )
+            )
+        return result
+
+    monkeypatch.setattr(adapter.os, "lstat", fake_lstat)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        adapter._ensure_cache_root()
+    assert "ancestor" in str(excinfo.value)
+    assert "owned by uid" in str(excinfo.value)
+
+
+def test_ensure_cache_root_refuses_world_writable_ancestor_without_sticky_bit(
+    monkeypatch, tmp_path
+):
+    # an ordinary world-writable ancestor (unlike /tmp, which is also sticky) lets another
+    # local account replace anything beneath it, including a leaf we already validated.
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    outer.chmod(0o777)
+    root = outer / "flash" / "env-cache"
+    root.mkdir(parents=True, mode=0o700)
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", root)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        adapter._ensure_cache_root()
+    assert "ancestor" in str(excinfo.value)
+    assert "sticky bit" in str(excinfo.value)
+
+
+def test_ensure_cache_root_allows_world_writable_ancestor_with_sticky_bit(monkeypatch, tmp_path):
+    # the sticky bit is what makes a shared temp root (e.g. /tmp) acceptable: it stops other
+    # accounts from renaming or replacing entries they do not own, even though they can create
+    # their own entries in the same directory.
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    outer.chmod(0o777 | stat.S_ISVTX)
+    root = outer / "flash" / "env-cache"
+    root.mkdir(parents=True, mode=0o700)
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", root)
+
+    assert adapter._ensure_cache_root() == root
+
+
+def test_ensure_cache_root_skips_posix_checks_when_getuid_missing(monkeypatch, tmp_path):
+    # windows: os.getuid does not exist, mkdir(mode=0o700) does not establish posix mode bits,
+    # and os.stat commonly reports directories as group/other-writable, so both the ancestor
+    # walk and the leaf mode-bit check must no-op rather than reject an otherwise-usable root.
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    outer.chmod(0o777)  # would fail the ancestor check if it ran
+    root = outer / "flash" / "env-cache"
+    root.mkdir(parents=True, mode=0o700)
+    root.chmod(0o777)  # would fail the leaf mode-bit check if it ran
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", root)
+    monkeypatch.delattr(adapter.os, "getuid", raising=False)
+
+    assert adapter._ensure_cache_root() == root
 
 
 def _make_entry(root: Path, name: str, *, size: int, age_seconds: float) -> Path:

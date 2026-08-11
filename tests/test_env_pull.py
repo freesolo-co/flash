@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import shlex
+import shutil
 import stat
 import tarfile
 import urllib.parse
@@ -911,6 +913,88 @@ def test_resolve_github_env_extracts_repo_level_siblings(monkeypatch, tmp_path):
 
     assert env_file.is_file()
     assert (env_file.parents[1] / "datasets" / "train.jsonl").is_file()
+
+
+def _github_env_tarball(content: bytes) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        info = tarfile.TarInfo(name="repo-sha/environment.py")
+        info.size = len(content)
+        tar.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+def test_resolve_github_env_ignores_symlinked_cache_entry(monkeypatch, tmp_path):
+    # a cache root that was previously group/other-writable can still hold a symlink planted
+    # by another local account at this guessable cache key (a sha of the ref) even after the
+    # root's own permissions are repaired; the cache-hit path must never follow it.
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **kwargs: "a" * 40)
+
+    monkeypatch.setattr(
+        adapter, "_download_github_tarball", lambda ref: _github_env_tarball(b"# original\n")
+    )
+    first = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+    assert first.read_bytes() == b"# original\n"
+    cache_dir = first.parent
+
+    # plant a symlink at the now-known cache_dir, standing in for another account's foreign
+    # content (this run's own uid would never have written a symlink there).
+    shutil.rmtree(cache_dir)
+    evil = tmp_path / "evil"
+    evil.mkdir()
+    (evil / "environment.py").write_bytes(b"evil\n")
+    cache_dir.symlink_to(evil, target_is_directory=True)
+
+    monkeypatch.setattr(
+        adapter, "_download_github_tarball", lambda ref: _github_env_tarball(b"# refreshed\n")
+    )
+    second = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+
+    assert second.read_bytes() == b"# refreshed\n"
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="posix-only uid check")
+def test_resolve_github_env_ignores_foreign_owned_cache_entry(monkeypatch, tmp_path):
+    # same guessable-cache-key hazard as the symlink case, but the planted entry is a real
+    # directory under a different owner rather than a symlink.
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **kwargs: "a" * 40)
+
+    monkeypatch.setattr(
+        adapter, "_download_github_tarball", lambda ref: _github_env_tarball(b"# original\n")
+    )
+    first = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+    cache_dir = first.parent
+    real_lstat = os.lstat
+
+    def fake_lstat(path, *args, **kwargs):
+        result = real_lstat(path, *args, **kwargs)
+        if Path(path) in (cache_dir, first):
+            result = os.stat_result(
+                (
+                    result.st_mode,
+                    result.st_ino,
+                    result.st_dev,
+                    result.st_nlink,
+                    result.st_uid + 1,
+                    result.st_gid,
+                    result.st_size,
+                    result.st_atime,
+                    result.st_mtime,
+                    result.st_ctime,
+                )
+            )
+        return result
+
+    monkeypatch.setattr(adapter.os, "lstat", fake_lstat)
+    monkeypatch.setattr(
+        adapter, "_download_github_tarball", lambda ref: _github_env_tarball(b"# refreshed\n")
+    )
+
+    second = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+
+    assert second.read_bytes() == b"# refreshed\n"
 
 
 def test_cmd_env_pull_multi_component_in_env_path_is_not_a_destination(

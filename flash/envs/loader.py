@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
+from flash.envs import cache_security
 from flash.envs.package.limits import (
     ARCHIVE_MEMBER_LIMIT,
     ARCHIVE_SCAN_MEMBER_LIMIT,
@@ -57,7 +58,7 @@ def _default_cache_root() -> Path:
     if xdg and Path(xdg).is_absolute():
         return Path(xdg) / "flash" / _CACHE_ROOT_DIR_NAME
     home = Path(os.path.expanduser("~"))
-    if home.is_absolute() and home.is_dir():
+    if home.is_absolute() and home.is_dir() and cache_security.home_is_usable(home):
         return home / ".cache" / "flash" / _CACHE_ROOT_DIR_NAME
     uid = os.getuid() if hasattr(os, "getuid") else 0
     return Path(tempfile.gettempdir()) / f"flash-env-cache-{uid}"
@@ -683,6 +684,7 @@ def _ensure_cache_root() -> Path:
     """
     root = _CACHE_ROOT
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    cache_security.validate_cache_root_ancestors(root)
     info = os.lstat(root)
     uid = os.getuid() if hasattr(os, "getuid") else info.st_uid
     if not stat.S_ISDIR(info.st_mode):
@@ -692,7 +694,10 @@ def _ensure_cache_root() -> Path:
             f"env cache root {root} is owned by uid {info.st_uid}, not {uid}; "
             "refusing to load environment code from it -- remove or reassign it"
         )
-    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+    # mode bits mean nothing on windows (mkdir(mode=0o700) does not establish them there, and
+    # a freshly created, perfectly private root commonly reports as group/other-writable), so
+    # this check -- like the ancestor walk above -- is posix-only.
+    if hasattr(os, "getuid") and info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         raise RuntimeError(
             f"env cache root {root} is group/other-writable (mode {info.st_mode & 0o777:04o}); "
             "refusing to load environment code from it -- chmod 700 it"
@@ -743,10 +748,20 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
     if env_file.is_dir():
         env_file = env_file / _DEFAULT_ENVIRONMENT_PATH
     if env_file.is_file():
-        # mark as recently used so LRU eviction keeps hot envs.
-        with contextlib.suppress(OSError):
-            os.utime(cache_dir)
-        return env_file
+        if cache_security.trust_cache_entry(cache_dir) and cache_security.trust_cache_entry(
+            env_file
+        ):
+            # mark as recently used so LRU eviction keeps hot envs.
+            with contextlib.suppress(OSError):
+                os.utime(cache_dir)
+            return env_file
+        # untrusted entry at this cache key (planted before the root's permissions were last
+        # repaired, or swapped in since): never import it -- clear it and fall through to a
+        # fresh download. a symlink is unlinked rather than rmtree'd, which refuses symlinks.
+        if cache_dir.is_symlink():
+            cache_dir.unlink()
+        else:
+            shutil.rmtree(cache_dir, ignore_errors=True)
     tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-github-"))
     resolved = GitHubEnvironmentRef(
         parsed.owner,
