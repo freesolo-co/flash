@@ -525,7 +525,12 @@ def test_warm_start_preparation_refuses_a_tampered_source_snapshot(monkeypatch):
         raising=False,
     )
 
-    with pytest.raises(ValueError, match="does not match the public run"):
+    # either guard inside the validating loader is a correct refusal: this source is auto-pinned,
+    # so the digest check now fires before the structural compare can. Matching one specific
+    # message would pin WHICH guard catches it rather than THAT it is caught, so this asserts the
+    # refusal and rules out the sentinel -- reaching artifact resolution means the tampered pin was
+    # adopted, which is the actual regression.
+    with pytest.raises(ValueError, match=r"preparation failed integrity|match the public run"):
         R._prepare_init_from_adapter_inner(_unpinned_child(), owner_org_id="org-a", token="token")
 
 

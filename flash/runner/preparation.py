@@ -394,6 +394,14 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
         "workload_profile",
     ):
         effective[managed_top] = public.get(managed_top)
+    # the pin VALUE travels with its marker: `to_dict()` drops a runner-assigned revision so the
+    # public spec cannot advertise a SHA it has no way to label, which leaves the halves legitimately
+    # asymmetric. exclude the value only in that case -- an AUTHORED pin is still compared, so a
+    # tampered authored revision keeps failing here. the auto-pinned value is not left unguarded:
+    # it is hashed into the preparation digest, and `effective_spec_from_status` now verifies that
+    # digest whenever the marker is set.
+    if worker_spec.model_revision_auto and not public.get("model_revision"):
+        effective["model_revision"] = public.get("model_revision")
     public_train = dict(public["train"])
     effective_train = dict(effective["train"])
     public_ref = public_train.get("init_from_adapter") or ""

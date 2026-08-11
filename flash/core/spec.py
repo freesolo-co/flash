@@ -482,7 +482,20 @@ class JobSpec:
         data = asdict(self)
         # server-assigned identity — never authored in a config.
         data.pop("run_id", None)
-        data.pop("model_revision_auto", None)
+        # a runner-assigned pin leaves with its marker: emitting the SHA without the provenance
+        # that labels it would advertise a revision the author never wrote, and resubmitting that
+        # spec reads the bare SHA back as authored (`_resolve_model_revision` derives `authored`
+        # from the marker), so the re-run is stamped user-authored and deploy refuses it -- the
+        # exact rejection this pin marker exists to prevent. dropping both keeps the public spec a
+        # faithful record of what the user asked for, and the re-run gets a fresh runner pin.
+        # cleared, not popped: an unpinned spec emits `model_revision: ""`, and a spec rebuilt from
+        # this output has no marker left to re-trigger the branch -- so popping would make the key
+        # absent at create and present at re-persist, and `_preparation_digest` hashes to_dict()
+        # output. That drift breaks the integrity check on the re-persist path
+        # (`runner.submit` rebuilds public_spec from the stored dict) for the exact runs this PR
+        # exists to keep deployable. "" is also the honest value: nothing was authored.
+        if data.pop("model_revision_auto", None):
+            data["model_revision"] = ""
         data.pop("workload_profile_kind", None)
         data.pop("workload_profile_input_digest", None)
         data.pop("workload_profile_producer_version", None)

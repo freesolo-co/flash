@@ -3021,6 +3021,7 @@ def test_deploy_allows_runner_assigned_revision_pin(api):
     there isolates the change to who chose the pin.
     """
     import flash.runner as runner
+    from flash.core.spec import JobSpec
 
     key = _login()
     run_id = api.post(
@@ -3028,19 +3029,25 @@ def test_deploy_allows_runner_assigned_revision_pin(api):
     ).json()["run_id"]
     status = runner.get_status(run_id)
     # reproduce the shape a REAL auto-pinned submit persists, which is asymmetric: submit stores
-    # `spec=public_spec.to_dict()`, and to_dict() strips the marker, so the public half never
-    # carries it and only the worker half does. Writing the marker onto status.spec too would be a
-    # shape production cannot produce, and it would paper over `_validate_effective_spec` rejecting
-    # the real one -- a 409 that leaves auto-pinned runs just as undeployable as the 400 did.
-    #
-    # Both halves still carry the revision itself: that IS symmetric in production, since
-    # model_revision is a public field.
-    status.spec["model_revision"] = "a" * 40
+    # `spec=public_spec.to_dict()`, and to_dict() strips a runner-assigned pin along with its
+    # marker, so the public half carries neither and only the worker half does. Writing either onto
+    # status.spec would be a shape production cannot produce, and it would paper over
+    # `_validate_effective_spec` rejecting the real one -- a 409 that leaves auto-pinned runs just
+    # as undeployable as the 400 did.
     assert "model_revision_auto" not in status.spec, status.spec
+    assert not status.spec.get("model_revision"), status.spec
     snapshot = status.effective_preparation
     assert isinstance(snapshot, dict), snapshot
     snapshot["worker_spec"]["model_revision"] = "a" * 40
     snapshot["worker_spec"]["model_revision_auto"] = True
+    # re-digest the way submit does. the marker is a privilege input the deploy guard reads, so it
+    # is bound to the digest; a fixture that skipped this would be forging one, which is what
+    # `test_deploy_rejects_a_forged_auto_pin_marker` covers.
+    snapshot["preparation_digest"] = runner._preparation_digest(
+        JobSpec.from_dict(status.spec),
+        JobSpec.from_dict(snapshot["worker_spec"]),
+        snapshot.get("adapter_identity"),
+    )
     runner._save_status(status)
 
     response = api.post(
@@ -3053,6 +3060,51 @@ def test_deploy_allows_runner_assigned_revision_pin(api):
     # one particular rejection
     assert response.status_code == 200, response.json()
     assert "revision-pinned" not in json.dumps(response.json())
+
+
+def test_deploy_rejects_a_forged_auto_pin_marker(api):
+    """A marker written into the snapshot without re-digesting must not buy deploy privileges.
+
+    The marker is excluded from `_validate_effective_spec`'s structural compare (the public half
+    reads False by construction), so nothing there can catch a forged one. Deploy reads it to
+    decide whether to waive the authored-pin rejection, which makes it a privilege decision taken
+    on an otherwise unverified value -- and the waiver is not the only cost: a run pinned to a
+    revision it never trained on deploys against those base weights.
+
+    The paired control is `test_deploy_allows_runner_assigned_revision_pin` above. Same forged
+    marker, same snapshot surface; the only difference is that the control re-digests the way
+    submit does. It passes, so this test is not merely rejecting everything -- it isolates the
+    forgery from the auto-pin shape itself.
+
+    The revision is written to BOTH halves here so the structural compare cannot be what rejects
+    it: equal values pass that check, and the marker is excluded from it. Verified against the
+    unfixed head -- without the digest check in `effective_spec_from_status` this deploy returns
+    200. That is also the pre-fix on-disk shape, when to_dict() still emitted a runner pin.
+    """
+    import flash.runner as runner
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    snapshot = status.effective_preparation
+    assert isinstance(snapshot, dict), snapshot
+    digest_before = snapshot["preparation_digest"]
+    status.spec["model_revision"] = "a" * 40
+    snapshot["worker_spec"]["model_revision"] = "a" * 40
+    snapshot["worker_spec"]["model_revision_auto"] = True
+    assert snapshot["preparation_digest"] == digest_before  # forged: no re-digest
+    runner._save_status(status)
+
+    response = api.post(
+        f"/v1/runs/{run_id}/deploy",
+        json={"dry_run": True},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 409, response.json()
+    assert "integrity validation" in response.json()["detail"]
 
 
 def test_deploy_dry_run_does_not_reconcile_unknown_alias(api, monkeypatch):
