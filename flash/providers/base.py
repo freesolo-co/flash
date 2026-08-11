@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
 
     from flash.core.spec import JobSpec
 
@@ -418,6 +418,145 @@ def combined_vram_gb(vram_gb: int, gpu_count: int) -> float:
     )
 
 
+def authored_gpu_ceiling(gpu_type: str, gpu_count: int | None) -> int | None:
+    """Return the author's card ceiling, or ``None`` when the run may be auto-sized.
+
+    THE single definition of "did the author choose a shape?". Flash decides GPU shape at four
+    boundaries that never call each other -- the parse gate (``flash/schema``), the offline
+    ``--cost`` quote (``flash/cost/analytical.py``) and ``allocate()`` (which rents the hardware) --
+    and each one previously re-derived this rule in its own shape. That drifted three times in
+    review: a pinned 24 GB RTX 4090 with no authored count quoted EIGHT cards for an 80 GB run, and
+    ``allocate()`` resolved the same pin to a ceiling of 8. A test at one boundary cannot fail for a
+    bug at another, so the suite stayed green while half the boundaries were wrong.
+
+    A pinned class with no count is a ONE-CARD pin, not an invitation to widen: escalating it would
+    bill hardware the author never asked for. Auto-sizing applies only when NEITHER is authored.
+    ``gpu.count`` is parsed with ``minimum=1``, so a falsy authored count is unreachable rather than
+    silently meaning "one".
+    """
+    if gpu_count is not None:
+        return gpu_count
+    return 1 if gpu_type else None
+
+
+def _eligible_gpu_infos(gpu_names: tuple[str, ...] | None = None) -> tuple[GpuClass, ...]:
+    """Return the validated structural pool used by offline sizing."""
+    if gpu_names is None:
+        return tuple(g for g in GPU_CLASSES if g.enum_member and g.validated)
+    names = set(gpu_names)
+    return tuple(g for g in GPU_CLASSES if g.name in names and g.validated)
+
+
+def gpu_capacity_shape(
+    gpu_count: int,
+    *,
+    min_vram_gb: float | None = None,
+    gpu_names: tuple[str, ...] | None = None,
+) -> tuple[GpuClass, int, float] | None:
+    """Return the largest shape, or the smallest shape clearing ``min_vram_gb``."""
+    count = largest_rentable_count(gpu_count)
+    shapes = [
+        (gpu, count, combined_vram_gb(gpu.vram_gb, count)) for gpu in _eligible_gpu_infos(gpu_names)
+    ]
+    if min_vram_gb is not None:
+        shapes = [shape for shape in shapes if shape[2] >= min_vram_gb]
+        return (
+            min(shapes, key=lambda shape: (shape[2], shape[0].vram_gb, shape[0].name))
+            if shapes
+            else None
+        )
+    return (
+        max(shapes, key=lambda shape: (shape[2], shape[0].vram_gb, shape[0].name))
+        if shapes
+        else None
+    )
+
+
+def smallest_fitting_gpu_count(
+    min_vram_gb: float,
+    *,
+    max_gpu_count: int,
+    gpu_names: tuple[str, ...] | None = None,
+) -> int | None:
+    """Return the smallest rentable count whose structural pool can hold the run."""
+    for count in reversed(rentable_gpu_counts(max_gpu_count)):
+        if gpu_capacity_shape(count, min_vram_gb=min_vram_gb, gpu_names=gpu_names) is not None:
+            return count
+    return None
+
+
+def _shape_label(gpu: GpuClass, count: int) -> str:
+    return f"{count}x {gpu.name}" if count > 1 else gpu.name
+
+
+def vram_knob_advice(algorithm: str) -> str:
+    """Return the algorithm knobs that actually reduce its measured vram floor."""
+    algorithm = (algorithm or "").lower()
+    if algorithm == "grpo":
+        return (
+            "lower [train].max_context_tokens / [train].max_completion_tokens / "
+            "[train].lora_rank to fit"
+        )
+    if algorithm == "opd":
+        return (
+            "lower [train].group_size and/or [train].batch_size (rollout concurrency = "
+            "batch_size x group_size; distillation needs no group variance, so group_size=1 is "
+            "fine) and/or [train].max_completion_tokens / [train].max_context_tokens to fit"
+        )
+    return "lower [train].batch_size / [train].max_context_tokens / [train].lora_rank to fit"
+
+
+def vram_fit_error_message(
+    algorithm: str,
+    need: float,
+    *,
+    requested_gpu_count: int | None,
+    effective_gpu_count: int,
+    max_gpu_count: int,
+    gpu_names: tuple[str, ...] | None = None,
+) -> str:
+    """Build an actionable pinned-count or terminal vram rejection."""
+    algorithm = (algorithm or "").lower()
+    fitting_count = smallest_fitting_gpu_count(
+        need, max_gpu_count=max_gpu_count, gpu_names=gpu_names
+    )
+    if requested_gpu_count is not None and fitting_count is not None:
+        provided = gpu_capacity_shape(effective_gpu_count, gpu_names=gpu_names)
+        fitting = gpu_capacity_shape(fitting_count, min_vram_gb=need, gpu_names=gpu_names)
+        if provided is not None and fitting is not None:
+            provided_gpu, provided_count, provided_vram = provided
+            fitting_gpu, fitting_count, fitting_vram = fitting
+            # `--gpus {n}` is spelled exactly as `wider_shape_remedy` spells it, so the flag a user
+            # copies out of a fit failure is the same string on every path that can reject one.
+            return (
+                f"{algorithm} needs >= {need:g} GB VRAM; gpu.count={requested_gpu_count} provides "
+                f"at most {provided_vram:g} GB ({_shape_label(provided_gpu, provided_count)}). "
+                f"Raise the card ceiling with `--gpus {fitting_count}` "
+                f"({_shape_label(fitting_gpu, fitting_count)} = {fitting_vram:g} GB), or "
+                f"{vram_knob_advice(algorithm)}."
+            )
+
+    widest = gpu_capacity_shape(max_gpu_count, gpu_names=gpu_names)
+    widest_count = largest_rentable_count(max_gpu_count)
+    biggest = widest[2] if widest is not None else 0.0
+    shape = (
+        f"any {widest_count}-card validated GPU combination"
+        if widest_count > 1
+        else "any single validated GPU"
+    )
+    if algorithm == "opd":
+        return (
+            f"opd needs >= {need:g} GB VRAM, more than {shape} ({biggest:g} GB max). "
+            "opd is resident-only: the trainer and the colocated vLLM student rollout engine hold "
+            "two model-weight copies plus the rollout KV cache at once. "
+            f"{vram_knob_advice(algorithm).capitalize()}."
+        )
+    return (
+        f"{algorithm} needs >= {need:g} GB VRAM, more than {shape} ({biggest:g} GB max). "
+        f"{vram_knob_advice(algorithm).capitalize()}."
+    )
+
+
 def cheapest_gpu(min_vram_gb: int, *, gpu_count: int = 1, cost_key=None) -> str:
     """Return the cheapest fitting validated GPU class for the card ceiling.
 
@@ -429,11 +568,7 @@ def cheapest_gpu(min_vram_gb: int, *, gpu_count: int = 1, cost_key=None) -> str:
     # size against the largest count providers actually RENT (powers of two): a ceiling of 3 buys
     # 2 cards at submit, so sizing on 3 would admit a shape that never gets provisioned.
     cards = largest_rentable_count(gpu_count)
-    pool = [
-        g
-        for g in GPU_INFO.values()
-        if g.enum_member and g.validated and combined_vram_gb(g.vram_gb, cards) >= min_vram_gb
-    ]
+    pool = [g for g in _eligible_gpu_infos() if combined_vram_gb(g.vram_gb, cards) >= min_vram_gb]
     if not pool:
         shape = f" even as a {cards}-card combination" if cards > 1 else ""
         raise UnsupportedGpuError(f"no validated GPU class has >= {min_vram_gb} GB VRAM{shape}")
@@ -447,6 +582,36 @@ def cheapest_gpu(min_vram_gb: int, *, gpu_count: int = 1, cost_key=None) -> str:
     return min(pool, key=lambda g: (hourly_rate(g.name), g.vram_gb)).name
 
 
+def provisional_gpu_count(
+    model_id: str,
+    algorithm: str = "sft",
+    *,
+    train=None,
+    thinking: bool = False,
+    model_revision: str = "",
+    geometry_model_revision: str | None = None,
+    gpu_count: int | None = None,
+) -> int:
+    """Resolve an authored ceiling or the smallest geometry-safe auto-sized count."""
+    from flash.providers.allocator import geometry_safe_gpu_cap, required_vram_gb
+
+    ceiling = MAX_COMBINATION_CARDS if gpu_count is None else gpu_count
+    geometry_revision = (
+        model_revision if geometry_model_revision is None else geometry_model_revision
+    )
+    safe_ceiling = geometry_safe_gpu_cap(model_id, ceiling, model_revision=geometry_revision)
+    if gpu_count is not None:
+        return safe_ceiling
+    need = required_vram_gb(
+        model_id,
+        algorithm,
+        train=train,
+        thinking=thinking,
+        model_revision=model_revision,
+    )
+    return smallest_fitting_gpu_count(need, max_gpu_count=safe_ceiling) or safe_ceiling
+
+
 def provisional_gpu(
     model_id: str,
     algorithm: str = "sft",
@@ -454,15 +619,28 @@ def provisional_gpu(
     train=None,
     thinking: bool = False,
     model_revision: str = "",
-    gpu_count: int = 1,
+    geometry_model_revision: str | None = None,
+    gpu_count: int | None = None,
+    authored_gpu_ceiling: int | None = None,
 ) -> str:
-    """Cheapest validated GPU for this model: parse-time provisional used by the schema for sizing/display.
+    """Return the offline class preview for an authored ceiling or auto-sized run.
 
-    ``gpu_count`` is the run's card ceiling, so a run allowed to shard is sized against the shape it
-    will actually be allocated. The returned class name is per-card either way.
+    Two DIFFERENT numbers, deliberately not folded together:
+
+    ``gpu_count`` is the width to preview a class AT, already through the geometry cap. The class
+    is chosen for the width, so previewing an authored eight on a model the cap holds to four names
+    a class that run never gets.
+
+    ``authored_gpu_ceiling`` is what the author wrote (``None`` when auto-sized) and only steers the
+    rejection's remedy: a ceiling the author chose can be raised, whereas an auto-sized run has
+    already tried every width and must be told to lower its knobs instead. Deriving it from the
+    capped width would report the cap as the author's choice. Callers that pass the author's value
+    straight through as ``gpu_count`` -- for whom the two ARE the same number -- may leave it unset.
     """
+    if authored_gpu_ceiling is None and gpu_count is not None:
+        authored_gpu_ceiling = gpu_count
     from flash.engine.plan.vram import model_required_vram_gb
-    from flash.providers.allocator import vram_headroom
+    from flash.providers.allocator import geometry_safe_gpu_cap, vram_headroom
 
     min_vram = model_required_vram_gb(
         model_id,
@@ -472,45 +650,41 @@ def provisional_gpu(
         headroom=vram_headroom(),
         model_revision=model_revision,
     )
+    effective_count = provisional_gpu_count(
+        model_id,
+        algorithm,
+        train=train,
+        thinking=thinking,
+        model_revision=model_revision,
+        geometry_model_revision=geometry_model_revision,
+        gpu_count=gpu_count,
+    )
+    geometry_revision = (
+        model_revision if geometry_model_revision is None else geometry_model_revision
+    )
+    auto_cap = geometry_safe_gpu_cap(
+        model_id, MAX_COMBINATION_CARDS, model_revision=geometry_revision
+    )
     try:
         # same job-cost basis the submit-time allocator ranks on, so the class previewed here is
         # the class that actually gets provisioned; falls back to $/hr for an unpriceable run.
         return cheapest_gpu(
             min_vram,
-            gpu_count=gpu_count,
+            gpu_count=effective_count,
             cost_key=_run_cost_key(
                 model_id, algorithm, train=train, thinking=thinking, model_revision=model_revision
             ),
         )
     except UnsupportedGpuError as exc:
-        if (algorithm or "").lower() == "opd":
-            cards = largest_rentable_count(gpu_count)
-            biggest = max(
-                (
-                    combined_vram_gb(g.vram_gb, cards)
-                    for g in GPU_CLASSES
-                    if g.enum_member and g.validated
-                ),
-                default=0,
+        raise UnsupportedGpuError(
+            vram_fit_error_message(
+                algorithm,
+                min_vram,
+                requested_gpu_count=authored_gpu_ceiling,
+                effective_gpu_count=effective_count,
+                max_gpu_count=auto_cap,
             )
-            # OPD is resident-only: the HF/PEFT trainer AND the colocated vLLM student rollout engine
-            # both stay resident, so the card must hold two model-weight copies plus the rollout KV
-            # cache (which scales with batch_size x group_size) at the loss backward peak. Point the
-            # user at the knobs that shrink it instead of the opaque "no GPU that big" message.
-            shape = (
-                f"any {cards}-card validated GPU combination"
-                if cards > 1
-                else ("any single validated GPU")
-            )
-            raise UnsupportedGpuError(
-                f"opd needs >= {min_vram} GB VRAM, more than {shape} "
-                f"({biggest:g} GB max). opd is resident-only: the trainer and the colocated vLLM student "
-                f"rollout engine hold two model-weight copies plus the rollout KV cache at once. "
-                f"Lower [train].group_size and/or [train].batch_size (rollout concurrency = "
-                f"batch_size x group_size; distillation needs no group variance, so group_size=1 is "
-                f"fine) and/or [train].max_completion_tokens / [train].max_context_tokens to fit."
-            ) from exc
-        raise
+        ) from exc
 
 
 @dataclass
@@ -565,6 +739,36 @@ def largest_rentable_count(max_gpu_count: int) -> int:
     Only powers of two up to ``MAX_COMBINATION_CARDS`` are offered, so a ceiling of 3 buys 2 cards.
     """
     return rentable_gpu_counts(min(max(1, int(max_gpu_count)), MAX_COMBINATION_CARDS))[0]
+
+
+def wider_shape_remedy(
+    vram_options: Iterable[int], need: float, *, ceiling: int, above: int = 0
+) -> str:
+    """The ``--gpus N`` clause a fit failure carries, or ``""`` when no wider shape would fit.
+
+    A fit failure is only worth reporting as unsatisfiable when NO shape the user can ask for
+    would fix it. `[gpu] count` is a user-authored ceiling, so a run that fails at the authored
+    count but fits at a wider one is a one-flag fix, not a dead end -- and the error is the only
+    place the user learns which flag.
+
+    The width is SEARCHED with ``combined_vram_gb``, the same fit model that rejected the run, so
+    a suggested N is one this function proved rather than one inferred from total VRAM. ``ceiling``
+    must be the caller's ``geometry_safe_gpu_cap`` so the suggestion is never a width verl rejects
+    at Ulysses init after the box is rented, and ``above`` excludes the counts already tried. The
+    smallest fitting count wins: the cheapest shape that works, not the widest on offer.
+
+    Every fit-rejection message routes through here so the remedy cannot drift in wording or in
+    the rule that produces it.
+    """
+    best = 0
+    for vram_gb in vram_options:
+        for count in sorted(rentable_gpu_counts(max(1, int(ceiling)))):
+            if count > above and combined_vram_gb(vram_gb, count) >= need:
+                best = count if best == 0 else min(best, count)
+                break
+    if best == 0:
+        return ""
+    return f"; it fits on {best} cards -- raise the card ceiling with `--gpus {best}`"
 
 
 @dataclass(frozen=True)
