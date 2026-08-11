@@ -183,6 +183,16 @@ from flash.envs.bounded_reads import (  # noqa: E402
     _read_error_body,
 )
 
+# re-exported, not merely imported: `loader` is the import site every caller and test already uses,
+# so these have to keep resolving as `loader.<name>`.
+from flash.envs.github_urls import (  # noqa: E402
+    _github_contents_url,
+    _github_response_message,
+    _github_tree_url,
+    _managed_hub_package_root,
+    _safe_contents_path,
+)
+
 
 def _urlopen(
     req: urllib.request.Request,
@@ -199,11 +209,13 @@ def _urlopen(
     sink is rewound and truncated first so a partial prefix can never be concatenated with the
     retry's full body.
 
-    ``body_deadline`` bounds the wall-clock of one attempt's body read. ``timeout`` alone cannot:
-    urllib applies it per blocking socket operation, so a large body read in many chunks gets a
-    fresh window each time and a slow peer can hold one attempt open indefinitely. Pass it when the
-    caller advertises an overall budget (an interactive request whose client will give up); leave it
-    unset for background downloads, where finishing a large transfer matters more than a deadline.
+    ``body_deadline`` bounds the wall-clock of one whole attempt -- the open AND the body read, not
+    just the body its name suggests. ``timeout`` alone cannot: urllib applies it per blocking socket
+    operation, so both a many-chunk body and a drip-fed set of response headers get a fresh window
+    each time, and a peer that stays inside every window holds one attempt open indefinitely. Pass it
+    when the caller advertises an overall budget (an interactive request whose client will give up);
+    leave it unset for background downloads, where finishing a large transfer matters more than a
+    deadline.
     """
     import random
 
@@ -249,7 +261,25 @@ def _urlopen(
             if out is not None:
                 out.seek(sink_start)
                 out.truncate()
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            # `timeout` is capped by what is left of the deadline, so the open phase cannot be given a
+            # longer socket window than the attempt's whole remaining budget. That is necessary but
+            # not sufficient: urllib restarts the window on EVERY blocking socket read, so a peer that
+            # drip-feeds headers -- each read landing inside the window -- still walks past the
+            # deadline without any single read exceeding it. Hence the explicit check below.
+            open_timeout = (
+                timeout if deadline is None else min(timeout, max(0.0, deadline - time.monotonic()))
+            )
+            with urllib.request.urlopen(req, timeout=open_timeout) as resp:
+                # checked here rather than left to `drain`: a slow open consumes the same budget the
+                # body does, and `_iter_capped_chunks` only looks at the deadline once it is already
+                # draining -- which a `max_bytes`-less caller never reaches at all. Without this, an
+                # attempt whose headers alone outlived the budget proceeded as though it were fresh,
+                # and the client hit its own fixed timeout instead of receiving the controlled
+                # 429/502 the budget exists to produce.
+                if deadline is not None and time.monotonic() > deadline:
+                    raise TimeoutError(
+                        "GitHub response headers exceeded the attempt's overall deadline"
+                    )
                 return drain(resp, deadline)
         except urllib.error.HTTPError as exc:
             # urllib can raise an HTTPError with fp=None; exc.read() is an AttributeError there.
@@ -342,52 +372,12 @@ def _download_github_tarball(ref: GitHubEnvironmentRef) -> Path:
     return tar_path
 
 
-def _managed_hub_package_root(ref: GitHubEnvironmentRef) -> str:
-    if ref.repo_full_name.lower() != _DEFAULT_MANAGED_ENV_REPO.lower():
-        return ""
-    parts = [part for part in ref.path.split("/") if part]
-    if len(parts) < 2 or not _is_safe_github_path_parts(tuple(parts[:2])):
-        return ""
-    return "/".join(parts[:2])
-
-
-def _github_contents_url(ref: GitHubEnvironmentRef, path: str) -> str:
-    quoted_path = "/".join(urllib.parse.quote(part, safe="") for part in path.split("/") if part)
-    return (
-        f"https://api.github.com/repos/{ref.repo_full_name}/contents/{quoted_path}"
-        f"?ref={urllib.parse.quote(ref.ref, safe='')}"
-    )
-
-
-def _github_tree_url(ref: GitHubEnvironmentRef, treeish: str, *, recursive: bool = False) -> str:
-    url = (
-        f"https://api.github.com/repos/{ref.repo_full_name}/git/trees/"
-        f"{urllib.parse.quote(treeish, safe='')}"
-    )
-    if recursive:
-        url = f"{url}?recursive=1"
-    return url
-
-
 def _github_headers(accept: str) -> dict[str, str]:
     headers = {"Accept": accept, "User-Agent": "freesolo-flash"}
     token = _github_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return headers
-
-
-def _safe_contents_path(path: object, root_parts: list[str]) -> str:
-    if not isinstance(path, str):
-        raise RuntimeError("GitHub contents response did not include a path")
-    try:
-        normalized = _normalize_env_path(path)
-    except ValueError as exc:
-        raise RuntimeError(f"unsafe path in environment contents: {path!r}") from exc
-    parts = normalized.split("/")
-    if parts[: len(root_parts)] != root_parts:
-        raise RuntimeError(f"unexpected path in environment contents: {path!r}")
-    return normalized
 
 
 def _download_github_json(
@@ -417,14 +407,6 @@ def _download_github_json(
             "GitHub environment request failed for "
             f"{ref.repo_full_name}@{ref.ref}:{context}: invalid response"
         ) from exc
-
-
-def _github_response_message(payload: object) -> str:
-    if isinstance(payload, dict):
-        message = payload.get("message")
-        if isinstance(message, str) and message:
-            return f" ({message})"
-    return ""
 
 
 def _github_tree_entries(

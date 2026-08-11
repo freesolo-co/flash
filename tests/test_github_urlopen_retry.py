@@ -530,6 +530,81 @@ def test_urlopen_body_deadline_covers_the_connect_not_just_the_body(monkeypatch)
         )
 
 
+def test_urlopen_deadline_is_enforced_after_a_slow_header_phase(monkeypatch):
+    """Starting the deadline before `urlopen` is necessary but NOT sufficient; it must be enforced.
+
+    urllib restarts its `timeout` window on every blocking socket read, so a peer that drip-feeds
+    response headers -- each read landing inside the window -- walks past the attempt's deadline
+    without any single read exceeding it. Recording the start time only helps if something then acts
+    on it, and the body-read path cannot: `_iter_capped_chunks` inspects the deadline only once it is
+    already draining, and a caller with no `max_bytes` never goes through it at all. So the attempt has
+    to be failed at the point the headers land.
+
+    Distinct from `..._covers_the_connect_not_just_the_body`: that one proves WHEN the deadline starts,
+    this one proves it is CHECKED after the open. Note `max_bytes` is deliberately unset here -- that
+    is the case no drain-time check can ever catch.
+    """
+    clock = [0.0]
+
+    def drip_fed_headers(req, timeout):
+        # no single socket read exceeded its window; the phase as a whole outlived the budget.
+        clock[0] += 25.0
+        return io.BytesIO(b"payload")
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(urllib.request, "urlopen", drip_fed_headers)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)
+
+    with pytest.raises(GitHubRateLimitError, match="transient network"):
+        _urlopen(
+            urllib.request.Request("https://api.github.com/test"),
+            body_deadline=20.0,
+            max_rate_limit_retries=1,
+        )
+
+
+def test_urlopen_open_timeout_never_exceeds_the_remaining_deadline(monkeypatch):
+    """The socket window handed to `urlopen` cannot outlast the attempt's own remaining budget.
+
+    A no-op on the list path, where `timeout` and `body_deadline` are both 20s -- but it holds the
+    invariant for any caller whose socket timeout is the larger of the two, where a single blocking
+    open would otherwise be allowed to outlive the whole attempt budget in one call.
+    """
+    seen: list[float] = []
+
+    def record_timeout(req, timeout):
+        seen.append(timeout)
+        return io.BytesIO(b"ok")
+
+    monkeypatch.setattr(time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(urllib.request, "urlopen", record_timeout)
+
+    assert (
+        _urlopen(
+            urllib.request.Request("https://api.github.com/test"),
+            timeout=60.0,
+            body_deadline=20.0,
+        )
+        == b"ok"
+    )
+    assert seen == [20.0], "a 60s socket window would outlive the 20s attempt budget"
+
+
+def test_urlopen_without_a_body_deadline_keeps_its_full_socket_timeout(monkeypatch):
+    """No deadline means no cap: the background path must keep the socket window it asked for."""
+    seen: list[float] = []
+
+    def record_timeout(req, timeout):
+        seen.append(timeout)
+        return io.BytesIO(b"ok")
+
+    monkeypatch.setattr(urllib.request, "urlopen", record_timeout)
+
+    assert _urlopen(urllib.request.Request("https://api.github.com/test"), timeout=60.0) == b"ok"
+    assert seen == [60.0]
+
+
 def test_urlopen_without_a_body_deadline_still_finishes_a_slow_download(monkeypatch):
     # background downloads must NOT inherit the bound: finishing a large transfer matters more than
     # a deadline there, so an unset `body_deadline` has to leave the old behaviour untouched.
