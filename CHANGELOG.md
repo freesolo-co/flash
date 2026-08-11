@@ -19,6 +19,14 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   `pip install 'freesolo-flash[server]'` could leave `flash` running RunPod's CLI, which exits 0
   and does nothing. `flash` is unchanged and remains correct on a base (client-only) install.
 
+### Fixed
+
+- Commands printed for the operator to run (the resume/cancel hand-off after `flash train`,
+  usage strings, `next:` hints) now name the executable actually invoked rather than always
+  `flash`. On a host where `runpod-flash` owns the `flash` script, the printed
+  `flash runs cancel <run-id>` exited 0 without cancelling, leaving a run billing while the
+  operator believed they had stopped it.
+
 ### Changed
 
 - CI runs the offline test suite on both supported interpreters (3.11 and 3.12) rather than

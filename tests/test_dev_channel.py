@@ -158,6 +158,35 @@ def test_flash_cli_alias_reaches_the_same_entry_point():
     )
 
 
+def test_printed_commands_name_the_executable_the_operator_invoked():
+    """Generated commands must name the script actually run, not the channel default.
+
+    On the documented `[server]` install, `flash` can be runpod-flash's console script. Printing
+    `flash runs cancel <id>` there hands the operator a command that exits 0 without cancelling,
+    leaving a billed run alive -- so an operator who reached us via `flash-cli` must be told
+    `flash-cli`. Anything that is not one of our scripts (`python -m flash.cli`, pytest) falls
+    back to the channel default so the hint stays copy-pasteable.
+    """
+    import importlib
+    import sys
+    from unittest import mock
+
+    from flash._internal import channel
+
+    for argv0, expected in (
+        ("/usr/local/bin/flash-cli", "flash-cli"),
+        ("/usr/local/bin/flash", "flash"),
+        ("flash-cli.exe", "flash-cli"),
+        ("/tmp/x/__main__.py", "flash"),
+        ("", "flash"),
+    ):
+        with mock.patch.object(sys, "argv", [argv0]):
+            resolved = importlib.reload(channel).CLI_NAME
+        assert resolved == expected, argv0
+
+    importlib.reload(channel)  # restore the pytest-invoked value for later tests
+
+
 def test_every_console_script_has_a_dev_rename():
     """A script key missing from SCRIPT_RENAMES ships unrenamed in the dev distribution.
 
