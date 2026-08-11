@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import http.client
+import ssl
 
 import pytest
 
@@ -201,12 +202,15 @@ class _Resp:
         # IncompleteRead is an HTTPException, not a ConnectionError -- catching ConnectionError
         # alone would still let this one escape raw.
         (http.client.IncompleteRead(b"partial"), "was interrupted"),
+        # a TLS teardown mid-body: SSLEOFError is an OSError but NOT a ConnectionError, and on this
+        # read path it is not wrapped in a URLError either, so it escaped every clause above.
+        (ssl.SSLEOFError("EOF occurred in violation of protocol"), "was interrupted"),
         # a truncated or non-JSON body, and a non-UTF-8 one: JSONDecodeError and UnicodeDecodeError
         # are both ValueError, so `_decode_response` owns these two and words them identically.
         (b"{not json", "did not return JSON"),
         (b'{"environments": "\xff\xfe"}', "did not return JSON"),
     ],
-    ids=["reset", "hangup", "truncated-read", "non-json", "non-utf8"],
+    ids=["reset", "hangup", "truncated-read", "tls-cut", "non-json", "non-utf8"],
 )
 def test_a_broken_response_degrades_to_the_reason_line_not_a_traceback(
     monkeypatch, capsys, failure, expected

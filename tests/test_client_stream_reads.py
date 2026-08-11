@@ -3,6 +3,7 @@ from __future__ import annotations
 import codecs
 import http.client
 import io
+import ssl
 from collections.abc import Iterator
 
 import pytest
@@ -158,4 +159,34 @@ def test_chat_stream_truncated_body_raises_client_error(
 
     with pytest.raises(ClientError, match="ended unexpectedly"):
         _drain()
+    assert "".join(collected) == "partial answer"
+
+
+class _TlsCutChunkedResponse(_Read1Response):
+    """A chunked body whose TLS session is torn down mid-generation.
+
+    `ssl.SSLEOFError` is an OSError but NOT a ConnectionError, and it is not wrapped in a URLError
+    on the read path, so it needs naming alongside IncompleteRead. Highest-stakes of the read paths:
+    an untranslated cut here ends the generator cleanly and presents a partial answer as a finished
+    one.
+    """
+
+    def read1(self, size: int = -1) -> bytes:
+        self.calls.append(("read1", size))
+        data = self._stream.read(size)
+        if not data:
+            raise ssl.SSLEOFError("EOF occurred in violation of protocol")
+        return data
+
+
+def test_chat_stream_tls_cut_raises_client_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A TLS teardown mid-generation must raise, not look like a completed answer."""
+    response = _TlsCutChunkedResponse(b"partial answer")
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: response)
+
+    stream = ApiClient("http://test").chat_stream("run-a", [])
+    collected: list[str] = []
+
+    with pytest.raises(ClientError, match="ended unexpectedly"):
+        collected.extend(stream)
     assert "".join(collected) == "partial answer"

@@ -7,6 +7,7 @@ import contextlib
 import http.client
 import json
 import os
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -449,11 +450,16 @@ class ApiClient:
                 f"request to the Flash service at {self.api_url} timed out; "
                 "check your network connection and FLASH_API_URL"
             ) from exc
-        # a mid-response disconnect does NOT arrive as URLError: `RemoteDisconnected` and
-        # `ConnectionResetError` are ConnectionError, and `IncompleteRead` is neither -- so without
-        # this clause a dropped connection escaped as a raw traceback instead of the clean
+        # a mid-response disconnect does NOT arrive as URLError, and no single base covers the three
+        # shapes it takes: `RemoteDisconnected` and `ConnectionResetError` are ConnectionError,
+        # `IncompleteRead` is an HTTPException, and a TLS teardown is `ssl.SSLEOFError` -- an OSError
+        # that is not a ConnectionError, and not wrapped in URLError on the read path. Without all
+        # three named, a dropped connection escaped as a raw traceback instead of the clean
         # ClientError every caller here is written to expect.
-        except (ConnectionError, http.client.IncompleteRead) as exc:
+        #
+        # ssl.SSLError rather than its OSError parent: OSError here would also swallow faults from
+        # the caller's own file handles, which are bugs to surface, not transport failures to retitle.
+        except (ConnectionError, ssl.SSLError, http.client.IncompleteRead) as exc:
             raise ClientError(
                 f"connection to the Flash service at {self.api_url} was interrupted ({exc}); "
                 "check your network connection and FLASH_API_URL"
@@ -948,11 +954,14 @@ class ApiClient:
                         raise exc
                     yield from decoded
                 yield from decoder.decode(b"", final=True)
-            except (http.client.IncompleteRead, ConnectionError) as exc:
+            except (http.client.IncompleteRead, ConnectionError, ssl.SSLError) as exc:
                 # the server aborts the chunked response when the serving backend fails
                 # mid-generation; urllib reports the missing terminating chunk (or reset) here.
                 # translate it so the caller raises instead of treating the truncated text as a
-                # finished answer.
+                # finished answer. ssl.SSLError covers the same abort arriving as a TLS teardown,
+                # which is an OSError but not a ConnectionError -- the stakes are higher here than
+                # on the other read paths, because an untranslated cut would surface as a partial
+                # answer that looks complete.
                 raise ClientError(
                     "chat stream ended unexpectedly before completion; the serving backend "
                     "likely failed mid-generation, so any partial output is truncated"
