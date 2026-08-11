@@ -122,11 +122,17 @@ def request_internal_json(
     logger: Logger,
     urlopen: UrlOpen = urllib.request.urlopen,
     raise_for: AbstractSet[int] | None = None,
+    expected: AbstractSet[int] | None = None,
 ) -> bool:
     """Best-effort internal JSON request; returns True on 2xx, False when disabled or failed.
 
     ``raise_for`` names status codes to surface as :class:`InternalRequestError` rather than
     fold into ``False``. Defaults to none, so the best-effort contract is unchanged.
+
+    ``expected`` names status codes that are a normal answer for this particular caller rather
+    than a fault, and so are logged at debug instead of warning. A probe whose whole purpose is
+    to ask "does this exist yet?" gets a 404 on the ordinary path; logging that as
+    "failed to ..." trains readers to ignore the warning that matters.
     """
     key = internal_key()
     if not key:
@@ -137,7 +143,10 @@ def request_internal_json(
             return 200 <= resp.status < 300
     except urllib.error.HTTPError as exc:
         detail = error_detail(exc)
-        logger.warning("failed to %s: HTTP %s %s", subject, exc.code, detail)
+        if expected and exc.code in expected:
+            logger.debug("%s: HTTP %s %s", subject, exc.code, detail)
+        else:
+            logger.warning("failed to %s: HTTP %s %s", subject, exc.code, detail)
         if raise_for and exc.code in raise_for:
             raise InternalRequestError(status=exc.code, detail=detail) from exc
     except OSError as exc:
@@ -153,6 +162,7 @@ def post_internal_json(
     logger: Logger,
     urlopen: UrlOpen = urllib.request.urlopen,
     raise_for: AbstractSet[int] | None = None,
+    expected: AbstractSet[int] | None = None,
 ) -> bool:
     return request_internal_json(
         path,
@@ -162,6 +172,7 @@ def post_internal_json(
         logger=logger,
         urlopen=urlopen,
         raise_for=raise_for,
+        expected=expected,
     )
 
 

@@ -45,7 +45,12 @@ class EnvironmentProjectConflict(Exception):
 
 
 def _post(
-    path: str, body: dict, *, subject: str, raise_for: AbstractSet[int] | None = None
+    path: str,
+    body: dict,
+    *,
+    subject: str,
+    raise_for: AbstractSet[int] | None = None,
+    expected: AbstractSet[int] | None = None,
 ) -> bool:
     return post_internal_json(
         path,
@@ -54,6 +59,7 @@ def _post(
         logger=_LOG,
         urlopen=urllib.request.urlopen,
         raise_for=raise_for,
+        expected=expected,
     )
 
 
@@ -116,6 +122,10 @@ def raise_if_owned_by_another_project(*, slug: str, project_id: str, org_id: str
             {"orgId": org_id, "projectId": project_id, "slug": slug},
             subject=f"check environment ownership for {slug}",
             raise_for=frozenset({409}),
+            # 404 IS the ordinary answer here: this probe asks whether the name is already taken,
+            # and "no" is what every first publish of a new name gets. Logging it as a failure
+            # would put a warning in the logs for the most common successful path.
+            expected=frozenset({404}),
         )
     except InternalRequestError as exc:
         raise EnvironmentProjectConflict(exc.detail) from exc

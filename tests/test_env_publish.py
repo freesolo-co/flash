@@ -6,6 +6,7 @@ import base64
 import gzip
 import io
 import json
+import logging
 import subprocess
 import tarfile
 import tracemalloc
@@ -904,6 +905,49 @@ def test_raise_if_owned_by_another_project_does_not_block_when_the_backend_is_do
         slug="acme/example",
         project_id="22222222-2222-4222-8222-222222222222",
         org_id="org-A",
+    )
+
+
+def test_ownership_probe_does_not_log_an_ordinary_first_publish_as_a_failure(monkeypatch, caplog):
+    """A 404 here means "that name is free" -- the answer every first publish gets.
+
+    The probe shares the best-effort transport, whose default is to log any HTTP error as
+    "failed to <subject>". For this one caller that would put a warning in the logs on the most
+    common SUCCESSFUL path, which is how operators learn to ignore the warning that matters. A
+    genuine fault must still warn, so both directions are asserted here.
+    """
+    from flash.server.domain import environment_registry
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-secret")
+
+    def _respond(status: int, payload: bytes):
+        monkeypatch.setattr(
+            environment_registry.urllib.request,
+            "urlopen",
+            lambda *_a, **_k: (_ for _ in ()).throw(_validate_http_error(status, payload)),
+        )
+
+    _respond(404, b'{"detail":"flash environment not found"}')
+    with caplog.at_level(logging.DEBUG, logger="flash.server.environments"):
+        environment_registry.raise_if_owned_by_another_project(
+            slug="acme/brand-new",
+            project_id="22222222-2222-4222-8222-222222222222",
+            org_id="org-A",
+        )
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+        "an ordinary first publish must not warn"
+    )
+
+    caplog.clear()
+    _respond(500, b'{"detail":"backend exploded"}')
+    with caplog.at_level(logging.DEBUG, logger="flash.server.environments"):
+        environment_registry.raise_if_owned_by_another_project(
+            slug="acme/brand-new",
+            project_id="22222222-2222-4222-8222-222222222222",
+            org_id="org-A",
+        )
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING], (
+        "a real backend fault must still warn"
     )
 
 
