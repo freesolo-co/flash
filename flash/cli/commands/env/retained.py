@@ -1,6 +1,5 @@
 """Warn about scaffold files a rerun retains from a differently-configured plane.
 
-Split out of setup.py to keep that module under the 1000-line cap. The concern is self-contained:
 setup never overwrites a file the user may have edited, so when a rerun targets the other plane
 kind the only available remedy is to name the retained file that now describes the wrong workflow.
 
@@ -13,21 +12,6 @@ from collections.abc import Callable
 from pathlib import Path
 
 
-def _readable(path: Path) -> str:
-    """The file's text, or "" when it is missing or cannot be read as UTF-8.
-
-    Every caller here is advisory: the warning tells the operator a retained file describes the
-    wrong plane, and setup proceeds either way. A strict `read_text(encoding="utf-8")` would let a
-    valid non-UTF-8 source file (PEP 263 declares an encoding, so latin-1 Python is legal) abort the
-    whole command with a `UnicodeDecodeError` -- turning an advisory into a fatal error on a file
-    setup is deliberately not touching. An unreadable file simply matches no marker.
-    """
-    try:
-        return path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return ""
-
-
 def _warn_if_retained_starter_files_describe_another_plane(
     starter_files: tuple[Path, ...],
     *,
@@ -36,34 +20,28 @@ def _warn_if_retained_starter_files_describe_another_plane(
 ) -> None:
     """Warn when a retained `environment.py` / `evaluations.py` documents the other plane kind.
 
-    The same idempotence that preserves the configs preserves these: `_render_starter` fills the
-    generated docstrings for this plane, but the result is only written under `if not
-    starter_env_exists`, and `evaluations.py` is nested one level deeper inside that same guard. So
-    a hosted-then-self-hosted rerun keeps files telling the operator to run `flash env push` -- a
-    command their plane cannot use -- while the configs and the printed next step describe the new
-    plane.
-
     Detect by the marker each rewrite targets rather than by a plane flag, so the warning tracks
     what is actually ON DISK: an operator who already hand-edited the guidance is not warned, and a
     file the rewrite missed still is.
 
-    Deliberately project-INDEPENDENT, unlike `_render_starter`, which interpolates the real uuid
-    because it renders the file's final text. Detection has the opposite
-    requirement: a directory scaffolded under one project and rerun under another still holds the
-    OLD uuid, so an interpolated marker would miss it and silently leave both files directing the
-    operator to a command their plane cannot run. Match the project-invariant prefix instead.
+    Deliberately project-INDEPENDENT, unlike `_render_starter`, which interpolates the real uuid: a
+    directory scaffolded under one project and rerun under another still holds the OLD uuid, so an
+    interpolated marker would miss it. Match the project-invariant prefix instead.
     """
     push_marker = "`flash env push --project "
-    # `_render_starter` writes DIFFERENT guidance into each file, so the reverse
-    # direction needs both markers: matching only environment.py's would warn about that file while
-    # silently keeping a stale evaluations.py beside it.
+    # `_render_starter` writes DIFFERENT guidance into each file, so the reverse direction needs
+    # both markers: matching only environment.py's would warn about that file while silently
+    # keeping a stale evaluations.py beside it.
     self_hosted_markers = (
         "this plane is self-hosted, so publishing",  # environment.py
-        "`flash env eval` currently requires a managed hub environment",  # evaluations.py
+        "in the git repo named by [environment] id",  # evaluations.py
     )
     wanted = self_hosted_markers if can_publish else (push_marker,)
     mismatched = [
-        path for path in starter_files if any(marker in _readable(path) for marker in wanted)
+        path
+        for path in starter_files
+        if path.exists()
+        if any(marker in path.read_text(encoding="utf-8") for marker in wanted)
     ]
     if not mismatched:
         return
@@ -75,15 +53,10 @@ def _warn_if_retained_starter_files_describe_another_plane(
             "git repo does not apply here -- run `flash env push` and use the returned id instead"
         )
         return
-    # hedged the same way the config warning below is, and for the same reason: what replaces the
-    # `env push` workflow depends on server-side FLASH_STANDALONE, which the CLI cannot read. Only a
-    # standalone plane takes a direct `github:` id, so a flat "commit it and name the repo" would be
-    # wrong advice on an identity-backed self-hosted plane.
     warn(
         f"existing {names} still tell you to run `flash env push`, which this plane cannot do; "
-        "keeping the files unchanged. If this plane runs with `FLASH_STANDALONE=1`, commit the "
-        "environment to a git repo your plane can read and name it in [environment] id; if it runs "
-        "against an identity backend, use the managed hub id its operator publishes for you"
+        "keeping the files unchanged. Commit the environment to a git repo your plane can read and "
+        "name it in [environment] id"
     )
 
 
@@ -92,21 +65,16 @@ def _warn_if_environment_form_disagrees(
 ) -> None:
     """Warn when configs left over from a run against the OTHER plane kind are kept as-is.
 
-    Setup is idempotent: the `_write_*` helpers skip a config that already exists, and
-    `_validate_existing_config_projects` only compares the project uuid. So a rerun in a directory
-    scaffolded against the other plane kind keeps its old `[environment]` block on disk while
-    printing this plane's next step -- guidance the retained file contradicts. Warn rather than
-    refuse or rewrite: refusing would break the idempotent rerun, and every helper here
-    deliberately preserves what the user has edited.
+    Setup is idempotent: the `_write_*` helpers skip a config that already exists, so a rerun in a
+    directory scaffolded against the other plane kind keeps its old `[environment]` block on disk
+    while printing this plane's next step. Warn rather than refuse or rewrite: refusing would break
+    the idempotent rerun.
 
     Classify with the loader's own predicates, not a `github:` prefix test. The loader accepts a
     plain `https://github.com/OWNER/REPO/...` URL as the same self-hosted form, so a prefix test
     would warn about an id this plane resolves fine.
 
-    Three states, not two. A blank id is neither form: it is the hosted branch's own placeholder
-    (`id = ""`), which `validate_spec` rejects outright. Collapsing it into "not github" would let
-    the self-hosted branch tell an identity-backend operator their blank ids are "already right",
-    which is the one thing they certainly are not.
+    Three states, not two: a blank id is neither form, and `validate_spec` rejects it outright.
     """
     from flash.client import ClientError
     from flash.envs.loader import is_github_environment_ref, is_managed_environment_slug
@@ -146,31 +114,18 @@ def _warn_if_environment_form_disagrees(
         return
 
     if managed:
-        # hedged, unlike the hosted branch above: which form a self-hosted plane can USE depends on
-        # server-side FLASH_STANDALONE, which the CLI cannot read. An identity-backed plane takes
-        # managed slugs, so a flat "replace it" would be advice to break a working config.
-        #
-        # "cannot resolve", not "rejects": standalone does not reject a slug at validation --
-        # `_require_hosted_environment_form` returns early under `auth.standalone()`, and so does
-        # `require_environment_project`. It fails one layer later, at fetch:
-        # `managed_slug_to_github_ref` maps every slug onto `freesolo-co/environment-hub`, which is
-        # an internal repo an external operator's GITHUB_TOKEN cannot read. Saying "rejects" would
-        # send someone hunting for a validation error that never appears in their logs.
+        # "cannot fetch", not "rejects": a slug passes validation and fails one layer later, at
+        # fetch -- `managed_slug_to_github_ref` maps every slug onto `freesolo-co/environment-hub`,
+        # which an external operator's GITHUB_TOKEN cannot read.
         warn(
-            f"existing {_names(managed)} use managed hub [environment] ids, which a standalone "
-            "plane accepts but cannot fetch -- they resolve to Freesolo's internal environment-hub "
-            "repo; keeping the files unchanged. If this plane runs with `FLASH_STANDALONE=1`, "
-            "replace each [environment] id with a `github:OWNER/REPO@REF:PATH` form pointing at a "
-            "repo your plane's GITHUB_TOKEN can read; if it runs against an identity backend, "
-            "managed hub ids are the accepted form and these are already right"
+            f"existing {_names(managed)} use managed hub [environment] ids, which this plane "
+            "accepts but cannot fetch -- they resolve to Freesolo's internal environment-hub "
+            "repo; keeping the files unchanged. Replace each [environment] id with a "
+            "`github:OWNER/REPO@REF:PATH` form pointing at a repo your plane's GITHUB_TOKEN can read"
         )
     if unfilled:
-        # Unhedged, because no plane accepts a blank id: `validate_spec` fails the submit before the
-        # standalone-vs-identity question is ever reached. Both forms are still named, since which
-        # one to fill in does depend on that server setting.
         warn(
             f"existing {_names(unfilled)} have no usable [environment] id, which fails validation on "
-            "any plane; keeping the files unchanged. Fill each one in -- with a "
-            "`github:OWNER/REPO@REF:PATH` form if this plane runs with `FLASH_STANDALONE=1`, or with "
-            "a managed hub id if it runs against an identity backend"
+            "any plane; keeping the files unchanged. Fill each one in with a "
+            "`github:OWNER/REPO@REF:PATH` form pointing at a repo your plane can read"
         )

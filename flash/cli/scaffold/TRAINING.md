@@ -164,34 +164,6 @@ id = "github:OWNER/REPO@main:environment.py"   # REF is a branch/tag name withou
                                                # environment.py
 ```
 
-The ref is validated as a single path component, so a slash-containing branch such as
-`feature/foo` is rejected before submission. Use a `/`-free branch or tag, or the commit sha.
-
-Direct `github:` ids need the plane started with `FLASH_STANDALONE=1`. A plane running against an
-identity backend rejects them with a 400 and accepts only managed hub ids, so check your server's
-configuration before pasting one in — the CLI cannot see that setting to check it for you.
-
-**A private repository needs `GITHUB_TOKEN` on the plane, not in your shell.** The ref is fetched by
-the control plane, which authenticates with its own `GITHUB_TOKEN` and forwards no credential of
-yours — so a private repo that you can clone locally still resolves as missing unless the plane
-itself holds a token that can read it. Either keep the environment repo public, or export a
-`GITHUB_TOKEN` with read access in the control plane's environment.
-
-`flash env eval` does not accept a `github:` id. It grades against a _published_ environment so the
-report can be filed under that identity, and refuses any reference that names no hub page — so on a
-standalone plane, the two commands below that mention it (`env eval` with `--split`/`--param`, and
-the held-out-suite workflow) are unavailable. `flash env test` is unaffected and remains the local
-gate.
-
-**Running OPD on a self-hosted plane needs two server-side settings.** The managed guidance further
-down — that the broker owns `PARASAIL_API_KEY` and there is nothing for you to declare — describes
-the hosted plane. On your own plane _you_ are the broker: export `PARASAIL_API_KEY` and a
-worker-reachable `FLASH_PUBLIC_URL` in the control plane's environment before submitting. Both are
-checked after the run record exists but before any GPU is allocated, so a missing one fails the run
-within seconds and bills nothing — the submit itself still succeeds. `FLASH_PUBLIC_URL`
-must be an origin a rented GPU can resolve — not `localhost`, and not a VPN-only name — because the
-worker dials back to it to have the teacher score its tokens.
-
 The ref is resolved at submit time, so re-pushing the repo and re-submitting picks up your edits
 the same way `flash env push` does on the managed plane. Pin a commit sha instead of a branch when
 you want a run to stay reproducible.
@@ -878,9 +850,6 @@ with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA
   `FLASH_PUBLIC_URL` and an attempt-scoped `FLASH_TEACHER_CAPABILITY`, never the provider key.
   The broker scores the student's own
   tokens, so there is nothing to run locally with your Flash credentials alone.
-  (Self-hosted: the broker is _your_ control plane, so you supply both `PARASAIL_API_KEY` and a
-  worker-reachable `FLASH_PUBLIC_URL` to it — see the self-hosted note under "Publish the
-  environment". The key still never reaches the worker or the spec.)
   Two workable routes:
 
   - _Best, if you can:_ get your own access to the same model (the allow-list is Parasail-hosted,
@@ -918,8 +887,6 @@ with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA
   Arbitrary bring-your-own teacher models or keys are not supported (the allow-list is curated to
   teachers verified to echo-score the student's tokens). The key is never stored in the spec or needed
   at serving time; teacher token cost varies by model and is shown in the pre-flight estimate.
-  On a self-hosted plane, "nothing to declare" applies to your _shell_, not your _server_: the key
-  belongs in the control plane's environment, alongside `FLASH_PUBLIC_URL`.
 - **The student (Qwen) and the teacher have different tokenizers.** Flash
   bridges the vocabulary mismatch with **groupwise reverse-KL** (the collinear-ai _spider_ / Tinker
   method): it aligns the two tokenizations by shared source-text spans and applies per-span reverse

@@ -536,7 +536,7 @@ def test_env_setup_resolves_the_project_locally_on_a_self_hosted_plane(monkeypat
 _SCAFFOLD_PROJECT = "11111111-1111-4111-8111-111111111111"
 
 
-def _scaffold(monkeypatch, tmp_path, api_url: str, *, turn_mode: str | None = None):
+def _scaffold(monkeypatch, tmp_path, api_url: str | None, *, turn_mode: str | None = None):
     """Run `flash env setup` in tmp_path against a plane at api_url; return the written files."""
     from argparse import Namespace
 
@@ -568,174 +568,66 @@ def test_env_setup_scaffolds_the_github_form_on_a_self_hosted_plane(monkeypatch,
     so a self-hoster following SELF_HOSTING.md got a config that fails validation and a next step
     that cannot work. `github:owner/repo@ref:path` is the id form their own plane resolves.
     """
-    written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
-
-    for name in ("sft.toml", "rl.toml", "opd.toml"):
-        assert 'id = "github:OWNER/REPO@main:environment.py"' in written[name], name
-        assert "flash env push --project" not in written[name], name
-        assert "FLASH_STANDALONE=1" in written[name], name
-        assert "identity backend instead accepts only managed hub ids" in written[name], name
-    # the generated .py files carry the same guidance in their docstrings
-    for name in ("environment.py", "evaluations.py"):
-        assert "flash env push" not in written[name], name
-
-
-def test_env_setup_self_hosted_does_not_offer_managed_only_eval(monkeypatch, tmp_path) -> None:
-    written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
-
-    evaluations = written["evaluations.py"]
-    assert "flash env eval TARGET" not in evaluations
-    assert "`flash env eval` currently requires a managed hub environment" in evaluations
-    assert "these suites still document the criteria" in evaluations
-
-
-def test_env_setup_self_hosted_ref_guidance_matches_parser(monkeypatch, tmp_path) -> None:
-    written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
-
-    for name in ("sft.toml", "rl.toml", "opd.toml"):
-        assert "REF is a branch/tag name without `/`, or a commit sha" in written[name], name
-        assert "REF is a branch, tag or commit" not in written[name], name
-
-
-def test_env_setup_opd_teacher_setup_matches_plane(monkeypatch, tmp_path) -> None:
-    self_hosted = _scaffold(
-        monkeypatch,
-        tmp_path / "self-hosted",
-        "https://plane.example.test",
-        turn_mode="multi",
-    )
-    self_hosted_opd = self_hosted["opd.toml"]
-    assert "PARASAIL_API_KEY" in self_hosted_opd
-    assert "FLASH_PUBLIC_URL" in self_hosted_opd
-    assert "platform-managed; nothing to set up or export" not in self_hosted_opd
-    assert "PARASAIL_API_KEY and FLASH_PUBLIC_URL" in self_hosted["environment.py"]
-    assert "teacher key is platform-managed" not in self_hosted["environment.py"]
-
-    hosted = _scaffold(monkeypatch, tmp_path / "hosted", "https://flash.freesolo.co")
-    hosted_opd = hosted["opd.toml"]
-    assert (
-        "# the teacher and its parasail key are platform-managed; nothing to set up or export."
-        in hosted_opd
-    )
-    assert "PARASAIL_API_KEY" not in hosted_opd
-    assert "FLASH_PUBLIC_URL" not in hosted_opd
-
-
-def test_no_starter_placeholder_survives_rendering_on_either_plane(monkeypatch, tmp_path) -> None:
-    """Every guidance placeholder must be filled for BOTH plane kinds, in every turn mode.
-
-    The starter templates carry placeholders that `_render_starter` fills from one of two dicts.
-    A placeholder present in the templates but missing from one dict renders that plane's file
-    with `ENVIRONMENT_GUIDANCE` sitting in the docstring -- valid Python, so nothing raises, and
-    the operator reads an internal token where the workflow should be. Assert on the rendered
-    output rather than on the dicts, so a placeholder added to a template and to neither dict is
-    caught too.
-    """
-    from flash.cli.commands.env import setup as setup_mod
-
-    placeholders = set(setup_mod._HOSTED_GUIDANCE) | set(setup_mod._SELF_HOSTED_GUIDANCE)
-    assert placeholders, "no guidance placeholders found; the render contract moved"
-
-    for index, (api_url, turn_mode) in enumerate(
-        (
-            ("https://flash.freesolo.co", None),
-            ("https://flash.freesolo.co", "multi"),
-            ("https://plane.example.test", None),
-            ("https://plane.example.test", "multi"),
-        )
-    ):
-        written = _scaffold(monkeypatch, tmp_path / f"case{index}", api_url, turn_mode=turn_mode)
-        for name in ("environment.py", "evaluations.py"):
-            for placeholder in placeholders | {"PROJECT_UUID"}:
-                assert placeholder not in written[name], (
-                    f"{name} scaffolded against {api_url} still contains {placeholder}"
-                )
-
-
-def test_scaffolded_self_hosted_id_is_a_form_the_loader_accepts(monkeypatch, tmp_path) -> None:
-    """The placeholder must PARSE, or it just trades one unusable id for another.
-
-    `github:OWNER/REPO@main:.` reads naturally and is rejected -- `_normalize_env_path` refuses
-    "." as an unsafe path -- so the scaffold would still hand a self-hoster a config that fails
-    before the run starts. Asserting on the substring alone would not have caught that.
-    """
     import tomllib
 
+    from flash.cli.commands.env import setup as setup_mod
     from flash.envs.loader import _parse_github_environment_ref
 
     written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
 
     for name in ("sft.toml", "rl.toml", "opd.toml"):
+        assert 'id = "github:OWNER/REPO@main:environment.py"' in written[name], name
+        assert "flash env push --project" not in written[name], name
+        # the id must PARSE, or the scaffold just trades one unusable id for another:
+        # `github:OWNER/REPO@main:.` reads naturally and `_normalize_env_path` rejects it.
         env_id = tomllib.loads(written[name])["environment"]["id"]
         assert _parse_github_environment_ref(env_id) is not None, (
             f"{name} scaffolds {env_id!r}, which the environment loader cannot parse"
         )
+    # the generated .py files carry the same guidance in their docstrings, with every placeholder
+    # filled: one left unrendered is valid python, so nothing raises and the operator reads an
+    # internal token where the workflow should be.
+    placeholders = set(setup_mod._HOSTED_GUIDANCE) | set(setup_mod._SELF_HOSTED_GUIDANCE)
+    assert placeholders, "no guidance placeholders found; the render contract moved"
+    for name in ("environment.py", "evaluations.py"):
+        assert "flash env push" not in written[name], name
+        for placeholder in placeholders | {"PROJECT_UUID"}:
+            assert placeholder not in written[name], f"{name} still contains {placeholder}"
 
 
 def test_env_setup_keeps_the_push_workflow_on_the_managed_plane(monkeypatch, tmp_path) -> None:
-    """The hosted path is the common one and must be untouched by the self-hosted branch."""
-    written = _scaffold(monkeypatch, tmp_path, "https://flash.freesolo.co")
+    """The hosted path is the common one and must be untouched by the self-hosted branch.
 
-    for name in ("sft.toml", "rl.toml", "opd.toml"):
-        assert f"flash env push --project {_SCAFFOLD_PROJECT} --name my-env ." in written[name], (
-            name
-        )
-        assert 'id = ""' in written[name], name
-        assert "github:OWNER" not in written[name], name
-    assert "flash env push" in written["environment.py"]
-
-
-def test_env_setup_warns_when_filled_hub_ids_are_retained_on_a_self_hosted_plane(
-    monkeypatch, tmp_path, capsys
-) -> None:
-    """A managed slug on a self-hosted plane is the case that genuinely depends on the server.
-
-    Reached by filling the hosted scaffold's blank the way `env push` would, because the blank
-    itself is a different case -- see the unfilled test below.
+    An unset api_url is the managed plane too: it means the built-in default.
     """
-    hosted = _scaffold(monkeypatch, tmp_path, "https://flash.freesolo.co")
-    for name in ("sft.toml", "rl.toml", "opd.toml"):
-        cfg = tmp_path / "configs" / name
-        cfg.write_text(cfg.read_text(encoding="utf-8").replace('id = ""', 'id = "acme/my-env"'))
-    filled = {
-        name: (tmp_path / "configs" / name).read_text(encoding="utf-8")
-        for name in ("sft.toml", "rl.toml", "opd.toml")
-    }
-    assert filled["sft.toml"] != hosted["sft.toml"]
-    capsys.readouterr()
+    from flash.cli.commands.env import setup as setup_mod
 
-    _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
-    warning = capsys.readouterr().err
+    placeholders = set(setup_mod._HOSTED_GUIDANCE) | set(setup_mod._SELF_HOSTED_GUIDANCE)
+    for index, api_url in enumerate(("https://flash.freesolo.co", None)):
+        written = _scaffold(monkeypatch, tmp_path / f"case{index}", api_url)
 
-    # "accepts but cannot fetch", not "rejects": both server-side gates return early under
-    # auth.standalone(), so the slug passes validation and fails at fetch instead -- it resolves to
-    # freesolo-co/environment-hub, which is internal. Naming the wrong layer sends the operator
-    # looking for a validation error their logs will never contain.
-    assert "accepts but cannot fetch" in warning
-    assert "rejects" not in warning
-    assert "internal environment-hub repo" in warning
-    assert "`github:OWNER/REPO@REF:PATH`" in warning
-    # both branches named, because the CLI cannot read server-side FLASH_STANDALONE: telling an
-    # identity-backed operator to switch to `github:` would break a config that is already correct
-    assert "FLASH_STANDALONE=1" in warning
-    assert "identity backend" in warning
-    assert "these are already right" in warning
-    for name in ("sft.toml", "rl.toml", "opd.toml"):
-        assert f"configs/{name}" in warning, name
-        assert (tmp_path / "configs" / name).read_text(encoding="utf-8") == filled[name], name
+        for name in ("sft.toml", "rl.toml", "opd.toml"):
+            assert (
+                f"flash env push --project {_SCAFFOLD_PROJECT} --name my-env ." in written[name]
+            ), name
+            assert 'id = ""' in written[name], name
+            assert "github:OWNER" not in written[name], name
+        assert "flash env push" in written["environment.py"]
+        for name in ("environment.py", "evaluations.py"):
+            for placeholder in placeholders | {"PROJECT_UUID"}:
+                assert placeholder not in written[name], f"{name} still contains {placeholder}"
 
 
-def test_env_setup_warns_when_retained_starter_files_describe_the_other_plane(
+def test_env_setup_warns_when_a_hosted_scaffold_is_rerun_on_a_self_hosted_plane(
     monkeypatch, tmp_path, capsys
 ) -> None:
-    """A rerun against the other plane kind leaves the .py files documenting the old workflow.
+    """A rerun against the other plane kind leaves every scaffolded file describing the old workflow.
 
-    `_render_starter` fills the generated docstrings, but the result is written only under
-    `if not starter_env_exists`, and `evaluations.py` is nested one level deeper inside that same
-    guard. So a hosted-then-self-hosted rerun keeps both files telling the operator to run
-    `flash env push` -- a command their plane cannot use -- while the configs and the printed next
-    step describe the new plane. The files are deliberately not rewritten (setup never overwrites a
-    file the user may have edited), so the warning is the whole remedy and has to name them.
+    Setup is idempotent: configs are written only when absent, and the starter .py files only under
+    `if not starter_env_exists`. So a hosted-then-self-hosted rerun keeps blank ids and files telling
+    the operator to run `flash env push` -- a command their plane cannot use -- while the printed
+    next step describes the new plane. The files are deliberately not rewritten, so the warning is
+    the whole remedy and has to name all five.
     """
     hosted = _scaffold(monkeypatch, tmp_path, "https://flash.freesolo.co")
     assert "flash env push" in hosted["environment.py"]
@@ -746,45 +638,23 @@ def test_env_setup_warns_when_retained_starter_files_describe_the_other_plane(
     warning = capsys.readouterr().err
 
     assert "still tell you to run `flash env push`, which this plane cannot do" in warning
-    assert "environment.py" in warning
-    assert "evaluations.py" in warning
-    # hedged like the config warning: only a standalone plane takes a direct `github:` id, and the
-    # CLI cannot read server-side FLASH_STANDALONE, so a flat "commit it and name the repo" would be
-    # wrong on an identity-backed self-hosted plane
-    assert "FLASH_STANDALONE=1" in warning
-    assert "identity backend" in warning
+    assert "no usable [environment] id, which fails validation on any plane" in warning
+    assert "`github:OWNER/REPO@REF:PATH`" in warning
+    for name in ("environment.py", "evaluations.py"):
+        assert name in warning, name
+    for name in ("sft.toml", "rl.toml", "opd.toml"):
+        assert f"configs/{name}" in warning, name
     # the premise the warning exists for: the files really are retained unrewritten
     assert retained["environment.py"] == hosted["environment.py"]
     assert retained["evaluations.py"] == hosted["evaluations.py"]
+    for name in ("sft.toml", "rl.toml", "opd.toml"):
+        assert retained[name] == hosted[name], name
 
 
-def test_training_guide_caveats_every_managed_hub_command_block(monkeypatch, tmp_path) -> None:
-    """The guide says `env push` is unavailable, then later prescribes it twice without caveat.
-
-    TRAINING.md is static prose read verbatim (only PROJECT_UUID is substituted), so it cannot
-    branch on the plane. The self-hosted section near the top is therefore contradicted further down
-    by the troubleshooting row that says to run `env push` after every edit, and by the command
-    reference. Both need the caveat, or a self-hoster who lands on either -- which is how a
-    reference gets read -- follows a command their plane cannot run.
-    """
-    guide = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")["TRAINING.md"]
-
-    # the troubleshooting row for a blank/stale id
-    assert "**Self-hosted:** `env push` targets the managed hub" in guide
-    # the command reference block: push/pull/delete are all managed-hub-only
-    assert "push/pull/delete act on Freesolo's managed hub" in guide
-
-
-def test_both_next_step_renderings_hedge_the_self_hosted_id_form(
+def test_env_setup_names_the_self_hosted_id_form_in_both_next_step_renderings(
     monkeypatch, tmp_path, capsys
 ) -> None:
-    """The printed next step is the last thing setup says, and it named only one of two forms.
-
-    `_require_hosted_environment_form` accepts a direct `github:` id only when the plane runs
-    standalone; an identity-backed self-hosted plane rejects it and takes a managed hub id. The
-    config comments carry that hedge, but both next-step renderings -- plain and styled -- stated
-    the `github:` form unconditionally, so the closing instruction contradicted the file it just
-    wrote for half of all self-hosted planes.
+    """The printed next step is the last thing setup says, and it named the hosted-only command.
 
     Both branches are asserted because they are separate code paths (`setup.py` and
     `render.env_setup`), and fixing one alone leaves whichever the operator's terminal selects.
@@ -796,170 +666,34 @@ def test_both_next_step_renderings_hedge_the_self_hosted_id_form(
     _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
     plain = capsys.readouterr().out
     assert "next: push this folder to a git repo" in plain
-    assert "FLASH_STANDALONE=1" in plain
-    assert "identity-backed" in plain
+    assert "flash env push" not in plain
 
     styled = render.env_setup(["environment.py"], "UUID", can_publish=False)
-    assert "FLASH_STANDALONE=1" in styled
-    assert "identity-backed" in styled
+    assert "github:OWNER/REPO@main:environment.py" in styled
+    assert "flash env push" not in styled
 
 
-def test_retained_file_probe_never_makes_an_advisory_warning_fatal(tmp_path) -> None:
-    """An unreadable retained file must not abort setup from inside an advisory check.
-
-    PEP 263 lets a source file declare a non-UTF-8 encoding, so latin-1 Python is valid and a strict
-    `read_text(encoding="utf-8")` raises `UnicodeDecodeError` on it. Setup deliberately does not
-    touch these files, so a probe that only decides whether to PRINT a warning must never be the
-    thing that fails the command -- an undecodable file matches no marker instead.
-
-    The second half is what makes the tolerance safe: swallowing the error must not swallow the
-    warning for a readable sibling scaffolded beside it.
-    """
-    from flash.cli.commands.env.retained import (
-        _warn_if_retained_starter_files_describe_another_plane as check,
-    )
-
-    undecodable = tmp_path / "evaluations.py"
-    undecodable.write_bytes(b"# -*- coding: latin-1 -*-\n# caf\xe9\nx = 1\n")
-    hosted = tmp_path / "environment.py"
-    hosted.write_text("upload with `flash env push --project ANY-UUID --name my-env .`")
-
-    warnings: list[str] = []
-    check((undecodable, hosted), can_publish=False, warn=warnings.append)
-
-    assert len(warnings) == 1, "the readable sibling must still warn"
-    assert "environment.py" in warnings[0]
-    assert "evaluations.py" not in warnings[0]
-
-
-def test_retained_hosted_docs_are_detected_across_a_project_change(tmp_path) -> None:
-    """Detection must not interpolate the current uuid, or a project change hides the stale files.
-
-    `_render_starter` interpolates the real project id because it renders the file's final text.
-    Detection has the opposite requirement: a directory scaffolded under one
-    project and rerun under another still holds the OLD uuid on disk, so an interpolated marker
-    matches nothing and both files keep directing the operator to `flash env push` with no warning.
-    """
-    from flash.cli.commands.env.retained import (
-        _warn_if_retained_starter_files_describe_another_plane as check,
-    )
-
-    retained = tmp_path / "environment.py"
-    retained.write_text("upload with\n`flash env push --project OLD-UUID-1111 --name my-env .`.\n")
-
-    warnings: list[str] = []
-    check((retained,), can_publish=False, warn=warnings.append)
-
-    assert len(warnings) == 1, "a retained file from another project must still warn"
-    assert "flash env push" in warnings[0]
-
-
-def test_env_setup_warns_about_both_retained_files_switching_back_to_hosted(
+def test_env_setup_warns_when_a_self_hosted_scaffold_is_rerun_on_a_hosted_plane(
     monkeypatch, tmp_path, capsys
 ) -> None:
-    """The reverse direction has to name evaluations.py too, which carries different rewritten text.
+    """The reverse direction, which carries different retained text and a different remedy.
 
-    `_render_starter` writes distinct guidance into each file: environment.py gets "this
-    plane is self-hosted, so publishing", evaluations.py gets the `env eval` caveat. Detecting only
-    the first would warn about environment.py while silently leaving a stale evaluations.py beside
-    it -- the same half-fix this warning exists to prevent in the other direction.
+    `_render_starter` writes distinct guidance into each file, and the retained configs hold
+    `github:` ids a hosted plane will not take. Detecting only one of the two would leave the other
+    stale beside it -- the same half-fix this warning exists to prevent in the other direction.
     """
     self_hosted = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
     assert "this plane is self-hosted, so publishing" in self_hosted["environment.py"]
-    assert "this plane is self-hosted, so publishing" not in self_hosted["evaluations.py"]
-    capsys.readouterr()
-
-    _scaffold(monkeypatch, tmp_path, "https://flash.freesolo.co")
-    warning = capsys.readouterr().err
-
-    assert "document a self-hosted plane" in warning
-    assert "environment.py" in warning
-    assert "evaluations.py" in warning
-
-
-def test_env_setup_does_not_warn_about_starter_files_that_match_the_plane(
-    monkeypatch, tmp_path, capsys
-) -> None:
-    """The detector reads what is on disk, so a same-plane rerun stays silent.
-
-    Guards the obvious failure of the test above: a warning that fired on every rerun would satisfy
-    it while making the idempotent path noisy.
-    """
-    _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
-    capsys.readouterr()
-
-    _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
-
-    assert "flash env push" not in capsys.readouterr().err
-
-
-def test_managed_slug_fails_at_fetch_not_validation_on_standalone() -> None:
-    """Pin the mechanism the managed-slug warning describes, so its wording cannot drift back.
-
-    The warning used to say a standalone plane "rejects" managed slugs. It does not: both
-    server-side gates return early under `auth.standalone()`, so the slug validates fine and fails
-    one layer later, at fetch, because every slug maps onto Freesolo's internal environment-hub.
-    That distinction is the whole value of the warning -- an operator told "rejects" searches for a
-    validation error that is never logged.
-    """
-    import inspect
-
-    from flash.envs.loader import managed_slug_to_github_ref
-    from flash.server.domain import environment_registry
-    from flash.server.platform import deps
-
-    # both gates bypass on standalone, so validation is NOT where a managed slug fails
-    for func in (
-        deps._require_hosted_environment_form,
-        environment_registry.require_environment_project,
-    ):
-        source = inspect.getsource(func)
-        assert "standalone()" in source, func.__name__
-        assert "return" in source, func.__name__
-
-    # and the slug resolves to the repo an external operator cannot read
-    assert managed_slug_to_github_ref("acme/my-env").startswith(
-        "github:freesolo-co/environment-hub@"
-    )
-
-
-def test_env_setup_warns_that_unfilled_ids_are_valid_nowhere(monkeypatch, tmp_path, capsys) -> None:
-    """The hosted scaffold's own `id = ""` is not a managed slug, and must not be blessed as one.
-
-    Rerunning a hosted scaffold against a self-hosted plane before `env push` filled the blanks used
-    to take the managed-slug branch, whose closing clause is "these are already right". Blank ids
-    are right nowhere: `validate_spec` rejects an empty `[environment] id` on every plane, standalone
-    or identity-backed, so that reassurance guaranteed a failed submit.
-    """
-    hosted = _scaffold(monkeypatch, tmp_path, "https://flash.freesolo.co")
-    assert 'id = ""' in hosted["sft.toml"]
-    capsys.readouterr()
-
-    retained = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
-    warning = capsys.readouterr().err
-
-    assert "no usable [environment] id" in warning
-    assert "fails validation on any plane" in warning
-    assert "these are already right" not in warning
-    # which form to fill in still depends on the server setting, so both are named
-    assert "FLASH_STANDALONE=1" in warning
-    assert "identity backend" in warning
-    for name in ("sft.toml", "rl.toml", "opd.toml"):
-        assert f"configs/{name}" in warning, name
-        assert retained[name] == hosted[name], name
-
-
-def test_env_setup_warns_when_self_hosted_configs_are_retained_on_a_hosted_plane(
-    monkeypatch, tmp_path, capsys
-) -> None:
-    self_hosted = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
     capsys.readouterr()
 
     retained = _scaffold(monkeypatch, tmp_path, "https://flash.freesolo.co")
     warning = capsys.readouterr().err
 
+    assert "document a self-hosted plane" in warning
     assert "hosted plane requires managed hub ids" in warning
     assert "Run `flash env push`" in warning
+    for name in ("environment.py", "evaluations.py"):
+        assert name in warning, name
     for name in ("sft.toml", "rl.toml", "opd.toml"):
         assert f"configs/{name}" in warning, name
         assert retained[name] == self_hosted[name], name
@@ -969,142 +703,32 @@ def test_env_setup_warns_when_self_hosted_configs_are_retained_on_a_hosted_plane
 def test_env_setup_clean_scaffold_has_no_environment_form_warning(
     monkeypatch, tmp_path, capsys, api_url
 ) -> None:
+    """A same-plane rerun stays silent: the detector reads what is on disk, not a plane flag.
+
+    Guards the obvious failure of the two transition tests -- a warning that fired on every rerun
+    would satisfy both while making the idempotent path noisy.
+    """
+    _scaffold(monkeypatch, tmp_path, api_url)
+    capsys.readouterr()
+
     _scaffold(monkeypatch, tmp_path, api_url)
 
     assert capsys.readouterr().err == ""
 
 
-def test_training_guide_ref_guidance_matches_the_parser(monkeypatch, tmp_path) -> None:
-    """The generated guide must carry the same REF constraint as the generated configs.
+def test_training_guide_caveats_the_managed_hub_commands(monkeypatch, tmp_path) -> None:
+    """The guide says `env push` is unavailable, then later prescribes it without caveat.
 
-    TRAINING.md is static prose, so it cannot branch on the plane -- which is exactly how it kept
-    the unrestricted "a branch, tag or commit" wording after the configs were corrected. A ref is
-    validated as ONE path component (`_is_safe_github_path_parts` in flash/envs/loader.py), so
-    `feature/foo` is rejected before submission, and a guide promising any branch sends the user
-    to an id that cannot resolve.
+    TRAINING.md is static prose read verbatim (only PROJECT_UUID is substituted), so it cannot
+    branch on the plane. The self-hosted section near the top is therefore contradicted further down
+    by the troubleshooting row and the command reference. Both need the caveat, or a self-hoster who
+    lands on either -- which is how a reference gets read -- follows a command their plane cannot run.
     """
-    written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
-
-    guide = written["TRAINING.md"]
-    assert "REF is a branch/tag name without `/`, or a commit" in guide
-    assert "REF is a branch, tag or commit" not in guide
-    # the guide and the config comments are separate surfaces that drifted once already
-    assert "without `/`" in written["rl.toml"]
-
-
-def test_training_guide_caveats_the_standalone_requirement(monkeypatch, tmp_path) -> None:
-    """The guide must carry the same `FLASH_STANDALONE=1` caveat as the config comments.
-
-    `_require_hosted_environment_form` (flash/server/platform/deps.py) 400s a `github:` id unless
-    the server has `auth.standalone()`, and the CLI cannot read that setting. Presenting the git
-    form as valid for every self-hosted plane sends an identity-backed operator to a config their
-    own plane rejects at submit time.
-    """
-    written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
-
-    guide = written["TRAINING.md"]
-    assert "FLASH_STANDALONE=1" in guide
-    assert "identity backend" in guide
-    # same caveat on both surfaces -- they are generated separately and have drifted before
-    assert "FLASH_STANDALONE=1" in written["rl.toml"]
-
-
-def test_training_guide_says_env_eval_rejects_the_id_it_scaffolds(monkeypatch, tmp_path) -> None:
-    """The guide recommends `env eval` for runs whose environment id that command refuses.
-
-    `_resolve_evaluation_environment` (flash/cli/commands/env/eval.py) gates on
-    `is_managed_environment_slug`, so every `github:` id -- the only form the self-hosted scaffold
-    writes -- fails before the suites load. The guide's `--split`/`--param` advice for `env eval`
-    is therefore unreachable on a standalone plane and has to say so.
-    """
-    from flash.envs.loader import is_managed_environment_slug
-
-    written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
-
-    # the premise: what this scaffold writes is exactly what env eval rejects
-    scaffolded_id = tomllib.loads(written["rl.toml"])["environment"]["id"]
-    assert not is_managed_environment_slug(scaffolded_id)
-
-    guide = written["TRAINING.md"]
-    assert "`flash env eval` does not accept a `github:` id" in guide
-    assert "`flash env test` is unaffected" in guide
-
-
-def test_training_guide_says_a_private_env_repo_needs_a_plane_side_token(
-    monkeypatch, tmp_path
-) -> None:
-    """The scaffold tells a self-hoster to point at their own repo without naming the token it needs.
-
-    `_github_token` (flash/envs/loader.py) reads `GITHUB_TOKEN` from the resolving process's own
-    environment and there is no spec or client field that carries one, so a private repo resolves as
-    missing no matter what the operator has exported locally. The guide has to name where the token
-    belongs, since the failure surfaces as an unreadable ref rather than an auth error.
-    """
-    import inspect
-
-    from flash.envs import loader
-
-    # the premise: the token comes from the plane's process env, not from anything the client sends
-    source = inspect.getsource(loader._github_token)
-    assert 'os.environ.get("GITHUB_TOKEN")' in source
-
     guide = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")["TRAINING.md"]
-    assert "A private repository needs `GITHUB_TOKEN` on the plane, not in your shell" in guide
-    assert "forwards no credential of" in guide
 
-
-def test_training_guide_names_the_self_hosted_opd_broker_settings(monkeypatch, tmp_path) -> None:
-    """The "key stays managed" line is hosted-only; a self-hoster runs the broker themselves.
-
-    `require_teacher_broker_configuration` (flash/server/domain/teacher_broker.py) demands both
-    `PARASAIL_API_KEY` and a valid `FLASH_PUBLIC_URL` on the control plane. `_require_opd_configuration`
-    calls it at seed_submission.py:816, one line above the attempt loop that allocates, so a missing
-    one fails the run in seconds at no cost -- but AFTER the submit was accepted, so the guide cannot
-    leave a self-hoster to discover it from a run that dies with no local misconfiguration to see.
-    """
-    written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
-
-    guide = written["TRAINING.md"]
-    assert "Running OPD on a self-hosted plane needs two server-side settings" in guide
-    assert "PARASAIL_API_KEY" in guide
-    assert "FLASH_PUBLIC_URL" in guide
-    # the managed passages that say otherwise must carry the pointer, since a reader can land there
-    # directly from the OPD section without passing the environment section above
-    assert "the broker is _your_ control plane" in guide
-    assert "applies to your _shell_, not your _server_" in guide
-
-
-def test_env_setup_accepts_a_browser_url_as_the_self_hosted_form(
-    monkeypatch, tmp_path, capsys
-) -> None:
-    """A plain github.com URL is the same self-hosted form, so it must not warn.
-
-    The loader's `_parse_github_environment_ref` accepts `https://github.com/OWNER/REPO/...`
-    alongside `github:OWNER/REPO@REF:PATH`, so classifying on the `github:` prefix alone would
-    tell a self-hoster their working id is the wrong kind and to replace it.
-    """
-    _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
-    rl = tmp_path / "configs" / "rl.toml"
-    rl.write_text(
-        rl.read_text(encoding="utf-8").replace(
-            'id = "github:OWNER/REPO@main:environment.py"',
-            'id = "https://github.com/owner/repo/blob/main/environment.py"',
-        ),
-        encoding="utf-8",
-    )
-    capsys.readouterr()
-
-    _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
-
-    assert capsys.readouterr().err == ""
-
-
-def test_env_setup_treats_an_unset_api_url_as_the_managed_plane(monkeypatch, tmp_path) -> None:
-    """No stored api_url means the built-in default, which is Freesolo's plane -- not self-hosted."""
-    written = _scaffold(monkeypatch, tmp_path, None)
-
-    assert 'id = ""' in written["sft.toml"]
-    assert "github:OWNER" not in written["sft.toml"]
+    assert 'id = "github:OWNER/REPO@main:environment.py"' in guide
+    assert "**Self-hosted:** `env push` targets the managed hub" in guide
+    assert "push/pull/delete act on Freesolo's managed hub" in guide
 
 
 def test_env_setup_still_rejects_a_malformed_project_when_self_hosted(monkeypatch) -> None:
