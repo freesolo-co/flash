@@ -245,6 +245,166 @@ def test_the_tests_repo_dispatch_cannot_silently_no_op():
     )
 
 
+def _triggers(document: dict[str, Any]) -> dict[str, Any]:
+    """return the `on:` block.
+
+    bare `on` is a YAML 1.1 boolean, so `yaml.safe_load` yields the key `True`, not `"on"`. a
+    workflow quoted as `"on":` yields the string. looking up only one spelling silently returns
+    nothing for the other, and a trigger contract that finds no triggers passes vacuously.
+    """
+    for key in (True, "on"):
+        if key in document:
+            return document[key] or {}
+    raise AssertionError("workflow declares no `on:` block")
+
+
+@pytest.mark.parametrize("path", _workflow_paths(), ids=lambda p: p.name)
+def test_no_workflow_is_triggered_by_a_tag_push(path: Path):
+    """tags in this repo are published BY a workflow; none may be an input to one.
+
+    `publish.yml` fires on a push to `main` that bumps the version, and creates `v<version>` itself
+    afterwards. a tag trigger alongside that is a second route to PyPI which skips the version-bump
+    check, the "already on PyPI" check and the tag-conflict preflight, every gate the design relies
+    on.
+
+    the failure this pins: pushing an abandoned `flash-v*` tag runs whatever publish file is stored
+    at that tagged commit, because Actions resolves the workflow from the pushed ref. no edit on
+    `dev` can stop that for a tag that already exists; what this test buys is that the pattern
+    cannot come back on any commit reachable from here.
+
+    a literal `tags:` key is not the only way in: per actions semantics, `on.push` with NEITHER
+    `branches` NOR `tags` runs on every pushed ref, tags included. `on: push` (the bare shorthand)
+    loads as `push is None`, and `push: {paths: [...]}` with no `branches` key loads as a dict with
+    no `tags` key either -- both used to return early or pass the old `"tags" not in push` check
+    while still triggering on a tag push, so deleting the `branches:` filter from `publish.yml`
+    would have restored the tag-triggered release path this test claims to prevent, and stayed
+    green. the fix is to require a POSITIVE branch restriction (`branches` or `branches-ignore`)
+    on every push trigger rather than merely forbidding the `tags` key. `tags-ignore` covering every
+    tag would also close the hole, but is not accepted here to keep the rule a single simple check
+    rather than one that has to reason about ignore-glob coverage.
+    """
+    push = _triggers(_load(path)).get("push")
+    if push is None:
+        return
+    assert isinstance(push, dict), (
+        f"{path.name} declares `on: push` (the bare shorthand, with no `branches` filter at all). "
+        "that runs on every pushed ref, tags included, which is exactly the tag-triggered publish "
+        "path this contract exists to prevent."
+    )
+    assert "branches" in push or "branches-ignore" in push, (
+        f"{path.name} declares an `on.push` trigger with no `branches` or `branches-ignore` key "
+        f"({push!r}). without a positive branch restriction the trigger also fires on tag pushes, "
+        "which bypasses the version-bump and already-on-PyPI gates that publish.yml relies on."
+    )
+    assert "tags" not in push, (
+        f"{path.name} declares an `on.push.tags` trigger ({push['tags']!r}). Tags are produced by "
+        "publish.yml, not consumed: a tag-triggered publish bypasses the version-bump and "
+        "already-on-PyPI gates."
+    )
+
+
+def test_main_source_guard_checks_provenance_not_just_the_branch_name():
+    """a branch NAME check is spoofable by anyone with a fork the moment this repo is public.
+
+    for a fork PR, `github.head_ref` is the branch name *inside the fork*, so a guard comparing
+    only that name lets someone fork the repo, name a branch `dev`, open a PR straight into `main`,
+    and go green, under a check whose displayed name ("Source branch is dev") is what a reviewer
+    reads in the checks list. the repository of the head ref is the part that cannot be renamed
+    into compliance, so it is what must be compared.
+
+    the script is EXECUTED rather than grepped, for the same reason as the dispatch test above:
+    substring-matching `head.repo.full_name` proves the characters exist, not that they gate
+    anything. each outcome is asserted separately, and the two rejection paths must be
+    distinguishable in their messages: "you targeted main from the wrong branch" and "fork heads
+    may never target main" call for different actions from the person reading the log.
+    """
+    document = _load(WORKFLOW_DIR / "main-source-guard.yml")
+    job = _jobs(document)["source-is-dev"]
+
+    # the guard is only meaningful on PRs into `main`; a widened trigger would run it (and pass it)
+    # where it means nothing.
+    assert _triggers(document)["pull_request"]["branches"] == ["main"], (
+        "main-source-guard must stay scoped to pull requests targeting main"
+    )
+
+    steps = [step for step in _steps(job) if "run" in step]
+    assert len(steps) == 1, "the guard should stay a single step"
+    step = steps[0]
+    script = step["run"]
+
+    # read the head repository from the `pull_request` payload, not from `github.repository`
+    # (which is the BASE repo on a fork PR and would compare a value to itself) and not from
+    # `github.event.pull_request.head.label` (a display string a fork owner influences).
+    #
+    # this checks the exact env MAPPING, not merely that the right-hand expression appears
+    # somewhere in the step -- and it runs before the script is ever executed. the run() helper
+    # below feeds HEAD_REPO/HEAD_REF/UPSTREAM_REPO to the script directly, so every assertion past
+    # this point exercises the script's logic in isolation from the workflow file. that gap used to
+    # be the whole test: an `any(... in str(value) ...)` over env.values() proves the expression is
+    # present SOMEWHERE, not that it is wired to the name the script reads. `HEAD_REPO` rewired to
+    # `github.repository` -- with the correct expression parked under an unused env key, or with
+    # both HEAD_REPO and UPSTREAM_REPO bound to the head-repo expression so the script compares a
+    # value to itself -- passed every assertion below while the live guard would accept a fork
+    # branch named `dev`. asserting the mapping itself is what closes that.
+    env = step.get("env") or {}
+    assert env.get("HEAD_REPO") == "${{ github.event.pull_request.head.repo.full_name }}", (
+        "HEAD_REPO must be wired to github.event.pull_request.head.repo.full_name -- that is the "
+        f"only value a fork owner cannot set. its env is {env!r}"
+    )
+    assert env.get("UPSTREAM_REPO") == "${{ github.repository }}", (
+        f"UPSTREAM_REPO must be wired to github.repository (the base repo). its env is {env!r}"
+    )
+    assert env.get("UPSTREAM_REPO") != env.get("HEAD_REPO"), (
+        "UPSTREAM_REPO and HEAD_REPO must not resolve to the same expression -- that would compare "
+        f"the base repo to itself and accept any head. its env is {env!r}"
+    )
+    assert env.get("HEAD_REF") == "${{ github.head_ref }}", (
+        f"HEAD_REF must be wired to github.head_ref. its env is {env!r}"
+    )
+
+    def run(head_repo: str, head_ref: str) -> tuple[int, str]:
+        completed = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                "HEAD_REPO": head_repo,
+                "HEAD_REF": head_ref,
+                "UPSTREAM_REPO": UPSTREAM_REPOSITORY,
+            },
+        )
+        return completed.returncode, completed.stdout + completed.stderr
+
+    # 1. the one legitimate promotion.
+    code, logged = run(UPSTREAM_REPOSITORY, "dev")
+    assert code == 0, f"upstream dev -> main must be allowed, got exit {code}: {logged}"
+
+    # 2. the spoof this test exists for: right branch name, wrong repository.
+    code, logged = run("attacker/flash", "dev")
+    assert code != 0, (
+        "a fork branch named 'dev' was accepted -- the guard is still comparing names only"
+    )
+    assert "fork" in logged.lower(), (
+        f"the fork rejection must say so, so it is not read as a branch-naming mistake: {logged}"
+    )
+
+    # 3. wrong branch, upstream repository. distinct message from case 2.
+    code, logged = run(UPSTREAM_REPOSITORY, "feature/thing")
+    assert code != 0, "a non-dev upstream branch was accepted"
+    assert "fork" not in logged.lower(), (
+        f"an upstream branch must not be reported as a fork problem: {logged}"
+    )
+    assert "dev" in logged, f"the branch rejection must name the required branch: {logged}"
+
+    # 4. fails closed when the field is absent (deleted fork, or a re-trigger where the payload
+    # carries no head repo) rather than treating "" as "not a fork".
+    code, logged = run("", "dev")
+    assert code != 0, (
+        f"an empty head repository must be rejected, not defaulted to upstream: {logged}"
+    )
+
+
 def test_workflows_that_touch_shared_resources_are_upstream_only():
     """A fork must not run the jobs that publish, push images, or spend GPU money.
 
