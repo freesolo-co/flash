@@ -585,16 +585,42 @@ def test_a_fixed_horizon_is_told_that_widening_costs_more_not_less(tmp_path, mon
     assert "quotes cheaper" not in err
 
 
-def test_a_derived_horizon_is_not_told_that_widening_raises_the_bill(tmp_path, monkeypatch, capsys):
-    """The mirror of the fixed-horizon case: here a wider batch really is cheaper."""
+def test_a_derived_horizon_states_the_mechanism_without_guaranteeing_a_cheaper_quote(
+    tmp_path, monkeypatch, capsys
+):
+    """The mirror of the fixed-horizon case, but it must not overclaim in the other direction.
+
+    Spreading the same prompts over fewer updates is always true here. "Cheaper" is not: the
+    derived horizon is `ceil(examples / batch)`, so the step count plateaus and an increase inside
+    a plateau adds generation at an unchanged horizon. The message states the mechanism and sends
+    the user to `--cost`, which prices the real answer.
+    """
     monkeypatch.setenv("FLASH_STYLE", "0")
 
     rc = cmd_train(_grpo_cost_args(tmp_path, 1))
     err = capsys.readouterr().err
 
     assert rc == 0
-    assert "quotes cheaper" in err
+    assert "spreads the same prompts over fewer updates" in err
     assert "higher bill" not in err
+    assert "quotes cheaper" not in err
+
+
+def test_a_ceiling_plateau_is_not_promised_a_cheaper_quote(tmp_path, monkeypatch, capsys):
+    """`ceil(5/3) == ceil(5/4) == 2`, so widening inside a plateau costs strictly more.
+
+    Measured on this exact shape: batch 3 quotes $0.0867 at 2 updates and batch 4 quotes $0.1027
+    at the same 2 updates. Any unconditional "raising this quotes cheaper" is false here, which is
+    why the derived-horizon remedy claims a mechanism rather than a direction for the bill.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, 3, max_examples=5))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "OPTIMIZER batch" in err  # batch 3 is still below the threshold, so it warns
+    assert "cheaper" not in err
 
 
 def test_an_environment_param_cap_is_named_as_such(tmp_path, monkeypatch, capsys):
