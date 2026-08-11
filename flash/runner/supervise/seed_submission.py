@@ -6,7 +6,7 @@ Split out of ``flash.runner.supervise.lifecycle`` to keep that module under the 
 from __future__ import annotations
 
 import contextlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, is_dataclass, replace
 
 from flash.core.spec import JobSpec, gpu_count_of
 from flash.runner.supervise import lifecycle as _lifecycle
@@ -347,6 +347,39 @@ def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOut
     )
 
 
+def _ranking_train_knobs(attempt_spec):
+    """Train knobs for hardware ranking, with SFT's batch taken from the profile.
+
+    Ranking prices candidate shapes through `sharded_step_seconds`, which credits SFT only the
+    ranks that will execute (`sft_data_parallel_cards`). That clamp reads `batch_size`, and the
+    AUTHORED batch is not what the run executes: the workload profile reduces it to
+    `examples_per_update`, which every exact-unpacked run pins to 1. Ranking off the authored
+    number would credit a 4-card candidate four ranks the worker will never launch, and pick a
+    wider, costlier shape than the run can use -- while the persisted quote, which does read the
+    profile, disagrees with it.
+
+    Falls back to the authored knobs whenever the profile is absent or unreadable: ranking must
+    never be the thing that fails a submission, and a missing profile is caught by the quote path
+    that validates the digest.
+    """
+    train = attempt_spec.train
+    if getattr(attempt_spec, "algorithm", "") != "sft":
+        return train
+    try:
+        from flash.cost.spec import _sft_profile
+
+        examples = int(_sft_profile(attempt_spec).examples_per_update)
+    except Exception:
+        return train
+    if examples < 1:
+        return train
+    if isinstance(train, dict):
+        return {**train, "batch_size": examples}
+    if is_dataclass(train):
+        return replace(train, batch_size=examples)
+    return train
+
+
 def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
     from flash.providers.allocator import allocate
     from flash.providers.base import PollResult, UnsupportedGpuError
@@ -364,7 +397,7 @@ def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
         allocation = allocate(
             prepared.attempt_spec.model,
             prepared.attempt_spec.algorithm,
-            train=prepared.attempt_spec.train,
+            train=_ranking_train_knobs(prepared.attempt_spec),
             thinking=prepared.attempt_spec.thinking,
             # the run's requested disk, so the vast capacity check searches at the same effective
             # floor submit provisions with — else a high-disk run is advertised vast capacity that

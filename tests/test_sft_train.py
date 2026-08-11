@@ -2230,3 +2230,40 @@ def test_sft_ships_no_val_file_so_the_child_cannot_validate():
     code = "\n".join(ln for ln in worker.splitlines() if not ln.strip().startswith("#"))
     assert "val.parquet" not in code
     assert "val_file" not in code
+
+
+def test_sft_hardware_ranking_prices_the_profiled_batch_not_the_authored_one(monkeypatch):
+    """Ranking must clamp on the batch the run EXECUTES, not the one the user typed.
+
+    `sharded_step_seconds` credits SFT only the ranks `sft_data_parallel_cards` allows, and that
+    reads `batch_size`. The workload profile reduces the authored batch to `examples_per_update`
+    (1 for every exact-unpacked run), so ranking off the authored number would credit a 4-card
+    candidate four ranks the worker will never launch -- picking a wider, costlier shape than the
+    run can use, and disagreeing with the persisted quote, which does read the profile.
+    """
+    import types
+
+    # a profile that reduces the authored batch of 8 to a single example per update.
+    import flash.cost.spec as cost_spec
+    from flash.core.spec import TrainSpec
+    from flash.runner.supervise import seed_submission
+
+    monkeypatch.setattr(
+        cost_spec,
+        "_sft_profile",
+        lambda spec: types.SimpleNamespace(examples_per_update=1),
+    )
+
+    spec = types.SimpleNamespace(algorithm="sft", train=TrainSpec(batch_size=8))
+    assert seed_submission._ranking_train_knobs(spec).batch_size == 1
+
+    # a non-sft run has no profile clamp and must pass its knobs through untouched.
+    grpo = types.SimpleNamespace(algorithm="grpo", train=TrainSpec(batch_size=8))
+    assert seed_submission._ranking_train_knobs(grpo).batch_size == 8
+
+    # an unreadable profile must not fail the submission -- fall back to the authored knobs.
+    def boom(spec):
+        raise ValueError("digest mismatch")
+
+    monkeypatch.setattr(cost_spec, "_sft_profile", boom)
+    assert seed_submission._ranking_train_knobs(spec).batch_size == 8
