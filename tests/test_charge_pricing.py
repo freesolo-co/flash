@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import math
 
+import pytest
+
 import flash.runner as runner
 
 SPEC = {
@@ -115,6 +117,60 @@ def test_charge_usd_for_spec_falls_back_when_unpriceable():
     # a spec that can't be priced returns the fallback rather than raising (a charge is never blocked)
     assert runner.charge_usd_for_spec(object(), fallback=1.5) == 1.5
     assert runner.charge_usd_for_spec(object(), steps=5, fallback=2.0) == 2.0
+
+
+def _unbounded_on_policy_spec(algorithm: str):
+    """A grpo/opd spec that states no prompt-pool size and no horizon -- the shape a quote refuses.
+
+    Neither ``max_examples`` nor ``max_steps`` is set, so ``spec_steps`` cannot derive an update
+    horizon and raises rather than inventing one. Submitting this is blocked; a run that predates
+    the check, or one whose environment supplies the pool at load time, still reaches cancellation.
+    """
+    from flash.schema import spec_from_dict
+
+    return spec_from_dict(
+        {
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": algorithm,
+            "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
+            "train": {"epochs": 1, "batch_size": 8, "group_size": 4},
+            "gpu": {},
+        },
+        run_id="run-unbounded",
+    )
+
+
+def test_cancel_prices_an_unbounded_on_policy_run_from_its_completed_steps():
+    # refusing to GUESS a horizon must not spread to a run that no longer needs one guessed: a
+    # cancel states the steps it ran, which is a horizon, so the missing pool size is irrelevant.
+    # regression -- the raise propagated through the blanket except here and returned the fallback,
+    # so a cancelled unbounded run billed $0 and settled as a pricing failure while having really
+    # rented the GPU. both algorithms derive the same way, so both regressed.
+    for algorithm in ("grpo", "opd"):
+        spec = _unbounded_on_policy_spec(algorithm)
+        charge = runner.charge_usd_for_spec(spec, steps=7, fallback=float("nan"))
+        assert math.isfinite(charge), f"{algorithm} cancel was unpriceable"
+        assert charge > 0
+        # priced from the completed count, not a guess: more steps run == more owed, and a cancel
+        # before the first step is still free.
+        assert runner.charge_usd_for_spec(spec, steps=14, fallback=float("nan")) > charge
+        assert runner.charge_usd_for_spec(spec, steps=0, fallback=float("nan")) == 0.0
+        # and the quote-anchored path reaches the same estimate instead of discarding the quote.
+        st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=12.0)
+        assert runner.cancelled_charge_usd(st, spec, steps=7, fallback=float("nan")) == charge
+
+
+def test_quoting_an_unbounded_on_policy_run_still_refuses_to_guess():
+    # the paired control: with no steps to state there is still no horizon, so a PRE-run quote must
+    # keep refusing. without this, a fix for the cancel path could silently restore the guess the
+    # raise exists to prevent, and the test above would pass just as well.
+    from flash.cost.spec import UnknownPromptPoolSize, spec_steps
+
+    for algorithm in ("grpo", "opd"):
+        spec = _unbounded_on_policy_spec(algorithm)
+        with pytest.raises(UnknownPromptPoolSize):
+            spec_steps(spec)
+        assert math.isnan(runner.charge_usd_for_spec(spec, fallback=float("nan")))
 
 
 def test_cancelled_charge_usd_prorates_and_clamps_to_the_quote():
