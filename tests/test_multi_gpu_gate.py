@@ -1298,8 +1298,12 @@ def test_an_uncertified_pin_still_narrows_below_the_four_card_ceiling():
 
         monkey.setattr(vram, "fetch_hf_model_geometry", _unreadable)
 
+        # `certify=True` is required for the stub above to fire at all: without it the cap never
+        # reaches the hub, the pin is never uncertified, and this asserts the unpinned path twice.
         # 6 % 4 != 0 and 6 % 2 == 0, so an uncertified pin must land on 2, not on the bare ceiling.
-        assert geometry_safe_gpu_cap("Qwen/Fake-6-Head", 8, model_revision="a" * 40) == 2
+        assert (
+            geometry_safe_gpu_cap("Qwen/Fake-6-Head", 8, model_revision="a" * 40, certify=True) == 2
+        )
         # the unpinned path already checked the row and must be unchanged by this.
         assert geometry_safe_gpu_cap("Qwen/Fake-6-Head", 8) == 2
     finally:
