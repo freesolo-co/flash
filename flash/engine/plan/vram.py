@@ -431,16 +431,11 @@ def estimate_vram_gb(
 # materializes a full activation set, and the wide expert stack makes each one large. 18.0 called a
 # run that OOMs a fit, on BOTH an H200 and a B200.
 #
-# 196.9 is NOT a measured activation cost. It is the residual that makes this equation's TOTAL
-# (weights + overhead + adapter + activations) land on the allocated-at-OOM boundary of the run in
-# test_moe_activation_constant_matches_the_live_b200_peak, at that run's rank 64. Two reasons it
-# cannot be read as an activation measurement: the run died, so 180.3 GB is a lower bound on what
-# the step needed, not a peak it reached; and verl's "After FSDP" baseline is logged BEFORE the
-# optimizer is built (transformer_impl.py:565 vs :569) and divides by 1024**3, so the tempting
-# "allocated minus resident" subtraction mixes units AND counts optimizer state as activation.
-# Calibrating the total sidesteps both, since `base` already carries the adapter/optimizer term.
-# A true activation coefficient needs a post-optimizer baseline and a SUCCESSFUL peak measurement;
-# until someone takes one, treat this as a fit-gate boundary and re-derive it the same way.
+# 196.9 is NOT a measured activation cost: it is the residual that lands this equation's TOTAL on
+# the allocated-at-OOM boundary of a live B200 run. Re-derive it the same way, never by measuring
+# activations alone. The run evidence, the unit trap, and the reason the naive
+# "allocated minus resident" subtraction is wrong all live in the test that pins this boundary,
+# test_moe_activation_constant_matches_the_live_b200_peak.
 _GC_OFF_ACT_K_DENSE = 65.0
 _GC_OFF_ACT_K_MOE = 196.9
 

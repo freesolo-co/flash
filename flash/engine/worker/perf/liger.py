@@ -36,12 +36,17 @@ def _liger_default_for_model(model_id: str, revision: str = "") -> bool:
     therefore disable gradient checkpointing on a 35B model and OOM the run. The catalog is local,
     exact, and always available, so it answers first; the probe remains for uncataloged models,
     which is the supported way to fork the catalog and add one.
-    """
-    from flash.core.catalog import MODELS
 
-    info = MODELS.get(model_id)
-    catalog_params_b = float(getattr(info, "params_b", 0.0) or 0.0) if info else 0.0
-    if catalog_params_b:
+    Resolved through ``resolve_params_b``, the shared worker/cost accessor, so this gate can never
+    disagree with the size the allocator and the VRAM equations use. Called without a revision on
+    purpose: a pinned commit resolves size by fetching the HF safetensors index, which is the
+    network read this short-circuit exists to avoid, and no cataloged model sits near enough to the
+    3B threshold for the +/-5% revision tolerance to change this answer.
+    """
+    from flash.engine.plan.vram import resolve_params_b
+
+    catalog_params_b = resolve_params_b(model_id)
+    if catalog_params_b is not None:
         return catalog_params_b >= _LIGER_MIN_PARAMS_B
     try:
         from transformers import AutoConfig

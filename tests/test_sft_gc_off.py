@@ -369,8 +369,10 @@ def test_size_gate_reads_the_catalog_not_a_dense_param_estimate():
     gate's answer was therefore correct by luck, on a model that clears the bar 11x over, and a
     small catalog change (a narrower vocab, fewer layers) would silently flip it to "small model,
     no gradient checkpointing needed" on a 35B MoE.
+
+    This test only characterizes the formula -- every assertion below holds with or without the
+    fix. ``test_size_gate_is_offline_and_fail_safe_for_cataloged_models`` owns the behavior.
     """
-    import flash.engine.worker.perf.liger as liger_mod
     from flash.core.catalog import MODELS
     from flash.engine.worker.perf.liger import _LIGER_MIN_PARAMS, _estimate_params
 
@@ -385,16 +387,6 @@ def test_size_gate_reads_the_catalog_not_a_dense_param_estimate():
     assert MODELS["Qwen/Qwen3.6-35B-A3B"].params_b == 35.0
     # the margin the old path depended on: 1% of the threshold, on an 11.5x-larger model.
     assert 1.0 < estimate / _LIGER_MIN_PARAMS < 1.02
-    # the assertions above only describe the formula -- they hold with or without the fix. this is
-    # the one that pins the BEHAVIOR: a cataloged model must answer without consulting the probe.
-    calls = []
-    original = liger_mod._estimate_params
-    try:
-        liger_mod._estimate_params = lambda cfg: calls.append(cfg) or original(cfg)
-        assert liger_mod._liger_default_for_model("Qwen/Qwen3.6-35B-A3B") is True
-    finally:
-        liger_mod._estimate_params = original
-    assert calls == [], "cataloged model fell through to the dense config probe"
 
 
 def test_size_gate_is_offline_and_fail_safe_for_cataloged_models(monkeypatch):
@@ -403,14 +395,24 @@ def test_size_gate_is_offline_and_fail_safe_for_cataloged_models(monkeypatch):
     ``_liger_default_for_model`` returns False on ANY exception, and False means "small model" ->
     ``_memory_mode`` False -> gradient checkpointing OFF. So a rate-limited or offline HF read used
     to disable checkpointing on a 35B model. The catalog is local and exact, so it answers first.
+
+    The failure is injected at ``AutoConfig.from_pretrained`` rather than at ``_estimate_params``:
+    that call IS the network boundary, and it runs first. Patching the estimator instead would let
+    a regressed short-circuit reach the real HF read before hitting anything this test controls.
     """
+    import sys
+    import types
+
     import flash.engine.worker.perf.liger as liger_mod
     from flash.engine.worker.perf.memory import _memory_mode
 
     def _explode(*a, **k):
-        raise RuntimeError("HF unreachable")
+        raise AssertionError("cataloged model fell through to the HF config probe")
 
-    monkeypatch.setattr(liger_mod, "_estimate_params", _explode)
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoConfig = types.SimpleNamespace(from_pretrained=_explode)
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
     # every cataloged model answers from params_b, with the probe guaranteed to fail if consulted.
     assert liger_mod._liger_default_for_model("Qwen/Qwen3.6-35B-A3B") is True
     assert liger_mod._liger_default_for_model("Qwen/Qwen3.6-27B") is True
