@@ -3027,12 +3027,16 @@ def test_deploy_allows_runner_assigned_revision_pin(api):
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
     status = runner.get_status(run_id)
-    # pin BOTH halves of the persisted snapshot. `_validate_effective_spec` compares the public
-    # spec against effective_preparation.worker_spec structurally, so mutating only status.spec
-    # clears the 400 and then dies at 409 "persisted effective preparation does not match the
-    # public run" -- which would satisfy a bare `!= 400` while proving nothing about deployability.
+    # reproduce the shape a REAL auto-pinned submit persists, which is asymmetric: submit stores
+    # `spec=public_spec.to_dict()`, and to_dict() strips the marker, so the public half never
+    # carries it and only the worker half does. Writing the marker onto status.spec too would be a
+    # shape production cannot produce, and it would paper over `_validate_effective_spec` rejecting
+    # the real one -- a 409 that leaves auto-pinned runs just as undeployable as the 400 did.
+    #
+    # Both halves still carry the revision itself: that IS symmetric in production, since
+    # model_revision is a public field.
     status.spec["model_revision"] = "a" * 40
-    status.spec["model_revision_auto"] = True
+    assert "model_revision_auto" not in status.spec, status.spec
     snapshot = status.effective_preparation
     assert isinstance(snapshot, dict), snapshot
     snapshot["worker_spec"]["model_revision"] = "a" * 40

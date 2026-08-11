@@ -1061,6 +1061,35 @@ def test_model_revision_auto_does_not_change_pre_existing_preparation_digests() 
     assert _preparation_digest(marked, marked, None) != legacy
 
 
+def test_effective_spec_validation_accepts_the_asymmetric_auto_pin_shape() -> None:
+    """The public/worker structural compare must tolerate the marker living on one half only.
+
+    Submit persists `spec=public_spec.to_dict()`, and to_dict() strips the marker, so a real
+    auto-pinned run is asymmetric by construction: the worker half carries True, and the public
+    half rebuilt from the stored dict reads the False default. `_validate_effective_spec` compares
+    the two structurally, so without an exclusion it raises for every auto-pinned run -- turning
+    the 400 this PR removes into a 409 and leaving those runs exactly as undeployable.
+
+    Built by round-tripping through to_dict() rather than by hand, so the test cannot assert a
+    shape that submit does not actually produce.
+    """
+    from flash.runner.preparation import _validate_effective_spec
+
+    worker = replace(
+        spec_from_dict(_raw(model="Qwen/Qwen3.5-9B", algorithm="sft", model_revision="a" * 40)),
+        model_revision_auto=True,
+    )
+    public = spec_from_dict(worker.to_dict())
+    assert public.model_revision_auto is False  # the strip is what makes this asymmetric
+    assert public.model_revision == worker.model_revision  # the pin itself IS symmetric
+
+    _validate_effective_spec(public, worker)  # raises if the exclusion is missing
+
+    # and the exclusion is narrow: a genuinely divergent revision is still caught
+    with pytest.raises(ValueError, match="does not match the public run"):
+        _validate_effective_spec(public, replace(worker, model_revision="b" * 40))
+
+
 def test_unknown_top_level_scalar_and_jobspec_gpu_shapes_fail_closed() -> None:
     with pytest.raises(ConfigError, match=r"unknown config key\(s\): model_revison"):
         spec_from_dict(_raw(model_revison="main"))
