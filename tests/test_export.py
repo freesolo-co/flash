@@ -73,8 +73,10 @@ def test_export_import_does_not_initialize_worker_package(tmp_path):
         [
             sys.executable,
             "-c",
-            "import sys; import flash.serve.export; "
-            "assert 'flash.engine.worker' not in sys.modules",
+            (
+                "import sys; import flash.serve.export; "
+                "assert 'flash.engine.worker' not in sys.modules"
+            ),
         ],
         cwd=Path(__file__).parents[1],
         env=env,
