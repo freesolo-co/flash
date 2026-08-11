@@ -7,7 +7,6 @@ import base64
 import contextlib
 import json
 import math
-import os
 import time
 from dataclasses import dataclass
 
@@ -64,7 +63,6 @@ __all__ = [
     "JobHandle",
     "PollResult",
     "apply_disk_gb",
-    "apply_image_override_constraints",
     "build_function_input",
     "capacity_escalation_note",
     "decode_output",
@@ -108,23 +106,6 @@ def stall_kwargs(on_last_gpu: bool = False) -> dict:
         "queue_grace_s": grace,
         "throttled_grace_s": grace,
     }
-
-
-def apply_image_override_constraints(config) -> None:
-    """Attach the override image's registry auth to a built endpoint config.
-
-    Private override images otherwise fail before Flash code starts.
-    """
-    from flash.providers._lifecycle.worker import worker_image_override
-
-    override = worker_image_override()
-    if not (override and override.registry_auth_id):
-        return
-    template = getattr(config, "template", None)
-    if template is None:
-        logger.warning("image override registry auth set but endpoint config has no template")
-        return
-    template.containerRegistryAuthId = override.registry_auth_id
 
 
 def apply_disk_gb(config, disk_gb: int | None) -> None:
@@ -210,7 +191,7 @@ def _is_balance_error(exc: Exception) -> bool:
 
 def build_function_input(payload: dict) -> dict:
     """The FunctionRequest dict a Flash queue worker expects for `_train_body(payload)`."""
-    if os.environ.get("FLASH_WORKER_IMAGE") or WORKER_IMAGE:
+    if WORKER_IMAGE:
         return payload
     from runpod_flash.runtime.serialization import serialize_args
     from runpod_flash.stubs.live_serverless import get_function_source
