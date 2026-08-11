@@ -608,7 +608,13 @@ def test_the_offline_probe_sizes_a_pinned_catalog_model_by_its_revision(monkeypa
     def _pinned_geometry(model_id, revision="", strict=False):
         assert model_id == model
         seen_revisions.append(revision)
-        return (info.params_b, info.vocab_size, info.hidden_size, info.num_layers)
+        return (
+            info.params_b,
+            info.vocab_size,
+            info.hidden_size,
+            info.num_layers,
+            info.num_attention_heads,
+        )
 
     monkeypatch.setattr(vram, "fetch_hf_model_geometry", _pinned_geometry)
     monkeypatch.setattr("flash.cost.facts._PINNED_SIZE_MEMO", dict(_PINNED_SIZE_MEMO))
@@ -623,12 +629,14 @@ def test_the_offline_probe_sizes_a_pinned_catalog_model_by_its_revision(monkeypa
     assert need > 0
     assert provider
     assert rate > 0
-    # TWO independent sites size a pinned run here -- the fail-closed params check and the VRAM
-    # requirement -- and each must carry the pin. Asserting only "some call saw the revision" cannot
-    # tell them apart: dropping the pin from either one still leaves the other populating the list,
-    # so the count is what makes this test able to fail.
-    assert len(seen_revisions) == 2, (
-        f"expected both the params check and the VRAM sizing to pass the pin, saw {seen_revisions}"
+    # THREE independent sites read a pinned run here -- the fail-closed params check, the VRAM
+    # requirement, and the head-geometry cap that decides how wide it may be rented -- and each must
+    # carry the pin. Asserting only "some call saw the revision" cannot tell them apart: dropping
+    # the pin from any one of them still leaves the others populating the list, so the count is what
+    # makes this test able to fail.
+    assert len(seen_revisions) == 3, (
+        "expected the params check, the VRAM sizing, and the geometry cap to pass the pin, "
+        f"saw {seen_revisions}"
     )
     assert set(seen_revisions) == {expected_revision}
 

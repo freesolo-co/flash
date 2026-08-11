@@ -495,18 +495,22 @@ def sft_grad_checkpoint_can_disable(
     return peak + float(margin_gb) <= float(card_vram_gb)
 
 
-def _config_geometry(config: dict) -> tuple[int, int, int]:
+def _config_geometry(config: dict) -> tuple[int, int, int, int]:
     text = config.get("text_config") if isinstance(config.get("text_config"), dict) else config
     return (
         int(text.get("vocab_size") or config.get("vocab_size") or 0),
         int(text.get("hidden_size") or config.get("hidden_size") or 0),
         int(text.get("num_hidden_layers") or config.get("num_hidden_layers") or 0),
+        # QUERY heads, read from the pinned commit's own config. verl's ulysses sequence
+        # parallelism requires this to divide the card count, so it is what decides how wide a
+        # pinned run may be rented -- see `allocator.geometry_safe_gpu_cap`.
+        int(text.get("num_attention_heads") or config.get("num_attention_heads") or 0),
     )
 
 
 def fetch_hf_model_geometry(
     model_id: str, revision: str = "", *, strict: bool = False
-) -> tuple[float | None, int, int, int]:
+) -> tuple[float | None, int, int, int, int]:
     """Return revision-aware params and config geometry from Hugging Face."""
     try:
         from huggingface_hub import HfApi, hf_hub_download
@@ -531,29 +535,24 @@ def fetch_hf_model_geometry(
             config = json.load(handle)
         if not isinstance(config, dict):
             raise ValueError("model config is not an object")
-        vocab, hidden, layers = _config_geometry(config)
-        return params_b, vocab, hidden, layers
+        vocab, hidden, layers, heads = _config_geometry(config)
+        return params_b, vocab, hidden, layers, heads
     except Exception as exc:
         if strict:
             raise ValueError(
                 f"could not resolve revision-specific sizing metadata for model {model_id!r}"
             ) from exc
-        return None, 0, 0, 0
+        return None, 0, 0, 0, 0
 
 
-def _validated_revision_geometry(model_id: str, revision: str, info):
-    params_b, vocab, hidden, layers = fetch_hf_model_geometry(model_id, revision, strict=True)
-    # Revision-aware sizing is authoritative and must fail closed. When the pinned commit exposes no
-    # parameter-count metadata (no safetensors.total), we cannot derive its size; silently reusing the
-    # catalog default-revision count would size the exact-GPU preflight on weights the worker never loads,
-    # the precise mis-provisioning this pin exists to prevent.
-    if params_b is None:
-        raise ValueError(
-            f"model_revision for {model_id!r} exposes no parameter-count metadata "
-            f"(no safetensors.total); cannot size the pinned revision"
-        )
+def _geometry_mismatches(info, params_b, vocab, hidden, layers, heads) -> list[str]:
+    """Catalog fields a pinned commit's own geometry contradicts.
+
+    Split out so the head-count path can certify a pin against the SAME rules the sizing path uses
+    without a second hub round trip. A zero means "the config did not say", which is not a conflict.
+    """
     mismatches: list[str] = []
-    if info.params_b > 0:
+    if info.params_b > 0 and params_b is not None:
         delta = abs(params_b - info.params_b) / info.params_b
         if delta > 0.05:
             mismatches.append("parameter count")
@@ -563,12 +562,78 @@ def _validated_revision_geometry(model_id: str, revision: str, info):
         mismatches.append("hidden size")
     if layers and info.num_layers and layers != info.num_layers:
         mismatches.append("layer count")
+    if heads and info.num_attention_heads and heads != info.num_attention_heads:
+        mismatches.append("attention head count")
+    return mismatches
+
+
+def _validated_revision_geometry(model_id: str, revision: str, info):
+    params_b, vocab, hidden, layers, heads = fetch_hf_model_geometry(
+        model_id, revision, strict=True
+    )
+    # Revision-aware sizing is authoritative and must fail closed. When the pinned commit exposes no
+    # parameter-count metadata (no safetensors.total), we cannot derive its size; silently reusing the
+    # catalog default-revision count would size the exact-GPU preflight on weights the worker never loads,
+    # the precise mis-provisioning this pin exists to prevent.
+    if params_b is None:
+        raise ValueError(
+            f"model_revision for {model_id!r} exposes no parameter-count metadata "
+            f"(no safetensors.total); cannot size the pinned revision"
+        )
+    mismatches = _geometry_mismatches(info, params_b, vocab, hidden, layers, heads)
     if mismatches:
         raise ValueError(
             f"model_revision for {model_id!r} has geometry incompatible with the catalog: "
             f"{', '.join(mismatches)}"
         )
     return params_b, vocab or info.vocab_size
+
+
+# Same shape and rationale as `cost.facts._PINNED_SIZE_MEMO`: a pinned lookup is a round trip to the
+# hub, and the allocator asks for the same pin several times per quote. Only SUCCESSES are stored --
+# a hub blip is a fact about the network, not about the model, and caching it would pin a run to
+# four cards until the plane restarted.
+_PINNED_HEADS_MEMO: dict[tuple[str, str], int] = {}
+
+
+def certified_revision_attention_heads(model_id: str, revision: str) -> int:
+    """Query-head count of a PINNED commit, or 0 when it cannot be certified.
+
+    How wide a pinned run may be rented is a divisibility question about the weights the worker
+    actually loads, so it has to be answered from that commit's own ``config.json`` rather than from
+    the catalog row describing the default revision.
+
+    Returns 0 -- "not certified" -- for everything unreadable: an uncataloged model, a hub failure,
+    or a config that omits the field. Never raises. Widening past the conservative ceiling is the
+    only thing this enables, so an unreadable pin has to degrade to that ceiling rather than reject
+    a run the sizing path already accepted.
+
+    Certified, not merely read: the same catalog cross-check the sizing path applies runs here, so a
+    pin whose geometry has drifted is rejected rather than widened. Widening a run on a config that
+    disagrees with everything else known about the model is the failure this exists to prevent.
+    """
+    from flash.core.catalog import MODELS
+
+    info = MODELS.get(model_id)
+    if info is None or not revision:
+        return 0
+    key = (model_id, revision)
+    if key not in _PINNED_HEADS_MEMO:
+        try:
+            params_b, vocab, hidden, layers, heads = fetch_hf_model_geometry(
+                model_id, revision, strict=True
+            )
+        except Exception:
+            return 0
+        # a commit exposing no parameter count is the same fail-closed case the sizing path rejects
+        # outright. checked here too so this function is safe on its own rather than by relying on
+        # sizing having run first -- the schema preflight calls the cap BEFORE it sizes anything.
+        if params_b is None:
+            return 0
+        if _geometry_mismatches(info, params_b, vocab, hidden, layers, heads):
+            return 0
+        _PINNED_HEADS_MEMO[key] = max(int(heads), 0)
+    return _PINNED_HEADS_MEMO[key]
 
 
 def _sizing_value(obj, key):

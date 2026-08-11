@@ -152,28 +152,39 @@ def geometry_safe_gpu_cap(model_id: str, max_gpu_count: int, *, model_revision: 
     The head count is READ from the row (``num_attention_heads``), never derived: ``hidden_size //
     head_dim`` is a different number on four of the six rows -- see ``_query_attention_heads``.
 
-    A pinned or unreadable revision keeps the pre-existing four-card ceiling rather than renting 8
-    cards verl may reject at startup, but that ceiling only NARROWS the divisor search; it is not a
-    substitute for it. A ceiling is a bound, not a divisibility proof -- 4 divides 24 but not 20 --
-    and SFT reaches allocation with the revision already resolved to a sha
-    (``runner.submit.prepare_job`` -> ``_resolve_model_revision`` with ``required=True``), so a
-    catalog row keyed on revision-emptiness alone would skip its own geometry on exactly the runs
-    that need it. Match the row by id and check the heads either way.
+    A revision whose geometry cannot be certified keeps the pre-existing four-card ceiling rather
+    than renting 8 cards verl may reject at startup, but that ceiling only NARROWS the divisor
+    search; it is not a substitute for it. A ceiling is a bound, not a divisibility proof -- 4
+    divides 24 but not 20 -- so the heads are checked either way.
+
+    A pin is not by itself unknown geometry. SFT reaches allocation with a revision ALWAYS resolved
+    to a sha (``runner.submit.prepare_job`` -> ``_resolve_model_revision`` with ``required=True``),
+    so treating "pinned" as "uncertifiable" capped every SFT run in the catalog at four cards and
+    made ``--gpus 8`` unreachable for the algorithm that always pins -- including for a run that
+    only fits at eight. The pinned commit's own ``config.json`` is what settles it: read the head
+    count from that commit (validated against the catalog row, fail-closed, so a drifted pin is
+    rejected rather than widened) and cap on the real number. An unreadable pin certifies nothing
+    and keeps the four-card ceiling.
     ALLOC-004 tracks validating arbitrary off-catalog head geometry at every width.
     """
     from flash.core.catalog import MODELS
 
     cap = largest_rentable_count(max_gpu_count)
-    if model_revision or model_id not in MODELS:
-        # an unvalidated revision keeps the pre-existing four-card ceiling, but that ceiling is a
-        # BOUND, not a divisibility proof -- it happens to divide 24 and would not divide 20. So it
-        # only narrows the search below, never substitutes for it.
-        cap = min(cap, 4)
     info = MODELS.get(model_id)
-    heads = _query_attention_heads(info) if info is not None else 0
+    if info is None:
+        # nothing to certify a width against, and nothing to cross-check a pin's own config with.
+        return min(cap, 4)
+    if model_revision:
+        # the weights the worker really loads are the pinned commit's, so its config -- not the
+        # row's default-revision geometry -- is what may widen this run. 0 means uncertified.
+        from flash.engine.plan.vram import certified_revision_attention_heads
+
+        heads = certified_revision_attention_heads(model_id, model_revision)
+    else:
+        heads = _query_attention_heads(info)
     if heads <= 0:
         # geometry we cannot read is geometry we cannot certify, so a catalog row that records no
-        # head count is treated exactly like an unvalidated revision rather than trusted for 8.
+        # head count is treated exactly like an uncertifiable revision rather than trusted for 8.
         return min(cap, 4)
     for count in rentable_gpu_counts(cap):
         if heads % count == 0:
