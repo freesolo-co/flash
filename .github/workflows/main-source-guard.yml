@@ -27,13 +27,27 @@ jobs:
     # The author must be read from `pull_request.user.login`, NOT `github.actor`. This workflow
     # declares no `types:`, so it takes the defaults opened+synchronize+reopened, and on a reopen
     # by a maintainer or a synchronize pushed by anyone other than the bot, `github.actor` is that
-    # HUMAN rather than `dependabot[bot]`. Keying on the actor would then go true, run the guard,
-    # and reject the `dependabot/*` head: the exact red required check this exemption exists to
-    # remove, reappearing on the second event instead of the first. `pull_request.user.login` is
-    # the PR opener and does not change with whoever triggered the event.
+    # HUMAN rather than `dependabot[bot]`. Keying the whole exemption on the actor would then go
+    # true, run the guard, and reject the `dependabot/*` head: the exact red required check this
+    # exemption exists to remove, reappearing on the second event instead of the first.
+    # `pull_request.user.login` is the PR opener and does not change with whoever triggered it.
+    #
+    # But author and head ref are BOTH immutable for the PR's lifetime, so they describe who opened
+    # it, never what it currently contains. A maintainer who pushes a commit to a Dependabot
+    # security PR leaves both signals untouched, and on those two alone the job stays skipped while
+    # arbitrary human code reaches `main` with no provenance check at all -- the exemption widening
+    # into a bypass. The third clause closes that: a `synchronize` (new head commits) whose actor is
+    # not the bot runs the guard, which then rejects the `dependabot/*` head.
+    #
+    # `github.event.action` is required alongside the actor here, not the actor by itself. Dependabot
+    # fires `synchronize` when it rebases its own PR, and it reopens nothing -- so gating on the
+    # actor alone would restore a red check on every maintainer REOPEN, trading this bug for the one
+    # above. The pair distinguishes "the bot updated its own PR" (skip) from "a human pushed code
+    # into a bot PR" (check it), which is the distinction that actually matters.
     if: >-
       github.event.pull_request.user.login != 'dependabot[bot]'
       || !startsWith(github.head_ref, 'dependabot/')
+      || (github.event.action == 'synchronize' && github.actor != 'dependabot[bot]')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
