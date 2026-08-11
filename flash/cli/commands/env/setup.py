@@ -914,5 +914,10 @@ def cmd_env_setup(args) -> int:
     if can_publish:
         print(f"next: flash env push --project {project_id} --name my-env .")
     else:
-        print("next: push this folder to a git repo, then set [environment] id to its github: form")
+        # hedged like every other self-hosted hint here: only a standalone plane accepts a direct
+        # `github:` id, and the CLI cannot read server-side FLASH_STANDALONE to tell which this is.
+        print(
+            "next: push this folder to a git repo, then set [environment] id to its github: form "
+            "(FLASH_STANDALONE=1 planes); on an identity-backed plane use the managed hub id instead"
+        )
     return 0

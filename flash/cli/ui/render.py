@@ -889,8 +889,13 @@ def env_setup(paths: list[str], project_id: str, *, can_publish: bool = True) ->
     if can_publish:
         next_step = arrow(f"publish it: flash env push --project {project_id} --name my-env .")
     else:
-        # `env push` targets the managed hub, which a self-hosted plane cannot write to.
-        next_step = arrow("publish it: push to a git repo, then set [environment] id = github:...")
+        # `env push` targets the managed hub, which a self-hosted plane cannot write to. Hedged on
+        # the standalone-vs-identity split for the same reason the config comments are: only a
+        # standalone plane takes a direct `github:` id, and FLASH_STANDALONE is server-side.
+        next_step = arrow(
+            "publish it: push to a git repo, then set [environment] id = github:... "
+            "(FLASH_STANDALONE=1); identity-backed planes take a managed hub id"
+        )
     return _safe(f"{head}\n{tree}\n\n{next_step}")
 
 

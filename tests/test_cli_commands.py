@@ -744,6 +744,35 @@ def test_training_guide_caveats_every_managed_hub_command_block(monkeypatch, tmp
     assert "push/pull/delete act on Freesolo's managed hub" in guide
 
 
+def test_both_next_step_renderings_hedge_the_self_hosted_id_form(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """The printed next step is the last thing setup says, and it named only one of two forms.
+
+    `_require_hosted_environment_form` accepts a direct `github:` id only when the plane runs
+    standalone; an identity-backed self-hosted plane rejects it and takes a managed hub id. The
+    config comments carry that hedge, but both next-step renderings -- plain and styled -- stated
+    the `github:` form unconditionally, so the closing instruction contradicted the file it just
+    wrote for half of all self-hosted planes.
+
+    Both branches are asserted because they are separate code paths (`setup.py` and
+    `render.env_setup`), and fixing one alone leaves whichever the operator's terminal selects.
+    """
+    from flash.cli.ui import render
+
+    # force the plain branch: render.styled() decides which of the two runs
+    monkeypatch.setattr(render, "styled", lambda: False)
+    _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+    plain = capsys.readouterr().out
+    assert "next: push this folder to a git repo" in plain
+    assert "FLASH_STANDALONE=1" in plain
+    assert "identity-backed" in plain
+
+    styled = render.env_setup(["environment.py"], "UUID", can_publish=False)
+    assert "FLASH_STANDALONE=1" in styled
+    assert "identity-backed" in styled
+
+
 def test_retained_file_probe_never_makes_an_advisory_warning_fatal(tmp_path) -> None:
     """An unreadable retained file must not abort setup from inside an advisory check.
 
