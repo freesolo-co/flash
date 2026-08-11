@@ -19,11 +19,7 @@ from flash.envs.evaluations import _DEFAULT_EVALUATIONS_PATH
 _STARTER_ENV_PY = '''\
 """Starter Freesolo environment.
 
-Edit dataset/train.jsonl and the reward code, then upload with
-`flash env push --project PROJECT_UUID --name my-env .`.
-
-A managed run should use the returned [environment] id from
-`flash env push --project PROJECT_UUID --name my-env .`.
+Edit dataset/train.jsonl and the reward code, then ENVIRONMENT_GUIDANCE
 
 This starter keeps a tiny smoke-test dataset in dataset/train.jsonl. Replace it
 with your real training rows before a real run.
@@ -82,10 +78,7 @@ _STARTER_DATASET_JSONL = """\
 _STARTER_EVALUATIONS_PY = '''\
 """Held-out checks for this environment.
 
-Publish this file beside environment.py with
-`flash env push --project PROJECT_UUID --name my-env .`, then run the suites against a
-model trained on it with `flash env eval TARGET`. The run names the published
-environment, so `env eval` takes no local path.
+EVALUATIONS_GUIDANCE
 """
 
 from __future__ import annotations
@@ -129,10 +122,7 @@ def load_evaluations(environment=None):
 _STARTER_EVALUATIONS_MULTITURN_PY = '''\
 """Held-out checks for this multi-turn environment.
 
-Publish this file beside environment.py with
-`flash env push --project PROJECT_UUID --name my-env .`, then run the suites against a
-model trained on it with `flash env eval TARGET`. The run names the published
-environment, so `env eval` takes no local path.
+EVALUATIONS_GUIDANCE
 
 `env eval` sends one prompt and grades one reply, so these cases check the FIRST
 assistant action rather than a finished episode: given the opening prompt, does the
@@ -207,11 +197,7 @@ action, `step_episode` advances the world (optionally appending an observation
 message), and the loop repeats until `done` or `max_episode_turns`. The finished
 transcript is graded by `score_episode`.
 
-Edit dataset/train.jsonl and the episode logic, then upload with
-`flash env push --project PROJECT_UUID --name my-env .`.
-
-A managed run should use the returned [environment] id from
-`flash env push --project PROJECT_UUID --name my-env .`.
+Edit dataset/train.jsonl and the episode logic, then ENVIRONMENT_GUIDANCE
 
 This starter implements a tiny "guess the secret number" game so you can see the
 episode hooks wired end-to-end. Replace it with your real task before a real run.
@@ -224,7 +210,7 @@ All three algorithms train off this file:
 - OPD (configs/opd.toml) rolls out each episode and distils EVERY assistant turn against
   the managed Parasail teacher (GLM 5.2 by default; pick another with [train] teacher_model),
   conditioned on the transcript so far — the multi-turn on-policy-distillation objective. The
-  teacher key is platform-managed (nothing to set).
+  TEACHER_KEY_GUIDANCE
 """
 
 from __future__ import annotations
@@ -391,60 +377,55 @@ def _require_setup_project(args) -> str:
     return resolve_project_id(selected, api_key, api_url)
 
 
-def _for_self_hosted_plane(source: str, project_id: str) -> str:
-    """Rewrite generated-file docstrings that instruct the user to run `flash env push`.
+# Guidance the starter .py docstrings carry, per plane kind. The templates hold placeholders
+# rather than one plane's wording plus a rewrite pass: the scaffolded files must describe the
+# workflow the operator can actually run, and matching prose back out after rendering breaks
+# silently the moment a template is reworded.
+_HOSTED_GUIDANCE = {
+    "ENVIRONMENT_GUIDANCE": (
+        "upload with\n"
+        "`flash env push --project PROJECT_UUID --name my-env .`.\n"
+        "\n"
+        "A managed run should use the returned [environment] id from\n"
+        "`flash env push --project PROJECT_UUID --name my-env .`."
+    ),
+    "EVALUATIONS_GUIDANCE": (
+        "Publish this file beside environment.py with\n"
+        "`flash env push --project PROJECT_UUID --name my-env .`, then run the suites against a\n"
+        "model trained on it with `flash env eval TARGET`. The run names the published\n"
+        "environment, so `env eval` takes no local path."
+    ),
+    "TEACHER_KEY_GUIDANCE": "teacher key is platform-managed (nothing to set).",
+}
 
-    The scaffolded .py files carry the same hosted-only guidance the configs do. Leaving them
-    alone would fix the config an operator edits and keep misdirecting the one they read.
+_SELF_HOSTED_GUIDANCE = {
+    "ENVIRONMENT_GUIDANCE": (
+        "commit it to a git repo your plane can read.\n"
+        "\n"
+        "A managed run names that repo in [environment] id, as\n"
+        "`github:OWNER/REPO@main:environment.py` -- this plane is self-hosted, so publishing\n"
+        "to Freesolo's managed environment hub does not apply."
+    ),
+    "EVALUATIONS_GUIDANCE": (
+        "Keep this file beside environment.py in the git repo named by [environment] id.\n"
+        "`flash env eval` currently requires a managed hub environment, so it cannot\n"
+        "evaluate a run using a direct `github:` id; these suites still document the criteria."
+    ),
+    "TEACHER_KEY_GUIDANCE": (
+        "plane operator must set PARASAIL_API_KEY and FLASH_PUBLIC_URL on the control plane."
+    ),
+}
 
-    Takes project_id because it runs AFTER the PROJECT_UUID substitution, so the text to match
-    already carries the real uuid.
+
+def _render_starter(template: str, project_id: str, *, can_publish: bool) -> str:
+    """Fill a starter .py template's placeholders for this plane, then its project uuid.
+
+    Guidance first, because the hosted wording itself contains PROJECT_UUID -- substituting the
+    uuid first would leave the placeholder text unrendered in the guidance that replaces it.
     """
-    push = f"`flash env push --project {project_id} --name my-env .`"
-    rewrites = (
-        # environment.py, single-turn and multi-turn: both carry this identical pair of sentences.
-        (
-            (
-                f"upload with\n{push}.\n\n"
-                f"A managed run should use the returned [environment] id from\n{push}."
-            ),
-            (
-                "commit it to a git repo your plane can read.\n"
-                "\n"
-                "A managed run names that repo in [environment] id, as\n"
-                "`github:OWNER/REPO@main:environment.py` -- this plane is self-hosted, so publishing\n"
-                "to Freesolo's managed environment hub does not apply."
-            ),
-        ),
-        # evaluations.py, single-turn and multi-turn: identical opening sentences.
-        (
-            (
-                f"Publish this file beside environment.py with\n{push}, then run the suites against a\n"
-                "model trained on it with `flash env eval TARGET`. The run names the published\n"
-                "environment, so `env eval` takes no local path."
-            ),
-            (
-                "Keep this file beside environment.py in the git repo named by [environment] id.\n"
-                "`flash env eval` currently requires a managed hub environment, so it cannot\n"
-                "evaluate a run using a direct `github:` id; these suites still document the criteria."
-            ),
-        ),
-    )
-    # Each template matches exactly one of these (environment.py or evaluations.py), so applying
-    # every rewrite and requiring that one landed is the check that catches template drift -- a
-    # silent no-op here would ship a file still telling a self-hoster to run `flash env push`.
-    for hosted, self_hosted in rewrites:
-        source = source.replace(hosted, self_hosted)
-    source = source.replace(
-        "teacher key is platform-managed (nothing to set).",
-        "plane operator must set PARASAIL_API_KEY and FLASH_PUBLIC_URL on the control plane.",
-    )
-    if push in source:
-        raise AssertionError(
-            "a scaffolded file still references `flash env push` after the self-hosted rewrite; "
-            "update _for_self_hosted_plane alongside the starter templates"
-        )
-    return source
+    for placeholder, text in (_HOSTED_GUIDANCE if can_publish else _SELF_HOSTED_GUIDANCE).items():
+        template = template.replace(placeholder, text)
+    return template.replace("PROJECT_UUID", project_id)
 
 
 def _plane_can_publish_environments() -> bool:
@@ -805,11 +786,11 @@ def cmd_env_setup(args) -> int:
 
     can_publish = _plane_can_publish_environments()
     _warn_if_environment_form_disagrees(reasoning_configs, can_publish=can_publish, warn=_warn)
-    env_py = (_STARTER_ENV_MULTITURN_PY if multi_turn else _STARTER_ENV_PY).replace(
-        "PROJECT_UUID", project_id
+    env_py = _render_starter(
+        _STARTER_ENV_MULTITURN_PY if multi_turn else _STARTER_ENV_PY,
+        project_id,
+        can_publish=can_publish,
     )
-    if not can_publish:
-        env_py = _for_self_hosted_plane(env_py, project_id)
     dataset_jsonl = traces_jsonl or (
         _STARTER_DATASET_MULTITURN_JSONL if multi_turn else _STARTER_DATASET_JSONL
     )
@@ -836,13 +817,13 @@ def cmd_env_setup(args) -> int:
         # uses a first-action format check because single-shot eval cannot grade a completed
         # episode.
         if not starter_evaluations.exists():
-            evaluations_py = (
-                _STARTER_EVALUATIONS_MULTITURN_PY if multi_turn else _STARTER_EVALUATIONS_PY
+            starter_evaluations.write_text(
+                _render_starter(
+                    _STARTER_EVALUATIONS_MULTITURN_PY if multi_turn else _STARTER_EVALUATIONS_PY,
+                    project_id,
+                    can_publish=can_publish,
+                )
             )
-            rendered_evaluations = evaluations_py.replace("PROJECT_UUID", project_id)
-            if not can_publish:
-                rendered_evaluations = _for_self_hosted_plane(rendered_evaluations, project_id)
-            starter_evaluations.write_text(rendered_evaluations)
     project_line = f"project = {json.dumps(project_id)}\n"
     env_comment = (
         _environment_comment(

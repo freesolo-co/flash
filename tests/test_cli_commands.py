@@ -699,7 +699,7 @@ def test_env_setup_warns_when_retained_starter_files_describe_the_other_plane(
 ) -> None:
     """A rerun against the other plane kind leaves the .py files documenting the old workflow.
 
-    `_for_self_hosted_plane` rewrites the generated docstrings, but the result is written only under
+    `_render_starter` fills the generated docstrings, but the result is written only under
     `if not starter_env_exists`, and `evaluations.py` is nested one level deeper inside that same
     guard. So a hosted-then-self-hosted rerun keeps both files telling the operator to run
     `flash env push` -- a command their plane cannot use -- while the configs and the printed next
@@ -804,8 +804,8 @@ def test_retained_file_probe_never_makes_an_advisory_warning_fatal(tmp_path) -> 
 def test_retained_hosted_docs_are_detected_across_a_project_change(tmp_path) -> None:
     """Detection must not interpolate the current uuid, or a project change hides the stale files.
 
-    `_for_self_hosted_plane` interpolates the real project id because it must match one exact string
-    in order to rewrite it. Detection has the opposite requirement: a directory scaffolded under one
+    `_render_starter` interpolates the real project id because it renders the file's final text.
+    Detection has the opposite requirement: a directory scaffolded under one
     project and rerun under another still holds the OLD uuid on disk, so an interpolated marker
     matches nothing and both files keep directing the operator to `flash env push` with no warning.
     """
@@ -828,7 +828,7 @@ def test_env_setup_warns_about_both_retained_files_switching_back_to_hosted(
 ) -> None:
     """The reverse direction has to name evaluations.py too, which carries different rewritten text.
 
-    `_for_self_hosted_plane` writes a distinct replacement into each file: environment.py gets "this
+    `_render_starter` writes distinct guidance into each file: environment.py gets "this
     plane is self-hosted, so publishing", evaluations.py gets the `env eval` caveat. Detecting only
     the first would warn about environment.py while silently leaving a stale evaluations.py beside
     it -- the same half-fix this warning exists to prevent in the other direction.

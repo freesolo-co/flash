@@ -36,8 +36,8 @@ def _warn_if_retained_starter_files_describe_another_plane(
 ) -> None:
     """Warn when a retained `environment.py` / `evaluations.py` documents the other plane kind.
 
-    The same idempotence that preserves the configs preserves these: `_for_self_hosted_plane`
-    rewrites the generated docstrings, but the result is only written under `if not
+    The same idempotence that preserves the configs preserves these: `_render_starter` fills the
+    generated docstrings for this plane, but the result is only written under `if not
     starter_env_exists`, and `evaluations.py` is nested one level deeper inside that same guard. So
     a hosted-then-self-hosted rerun keeps files telling the operator to run `flash env push` -- a
     command their plane cannot use -- while the configs and the printed next step describe the new
@@ -47,14 +47,14 @@ def _warn_if_retained_starter_files_describe_another_plane(
     what is actually ON DISK: an operator who already hand-edited the guidance is not warned, and a
     file the rewrite missed still is.
 
-    Deliberately project-INDEPENDENT, unlike `_for_self_hosted_plane`, which interpolates the real
-    uuid because it must match one exact string to rewrite it. Detection has the opposite
+    Deliberately project-INDEPENDENT, unlike `_render_starter`, which interpolates the real uuid
+    because it renders the file's final text. Detection has the opposite
     requirement: a directory scaffolded under one project and rerun under another still holds the
     OLD uuid, so an interpolated marker would miss it and silently leave both files directing the
     operator to a command their plane cannot run. Match the project-invariant prefix instead.
     """
     push_marker = "`flash env push --project "
-    # `_for_self_hosted_plane` writes DIFFERENT replacement text into each file, so the reverse
+    # `_render_starter` writes DIFFERENT guidance into each file, so the reverse
     # direction needs both markers: matching only environment.py's would warn about that file while
     # silently keeping a stale evaluations.py beside it.
     self_hosted_markers = (
