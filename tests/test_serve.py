@@ -1418,3 +1418,105 @@ def test_chat_stream_accepts_json_fallback(monkeypatch):
     assert list(d.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])) == [
         "full reply"
     ]
+
+
+def _erroring_stream_seams(monkeypatch, resp):
+    """Point the chat_stream seams at a fake client whose stream() yields ``resp``."""
+    import flash.serve.deploy as d
+
+    class _FakeClient:
+        def stream(self, method, url, **kwargs):
+            return resp
+
+    monkeypatch.setattr(d, "_stream_http_client", lambda: _FakeClient())
+    monkeypatch.setattr(d, "serving_openai_base_url", lambda: "https://serve.example/v1")
+
+
+def test_chat_stream_upstream_error_raises_before_first_chunk(monkeypatch):
+    """An upstream 4xx/5xx raises at chat_stream() call time, not during iteration.
+
+    The serving route wraps only the serve_chat_stream CALL in its try/except; by the time
+    the body iterates, the 200 and headers are already flushed. The request and
+    raise_for_status therefore must run inside chat_stream itself, and the upstream response
+    must be closed on the way out.
+    """
+    import httpx
+
+    import flash.serve.deploy as d
+
+    exits = []
+
+    class _ErrorResp:
+        def __init__(self):
+            self.headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            exits.append(exc)
+            return False
+
+        def raise_for_status(self):
+            request = httpx.Request("POST", "https://serve.example/v1/chat/completions")
+            response = httpx.Response(502, request=request)
+            raise httpx.HTTPStatusError("bad gateway", request=request, response=response)
+
+    _erroring_stream_seams(monkeypatch, _ErrorResp())
+
+    with pytest.raises(httpx.HTTPStatusError):
+        d.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])
+    assert len(exits) == 1
+
+
+class _MidstreamFailureResp:
+    def __init__(self):
+        self.exits = []
+        self.headers = {"content-type": "text/event-stream"}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.exits.append(exc)
+        return False
+
+    def raise_for_status(self):
+        return None
+
+    def iter_lines(self):
+        yield 'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}'
+        raise RuntimeError("upstream connection lost")
+
+
+def test_chat_stream_midstream_failure_raises_and_closes_upstream(monkeypatch):
+    """A failure after the first chunk propagates out of the iterator and closes upstream.
+
+    The propagating exception is what makes the serving route abort the chunked body, so the
+    client sees a truncated transfer rather than a clean eof."""
+    import flash.serve.deploy as d
+
+    resp = _MidstreamFailureResp()
+    _erroring_stream_seams(monkeypatch, resp)
+
+    stream = d.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])
+    assert next(stream) == "hi"
+    with pytest.raises(RuntimeError, match="upstream connection lost"):
+        next(stream)
+    assert len(resp.exits) == 1
+
+
+def test_chat_stream_close_without_iterating_closes_upstream(monkeypatch):
+    """Closing the returned iterator before reading any chunk still releases the response.
+
+    chat_stream opens the upstream connection eagerly, so the returned generator must already
+    be running: close() on a never-started generator skips the finally that exits the httpx
+    stream context."""
+    import flash.serve.deploy as d
+
+    resp = _MidstreamFailureResp()
+    _erroring_stream_seams(monkeypatch, resp)
+
+    stream = d.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])
+    stream.close()
+    assert len(resp.exits) == 1
