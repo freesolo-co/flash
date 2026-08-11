@@ -267,8 +267,9 @@ ignored. Everything in the block above (`epochs`, `max_examples`, `max_steps`, `
 > with `group_size`, `max_completion_tokens` or `max_context_tokens` instead. Under **OPD** there
 > are no advantages to preserve (the objective is reverse KL against the teacher), and `batch_size`
 > **is** one of the strongest memory levers: it sizes rollout concurrency and the loss micro-batch.
-> So on OPD raise it only as far as the GPU allows, and do not expect `group_size` to buy memory
-> back, since it already defaults to 1.
+> So on OPD raise it only as far as the GPU allows. `group_size` buys memory back only if you
+> authored one above OPD's default of 1, since rollout concurrency is `batch_size * group_size`;
+> at the default there is nothing left to cut there.
 >
 > What widening costs depends on which knob you widen and on your horizon. Raising `batch_size`
 > against a fixed prompt pool spreads the same prompts over no more updates than you have now,
@@ -277,8 +278,10 @@ ignored. Everything in the block above (`epochs`, `max_examples`, `max_steps`, `
 > both resolve to 2 updates and the wider one just generates more. Raising a `max_examples` cap
 > instead grows the pool, and what that buys depends on `batch_size`: with one set and left
 > pinned, the bigger pool is spread over more updates and quotes dearer; with none set, or with
-> both raised together, prompts-per-step follows the pool and the horizon does not move, but only
-> up to the batch it is following. Past that ceiling the extra prompts become extra updates again,
+> both raised together, prompts-per-step follows the pool and the horizon does not grow, but only
+> up to the batch it is following. It can shrink: raising both from an unequal start widens each
+> update faster than the pool grows, so `batch_size = 1` with `max_examples = 2` is 2 updates and
+> lifting both to 4 is 1. Past that ceiling the extra prompts become extra updates again,
 > and with no `batch_size` authored the ceiling is the recipe default you never wrote (GRPO 64,
 > OPD 8), so on OPD a cap of 2 -> 16 goes from 1 update to 2. And under a positive `max_steps` the
 > update count is pinned,

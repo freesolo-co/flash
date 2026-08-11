@@ -320,10 +320,14 @@ def _thin_rl_batch_remedy(spec, *, raise_target: str, batch_binds: bool, pool_bi
             "without adding updates. Re-run `--cost` to see what it does to this quote."
         )
     if pool_binds and batch_binds:
-        # both knobs are named here, so they move TOGETHER and the horizon does not grow:
-        # ceil(2/2) == ceil(4/4) == ceil(8/8) == 1. "adds passes" describes raising the cap while
-        # the batch stays pinned (batch 2, cap 2 -> 8: 1 step to 4), which is not what this remedy
-        # asks for, so state the same-horizon, wider-update effect and price it with `--cost`.
+        # both knobs are named here, so they move TOGETHER and the horizon never grows. from an
+        # equal start it is flat -- ceil(2/2) == ceil(4/4) == ceil(8/8) == 1 -- and from an unequal
+        # one it SHRINKS, because the batch catches up to the pool faster than the pool grows:
+        # batch 1 with cap 2 is 2 updates, and lifting both to 4 is 1. "does not add updates" is
+        # therefore the claim that survives every arrangement, while "the horizon does not move"
+        # would be true only of the equal case. "adds passes" describes raising the cap while the
+        # batch stays pinned (batch 2, cap 2 -> 8: 1 step to 4), which is not what this remedy asks
+        # for, so state the no-new-updates effect and price the rest with `--cost`.
         return (
             f"Raise {raise_target} together: both hold prompts-per-step down, so lifting them in "
             "step widens each update rather than adding updates. Re-run `--cost` to see what it "
