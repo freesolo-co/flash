@@ -1227,31 +1227,105 @@ def test_a_superseded_ping_is_not_called_alive_by_the_quiet_hint(monkeypatch):
     assert "already gone" not in live_out
 
 
-def test_superseded_hint_yields_to_the_more_specific_diagnoses():
-    """It is the fallback, not a replacement: the stage-aware hints say strictly more when they fire.
+def test_at_most_one_progress_hint_can_ever_fire():
+    """The `or` chain in `_heartbeat_pairs` must not be what keeps the panel to a single reading.
 
-    Both of those already refuse a superseded ping, so without an explicit order this hint would
-    simply never appear on the stages they cover -- or, wired first, would displace them.
+    Only one `progress` row is rendered, so if two hints could both fire, the chain's hand-written
+    order would silently decide which diagnosis a user sees -- and reordering it would change the
+    displayed reading with nothing failing. The three predicates are meant to be mutually exclusive
+    by their own gates instead: `current_attempt` splits `_superseded_hint` from the other two, and
+    disjoint stage sets split those two from each other. That is the property worth pinning, because
+    it is what makes the order an implementation detail rather than load-bearing behavior.
+
+    Asserted by exhaustive enumeration rather than a few samples: the gates interact across four
+    inputs, and a hand-picked case cannot show that no combination overlaps.
+    """
+    import itertools
+    import time as _time
+
+    from flash.cli.ui import heartbeat as hb_mod
+
+    stages = sorted(
+        hb_mod._LIVENESS_SETUP_STAGES
+        | hb_mod._TRAINING_STEP_STAGES
+        | hb_mod._WARMUP_STAGES
+        | {"unknown_stage"}
+    )
+    now = _time.time()
+    overlaps = []
+    for stage, age, current, running, step in itertools.product(
+        stages,
+        # straddle both gates (300s quiet, 900s setup-silent) from either side.
+        [10.0, 400.0, 1000.0, 5000.0],
+        [True, False],
+        [True, False],
+        [None, 0, 455],
+    ):
+        heartbeat = {"stage": stage, "ts": now - age, "step": step}
+        fired = [
+            name
+            for name, hint in (
+                (
+                    "stale_step",
+                    hb_mod._stale_step_hint(
+                        heartbeat, age, running=running, current_attempt=current
+                    ),
+                ),
+                (
+                    "stale_setup",
+                    hb_mod._stale_setup_hint(
+                        heartbeat, age, running=running, current_attempt=current
+                    ),
+                ),
+                (
+                    "superseded",
+                    hb_mod._superseded_hint(age, running=running, current_attempt=current),
+                ),
+            )
+            if hint
+        ]
+        if len(fired) > 1:
+            overlaps.append((stage, age, current, running, step, fired))
+    assert not overlaps, (
+        f"two hints fire for the same heartbeat, so the chain order decides: {overlaps[:3]}"
+    )
+
+
+def test_each_hint_owns_the_heartbeats_it_is_written_for():
+    """Mutual exclusivity is worthless if the wrong hint owns a case, or none does.
+
+    Pairs with the test above: that one proves at most one fires, this one proves the right one
+    does. A superseded ping must get the superseded reading on BOTH a setup stage and a training
+    stage -- and in particular must never be told its dead worker's step is merely lagging.
     """
     import time as _time
 
     from flash.cli.ui.heartbeat import _heartbeat_pairs
 
-    def progress(stage: str, **hb) -> str:
+    def progress(stage: str, *, attempt: int, **hb) -> str:
         pairs = _heartbeat_pairs(
             {
                 "state": "running",
                 "remote": {"attempt": 2},
-                "last_heartbeat": {"stage": stage, "attempt": 1, "ts": _time.time() - 1200, **hb},
+                "last_heartbeat": {
+                    "stage": stage,
+                    "attempt": attempt,
+                    "ts": _time.time() - 1200,
+                    **hb,
+                },
             }
         )
         return dict(pairs).get("progress", "")
 
-    # a superseded setup stage: the setup hint declines it, so the fallback is what is left.
-    assert "already gone" in progress("sft_model_load")
-    # a superseded training step: same, and it must not claim the dead worker's step is advancing.
-    assert "already gone" in progress("sft_step", step=455)
-    assert "last one UPLOADED" not in progress("sft_step", step=455)
+    # superseded: the stage-aware hints decline it, and the superseded reading is what is left.
+    assert "already gone" in progress("sft_model_load", attempt=1)
+    assert "already gone" in progress("sft_step", attempt=1, step=455)
+    assert "last one UPLOADED" not in progress("sft_step", attempt=1, step=455)
+
+    # live: the stage-aware hints own it, and each says the more specific thing.
+    assert "longer than throttling explains" in progress("sft_model_load", attempt=2)
+    assert "last one UPLOADED" in progress("sft_step", attempt=2, step=455)
+    assert "already gone" not in progress("sft_step", attempt=2, step=455)
 
 
 def test_superseded_hint_stays_quiet_when_there_is_no_silence_to_explain():
