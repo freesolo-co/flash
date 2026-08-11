@@ -187,7 +187,7 @@ def test_onstart_spills_large_spec_to_hf(monkeypatch):
 
     monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
 
-    big = "x" * 20_000  # > _SPEC_SPILL_THRESHOLD (16k)
+    big = "x" * 20_000  # > _SPEC_SPILL_THRESHOLD
     payload = {
         "job_spec_json": big,
         "hf_prefix": "sft/run/seed0",

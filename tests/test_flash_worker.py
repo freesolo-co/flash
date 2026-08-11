@@ -274,6 +274,13 @@ def test_the_redactor_metadata_name_is_reserved_from_declared_secrets():
     assert SECRET_ENV_KEYS_ENV in CONTROL_PLANE_OWNED_ENV_KEYS
     with pytest.raises(ConfigError, match="platform-managed key"):
         _environment_secrets([SECRET_ENV_KEYS_ENV])
+    # a case variant is a distinct linux env name but not a distinct DECLARATION: build_worker_env
+    # tests ownership on the uppercased name, so accepting it here would drop the secret from the
+    # worker env without a word and launch the job missing a credential it declared as required.
+    # every reserved name is refused across its whole case-space for that reason.
+    for variant in (SECRET_ENV_KEYS_ENV.lower(), "Hf_Token", "runpod_api_key"):
+        with pytest.raises(ConfigError, match="platform-managed key"):
+            _environment_secrets([variant])
 
 
 def test_declared_secret_names_cannot_contain_the_metadata_delimiter():

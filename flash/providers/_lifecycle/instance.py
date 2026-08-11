@@ -20,7 +20,13 @@ _SUFFIX_BUDGET = 12
 _PREFIX_BUDGET = _MAX_NAME - _SUFFIX_BUDGET
 
 # Above this, the job spec is spilled to HF so a large inline spec can't overflow the user_data cap.
-_SPEC_SPILL_THRESHOLD = 16_000
+# The budget is what is LEFT of the ~64,000-byte provider cap after the fixed framing: this module's
+# template plus every source file it heredocs in (bootstrap.py and bootstrap_secrets.py), which is
+# ~52,000 bytes and grows whenever that bootstrap does. base64 + json escaping inflate the spec
+# ~1.35x on the way in, so this ceiling must stay well under the remaining ~11,800 bytes; shrink it
+# again whenever the embedded sources grow. test_user_data_spills_large_job_spec_to_hf pins the
+# worst case (a spec of exactly this size) against the cap so the two cannot drift apart silently.
+_SPEC_SPILL_THRESHOLD = 6_000
 
 
 def run_label_prefix(run_id: str) -> str:

@@ -2534,6 +2534,19 @@ def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
     assert "job_spec_in_hf" not in emb2
     assert uploaded == {}
 
+    # The threshold is only as good as the framing it was chosen against, and that framing grows
+    # every time the heredoc'd bootstrap sources do (embedding bootstrap_secrets.py alone added
+    # ~5,900 bytes). Pin the WORST inline case - a spec of exactly the threshold size - against the
+    # cap, so a future bootstrap that grows past the remaining budget fails here instead of at a
+    # provider's launch call. The margin is asserted too: the real payload also carries env,
+    # deadline, and cache fields this minimal one does not.
+    uploaded.clear()
+    worst = inst.build_user_data(
+        {**payload, "job_spec_json": "x" * inst._SPEC_SPILL_THRESHOLD}, image="img:latest"
+    )
+    assert uploaded == {}
+    assert len(worst) < 64_000 - 2_000
+
 
 def test_build_user_data_starts_no_spec_upload_at_deadline(monkeypatch):
     import huggingface_hub
