@@ -1372,6 +1372,21 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
 
     monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", fake_export)
 
+    # the fake run_verl_training each test supplies never executes the rendered sitecustomize, so
+    # stand in for the child's marker writes: record every expected fragment as applied. the real
+    # verifier still runs against this file, so a test that wants the missing-marker failure
+    # restores the real _prepare_sft_child.
+    real_prepare_child = sft_train._prepare_sft_child
+
+    def prepare_child_with_applied_shims(*args, **kwargs):
+        child = real_prepare_child(*args, **kwargs)
+        with open(child.shim_markers, "w", encoding="utf-8") as handle:
+            handle.write("".join(name + "\n" for name in child.expected_shims))
+        captured["child"] = child
+        return child
+
+    monkeypatch.setattr(sft_train, "_prepare_sft_child", prepare_child_with_applied_shims)
+
     return spec, captured
 
 
@@ -1864,3 +1879,99 @@ def test_sft_ships_no_val_file_so_the_child_cannot_validate():
     code = "\n".join(ln for ln in worker.splitlines() if not ln.strip().startswith("#"))
     assert "val.parquet" not in code
     assert "val_file" not in code
+
+
+# ---------------------- fail-closed sitecustomize fragments (shim markers) ----------------------
+
+
+def test_sft_child_sitecustomize_fails_closed_and_names_its_required_fragments(monkeypatch):
+    """the rendered sitecustomize wraps every required fragment (see child_io.wrap_shim_fragment):
+    execsitecustomize swallows a fragment's exception, so an unwrapped failure trains unpatched --
+    no seeding, no exact dataloader order, no lora+ -- while looking healthy."""
+    from flash.engine.worker import sft_train
+
+    spec, captured = _stub_sft_run(monkeypatch)
+
+    def fake_training(command, *, env, on_step, on_line, heartbeat):
+        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
+        on_line("step:2 - train/loss:1.0\n")
+        on_step(2)
+        return 0
+
+    monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
+    sft_train.run_sft_train(spec)
+
+    child = captured["child"]
+    # the non-gdn stub run carries exactly the core fragment; a gdn hybrid would add gdn-varlen.
+    assert child.expected_shims == ("sft-core",)
+    shim_dir = child.child_env["PYTHONPATH"].split(os.pathsep)[0]
+    source = pathlib.Path(shim_dir, "sitecustomize.py").read_text()
+    # the wrap indents the whole fragment into a try block, so a syntax slip would turn the child's
+    # entire patch set into a silent no-op; compiling is the only real gate.
+    compile(source, "sitecustomize.py", "exec")
+    assert "_flash_record_applied_shim('sft-core')" in source
+    assert f"_flash_shim_os._exit({sft_train.SHIM_FRAGMENT_FAILED_EXIT_CODE})" in source
+    # the marker file lives next to the sitecustomize and the parent verified against it.
+    assert child.shim_markers == os.path.join(shim_dir, "applied_shims.txt")
+
+
+def test_sft_run_fails_at_the_first_step_when_no_marker_was_recorded(monkeypatch):
+    """a child whose sitecustomize never ran (shadowed sitecustomize, dropped PYTHONPATH entry on a
+    foreign FLASH_VERL_PYTHON) reaches optimizer steps with no marker on disk. that child is
+    training with no flash patch at all, so the first step line must fail the attempt."""
+    from flash.engine.worker import sft_train, sft_train_runner
+
+    spec, _captured = _stub_sft_run(monkeypatch, watcher_cls=_TolerantWatcher)
+    # restore the real child preparation: this test wants the marker file absent, exactly as when
+    # the child's sitecustomize never ran.
+    monkeypatch.setattr(sft_train, "_prepare_sft_child", sft_train_runner._prepare_sft_child)
+
+    def fake_training(command, *, env, on_step, on_line, heartbeat):
+        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
+        on_line("step:2 - train/loss:1.0 - train/grad_norm:1.0 - train/lr:0.0001\n")
+        raise AssertionError("the missing-marker guard should have stopped the run")
+
+    monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
+    with pytest.raises(RuntimeError, match="never proved"):
+        sft_train.run_sft_train(spec)
+
+
+def test_finish_sft_child_classifies_the_shim_exit_code_as_permanent():
+    """exit 97 is the wrapped fragment's own hard exit; the message must say the interpreter is
+    incompatible rather than read as a retriable infra fault."""
+    from flash.engine.worker.sft_train_runner import _finish_sft_child, _SftProgress
+
+    progress = _SftProgress(
+        values={},
+        zero_grad_steps=[],
+        observed_grad_norms=[],
+        loss_curve=[],
+        train_tokens=0,
+        loraplus_applied=True,
+        wandb_link={},
+    )
+    sampler = SimpleNamespace(stop_gb=lambda: 1.0)
+    with pytest.raises(RuntimeError, match="failed to apply"):
+        _finish_sft_child(sampler, 0.0, 97, progress)
+
+
+def test_sft_marker_verification_abstains_when_the_child_never_launched():
+    """a resume already at the horizon skips the child entirely: there is no marker file and
+    nothing left for the shims to patch, exactly like the loraplus_applied abstention."""
+    from flash.engine.worker.sft_train_runner import (
+        _finish_sft_child,
+        _prepare_sft_progress,
+    )
+
+    data = SimpleNamespace(rows=[{"input_ids": [1, 2, 3]}])
+    model = SimpleNamespace(train_batch_size=1, update_horizon=2)
+    child = SimpleNamespace(
+        resume_step=2,
+        shim_markers="/nonexistent/applied_shims.txt",
+        expected_shims=("sft-core",),
+    )
+    progress = _prepare_sft_progress(data, model, child)
+    assert progress.shims_verified is True
+    sampler = SimpleNamespace(stop_gb=lambda: 1.0)
+    # must not raise: the file is absent because no child ran, not because a patch was skipped.
+    _finish_sft_child(sampler, 0.0, 0, progress)

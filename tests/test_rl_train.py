@@ -6732,3 +6732,151 @@ def test_grpo_finalization_carries_the_completed_step():
 
     forwarding = inspect.getsource(finalize.write_train_meta)
     assert '"step": int(step)' in forwarding
+
+
+# ---------------------- fail-closed shim markers and the fp8 probe ----------------------
+
+
+def _shim_files(tmp_path):
+    return {
+        "shim_dir": str(tmp_path),
+        "shim_py": str(tmp_path / "sitecustomize.py"),
+        "shim_markers": str(tmp_path / "applied_shims.txt"),
+        "multi_turn": False,
+    }
+
+
+def test_write_rl_shim_wraps_required_fragments_and_returns_the_expected_marker_set(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    files = _shim_files(tmp_path)
+    inp = {
+        "reentrant_checkpointing": True,
+        "multimodal": False,
+        "entropy_quantile": 0.2,
+        "per_turn_credit": False,
+        "stop_sequences": ("</answer>",),
+        "image_pad_token_id": None,
+        "structured_outputs": None,
+        "save_at_steps": (7,),
+        "steps": 20,
+        "warmstart_adapter": "adapter",
+        "kl_coef": 0.04,
+        "multi_turn": False,
+    }
+    expected = rl_train._write_rl_shim(inp, files)
+    # exactly the enabled features, in composition order; off features owe no marker.
+    assert expected == [
+        "reentrant-checkpointing",
+        "entropy-quantile",
+        "stop-sequences",
+        "exact-save-steps",
+        "kl-ref-adapter",
+    ]
+    source = Path(files["shim_py"]).read_text()
+    # the wrap indents whole fragments into try blocks; a syntax slip would turn the child's
+    # entire patch set into a silent no-op, so compiling is the only real gate.
+    compile(source, "sitecustomize.py", "exec")
+    for name in expected:
+        assert f"_flash_record_applied_shim({name!r})" in source
+    assert "per-turn-credit" not in source
+    # tf32 stays first and unwrapped: it swallows its own failures by design and a later fragment
+    # that raised must not be able to cost the run its tensor-core throughput.
+    assert source.index("tf32") < source.index("_FLASH_SHIM_MARKER_FILE")
+    assert f"_flash_shim_os._exit({backend_common.SHIM_FRAGMENT_FAILED_EXIT_CODE})" in source
+
+
+def test_the_gdn_varlen_append_is_wrapped_and_extends_the_expected_marker_set():
+    # the gdn shim is appended after python_bin resolution, so it must join the same fail-closed
+    # contract as the fragments _write_rl_shim composed -- an unpatched gdn child trains across
+    # packed example boundaries, the exact silent failure the wrapper exists to prevent.
+    src = inspect.getsource(rl_train._configure_rl_child)
+    assert 'wrap_shim_fragment("gdn-varlen", render_gdn_varlen_shim(gdn_reset_arch))' in src
+    assert 'files["expected_shims"].append("gdn-varlen")' in src
+
+
+def test_the_stdout_loop_verifies_the_marker_set_at_the_first_step_line():
+    """before/at training start: the first step line is the earliest point where sitecustomize is
+    provably finished (fragments print while later ones are still applying, so the first OUTPUT
+    line would race the file). a missing marker there means the child trains unpatched."""
+    stdout_loop = " ".join(inspect.getsource(rl_train._execute_rl_child).split())
+    step_at = stdout_loop.index('progress["step"] = int(m.group(1))')
+    verify_at = stdout_loop.index("verify_applied_shim_markers(shim_markers, expected_shims)")
+    assert step_at < verify_at < stdout_loop.index("close_generation")
+    # and the entry point wires the files dict (marker path + expected set) into both the loop
+    # and the final verdict.
+    entry = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    assert "_reward_observability=_reward_observability, files=files," in entry
+    assert (
+        'rc, state, files["resume_step"], expected_steps, resume_uploader, files=files' in entry
+    )
+
+
+def test_validate_rl_child_fails_a_run_whose_markers_are_missing(tmp_path):
+    state = rl_train._StepMetricState()
+    state.reward_history.append(0.5)
+    state.adv_spread_history.append(1.0)
+    marker = tmp_path / "applied_shims.txt"
+    marker.write_text("entropy-quantile\n")
+    # the complete set passes and falls through to the gradient verdict.
+    rl_train._validate_rl_child(
+        0,
+        state,
+        0,
+        1,
+        None,
+        files={"shim_markers": str(marker), "expected_shims": ["entropy-quantile"]},
+    )
+    with pytest.raises(RuntimeError, match="never proved"):
+        rl_train._validate_rl_child(
+            0,
+            state,
+            0,
+            1,
+            None,
+            files={
+                "shim_markers": str(marker),
+                "expected_shims": ["entropy-quantile", "kl-ref-adapter"],
+            },
+        )
+
+
+def test_validate_rl_child_classifies_the_shim_exit_code_as_permanent():
+    from flash.engine.worker.perf.lifecycle import RetriableInfraError
+
+    with pytest.raises(RuntimeError, match="failed to apply") as err:
+        rl_train._validate_rl_child(
+            backend_common.SHIM_FRAGMENT_FAILED_EXIT_CODE, rl_train._StepMetricState(), 0, 1, None
+        )
+    # permanent by design: the same interpreter fails the same fragment on retry, so it must not
+    # be classified as retriable infra.
+    assert not isinstance(err.value, RetriableInfraError)
+    assert "FLASH_VERL_PYTHON" in str(err.value)
+
+
+def test_the_fp8_kv_probe_reads_the_child_capability_probe_not_parent_cuda(monkeypatch):
+    """backend_common.fused_ce_backend's rule applies here too: opening cuda in this long-lived
+    parent retains a context on the devices the verl child is about to own. a stub torch whose
+    cuda attribute explodes stands in for 'somebody reintroduced the live probe'."""
+
+    class _ExplodingCuda:
+        def __getattr__(self, name):
+            raise AssertionError("the fp8 probe touched torch.cuda in the parent")
+
+    exploding_torch = types.ModuleType("torch")
+    exploding_torch.cuda = _ExplodingCuda()
+    monkeypatch.setitem(sys.modules, "torch", exploding_torch)
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+
+    inp = {"steps": 4}
+    for caps, cc_ok in (
+        ({"capability": [8, 9]}, True),
+        ({"capability": [9, 0]}, True),
+        ({"capability": [8, 6]}, False),
+        ({"capability": None}, False),
+        ({}, False),
+    ):
+        settings = rl_train._resolve_training_settings(inp, caps)
+        assert settings[0] == 4
+        assert settings[-1] is cc_ok, caps
