@@ -322,13 +322,13 @@ def _tokenize_prompt_rows(
         example,
         prompt_messages,
         completion_messages,
-        used_raw_output_fallback,
+        coerced_scalar_output,
     ) in enumerate(prompt_rows):
         _reject_image_completion(completion_messages)
         if len(completion_messages) > 1:
             multiturn_targets += 1
         elif (
-            used_raw_output_fallback
+            coerced_scalar_output
             and len(completion_messages) == 1
             and completion_messages[0].get("role") == "assistant"
         ):
@@ -599,12 +599,8 @@ def prepare_sft_workload(
     prompt_rows = []
     for example in selected:
         prompt_messages = env.prompt_messages(example)
-        completion_messages, used_raw_output_fallback = _sft_completion_with_provenance(
-            env, example
-        )
-        prompt_rows.append(
-            (example, prompt_messages, completion_messages, used_raw_output_fallback)
-        )
+        completion_messages, coerced_scalar_output = _sft_completion_with_provenance(env, example)
+        prompt_rows.append((example, prompt_messages, completion_messages, coerced_scalar_output))
     package_root = getattr(env, "package_root", None)
     multimodal = any(
         record_has_images(example, prompt_messages)

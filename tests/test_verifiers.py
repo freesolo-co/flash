@@ -422,23 +422,56 @@ def test_freesolo_sft_completion_reports_raw_output_fallback_provenance(monkeypa
 
     sdk_env = _HookEnv()
     hook_env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
-    messages, used_raw_output_fallback = hook_env.sft_completion_with_provenance(
+    messages, coerced_scalar_output = hook_env.sft_completion_with_provenance(
         {"input": "x", "output": "raw"}
     )
 
     assert messages == [{"role": "assistant", "content": "from hook"}]
-    assert used_raw_output_fallback is False
+    assert coerced_scalar_output is False
     assert sdk_env.calls == 1
 
     fallback_env = FreesoloEnvironment(
         _FakeSingleTurnEnv(), "owner/env", source=None, contract_text=""
     )
-    messages, used_raw_output_fallback = fallback_env.sft_completion_with_provenance(
+    messages, coerced_scalar_output = fallback_env.sft_completion_with_provenance(
         {"input": "x", "output": "raw"}
     )
 
     assert messages == [{"role": "assistant", "content": "raw"}]
-    assert used_raw_output_fallback is True
+    assert coerced_scalar_output is True
+
+
+def test_freesolo_sft_completion_does_not_flag_structured_targets_as_coerced(monkeypatch):
+    """An explicitly structured target is NOT a scalar coercion.
+
+    a message list and a {"messages": [...]} container both encode a real trajectory, so counting
+    them as coerced would make the collapse warning fire on datasets that already use the
+    supported encoding -- telling users to do the thing they are already doing.
+    """
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(_FakeSingleTurnEnv(), "owner/env", source=None, contract_text="")
+    single = [{"role": "assistant", "content": "structured"}]
+
+    messages, coerced_scalar_output = env.sft_completion_with_provenance(
+        {"input": "x", "output": single}
+    )
+    assert messages == single
+    assert coerced_scalar_output is False
+
+    messages, coerced_scalar_output = env.sft_completion_with_provenance(
+        {"input": "x", "output": {"messages": single}}
+    )
+    assert messages == single
+    assert coerced_scalar_output is False
+
+    # a scalar gold answer IS a coercion, so the flag still separates the two.
+    _messages, coerced_scalar_output = env.sft_completion_with_provenance(
+        {"input": "x", "output": "42"}
+    )
+    assert coerced_scalar_output is True
 
 
 @pytest.mark.parametrize(

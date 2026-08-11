@@ -1217,6 +1217,7 @@ def _stub_sft_run(
     save_at_steps=(),
     watcher_cls=None,
     structured_targets=False,
+    structured_singleturn=False,
     raw_output_fallback=False,
     missing_output=False,
 ):
@@ -1275,6 +1276,13 @@ def _stub_sft_run(
                     {"prompt": "one", "output": trajectory},
                     {"prompt": "two", "output": trajectory},
                 ]
+            if structured_singleturn:
+                # one assistant message, but explicitly structured -- NOT a scalar coercion.
+                single = [{"role": "assistant", "content": "answer"}]
+                return [
+                    {"prompt": "one", "output": single},
+                    {"prompt": "two", "output": {"messages": single}},
+                ]
             rows = [
                 {"prompt": "one", "output": "answer"},
                 {"prompt": "two", "output": "answer"},
@@ -1298,10 +1306,30 @@ def _stub_sft_run(
             return [{"role": "assistant", "content": "" if output is None else str(output)}], True
 
         def sft_completion(self, example):
-            messages, _used_raw_output_fallback = self.sft_completion_with_provenance(example)
+            messages, _coerced_scalar_output = self.sft_completion_with_provenance(example)
             return messages
 
-    EnvClass = RawOutputFallbackEnv if raw_output_fallback else Env
+    class StructuredSingleTurnEnv(Env):
+        """One assistant turn per row, reported as structured (not coerced).
+
+        this is what the real adapter now returns for `output: [{...}]` and `{"messages": [...]}`:
+        a single-message target whose provenance says no scalar coercion happened. it is the case
+        the collapse warning must stay quiet for -- the row IS one assistant turn, so only the
+        provenance flag separates it from a bare stringified answer.
+        """
+
+        def sft_completion_with_provenance(self, example):
+            return [{"role": "assistant", "content": "answer"}], False
+
+        def sft_completion(self, example):
+            messages, _coerced_scalar_output = self.sft_completion_with_provenance(example)
+            return messages
+
+    EnvClass = Env
+    if raw_output_fallback:
+        EnvClass = RawOutputFallbackEnv
+    elif structured_singleturn:
+        EnvClass = StructuredSingleTurnEnv
 
     class Tokenizer(_ExactTokenizer):
         pad_token = None
@@ -1522,6 +1550,26 @@ def test_sft_collapse_warning_stays_quiet_for_structured_multiturn_targets(monke
 
     output = capsys.readouterr().out
     assert "[sft] multi-turn SFT: 2/2 rows" in output
+    assert "bare assistant target coerced" not in output
+
+
+def test_sft_collapse_warning_stays_quiet_for_structured_singleturn_targets(monkeypatch, capsys):
+    """A structured target is not a coercion even when it is a SINGLE assistant turn.
+
+    the multi-turn case above is separated by length alone, so it cannot catch a provenance flag
+    that marks parsed message lists as coerced. these rows are one assistant turn each, exactly
+    like a stringified scalar, so only provenance keeps the warning quiet -- and firing here would
+    tell users to encode message lists they have already encoded.
+    """
+    from flash.engine.worker import sft_train, sft_train_runner
+
+    spec, _captured = _stub_sft_run(monkeypatch, structured_singleturn=True)
+    monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
+
+    options = sft_train_runner._resolve_sft_options(spec)
+    sft_train_runner._prepare_sft_data(options)
+
+    output = capsys.readouterr().out
     assert "bare assistant target coerced" not in output
 
 

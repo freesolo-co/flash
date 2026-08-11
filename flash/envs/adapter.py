@@ -223,11 +223,17 @@ class FreesoloEnvironment(BaseEnvironment):
 
     def sft_completion(self, example: dict) -> list[dict]:
         """Target completion messages for one SFT example; falls back to raw record output."""
-        messages, _used_raw_output_fallback = self.sft_completion_with_provenance(example)
+        messages, _coerced_scalar_output = self.sft_completion_with_provenance(example)
         return messages
 
     def sft_completion_with_provenance(self, example: dict) -> tuple[list[dict], bool]:
-        """Return completion messages and whether the raw-output fallback produced them."""
+        """Return completion messages and whether a scalar output was coerced into one turn.
+
+        the flag marks ONLY the final ``str(value)`` coercion. an explicitly structured target --
+        the env's own hook, a message list, or a ``{"messages": [...]}`` container -- is not
+        coerced, so a dataset that already encodes real trajectories never trips the collapse
+        warning.
+        """
         fn = getattr(self._env, "sft_completion", None)
         if callable(fn):
             msgs = fn(self._task_example(example))
@@ -244,7 +250,7 @@ class FreesoloEnvironment(BaseEnvironment):
                     f"sft output for row id {row_id!r} contains non-object message entries at "
                     f"indexes {invalid_indexes}; expected a list of message objects"
                 )
-            return [dict(message) for message in value], True
+            return [dict(message) for message in value], False
         if isinstance(value, dict) and "messages" in value:
             sibling_keys = sorted(str(key) for key in value if key != "messages")
             if sibling_keys:
@@ -266,7 +272,7 @@ class FreesoloEnvironment(BaseEnvironment):
                     f"sft output for row id {row_id!r} contains non-object 'messages' entries at "
                     f"indexes {invalid_indexes}; expected a list of message objects"
                 )
-            return [dict(message) for message in messages], True
+            return [dict(message) for message in messages], False
         return [{"role": "assistant", "content": "" if value is None else str(value)}], True
 
     def _single(self, results, method: str):
