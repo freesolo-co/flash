@@ -621,6 +621,37 @@ def test_env_setup_opd_teacher_setup_matches_plane(monkeypatch, tmp_path) -> Non
     assert "FLASH_PUBLIC_URL" not in hosted_opd
 
 
+def test_no_starter_placeholder_survives_rendering_on_either_plane(monkeypatch, tmp_path) -> None:
+    """Every guidance placeholder must be filled for BOTH plane kinds, in every turn mode.
+
+    The starter templates carry placeholders that `_render_starter` fills from one of two dicts.
+    A placeholder present in the templates but missing from one dict renders that plane's file
+    with `ENVIRONMENT_GUIDANCE` sitting in the docstring -- valid Python, so nothing raises, and
+    the operator reads an internal token where the workflow should be. Assert on the rendered
+    output rather than on the dicts, so a placeholder added to a template and to neither dict is
+    caught too.
+    """
+    from flash.cli.commands.env import setup as setup_mod
+
+    placeholders = set(setup_mod._HOSTED_GUIDANCE) | set(setup_mod._SELF_HOSTED_GUIDANCE)
+    assert placeholders, "no guidance placeholders found; the render contract moved"
+
+    for index, (api_url, turn_mode) in enumerate(
+        (
+            ("https://flash.freesolo.co", None),
+            ("https://flash.freesolo.co", "multi"),
+            ("https://plane.example.test", None),
+            ("https://plane.example.test", "multi"),
+        )
+    ):
+        written = _scaffold(monkeypatch, tmp_path / f"case{index}", api_url, turn_mode=turn_mode)
+        for name in ("environment.py", "evaluations.py"):
+            for placeholder in placeholders | {"PROJECT_UUID"}:
+                assert placeholder not in written[name], (
+                    f"{name} scaffolded against {api_url} still contains {placeholder}"
+                )
+
+
 def test_scaffolded_self_hosted_id_is_a_form_the_loader_accepts(monkeypatch, tmp_path) -> None:
     """The placeholder must PARSE, or it just trades one unusable id for another.
 
