@@ -15,29 +15,11 @@ from collections.abc import Callable, Iterator, Mapping
 from typing import Any
 
 from flash.client.config import load_credentials_with_source
+from flash.client.shapes import RequireSpec, matches_require
 from flash.core.spec import require_project_id
 from flash.serve.urls import is_freesolo_hosted_url
 
 ProgressCallback = Callable[[int, int], None]
-
-# One accepted shape for a required response value: a type, a tuple of accepted types, or a
-# one-element list ``[element_spec]`` meaning "a list whose every element matches element_spec".
-RequireSpec = type | tuple[type, ...] | list[Any]
-
-
-def _matches_require(value: object, expected: RequireSpec) -> bool:
-    """True when a required response value has a shape the caller can actually read.
-
-    ``[dict]`` exists because a bare ``list`` accepts ``{"runs": [null]}``, which then crashes on
-    element access in the caller instead of surfacing as a ``ClientError``. bool subclasses int,
-    so a json true/false would satisfy an int requirement and flow into arithmetic; it counts as
-    malformed unless bool is itself expected.
-    """
-    if isinstance(expected, list):
-        (element,) = expected
-        return isinstance(value, list) and all(_matches_require(item, element) for item in value)
-    wants_bool = expected is bool or (isinstance(expected, tuple) and bool in expected)
-    return isinstance(value, expected) and (wants_bool or not isinstance(value, bool))
 
 
 class ClientError(RuntimeError):
@@ -563,7 +545,7 @@ class ApiClient:
         bad = [
             key
             for key, expected in (require or {}).items()
-            if key not in payload or not _matches_require(payload[key], expected)
+            if key not in payload or not matches_require(payload[key], expected)
         ]
         if bad:
             raise _unexpected_response(
