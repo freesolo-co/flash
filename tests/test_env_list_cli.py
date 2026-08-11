@@ -28,7 +28,6 @@ def _logged_in(monkeypatch, published, *, error: Exception | None = None):
     monkeypatch.setattr(
         commands, "load_credentials", lambda: ("https://api.freesolo.co", "fslo-key")
     )
-    monkeypatch.setattr(commands, "has_freesolo_backend", lambda _url: True)
 
     class _C:
         def list_envs(self):
@@ -106,11 +105,6 @@ def test_a_server_refusal_is_reported_not_silently_empty(monkeypatch, capsys):
 def test_logged_out_says_so_instead_of_claiming_nothing_is_published(monkeypatch, capsys):
     monkeypatch.setattr(commands, "load_credentials", lambda: ("https://api.freesolo.co", None))
     monkeypatch.setattr(
-        commands,
-        "has_freesolo_backend",
-        lambda _url: pytest.fail("must refuse before checking the backend"),
-    )
-    monkeypatch.setattr(
         "flash.client.client_from_config",
         lambda: pytest.fail("must not call the plane while logged out"),
     )
@@ -122,18 +116,47 @@ def test_logged_out_says_so_instead_of_claiming_nothing_is_published(monkeypatch
     assert "not logged in" in out
 
 
-def test_self_hosted_plane_reports_no_managed_hub(monkeypatch, capsys):
-    """A self-hosted plane has no managed hub; say that rather than imply an empty one."""
+def test_a_custom_plane_is_asked_rather_than_ruled_out_client_side(monkeypatch, capsys):
+    """A non-freesolo.co api-url is still asked: the PLANE owns the hub, not the client.
+
+    The plane derives the namespace from the authenticated key and reads GitHub with its own
+    server-side token, so whether a hub exists is not decidable from the api-url. Skipping the
+    request for a self-hosted plane configured with both would report the empty state for an org
+    that has published environments.
+    """
     monkeypatch.setattr(commands, "load_credentials", lambda: ("http://localhost:8000", "key"))
-    monkeypatch.setattr(commands, "has_freesolo_backend", lambda _url: False)
-    monkeypatch.setattr(
-        "flash.client.client_from_config",
-        lambda: pytest.fail("a self-hosted plane has no hub to list"),
-    )
+    _self_hosted = ["acme/my-env"]
+
+    class _C:
+        def list_envs(self):
+            return _self_hosted
+
+    monkeypatch.setattr("flash.client.client_from_config", lambda: _C())
 
     assert commands.cmd_env_list(argparse.Namespace()) == 0
 
-    assert "no managed environment hub" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "acme/my-env" in out
+    assert "no environments yet" not in out
+
+
+def test_a_custom_plane_without_a_hub_reports_the_planes_own_reason(monkeypatch, capsys):
+    """When a plane has no hub configured it says so itself, and that reason is more accurate."""
+    from flash.client import ApiError
+
+    monkeypatch.setattr(commands, "load_credentials", lambda: ("http://localhost:8000", "key"))
+
+    class _C:
+        def list_envs(self):
+            raise ApiError(503, "GITHUB_TOKEN is required to list published environments")
+
+    monkeypatch.setattr("flash.client.client_from_config", lambda: _C())
+
+    assert commands.cmd_env_list(argparse.Namespace()) == 0
+
+    out = capsys.readouterr().out
+    assert "published environments unavailable" in out
+    assert "GITHUB_TOKEN is required" in out
 
 
 def test_styled_renderer_receives_published_and_unavailable(monkeypatch, capsys):
@@ -225,7 +248,6 @@ def test_a_broken_response_degrades_to_the_reason_line_not_a_traceback(
     monkeypatch.setattr(
         commands, "load_credentials", lambda: ("https://api.freesolo.co", "fslo-key")
     )
-    monkeypatch.setattr(commands, "has_freesolo_backend", lambda _url: True)
     monkeypatch.setattr(
         "flash.client.client_from_config",
         lambda: ApiClient("https://api.freesolo.co", "fslo-key"),
@@ -271,7 +293,6 @@ def test_a_truncated_error_body_degrades_instead_of_raising(monkeypatch, capsys)
     monkeypatch.setattr(
         commands, "load_credentials", lambda: ("https://api.freesolo.co", "fslo-key")
     )
-    monkeypatch.setattr(commands, "has_freesolo_backend", lambda _url: True)
     monkeypatch.setattr(
         "flash.client.client_from_config",
         lambda: ApiClient("https://api.freesolo.co", "fslo-key"),
