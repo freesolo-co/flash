@@ -596,9 +596,12 @@ def run_sft_train(spec=None) -> None:
             python_bin=child.python_bin,
         )
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-        if (
-            final_save_due(final_step, options.save_at_steps)
-            and final_step not in child.watcher.processed_steps
+        # only a step this session's watcher actually published may suppress the final publish.
+        # the seeded resume step is excluded: the prior attempt's deployable publish is best-effort
+        # (`required=False`) while its resume upload is not, so hf can hold the resumable state
+        # without the servable adapter. re-publishing is an idempotent upload to the same path.
+        if final_save_due(final_step, options.save_at_steps) and final_step not in (
+            child.watcher.processed_steps - {child.resume_step}
         ):
             _w.publish_deployable_checkpoint(adapter_dir, final_step)
         outputs = _SftOutputs(adapter_dir, train_wall, device_peak_gpu_gb)

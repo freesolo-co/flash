@@ -1325,6 +1325,7 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
 
     class _DefaultWatcher:
         def __init__(self, **kwargs):
+            self.required_steps = frozenset(kwargs["required_steps"])
             self.processed_steps = set()
 
         def start(self):
@@ -1528,6 +1529,29 @@ def test_the_sft_runner_seeds_the_watcher_with_the_step_it_resumed_from(monkeypa
     assert seeded["at_start"] == {1}
     # the new step is still published, so the seed cannot be a blanket skip of everything.
     assert captured["published"][0][1] == 2
+
+
+def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatch):
+    """the seeded resume step must not suppress the final publish.
+
+    the previous attempt's per-step deployable publish is best-effort (``required=False``) while
+    its resume upload is not, so hf can hold the resumable state without the servable adapter.
+    """
+    from flash.engine.worker import sft_train
+
+    spec, captured = _stub_sft_run(monkeypatch)
+    # max_steps is 2, so resuming at 2 means the watcher never runs and finalization is the only
+    # path left that can publish the step.
+    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir: 2)
+
+    def fake_training(command, *, env, on_step, on_line, heartbeat):
+        raise AssertionError("a run resumed at its horizon must not start the child")
+
+    monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
+
+    sft_train.run_sft_train(spec)
+
+    assert [step for _adapter, step in captured["published"]] == [2]
 
 
 def test_a_workload_that_moved_under_the_frozen_quote_stops_before_training(monkeypatch):
