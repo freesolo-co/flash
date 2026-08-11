@@ -85,7 +85,11 @@ def sft_profile_input_payload(
         "producer_version": str(producer_version),
         "environment": {
             "id": str(environment.id),
-            "resolved_sha": str(environment.resolved_sha or ""),
+            # the environment's OWN content revision, not the shared hub branch tip. resolved_sha
+            # points at environment-hub@main, which any org's `env push` advances, so keying on it
+            # invalidated every pending quote fleet-wide and re-billed a profile per attempt.
+            # content_sha is empty only for generic github refs, where the user's own pin is exact.
+            "content_revision": str(environment.content_sha or environment.resolved_sha or ""),
             "params_sha256": _digest_mapping(environment.params),
         },
         "model": {

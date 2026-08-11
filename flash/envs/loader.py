@@ -510,6 +510,30 @@ def _resolve_github_directory_tree_sha(ref: GitHubEnvironmentRef, repo_dir: str)
     return treeish
 
 
+def _resolve_environment_content_sha(env_id: str, resolved_sha: str) -> str:
+    """Resolve one managed environment package tree at an already-pinned repository commit.
+
+    Generic GitHub environments have no managed package root, so their repository commit remains the
+    exact content revision and this returns an empty optional override. For a managed slug, rebuilding
+    the reference with ``resolved_sha`` is load-bearing: reading ``main`` again here would race the
+    commit pin and could bind the profile digest to content the worker never loads.
+    """
+    if not is_commit_sha(resolved_sha):
+        raise ValueError("environment content resolution requires an immutable commit sha")
+    ref_text = managed_slug_to_github_ref(env_id) if is_managed_environment_slug(env_id) else env_id
+    parsed = _parse_github_environment_ref(ref_text)
+    if parsed is None:
+        return ""
+    package_root = _managed_hub_package_root(parsed)
+    if not package_root:
+        return ""
+    pinned = GitHubEnvironmentRef(parsed.owner, parsed.repo, resolved_sha, parsed.path)
+    content_sha = _resolve_github_directory_tree_sha(pinned, package_root)
+    if not is_commit_sha(content_sha):
+        raise RuntimeError("GitHub environment directory did not resolve to an immutable tree sha")
+    return content_sha.lower()
+
+
 def _download_github_directory(ref: GitHubEnvironmentRef, repo_dir: str, dest: Path) -> Path:
     """Download one GitHub directory into a repo-shaped tree under ``dest``."""
     repo_root = dest / "repo"

@@ -246,11 +246,12 @@ _TOP_LEVEL_KEYS = frozenset(
 # preserves the runner's disk sizing, weight-cache volume, and platform retry/wall-clock policy.
 _GPU_KEYS = frozenset(item.name for item in dataclass_fields(GpuSpec)) - MANAGED_GPU_KEYS
 # [environment] user-authorable keys, derived from EnvironmentSpec (mirrors _GPU_KEYS) so a new field
-# is accepted automatically; resolved_sha is control-plane-pinned (see _assign_resolved_env_sha).
+# is accepted automatically; resolved_sha and content_sha are control-plane-pinned (see
+# _assign_resolved_env_sha and _assign_profile_environment_content_sha).
 # pip is platform-managed: worker_pip_for_env ignores the env id and returns one constant worker
 # requirement, so an override only ever selected the same list or a broken one. EnvironmentSpec still
 # carries the field, and spec_payload/provider submit keep populating it from worker_pip_for_env.
-_ENV_MANAGED_KEYS = frozenset({"resolved_sha", "pip"})
+_ENV_MANAGED_KEYS = frozenset({"resolved_sha", "content_sha", "pip"})
 _ENVIRONMENT_KEYS = (
     frozenset(item.name for item in dataclass_fields(EnvironmentSpec)) - _ENV_MANAGED_KEYS
 )

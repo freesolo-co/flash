@@ -396,12 +396,16 @@ def _raise_walk_error(error: OSError) -> None:
 def _tar_b64(directory: Path) -> str:
     """Pack a directory into a base64 tarball, excluding caches and metadata directories."""
     import base64
+    import gzip
     import io
     import os
     import tarfile
 
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+    with (
+        gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as compressed,
+        tarfile.open(fileobj=compressed, mode="w") as tar,
+    ):
         for root, dirs, files in os.walk(directory):
             root_path = Path(root)
             dirs[:] = sorted(d for d in dirs if d.lower() not in _ENV_PUSH_IGNORED_NAMES)

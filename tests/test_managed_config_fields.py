@@ -3,7 +3,8 @@
 These fields are assigned by the control plane / runner, never authored by the user: the top-level
 ``run_id``, the per-run artifact repo ``train.hf_repo``, the runner-sized
 ``gpu.disk_gb`` and the weight-cache ``gpu.network_volume`` / ``gpu.network_volume_gb``, the
-control-plane-pinned ``environment.resolved_sha``, and the retry/wall-clock lifecycle policy
+control-plane-pinned ``environment.resolved_sha`` / ``environment.content_sha``, and the
+retry/wall-clock lifecycle policy
 ``gpu.max_retries`` / ``gpu.max_wall_seconds``. The user-facing parser (``spec_from_dict``) rejects
 each loudly instead of silently dropping it, and ``JobSpec.to_dict()`` (the public, user-authorable
 representation) omits them all so the client-submit -> server-revalidation round trip never trips
@@ -49,6 +50,11 @@ _MANAGED_REJECTIONS = [
         {"environment": {"id": "owner/env", "resolved_sha": "a" * 40}},
         r"\[environment\] unknown key\(s\): resolved_sha",
     ),
+    (
+        "environment.content_sha",
+        {"environment": {"id": "owner/env", "content_sha": "a" * 40}},
+        r"\[environment\] unknown key\(s\): content_sha",
+    ),
 ]
 
 
@@ -73,6 +79,7 @@ def _fully_managed_internal_spec() -> JobSpec:
             "environment": {
                 "id": "github:owner/repo@main:env/environment.py",
                 "resolved_sha": "b" * 40,
+                "content_sha": "c" * 40,
             },
             "train": {"epochs": 1, "max_examples": 8, "lora_rank": 16, "hf_repo": "operator/runs"},
             "gpu": {
@@ -95,6 +102,7 @@ def _fully_managed_internal_spec() -> JobSpec:
     assert spec.gpu.max_retries == 9
     assert spec.gpu.max_wall_seconds == 7200
     assert spec.environment.resolved_sha == "b" * 40
+    assert spec.environment.content_sha == "c" * 40
     return spec
 
 
@@ -107,6 +115,7 @@ def test_public_spec_omits_all_managed_fields():
         & set(public["gpu"])
     )
     assert "resolved_sha" not in public["environment"]
+    assert "content_sha" not in public["environment"]
 
 
 def test_internal_dict_retains_all_managed_fields():
@@ -119,6 +128,7 @@ def test_internal_dict_retains_all_managed_fields():
     assert internal["gpu"]["max_retries"] == 9
     assert internal["gpu"]["max_wall_seconds"] == 7200
     assert internal["environment"]["resolved_sha"] == "b" * 40
+    assert internal["environment"]["content_sha"] == "c" * 40
 
 
 def test_public_spec_round_trips_through_user_parser():
@@ -135,6 +145,7 @@ def test_public_spec_round_trips_through_user_parser():
     assert reparsed.gpu.max_retries == 5  # GpuSpec default
     assert reparsed.gpu.max_wall_seconds == 24 * 3600  # GpuSpec default
     assert reparsed.environment.resolved_sha == ""
+    assert reparsed.environment.content_sha == ""
     # rank and its derived alpha survive the public round trip.
     assert reparsed.train.lora_rank == 16
     assert reparsed.train.lora_alpha == 32

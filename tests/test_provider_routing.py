@@ -726,17 +726,7 @@ def test_effective_spec_rejects_other_environment_mutations(field, value):
         runner._validate_effective_spec(public, worker)
 
 
-@pytest.mark.parametrize(
-    "resolved_sha",
-    [
-        pytest.param("main", id="symbolic-ref"),
-        pytest.param("not-a-commit", id="arbitrary-string"),
-        pytest.param("a" * 39, id="short-hex"),
-        pytest.param("g" * 40, id="non-hex"),
-        pytest.param(123, id="non-string"),
-    ],
-)
-def test_effective_spec_rejects_malformed_worker_resolved_sha(resolved_sha):
+def test_effective_spec_accepts_managed_environment_content_sha() -> None:
     from dataclasses import replace
 
     from flash import runner
@@ -749,7 +739,41 @@ def test_effective_spec_rejects_malformed_worker_resolved_sha(resolved_sha):
     )
     worker = replace(
         public,
-        environment=replace(public.environment, resolved_sha=resolved_sha),
+        environment=replace(
+            public.environment,
+            resolved_sha="a" * 40,
+            content_sha="b" * 40,
+        ),
+    )
+
+    runner._validate_effective_spec(public, worker)
+
+
+@pytest.mark.parametrize("revision_key", ["resolved_sha", "content_sha"])
+@pytest.mark.parametrize(
+    "revision",
+    [
+        pytest.param("main", id="symbolic-ref"),
+        pytest.param("not-a-commit", id="arbitrary-string"),
+        pytest.param("a" * 39, id="short-hex"),
+        pytest.param("g" * 40, id="non-hex"),
+        pytest.param(123, id="non-string"),
+    ],
+)
+def test_effective_spec_rejects_malformed_worker_environment_revision(revision_key, revision):
+    from dataclasses import replace
+
+    from flash import runner
+
+    public = JobSpec.from_dict(
+        {
+            **_spec().to_internal_dict(),
+            "environment": {"id": "github:owner/repo@main:env/environment.py"},
+        }
+    )
+    worker = replace(
+        public,
+        environment=replace(public.environment, **{revision_key: revision}),
     )
 
     with pytest.raises(ValueError, match="effective preparation"):

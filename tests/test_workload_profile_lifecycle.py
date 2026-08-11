@@ -22,6 +22,7 @@ def _spec() -> JobSpec:
         environment=EnvironmentSpec(
             id="team/example",
             resolved_sha="b" * 40,
+            content_sha="c" * 40,
             params={"dataset_split": "train"},
         ),
         train=TrainSpec(
@@ -42,7 +43,7 @@ def _profile(input_digest: str) -> SftWorkloadProfile:
         producer_version="1.2.3",
         tokenizer_revision="a" * 40,
         environment_id="team/example",
-        environment_revision="b" * 40,
+        environment_revision="c" * 40,
         source_examples=80,
         selected_examples=64,
         retained_examples=60,

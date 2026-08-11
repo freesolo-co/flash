@@ -1232,6 +1232,7 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
         environment=SimpleNamespace(
             id="owner/env",
             resolved_sha="b" * 40,
+            content_sha="c" * 40,
             params={},
         ),
         gpu=SimpleNamespace(type="RTX 4090", exact_type="", count=2),

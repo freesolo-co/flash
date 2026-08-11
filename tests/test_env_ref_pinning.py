@@ -20,6 +20,7 @@ from flash.core.spec import JobSpec
 
 _SHA = "a" * 40
 _NEWER_SHA = "b" * 40
+_CONTENT_SHA = "c" * 40
 
 
 def _env_spec(resolved_sha: str = "", **extra) -> JobSpec:
@@ -41,8 +42,48 @@ def _with_sha(spec: JobSpec, sha: str) -> JobSpec:
 
 
 # ============================================================================================
-# the two helpers, in isolation
+# the content and commit helpers, in isolation
 # ============================================================================================
+def test_managed_content_sha_resolves_at_the_already_pinned_commit(monkeypatch) -> None:
+    import flash.envs.loader as loader
+
+    seen: dict[str, object] = {}
+
+    def resolve(ref, repo_dir):
+        seen["ref"] = ref
+        seen["repo_dir"] = repo_dir
+        return _CONTENT_SHA
+
+    monkeypatch.setattr(loader, "_resolve_github_directory_tree_sha", resolve)
+
+    assert loader._resolve_environment_content_sha("acme/my-env", _SHA) == _CONTENT_SHA
+    assert seen["ref"] == loader.GitHubEnvironmentRef(
+        "freesolo-co",
+        "environment-hub",
+        _SHA,
+        "acme/my-env/environment.py",
+    )
+    assert seen["repo_dir"] == "acme/my-env"
+
+
+def test_generic_github_ref_has_no_managed_content_override(monkeypatch) -> None:
+    import flash.envs.loader as loader
+
+    monkeypatch.setattr(
+        loader,
+        "_resolve_github_directory_tree_sha",
+        lambda *_args, **_kwargs: pytest.fail("generic refs have no managed package subtree"),
+    )
+
+    assert (
+        loader._resolve_environment_content_sha(
+            "github:someorg/repo@abc:envs/foo.py",
+            _SHA,
+        )
+        == ""
+    )
+
+
 def test_spec_with_resolved_env_sha_applies_the_pin() -> None:
     from flash.runner.supervise.lifecycle import _spec_with_resolved_env_sha
 
@@ -144,6 +185,46 @@ def test_pin_still_applies_a_submit_time_pin_after_an_attempt_has_run(monkeypatc
 
     assert out.environment.resolved_sha == _SHA
     assert log.getvalue() == ""
+
+
+def test_sft_profile_environment_pins_managed_content_sha(monkeypatch) -> None:
+    import flash.envs.loader as loader
+    import flash.runner as runner
+
+    monkeypatch.setattr(loader, "_resolve_environment_content_sha", lambda *_args: _CONTENT_SHA)
+
+    pinned = runner._require_pinned_profile_environment(
+        JobSpec.from_dict(
+            {
+                "model": "Qwen/Qwen3.5-0.8B",
+                "algorithm": "sft",
+                "environment": {"id": "acme/my-env", "resolved_sha": _SHA},
+            }
+        )
+    )
+
+    assert pinned.environment.resolved_sha == _SHA
+    assert pinned.environment.content_sha == _CONTENT_SHA
+
+
+def test_sft_profile_environment_fails_closed_when_content_pin_fails(monkeypatch) -> None:
+    import flash.envs.loader as loader
+    import flash.runner as runner
+
+    def fail(*_args):
+        raise RuntimeError("github unavailable")
+
+    monkeypatch.setattr(loader, "_resolve_environment_content_sha", fail)
+    spec = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "sft",
+            "environment": {"id": "acme/my-env", "resolved_sha": _SHA},
+        }
+    )
+
+    with pytest.raises(runner.WorkloadProfileUnavailable, match="content revision"):
+        runner._require_pinned_profile_environment(spec)
 
 
 # ============================================================================================

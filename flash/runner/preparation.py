@@ -426,13 +426,13 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
     effective["train"] = effective_train
     public_environment = dict(public["environment"])
     effective_environment = dict(effective["environment"])
-    public_sha = public_environment.get("resolved_sha")
-    effective_sha = effective_environment.get("resolved_sha")
-    if not public_sha and isinstance(effective_sha, str):
-        from flash.envs.loader import is_commit_sha
+    from flash.envs.loader import is_commit_sha
 
-        if is_commit_sha(effective_sha):
-            effective_environment["resolved_sha"] = ""
+    for revision_key in ("resolved_sha", "content_sha"):
+        public_sha = public_environment.get(revision_key)
+        effective_sha = effective_environment.get(revision_key)
+        if not public_sha and isinstance(effective_sha, str) and is_commit_sha(effective_sha):
+            effective_environment[revision_key] = ""
     effective["environment"] = effective_environment
     public_gpu = dict(public["gpu"])
     effective_gpu = {**effective["gpu"], "type": public_gpu["type"]}
@@ -517,6 +517,21 @@ def _profile_producer_version() -> str:
     return str(__version__)
 
 
+def _assign_profile_environment_content_sha(spec: JobSpec) -> JobSpec:
+    """Pin the managed environment package tree without rereading its moving branch."""
+    environment = spec.environment
+    if environment.content_sha:
+        return spec
+    from flash.envs.loader import _resolve_environment_content_sha
+
+    content_sha = _resolve_environment_content_sha(environment.id, environment.resolved_sha)
+    if not content_sha:
+        # generic github refs have no managed package subtree. their already-pinned repository commit
+        # remains the exact revision, so leaving the optional narrower pin empty is intentional.
+        return spec
+    return replace(spec, environment=replace(environment, content_sha=content_sha))
+
+
 def _require_pinned_profile_environment(spec: JobSpec) -> JobSpec:
     pinned = _runner()._assign_resolved_env_sha(spec)
     if not pinned.environment.id:
@@ -527,7 +542,14 @@ def _require_pinned_profile_environment(spec: JobSpec) -> JobSpec:
         raise _runner().WorkloadProfileUnavailable(
             "sft workload profiling requires an immutable resolved environment revision"
         )
-    return pinned
+    try:
+        return _runner()._assign_profile_environment_content_sha(pinned)
+    except Exception as exc:
+        # this gate already fails closed when the repository commit cannot be pinned. treating a failed
+        # package-tree lookup the same way avoids billing a profile under a weaker fleet-wide identity.
+        raise _runner().WorkloadProfileUnavailable(
+            "sft workload profiling could not pin the managed environment content revision"
+        ) from exc
 
 
 def _prepared_sft_profile_job(spec: JobSpec, *, input_digest: str) -> PreparedJob:

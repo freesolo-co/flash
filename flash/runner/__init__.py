@@ -847,6 +847,7 @@ from flash.runner.deadlines import (  # noqa: E402,F401
 from flash.runner.deadlines import _profile_wall_armed_at as _profile_wall_armed_at  # noqa: E402
 from flash.runner.preparation import (  # noqa: E402,F401
     _adopted_warmstart_revision,
+    _assign_profile_environment_content_sha,
     _inherit_warmstart_revision,
     _mark_warmstart_source,
     _preparation_digest,

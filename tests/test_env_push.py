@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import gzip
 import io
 import os
 import subprocess
@@ -49,6 +50,20 @@ def _args(
     path, *, name: str = "my-env", project: str | None = "11111111-1111-4111-8111-111111111111"
 ):
     return argparse.Namespace(path=str(path), name=name, project=project)
+
+
+def test_tar_b64_is_byte_identical_across_wall_clock_times(monkeypatch, tmp_path) -> None:
+    from flash.cli.commands.env.push import _tar_b64
+
+    (tmp_path / "environment.py").write_text("VALUE = 1\n")
+    wall_times = iter((1_700_000_000.0, 1_800_000_000.0))
+    monkeypatch.setattr(gzip.time, "time", lambda: next(wall_times))
+
+    first = _tar_b64(tmp_path)
+    second = _tar_b64(tmp_path)
+
+    assert first == second
+    assert _members(first) == {"environment.py": "VALUE = 1\n"}
 
 
 def test_push_single_py_module_is_packaged(monkeypatch, tmp_path, capsys):

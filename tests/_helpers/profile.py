@@ -1,9 +1,9 @@
 """Shared helper that satisfies the mandatory sft workload-profile gate.
 
 ``prepare_job`` fails closed for sft until a completed profile with a matching input digest
-exists, and the digest covers the immutable model revision and environment sha. Pinning the
-model revision then makes sizing revision-aware too, so a real sft submission performs three
-hub/github round-trips before it reaches the behaviour most tests are actually about.
+exists, and the digest covers the immutable model revision and environment content. pinning the
+model revision then makes sizing revision-aware too, so a real sft submission performs four
+remote resolution paths before it reaches the behaviour most tests are actually about.
 
 Use this only where the test's subject is something else (disk floors, artifact repos, provider
 acceptance). Tests that assert profile behaviour itself build their own records so a helper bug
@@ -17,6 +17,7 @@ from typing import Any
 
 _MODEL_REVISION = "a" * 40
 _ENV_REVISION = "b" * 40
+_ENV_CONTENT_SHA = "c" * 40
 # provenance, not measurement: fixed so a helper-built profile stays byte-identical across runs.
 _PROFILE_CREATED_AT = 1_780_000_000.0
 
@@ -26,10 +27,21 @@ def _pin_model_revision(spec: Any) -> Any:
 
 
 def _pin_env_revision(spec: Any) -> Any:
+    from flash.envs.loader import is_managed_environment_slug
+
     env = spec.environment
-    if not env.id or env.resolved_sha:
+    if not env.id:
         return spec
-    return replace(spec, environment=replace(env, resolved_sha=_ENV_REVISION))
+    resolved_sha = env.resolved_sha or _ENV_REVISION
+    content_sha = env.content_sha
+    if is_managed_environment_slug(env.id):
+        content_sha = content_sha or _ENV_CONTENT_SHA
+    if resolved_sha == env.resolved_sha and content_sha == env.content_sha:
+        return spec
+    return replace(
+        spec,
+        environment=replace(env, resolved_sha=resolved_sha, content_sha=content_sha),
+    )
 
 
 def sft_profile_for(spec: Any, *, input_digest: str, producer_version: str):
@@ -55,7 +67,7 @@ def sft_profile_for(spec: Any, *, input_digest: str, producer_version: str):
         producer_version=producer_version,
         tokenizer_revision=spec.model_revision,
         environment_id=spec.environment.id,
-        environment_revision=spec.environment.resolved_sha,
+        environment_revision=spec.environment.content_sha or spec.environment.resolved_sha,
         source_examples=retained,
         selected_examples=retained,
         retained_examples=retained,
@@ -190,11 +202,12 @@ def satisfy_sft_profile(runner, monkeypatch, spec: Any):
     if spec.algorithm != "sft":
         return spec
 
-    # The three hub/github round-trips a pinned sft submission performs, replaced in place. Each
-    # has its own dedicated coverage (revision resolution, env-sha pinning, revision geometry);
-    # reaching the network here would make every sft submit test an integration test.
+    # the four remote resolution paths a pinned sft submission performs, replaced in place. each has
+    # dedicated coverage (model revision, env commit, env content, revision geometry); reaching the
+    # network here would make every sft submit test an integration test.
     monkeypatch.setattr(runner, "_resolve_model_revision", lambda s, **_kw: _pin_model_revision(s))
     monkeypatch.setattr(runner, "_assign_resolved_env_sha", _pin_env_revision)
+    monkeypatch.setattr(runner, "_assign_profile_environment_content_sha", _pin_env_revision)
     stub_revision_geometry(monkeypatch)
 
     pinned = _pin_env_revision(_pin_model_revision(spec))

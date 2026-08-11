@@ -22,6 +22,7 @@ def _spec() -> JobSpec:
         environment=EnvironmentSpec(
             id="team/example",
             resolved_sha="b" * 40,
+            content_sha="c" * 40,
             params={"dataset_split": "train", "private_selector": "not-persisted"},
         ),
         train=TrainSpec(
@@ -43,7 +44,7 @@ def _profile(**overrides) -> SftWorkloadProfile:
         "producer_version": "1.2.3",
         "tokenizer_revision": "d" * 64,
         "environment_id": "team/example",
-        "environment_revision": "b" * 40,
+        "environment_revision": "c" * 40,
         "source_examples": 80,
         "selected_examples": 64,
         "retained_examples": 60,
@@ -152,6 +153,56 @@ def test_created_at_rejects_values_that_are_not_a_timestamp() -> None:
             _profile(created_at=bad)
 
 
+def test_sft_profile_key_ignores_unrelated_managed_hub_commits() -> None:
+    spec = _spec()
+    moved_hub_tip = replace(
+        spec,
+        environment=replace(spec.environment, resolved_sha="d" * 40),
+    )
+
+    assert sft_profile_input_digest(
+        spec,
+        tokenizer_revision="tokenizer-a",
+        producer_version="1.2.3",
+    ) == sft_profile_input_digest(
+        moved_hub_tip,
+        tokenizer_revision="tokenizer-a",
+        producer_version="1.2.3",
+    )
+
+
+def test_sft_profile_key_falls_back_to_generic_github_commit() -> None:
+    spec = replace(
+        _spec(),
+        environment=EnvironmentSpec(
+            id="github:someorg/repo@abc:envs/foo.py",
+            resolved_sha="b" * 40,
+        ),
+    )
+    moved_ref = replace(
+        spec,
+        environment=replace(spec.environment, resolved_sha="d" * 40),
+    )
+
+    first = sft_profile_input_payload(
+        spec,
+        tokenizer_revision="tokenizer-a",
+        producer_version="1.2.3",
+    )
+    second = sft_profile_input_digest(
+        moved_ref,
+        tokenizer_revision="tokenizer-a",
+        producer_version="1.2.3",
+    )
+
+    assert first["environment"]["content_revision"] == "b" * 40
+    assert second != sft_profile_input_digest(
+        spec,
+        tokenizer_revision="tokenizer-a",
+        producer_version="1.2.3",
+    )
+
+
 def test_sft_profile_key_changes_for_every_workload_shaping_input() -> None:
     spec = _spec()
     base = sft_profile_input_digest(
@@ -163,7 +214,7 @@ def test_sft_profile_key_changes_for_every_workload_shaping_input() -> None:
         replace(spec, seed=43),
         replace(spec, thinking=False),
         replace(spec, model_revision="e" * 40),
-        replace(spec, environment=replace(spec.environment, resolved_sha="f" * 40)),
+        replace(spec, environment=replace(spec.environment, content_sha="f" * 40)),
         replace(spec, environment=replace(spec.environment, params={"dataset_split": "eval"})),
         replace(spec, train=replace(spec.train, epochs=3)),
         replace(spec, train=replace(spec.train, batch_size=16)),
@@ -244,4 +295,6 @@ def test_profile_carrier_is_internal_and_round_trips_only_in_worker_specs() -> N
     assert "workload_profile_input_digest" not in public
     assert "workload_profile_producer_version" not in public
     assert "workload_profile" not in public
+    assert "resolved_sha" not in public["environment"]
+    assert "content_sha" not in public["environment"]
     assert JobSpec.from_dict(internal) == spec

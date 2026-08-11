@@ -259,6 +259,12 @@ class EnvironmentSpec:
     secrets: tuple[str, ...] = ()
     # Resolved once in control plane to avoid GitHub rate-limits on cold spawn waves.
     resolved_sha: str = ""
+    # Git tree sha of THIS environment's own package directory, pinned by the control plane at the
+    # commit resolved_sha already pinned. resolved_sha is the shared environment-hub branch tip, so
+    # it moves whenever any unrelated org publishes; keying profile identity on it made a byte
+    # identical config produce a new digest (and a new billed profile run) each attempt. Empty for
+    # generic github refs, which have no managed subtree and are already pinned by the user.
+    content_sha: str = ""
 
 
 # internal persisted-record compatibility only, never public config parsing. #968 removed
@@ -515,6 +521,7 @@ class JobSpec:
         for managed in MANAGED_GPU_KEYS:
             gpu.pop(managed, None)
         data["environment"].pop("resolved_sha", None)  # resolve-once env ref pin
+        data["environment"].pop("content_sha", None)  # control-plane per-env package tree pin
         # platform-managed worker requirement list, resolved by worker_pip_for_env at submit.
         data["environment"].pop("pip", None)
         return data
@@ -595,6 +602,7 @@ class JobSpec:
                 pip=tuple(str(p) for p in env.get("pip") or ()),
                 secrets=_str_tuple(env.get("secrets")),
                 resolved_sha=str(env.get("resolved_sha") or ""),
+                content_sha=str(env.get("content_sha") or ""),
             ),
             train=TrainSpec(
                 epochs=_opt_int(train.get("epochs")),
