@@ -24,7 +24,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Iterator
 from pathlib import Path
 from typing import BinaryIO
 
@@ -179,32 +178,10 @@ def _resolve_ref_sha(
     return sha
 
 
-def _iter_capped_chunks(
-    resp: object, max_bytes: int, deadline: float | None = None
-) -> Iterator[bytes]:
-    # per-attempt accounting is also per-download accounting: _urlopen rewinds and truncates the
-    # sink before every attempt, so the bytes this generator caps are exactly the bytes that
-    # survive on disk. a retried download can never leave more than max_bytes behind.
-    total = 0
-    while True:
-        # urllib's timeout applies to each blocking socket read, not to the response as a whole, so
-        # a peer that dribbles out one chunk just inside every timeout window keeps a single attempt
-        # alive far past it. `deadline` bounds the wall-clock of the whole body for callers that
-        # promise an overall budget; without it, that promise is only per-read.
-        if deadline is not None and time.monotonic() > deadline:
-            raise TimeoutError(
-                f"GitHub response body exceeded its overall deadline after {total} bytes"
-            )
-        chunk = resp.read(_DOWNLOAD_CHUNK_BYTES)
-        if not chunk:
-            break
-        if total + len(chunk) > max_bytes:
-            raise RuntimeError(
-                f"GitHub response body exceeded the maximum allowed size ({max_bytes} bytes); "
-                "download aborted"
-            )
-        total += len(chunk)
-        yield chunk
+from flash.envs.bounded_reads import (  # noqa: E402
+    _iter_capped_chunks,
+    _read_error_body,
+)
 
 
 def _urlopen(
@@ -274,7 +251,7 @@ def _urlopen(
             # would escape unretried as an uncaught 500 instead of the classified 429/502. the
             # status and headers still classify the failure, so an unreadable body just goes empty.
             try:
-                body = exc.read().decode("utf-8", "replace") if exc.fp is not None else ""
+                body = _read_error_body(exc, body_deadline)
             except (ConnectionError, http.client.IncompleteRead, OSError):
                 body = ""
             remaining = (exc.headers.get("X-RateLimit-Remaining") if exc.headers else None) or ""

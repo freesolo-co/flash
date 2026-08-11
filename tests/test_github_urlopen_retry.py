@@ -298,6 +298,86 @@ def test_urlopen_still_classifies_a_throttled_429_with_a_truncated_body(monkeypa
     assert excinfo.value.throttled is True
 
 
+def test_urlopen_asks_the_error_body_for_a_bounded_amount(monkeypatch):
+    """The error-body read must pass a size, because a sizeless read is unbounded.
+
+    `HTTPResponse.read(None)` is documented as an unbounded read and streams a chunked body until it
+    ends, so a slow 429/5xx whose chunks each land inside the socket timeout held this handler open
+    past the interactive list's deadline -- the caller then timed out locally instead of receiving
+    the controlled 429/502 the status was about to produce.
+
+    Asserting on the size ARGUMENT rather than on wall-clock is deliberate: the loop lives inside a
+    real `HTTPResponse`, and `exc.read()` delegates one-to-one to the file object, so no in-memory
+    stub can reproduce the endless stream. What is observable -- and what actually fixes it -- is
+    that we never issue a sizeless read.
+    """
+    sizes: list[object] = []
+
+    class _RecordingErrorBody(io.BytesIO):
+        def read(self, size=-1):
+            sizes.append(size)
+            return b"x" * 512 if len(sizes) < 3 else b""
+
+        def close(self):  # HTTPError's tempfile teardown calls this
+            pass
+
+    def fake_urlopen(req, timeout):
+        raise urllib.error.HTTPError(
+            url="https://api.github.com/test",
+            code=404,  # not transient: classify once, no retry, keeps the assertion unambiguous
+            msg="",
+            hdrs={},  # type: ignore[arg-type]
+            fp=_RecordingErrorBody(b""),
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)
+
+    with pytest.raises(RuntimeError, match="GitHub environment request failed"):
+        _urlopen(
+            urllib.request.Request("https://api.github.com/test"),
+            max_bytes=16 * 1024 * 1024,
+            body_deadline=20.0,
+        )
+
+    assert sizes, "the error body was never read"
+    # collect first, assert once: a per-iteration assertion reports only the first bad read.
+    unbounded = [size for size in sizes if not isinstance(size, int) or size <= 0]
+    assert unbounded == [], f"unbounded error-body reads: {unbounded!r}"
+
+
+def test_urlopen_stops_reading_an_error_body_at_its_cap(monkeypatch):
+    """A huge error body must not be buffered in full just to classify a status."""
+    served = [0]
+
+    class _EndlessErrorBody(io.BytesIO):
+        def read(self, size=-1):
+            served[0] += 1
+            if served[0] > 10_000:  # a stand-in for "forever", so a regression fails loudly
+                raise AssertionError("error body read was never capped")
+            return b"x" * (size if isinstance(size, int) and size > 0 else 1024)
+
+        def close(self):
+            pass
+
+    def fake_urlopen(req, timeout):
+        raise urllib.error.HTTPError(
+            url="https://api.github.com/test",
+            code=404,
+            msg="",
+            hdrs={},  # type: ignore[arg-type]
+            fp=_EndlessErrorBody(b""),
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)
+
+    with pytest.raises(RuntimeError, match="GitHub environment request failed"):
+        _urlopen(urllib.request.Request("https://api.github.com/test"), max_bytes=16 * 1024 * 1024)
+
+
 def test_urlopen_body_deadline_bounds_a_slow_dripping_response(monkeypatch):
     # urllib restarts `timeout` on every blocking read, so a peer returning one chunk just inside
     # each window keeps ONE attempt alive indefinitely -- the per-read timeout is not a per-attempt
