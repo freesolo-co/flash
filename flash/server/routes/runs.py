@@ -325,6 +325,71 @@ def _record_environment_use(
         )
 
 
+def _dispose_failed_submission(
+    run_id: str,
+    *,
+    dry_run: bool,
+    had_runtime_secrets: bool,
+    environment_slug: str | None,
+    project_id: str,
+    reporting_key: dict,
+) -> None:
+    """Settle whatever a failed create_run left behind; never raises past the failure.
+
+    drop the ownership row only when the launch left no run behind. once submit_job has persisted
+    status the run exists to the sweeps and to recovery, so deleting the row would orphan it: 404
+    on status, logs and cancel for its owner while the provider footprint lives on. keep it
+    visible instead and let the normal failure and reconcile machinery drive it to a terminal
+    state.
+    """
+    if not os.path.exists(runs_file_path(run_id, ".json")):
+        db.delete_run(run_id)
+    elif dry_run:
+        # a dry run must never be retained: submit_job persists it as `queued` before flipping
+        # the state to `dry_run`, and startup recovery resubmits every owned queued run as a
+        # real job, so a retained half-flipped dry run could provision a gpu the user never
+        # asked to rent. recovery walks the ownership rows, so dropping the row keeps the
+        # record out of it exactly as before the retain guard existed.
+        db.delete_run(run_id)
+    elif had_runtime_secrets:
+        # this run's secrets live only in the request: recovery resubmits from the persisted
+        # spec, which deliberately excludes them, so a retained secretful run would silently
+        # train without its credentials. fail it loudly instead; the owner keeps the row and
+        # the error, and recovery ignores terminal runs. the update is terminal-sticky, so a
+        # record that already reached a terminal state is left untouched.
+        terminalized = False
+        try:
+            _runner._update(
+                run_id,
+                "failed",
+                error=(
+                    "submission failed before its runtime secrets could be dispatched; "
+                    "the run was not started because recovery cannot restore them - resubmit"
+                ),
+            )
+            # returning without raising IS the proof of terminality: True applied the write, and a
+            # sticky False means the record was already terminal. no re-read - a transient status
+            # read error says nothing about the state and must never be read as failure.
+            terminalized = True
+        except Exception:
+            _LOG.warning(
+                "could not terminalize secretless-recoverable run %s", run_id, exc_info=True
+            )
+        if not terminalized:
+            # the update RAISED, and it is the ONLY write keeping recovery away from this run; a
+            # full or read-only status store can fail it. owner visibility is worth less than the
+            # guarantee: drop the ownership row so recovery, which walks those rows, can never
+            # resubmit the run without the secrets it needs.
+            with contextlib.suppress(Exception):
+                db.delete_run(run_id)
+    else:
+        # a retained run stays live and can recover into real training, so it must carry the
+        # same managed-environment association a successful submission records.
+        _record_environment_use(
+            environment_slug, project_id=project_id, run_id=run_id, reporting_key=reporting_key
+        )
+
+
 @router.post("/v1/runs")
 def create_run(
     payload: dict,
@@ -452,7 +517,14 @@ def create_run(
             submit_kwargs["platform_context"] = platform_context
         status = _app.submit_job(prepared.public_spec, **submit_kwargs)
     except Exception as exc:
-        db.delete_run(run_id)
+        _dispose_failed_submission(
+            run_id,
+            dry_run=dry_run,
+            had_runtime_secrets=bool(runtime_secrets),
+            environment_slug=environment_slug,
+            project_id=project_id,
+            reporting_key=reporting_key,
+        )
         if isinstance(exc, HTTPException):
             raise
         raise HTTPException(status_code=400, detail=str(exc)) from exc

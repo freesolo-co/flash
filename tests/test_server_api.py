@@ -1601,6 +1601,271 @@ def test_create_run_does_not_blame_the_adapter_for_an_unrelated_failure(api, mon
     assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
 
 
+def test_create_run_keeps_ownership_when_submit_fails_after_persisting_status(api, monkeypatch):
+    """A submit that dies after saving status leaves a run the owner can still see and cancel.
+
+    ``submit_job`` persists ``RunStatus`` and then keeps working (dispatch, provisioning), so a
+    failure past that point leaves a real run behind: the charge sweep and recovery both walk the
+    status files, not the db. Deleting the ownership row there would strand it: 404 on status,
+    logs and cancel for the only key entitled to it, while the provider footprint lives on.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.server.platform import db
+
+    submitted = []
+
+    def submit(spec, **_kwargs):
+        submitted.append(spec.run_id)
+        # mirror the real ordering: status lands first, the rest of the launch can still blow up.
+        runner._save_status(
+            runner.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
+        )
+        raise RuntimeError("provisioning died after status was written")
+
+    monkeypatch.setattr(app_mod, "submit_job", submit)
+
+    key = _login()
+    resp = api.post("/v1/runs", headers=_bearer(key), json={"spec": SPEC})
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    # the owner keeps its handle on the run the failed submit left behind.
+    assert db.run_owner(run_id) is not None
+    assert api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).status_code == 200
+    assert api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key)).status_code == 200
+    assert [r["run_id"] for r in api.get("/v1/runs", headers=_bearer(key)).json()["runs"]] == [
+        run_id
+    ]
+    # and can still drive it to a terminal state itself.
+    cancelled = api.post(f"/v1/runs/{run_id}/cancel", headers=_bearer(key))
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["state"] == "cancelled"
+
+
+def test_create_run_deletes_the_row_when_submit_fails_before_persisting_status(api, monkeypatch):
+    # the other half of the guard: no status file means the launch left nothing behind, so the
+    # ownership row is pure debris and must go rather than wedge the id forever.
+    import flash.server.app as app_mod
+    from flash.server.platform import db
+
+    submitted = []
+
+    def submit(spec, **_kwargs):
+        submitted.append(spec.run_id)
+        raise RuntimeError("provisioning died before status was written")
+
+    monkeypatch.setattr(app_mod, "submit_job", submit)
+
+    key = _login()
+    resp = api.post("/v1/runs", headers=_bearer(key), json={"spec": SPEC})
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    assert db.run_owner(run_id) is None
+    assert api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).status_code == 404
+    assert api.get("/v1/runs", headers=_bearer(key)).json()["runs"] == []
+
+
+def _persist_queued_then_raise(app_mod, runner, monkeypatch, submitted):
+    """Monkeypatch submit_job to mirror its real failure ordering: status lands, then it dies."""
+
+    def submit(spec, **_kwargs):
+        submitted.append(spec.run_id)
+        runner._save_status(
+            runner.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
+        )
+        raise RuntimeError("provisioning died after status was written")
+
+    monkeypatch.setattr(app_mod, "submit_job", submit)
+
+
+def _classified_resubmits() -> list[str]:
+    """Run ids startup recovery would resubmit right now."""
+    from flash.server.platform import runtime
+
+    active: set[str] = set()
+    known: set[str] = set()
+    resubmit: list = []
+    runtime._classify_recoverable_runs(active, known, resubmit)
+    return [spec.run_id for spec, _state in resubmit]
+
+
+def test_create_run_dry_run_failure_leaves_no_recoverable_run(api, monkeypatch):
+    """A dry-run submit that dies after persisting `queued` must not be retained.
+
+    submit_job persists the status as `queued` and only later flips it to `dry_run`, so a failure
+    in between leaves a queued record. Retaining its ownership row would hand it to startup
+    recovery, which resubmits every owned queued run as a REAL job - provisioning a gpu the user
+    explicitly asked never to rent. The row is dropped instead, exactly as before the guard.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.server.platform import db
+
+    submitted: list[str] = []
+    _persist_queued_then_raise(app_mod, runner, monkeypatch, submitted)
+
+    key = _login()
+    resp = api.post("/v1/runs", headers=_bearer(key), json={"spec": SPEC, "dry_run": True})
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    assert db.run_owner(run_id) is None
+    assert api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).status_code == 404
+    # recovery walks the ownership rows: with the row gone the queued record is unreachable.
+    assert run_id not in _classified_resubmits()
+
+
+def test_create_run_retained_secretful_run_fails_instead_of_recovering(api, monkeypatch):
+    """A retained run whose runtime secrets were never dispatched must not silently recover.
+
+    the secrets live only in the request and are deliberately excluded from the persisted spec, so
+    recovery would resubmit the run without them: it would train with missing credentials and
+    silently change behavior. the guard fails the run loudly instead; the owner keeps the row and
+    the error, and recovery skips terminal runs.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.server.platform import db
+
+    submitted: list[str] = []
+    _persist_queued_then_raise(app_mod, runner, monkeypatch, submitted)
+
+    key = _login()
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer(key),
+        json={"spec": SPEC, "runtime_secrets": {"WANDB_API_KEY": "user-wandb-key"}},
+    )
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    # the owner keeps the run and a loud, actionable error.
+    assert db.run_owner(run_id) is not None
+    body = api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).json()
+    assert body["state"] == "failed"
+    assert "runtime secrets" in body["error"]
+    # and recovery classifies nothing to resubmit for it.
+    assert run_id not in _classified_resubmits()
+
+
+def test_create_run_secretful_run_dropped_when_terminalization_fails(api, monkeypatch):
+    """If the compensating terminal write RAISES, the ownership row must go.
+
+    that `_update` is the only thing keeping startup recovery away from a queued run whose
+    secrets were never dispatched. a full or read-only status store makes it raise, and
+    swallowing that would leave the run both recoverable and secretless. an orphaned 404 is the
+    lesser harm, so the row is dropped instead.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.server.platform import db
+
+    submitted: list[str] = []
+    _persist_queued_then_raise(app_mod, runner, monkeypatch, submitted)
+
+    def boom(*_args, **_kwargs):
+        raise OSError("[Errno 28] No space left on device")
+
+    monkeypatch.setattr(runner, "_update", boom)
+
+    key = _login()
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer(key),
+        json={"spec": SPEC, "runtime_secrets": {"WANDB_API_KEY": "user-wandb-key"}},
+    )
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    # the queued status record survives on disk, so only the dropped row keeps recovery off it.
+    assert runner.get_status(run_id).state == "queued"
+    assert db.run_owner(run_id) is None
+    assert run_id not in _classified_resubmits()
+
+
+def test_create_run_secretful_run_kept_when_status_read_fails(api, monkeypatch):
+    """A terminal write that returned must not be second-guessed by a failing status read.
+
+    `_update` returning without raising already proves the run is terminal (True applied the write,
+    a sticky False means it was already terminal). a transient read error afterwards says nothing
+    about that, so treating it as a failed terminalization would delete the ownership row of a
+    correctly failed run - orphaning it for its owner and throwing away the error just persisted.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.server.platform import db
+
+    submitted: list[str] = []
+    _persist_queued_then_raise(app_mod, runner, monkeypatch, submitted)
+
+    # break status reads only once the terminal write itself has landed (`_update` reads the record
+    # to apply it), so this is exactly "the write succeeded, the read after it did not".
+    real_get_status, real_update = runner.get_status, runner._update
+    reading_fails = {"on": False}
+
+    def flaky(run_id, *args, **kwargs):
+        if reading_fails["on"]:
+            raise OSError("[Errno 5] Input/output error")
+        return real_get_status(run_id, *args, **kwargs)
+
+    def update_then_break_reads(*args, **kwargs):
+        applied = real_update(*args, **kwargs)
+        reading_fails["on"] = True
+        return applied
+
+    monkeypatch.setattr(runner, "get_status", flaky)
+    monkeypatch.setattr(runner, "_update", update_then_break_reads)
+
+    key = _login()
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer(key),
+        json={"spec": SPEC, "runtime_secrets": {"WANDB_API_KEY": "user-wandb-key"}},
+    )
+    reading_fails["on"] = False
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    # the terminal write landed, so the owner keeps the row and the actionable error.
+    assert db.run_owner(run_id) is not None
+    body = api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).json()
+    assert body["state"] == "failed"
+    assert "runtime secrets" in body["error"]
+    # and the run is terminal, so recovery still has nothing to resubmit.
+    assert run_id not in _classified_resubmits()
+
+
+def test_create_run_retained_run_records_managed_environment_use(api, monkeypatch):
+    # a retained run stays live and can recover into real training, so it must carry the same
+    # managed-environment association a successful submission records.
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    import flash.server.domain.environment_registry as registry
+    from flash.server.platform import db
+
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        registry,
+        "record_environment_use",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+    submitted: list[str] = []
+    _persist_queued_then_raise(app_mod, runner, monkeypatch, submitted)
+    spec = {**SPEC, "environment": {"id": "acme/my-env"}}
+
+    key = _login()
+    resp = api.post("/v1/runs", headers=_bearer(key), json={"spec": spec})
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    assert db.run_owner(run_id) is not None
+    assert calls
+    assert calls[0]["slug"] == "acme/my-env"
+    assert calls[0]["run_id"] == run_id
+
+
 def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
     # A freesolo key that verifies with the backend but whose db row was disabled (revoked)
     # must be rejected as 401 (authenticate -> None), not raise a 500.
