@@ -422,11 +422,18 @@ def estimate_vram_gb(
     return base + activations + logits
 
 
-# gc-off activation factors are empirical and geometry-specific: dense 65.0 from a live RTX 5090
-# fit, and MoE 18.0 as a conservative unvalidated value. remeasure before widening the >=120 GB
-# dense gate or changing the 35B-A3B MoE factor; the estimate scales with layers*batch*seq*hidden.
+# gc-off activation factors are empirical and geometry-specific; the estimate scales with
+# layers*batch*seq*hidden. both are live-GPU fits: dense 65.0 from an RTX 5090, MoE 196.9 from a
+# B200 running Qwen3.6-35B-A3B. remeasure before widening the >=120 GB dense gate.
+#
+# the MoE factor was 18.0 -- a guess, carried on the assumption that ~3B active params imply small
+# activations. that is wrong: routing is per-token, so every one of the 40 layers still
+# materializes a full activation set, and the wide expert stack makes each one large. the measured
+# step (micro_batch=1, seq 1404, the smallest this platform can express) peaked at 180.3 GB where
+# 18.0 predicted 139.1 GB, so the gate called a run that OOMs a fit -- on BOTH an H200 and a B200.
+# see test_moe_activation_constant_matches_the_live_b200_peak.
 _GC_OFF_ACT_K_DENSE = 65.0
-_GC_OFF_ACT_K_MOE = 18.0
+_GC_OFF_ACT_K_MOE = 196.9
 
 
 def sft_gc_off_peak_gb(
