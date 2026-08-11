@@ -6,8 +6,9 @@ helper (runs on the CPU runner) does that offload and lands the artifact in ``--
 following ``docker build --build-arg BUILD_KERNEL_CACHE=true`` bakes it into the per-sm image:
 
   1. upload THIS checkout's flash package to a fresh private HF dataset (code/flash), like a worker,
-  2. create a RunPod pod FROM the worker image on a GPU of the target arch; its command base64-decodes
-     docker/bake_pod_entry.py and runs it (download code/** -> kernel_warmup -> upload out/),
+  2. create a RunPod pod FROM the worker image on a GPU of the target arch (retried past transient
+     capacity rejections); its command base64-decodes docker/bake_pod_entry.py and runs it
+     (download code/** -> kernel_warmup -> upload out/),
   3. poll HF for the out/STATUS marker (and pod liveness) until done or the deadline,
   4. download out/ into ``--out`` (build/kernel_cache), terminate the pod, delete the temp dataset.
 
@@ -21,11 +22,30 @@ import argparse
 import base64
 import json
 import os
+import random
 import shutil
 import time
 import uuid
 
 ARTIFACT_NAMESPACE = "Freesolo-Co"
+
+# RunPod picks the host at create time, so a create can be rejected simply because the machine it
+# picked has nothing free right now. that is transient placement, not a broken bake: the API takes
+# no "not this machine" hint, but each create is placed again server-side, so retrying is what moves
+# us to another host. everything else (auth, quota, an unpullable image) is a real error and must
+# fail the arch immediately instead of burning attempts and GPU-queue time on it.
+CAPACITY_MARKERS = (
+    # "This machine does not have the resources to deploy your pod. Please try a different machine"
+    "does not have the resources",
+    # "There are no longer any instances available with the requested specifications." (and the
+    # "...with enough disk space." variant)
+    "no longer any instances",
+    "no instances available",
+)
+CREATE_ATTEMPTS = 5
+# capacity on a scarce class (Blackwell, A6000) frees up in minutes, not seconds; the last entry
+# repeats for any further attempt. under 10 min of waiting worst case, well inside the 120-min cap.
+CREATE_BACKOFF_S = (30, 60, 120, 240)
 
 
 def log(msg: str) -> None:
@@ -60,6 +80,41 @@ def _docker_args(entry_path: str) -> str:
         f"bash -lc 'echo {b64} | base64 -d > /tmp/bake_pod_entry.py "
         f"&& python /tmp/bake_pod_entry.py'"
     )
+
+
+def _is_capacity_error(exc: BaseException) -> bool:
+    """True for RunPod's transient "this host has nothing free" rejections, false for real errors."""
+    msg = str(exc).lower()
+    return any(marker in msg for marker in CAPACITY_MARKERS)
+
+
+def _create_pod_with_retry(
+    runpod,
+    *,
+    attempts: int = CREATE_ATTEMPTS,
+    backoff_s: tuple[int, ...] = CREATE_BACKOFF_S,
+    **kwargs,
+):
+    """create_pod, retried past capacity rejections; any other failure raises on the first try."""
+    last: BaseException | None = None
+    for i in range(attempts):
+        try:
+            return runpod.create_pod(**kwargs)
+        except Exception as e:
+            if not _is_capacity_error(e):
+                raise
+            last = e
+            log(f"create attempt {i + 1}/{attempts} rejected for capacity: {str(e)[:160]}")
+            if i == attempts - 1:
+                break
+            # jitter so the matrix legs (and concurrent runs) do not re-ask in lockstep.
+            delay = backoff_s[min(i, len(backoff_s) - 1)]
+            delay += random.uniform(0, 0.25 * delay)
+            log(f"retrying create in {delay:.0f}s")
+            time.sleep(delay)
+    raise RuntimeError(
+        f"no {kwargs.get('gpu_type_id')!r} capacity after {attempts} create attempts"
+    ) from last
 
 
 def main() -> int:
@@ -108,7 +163,8 @@ def main() -> int:
     outcome = "error"
     rc = 1
     try:
-        pod = runpod.create_pod(
+        pod = _create_pod_with_retry(
+            runpod,
             name=f"kernel-bake-{args.sm}-{suffix}",
             image_name=args.image,
             gpu_type_id=args.gpu_type_id,

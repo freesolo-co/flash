@@ -57,16 +57,19 @@ def test_agent_loop_workers_rejects_a_nonpositive_batch():
 def test_ray_num_cpus_prefers_the_cgroup_quota_over_the_host_core_count():
     # the exact failure that killed both real-gpu arms: a 1x4090 pod on a 48-core host. the quota is
     # the container's truth, so a large affinity mask must NOT win over it.
+    #
+    # os.sched_getaffinity is linux-only, so every patch of it in this file needs create=True to
+    # run on a mac. only the worker (linux) ever reaches the real syscall.
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=12),
-        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48))),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48)), create=True),
     ):
         assert vc.ray_num_cpus() == 12
     # a quota BELOW verl's placement-group demand is the one case the quota must not win outright:
     # honouring it exactly would schedule nothing and hang. see the floor test below.
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=4),
-        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48))),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48)), create=True),
     ):
         assert vc.ray_num_cpus() == vc.verl_cpu_demand(1)
 
@@ -74,7 +77,7 @@ def test_ray_num_cpus_prefers_the_cgroup_quota_over_the_host_core_count():
 def test_ray_num_cpus_falls_back_to_affinity_when_no_quota_is_set():
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=None),
-        mock.patch.object(os, "sched_getaffinity", return_value=set(range(6))),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(6)), create=True),
     ):
         assert vc.ray_num_cpus() == 6
 
@@ -84,7 +87,7 @@ def test_ray_num_cpus_caps_an_unconstrained_host():
     # is exactly the case that forked 48 idle workers. the cap is what makes that survivable.
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=None),
-        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48))),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48)), create=True),
     ):
         assert vc.ray_num_cpus() == 16
         # the cap tightens the pool but cannot push it under verl's placement-group demand, which
@@ -99,7 +102,7 @@ def test_ray_num_cpus_never_returns_zero():
             assert vc.ray_num_cpus() >= 1
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=None),
-        mock.patch.object(os, "sched_getaffinity", side_effect=OSError("boom")),
+        mock.patch.object(os, "sched_getaffinity", side_effect=OSError("boom"), create=True),
         mock.patch.object(os, "cpu_count", return_value=None),
     ):
         assert vc.ray_num_cpus() >= 1
@@ -154,7 +157,7 @@ def test_ray_cpu_floor_clears_what_verl_actually_reserves():
     assert vc.verl_cpu_demand(1) == verl_peak_cpu_demand
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=None),
-        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48))),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48)), create=True),
     ):
         assert vc.ray_num_cpus() >= verl_peak_cpu_demand
 
@@ -176,7 +179,7 @@ def test_the_cpu_pool_scales_with_gpu_count():
     assert vc.verl_cpu_demand(8) == 8 * 3 + 2
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=None),
-        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48))),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48)), create=True),
     ):
         for gpus in range(1, 9):
             assert vc.ray_num_cpus(gpus) >= vc.verl_cpu_demand(gpus), gpus
@@ -1692,9 +1695,11 @@ def test_run_verl_training_preserves_oom_over_device_unavailable_after_eviction(
     command = [
         "bash",
         "-c",
-        'printf \'%s\\n\' "$FIRST" "$SECOND"; '
-        "for i in $(seq 1 70); do echo filler-$i; done; "
-        "exit 1",
+        (
+            'printf \'%s\\n\' "$FIRST" "$SECOND"; '
+            "for i in $(seq 1 70); do echo filler-$i; done; "
+            "exit 1"
+        ),
     ]
     tail = vc.ChildOutputTail(limit=3)
 
@@ -1918,10 +1923,12 @@ def test_kill_process_group_escalates_to_sigkill_when_sigterm_is_ignored(quick_t
         [
             sys.executable,
             "-c",
-            "import signal, sys, time\n"
-            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-            "print('ready', flush=True)\n"
-            "time.sleep(300)\n",
+            (
+                "import signal, sys, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "print('ready', flush=True)\n"
+                "time.sleep(300)\n"
+            ),
         ],
         stdout=subprocess.PIPE,
         text=True,
