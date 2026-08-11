@@ -2144,13 +2144,21 @@ def test_merge_headroom_counts_a_hardlinked_checkpoint_once(tmp_path):
     `_staged_source` hardlinks the checkpoint before publishing, so the same inode is reachable
     through two paths. Counting it twice would inflate the requirement and refuse a merge that
     fits.
+
+    Both links must carry a SHARD name for this to test anything: the walk skips non-shard files
+    before it ever reaches the inode check, so linking to e.g. `staged.pt` would leave the
+    assertion green even with the dedup deleted. `_staged_source` copies the tree with
+    `copy_function=os.link` and keeps each filename, so a shard-named link in a sibling directory
+    is also what production actually produces.
     """
     from flash.engine.worker.verl import checkpoints as verl_checkpoints
 
     source = tmp_path / "ckpt"
-    source.mkdir()
-    (source / "model_world_size_2_rank_0.pt").write_bytes(b"x" * 8192)
-    os.link(source / "model_world_size_2_rank_0.pt", source / "staged.pt")
+    staged = source / "staged"
+    staged.mkdir(parents=True)
+    shard = source / "model_world_size_2_rank_0.pt"
+    shard.write_bytes(b"x" * 8192)
+    os.link(shard, staged / "model_world_size_2_rank_0.pt")
 
     assert verl_checkpoints._model_shard_bytes(str(source)) == 8192
 
