@@ -107,6 +107,9 @@ class _OpdProgressState:
         self.base_train_wall_seconds = float(state.get("train_wall_seconds", 0.0))
         self._prev_aligned = int(state.get("aligned_sequences", state.get("granularity_n", 0)))
         self._prev_cov_sum = float(state.get("coverage_sum", state.get("granularity_sum", 0.0)))
+        self._prev_truncated = int(state.get("truncated_rollouts", 0))
+        self._prev_samples_seen = int(state.get("samples_seen", 0))
+        self._prev_no_signal_skipped_steps = int(state.get("no_signal_skipped_steps", 0))
         self._train_started_at: float | None = None
         self._step_states: dict[int, dict] = {}
         if resume_state is not None:
@@ -121,7 +124,7 @@ class _OpdProgressState:
             elapsed = max(0.0, time.time() - self._train_started_at)
         return self.base_train_wall_seconds + elapsed
 
-    def record_step(self, step: int, loss: float, bridge: _TeacherAlignmentBridge) -> None:
+    def record_step(self, step: int, loss: float, bridge: _TeacherAlignmentBridge) -> float:
         with self._condition:
             expected_step = len(self.loss_curve) + 1
             if step != expected_step:
@@ -141,15 +144,50 @@ class _OpdProgressState:
                 (d_cov / d_aligned) if d_aligned > 0 else (cov_sum / aligned if aligned else 0.0)
             )
             self.coverage_curve.append(coverage)
+            truncated = int(snapshot["truncated_rollouts"])
+            samples_seen = int(snapshot["samples_seen"])
+            # truncation can change abruptly with prompt mix, so report this step's rollout share
+            # rather than the cumulative average, which would hide a newly saturated completion cap.
+            d_truncated = truncated - self._prev_truncated
+            d_samples_seen = samples_seen - self._prev_samples_seen
+            self._prev_truncated, self._prev_samples_seen = truncated, samples_seen
+            self._prev_no_signal_skipped_steps = int(snapshot.get("no_signal_skipped_steps", 0))
+            truncation_rate = (
+                d_truncated / d_samples_seen
+                if d_samples_seen > 0
+                else truncated / samples_seen
+                if samples_seen
+                else 0.0
+            )
             snapshot.update(
                 {
                     "train_wall_seconds": self._train_wall_seconds(),
                     "loss_curve": list(self.loss_curve),
                     "coverage_curve": list(self.coverage_curve),
+                    "truncation_rate": truncation_rate,
                 }
             )
             self._step_states[step] = snapshot
             self._condition.notify_all()
+            return truncation_rate
+
+    def failure_accounting_snapshot(self, bridge: _TeacherAlignmentBridge) -> dict:
+        snapshot = bridge.accounting_snapshot()
+        with self._condition:
+            # the fatal no-signal diagnosis must describe the attempts after the last completed step.
+            # cumulative rollout history can otherwise blame an old truncation spike for a current
+            # empty-alignment failure.
+            snapshot["truncated_rollouts"] = max(
+                0, int(snapshot["truncated_rollouts"]) - self._prev_truncated
+            )
+            snapshot["samples_seen"] = max(
+                0, int(snapshot["samples_seen"]) - self._prev_samples_seen
+            )
+            snapshot["no_signal_skipped_steps"] = max(
+                0,
+                int(snapshot["no_signal_skipped_steps"]) - self._prev_no_signal_skipped_steps,
+            )
+        return snapshot
 
     def checkpoint_state(self, step: int, *, timeout_s: float = 300.0) -> dict:
         deadline = time.monotonic() + timeout_s

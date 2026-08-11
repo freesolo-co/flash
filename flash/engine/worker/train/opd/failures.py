@@ -24,6 +24,7 @@ from flash.engine.worker.sft_train import (
     _VerlCheckpointWatcher,
 )
 from flash.engine.worker.train.opd.bridge import _TeacherAlignmentBridge
+from flash.teacher.limits import OPD_NO_SIGNAL_ATTEMPTS
 from flash.teacher.retry_contract import (
     OPD_RESUME_STATE_VERSION,
     validate_opd_resume_state_metadata,
@@ -132,6 +133,9 @@ def _raise_verl_failure(
     cycle_commit_failure: tuple[str, str] | None = None,
     no_signal_failure: tuple[str, str] | None = None,
     score_delivery_failure: tuple[str, str] | None = None,
+    *,
+    accounting: dict | None = None,
+    max_completion: int | None = None,
 ) -> None:
     if return_code == 0:
         return
@@ -166,6 +170,21 @@ def _raise_verl_failure(
         raise _w.RetriableInfraError("transient teacher bridge failure")
     if return_code == _PERMANENT_TEACHER_EXIT:
         raise RuntimeError("permanent teacher bridge failure")
+    if accounting is not None and max_completion is not None:
+        no_signal_steps = int(accounting.get("no_signal_skipped_steps", 0))
+        samples_seen = int(accounting.get("samples_seen", 0))
+        truncated = int(accounting.get("truncated_rollouts", 0))
+        # require a strict majority of all scored rollouts before naming the cap. no-signal batches can
+        # also come from teacher failures or empty alignments, and a speculative diagnosis is worse
+        # than the generic child status when truncation is not the dominant observed outcome.
+        if no_signal_steps > 0 and samples_seen > 0 and truncated * 2 > samples_seen:
+            raise RuntimeError(
+                f"verl OPD subprocess exited with status {return_code}: flash OPD produced no "
+                f"aligned teacher signal after {OPD_NO_SIGNAL_ATTEMPTS} rollout attempts; "
+                f"{truncated}/{samples_seen} rollouts were truncated at the "
+                f"configured max_completion_len={int(max_completion)}, so the completion cap is "
+                "likely too small"
+            )
     raise RuntimeError(f"verl OPD subprocess exited with status {return_code}")
 
 

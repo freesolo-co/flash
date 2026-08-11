@@ -2743,6 +2743,47 @@ def test_resume_restores_bridge_counters_and_extends_full_curves():
     assert restored["train_wall_seconds"] >= 12.5
 
 
+def _progress_bridge_snapshot(*, samples_seen: int, truncated_rollouts: int):
+    return SimpleNamespace(
+        accounting_snapshot=lambda: {
+            "aligned_sequences": 0,
+            "coverage_sum": 0.0,
+            "samples_seen": samples_seen,
+            "truncated_rollouts": truncated_rollouts,
+        }
+    )
+
+
+def test_opd_progress_truncation_rate_is_per_step_not_cumulative():
+    progress = _OpdProgressState()
+
+    progress.record_step(
+        1,
+        0.8,
+        _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
+    )
+    progress.record_step(
+        2,
+        0.4,
+        _progress_bridge_snapshot(samples_seen=8, truncated_rollouts=3),
+    )
+
+    assert progress.checkpoint_state(1, timeout_s=0.1)["truncation_rate"] == pytest.approx(0.75)
+    assert progress.checkpoint_state(2, timeout_s=0.1)["truncation_rate"] == 0.0
+
+
+def test_opd_progress_truncation_rate_handles_zero_rollouts():
+    progress = _OpdProgressState()
+
+    progress.record_step(
+        1,
+        0.8,
+        _progress_bridge_snapshot(samples_seen=0, truncated_rollouts=0),
+    )
+
+    assert progress.checkpoint_state(1, timeout_s=0.1)["truncation_rate"] == 0.0
+
+
 def test_restore_verl_resume_returns_validated_accounting(monkeypatch, tmp_path):
     from flash.engine.worker import opd_train
 
@@ -4854,6 +4895,97 @@ def test_mutation_marker_failure_survives_actor_exit_and_generic_driver_status(
             )
 
 
+def _reconcile_opd_failure(accounting: dict, *, max_completion: int = 1536):
+    import flash.engine.worker.opd_train_runner as opd_runner
+
+    bridge = SimpleNamespace(
+        teacher_failure=None,
+        mutation_failure=None,
+    )
+    workload = SimpleNamespace(
+        score_delivery_failure_path="",
+        resample_failure_path="",
+        abandonment_failure_path="",
+        mutation_failure_path="",
+        cycle_commit_failure_path="",
+    )
+    opd_runner._reconcile_child_failures(
+        workload,
+        bridge,
+        1,
+        accounting=accounting,
+        max_completion=max_completion,
+    )
+
+
+def test_no_signal_failure_names_dominant_truncation_and_completion_cap():
+    accounting = {
+        "no_signal_skipped_steps": 1,
+        "samples_seen": 8,
+        "truncated_rollouts": 7,
+    }
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _raise_verl_failure(
+            1,
+            None,
+            accounting=accounting,
+            max_completion=1536,
+        )
+
+    message = str(excinfo.value)
+    assert "no aligned teacher signal after 3 rollout attempts" in message
+    assert "7/8 rollouts were truncated" in message
+    assert "max_completion_len=1536" in message
+
+    with pytest.raises(RuntimeError, match="7/8 rollouts were truncated") as parent_error:
+        _reconcile_opd_failure(accounting)
+    assert "max_completion_len=1536" in str(parent_error.value)
+
+
+def test_no_signal_failure_does_not_blame_cap_without_dominant_truncation():
+    accounting = {
+        "no_signal_skipped_steps": 1,
+        "samples_seen": 8,
+        "truncated_rollouts": 2,
+        "skip_counts": {"empty_alignment": 6},
+    }
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _raise_verl_failure(
+            1,
+            None,
+            accounting=accounting,
+            max_completion=1536,
+        )
+
+    assert str(excinfo.value) == "verl OPD subprocess exited with status 1"
+
+    prior = _resume_accounting()
+    prior.update(
+        {
+            "samples_seen": 100,
+            "truncated_rollouts": 90,
+            "no_signal_skipped_steps": 0,
+        }
+    )
+    progress = _OpdProgressState(prior)
+    current_failure = progress.failure_accounting_snapshot(
+        SimpleNamespace(
+            accounting_snapshot=lambda: {
+                "samples_seen": 108,
+                "truncated_rollouts": 90,
+                "no_signal_skipped_steps": 1,
+            }
+        )
+    )
+    assert current_failure["samples_seen"] == 8
+    assert current_failure["truncated_rollouts"] == 0
+    with pytest.raises(RuntimeError) as parent_error:
+        _reconcile_opd_failure(current_failure)
+    assert str(parent_error.value) == "verl OPD subprocess exited with status 1"
+
+
 def test_parent_maps_teacher_failures_to_fatal_or_retriable_run_errors():
     from flash.engine.worker.perf import RetriableInfraError
 
@@ -5917,6 +6049,33 @@ def test_on_line_parses_the_numpy2_distillation_loss_the_image_actually_prints()
         ov.parse_verl_metric("step:4 - distillation/loss:np.float32(0.25)", "distillation/loss")
         == 0.25
     )
+
+
+def test_opd_step_heartbeat_carries_truncation_rate(monkeypatch):
+    import flash.engine.worker.opd_train_runner as opd_runner
+
+    emitted = []
+    monkeypatch.setattr(
+        opd_train._w,
+        "heartbeat",
+        lambda stage, **payload: emitted.append((stage, payload)),
+    )
+    callbacks = opd_runner._build_child_callbacks(
+        SimpleNamespace(raise_if_failed=lambda: None),
+        _OpdProgressState(),
+        _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
+        0,
+    )
+
+    callbacks.on_line("step:1 - actor/distillation/loss:0.5")
+    callbacks.on_step(1)
+
+    assert emitted == [
+        (
+            "opd_step",
+            {"step": 1, "loss": 0.5, "truncation_rate": pytest.approx(0.75)},
+        )
+    ]
 
 
 def test_opd_line_handler_reads_the_loss_through_the_shared_parser():
