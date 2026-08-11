@@ -82,14 +82,9 @@ class _EnvironmentMultiTurn:
 
 
 class _FakeSingleTurnEnv(_EnvironmentSingleTurn):
-    dataset: ClassVar[list[dict]] = [
-        {
-            "id": "ex-1",
-            "input": "2+2?",
-            "output": "4",
-            "metadata": {"split": "train"},
-        }
-    ]
+    # no class-level dataset: like a real sdk env that does not build one, so file-backed
+    # sources exercise the fallback path. tests that need an env-built dataset set it on
+    # the instance explicitly.
 
     def start_episode(self, example, prompt_text):
         return [
@@ -624,18 +619,95 @@ def test_freesolo_adapter_split_train_uses_default_dataset(monkeypatch, tmp_path
     assert env.dataset() == [{"id": "t", "input": "train?", "output": "no"}]
 
 
-def test_freesolo_adapter_does_not_auto_load_datasets_dir(monkeypatch, tmp_path):
-    sdk_env = _FakeSingleTurnEnv()
-    sdk_env.dataset = [{"id": "sdk", "input": "sdk?", "output": "sdk"}]
-    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+def test_freesolo_adapter_datasets_plural_dir_raises_actionable_error(monkeypatch, tmp_path):
+    """a package with datasets/ (plural) but no dataset/ used to fall through silently to
+    whatever else resolved; it must fail loudly and name the expected directory instead."""
+    _install_fake_freesolo(monkeypatch)
     env_file = _split_env(
         tmp_path, {"datasets/train.jsonl": '{"id":"legacy","input":"old?","output":"old"}\n'}
     )
 
     from flash.envs.adapter import load_freesolo_environment
 
-    env = load_freesolo_environment(str(env_file), split="train", contract_text="c")
-    assert env.dataset() == [{"id": "sdk", "input": "sdk?", "output": "sdk"}]
+    with pytest.raises(ValueError, match="'datasets/' directory"):
+        load_freesolo_environment(str(env_file), split="train", contract_text="c")
+
+
+def test_freesolo_adapter_datasets_plural_dir_allowed_with_explicit_dataset_path(
+    monkeypatch, tmp_path
+):
+    """explicit [environment.params] dataset_path resolves the datasets/ ambiguity, so the
+    loader must not raise and must train on the named file."""
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path, {"datasets/train.jsonl": '{"id":"t","input":"x","output":"y"}\n'}
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(
+        str(env_file), dataset_path="datasets/train.jsonl", contract_text="c"
+    )
+    assert env.dataset() == [{"id": "t", "input": "x", "output": "y"}]
+
+
+def test_freesolo_adapter_env_built_dataset_wins_over_packaged_file(monkeypatch, tmp_path, capsys):
+    """an env that filters/subsamples its dataset in load_environment (the documented
+    single-turn.mdx pattern) is what flash trains on; the packaged train.jsonl is only a
+    fallback, and the override is logged with both row counts."""
+    sdk_env = _FakeSingleTurnEnv()
+    sdk_env.dataset = [{"id": "kept", "input": "2+2?", "output": "4"}]
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+    env_file = _split_env(
+        tmp_path,
+        {
+            "dataset/train.jsonl": (
+                '{"id":"kept","input":"2+2?","output":"4"}\n'
+                '{"id":"dropped","input":"3+3?","output":"6"}\n'
+            )
+        },
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(str(env_file), contract_text="c")
+    assert env.dataset() == [{"id": "kept", "input": "2+2?", "output": "4"}]
+    logged = capsys.readouterr().out
+    assert "environment's own dataset (1 rows)" in logged
+    assert "(2 rows)" in logged
+
+
+def test_freesolo_adapter_env_dataset_matching_file_logs_nothing(monkeypatch, tmp_path, capsys):
+    sdk_env = _FakeSingleTurnEnv()
+    sdk_env.dataset = [{"id": "t", "input": "2+2?", "output": "4"}]
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+    env_file = _split_env(
+        tmp_path, {"dataset/train.jsonl": '{"id":"t","input":"2+2?","output":"4"}\n'}
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(str(env_file), contract_text="c")
+    assert env.dataset() == [{"id": "t", "input": "2+2?", "output": "4"}]
+    assert "environment's own dataset" not in capsys.readouterr().out
+
+
+def test_freesolo_adapter_records_param_wins_over_env_dataset(monkeypatch, tmp_path):
+    """explicit [environment.params] records never reach the sdk env, so they keep
+    precedence over a hardcoded env dataset."""
+    sdk_env = _FakeSingleTurnEnv()
+    sdk_env.dataset = [{"id": "envrow", "input": "e?", "output": "e"}]
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+    env_file = _split_env(tmp_path, {})
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(
+        str(env_file),
+        records=[{"id": "r", "input": "r?", "output": "r"}],
+        contract_text="c",
+    )
+    assert env.dataset() == [{"id": "r", "input": "r?", "output": "r"}]
 
 
 def test_freesolo_adapter_explicit_dataset_path_wins_over_split(monkeypatch, tmp_path):
@@ -783,8 +855,10 @@ def test_freesolo_adapter_uses_env_dataset_when_no_source(monkeypatch):
 
     from flash.envs.adapter import FreesoloEnvironment
 
+    sdk_env = _FakeSingleTurnEnv()
+    sdk_env.dataset = [{"id": "ex-1", "input": "2+2?", "output": "4"}]
     env = FreesoloEnvironment(
-        _FakeSingleTurnEnv(),
+        sdk_env,
         "github:owner/repo@main:env/environment.py",
         source=None,
         contract_text="",

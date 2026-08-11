@@ -833,11 +833,16 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
 
     params = dict(kwargs)
     source = params.pop("records", None)
+    # true when source is a dataset_path file the environment itself received as a param; the
+    # env instance's own dataset then takes precedence over re-reading the file (see
+    # FreesoloEnvironment.dataset). explicit records never reach the env, so they keep winning.
+    source_is_dataset_file = False
     dataset_path = params.get("dataset_path")
     if source is None and dataset_path:
         resolved_dataset_path = _resolve_path_arg(dataset_path, base_dir)
         params["dataset_path"] = resolved_dataset_path
         source = resolved_dataset_path
+        source_is_dataset_file = True
     # [environment.params] split selects which packaged dataset file Flash trains on. It used to
     # be forwarded to the SDK only, so SFT (and GRPO problem selection driven off dataset())
     # SILENTLY trained on the default dataset/train.jsonl even when a side split was requested.
@@ -846,6 +851,17 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
     if split:
         split = _validate_packaged_dataset_split(split)
     if source is None:
+        # a top-level datasets/ (plural) directory is never probed, so packages that use it used
+        # to fall through silently to whatever else resolved (often the wrong rows entirely).
+        # fail loudly and name the expected layout instead. explicit records/dataset_path params
+        # skip this because the user already said what to train on.
+        if (base_dir / "datasets").is_dir() and not (base_dir / "dataset").is_dir():
+            raise ValueError(
+                "environment package has a top-level 'datasets/' directory, which Flash never "
+                "reads (it probes dataset/<split>.jsonl or dataset/<split>.json). Rename the "
+                "directory to 'dataset/', or set [environment.params] dataset_path to the exact "
+                "file to train on."
+            )
         wanted = split if split and split != "train" else "train"
         found = _packaged_dataset_file(base_dir, wanted)
         if found is None and wanted != "train" and _packaged_dataset_file(base_dir, "train"):
@@ -861,6 +877,7 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
         if found is not None:
             params.setdefault("dataset_path", str(found))
             source = str(found)
+            source_is_dataset_file = True
 
     contract_path = _resolve_path_arg(params.get("contract_path"), base_dir)
     if isinstance(contract_path, str):
@@ -876,6 +893,7 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
         sdk_env,
         env_id,
         source=source,
+        prefer_env_dataset=source_is_dataset_file,
         contract_text=contract_text,
         package_root=base_dir,
     )
