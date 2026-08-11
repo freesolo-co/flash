@@ -405,6 +405,119 @@ def test_main_source_guard_checks_provenance_not_just_the_branch_name():
     )
 
 
+def test_main_source_guard_cannot_be_skipped_into_a_pass():
+    """`Source branch is dev` is a REQUIRED check, and a skipped required check counts as SUCCESS.
+
+    That makes a job-level `if:` on this job a supersede primitive rather than an exemption. Let
+    the guard run and fail on a human head, then fire an event whose payload takes the `if:` false
+    branch: the run is SKIPPED, the skip supersedes the failure on the same SHA, and the required
+    check reads green with the human commits still in place. Close-and-reopen is enough to do it --
+    this workflow declares no `types:`, so `reopened` is in its trigger set.
+
+    Every event-derived signal has this shape, which is why the exemption cannot be expressed as a
+    condition on the job. `pull_request.user.login` and `head_ref` are immutable for the PR's
+    lifetime (they describe who OPENED it, not what it now CONTAINS), and `github.actor` is the
+    event trigger, which differs between two runs of the same commits. So the invariant is
+    structural: no `if:`, and the exemption lives in the script, keyed on the head COMMIT.
+    """
+    job = _jobs(_load(WORKFLOW_DIR / "main-source-guard.yml"))["source-is-dev"]
+    assert "if" not in job, (
+        "source-is-dev must carry no job-level `if:`. it is a required check, so a false condition "
+        f"yields a SKIPPED run that counts as success and can supersede a real failure. got: {job['if']!r}"
+    )
+
+
+def test_main_source_guard_exempts_dependabot_only_by_verified_head_commit():
+    """The dependabot exemption must track the CONTENT of the branch, not who opened the PR.
+
+    Dependabot security updates are alert-driven, so they ignore `target-branch: dev` and open
+    against `main` from a `dependabot/...` head that can never be `dev` -- without an exemption the
+    guard is red by construction on exactly the PRs carrying CVE fixes. But the two signals that
+    identify such a PR (author and head ref) are both fixed at open time, so a maintainer who
+    pushes a commit onto a dependabot security PR keeps them and would inherit the exemption for
+    arbitrary human code.
+
+    The head commit's signature is what closes that: `.author.login` is resolved from the commit's
+    email header, which whoever pushes chooses, so `verified` is the part that cannot be forged.
+    The script is EXECUTED here (with `gh` stubbed) rather than grepped, because the characters
+    being present proves nothing about which branch they gate.
+    """
+    job = _jobs(_load(WORKFLOW_DIR / "main-source-guard.yml"))["source-is-dev"]
+    step = next(s for s in _steps(job) if "run" in s)
+    env = step.get("env") or {}
+
+    assert env.get("PR_AUTHOR") == "${{ github.event.pull_request.user.login }}", (
+        f"PR_AUTHOR must be the PR opener, which cannot be spoofed to a bracketed login. env: {env!r}"
+    )
+    assert env.get("HEAD_SHA") == "${{ github.event.pull_request.head.sha }}", (
+        f"HEAD_SHA must be the head commit under test, not a ref that can move. env: {env!r}"
+    )
+
+    with tempfile.TemporaryDirectory() as bindir:
+        stub = Path(bindir) / "gh"
+
+        def run(head_repo: str, head_ref: str, author: str, commit: str | None) -> int:
+            # emit exactly what the real `gh api ... --jq` would print, or fail like an
+            # unreachable API.
+            stub.write_text(
+                "#!/bin/bash\n" + (f"echo '{commit}'\n" if commit is not None else "exit 1\n")
+            )
+            stub.chmod(0o755)
+            return subprocess.run(
+                ["bash", "-c", step["run"]],
+                capture_output=True,
+                text=True,
+                env={
+                    "PATH": f"{bindir}:{os.environ.get('PATH', '')}",
+                    "HEAD_REPO": head_repo,
+                    "HEAD_REF": head_ref,
+                    "UPSTREAM_REPO": UPSTREAM_REPOSITORY,
+                    "PR_AUTHOR": author,
+                    "HEAD_SHA": "0" * 40,
+                    "GH_TOKEN": "stub",
+                },
+            ).returncode
+
+        bot = "dependabot[bot]"
+        verified = f"{bot} true"
+
+        # the case the exemption exists for.
+        assert run(UPSTREAM_REPOSITORY, "dependabot/pip/urllib3-2.5.0", bot, verified) == 0, (
+            "a dependabot security PR whose head is a verified dependabot commit must pass -- "
+            "otherwise the required check is red by construction on every CVE fix"
+        )
+
+        # a human pushed onto that same PR. author and head ref are unchanged; only the commit is.
+        assert (
+            run(UPSTREAM_REPOSITORY, "dependabot/pip/urllib3-2.5.0", bot, "DavidBShan false") != 0
+        ), (
+            "human commits pushed onto a dependabot PR inherited the exemption -- the guard must "
+            "key on the head commit, not on who opened the PR"
+        )
+
+        # the commit claims dependabot's email but carries no valid signature.
+        assert run(UPSTREAM_REPOSITORY, "dependabot/pip/urllib3-2.5.0", bot, f"{bot} false") != 0, (
+            "an UNVERIFIED commit claiming dependabot's login was exempted -- .author.login comes "
+            "from the email header, so the signature is the only unforgeable half"
+        )
+
+        # the lookup failing is not an exemption.
+        assert run(UPSTREAM_REPOSITORY, "dependabot/pip/urllib3-2.5.0", bot, None) != 0, (
+            "an unreadable head commit must fail closed, not be treated as a dependabot bump"
+        )
+
+        # a human branch merely NAMED like dependabot's.
+        assert run(UPSTREAM_REPOSITORY, "dependabot/evil", "DavidBShan", verified) != 0, (
+            "a human-authored branch named `dependabot/...` bypassed the guard"
+        )
+
+        # a fork must never reach the exemption at all: on a fork head the commit and its
+        # signatures are attacker-controlled.
+        assert run("attacker/flash", "dependabot/pip/x", bot, verified) != 0, (
+            "a fork PR claimed the dependabot exemption -- it must be rejected as a fork first"
+        )
+
+
 def test_workflows_that_touch_shared_resources_are_upstream_only():
     """A fork must not run the jobs that publish, push images, or spend GPU money.
 

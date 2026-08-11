@@ -10,44 +10,22 @@ concurrency:
 jobs:
   source-is-dev:
     name: Source branch is dev
-    # Dependabot SECURITY updates are alert-driven, not schedule-driven, so they ignore
-    # `target-branch: dev` in .github/dependabot.yml and open against the default branch (main)
-    # from a `dependabot/...` head. That head can never be `dev`, so without an exemption this
-    # guard fails by construction on every one of them, holding a permanently red check on the
-    # exact PRs that carry CVE fixes while their `lint + offline tests` legs pass in full. The
-    # rule this guard exists to enforce is that a HUMAN cannot sneak a feature branch into main;
-    # a bot bump that GitHub itself targets at main is not that.
+    # This job carries NO `if:`, and the dependabot exemption lives in the script instead. That is
+    # a security property, not a style choice. A job-level `if:` that goes false yields SKIPPED,
+    # and `Source branch is dev` is a REQUIRED check under this repo's `main` ruleset (17887734),
+    # where a skipped required check counts as SUCCESS. So any event-shaped exemption is also a
+    # supersede primitive: run the guard, let it fail on a human head, then fire an event that
+    # takes the exemption branch, and the skip supersedes the failure on the same SHA. Close and
+    # reopen is enough -- `reopened` is in this workflow's trigger set (no `types:` is declared, so
+    # it takes the opened+synchronize+reopened defaults). No `if:` means the job always produces a
+    # real pass or a real fail, and a failure can never be replaced by a skip.
     #
-    # `||`, NOT `&&`: the job must run unless BOTH bot signals hold. With `&&` the job skips when
-    # EITHER holds, so a human could open a feature branch named `dependabot/x` and bypass the
-    # guard outright. The PR author cannot be spoofed to `dependabot[bot]` (brackets are not legal
-    # in a username, so no human account can hold that login), which is what makes requiring both
-    # safe rather than a hole.
-    #
-    # The author must be read from `pull_request.user.login`, NOT `github.actor`. This workflow
-    # declares no `types:`, so it takes the defaults opened+synchronize+reopened, and on a reopen
-    # by a maintainer or a synchronize pushed by anyone other than the bot, `github.actor` is that
-    # HUMAN rather than `dependabot[bot]`. Keying the whole exemption on the actor would then go
-    # true, run the guard, and reject the `dependabot/*` head: the exact red required check this
-    # exemption exists to remove, reappearing on the second event instead of the first.
-    # `pull_request.user.login` is the PR opener and does not change with whoever triggered it.
-    #
-    # But author and head ref are BOTH immutable for the PR's lifetime, so they describe who opened
-    # it, never what it currently contains. A maintainer who pushes a commit to a Dependabot
-    # security PR leaves both signals untouched, and on those two alone the job stays skipped while
-    # arbitrary human code reaches `main` with no provenance check at all -- the exemption widening
-    # into a bypass. The third clause closes that: a `synchronize` (new head commits) whose actor is
-    # not the bot runs the guard, which then rejects the `dependabot/*` head.
-    #
-    # `github.event.action` is required alongside the actor here, not the actor by itself. Dependabot
-    # fires `synchronize` when it rebases its own PR, and it reopens nothing -- so gating on the
-    # actor alone would restore a red check on every maintainer REOPEN, trading this bug for the one
-    # above. The pair distinguishes "the bot updated its own PR" (skip) from "a human pushed code
-    # into a bot PR" (check it), which is the distinction that actually matters.
-    if: >-
-      github.event.pull_request.user.login != 'dependabot[bot]'
-      || !startsWith(github.head_ref, 'dependabot/')
-      || (github.event.action == 'synchronize' && github.actor != 'dependabot[bot]')
+    # Every event-derived signal has this shape, which is why none of them can express the
+    # exemption safely. `github.event.pull_request.user.login` and `github.head_ref` are immutable
+    # for the PR's lifetime, so they describe who OPENED it, never what it currently CONTAINS: a
+    # maintainer pushing a commit to a dependabot security PR leaves both untouched. `github.actor`
+    # is the event trigger, which changes per event and so differs across two runs of the same
+    # commits. The head COMMIT is the only signal that tracks the content being merged.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -56,6 +34,24 @@ jobs:
           HEAD_REF: ${{ github.head_ref }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           UPSTREAM_REPO: ${{ github.repository }}
+          # Dependabot SECURITY updates are alert-driven, not schedule-driven, so they ignore
+          # `target-branch: dev` in .github/dependabot.yml and open against the default branch
+          # (main) from a `dependabot/...` head. That head can never be `dev`, so with no exemption
+          # this guard fails by construction on every one of them: a permanently red required check
+          # on exactly the PRs carrying CVE fixes, while their `lint + offline tests` legs pass in
+          # full. The rule this guard enforces is that a HUMAN cannot route a feature branch into
+          # main; a bot bump GitHub itself targets at main is not that.
+          #
+          # The exemption is keyed on the head COMMIT, resolved through the API below, because the
+          # commit is the only signal that tracks what is actually being merged. Its GPG
+          # verification is what makes the author usable: `.author.login` is resolved from the
+          # commit's email header, which whoever pushes chooses, so the signature is the part that
+          # cannot be forged. GitHub signs every commit dependabot pushes, so a human commit on a
+          # dependabot branch is unsigned or signed by someone else, the exemption does not apply,
+          # and the branch rule below rejects the `dependabot/*` head.
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           # provenance is checked BEFORE the branch name, because the name alone proves nothing.
           # `github.head_ref` is the branch name inside the HEAD repository, which for a fork PR is
@@ -69,6 +65,29 @@ jobs:
           if [ "$HEAD_REPO" != "$UPSTREAM_REPO" ]; then
             echo "::error::fork source not allowed for main: this PR's head repository is '$HEAD_REPO', not '$UPSTREAM_REPO'. Open contributions against dev; only a dev -> main promotion inside '$UPSTREAM_REPO' may target main."
             exit 1
+          fi
+          # the dependabot exemption is checked only AFTER the fork rejection above, so a fork PR
+          # can never reach it: `$HEAD_SHA` would otherwise be resolved against a repository whose
+          # commits and signatures an attacker controls.
+          #
+          # both conditions are required. the PR author cannot be spoofed to `dependabot[bot]`
+          # (brackets are not legal in a username, so no human account holds that login), and the
+          # head commit must be a VERIFIED dependabot commit -- which is what ties the exemption to
+          # the content currently on the branch rather than to who opened the PR. a human commit
+          # pushed onto a dependabot branch fails the second condition and falls through to the
+          # branch rule below, which rejects it.
+          if [ "$PR_AUTHOR" = "dependabot[bot]" ] && case "$HEAD_REF" in dependabot/*) true ;; *) false ;; esac; then
+            head_commit="$(gh api "repos/$UPSTREAM_REPO/commits/$HEAD_SHA" \
+              --jq '[(.author.login // ""), (.commit.verification.verified | tostring)] | join(" ")' 2>/dev/null || true)"
+            if [ "$head_commit" = "dependabot[bot] true" ]; then
+              echo "Dependabot security update: head commit $HEAD_SHA is a verified dependabot commit on '$HEAD_REF'."
+              echo "These are alert-driven and target the default branch by construction, so the dev -> main rule does not apply."
+              exit 0
+            fi
+            # an unreadable or unverified head commit is NOT an exemption. say why, then fall
+            # through to the branch rule, which fails: a dependabot-looking PR carrying a commit
+            # this job cannot verify is exactly the case the guard exists for.
+            echo "::warning::head commit $HEAD_SHA on '$HEAD_REF' is not a verified dependabot commit (got '$head_commit'), so the dependabot exemption does not apply."
           fi
           if [ "$HEAD_REF" != "dev" ]; then
             echo "::error::wrong source branch: PRs into main must come from 'dev' (got '$HEAD_REF'). Merge into dev, then promote dev -> main."
