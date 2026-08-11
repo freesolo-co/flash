@@ -1851,6 +1851,237 @@ def test_run_preload_records_download_failure(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# payload-secret redaction
+# ---------------------------------------------------------------------------
+# The worker container starts with an empty environment: the run's HF_TOKEN, GITHUB_TOKEN and user
+# runtime secrets reach the worker subprocess through payload["env"] only, so the bootstrap's own
+# os.environ value-redacts none of them. Everything the bootstrap uploads has to be redacted against
+# the payload env instead.
+_PAYLOAD_SECRET = "wandb-local-9f3ac1d2e4b5f7a8"
+
+
+def test_console_snapshot_redacts_a_payload_env_secret(tmp_path, monkeypatch):
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    uploads: list[tuple] = []
+    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: uploads.append((path, sub)))
+    console = tmp_path / "console_sft.txt"
+    console.write_text(
+        "Traceback (most recent call last):\n"
+        '  File "train.py", line 7, in <module>\n'
+        f"RuntimeError: wandb login rejected {_PAYLOAD_SECRET}\n"
+    )
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/run",
+        "env": {"WANDB_API_KEY": _PAYLOAD_SECRET},
+    }
+
+    b._upload_console_snapshot(payload, str(console), "sft")
+
+    tail = (tmp_path / "console_sft.txt.tail").read_text()
+    assert _PAYLOAD_SECRET not in tail
+    assert "RuntimeError: wandb login rejected <redacted>" in tail
+    # the surrounding traceback is the whole point of the upload; redaction must not eat it.
+    assert "Traceback (most recent call last):" in tail
+    assert '  File "train.py", line 7, in <module>' in tail
+    assert uploads == [(str(console) + ".tail", "console_sft.txt")]
+
+
+def test_attempt_marker_error_redacts_a_payload_env_secret(monkeypatch):
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub, **kwargs: None)
+    monkeypatch.setattr(b.time, "time", lambda: 100.0)
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "p",
+        "flash_arm": "vast",
+        "attempt": 1,
+        "run_id": "run-marker",
+        "deadline_at": 200.0,
+        "run_created_at": 100.0,
+        "run_max_wall_seconds": 100.0,
+        "env": {"WANDB_API_KEY": _PAYLOAD_SECRET},
+    }
+
+    b.write_attempt_marker(payload, ok=False, error=f"worker died holding {_PAYLOAD_SECRET}")
+
+    with open("/tmp/attempt_marker.json") as f:
+        marker = json.load(f)
+    assert marker["error"] == "worker died holding <redacted>"
+
+
+def test_safe_detail_redacts_declared_secrets_with_arbitrary_names(monkeypatch):
+    """[environment] secrets accepts any env name; the explicit FLASH_SECRET_ENV_KEYS list is what
+    lets the bootstrap redact names the suffix heuristic misses."""
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    payload = {
+        "env": {
+            "FLASH_SECRET_ENV_KEYS": "AWS_SECRET_ACCESS_KEY",
+            "AWS_SECRET_ACCESS_KEY": "aws-declared-3f9e1c7b5a2d4680",
+            "RUN_ID": "run-visible",
+        }
+    }
+
+    detail = b._safe_detail(
+        "boto3 auth failed with aws-declared-3f9e1c7b5a2d4680 for run-visible",
+        secrets=b._payload_secrets(payload),
+    )
+
+    assert detail == "boto3 auth failed with <redacted> for run-visible"
+
+
+def test_safe_detail_redacts_overlapping_secrets_longest_first():
+    """replacing a shorter secret first would turn the longer one into <redacted>+suffix and leave
+    the suffix behind; longest-first replacement cannot."""
+    secrets = {
+        "SHORT_TOKEN": "abc123456789",
+        "LONG_TOKEN": "abc1234567890diagnosticsuffix",
+    }
+
+    detail = b._safe_detail(
+        "rejected: abc1234567890diagnosticsuffix and abc123456789", secrets=secrets
+    )
+
+    assert detail == "rejected: <redacted> and <redacted>"
+
+
+def test_safe_detail_redacts_each_line_of_a_multiline_secret():
+    """a PEM key never reaches a redactor whole: console tails are cut and the child's stdout is
+    sanitized one line at a time, so only a component line is ever seen. the whole value alone as a
+    needle would match nothing and the component would print verbatim."""
+    pem = (
+        "-----BEGIN PRIVATE KEY-----\n"
+        "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n"
+        "KoZIhvcNAQEBBQADggEPADCCAQoCggEB\n"
+        "-----END PRIVATE KEY-----"
+    )
+    secrets = {"DEPLOY_KEY": pem}
+
+    assert (
+        b._safe_detail("ssh failed: MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", secrets=secrets)
+        == "ssh failed: <redacted>"
+    )
+    assert b._safe_detail(pem, secrets=secrets) == "<redacted>"
+
+
+def test_safe_detail_keeps_short_components_of_a_multiline_secret_readable():
+    """the component floor exists so a structural fragment such as `}` in a multiline json
+    credential cannot blank out innocent diagnostics everywhere it appears."""
+    secrets = {"BLOB": "{\n}\nabc\nlongenoughsecretcomponent"}
+
+    detail = b._safe_detail("parse error near } and abc", secrets=secrets)
+
+    assert detail == "parse error near } and abc"
+
+
+def test_safe_detail_keeps_a_very_short_declared_secret_out_of_global_replacement():
+    """a declared secret can carry any value, including a 3-char one. as an unconstrained global
+    replacement needle it would mangle every diagnostic containing those characters, so the same
+    floor the multiline components use applies to the whole value. long values still redact."""
+    assert (
+        b._safe_detail("trainer crashed after validation", secrets={"PIN": "ati"})
+        == "trainer crashed after validation"
+    )
+    assert (
+        b._safe_detail("trainer crashed holding sk-live-abc123456", secrets={"PIN": "ati"})
+        == "trainer crashed holding sk-live-abc123456"
+    )
+    assert (
+        b._safe_detail(
+            "trainer crashed holding sk-live-abc123456", secrets={"PIN": "sk-live-abc123456"}
+        )
+        == "trainer crashed holding <redacted>"
+    )
+
+
+def test_read_console_tail_keeps_a_complete_line_at_the_boundary(tmp_path):
+    """the first retained line is dropped only when the byte boundary actually SPLIT it. a boundary
+    landing right after a newline starts a complete line, and discarding it would throw away a full
+    line of diagnostics -- possibly the root-cause exception -- for a split that never happened."""
+    console = tmp_path / "console.txt"
+    console.write_bytes(b"older\nROOTCAUSE: boom\nshutdown\n")
+
+    # 24 bytes = exactly "ROOTCAUSE: boom\nshutdown\n", so the boundary sits on the newline.
+    assert b._read_console_tail(str(console), 25) == "ROOTCAUSE: boom\nshutdown\n"
+    # one byte less splits the line, so it is dropped rather than half-redacted.
+    assert b._read_console_tail(str(console), 24) == "shutdown\n"
+    # no truncation at all keeps everything.
+    assert b._read_console_tail(str(console), 64_000) == "older\nROOTCAUSE: boom\nshutdown\n"
+
+
+def test_read_console_tail_drops_a_split_credential(tmp_path):
+    """the guard's reason for existing: a value cut in half no longer matches full-value
+    redaction, so the partial line must never reach the sanitizer."""
+    console = tmp_path / "console.txt"
+    console.write_bytes(b"token=abc123456789secret\nnext\n")
+
+    tail = b._read_console_tail(str(console), 15)
+
+    assert "secret" not in tail
+    assert tail == "next\n"
+
+
+def test_safe_detail_redacts_the_percent_encoded_form_of_a_secret():
+    """http and git errors print encoded request urls, so the encoded form leaks the secret even
+    when the configured value never appears literally."""
+    secrets = {"REPO_TOKEN": "abc/def+ghi="}
+
+    detail = b._safe_detail(
+        "fatal: unable to access https://x@host/abc%2Fdef%2Bghi%3D/repo.git", secrets=secrets
+    )
+
+    assert "abc%2Fdef%2Bghi%3D" not in detail
+    assert "<redacted>" in detail
+
+
+def test_console_snapshot_drops_the_truncated_first_line_before_redacting(tmp_path, monkeypatch):
+    """when the 64k tail boundary lands inside a one-line credential, the surviving suffix no
+    longer value-matches; the partial first line must go before sanitizing."""
+    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: None)
+    secret = "wandb-boundary-secret-0123456789abcdef"
+    console = tmp_path / "console_sft.txt"
+    head = f"key {secret}\n"
+    tail_line = "tail line survives\n"
+    # size the filler so the 64k byte boundary falls inside the secret on the first line.
+    boundary_offset = len(head) // 2
+    filler = "x" * (64_000 - len(head) - len(tail_line) + boundary_offset - 1) + "\n"
+    console.write_text(head + filler + tail_line)
+    assert len(head) + len(filler) + len(tail_line) - 64_000 == boundary_offset
+    payload = {"hf_repo": "o/r", "hf_prefix": "sft/run", "env": {"WANDB_API_KEY": secret}}
+
+    b._upload_console_snapshot(payload, str(console), "sft")
+
+    tail = (tmp_path / "console_sft.txt.tail").read_text()
+    assert secret not in tail
+    for fragment_length in range(6, len(secret)):
+        assert secret[-fragment_length:] not in tail
+    assert "tail line survives" in tail
+
+
+def test_hf_call_retry_log_redacts_payload_secrets(monkeypatch, capsys):
+    """the retried hf error message can echo the payload-only token, which os.environ does not
+    know; the retry path must redact against the payload env."""
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setattr(b.time, "sleep", lambda s: None)
+    secret = "hf_ZZZretrypathsecret0123456789"
+    payload = {"env": {"HF_TOKEN": secret}}
+    attempts = []
+
+    def call():
+        attempts.append(1)
+        if len(attempts) == 1:
+            error = RuntimeError(f"429 rate limited for token {secret}")
+            error.response = types.SimpleNamespace(status_code=429, headers={})
+            raise error
+        return "ok"
+
+    assert b._hf_call(call, "download spec", secrets=b._payload_secrets(payload)) == "ok"
+    printed = capsys.readouterr().out
+    assert secret not in printed
+    assert "<redacted>" in printed
+
+
+# ---------------------------------------------------------------------------
 # main(): the preload branch
 # ---------------------------------------------------------------------------
 def _preload_payload(**over):
