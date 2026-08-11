@@ -22,6 +22,7 @@ from flash.envs.loader import (
     GitHubRateLimitError,
     _import_freesolo_environment_tools,
     canonical_managed_environment_slug,
+    env_dataset_rows,
     is_freesolo_environment_id,
     is_github_environment_ref,
     is_managed_environment_slug,
@@ -36,6 +37,8 @@ from flash.teacher.limits import (
 
 _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
+# ceiling on a .json dataset file the override diagnostic is willing to parse just to count rows.
+_MAX_ROW_COUNT_JSON_BYTES = 16 * 1024 * 1024
 
 
 def _json_safe(value: Any) -> Any:
@@ -89,12 +92,17 @@ class FreesoloEnvironment(BaseEnvironment):
         env_id: str,
         *,
         source: object | None,
+        prefer_env_dataset: bool = False,
         contract_text: str = "",
         package_root: str | Path | None = None,
     ):
         super().__init__(id=env_id)
         self._env = sdk_env
         self._source = source
+        # set by the loader when source is a dataset_path file the sdk env itself received as a
+        # param: the env instance's own dataset then wins over re-reading the raw file, so an env
+        # that filters/subsamples/augments in load_environment trains on what it built.
+        self._prefer_env_dataset = bool(prefer_env_dataset)
         self._contract_text = contract_text
         self.package_root = Path(package_root).resolve() if package_root is not None else None
         tools = _import_freesolo_environment_tools()
@@ -186,19 +194,68 @@ class FreesoloEnvironment(BaseEnvironment):
         out["total"] = float(getattr(reward, "score", 0.0))
         return out
 
+    def _source_row_count(self) -> int | None:
+        """row count of the packaged dataset file, for the override log line only."""
+        if not isinstance(self._source, str):
+            return None
+        path = Path(self._source)
+        try:
+            if path.suffix == ".jsonl":
+                with path.open(encoding="utf-8") as f:
+                    return sum(1 for line in f if line.strip())
+            # a .json dataset can only be counted by parsing all of it, and the env has already
+            # replaced it. give the diagnostic up rather than let it be the allocation that runs
+            # the worker out of memory on a file nothing else in this path reads.
+            if path.stat().st_size > _MAX_ROW_COUNT_JSON_BYTES:
+                return None
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if isinstance(loaded, list):
+            return len(loaded)
+        if isinstance(loaded, dict) and isinstance(loaded.get("records"), list):
+            return len(loaded["records"])
+        return None
+
     def dataset(self) -> list[dict]:
         if self._dataset_cache is not None:
             return self._dataset_cache
-        if self._source is None:
-            rows = getattr(self._env, "dataset", None) or getattr(self._env, "examples", None)
-            if rows is None:
-                raise ValueError(
-                    "Freesolo environment has no dataset source. Set "
-                    "[environment.params] dataset_path or records so Flash can train."
-                )
-            examples = self._load_task_examples(rows)
-        else:
+        # the environment owns its dataset: when the instance exposes one (the documented
+        # `self.dataset = load_task_examples(...)` pattern, including filtering/subsampling),
+        # it wins over re-reading the dataset_path file it was handed; the file is only the
+        # fallback for envs with no in-code dataset. explicit [environment.params] records
+        # never reach the env, so they keep precedence over a hardcoded env dataset.
+        env_rows = env_dataset_rows(self._env)
+        env_precedence = self._source is None or self._prefer_env_dataset
+        # only an ABSENT attribute means "no in-code dataset". a dataset the env built and left
+        # empty (a filter that matched nothing) is a deliberate answer, so it must not fall
+        # through to the unfiltered packaged file: training on the rows the env rejected is a
+        # silent wrong-data run, worse than refusing to start. an explicit non-default
+        # dataset_path/records keeps the file authoritative, so there is nothing to refuse there.
+        if env_rows is not None and not env_rows and env_precedence:
+            raise ValueError(
+                f"environment produced 0 rows ({self.id}): its in-code dataset is empty, and "
+                "Flash will not fall back to the packaged dataset file (that would train on the "
+                "rows the environment filtered out). Fix the filter that emptied it, or remove "
+                "the dataset attribute to train on the packaged file."
+            )
+        use_env_rows = bool(env_rows) and env_precedence
+        if use_env_rows:
+            examples = self._load_task_examples(env_rows)
+        elif self._source is not None:
             examples = self._load_task_examples(self._source)
+        else:
+            raise ValueError(
+                "Freesolo environment has no dataset source. Set "
+                "[environment.params] dataset_path or records so Flash can train."
+            )
+        if use_env_rows and self._source is not None:
+            file_rows = self._source_row_count()
+            if file_rows is not None and file_rows != len(examples):
+                print(
+                    f"[envs] training on the environment's own dataset ({len(examples)} rows), "
+                    f"not the packaged file {self._source} ({file_rows} rows)"
+                )
         records = []
         for example in examples:
             raw = dict(getattr(example, "record", {}) or {})
