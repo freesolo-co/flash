@@ -2293,3 +2293,23 @@ def test_worker_image_cudart_fix_is_extracted_not_duplicated():
         "the baked script drifted from _CHILD_CUDART_FIX; the image and the runtime path would "
         "repair the same venv differently."
     )
+
+
+def test_worker_image_rebuilds_when_the_cudart_extractor_changes():
+    """A change to the extractor alone must rebuild :cu128.
+
+    The repair is generated at build time, so its output is frozen into the image. `flash/**`
+    watches the `_CHILD_CUDART_FIX` source the extractor reads, but the extractor lives outside
+    `flash/`: without its own entry an extractor-only fix merges green and every GPU worker keeps
+    running the image built from the previous script.
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    workflow = (root / ".github" / "workflows" / "worker-image.yml").read_text()
+
+    for script in ("docker/extract_cudart_fix.py", "docker/make_rp_handler.py"):
+        assert f"- {script}" in workflow, (
+            f"worker-image.yml does not rebuild on {script}; a change to a build-time generator "
+            "would ship an image built from the old one."
+        )
