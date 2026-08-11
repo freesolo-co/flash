@@ -398,13 +398,26 @@ def _idle_card_warning(
        ways. Name the dataset as the limiter there instead.
      - only powers of two are rentable, and the resolved width usually is not one -- see
        `_widest_rentable_width` for why clamping cannot produce one.
+
+    Batch 1 is its own case, not a degenerate version of either. The batch IS the binding input --
+    one example cannot be dealt to two ranks -- but raising it is not the remedy, because the packing
+    mode fixes it at 1. Folding it into the rows branch made the line state something false: at 4
+    cards over 12 rows it read "a dataset of 12 rows cannot be split across 4 ranks" when 12 divides
+    4 exactly and the single example was the whole problem.
     """
     rows_fit = row_count == 0 or row_count % gpu_count == 0
     batch_fits = train_batch_size % gpu_count == 0
-    # the batch is only worth naming when fixing it is sufficient, i.e. the rows already fit.
-    batch_helps = rows_fit and not batch_fits and train_batch_size > 1
+    unpacked = train_batch_size <= 1
+    # the batch is only worth naming as a knob when fixing it is sufficient, i.e. the rows already
+    # fit. an unpacked batch of 1 is named as a fact instead: it binds, but it cannot be raised.
+    batch_helps = rows_fit and not batch_fits and not unpacked
     rentable = _widest_rentable_width(world_size, train_batch_size, row_count)
-    limiter = f"a batch of {train_batch_size}" if batch_helps else f"a dataset of {row_count} rows"
+    if unpacked:
+        limiter = "an unpacked run's single example per update"
+    elif batch_helps:
+        limiter = f"a batch of {train_batch_size}"
+    else:
+        limiter = f"a dataset of {row_count} rows"
     remedy = (
         f"raise [train] batch_size to a multiple of {gpu_count}, or allocate {rentable} card(s) "
         "instead"

@@ -2409,6 +2409,16 @@ def test_sft_idle_card_warning_only_recommends_widths_that_actually_work():
     assert "a dataset of 10 rows" in text, text
     assert "batch_size" not in text, "rows block full width too, so the batch remedy is a dead end"
 
+    # an unpacked run pins the batch to 1, which binds on its own -- but it is not the ROWS that
+    # bind, and saying so is a false statement about the dataset. 12 divides 4 exactly here, so
+    # blaming the rows sends the operator to reshape a dataset that was never the problem.
+    width, text = warn(4, 1, 12)
+    assert width == 1
+    assert "single example per update" in text, text
+    assert "12 rows" not in text, "12 divides 4 cleanly; the rows are not what bind at batch 1"
+    assert "batch_size" not in text, "packing mode fixes the batch at 1, so it cannot be raised"
+    assert "allocate 1 card(s)" in text, text
+
     # a batch remedy is only ever printed when acting on it actually restores the full allocation.
     for cards in range(1, 9):
         for batch in range(1, 17):
