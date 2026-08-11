@@ -22,6 +22,7 @@ from flash.envs.loader import (
     GitHubRateLimitError,
     _import_freesolo_environment_tools,
     canonical_managed_environment_slug,
+    env_dataset_rows,
     is_freesolo_environment_id,
     is_github_environment_ref,
     is_managed_environment_slug,
@@ -224,10 +225,21 @@ class FreesoloEnvironment(BaseEnvironment):
         # it wins over re-reading the dataset_path file it was handed; the file is only the
         # fallback for envs with no in-code dataset. explicit [environment.params] records
         # never reach the env, so they keep precedence over a hardcoded env dataset.
-        env_rows = getattr(self._env, "dataset", None) or getattr(self._env, "examples", None)
-        # bool, not `is not None`: an env whose dataset is empty has nothing to train on, so it
-        # reads as "no in-code dataset" for both attributes rather than one each way.
-        use_env_rows = bool(env_rows) and (self._source is None or self._prefer_env_dataset)
+        env_rows = env_dataset_rows(self._env)
+        env_precedence = self._source is None or self._prefer_env_dataset
+        # only an ABSENT attribute means "no in-code dataset". a dataset the env built and left
+        # empty (a filter that matched nothing) is a deliberate answer, so it must not fall
+        # through to the unfiltered packaged file: training on the rows the env rejected is a
+        # silent wrong-data run, worse than refusing to start. an explicit non-default
+        # dataset_path/records keeps the file authoritative, so there is nothing to refuse there.
+        if env_rows is not None and not env_rows and env_precedence:
+            raise ValueError(
+                f"environment produced 0 rows ({self.id}): its in-code dataset is empty, and "
+                "Flash will not fall back to the packaged dataset file (that would train on the "
+                "rows the environment filtered out). Fix the filter that emptied it, or remove "
+                "the dataset attribute to train on the packaged file."
+            )
+        use_env_rows = bool(env_rows) and env_precedence
         if use_env_rows:
             examples = self._load_task_examples(env_rows)
         elif self._source is not None:

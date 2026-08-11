@@ -805,9 +805,15 @@ def test_freesolo_adapter_default_dataset_path_keeps_env_precedence(monkeypatch,
     assert env.dataset() == [{"id": "kept", "input": "2+2?", "output": "4"}]
 
 
-def test_freesolo_adapter_empty_env_dataset_falls_back_to_the_packaged_file(monkeypatch, tmp_path):
-    """an env exposing no rows has nothing to train on, and `examples` must read the same way as
-    `dataset` rather than one falling back to the file and the other winning empty."""
+def test_freesolo_adapter_empty_env_dataset_is_a_hard_error(monkeypatch, tmp_path):
+    """this used to fall back to the packaged file; it now raises, and the change is the point.
+
+    an env that sets `dataset` to a filter result that matched nothing has SAID which rows are
+    trainable: none. re-reading the unfiltered file behind its back trains on exactly the rows it
+    rejected, and nothing in the run surfaces that -- a silent wrong-data run is worse than a
+    hard failure the operator sees on the first step. `examples` still reads the same way as
+    `dataset`, so neither attribute can be the quiet one.
+    """
     from flash.envs.adapter import load_freesolo_environment
 
     rows = '{"id":"t","input":"2+2?","output":"4"}\n'
@@ -820,7 +826,122 @@ def test_freesolo_adapter_empty_env_dataset_falls_back_to_the_packaged_file(monk
         env_file = _split_env(root, {"dataset/train.jsonl": rows})
 
         env = load_freesolo_environment(str(env_file), contract_text="c")
+        with pytest.raises(ValueError, match="environment produced 0 rows"):
+            env.dataset()
+
+
+def test_freesolo_adapter_empty_env_dataset_errors_under_default_dataset_path(
+    monkeypatch, tmp_path
+):
+    """dataset_path naming the default train file keeps env precedence, so an env that filtered
+    every row away must fail there too rather than re-read the file it was handed."""
+    sdk_env = _FakeSingleTurnEnv()
+    sdk_env.dataset = []
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+    env_file = _split_env(
+        tmp_path,
+        {
+            "dataset/train.jsonl": (
+                '{"id":"kept","input":"2+2?","output":"4"}\n'
+                '{"id":"dropped","input":"3+3?","output":"6"}\n'
+            )
+        },
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(
+        str(env_file), dataset_path="dataset/train.jsonl", contract_text="c"
+    )
+    with pytest.raises(ValueError, match="environment produced 0 rows"):
+        env.dataset()
+
+
+def test_freesolo_adapter_empty_env_dataset_yields_to_an_explicit_dataset_path(
+    monkeypatch, tmp_path
+):
+    """an explicit non-default dataset_path is already authoritative over the env's dataset, so
+    an empty one is not a rejection of those rows and must not block the run."""
+    sdk_env = _FakeSingleTurnEnv()
+    sdk_env.dataset = []
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+    env_file = _split_env(
+        tmp_path,
+        {
+            "dataset/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n',
+            "dataset/oracle.jsonl": '{"id":"o","input":"2+2?","output":"4"}\n',
+        },
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(
+        str(env_file), dataset_path="dataset/oracle.jsonl", contract_text="c"
+    )
+    assert env.dataset() == [{"id": "o", "input": "2+2?", "output": "4"}]
+
+
+def test_freesolo_adapter_absent_env_dataset_still_falls_back_to_the_packaged_file(
+    monkeypatch, tmp_path
+):
+    """no dataset attribute (or an explicit None) is "no in-code dataset", not "zero rows": the
+    packaged file stays the source, which is the common env and must not start erroring."""
+    from flash.envs.adapter import load_freesolo_environment
+
+    rows = '{"id":"t","input":"2+2?","output":"4"}\n'
+    for label in ("absent", "none"):
+        sdk_env = _FakeSingleTurnEnv()
+        if label == "none":
+            sdk_env.dataset = None
+            sdk_env.examples = None
+        _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+        root = tmp_path / label
+        root.mkdir()
+        env_file = _split_env(root, {"dataset/train.jsonl": rows})
+
+        env = load_freesolo_environment(str(env_file), contract_text="c")
         assert env.dataset() == [{"id": "t", "input": "2+2?", "output": "4"}]
+
+
+def test_freesolo_adapter_datasets_plural_dir_allowed_when_the_env_owns_its_rows(
+    monkeypatch, tmp_path
+):
+    """an env that builds every row in load_environment never reads the packaged file, so a
+    datasets/ directory is raw or eval assets there: the guard must not stop it from loading."""
+    sdk_env = _FakeSingleTurnEnv()
+    sdk_env.dataset = [{"id": "built", "input": "2+2?", "output": "4"}]
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+    env_file = _split_env(
+        tmp_path, {"datasets/raw.jsonl": '{"id":"raw","input":"raw?","output":"raw"}\n'}
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(str(env_file), contract_text="c")
+    assert env.dataset() == [{"id": "built", "input": "2+2?", "output": "4"}]
+
+
+def test_freesolo_adapter_datasets_plural_dir_raises_when_the_env_needs_the_file(
+    monkeypatch, tmp_path
+):
+    """the guard is deferred, not dropped: an env with no rows of its own still depends on the
+    file the datasets/ layout hid, and an env whose dataset came back empty does too. both get
+    the layout message, which names the fix, over the adapter's generic empty-dataset one."""
+    from flash.envs.adapter import load_freesolo_environment
+
+    for label, rows in (("absent", None), ("empty", [])):
+        sdk_env = _FakeSingleTurnEnv()
+        if rows is not None:
+            sdk_env.dataset = rows
+        _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+        root = tmp_path / label
+        root.mkdir()
+        env_file = _split_env(
+            root, {"datasets/train.jsonl": '{"id":"legacy","input":"old?","output":"old"}\n'}
+        )
+
+        with pytest.raises(ValueError, match="'datasets/' directory"):
+            load_freesolo_environment(str(env_file), contract_text="c")
 
 
 def test_freesolo_adapter_records_param_wins_over_env_dataset(monkeypatch, tmp_path):

@@ -822,6 +822,23 @@ def _validate_packaged_dataset_split(split: str) -> str:
     return split
 
 
+def env_dataset_rows(sdk_env: object):
+    """The rows an sdk env supplies in code, or None when it exposes no dataset attribute.
+
+    ``dataset`` is probed first and ``examples`` only when it is absent or None: an attribute
+    that is present but empty is a deliberate answer (a filter that matched nothing), not a
+    reason to keep probing. Callers distinguish None (no in-code dataset, the packaged file is
+    the source) from an empty sequence (the env rejected every row).
+
+    It lives here rather than in adapter.py because adapter.py imports this module; the reverse
+    direction is a cycle.
+    """
+    rows = getattr(sdk_env, "dataset", None)
+    if rows is None:
+        rows = getattr(sdk_env, "examples", None)
+    return rows
+
+
 def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **kwargs):
     # pinned_sha is positional-only so user [environment.params] named "pinned_sha" goes to **kwargs, not here.
     from flash.envs.adapter import FreesoloEnvironment
@@ -861,6 +878,7 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
     split = split.strip() if isinstance(split, str) else None
     if split:
         split = _validate_packaged_dataset_split(split)
+    datasets_dir_unread = False
     if source is None:
         wanted = split if split and split != "train" else "train"
         found = _packaged_dataset_file(base_dir, wanted)
@@ -879,17 +897,13 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
         # entirely. only when the probe found nothing: a package may legitimately carry datasets/
         # for eval or other assets alongside a supported top-level <split>.jsonl. explicit
         # records/dataset_path params skip it because the user already said what to train on.
-        if (
+        # the verdict is deferred to after load_environment: only an env that cannot supply its
+        # own rows actually needs the file this layout hid.
+        datasets_dir_unread = (
             found is None
             and (base_dir / "datasets").is_dir()
             and not (base_dir / "dataset").is_dir()
-        ):
-            raise ValueError(
-                "environment package has a top-level 'datasets/' directory, which Flash never "
-                "reads (it probes dataset/<split>.jsonl or dataset/<split>.json). Rename the "
-                "directory to 'dataset/', or set [environment.params] dataset_path to the exact "
-                "file to train on."
-            )
+        )
         if found is not None:
             params.setdefault("dataset_path", str(found))
             source = str(found)
@@ -910,6 +924,17 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
     )
 
     sdk_env = tools["load_environment"](reference, **params)
+    # an env that generates or owns every row in load_environment needs no packaged file, and a
+    # datasets/ directory is then just raw or eval assets, so it must be able to load. an env
+    # whose in-code dataset is empty still needs the file, so it still lands here, where the
+    # message names the layout problem instead of the adapter's generic empty-dataset one.
+    if datasets_dir_unread and not env_dataset_rows(sdk_env):
+        raise ValueError(
+            "environment package has a top-level 'datasets/' directory, which Flash never "
+            "reads (it probes dataset/<split>.jsonl or dataset/<split>.json). Rename the "
+            "directory to 'dataset/', or set [environment.params] dataset_path to the exact "
+            "file to train on."
+        )
     return FreesoloEnvironment(
         sdk_env,
         env_id,
