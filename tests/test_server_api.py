@@ -6374,6 +6374,40 @@ def test_deploy_ignores_stored_training_gpu(api, monkeypatch):
     assert "gpu_name" not in seen["deploy_kwargs"]
 
 
+def test_deploy_works_the_same_whether_or_not_gpu_count_was_authored(api, monkeypatch):
+    """Deploy must not depend on whether the author wrote gpu.count.
+
+    `gpu_count_auto` was briefly added to the digest-verified set in `effective_spec_from_status`.
+    The digest covers the whole public spec including `gpu.type`, which the allocator legitimately
+    rewrites onto the stored status when a run is provisioned -- so gating on the marker made an
+    ordinary provisioned run fail integrity validation at deploy. An omitted count is the DEFAULT,
+    so that was nearly every run. These two specs differ only in that one authors `gpu.count = 1`.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    def fake_start(target, *args, **kwargs):
+        kwargs["deploy_lock"].release()
+        return False
+
+    monkeypatch.setattr(app_mod, "start_deployment_job", fake_start)
+
+    for gpu_section in ({}, {"count": 1}):
+        key = _login()
+        spec = {**SPEC, "gpu": gpu_section}
+        run_id = api.post(
+            "/v1/runs", json={"spec": spec, "dry_run": True}, headers=_bearer(key)
+        ).json()["run_id"]
+        status = runner.get_status(run_id)
+        status.state = "done"
+        # the allocator writes the class it actually rented onto the public status.
+        status.spec["gpu"]["type"] = "H200"
+        runner._save_status(status)
+
+        resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+        assert resp.status_code == 200, f"gpu={gpu_section!r} deploy failed: {resp.text}"
+
+
 def test_deploy_missing_run_level_adapter_points_at_checkpoint_steps(api, monkeypatch):
     """A run whose finalize never published the run-level <prefix>/adapter (but which streamed
     per-step deployable checkpoints) must not fail run-level deploy with an opaque 502 rank

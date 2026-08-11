@@ -84,6 +84,9 @@ class _Spec:
     model_revision = "main"
     seed = 0
     thinking = False
+    # mirrors JobSpec's default: this fake stands in for an authored spec, and an authored gpu.count
+    # is exactly what `count = 1` below represents.
+    gpu_count_auto = False
     train = _Train()
     environment = _Env()
 

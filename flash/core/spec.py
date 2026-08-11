@@ -437,6 +437,10 @@ class JobSpec:
     # from the internal worker spec under `effective_preparation` instead (see
     # `_internal_spec_from_status`), which carries it verbatim.
     model_revision_auto: bool = False
+    # platform-managed marker: true when the author omitted both gpu.type and gpu.count and the stored
+    # integer 1 is only the digest-stable public placeholder. allocation reads this marker as
+    # "auto-size"; a type pin or authored count=1 leaves it false and remains a hard ceiling.
+    gpu_count_auto: bool = False
     # platform-managed workload-profile carrier. public configs never author these fields.
     workload_profile_kind: str = ""
     workload_profile_input_digest: str = ""
@@ -459,6 +463,13 @@ class JobSpec:
         # deploy guard reads the pair.
         if self.model_revision_auto and not self.model_revision:
             object.__setattr__(self, "model_revision_auto", False)
+        # NOT cleared when gpu.count != 1. the marker records PROVENANCE -- that the author omitted
+        # gpu.count -- which stays true after allocation resolves a shape onto the spec. clearing it
+        # there destroyed the only record distinguishing an auto-sized run from an authored
+        # single-card pin: the public halves are byte-identical (to_dict strips the marker and keeps
+        # the placeholder count=1 for digest stability), so a recovered auto-sized run came back
+        # hard-pinned to one card and could never be re-offered its multi-card shape. consumers that
+        # mean "auto-size NOW" must additionally check that no shape has been resolved yet.
         profile_kind = str(self.workload_profile_kind or "")
         if profile_kind not in {"", "sft"}:
             raise ValueError("unsupported workload profile kind")
@@ -477,6 +488,19 @@ class JobSpec:
         if self.workload_profile_kind:
             return "profile"
         return "rl" if self.algorithm == "grpo" else self.algorithm
+
+    @property
+    def authored_gpu_count(self) -> int | None:
+        """The author's card ceiling: ``None`` when they omitted ``gpu.count``.
+
+        THE single reading of "is the stored count real, or the placeholder?". `gpu_count_auto` and
+        `gpu.count` are one value -- an optional ceiling -- split across two fields only because
+        `to_dict` must keep a digest-stable integer in the public spec. Every consumer that wants
+        the ceiling had to rejoin them by hand, and the hand-written guards disagreed: one checked
+        `count == 1`, another `count == 1 and not type`, two checked neither. Rejoin them here so a
+        consumer cannot invent a fifth spelling.
+        """
+        return None if self.gpu_count_auto else gpu_count_of(self)
 
     def to_dict(self) -> dict[str, Any]:
         """return the public user-authorable job specification.
@@ -501,6 +525,9 @@ class JobSpec:
         # exists to keep deployable. "" is also the honest value: nothing was authored.
         if data.pop("model_revision_auto", None):
             data["model_revision"] = ""
+        # keep gpu.count=1 in the public gpu object for preparation-digest stability. only the
+        # platform-managed provenance marker is stripped; internal round trips carry it verbatim.
+        data.pop("gpu_count_auto", None)
         data.pop("workload_profile_kind", None)
         data.pop("workload_profile_input_digest", None)
         data.pop("workload_profile_producer_version", None)
@@ -651,6 +678,7 @@ class JobSpec:
             wandb=_coerce_wandb(data.get("wandb")),
             seed=parse_seed(data.get("seed", FIXED_SEED)),
             model_revision_auto=coerce_bool(data.get("model_revision_auto", False)),
+            gpu_count_auto=coerce_bool(data.get("gpu_count_auto", False)),
             workload_profile_kind=str(data.get("workload_profile_kind") or ""),
             workload_profile_input_digest=str(data.get("workload_profile_input_digest") or ""),
             workload_profile_producer_version=str(
