@@ -18,7 +18,7 @@ from flash.cli.ui import render
 from flash.client import ApiClient, ApiError, ClientError
 from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
-from flash.cost.spec import runconfig_from_spec
+from flash.cost.spec import runconfig_from_spec, thin_rl_batch_warning
 from flash.schema import spec_and_train_keys_from_file, train_schema_metadata
 
 
@@ -88,6 +88,7 @@ def _cmd_train_cost_offline(spec) -> int:
         print(render.cost_panel(estimate))
     else:
         print(estimate.breakdown())
+    _print_thin_rl_batch_warning(spec)  # after the payload, so stdout stays parseable
     return 0
 
 
@@ -250,6 +251,18 @@ def _exact_sft_cost_rows(spec, profile: dict) -> list[tuple[str, str | None]]:
         ("tokens", tokens),
         ("profile", digest[:12] or None),
     ]
+
+
+def _print_thin_rl_batch_warning(spec) -> None:
+    """Warn that a grpo/opd ``batch_size`` is the optimizer batch, before any gpu is allocated.
+
+    Derived from the spec alone, so unlike the sft packing warning it needs no server response and
+    fires on the offline ``--cost`` quote too.
+    """
+    message = thin_rl_batch_warning(spec)
+    if not message:
+        return
+    print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
 
 
 def _print_exact_sft_cost(status: dict, spec) -> None:

@@ -126,6 +126,60 @@ def _on_policy_prompts_per_step(spec, examples: int) -> int:
     return min(requested, max(1, int(examples)))
 
 
+# the prompts-per-step below which an on-policy step stops being a batch. at 1 the update is a
+# single prompt's group, so nothing averages the prompt-to-prompt spread out of the gradient; the
+# few above it are still thin enough that one unlucky prompt dominates an update. not a hard
+# minimum -- a deliberately tiny batch is a legitimate way to buy optimizer steps on a derived
+# horizon (see TRAINING.md), which is exactly why this warns instead of rejecting.
+RL_THIN_PROMPTS_PER_STEP = 4
+
+
+def thin_rl_batch_warning(spec) -> str | None:
+    """One user-facing line when an rl run's ``[train] batch_size`` is too thin to be a batch.
+
+    ``batch_size`` names two different quantities. Under sft it is a memory knob: the optimizer
+    batch comes from the workload profile's ``examples_per_update``, and the authored value only
+    picks the per-device micro-batch it is split into. Under grpo/opd the same key IS the optimizer
+    batch -- it becomes ``prompts_per_step``, then verl's ``data.train_batch_size`` and
+    ``ppo_mini_batch_size``. So the standard sft memory workaround, ``batch_size = 1``, silently
+    turns an rl run into one prompt per update.
+
+    Nothing errors, and the run is not broken: verl centres advantages per prompt over
+    ``group_size`` (dr-grpo, ``norm_adv_by_std_in_grpo=False``), so a group baseline still exists
+    at any batch size. What is lost is the averaging ACROSS prompts -- every update follows one
+    prompt's group, so the gradient is far noisier at full price. Returns None for sft, for a
+    healthy batch, and when nothing was authored (the recipe default is already sane).
+    """
+    if spec.algorithm not in ("grpo", "opd"):
+        return None
+    authored = getattr(spec.train, "batch_size", None)
+    if authored is None:
+        return None
+    try:
+        prompts_per_step = int(authored)
+    except (TypeError, ValueError):
+        return None
+    if prompts_per_step >= RL_THIN_PROMPTS_PER_STEP:
+        return None
+    # group_size is what still gives the update its baseline, so name the one the run will use
+    # rather than implying the advantage is gone.
+    from flash.engine.plan.recipe import RECIPE
+
+    default_group = RECIPE.rl.group_size if spec.algorithm == "grpo" else RECIPE.opd.group_size
+    configured_group = getattr(spec.train, "group_size", None)
+    group_size = int(configured_group) if configured_group is not None else int(default_group)
+    return (
+        f"[train] batch_size = {prompts_per_step} is the OPTIMIZER batch for {spec.algorithm}, not "
+        f"a memory knob: it sets prompts-per-step, so each update trains on {prompts_per_step} "
+        f"prompt(s) x group_size {group_size} completions. Under sft the same key means the "
+        "micro-batch and the optimizer batch comes from the workload profile, so an sft "
+        "`batch_size = 1` memory workaround does not carry over. Advantages are still centred "
+        "within each prompt's group, but no averaging across prompts survives, so expect much "
+        "noisier updates at full price. Raise it (or lower train.learning_rate) unless you are "
+        "deliberately buying optimizer steps on a derived horizon."
+    )
+
+
 def spec_steps(spec) -> int:
     """Per-seed optimizer steps implied by a train spec (mirrors the worker).
 

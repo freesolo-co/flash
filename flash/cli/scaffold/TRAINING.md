@@ -246,6 +246,19 @@ ignored. Everything in the block above (`epochs`, `max_examples`, `max_steps`, `
 | `entropy_quantile`, `thinking_length_penalty_coef`, `credit_assignment`                                         | rejected | yes      | rejected |
 | `teacher_model`                                                                                                 | rejected | rejected | yes      |
 
+> **`batch_size` applies everywhere but does not MEAN the same thing everywhere.** Under SFT it is
+> a memory knob: the optimizer batch is the workload profile's measured `examples_per_update`, and
+> the authored value only picks the per-device micro-batch it is split into (and with packing off,
+> the optimizer batch is pinned to 1 regardless of what you set). Under GRPO and OPD the same key
+> IS the optimizer batch: it becomes prompts-per-step, i.e. verl's `data.train_batch_size` and
+> `ppo_mini_batch_size`. So the usual SFT out-of-memory workaround, `batch_size = 1`, does not
+> carry over: in an RL config it means one prompt per optimizer update. Advantages are still
+> centred within each prompt's group (that is `group_size`'s job, and it is a separate knob), so
+> nothing errors and the run still learns, but no averaging across prompts survives, so the
+> updates are far noisier for the same money. `flash train` warns when an RL `batch_size` is
+> below 4. To cut RL memory, lower `group_size`, `max_completion_tokens` or `max_context_tokens`
+> instead.
+
 So `credit_assignment` (multi-turn GRPO defaults to one reward per rollout; `"per_turn"` gives
 turn-level credit, needs `per_turn_rewards` metadata, and is unsupported for tool-calling envs —
 see below) belongs on a `grpo` run, and setting it on `sft` or `opd` is a submit-time error.
@@ -1006,7 +1019,7 @@ in a sensible value, so only override with a reason.
 | `kl_penalty_coef`              | Keeps the trained model from drifting too far from the base. Raise it to anchor against entropy collapse; lower it for more freedom to move.                                                                                                                                                                                                                                                                      |
 | `thinking_length_penalty_coef` | Per-reasoning-token reward deduction — curb overthinking, but watch it doesn't push the model into terse degeneracy.                                                                                                                                                                                                                                                                                              |
 | `learning_rate`                | Change it in small steps. Too high destabilizes RL and degrades output quality; if the model is collapsing, lower it.                                                                                                                                                                                                                                                                                             |
-| `batch_size`                   | The effective prompts-per-step. Too small and the reward trend is pure noise; size it so the trend is readable.                                                                                                                                                                                                                                                                                                   |
+| `batch_size`                   | The effective prompts-per-step, i.e. the OPTIMIZER batch (not the SFT memory knob of the same name). Too small and the reward trend is pure noise; size it so the trend is readable. Below 4 `flash train` warns: one prompt per update keeps its own group baseline but averages nothing across prompts.                                                                                                         |
 | `structured_outputs`           | Guided decoding for every GRPO/OPD rollout: a JSON schema (inline table or JSON string), `regex`, or `choice`. The sampler then _cannot_ emit off-format text, so the reward measures content instead of formatting. Works with `thinking = true`: the grammar is held until the `</think>` boundary (via a reasoning-aware decoding gate), so the model reasons freely first and only its answer is constrained. |
 
 For thinking models, `max_completion_tokens` is shared between `<think>` reasoning and the final

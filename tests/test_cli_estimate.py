@@ -330,6 +330,133 @@ def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):
     assert "GPU" in out  # the breakdown names the chosen (provisional cheapest-fit) class
 
 
+def _grpo_cost_args(tmp_path, batch_size: int, algorithm: str = "grpo", **train):
+    """A `--cost` invocation for an on-policy run with the given optimizer batch."""
+    rows = "".join(f"{key} = {value}\n" for key, value in train.items())
+    cfg = tmp_path / "run.toml"
+    cfg.write_text(
+        'model = "Qwen/Qwen3.5-9B"\n'
+        'project = "11111111-1111-4111-8111-111111111111"\n'
+        f'algorithm = "{algorithm}"\n'
+        "[environment]\n"
+        'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
+        "[train]\n"
+        "epochs = 1\n"
+        "max_examples = 800\n"
+        f"batch_size = {batch_size}\n"
+        f"{rows}"
+        "[gpu]\n"
+    )
+    return types.SimpleNamespace(
+        config=str(cfg),
+        overrides=[],
+        extra_configs=[],
+        cost=True,
+        dry_run=False,
+        background=False,
+    )
+
+
+def test_grpo_cost_warns_that_a_thin_batch_size_is_the_optimizer_batch(
+    tmp_path, monkeypatch, capsys
+):
+    """`batch_size = 1` is the sft memory workaround; on grpo it is one prompt per update.
+
+    Nothing errors and the run still trains, so the quote is the last place this is cheap to
+    learn. It is spec-derived, so the offline grpo quote can warn without any server response.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, 1))
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "TOTAL" in captured.out  # the quote itself still prints
+    assert "OPTIMIZER batch" in captured.err
+    assert "batch_size = 1" in captured.err
+    # the warning must name the group that still supplies the baseline, not claim there is none
+    assert "group_size 8" in captured.err
+    assert "sft" in captured.err
+
+
+def test_thin_batch_warning_names_the_configured_group_size(tmp_path, monkeypatch, capsys):
+    """The completions per update are batch x group, so the reported group must be the run's."""
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, 2, group_size=4))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "2 prompt(s) x group_size 4 completions" in err
+
+
+def test_opd_cost_warns_about_a_thin_batch_size_too(tmp_path, monkeypatch, capsys):
+    """opd reads the same key into prompts_per_step, so it carries the same collision."""
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, 1, algorithm="opd"))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "OPTIMIZER batch for opd" in err
+
+
+def test_grpo_cost_stays_quiet_when_the_batch_is_a_real_batch(tmp_path, monkeypatch, capsys):
+    """A healthy batch must not be nagged about, or the warning stops meaning anything."""
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, 16))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "OPTIMIZER batch" not in err
+
+
+def test_a_real_thin_batch_submit_warns_before_the_run_starts(tmp_path, monkeypatch, capsys):
+    """The submit path is the one that spends the money, so it cannot be the one that stays quiet.
+
+    `--cost` is optional; a user who goes straight to `flash train` would otherwise pay for the
+    whole degraded run before anything says the batch is one prompt.
+    """
+    _use_client(monkeypatch, _QuotingClient({"run_id": "run-thin-batch"}))
+
+    args = _grpo_cost_args(tmp_path, 1)
+    args.cost = False
+    args.background = True
+
+    rc = cmd_train(args)
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "OPTIMIZER batch" in err
+
+
+def test_a_thin_batch_dry_run_warns_too(tmp_path, monkeypatch, capsys):
+    """`--dry-run` is the rehearsal for a submit, so it must surface the same fact."""
+    _use_client(monkeypatch, _QuotingClient({"run_id": "run-thin-batch"}))
+
+    args = _grpo_cost_args(tmp_path, 1)
+    args.cost = False
+    args.dry_run = True
+
+    rc = cmd_train(args)
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "OPTIMIZER batch" in err
+
+
+def test_sft_cost_never_warns_about_the_optimizer_batch(tmp_path, monkeypatch, capsys):
+    """Under sft `batch_size` really IS the memory knob, so warning here would be wrong."""
+    _use_client(monkeypatch, _QuotingClient())
+
+    rc = cmd_train(_sft_args(tmp_path))  # SFT_TOML authors batch_size = 8
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "OPTIMIZER batch" not in err
+
+
 SFT_TOML = (
     'model = "Qwen/Qwen3.5-4B"\n'
     'project = "11111111-1111-4111-8111-111111111111"\n'

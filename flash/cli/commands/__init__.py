@@ -461,6 +461,7 @@ def cmd_train(args) -> int:
             )
         else:
             print(json.dumps(status, indent=2))
+        _print_thin_rl_batch_warning(spec)  # after the payload, so stdout stays parseable
         return 0
     try:
         status = client.create_run(
@@ -475,6 +476,7 @@ def cmd_train(args) -> int:
         _raise_if_workload_profile_pending(client, exc)
         raise
     run_id = status["run_id"]
+    _print_thin_rl_batch_warning(spec)  # a real submit spends the money this warns about
     logger.info(
         "submitted run %s: model=%s algorithm=%s gpu=%s",
         run_id,
@@ -990,6 +992,7 @@ from flash.cli.commands.train_cost import (  # noqa: E402,F401
     _exact_sft_cost_rows,
     _legacy_train_key_rejection_detail,
     _print_exact_sft_cost,
+    _print_thin_rl_batch_warning,
     _print_train_schema_compatibility,
     _profile_charge,
     _raise_if_workload_profile_pending,
