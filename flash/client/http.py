@@ -11,10 +11,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from typing import Any
 
 from flash.client.config import load_credentials_with_source
+from flash.client.shapes import RequireSpec, matches_require
 from flash.core.spec import require_project_id
 from flash.serve.urls import is_freesolo_hosted_url
 
@@ -126,6 +127,21 @@ def _detail_from_http_error(exc: urllib.error.HTTPError) -> object:
 def _api_error(exc: urllib.error.HTTPError) -> ApiError:
     detail = _detail_from_http_error(exc)
     return ApiError(exc.code, str(detail), detail=detail)
+
+
+def _unexpected_response(api_url: str, path: str, problem: str) -> ClientError:
+    """The one error for a 2xx body this client cannot use.
+
+    A body that is not JSON and valid JSON of the wrong shape are the same user state (something
+    other than a Flash control plane answered), so both carry the hint ``flash login`` already
+    gives, see ``_verify_key_against_plane``. Nothing in the CLI turns a raw
+    ``json.JSONDecodeError`` or ``KeyError`` into an error message, so neither may escape.
+    """
+    return ClientError(
+        f"{api_url}{path} {problem}. Check that --api-url points at your Flash control plane "
+        '(its /v1/health should report "service": "flash") rather than at a proxy or another '
+        "service."
+    )
 
 
 def _read_capped_response(resp: object, max_bytes: int) -> bytes:
@@ -490,6 +506,56 @@ class ApiClient:
                 "check your network connection and FLASH_API_URL"
             ) from exc
 
+    def _decode_response(
+        self,
+        path: str,
+        raw: bytes,
+        content_type: str = "",
+        *,
+        require: Mapping[str, RequireSpec] | None = None,
+    ) -> Any:
+        """Parse a 2xx body and require the top-level keys, and value types, the caller reads.
+
+        Every response body this client reads goes through here, so a proxy answering
+        ``200 text/html`` and a plane answering the wrong shape both surface as the same
+        ``ClientError``. An empty body decodes to ``{}``.
+
+        The type is required alongside the key because a present-but-unusable value is the same
+        user state: ``{"logs": "x", "offset": null}`` passes a presence check and then raises a
+        bare ``TypeError`` out of ``int(None)``, which nothing in the CLI translates either. A
+        ``[dict]`` spec extends that one level into a list, because ``{"runs": [null]}`` is the
+        same story one element down.
+        """
+        try:
+            payload = json.loads(raw) if raw else {}
+        except ValueError as exc:
+            raise _unexpected_response(
+                self.api_url,
+                path,
+                f"did not return JSON (Content-Type: {content_type or 'unset'})",
+            ) from exc
+        # every consumer of this decoder reads an object; a bare list or scalar from a proxy
+        # or wrong service would otherwise surface as an AttributeError several frames later.
+        if not isinstance(payload, dict):
+            raise _unexpected_response(
+                self.api_url,
+                path,
+                f"returned JSON that is not an object ({type(payload).__name__})",
+            )
+        bad = [
+            key
+            for key, expected in (require or {}).items()
+            if key not in payload or not matches_require(payload[key], expected)
+        ]
+        if bad:
+            raise _unexpected_response(
+                self.api_url,
+                path,
+                "returned an unexpected response shape "
+                f"(missing or malformed {', '.join(repr(key) for key in bad)})",
+            )
+        return payload
+
     def _request(
         self,
         method: str,
@@ -498,6 +564,7 @@ class ApiClient:
         timeout: float | None = None,
         progress: ProgressCallback | None = None,
         extra_headers: dict[str, str] | None = None,
+        require: Mapping[str, RequireSpec] | None = None,
     ) -> Any:
         headers = {
             "Content-Type": "application/json",
@@ -520,8 +587,9 @@ class ApiClient:
             self._translate_http_errors(),
             urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp,
         ):
-            raw = resp.read()
-            return json.loads(raw) if raw else {}
+            return self._decode_response(
+                path, resp.read(), resp.headers.get("Content-Type", ""), require=require
+            )
 
     def _request_bytes(
         self,
@@ -621,6 +689,7 @@ class ApiClient:
             f"/v1/envs/{quoted}",
             timeout=1800.0,
             extra_headers={"X-Freesolo-Project-Id": project_id},
+            require={"deleted": bool},
         )
 
     def download_env_package(self, env_id: str) -> bytes:
@@ -660,16 +729,20 @@ class ApiClient:
             body["dry_run"] = True
         if client_train_schema is not None:
             body["client_train_schema"] = client_train_schema
-        return self._request("POST", "/v1/runs", body=body)
+        return self._request("POST", "/v1/runs", body=body, require={"run_id": str})
 
     def list_runs(self) -> list[dict]:
-        return self._request("GET", "/v1/runs")["runs"]
+        return self._request("GET", "/v1/runs", require={"runs": [dict]})["runs"]
 
     def get_run(self, run_id: str) -> dict:
         return self._request("GET", f"/v1/runs/{run_id}")
 
     def get_logs(self, run_id: str, offset: int = 0) -> dict:
-        return self._request("GET", f"/v1/runs/{run_id}/logs?offset={int(offset)}")
+        return self._request(
+            "GET",
+            f"/v1/runs/{run_id}/logs?offset={int(offset)}",
+            require={"logs": str, "offset": int},
+        )
 
     def get_worker_output(self, run_id: str) -> dict[str, str]:
         try:
@@ -684,7 +757,9 @@ class ApiClient:
         # server may still have accepted the cancel and later persisted a terminal state. Resolve
         # that by polling the authoritative run status instead of surfacing a raw timeout.
         try:
-            return self._request("POST", f"/v1/runs/{run_id}/cancel", timeout=60.0)
+            return self._request(
+                "POST", f"/v1/runs/{run_id}/cancel", timeout=60.0, require={"state": str}
+            )
         except RequestTimeoutError as exc:
             return self._poll_cancel_status(run_id, cause=exc)
 
@@ -720,7 +795,9 @@ class ApiClient:
 
     def checkpoints(self, run_id: str) -> list[dict]:
         """Deployable per-step RL checkpoints for a run (serve one with `flash models deploy RUN/step-N`)."""
-        return self._request("GET", f"/v1/runs/{run_id}/checkpoints")["checkpoints"]
+        return self._request(
+            "GET", f"/v1/runs/{run_id}/checkpoints", require={"checkpoints": [dict]}
+        )["checkpoints"]
 
     def deploy(
         self,
@@ -757,7 +834,9 @@ class ApiClient:
         return self._request("DELETE", f"/v1/runs/{run_id}/deploy")
 
     def deployments(self, timeout: float | None = None) -> list[dict]:
-        return self._request("GET", "/v1/deployments", timeout=timeout)["deployments"]
+        return self._request(
+            "GET", "/v1/deployments", timeout=timeout, require={"deployments": [dict]}
+        )["deployments"]
 
     def deployment_for(self, run_id: str, timeout: float | None = None) -> dict | None:
         """The current deployment record for one run, or None when it is not listed.
@@ -861,7 +940,12 @@ class ApiClient:
         ):
             content_type = resp.headers.get("Content-Type", "")
             if "application/json" in content_type:
-                payload = json.loads(resp.read() or b"{}")
+                payload = self._decode_response(
+                    f"/v1/runs/{base_run_id}/chat",
+                    resp.read(),
+                    content_type,
+                    require={"choices": [dict]},
+                )
                 content = ((payload.get("choices") or [{}])[0].get("message") or {}).get("content")
                 if content:
                     yield str(content)

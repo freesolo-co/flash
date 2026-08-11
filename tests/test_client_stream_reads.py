@@ -82,6 +82,19 @@ def test_chat_stream_reads_match_bytewise_utf8_chunks(
     assert all(call == (reader_name, read_size) for call in response.calls)
 
 
+def test_chat_stream_json_fallback_rejects_a_wrong_service_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 200 application/json without choices must error, not read as an empty answer."""
+    response = _ReadResponse(b'{"hello": "world"}')
+    response.headers = {"Content-Type": "application/json"}
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: response)
+
+    with pytest.raises(ClientError) as caught:
+        list(ApiClient("http://test").chat_stream("run-a", []))
+    assert "'choices'" in str(caught.value)
+
+
 def test_chat_stream_without_read1_yields_before_full_body(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
