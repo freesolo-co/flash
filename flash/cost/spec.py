@@ -149,7 +149,15 @@ def thin_rl_batch_warning(spec) -> str | None:
     the standard sft memory workaround, ``batch_size = 1``, silently turns an rl run into one
     prompt per update, and nothing errors.
 
-    Reads the EFFECTIVE prompts-per-step, not the authored field: a ``max_examples`` cap (from
+    Reads the configured prompts-per-step rather than the authored field. That is an UPPER BOUND on
+    the runtime batch, not the resolved one: the worker filters prompts over the token budget before
+    clamping (``_build_grpo_prompts`` then ``resolve_grpo_prompts_per_step``), so an uncapped config
+    can still resolve thin and go unwarned. Closing that gap would mean importing and running the
+    user's ``environment.py``, which an offline quote deliberately does not do. The bound is
+    one-sided on purpose: everything it warns about is genuinely thin, and what it misses is a false
+    negative rather than a false alarm on a healthy run.
+
+    Within that bound it still beats the authored field, because a ``max_examples`` cap (from
     either ``[train]`` or ``[environment.params]``) clamps the batch to the retained prompt pool
     (``_on_policy_prompts_per_step``), so a scaffolded ``max_examples = 2`` run trains on 2 prompts
     per update whether or not a ``batch_size`` was ever written. The caps do not override each

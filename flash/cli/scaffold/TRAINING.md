@@ -256,8 +256,10 @@ ignored. Everything in the block above (`epochs`, `max_examples`, `max_steps`, `
 > and `ppo_mini_batch_size`. So an SFT out-of-memory workaround of `batch_size = 1` lands
 > differently here: it means one prompt per optimizer update. Nothing errors and the run still
 > learns, but each update follows very few prompts, so the gradient is far noisier. `flash train`
-> warns when the effective optimizer batch is below 4, including when a `max_examples` cap is what
-> clamps it, since a small prompt pool caps the batch regardless of what you authored.
+> warns when the optimizer batch your config implies is below 4, including when a `max_examples`
+> cap is what clamps it, since a small prompt pool caps the batch regardless of what you authored.
+> That check reads your config, not the loaded dataset, so it is one-sided: the worker also drops
+> prompts over the token budget, and a run can still end up thin without being warned here.
 >
 > What to do about it differs by algorithm. Under **GRPO** each prompt's completions are still
 > centred against their own group (that is `group_size`'s job, a separate knob), so the advantage
