@@ -7,6 +7,16 @@ import sys
 
 from flash._internal.channel import CLI_NAME
 
+# Cost selection lives in `flash.cli.ui.cost` (split out to keep this module under the file-size
+# limit). Imported at the TOP rather than the bottom like `tables` below, because that module
+# depends on nothing here -- it decides a number, it renders nothing -- so there is no cycle to
+# order around. Re-exported so `render.run_cost` / `render.SETTLED_COST_STATES` keep resolving.
+from flash.cli.ui.cost import (  # noqa: F401
+    SETTLED_COST_STATES,
+    cost_estimate_reason,
+    run_cost,
+)
+
 _ROWS = (
     ("email", "account"),
     ("org_id", "org"),
@@ -351,57 +361,6 @@ def money(value: float, decimals: int = 4) -> str:
     return _paint(f"${value:.{decimals}f}", _TEAL)
 
 
-# the states after which `cost_usd` is the settled charge. before one of these the field is still
-# 0.0, because the server only writes it on the terminal transition. kept here rather than imported
-# from flash.runner so this module stays stdlib-only; the set is asserted against the runner's
-# TERMINAL_STATES in the test suite so the two cannot drift.
-SETTLED_COST_STATES = frozenset({"done", "failed", "cancelled", "dry_run", "deployed"})
-
-
-def run_cost(obj: dict) -> tuple[float, bool]:
-    """The cost to show for a run, and whether it is a pre-settlement estimate.
-
-    ``cost_usd`` is only written when a run reaches a terminal state, so a run that is queued or
-    training reports 0.0 -- which reads as "this has cost nothing", exactly when the GPU is billing.
-    The submit-time quote is already on the record as ``estimated_cost_usd``; prefer it while the
-    run is live so current spend is never understated as free.
-
-    A FAILED run reporting 0.0 is the one terminal case where that zero is not a measurement
-    either. ``cost_usd`` is derived from the WORKER's metrics, so a run whose attempts all died
-    before producing any never had one written -- and a failed run is the case most likely to have
-    rented hardware repeatedly. One profile run rented 47 instances, could not confirm teardown on
-    44 of them, and still reported $0.0000 as settled fact.
-
-    Only ``failed`` gets that treatment. The other settled states earn their zero: ``dry_run``
-    never rents anything, and a ``cancelled``/``done`` run with no charge went through the normal
-    accounting path. Showing them a quote would invent a charge nobody incurred.
-    """
-    settled = float(obj.get("cost_usd") or 0.0)
-    if settled:
-        # a measured charge is the best number available, settled or not.
-        return settled, str(obj.get("state") or "") not in SETTLED_COST_STATES
-    quote = obj.get("estimated_cost_usd")
-    if isinstance(quote, (int, float)) and (
-        str(obj.get("state") or "") not in SETTLED_COST_STATES or _spent_without_measuring(obj)
-    ):
-        # the quote priced the work, not the failure, so it is not what a dead run cost -- but it
-        # is the only non-zero evidence that money was at stake, and flagging it as unmeasured is
-        # honest where printing a bare $0.0000 was not.
-        return float(quote), True
-    return settled, False
-
-
-def _spent_without_measuring(obj: dict) -> bool:
-    """A failed run that rented hardware but never produced a measured charge.
-
-    ``realized_cost_usd`` is deliberately NOT used as the number to show: it is provider COGS
-    pulled by reconciliation (see ``runner.RunStatus``), distinct from the ``cost_usd`` estimate
-    the customer is charged. Presenting our internal spend as their bill would be wrong, and
-    ``run_status`` already prints it on its own ``realized`` row.
-    """
-    return str(obj.get("state") or "") == "failed"
-
-
 def _kv(pairs: list[tuple[str, str | None]], indent: int = 2) -> str:
     """Aligned ``key · value`` panel; keys dimmed and padded to a common width."""
     rows = [(k, v) for k, v in pairs if v is not None]
@@ -538,18 +497,11 @@ def run_status(obj: dict) -> str:
     spec = obj.get("spec") or {}
     where = gpu_label(spec, obj.get("remote") or {}) or None
     amount, is_estimate = run_cost(obj)
-    if is_estimate:
-        # a settled state with a flagged amount is the failed-run case: the run is over and the
-        # quote stands in for a charge the worker never measured. saying "run in progress" there
-        # would be false, and the reason the number is soft is different, so say which it is.
-        why = (
-            "estimate, not measured"
-            if str(obj.get("state") or "") in SETTLED_COST_STATES
-            else "estimate, run in progress"
-        )
-        cost = f"{money(amount)} {_dim(f'({why})')}"
-    else:
-        cost = money(amount)
+    cost = (
+        f"{money(amount)} {_dim(f'({cost_estimate_reason(obj)})')}"
+        if is_estimate
+        else money(amount)
+    )
     pairs = [
         ("run id", _paint(obj.get("run_id", ""), _ACCENT2)),
         ("model", spec.get("model")),
