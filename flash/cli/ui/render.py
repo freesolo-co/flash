@@ -804,14 +804,18 @@ def cost_panel(est) -> str:
         ),
         (
             "gpu",
-            f"{est.gpu}  "
-            f"{_dim(f'({est.gpu_vram_gb} GB; needs >= {est.required_vram_gb} GB)')}  "
-            f"@ {money(est.gpu_hourly_usd, 2)}/hr",
+            (
+                f"{est.gpu}  "
+                f"{_dim(f'({est.gpu_vram_gb} GB; needs >= {est.required_vram_gb} GB)')}  "
+                f"@ {money(est.gpu_hourly_usd, 2)}/hr"
+            ),
         ),
         (
             "setup",
-            f"{est.setup_seconds / 60:.1f} min  "
-            f"{_dim(f'(cold start: boot + deps + model load{setup_extra}; not billed)')}",
+            (
+                f"{est.setup_seconds / 60:.1f} min  "
+                f"{_dim(f'(cold start: boot + deps + model load{setup_extra}; not billed)')}"
+            ),
         ),
         ("per step", f"{est.seconds_per_step:.2f} s"),
         (
@@ -828,8 +832,10 @@ def cost_panel(est) -> str:
         pairs.append(
             (
                 "teacher api",
-                f"{money(est.teacher_api_usd, 2)}  "
-                f"{_dim('(Parasail teacher token spend on the managed key; billed by Parasail, NOT in TOTAL)')}",
+                (
+                    f"{money(est.teacher_api_usd, 2)}  "
+                    f"{_dim('(Parasail teacher token spend on the managed key; billed by Parasail, NOT in TOTAL)')}"
+                ),
             )
         )
     panel = _kv(pairs)
