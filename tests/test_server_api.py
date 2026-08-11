@@ -1750,6 +1750,41 @@ def test_create_run_retained_secretful_run_fails_instead_of_recovering(api, monk
     assert run_id not in _classified_resubmits()
 
 
+def test_create_run_secretful_run_dropped_when_terminalization_fails(api, monkeypatch):
+    """If the compensating terminal write fails, the ownership row must go.
+
+    that `_update` is the only thing keeping startup recovery away from a queued run whose
+    secrets were never dispatched. a full or read-only status store makes it raise, and
+    swallowing that would leave the run both recoverable and secretless. an orphaned 404 is the
+    lesser harm, so the row is dropped instead.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.server.platform import db
+
+    submitted: list[str] = []
+    _persist_queued_then_raise(app_mod, runner, monkeypatch, submitted)
+
+    def boom(*_args, **_kwargs):
+        raise OSError("[Errno 28] No space left on device")
+
+    monkeypatch.setattr(runner, "_update", boom)
+
+    key = _login()
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer(key),
+        json={"spec": SPEC, "runtime_secrets": {"WANDB_API_KEY": "user-wandb-key"}},
+    )
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    # the queued status record survives on disk, so only the dropped row keeps recovery off it.
+    assert runner.get_status(run_id).state == "queued"
+    assert db.run_owner(run_id) is None
+    assert run_id not in _classified_resubmits()
+
+
 def test_create_run_retained_run_records_managed_environment_use(api, monkeypatch):
     # a retained run stays live and can recover into real training, so it must carry the same
     # managed-environment association a successful submission records.

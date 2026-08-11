@@ -357,7 +357,8 @@ def _dispose_failed_submission(
         # train without its credentials. fail it loudly instead; the owner keeps the row and
         # the error, and recovery ignores terminal runs. the update is terminal-sticky, so a
         # record that already reached a terminal state is left untouched.
-        with contextlib.suppress(Exception):
+        terminalized = False
+        try:
             _runner._update(
                 run_id,
                 "failed",
@@ -366,6 +367,18 @@ def _dispose_failed_submission(
                     "the run was not started because recovery cannot restore them - resubmit"
                 ),
             )
+            terminalized = _runner.get_status(run_id).state in _runner.TERMINAL_STATES
+        except Exception:
+            _LOG.warning(
+                "could not terminalize secretless-recoverable run %s", run_id, exc_info=True
+            )
+        if not terminalized:
+            # that update is the ONLY write keeping recovery away from this run, and a full or
+            # read-only status store can fail it. owner visibility is worth less than the
+            # guarantee: drop the ownership row so recovery, which walks those rows, can never
+            # resubmit the run without the secrets it needs.
+            with contextlib.suppress(Exception):
+                db.delete_run(run_id)
     else:
         # a retained run stays live and can recover into real training, so it must carry the
         # same managed-environment association a successful submission records.
