@@ -325,6 +325,8 @@ def test_sft_launches_the_resolved_width_not_the_allocated_cards():
 
     assert line == 'f"--nproc-per-node={world_size}",', line
     assert '"n_gpus_per_node": world_size,' in src
+    # and the width is the RESOLVED one, not the raw allocation.
+    assert "world_size = _resolve_sft_world_size(options.gpu_count, model.train_batch_size)" in src
 
 
 def test_remove_padding_is_unconditional():

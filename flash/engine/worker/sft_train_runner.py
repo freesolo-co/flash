@@ -373,6 +373,35 @@ def sft_data_parallel_cards(gpu_count: int, train_batch_size: int) -> int:
     return 1
 
 
+def _resolve_sft_world_size(gpu_count: int, train_batch_size: int) -> int:
+    """Ranks to launch, warning when that is fewer than the cards the run is paying for.
+
+    SFT shards by DATA, not by sequence: ulysses is pinned to 1 and fsdp splits the batch. verl's
+    ulysses support patches `_flash_attention_forward` and slices the qwen text model's inputs, but
+    passes NO state between ranks -- and every catalog model is a GatedDeltaNet hybrid whose layers
+    are mostly linear attention plus a causal conv, both of which carry state along the sequence. A
+    sequence shard would run its recurrence and conv as if it were a whole sequence, so sequence
+    parallelism is not merely unimplemented for this family, it is incorrect for it.
+
+    It also crashed outright. remove-padding flattens the batch to one `(1, total_nnz)` row, and
+    verl slices that row per rank, so the shapes reaching the GDN kernels stop agreeing and a
+    sharded run died on `seq_idx must have shape (batch_size, seqlen)` -- at any batch size,
+    including 1, because "remove padding" leaves no batch dimension to keep an example whole.
+    """
+    world_size = sft_data_parallel_cards(gpu_count, train_batch_size)
+    if world_size < gpu_count:
+        # the run is BILLED for every allocated card, so a card the batch cannot feed is money
+        # spent on an idle gpu. the notes carry it too, but those are read after the fact -- say it
+        # while the run is live, and say what would actually use the card.
+        print(
+            f"[sft][warn] training on {world_size} of {gpu_count} allocated cards: a batch of "
+            f"{train_batch_size} cannot be split across {gpu_count} ranks without starving one or "
+            "silently dropping the remainder. the idle cards are still billed -- raise [train] "
+            f"batch_size to a multiple of {gpu_count}, or allocate {world_size} card(s)."
+        )
+    return world_size
+
+
 def _prepare_sft_child(
     options: _SftOptions,
     data: _SftData,
@@ -398,29 +427,7 @@ def _prepare_sft_child(
     # `gdn_reset_arch` is resolved by the caller, inside the configuring liveness wrap, because the
     # probe is part of the setup silence that wrap exists to cover, and because a packed run must
     # take the RAISING gate there rather than the soft form.
-    #
-    # SFT shards by DATA, not by sequence: ulysses is pinned to 1 and fsdp splits the batch. verl's
-    # ulysses support patches `_flash_attention_forward` and nothing else, but every catalog model
-    # is a GatedDeltaNet hybrid whose layers are mostly LINEAR attention plus a causal conv -- and
-    # both carry recurrent state along the sequence. slicing the sequence across ranks would run
-    # each shard's recurrence and conv as if it were a whole sequence, with no cross-rank state, so
-    # sequence parallelism is not merely unimplemented for this family, it is incorrect for it.
-    # It also crashed outright. remove-padding flattens the batch to one `(1, total_nnz)` row, and
-    # verl slices that row per rank, so the shapes reaching the GDN kernels stop agreeing and a
-    # sharded run died on `seq_idx must have shape (batch_size, seqlen)` -- at any batch size,
-    # including 1, because "remove padding" leaves no batch dimension to keep an example whole.
-    world_size = sft_data_parallel_cards(options.gpu_count, model.train_batch_size)
-    if world_size < options.gpu_count:
-        # the run is BILLED for every allocated card, so a card the batch cannot feed is money
-        # spent on an idle gpu. the notes carry it too, but those are read after the fact -- say it
-        # while the run is live, and say what would actually use the card.
-        print(
-            f"[sft][warn] training on {world_size} of {options.gpu_count} allocated cards: a batch "
-            f"of {model.train_batch_size} cannot be split across {options.gpu_count} ranks without "
-            "starving one or silently dropping the remainder. the idle cards are still billed -- "
-            f"raise [train] batch_size to a multiple of {options.gpu_count}, or allocate "
-            f"{world_size} card(s)."
-        )
+    world_size = _resolve_sft_world_size(options.gpu_count, model.train_batch_size)
     config = {
         "train_files": data.train_file,
         "train_batch_size": model.train_batch_size,
