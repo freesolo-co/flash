@@ -437,14 +437,20 @@ def test_main_source_guard_exempts_dependabot_only_by_verified_head_commit():
     pushes a commit onto a dependabot security PR keeps them and would inherit the exemption for
     arbitrary human code.
 
-    The head commit's SIGNATURE is what closes that, and it must be read off the committer. A
-    signature attests to its signer, who is the committer, while `.author.login` is resolved from
-    the author email header that whoever pushes chooses. The two are independent identities: on
-    this repo's own merged dependabot commits `.author.login` is `dependabot[bot]` while
-    `.committer.login` is `web-flow` and `verified: true` describes web-flow's signature. Pairing
-    the author with `verified` therefore checks a forgeable header against somebody else's
-    signature, and a collaborator pushing with dependabot's noreply author email and their own
-    valid key satisfies both halves while shipping arbitrary code to `main`.
+    The head commit closes that, but only when author, committer AND signature are read together.
+    Neither identity field works alone, and the real commits on this repo's dependabot branches
+    show why:
+
+        dependabot's own push:  author=dependabot[bot]  committer=web-flow  verified=true
+        human web-UI merge:     author=DavidBShan       committer=web-flow  verified=true
+
+    `.committer.login` is `web-flow` in BOTH -- it is GitHub's generic web signer, not an identity
+    specific to the bot -- so a committer-only check exempts any maintainer edit made through the
+    web editor or the contents API. And `.author.login` alone is worthless because it is resolved
+    from the author email header, which whoever pushes sets freely; a signature attests to the
+    COMMITTER, so pairing the author with `verified` checks a forgeable field against somebody
+    else's signature. Requiring the pair separates the two rows above: a human web edit keeps its
+    human author, and a forged author header cannot also produce the signature.
 
     The script is EXECUTED here (with `gh` stubbed) rather than grepped, because the characters
     being present proves nothing about which branch they gate.
@@ -487,46 +493,55 @@ def test_main_source_guard_exempts_dependabot_only_by_verified_head_commit():
 
         bot = "dependabot[bot]"
         branch = "dependabot/pip/urllib3-2.5.0"
-        # the stub emits `<committer.login> <verified> <reason>` -- what the script's --jq prints.
-        signed_by_bot = f"{bot} true valid"
-        # GitHub signs dependabot's pushes as `web-flow`, which is what this repo's own merged
-        # dependabot commits actually carry, so it must be accepted too.
-        signed_by_web_flow = "web-flow true valid"
+        # the stub emits `<author.login> <committer.login> <verified> <reason>` -- what the
+        # script's --jq prints. the first two fixtures are copied from real commits on this repo's
+        # dependabot branches, not invented.
+        dependabot_push = f"{bot} web-flow true valid"
+        dependabot_self_signed = f"{bot} {bot} true valid"
 
-        # the two cases the exemption exists for.
-        assert run(UPSTREAM_REPOSITORY, branch, bot, signed_by_bot) == 0, (
-            "a dependabot security PR whose head is signed by dependabot must pass -- otherwise "
-            "the required check is red by construction on every CVE fix"
+        # the case the exemption exists for. web-flow is the committer on dependabot's real
+        # pushes, so rejecting it would make the exemption dead code and leave the required check
+        # red on every CVE fix.
+        assert run(UPSTREAM_REPOSITORY, branch, bot, dependabot_push) == 0, (
+            "a real dependabot push (author=dependabot[bot], committer=web-flow, signed) must "
+            "pass -- otherwise the required check is red by construction on every CVE fix"
         )
-        assert run(UPSTREAM_REPOSITORY, branch, bot, signed_by_web_flow) == 0, (
-            "a dependabot head signed by web-flow must pass -- that is what GitHub actually puts "
-            "on this repo's merged dependabot commits"
+        assert run(UPSTREAM_REPOSITORY, branch, bot, dependabot_self_signed) == 0, (
+            "a dependabot commit signed under the bot's own identity must pass too"
         )
 
-        # a human pushed onto that same PR. author and head ref are unchanged; only the commit is.
-        assert run(UPSTREAM_REPOSITORY, branch, bot, "DavidBShan false ") != 0, (
+        # THE WEB-EDITOR CASE: a maintainer edits the dependabot branch through GitHub's web UI or
+        # the contents API. PR author and head ref are untouched, and GitHub signs it as
+        # `web-flow` with verified=true -- byte-identical to a real dependabot push on the
+        # committer and signature alone. only the AUTHOR distinguishes them.
+        assert run(UPSTREAM_REPOSITORY, branch, bot, "DavidBShan web-flow true valid") != 0, (
+            "a human web-UI edit on a dependabot branch was exempted -- web-flow is GitHub's "
+            "generic web signer, so the committer cannot tell it apart from a dependabot push. "
+            "the author is the field that can"
+        )
+
+        # THE FORGED-HEADER CASE: a collaborator pushes with dependabot's noreply author email and
+        # signs with their OWN key. `.author.login` resolves to dependabot from the forged header,
+        # so an author-only check reads "dependabot, verified" for human content. the committer is
+        # what distinguishes this one -- the mirror image of the case above.
+        assert run(UPSTREAM_REPOSITORY, branch, bot, f"{bot} DavidBShan true valid") != 0, (
+            "a commit whose author header was forged to dependabot but which is SIGNED BY A HUMAN "
+            "was exempted -- verification binds to the committer, so the committer must be read too"
+        )
+
+        # a human pushed onto that same PR under their own identity, unsigned.
+        assert run(UPSTREAM_REPOSITORY, branch, bot, "DavidBShan DavidBShan false unsigned") != 0, (
             "human commits pushed onto a dependabot PR inherited the exemption -- the guard must "
             "key on the head commit, not on who opened the PR"
         )
 
-        # THE SPOOF: a collaborator pushes with dependabot's noreply author email and signs with
-        # their OWN valid key. `.author.login` resolves to dependabot from the forged header while
-        # the signature verifies against the collaborator, so an author-keyed check reads
-        # "dependabot, verified" for human-authored content. reading the committer is what makes
-        # this case distinguishable at all.
-        assert run(UPSTREAM_REPOSITORY, branch, bot, "DavidBShan true valid") != 0, (
-            "a commit whose author header was set to dependabot's address but which is SIGNED BY A "
-            "HUMAN was exempted -- verification binds to the committer, so the committer is what "
-            "the exemption must read"
-        )
-
-        # signed by dependabot's identity but the signature does not check out.
-        assert run(UPSTREAM_REPOSITORY, branch, bot, f"{bot} false unverified") != 0, (
+        # dependabot's identity on both halves but the signature does not check out.
+        assert run(UPSTREAM_REPOSITORY, branch, bot, f"{bot} web-flow false unverified") != 0, (
             "an UNVERIFIED commit claiming dependabot's identity was exempted"
         )
 
         # verified true under a reason other than `valid`.
-        assert run(UPSTREAM_REPOSITORY, branch, bot, f"{bot} true unknown_key") != 0, (
+        assert run(UPSTREAM_REPOSITORY, branch, bot, f"{bot} web-flow true unknown_key") != 0, (
             "a signature reporting verified=true under a non-`valid` reason was exempted -- both "
             "fields are pinned so a weaker future reason cannot widen the exemption"
         )
@@ -537,13 +552,13 @@ def test_main_source_guard_exempts_dependabot_only_by_verified_head_commit():
         )
 
         # a human branch merely NAMED like dependabot's.
-        assert run(UPSTREAM_REPOSITORY, "dependabot/evil", "DavidBShan", signed_by_bot) != 0, (
+        assert run(UPSTREAM_REPOSITORY, "dependabot/evil", "DavidBShan", dependabot_push) != 0, (
             "a human-authored branch named `dependabot/...` bypassed the guard"
         )
 
         # a fork must never reach the exemption at all: on a fork head the commit and its
         # signatures are attacker-controlled.
-        assert run("attacker/flash", branch, bot, signed_by_bot) != 0, (
+        assert run("attacker/flash", branch, bot, dependabot_push) != 0, (
             "a fork PR claimed the dependabot exemption -- it must be rejected as a fork first"
         )
 
