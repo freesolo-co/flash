@@ -422,16 +422,15 @@ class JobSpec:
     model_revision: str = ""
     # platform-managed marker: True when the runner resolved model_revision for a spec whose
     # author left it blank (SFT, where `_resolve_model_revision(required=True)` pins the base so
-    # workload profiling keys on an immutable commit). serving resolves the base model BY NAME and
-    # `deploy_adapter` takes no base-revision argument, so an AUTHORED pin is a real mismatch and
-    # stays rejected at deploy. An auto-assigned one asks for nothing serving cannot honour, and
-    # rejecting it made every SFT run -- and every adapter warm-started from one -- permanently
-    # undeployable, unservable, and unscoreable by `flash env eval`.
+    # workload profiling keys on an immutable commit). An AUTHORED pin stays rejected at deploy;
+    # rejecting the auto-assigned one made every SFT run -- and every adapter warm-started from one
+    # -- permanently undeployable, unservable, and unscoreable by `flash env eval`.
     #
-    # unlike the workload_profile_* carriers this is NOT stripped by to_dict(): deploy reads a spec
-    # rebuilt from the persisted PUBLIC status (submit persists `spec=public_spec.to_dict()`), so a
-    # stripped marker would always read False there and the guard could never tell the two apart.
-    # the public parser rejects it from user configs by omission from `_TOP_LEVEL_KEYS`.
+    # stripped by to_dict() like the other platform-managed carriers: the public spec must stay
+    # re-parseable by the submission schema, which rejects every key outside `_TOP_LEVEL_KEYS`, so
+    # emitting it would break the public-spec resubmission round trip. Deploy reads the provenance
+    # from the internal worker spec under `effective_preparation` instead (see
+    # `_internal_spec_from_status`), which carries it verbatim.
     model_revision_auto: bool = False
     # platform-managed workload-profile carrier. public configs never author these fields.
     workload_profile_kind: str = ""
@@ -483,13 +482,7 @@ class JobSpec:
         data = asdict(self)
         # server-assigned identity — never authored in a config.
         data.pop("run_id", None)
-        # deploy rebuilds the spec from the persisted PUBLIC status, so this marker has to survive
-        # to_dict() -- but the public parser rejects every key outside _TOP_LEVEL_KEYS, and
-        # to_dict() output must stay re-parseable. Emit it only when set: False is the dataclass
-        # default, so a submit round trip reconstructs it exactly, while a marked run keeps the one
-        # bit deploy needs. A user cannot forge it; the parser still refuses it on the way in.
-        if not data.get("model_revision_auto"):
-            data.pop("model_revision_auto", None)
+        data.pop("model_revision_auto", None)
         data.pop("workload_profile_kind", None)
         data.pop("workload_profile_input_digest", None)
         data.pop("workload_profile_producer_version", None)

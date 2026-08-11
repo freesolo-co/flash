@@ -44,6 +44,10 @@ def prepare_job(
     owner_key_id: int | None = None,
 ) -> PreparedJob:
     """Prepare all read-only submission inputs before persistence or allocation."""
+    # before _resolve_model_revision, and before every sizing step below: a warm start inherits its
+    # source's runner-assigned pin, and `resolve_model`/`_with_model_disk` size against whatever
+    # revision the spec carries by then.
+    spec = _runner()._inherit_warmstart_revision(spec)
     spec = _runner()._resolve_model_revision(spec, required=spec.algorithm == "sft")
     _runner()._require_supported_adapter_continuation(spec)
     if spec.algorithm == "sft":

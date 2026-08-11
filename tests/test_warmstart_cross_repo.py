@@ -331,6 +331,89 @@ def test_warm_start_inherits_a_runner_assigned_source_revision(monkeypatch):
         R._prepare_init_from_adapter_inner(child, token="token")
 
 
+def test_warm_start_pin_is_inherited_before_the_spec_is_sized_against_it(monkeypatch):
+    """The inherited pin must be on the spec BEFORE `resolve_model` sizes the run.
+
+    Sizing reads the revision: `resolve_model` re-derives params/vocab from the pinned commit and
+    raises `min_disk_gb` to `params_b * 2 + 64`, which for half of today's catalog exceeds the
+    catalog default (Qwen3.5-4B: 0 -> 73). Inheriting inside `_prepare_init_from_adapter`, which
+    runs after `resolve_model`, `_with_model_disk`, and `_assign_weight_cache_volume`, provisions
+    the child as if unpinned while training it pinned, and skips the geometry validation the pin
+    exists to enforce.
+
+    So this asserts the ORDER, not just the final value: what `resolve_model` was handed. The
+    sibling test above covers the value; only this one fails if the inheritance moves back down.
+    """
+    import flash.adapters.lora_rank as rank_mod
+    import flash.cost.spec as cost_spec
+    import flash.runner as R
+    import flash.runner.results.checkpoints as checkpoints
+    from flash.core.spec import JobSpec
+
+    source = JobSpec.from_dict(
+        {
+            "run_id": "source-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "model_revision": _REVISION,
+            "model_revision_auto": True,
+            "algorithm": "sft",
+            "train": {"hf_repo": "owner/source-runs"},
+        }
+    )
+    source_status = provisioned_status(R, source, state="done")
+    child = JobSpec.from_dict(
+        {
+            "run_id": "child-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
+            "train": {"init_from_adapter": "source-run", "lora_rank": 8, "lora_alpha": 16},
+        }
+    )
+    seen_revisions = []
+
+    monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
+    # the resolver would hit the HF API for the sha; the pin is already immutable, so echo it back
+    monkeypatch.setattr(R, "_resolve_model_revision", lambda spec, *, required=False: spec)
+
+    real_resolve = R.resolve_model
+
+    def spy(model_id, algorithm, model_revision=""):
+        seen_revisions.append(model_revision)
+        return real_resolve(model_id, algorithm)  # unpinned: no HF geometry fetch in a unit test
+
+    monkeypatch.setattr(R, "resolve_model", spy)
+    monkeypatch.setattr(rank_mod, "resolve_hf_dataset_revision", lambda repo, token: _REVISION)
+    monkeypatch.setattr(
+        checkpoints, "adapter_artifact_exists", lambda spec, *, step, revision=None: True
+    )
+    monkeypatch.setattr(
+        rank_mod,
+        "load_hf_adapter_config",
+        lambda adapter_ref, token, revision: {
+            "peft_type": "LORA",
+            "task_type": "CAUSAL_LM",
+            "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+            "r": 64,
+            "lora_alpha": 128,
+        },
+    )
+    monkeypatch.setattr(
+        rank_mod,
+        "adapter_artifact_identity",
+        lambda *a, **k: rank_mod.AdapterArtifactIdentity(
+            "digest", "config", "adapter_model.safetensors", "weight:1"
+        ),
+    )
+    monkeypatch.setattr(cost_spec, "estimate_for_spec", lambda spec: SimpleNamespace(total_usd=1.0))
+
+    prepared = R.prepare_job(child)
+
+    assert seen_revisions == [_REVISION], seen_revisions
+    assert prepared.worker_spec.model_revision == _REVISION
+    # and the provenance survives, or deploy refuses the child for a pin it never wrote
+    assert prepared.worker_spec.model_revision_auto is True
+
+
 def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
     import types
 

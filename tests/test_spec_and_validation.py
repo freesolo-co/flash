@@ -986,17 +986,21 @@ def test_model_revision_strips_round_trips_and_rejects_non_strings() -> None:
             _job_from_dict({"model_revision": value})
 
 
-def test_model_revision_auto_is_platform_managed_and_survives_the_public_round_trip() -> None:
+def test_model_revision_auto_is_platform_managed_and_stripped_from_the_public_spec() -> None:
     """The marker records WHO pinned the base model, and only the runner may set it.
 
-    It must survive `to_dict()` unlike the other platform-managed carriers: deploy rebuilds the
-    spec from the persisted PUBLIC status (submit stores `spec=public_spec.to_dict()`), so a
-    stripped marker would always read False there and the deploy guard could not tell a
-    runner-assigned pin from an authored one.
+    `to_dict()` strips it like the other platform-managed carriers, because that output is the
+    public `RunStatus.spec` and has to stay re-parseable by the submission schema -- emitting it
+    would break resubmitting a public spec with `ConfigError: unknown config key(s)`. The internal
+    worker spec keeps it, which is where the deploy guard reads provenance from.
     """
-    auto = JobSpec(model="Qwen/Qwen3.5-9B", model_revision="c" * 40, model_revision_auto=True)
-    assert auto.to_dict()["model_revision_auto"] is True
-    assert JobSpec.from_dict(auto.to_dict()).model_revision_auto is True
+    # built through the public parser so the resubmission check below exercises a real config
+    auto = replace(spec_from_dict(_raw(model_revision="c" * 40)), model_revision_auto=True)
+    assert "model_revision_auto" not in auto.to_dict()
+    # the public spec still resubmits -- emitting the marker here would raise ConfigError
+    assert spec_from_dict(auto.to_dict()).model_revision == "c" * 40
+    assert auto.to_internal_dict()["model_revision_auto"] is True
+    assert JobSpec.from_dict(auto.to_internal_dict()).model_revision_auto is True
     assert JobSpec.from_json(auto.to_json()).model_revision_auto is True
 
     # a user cannot forge it: it is absent from _TOP_LEVEL_KEYS, so the public parser refuses it
@@ -1034,8 +1038,7 @@ def test_model_revision_auto_does_not_change_pre_existing_preparation_digests() 
         if not worker_payload.get(key):
             worker_payload.pop(key, None)
     worker_payload.pop("model_revision_auto", None)
-    public_payload = unmarked.to_dict()
-    public_payload.pop("model_revision_auto", None)
+    public_payload = unmarked.to_dict()  # to_dict() already strips the marker
 
     payload = json.dumps(
         {

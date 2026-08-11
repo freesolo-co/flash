@@ -24,6 +24,7 @@ from jsonschema.validators import validator_for  # noqa: F401
 
 from flash.core.spec import JobSpec
 from flash.runner import (
+    _internal_spec_from_status,
     effective_spec_from_status,
     # kept although this module no longer calls it: a deploy test patches
     # `serving.mark_deployed`, and `monkeypatch.setattr` needs the attribute to already exist.
@@ -245,9 +246,7 @@ def _validate_deploy_request(
 
     Returns the effective spec and the current deployment record for the caller to work from.
     """
-    # serving resolves the base model BY NAME (`deploy_adapter` takes no base-revision argument),
-    # so a pin the AUTHOR wrote is a request serving cannot honour: the run would train against one
-    # commit and serve whatever the catalog tag points at today. That silent mismatch stays refused.
+    # A pin the AUTHOR wrote is a request serving cannot honour, so it stays refused.
     #
     # A pin the RUNNER assigned is different. SFT is force-pinned by
     # `runner.submit.prepare_job` -> `_resolve_model_revision(required=True)` so workload profiling
@@ -255,7 +254,14 @@ def _validate_deploy_request(
     # made every SFT run, and every adapter warm-started from one, permanently undeployable --
     # which also blocks `flash models chat` and `flash env eval`, since both require a deployment.
     # The advice below ("train without model_revision") was impossible to follow for SFT.
-    if spec.model_revision and not spec.model_revision_auto:
+    #
+    # provenance is read from the INTERNAL worker spec, not `spec`: to_dict() strips the marker so
+    # the public spec stays re-parseable by the submission schema, so the public `spec` argument
+    # always reports False. `_internal_spec_from_status` prefers the persisted worker spec and
+    # falls back to the public one, which reads False for pre-upgrade runs -- correctly, since
+    # those carry no provenance and must keep failing closed.
+    auto_pinned = _internal_spec_from_status(status).model_revision_auto
+    if spec.model_revision and not auto_pinned:
         raise HTTPException(
             status_code=400,
             detail=(

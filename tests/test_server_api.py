@@ -3027,8 +3027,16 @@ def test_deploy_allows_runner_assigned_revision_pin(api):
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
     status = runner.get_status(run_id)
+    # pin BOTH halves of the persisted snapshot. `_validate_effective_spec` compares the public
+    # spec against effective_preparation.worker_spec structurally, so mutating only status.spec
+    # clears the 400 and then dies at 409 "persisted effective preparation does not match the
+    # public run" -- which would satisfy a bare `!= 400` while proving nothing about deployability.
     status.spec["model_revision"] = "a" * 40
     status.spec["model_revision_auto"] = True
+    snapshot = status.effective_preparation
+    assert isinstance(snapshot, dict), snapshot
+    snapshot["worker_spec"]["model_revision"] = "a" * 40
+    snapshot["worker_spec"]["model_revision_auto"] = True
     runner._save_status(status)
 
     response = api.post(
@@ -3037,7 +3045,9 @@ def test_deploy_allows_runner_assigned_revision_pin(api):
         headers=_bearer(key),
     )
 
-    assert response.status_code != 400, response.json()
+    # a coherent auto-pinned run deploys, so assert the success itself rather than the absence of
+    # one particular rejection
+    assert response.status_code == 200, response.json()
     assert "revision-pinned" not in json.dumps(response.json())
 
 

@@ -48,6 +48,54 @@ def _require_supported_adapter_continuation(spec: JobSpec) -> None:
         )
 
 
+def _adopted_warmstart_revision(spec: JobSpec, src_spec: JobSpec) -> JobSpec:
+    """Take the warm-start source's pin when the runner, not the author, chose it.
+
+    SFT is always force-pinned by ``_resolve_model_revision(required=True)``, and the warm-start
+    check demands the child's revision equal the source's. Satisfying it meant the AUTHOR writing
+    the sha into rl.toml, which makes the child's pin author-supplied, which deploy refuses. So a
+    warm start off SFT could pass that check or be deployable, never both. Inheriting the pin AND
+    its provenance gives the child the same immutable base its parent trained against and keeps it
+    deployable for the same reason the parent is.
+    """
+    if spec.model_revision or not src_spec.model_revision or not src_spec.model_revision_auto:
+        return spec
+    return replace(spec, model_revision=src_spec.model_revision, model_revision_auto=True)
+
+
+def _inherit_warmstart_revision(spec: JobSpec) -> JobSpec:
+    """Adopt a warm-start source's runner-assigned pin BEFORE the spec is sized against it.
+
+    Sizing reads the revision: ``resolve_model`` re-derives params/vocab/disk from the pinned
+    commit's geometry, and ``min_disk_gb`` becomes ``params_b * 2 + 64``, which for half of today's
+    catalog is strictly larger than the catalog default. Adopting the pin only inside
+    ``_prepare_init_from_adapter`` -- which runs after ``resolve_model``, ``_with_model_disk``, and
+    ``_assign_weight_cache_volume`` -- would provision the child as if unpinned while training it
+    pinned, and skip the geometry validation the pin exists to enforce.
+
+    Best-effort by design: every way the source can be unusable (unknown run, wrong org, wrong
+    model, missing artifacts) is diagnosed by ``_prepare_init_from_adapter`` with its own message
+    and its own error type. Raising here would report those as generic submission failures instead,
+    so an unreadable source simply leaves the spec untouched and the real check speaks.
+    """
+    ref = spec.train.init_from_adapter
+    if spec.model_revision or not ref or spec.algorithm == "sft":
+        return spec
+    from flash.schema import parse_checkpoint_ref
+
+    parsed = parse_checkpoint_ref(ref)
+    if parsed is None:
+        return spec
+    try:
+        src_status = _runner().get_status(parsed[0])
+        src_spec = _runner()._internal_spec_from_status(src_status)
+    except Exception:
+        return spec
+    if src_spec.model != spec.model:
+        return spec  # _prepare_init_from_adapter raises on this with the specific message
+    return _runner()._adopted_warmstart_revision(spec, src_spec)
+
+
 def _prepare_init_from_adapter(
     spec: JobSpec,
     *,
@@ -125,18 +173,10 @@ def _prepare_init_from_adapter_inner(
             f"train.init_from_adapter source model {src_spec.model!r} does not match target model "
             f"{spec.model!r}"
         )
-    if not spec.model_revision and src_spec.model_revision and src_spec.model_revision_auto:
-        # the source's pin was assigned by the runner, not written by its author (SFT is always
-        # force-pinned). requiring the child to restate it would make the child's pin AUTHORED,
-        # which deploy then refuses -- so a warm start off SFT could satisfy this check or be
-        # deployable, never both. inherit the pin AND its provenance instead: the child trains
-        # against the same immutable base its parent did, and stays deployable for the same reason
-        # the parent is.
-        spec = replace(
-            spec,
-            model_revision=src_spec.model_revision,
-            model_revision_auto=True,
-        )
+    # normally a no-op: `prepare_job` adopts the pin before it sizes anything. this repeats the
+    # decision for callers that reach the warm-start path directly, so the equality check below
+    # cannot depend on which entry point was used.
+    spec = _adopted_warmstart_revision(spec, src_spec)
     if src_spec.model_revision != spec.model_revision:
         raise ValueError(
             "train.init_from_adapter source model_revision "
@@ -254,14 +294,6 @@ def _preparation_digest(
     ):
         if not worker_payload.get(key):
             worker_payload.pop(key, None)
-    # same reason, public side: unlike the workload_profile_* carriers, to_dict() KEEPS
-    # model_revision_auto when set (deploy reads the persisted public spec and needs it), so it can
-    # reach the public payload too. A snapshot prepared before this field existed hashed a public
-    # spec without the key, so emitting it would fail integrity validation on recovery for every
-    # pre-upgrade run. Omit it when falsy; a True marker binds into the digest from here on, so
-    # tampering with the persisted value is still caught.
-    if not public_payload.get("model_revision_auto"):
-        public_payload.pop("model_revision_auto", None)
     # Restore since-removed keys the STORED payload carried, for the same reason as the omissions
     # above: the digest has to reproduce the bytes that were hashed, not today's serialization. A
     # pre-upgrade snapshot hashed `model_policy` in (to_internal_dict was asdict, so it emitted the
@@ -395,7 +427,10 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
 
 
 def _resolve_model_revision(spec: JobSpec, *, required: bool = False) -> JobSpec:
-    authored = spec.model_revision
+    # a pin already marked runner-assigned (inherited from a warm-start source) is not authored,
+    # even though it is present. reading presence alone would relabel it as the author's and hand
+    # deploy a pin it refuses -- the exact failure the marker exists to prevent.
+    authored = "" if spec.model_revision_auto else spec.model_revision
     if not authored and not required:
         return spec
     try:
