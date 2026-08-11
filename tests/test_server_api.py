@@ -2987,8 +2987,12 @@ def test_internal_owned_run_still_requires_matching_org_for_deployment_managemen
     assert calls == {"deploy": 1, "undeploy": 1}
 
 
-def test_deploy_rejects_revision_pinned_base_model(api):
+def test_deploy_allows_revision_pinned_base_model(api):
+    # Serving always loads one fixed checkpoint per base model regardless of which commit a run
+    # trained against, so a revision-pinned spec (every SFT run pins one, per
+    # `_resolve_model_revision(..., required=True)`) must still be deployable.
     import flash.runner as runner
+    from flash.core.spec import JobSpec
 
     key = _login()
     run_id = api.post(
@@ -2996,6 +3000,15 @@ def test_deploy_rejects_revision_pinned_base_model(api):
     ).json()["run_id"]
     status = runner.get_status(run_id)
     status.spec["model_revision"] = "a" * 40
+    public_spec = JobSpec.from_dict(status.spec)
+    snapshot = status.effective_preparation
+    worker_spec = replace(JobSpec.from_dict(snapshot["worker_spec"]), model_revision="a" * 40)
+    adapter_identity = snapshot.get("adapter_identity")
+    snapshot["worker_spec"] = worker_spec.to_internal_dict()
+    snapshot["preparation_digest"] = runner._preparation_digest(
+        public_spec, worker_spec, adapter_identity
+    )
+    status.effective_preparation = snapshot
     runner._save_status(status)
 
     response = api.post(
@@ -3004,8 +3017,8 @@ def test_deploy_rejects_revision_pinned_base_model(api):
         headers=_bearer(key),
     )
 
-    assert response.status_code == 400
-    assert "does not support revision-pinned base models" in response.json()["detail"]
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "dry_run"
 
 
 def test_deploy_dry_run_does_not_reconcile_unknown_alias(api, monkeypatch):

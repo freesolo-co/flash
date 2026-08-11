@@ -268,6 +268,65 @@ def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
         R._prepare_init_from_adapter(child, token="token")
 
 
+def test_prepare_init_adapter_inherits_unset_model_revision_from_source(monkeypatch):
+    """A warm-start child that leaves model_revision unset inherits the source's pin, instead of
+    having to copy the SHA by hand -- every SFT source is pinned automatically (required=True in
+    `_resolve_model_revision`), so this is the common case, not an edge case."""
+    import flash.adapters.lora_rank as rank_mod
+    import flash.runner as R
+    import flash.runner.results.checkpoints as checkpoints
+    from flash.core.spec import JobSpec
+
+    source = JobSpec.from_dict(
+        {
+            "run_id": "source-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "model_revision": "source-revision",
+            "algorithm": "sft",
+            "train": {"hf_repo": "owner/source-runs"},
+        }
+    )
+    source_status = provisioned_status(R, source, state="done")
+    child = JobSpec.from_dict(
+        {
+            "run_id": "child-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
+            "train": {"init_from_adapter": "source-run"},
+        }
+    )
+    monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
+    monkeypatch.setattr(rank_mod, "resolve_hf_dataset_revision", lambda repo, token: _REVISION)
+    monkeypatch.setattr(
+        checkpoints, "adapter_artifact_exists", lambda spec, *, step, revision=None: True
+    )
+    monkeypatch.setattr(
+        rank_mod,
+        "load_hf_adapter_config",
+        lambda *a, **k: {
+            "peft_type": "LORA",
+            "task_type": "CAUSAL_LM",
+            "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+            "r": 32,
+            "rank_pattern": {"module": 64},
+            "lora_alpha": 64,
+            "alpha_pattern": {"module": 128},
+        },
+    )
+    monkeypatch.setattr(
+        rank_mod,
+        "adapter_artifact_identity",
+        lambda *a, **k: rank_mod.AdapterArtifactIdentity(
+            "digest", "config", "adapter_model.safetensors", "weight:1"
+        ),
+    )
+
+    public_spec, worker_spec, _identity = R._prepare_init_from_adapter(child, token="token")
+
+    assert public_spec.model_revision == "source-revision"
+    assert worker_spec.model_revision == "source-revision"
+
+
 def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
     import types
 

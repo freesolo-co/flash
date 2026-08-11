@@ -245,14 +245,6 @@ def _validate_deploy_request(
 
     Returns the effective spec and the current deployment record for the caller to work from.
     """
-    if spec.model_revision:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "deployment does not support revision-pinned base models; "
-                "train without model_revision to deploy this run"
-            ),
-        )
     try:
         effective_spec = effective_spec_from_status(status)
     except ValueError as exc:

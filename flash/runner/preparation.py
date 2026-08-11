@@ -125,12 +125,17 @@ def _prepare_init_from_adapter_inner(
             f"train.init_from_adapter source model {src_spec.model!r} does not match target model "
             f"{spec.model!r}"
         )
-    if src_spec.model_revision != spec.model_revision:
-        raise ValueError(
-            "train.init_from_adapter source model_revision "
-            f"{src_spec.model_revision!r} does not match target model_revision "
-            f"{spec.model_revision!r}"
-        )
+    if spec.model_revision:
+        if src_spec.model_revision != spec.model_revision:
+            raise ValueError(
+                "train.init_from_adapter source model_revision "
+                f"{src_spec.model_revision!r} does not match target model_revision "
+                f"{spec.model_revision!r}"
+            )
+    else:
+        # The caller didn't pin one: inherit the source's, so both sides train on the identical
+        # base-model commit without making every warm-start caller copy the SHA by hand.
+        spec = replace(spec, model_revision=src_spec.model_revision)
     if not src_spec.train.hf_repo:
         raise ValueError(
             f"train.init_from_adapter run {src_run_id!r} has no stored adapter artifacts"
