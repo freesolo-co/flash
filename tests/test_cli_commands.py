@@ -795,6 +795,29 @@ def test_training_guide_says_env_eval_rejects_the_id_it_scaffolds(monkeypatch, t
     assert "`flash env test` is unaffected" in guide
 
 
+def test_training_guide_says_a_private_env_repo_needs_a_plane_side_token(
+    monkeypatch, tmp_path
+) -> None:
+    """The scaffold tells a self-hoster to point at their own repo without naming the token it needs.
+
+    `_github_token` (flash/envs/loader.py) reads `GITHUB_TOKEN` from the resolving process's own
+    environment and there is no spec or client field that carries one, so a private repo resolves as
+    missing no matter what the operator has exported locally. The guide has to name where the token
+    belongs, since the failure surfaces as an unreadable ref rather than an auth error.
+    """
+    import inspect
+
+    from flash.envs import loader
+
+    # the premise: the token comes from the plane's process env, not from anything the client sends
+    source = inspect.getsource(loader._github_token)
+    assert 'os.environ.get("GITHUB_TOKEN")' in source
+
+    guide = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")["TRAINING.md"]
+    assert "A private repository needs `GITHUB_TOKEN` on the plane, not in your shell" in guide
+    assert "forwards no credential of" in guide
+
+
 def test_training_guide_names_the_self_hosted_opd_broker_settings(monkeypatch, tmp_path) -> None:
     """The "key stays managed" line is hosted-only; a self-hoster runs the broker themselves.
 

@@ -171,6 +171,12 @@ Direct `github:` ids need the plane started with `FLASH_STANDALONE=1`. A plane r
 identity backend rejects them with a 400 and accepts only managed hub ids, so check your server's
 configuration before pasting one in — the CLI cannot see that setting to check it for you.
 
+**A private repository needs `GITHUB_TOKEN` on the plane, not in your shell.** The ref is fetched by
+the control plane, which authenticates with its own `GITHUB_TOKEN` and forwards no credential of
+yours — so a private repo that you can clone locally still resolves as missing unless the plane
+itself holds a token that can read it. Either keep the environment repo public, or export a
+`GITHUB_TOKEN` with read access in the control plane's environment.
+
 `flash env eval` does not accept a `github:` id. It grades against a _published_ environment so the
 report can be filed under that identity, and refuses any reference that names no hub page — so on a
 standalone plane, the two commands below that mention it (`env eval` with `--split`/`--param`, and
