@@ -13,6 +13,21 @@ from collections.abc import Callable
 from pathlib import Path
 
 
+def _readable(path: Path) -> str:
+    """The file's text, or "" when it is missing or cannot be read as UTF-8.
+
+    Every caller here is advisory: the warning tells the operator a retained file describes the
+    wrong plane, and setup proceeds either way. A strict `read_text(encoding="utf-8")` would let a
+    valid non-UTF-8 source file (PEP 263 declares an encoding, so latin-1 Python is legal) abort the
+    whole command with a `UnicodeDecodeError` -- turning an advisory into a fatal error on a file
+    setup is deliberately not touching. An unreadable file simply matches no marker.
+    """
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
 def _warn_if_retained_starter_files_describe_another_plane(
     starter_files: tuple[Path, ...],
     *,
@@ -46,15 +61,9 @@ def _warn_if_retained_starter_files_describe_another_plane(
         "this plane is self-hosted, so publishing",  # environment.py
         "`flash env eval` currently requires a managed hub environment",  # evaluations.py
     )
+    wanted = self_hosted_markers if can_publish else (push_marker,)
     mismatched = [
-        path
-        for path in starter_files
-        if path.exists()
-        and (
-            any(marker in path.read_text(encoding="utf-8") for marker in self_hosted_markers)
-            if can_publish
-            else push_marker in path.read_text(encoding="utf-8")
-        )
+        path for path in starter_files if any(marker in _readable(path) for marker in wanted)
     ]
     if not mismatched:
         return

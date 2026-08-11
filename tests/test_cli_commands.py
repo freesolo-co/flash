@@ -744,6 +744,34 @@ def test_training_guide_caveats_every_managed_hub_command_block(monkeypatch, tmp
     assert "push/pull/delete act on Freesolo's managed hub" in guide
 
 
+def test_retained_file_probe_never_makes_an_advisory_warning_fatal(tmp_path) -> None:
+    """An unreadable retained file must not abort setup from inside an advisory check.
+
+    PEP 263 lets a source file declare a non-UTF-8 encoding, so latin-1 Python is valid and a strict
+    `read_text(encoding="utf-8")` raises `UnicodeDecodeError` on it. Setup deliberately does not
+    touch these files, so a probe that only decides whether to PRINT a warning must never be the
+    thing that fails the command -- an undecodable file matches no marker instead.
+
+    The second half is what makes the tolerance safe: swallowing the error must not swallow the
+    warning for a readable sibling scaffolded beside it.
+    """
+    from flash.cli.commands.env.retained import (
+        _warn_if_retained_starter_files_describe_another_plane as check,
+    )
+
+    undecodable = tmp_path / "evaluations.py"
+    undecodable.write_bytes(b"# -*- coding: latin-1 -*-\n# caf\xe9\nx = 1\n")
+    hosted = tmp_path / "environment.py"
+    hosted.write_text("upload with `flash env push --project ANY-UUID --name my-env .`")
+
+    warnings: list[str] = []
+    check((undecodable, hosted), can_publish=False, warn=warnings.append)
+
+    assert len(warnings) == 1, "the readable sibling must still warn"
+    assert "environment.py" in warnings[0]
+    assert "evaluations.py" not in warnings[0]
+
+
 def test_retained_hosted_docs_are_detected_across_a_project_change(tmp_path) -> None:
     """Detection must not interpolate the current uuid, or a project change hides the stale files.
 
