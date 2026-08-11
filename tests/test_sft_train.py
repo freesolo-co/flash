@@ -2281,12 +2281,18 @@ def test_sft_hardware_ranking_prices_the_profiled_batch_not_the_authored_one(mon
 def test_sft_idle_card_warning_only_recommends_widths_that_actually_work():
     """A remedy that cannot be acted on is worse than no remedy.
 
-    Two ways the earlier wording failed. It routed the card advice through
+    Three ways the earlier wording failed. It routed the card advice through
     `largest_rentable_count(world_size)`, which is the next power of two DOWN and need not divide
     the batch or the rows either -- at 4 cards with a batch of 3 it named 2, and 2 does not divide
     3. And it advised raising `batch_size` whenever the batch was above 1, including when the batch
     already divided the allocation and the ROWS were what bound the width, where raising the batch
     changes nothing.
+
+    Fixing the first by re-resolving under a rentable ceiling then broke rentability instead:
+    `sft_data_parallel_cards` searches DOWNWARD for a divisor, so it walks back off the power-of-two
+    grid and named 3 cards at 7/batch 6/rows 6. Divisibility and rentability are independent, so the
+    sweep below asserts BOTH -- it passed on that revision while providers sold none of what it
+    advised.
     """
     import contextlib
     import io
@@ -2294,6 +2300,7 @@ def test_sft_idle_card_warning_only_recommends_widths_that_actually_work():
 
     from flash.engine.plan.steps import sft_data_parallel_cards
     from flash.engine.worker.sft_train_runner import _resolve_sft_world_size
+    from flash.providers.base import rentable_gpu_counts
 
     def warn(cards, batch, rows):
         buf = io.StringIO()
@@ -2313,8 +2320,9 @@ def test_sft_idle_card_warning_only_recommends_widths_that_actually_work():
     assert "a batch of 3" in text, text
     assert "batch_size" in text, text
 
-    # every width this warning recommends must divide both the batch and the rows -- the rentable
-    # count alone does not (4 cards, batch 3 -> largest_rentable_count(3) == 2, and 3 % 2 != 0).
+    # every width this warning recommends must be BOTH rentable and usable. neither implies the
+    # other: the rentable count need not divide the batch (4 cards, batch 3 -> 2, and 3 % 2 != 0),
+    # and a divisor need not be rentable (7 cards, batch 6, rows 6 -> 3, which nobody sells).
     for cards in range(1, 9):
         for batch in range(1, 17):
             for rows in range(1, 32):
@@ -2325,9 +2333,13 @@ def test_sft_idle_card_warning_only_recommends_widths_that_actually_work():
                 found = re.search(r"allocate (\d+) card", text)
                 assert found, text
                 advised = int(found.group(1))
+                assert advised in rentable_gpu_counts(cards), (
+                    f"advised {advised} cards at {cards}/{batch}/{rows}: not a shape providers rent"
+                )
                 assert batch % advised == 0, (cards, batch, rows, advised)
                 assert rows % advised == 0, (cards, batch, rows, advised)
                 assert advised == sft_data_parallel_cards(advised, batch, rows)
+                assert advised <= width, "advising more cards than the run can use is the same bug"
 
 
 def test_sft_quote_credits_the_width_the_rows_allow_not_just_the_batch():

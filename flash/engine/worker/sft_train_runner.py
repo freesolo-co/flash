@@ -15,7 +15,7 @@ from math import gcd
 
 from flash.engine.plan.steps import sft_data_parallel_cards
 from flash.engine.worker import sft_train as _sft_train
-from flash.providers.base import largest_rentable_count
+from flash.providers.base import rentable_gpu_counts
 
 RECIPE = _sft_train.RECIPE
 _w = _sft_train._w
@@ -349,6 +349,23 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
     )
 
 
+def _widest_rentable_width(max_cards: int, train_batch_size: int, row_count: int) -> int:
+    """Widest allocation that is both rentable and fully usable by SFT, at most ``max_cards``.
+
+    Two constraints, and only counts meeting BOTH are worth advising: providers sell powers of two
+    (`rentable_gpu_counts`), and SFT needs the width to divide the batch and the row count or it is
+    back to idling cards. Neither implies the other, so this searches the rentable shapes rather
+    than clamping a resolved width -- `sft_data_parallel_cards` walks downward to find a divisor and
+    happily returns 3 or 5, which are not shapes anyone can allocate. 1 always qualifies.
+    """
+    batch = max(1, int(train_batch_size))
+    rows = max(0, int(row_count))
+    for count in rentable_gpu_counts(max_cards):
+        if batch % count == 0 and (rows == 0 or rows % count == 0):
+            return count
+    return 1
+
+
 def _resolve_sft_world_size(gpu_count: int, train_batch_size: int, row_count: int) -> int:
     """Ranks to launch, warning when that is fewer than the cards the run is paying for.
 
@@ -381,14 +398,14 @@ def _resolve_sft_world_size(gpu_count: int, train_batch_size: int, row_count: in
         #    move this width at all.
         #  - when the batch already divides the allocation, the ROWS are what bind, and raising
         #    the batch again changes nothing.
-        #  - only powers of two are rentable, and the next one down need not divide the batch or
-        #    the rows either: at 4 cards with a batch of 3, `largest_rentable_count(3)` is 2, and
-        #    2 does not divide 3. so re-resolve at the rentable count and name a width that is
-        #    actually usable.
+        #  - only powers of two are rentable, and the resolved width usually is not one. it cannot
+        #    simply be re-resolved under a rentable ceiling either: `sft_data_parallel_cards`
+        #    searches DOWNWARD for divisibility and lands back off the power-of-two grid, so at 7
+        #    cards with a batch of 6 over 6 rows it would advise 3, which no provider sells. the
+        #    advised width has to satisfy both constraints at once, so search the rentable shapes
+        #    themselves and take the widest that divides the batch and the rows.
         rows_bind = train_batch_size % gpu_count == 0
-        rentable = sft_data_parallel_cards(
-            largest_rentable_count(world_size), train_batch_size, row_count
-        )
+        rentable = _widest_rentable_width(world_size, train_batch_size, row_count)
         limiter = (
             f"a dataset of {row_count} rows" if rows_bind else f"a batch of {train_batch_size}"
         )
