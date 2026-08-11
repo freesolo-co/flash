@@ -24,6 +24,7 @@ from jsonschema.validators import validator_for  # noqa: F401
 
 from flash.core.spec import JobSpec
 from flash.runner import (
+    _internal_spec_from_status,
     effective_spec_from_status,
     # kept although this module no longer calls it: a deploy test patches
     # `serving.mark_deployed`, and `monkeypatch.setattr` needs the attribute to already exist.
@@ -245,7 +246,22 @@ def _validate_deploy_request(
 
     Returns the effective spec and the current deployment record for the caller to work from.
     """
-    if spec.model_revision:
+    # A pin the AUTHOR wrote is a request serving cannot honour, so it stays refused.
+    #
+    # A pin the RUNNER assigned is different. SFT is force-pinned by
+    # `runner.submit.prepare_job` -> `_resolve_model_revision(required=True)` so workload profiling
+    # keys on an immutable commit; the user never asked for it and cannot opt out. Rejecting those
+    # made every SFT run, and every adapter warm-started from one, permanently undeployable --
+    # which also blocks `flash models chat` and `flash env eval`, since both require a deployment.
+    # The advice below ("train without model_revision") was impossible to follow for SFT.
+    #
+    # provenance is read from the INTERNAL worker spec, not `spec`: to_dict() strips the marker so
+    # the public spec stays re-parseable by the submission schema, so the public `spec` argument
+    # always reports False. `_internal_spec_from_status` prefers the persisted worker spec and
+    # falls back to the public one, which reads False for pre-upgrade runs -- correctly, since
+    # those carry no provenance and must keep failing closed.
+    auto_pinned = _internal_spec_from_status(status).model_revision_auto
+    if spec.model_revision and not auto_pinned:
         raise HTTPException(
             status_code=400,
             detail=(
@@ -539,7 +555,13 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 dest_token=hf_token,
                 private=private,
                 base_model=spec.model,
-                base_model_revision=spec.model_revision,
+                # the effective half, not the public one: a runner-assigned pin is stripped from
+                # the public spec (it cannot carry the marker that labels it), so `spec` reads "".
+                # the worker stamps the real sha into adapter_config.json from its internal spec,
+                # and export refuses a stamped revision that disagrees with what it is handed --
+                # so reading the public half here 404s every auto-pinned sft run and every warm
+                # start that inherited its pin.
+                base_model_revision=effective_spec.model_revision,
             )
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -687,6 +709,11 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
     ] or None
     try:
         if payload.get("stream") is True:
+            # serve_chat_stream sends the upstream request and validates its status at call
+            # time, so an upstream 4xx/5xx raises here, inside the try, and becomes a real 502
+            # before the 200 headers are flushed. a failure after the first byte propagates out
+            # of the body iterator instead, which aborts the chunked response so the client
+            # cannot mistake the truncation for a finished answer.
             return StreamingResponse(
                 _app.serve_chat_stream(
                     run_id=serving_model,

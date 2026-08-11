@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import io
+import json
 import math
+import sqlite3
+import time
+import urllib.error
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -315,3 +320,281 @@ def test_score_many_stops_billing_requests_after_one_fails():
     # failure point, not an equality: the exact count depends on how many workers have picked up
     # work when the raise lands. an input-order consumer scores 64 here and fails this.
     assert len(executed) <= OPD_TEACHER_SCORING_CONCURRENCY + 6, len(executed)
+
+
+# --------------------------------------------------------------------------------------------------
+# transient-failure retry through the real broker and ledger
+# --------------------------------------------------------------------------------------------------
+class _WholeTextTokenizer:
+    def encode(self, text):
+        return [EncodedTeacherToken(7, 0, len(text))]
+
+
+class _StaticResponse:
+    def __init__(self, body):
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self):
+        return self._body
+
+
+class _LedgerBrokerTransport:
+    """Drive the worker client through the real broker and sqlite ledger in-process."""
+
+    def __init__(self, token, *, drop_responses=0):
+        self.token = token
+        self.drop_responses = drop_responses
+        self.request_ids = []
+
+    def urlopen(self, request, *, timeout):
+        del timeout
+        from flash.server.domain import teacher_broker
+
+        request_id = dict(request.header_items())["X-flash-teacher-request-id"]
+        self.request_ids.append(request_id)
+        try:
+            response = teacher_broker.complete_teacher_request(
+                capability_token=self.token,
+                request_id=request_id,
+                raw_body=request.data,
+            )
+        except teacher_broker.TeacherBrokerError as error:
+            raise urllib.error.HTTPError(
+                request.full_url,
+                error.status_code,
+                error.code,
+                {},
+                io.BytesIO(json.dumps(error.payload()).encode()),
+            ) from None
+        if self.drop_responses > 0:
+            self.drop_responses -= 1
+            raise ConnectionResetError("worker-side response loss")
+        return _StaticResponse(json.dumps(response).encode())
+
+
+def _parasail_success():
+    return json.dumps(
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "prompt_token_ids": [7],
+                    "token_ids": [8],
+                    "prompt_logprobs": [{"7": {"logprob": -0.1, "decoded_token": "answer"}}],
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+    ).encode()
+
+
+@pytest.fixture
+def broker_ledger(monkeypatch, tmp_path):
+    from flash.server.domain import teacher_broker
+    from flash.server.platform import db
+
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
+    owner = db.ensure_internal_key("test-owner-key")
+    db.record_run("run-1", owner["id"])
+    monkeypatch.setattr(teacher_broker, "_require_current_attempt", lambda _capability: None)
+    monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
+    return db.issue_teacher_capability(
+        run_id="run-1",
+        attempt=2,
+        teacher_alias="glm-5.2",
+        provider=teacher_broker.PARASAIL_PROVIDER,
+        model="parasail-glm-52",
+        scoring_mode=teacher_broker.PARASAIL_SCORING_MODE,
+        expires_at=time.time() + 600,
+        limits={
+            "max_requests": 8,
+            "max_score_items": 8,
+            "max_request_bytes": teacher_broker.MAX_REQUEST_BODY_BYTES,
+            "max_response_bytes": teacher_broker.MAX_RESPONSE_BODY_BYTES,
+            "max_concurrency": 2,
+            "max_upstream_attempts": teacher_broker.MAX_UPSTREAM_ATTEMPTS,
+            "max_request_tokens": 128,
+            "max_total_tokens": 512,
+        },
+    )
+
+
+def _ledger_client(token, *, drop_responses=0):
+    client = TeacherClient(
+        token,
+        "https://plane.example",
+        "parasail-glm-52",
+        tokenizer=_WholeTextTokenizer(),
+    )
+    transport = _LedgerBrokerTransport(token, drop_responses=drop_responses)
+    client._transport = transport
+    return client, transport
+
+
+def _ledger_row(request_id):
+    from flash.server.platform import db
+
+    connection = sqlite3.connect(db.DB_PATH)
+    row = connection.execute(
+        "SELECT state, upstream_attempt_count, provider_status, error_class, "
+        "input_tokens, output_tokens FROM teacher_score_requests WHERE request_id = ?",
+        (request_id,),
+    ).fetchone()
+    connection.close()
+    return row
+
+
+def test_provider_500_then_success_retries_same_request_and_bills_once(broker_ledger, monkeypatch):
+    from flash.engine.worker.teacher import client as worker_teacher
+    from flash.server.domain import teacher_broker
+
+    outcomes = [(500, b"provider incident"), (200, _parasail_success())]
+    dispatches = []
+
+    def dispatch(*_args):
+        dispatches.append(1)
+        return outcomes[len(dispatches) - 1]
+
+    monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
+    sleeps = []
+    monkeypatch.setattr(worker_teacher.time, "sleep", sleeps.append)
+    client, transport = _ledger_client(broker_ledger)
+
+    scored = client.score("question", "answer")
+
+    assert scored.input_tokens == 1
+    assert scored.output_tokens == 1
+    assert len(dispatches) == 2
+    assert len(transport.request_ids) == 2
+    assert len(set(transport.request_ids)) == 1
+    assert sleeps == [2.0]
+    state, attempts, _status, _error, input_tokens, output_tokens = _ledger_row(
+        transport.request_ids[0]
+    )
+    assert (state, attempts) == ("succeeded", 2)
+    # billed once: usage is recorded only on the single terminal succeeded completion.
+    assert (input_tokens, output_tokens) == (1, 1)
+
+
+def test_provider_429_is_retried_with_bounded_backoff(broker_ledger, monkeypatch):
+    from flash.engine.worker.teacher import client as worker_teacher
+    from flash.server.domain import teacher_broker
+
+    outcomes = [(429, b"rate limited"), (429, b"rate limited"), (200, _parasail_success())]
+    dispatches = []
+
+    def dispatch(*_args):
+        dispatches.append(1)
+        return outcomes[len(dispatches) - 1]
+
+    monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
+    sleeps = []
+    monkeypatch.setattr(worker_teacher.time, "sleep", sleeps.append)
+    client, transport = _ledger_client(broker_ledger)
+
+    scored = client.score("question", "answer")
+
+    assert scored.input_tokens == 1
+    assert len(dispatches) == 3
+    assert len(set(transport.request_ids)) == 1
+    # exponential backoff between attempts, not a hot loop against a rate-limited provider.
+    assert sleeps == [2.0, 4.0]
+    state, attempts, _status, _error, input_tokens, output_tokens = _ledger_row(
+        transport.request_ids[0]
+    )
+    assert (state, attempts) == ("succeeded", 3)
+    assert (input_tokens, output_tokens) == (1, 1)
+
+
+def test_ambiguous_provider_transport_failure_is_retried_and_billed_once(
+    broker_ledger, monkeypatch
+):
+    from flash.engine.worker.teacher import client as worker_teacher
+    from flash.server.domain import teacher_broker
+
+    dispatches = []
+
+    def dispatch(*_args):
+        dispatches.append(1)
+        if len(dispatches) == 1:
+            raise ConnectionResetError("provider connection dropped mid-call")
+        return 200, _parasail_success()
+
+    monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
+    monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
+    client, transport = _ledger_client(broker_ledger)
+
+    scored = client.score("question", "answer")
+
+    assert scored.input_tokens == 1
+    assert len(dispatches) == 2
+    assert len(set(transport.request_ids)) == 1
+    state, attempts, _status, _error, input_tokens, output_tokens = _ledger_row(
+        transport.request_ids[0]
+    )
+    assert (state, attempts) == ("succeeded", 2)
+    assert (input_tokens, output_tokens) == (1, 1)
+
+
+def test_lost_worker_response_replays_the_succeeded_result_without_a_second_bill(
+    broker_ledger, monkeypatch
+):
+    from flash.engine.worker.teacher import client as worker_teacher
+    from flash.server.domain import teacher_broker
+
+    dispatches = []
+
+    def dispatch(*_args):
+        dispatches.append(1)
+        return 200, _parasail_success()
+
+    monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
+    monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
+    # the broker settles the request as succeeded, then the worker loses the response in
+    # transit. the retry with the same request_id must replay from the ledger, not redispatch.
+    client, transport = _ledger_client(broker_ledger, drop_responses=1)
+
+    scored = client.score("question", "answer")
+
+    assert scored.input_tokens == 1
+    assert len(dispatches) == 1
+    assert len(transport.request_ids) == 2
+    assert len(set(transport.request_ids)) == 1
+    state, attempts, _status, _error, input_tokens, output_tokens = _ledger_row(
+        transport.request_ids[0]
+    )
+    assert (state, attempts) == ("succeeded", 1)
+    assert (input_tokens, output_tokens) == (1, 1)
+
+
+def test_provider_401_rejection_stays_permanent_and_never_retries(broker_ledger, monkeypatch):
+    from flash.engine.worker.teacher import client as worker_teacher
+    from flash.server.domain import teacher_broker
+
+    dispatches = []
+
+    def dispatch(*_args):
+        dispatches.append(1)
+        return 401, b"invalid provider key"
+
+    monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
+    monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
+    client, transport = _ledger_client(broker_ledger)
+
+    with pytest.raises(TeacherError, match="provider_rejected") as error:
+        client.score("question", "answer")
+
+    assert error.value.permanent is True
+    assert len(dispatches) == 1
+    assert len(transport.request_ids) == 1
+    state, attempts, status, error_class, input_tokens, output_tokens = _ledger_row(
+        transport.request_ids[0]
+    )
+    assert (state, attempts, status, error_class) == ("provider_rejected", 1, 401, "permanent")
+    assert (input_tokens, output_tokens) == (0, 0)
