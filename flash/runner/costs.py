@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import replace
 
@@ -71,6 +72,42 @@ def charge_usd_for_spec(spec, *, steps: int | None = None, fallback: float = 0.0
         return float(estimate_cost(cfg).total_usd)
     except Exception:
         return float(fallback)
+
+
+def cancelled_charge_usd(status: RunStatus, spec, *, steps: int, fallback: float = 0.0) -> float:
+    """Price a mid-training cancellation from the accepted quote, prorated by completed steps.
+
+    the persisted quote (``estimated_cost_usd``) carries the exact live rate the user accepted: the
+    lifecycle refreshes it from the selected candidate before provisioning. repricing the spec with
+    ``estimate_cost`` instead takes the offline static-rate path, and on live-market providers
+    (vast, lambda) those rates differ materially from the accepted one, so a cancel near completion
+    could bill above the quote the run would have been charged on success. so the cancel charge is
+    the quote scaled linearly by ``steps / planned steps``, which by construction never exceeds the
+    quote. a run with no persisted quote falls back to the spec reprice, clamped to nothing here
+    because there is no quote to clamp to.
+    """
+    n = max(0, int(steps))
+    if n == 0:
+        # cancelled before any training step: nothing rented, nothing owed.
+        return 0.0
+    quote = getattr(status, "estimated_cost_usd", None)
+    if quote is None:
+        return runner.charge_usd_for_spec(spec, steps=n, fallback=fallback)
+    quote = float(quote)
+    try:
+        from flash.cost.spec import runconfig_from_spec
+
+        planned = int(runconfig_from_spec(spec).steps or 0)
+    except Exception:
+        planned = 0
+    if planned > 0:
+        return quote * min(n, planned) / planned
+    # planned steps unknown: reprice the spec but never bill a cancel above the accepted quote.
+    # a non-finite reprice is a pricing failure and must propagate so the caller records it.
+    repriced = runner.charge_usd_for_spec(spec, steps=n, fallback=fallback)
+    if not math.isfinite(repriced):
+        return repriced
+    return min(repriced, quote)
 
 
 def _status_estimated_charge(status: RunStatus, spec, *, fallback: float = 0.0) -> float:

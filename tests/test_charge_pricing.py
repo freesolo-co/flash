@@ -1,5 +1,6 @@
 """Customer-charge pricing: a completed run is charged its QUOTE (the flash.cost estimate at planned
-steps); a run cancelled mid-training is re-priced to the SAME estimate at the steps it actually ran."""
+steps); a run cancelled mid-training bills the persisted quote prorated by the steps it actually
+ran (never above the quote), falling back to a spec reprice only when no quote was persisted."""
 
 from __future__ import annotations
 
@@ -114,6 +115,28 @@ def test_charge_usd_for_spec_falls_back_when_unpriceable():
     assert runner.charge_usd_for_spec(object(), steps=5, fallback=2.0) == 2.0
 
 
+def test_cancelled_charge_usd_prorates_and_clamps_to_the_quote():
+    # the persisted quote carries the accepted live rate, so a cancel bills a linear share of it
+    # by completed steps and can never exceed it.
+    spec = _spec()  # 20 planned steps
+    st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=8.0)
+    assert runner.cancelled_charge_usd(st, spec, steps=0) == 0.0
+    assert runner.cancelled_charge_usd(st, spec, steps=10) == 4.0
+    assert runner.cancelled_charge_usd(st, spec, steps=20) == 8.0
+    # a step count beyond the plan still caps at the full quote.
+    assert runner.cancelled_charge_usd(st, spec, steps=25) == 8.0
+
+
+def test_cancelled_charge_usd_falls_back_to_reprice_without_a_quote():
+    # a run persisted before quotes existed has nothing to prorate; the spec reprice still bills it.
+    spec = _spec()
+    st = runner.RunStatus(run_id="r", state="cancelled", spec={})
+    assert runner.cancelled_charge_usd(st, spec, steps=10) == runner.charge_usd_for_spec(
+        spec, steps=10
+    )
+    assert runner.cancelled_charge_usd(st, spec, steps=0) == 0.0
+
+
 # --------------------------------------------------------------------------- actual steps
 
 
@@ -170,9 +193,70 @@ def test_cancel_run_prices_mid_training_cancel_at_actual_steps(monkeypatch, tmp_
 
     st = runner.get_status("run-1")
     assert st.state == "cancelled"
-    # re-priced to the estimate at the 10 steps it ran: > 0 and less than the full 20-step quote.
+    # no persisted quote on this status, so the cancel falls back to re-pricing the spec at the
+    # 10 steps it ran: > 0 and less than the full 20-step quote.
     assert st.cost_usd == runner.charge_usd_for_spec(spec, steps=10)
     assert 0 < st.cost_usd < runner.charge_usd_for_spec(spec)
+
+
+def test_cancel_near_completion_never_bills_above_the_accepted_quote(monkeypatch, tmp_path):
+    """when the accepted live rate is below today's static rate, a near-complete cancel must bill
+    a prorated share of the persisted quote, not the (higher) offline static-rate reprice."""
+    from flash.runner.supervise import deploy
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)
+    spec = _spec()  # 20 planned steps
+    static_reprice = runner.charge_usd_for_spec(spec, steps=19)
+    # the user accepted a live-market quote at half the static rate for the full run.
+    accepted_quote = runner.charge_usd_for_spec(spec) / 2
+    assert static_reprice > accepted_quote  # the overbilling hazard this fix removes
+    runner._save_status(
+        runner.RunStatus(
+            run_id="run-1",
+            state="running",
+            spec=spec.to_dict(),
+            billing_context={"org_id": "o"},
+            billing_state="pending",
+            estimated_cost_usd=accepted_quote,
+            last_heartbeat={"stage": "rl_step", "step": 19},
+        )
+    )
+
+    deploy.cancel_run("run-1")
+
+    st = runner.get_status("run-1")
+    assert st.state == "cancelled"
+    # prorated share of the accepted quote, strictly under both the quote and the static reprice.
+    assert st.cost_usd == accepted_quote * 19 / 20
+    assert st.cost_usd < accepted_quote
+    assert st.cost_usd < static_reprice
+
+
+def test_cancel_run_prorates_the_persisted_quote(monkeypatch, tmp_path):
+    from flash.runner.supervise import deploy
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)
+    spec = _spec()  # 20 planned steps
+    runner._save_status(
+        runner.RunStatus(
+            run_id="run-1",
+            state="running",
+            spec=spec.to_dict(),
+            billing_context={"org_id": "o"},
+            billing_state="pending",
+            estimated_cost_usd=8.0,
+            last_heartbeat={"stage": "rl_step", "step": 10},
+        )
+    )
+
+    deploy.cancel_run("run-1")
+
+    st = runner.get_status("run-1")
+    assert st.state == "cancelled"
+    # half the steps -> half the accepted quote.
+    assert st.cost_usd == 4.0
 
 
 def test_cancel_run_before_any_step_is_free(monkeypatch, tmp_path):
