@@ -400,7 +400,7 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
         "gpu": {},
         "train": {
             "learning_rate": 3e-5,
-            "batch_size": 16,
+            "prompts_per_step": 16,
             "max_context_tokens": 2048,
             "save_every": 5,
             "max_completion_tokens": 512,
@@ -410,7 +410,7 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
     spec = spec_from_dict(raw, run_id="grpo-z")
     for s in (spec, JobSpec.from_dict(spec.to_dict())):  # server parse + worker re-parse
         assert s.train.learning_rate == 3e-5
-        assert s.train.batch_size == 16
+        assert s.train.prompts_per_step == 16
         assert s.train.max_context_tokens == 2048
         assert s.train.save_every == 5
         assert s.train.max_completion_tokens == 512

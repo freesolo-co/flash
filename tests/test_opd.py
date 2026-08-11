@@ -1399,7 +1399,7 @@ def test_opd_spec_json_round_trip():
             "train": {
                 "epochs": 25,
                 "max_examples": 8,
-                "batch_size": 8,
+                "prompts_per_step": 8,
             },
         },
         run_id="x",

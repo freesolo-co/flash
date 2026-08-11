@@ -1443,7 +1443,7 @@ def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeyp
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
-            "train": {"batch_size": 16, "epochs": 2},
+            "train": {"prompts_per_step": 16, "epochs": 2},
         }
     )
     monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
@@ -5172,7 +5172,7 @@ def _resolved_inputs_for_notes(monkeypatch):
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
-            "train": {"batch_size": 16, "epochs": 2},
+            "train": {"prompts_per_step": 16, "epochs": 2},
         }
     )
     monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
