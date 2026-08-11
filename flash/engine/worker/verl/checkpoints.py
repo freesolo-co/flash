@@ -32,12 +32,16 @@ def _model_shard_bytes(path: str) -> int:
 
     checkpoints are staged with hardlinks, so the same inode can appear under several paths; counting
     it twice would overstate the very number this guard compares against free space.
+
+    shares `_FSDP_SHARD_RE` with `checkpoint_world_size` rather than matching the name a second way:
+    one definition of what a shard filename is, so a future change to verl's layout cannot leave the
+    two disagreeing about which files a merge reads.
     """
     seen: set[tuple[int, int]] = set()
     total = 0
     for root, _dirs, files in os.walk(path, followlinks=False):
         for name in files:
-            if not name.startswith("model_world_size_"):
+            if _FSDP_SHARD_RE.fullmatch(name) is None:
                 continue
             try:
                 stat = os.lstat(os.path.join(root, name))
