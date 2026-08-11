@@ -194,6 +194,49 @@ from flash.envs.github_urls import (  # noqa: E402
 )
 
 
+def _classify_github_http_error(
+    exc: urllib.error.HTTPError,
+    body_deadline: float | None,
+    attempt: int,
+    max_rate_limit_retries: int,
+) -> bool:
+    """Whether this non-2xx should be retried; raises the classified failure when it should not.
+
+    Returns ``True`` for a transient status with retries left. Otherwise it raises rather than
+    returning, so the decision and the terminal exception cannot drift apart: a rate limit and a 5xx
+    become ``GitHubRateLimitError`` (the retriable signal a caller maps to 429/502), and anything else
+    a plain ``RuntimeError``. ``throttled`` separates real throttling from an upstream outage.
+    """
+    # urllib can raise an HTTPError with fp=None; exc.read() is an AttributeError there. the read can
+    # also truncate: GitHub can return a 429/5xx and then drop the connection. that must not propagate
+    # -- the caller is inside its own `except HTTPError` handler, and Python does not offer an
+    # exception raised there to that block's sibling clause, so a truncated error body would escape
+    # unretried as an uncaught 500 instead of the classified 429/502. the status and headers still
+    # classify the failure, so an unreadable body just goes empty.
+    try:
+        body = _read_error_body(exc, body_deadline)
+    except (OSError, http.client.HTTPException):
+        # OSError covers ConnectionError and the TLS teardowns; HTTPException covers the framing
+        # faults, which are not OSErrors. A bare OSError clause is safe HERE, unlike in `_urlopen`'s
+        # transient clause: this reads GitHub's error body, never the caller's sink.
+        body = ""
+    remaining = (exc.headers.get("X-RateLimit-Remaining") if exc.headers else None) or ""
+    is_rate_limit = exc.code == 429 or (
+        exc.code == 403 and (remaining.strip() == "0" or "rate limit" in body.lower())
+    )
+    if (is_rate_limit or exc.code >= 500) and attempt < max_rate_limit_retries:
+        return True
+    if is_rate_limit:
+        raise GitHubRateLimitError(
+            f"GitHub API rate limit exceeded ({exc.code}): {body[:300]}", throttled=True
+        ) from exc
+    if exc.code >= 500:
+        raise GitHubRateLimitError(
+            f"GitHub server error ({exc.code}, transient) after {attempt} retries: {body[:300]}"
+        ) from exc
+    raise RuntimeError(f"GitHub environment request failed ({exc.code}): {body[:500]}") from exc
+
+
 def _urlopen(
     req: urllib.request.Request,
     *,
@@ -282,39 +325,15 @@ def _urlopen(
                     )
                 return drain(resp, deadline)
         except urllib.error.HTTPError as exc:
-            # urllib can raise an HTTPError with fp=None; exc.read() is an AttributeError there.
-            # the read can also truncate: GitHub can return a 429/5xx and then drop the connection.
-            # that must not propagate -- we are inside this block's own handler, and Python does not
-            # offer an exception raised here to the sibling clause below, so a truncated error body
-            # would escape unretried as an uncaught 500 instead of the classified 429/502. the
-            # status and headers still classify the failure, so an unreadable body just goes empty.
-            try:
-                body = _read_error_body(exc, body_deadline)
-            except (OSError, http.client.HTTPException):
-                # OSError covers ConnectionError and the TLS teardowns; HTTPException covers the
-                # framing faults, which are not OSErrors. A bare OSError clause is safe HERE, unlike
-                # in the retry clause below: this reads GitHub's error body, never the caller's sink.
-                body = ""
-            remaining = (exc.headers.get("X-RateLimit-Remaining") if exc.headers else None) or ""
-            is_rate_limit = exc.code == 429 or (
-                exc.code == 403 and (remaining.strip() == "0" or "rate limit" in body.lower())
-            )
-            is_transient = is_rate_limit or exc.code >= 500
-            if is_transient and attempt < max_rate_limit_retries:
+            # the classification and the terminal exception both live in the helper: splitting them
+            # would let a caller retry on one rule and raise by another. It returns True only when
+            # this attempt should be retried, and otherwise raises the classified failure itself --
+            # so a bare `raise` here would surface the raw HTTPError instead, which is exactly the
+            # uncaught-500 shape the classification exists to prevent.
+            if _classify_github_http_error(exc, body_deadline, attempt, max_rate_limit_retries):
                 time.sleep(backoff_delay(attempt))
                 attempt += 1
                 continue
-            if is_rate_limit:
-                raise GitHubRateLimitError(
-                    f"GitHub API rate limit exceeded ({exc.code}): {body[:300]}", throttled=True
-                ) from exc
-            if exc.code >= 500:
-                raise GitHubRateLimitError(
-                    f"GitHub server error ({exc.code}, transient) after {attempt} retries: {body[:300]}"
-                ) from exc
-            raise RuntimeError(
-                f"GitHub environment request failed ({exc.code}): {body[:500]}"
-            ) from exc
         # two families escape the obvious clauses, and both do so while a SUCCESSFUL response is
         # being read, which is why the HTTPError branch above does not see them either:
         #   - every framing fault is an `http.client.HTTPException`: not a URLError, TimeoutError,
