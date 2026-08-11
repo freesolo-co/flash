@@ -19,7 +19,15 @@ _MAX_NAME = 60
 _SUFFIX_BUDGET = 12
 _PREFIX_BUDGET = _MAX_NAME - _SUFFIX_BUDGET
 
-# Above this, the job spec is spilled to HF so a large inline spec can't overflow the user_data cap.
+# The provider-aligned user_data ceiling (cloud-init limits run ~16KB on AWS to 64KB elsewhere) less
+# a stated margin for provider-side framing. This budget is the BINDING spill check: build_user_data
+# measures the COMPLETE encoded user_data against it, so nothing riding along with the spec (runtime
+# secrets, env, cache fields) can push a launch over the cap.
+_USER_DATA_CAP = 64_000
+_USER_DATA_MARGIN = 2_000
+_USER_DATA_BUDGET = _USER_DATA_CAP - _USER_DATA_MARGIN
+
+# Fast path only: above this, the spec is spilled to HF without rendering a payload that cannot fit.
 # The budget is what is LEFT of the ~64,000-byte provider cap after the fixed framing: this module's
 # template plus every source file it heredocs in (bootstrap.py and bootstrap_secrets.py), which is
 # ~52,000 bytes and grows whenever that bootstrap does. base64 + json escaping inflate the spec
@@ -367,10 +375,11 @@ except Exception:
 """
 
 
-def _spill_large_spec_to_hf(payload: dict) -> dict:
-    """Keep a large ``job_spec_json`` OUT of the inline cloud-init user_data."""
+def _spill_large_spec_to_hf(payload: dict, *, force: bool = False) -> dict:
+    """Keep a large ``job_spec_json`` OUT of the inline cloud-init user_data. ``force`` spills a spec
+    that is under the fast-path threshold, for when the COMPLETE payload is what overflows the cap."""
     spec_json = payload.get("job_spec_json") or ""
-    if len(spec_json) <= _SPEC_SPILL_THRESHOLD:
+    if not spec_json or (not force and len(spec_json) <= _SPEC_SPILL_THRESHOLD):
         return payload
     if "deadline_at" in payload and remaining_seconds(payload["deadline_at"]) <= 0:
         raise TimeoutError("run wall deadline exceeded before job spec upload")
@@ -390,8 +399,21 @@ def _spill_large_spec_to_hf(payload: dict) -> dict:
 
 
 def build_user_data(payload: dict, *, image: str) -> str:
-    """Cloud-init ``user_data``: run the worker ``image`` via Docker on the host."""
+    """Cloud-init ``user_data``: run the worker ``image`` via Docker on the host.
+
+    The spill decision is BINDING on the final encoded bytes, not on the spec alone: the spec shares
+    user_data with runtime secrets (a multiline PEM is a valid one), so a spec under the fast-path
+    threshold plus big secrets could otherwise still overflow the provider cap. Render, measure, and
+    spill the spec out whenever the total exceeds the budget."""
     payload = _spill_large_spec_to_hf(payload)
+    user_data = _render_user_data(payload, image=image)
+    if len(user_data.encode()) <= _USER_DATA_BUDGET or not (payload.get("job_spec_json") or ""):
+        return user_data
+    return _render_user_data(_spill_large_spec_to_hf(payload, force=True), image=image)
+
+
+def _render_user_data(payload: dict, *, image: str) -> str:
+    """The user_data text for an already-spill-decided ``payload``."""
     payload_b64 = base64.encodebytes(json.dumps(payload).encode()).decode()
     bootstrap_src = (Path(__file__).parent / "bootstrap.py").read_text()
     # shipped next to bootstrap.py: the bootstrap imports it as a bare sibling module on the box.

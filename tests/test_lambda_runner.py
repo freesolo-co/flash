@@ -2547,6 +2547,25 @@ def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
     assert uploaded == {}
     assert len(worst) < 64_000 - 2_000
 
+    # The spec does not ride alone: runtime secrets (a multiline PEM is a valid one) share the same
+    # user_data. A spec UNDER the threshold plus a big secret must still spill, because the binding
+    # check is the complete encoded payload rather than the spec component.
+    uploaded.clear()
+    pem = "-----BEGIN PRIVATE KEY-----\n" + "k" * 4_000 + "\n-----END PRIVATE KEY-----"
+    heavy = inst.build_user_data(
+        {
+            **payload,
+            "job_spec_json": "x" * (inst._SPEC_SPILL_THRESHOLD - 1),
+            "env": {"HF_TOKEN": "t", "DEPLOY_KEY": pem},
+        },
+        image="img:latest",
+    )
+    assert uploaded["path"] == "sft/x/job_spec.json"
+    emb3 = json.loads(base64.b64decode(heavy.split("FLASH_PAYLOAD_EOF")[1].strip()))
+    assert emb3["job_spec_in_hf"] is True
+    assert emb3["job_spec_json"] == ""
+    assert len(heavy) < 64_000 - 2_000
+
 
 def test_build_user_data_starts_no_spec_upload_at_deadline(monkeypatch):
     import huggingface_hub
