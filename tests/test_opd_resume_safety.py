@@ -173,15 +173,23 @@ def test_marker_path_and_canonical_exact_schema():
     "raw",
     [
         b"{}",
-        b'{"attempt":3,"contract":"flash.opd.optimizer-start","phase":"opd",'
-        b'"run_id":"run-1","seed":42,"version":1,"extra":0}',
-        b'{"attempt":true,"contract":"flash.opd.optimizer-start","phase":"opd",'
-        b'"run_id":"run-1","seed":42,"version":1}',
+        (
+            b'{"attempt":3,"contract":"flash.opd.optimizer-start","phase":"opd",'
+            b'"run_id":"run-1","seed":42,"version":1,"extra":0}'
+        ),
+        (
+            b'{"attempt":true,"contract":"flash.opd.optimizer-start","phase":"opd",'
+            b'"run_id":"run-1","seed":42,"version":1}'
+        ),
         b'{"attempt":3,"contract":"wrong","phase":"opd","run_id":"run-1","seed":42,"version":1}',
-        b'{"attempt":3,"attempt":3,"contract":"flash.opd.optimizer-start",'
-        b'"phase":"opd","run_id":"run-1","seed":42,"version":1}',
-        b'{"attempt": 3, "contract": "flash.opd.optimizer-start", "phase": "opd", '
-        b'"run_id": "run-1", "seed": 42, "version": 1}',
+        (
+            b'{"attempt":3,"attempt":3,"contract":"flash.opd.optimizer-start",'
+            b'"phase":"opd","run_id":"run-1","seed":42,"version":1}'
+        ),
+        (
+            b'{"attempt": 3, "contract": "flash.opd.optimizer-start", "phase": "opd", '
+            b'"run_id": "run-1", "seed": 42, "version": 1}'
+        ),
         b"\xff",
     ],
 )

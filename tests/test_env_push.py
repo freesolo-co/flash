@@ -549,9 +549,11 @@ def test_push_keeps_a_noncanonical_entrypoint_importable_by_its_local_name(monke
         [
             sys.executable,
             "-c",
-            "import custom, environment; "
-            "assert custom is environment, (custom, environment); "
-            "print(custom.SCORER)",
+            (
+                "import custom, environment; "
+                "assert custom is environment, (custom, environment); "
+                "print(custom.SCORER)"
+            ),
         ],
         cwd=tmp_path / "published",
         capture_output=True,
