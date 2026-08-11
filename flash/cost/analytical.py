@@ -459,6 +459,7 @@ def _offline_gpu_shape(
         rentable_gpu_counts,
         smallest_fitting_gpu_count,
         vram_fit_error_message,
+        vram_knob_advice,
     )
 
     provider = config.provider if config.provider != "auto" else "auto"
@@ -481,13 +482,17 @@ def _offline_gpu_shape(
     auto_cap = geometry_safe_gpu_cap(
         config.model_id, MAX_COMBINATION_CARDS, model_revision=config.model_revision
     )
-    if config.gpu_count is None:
+    # auto-size only when NEITHER the class nor the count is authored, matching the parse-time gate
+    # (flash/schema/__init__.py). a pinned class with no count stays one card: escalating it would
+    # quote eight cheap cards for a run the author asked to place on one, and submit rejects that
+    # shape anyway -- the quote would name hardware allocation never provisions.
+    if config.gpu_count is None and not config.gpu_type:
         safe_gpu_count = (
             smallest_fitting_gpu_count(need, max_gpu_count=auto_cap, gpu_names=names) or auto_cap
         )
     else:
         safe_gpu_count = geometry_safe_gpu_cap(
-            config.model_id, config.gpu_count, model_revision=config.model_revision
+            config.model_id, config.gpu_count or 1, model_revision=config.model_revision
         )
     ranked = []
     for gpu in names:
@@ -524,6 +529,14 @@ def _offline_gpu_shape(
                 )
             )
     if not ranked:
+        if config.gpu_type:
+            # name the pinned class and its own ceiling. the pool-wide message below would report the
+            # widest validated shape, which is not the hardware this quote was ever allowed to use.
+            info = GPU_INFO[canonical_gpu(config.gpu_type)]
+            raise ValueError(
+                f"exact GPU {info.name!r} cannot fit this run: it requires at least {need} GB. "
+                f"{vram_knob_advice(config.method).capitalize()}."
+            )
         raise ValueError(
             vram_fit_error_message(
                 config.method,

@@ -556,6 +556,18 @@ def test_offline_unpinned_estimate_does_not_bill_the_ceiling():
     assert wide.total_usd == pytest.approx(single.total_usd)
 
 
+def test_a_pinned_gpu_class_is_never_auto_widened_by_the_quote():
+    """Auto-sizing applies only when neither the class nor the count is authored.
+
+    A pinned class with no count is a one-card pin at the parse boundary
+    (`flash/schema/__init__.py`), so quoting it across eight cards would both bill eight cheap cards
+    the author never asked for and name a shape submit rejects. Measured: before this guard, a 24 GB
+    RTX 4090 quoted 8 cards for an 80 GB run instead of raising.
+    """
+    with pytest.raises(ValueError, match=r"exact GPU 'RTX 4090' cannot fit this run"):
+        estimate_cost(RunConfig("Qwen/Qwen3.5-9B", "grpo", 10, gpu_type="RTX 4090"))
+
+
 def test_offline_estimate_supports_eight_card_only_runs(monkeypatch):
     """`flash train --cost` must price a run that fits eight cards but no four-card shape."""
     monkeypatch.setattr("flash.cost.analytical.required_vram_gb", lambda *a, **k: 700)
@@ -563,7 +575,9 @@ def test_offline_estimate_supports_eight_card_only_runs(monkeypatch):
     estimate = estimate_cost(config)
     assert estimate.required_vram_gb == 700
     assert estimate.gpu_count == 8
-    with pytest.raises(ValueError, match="no GPU class fits"):
+    # the pinned four-card ceiling is the reason this fails, so the message must name that ceiling
+    # and the count that would fit -- not just report a generic no-fit.
+    with pytest.raises(ValueError, match=r"gpu\.count=4 provides at most .* Raise gpu\.count"):
         estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "sft", 1, gpu_count=4))
 
 
@@ -583,7 +597,7 @@ def test_offline_estimate_applies_the_pinned_revision_geometry_cap(monkeypatch):
 
     # four: the pin keeps the unvalidated-revision ceiling, and 3.5-4B's 16 recorded heads divide it,
     # so the geometry check narrows nothing further.
-    with pytest.raises(ValueError, match="across up to 4 cards"):
+    with pytest.raises(ValueError, match="any 4-card validated GPU combination"):
         _offline_gpu_shape(config)
 
 
