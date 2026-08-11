@@ -1606,7 +1606,7 @@ def test_create_run_keeps_ownership_when_submit_fails_after_persisting_status(ap
 
     ``submit_job`` persists ``RunStatus`` and then keeps working (dispatch, provisioning), so a
     failure past that point leaves a real run behind: the charge sweep and recovery both walk the
-    status files, not the db. Deleting the ownership row there would strand it -- 404 on status,
+    status files, not the db. Deleting the ownership row there would strand it: 404 on status,
     logs and cancel for the only key entitled to it, while the provider footprint lives on.
     """
     import flash.runner as runner
