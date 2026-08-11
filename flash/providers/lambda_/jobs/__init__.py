@@ -293,22 +293,37 @@ _EXACT_CLEANUP_ATTR = "_flash_exact_cleanup_done"
 
 
 class _CoarseReapGuard:
-    """Whether an unnamed box may be rented right now, so the run-label reap owes it a sweep.
+    """What this seed owes on an interrupt: a run-label sweep, an exact terminate, or nothing.
 
-    Armed for exactly the window a launch request is in flight with no instance id in hand, and
-    disarmed the moment some path proves nothing stayed rented or that the exact instance was
-    already terminated. It is an object rather than a local so the cache-less retry can arm it
-    around its own request instead of the caller arming across that whole call.
+    Armed for exactly the window a launch request is in flight with no instance id in hand, when
+    the label reap is the ONLY thing that can find a box that is rented but not yet named. It is
+    an object rather than a local so the cache-less retry can arm it around its own request
+    instead of the caller arming across that whole call.
+
+    ``owns`` narrows the guard the instant an id exists. Ownership transfer would otherwise span
+    two statements (the publication helper returns, then the caller disarms), and an interrupt
+    landing between them reaps by run label and terminates every other concurrent seed sharing
+    that label. Disarming before the handle is returned would close that window by opening a
+    worse one: an interrupt would then leave the box rented with nothing to clean it. Holding the
+    id keeps the window covered by cleanup that names exactly one instance.
     """
 
     def __init__(self) -> None:
         self.armed = False
+        self.instance_id: str | None = None
 
     def arm(self) -> None:
         self.armed = True
+        self.instance_id = None
+
+    def owns(self, instance_id: str) -> None:
+        """Take exact ownership of a launched box, retiring the label reap for it."""
+        self.armed = True
+        self.instance_id = instance_id
 
     def disarm(self) -> None:
         self.armed = False
+        self.instance_id = None
 
 
 def _mark_exact_cleanup(error: BaseException) -> None:
@@ -321,14 +336,19 @@ def _exact_cleanup_taken(error: BaseException) -> bool:
 
 
 def _publish_launched_instance(
-    plan: _LaunchPlan, instance_id: str, inst: LambdaInstance, say, message: str
+    plan: _LaunchPlan, instance_id: str, inst: LambdaInstance, say, message: str, reap
 ) -> LambdaJobHandle:
     """Return the handle for a launched instance, tearing the box down if this window is cut short.
 
     Between a successful launch and a returned handle the instance is unpublished: no caller,
     teardown path, or reconciler can name it yet. A raising log stream must not stop the handle
     from being returned, and any ``BaseException`` (interrupt, SystemExit) must clean up first.
+
+    ``reap`` takes exact ownership here rather than in the caller: an id now exists, so the caller
+    returning and only then disarming would leave an interrupt in between reaping by run label
+    and killing every other concurrent seed.
     """
+    reap.owns(instance_id)
     try:
         with contextlib.suppress(Exception):
             say(message)
@@ -343,19 +363,20 @@ def _publish_launched_instance(
 
 
 def _retry_launch_without_cache(
-    plan: _LaunchPlan, inst: LambdaInstance, say, arm_reap
+    plan: _LaunchPlan, inst: LambdaInstance, say, reap
 ) -> tuple[LambdaJobHandle | None, Exception | None]:
     """Rent a cache-less box for this region, arming the caller's coarse reap around the request.
 
-    ``arm_reap`` is called immediately before the launch request and only then: everything else
+    ``reap.arm()`` is called immediately before the launch request and only then: everything else
     here (the preamble ``say``, the deadline precheck, an ambiguous reject that already reconciled)
     rents nothing this seed owes a run-label reap for, and reaping on those paths would terminate
-    every other concurrent seed sharing the run id.
+    every other concurrent seed sharing the run id. Once the request returns an id, publication
+    narrows the guard to that exact instance.
     """
     say(f"retrying {inst.region} WITHOUT the weight cache (attach may have caused the reject)")
     try:
         require_create_allowance(plan.absolute_deadline)
-        arm_reap()
+        reap.arm()
         instance_id = lambda_api.launch_instance(
             region_name=inst.region,
             instance_type_name=inst.instance_type,
@@ -379,7 +400,7 @@ def _retry_launch_without_cache(
         f"launched lambda instance {instance_id} (cold, cache-less): {inst.gpu} "
         f"{inst.instance_type} in {inst.region} attempt={plan.attempt} seed={plan.seed}"
     )
-    return _publish_launched_instance(plan, instance_id, inst, say, message), None
+    return _publish_launched_instance(plan, instance_id, inst, say, message, reap), None
 
 
 def _refresh_launch_candidates(
@@ -601,7 +622,7 @@ def launch_and_submit(
                     # created but unnamed, and only the run-label reap can find it. Arming across
                     # the whole call instead would reap on paths that rented nothing (a deadline
                     # miss in the precheck, a raising preamble) or that already cleaned up exactly.
-                    handle, last_err = _retry_launch_without_cache(plan, inst, say, reap.arm)
+                    handle, last_err = _retry_launch_without_cache(plan, inst, say, reap)
                     # a returned handle publishes the box; None means nothing stayed rented.
                     reap.disarm()
                     if handle is not None:
@@ -623,21 +644,28 @@ def launch_and_submit(
                 f"launched lambda instance {instance_id}: {inst.gpu} {inst.instance_type} "
                 f"${inst.price_usd_hr:.2f}/hr in {inst.region} attempt={attempt} seed={seed}"
             )
-            # the flag stays armed into the call: the instance is rented and still unnamed, so if
+            # the guard stays armed into the call: the instance is rented and still unnamed, so if
             # an interrupt lands before _publish_launched_instance takes ownership the coarse reap
-            # is the only thing that can find it. Once that helper terminates the exact instance it
-            # stamps the exception and the outer guard stands down, so the reap never layers on top
-            # of an exact cleanup (which would kill every other concurrent seed of this run).
-            handle = _publish_launched_instance(plan, instance_id, inst, say, message)
+            # is the only thing that can find it. That helper narrows the guard to this exact id on
+            # entry, so the return-then-disarm window below can no longer reap by run label (which
+            # would kill every other concurrent seed of this run).
+            handle = _publish_launched_instance(plan, instance_id, inst, say, message, reap)
             reap.disarm()
             return handle
         return _raise_all_regions_rejected(spec, tried_regions, last_err)
     except BaseException as error:
-        # armed for every window where a box may be rented but unnamed; stands down only once some
-        # inner path proved it already terminated that exact instance.
+        # armed for every window where a box may be rented; stands down only once some inner path
+        # proved it already terminated that exact instance. Once an id exists the guard holds it,
+        # so this cleans up exactly one instance: the run-label sweep is reserved for the in-flight
+        # create that has no id to name, where it is the only thing that can find the box.
         if reap.armed and not _exact_cleanup_taken(error):
-            with contextlib.suppress(BaseException):
-                terminate_run_instances(spec.run_id)
+            if reap.instance_id is not None:
+                _cleanup_unpublished_instance(
+                    spec.run_id, reap.instance_id, context="interrupted launch walk"
+                )
+            else:
+                with contextlib.suppress(BaseException):
+                    terminate_run_instances(spec.run_id)
         raise
 
 

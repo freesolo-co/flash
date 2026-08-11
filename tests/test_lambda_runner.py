@@ -1230,6 +1230,49 @@ def test_cacheless_retry_that_never_reaches_its_request_does_not_reap_the_run_la
     assert reaped == []  # so no concurrent seed of this run was terminated
 
 
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
+def test_interrupt_after_publication_returns_terminates_only_this_instance(
+    monkeypatch, interrupt_type
+):
+    """An interrupt landing AFTER _publish_launched_instance returns must not reap the run label.
+
+    Ownership transfer spans two statements (the helper returns, then the caller disarms). An
+    interrupt in between used to leave the guard armed with no id, so the outer handler reaped by
+    run label and terminated every other concurrently-launched seed sharing it. The guard now
+    holds the id from publication onward, so this window cleans up exactly one instance.
+    """
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(lambda_api, "launch_instance", lambda **_kwargs: "i-4242")
+
+    # fire in the gap the finding names: the helper has RETURNED (so its own guarded frame is
+    # gone and nothing stamped exact cleanup) but the caller's disarm has not run yet. Wrapping
+    # the helper reproduces exactly that statement boundary; raising inside it would instead be
+    # caught by its own handler, which is a different, already-covered window.
+    real_publish = jobs._publish_launched_instance
+
+    def interrupt_after_publication(*args, **kwargs):
+        real_publish(*args, **kwargs)
+        raise interrupt_type("interrupted after publication returned")
+
+    monkeypatch.setattr(jobs, "_publish_launched_instance", interrupt_after_publication)
+
+    terminated: list[str] = []
+    monkeypatch.setattr(
+        lambda_api, "terminate_instance_confirmed", lambda iid: terminated.append(iid)
+    )
+    reaped: list[str] = []
+    monkeypatch.setattr(jobs, "terminate_run_instances", lambda run_id: reaped.append(run_id) or [])
+
+    with pytest.raises(interrupt_type):
+        _launch(jobs, _spec(), seed=0, instances=[_inst()], attempt=0)
+
+    assert terminated == ["i-4242"]  # the box this seed rented is cleaned up by id
+    assert reaped == []  # and no concurrent seed sharing the run label is touched
+
+
 def test_launch_raises_when_no_capacity(monkeypatch):
     from flash.providers.lambda_ import api as lambda_api
     from flash.providers.lambda_ import jobs
