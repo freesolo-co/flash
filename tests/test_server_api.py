@@ -896,7 +896,7 @@ def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
             # for them). training the routed experts puts this past every single card at any batch
             # size, so the run is pinned to two below; otherwise the valid-context case would fail
             # allocation instead of exercising the ordering this test is about.
-            "batch_size": 4,
+            "prompts_per_step": 4,
             "max_completion_tokens": max_completion_tokens,
             "structured_outputs": {"choice": ["4"]},
         },
