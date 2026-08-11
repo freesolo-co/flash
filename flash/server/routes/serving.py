@@ -687,6 +687,11 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
     ] or None
     try:
         if payload.get("stream") is True:
+            # serve_chat_stream sends the upstream request and validates its status at call
+            # time, so an upstream 4xx/5xx raises here, inside the try, and becomes a real 502
+            # before the 200 headers are flushed. a failure after the first byte propagates out
+            # of the body iterator instead, which aborts the chunked response so the client
+            # cannot mistake the truncation for a finished answer.
             return StreamingResponse(
                 _app.serve_chat_stream(
                     run_id=serving_model,
