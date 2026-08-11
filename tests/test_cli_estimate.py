@@ -647,6 +647,42 @@ def test_an_environment_param_cap_is_named_as_such(tmp_path, monkeypatch, capsys
     assert "`[train] max_examples`" not in err
 
 
+def test_the_smaller_of_two_configured_caps_is_the_one_that_binds(tmp_path, monkeypatch, capsys):
+    """A large `[train]` cap must not hide a small `[environment.params]` one.
+
+    The caps act at different points and neither overrides the other: the environment param is
+    passed to `load_environment`, so it bounds what `env.dataset()` returns at all, and `[train]
+    max_examples` only slices that result afterwards. With `[train] = 800` over an environment
+    handing back 2 rows, `train[:800]` is a no-op and the run really does train on 2 prompts per
+    update. Reading the train cap first reported a pool of 800 and stayed silent on exactly the
+    config that needed the warning.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(
+        _grpo_cost_args(tmp_path, None, max_examples=800, env_params={"max_examples": 2})
+    )
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "OPTIMIZER batch is 2 prompts per update" in err
+    # the environment cap is the one holding the pool down, so it is the one to raise
+    assert "`[environment.params] max_examples`" in err
+    assert "`[train] max_examples`" not in err
+
+
+def test_every_cap_sitting_at_the_pool_is_named(tmp_path, monkeypatch, capsys):
+    """Two caps at the same value both bind, so raising only one moves nothing."""
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, None, max_examples=2, env_params={"max_examples": 2}))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "`[train] max_examples` and `[environment.params] max_examples`" in err
+    assert "max_examples` cap the prompt pool" in err  # plural subject, plural verb
+
+
 def test_grpo_cost_stays_quiet_when_the_batch_is_a_real_batch(tmp_path, monkeypatch, capsys):
     """A healthy batch must not be nagged about, or the warning stops meaning anything."""
     monkeypatch.setenv("FLASH_STYLE", "0")

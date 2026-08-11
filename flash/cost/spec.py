@@ -90,13 +90,17 @@ def _rollout_profile(spec):
 
 
 def _on_policy_example_count(spec) -> int:
-    t = spec.train
-    pinned_examples = int(t.max_examples) if t.max_examples else 0
-    if pinned_examples > 0:
-        return pinned_examples
-    env_examples = _env_max_examples(spec)
-    if env_examples > 0:
-        return env_examples
+    """Prompts the run actually retains, which is the SMALLEST explicit cap, not the first one.
+
+    The two caps act at different points and do not override each other. ``[environment.params]
+    max_examples`` is passed to ``load_environment``, so it bounds what ``env.dataset()`` returns
+    at all; ``[train] max_examples`` only slices that result afterwards
+    (``flash/engine/worker/train/rl/inputs.py``). Preferring the train cap therefore reported 800
+    prompts for a config whose environment hands back 2, and ``train[:800]`` is a no-op on 2 rows.
+    """
+    caps = [c for c in (int(spec.train.max_examples or 0), _env_max_examples(spec)) if c > 0]
+    if caps:
+        return min(caps)
     return _on_policy_requested_prompts_per_step(spec)
 
 
@@ -148,8 +152,10 @@ def thin_rl_batch_warning(spec) -> str | None:
     Reads the EFFECTIVE prompts-per-step, not the authored field: a ``max_examples`` cap (from
     either ``[train]`` or ``[environment.params]``) clamps the batch to the retained prompt pool
     (``_on_policy_prompts_per_step``), so a scaffolded ``max_examples = 2`` run trains on 2 prompts
-    per update whether or not a ``batch_size`` was ever written. Both can bind at once, and raising
-    one while the other still binds moves nothing, so the message names every binding knob.
+    per update whether or not a ``batch_size`` was ever written. The caps do not override each
+    other -- the environment one bounds what ``env.dataset()`` returns and the train one slices
+    that afterwards -- so the pool is the SMALLEST of them. Any of these can bind at once, and
+    raising one while another still binds moves nothing, so the message names every binding knob.
 
     What the thin batch costs differs by algorithm, so the message does too. grpo keeps a working
     per-prompt baseline at any batch size (verl centres each response against its own prompt's
@@ -177,13 +183,19 @@ def thin_rl_batch_warning(spec) -> str | None:
     # `_on_policy_example_count` falls back to the requested batch, which makes `examples` equal
     # `prompts_per_step` for reasons that have nothing to do with a pool -- reading a bind off that
     # equality would invent a cap the config does not contain and send the user to a phantom key.
-    cap_key = (
-        "[train] max_examples"
-        if spec.train.max_examples
-        else "[environment.params] max_examples"
-        if _env_max_examples(spec)
-        else None
-    )
+    #
+    # both tables can cap at once and the effective pool is the smaller, so name every cap sitting
+    # AT it: raising only one of two equal caps moves nothing, and naming only the first would send
+    # the user to raise a key that is not what is holding the pool down.
+    cap_keys = [
+        key
+        for key, value in (
+            ("[train] max_examples", int(spec.train.max_examples or 0)),
+            ("[environment.params] max_examples", _env_max_examples(spec)),
+        )
+        if value == examples
+    ]
+    cap_key = " and ".join(f"`{k}`" for k in cap_keys) if cap_keys else None
     # name every input that is actually holding the batch down, because raising one while another
     # still binds is a no-op the user pays for. the pool caps prompts-per-step, so an authored
     # batch at or above the pool is not the constraint even when the two are equal.
@@ -199,16 +211,17 @@ def thin_rl_batch_warning(spec) -> str | None:
         )
         if pool_binds:
             lead += (
-                f" `{cap_key}` holds the prompt pool at {examples} as well, so raising one without "
+                f" {cap_key} holds the prompt pool at {examples} as well, so raising one without "
                 "the other leaves the batch exactly where it is."
             )
     else:
+        caps_verb = "cap" if len(cap_keys) > 1 else "caps"
         lead = (
-            f"This {spec.algorithm} run's OPTIMIZER batch is {prompts} per update: `{cap_key}` "
-            "caps the prompt pool that small, and prompts-per-step cannot exceed the pool."
+            f"This {spec.algorithm} run's OPTIMIZER batch is {prompts} per update: {cap_key} "
+            f"{caps_verb} the prompt pool that small, and prompts-per-step cannot exceed the pool."
         )
     targets = [
-        k for k, binds in (("`batch_size`", batch_binds), (f"`{cap_key}`", pool_binds)) if binds
+        k for k, binds in (("`batch_size`", batch_binds), (cap_key or "", pool_binds)) if binds
     ]
     raise_target = " and ".join(targets)
     if spec.algorithm == "grpo":
