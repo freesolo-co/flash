@@ -339,14 +339,22 @@ class FreesoloEnvironment(BaseEnvironment):
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         return float(getattr(self._score_one(completion, example, state), "score", 0.0))
 
-    def reward_error(self, completion: str, example: dict, state: dict | None = None) -> str:
-        """The scorer's own ``RewardResult.error`` for this completion, or "" when it reported none.
+    def reward_with_error(
+        self, completion: str, example: dict, state: dict | None = None
+    ) -> tuple[float, str]:
+        """This completion's reward and the scorer's own ``RewardResult.error`` from one call.
 
         ``reward`` above keeps only ``score``, so a scorer that crashed behind the SDK's guard and
-        one that judged the answer wrong both reach training as ``0.0``. Diagnostics that need to
-        tell those apart read the error here rather than reaching into ``_score_one``.
+        one that judged the answer wrong both reach training as ``0.0``. Both values come from a
+        single scoring call because scoring is not guaranteed to be pure: a rate-limited judge or a
+        flaky dependency can answer differently the second time, so re-scoring to read the error
+        can report one that did not produce this reward -- and bills a paid judge twice.
         """
-        return str(getattr(self._score_one(completion, example, state), "error", "") or "")
+        result = self._score_one(completion, example, state)
+        return (
+            float(getattr(result, "score", 0.0)),
+            str(getattr(result, "error", "") or ""),
+        )
 
     @staticmethod
     def _turn_rewards_from_result(result) -> tuple[float, ...] | None:

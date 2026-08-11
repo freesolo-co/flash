@@ -157,6 +157,17 @@ def _preview(value: object) -> str:
     return f"{text[: _PREVIEW_CHARS - 3]}..."
 
 
+def _scored_text(responses: list) -> str:
+    """The exact text the grader scored, joined as the drive functions built it.
+
+    Unlike ``_preview`` this preserves whitespace and does not truncate: it is printed with
+    ``repr`` beside a zero reward so a trailing newline, a tab, or a wrapper past the preview
+    cutoff stays visible. Those are the formatting faults that make a correct grader reject a
+    gold answer, so hiding them defeats the diagnostic.
+    """
+    return "\n".join(str(item) for item in responses)
+
+
 def _new_record() -> dict:
     """Mutable per-episode record so a failing episode still reports real progress."""
     return {
@@ -167,6 +178,11 @@ def _new_record() -> dict:
         "responses": [],
         "thinking_markup": False,
         "replay_incomplete": False,
+        # the scorer's own `RewardResult.error` from the call that produced `reward`, captured
+        # there rather than re-scored later: a non-deterministic scorer (a rate-limited judge, a
+        # flaky dependency) can return a different result the second time, so a re-score can miss
+        # the error that actually produced this reward -- and would charge a paid judge twice.
+        "scorer_error": "",
         # the multi-turn rollout state, kept so the per-turn check below can ask about the episode
         # that was actually scored rather than a fresh one. None for single-turn, which has no state
         # and no per-turn vector either.
@@ -188,7 +204,7 @@ def _drive_single_turn(env, example: dict, record: dict, *, force_echo: bool = F
     )
     record["responses"] = [response]
     record["turns"] = 1
-    record["reward"] = float(env.reward(response, example))
+    record["reward"], record["scorer_error"] = _score_with_error(env, response, example)
 
 
 def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = False) -> None:
@@ -250,7 +266,7 @@ def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = Fa
     # extra move. rollout_done covers the env having declared the episode over.
     if env_step_pending and not env.rollout_done(state, hard_cap):
         env.env_reply(state["messages"], state)
-    record["reward"] = float(env.reward("", example, state))
+    record["reward"], record["scorer_error"] = _score_with_error(env, "", example, state)
     record["state"] = state
 
 
@@ -275,23 +291,21 @@ def _scores_gold_no_better_than_junk(env, example: dict, gold_reward: float) -> 
     return junk_reward >= gold_reward
 
 
-def _replay_scorer_error(env, example: dict, record: dict) -> str:
-    """The scorer's own error string for this episode, or "" when it did not report one.
+def _score_with_error(env, completion: str, example: dict, state: dict | None = None):
+    """Score one completion, returning ``(reward, scorer_error)`` from a single scoring call.
 
     ``FreesoloEnvironment.reward`` returns ``float(result.score)``, so a scorer that crashed behind
     the SDK's guard and one that deliberately scored zero are indistinguishable by reward alone.
-    ``reward_error`` re-scores the same text and keeps ``RewardResult.error`` instead. Advisory
-    only: an env without the hook, or any failure here, leaves the reward authoritative.
+    The error is read from the same call that produced the reward rather than a second one:
+    scoring is not guaranteed to be pure, so a re-score can report an error that did not produce
+    this reward -- and would bill a paid judge twice per episode. Envs without the richer hook
+    (anything not backed by the Freesolo adapter) fall back to the plain reward and no error.
     """
-    reward_error = getattr(env, "reward_error", None)
-    if not callable(reward_error):
-        return ""
-    responses = record.get("responses") or []
-    completion = responses[-1] if responses else ""
-    try:
-        return str(reward_error(completion, example, record.get("state")) or "")
-    except (Exception, SystemExit):
-        return ""
+    reward_with_error = getattr(env, "reward_with_error", None)
+    if callable(reward_with_error):
+        reward, error = reward_with_error(completion, example, state)
+        return float(reward), str(error or "")
+    return float(env.reward(completion, example, state)), ""
 
 
 def _separates_on_turn_rewards(env, example: dict, state: dict | None) -> bool:
@@ -757,11 +771,15 @@ def cmd_env_test(args) -> int:
                     render.warn(message) if render.styled() else f"warning: {message}",
                     file=sys.stderr,
                 )
+                # printed with repr rather than through `_preview`: the whole point of showing this
+                # text is to expose a formatting defect, and `_preview` collapses whitespace and
+                # truncates, so a stray newline or a `\boxed{}` past the cutoff -- exactly the
+                # faults this line exists to reveal -- would be invisible.
                 print(
-                    f"  scored gold answer: {_preview(record['responses'])}",
+                    f"  scored gold answer: {_scored_text(record['responses'])!r}",
                     file=sys.stderr,
                 )
-                scorer_error = _replay_scorer_error(env, example, record)
+                scorer_error = record.get("scorer_error") or ""
                 if scorer_error:
                     # a scorer that crashed and a scorer that judged are both reported as 0.0 by
                     # `FreesoloEnvironment.reward`, which keeps only `RewardResult.score`. surfacing

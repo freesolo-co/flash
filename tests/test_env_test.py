@@ -695,7 +695,7 @@ def test_env_test_low_reward_warning_names_the_gold_completion_too(monkeypatch, 
     captured = capsys.readouterr()
     assert "check the reward function or the gold completion it scored" in captured.err
     # the exact text that scored zero, so a bare `4` is visibly the wrong gold turn.
-    assert "scored gold answer: 4" in captured.err
+    assert "scored gold answer: '4'" in captured.err
 
 
 def test_env_test_surfaces_the_scorer_error_behind_a_zero_reward(monkeypatch, tmp_path, capsys):
@@ -706,8 +706,9 @@ def test_env_test_surfaces_the_scorer_error_behind_a_zero_reward(monkeypatch, tm
     """
     env_dir = _environment_dir(tmp_path)
     env = _SingleTurnEnv(rows=[{"input": "what is 2 + 2?", "output": "4"}], reward=0.0)
-    env.reward_error = lambda completion, example, state=None: (
-        "ModuleNotFoundError: No module named 'pymongo'"
+    env.reward_with_error = lambda completion, example, state=None: (
+        0.0,
+        "ModuleNotFoundError: No module named 'pymongo'",
     )
     _patch_loader(monkeypatch, env)
 
@@ -723,7 +724,7 @@ def test_env_test_omits_the_scorer_error_line_when_the_scorer_reported_none(
     # a crash on every deliberately-zero reward.
     env_dir = _environment_dir(tmp_path)
     env = _SingleTurnEnv(rows=[{"input": "what is 2 + 2?", "output": "4"}], reward=0.0)
-    env.reward_error = lambda completion, example, state=None: ""
+    env.reward_with_error = lambda completion, example, state=None: (0.0, "")
     _patch_loader(monkeypatch, env)
 
     assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
@@ -1514,11 +1515,11 @@ def test_env_test_malformed_param_fails_before_loading(monkeypatch, tmp_path, ca
     assert "overall: FAIL" in captured.err
 
 
-def test_adapter_reward_error_exposes_what_reward_discards():
+def test_adapter_reward_with_error_exposes_what_reward_discards():
     """`reward` keeps only `score`, so the scorer's error needs its own accessor.
 
     A scorer whose runtime dependency is missing returns the documented 0.0 floor with `error` set.
-    Reading `reward` alone reports that as an ordinary wrong answer; `reward_error` recovers the
+    Reading `reward` alone reports that as an ordinary wrong answer; `reward_with_error` recovers the
     string that names the real cause.
     """
     from freesolo.datasets.types import TaskExample
@@ -1542,10 +1543,13 @@ def test_adapter_reward_error_exposes_what_reward_discards():
 
     # the reward alone cannot tell a crashed scorer from a judged-wrong answer.
     assert env.reward("alice", example) == 0.0
-    assert env.reward_error("alice", example) == "ModuleNotFoundError: No module named 'pymongo'"
+    assert env.reward_with_error("alice", example) == (
+        0.0,
+        "ModuleNotFoundError: No module named 'pymongo'",
+    )
 
 
-def test_adapter_reward_error_is_empty_when_the_scorer_reported_none():
+def test_adapter_reward_with_error_is_empty_when_the_scorer_reported_none():
     from freesolo.datasets.types import TaskExample
     from freesolo.environments import EnvironmentSingleTurn, RewardResult
 
@@ -1564,4 +1568,86 @@ def test_adapter_reward_error_is_empty_when_the_scorer_reported_none():
     example = env.dataset()[0]
 
     assert env.reward("4", example) == 1.0
-    assert env.reward_error("4", example) == ""
+    assert env.reward_with_error("4", example) == (1.0, "")
+
+
+def test_env_test_scores_each_episode_exactly_once():
+    """Reading the scorer's error must not cost a second scoring call.
+
+    Scoring is not guaranteed to be pure: a rate-limited judge can answer differently the second
+    time, so a re-score can report an error that did not produce the printed reward -- and bills a
+    paid judge twice per episode. Both values come from one call.
+    """
+    from freesolo.datasets.types import TaskExample
+    from freesolo.environments import EnvironmentSingleTurn, RewardResult
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    calls: list[str] = []
+
+    class _Env(EnvironmentSingleTurn):
+        dataset: ClassVar[list] = [{"input": "q", "output": "a"}]
+
+        def build_prompt_messages(self, example: TaskExample, prompt_text: str):
+            return [{"role": "user", "content": example.input}]
+
+        def score_response(self, example: TaskExample, response_text: str) -> RewardResult:
+            calls.append(response_text)
+            # a flaky judge: only the FIRST call reports the rate limit.
+            if len(calls) == 1:
+                return RewardResult(score=0.0, threshold=1.0, error="RateLimitError: 429")
+            return RewardResult(score=0.0, threshold=1.0)
+
+    env = FreesoloEnvironment(_Env(), "env", source=None)
+    example = env.dataset()[0]
+
+    reward, error = env.reward_with_error("a", example)
+    assert len(calls) == 1, f"scored {len(calls)} times; a re-score would lose the real error"
+    assert reward == 0.0
+    # the error belongs to the call that produced this reward, not to a later, different one.
+    assert error == "RateLimitError: 429"
+
+
+def test_env_test_prints_the_scored_text_without_collapsing_it(monkeypatch, tmp_path, capsys):
+    """The scored text is printed faithfully, since formatting IS the defect being diagnosed.
+
+    `_preview` collapses whitespace and truncates at 200 characters, which hides exactly the faults
+    that make a correct grader reject a gold answer: a stray newline, a trailing tab, or a wrapper
+    that sits past the cutoff.
+    """
+    env_dir = _environment_dir(tmp_path)
+    gold = "answer\n\t42 "
+    env = _SingleTurnEnv(rows=[{"input": "q", "output": gold}], reward=0.0)
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
+    captured = capsys.readouterr()
+    # repr, so the newline and tab that a collapsing preview would erase stay visible.
+    assert "scored gold answer: 'answer\\n\\t42 '" in captured.err
+
+
+def test_env_test_shows_a_wrapper_past_the_preview_cutoff(monkeypatch, tmp_path, capsys):
+    # a gold answer whose `\boxed{}` sits past _PREVIEW_CHARS is the case the truncating preview
+    # hid -- and it is precisely the formatting evidence the reader needs.
+    env_dir = _environment_dir(tmp_path)
+    gold = "x" * 250 + "\\boxed{72}"
+    env = _SingleTurnEnv(rows=[{"input": "q", "output": gold}], reward=0.0)
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
+    captured = capsys.readouterr()
+    assert "boxed{72}" in captured.err
+
+
+def test_scaffolded_environment_documents_the_gold_completion_contract():
+    """The guidance has to reach the generated file, not just the generator's source.
+
+    A comment outside the template string is read by nobody running `flash env setup`.
+    """
+    from flash.cli.commands.env.setup import _STARTER_ENV_PY
+
+    assert "gold" in _STARTER_ENV_PY
+    assert "sft_completion" in _STARTER_ENV_PY
+    # names the wrapper trap and where per-row scorer state belongs.
+    assert "boxed" in _STARTER_ENV_PY
+    assert "metadata" in _STARTER_ENV_PY
