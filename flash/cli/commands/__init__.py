@@ -532,10 +532,10 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
         # relaunch window, and the ping is just as superseded there: the worker that produced it has
         # already been torn down. `heartbeat_is_current_attempt` answers True because it cannot
         # prove otherwise from the identity alone, so the qualifier has to come from the clear
-        # itself or `step=455` reads as the replacement's progress.
-        stale_heartbeat = remote_cleared or not render.heartbeat_is_current_attempt(
-            status, heartbeat
-        )
+        # itself or `step=455` reads as the replacement's progress. `heartbeat_is_superseded` is
+        # exactly that pair of conditions, shared with the status panel so the two surfaces cannot
+        # disagree about whether a run is between attempts.
+        stale_heartbeat = render.heartbeat_is_superseded(status, heartbeat)
         stage = heartbeat.get("stage")
         if stage:
             parts.append(f"stage={stage}")
