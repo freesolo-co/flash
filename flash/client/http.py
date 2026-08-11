@@ -64,6 +64,11 @@ FREESOLO_EVAL_RUNS_PATH = "/api/evals/runs"
 # magic number so a change on the server side is visible here as a changed term, and deliberately
 # NOT imported from the loader: `flash.client` must stay importable without the server extra.
 _ENV_LIST_GITHUB_READS = 2  # namespace lookup, then the recursive namespace subtree
+# NOT multiplied by the truncation-recovery fan-out, even though that path can issue more reads: the
+# server caps its whole listing at this same total (`namespace_listing._LISTING_DEADLINE_SECONDS`) and
+# each read draws from the remainder, so extra reads make the reads shorter rather than the request
+# longer. Widening this to cover the fan-out instead would mean a ~24 minute interactive wait, which
+# would defeat the bound below -- a fast upstream failure has to stay reportable.
 _ENV_LIST_ATTEMPTS_PER_READ = 2  # one initial attempt + `max_rate_limit_retries` (1)
 _ENV_LIST_SOCKET_TIMEOUT_SECONDS = 20.0  # `_LIST_READ_BUDGET["timeout"]`
 # an attempt can spend the socket timeout connecting AND the body deadline streaming the response;
@@ -221,6 +226,7 @@ from flash.client.freesolo_api import (  # noqa: E402
     verify_freesolo_key as verify_freesolo_key,
 )
 from flash.client.streaming import (  # noqa: E402
+    _capped_timeout,
     _ProgressReader,
     _read_capped_response,
     _read_response_body,
@@ -389,11 +395,21 @@ class ApiClient:
             data=data,
             headers=headers,
         )
+        # the deadline starts BEFORE the open, not at the first body read: DNS, the TCP connect, the
+        # TLS handshake and header parsing all happen inside `urlopen`, and urllib restarts its socket
+        # window on every receive -- so a peer that drip-feeds headers holds this open indefinitely
+        # without any single operation exceeding `timeout`. Bounding only the body would leave the
+        # whole setup phase unbounded, which is the same defect the hub reads already fixed.
+        deadline = time.monotonic() + body_deadline if body_deadline is not None else None
         with (
             self._translate_http_errors(),
-            urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp,
+            urllib.request.urlopen(
+                req, timeout=_capped_timeout(timeout or self.timeout, deadline)
+            ) as resp,
         ):
-            raw = _read_response_body(resp, max_bytes=max_bytes, body_deadline=body_deadline)
+            raw = _read_response_body(
+                resp, max_bytes=max_bytes, deadline=deadline, path=f"{self.api_url}{path}"
+            )
             return self._decode_response(
                 path, raw, resp.headers.get("Content-Type", ""), require=require
             )

@@ -604,3 +604,168 @@ def test_a_truncated_tree_needing_too_many_reads_fails_loudly(monkeypatch):
 
     with pytest.raises(RuntimeError, match="additional hub reads"):
         loader.list_managed_namespace_slugs("acme")
+
+
+def test_the_listing_shares_one_deadline_across_every_read(monkeypatch):
+    """The recovery fan-out must not outlast the wait the client derived from two reads.
+
+    Without a shared deadline the truncation recovery could issue 1 + 8 more reads, each with its own
+    full retry budget, so the server would still be working ~18 minutes after the CLI gave up at 310s
+    -- replacing the controlled 429/502 with a local timeout that says nothing about why. Widening the
+    client instead would mean a ~24 minute interactive wait, which defeats the point of bounding these
+    reads at all, so the budget is shared and each read draws from the remainder.
+    """
+    from flash.envs import namespace_listing
+
+    budgets: list[dict] = []
+    clock = [0.0]
+    _fake_hub(
+        monkeypatch,
+        {
+            "main": _tree(_dir("acme", "sha-acme")),
+            "sha-acme": _tree(_blob("my-env/environment.py")),
+        },
+        budgets=budgets,
+    )
+
+    # drive the clock from the READ count, not from every `monotonic()` call: the budget helper reads
+    # the clock itself, so a per-call step would consume the deadline just by being inspected. The
+    # first read is charged nearly the whole budget, leaving the second visibly tighter -- a smaller
+    # step would prove nothing, since with 150s left `min(20, 150)` is legitimately still 20.
+    reads = [0]
+    monkeypatch.setattr(
+        namespace_listing.time,
+        "monotonic",
+        lambda: clock[0] + (namespace_listing._LISTING_DEADLINE_SECONDS - 5.0) * reads[0],
+    )
+    real_budget = namespace_listing._remaining_budget
+
+    def counting_budget(deadline, namespace):
+        budget = real_budget(deadline, namespace)
+        reads[0] += 1
+        return budget
+
+    monkeypatch.setattr(namespace_listing, "_remaining_budget", counting_budget)
+
+    assert loader.list_managed_namespace_slugs("acme") == ["acme/my-env"]
+    assert len(budgets) == 2, f"expected two reads, got {len(budgets)}"
+    # the later read must be strictly tighter: the budget shrinks as the deadline is consumed
+    assert budgets[-1]["timeout"] < namespace_listing._LIST_SOCKET_TIMEOUT_SECONDS, (
+        f"a later read must draw from the remainder, got {budgets}"
+    )
+    assert budgets[-1]["body_deadline"] < namespace_listing._LIST_BODY_DEADLINE_SECONDS
+
+
+def test_a_listing_that_runs_out_of_budget_fails_instead_of_reading_on(monkeypatch):
+    """Once the deadline is spent, the next read must not start at all.
+
+    A read begun with no time left would either block for its own full timeout -- defeating the shared
+    deadline -- or fail in a way that does not say the budget ran out.
+    """
+    from flash.envs import namespace_listing
+
+    _fake_hub(
+        monkeypatch,
+        {
+            "main": _tree(_dir("acme", "sha-acme")),
+            "sha-acme": _tree(_blob("my-env/environment.py")),
+        },
+    )
+    monkeypatch.setattr(
+        namespace_listing.time,
+        "monotonic",
+        lambda: 10_000.0,  # constant, so the deadline is already in the past when checked
+    )
+    monkeypatch.setattr(namespace_listing, "_LISTING_DEADLINE_SECONDS", 0.0)
+
+    with pytest.raises(RuntimeError, match="exceeded its overall deadline"):
+        loader.list_managed_namespace_slugs("acme")
+
+
+def test_the_server_deadline_stays_below_the_client_wait():
+    """The one-directional invariant: the server must give up FIRST.
+
+    If the client timed out first, a real upstream failure would reach the user as a local timeout
+    instead of the controlled 429/502 -- which is the whole reason both numbers are derived rather
+    than guessed. Pinned as a test because the two live in different modules (the client cannot import
+    the server side) and nothing else would catch them drifting apart.
+    """
+    from flash.client import http as client_http
+    from flash.envs import namespace_listing
+
+    assert namespace_listing._LISTING_DEADLINE_SECONDS < client_http.ENV_LIST_CLIENT_TIMEOUT_SECONDS
+    assert namespace_listing._LISTING_DEADLINE_SECONDS == client_http.ENV_LIST_SERVER_BUDGET_SECONDS
+
+
+def test_a_malformed_type_during_recovery_is_a_fault_not_an_absent_env(monkeypatch):
+    """The recovery must validate the type after matching the path, as the prefix path does.
+
+    Folding the two into one predicate made an unusable type indistinguishable from an absent marker,
+    so a broken hub response silently omitted a published environment -- the silent-empty failure this
+    endpoint exists to remove -- instead of reaching the controlled 502.
+    """
+    _fake_hub(
+        monkeypatch,
+        {
+            "main": _tree(_dir("acme", "sha-acme")),
+            "sha-acme": _truncated(),
+            # the marker path matches but carries no usable type
+            "sha-broken": _tree({"path": "environment.py"}),
+        },
+    )
+    real = loader._download_github_json
+
+    def routing_download(ref, url, context, **kwargs):
+        if "sha-acme" in url and "recursive" not in url:
+            return _tree(_dir("broken", "sha-broken"))
+        return real(ref, url, context, **kwargs)
+
+    monkeypatch.setattr(loader, "_download_github_json", routing_download)
+
+    with pytest.raises(RuntimeError, match="unusable type"):
+        loader.list_managed_namespace_slugs("acme")
+
+
+def test_a_malformed_package_type_during_recovery_is_also_a_fault(monkeypatch):
+    """Same rule one level up: a first-level entry with an unusable type is a fault, not a skip."""
+    _fake_hub(
+        monkeypatch,
+        {
+            "main": _tree(_dir("acme", "sha-acme")),
+            "sha-acme": _truncated(),
+        },
+    )
+    real = loader._download_github_json
+
+    def routing_download(ref, url, context, **kwargs):
+        if "sha-acme" in url and "recursive" not in url:
+            return _tree({"path": "broken", "sha": "sha-broken"})
+        return real(ref, url, context, **kwargs)
+
+    monkeypatch.setattr(loader, "_download_github_json", routing_download)
+
+    with pytest.raises(RuntimeError, match="unusable type"):
+        loader.list_managed_namespace_slugs("acme")
+
+
+def test_a_directory_named_environment_py_is_still_skipped_during_recovery(monkeypatch):
+    """A well-formed non-blob stays a legitimate skip, and the scan continues past it."""
+    _fake_hub(
+        monkeypatch,
+        {
+            "main": _tree(_dir("acme", "sha-acme")),
+            "sha-acme": _truncated(),
+            # environment.py exists as a DIRECTORY, then as the real blob after it
+            "sha-both": _tree(_dir("environment.py", "sha-d"), _blob("environment.py")),
+        },
+    )
+    real = loader._download_github_json
+
+    def routing_download(ref, url, context, **kwargs):
+        if "sha-acme" in url and "recursive" not in url:
+            return _tree(_dir("both", "sha-both"))
+        return real(ref, url, context, **kwargs)
+
+    monkeypatch.setattr(loader, "_download_github_json", routing_download)
+
+    assert loader.list_managed_namespace_slugs("acme") == ["acme/both"]

@@ -13,11 +13,53 @@ this namespace would keep pointing at the original function and silently ignore 
 
 from __future__ import annotations
 
-# how many per-package reads the truncation recovery may add. Sized so the worst case stays within
-# the client's derived wait rather than by how many envs an org "should" have: the recursive read
-# only truncates once a namespace holds roughly twenty full packages, and a prefix that settles none
-# of them is the pathological shape this bound exists for.
+import time
+
+# how many per-package reads the truncation recovery may add. A count bound as well as the wall-clock
+# one below, because the two limit different things: the deadline stops a slow hub, this stops a hub
+# large enough that even fast reads cannot enumerate it -- which must be reported, not answered short.
 _MAX_TRUNCATION_RECOVERY_READS = 8
+
+# the whole listing's wall-clock budget, shared across every read it makes. This is what lets the
+# truncation recovery issue more than two reads without the client giving up first: each read is
+# capped at the remainder rather than at a fixed per-read timeout, so a fan-out makes the individual
+# reads shorter instead of making the request longer.
+#
+# Deliberately equal to the client's derived ceiling MINUS its safety margin
+# (`http.ENV_LIST_SERVER_BUDGET_SECONDS`), duplicated as arithmetic rather than imported because
+# `flash.client` must stay importable without the server extra and this module is the server side. The
+# invariant that matters is one-directional and stated here so a future edit can check it: the server
+# must give up FIRST, so that a real upstream failure reaches the user as the controlled 429/502
+# rather than as a local timeout that says nothing about why.
+_LIST_READS = 2
+_LIST_ATTEMPTS_PER_READ = 2
+_LIST_SOCKET_TIMEOUT_SECONDS = 20.0
+_LIST_BODY_DEADLINE_SECONDS = 20.0
+_LIST_MAX_BACKOFF_PER_READ_SECONDS = 45.0
+_LISTING_DEADLINE_SECONDS = _LIST_READS * (
+    _LIST_ATTEMPTS_PER_READ * (_LIST_SOCKET_TIMEOUT_SECONDS + _LIST_BODY_DEADLINE_SECONDS)
+    + _LIST_MAX_BACKOFF_PER_READ_SECONDS
+)
+
+
+def _remaining_budget(deadline: float, namespace: str) -> dict:
+    """The read budget for the next read, narrowed to what is left of the listing's deadline.
+
+    Raises rather than issuing a doomed read once the budget is spent: a read started with no time
+    left would either block for its own full timeout (defeating the deadline) or fail confusingly.
+    """
+    from flash.envs import loader
+
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise RuntimeError(
+            f"listing environment namespace {namespace!r} exceeded its overall deadline; "
+            "the hub listing could not be read"
+        )
+    budget = dict(loader._LIST_READ_BUDGET)
+    budget["timeout"] = min(budget["timeout"], left)
+    budget["body_deadline"] = min(budget["body_deadline"], left)
+    return budget
 
 
 def list_managed_namespace_slugs(namespace: str) -> list[str]:
@@ -50,7 +92,8 @@ def list_managed_namespace_slugs(namespace: str) -> list[str]:
     if ref is None:  # pragma: no cover - the literal above always parses
         raise RuntimeError("could not build a managed environment reference")
 
-    root_sha = _namespace_root_sha(ref, namespace)
+    deadline = time.monotonic() + _LISTING_DEADLINE_SECONDS
+    root_sha = _namespace_root_sha(ref, namespace, deadline)
     if root_sha is None:
         return []
 
@@ -64,15 +107,15 @@ def list_managed_namespace_slugs(namespace: str) -> list[str]:
     # namespace exceed GitHub's response limit. Raising there would make every environment in that
     # namespace unlistable, so a truncated tree keeps what it did prove and settles the rest below.
     entries, truncated = loader._github_tree_entries_allowing_truncation(
-        ref, root_sha, namespace, recursive=True, **loader._LIST_READ_BUDGET
+        ref, root_sha, namespace, recursive=True, **_remaining_budget(deadline, namespace)
     )
     slugs = _slugs_from_recursive_entries(entries, namespace)
     if truncated:
-        slugs.update(_recover_truncated_namespace_slugs(ref, root_sha, namespace, slugs))
+        slugs.update(_recover_truncated_namespace_slugs(ref, root_sha, namespace, slugs, deadline))
     return sorted(slugs)
 
 
-def _namespace_root_sha(ref: object, namespace: str) -> str | None:
+def _namespace_root_sha(ref: object, namespace: str, deadline: float) -> str | None:
     """The tree sha of the namespace directory, or ``None`` when the org published nothing yet."""
     from flash.envs import loader
 
@@ -83,7 +126,7 @@ def _namespace_root_sha(ref: object, namespace: str) -> str | None:
         (
             entry
             for entry in loader._github_tree_entries(
-                ref, ref.ref, ref.ref, **loader._LIST_READ_BUDGET
+                ref, ref.ref, ref.ref, **_remaining_budget(deadline, namespace)
             )
             if entry.get("path") == namespace
         ),
@@ -142,7 +185,7 @@ def _slugs_from_recursive_entries(entries: list[dict], namespace: str) -> set[st
 
 
 def _recover_truncated_namespace_slugs(
-    ref: object, root_sha: str, namespace: str, found: set[str]
+    ref: object, root_sha: str, namespace: str, found: set[str], deadline: float
 ) -> set[str]:
     """Settle the packages a truncated recursive tree left undecided.
 
@@ -166,11 +209,26 @@ def _recover_truncated_namespace_slugs(
 
     recovered: set[str] = set()
     reads = 0
-    for entry in loader._github_tree_entries(ref, root_sha, namespace, **loader._LIST_READ_BUDGET):
+    for entry in loader._github_tree_entries(
+        ref, root_sha, namespace, **_remaining_budget(deadline, namespace)
+    ):
         name = entry.get("path")
-        if not isinstance(name, str) or entry.get("type") != "tree":
+        if not isinstance(name, str):
             continue
         if not loader._is_safe_github_path_parts((name,)):
+            continue
+        # validate the type only AFTER the path matched, exactly as the prefix path does. Folding the
+        # two into one predicate made a malformed type look like an absent one, so an unreadable hub
+        # response silently omitted a published environment instead of reaching the controlled 502.
+        kind = entry.get("type")
+        if not isinstance(kind, str) or not kind:
+            raise RuntimeError(
+                f"GitHub tree entry for environment {namespace}/{name!r} has an unusable type; "
+                "the hub listing could not be read"
+            )
+        # a well-formed non-tree is a readable answer: publish writes a directory, so a stray file at
+        # this path is unambiguously not an environment.
+        if kind != "tree":
             continue
         if f"{namespace}/{name}" in found:
             continue
@@ -188,11 +246,33 @@ def _recover_truncated_namespace_slugs(
                 "the hub listing could not be read"
             )
         members = loader._github_tree_entries(
-            ref, sha, f"{namespace}/{name}", **loader._LIST_READ_BUDGET
+            ref, sha, f"{namespace}/{name}", **_remaining_budget(deadline, namespace)
         )
-        if any(
-            member.get("path") == loader._DEFAULT_ENVIRONMENT_PATH and member.get("type") == "blob"
-            for member in members
-        ):
+        if _package_has_marker(members, namespace, name):
             recovered.add(f"{namespace}/{name}")
     return recovered
+
+
+def _package_has_marker(members: list[dict], namespace: str, name: str) -> bool:
+    """Whether one package's immediate children hold the ``environment.py`` blob publish writes.
+
+    Matches on the path first and only then validates the type, for the same reason the prefix path
+    does: a combined predicate makes an unusable type indistinguishable from an absent marker, so a
+    broken hub response omits a published environment rather than reaching the controlled 502.
+    """
+    from flash.envs import loader
+
+    for member in members:
+        if member.get("path") != loader._DEFAULT_ENVIRONMENT_PATH:
+            continue
+        kind = member.get("type")
+        if not isinstance(kind, str) or not kind:
+            raise RuntimeError(
+                f"GitHub tree entry {loader._DEFAULT_ENVIRONMENT_PATH!r} in environment "
+                f"{namespace}/{name!r} has an unusable type; the hub listing could not be read"
+            )
+        # a directory that happens to be named environment.py is a legitimate skip, not a fault, so
+        # keep scanning rather than deciding on the first path match.
+        if kind == "blob":
+            return True
+    return False

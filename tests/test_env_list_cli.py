@@ -673,3 +673,74 @@ def test_a_stalled_list_body_gives_up_instead_of_hanging(monkeypatch):
     client = ApiClient("https://api.freesolo.co", "fs-key")
     with pytest.raises(ClientError, match="stalled"):
         client.list_envs()
+
+
+def test_the_list_deadline_covers_the_open_phase_not_just_the_body(monkeypatch):
+    """The deadline has to start before `urlopen`, or it bounds only the tail of the request.
+
+    DNS, the TCP connect, the TLS handshake and header parsing all happen inside `urlopen`, and urllib
+    restarts its socket window on every receive -- so a peer that drip-feeds headers holds the call
+    open indefinitely without any single operation exceeding `timeout`. Starting the clock at the first
+    body read leaves that whole phase unbounded. This is the same defect already fixed for the hub
+    reads, reintroduced on the client side, so it is pinned here too.
+    """
+    import time
+    import urllib.request
+
+    from flash.client.http import ApiClient, ClientError
+
+    clock = [0.0]
+
+    def slow_open(req, timeout):
+        clock[0] += 100_000.0  # headers dribble in for far longer than the deadline
+        return _Resp(b'{"environments": []}')
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(urllib.request, "urlopen", slow_open)
+
+    client = ApiClient("https://api.freesolo.co", "fs-key")
+    with pytest.raises(ClientError, match="took too long to answer"):
+        client.list_envs()
+
+
+def test_the_open_timeout_never_exceeds_what_is_left_of_the_deadline(monkeypatch):
+    """A socket window longer than the remaining budget could overshoot by nearly a whole window."""
+    import time
+    import urllib.request
+
+    from flash.client.http import ENV_LIST_CLIENT_TIMEOUT_SECONDS, ApiClient
+
+    seen: list[float] = []
+    clock = [0.0]
+
+    def record(req, timeout):
+        seen.append(timeout)
+        return _Resp(b'{"environments": []}')
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(urllib.request, "urlopen", record)
+
+    client = ApiClient("https://api.freesolo.co", "fs-key")
+    assert client.list_envs() == []
+    assert seen == [ENV_LIST_CLIENT_TIMEOUT_SECONDS], (
+        f"a fresh deadline must not shorten the first open, got {seen}"
+    )
+
+
+def test_a_request_without_a_deadline_keeps_its_full_timeout(monkeypatch):
+    """Every other call passes no deadline, so none of them may change behaviour."""
+    import urllib.request
+
+    from flash.client.http import ApiClient
+
+    seen: list[float] = []
+
+    def record(req, timeout):
+        seen.append(timeout)
+        return _Resp(b'{"runs": []}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", record)
+
+    client = ApiClient("https://api.freesolo.co", "fs-key", timeout=42.0)
+    assert client.list_runs() == []
+    assert seen == [42.0], f"an undeadlined request must keep its own timeout, got {seen}"

@@ -12,6 +12,7 @@ keeps that seam live after the move.
 from __future__ import annotations
 
 import contextlib
+import time
 from collections.abc import Callable
 
 # the single definition. `http` re-exports it, because `cli.commands.env.push` imports the name from
@@ -49,7 +50,6 @@ def _read_error_body(exc: object, deadline_seconds: float = _ERROR_BODY_DEADLINE
     A read that FAILS still raises, so the caller can distinguish "unreadable" from "truncated here"
     and say so.
     """
-    import time
 
     fp = getattr(exc, "fp", None)
     if fp is None:
@@ -69,8 +69,25 @@ def _read_error_body(exc: object, deadline_seconds: float = _ERROR_BODY_DEADLINE
     return b"".join(chunks)
 
 
+def _capped_timeout(timeout: float, deadline: float | None) -> float:
+    """``timeout``, shortened to whatever is left of ``deadline``.
+
+    Without this the socket window could outlast the overall budget: a single blocking operation would
+    be allowed its full ``timeout`` even when the deadline expires part-way through it, so the caller
+    could overshoot by nearly a whole window on the very last read.
+    """
+
+    if deadline is None:
+        return timeout
+    return min(timeout, max(0.0, deadline - time.monotonic()))
+
+
 def _read_response_body(
-    resp: object, *, max_bytes: int | None = None, body_deadline: float | None = None
+    resp: object,
+    *,
+    max_bytes: int | None = None,
+    deadline: float | None = None,
+    path: str = "",
 ) -> bytes:
     """Read a 2xx body, bounded only if the caller asked for a bound.
 
@@ -79,20 +96,33 @@ def _read_response_body(
     holds the read open past any deadline the caller believes it set. The bound is opt-in because only
     a caller on an interactive path, with a ceiling it has promised the user, has a reason to abandon
     a body it could still finish reading.
+
+    ``deadline`` is an absolute ``time.monotonic()`` instant rather than a duration, because the caller
+    starts it before ``urlopen``: the connect and header phases have to spend from the same budget, or
+    the bound covers only the tail of the request. An already-expired deadline therefore fails here
+    even if the body would have been readable -- the wait the caller promised is already over.
     """
-    if max_bytes is None and body_deadline is None:
+    if max_bytes is None and deadline is None:
         return resp.read()  # type: ignore[attr-defined]
+    if deadline is not None and time.monotonic() > deadline:
+        from flash.client.http import ClientError
+
+        raise ClientError(
+            f"the control plane took too long to answer{f' {path}' if path else ''} "
+            "and exceeded its overall deadline"
+        )
     return _read_capped_response(
         resp,
         max_bytes if max_bytes is not None else _MAX_JSON_RESPONSE_BYTES,
-        deadline_seconds=body_deadline,
+        deadline=deadline,
     )
 
 
-def _read_capped_response(
-    resp: object, max_bytes: int, deadline_seconds: float | None = None
-) -> bytes:
+def _read_capped_response(resp: object, max_bytes: int, deadline: float | None = None) -> bytes:
     """Read a 2xx body under a byte cap, and optionally under a wall-clock deadline too.
+
+    ``deadline`` is an absolute ``time.monotonic()`` instant, not a duration: it is started by the
+    caller before the request is opened so that connect and header time count against it.
 
     The deadline is opt-in because the two callers want opposite things. A package download should
     finish even if it is slow -- there is nothing better to do with a half-fetched archive. An
@@ -100,11 +130,8 @@ def _read_capped_response(
     command can report what it does know; without a deadline urllib's per-receive timeout lets a
     peer that stays inside every window hold the read open indefinitely.
     """
-    import time
-
     from flash.client.http import ClientError
 
-    deadline = time.monotonic() + deadline_seconds if deadline_seconds is not None else None
     # see `_ERROR_BODY_CHUNK_BYTES`: the deadline is only checked between reads, so a deadline-bearing
     # read asks for less in order to regain control often enough for the bound to mean anything.
     read_size = _DOWNLOAD_CHUNK_BYTES if deadline is None else _ERROR_BODY_CHUNK_BYTES
