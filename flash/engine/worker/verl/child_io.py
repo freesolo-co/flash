@@ -65,17 +65,13 @@ except Exception:
 FLASH_CUDART_STUB_MARKER = "[flash-verl] tilelang libcudart stub repointed"
 
 
-def render_tilelang_cudart_shim() -> str:
-    """child-side sitecustomize fragment that repoints tilelang's libcudart stub at the real runtime.
+def _render_cudart_discovery() -> str:
+    """the discovery half of the stub fragment: find a libcudart that exports cudaDeviceReset.
 
-    mirrors ``perf._neutralize_tilelang_cudart_stub`` inside the verl interpreter, and keeps its two
-    load-bearing rules: never ``dlopen`` the stub to test it (that maps the stub into this process,
-    which is the crash being avoided), and leave the stub alone when no real libcudart is found.
-
-    never raises. an unrepointed stub only crashes the runs that build a sleeping vLLM engine, so a
-    fragment that cannot find a runtime must leave the child to start rather than abort it here.
+    split from the swap half only to keep each renderer under the function-size limit; the two are
+    concatenated into one ``try`` block and are not independently useful.
     """
-    return f'''
+    return '''
 # --- flash: repoint tilelang's libcudart stub (see child_io.render_tilelang_cudart_shim) ---
 try:
     import ctypes as _flash_cudart_ctypes
@@ -136,7 +132,16 @@ try:
             if _real is not None:
                 return _real
         return None
+'''
 
+
+def _render_cudart_swap() -> str:
+    """the swap half: locate tilelang's stub and atomically repoint it at the discovered runtime.
+
+    concatenated onto ``_render_cudart_discovery()`` inside the same ``try`` block, so it relies on
+    the names that half binds.
+    """
+    return f"""
     try:
         _flash_cudart_spec = _flash_cudart_importlib_util.find_spec("tilelang")
     except Exception:
@@ -179,22 +184,61 @@ try:
                     pass  # cross-device or a filesystem without hard links: proceed unbacked
                 # atomic swap through a private temp name: symlink() cannot overwrite, and an
                 # unlink-then-symlink would leave a window where the path does not resolve at all.
-                _flash_cudart_tmp = _flash_cudart_stub + ".flash-" + str(_flash_cudart_os.getpid())
+                # the name carries os.urandom entropy, not just the pid: a worker killed between
+                # symlink() and replace() leaves its temp link behind, and a pid-only name would
+                # collide once the container reuses that pid -- symlink() would raise, the swap
+                # would be skipped, and the stub would silently stay in place.
+                _flash_cudart_tmp = ""
                 try:
-                    _flash_cudart_os.symlink(_flash_cudart_real, _flash_cudart_tmp)
+                    for _flash_cudart_attempt in range(8):
+                        _flash_cudart_tmp = (
+                            _flash_cudart_stub
+                            + ".flash-"
+                            + str(_flash_cudart_os.getpid())
+                            + "-"
+                            + _flash_cudart_os.urandom(8).hex()
+                        )
+                        try:
+                            _flash_cudart_os.symlink(_flash_cudart_real, _flash_cudart_tmp)
+                            break
+                        except FileExistsError:
+                            # astronomically unlikely; clear it and draw a fresh name.
+                            try:
+                                _flash_cudart_os.remove(_flash_cudart_tmp)
+                            except OSError:
+                                pass
+                    else:
+                        raise RuntimeError("could not create a temp swap link")
                     _flash_cudart_os.replace(_flash_cudart_tmp, _flash_cudart_stub)
                 finally:
-                    try:
-                        _flash_cudart_os.remove(_flash_cudart_tmp)
-                    except OSError:
-                        pass
+                    if _flash_cudart_tmp:
+                        try:
+                            _flash_cudart_os.remove(_flash_cudart_tmp)
+                        except OSError:
+                            pass
                 print(
                     {FLASH_CUDART_STUB_MARKER!r} + " -> " + _flash_cudart_real,
                     flush=True,
                 )
 except Exception as _flash_cudart_exc:
     print("[flash-verl] tilelang libcudart stub repoint failed: " + repr(_flash_cudart_exc), flush=True)
-'''
+"""
+
+
+def render_tilelang_cudart_shim() -> str:
+    """child-side sitecustomize fragment that repoints tilelang's libcudart stub at the real runtime.
+
+    mirrors ``perf._neutralize_tilelang_cudart_stub`` inside the verl interpreter, and keeps its two
+    load-bearing rules: never ``dlopen`` the stub to test it (that maps the stub into this process,
+    which is the crash being avoided), and leave the stub alone when no real libcudart is found.
+
+    never raises. an unrepointed stub only crashes the runs that build a sleeping vLLM engine, so a
+    fragment that cannot find a runtime must leave the child to start rather than abort it here.
+
+    the two halves are one ``try`` block split across two renderers purely for the function-size
+    limit; the swap half reads names the discovery half binds, so they are always emitted together.
+    """
+    return _render_cudart_discovery() + _render_cudart_swap()
 
 
 # --------------------------- w&b run link (all three verl backends) ---------------------------

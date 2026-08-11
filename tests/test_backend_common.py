@@ -3852,9 +3852,19 @@ import ctypes, ctypes.util, glob, os, sys
 sys.path.insert(0, {str(tmp_path)!r})
 _real = {real!r}
 _realglob = glob.glob
-glob.glob = lambda pat, *a, **k: (
-    [_real] if (_real and "libcudart.so" in pat) else _realglob(pat, *a, **k)
-)
+
+
+def _glob(pat, *a, **k):
+    # hermetic: NEVER let a libcudart pattern reach the real glob. this host may have
+    # /usr/local/cuda* or a system libcudart, and the fake CDLL below reports cudaDeviceReset for
+    # every non-stub candidate -- so delegating would let a CUDA-enabled runner discover a real
+    # library and repoint the stub in the test that asserts it is left alone.
+    if "libcudart.so" in pat:
+        return [_real] if _real else []
+    return _realglob(pat, *a, **k)
+
+
+glob.glob = _glob
 ctypes.util.find_library = lambda name: None
 
 
@@ -4019,6 +4029,41 @@ def test_concurrent_ray_workers_never_lose_the_stub_or_the_original(tmp_path):
     # no temp links left behind by a worker that died mid-swap.
     leftovers = list((tmp_path / "tilelang" / "lib").glob("libcudart_stub.so.flash-*"))
     assert not leftovers, f"temporary swap links leaked: {leftovers}"
+
+
+def test_a_stale_swap_link_does_not_block_the_repoint(tmp_path):
+    """A worker killed between symlink() and replace() leaves its temp link on disk.
+
+    With a pid-only temp name, the next worker to reuse that pid would hit FileExistsError,
+    skip the swap, and leave the stub in place -- a silently unrepointed stub, which is the
+    original crash one step later. Plant a stale link for THIS interpreter's pid and assert the
+    repoint still lands.
+    """
+    _pkg, stub = _fake_child_tilelang(tmp_path)
+    real = tmp_path / "libcudart.so.12"
+    real.write_bytes(b"REAL-CUDART")
+
+    # the child's pid is not knowable from here, so it plants the stale link on ITSELF: a dangling
+    # symlink at exactly the pid-only name the old scheme would have chosen, created before the
+    # fragment runs. that is precisely the post-crash state a reused pid inherits.
+    plant = (
+        "import os as _p_os\n"
+        f"_p_stale = {str(tmp_path / 'tilelang' / 'lib' / 'libcudart_stub.so')!r}"
+        ' + ".flash-" + str(_p_os.getpid())\n'
+        '_p_os.symlink("/nonexistent/stale", _p_stale)\n'
+    )
+    result = _run_cudart_fragment(
+        plant + vc.render_tilelang_cudart_shim(),
+        tmp_path,
+        real=str(real),
+        extra="print('FRAGMENT_DONE', flush=True)",
+    )
+
+    assert "FRAGMENT_DONE" in result.stdout, f"fragment aborted the child: {result.stderr[-2000:]}"
+    assert stub.is_symlink(), (
+        "a stale temp swap link blocked the repoint; the stub is still tilelang's own file"
+    )
+    assert os.path.realpath(stub) == os.path.realpath(str(real))
 
 
 @pytest.mark.parametrize("backend", ["grpo", "opd", "sft"])
