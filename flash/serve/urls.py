@@ -39,19 +39,30 @@ def displayable_url(url: str) -> str:
     than pattern-matched: an allowlist of two fields cannot be outgrown by a new secret-bearing one.
     A value too malformed to parse is reported as a placeholder, never echoed back.
 
+    Every field is read inside the guard. ``urlsplit`` defers validation to the accessors, so
+    ``.port`` raises on ``host:notaport`` long after the split succeeded -- and this helper exists
+    to build ERROR messages, so a raise here replaces a friendly failure with a traceback from the
+    reporting path itself. There is no "already parsed, so the rest is safe" point to relax at.
+
     Sits beside ``is_freesolo_hosted_url`` because both answer questions about a URL's authority
     and must agree on how one is parsed.
     """
     try:
         parsed = urlsplit(url)
-    except ValueError:  # malformed authority (e.g. a bad ipv6 literal)
+        host = parsed.hostname or ""
+        # an ipv6 literal loses its brackets through ``hostname``, and without them a trailing
+        # port is unreadable (``2001:db8::1:8443``) and the address itself ambiguous. restore them.
+        if ":" in host:
+            host = f"[{host}]"
+        port = parsed.port
+        scheme = parsed.scheme
+    except ValueError:  # malformed authority: a bad ipv6 literal, or a port that is not a number
         return "(unparseable url)"
-    host = parsed.hostname or ""
     if not host:
         return "(unparseable url)"
-    if parsed.port:
-        host = f"{host}:{parsed.port}"
-    return f"{parsed.scheme}://{host}" if parsed.scheme else host
+    if port:
+        host = f"{host}:{port}"
+    return f"{scheme}://{host}" if scheme else host
 
 
 def serving_control_url(value: str) -> str:

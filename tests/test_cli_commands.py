@@ -3477,6 +3477,48 @@ def test_hosted_key_rejection_names_the_url_that_rejected_it(monkeypatch):
     assert "--api-url" not in str(exc.value)
 
 
+def test_key_rejection_survives_a_url_whose_port_is_not_a_number(monkeypatch):
+    """A malformed port must not turn the login failure into a traceback.
+
+    ``urlsplit`` defers validation to its accessors, so a bad port raises on the ``.port`` read
+    rather than at parse time. This helper builds the ERROR message, so a raise inside it replaces
+    the friendly ClientError with a ValueError from the reporting path -- the user then sees a
+    stack trace instead of being told their key was rejected.
+    """
+    import urllib.error
+
+    from flash.client.http import ClientError, verify_freesolo_key
+
+    def _reject(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr("urllib.request.urlopen", _reject)
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://identity.example:notaport")
+
+    with pytest.raises(ClientError) as exc:
+        verify_freesolo_key("fs-key")
+    assert "rejected this API key" in str(exc.value)
+
+
+def test_displayable_url_keeps_ipv6_brackets_and_rejects_bad_ports():
+    """An IPv6 host must stay bracketed, and an unreadable authority must degrade, not raise.
+
+    ``hostname`` strips the brackets an IPv6 literal needs, so appending a port yields
+    ``2001:db8::1:8443`` -- an address the reader cannot split back into host and port. A URL
+    printed in an error is meant to be copied, so it has to survive the round trip.
+    """
+    from flash.serve.urls import displayable_url
+
+    assert displayable_url("https://[2001:db8::1]:8443") == "https://[2001:db8::1]:8443"
+    assert displayable_url("https://[2001:db8::1]") == "https://[2001:db8::1]"
+    assert displayable_url("https://[::1]:80") == "https://[::1]:80"
+    # userinfo is still dropped when the host is IPv6.
+    assert displayable_url("https://user:pw@[2001:db8::1]:443") == "https://[2001:db8::1]:443"
+    # every unreadable authority degrades to the placeholder rather than raising.
+    for bad in ("https://identity.example:notaport", "https://host:99999999", "https://[bad::ipv6"):
+        assert displayable_url(bad) == "(unparseable url)", bad
+
+
 def test_hosted_key_rejection_does_not_echo_credentials_from_the_base_url(monkeypatch):
     """The URL named in the error must never carry the secret it was configured with.
 
