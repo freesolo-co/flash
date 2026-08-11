@@ -70,24 +70,36 @@ jobs:
           # can never reach it: `$HEAD_SHA` would otherwise be resolved against a repository whose
           # commits and signatures an attacker controls.
           #
-          # both conditions are required. the PR author cannot be spoofed to `dependabot[bot]`
-          # (brackets are not legal in a username, so no human account holds that login), and the
-          # head commit must be a VERIFIED dependabot commit -- which is what ties the exemption to
-          # the content currently on the branch rather than to who opened the PR. a human commit
-          # pushed onto a dependabot branch fails the second condition and falls through to the
-          # branch rule below, which rejects it.
+          # the exemption reads the COMMITTER, never the author. `.author.login` is resolved from
+          # the commit's author email header, which whoever pushes chooses freely, and GPG
+          # verification attests to the SIGNER -- who is the committer, a separate identity. the
+          # two are independent: on this repo's own merged dependabot commits `.author.login` is
+          # `dependabot[bot]` while `.committer.login` is `web-flow`, with `verified: true`
+          # describing web-flow's signature. so pairing `.author.login` with `.verified` checks a
+          # forgeable header against a signature belonging to someone else, and a collaborator who
+          # pushes with dependabot's noreply author email and their own valid signature satisfies
+          # both halves while shipping arbitrary code. `.committer.login` is the identity the
+          # signature actually binds to, so it is the only one worth checking.
+          #
+          # the PR author is required alongside it and cannot be spoofed to `dependabot[bot]`
+          # (brackets are not legal in a username, so no human account holds that login).
           if [ "$PR_AUTHOR" = "dependabot[bot]" ] && case "$HEAD_REF" in dependabot/*) true ;; *) false ;; esac; then
             head_commit="$(gh api "repos/$UPSTREAM_REPO/commits/$HEAD_SHA" \
-              --jq '[(.author.login // ""), (.commit.verification.verified | tostring)] | join(" ")' 2>/dev/null || true)"
-            if [ "$head_commit" = "dependabot[bot] true" ]; then
-              echo "Dependabot security update: head commit $HEAD_SHA is a verified dependabot commit on '$HEAD_REF'."
-              echo "These are alert-driven and target the default branch by construction, so the dev -> main rule does not apply."
-              exit 0
-            fi
-            # an unreadable or unverified head commit is NOT an exemption. say why, then fall
-            # through to the branch rule, which fails: a dependabot-looking PR carrying a commit
-            # this job cannot verify is exactly the case the guard exists for.
-            echo "::warning::head commit $HEAD_SHA on '$HEAD_REF' is not a verified dependabot commit (got '$head_commit'), so the dependabot exemption does not apply."
+              --jq '[(.committer.login // ""), (.commit.verification.verified | tostring), (.commit.verification.reason // "")] | join(" ")' 2>/dev/null || true)"
+            # `reason` is required to be exactly `valid`, not merely `verified: true`: the pair is
+            # what GitHub documents as a trustworthy signature, and pinning both leaves no room for
+            # a future reason string that reports true under weaker terms.
+            case "$head_commit" in
+              "dependabot[bot] true valid"|"web-flow true valid")
+                echo "Dependabot security update: head commit $HEAD_SHA carries a valid signature from '${head_commit%% *}' on '$HEAD_REF'."
+                echo "These are alert-driven and target the default branch by construction, so the dev -> main rule does not apply."
+                exit 0
+                ;;
+            esac
+            # an unreadable, unsigned, or differently-signed head commit is NOT an exemption. say
+            # why, then fall through to the branch rule, which fails: a dependabot-looking PR
+            # carrying a commit this job cannot verify is exactly the case the guard exists for.
+            echo "::warning::head commit $HEAD_SHA on '$HEAD_REF' does not carry a valid dependabot signature (committer/verified/reason: '$head_commit'), so the dependabot exemption does not apply."
           fi
           if [ "$HEAD_REF" != "dev" ]; then
             echo "::error::wrong source branch: PRs into main must come from 'dev' (got '$HEAD_REF'). Merge into dev, then promote dev -> main."

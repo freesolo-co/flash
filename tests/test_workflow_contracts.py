@@ -437,8 +437,15 @@ def test_main_source_guard_exempts_dependabot_only_by_verified_head_commit():
     pushes a commit onto a dependabot security PR keeps them and would inherit the exemption for
     arbitrary human code.
 
-    The head commit's signature is what closes that: `.author.login` is resolved from the commit's
-    email header, which whoever pushes chooses, so `verified` is the part that cannot be forged.
+    The head commit's SIGNATURE is what closes that, and it must be read off the committer. A
+    signature attests to its signer, who is the committer, while `.author.login` is resolved from
+    the author email header that whoever pushes chooses. The two are independent identities: on
+    this repo's own merged dependabot commits `.author.login` is `dependabot[bot]` while
+    `.committer.login` is `web-flow` and `verified: true` describes web-flow's signature. Pairing
+    the author with `verified` therefore checks a forgeable header against somebody else's
+    signature, and a collaborator pushing with dependabot's noreply author email and their own
+    valid key satisfies both halves while shipping arbitrary code to `main`.
+
     The script is EXECUTED here (with `gh` stubbed) rather than grepped, because the characters
     being present proves nothing about which branch they gate.
     """
@@ -479,41 +486,64 @@ def test_main_source_guard_exempts_dependabot_only_by_verified_head_commit():
             ).returncode
 
         bot = "dependabot[bot]"
-        verified = f"{bot} true"
+        branch = "dependabot/pip/urllib3-2.5.0"
+        # the stub emits `<committer.login> <verified> <reason>` -- what the script's --jq prints.
+        signed_by_bot = f"{bot} true valid"
+        # GitHub signs dependabot's pushes as `web-flow`, which is what this repo's own merged
+        # dependabot commits actually carry, so it must be accepted too.
+        signed_by_web_flow = "web-flow true valid"
 
-        # the case the exemption exists for.
-        assert run(UPSTREAM_REPOSITORY, "dependabot/pip/urllib3-2.5.0", bot, verified) == 0, (
-            "a dependabot security PR whose head is a verified dependabot commit must pass -- "
-            "otherwise the required check is red by construction on every CVE fix"
+        # the two cases the exemption exists for.
+        assert run(UPSTREAM_REPOSITORY, branch, bot, signed_by_bot) == 0, (
+            "a dependabot security PR whose head is signed by dependabot must pass -- otherwise "
+            "the required check is red by construction on every CVE fix"
+        )
+        assert run(UPSTREAM_REPOSITORY, branch, bot, signed_by_web_flow) == 0, (
+            "a dependabot head signed by web-flow must pass -- that is what GitHub actually puts "
+            "on this repo's merged dependabot commits"
         )
 
         # a human pushed onto that same PR. author and head ref are unchanged; only the commit is.
-        assert (
-            run(UPSTREAM_REPOSITORY, "dependabot/pip/urllib3-2.5.0", bot, "DavidBShan false") != 0
-        ), (
+        assert run(UPSTREAM_REPOSITORY, branch, bot, "DavidBShan false ") != 0, (
             "human commits pushed onto a dependabot PR inherited the exemption -- the guard must "
             "key on the head commit, not on who opened the PR"
         )
 
-        # the commit claims dependabot's email but carries no valid signature.
-        assert run(UPSTREAM_REPOSITORY, "dependabot/pip/urllib3-2.5.0", bot, f"{bot} false") != 0, (
-            "an UNVERIFIED commit claiming dependabot's login was exempted -- .author.login comes "
-            "from the email header, so the signature is the only unforgeable half"
+        # THE SPOOF: a collaborator pushes with dependabot's noreply author email and signs with
+        # their OWN valid key. `.author.login` resolves to dependabot from the forged header while
+        # the signature verifies against the collaborator, so an author-keyed check reads
+        # "dependabot, verified" for human-authored content. reading the committer is what makes
+        # this case distinguishable at all.
+        assert run(UPSTREAM_REPOSITORY, branch, bot, "DavidBShan true valid") != 0, (
+            "a commit whose author header was set to dependabot's address but which is SIGNED BY A "
+            "HUMAN was exempted -- verification binds to the committer, so the committer is what "
+            "the exemption must read"
+        )
+
+        # signed by dependabot's identity but the signature does not check out.
+        assert run(UPSTREAM_REPOSITORY, branch, bot, f"{bot} false unverified") != 0, (
+            "an UNVERIFIED commit claiming dependabot's identity was exempted"
+        )
+
+        # verified true under a reason other than `valid`.
+        assert run(UPSTREAM_REPOSITORY, branch, bot, f"{bot} true unknown_key") != 0, (
+            "a signature reporting verified=true under a non-`valid` reason was exempted -- both "
+            "fields are pinned so a weaker future reason cannot widen the exemption"
         )
 
         # the lookup failing is not an exemption.
-        assert run(UPSTREAM_REPOSITORY, "dependabot/pip/urllib3-2.5.0", bot, None) != 0, (
+        assert run(UPSTREAM_REPOSITORY, branch, bot, None) != 0, (
             "an unreadable head commit must fail closed, not be treated as a dependabot bump"
         )
 
         # a human branch merely NAMED like dependabot's.
-        assert run(UPSTREAM_REPOSITORY, "dependabot/evil", "DavidBShan", verified) != 0, (
+        assert run(UPSTREAM_REPOSITORY, "dependabot/evil", "DavidBShan", signed_by_bot) != 0, (
             "a human-authored branch named `dependabot/...` bypassed the guard"
         )
 
         # a fork must never reach the exemption at all: on a fork head the commit and its
         # signatures are attacker-controlled.
-        assert run("attacker/flash", "dependabot/pip/x", bot, verified) != 0, (
+        assert run("attacker/flash", branch, bot, signed_by_bot) != 0, (
             "a fork PR claimed the dependabot exemption -- it must be rejected as a fork first"
         )
 
