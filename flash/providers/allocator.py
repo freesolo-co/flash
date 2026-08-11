@@ -419,6 +419,14 @@ def allocate(
         )
         if not available:
             raise UnsupportedGpuError(f"exact GPU {exact!r} has no configured active provider")
+        # a pinned class with no authored count is a ONE-CARD pin, matching the parse gate
+        # (flash/schema/__init__.py) and the offline quote (flash/cost/analytical.py). without this,
+        # a direct allocate(gpu_type=...) call auto-sized the pinned class up to eight cards --
+        # measured: a 24 GB RTX 4090 resolved to 8 cards for an 80 GB run, renting hardware the
+        # author never asked for. auto-sizing applies only when neither the class nor the count is
+        # authored.
+        if max_gpu_count is None:
+            max_gpu_count = 1
     cap = _resolved_gpu_count(
         model_id,
         algorithm,

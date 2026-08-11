@@ -1580,6 +1580,24 @@ def test_unset_count_auto_sizes_the_27b_grpo_run_to_two_cards(monkeypatch):
     assert all(candidate.gpu_count <= 2 for candidate in allocation.candidates)
 
 
+def test_a_pinned_gpu_type_without_a_count_stays_one_card_in_allocate(monkeypatch):
+    """`allocate()` is the THIRD boundary that decides this, and it decides independently.
+
+    The parse gate and the offline quote already keep a pinned class at one card when no count was
+    authored. `allocate()` resolved its own ceiling from `max_gpu_count`, so a direct call with a
+    pinned type and no count auto-sized the pinned class: measured, a 24 GB RTX 4090 resolved to 8
+    cards for an 80 GB run and would have rented them. Auto-sizing applies only when NEITHER the
+    class nor the count is authored.
+    """
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, UnsupportedGpuError
+
+    cands = [Candidate(provider="runpod", gpu="RTX 4090", hourly_usd=0.69, vram_gb=24)]
+    _stub_provider(monkeypatch, allocator, cands)
+    with pytest.raises(UnsupportedGpuError, match=r"gpu\.count=1 provides at most"):
+        allocator.allocate("Qwen/Qwen3.5-9B", "grpo", gpu_type="RTX 4090")
+
+
 def test_unset_count_quote_prices_the_auto_sized_shape():
     from flash.cost import RunConfig, estimate_cost
 
