@@ -7,7 +7,10 @@ import pytest
 
 from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
 from flash.engine.profiling.sft_workload import prepare_sft_workload, sft_tokens_for_updates
-from flash.engine.profiling.workload_profile import sft_profile_input_digest
+from flash.engine.profiling.workload_profile import (
+    sft_profile_input_digest,
+    unpacked_batch_warning,
+)
 
 
 class FakeTokenizer:
@@ -152,6 +155,102 @@ def test_exact_unpacked_mode_trains_one_example_per_update() -> None:
     assert prepared.rows == packed.rows
     assert prepared.profile.real_tokens_per_epoch == packed.profile.real_tokens_per_epoch
     assert prepared.profile.derived_steps > packed.profile.derived_steps
+
+
+def test_unpacked_run_warns_that_the_configured_batch_size_is_ignored(capsys) -> None:
+    """An unpacked prepare announces the one-example-per-update override on stderr."""
+    _prepare(_spec(), packed=False)
+    err = capsys.readouterr().err
+
+    assert "sequence packing is OFF" in err
+    assert "the configured batch_size 2 no longer groups examples into an update" in err
+    assert "learning_rate" in err
+
+
+def test_packed_run_does_not_warn_about_the_batch_size(capsys) -> None:
+    packed = _prepare(_spec(), packed=True)
+    err = capsys.readouterr().err
+
+    assert packed.profile.examples_per_update == 2
+    assert "sequence packing is OFF" not in err
+
+
+@pytest.mark.parametrize(
+    ("architecture_mode", "expected"),
+    [
+        ("multimodal", "multimodal"),
+        ("gdn-hybrid", "linear-attention recurrence"),
+        ("unsupported", "no boundary-safe packing path"),
+    ],
+)
+def test_unpacked_warning_names_the_reason_the_packing_decision_froze(
+    architecture_mode: str, expected: str
+) -> None:
+    """The reason comes from the architecture label the packing decision recorded on the profile."""
+    message = unpacked_batch_warning(
+        packing_mode="exact-unpacked",
+        architecture_mode=architecture_mode,
+        examples_per_update=1,
+        configured_batch_size=32,
+    )
+
+    assert message is not None
+    assert expected in message
+
+
+def test_unpacked_warning_names_the_recipe_default_when_batch_size_was_omitted() -> None:
+    """An omitted batch_size is the recipe's 32, which is the batch packing discarded: the cli
+    reads it straight off the spec, so the default has to resolve here or the number goes missing.
+    """
+    from flash.engine.plan.recipe import RECIPE
+
+    message = unpacked_batch_warning(
+        packing_mode="exact-unpacked",
+        architecture_mode="multimodal",
+        examples_per_update=1,
+        configured_batch_size=None,
+    )
+
+    assert message is not None
+    # an omitted batch_size is reported as the default, not as something the user configured.
+    assert f"the default batch_size {RECIPE.sft.effective_batch}" in message
+
+
+def test_unpacked_warning_is_silent_when_the_authored_batch_was_already_one() -> None:
+    """Nothing was overridden, so there is nothing to warn about."""
+    assert (
+        unpacked_batch_warning(
+            packing_mode="exact-unpacked",
+            architecture_mode="multimodal",
+            examples_per_update=1,
+            configured_batch_size=1,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("authored", [True, False])
+def test_worker_unpacked_warning_names_the_batch_source_truthfully(capsys, authored: bool) -> None:
+    """The worker path resolves batch_size to the recipe default before it warns, so handing the
+    resolved number to the helper made an omitted knob read as one the user configured -- the
+    opposite of what the cli says about the same run.
+    """
+    from flash.engine.plan.recipe import RECIPE
+
+    spec = _spec()
+    spec = _rebuild_digest(
+        replace(spec, train=replace(spec.train, batch_size=2 if authored else None))
+    )
+
+    _prepare(spec, packed=False)
+
+    warning = capsys.readouterr().err
+    expected = (
+        "the configured batch_size 2"
+        if authored
+        else f"the default batch_size {RECIPE.sft.effective_batch}"
+    )
+    assert expected in warning
 
 
 def _rebuild_digest(spec: JobSpec) -> JobSpec:
