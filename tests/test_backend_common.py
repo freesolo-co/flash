@@ -858,8 +858,15 @@ def test_the_shim_patches_the_module_the_caller_actually_receives():
     pytest.importorskip("transformers", reason="the patch imports transformers' packing helpers")
     shim = vc.render_gdn_varlen_shim("qwen3_5")
     namespace: dict = {}
-    # the shim is our own render, not external input
-    exec(compile(shim, "<gdn-shim>", "exec"), namespace)
+    # executing the shim arms its meta_path finder against THIS interpreter, so restore the list
+    # afterwards: leaving it installed would patch the real modeling module for whichever later
+    # test imports it first, which is an order-dependent failure rather than an honest one.
+    saved_meta_path = sys.meta_path[:]
+    try:
+        # the shim is our own render, not external input
+        exec(compile(shim, "<gdn-shim>", "exec"), namespace)
+    finally:
+        sys.meta_path[:] = saved_meta_path
     patch = namespace["_flash_patch_gdn_varlen"]
 
     class Stand:
