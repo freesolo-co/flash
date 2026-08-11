@@ -2303,6 +2303,62 @@ def test_sft_hardware_ranking_prices_the_profiled_batch_not_the_authored_one(mon
     assert fallback.batch_size == 8
 
 
+def test_sft_vram_sizing_uses_the_profiled_batch_not_the_authored_one(monkeypatch):
+    """Submit must RESERVE for the work that runs, not the batch the user typed.
+
+    Ranking takes the profile through `overrides`, but `required_vram_gb` sizes from `train`. Those
+    are different vocabularies (`seq_len` vs `max_context_tokens`), so moving the profiled batch
+    into `overrides` silently left sizing on the authored one: a 4B at the authored batch 8 / 4096
+    reserves 23.0 GB while the run executes batch 1 / 1404 and needs 19.0 GB. That over-reserves by
+    4 GB and can reject a card the run would have fit on -- the same authored-vs-executed split the
+    ranking clamp exists to close.
+
+    The assertion drives `allocate` and captures what sizing actually receives. Exercising
+    `_overridden_train` alone cannot catch this: the helper keeps translating correctly whether or
+    not the call site uses it, so a version that sizes off the authored `train` still passes.
+    """
+    from flash.core.spec import TrainSpec
+    from flash.providers import allocator
+
+    authored = {"batch_size": 8, "max_context_tokens": 4096}
+    overrides = {"batch_size": 1, "seq_len": 1404, "sft_retained_examples": 10}
+
+    sized_authored = allocator.required_vram_gb("Qwen/Qwen3.5-4B", "sft", train=authored)
+    sized_executed = allocator.required_vram_gb(
+        "Qwen/Qwen3.5-4B", "sft", train={"batch_size": 1, "max_context_tokens": 1404}
+    )
+    assert sized_executed < sized_authored, (
+        f"sizing off the authored batch reserves {sized_authored} GB for work that needs "
+        f"{sized_executed} GB"
+    )
+
+    captured = {}
+
+    def capture(model_id, algorithm, *, train=None, thinking=False, model_revision=""):
+        captured["train"] = train
+        return sized_executed
+
+    monkeypatch.setattr(allocator, "required_vram_gb", capture)
+    # allocation itself may fail on provider availability; sizing runs first, which is the contract
+    # under test.
+    with contextlib.suppress(Exception):
+        allocator.allocate("Qwen/Qwen3.5-4B", "sft", train=authored, overrides=overrides)
+    assert captured["train"] == {"batch_size": 1, "max_context_tokens": 1404}, (
+        f"allocate() sized VRAM from {captured.get('train')!r}; it must pass the profile-overridden "
+        "knobs or submit reserves for a batch the run never executes"
+    )
+
+    # a dataclass train table must substitute the same way, and absent overrides must not touch it.
+    spec_train = TrainSpec(batch_size=8, max_context_tokens=4096)
+    with contextlib.suppress(Exception):
+        allocator.allocate("Qwen/Qwen3.5-4B", "sft", train=spec_train, overrides=overrides)
+    assert captured["train"].batch_size == 1
+    assert captured["train"].max_context_tokens == 1404
+    with contextlib.suppress(Exception):
+        allocator.allocate("Qwen/Qwen3.5-4B", "sft", train=spec_train)
+    assert captured["train"] is spec_train
+
+
 def test_sft_idle_card_warning_only_recommends_widths_that_actually_work():
     """A remedy that cannot be acted on is worse than no remedy.
 

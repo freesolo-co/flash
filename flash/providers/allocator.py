@@ -72,6 +72,39 @@ def _profile_cost_ranker():
     return lambda candidate: candidate.total_hourly_usd
 
 
+# RunConfig field -> the `train` knob holding the same quantity. The two vocabularies differ, so
+# VRAM sizing (which reads `train`) cannot consume `overrides` without this mapping. `lora_rank`
+# and the rest are absent because the profile does not measure them -- only these three move.
+_TRAIN_KNOB_FOR_OVERRIDE = {
+    "batch_size": "batch_size",
+    "seq_len": "max_context_tokens",
+}
+
+
+def _overridden_train(train, overrides):
+    """``train`` with profile-measured knobs substituted in, for VRAM sizing.
+
+    Ranking and sizing must agree on the shape of the work: ranking takes the profile through
+    ``overrides``, so sizing has to see the same numbers or submit reserves for a batch the run
+    never executes. Returns ``train`` untouched when there is nothing to substitute, which keeps
+    every non-SFT path byte-identical.
+    """
+    knobs = {
+        _TRAIN_KNOB_FOR_OVERRIDE[key]: value
+        for key, value in (overrides or {}).items()
+        if key in _TRAIN_KNOB_FOR_OVERRIDE
+    }
+    if not knobs or train is None:
+        return train
+    if isinstance(train, dict):
+        return {**train, **knobs}
+    from dataclasses import is_dataclass, replace
+
+    if is_dataclass(train):
+        return replace(train, **knobs)
+    return train
+
+
 def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision="", overrides=None):
     """``candidate -> dollars for one optimizer step``, or None when the run cannot be priced.
 
@@ -372,7 +405,11 @@ def allocate(
         need = required_vram_gb(
             model_id,
             algorithm,
-            train=train,
+            # the same profile knobs ranking prices on: VRAM must be sized for the work that will
+            # RUN, not the authored request. an exact-unpacked run executes batch 1 at the measured
+            # length, so sizing off the authored batch over-reserves (4 GB on a 4B at batch 8 /
+            # 4096) and can reject a card the run would have fit on.
+            train=_overridden_train(train, overrides),
             thinking=thinking,
             model_revision=model_revision,
         )
