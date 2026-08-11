@@ -6263,10 +6263,10 @@ def _deployed_chat_run(api):
 def test_chat_stream_upstream_error_before_first_byte_is_502(api, monkeypatch):
     """The streaming branch returns a real 502 when the upstream request fails at start.
 
-    Drives the REAL chat_stream (only the httpx seams are stubbed): the regression was a lazy
-    generator whose request and raise_for_status only ran once Starlette iterated the body,
-    after the 200 had been flushed, so the route's except could never fire and an upstream
-    502 arrived as an empty success."""
+    Drives the REAL chat_stream (only the httpx seams are stubbed): a lazy generator whose
+    request and raise_for_status run only once Starlette iterates the body does so after the
+    200 has been flushed, so the route's except can never fire and an upstream 502 arrives as
+    an empty success."""
     import flash.serve.deploy as deploy
 
     key, run_id = _deployed_chat_run(api)
