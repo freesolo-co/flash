@@ -506,18 +506,21 @@ def sft_grad_checkpoint_can_disable(
     return peak + float(margin_gb) <= float(card_vram_gb)
 
 
-def _config_geometry(config: dict) -> tuple[int, int, int]:
+def _config_geometry(config: dict) -> tuple[int, int, int, int]:
     text = config.get("text_config") if isinstance(config.get("text_config"), dict) else config
     return (
         int(text.get("vocab_size") or config.get("vocab_size") or 0),
         int(text.get("hidden_size") or config.get("hidden_size") or 0),
         int(text.get("num_hidden_layers") or config.get("num_hidden_layers") or 0),
+        # QUERY heads. verl's ulysses sequence parallelism requires this to divide the card count,
+        # so it decides how wide a pinned run may be -- see `allocator.geometry_safe_gpu_cap`.
+        int(text.get("num_attention_heads") or config.get("num_attention_heads") or 0),
     )
 
 
 def fetch_hf_model_geometry(
     model_id: str, revision: str = "", *, strict: bool = False
-) -> tuple[float | None, int, int, int]:
+) -> tuple[float | None, int, int, int, int]:
     """Return revision-aware params and config geometry from Hugging Face."""
     try:
         from huggingface_hub import HfApi, hf_hub_download
@@ -542,44 +545,14 @@ def fetch_hf_model_geometry(
             config = json.load(handle)
         if not isinstance(config, dict):
             raise ValueError("model config is not an object")
-        vocab, hidden, layers = _config_geometry(config)
-        return params_b, vocab, hidden, layers
+        vocab, hidden, layers, heads = _config_geometry(config)
+        return params_b, vocab, hidden, layers, heads
     except Exception as exc:
         if strict:
             raise ValueError(
                 f"could not resolve revision-specific sizing metadata for model {model_id!r}"
             ) from exc
-        return None, 0, 0, 0
-
-
-def _validated_revision_geometry(model_id: str, revision: str, info):
-    params_b, vocab, hidden, layers = fetch_hf_model_geometry(model_id, revision, strict=True)
-    # Revision-aware sizing is authoritative and must fail closed. When the pinned commit exposes no
-    # parameter-count metadata (no safetensors.total), we cannot derive its size; silently reusing the
-    # catalog default-revision count would size the exact-GPU preflight on weights the worker never loads,
-    # the precise mis-provisioning this pin exists to prevent.
-    if params_b is None:
-        raise ValueError(
-            f"model_revision for {model_id!r} exposes no parameter-count metadata "
-            f"(no safetensors.total); cannot size the pinned revision"
-        )
-    mismatches: list[str] = []
-    if info.params_b > 0:
-        delta = abs(params_b - info.params_b) / info.params_b
-        if delta > 0.05:
-            mismatches.append("parameter count")
-    if vocab and info.vocab_size and vocab != info.vocab_size:
-        mismatches.append("vocabulary size")
-    if hidden and info.hidden_size and hidden != info.hidden_size:
-        mismatches.append("hidden size")
-    if layers and info.num_layers and layers != info.num_layers:
-        mismatches.append("layer count")
-    if mismatches:
-        raise ValueError(
-            f"model_revision for {model_id!r} has geometry incompatible with the catalog: "
-            f"{', '.join(mismatches)}"
-        )
-    return params_b, vocab or info.vocab_size
+        return None, 0, 0, 0, 0
 
 
 def _sizing_value(obj, key):
@@ -933,4 +906,18 @@ from flash.engine.plan.kv_sizing import (  # noqa: E402,F401
     _colocate_util_cap,
     _resident_kv_gb,
     colocate_kv_util,
+)
+
+# The pinned-commit config probe lives in `flash.engine.plan.model_config_probe`, for the same
+# file-size reason. Re-exported because `from flash.engine.plan.vram import
+# _validated_revision_geometry` must keep working. NOTE that `_CONFIG_PROBE_MEMO` is
+# deliberately NOT re-exported: an alias would be a SECOND name for one dict, and a test that
+# swaps `vram._CONFIG_PROBE_MEMO` would leave the module actually reading the original --
+# a silently ineffective patch. Reach for it at its defining module.
+from flash.engine.plan.model_config_probe import (  # noqa: E402,F401
+    _certify_model_config,
+    _config_mismatches,
+    _memoized_config_probe,
+    _validated_revision_geometry,
+    certified_attention_heads,
 )

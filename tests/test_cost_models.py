@@ -114,7 +114,13 @@ def _stub_geometry(monkeypatch, model_id: str, calls: list):
 
     def _counting(_mid, revision="", strict=False):
         calls.append(revision)
-        return (info.params_b, info.vocab_size, info.hidden_size, info.num_layers)
+        return (
+            info.params_b,
+            info.vocab_size,
+            info.hidden_size,
+            info.num_layers,
+            info.num_attention_heads,
+        )
 
     monkeypatch.setattr(vram, "fetch_hf_model_geometry", _counting)
 
