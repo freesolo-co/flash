@@ -6,24 +6,21 @@ Launch scripts must ship ``bootstrap_secrets.py`` (credential redaction) next to
 
 from __future__ import annotations
 
-import collections
 import contextlib
 import json
 import math
 import multiprocessing
 import os
-import re
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from subprocess import PIPE, STDOUT
 
 if __package__:
+    from flash.providers._lifecycle import bootstrap_pip
     from flash.providers._lifecycle.bootstrap_secrets import (
         _payload_secrets,
         _read_console_tail,
@@ -32,6 +29,7 @@ if __package__:
 else:
     # running as a bare script on the box: the launch scripts ship bootstrap_secrets.py into the
     # same directory, and the script directory leads sys.path.
+    import bootstrap_pip  # type: ignore[no-redef]
     from bootstrap_secrets import (  # type: ignore[no-redef]
         _payload_secrets,
         _read_console_tail,
@@ -48,23 +46,6 @@ _CONSOLE_UPLOAD_REAP_RESERVE_S = 2 * _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S
 _HF_TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 _HF_RETRY_DELAYS_S = (1.0, 3.0, 8.0, 20.0, 60.0)
 _HF_RETRY_AFTER_MAX_S = 60.0
-_PIP_RETRY_DELAYS_S = (3.0, 9.0, 27.0)
-_PIP_OUTPUT_TAIL_LINES = 400
-_PIP_RETRY_RESERVE_S = 1.0  # kept back from a clamped backoff so the next attempt can run
-# Network-shaped pip failures (retriable) vs deterministic build/resolution failures (terminal, outranking a transient
-# warning pip already recovered from in the same tail). Bare "subprocess-exited-with-error" is in NEITHER: pip prints it
-# for any child, including a VCS pin's `git clone`, so calling it terminal fails a paid run on a mid-clone reset.
-_PIP_TRANSIENT_RE = re.compile(
-    r"(?i)connection (?:broken|reset|aborted|refused|timed out)|read timed out|proxyerror"
-    r"|temporary failure in name resolution|failed to establish a new connection|incompleteread"
-    r"|network is unreachable|remote end closed connection|newconnectionerror|maxretryerror"
-    r"|ssleoferror|service unavailable|bad gateway|gateway time-?out|too many requests"
-    r"|retrying \(retry\(|\b(?:429|5\d\d) (?:client|server) error"
-)
-_PIP_TERMINAL_RE = re.compile(
-    r"(?i)failed building wheel|could not build wheels|metadata-generation-failed"
-    r"|no matching distribution|could not find a version|resolutionimpossible|invalid requirement"
-)
 _TERMINAL_MARKER_GRACE_S = 0.25
 _TERMINAL_BOOKKEEPING_RESERVE_S = _TERMINAL_MARKER_GRACE_S
 _MAX_ATTEMPT_ID = (1 << 63) - 1
@@ -562,97 +543,17 @@ def build_worker_env(payload: dict) -> dict:
     return env
 
 
-def _extra_pip_env(payload: dict) -> tuple[dict[str, str], str | None]:
-    env = dict(os.environ)
-    env.update({k: str(v) for k, v in (payload.get("env") or {}).items()})
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    askpass = None
-    if env.get("GITHUB_TOKEN"):
-        fd, askpass = tempfile.mkstemp(prefix="flash-github-askpass-", suffix=".sh")
-        with os.fdopen(fd, "w") as f:
-            f.write(
-                "#!/bin/sh\n"
-                'case "$1" in\n'
-                '*Username*) printf "%s\\n" "x-access-token" ;;\n'
-                '*) printf "%s\\n" "$GITHUB_TOKEN" ;;\n'
-                "esac\n"
-            )
-        os.chmod(askpass, 0o700)
-        env["GIT_ASKPASS"] = askpass
-    return env, askpass
-
-
-def _drain_pip(proc, tail) -> int:
-    """Tee pip's output into ``tail`` and the console; return its exit status.
-
-    The console write is best-effort: a closed log stream must not end the drain, or pip is left
-    running while the caller deletes its askpass helper and the console error is reported in place
-    of pip's own status. What does escape kills the child rather than orphaning it on a paid box.
-    """
-    try:
-        with proc.stdout:
-            for line in proc.stdout:
-                tail.append(line)
-                with contextlib.suppress(OSError, ValueError):
-                    print(line, end="", flush=True)
-        return proc.wait()
-    except BaseException:
-        proc.kill()
-        proc.wait()
-        raise
-
-
 def install_extra_pip(payload: dict) -> None:
-    """Install the run's extra requirements; retry an index blip, fail fast on a bad package spec.
+    """Install the run's extra requirements under this bootstrap's deadline and retry policy.
 
-    Same precedent as the pre-worker HF fetches: an index blip is infra, not user error, so it
-    retries in place and surfaces as ``RetriableBootstrapError`` rather than failing a paid run."""
-    extra_pip = payload.get("extra_pip") or []
-    if not extra_pip:
-        return
-    env, askpass = _extra_pip_env(payload)
-    args = [sys.executable, "-m", "pip", "install", *extra_pip]
-    try:
-        for attempt in range(len(_PIP_RETRY_DELAYS_S) + 1):
-            deadline_at = require_deadline_at(payload) if "deadline_at" in payload else None
-            tail = collections.deque(maxlen=_PIP_OUTPUT_TAIL_LINES)
-            # errors="replace": a build or VCS child can emit bytes invalid under the worker's
-            # locale, and strict decoding raises mid-stream, failing a paid run whose install
-            # actually succeeded. undecodable bytes are diagnostics, never the exit status.
-            proc = subprocess.Popen(
-                args, env=env, stdout=PIPE, stderr=STDOUT, text=True, errors="replace"
-            )
-            rc = _drain_pip(proc, tail)
-            if rc == 0:
-                return
-            output = "".join(tail)  # a build failure outranks it; below that, network shapes retry
-            if _PIP_TERMINAL_RE.search(output) or not _PIP_TRANSIENT_RE.search(output):
-                raise RuntimeError(f"extra_pip install failed: pip exited {rc}")
-            if attempt >= len(_PIP_RETRY_DELAYS_S):
-                raise RetriableBootstrapError(
-                    f"extra_pip install could not reach the package index after {attempt + 1} "
-                    f"attempts (pip exited {rc})"
-                )
-            delay = _PIP_RETRY_DELAYS_S[attempt]
-            if deadline_at is not None:
-                # clamping to the remaining wall alone sleeps the whole window, so the retry just
-                # announced never issues: the next pass only fails the deadline precheck.
-                remaining = deadline_at - time.time() - _PIP_RETRY_RESERVE_S
-                delay = max(0.0, min(delay, remaining))
-            # best-effort for the same reason the tee is: a console that closed between attempts
-            # would otherwise raise HERE and end the install with a terminal, non-retriable console
-            # error, losing the retry this line only announces.
-            with contextlib.suppress(OSError, ValueError):
-                print(
-                    f"extra_pip install hit a transient index error; retrying in {delay:.0f}s",
-                    flush=True,
-                )
-            if delay > 0:
-                time.sleep(delay)
-    finally:
-        if askpass:
-            with contextlib.suppress(OSError):
-                os.remove(askpass)
+    The install itself lives in the shipped ``bootstrap_pip`` sibling, which stays a leaf: it takes
+    the deadline check and the retriable error class from here rather than importing them back.
+    """
+    bootstrap_pip.install(
+        payload,
+        require_deadline_at=require_deadline_at,
+        retriable_error=RetriableBootstrapError,
+    )
 
 
 def fetch_code(payload: dict) -> None:
@@ -721,10 +622,16 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         proc = subprocess.Popen(
             [sys.executable, "-m", "flash.engine.worker_entrypoint"],
             cwd=code_dir,
-            env={**env, "RUN_MODE": mode, "FLASH_RUN_DEADLINE_AT": str(worker_deadline_at)},
-            stdout=PIPE,
-            stderr=STDOUT,
+            env={
+                **env,
+                "RUN_MODE": mode,
+                "FLASH_RUN_DEADLINE_AT": str(worker_deadline_at),
+            },
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
+            # the worker's own output can carry bytes invalid under the container locale; strict
+            # decoding would raise mid-stream and fail a paid run whose training actually ran.
             errors="replace",
         )
         pump_done = threading.Event()
