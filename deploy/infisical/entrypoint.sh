@@ -108,7 +108,7 @@ eval "$(
   for _infisical_keep_name in ${INFISICAL_KEEP:-}; do
     case $_infisical_keep_name in
       # The leading paren is optional POSIX syntax everywhere else and REQUIRED here: bash before
-      # 4.0 -- macOS ships 3.2 as both /bin/sh and /bin/bash -- mis-parses a case pattern inside a
+      # 4.0 (macOS ships 3.2 as both /bin/sh and /bin/bash) mis-parses a case pattern inside a
       # command substitution without it, dying with a syntax error AT RUNTIME that sh -n cannot
       # see, misreading the loop, and leaking this branch into the evaluated stream. The container
       # runs dash and is unaffected; this keeps the shebang honest on contributor shells too.
