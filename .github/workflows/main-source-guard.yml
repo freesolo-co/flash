@@ -20,9 +20,20 @@ jobs:
     #
     # `||`, NOT `&&`: the job must run unless BOTH bot signals hold. With `&&` the job skips when
     # EITHER holds, so a human could open a feature branch named `dependabot/x` and bypass the
-    # guard outright. github.actor is the authenticated opener and cannot be spoofed to
-    # `dependabot[bot]` (brackets are not legal in a username), so requiring both is safe.
-    if: github.actor != 'dependabot[bot]' || !startsWith(github.head_ref, 'dependabot/')
+    # guard outright. The PR author cannot be spoofed to `dependabot[bot]` (brackets are not legal
+    # in a username, so no human account can hold that login), which is what makes requiring both
+    # safe rather than a hole.
+    #
+    # The author is read from `pull_request.user.login`, NOT `github.actor`. This workflow declares
+    # no `types:`, so it takes the defaults opened+synchronize+reopened -- and on a reopen by a
+    # maintainer, or a synchronize pushed by anyone other than the bot, `github.actor` is that
+    # HUMAN, not `dependabot[bot]`. The condition would then go true, run the guard, and reject the
+    # `dependabot/*` head: the exact red required check this exemption exists to remove, reappearing
+    # on the second event instead of the first. `pull_request.user.login` is the PR opener and does
+    # not change with whoever triggered the event.
+    if: >-
+      github.event.pull_request.user.login != 'dependabot[bot]'
+      || !startsWith(github.head_ref, 'dependabot/')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
