@@ -112,10 +112,10 @@ class VastJobHandle(InstanceJobHandle):
 
 def vast_image(gpu: str | None = None) -> str:
     """Docker image for the rented container: the prebuilt PUBLIC worker image, routed through
-    ``worker_image_for_gpu`` so the same operator overrides RunPod/Lambda honor apply to Vast too
-    (``FLASH_WORKER_IMAGE`` and the per-SM kernel-cache image). Vast runs the worker via its own onstart,
-    so the image's CMD is irrelevant — only the baked deps/cache matter. The Blackwell driver floor lives
-    in the ``cuda_max_good`` offer filter, not the image."""
+    ``worker_image_for_gpu`` so Vast selects the same per-SM kernel-cache image RunPod and Lambda do.
+    Vast runs the worker via its own onstart, so the image's CMD is irrelevant — only the baked
+    deps/cache matter. The Blackwell driver floor lives in the ``cuda_max_good`` offer filter, not
+    the image."""
     from flash.providers._lifecycle.worker import WORKER_IMAGE, worker_image_for_gpu
 
     return worker_image_for_gpu(gpu) or WORKER_IMAGE
