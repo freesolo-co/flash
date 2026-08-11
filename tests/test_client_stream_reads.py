@@ -190,3 +190,34 @@ def test_chat_stream_tls_cut_raises_client_error(monkeypatch: pytest.MonkeyPatch
     with pytest.raises(ClientError, match="ended unexpectedly"):
         collected.extend(stream)
     assert "".join(collected) == "partial answer"
+
+
+class _BrokenFramingChunkedResponse(_Read1Response):
+    """A chunked body whose chunk-size line exceeds urllib's limit mid-generation.
+
+    `LineTooLong` is an `HTTPException` SIBLING of `IncompleteRead`, not a subclass, so a clause
+    naming only IncompleteRead let it end the generator cleanly -- presenting a truncated answer as a
+    finished one, which is the worst outcome on this path.
+    """
+
+    def read1(self, size: int = -1) -> bytes:
+        self.calls.append(("read1", size))
+        data = self._stream.read(size)
+        if not data:
+            raise http.client.LineTooLong("chunk size")
+        return data
+
+
+def test_chat_stream_broken_chunk_framing_raises_client_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Broken chunk framing mid-generation must raise, not look like a completed answer."""
+    response = _BrokenFramingChunkedResponse(b"partial answer")
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: response)
+
+    stream = ApiClient("http://test").chat_stream("run-a", [])
+    collected: list[str] = []
+
+    with pytest.raises(ClientError, match="ended unexpectedly"):
+        collected.extend(stream)
+    assert "".join(collected) == "partial answer"

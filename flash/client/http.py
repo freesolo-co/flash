@@ -145,7 +145,10 @@ def _detail_from_http_error(exc: urllib.error.HTTPError) -> object:
     """
     try:
         body = exc.read()
-    except (ConnectionError, http.client.IncompleteRead, OSError):
+    except (OSError, http.client.HTTPException):
+        # OSError covers ConnectionError and the TLS teardowns; HTTPException covers the framing
+        # faults, which are not OSErrors. A bare OSError clause is safe HERE, unlike in the
+        # translation block below: the only thing being read is the server's own error body.
         return f"{exc} (the error body was truncated before it could be read)"
     try:
         detail = json.loads(body).get("detail") or body.decode()
@@ -450,16 +453,24 @@ class ApiClient:
                 f"request to the Flash service at {self.api_url} timed out; "
                 "check your network connection and FLASH_API_URL"
             ) from exc
-        # a mid-response disconnect does NOT arrive as URLError, and no single base covers the three
-        # shapes it takes: `RemoteDisconnected` and `ConnectionResetError` are ConnectionError,
-        # `IncompleteRead` is an HTTPException, and a TLS teardown is `ssl.SSLEOFError` -- an OSError
-        # that is not a ConnectionError, and not wrapped in URLError on the read path. Without all
-        # three named, a dropped connection escaped as a raw traceback instead of the clean
+        # a response that breaks mid-flight does NOT arrive as URLError, and no single base covers the
+        # shapes it takes: `RemoteDisconnected` and `ConnectionResetError` are ConnectionError, a TLS
+        # teardown is `ssl.SSLEOFError` -- an OSError that is not a ConnectionError and is not wrapped
+        # in URLError on the read path -- and every framing fault is an `http.client.HTTPException`.
+        # Without all three named, a broken response escaped as a raw traceback instead of the clean
         # ClientError every caller here is written to expect.
         #
-        # ssl.SSLError rather than its OSError parent: OSError here would also swallow faults from
-        # the caller's own file handles, which are bugs to surface, not transport failures to retitle.
-        except (ConnectionError, ssl.SSLError, http.client.IncompleteRead) as exc:
+        # HTTPException rather than only its `IncompleteRead` member: `BadStatusLine` (a garbled
+        # status line from a proxy) and `LineTooLong` (an overlong chunk-size line) are siblings of
+        # IncompleteRead, not subclasses, so naming just that one left them escaping. The whole
+        # subtree is HTTP protocol failures, and its only OSError member is RemoteDisconnected, which
+        # is already a ConnectionError -- so widening here cannot swallow a caller's file or disk
+        # fault the way a bare OSError clause would.
+        #
+        # ssl.SSLError rather than its OSError parent, for that same reason: OSError here would also
+        # swallow faults from the caller's own file handles, which are bugs to surface, not transport
+        # failures to retitle.
+        except (ConnectionError, ssl.SSLError, http.client.HTTPException) as exc:
             raise ClientError(
                 f"connection to the Flash service at {self.api_url} was interrupted ({exc}); "
                 "check your network connection and FLASH_API_URL"
@@ -954,12 +965,14 @@ class ApiClient:
                         raise exc
                     yield from decoded
                 yield from decoder.decode(b"", final=True)
-            except (http.client.IncompleteRead, ConnectionError, ssl.SSLError) as exc:
+            except (http.client.HTTPException, ConnectionError, ssl.SSLError) as exc:
                 # the server aborts the chunked response when the serving backend fails
                 # mid-generation; urllib reports the missing terminating chunk (or reset) here.
                 # translate it so the caller raises instead of treating the truncated text as a
                 # finished answer. ssl.SSLError covers the same abort arriving as a TLS teardown,
-                # which is an OSError but not a ConnectionError -- the stakes are higher here than
+                # which is an OSError but not a ConnectionError, and HTTPException covers every
+                # framing shape rather than IncompleteRead alone -- `LineTooLong` on an overlong
+                # chunk-size line is a sibling of it, not a subclass. The stakes are higher here than
                 # on the other read paths, because an untranslated cut would surface as a partial
                 # answer that looks complete.
                 raise ClientError(

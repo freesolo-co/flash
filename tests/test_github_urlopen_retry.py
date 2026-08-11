@@ -201,6 +201,101 @@ def test_urlopen_retries_a_tls_read_failure_then_succeeds(monkeypatch):
     assert len(calls) == 2
 
 
+@pytest.mark.parametrize(
+    "framing_failure",
+    [
+        http.client.BadStatusLine("<html>502 from an intermediary</html>"),
+        http.client.LineTooLong("chunk size"),
+    ],
+    ids=["garbled-status-line", "overlong-chunk-line"],
+)
+def test_urlopen_retries_a_framing_failure_then_succeeds(monkeypatch, framing_failure):
+    # GitHub or a proxy in front of it can answer with a malformed status line or a chunk-size line
+    # over the limit. Both are `HTTPException` SIBLINGS of `IncompleteRead`, not subclasses, so a
+    # clause naming only IncompleteRead skipped the retry loop and escaped as an uncaught 500.
+    calls = []
+
+    class _BrokenFraming(io.BytesIO):
+        def read(self, *_a):
+            raise framing_failure
+
+    def fake_urlopen(req, timeout):
+        calls.append(1)
+        return _BrokenFraming(b"") if len(calls) == 1 else io.BytesIO(b"recovered")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)
+
+    assert _urlopen(urllib.request.Request("https://api.github.com/test")) == b"recovered"
+    assert len(calls) == 2
+
+
+def test_urlopen_retries_a_garbled_status_line_raised_from_urlopen_itself(monkeypatch):
+    # `BadStatusLine` comes out of `getresponse`, so it surfaces from `urlopen` rather than from a
+    # body read -- and urllib does not wrap it in a URLError there. The retry clause has to cover it
+    # at that position too, not only when a stubbed body raises it.
+    calls = []
+
+    def fake_urlopen(req, timeout):
+        calls.append(1)
+        if len(calls) == 1:
+            raise http.client.BadStatusLine("<html>502 from an intermediary</html>")
+        return io.BytesIO(b"recovered")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)
+
+    assert _urlopen(urllib.request.Request("https://api.github.com/test")) == b"recovered"
+    assert len(calls) == 2
+
+
+def test_urlopen_persistent_framing_failure_becomes_retriable_signal(monkeypatch):
+    # Exhausting retries on a framing fault must end as the typed retriable error so the domain layer
+    # answers a controlled 502, not a 500.
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda req, timeout: (_ for _ in ()).throw(http.client.LineTooLong("chunk size")),
+    )
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)
+
+    with pytest.raises(GitHubRateLimitError, match="transient network") as excinfo:
+        _urlopen(urllib.request.Request("https://api.github.com/test"))
+    # an upstream transport fault, not throttling: 502 rather than 429.
+    assert excinfo.value.throttled is False
+
+
+def test_urlopen_error_body_framing_failure_keeps_the_classifying_status(monkeypatch):
+    # The error-body read runs inside the `except HTTPError` handler, and Python does not offer an
+    # exception raised there to that block's sibling clauses. A framing fault while reading a 503's
+    # body therefore had to be handled at the read, or it escaped past the retry as a raw traceback --
+    # losing the status that classifies the failure.
+    class _BrokenFramingBody:
+        def read(self, *_a):
+            raise http.client.LineTooLong("chunk size")
+
+        def close(self):
+            """HTTPError's tempfile teardown calls this."""
+
+    exc = urllib.error.HTTPError(
+        url="https://api.github.com/test",
+        code=503,
+        msg="Service Unavailable",
+        hdrs={},  # type: ignore[arg-type]
+        fp=_BrokenFramingBody(),
+    )
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: (_ for _ in ()).throw(exc))
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)
+
+    with pytest.raises(GitHubRateLimitError, match="503") as excinfo:
+        _urlopen(urllib.request.Request("https://api.github.com/test"))
+    assert excinfo.value.throttled is False
+
+
 def test_urlopen_persistent_tls_read_failure_becomes_retriable_signal(monkeypatch):
     # Exhausting retries on a TLS cut must end as the typed retriable error so the domain layer
     # answers a controlled 502, not a 500.

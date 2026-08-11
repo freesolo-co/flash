@@ -225,6 +225,9 @@ class _Resp:
         # IncompleteRead is an HTTPException, not a ConnectionError -- catching ConnectionError
         # alone would still let this one escape raw.
         (http.client.IncompleteRead(b"partial"), "was interrupted"),
+        # an overlong chunk-size line from a broken proxy. LineTooLong is a SIBLING of IncompleteRead
+        # under HTTPException, not a subclass, so naming only IncompleteRead left it escaping.
+        (http.client.LineTooLong("chunk size"), "was interrupted"),
         # a TLS teardown mid-body: SSLEOFError is an OSError but NOT a ConnectionError, and on this
         # read path it is not wrapped in a URLError either, so it escaped every clause above.
         (ssl.SSLEOFError("EOF occurred in violation of protocol"), "was interrupted"),
@@ -233,7 +236,15 @@ class _Resp:
         (b"{not json", "did not return JSON"),
         (b'{"environments": "\xff\xfe"}', "did not return JSON"),
     ],
-    ids=["reset", "hangup", "truncated-read", "tls-cut", "non-json", "non-utf8"],
+    ids=[
+        "reset",
+        "hangup",
+        "truncated-read",
+        "overlong-chunk-line",
+        "tls-cut",
+        "non-json",
+        "non-utf8",
+    ],
 )
 def test_a_broken_response_degrades_to_the_reason_line_not_a_traceback(
     monkeypatch, capsys, failure, expected
@@ -262,21 +273,66 @@ def test_a_broken_response_degrades_to_the_reason_line_not_a_traceback(
     assert "Traceback" not in out
 
 
-def test_a_truncated_error_body_degrades_instead_of_raising(monkeypatch, capsys):
-    """A non-2xx whose body drops mid-read must still surface as the status, not a traceback.
+def test_a_garbled_status_line_degrades_and_still_prints_local_sources(
+    monkeypatch, capsys, tmp_path
+):
+    """A proxy that answers with a malformed status line must not cost the local half of the output.
+
+    `BadStatusLine` is raised out of `getresponse`, so it surfaces from `urlopen` itself rather than
+    from a body read -- and urllib does NOT wrap it in a URLError there. It is an HTTPException
+    sibling of `IncompleteRead`, so the clause that caught truncated bodies did not catch this, and
+    the traceback escaped before `_local_env_sources` could be printed.
+    """
+    (tmp_path / "environment.py").write_text("# env\n")
+
+    from flash.client import ApiClient
+
+    def garbled(*_a, **_k):
+        raise http.client.BadStatusLine("<html>502 from an intermediary</html>")
+
+    monkeypatch.setattr(
+        commands, "load_credentials", lambda: ("https://api.freesolo.co", "fslo-key")
+    )
+    monkeypatch.setattr(
+        "flash.client.client_from_config",
+        lambda: ApiClient("https://api.freesolo.co", "fslo-key"),
+    )
+    monkeypatch.setattr("urllib.request.urlopen", garbled)
+
+    assert commands.cmd_env_list(argparse.Namespace()) == 0
+
+    out = capsys.readouterr().out
+    assert "published environments unavailable" in out
+    assert "was interrupted" in out
+    assert "local env sources" in out, "the local half must survive a broken published lookup"
+    assert "Traceback" not in out
+
+
+@pytest.mark.parametrize(
+    "body_failure",
+    [
+        http.client.IncompleteRead(b"partial"),
+        http.client.LineTooLong("chunk size"),
+        ssl.SSLEOFError("EOF occurred in violation of protocol"),
+    ],
+    ids=["truncated", "overlong-chunk-line", "tls-cut"],
+)
+def test_an_unreadable_error_body_degrades_instead_of_raising(monkeypatch, capsys, body_failure):
+    """A non-2xx whose body cannot be read must still surface as the status, not a traceback.
 
     The read happens in `_detail_from_http_error`, called from inside the `except HTTPError` handler.
     Python does not offer an exception raised inside one handler to that block's sibling clauses, so
-    the IncompleteRead clause added for successful responses cannot catch this one -- it has to be
-    handled at the read itself.
+    the clause added for successful responses cannot catch this one -- it has to be handled at the
+    read itself, and it has to cover every shape a broken body read takes rather than just the
+    truncation.
     """
     import urllib.error
 
     from flash.client import ApiClient
 
-    class _TruncatedErrorBody:
+    class _UnreadableErrorBody:
         def read(self, *_a):
-            raise http.client.IncompleteRead(b"partial")
+            raise body_failure
 
         def close(self):
             """HTTPError's tempfile teardown calls this; without it the GC raises on collection."""
@@ -287,7 +343,7 @@ def test_a_truncated_error_body_degrades_instead_of_raising(monkeypatch, capsys)
             code=502,
             msg="Bad Gateway",
             hdrs={},  # type: ignore[arg-type]
-            fp=_TruncatedErrorBody(),
+            fp=_UnreadableErrorBody(),
         )
 
     monkeypatch.setattr(

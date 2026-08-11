@@ -260,7 +260,10 @@ def _urlopen(
             # status and headers still classify the failure, so an unreadable body just goes empty.
             try:
                 body = _read_error_body(exc, body_deadline)
-            except (ConnectionError, http.client.IncompleteRead, OSError):
+            except (OSError, http.client.HTTPException):
+                # OSError covers ConnectionError and the TLS teardowns; HTTPException covers the
+                # framing faults, which are not OSErrors. A bare OSError clause is safe HERE, unlike
+                # in the retry clause below: this reads GitHub's error body, never the caller's sink.
                 body = ""
             remaining = (exc.headers.get("X-RateLimit-Remaining") if exc.headers else None) or ""
             is_rate_limit = exc.code == 429 or (
@@ -284,22 +287,27 @@ def _urlopen(
             ) from exc
         # two families escape the obvious clauses, and both do so while a SUCCESSFUL response is
         # being read, which is why the HTTPError branch above does not see them either:
-        #   - IncompleteRead is an HTTPException: not a URLError, TimeoutError, ConnectionError, or
-        #     even an OSError.
+        #   - every framing fault is an `http.client.HTTPException`: not a URLError, TimeoutError,
+        #     ConnectionError, or even an OSError. `IncompleteRead` (a body cut short) is the
+        #     familiar one, but `BadStatusLine` (a garbled status line from a proxy) and
+        #     `LineTooLong` (an overlong chunk-size line) are its SIBLINGS, not its subclasses, so
+        #     naming only IncompleteRead left those escaping.
         #   - a TLS teardown mid-body raises ssl.SSLEOFError, which IS an OSError but is NOT a
         #     ConnectionError.
-        # Being no RuntimeError, either one escaped every caller's translation as an uncaught 500
+        # Being no RuntimeError, any of them escaped every caller's translation as an uncaught 500
         # rather than the intended retry and controlled 502.
         #
-        # ssl.SSLError is named rather than its OSError parent deliberately: `drain` writes to the
-        # caller's `out` sink, so a bare OSError clause here would also swallow a disk-full or
-        # closed-file write and retry it five times as though it were a network fault.
+        # HTTPException is safe to name whole where a bare OSError is not: its only OSError member is
+        # RemoteDisconnected, already covered by ConnectionError, so it cannot reach a disk fault.
+        # ssl.SSLError is named rather than its OSError parent for exactly that reason -- `drain`
+        # writes to the caller's `out` sink, so a bare OSError clause here would also swallow a
+        # disk-full or closed-file write and retry it five times as though it were a network fault.
         except (
             urllib.error.URLError,
             TimeoutError,
             ConnectionError,
             ssl.SSLError,
-            http.client.IncompleteRead,
+            http.client.HTTPException,
         ) as exc:
             if attempt < max_rate_limit_retries:
                 time.sleep(backoff_delay(attempt))
