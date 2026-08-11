@@ -314,10 +314,12 @@ _RESERVED_ENVIRONMENT_SECRET_KEYS = frozenset(
 )
 
 
-# `scheme://userinfo@host` in a direct or VCS requirement. Anchored on `://` so a bare `pkg@1.2` or
-# a PEP 508 `name @ https://host/x.whl` without userinfo is untouched; `[^/\s]*:[^/\s]*@` requires
-# the colon-separated user:password shape inside a single URL authority.
-_PIP_URL_CREDENTIAL_RE = re.compile(r"://[^/\s]*:[^/\s]*@")
+# `scheme://userinfo@host` in a direct or VCS requirement, where userinfo is anything before the
+# authority's `@`. ANY nonempty userinfo is rejected, not just the `user:password` shape: a github
+# token is conventionally supplied username-only (`https://ghp_xxx@github.com/...`), and a colon can
+# also arrive percent-encoded, so matching on the colon would miss the most likely leak. Anchored on
+# `://` and stopping at `/` so a bare `pkg@1.2` or a PEP 508 `name @ https://host/x.whl` is untouched.
+_PIP_URL_USERINFO_RE = re.compile(r"://[^/@\s]+@")
 
 
 def _environment_pip(raw: Any) -> tuple[str, ...]:
@@ -355,11 +357,20 @@ def _environment_pip(raw: Any) -> tuple[str, ...]:
         # inside the worker's ``metrics.json`` job_spec, so a token embedded in a direct or VCS URL
         # would be written to disk and to the run log in plaintext. The offending requirement is
         # deliberately NOT echoed: quoting it back would copy the very credential this keeps out.
-        if _PIP_URL_CREDENTIAL_RE.search(requirement):
+        if _PIP_URL_USERINFO_RE.search(requirement):
             raise ConfigError(
                 "[environment] pip entries must not embed credentials in a URL: the spec is stored "
                 "and uploaded in plaintext. Use [environment] secrets for the credential and an "
                 "unauthenticated requirement URL."
+            )
+        # whitespace inside a bare requirement is almost always a typo (`pymongo >= 4.6` splits into
+        # three operands, `not a req` into three names), and pip would only report it after the GPU
+        # is allocated. a PEP 508 direct reference (`pkg @ https://host/x.whl`) and an environment
+        # marker (`pkg; python_version < "3.12"`) legitimately contain spaces, so both are exempt.
+        if " " in requirement and "@" not in requirement and ";" not in requirement:
+            raise ConfigError(
+                "[environment] pip entries must be one requirement each, without spaces "
+                f"(got: {requirement!r})"
             )
         requirements.append(requirement)
     return tuple(requirements)

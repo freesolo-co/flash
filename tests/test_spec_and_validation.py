@@ -733,6 +733,25 @@ def test_environment_pip_rejects_pip_options() -> None:
             spec_from_dict(raw)
 
 
+def test_environment_pip_rejects_space_separated_entries() -> None:
+    """One entry is one requirement, so embedded whitespace is a typo pip only reports on the GPU.
+
+    ``pymongo >= 4.6`` splits into three operands and ``not a req`` into three package names, both
+    failing mid-install after the card is allocated and billing.
+    """
+    for entry in ("pymongo >= 4.6", "not a req ???", "rapidfuzz pymongo"):
+        raw = _raw()
+        raw["environment"]["pip"] = [entry]
+        with pytest.raises(ConfigError, match="must be one requirement each"):
+            spec_from_dict(raw)
+
+    # the two requirement forms that legitimately contain spaces stay usable.
+    for entry in ('pkg; python_version < "3.12"', "pkg @ https://host/a-1.0.whl"):
+        raw = _raw()
+        raw["environment"]["pip"] = [entry]
+        assert spec_from_dict(raw).environment.pip == (entry,)
+
+
 def test_environment_pip_rejects_url_credentials() -> None:
     """A spec is not a secret store: pip entries are persisted and uploaded verbatim.
 
@@ -744,6 +763,11 @@ def test_environment_pip_rejects_url_credentials() -> None:
         "https://tok:s3cret@example.com/pkg-1.0.tar.gz",
         "pkg @ https://x:y@host/a.whl",
         "git+ssh://git:deploykey@host/repo.git",
+        # ANY nonempty userinfo, not just `user:password`. a github token is conventionally passed
+        # username-only, so requiring a literal colon would miss the most likely leak outright...
+        "git+https://ghp_SECRETTOKEN@github.com/org/repo.git",
+        # ...and the separator can arrive percent-encoded, which is the same credential.
+        "git+https://user%3As3cret@github.com/org/repo.git",
     ):
         raw = _raw()
         raw["environment"]["pip"] = [url]
@@ -759,6 +783,8 @@ def test_environment_pip_rejects_url_credentials() -> None:
         "pkg @ https://host/a-1.0.whl",
         "git+https://github.com/org/repo.git#egg=pkg",
         "pymongo>=4.6",
+        # a VCS ref pin puts `@` AFTER the authority, so it must not read as userinfo.
+        "git+https://github.com/org/repo.git@v1.2.3",
     ):
         raw = _raw()
         raw["environment"]["pip"] = [url]
