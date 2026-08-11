@@ -6,6 +6,7 @@ import json
 import logging
 import urllib.error
 import urllib.request
+from collections.abc import Set as AbstractSet
 
 from fastapi import HTTPException
 
@@ -16,6 +17,7 @@ from flash.server.platform.internal_client import (
     InternalRequestError,
     build_internal_request,
     delete_internal_json,
+    error_detail,
     internal_key,
     org_id_of,
     post_internal_json,
@@ -42,7 +44,9 @@ class EnvironmentProjectConflict(Exception):
     """
 
 
-def _post(path: str, body: dict, *, subject: str, raise_for: frozenset[int] | None = None) -> bool:
+def _post(
+    path: str, body: dict, *, subject: str, raise_for: AbstractSet[int] | None = None
+) -> bool:
     return post_internal_json(
         path,
         body,
@@ -90,20 +94,7 @@ def record_published_environment(*, slug: str, name: str, key: dict, project_id:
         raise EnvironmentProjectConflict(exc.detail) from exc
 
 
-def _validation_error_detail(exc: urllib.error.HTTPError) -> str:
-    try:
-        payload = json.loads(exc.read())
-    except (TypeError, ValueError):
-        return ""
-    if not isinstance(payload, dict):
-        return ""
-    detail = payload.get("detail") or payload.get("error")
-    return str(detail).strip() if detail else ""
-
-
-def raise_if_owned_by_another_project(
-    *, slug: str, project_id: str, key: dict, org_id: str
-) -> None:
+def raise_if_owned_by_another_project(*, slug: str, project_id: str, org_id: str) -> None:
     """Raise :class:`EnvironmentProjectConflict` if ``slug`` already belongs to another project.
 
     Called BEFORE the hub upload. Publishing writes ``<org-slug>/<name>`` by deleting that
@@ -119,23 +110,15 @@ def raise_if_owned_by_another_project(
     if standalone():
         # No Freesolo mirror here, so there are no cross-project rows to collide with.
         return
-    token = internal_key()
-    if not token:
-        return
-    request = build_internal_request(
-        _VALIDATE_PATH,
-        {"orgId": org_id, "projectId": project_id, "slug": slug},
-        token=token,
-    )
     try:
-        with urllib.request.urlopen(request, timeout=DEFAULT_TIMEOUT_S):
-            return
-    except urllib.error.HTTPError as exc:
-        if exc.code == 409:
-            raise EnvironmentProjectConflict(_validation_error_detail(exc)) from exc
-        return
-    except OSError:
-        return
+        _post(
+            _VALIDATE_PATH,
+            {"orgId": org_id, "projectId": project_id, "slug": slug},
+            subject=f"check environment ownership for {slug}",
+            raise_for=frozenset({409}),
+        )
+    except InternalRequestError as exc:
+        raise EnvironmentProjectConflict(exc.detail) from exc
 
 
 def require_environment_project(
@@ -181,7 +164,7 @@ def require_environment_project(
         with urllib.request.urlopen(request, timeout=DEFAULT_TIMEOUT_S) as response:
             raw = response.read()
     except urllib.error.HTTPError as exc:
-        detail = _validation_error_detail(exc)
+        detail = error_detail(exc)
         if exc.code == 404 and repair_missing:
             from flash.server.domain import envs
 

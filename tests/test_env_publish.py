@@ -868,7 +868,6 @@ def test_raise_if_owned_by_another_project_blocks_only_a_real_conflict(monkeypat
         environment_registry.raise_if_owned_by_another_project(
             slug="acme/example",
             project_id="22222222-2222-4222-8222-222222222222",
-            key={"org_id": "org-A"},
             org_id="org-A",
         )
 
@@ -882,7 +881,6 @@ def test_raise_if_owned_by_another_project_blocks_only_a_real_conflict(monkeypat
     environment_registry.raise_if_owned_by_another_project(
         slug="acme/brand-new",
         project_id="22222222-2222-4222-8222-222222222222",
-        key={"org_id": "org-A"},
         org_id="org-A",
     )
 
@@ -905,7 +903,6 @@ def test_raise_if_owned_by_another_project_does_not_block_when_the_backend_is_do
     environment_registry.raise_if_owned_by_another_project(
         slug="acme/example",
         project_id="22222222-2222-4222-8222-222222222222",
-        key={"org_id": "org-A"},
         org_id="org-A",
     )
 

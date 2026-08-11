@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Response
 
 from flash._internal.logging import get_logger
 from flash.server.platform.deps import require_key
+from flash.server.platform.internal_client import org_id_of
 
 logger = get_logger("flash.server.routes.envs")
 router = APIRouter()
@@ -16,6 +17,25 @@ _PUBLISH_ASSOCIATION_FAILURE = (
     "environment package may already be uploaded, but its project association could not be "
     "recorded; retry the same publish to repair the association"
 )
+
+
+def publish_conflict_org_id(*, key: dict, internal_org_id: str | None) -> str:
+    """The org whose environment names this publish must be checked against, or ``""``.
+
+    The two auth kinds carry their trusted org in different places, and picking the wrong one is
+    not a style question -- it decides whether the ownership check can be bypassed:
+
+    * internal key: `require_project_access` REQUIRES `X-Freesolo-Org-Id` (400 without it) and
+      validates the project against it, so by the time we get here that header is established
+      fact. It is also the only org this key has: the internal key is org-agnostic.
+    * user key: `require_project_access` validates against `key["org_id"]` and ignores the header
+      entirely. Trusting the header here would check ownership in an org the caller merely
+      asserted while the hub path stays namespaced by the key's own slug -- a garbage id finds
+      nothing, returns 404 instead of 409, and waves the colliding write through.
+    """
+    if key.get("auth_kind") == "internal":
+        return str(internal_org_id or "").strip()
+    return org_id_of(key)
 
 
 def _name_conflict_detail(slug: str) -> str:
@@ -65,53 +85,32 @@ def publish_env(
     )
 
     resolved_key = {**key, "org_id": key.get("org_id") or x_freesolo_org_id}
-
-    # Check ownership BEFORE the hub write: publishing replaces the whole `<org-slug>/<name>`
-    # directory, so a colliding name would otherwise destroy the other project's package on its
-    # way to failing.
-    #
-    # This runs as publish_package's pre-write hook rather than ahead of it, so that a request
-    # which could never publish -- bad base64, a corrupt archive, an unsafe member, no
-    # environment.py -- keeps its own deterministic 400/413 instead of being answered with this
-    # guard's 409. By the time the hook fires the package is fully validated and nothing has been
-    # written yet.
-    #
-    # The KEY's org, never the `X-Freesolo-Org-Id` header. For a user key require_project_access
-    # validates the project against `key["org_id"]` and ignores that header entirely, so trusting
-    # it here would check ownership in an org the caller merely asserted while the hub path stays
-    # namespaced by the key's own slug -- a garbage id finds nothing, returns 404 instead of 409,
-    # and waves the colliding write through. `resolved_key` keeps the header for the association
-    # step below, which is pre-existing behaviour and not an authorization decision.
-    org_for_conflict = str(key.get("org_id") or "").strip()
+    org_for_conflict = publish_conflict_org_id(key=key, internal_org_id=x_freesolo_org_id)
 
     def _guard_destination(intended_slug: str) -> None:
-        if key.get("auth_kind") == "internal":
-            # The internal key is org-agnostic by design: require_project_access validates its
-            # project through the internal endpoint against the explicit `X-Freesolo-Org-Id`, so
-            # ownership is already established for this request and there is no key org to check
-            # against. Refusing it for a missing `key["org_id"]` would break the platform's own
-            # publish path, which is exactly what dev does today and is not this PR's contract.
-            return
+        # Check ownership BEFORE the hub write: publishing replaces the whole `<org-slug>/<name>`
+        # directory, so a colliding name would otherwise destroy the other project's package on
+        # its way to failing.
+        #
+        # This runs as publish_package's pre-write hook rather than ahead of it, so a request
+        # that could never publish -- bad base64, a corrupt archive, an unsafe member, no
+        # environment.py -- keeps its own deterministic 400/413 instead of being answered with
+        # this guard's 409. By the time the hook fires the package is fully validated and nothing
+        # has been written yet.
         if not org_for_conflict:
-            # A user key can carry an org slug (all auth requires) without an org id, and the
-            # hub slug is namespaced by the SLUG -- so this request would still overwrite
-            # `<org-slug>/<name>` while being unable to check who owns it. Refuse before the
-            # write instead of skipping the guard: the association step cannot save us here
-            # either, since it needs the same org id and returns False without it.
             raise HTTPException(
                 status_code=400,
                 detail=(
                     "organization could not be resolved for this key, so the environment's "
                     "project ownership cannot be verified; re-run `flash login` to refresh the "
                     "key. Supplying X-Freesolo-Org-Id does not resolve this: the header is "
-                    "caller-asserted and deliberately not trusted for this check."
+                    "caller-asserted and deliberately not trusted for a user key."
                 ),
             )
         try:
             raise_if_owned_by_another_project(
                 slug=intended_slug,
                 project_id=project_id,
-                key=key,
                 org_id=org_for_conflict,
             )
         except EnvironmentProjectConflict as exc:

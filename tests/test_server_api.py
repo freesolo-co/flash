@@ -9022,6 +9022,59 @@ def test_publish_env_ignores_the_org_header_for_the_ownership_guard(api, monkeyp
     assert checked_orgs == [], f"guard consulted a caller-supplied org: {checked_orgs}"
 
 
+def test_publish_env_checks_ownership_for_an_internal_key_using_the_validated_header(
+    api, monkeypatch
+):
+    """The internal key must reach the guard too, using the org header auth already validated.
+
+    The header is caller-asserted for a USER key and deliberately ignored there, but for the
+    internal key `require_project_access` REQUIRES it (400 without) and validates the project
+    against it -- so by the time the guard runs it is established fact, and it is the only org
+    this key has. Skipping the guard for internal keys left the platform's own publish path with
+    the exact destructive behaviour this PR exists to remove: it overwrote the other project's
+    hub directory and only then returned a conflict.
+    """
+    import flash.server.domain.envs as envs_mod
+    import flash.server.platform.deps as deps
+    from flash.server.domain import environment_registry as registry_mod
+    from flash.server.domain import projects as projects_mod
+
+    monkeypatch.setitem(
+        api.app.dependency_overrides,
+        deps.require_key,
+        # No `org_id`: the internal key is org-agnostic, which is why it must use the header.
+        lambda: {"org_slug": "acme", "auth_kind": "internal"},
+    )
+    monkeypatch.setattr(projects_mod, "require_project_access", lambda **_kwargs: SPEC["project"])
+
+    checked_orgs: list = []
+
+    def _guard(**kwargs):
+        checked_orgs.append(kwargs.get("org_id"))
+        raise registry_mod.EnvironmentProjectConflict("owned by another project")
+
+    monkeypatch.setattr(registry_mod, "raise_if_owned_by_another_project", _guard)
+    monkeypatch.setattr(
+        envs_mod,
+        "publish_package",
+        stub_publish_package_failing_on_write(
+            "an internal-key name conflict must not upload over the other project"
+        ),
+    )
+
+    response = api.post(
+        "/v1/envs",
+        headers={**_bearer(_login()), "X-Freesolo-Org-Id": "org-validated"},
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "already belongs to a different project" in response.json()["detail"]
+    assert checked_orgs == ["org-validated"], (
+        f"internal key skipped the guard or used the wrong org: {checked_orgs}"
+    )
+
+
 def _b64_targz(members: dict[str, bytes]) -> str:
     """Deterministic base64 `.tar.gz`.
 

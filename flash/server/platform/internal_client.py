@@ -7,6 +7,7 @@ import os
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from collections.abc import Set as AbstractSet
 from contextlib import suppress
 from logging import Logger
 from typing import Any
@@ -93,11 +94,12 @@ class InternalRequestError(Exception):
         self.detail = detail
 
 
-def _error_detail(exc: urllib.error.HTTPError) -> str:
+def error_detail(exc: urllib.error.HTTPError) -> str:
     """The backend's own message for ``exc``, or ``""``.
 
     Reads the body once (it is not re-readable) and unwraps the ``detail``/``error`` envelope
-    FastAPI and the Next.js routes both use, falling back to the raw text.
+    FastAPI and the Next.js routes both use, falling back to the raw text. Shared because every
+    internal-backend caller needs exactly this and each hand-rolled copy drifts differently.
     """
     raw = ""
     with suppress(Exception):
@@ -119,7 +121,7 @@ def request_internal_json(
     subject: str,
     logger: Logger,
     urlopen: UrlOpen = urllib.request.urlopen,
-    raise_for: frozenset[int] | set[int] | None = None,
+    raise_for: AbstractSet[int] | None = None,
 ) -> bool:
     """Best-effort internal JSON request; returns True on 2xx, False when disabled or failed.
 
@@ -134,7 +136,7 @@ def request_internal_json(
         with urlopen(req, timeout=DEFAULT_TIMEOUT_S) as resp:
             return 200 <= resp.status < 300
     except urllib.error.HTTPError as exc:
-        detail = _error_detail(exc)
+        detail = error_detail(exc)
         logger.warning("failed to %s: HTTP %s %s", subject, exc.code, detail)
         if raise_for and exc.code in raise_for:
             raise InternalRequestError(status=exc.code, detail=detail) from exc
@@ -150,7 +152,7 @@ def post_internal_json(
     subject: str,
     logger: Logger,
     urlopen: UrlOpen = urllib.request.urlopen,
-    raise_for: frozenset[int] | set[int] | None = None,
+    raise_for: AbstractSet[int] | None = None,
 ) -> bool:
     return request_internal_json(
         path,
