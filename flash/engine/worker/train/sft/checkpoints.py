@@ -180,13 +180,6 @@ class _VerlCheckpointWatcher:
     def _publish_from(self, step: int, checkpoint_dir: str) -> None:
         actor_dir = resolve_checkpoint_actor_dir(checkpoint_dir)
         adapter_dir = os.path.join(self.export_root, f"step-{step}")
-        _sft_train()._export_checkpoint_adapter(
-            actor_dir,
-            adapter_dir,
-            model_id=self.model_id,
-            model_revision=self.model_revision,
-            python_bin=self.python_bin,
-        )
 
         def publish_adapter() -> None:
             _w.publish_deployable_checkpoint(
@@ -196,11 +189,30 @@ class _VerlCheckpointWatcher:
                 _provenance_ready=True,
             )
 
-        uploaded = _w.upload_resume_checkpoint(
-            step,
-            checkpoint_dir,
-            before_upload=publish_adapter,
-        )
+        # the try opens before the export, so a run that dies partway through writing the adapter
+        # still frees the partial directory. nothing in the sft path reads the export again --
+        # `step` joins `processed_steps` below, `_pending` filters on that set, and no sweep or
+        # finalization walks `export_root` -- so an adapter kept past this call has no reader and
+        # would just accumulate one directory per save.
+        #
+        # not safe in the two sibling watchers, which keep their exports for a real later reader:
+        # the rl uploader republishes from `staged_steps` on subsequent sweeps, and the opd watcher
+        # hands `adapter_dir` to `_stage_retry_contract`. sft is done with it inside this call.
+        try:
+            _sft_train()._export_checkpoint_adapter(
+                actor_dir,
+                adapter_dir,
+                model_id=self.model_id,
+                model_revision=self.model_revision,
+                python_bin=self.python_bin,
+            )
+            uploaded = _w.upload_resume_checkpoint(
+                step,
+                checkpoint_dir,
+                before_upload=publish_adapter,
+            )
+        finally:
+            shutil.rmtree(adapter_dir, ignore_errors=True)
         if step in self.required_steps and not uploaded:
             raise RuntimeError(f"required save step {step} full-state checkpoint was not published")
         self.processed_steps.add(step)

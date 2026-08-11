@@ -1137,6 +1137,132 @@ def test_resume_checkpoint_download_is_wrapped_in_liveness_heartbeat():
     )
 
 
+def test_post_download_model_setup_runs_under_a_liveness_wrap():
+    """The span AFTER the weights land must keep pinging (issue 26).
+
+    `prefetch_model` covers the download itself, but the model-setup reads that follow it (adapter,
+    tokenizer/vocab, architecture config) hit the hub or a cold cache mount and emit nothing of
+    their own. Without a wrap the last ping is the one-shot `*_model_load` transition, so `runs
+    status` freezes there for the whole span and a healthy cold cache is indistinguishable from a
+    dead worker.
+    """
+    from flash.engine.worker import opd_train, sft_train_runner
+
+    sft_src = inspect.getsource(sft_train_runner._prepare_sft_model)
+    assert re.search(r'liveness_heartbeat\(\s*"sft_model_load"', sft_src), (
+        "the post-download sft model setup must keep the heartbeat fresh"
+    )
+    # the reads that actually pay the cold-cache cost have to be INSIDE the wrap, not beside it.
+    tree = ast.parse(textwrap.dedent(sft_src))
+    wraps = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.With)
+        and any(
+            isinstance(item.context_expr, ast.Call)
+            and isinstance(item.context_expr.func, ast.Name)
+            and item.context_expr.func.id == "liveness_heartbeat"
+            and item.context_expr.args
+            and isinstance(item.context_expr.args[0], ast.Constant)
+            and item.context_expr.args[0].value == "sft_model_load"
+            for item in node.items
+        )
+    ]
+    assert len(wraps) == 1
+    wrapped = textwrap.dedent(ast.unparse(wraps[0]))
+    for call in ("make_lora", "_warmstart_adapter_path", "_resolve_sft_vocab_size"):
+        assert call in wrapped, f"{call} is part of the silent span and must share the wrap"
+
+    opd_src = inspect.getsource(opd_train._load_opd_model)
+    assert re.search(r'liveness_heartbeat\(\s*"opd_model_load"', opd_src), (
+        "the post-download opd model setup must keep the heartbeat fresh"
+    )
+    # the config read is the silent span, so it has to be inside the wrap rather than after it.
+    assert "generation_eos_from_cached_config" in opd_src
+    # and the phase must still be reached from the entry point.
+    assert "_load_opd_model(" in inspect.getsource(opd_train.run_opd_train)
+
+
+def test_opd_model_load_stage_is_actually_emitted():
+    """`opd_model_load` is classified as setup by the poller and documented to users in TRAINING.md,
+    but nothing ever emitted it -- so the stage users are told to expect never appeared."""
+    from flash.engine.worker import opd_train
+
+    src = inspect.getsource(opd_train._load_opd_model)
+    assert re.search(r'heartbeat\(\s*\n?\s*"opd_model_load"', src), (
+        "opd must emit the opd_model_load stage the poller and TRAINING.md already name"
+    )
+
+
+@pytest.mark.parametrize("stage", ["sft_model_load", "opd_model_load"])
+def test_model_load_is_a_throttled_setup_stage(stage):
+    """Now that these hold a liveness thread, they re-emit every 30s -- so they must be throttled or
+    a slow cold mount spends the HF commit budget on them, and must keep the WIDE setup grace since
+    no training has started."""
+    import flash.engine.worker as ne
+    from flash.providers._lifecycle.poll import SETUP_HEARTBEAT_STAGES, is_training_heartbeat
+
+    assert stage in SETUP_HEARTBEAT_STAGES
+    assert is_training_heartbeat(stage, 0) is False
+    assert stage in ne._HB_SETUP_LIVENESS_STAGES
+    assert stage in ne._HB_THROTTLED_STAGES
+
+
+@pytest.mark.parametrize("stage", ["sft_model_load", "opd_model_load"])
+def test_model_load_transition_commits_even_behind_a_fresh_setup_ping(stage, monkeypatch):
+    """The one-shot transition must land; only the liveness ticks after it may be coalesced.
+
+    Throttling the stage as a whole drops the transition whenever a setup ping committed inside the
+    240s interval -- and the ping right before it is `model_prefetching`, which pings all through the
+    download. So the common case loses the only heartbeat that says the run reached this stage, which
+    is precisely what adding the stage was meant to make visible. Membership assertions cannot catch
+    this; it has to be exercised through `heartbeat()`.
+    """
+    import json
+
+    import flash.engine.worker.io.heartbeat as hb_mod
+    from flash.engine.worker.runtime.pkg_proxy import W as _w
+
+    committed: list[str] = []
+
+    def _fake_upload(local, remote, required=False):
+        with open(local) as f:
+            committed.append(json.load(f)["stage"])
+        return True
+
+    monkeypatch.setattr(_w, "hf_upload_file", _fake_upload)
+    monkeypatch.setattr(_w, "gpu_diagnostics", lambda **k: {})
+    monkeypatch.setattr(_w, "_HB_LAST_UPLOAD", 0.0)
+    monkeypatch.setattr(_w, "_HB_LAST_COMMITTED_STEP", -1)
+    monkeypatch.setattr(_w, "_HB_LAST_FORCED_UPLOAD", 0.0)
+
+    # the download's own liveness ping commits first and arms the throttle window.
+    hb_mod.heartbeat("model_prefetching", liveness=True)
+    hb_mod.heartbeat(stage, download_seconds=12.0)
+    assert stage in committed, "the stage transition was swallowed by the liveness throttle"
+
+    # and the wrap that follows must still be coalesced -- that is what the throttle is for.
+    before = len(committed)
+    for _ in range(6):
+        hb_mod.heartbeat(stage, liveness=True)
+    assert len(committed) == before, "liveness ticks must stay throttled"
+
+
+def test_status_panel_knows_every_setup_liveness_stage():
+    """The panel's hint set must track the worker's, or a new stage silently loses its diagnosis.
+
+    `_stale_setup_hint` fires only for stages it lists. The worker owns the real set, so a stage
+    added there and not here would fall back to the generic "quiet is not dead" reassurance at
+    exactly the ages this PR exists to stop reassuring at -- with nothing failing to say so.
+    """
+    import flash.engine.worker as ne
+    from flash.cli.ui.heartbeat import _LIVENESS_SETUP_STAGES
+
+    assert _LIVENESS_SETUP_STAGES == ne._HB_SETUP_LIVENESS_STAGES, (
+        "the status panel's liveness-setup stages drifted from the worker's"
+    )
+
+
 def test_no_worker_side_stall_watchdog():
     """The worker has no separate stall watchdog: the provider owns kill+retry, and the dump fires on
     liveness give-up. Guard against re-adding the env-tunable faulthandler timer."""
