@@ -13,7 +13,11 @@ from typing import Any
 
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import resolve_update_horizon, sft_update_steps
-from flash.engine.profiling.workload_profile import SftWorkloadProfile, sft_sample_policy
+from flash.engine.profiling.workload_profile import (
+    SftWorkloadProfile,
+    sft_sample_policy,
+    unpacked_batch_warning,
+)
 from flash.engine.worker.entry.sft import (
     _pretokenize_completion_only,
     _reject_image_completion,
@@ -640,6 +644,20 @@ def prepare_sft_workload(
         measurements=measurements,
         horizon=horizon,
     )
+    # one example per update instead of the authored batch is an optimization-semantics change
+    # whose only other trace is `notes["packing"]` in the finished run's metrics, which is not
+    # visible until after the run is paid for. this function runs in the profile job and again on
+    # the training worker, so the warning lands in both logs. pass the authored batch_size rather
+    # than `effective_batch`: the helper resolves None to the same recipe default but keeps the
+    # value's source, so an omitted knob is not reported to the user as one they configured.
+    warning = unpacked_batch_warning(
+        packing_mode=profile.packing_mode,
+        architecture_mode=profile.architecture_mode,
+        examples_per_update=profile.examples_per_update,
+        configured_batch_size=train_spec.batch_size,
+    )
+    if warning:
+        print(f"warning: [train] {warning}", file=sys.stderr)
     return PreparedSftWorkload(
         rows=retained.rows,
         profile=profile,

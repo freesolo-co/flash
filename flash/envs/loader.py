@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -26,6 +27,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
+from flash.envs import cache_security
+
+# the underscored names are re-exports: tests and content.multimodal reach them via loader.
+from flash.envs.dataset_selection import (
+    _packaged_dataset_file as _packaged_dataset_file,
+)
+from flash.envs.dataset_selection import (
+    _plural_dataset_file as _plural_dataset_file,
+)
+from flash.envs.dataset_selection import (
+    _validate_packaged_dataset_split as _validate_packaged_dataset_split,
+)
+from flash.envs.dataset_selection import (
+    env_dataset_rows,
+    select_dataset_source,
+)
 from flash.envs.package.limits import (
     ARCHIVE_MEMBER_LIMIT,
     ARCHIVE_SCAN_MEMBER_LIMIT,
@@ -37,7 +54,42 @@ from flash.envs.package.unpack import extract_validated_archive_members
 _DEFAULT_GITHUB_REF = "main"
 _DEFAULT_ENVIRONMENT_PATH = "environment.py"
 _DEFAULT_MANAGED_ENV_REPO = "freesolo-co/environment-hub"
-_CACHE_ROOT = Path("/tmp/flash-env-cache")
+_CACHE_ROOT_DIR_NAME = "env-cache"
+
+
+def _default_cache_root() -> Path:
+    """where the on-disk env cache lives: a directory private to the current user.
+
+    the cache holds code that ``load_environment`` imports and executes, and its keys are
+    fully predictable (a sha of a public repo/ref/path), so a shared world-writable root
+    would let any other local account pre-create the tree and plant an ``environment.py``
+    that the cache-hit path hands back with no network call and no integrity check. prefer a
+    home-owned location; worker containers can be homeless, so fall back to a uid-suffixed
+    dir under the temp root rather than a shared name.
+
+    deliberately not env-tunable, see ``_ensure_cache_root``.
+    """
+    xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+    if xdg and Path(xdg).is_absolute():
+        # vetted exactly like the home branch below: XDG_CACHE_HOME is commonly inherited from
+        # a container image and points at another account's home, which an arbitrary uid cannot
+        # create under. selecting it unconditionally means _ensure_cache_root dies with
+        # PermissionError instead of falling through to the uid-scoped temp root.
+        xdg_root = Path(xdg) / "flash" / _CACHE_ROOT_DIR_NAME
+        if cache_security.cache_root_is_creatable(xdg_root):
+            return xdg_root
+    home = Path(os.path.expanduser("~"))
+    if home.is_absolute() and home.is_dir():
+        # the whole path is vetted, not just `home`: an existing root-owned `~/.cache` makes
+        # the home-based root uncreatable even when home itself is fine.
+        home_root = home / ".cache" / "flash" / _CACHE_ROOT_DIR_NAME
+        if cache_security.cache_root_is_creatable(home_root):
+            return home_root
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    return Path(tempfile.gettempdir()) / f"flash-env-cache-{uid}"
+
+
+_CACHE_ROOT = _default_cache_root()
 # bound the on-disk env cache so it cannot grow without limit (one subdir per env
 # content-sha, ~30-80 MB each). evicted LRU by dir mtime, which we bump on cache hit.
 _CACHE_MAX_ENTRIES = 32
@@ -58,7 +110,6 @@ _CONTROL_PLANE_GITHUB_TIMEOUT_S = 10.0
 _CONTROL_PLANE_GITHUB_RETRIES = 0
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 _GITHUB_SAFE_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
-_DATASET_SPLIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 class GitHubRateLimitError(RuntimeError):
@@ -737,6 +788,47 @@ def _dir_size_bytes(path: Path) -> int:
     return total
 
 
+def _ensure_cache_root() -> Path:
+    """create the env cache root 0700 and refuse it if it is not private to this user.
+
+    creation is per-component and EEXIST-tolerant (``make_private_dir``): the ancestors have to
+    be created 0700 too, or the ancestor walk below rejects the path this call just made, and
+    tolerating EEXIST is the race-safe create -- whoever wins, the checks below decide whether
+    the winner's directory is trustworthy. ``lstat`` rather than ``stat`` so a pre-created
+    symlink pointing the cache somewhere attacker-controlled is rejected instead of followed.
+    the root stays hardcoded (no ``FLASH_ENV_CACHE_DIR``) on purpose: an ambient var that
+    redirects where executable environment code is read from is the same hazard.
+    """
+    root = _CACHE_ROOT
+    cache_security.make_private_dir(root)
+    cache_security.validate_cache_root_ancestors(root)
+    info = os.lstat(root)
+    uid = os.getuid() if hasattr(os, "getuid") else info.st_uid
+    if not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError(f"env cache root {root} is not a directory; refusing to use it")
+    if info.st_uid != uid:
+        raise RuntimeError(
+            f"env cache root {root} is owned by uid {info.st_uid}, not {uid}; "
+            "refusing to load environment code from it -- remove or reassign it"
+        )
+    # any group/other access on the root is refused, not just the write bits: a 0755/0710
+    # root lets a same-group account traverse into cached entries, and entry CONTENTS can
+    # legitimately carry group-writable modes (the contents-API path mkdirs parents under the
+    # ambient umask, ancient git trees carry 100664 blobs, copytree preserves both), where
+    # in-place tampering keeps the victim's uid and so still passes the entry ownership
+    # vetting. nobody but this user ever needs to look inside the cache. mode bits mean
+    # nothing on windows (mkdir(mode=0o700) does not establish them there, and a freshly
+    # created, perfectly private root commonly reports group/other bits), so this check --
+    # like the ancestor walk above -- is posix-only.
+    if hasattr(os, "getuid") and info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise RuntimeError(
+            f"env cache root {root} is accessible to group/other "
+            f"(mode {info.st_mode & 0o777:04o}); "
+            "refusing to load environment code from it -- chmod 700 it"
+        )
+    return root
+
+
 def _evict_env_cache(keep: Path) -> None:
     # evict least-recently-used cache dirs until both the entry count and total
     # size are under their caps. never remove `keep` (just written) or anything
@@ -775,15 +867,34 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
     cache_key = hashlib.sha256(
         f"{cache_scope}:github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}".encode()
     ).hexdigest()[:24]
-    cache_dir = _CACHE_ROOT / cache_key
+    cache_dir = _ensure_cache_root() / cache_key
+    # vet ANY existing entry at this key before looking inside it, not just one that already
+    # holds the expected entrypoint. a foreign-owned directory missing the entrypoint used to
+    # skip these checks entirely and fall straight to the download, which then writes the
+    # environment into a directory another account owns. untrusted here means planted before
+    # the root's permissions were last repaired, or swapped in since: never import it -- clear
+    # it and fall through to a fresh download. raises if the entry cannot be removed, which has
+    # to happen HERE: continuing would download the environment only for copytree to fail on
+    # the entry still sitting there, and the alternative -- using it -- is what is refused.
+    # a cache entry is a DIRECTORY, whoever owns it: a regular file at the key (manual cache
+    # corruption, an interrupted write) passes the ownership check when we own it, and the
+    # download path's rmtree(ignore_errors=True) then swallows NotADirectoryError and leaves
+    # copytree to fail with FileExistsError on this key forever.
+    if os.path.lexists(cache_dir) and not (
+        cache_security.trust_cache_entry(cache_dir) and cache_dir.is_dir()
+    ):
+        cache_security.discard_untrusted_entry(cache_dir)
     env_file = cache_dir / parsed.path
     if env_file.is_dir():
         env_file = env_file / _DEFAULT_ENVIRONMENT_PATH
     if env_file.is_file():
-        # mark as recently used so LRU eviction keeps hot envs.
-        with contextlib.suppress(OSError):
-            os.utime(cache_dir)
-        return env_file
+        if cache_security.trust_cache_entry(env_file):
+            # mark as recently used so LRU eviction keeps hot envs.
+            with contextlib.suppress(OSError):
+                os.utime(cache_dir)
+            return env_file
+        # a foreign file inside our own directory condemns the whole entry, same as above.
+        cache_security.discard_untrusted_entry(cache_dir)
     tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-github-"))
     resolved = GitHubEnvironmentRef(
         parsed.owner,
@@ -808,7 +919,6 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
             raise FileNotFoundError(
                 f"environment archive did not contain required entrypoint {required_entrypoint!r}"
             )
-        cache_dir.parent.mkdir(parents=True, exist_ok=True)
         shutil.rmtree(cache_dir, ignore_errors=True)
         shutil.copytree(extracted, cache_dir)
         _evict_env_cache(keep=cache_dir)
@@ -886,33 +996,6 @@ def _import_freesolo_environment_tools():
         ) from exc
 
 
-def _packaged_dataset_file(base_dir: Path, name: str) -> Path | None:
-    """First existing packaged dataset file for split `name`.
-
-    ``dataset/`` is canonical for new environments because a top-level ``datasets/``
-    directory shadows the Hugging Face ``datasets`` package in local scripts.
-    """
-    for rel in (
-        f"dataset/{name}.jsonl",
-        f"dataset/{name}.json",
-        f"{name}.jsonl",
-        f"{name}.json",
-    ):
-        candidate = base_dir / rel
-        if candidate.is_file():
-            return candidate
-    return None
-
-
-def _validate_packaged_dataset_split(split: str) -> str:
-    if not _DATASET_SPLIT_RE.fullmatch(split):
-        raise ValueError(
-            "[environment.params] split must be a simple dataset name "
-            "(letters, numbers, '.', '_', '-' only; no slashes or traversal)"
-        )
-    return split
-
-
 def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **kwargs):
     # pinned_sha is positional-only so user [environment.params] named "pinned_sha" goes to **kwargs, not here.
     from flash.envs.adapter import FreesoloEnvironment
@@ -924,34 +1007,8 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
 
     params = dict(kwargs)
     source = params.pop("records", None)
-    dataset_path = params.get("dataset_path")
-    if source is None and dataset_path:
-        resolved_dataset_path = _resolve_path_arg(dataset_path, base_dir)
-        params["dataset_path"] = resolved_dataset_path
-        source = resolved_dataset_path
-    # [environment.params] split selects which packaged dataset file Flash trains on. It used to
-    # be forwarded to the SDK only, so SFT (and GRPO problem selection driven off dataset())
-    # SILENTLY trained on the default dataset/train.jsonl even when a side split was requested.
-    split = params.get("split")
-    split = split.strip() if isinstance(split, str) else None
-    if split:
-        split = _validate_packaged_dataset_split(split)
-    if source is None:
-        wanted = split if split and split != "train" else "train"
-        found = _packaged_dataset_file(base_dir, wanted)
-        if found is None and wanted != "train" and _packaged_dataset_file(base_dir, "train"):
-            # A default train.jsonl exists but the requested split file does not: refuse to fall
-            # back silently (that trains on the wrong targets); envs with no packaged dataset at
-            # all keep the SDK path, which may implement split itself.
-            raise ValueError(
-                f"[environment.params] split={split!r} was requested but no "
-                f"dataset/{split}.jsonl or {split}.json exists in the environment; "
-                "refusing to fall back to the default train split. Package the split file "
-                "or drop the split param."
-            )
-        if found is not None:
-            params.setdefault("dataset_path", str(found))
-            source = str(found)
+    selection = select_dataset_source(params, base_dir, source, _resolve_path_arg)
+    source = selection.source
 
     contract_path = _resolve_path_arg(params.get("contract_path"), base_dir)
     if isinstance(contract_path, str):
@@ -963,10 +1020,25 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
     )
 
     sdk_env = tools["load_environment"](reference, **params)
+    # an env that generates or owns every row in load_environment needs no packaged file, and a
+    # datasets/ directory is then just raw or eval assets, so it must be able to load. an env
+    # whose in-code dataset is empty still needs the file, so it still lands here, where the
+    # message names the layout problem instead of the adapter's generic empty-dataset one. an
+    # explicitly requested side split lands here too, env rows or not: the layout hid any
+    # packaged split file, and rows the env supplies in code cannot be verified against the
+    # requested split, so training on them would silently undo the split guarantee.
+    if selection.datasets_dir_unread and (selection.side_split or not env_dataset_rows(sdk_env)):
+        raise ValueError(
+            "environment package has a top-level 'datasets/' directory, which Flash never "
+            "reads (it probes dataset/<split>.jsonl or dataset/<split>.json). Rename the "
+            "directory to 'dataset/', or set [environment.params] dataset_path to the exact "
+            "file to train on." + selection.unread_split_hint
+        )
     return FreesoloEnvironment(
         sdk_env,
         env_id,
         source=source,
+        prefer_env_dataset=selection.source_is_dataset_file,
         contract_text=contract_text,
         package_root=base_dir,
     )

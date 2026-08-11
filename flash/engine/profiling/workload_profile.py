@@ -51,6 +51,70 @@ def sft_sample_policy(max_examples: object) -> str:
     return SFT_SAMPLE_POLICY_PREFIX if cap > 0 else SFT_SAMPLE_POLICY_FULL
 
 
+# why a run resolved to `exact-unpacked`, keyed by the architecture label the packing decision
+# froze alongside the mode (`sft_workload._packing_mode`). that label is the only part of the
+# decision that survives into the profile, so it is the only place the reason can come from.
+_UNPACKED_REASONS = {
+    "multimodal": "this run is multimodal, and image rows are never packed",
+    "gdn-hybrid": (
+        "this model is a gated-delta-net hybrid and the installed stack cannot reset the "
+        "linear-attention recurrence at example boundaries, so packed examples would bleed state"
+    ),
+    "unsupported": "this model architecture has no boundary-safe packing path in flash",
+    "pure-attention": "packing was disabled for this run",
+}
+
+
+def unpacked_batch_warning(
+    *,
+    packing_mode: str,
+    architecture_mode: str,
+    examples_per_update: int,
+    configured_batch_size: object = None,
+) -> str | None:
+    """One user-facing line for an sft run whose packing mode pins the optimizer batch to 1.
+
+    ``exact-unpacked`` is the boundary-safe design (see
+    ``sft_workload._resolve_sft_step_horizon``), and it overrides the authored ``batch_size``.
+    Returns None when packing is on, or when nothing was overridden because the authored batch
+    was already 1. An omitted ``configured_batch_size`` resolves to the recipe default, which is
+    the batch the run would otherwise have used and the one packing discarded.
+
+    The horizon is deliberately not described here: ``train.max_steps`` outranks epochs over rows
+    (``_resolve_sft_step_horizon``), and this helper is not given either, so any step-count claim
+    would be wrong for a ``max_steps`` run.
+    """
+    from flash.engine.plan.recipe import RECIPE
+
+    if packing_mode == "packed" or examples_per_update > 1:
+        return None
+    try:
+        batch = (
+            int(configured_batch_size)
+            if configured_batch_size is not None
+            else int(RECIPE.sft.effective_batch)
+        )
+    except (TypeError, ValueError):
+        batch = 0
+    if batch == 1:
+        return None
+    reason = _UNPACKED_REASONS.get(
+        architecture_mode, f"packing is unavailable for architecture {architecture_mode!r}"
+    )
+    # an omitted batch_size resolved to the recipe default above; calling that "configured"
+    # would send the reader hunting for a knob their toml never set.
+    source = "configured" if configured_batch_size is not None else "default"
+    authored = f"the {source} batch_size {batch}" if batch > 1 else f"the {source} batch_size"
+    return (
+        f"sequence packing is OFF for this SFT run ({architecture_mode}): {reason}. "
+        f"every optimizer update therefore trains exactly 1 example, so {authored} no longer "
+        "groups examples into an update. it is not inert: it still keys the workload profile and "
+        "sizes the gpu for an auto-sized run, so changing it can bill another profile and move "
+        "the card. the default learning rate is tuned for a batched update: expect noisier steps, "
+        "and lower train.learning_rate if you are comparing against a packed run."
+    )
+
+
 def _canonical_json(value: object) -> str:
     return json.dumps(
         value,
