@@ -56,7 +56,18 @@ _DATASET_SPLIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 class GitHubRateLimitError(RuntimeError):
-    """Persistent GitHub rate-limit; worker handler stamps retriable=True for rescheduling."""
+    """Persistent transient GitHub failure; worker stamps retriable=True for rescheduling.
+
+    Raised for three distinct causes that are all worth retrying: a real rate limit, a persistent
+    5xx, and a network failure. ``throttled`` says which -- True only for an actual rate limit --
+    so a caller mapping this onto an HTTP status can answer 429 for throttling and 502 for an
+    upstream outage instead of blaming the caller for GitHub being down. The retry semantics every
+    existing handler relies on are unchanged.
+    """
+
+    def __init__(self, *args, throttled: bool = False):
+        super().__init__(*args)
+        self.throttled = throttled
 
 
 @dataclass(frozen=True)
@@ -357,7 +368,7 @@ def _urlopen(
                 continue
             if is_rate_limit:
                 raise GitHubRateLimitError(
-                    f"GitHub API rate limit exceeded ({exc.code}): {body[:300]}"
+                    f"GitHub API rate limit exceeded ({exc.code}): {body[:300]}", throttled=True
                 ) from exc
             if exc.code >= 500:
                 raise GitHubRateLimitError(
@@ -471,8 +482,12 @@ def _github_response_message(payload: object) -> str:
     return ""
 
 
-def _github_tree_entries(ref: GitHubEnvironmentRef, treeish: str, context: str) -> list[dict]:
-    payload = _download_github_json(ref, _github_tree_url(ref, treeish), context)
+def _github_tree_entries(
+    ref: GitHubEnvironmentRef, treeish: str, context: str, *, recursive: bool = False
+) -> list[dict]:
+    payload = _download_github_json(
+        ref, _github_tree_url(ref, treeish, recursive=recursive), context
+    )
     if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
         raise RuntimeError(
             f"GitHub path {context!r} is not an environment directory"
@@ -543,19 +558,21 @@ def list_managed_namespace_slugs(namespace: str) -> list[str]:
     )
     if root is None:
         return []
+    # ONE recursive fetch of the namespace subtree, not a tree request per environment: an org with
+    # 100 envs would otherwise spend 102 calls of the shared GITHUB_TOKEN's budget on a list. Paths
+    # in a recursive response are relative to the namespace, so `<name>/environment.py` identifies an
+    # environment directly and no per-directory read is needed.
     slugs = []
-    for entry in _github_tree_entries(ref, root["sha"], namespace):
-        name = entry.get("path")
-        if entry.get("type") != "tree" or not isinstance(name, str):
+    for entry in _github_tree_entries(ref, root["sha"], namespace, recursive=True):
+        path = entry.get("path")
+        if entry.get("type") != "blob" or not isinstance(path, str):
             continue
-        if not _is_safe_github_path_parts((name,)) or not isinstance(entry.get("sha"), str):
+        parts = path.split("/")
+        if len(parts) != 2 or parts[1] != _DEFAULT_ENVIRONMENT_PATH:
             continue
-        children = _github_tree_entries(ref, entry["sha"], f"{namespace}/{name}")
-        if any(
-            child.get("path") == _DEFAULT_ENVIRONMENT_PATH and child.get("type") == "blob"
-            for child in children
-        ):
-            slugs.append(f"{namespace}/{name}")
+        if not _is_safe_github_path_parts((parts[0],)):
+            continue
+        slugs.append(f"{namespace}/{parts[0]}")
     return sorted(slugs)
 
 

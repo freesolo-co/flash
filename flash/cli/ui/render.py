@@ -871,56 +871,6 @@ def project_created(project_id: str, name: str) -> str:
     )
 
 
-def env_setup(paths: list[str], project_id: str) -> str:
-    """Confirmation + file tree for `flash env setup`."""
-    labels = {
-        "environment.py": "env entrypoint — edit the reward + prompt",
-        "dataset/train.jsonl": "starter training rows",
-        "configs/sft.toml": "SFT run config",
-        "configs/rl.toml": "GRPO run config",
-        "configs/opd.toml": "OPD (distillation) run config",
-        "TRAINING.md": "how to train well — read this first",
-    }
-    keyw = max(len(p) for p in paths)
-    tree = "\n".join(
-        f"  {_paint(p.ljust(keyw), _ACCENT2)}  {_dim(labels.get(p, ''))}" for p in paths
-    )
-    head = f"{header('env setup', 'starter Freesolo environment')}\n{ok('scaffold ready')}\n"
-    next_step = arrow(f"publish it: flash env push --project {project_id} --name my-env .")
-    return _safe(f"{head}\n{tree}\n\n{next_step}")
-
-
-def env_list(
-    local: list[str], *, published: list[str] | None = None, unavailable: str | None = None
-) -> str:
-    published = published or []
-    parts = [header("env list", "published and local environments")]
-    if published:
-        parts.append(
-            _paint("published", _GRAY, "1")
-            + _dim('  (reference one with [environment] id = "<id>")')
-        )
-        parts.extend(
-            f"  {_paint(_glyph('·', '-'), _FAINT)} {_paint(env_id, _ACCENT2)}"
-            for env_id in published
-        )
-    elif unavailable:
-        # never fold this into the "no environments yet" line: an unchecked hub must not read as an
-        # empty one, or a publish that worked looks like it silently did nothing.
-        parts.append(_dim(f"  published environments unavailable: {unavailable}"))
-    if local:
-        if published or unavailable:
-            parts.append("")
-        parts.append(
-            _paint("local sources", _GRAY, "1")
-            + _dim("  (publish with flash env push --project <project-uuid> --name <name> <path>)")
-        )
-        parts.extend(f"  {_paint(_glyph('·', '-'), _FAINT)} {_paint(p, _ACCENT2)}" for p in local)
-    if not local and not published:
-        parts.append(_dim("  no environments yet — scaffold one with `flash env setup`"))
-    return _safe("\n".join(parts))
-
-
 def chat_label() -> str:
     """Speaker label printed above a styled chat reply."""
     return _paint("assistant", _ACCENT2, "1")
@@ -932,21 +882,6 @@ def log_section(name: str) -> str:
     keeps the plain ``----- name -----`` divider that scripts and tests match on."""
     rule = _paint(_glyph("─", "-") * 3, _FAINT)
     return _safe(f"{rule} {_paint(name, _ACCENT2, '1')} {rule}")
-
-
-def env_published(slug: str) -> str:
-    snippet = f'[environment]\nid = "{slug}"'
-    body = "\n".join(f"  {_paint(line, _ACCENT2)}" for line in snippet.splitlines())
-    return _safe(
-        f"{ok(f'published {_bold(slug)}')}\n\n{_dim('reference it in your config:')}\n{body}"
-    )
-
-
-def env_pulled(dest: str, detail: str = "") -> str:
-    line = ok(f"pulled {_bold(dest)}")
-    if detail:
-        line += f"\n{_dim(f'  {detail}')}"
-    return _safe(line)
 
 
 def help_page(
@@ -993,6 +928,12 @@ def help_page(
 # Table layouts live in `flash.cli.ui.tables`, which imports the primitives above. Re-exported
 # here (at the bottom, so those primitives are defined first) because every call site and the
 # render monkeypatches in the CLI tests reach them as `render.<name>`.
+from flash.cli.ui.env_panels import (  # noqa: E402,F401
+    env_list,
+    env_published,
+    env_pulled,
+    env_setup,
+)
 from flash.cli.ui.tables import (  # noqa: E402,F401
     checkpoints_table,
     deployments_table,

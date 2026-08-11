@@ -39,24 +39,58 @@ def _fake_hub(monkeypatch, trees: dict[str, dict], *, record: list | None = None
 
 
 def test_lists_only_directories_that_contain_an_environment_file(monkeypatch):
-    """An env is a directory holding environment.py — what publish writes."""
+    """An env is a directory holding environment.py — what publish writes.
+
+    Paths in the recursive namespace response are relative to the namespace, so ``<name>/
+    environment.py`` marks an environment. A directory without that file is not one, and a blob
+    deeper than one level belongs to an environment already identified by its own entry.
+    """
     _fake_hub(
         monkeypatch,
         {
             "main": _tree(_dir("acme", "sha-acme"), _dir("other-org", "sha-other")),
             "sha-acme": _tree(
                 _dir("my-env", "sha-my-env"),
+                _blob("my-env/environment.py"),
+                _blob("my-env/README.md"),
                 _dir("beta", "sha-beta"),
+                _blob("beta/environment.py"),
                 _dir("not-an-env", "sha-not-an-env"),
+                _blob("not-an-env/notes.txt"),
                 _blob("README.md"),
+                _blob("nested/deeper/environment.py"),
             ),
-            "sha-my-env": _tree(_blob("environment.py"), _blob("README.md")),
-            "sha-beta": _tree(_blob("environment.py")),
-            "sha-not-an-env": _tree(_blob("notes.txt")),
         },
     )
 
     assert loader.list_managed_namespace_slugs("acme") == ["acme/beta", "acme/my-env"]
+
+
+def test_lists_the_namespace_in_one_recursive_request(monkeypatch):
+    """Two requests total, regardless of how many environments the org has published.
+
+    A per-environment tree read would make an org with 100 envs spend 102 calls of the shared
+    GITHUB_TOKEN's rate budget on a single list, so the namespace subtree is fetched recursively.
+    """
+    seen: list[str] = []
+    _fake_hub(
+        monkeypatch,
+        {
+            "main": _tree(_dir("acme", "sha-acme")),
+            "sha-acme": _tree(
+                *[
+                    entry
+                    for i in range(25)
+                    for entry in (_dir(f"env-{i}", f"sha-{i}"), _blob(f"env-{i}/environment.py"))
+                ]
+            ),
+        },
+        record=seen,
+    )
+
+    assert len(loader.list_managed_namespace_slugs("acme")) == 25
+    assert len(seen) == 2, seen
+    assert seen[1].endswith("?recursive=1"), seen[1]
 
 
 def test_absent_namespace_directory_is_an_empty_list(monkeypatch):
@@ -73,8 +107,7 @@ def test_never_reads_another_namespace(monkeypatch):
         monkeypatch,
         {
             "main": _tree(_dir("acme", "sha-acme"), _dir("rival", "sha-rival")),
-            "sha-acme": _tree(_dir("my-env", "sha-my-env")),
-            "sha-my-env": _tree(_blob("environment.py")),
+            "sha-acme": _tree(_dir("my-env", "sha-my-env"), _blob("my-env/environment.py")),
         },
         record=seen,
     )
@@ -89,8 +122,7 @@ def test_listing_never_clones_the_hub(monkeypatch):
         monkeypatch,
         {
             "main": _tree(_dir("acme", "sha-acme")),
-            "sha-acme": _tree(_dir("my-env", "sha-my-env")),
-            "sha-my-env": _tree(_blob("environment.py")),
+            "sha-acme": _tree(_dir("my-env", "sha-my-env"), _blob("my-env/environment.py")),
         },
     )
     monkeypatch.setattr(
@@ -101,12 +133,19 @@ def test_listing_never_clones_the_hub(monkeypatch):
 
 
 def test_truncated_tree_response_raises_instead_of_under_reporting(monkeypatch):
-    """A truncated listing must fail loudly; a short list would read as "those are all of them"."""
+    """A truncated listing must fail loudly; a short list would read as "those are all of them".
+
+    This matters more with one recursive request than it did with a walk: the recursive response
+    carries every environment, so truncation silently drops real ones.
+    """
     _fake_hub(
         monkeypatch,
         {
             "main": _tree(_dir("acme", "sha-acme")),
-            "sha-acme": {"tree": [_dir("my-env", "sha-my-env")], "truncated": True},
+            "sha-acme": {
+                "tree": [_dir("my-env", "sha-my-env"), _blob("my-env/environment.py")],
+                "truncated": True,
+            },
         },
     )
 
@@ -191,10 +230,46 @@ def test_domain_list_translates_rate_limiting_into_429(monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
 
     def boom(namespace):
-        raise loader.GitHubRateLimitError("rate limit exceeded")
+        raise loader.GitHubRateLimitError("rate limit exceeded", throttled=True)
 
     monkeypatch.setattr(loader, "list_managed_namespace_slugs", boom)
 
     with pytest.raises(envs_mod.EnvPublishError) as excinfo:
         envs_mod.list_namespace_slugs(key=_user_key())
     assert excinfo.value.status == 429
+
+
+def test_a_github_outage_is_502_not_429(monkeypatch):
+    """GitHubRateLimitError also covers persistent 5xx and network failure, which are not throttling.
+
+    Answering 429 for an upstream outage tells the caller to back off, when backing off cannot help
+    and nothing they did caused it. Only a genuine rate limit sets ``throttled``.
+    """
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+
+    for message in ("GitHub returned 502", "network unreachable"):
+
+        def boom(namespace, message=message):
+            raise loader.GitHubRateLimitError(message)
+
+        monkeypatch.setattr(loader, "list_managed_namespace_slugs", boom)
+
+        with pytest.raises(envs_mod.EnvPublishError) as excinfo:
+            envs_mod.list_namespace_slugs(key=_user_key())
+        assert excinfo.value.status == 502, message
+
+
+def test_only_a_real_rate_limit_is_marked_throttled():
+    """The flag defaults to False, so a new raise site cannot accidentally claim throttling."""
+    assert loader.GitHubRateLimitError("x").throttled is False
+    assert loader.GitHubRateLimitError("x", throttled=True).throttled is True
+
+
+def test_rate_limit_error_still_reschedules_worker_retries():
+    """The retry semantics existing handlers rely on must survive adding the flag.
+
+    ``flash/engine/worker/__init__.py`` isinstance-checks this class to stamp retriable=True, so it
+    has to stay a RuntimeError subclass and keep matching that check.
+    """
+    assert issubclass(loader.GitHubRateLimitError, RuntimeError)
+    assert isinstance(loader.GitHubRateLimitError("x", throttled=True), loader.GitHubRateLimitError)

@@ -24,7 +24,6 @@ from flash.cli.commands import (  # noqa: F401
     cmd_checkpoints,
     cmd_deploy,
     cmd_deployments,
-    cmd_env_list,
     cmd_export,
     cmd_gpus,
     cmd_log,
@@ -47,6 +46,7 @@ from flash.cli.commands.env.eval import (
     finite_float,
     positive_int,
 )
+from flash.cli.commands.env.list import cmd_env_list
 from flash.cli.commands.env.push import cmd_env_delete, cmd_env_pull, cmd_env_push
 from flash.cli.commands.env.setup import cmd_env_setup
 from flash.cli.commands.env.test import cmd_env_test

@@ -468,7 +468,12 @@ class ApiClient:
 
     @contextlib.contextmanager
     def _translate_http_errors(self) -> Iterator[None]:
-        """Map urllib transport errors to ApiError/ClientError; other exceptions propagate."""
+        """Map transport and response-decode errors to ApiError/ClientError; others propagate.
+
+        Covers the whole request, not just the connect: ``resp.read()`` and the ``json.loads`` of the
+        body both run inside this block, so a connection dropped mid-response and a truncated body
+        are transport failures too and must surface as ClientError like the rest.
+        """
         try:
             yield
         except urllib.error.HTTPError as exc:
@@ -488,6 +493,22 @@ class ApiClient:
             raise RequestTimeoutError(
                 f"request to the Flash service at {self.api_url} timed out; "
                 "check your network connection and FLASH_API_URL"
+            ) from exc
+        # a mid-response disconnect does NOT arrive as URLError: `RemoteDisconnected` and
+        # `ConnectionResetError` are ConnectionError, and `IncompleteRead` is neither -- so without
+        # these two clauses a dropped connection escaped as a raw traceback instead of the clean
+        # ClientError every caller here is written to expect.
+        except (ConnectionError, http.client.IncompleteRead) as exc:
+            raise ClientError(
+                f"connection to the Flash service at {self.api_url} was interrupted ({exc}); "
+                "check your network connection and FLASH_API_URL"
+            ) from exc
+        # the JSON decode of a truncated or non-JSON body happens inside this block, and
+        # JSONDecodeError is a ValueError, so it needs naming too.
+        except json.JSONDecodeError as exc:
+            raise ClientError(
+                f"the Flash service at {self.api_url} returned a malformed response "
+                f"({exc}); retry, and check FLASH_API_URL points at a Flash control plane"
             ) from exc
 
     def _request(
@@ -521,7 +542,19 @@ class ApiClient:
             urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp,
         ):
             raw = resp.read()
-            return json.loads(raw) if raw else {}
+            if not raw:
+                return {}
+            try:
+                return json.loads(raw)
+            except UnicodeDecodeError as exc:
+                # a non-UTF-8 body raises UnicodeDecodeError, a SIBLING of JSONDecodeError under
+                # ValueError, so the clause in `_translate_http_errors` does not cover it. it cannot
+                # be added there either: `chat_stream` deliberately propagates UnicodeDecodeError
+                # through that manager to report a mid-stream decode fault.
+                raise ClientError(
+                    f"the Flash service at {self.api_url} returned an undecodable response "
+                    f"({exc}); check FLASH_API_URL points at a Flash control plane"
+                ) from exc
 
     def _request_bytes(
         self,
@@ -600,10 +633,14 @@ class ApiClient:
     def list_envs(self) -> list[str]:
         """Return the published environment ids the authenticated org owns.
 
-        The server reads the hub over the GitHub API (a few requests, no clone), so this is a normal
-        request rather than one carrying publish's 1800s timeout.
+        Two GitHub reads server-side (no clone), so this needs nothing like publish's 1800s. But it
+        must exceed the server's own retry budget: `_urlopen` retries a rate-limited or 5xx GitHub
+        up to 5 times with a 10s base backoff, so the plane can legitimately take ~80s+ before it
+        answers. At the 60s client default the CLI would disconnect first and report a timeout
+        instead of the 429/502 the server was about to send -- turning a diagnosable upstream
+        condition into a generic failure.
         """
-        payload = self._request("GET", "/v1/envs")
+        payload = self._request("GET", "/v1/envs", timeout=180.0)
         rows = payload.get("environments") if isinstance(payload, dict) else None
         if not isinstance(rows, list):
             raise ClientError("control plane returned a malformed environment list")

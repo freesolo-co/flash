@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import flash.cli.commands as commands
+import flash.cli.commands.env.list as env_list_cmd
 
 
 class _Client:
@@ -49,17 +50,19 @@ def test_env_list_filters_non_environments_and_uses_styled_renderer(
     (environments / "empty").mkdir()
     monkeypatch.chdir(tmp_path)
     seen = []
-    monkeypatch.setattr(commands.render, "styled", lambda: True)
+    # `env list` lives in flash.cli.commands.env.list, so patch the render alias THAT module holds:
+    # patching flash.cli.commands.render would leave the real renderer bound at the call site.
+    monkeypatch.setattr(env_list_cmd.render, "styled", lambda: True)
     monkeypatch.setattr(
-        commands.render,
+        env_list_cmd.render,
         "env_list",
         lambda paths, *, published, unavailable: seen.extend(paths) or "styled-envs",
     )
     # this case is about local filtering; pin the published half so it can't reach the network or
     # vary with whatever ~/.flash/config.json this machine happens to hold.
-    monkeypatch.setattr(commands, "_published_envs", lambda: ([], None))
+    monkeypatch.setattr(env_list_cmd, "_published_envs", lambda: ([], None))
 
-    assert commands.cmd_env_list(SimpleNamespace()) == 0
+    assert env_list_cmd.cmd_env_list(SimpleNamespace()) == 0
 
     assert capsys.readouterr().out == "styled-envs\n"
     assert seen == [

@@ -8,10 +8,11 @@ that is "the publish silently failed", which invites re-pushing under new names.
 from __future__ import annotations
 
 import argparse
+import http.client
 
 import pytest
 
-import flash.cli.commands as commands
+import flash.cli.commands.env.list as commands
 from flash.client import ClientError
 
 
@@ -169,3 +170,92 @@ def test_styled_renderer_lists_published_ids_above_local_sources(monkeypatch):
 
     assert out.index("acme/my-env") < out.index("local sources")
     assert "no environments yet" not in out
+
+
+class _Resp:
+    """A urlopen response whose body read or content fails the way a real one can."""
+
+    def __init__(self, failure):
+        self._failure = failure
+        self.headers = {"Content-Type": "application/json"}
+
+    def read(self, *_a):
+        if isinstance(self._failure, BaseException):
+            raise self._failure
+        return self._failure
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        # a reset or a server hangup mid-response: ConnectionError, NOT a urllib URLError, so the
+        # URLError clause never saw these.
+        (ConnectionResetError("connection reset by peer"), "was interrupted"),
+        (http.client.RemoteDisconnected("remote end closed connection"), "was interrupted"),
+        # IncompleteRead is an HTTPException, not a ConnectionError -- catching ConnectionError
+        # alone would still let this one escape raw.
+        (http.client.IncompleteRead(b"partial"), "was interrupted"),
+        # a truncated or non-JSON body: JSONDecodeError is a ValueError.
+        (b"{not json", "malformed response"),
+        # a non-UTF-8 body raises UnicodeDecodeError, a SIBLING of JSONDecodeError.
+        (b'{"environments": "\xff\xfe"}', "undecodable response"),
+    ],
+    ids=["reset", "hangup", "truncated-read", "non-json", "non-utf8"],
+)
+def test_a_broken_response_degrades_to_the_reason_line_not_a_traceback(
+    monkeypatch, capsys, failure, expected
+):
+    """The whole point of the reason line: a transport fault must not print a raw traceback.
+
+    These reach `json.loads`/`resp.read()` INSIDE the client's error-translation block, so each has
+    to become a ClientError for `_published_envs` to catch it and degrade cleanly.
+    """
+    from flash.client import ApiClient
+
+    monkeypatch.setattr(
+        commands, "load_credentials", lambda: ("https://api.freesolo.co", "fslo-key")
+    )
+    monkeypatch.setattr(commands, "has_freesolo_backend", lambda _url: True)
+    monkeypatch.setattr(
+        "flash.client.client_from_config",
+        lambda: ApiClient("https://api.freesolo.co", "fslo-key"),
+    )
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_a, **_k: _Resp(failure))
+
+    assert commands.cmd_env_list(argparse.Namespace()) == 0
+
+    out = capsys.readouterr().out
+    assert "published environments unavailable" in out
+    assert expected in out
+    assert "Traceback" not in out
+
+
+def test_list_envs_outlasts_the_servers_own_github_retry_budget():
+    """The client must not time out before the plane can answer.
+
+    The server retries a rate-limited or 5xx GitHub up to 5 times on a 10s base backoff, so it can
+    legitimately take ~80s+ to answer with a 429/502. At the 60s default the CLI would disconnect
+    first and report a generic timeout, hiding the diagnosable upstream condition.
+    """
+    from flash.client import ApiClient
+
+    seen: dict = {}
+    client = ApiClient("https://api.freesolo.co", "fslo-key")
+
+    def fake_request(method, path, *_a, timeout=None, **_k):
+        seen.update(method=method, path=path, timeout=timeout)
+        return {"environments": []}
+
+    client._request = fake_request
+    assert client.list_envs() == []
+    assert seen["method"] == "GET"
+    assert seen["path"] == "/v1/envs"
+    assert seen["timeout"] is not None, "must pass an explicit timeout, not the shared default"
+    assert seen["timeout"] > 80.0, seen["timeout"]
+    assert seen["timeout"] > client.timeout, "must exceed the shared default, not fall back to it"

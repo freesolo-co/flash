@@ -614,9 +614,14 @@ def list_namespace_slugs(*, key: dict) -> list[str]:
     try:
         return loader.list_managed_namespace_slugs(namespace)
     except loader.GitHubRateLimitError as exc:
-        raise EnvPublishError(
-            f"Freesolo environment list is rate limited: {exc}", status=429
-        ) from exc
+        # this exception also covers persistent 5xx and network failures, so only a genuine rate
+        # limit may answer 429: blaming the caller for a GitHub outage would tell them to slow down
+        # when backing off cannot help.
+        if exc.throttled:
+            raise EnvPublishError(
+                f"Freesolo environment list is rate limited: {exc}", status=429
+            ) from exc
+        raise EnvPublishError(f"Freesolo environment list failed: {exc}", status=502) from exc
     except RuntimeError as exc:
         raise EnvPublishError(f"Freesolo environment list failed: {exc}", status=502) from exc
 

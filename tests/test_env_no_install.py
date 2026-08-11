@@ -1,7 +1,7 @@
 """`flash env install` (and its local manifest) was removed.
 
-Only setup/list/push remain under `flash env`, and `flash env list` now reports local
-environment sources only (no "installed" manifest section).
+Only setup/list/push remain under `flash env`. `flash env list` reports local environment sources
+alongside the org's published ids, and has no "installed" manifest section.
 """
 
 from __future__ import annotations
@@ -10,9 +10,9 @@ import argparse
 
 import pytest
 
-import flash.cli.commands as commands
+import flash.cli.commands.env.list as commands
 from flash.cli import _build_parser
-from flash.cli.commands import cmd_env_list
+from flash.cli.commands.env.list import cmd_env_list
 
 
 def _no_published(monkeypatch):
