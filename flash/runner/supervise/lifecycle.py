@@ -136,10 +136,11 @@ def _spec_with_gpu(spec: JobSpec, gpu_type: str, gpu_count: int = 0) -> JobSpec:
     strand rented cards or launch more ranks than were rented.
     """
     count = gpu_count if gpu_count >= 1 else gpu_count_of(spec)
-    if spec.gpu.type == gpu_type and gpu_count_of(spec) == count:
+    if spec.gpu.type == gpu_type and gpu_count_of(spec) == count and not spec.gpu_count_auto:
         return spec
     d = spec.to_internal_dict()
     d["gpu"] = {**d["gpu"], "type": gpu_type, "count": count}
+    d["gpu_count_auto"] = False
     return JobSpec.from_dict(d)
 
 

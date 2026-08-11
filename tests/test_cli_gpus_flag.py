@@ -19,6 +19,16 @@ BASE = (
     '[gpu]\ntype = "B200"\nprovider = "runpod"\n'
 )
 
+BIG_GRPO = (
+    'model = "Qwen/Qwen3.6-27B"\n'
+    'project = "11111111-1111-4111-8111-111111111111"\n'
+    'algorithm = "grpo"\n'
+    '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
+    "[train]\nepochs = 1\nmax_examples = 100\n"
+    "max_context_tokens = 8192\nmax_completion_tokens = 4096\n"
+    "[gpu]\n"
+)
+
 
 def _overrides(*argv: str) -> list[str]:
     """the override list the real parser produces for `flash train run.toml <argv>`."""
@@ -47,12 +57,39 @@ def test_the_parser_turns_gpus_into_the_override_it_is_sugar_for():
 
 def test_no_gpus_flag_contributes_no_override():
     # an absent flag must be indistinguishable from no flag. emitting `gpu.count=1` here would
-    # silently DOWNGRADE every multi-gpu config whose count lives in the file.
+    # turn auto-sizing into an explicit one-card pin.
     assert _overrides() == []
+
+
+def test_no_gpus_flag_marks_the_count_for_auto_sizing(tmp_path):
+    spec = _spec(tmp_path, config=BIG_GRPO)
+    assert spec.gpu.count == 1  # digest-stable public placeholder
+    assert spec.gpu_count_auto is True
 
 
 def test_gpus_reaches_the_spec(tmp_path):
     assert _spec(tmp_path, "--gpus", "4").gpu.count == 4
+
+
+def test_unset_count_accepts_a_grpo_run_that_needs_two_cards(tmp_path):
+    spec = _spec(tmp_path, config=BIG_GRPO)
+    assert spec.gpu_count_auto is True
+    assert spec.gpu.count == 1
+
+
+def test_explicit_one_card_pin_rejects_with_a_fitting_count(tmp_path):
+    from flash.schema import ConfigError
+
+    with pytest.raises(ConfigError) as exc:
+        _spec(tmp_path, "--gpus", "1", config=BIG_GRPO)
+    message = str(exc.value)
+    assert "grpo needs >= 229 GB VRAM" in message
+    assert "gpu.count=1 provides at most 180 GB (B200)" in message
+    assert "gpu.count / --gpus to 2" in message
+    assert "max_context_tokens" in message
+    assert "max_completion_tokens" in message
+    assert "lora_rank" in message
+    assert "batch_size" not in message
 
 
 def test_no_gpus_flag_leaves_the_configs_count_alone(tmp_path):
@@ -124,16 +161,8 @@ def test_gpus_is_accepted_on_every_provider(tmp_path, provider):
     assert _spec(tmp_path, "--gpus", "4", config=config).gpu.count == 4
 
 
-def test_the_help_does_not_promise_an_exact_card_count():
-    """The flag must describe gpu.count as the CEILING the allocator treats it as.
-
-    allocate() takes this field as max_gpu_count and keeps fit-alone candidates, so a class that
-    fits the run on one card is allocated as one card and _spec_with_gpu rewrites the effective
-    count to 1 -- the worker then launches one rank. Help that reads "cards to run the job on"
-    states something the allocator does not honor, and a user sizing an experiment off it would be
-    wrong with nothing in the output saying so. Asserted on the rendered help (not the source
-    string) because that is what the user actually reads.
-    """
+def test_the_help_explains_auto_sizing_and_authored_ceilings():
+    """The flag must distinguish an omitted auto-size from an authored hard ceiling."""
     from flash.cli import _build_parser
 
     # render the train subparser's help, which is the text `flash train --help` prints.
@@ -144,7 +173,8 @@ def test_the_help_does_not_promise_an_exact_card_count():
     # collapse argparse's wrapping first, or a phrase split across two lines reads as absent.
     start = rendered.rindex("--gpus")
     window = " ".join(rendered[start : start + 400].split()).lower()
-    assert "ceiling" in window, "help must say the count is a ceiling, not an exact card count"
+    assert "auto-size" in window, "help must say omission auto-sizes"
+    assert "pins the ceiling" in window, "help must say an authored value pins the ceiling"
     assert "1, 2, 4, 8" in window, "help must name the public maximum as a rentable shape"
     assert not window.startswith("--gpus n cards to run the job on"), (
         "that phrasing promises exact-count semantics the allocator does not provide"

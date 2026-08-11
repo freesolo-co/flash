@@ -452,10 +452,13 @@ def _offline_gpu_shape(
     )
     from flash.providers.base import (
         GPU_INFO,
+        MAX_COMBINATION_CARDS,
         canonical_gpu,
         combined_vram_gb,
         providers_for,
         rentable_gpu_counts,
+        smallest_fitting_gpu_count,
+        vram_fit_error_message,
     )
 
     provider = config.provider if config.provider != "auto" else "auto"
@@ -475,9 +478,17 @@ def _offline_gpu_shape(
         # precheck - overstated cost against a cheaper shape `allocate()` would really pick. the
         # `providers_for` filter below narrows this pool to the classes the provider can provision.
         names = tuple(info.name for info in GPU_INFO.values() if info.validated)
-    safe_gpu_count = geometry_safe_gpu_cap(
-        config.model_id, config.gpu_count, model_revision=config.model_revision
+    auto_cap = geometry_safe_gpu_cap(
+        config.model_id, MAX_COMBINATION_CARDS, model_revision=config.model_revision
     )
+    if config.gpu_count is None:
+        safe_gpu_count = (
+            smallest_fitting_gpu_count(need, max_gpu_count=auto_cap, gpu_names=names) or auto_cap
+        )
+    else:
+        safe_gpu_count = geometry_safe_gpu_cap(
+            config.model_id, config.gpu_count, model_revision=config.model_revision
+        )
     ranked = []
     for gpu in names:
         info = GPU_INFO[gpu]
@@ -513,13 +524,16 @@ def _offline_gpu_shape(
                 )
             )
     if not ranked:
-        if config.gpu_type:
-            info = GPU_INFO[canonical_gpu(config.gpu_type)]
-            raise ValueError(
-                f"exact GPU {info.name!r} cannot fit this run: it requires at least {need} GB"
+        raise ValueError(
+            vram_fit_error_message(
+                config.method,
+                need,
+                requested_gpu_count=config.gpu_count,
+                effective_gpu_count=safe_gpu_count,
+                max_gpu_count=auto_cap,
+                gpu_names=names,
             )
-        shape = f" across up to {safe_gpu_count} cards" if safe_gpu_count > 1 else ""
-        raise ValueError(f"no GPU class fits >= {need} GB{shape}")
+        )
     _cost, count, _combined, _per_card, gpu, hourly = min(ranked)
     return gpu, need, count, provider, hourly
 

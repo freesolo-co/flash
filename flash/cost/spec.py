@@ -165,7 +165,8 @@ def profile_runconfig_from_spec(spec) -> RunConfig:
         gpu_type=g.type,
         model_revision=spec.model_revision,
         disk_gb=float(getattr(g, "disk_gb", 0.0) or 0.0),
-        gpu_count=g.count,
+        # the workload profile never loads model weights and always rents one cheapest card.
+        gpu_count=1,
         max_wall_seconds=g.max_wall_seconds,
         environment=spec.environment.id or None,
     )
@@ -217,7 +218,7 @@ def runconfig_from_spec(spec) -> RunConfig:
         gpu_type=g.type,
         model_revision=spec.model_revision,
         disk_gb=float(getattr(g, "disk_gb", 0.0) or 0.0),
-        gpu_count=g.count,
+        gpu_count=None if spec.gpu_count_auto else g.count,
         max_wall_seconds=g.max_wall_seconds,
         environment=spec.environment.id or None,
         save_at_steps=t.save_at_steps,

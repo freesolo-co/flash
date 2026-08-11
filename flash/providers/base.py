@@ -418,6 +418,122 @@ def combined_vram_gb(vram_gb: int, gpu_count: int) -> float:
     )
 
 
+def _eligible_gpu_infos(gpu_names: tuple[str, ...] | None = None) -> tuple[GpuClass, ...]:
+    """Return the validated structural pool used by offline sizing."""
+    if gpu_names is None:
+        return tuple(g for g in GPU_CLASSES if g.enum_member and g.validated)
+    names = set(gpu_names)
+    return tuple(g for g in GPU_CLASSES if g.name in names and g.validated)
+
+
+def gpu_capacity_shape(
+    gpu_count: int,
+    *,
+    min_vram_gb: float | None = None,
+    gpu_names: tuple[str, ...] | None = None,
+) -> tuple[GpuClass, int, float] | None:
+    """Return the largest shape, or the smallest shape clearing ``min_vram_gb``."""
+    count = largest_rentable_count(gpu_count)
+    shapes = [
+        (gpu, count, combined_vram_gb(gpu.vram_gb, count)) for gpu in _eligible_gpu_infos(gpu_names)
+    ]
+    if min_vram_gb is not None:
+        shapes = [shape for shape in shapes if shape[2] >= min_vram_gb]
+        return (
+            min(shapes, key=lambda shape: (shape[2], shape[0].vram_gb, shape[0].name))
+            if shapes
+            else None
+        )
+    return (
+        max(shapes, key=lambda shape: (shape[2], shape[0].vram_gb, shape[0].name))
+        if shapes
+        else None
+    )
+
+
+def smallest_fitting_gpu_count(
+    min_vram_gb: float,
+    *,
+    max_gpu_count: int,
+    gpu_names: tuple[str, ...] | None = None,
+) -> int | None:
+    """Return the smallest rentable count whose structural pool can hold the run."""
+    for count in reversed(rentable_gpu_counts(max_gpu_count)):
+        if gpu_capacity_shape(count, min_vram_gb=min_vram_gb, gpu_names=gpu_names) is not None:
+            return count
+    return None
+
+
+def _shape_label(gpu: GpuClass, count: int) -> str:
+    return f"{count}x {gpu.name}" if count > 1 else gpu.name
+
+
+def vram_knob_advice(algorithm: str) -> str:
+    """Return the algorithm knobs that actually reduce its measured vram floor."""
+    algorithm = (algorithm or "").lower()
+    if algorithm == "grpo":
+        return (
+            "lower [train].max_context_tokens / [train].max_completion_tokens / "
+            "[train].lora_rank to fit"
+        )
+    if algorithm == "opd":
+        return (
+            "lower [train].group_size and/or [train].batch_size (rollout concurrency = "
+            "batch_size x group_size; distillation needs no group variance, so group_size=1 is "
+            "fine) and/or [train].max_completion_tokens / [train].max_context_tokens to fit"
+        )
+    return "lower [train].batch_size / [train].max_context_tokens / [train].lora_rank to fit"
+
+
+def vram_fit_error_message(
+    algorithm: str,
+    need: float,
+    *,
+    requested_gpu_count: int | None,
+    effective_gpu_count: int,
+    max_gpu_count: int,
+    gpu_names: tuple[str, ...] | None = None,
+) -> str:
+    """Build an actionable pinned-count or terminal vram rejection."""
+    algorithm = (algorithm or "").lower()
+    fitting_count = smallest_fitting_gpu_count(
+        need, max_gpu_count=max_gpu_count, gpu_names=gpu_names
+    )
+    if requested_gpu_count is not None and fitting_count is not None:
+        provided = gpu_capacity_shape(effective_gpu_count, gpu_names=gpu_names)
+        fitting = gpu_capacity_shape(fitting_count, min_vram_gb=need, gpu_names=gpu_names)
+        if provided is not None and fitting is not None:
+            provided_gpu, provided_count, provided_vram = provided
+            fitting_gpu, fitting_count, fitting_vram = fitting
+            return (
+                f"{algorithm} needs >= {need:g} GB VRAM; gpu.count={requested_gpu_count} provides "
+                f"at most {provided_vram:g} GB ({_shape_label(provided_gpu, provided_count)}). "
+                f"Raise gpu.count / --gpus to {fitting_count} "
+                f"({_shape_label(fitting_gpu, fitting_count)} = {fitting_vram:g} GB), or "
+                f"{vram_knob_advice(algorithm)}."
+            )
+
+    widest = gpu_capacity_shape(max_gpu_count, gpu_names=gpu_names)
+    widest_count = largest_rentable_count(max_gpu_count)
+    biggest = widest[2] if widest is not None else 0.0
+    shape = (
+        f"any {widest_count}-card validated GPU combination"
+        if widest_count > 1
+        else "any single validated GPU"
+    )
+    if algorithm == "opd":
+        return (
+            f"opd needs >= {need:g} GB VRAM, more than {shape} ({biggest:g} GB max). "
+            "opd is resident-only: the trainer and the colocated vLLM student rollout engine hold "
+            "two model-weight copies plus the rollout KV cache at once. "
+            f"{vram_knob_advice(algorithm).capitalize()}."
+        )
+    return (
+        f"{algorithm} needs >= {need:g} GB VRAM, more than {shape} ({biggest:g} GB max). "
+        f"{vram_knob_advice(algorithm).capitalize()}."
+    )
+
+
 def cheapest_gpu(min_vram_gb: int, *, gpu_count: int = 1, cost_key=None) -> str:
     """Return the cheapest fitting validated GPU class for the card ceiling.
 
@@ -429,11 +545,7 @@ def cheapest_gpu(min_vram_gb: int, *, gpu_count: int = 1, cost_key=None) -> str:
     # size against the largest count providers actually RENT (powers of two): a ceiling of 3 buys
     # 2 cards at submit, so sizing on 3 would admit a shape that never gets provisioned.
     cards = largest_rentable_count(gpu_count)
-    pool = [
-        g
-        for g in GPU_INFO.values()
-        if g.enum_member and g.validated and combined_vram_gb(g.vram_gb, cards) >= min_vram_gb
-    ]
+    pool = [g for g in _eligible_gpu_infos() if combined_vram_gb(g.vram_gb, cards) >= min_vram_gb]
     if not pool:
         shape = f" even as a {cards}-card combination" if cards > 1 else ""
         raise UnsupportedGpuError(f"no validated GPU class has >= {min_vram_gb} GB VRAM{shape}")
@@ -447,6 +559,36 @@ def cheapest_gpu(min_vram_gb: int, *, gpu_count: int = 1, cost_key=None) -> str:
     return min(pool, key=lambda g: (hourly_rate(g.name), g.vram_gb)).name
 
 
+def provisional_gpu_count(
+    model_id: str,
+    algorithm: str = "sft",
+    *,
+    train=None,
+    thinking: bool = False,
+    model_revision: str = "",
+    geometry_model_revision: str | None = None,
+    gpu_count: int | None = None,
+) -> int:
+    """Resolve an authored ceiling or the smallest geometry-safe auto-sized count."""
+    from flash.providers.allocator import geometry_safe_gpu_cap, required_vram_gb
+
+    ceiling = MAX_COMBINATION_CARDS if gpu_count is None else gpu_count
+    geometry_revision = (
+        model_revision if geometry_model_revision is None else geometry_model_revision
+    )
+    safe_ceiling = geometry_safe_gpu_cap(model_id, ceiling, model_revision=geometry_revision)
+    if gpu_count is not None:
+        return safe_ceiling
+    need = required_vram_gb(
+        model_id,
+        algorithm,
+        train=train,
+        thinking=thinking,
+        model_revision=model_revision,
+    )
+    return smallest_fitting_gpu_count(need, max_gpu_count=safe_ceiling) or safe_ceiling
+
+
 def provisional_gpu(
     model_id: str,
     algorithm: str = "sft",
@@ -454,15 +596,14 @@ def provisional_gpu(
     train=None,
     thinking: bool = False,
     model_revision: str = "",
-    gpu_count: int = 1,
+    geometry_model_revision: str | None = None,
+    gpu_count: int | None = None,
+    authored_gpu_count: int | None = None,
+    gpu_count_auto: bool = False,
 ) -> str:
-    """Cheapest validated GPU for this model: parse-time provisional used by the schema for sizing/display.
-
-    ``gpu_count`` is the run's card ceiling, so a run allowed to shard is sized against the shape it
-    will actually be allocated. The returned class name is per-card either way.
-    """
+    """Return the offline class preview for an authored ceiling or auto-sized run."""
     from flash.engine.plan.vram import model_required_vram_gb
-    from flash.providers.allocator import vram_headroom
+    from flash.providers.allocator import geometry_safe_gpu_cap, vram_headroom
 
     min_vram = model_required_vram_gb(
         model_id,
@@ -472,45 +613,45 @@ def provisional_gpu(
         headroom=vram_headroom(),
         model_revision=model_revision,
     )
+    effective_count = provisional_gpu_count(
+        model_id,
+        algorithm,
+        train=train,
+        thinking=thinking,
+        model_revision=model_revision,
+        geometry_model_revision=geometry_model_revision,
+        gpu_count=gpu_count,
+    )
+    geometry_revision = (
+        model_revision if geometry_model_revision is None else geometry_model_revision
+    )
+    auto_cap = geometry_safe_gpu_cap(
+        model_id, MAX_COMBINATION_CARDS, model_revision=geometry_revision
+    )
     try:
         # same job-cost basis the submit-time allocator ranks on, so the class previewed here is
         # the class that actually gets provisioned; falls back to $/hr for an unpriceable run.
         return cheapest_gpu(
             min_vram,
-            gpu_count=gpu_count,
+            gpu_count=effective_count,
             cost_key=_run_cost_key(
                 model_id, algorithm, train=train, thinking=thinking, model_revision=model_revision
             ),
         )
     except UnsupportedGpuError as exc:
-        if (algorithm or "").lower() == "opd":
-            cards = largest_rentable_count(gpu_count)
-            biggest = max(
-                (
-                    combined_vram_gb(g.vram_gb, cards)
-                    for g in GPU_CLASSES
-                    if g.enum_member and g.validated
+        raise UnsupportedGpuError(
+            vram_fit_error_message(
+                algorithm,
+                min_vram,
+                requested_gpu_count=(
+                    None
+                    if gpu_count_auto
+                    else (gpu_count if authored_gpu_count is None else authored_gpu_count)
                 ),
-                default=0,
+                effective_gpu_count=effective_count,
+                max_gpu_count=auto_cap,
             )
-            # OPD is resident-only: the HF/PEFT trainer AND the colocated vLLM student rollout engine
-            # both stay resident, so the card must hold two model-weight copies plus the rollout KV
-            # cache (which scales with batch_size x group_size) at the loss backward peak. Point the
-            # user at the knobs that shrink it instead of the opaque "no GPU that big" message.
-            shape = (
-                f"any {cards}-card validated GPU combination"
-                if cards > 1
-                else ("any single validated GPU")
-            )
-            raise UnsupportedGpuError(
-                f"opd needs >= {min_vram} GB VRAM, more than {shape} "
-                f"({biggest:g} GB max). opd is resident-only: the trainer and the colocated vLLM student "
-                f"rollout engine hold two model-weight copies plus the rollout KV cache at once. "
-                f"Lower [train].group_size and/or [train].batch_size (rollout concurrency = "
-                f"batch_size x group_size; distillation needs no group variance, so group_size=1 is "
-                f"fine) and/or [train].max_completion_tokens / [train].max_context_tokens to fit."
-            ) from exc
-        raise
+        ) from exc
 
 
 @dataclass

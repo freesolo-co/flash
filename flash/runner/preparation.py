@@ -330,6 +330,7 @@ def _preparation_digest(
     # omit empty fields so existing version-1 snapshots keep their historical digest.
     for key in (
         "model_revision_auto",
+        "gpu_count_auto",
         "workload_profile_kind",
         "workload_profile_input_digest",
         "workload_profile_producer_version",
@@ -388,6 +389,7 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
         # False while the worker half carries the real value. Comparing them would reject every
         # auto-pinned run here -- the same runs the deploy guard was just relaxed to admit.
         "model_revision_auto",
+        "gpu_count_auto",
         "workload_profile_kind",
         "workload_profile_input_digest",
         "workload_profile_producer_version",

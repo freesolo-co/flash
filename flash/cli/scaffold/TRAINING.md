@@ -1282,34 +1282,34 @@ kind because the run itself looks fine.
 
 ---
 
-## Multi-GPU training (`gpu.count > 1`)
+## Multi-GPU training and `gpu.count` pins
 
-Flash trains on one card by default. Raising `gpu.count` shards the job with nothing else to
-select:
+When both `gpu.type` and `gpu.count` are omitted, Flash auto-sizes to the smallest geometry-safe card
+ceiling that can hold the run. Fitting shapes within that ceiling still compete on dollars per
+optimizer step, so no extra multi-GPU setting is required. A pinned `gpu.type` without a count keeps
+the historical single-card constraint; set `gpu.count` too when that exact class should shard.
+
+Set a count only when you want to pin the maximum:
 
 ```toml
 [gpu]
 type = "B200"
 count = 4
-# provider is optional: allocation compares multi-card shapes across every configured provider
-# and picks the cheapest that can rent n cards on one machine. pin one only to force a choice.
+# provider is optional: allocation compares fitting shapes across every configured provider.
 ```
 
-`flash train configs/grpo.toml --gpus 4` sets the same key from the command line, so a config can
-stay at its authored count while one submit asks for more. The flag is exactly `--set
-gpu.count=4`, and the same 1..8 bound rejects a bad value.
+`flash train configs/grpo.toml --gpus 4` sets the same key from the command line. The flag is exactly
+`--set gpu.count=4`, and the same 1..8 bound rejects a bad value.
 
-`gpu.count` is a **ceiling, not an exact count** — by either spelling. Allocation treats it as the
-most cards it may use, and it stops at the first count that fits: a class that fits the run on one
-card is allocated as one card, and a class that needs sharding gets the _smallest_ fitting
-combination, not the count you asked for. `--gpus 4` on a 9B **SFT** run pinned to a 24 GB class
-allocates 2. Eight cards is the public and allocatable maximum; ceilings between powers of two round
+An authored `gpu.count` is a **ceiling, not an exact count**. Allocation never escalates past it, but
+a class that fits with fewer cards may still use fewer. An explicit `count = 1` is therefore a real
+pin: if the run needs two cards, Flash rejects it and names the smallest count that would fit rather
+than silently escalating. Eight cards is the public maximum; ceilings between powers of two round
 down to the next rentable count.
 
-That example is SFT-specific on purpose. The fit test is per algorithm, and the same 9B pinned to
-the same 24 GB class may need a wider combination under GRPO or OPD because rollout memory raises
-the whole-run floor. Raising `--gpus` still cannot rescue a pin the algorithm does not fit on even
-as an 8-card combination.
+The fit test is per algorithm. GRPO and OPD can need a wider combination than SFT because rollout
+memory raises the whole-run floor. Raising `--gpus` still cannot rescue a pin the algorithm does not
+fit on even as an 8-card combination.
 
 **There is no exact-count mechanism.** Pinning a small `[gpu] type` raises the floor above one card
 but still does not pin n — it only moves which combination is smallest. To see what a submit
@@ -1317,15 +1317,16 @@ actually chose, read the `allocated 2x <class> on <provider> at $N/hr` line at t
 log`: the runner writes it when it places the run, so it is there before a worker exists and stays
 there for the life of the run. A single card is spelled without the `Nx` prefix.
 
-Do **not** read the count off `spec.gpu.count` in `flash runs status` — that echoes the ceiling you
-submitted, so it shows 4 even on a run allocated 1 card. `gpu_status.device_count` is a genuine
-worker-side observation, but it is not a reliable place to look either: the mid-run heartbeats
+Do **not** read the allocated count off `spec.gpu.count` in `flash runs status`. It echoes an
+authored ceiling, and an auto-sized public spec retains the digest-stable integer placeholder rather
+than the selected shape. `gpu_status.device_count` is a genuine worker-side observation, but it is
+not a reliable place to look either: the mid-run heartbeats
 (`sft_train`, `opd_step`, `rl_step`) collect diagnostics without torch, and each heartbeat _replaces_
 `gpu_status` wholesale, so the field is usually absent while a run is live and reappears only on the
 terminal heartbeat.
 
-GRPO, SFT and OPD all shard across `gpu.count` with no backend key to set: the worker launches one
-rank per card with Ulysses sequence parallelism.
+GRPO, SFT and OPD all shard across the selected count with no backend key to set: the worker
+launches one rank per card with Ulysses sequence parallelism.
 
 OPD has one unsupported combination, and because there is no other backend to fall back to it
 raises at startup: a multi-turn env together with `[train] structured_outputs`. Multi-turn OPD
@@ -1357,7 +1358,7 @@ flash env delete --project <project-uuid> your-org/my-env -y   # delete a publis
 flash train configs/sft.toml --dry-run # validate the config on the server (no GPU, no charge)
 flash train configs/sft.toml --cost    # pre-flight USD estimate, then exit
 flash train configs/sft.toml           # submit and follow logs (Ctrl-C detaches; --background to skip following)
-flash train configs/grpo.toml --gpus 4 # shorthand for --set gpu.count=4; a CEILING (needs a multi-card provider)
+flash train configs/grpo.toml --gpus 4 # shorthand for --set gpu.count=4; pins the ceiling
 flash runs status <run-id>                 # state + accrued cost
 flash runs log <run-id>                    # reward/loss trend + worker console/error logs
 flash runs log <run-id> --follow           # stream a live run to completion

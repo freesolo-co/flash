@@ -437,6 +437,10 @@ class JobSpec:
     # from the internal worker spec under `effective_preparation` instead (see
     # `_internal_spec_from_status`), which carries it verbatim.
     model_revision_auto: bool = False
+    # platform-managed marker: true when the author omitted both gpu.type and gpu.count and the stored
+    # integer 1 is only the digest-stable public placeholder. allocation reads this marker as
+    # "auto-size"; a type pin or authored count=1 leaves it false and remains a hard ceiling.
+    gpu_count_auto: bool = False
     # platform-managed workload-profile carrier. public configs never author these fields.
     workload_profile_kind: str = ""
     workload_profile_input_digest: str = ""
@@ -459,6 +463,9 @@ class JobSpec:
         # deploy guard reads the pair.
         if self.model_revision_auto and not self.model_revision:
             object.__setattr__(self, "model_revision_auto", False)
+        # the marker qualifies the default integer placeholder and cannot outlive a resolved count.
+        if self.gpu_count_auto and self.gpu.count != 1:
+            object.__setattr__(self, "gpu_count_auto", False)
         profile_kind = str(self.workload_profile_kind or "")
         if profile_kind not in {"", "sft"}:
             raise ValueError("unsupported workload profile kind")
@@ -501,6 +508,9 @@ class JobSpec:
         # exists to keep deployable. "" is also the honest value: nothing was authored.
         if data.pop("model_revision_auto", None):
             data["model_revision"] = ""
+        # keep gpu.count=1 in the public gpu object for preparation-digest stability. only the
+        # platform-managed provenance marker is stripped; internal round trips carry it verbatim.
+        data.pop("gpu_count_auto", None)
         data.pop("workload_profile_kind", None)
         data.pop("workload_profile_input_digest", None)
         data.pop("workload_profile_producer_version", None)
@@ -650,6 +660,7 @@ class JobSpec:
             wandb=_coerce_wandb(data.get("wandb")),
             seed=parse_seed(data.get("seed", FIXED_SEED)),
             model_revision_auto=coerce_bool(data.get("model_revision_auto", False)),
+            gpu_count_auto=coerce_bool(data.get("gpu_count_auto", False)),
             workload_profile_kind=str(data.get("workload_profile_kind") or ""),
             workload_profile_input_digest=str(data.get("workload_profile_input_digest") or ""),
             workload_profile_producer_version=str(

@@ -9,6 +9,7 @@ from flash._internal.logging import get_logger
 from flash.providers import PROVIDER_NAMES, available_providers, get_provider
 from flash.providers.base import (
     GPU_INFO,
+    MAX_COMBINATION_CARDS,
     SHARD_VRAM_EFFICIENCY,
     Allocation,
     AllocationConstraints,
@@ -22,6 +23,8 @@ from flash.providers.base import (
     providers_for,
     rentable_gpu_counts,
     run_config_for_ranking,
+    smallest_fitting_gpu_count,
+    vram_fit_error_message,
 )
 
 logger = get_logger(__name__)
@@ -196,9 +199,6 @@ def _query_attention_heads(info) -> int:
 def _resolve_exact_gpu(
     gpu_type: str,
     *,
-    need: float,
-    cap: int,
-    max_gpu_count: int,
     provider: str,
     available: tuple[str, ...],
 ) -> tuple[str, tuple[str, ...]]:
@@ -207,26 +207,62 @@ def _resolve_exact_gpu(
     exact_info = GPU_INFO.get(exact)
     if exact_info is None or not exact_info.validated:
         raise UnsupportedGpuError(f"exact GPU {exact!r} is not an active validated GPU class")
-    if exact_info.vram_gb < need and max_gpu_count <= 1:
-        raise UnsupportedGpuError(
-            f"exact GPU {exact!r} has {exact_info.vram_gb} GB VRAM, "
-            f"but this run requires at least {need} GB"
-        )
-    # the widest shape providers actually rent for this ceiling, not the ceiling itself: a pin
-    # that only fits at a non-rentable count (3) must be rejected here with a precise reason
-    # rather than passing and dying later on a generic no-capacity error.
-    if (
-        exact_info.vram_gb < need
-        and max_gpu_count > 1
-        and combined_vram_gb(exact_info.vram_gb, cap) < need
-    ):
-        raise UnsupportedGpuError(
-            f"exact GPU {exact!r} cannot fit this run even as a {cap}-card combination"
-        )
     exact_providers = providers_for(exact)
     if provider and provider not in exact_providers:
         raise UnsupportedGpuError(f"provider {provider!r} cannot provision exact GPU {exact!r}")
     return exact, tuple(name for name in available if name in exact_providers)
+
+
+def _structural_gpu_names(available: tuple[str, ...], exact: str) -> tuple[str, ...]:
+    """Validated classes the requested provider set can structurally provision."""
+    return tuple(
+        info.name
+        for info in GPU_INFO.values()
+        if info.validated
+        and (not exact or info.name == exact)
+        and any(provider in available for provider in providers_for(info.name))
+    )
+
+
+def _resolved_gpu_count(
+    model_id: str,
+    algorithm: str,
+    *,
+    need: float,
+    requested_gpu_count: int | None,
+    model_revision: str,
+    available: tuple[str, ...],
+    exact: str,
+) -> int:
+    """Resolve auto-size or validate that an authored ceiling can structurally fit."""
+    auto_cap = geometry_safe_gpu_cap(model_id, MAX_COMBINATION_CARDS, model_revision=model_revision)
+    gpu_names = _structural_gpu_names(available, exact)
+    if requested_gpu_count is None:
+        fitting_count = smallest_fitting_gpu_count(
+            need, max_gpu_count=auto_cap, gpu_names=gpu_names
+        )
+        if fitting_count is not None:
+            return fitting_count
+        effective_count = auto_cap
+    else:
+        effective_count = geometry_safe_gpu_cap(
+            model_id, requested_gpu_count, model_revision=model_revision
+        )
+        if (
+            smallest_fitting_gpu_count(need, max_gpu_count=effective_count, gpu_names=gpu_names)
+            is not None
+        ):
+            return effective_count
+    raise UnsupportedGpuError(
+        vram_fit_error_message(
+            algorithm,
+            need,
+            requested_gpu_count=requested_gpu_count,
+            effective_gpu_count=effective_count,
+            max_gpu_count=auto_cap,
+            gpu_names=gpu_names,
+        )
+    )
 
 
 def _gather_candidates(
@@ -341,15 +377,13 @@ def allocate(
     provider: str = "",
     gpu_type: str = "",
     model_revision: str = "",
-    max_gpu_count: int = 1,
+    max_gpu_count: int | None = None,
     workload_profile: bool = False,
 ) -> Allocation:
     """Pick the cheapest fitting combination of (provider, GPU class, count) able to run the job.
 
-    With ``max_gpu_count=1`` (the default) this is exactly the classic cheapest single-class
-    allocation. A caller whose algorithm can shard across cards passes a higher cap, and fitting
-    multi-card combinations (same class x count) then compete on TOTAL hourly cost — e.g.
-    2 x A100 beats 1 x H200 whenever 2 * $A100 < $H200 and the sharded fit clears the need.
+    ``max_gpu_count=None`` auto-sizes to the smallest geometry-safe ceiling that can fit. an integer
+    is an authored hard ceiling; fitting shapes up to that ceiling still compete on dollars per step.
 
     ``workload_profile=True`` allocates the cpu-only profile job instead of the run it measures: it
     needs no training VRAM and gains nothing from a faster card, so it ranks on rate alone.
@@ -376,17 +410,24 @@ def allocate(
             raise UnsupportedGpuError(f"requested provider {provider!r} is not configured")
         available = (provider,)
 
-    cap = geometry_safe_gpu_cap(model_id, max_gpu_count, model_revision=model_revision)
     exact = ""
     if gpu_type:
         exact, available = _resolve_exact_gpu(
             gpu_type,
-            need=need,
-            cap=cap,
-            max_gpu_count=max_gpu_count,
             provider=provider,
             available=available,
         )
+        if not available:
+            raise UnsupportedGpuError(f"exact GPU {exact!r} has no configured active provider")
+    cap = _resolved_gpu_count(
+        model_id,
+        algorithm,
+        need=need,
+        requested_gpu_count=max_gpu_count,
+        model_revision=model_revision,
+        available=available,
+        exact=exact,
+    )
 
     constraints = AllocationConstraints(
         disk_gb=disk_gb,
