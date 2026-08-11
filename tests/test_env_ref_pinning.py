@@ -49,9 +49,11 @@ def test_managed_content_sha_resolves_at_the_already_pinned_commit(monkeypatch) 
 
     seen: dict[str, object] = {}
 
-    def resolve(ref, repo_dir):
+    def resolve(ref, repo_dir, *, timeout, max_rate_limit_retries):
         seen["ref"] = ref
         seen["repo_dir"] = repo_dir
+        seen["timeout"] = timeout
+        seen["retries"] = max_rate_limit_retries
         return _CONTENT_SHA
 
     monkeypatch.setattr(loader, "_resolve_github_directory_tree_sha", resolve)
@@ -64,6 +66,13 @@ def test_managed_content_sha_resolves_at_the_already_pinned_commit(monkeypatch) 
         "acme/my-env/environment.py",
     )
     assert seen["repo_dir"] == "acme/my-env"
+    # this lookup runs inline inside submit, so it must take the same fast bounds the commit pin
+    # beside it takes. the worker download defaults (120s x 5 retries, per request) would hold a
+    # control-plane request open for minutes whenever github is rate-limiting.
+    assert seen["timeout"] == loader._CONTROL_PLANE_GITHUB_TIMEOUT_S
+    assert seen["retries"] == loader._CONTROL_PLANE_GITHUB_RETRIES
+    assert seen["timeout"] <= 10.0
+    assert seen["retries"] == 0
 
 
 def test_generic_github_ref_has_no_managed_content_override(monkeypatch) -> None:

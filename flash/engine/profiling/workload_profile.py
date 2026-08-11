@@ -89,7 +89,13 @@ def sft_profile_input_payload(
             # points at environment-hub@main, which any org's `env push` advances, so keying on it
             # invalidated every pending quote fleet-wide and re-billed a profile per attempt.
             # content_sha is empty only for generic github refs, where the user's own pin is exact.
-            "content_revision": str(environment.content_sha or environment.resolved_sha or ""),
+            #
+            # the KEY keeps its historical name while the VALUE narrows. renaming it to something
+            # like content_revision would change the canonical json for a pre-upgrade run whose
+            # revision is unchanged, so recomputing its digest during recovery or reallocation would
+            # raise WorkloadProfileMismatch and strand an in-flight run. holding the name makes that
+            # compatibility free rather than something a legacy branch has to reproduce.
+            "resolved_sha": str(environment.content_sha or environment.resolved_sha or ""),
             "params_sha256": _digest_mapping(environment.params),
         },
         "model": {

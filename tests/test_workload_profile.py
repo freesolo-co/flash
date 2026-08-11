@@ -195,12 +195,32 @@ def test_sft_profile_key_falls_back_to_generic_github_commit() -> None:
         producer_version="1.2.3",
     )
 
-    assert first["environment"]["content_revision"] == "b" * 40
+    assert first["environment"]["resolved_sha"] == "b" * 40
     assert second != sft_profile_input_digest(
         spec,
         tokenizer_revision="tokenizer-a",
         producer_version="1.2.3",
     )
+
+
+def test_sft_profile_payload_holds_its_historical_environment_key_name() -> None:
+    """The payload KEY stays ``resolved_sha`` even though the VALUE narrowed to the content sha.
+
+    A run in flight was keyed under the old payload, so renaming the key would change the canonical
+    json for an environment whose revision never moved. Recomputing that run's digest on recovery or
+    reallocation would then raise and strand it. Narrowing only the value keeps compatibility free.
+    """
+    spec = _spec()
+    environment = sft_profile_input_payload(
+        spec,
+        tokenizer_revision="tokenizer-a",
+        producer_version="1.2.3",
+    )["environment"]
+
+    assert set(environment) == {"id", "resolved_sha", "params_sha256"}
+    # the value is the per-environment content sha, NOT the shared hub tip it is keyed beside.
+    assert environment["resolved_sha"] == spec.environment.content_sha
+    assert environment["resolved_sha"] != spec.environment.resolved_sha
 
 
 def test_sft_profile_key_changes_for_every_workload_shaping_input() -> None:

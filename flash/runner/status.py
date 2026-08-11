@@ -75,6 +75,10 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     raw_public = status.spec if isinstance(status.spec, dict) else {}
     legacy_public_keys = {k: raw_public[k] for k in _DROPPED_TOP_LEVEL_KEYS if k in raw_public}
     legacy_public_alpha = runner._prepared_before_public_alpha(raw_public)
+    # a snapshot written before environment.content_sha existed hashed an environment object
+    # without the key; read that from the STORED payload rather than the reloaded spec, which
+    # always materializes the field.
+    legacy_missing_content_sha = runner._prepared_before_environment_content_sha(raw_worker)
     has_workload_profile = bool(
         worker_spec.workload_profile_kind
         or worker_spec.workload_profile_input_digest
@@ -101,6 +105,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
             legacy_keys=legacy_keys,
             legacy_public_keys=legacy_public_keys,
             legacy_public_alpha=legacy_public_alpha,
+            legacy_missing_content_sha=legacy_missing_content_sha,
         )
     ):
         raise ValueError("persisted effective preparation failed integrity validation")
@@ -117,6 +122,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
             legacy_keys=legacy_keys,
             legacy_public_keys=legacy_public_keys,
             legacy_public_alpha=legacy_public_alpha,
+            legacy_missing_content_sha=legacy_missing_content_sha,
         ):
             raise ValueError("persisted effective preparation failed integrity validation")
     if verify_source and public_spec.train.init_from_adapter:

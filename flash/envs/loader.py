@@ -50,6 +50,11 @@ _MAX_CONTENTS_JSON_BYTES = 16 * 1024 * 1024
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = ARCHIVE_MEMBER_LIMIT
 _MAX_ARCHIVE_SCAN_MEMBERS = ARCHIVE_SCAN_MEMBER_LIMIT
+# bounds for github reads that happen inline on a control-plane request. mirrors what
+# _assign_resolved_env_sha already passes for the commit pin: fail fast and let the caller's gate
+# report it, rather than holding a submit open through a rate-limit backoff.
+_CONTROL_PLANE_GITHUB_TIMEOUT_S = 10.0
+_CONTROL_PLANE_GITHUB_RETRIES = 0
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 _GITHUB_SAFE_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _DATASET_SPLIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -448,10 +453,24 @@ def _safe_contents_path(path: object, root_parts: list[str]) -> str:
     return normalized
 
 
-def _download_github_json(ref: GitHubEnvironmentRef, url: str, context: str) -> object:
+def _download_github_json(
+    ref: GitHubEnvironmentRef,
+    url: str,
+    context: str,
+    *,
+    timeout: float = 120.0,
+    max_rate_limit_retries: int = 5,
+) -> object:
+    """Fetch one GitHub json document.
+
+    The defaults suit the worker download path, which is asynchronous and would rather wait than
+    fail. Callers on a synchronous request path pass their own bounds -- see
+    ``_CONTROL_PLANE_*`` and ``_resolve_environment_content_sha``.
+    """
     data = _urlopen(
         urllib.request.Request(url, headers=_github_headers("application/vnd.github+json")),
-        timeout=120.0,
+        timeout=timeout,
+        max_rate_limit_retries=max_rate_limit_retries,
         max_bytes=_MAX_CONTENTS_JSON_BYTES,
     )
     try:
@@ -471,8 +490,21 @@ def _github_response_message(payload: object) -> str:
     return ""
 
 
-def _github_tree_entries(ref: GitHubEnvironmentRef, treeish: str, context: str) -> list[dict]:
-    payload = _download_github_json(ref, _github_tree_url(ref, treeish), context)
+def _github_tree_entries(
+    ref: GitHubEnvironmentRef,
+    treeish: str,
+    context: str,
+    *,
+    timeout: float = 120.0,
+    max_rate_limit_retries: int = 5,
+) -> list[dict]:
+    payload = _download_github_json(
+        ref,
+        _github_tree_url(ref, treeish),
+        context,
+        timeout=timeout,
+        max_rate_limit_retries=max_rate_limit_retries,
+    )
     if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
         raise RuntimeError(
             f"GitHub path {context!r} is not an environment directory"
@@ -488,11 +520,23 @@ def _github_tree_entries(ref: GitHubEnvironmentRef, treeish: str, context: str) 
     return entries
 
 
-def _resolve_github_directory_tree_sha(ref: GitHubEnvironmentRef, repo_dir: str) -> str:
+def _resolve_github_directory_tree_sha(
+    ref: GitHubEnvironmentRef,
+    repo_dir: str,
+    *,
+    timeout: float = 120.0,
+    max_rate_limit_retries: int = 5,
+) -> str:
     treeish = ref.ref
     current = ""
     for part in [part for part in repo_dir.split("/") if part]:
-        entries = _github_tree_entries(ref, treeish, current or ref.ref)
+        entries = _github_tree_entries(
+            ref,
+            treeish,
+            current or ref.ref,
+            timeout=timeout,
+            max_rate_limit_retries=max_rate_limit_retries,
+        )
         match = next(
             (
                 entry
@@ -528,7 +572,16 @@ def _resolve_environment_content_sha(env_id: str, resolved_sha: str) -> str:
     if not package_root:
         return ""
     pinned = GitHubEnvironmentRef(parsed.owner, parsed.repo, resolved_sha, parsed.path)
-    content_sha = _resolve_github_directory_tree_sha(pinned, package_root)
+    # this runs synchronously inside submit, so it takes the same fast bounds the commit-pin
+    # lookup above it uses rather than the worker download defaults. a managed slug costs two tree
+    # requests, and at 120s x 5 retries each those would hold a request open long past any
+    # client or server deadline whenever github is slow or rate-limited.
+    content_sha = _resolve_github_directory_tree_sha(
+        pinned,
+        package_root,
+        timeout=_CONTROL_PLANE_GITHUB_TIMEOUT_S,
+        max_rate_limit_retries=_CONTROL_PLANE_GITHUB_RETRIES,
+    )
     if not is_commit_sha(content_sha):
         raise RuntimeError("GitHub environment directory did not resolve to an immutable tree sha")
     return content_sha.lower()

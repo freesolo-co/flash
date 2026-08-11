@@ -550,7 +550,7 @@ def test_download_github_tarball_uses_whole_repo_ceiling(monkeypatch):
     assert adapter._MAX_TARBALL_BYTES > adapter._MAX_ARCHIVE_BYTES
     big = b"x" * (adapter._MAX_ARCHIVE_BYTES + 10)
 
-    def fake_urlopen(req, timeout=None, max_bytes=None, out=None):
+    def fake_urlopen(req, timeout=None, max_bytes=None, out=None, max_rate_limit_retries=5):
         assert max_bytes == adapter._MAX_TARBALL_BYTES
         out.write(big)
         return b""
@@ -619,7 +619,7 @@ def test_resolve_managed_hub_env_downloads_only_requested_package(monkeypatch, t
     }
     seen_urls: list[str] = []
 
-    def fake_urlopen(req, timeout=None, max_bytes=None, out=None):
+    def fake_urlopen(req, timeout=None, max_bytes=None, out=None, max_rate_limit_retries=5):
         seen_urls.append(req.full_url)
         accept = req.headers.get("Accept")
         if "/git/trees/" in req.full_url:
@@ -690,7 +690,7 @@ def test_explicit_environment_hub_github_ref_downloads_only_requested_package(
         "david-freesolo-co/stuff/datasets/train.jsonl": b'{"a":1}\n',
     }
 
-    def fake_urlopen(req, timeout=None, max_bytes=None, out=None):
+    def fake_urlopen(req, timeout=None, max_bytes=None, out=None, max_rate_limit_retries=5):
         accept = req.headers.get("Accept")
         if "/git/trees/" in req.full_url:
             assert accept == "application/vnd.github+json"
@@ -777,7 +777,7 @@ def test_download_github_directory_handles_large_tree_listing(monkeypatch, tmp_p
         },
     }
 
-    def fake_urlopen(req, timeout=None, max_bytes=None, out=None):
+    def fake_urlopen(req, timeout=None, max_bytes=None, out=None, max_rate_limit_retries=5):
         accept = req.headers.get("Accept")
         if "/git/trees/" in req.full_url:
             assert accept == "application/vnd.github+json"
@@ -807,7 +807,7 @@ def test_download_github_directory_surfaces_tree_error_message(monkeypatch, tmp_
         "david-freesolo-co/missing/environment.py",
     )
 
-    def fake_urlopen(req, timeout=None, max_bytes=None, out=None):
+    def fake_urlopen(req, timeout=None, max_bytes=None, out=None, max_rate_limit_retries=5):
         return json.dumps({"message": "Not Found"}).encode()
 
     monkeypatch.setattr(adapter, "_urlopen", fake_urlopen)

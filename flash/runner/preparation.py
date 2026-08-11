@@ -316,6 +316,26 @@ def _prepared_before_public_alpha(raw_public: object) -> bool:
     return not train.get("init_from_adapter")
 
 
+def _prepared_before_environment_content_sha(raw_worker: object) -> bool:
+    """True when this run's PERSISTED worker spec predates ``environment.content_sha``.
+
+    Same discriminator as ``_prepared_before_public_alpha``: the stored bytes, not this build's
+    serialization. from_dict() materializes the new field as "", so rehashing a pre-upgrade snapshot
+    would add an empty key the hashed bytes never had and fail a still-valid run's integrity check.
+
+    A payload that also omits ``resolved_sha`` is excluded. Only ``to_internal_dict()`` emits the
+    managed environment keys; a public-shaped payload strips ALL of them in every version, so absence
+    there says nothing about when the run was prepared, and treating it as legacy would drop a
+    binding that costs nothing to keep.
+    """
+    if not isinstance(raw_worker, dict):
+        return False
+    environment = raw_worker.get("environment")
+    if not isinstance(environment, dict) or "content_sha" in environment:
+        return False
+    return "resolved_sha" in environment
+
+
 def _preparation_digest(
     public_spec: JobSpec,
     worker_spec: JobSpec,
@@ -324,6 +344,7 @@ def _preparation_digest(
     legacy_keys: dict | None = None,
     legacy_public_keys: dict | None = None,
     legacy_public_alpha: bool = False,
+    legacy_missing_content_sha: bool = False,
 ) -> str:
     worker_payload = worker_spec.to_internal_dict()
     public_payload = public_spec.to_dict()
@@ -364,6 +385,14 @@ def _preparation_digest(
     # the only thing that could cover it.
     if legacy_public_alpha:
         public_payload["train"].pop("lora_alpha", None)
+    # ``environment.content_sha`` is new, and a pre-upgrade snapshot hashed an environment object
+    # without it. from_dict() supplies the missing field as "", so rehashing would add an empty key
+    # the stored bytes never had and fail a still-valid run's integrity check on recovery. Same
+    # reason as the omissions and restorations above, and scoped the same way: the omission applies
+    # only to snapshots whose stored payload genuinely lacked the key, so every digest created from
+    # here on binds content_sha and a tampered value is still caught.
+    if legacy_missing_content_sha:
+        worker_payload.get("environment", {}).pop("content_sha", None)
     payload = {
         "version": 1,
         "public_spec": public_payload,

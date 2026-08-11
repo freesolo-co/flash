@@ -696,6 +696,146 @@ def test_legacy_pre_alpha_snapshot_still_recovers(tmp_path, monkeypatch) -> None
     assert runner.effective_spec_from_status(runner.get_status(worker.run_id)) == worker
 
 
+def _content_sha_status(runner, *, public: JobSpec, worker: JobSpec, profile: dict, legacy: bool):
+    """A persisted profile run, snapshotted before or after environment.content_sha existed."""
+    stored_worker = worker.to_internal_dict()
+    if legacy:
+        stored_worker["environment"] = {
+            k: v for k, v in stored_worker["environment"].items() if k != "content_sha"
+        }
+    return runner.RunStatus(
+        run_id=worker.run_id,
+        state="queued",
+        spec=public.to_dict(),
+        effective_preparation={
+            "worker_spec": stored_worker,
+            "workload_profile": profile,
+            "adapter_identity": None,
+            "preparation_digest": runner._preparation_digest(
+                public, worker, None, legacy_missing_content_sha=legacy
+            ),
+        },
+    )
+
+
+def test_legacy_snapshot_without_content_sha_still_recovers(tmp_path, monkeypatch) -> None:
+    """A run snapshotted before environment.content_sha existed keeps its historical digest.
+
+    from_dict() materializes the new field as "", so rehashing a pre-upgrade snapshot would add an
+    empty key the stored bytes never had and fail a still-valid run's integrity check on recovery.
+    The omission is read from the STORED payload, so it cannot be claimed by a current snapshot.
+    """
+    runner = fresh_runner(tmp_path, monkeypatch)
+    spec = _spec()
+    digest = _input_digest(spec)
+    profile = _profile(digest).to_dict()
+    worker = replace(
+        spec,
+        run_id="training-run",
+        workload_profile_input_digest=digest,
+        workload_profile_producer_version="1.2.3",
+        workload_profile=profile,
+    )
+    public = replace(
+        worker,
+        workload_profile_input_digest="",
+        workload_profile_producer_version="",
+        workload_profile={},
+    )
+
+    status = _content_sha_status(runner, public=public, worker=worker, profile=profile, legacy=True)
+    # guard: the stored payload really is the pre-upgrade shape, while the live spec is not.
+    assert "content_sha" not in status.effective_preparation["worker_spec"]["environment"]
+    assert worker.environment.content_sha
+
+    # it recovers rather than raising, and reports the environment the snapshot actually stored:
+    # a pre-upgrade run has no per-environment pin, so the field reloads empty by construction.
+    recovered = runner.effective_spec_from_status(status)
+    assert recovered == replace(worker, environment=replace(worker.environment, content_sha=""))
+
+    # re-persisting (quote refresh, realloc) writes the current shape, whose digest the NEXT
+    # integrity check reproduces without the legacy omission.
+    runner._save_status(status)
+    assert runner._persist_effective_worker_spec(worker)
+    reloaded = runner.get_status(worker.run_id)
+    assert reloaded.effective_preparation["worker_spec"]["environment"]["content_sha"]
+    assert runner.effective_spec_from_status(reloaded) == worker
+
+
+def test_new_snapshots_bind_environment_content_sha(tmp_path, monkeypatch) -> None:
+    """The legacy omission is not the default: a current snapshot hashes content_sha and detects
+    a forged one. Otherwise the fix would hand every run a field nothing verifies."""
+    runner = fresh_runner(tmp_path, monkeypatch)
+    spec = _spec()
+    digest = _input_digest(spec)
+    profile = _profile(digest).to_dict()
+    worker = replace(
+        spec,
+        run_id="training-run",
+        workload_profile_input_digest=digest,
+        workload_profile_producer_version="1.2.3",
+        workload_profile=profile,
+    )
+    public = replace(
+        worker,
+        workload_profile_input_digest="",
+        workload_profile_producer_version="",
+        workload_profile={},
+    )
+
+    status = _content_sha_status(
+        runner, public=public, worker=worker, profile=profile, legacy=False
+    )
+    assert runner.effective_spec_from_status(status) == worker
+
+    # the two shapes are genuinely different digests, so a legacy snapshot cannot be forged out of
+    # a current one by deleting the key -- the stored digest no longer reproduces either way.
+    assert runner._preparation_digest(public, worker, None) != runner._preparation_digest(
+        public, worker, None, legacy_missing_content_sha=True
+    )
+
+    forged = status.effective_preparation["worker_spec"]
+    forged["environment"] = {**forged["environment"], "content_sha": "f" * 40}
+    with pytest.raises(ValueError, match="failed integrity validation"):
+        runner.effective_spec_from_status(status)
+
+    stripped = _content_sha_status(
+        runner, public=public, worker=worker, profile=profile, legacy=False
+    )
+    stripped_env = stripped.effective_preparation["worker_spec"]["environment"]
+    stripped.effective_preparation["worker_spec"]["environment"] = {
+        k: v for k, v in stripped_env.items() if k != "content_sha"
+    }
+    with pytest.raises(ValueError, match="failed integrity validation"):
+        runner.effective_spec_from_status(stripped)
+
+
+def test_content_sha_legacy_discriminator_reads_the_stored_environment_shape(
+    tmp_path, monkeypatch
+) -> None:
+    """Only a payload that carries the OTHER managed env keys can be a pre-upgrade snapshot.
+
+    ``to_internal_dict()`` emits every managed environment key; the public ``to_dict()`` strips all
+    of them in every version. Treating a public-shaped payload as legacy would drop the content_sha
+    binding for runs that never lacked it, so absence alone cannot be the discriminator.
+    """
+    runner = fresh_runner(tmp_path, monkeypatch)
+    spec = _spec()
+    internal_env = spec.to_internal_dict()["environment"]
+    public_env = spec.to_dict()["environment"]
+    # guard: the two shapes really do differ in the way the discriminator relies on.
+    assert {"resolved_sha", "content_sha"} <= set(internal_env)
+    assert not {"resolved_sha", "content_sha"} & set(public_env)
+
+    pre_upgrade = {k: v for k, v in internal_env.items() if k != "content_sha"}
+    assert runner._prepared_before_environment_content_sha({"environment": pre_upgrade})
+    # a current internal payload, and a public-shaped one, are both non-legacy.
+    assert not runner._prepared_before_environment_content_sha({"environment": internal_env})
+    assert not runner._prepared_before_environment_content_sha({"environment": public_env})
+    assert not runner._prepared_before_environment_content_sha({})
+    assert not runner._prepared_before_environment_content_sha(None)
+
+
 class _StopAfterAllocation(Exception):
     """Sentinel: the test only needs the constraint allocate() was called with."""
 
