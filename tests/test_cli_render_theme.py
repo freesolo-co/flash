@@ -780,7 +780,9 @@ def test_long_silence_at_a_liveness_setup_stage_names_both_causes(monkeypatch):
         "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
     }
 
-    frozen = dict(base, last_heartbeat={"stage": "sft_model_load", "ts": _time.time() - 1200})
+    # model_prefetching is the stage that actually pulls base weights, so it is the one whose
+    # silence the cold-cache reading describes.
+    frozen = dict(base, last_heartbeat={"stage": "model_prefetching", "ts": _time.time() - 1200})
     out = render.run_status(frozen)
     assert "longer than throttling explains" in out
     # every reading, because the panel genuinely cannot distinguish them -- naming only one is how
@@ -854,6 +856,73 @@ def test_setup_hint_does_not_blame_a_download_on_a_stage_that_never_downloads(mo
     assert "downloads tens of GB" not in out
 
 
+def test_warmup_reassurance_yields_once_the_silence_is_unexplained(monkeypatch):
+    """The warmup and stale-setup windows overlap, and they say opposite things.
+
+    `rl_initializing` counts as fresh for 1200s but goes silent-unexplained at 900s, so between
+    those the panel printed "setup is not billed; do not cancel" directly above "the instance may
+    be gone ... check before cancelling". A panel that contradicts itself is worse than either row
+    alone: the user cannot act on it at all.
+    """
+    import time as _time
+
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    base = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "rl"},
+    }
+
+    # inside the overlap: the specific hint wins, the reassurance stands down.
+    overlap = dict(base, last_heartbeat={"stage": "rl_initializing", "ts": _time.time() - 1080})
+    out = render.run_status(overlap)
+    assert "longer than throttling explains" in out
+    assert "do not cancel" not in out, "reassurance printed alongside a possible-dead-instance hint"
+
+    # and warmup still reassures where it is the honest reading.
+    fresh = dict(base, last_heartbeat={"stage": "rl_initializing", "ts": _time.time() - 300})
+    fresh_out = render.run_status(fresh)
+    assert "do not cancel" in fresh_out
+    assert "longer than throttling explains" not in fresh_out
+
+
+def test_opd_model_load_is_not_described_as_a_weight_download(monkeypatch):
+    """`opd_model_load` reads the cached config with local_files_only; it downloads nothing.
+
+    Both model-load stages are emitted only after `prefetch_model` returns, so neither is the
+    tens-of-GB base-weight transfer (that is `model_prefetching`). SFT still fetches a warm-start
+    adapter inside its span, so it keeps a download explanation -- a smaller one.
+    """
+    import time as _time
+
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    base = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "opd"},
+    }
+
+    opd = dict(base, last_heartbeat={"stage": "opd_model_load", "ts": _time.time() - 1200})
+    opd_out = render.run_status(opd)
+    assert "longer than throttling explains" in opd_out
+    assert "tens of GB" not in opd_out
+    assert "does no download" in opd_out
+
+    # sft's span DOES fetch an adapter, so it keeps a download reading, sized honestly.
+    sft = dict(base, last_heartbeat={"stage": "sft_model_load", "ts": _time.time() - 1200})
+    sft_out = render.run_status(sft)
+    assert "fetches an adapter" in sft_out
+    assert "tens of GB" not in sft_out
+
+
 def test_setup_hint_cites_the_datacenter_only_when_the_row_is_rendered(monkeypatch):
     """`dc` is optional, and the datacenter row is omitted when it is absent.
 
@@ -873,7 +942,9 @@ def test_setup_hint_cites_the_datacenter_only_when_the_row_is_rendered(monkeypat
         "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
     }
 
-    without_dc = dict(base, last_heartbeat={"stage": "sft_model_load", "ts": _time.time() - 1200})
+    without_dc = dict(
+        base, last_heartbeat={"stage": "model_prefetching", "ts": _time.time() - 1200}
+    )
     out = render.run_status(without_dc)
     assert "datacenter above" not in out, "cites a row that is not on the panel"
     # the download itself is still the right explanation for this stage.
@@ -881,7 +952,7 @@ def test_setup_hint_cites_the_datacenter_only_when_the_row_is_rendered(monkeypat
 
     with_dc = dict(
         base,
-        last_heartbeat={"stage": "sft_model_load", "ts": _time.time() - 1200, "dc": "EU-RO-1"},
+        last_heartbeat={"stage": "model_prefetching", "ts": _time.time() - 1200, "dc": "EU-RO-1"},
     )
     out_dc = render.run_status(with_dc)
     assert "datacenter above" in out_dc

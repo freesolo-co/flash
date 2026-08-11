@@ -1248,6 +1248,21 @@ def test_model_load_transition_commits_even_behind_a_fresh_setup_ping(stage, mon
     assert len(committed) == before, "liveness ticks must stay throttled"
 
 
+def test_status_panel_knows_every_setup_liveness_stage():
+    """The panel's hint set must track the worker's, or a new stage silently loses its diagnosis.
+
+    `_stale_setup_hint` fires only for stages it lists. The worker owns the real set, so a stage
+    added there and not here would fall back to the generic "quiet is not dead" reassurance at
+    exactly the ages this PR exists to stop reassuring at -- with nothing failing to say so.
+    """
+    import flash.engine.worker as ne
+    from flash.cli.ui.heartbeat import _LIVENESS_SETUP_STAGES
+
+    assert _LIVENESS_SETUP_STAGES == ne._HB_SETUP_LIVENESS_STAGES, (
+        "the status panel's liveness-setup stages drifted from the worker's"
+    )
+
+
 def test_no_worker_side_stall_watchdog():
     """The worker has no separate stall watchdog: the provider owns kill+retry, and the dump fires on
     liveness give-up. Guard against re-adding the env-tunable faulthandler timer."""

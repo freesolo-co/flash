@@ -127,6 +127,13 @@ _LIVENESS_SETUP_STAGES = frozenset(
         "sft_initializing",
         "rl_initializing",
         "opd_initializing",
+        # adapter export/upload holds a keepalive liveness wrap on the same 240s cadence, so a long
+        # silence here is no more ordinary than at any other setup stage. these run AFTER training,
+        # where the reassuring reading is the expensive one to get wrong: the work is done and only
+        # the upload stands between the user and their adapter.
+        "sft_finalizing",
+        "rl_finalizing",
+        "opd_finalizing",
     }
 )
 # a liveness-backed setup stage pings every 240s, so silence past ~3 missed ticks is the point where
@@ -137,15 +144,22 @@ _SETUP_SILENT_AFTER_S = 900.0
 # explained by a cold per-datacenter cache, so only these may say so: telling a user that
 # sft_configuring is "downloading tens of GB" sends them looking for a transfer that stage never
 # performs, which is the same misdiagnosis this hint exists to prevent.
+#
+# base weights are already down by the time either model_load stage is emitted (both follow
+# prefetch_model), so neither is the tens-of-GB transfer -- that is model_prefetching. sft_model_load
+# is still here because its span calls _warmstart_adapter_path -> _download_adapter, a real network
+# fetch; opd_model_load only reads the config with local_files_only, so it is not.
 _DOWNLOADING_SETUP_STAGES = frozenset(
     {
         "model_prefetching",
         "checkpoint_prefetching",
         "sft_model_load",
-        "opd_model_load",
         "rl_adapter_loading",
     }
 )
+# stages that fetch an ADAPTER rather than base weights: same cold-cache cause, but far smaller, so
+# describing them as "tens of GB" overstates what the user should expect to be waiting on.
+_ADAPTER_DOWNLOAD_STAGES = frozenset({"sft_model_load", "rl_adapter_loading"})
 
 
 def _stale_setup_hint(
@@ -179,7 +193,10 @@ def _stale_setup_hint(
     if stage not in _LIVENESS_SETUP_STAGES:
         return None
     if stage in _DOWNLOADING_SETUP_STAGES:
-        blocking = "a cold weight cache downloads tens of GB with no ping"
+        if stage in _ADAPTER_DOWNLOAD_STAGES:
+            blocking = "this stage fetches an adapter, which a cold cache serves slowly"
+        else:
+            blocking = "a cold weight cache downloads tens of GB with no ping"
         if heartbeat.get("dc"):
             blocking += ", and the datacenter above is where it landed"
     else:
@@ -261,14 +278,6 @@ def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
         pairs.append(("datacenter", str(datacenter)[:64]))
     heartbeat_age_seconds = _heartbeat_age_seconds(hb.get("ts"))
     running = str(obj.get("state") or "") == "running"
-    if running:
-        warmup = warmup_message(
-            hb.get("stage"),
-            heartbeat_age_seconds,
-            heartbeat_is_current_attempt(obj, hb),
-        )
-        if warmup:
-            pairs.append(("warmup", warmup))
     stale_step = _stale_step_hint(
         hb,
         heartbeat_age_seconds,
@@ -283,6 +292,18 @@ def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
         current_attempt=heartbeat_is_current_attempt(obj, hb),
     )
     explained = stale_step or stale_setup
+    # warmup is computed AFTER the hints so a stale setup stage can suppress it. the two windows
+    # overlap (rl_initializing stays "fresh" for 1200s but goes silent-unexplained at 900s), and
+    # showing both puts "setup is not billed; do not cancel" directly above "the instance may be
+    # gone, check before cancelling". a panel that argues with itself is worse than either row.
+    if running and not stale_setup:
+        warmup = warmup_message(
+            hb.get("stage"),
+            heartbeat_age_seconds,
+            heartbeat_is_current_attempt(obj, hb),
+        )
+        if warmup:
+            pairs.append(("warmup", warmup))
     age = _humanize_age_seconds(heartbeat_age_seconds)
     if age:
         # the progress row already explains this silence, and does it more precisely. show one or

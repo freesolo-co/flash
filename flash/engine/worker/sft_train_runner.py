@@ -296,6 +296,13 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
             options.model_id, options.model_revision, lora_rank
         )
         vocab_size = _sft_train._resolve_sft_vocab_size(options.model_id, options.model_revision)
+        # hoisted into the span: on a PINNED revision this falls through to a live AutoConfig read
+        # with no local_files_only, so it is the same cold-mount/hub stall as the reads above. it
+        # only needs the model id, and everything between here and its old call site is arithmetic
+        # on already-resolved values, so moving it up changes ordering but not results.
+        hidden, layers = _sft_train._model_arch_dims(
+            options.model_id, revision=options.model_revision
+        )
     fused_ce = sft_chunked_nll_enabled(options.model_id)
     per_device_batch, _ = _sft_train._resolve_sft_grad_accum(
         options.effective_batch,
@@ -314,7 +321,6 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
     card_vram_gb = float(options.gpu_probe.get("memory_gb") or 0.0)
     raw_capability = options.gpu_probe.get("capability")
     capability = tuple(raw_capability) if raw_capability else None
-    hidden, layers = _sft_train._model_arch_dims(options.model_id, revision=options.model_revision)
     info = MODELS.get(options.model_id)
     active_params_b = float(getattr(info, "active_params_b", 0.0) or 0.0) or None
     gradient_checkpointing = _sft_train._resolve_sft_gradient_checkpointing(
