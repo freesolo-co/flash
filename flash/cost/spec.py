@@ -165,11 +165,18 @@ def thin_rl_batch_warning(spec) -> str | None:
     grpo its ``batch_size`` genuinely IS a memory lever (it scales rollout concurrency and the loss
     microbatch in ``estimate_vram_gb``). Telling an opd user to raise it would be advice to OOM.
 
-    The price of widening also flips with the horizon, so the message never says "for the same
-    money". On a DERIVED horizon a wider batch means proportionally fewer updates, so it is cheaper
-    (measured: grpo 9B over 800 prompts quotes $21.88 at 1 and $7.37 at 16). Under a positive
-    ``max_steps`` the update count is pinned, so widening buys averaging at strictly more
-    generation: the same run quotes $0.27 at 1 and $0.51 at 4 for an identical 10 steps.
+    The price of widening also flips with the horizon and with WHICH knob is raised, so the message
+    never says "for the same money". On a DERIVED horizon a wider batch means no more updates and
+    usually fewer, so it is cheaper (measured: grpo 9B over 800 prompts quotes $21.88 at 1 and
+    $7.37 at 16). Under a positive ``max_steps`` the update count is pinned, so widening buys
+    averaging at strictly more generation: the same run quotes $0.27 at 1 and $0.51 at 4 for an
+    identical 10 steps. Raising a POOL cap splits again on whether a ``batch_size`` was authored: a
+    pinned batch spreads the bigger pool over more updates and quotes dearer (batch 2, cap 2 -> 8:
+    1 step at $0.035 to 4 steps at $0.141), but with no authored batch the request is the recipe
+    default and prompts-per-step rises with the cap, so the horizon does not move at all (cap 2, 4,
+    ... 64 all derive 1 update) and the quote is flat at $0.47 across every one of them, because it
+    prices the recipe's full rollout width rather than the retained pool. So that branch names the
+    mechanism and sends the user to ``--cost`` instead of promising a direction.
     """
     if spec.algorithm not in ("grpo", "opd"):
         return None
@@ -246,13 +253,24 @@ def thin_rl_batch_warning(spec) -> str | None:
             f"Your `max_steps` pins the update count, so raising {raise_target} buys that averaging "
             "at strictly more generated work and a higher bill for the same number of updates."
         )
-    elif pool_binds:
-        # raising a CAP grows the prompt pool, so the run gains passes instead of shedding them and
-        # the bill goes UP: at batch 2, lifting max_examples 2 -> 8 goes from 1 step at $0.035 to 4
-        # steps at $0.141. only widening the batch against a FIXED pool trades updates for money.
+    elif pool_binds and batch_binds:
+        # an authored batch pins prompts-per-step, so a bigger pool is spread over MORE updates:
+        # at batch 2, lifting max_examples 2 -> 8 goes from 1 step at $0.035 to 4 steps at $0.141.
         remedy = (
-            f"Raise {raise_target}: growing the prompt pool adds passes rather than removing them, "
-            "so this quotes dearer, not cheaper -- it buys the averaging with a longer run."
+            f"Raise {raise_target}: with `batch_size` pinning prompts-per-step, a bigger prompt "
+            "pool adds passes rather than removing them, so this quotes dearer, not cheaper -- it "
+            "buys the averaging with a longer run."
+        )
+    elif pool_binds:
+        # with no authored batch the request is the recipe default, so prompts-per-step rises WITH
+        # the cap and the horizon does not move: at max_examples 2, 4, ... 64 the derived horizon
+        # stays at 1 update. claim no direction for the bill here -- the quote prices the recipe's
+        # full rollout width rather than the retained pool, so it reads $0.47 at every one of those
+        # caps, and `--cost` is the honest place to look rather than a promise in this sentence.
+        remedy = (
+            f"Raise {raise_target}: with no `batch_size` set, prompts-per-step follows the pool, so "
+            "this widens each update rather than adding updates. Re-run `--cost` to see what it "
+            "does to this quote."
         )
     else:
         # the "buying steps" workflow is about lowering batch_size against a fixed pool. a thin

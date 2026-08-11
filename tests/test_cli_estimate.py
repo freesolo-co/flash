@@ -451,10 +451,14 @@ def test_raising_a_binding_pool_is_priced_as_dearer_not_cheaper(tmp_path, monkey
     Measured on this shape: at batch 2, lifting `max_examples` 2 -> 8 goes from 1 step at $0.0353
     to 4 steps at $0.1414. Promising a cheaper quote there is the same class of defect as the
     fixed-horizon one, in the branch that fix did not cover.
+
+    Authors the `batch_size = 2` its evidence is measured at. Passing no batch took the no-pinned-
+    batch branch instead, where prompts-per-step follows the cap and the horizon does not move at
+    all, so this asserted the pinned-batch promise against a case that does not make it.
     """
     monkeypatch.setenv("FLASH_STYLE", "0")
 
-    rc = cmd_train(_grpo_cost_args(tmp_path, None, max_examples=2))
+    rc = cmd_train(_grpo_cost_args(tmp_path, 2, max_examples=2))
     err = capsys.readouterr().err
 
     assert rc == 0
@@ -681,6 +685,44 @@ def test_every_cap_sitting_at_the_pool_is_named(tmp_path, monkeypatch, capsys):
     assert rc == 0
     assert "`[train] max_examples` and `[environment.params] max_examples`" in err
     assert "max_examples` cap the prompt pool" in err  # plural subject, plural verb
+
+
+def test_a_cap_without_a_batch_size_is_not_told_it_buys_more_passes(tmp_path, monkeypatch, capsys):
+    """With no authored `batch_size`, raising the cap adds no updates at all.
+
+    prompts-per-step is `min(recipe default, pool)`, so it rises WITH the cap: `max_examples` of
+    2, 4, 8, 16 and 64 every one derive a 1-update horizon. Telling this (scaffolded, very common)
+    case that it "buys the averaging with a longer run" describes the pinned-batch case instead.
+
+    It also claims no direction for the bill: the quote prices the recipe's full rollout width
+    rather than the retained pool, so it reads $0.47 at every one of those caps.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, None, max_examples=2))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "widens each update rather than adding updates" in err
+    assert "adds passes" not in err
+    assert "longer run" not in err
+    assert "dearer" not in err
+
+
+def test_a_cap_with_a_pinned_batch_size_is_told_it_buys_more_passes(tmp_path, monkeypatch, capsys):
+    """The mirror case: an authored `batch_size` pins prompts-per-step, so the pool adds updates.
+
+    At batch 2, lifting `max_examples` 2 -> 8 really does go from 1 step to 4, so here the longer
+    run is the correct mechanism and the dearer quote is real.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    rc = cmd_train(_grpo_cost_args(tmp_path, 2, max_examples=2))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "adds passes rather than removing them" in err
+    assert "quotes dearer, not cheaper" in err
 
 
 def test_grpo_cost_stays_quiet_when_the_batch_is_a_real_batch(tmp_path, monkeypatch, capsys):
