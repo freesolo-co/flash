@@ -8,6 +8,7 @@ import pytest
 
 import flash.providers.preflight as pf
 import flash.providers.runpod.auth as runpod_keys
+from flash._internal.channel import CLI_NAME
 
 # Credentials every control plane needs regardless of which GPU substrate it runs on.
 _ALWAYS_REQUIRED = (
@@ -193,7 +194,7 @@ def test_client_requires_login(monkeypatch, tmp_path):
         from flash.client import ClientError
         from flash.client.http import client_from_config
 
-        with pytest.raises(ClientError, match="flash login"):
+        with pytest.raises(ClientError, match=rf"{CLI_NAME} login"):
             client_from_config()
         client = client_from_config(require_key=False)
         assert client.api_key is None

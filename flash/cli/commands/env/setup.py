@@ -7,6 +7,7 @@ import sys
 import tomllib
 from pathlib import Path
 
+from flash._internal.channel import CLI_NAME
 from flash.cli.commands import traces
 from flash.cli.scaffold import TRAINING_MD
 from flash.cli.ui import render
@@ -358,7 +359,8 @@ def _require_setup_project(args) -> str:
     api_url, api_key = load_credentials()
     if not api_key:
         raise ClientError(
-            "not logged in. Run `flash login` before `flash env setup` so the project can be validated"
+            f"not logged in. Run `{CLI_NAME} login` before `{CLI_NAME} env setup` "
+            "so the project can be validated"
         )
 
     supplied = str(getattr(args, "project", "") or "").strip()
@@ -381,7 +383,8 @@ def _require_setup_project(args) -> str:
     options = traces.project_options(projects)
     if not options:
         raise ClientError(
-            "no Freesolo projects are available for this organization; create one with `flash projects create NAME`"
+            f"no Freesolo projects are available for this organization; create one with "
+            f"`{CLI_NAME} projects create NAME`"
         )
     selected = render.select_required("Choose the Freesolo project for this environment", options)
     return resolve_project_id(selected, api_key, api_url)
@@ -436,7 +439,7 @@ def _existing_reasoning(configs: tuple[Path, ...]) -> bool | None:
         raise ClientError(
             f"existing configs disagree about reasoning: {on} set `thinking = true`, "
             f"{off} do not. Delete {', '.join(str(cfg) for cfg in found)} and re-run "
-            "`flash env setup` with --reasoning or --no-reasoning to scaffold them together."
+            f"`{CLI_NAME} env setup` with --reasoning or --no-reasoning to scaffold them together."
         )
     return next(iter(found.values()), None)
 
@@ -643,7 +646,7 @@ def _write_opd_config(
             f"{thinking_line}"
             "\n"
             "# Environment: upload this project folder with\n"
-            f"# `flash env push --project {project_id} --name my-env .`, then paste the returned id below.\n"
+            f"# `{CLI_NAME} env push --project {project_id} --name my-env .`, then paste the returned id below.\n"
             "# the teacher and its parasail key are platform-managed; nothing to set up or export.\n"
             "[environment]\n"
             'id = ""\n\n'
@@ -721,7 +724,7 @@ def cmd_env_setup(args) -> int:
     project_line = f"project = {json.dumps(project_id)}\n"
     env_comment = (
         "# Environment: upload this project folder with\n"
-        f"# `flash env push --project {project_id} --name my-env .`, then paste the returned id below.\n"
+        f"# `{CLI_NAME} env push --project {project_id} --name my-env .`, then paste the returned id below.\n"
         "# If the environment reads secrets with os.environ, list only the env var names here.\n"
         "# Values are read from your shell or .env at submit time and are not stored in the spec.\n"
         "[environment]\n"
@@ -776,5 +779,5 @@ def cmd_env_setup(args) -> int:
         print(render.env_setup(scaffolded, project_id))
         return 0
     print(f"ensured {', '.join(scaffolded)}")
-    print(f"next: flash env push --project {project_id} --name my-env .")
+    print(f"next: {CLI_NAME} env push --project {project_id} --name my-env .")
     return 0

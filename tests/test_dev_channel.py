@@ -187,6 +187,54 @@ def test_printed_commands_name_the_executable_the_operator_invoked():
     importlib.reload(channel)  # restore the pytest-invoked value for later tests
 
 
+def test_operator_hints_follow_flash_cli_invocation():
+    """Operator hints rendered after a flash-cli entry must keep naming flash-cli."""
+    import importlib
+    import re
+    import sys
+    from unittest import mock
+
+    from flash._internal import channel
+    from flash.cli.ui import render as render_module
+    from flash.cli.ui import tables as tables_module
+
+    original_argv = list(sys.argv)
+    outputs: dict[str, str] = {}
+    try:
+        with mock.patch.object(sys, "argv", ["/usr/local/bin/flash-cli"]):
+            importlib.reload(channel)
+            importlib.reload(tables_module)
+            render = importlib.reload(render_module)
+            outputs = {
+                "flash/cli/ui/render.py:login_ok": render.login_ok(None),
+                "flash/cli/ui/render.py:login_failed": render.login_failed("bad key"),
+                "flash/cli/ui/render.py:_QUIET_HEARTBEAT_HINT": render._QUIET_HEARTBEAT_HINT,
+                "flash/cli/ui/render.py:env_setup": render.env_setup(
+                    ["environment.py"], "11111111-1111-4111-8111-111111111111"
+                ),
+                "flash/cli/ui/render.py:env_list(local)": render.env_list(["."]),
+                "flash/cli/ui/render.py:env_list(empty)": render.env_list([]),
+                "flash/cli/ui/tables.py:models_table": render.models_table([{"id": "acme/model"}]),
+                "flash/cli/ui/tables.py:projects_table": render.projects_table([]),
+                "flash/cli/ui/tables.py:checkpoints_table": render.checkpoints_table(
+                    "run-1", [{"step": 1}]
+                ),
+            }
+    finally:
+        with mock.patch.object(sys, "argv", original_argv):
+            importlib.reload(channel)
+            importlib.reload(tables_module)
+            importlib.reload(render_module)
+
+    bare_command = re.compile(
+        r"(?<![\w-])flash (?=(?:env|login|models|projects|runs|traces|train|whoami)\b)"
+    )
+    for site, output in outputs.items():
+        assert "flash-cli " in output, f"{site} did not render a flash-cli command: {output!r}"
+        match = bare_command.search(output)
+        assert match is None, f"{site} rendered a bare flash command: {output!r}"
+
+
 def test_module_invocation_is_named_back_as_itself_not_as_flash():
     """`python -m flash.cli` must print itself, because it is the escape hatch FROM `flash`.
 

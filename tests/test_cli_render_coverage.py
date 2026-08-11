@@ -395,7 +395,7 @@ def test_env_list_with_local_sources(styled_plain) -> None:
     assert "local sources" in out
     assert "envs/one" in out
     assert "envs/two" in out
-    assert "flash env push --project <project-uuid> --name <name> <path>" in out
+    assert f"{render.CLI_NAME} env push --project <project-uuid> --name <name> <path>" in out
 
 
 def test_projects_table_lists_name_and_id(styled_plain) -> None:

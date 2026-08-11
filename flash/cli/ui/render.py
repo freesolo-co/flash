@@ -125,7 +125,7 @@ def login_ok(me: dict | None) -> str:
     head = f"{_paint(_glyph('✓', 'ok:'), _GREEN, '1')} {_bold('logged in to flash')}"
     if not me:
         return _safe(
-            f"{head}\n{_dim('  account details unavailable right now — run `flash whoami` later')}"
+            f"{head}\n{_dim(f'  account details unavailable right now — run `{CLI_NAME} whoami` later')}"
         )
     return _safe(f"{head}\n\n{format_identity(me)}")
 
@@ -138,7 +138,7 @@ def login_failed(reason: str) -> str:
     return _safe(
         f"{_paint(_glyph('✗', 'x:'), _RED, '1')} {_bold('login failed')}\n"
         f"  {reason}\n"
-        f"  {_dim('then run `flash login --api-key <key>` to try again')}\n"
+        f"  {_dim(f'then run `{CLI_NAME} login --api-key <key>` to try again')}\n"
         f"  {_dim('if it keeps failing, email founders@freesolo.co')}"
     )
 
@@ -580,7 +580,7 @@ def warmup_message(
 # the throttle hint points at `runs log`, which reads the SAME uploaded heartbeats -- so when the
 # step counter itself is what has gone stale, that advice sends you to an equally frozen surface.
 _QUIET_HEARTBEAT_HINT = (
-    "heartbeat uploads are throttled; quiet is not dead - check flash runs log <run-id> -f"
+    f"heartbeat uploads are throttled; quiet is not dead - check {CLI_NAME} runs log <run-id> -f"
 )
 # a throttled training step is never guaranteed current: the worker holds mid-training commits for
 # up to _HB_MIN_INTERVAL_S (900s), so from upload until the next commit the displayed step lags by
@@ -886,7 +886,7 @@ def env_setup(paths: list[str], project_id: str) -> str:
         f"  {_paint(p.ljust(keyw), _ACCENT2)}  {_dim(labels.get(p, ''))}" for p in paths
     )
     head = f"{header('env setup', 'starter Freesolo environment')}\n{ok('scaffold ready')}\n"
-    next_step = arrow(f"publish it: flash env push --project {project_id} --name my-env .")
+    next_step = arrow(f"publish it: {CLI_NAME} env push --project {project_id} --name my-env .")
     return _safe(f"{head}\n{tree}\n\n{next_step}")
 
 
@@ -895,11 +895,13 @@ def env_list(local: list[str]) -> str:
     if local:
         parts.append(
             _paint("local sources", _GRAY, "1")
-            + _dim("  (publish with flash env push --project <project-uuid> --name <name> <path>)")
+            + _dim(
+                f"  (publish with {CLI_NAME} env push --project <project-uuid> --name <name> <path>)"
+            )
         )
         parts.extend(f"  {_paint(_glyph('·', '-'), _FAINT)} {_paint(p, _ACCENT2)}" for p in local)
     else:
-        parts.append(_dim("  no environments yet — scaffold one with `flash env setup`"))
+        parts.append(_dim(f"  no environments yet — scaffold one with `{CLI_NAME} env setup`"))
     return _safe("\n".join(parts))
 
 

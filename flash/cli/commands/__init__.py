@@ -278,7 +278,7 @@ def cmd_projects_create(args) -> int:
         project_id = str(uuid.uuid4())
     else:
         if not api_key:
-            raise ClientError("not logged in. Run `flash login` before creating a project")
+            raise ClientError(f"not logged in. Run `{CLI_NAME} login` before creating a project")
         project_id = create_project(args.name, getattr(args, "description", None), api_key)["id"]
 
     # both ids are reported the same way: where it came from is the only difference above.
@@ -303,7 +303,7 @@ def cmd_projects_list(args) -> int:
             ),
         )
     if not api_key:
-        raise ClientError("not logged in. Run `flash login` before listing projects")
+        raise ClientError(f"not logged in. Run `{CLI_NAME} login` before listing projects")
     projects = list_projects(api_key)
     if render.styled():
         print(render.projects_table(projects))
@@ -377,13 +377,13 @@ def cmd_env_list(args) -> int:
         return 0
     if paths:
         print(
-            "local env sources (publish with `flash env push --project <project-uuid> "
+            f"local env sources (publish with `{CLI_NAME} env push --project <project-uuid> "
             "--name <name> <path>`):"
         )
         for path in sorted(paths):
             print(f"  {path}")
     else:
-        print("no environments yet - scaffold one with `flash env setup`")
+        print(f"no environments yet - scaffold one with `{CLI_NAME} env setup`")
     return 0
 
 
@@ -777,7 +777,9 @@ def cmd_runs(args) -> int:
     runs = client_from_config().list_runs()
     if not runs:
         if render.styled():
-            print(render.empty("runs", "0 runs", "no runs yet — submit one with `flash train`"))
+            print(
+                render.empty("runs", "0 runs", f"no runs yet — submit one with `{CLI_NAME} train`")
+            )
         else:
             print("no runs yet")
         return 0
@@ -829,10 +831,10 @@ def cmd_cancel(args) -> int:
         out = sys.stdout if render.styled() else sys.stderr
         base = (
             f"{len(checkpoints)} deployable checkpoint(s) survive this cancel — list with "
-            f"`flash runs checkpoint {args.run_id}`"
+            f"`{CLI_NAME} runs checkpoint {args.run_id}`"
         )
         msg = (
-            f"{base}, deploy one with `flash models deploy {args.run_id}/step-{max(steps)}`."
+            f"{base}, deploy one with `{CLI_NAME} models deploy {args.run_id}/step-{max(steps)}`."
             if steps
             else f"{base}."
         )
@@ -862,7 +864,7 @@ def cmd_checkpoints(args) -> int:
         # the canonical short form, paste-able into train.init_from_adapter.
         print(f"step {c['step']} {format_checkpoint_ref(args.run_id, c['step'])}")
     print(
-        f"\ndeploy one with `flash models deploy {args.run_id}/step-<STEP>`.",
+        f"\ndeploy one with `{CLI_NAME} models deploy {args.run_id}/step-<STEP>`.",
         file=sys.stderr,
     )
     return 0

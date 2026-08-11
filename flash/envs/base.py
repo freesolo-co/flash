@@ -7,6 +7,8 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Protocol, TypeVar
 
+from flash._internal.channel import CLI_NAME
+
 # the two units reward scoring overlaps, kept together so the difference between them is a decision
 # rather than a coincidence of where each was written.
 #
@@ -167,7 +169,7 @@ def load_environment(
     if not env_id:
         raise ValueError(
             "no environment specified: set [environment] id to the id returned by "
-            "`flash env push --project <project-uuid> --name <name>` "
+            f"`{CLI_NAME} env push --project <project-uuid> --name <name>` "
             "(for example 'your-name/your-env')"
         )
     # resolved_sha is positional-only so a user param named "resolved_sha" can't shadow it.

@@ -9,6 +9,7 @@ from collections.abc import Collection
 from dataclasses import fields as dataclass_fields
 from typing import Any
 
+from flash._internal.channel import CLI_NAME
 from flash.core.catalog import normalize_algorithm, resolve_model, serving_lora_rank_cap
 from flash.core.spec import (
     FIXED_SEED,
@@ -135,7 +136,7 @@ def load_toml(path: str) -> dict[str, Any]:
             return tomllib.load(f)
     except FileNotFoundError as exc:
         raise ConfigError(
-            f"config file not found: {path} (run `flash env setup` to scaffold configs/sft.toml)"
+            f"config file not found: {path} (run `{CLI_NAME} env setup` to scaffold configs/sft.toml)"
         ) from exc
     except IsADirectoryError as exc:
         raise ConfigError(
@@ -219,7 +220,7 @@ def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
         return ref
     raise ConfigError(
         "train.init_from_adapter must be `<run_id>` (continue that run's trained adapter) or "
-        "`<run_id>/step-N` (warm-start from a checkpoint listed by `flash runs checkpoint`)"
+        f"`<run_id>/step-N` (warm-start from a checkpoint listed by `{CLI_NAME} runs checkpoint`)"
     )
 
 
@@ -475,7 +476,7 @@ def _validate_algorithm_model_consistency(
     if thinking and info.thinking == "none":
         raise ConfigError(
             f"{model} does not support thinking mode (its chat template has no "
-            f"<think> support); pick a thinking-capable model — `flash models list` lists "
+            f"<think> support); pick a thinking-capable model — `{CLI_NAME} models list` lists "
             f"each model's thinking capability"
         )
     if not thinking and info.thinking == "always":
@@ -764,7 +765,7 @@ def _validate_spec(spec: JobSpec) -> None:
     if not spec.environment.id:
         raise ConfigError(
             "config must set [environment] id (upload an environment with "
-            '`flash env push --project <project-uuid> --name <name>` and paste the returned id, e.g. "your-name/your-env"); '
+            f'`{CLI_NAME} env push --project <project-uuid> --name <name>` and paste the returned id, e.g. "your-name/your-env"); '
             "there is no local path mode"
         )
     _require_environment_ref(
