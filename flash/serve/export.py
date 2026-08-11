@@ -164,10 +164,48 @@ def _adapter_weight_paths(adapter_dir: Path) -> list[Path]:
     )
     for suffix in ADAPTER_WEIGHT_SUFFIXES:
         candidates = [p for p in files if p.name.endswith(suffix)]
-        if candidates:
-            single = [p for p in candidates if not p.name.startswith(ADAPTER_SHARD_PREFIX)]
-            return single or candidates
+        if not candidates:
+            continue
+        single = [p for p in candidates if not p.name.startswith(ADAPTER_SHARD_PREFIX)]
+        if single:
+            return single
+        # Sharded: the index names the CURRENT shard set. A retry that changed the shard count
+        # uploads over the previous attempt without deleting what it no longer writes (see
+        # flash/engine/worker/io/hf.py), so same-suffix shards from both attempts coexist on disk
+        # and only the index distinguishes them. Scanning the stale ones would let a dead visual
+        # tensor pin the live text-only shards to the multimodal namespace, or collide a key with
+        # its own previous copy and refuse a good export.
+        active = _index_referenced_shards(adapter_dir, suffix, candidates)
+        if active:
+            return active
+        return candidates
     return []
+
+
+def _weight_suffix_of(path: Path) -> str:
+    """The accepted weight suffix this file carries (`.safetensors` / `.bin`)."""
+    for suffix in ADAPTER_WEIGHT_SUFFIXES:
+        if path.name.endswith(suffix):
+            return suffix
+    raise ValueError(f"{path.name}: not an adapter weight file")
+
+
+def _index_referenced_shards(adapter_dir: Path, suffix: str, candidates: list[Path]) -> list[Path]:
+    """The shards this suffix's index actually points at, or [] when it names none we can read."""
+    index_path = adapter_dir / f"adapter_model{suffix}.index.json"
+    if not index_path.is_file():
+        return []
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        weight_map = index.get("weight_map") if isinstance(index, dict) else None
+        if not isinstance(weight_map, dict):
+            return []
+        referenced = {str(shard) for shard in weight_map.values()}
+    except (OSError, ValueError):
+        # an unreadable index is not evidence about which shards are live; fall back to the whole
+        # candidate set, which _scan_* will then fail closed on if it cannot be parsed either.
+        return []
+    return [p for p in candidates if p.name in referenced]
 
 
 def _read_safetensors_header(path: Path) -> tuple[dict[str, object], int, int]:
@@ -323,9 +361,16 @@ def _rewrite_bin_keys(scan: _WeightScan, renames: dict[str, str]) -> None:
         torch.save(state, destination)
 
 
-def _rewrite_weight_index_keys(adapter_dir: Path, renames: dict[str, str]) -> None:
-    """Keep the shard index in step with the shards it points at."""
+def _rewrite_weight_index_keys(adapter_dir: Path, renames: dict[str, str], suffix: str) -> None:
+    """Keep the selected representation's shard index in step with the shards it points at.
+
+    Scoped to ``suffix`` because only that representation's shards were rewritten. Remapping the
+    other suffix's index too would leave it naming keys its own (untouched) shards do not contain,
+    which is the same index/payload disagreement this function exists to prevent.
+    """
     for name in ADAPTER_WEIGHT_INDEX_FILES:
+        if not name.startswith(f"adapter_model{suffix}."):
+            continue
         path = adapter_dir / name
         if not path.is_file():
             continue
@@ -373,7 +418,7 @@ def _normalize_adapter_key_namespace(adapter_dir: Path) -> str:
             _rewrite_safetensors_keys(scan, renames)
         else:
             _rewrite_bin_keys(scan, renames)
-    _rewrite_weight_index_keys(adapter_dir, renames)
+    _rewrite_weight_index_keys(adapter_dir, renames, _weight_suffix_of(paths[0]))
     logger.info(
         "normalized %d exported adapter weight keys across %d file(s)", len(renames), len(paths)
     )

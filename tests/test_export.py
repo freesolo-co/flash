@@ -676,6 +676,72 @@ def test_export_adapter_normalizes_sharded_safetensors_and_index(monkeypatch):
     assert set(uploaded["index"]["weight_map"]) == set(header_a) | set(header_b)
 
 
+def test_stale_shards_left_by_a_shorter_retry_are_not_scanned(tmp_path):
+    """The index names the live shard set; same-suffix leftovers from a longer attempt do not.
+
+    hf_upload_folder writes a retry's adapter over the previous attempt without deleting what it no
+    longer writes, so a 3-shard attempt followed by a 2-shard one leaves shard 3 on disk. Scanning
+    it would let its dead visual tensor pin the live text-only shards to the multimodal namespace,
+    exporting keys peft loads as a no-op.
+    """
+    from flash.serve import export
+
+    live_key = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
+    stale_visual = "base_model.model.model.visual.blocks.0.attn.proj.lora_B.default.weight"
+    live_names = ("adapter_model-00001-of-00002.safetensors",)
+    (tmp_path / live_names[0]).write_bytes(
+        _safetensors_bytes(
+            {live_key: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]}}, b"\x01\x02"
+        )
+    )
+    # the orphan from the previous, longer attempt: still on disk, absent from the current index.
+    (tmp_path / "adapter_model-00003-of-00003.safetensors").write_bytes(
+        _safetensors_bytes(
+            {stale_visual: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]}}, b"\x09\x09"
+        )
+    )
+    (tmp_path / "adapter_model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {live_key: live_names[0]}})
+    )
+
+    assert [p.name for p in export._adapter_weight_paths(tmp_path)] == list(live_names)
+    # the stale visual tensor must not pin the live text-only weights to the multimodal namespace
+    assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
+
+
+def test_index_rewrite_leaves_the_unselected_representation_alone(tmp_path):
+    """Only the selected representation's shards are rewritten, so only its index may be remapped.
+
+    Remapping the other suffix's index would leave it naming keys its own untouched shards do not
+    contain -- the index/payload disagreement the rewrite exists to prevent.
+    """
+    from flash.serve import export
+
+    infixed = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
+    shard = "adapter_model-00001-of-00001.safetensors"
+    (tmp_path / shard).write_bytes(
+        _safetensors_bytes(
+            {infixed: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]}}, b"\x01\x02"
+        )
+    )
+    (tmp_path / "adapter_model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {infixed: shard}})
+    )
+    # a .bin index for shards that were NOT selected and therefore never rewritten
+    bin_index = tmp_path / "adapter_model.bin.index.json"
+    bin_index.write_text(json.dumps({"weight_map": {infixed: "adapter_model-00001-of-00001.bin"}}))
+
+    assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
+
+    expected = infixed.replace(".language_model.", ".", 1)
+    safetensors_map = json.loads((tmp_path / "adapter_model.safetensors.index.json").read_text())[
+        "weight_map"
+    ]
+    assert set(safetensors_map) == {expected}  # the selected index tracks its rewritten shard
+    # the untouched representation's index still names the keys ITS shards actually contain
+    assert set(json.loads(bin_index.read_text())["weight_map"]) == {infixed}
+
+
 def test_export_adapter_with_out_of_bounds_non_lm_offsets_is_refused(tmp_path):
     """A header we cannot read is a namespace we cannot vouch for, so the export fails.
 
