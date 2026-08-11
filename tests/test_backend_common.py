@@ -4228,6 +4228,35 @@ def test_the_child_probe_is_the_parents_own_source_not_a_copy():
     )
 
 
+def test_rendering_the_probe_ignores_a_monkeypatched_parent(monkeypatch):
+    """Rendering must ship the REAL probe body even while ``perf._find_real_libcudart`` is patched.
+
+    ``perf``'s own docstring says tests monkeypatch that name and its callers resolve it through the
+    patched module globals. This caller is the exception: it needs the function's SOURCE, so if it
+    ever resolved through ``perf.<attr>`` a test double's body would be rendered into the child and
+    the shipped shim would be whatever the last test stubbed. Pin the immunity.
+    """
+    from flash.engine.worker import perf
+
+    before = vc.render_tilelang_cudart_shim()
+    monkeypatch.setattr(perf, "_find_real_libcudart", lambda: "/fake/libcudart.so")
+    after = vc.render_tilelang_cudart_shim()
+
+    assert before == after, (
+        "the rendered fragment changed while perf._find_real_libcudart was monkeypatched; the "
+        "renderer is resolving through the patched module global and can ship a test double"
+    )
+    assert "cudaDeviceReset" in after, (
+        "the rendered probe lost its cudaDeviceReset check under a patched parent"
+    )
+    # asserted as a fragment, not the full path: this file's platform-guard meta-test scans function
+    # bodies for the proc-filesystem prefix and would demand @_needs_process_teardown. this test only
+    # inspects rendered TEXT and opens nothing, so it needs no process-teardown capability.
+    assert "self/maps" in after, (
+        "the rendered probe lost its soname resolution under a patched parent"
+    )
+
+
 def test_grpo_does_not_enable_tf32_in_the_parent():
     """the grpo parent holds a cuda context (wait_for_gpu touches the device) but runs no matmuls --
     verl does, out of process. a setup_perf_backends() call here sets flags on the wrong process and

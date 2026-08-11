@@ -16,6 +16,11 @@ import math
 import re
 import textwrap
 
+# imported BY VALUE on purpose. perf's docstring notes that tests monkeypatch
+# `perf._find_real_libcudart` and its callers resolve it through the patched module globals -- this
+# caller must NOT. it needs the function's SOURCE to ship into the child, so resolving through
+# `perf.<attr>` would render a test double's body into the fragment and emit a broken shim. the
+# from-import keeps the real object bound here regardless of what is patched over there.
 from flash.engine.worker.perf import _find_real_libcudart
 
 # --------------------------- tf32 matmul (all three verl backends) ---------------------------
