@@ -476,6 +476,7 @@ def cmd_train(args) -> int:
         _raise_if_workload_profile_pending(client, exc)
         raise
     run_id = status["run_id"]
+    _print_unpacked_batch_warning(status, spec)  # a real submit overrides batch_size the same way
     logger.info(
         "submitted run %s: model=%s algorithm=%s gpu=%s",
         run_id,

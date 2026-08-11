@@ -162,7 +162,7 @@ def test_unpacked_run_warns_that_the_configured_batch_size_is_ignored(capsys) ->
     err = capsys.readouterr().err
 
     assert "sequence packing is OFF" in err
-    assert "the configured batch_size 2 is ignored" in err
+    assert "the configured batch_size 2 no longer groups examples into an update" in err
     assert "learning_rate" in err
 
 
@@ -195,6 +195,23 @@ def test_unpacked_warning_names_the_reason_the_packing_decision_froze(
 
     assert message is not None
     assert expected in message
+
+
+def test_unpacked_warning_names_the_recipe_default_when_batch_size_was_omitted() -> None:
+    """An omitted batch_size is the recipe's 32, which is the batch packing discarded: the cli
+    reads it straight off the spec, so the default has to resolve here or the number goes missing.
+    """
+    from flash.engine.plan.recipe import RECIPE
+
+    message = unpacked_batch_warning(
+        packing_mode="exact-unpacked",
+        architecture_mode="multimodal",
+        examples_per_update=1,
+        configured_batch_size=None,
+    )
+
+    assert message is not None
+    assert f"the configured batch_size {RECIPE.sft.effective_batch}" in message
 
 
 def test_unpacked_warning_is_silent_when_the_authored_batch_was_already_one() -> None:

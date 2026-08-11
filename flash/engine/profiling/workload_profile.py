@@ -77,12 +77,23 @@ def unpacked_batch_warning(
     ``exact-unpacked`` is the boundary-safe design (see
     ``sft_workload._resolve_sft_step_horizon``), and it overrides the authored ``batch_size``.
     Returns None when packing is on, or when nothing was overridden because the authored batch
-    was already 1.
+    was already 1. An omitted ``configured_batch_size`` resolves to the recipe default, which is
+    the batch the run would otherwise have used and the one packing discarded.
+
+    The horizon is deliberately not described here: ``train.max_steps`` outranks epochs over rows
+    (``_resolve_sft_step_horizon``), and this helper is not given either, so any step-count claim
+    would be wrong for a ``max_steps`` run.
     """
+    from flash.engine.plan.recipe import RECIPE
+
     if packing_mode == "packed" or examples_per_update > 1:
         return None
     try:
-        batch = int(configured_batch_size) if configured_batch_size is not None else 0
+        batch = (
+            int(configured_batch_size)
+            if configured_batch_size is not None
+            else int(RECIPE.sft.effective_batch)
+        )
     except (TypeError, ValueError):
         batch = 0
     if batch == 1:
@@ -93,10 +104,11 @@ def unpacked_batch_warning(
     authored = f"the configured batch_size {batch}" if batch > 1 else "the configured batch_size"
     return (
         f"sequence packing is OFF for this SFT run ({architecture_mode}): {reason}. "
-        f"every optimizer update therefore trains exactly 1 example and {authored} is ignored, "
-        "so the run takes one step per example per epoch. the default learning rate is tuned for "
-        "a batched update: expect noisier steps, and lower train.learning_rate if you are "
-        "comparing against a packed run."
+        f"every optimizer update therefore trains exactly 1 example, so {authored} no longer "
+        "groups examples into an update. it is not inert: it still keys the workload profile and "
+        "sizes the gpu for an auto-sized run, so changing it can bill another profile and move "
+        "the card. the default learning rate is tuned for a batched update: expect noisier steps, "
+        "and lower train.learning_rate if you are comparing against a packed run."
     )
 
 
