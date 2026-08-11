@@ -2207,6 +2207,30 @@ def test_read_console_tail_drops_the_line_when_the_margin_would_consume_it(tmp_p
     assert b._read_console_tail(str(console), 100, secrets={"K": secret}) == ""
 
 
+def test_read_console_tail_drops_the_line_when_no_secret_bounds_it(tmp_path, monkeypatch):
+    """a POSITIVE bound is required to keep an unterminated line at all.
+
+    the margin can only be measured against values this process knows. a credential minted at
+    runtime -- a presigned url, a broker capability, a token a provider echoed back -- is in
+    neither the payload nor the environment, so it contributes no needle and the margin is zero.
+    trimming nothing then published the straddling value verbatim, which is strictly worse than
+    the empty tail this branch replaced: that never leaked.
+    """
+    from flash.providers._lifecycle import bootstrap_secrets
+
+    for name in [key for key in b.os.environ if bootstrap_secrets._secret_env_name(key)]:
+        monkeypatch.delenv(name, raising=False)
+    runtime_secret = "dyn-" + "D" * 400
+    console, limit = _console_with_secret_on_the_boundary(tmp_path, runtime_secret)
+
+    # nothing configured: the value exists only in the child's output.
+    assert b._read_console_tail(str(console), limit, secrets={}) == ""
+
+    # a configured credential restores the bound, and the diagnostics come back with it.
+    kept = b._read_console_tail(str(console), limit, secrets={"K": "sk-live-abc123456789"})
+    assert len(kept) > 60_000
+
+
 def test_safe_detail_redacts_the_percent_encoded_form_of_a_secret():
     """http and git errors print encoded request urls, so the encoded form leaks the secret even
     when the configured value never appears literally."""

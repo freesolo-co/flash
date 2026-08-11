@@ -147,8 +147,14 @@ def _read_console_tail(path: str, limit: int, secrets: dict | None = None) -> st
     dropping it returned "" -- a crash whose only evidence is one huge line (a json blob, a native
     stack) uploaded an empty console. the line is kept minus ``_split_margin``, the smallest prefix
     guaranteed to carry off a value straddling the cut; whole credentials are still redacted by the
-    caller. if that margin would consume the line it IS dropped: the empty tail never leaked, so a
-    partial credential must not be published in its place.
+    caller.
+
+    that margin is only trustworthy for values this process KNOWS. a credential minted at runtime --
+    a presigned url, a broker capability, a token echoed back by a provider -- is in neither the
+    payload nor the environment, so it contributes no needle and a zero margin would retain it
+    verbatim. a positive bound is therefore required to keep anything: with no configured secret to
+    measure against, or a margin that would consume the line, the line is DROPPED. the empty tail
+    never leaked, so it stays the floor rather than being traded for a partial credential.
     """
     with open(path, "rb") as handle:
         handle.seek(0, os.SEEK_END)
@@ -171,7 +177,7 @@ def _read_console_tail(path: str, limit: int, secrets: dict | None = None) -> st
         if secret:
             values.add(str(secret))
     margin = _split_margin(values)
-    if margin >= len(tail):
+    if not margin or margin >= len(tail):
         return ""
     # the marker is prepended to a region already sized to ``limit``, so it has to be paid for out
     # of the body -- and out of its FRONT, since the root cause is at the end. returning more than

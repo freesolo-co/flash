@@ -451,9 +451,13 @@ def _train_body(input_data: dict) -> dict:
                             # boundary leaves at most len(value)-1 characters of itself at the
                             # front, and that fragment no longer matches full-value redaction. a
                             # fixed margin only covers values up to its own size, so a long token
-                            # straddling the cut left a usable suffix behind. with no bound
-                            # available the line is dropped -- the empty tail never leaked, so it
-                            # is the safe floor. mirrors bootstrap_secrets._read_console_tail.
+                            # straddling the cut left a usable suffix behind.
+                            # a POSITIVE bound is required to keep anything. a credential minted at
+                            # runtime (a presigned url, a capability echoed by a provider) is in
+                            # neither the env nor the payload, so it contributes no needle and a
+                            # zero margin would retain it verbatim. with no bound the line is
+                            # dropped: the empty tail never leaked, so it is the safe floor.
+                            # mirrors bootstrap_secrets._read_console_tail.
                             split_margin = _split_margin(env)
                             marker = (
                                 "[flash: the console tail is one unterminated line; a leading "
@@ -464,7 +468,11 @@ def _train_body(input_data: dict) -> dict:
                             # below cuts from the front, so overflowing tail_bytes here would drop
                             # the end -- the root cause this branch exists to keep.
                             cut_at = max(split_margin, len(tail) - tail_bytes + len(marker))
-                            tail = "" if split_margin >= len(tail) else marker + tail[cut_at:]
+                            tail = (
+                                ""
+                                if not split_margin or split_margin >= len(tail)
+                                else marker + tail[cut_at:]
+                            )
                 with open(console + ".tail", "w", encoding="utf-8", errors="replace") as f:
                     f.write(_safe_detail(tail, env, 64_000))
                 _require_deadline_allowance()
