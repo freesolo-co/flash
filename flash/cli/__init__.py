@@ -24,7 +24,6 @@ from flash.cli.commands import (  # noqa: F401
     cmd_checkpoints,
     cmd_deploy,
     cmd_deployments,
-    cmd_env_list,
     cmd_export,
     cmd_gpus,
     cmd_log,
@@ -47,6 +46,7 @@ from flash.cli.commands.env.eval import (
     finite_float,
     positive_int,
 )
+from flash.cli.commands.env.list import cmd_env_list
 from flash.cli.commands.env.push import cmd_env_delete, cmd_env_pull, cmd_env_push
 from flash.cli.commands.env.setup import cmd_env_setup
 from flash.cli.commands.env.test import cmd_env_test
@@ -411,8 +411,10 @@ def _add_env_setup_command(env_sub: argparse._SubParsersAction) -> None:
 
 
 def _add_env_test_commands(env_sub: argparse._SubParsersAction) -> None:
-    """`env list` and `env test`: local inspection before anything is published."""
-    env_list = env_sub.add_parser("list", help="list local environment sources")
+    """`env list` and `env test`: inspect published environments and local sources."""
+    env_list = env_sub.add_parser(
+        "list", help="list published environments and local environment sources"
+    )
     env_list.set_defaults(func=cmd_env_list)
 
     env_test = env_sub.add_parser(
@@ -649,9 +651,9 @@ def _add_train_commands(sub: argparse._SubParsersAction) -> None:
         type=_gpu_count_override,
         metavar="N",
         help=(
-            "most cards to run the job on; sets [gpu] count (1-8). a ceiling, not an exact "
-            "count: allocation still picks one card when one fits the run alone, and only "
-            "rentable counts (1, 2, 4, 8) are ever provisioned"
+            "optional card ceiling; sets [gpu] count (1-8). omit it with an unpinned gpu type to "
+            "auto-size the smallest fitting geometry; an authored value pins the ceiling, and only "
+            "(1, 2, 4, 8) are ever provisioned"
         ),
     )
     train.add_argument("--dry-run", action="store_true")

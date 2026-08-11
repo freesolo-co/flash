@@ -499,11 +499,20 @@ def _safe_contents_path(path: object, root_parts: list[str]) -> str:
     return normalized
 
 
-def _download_github_json(ref: GitHubEnvironmentRef, url: str, context: str) -> object:
+def _download_github_json(
+    ref: GitHubEnvironmentRef,
+    url: str,
+    context: str,
+    *,
+    timeout: float = 120.0,
+    max_rate_limit_retries: int = 5,
+) -> object:
+    request_options = {"timeout": timeout, "max_bytes": _MAX_CONTENTS_JSON_BYTES}
+    if max_rate_limit_retries != 5:
+        request_options["max_rate_limit_retries"] = max_rate_limit_retries
     data = _urlopen(
         urllib.request.Request(url, headers=_github_headers("application/vnd.github+json")),
-        timeout=120.0,
-        max_bytes=_MAX_CONTENTS_JSON_BYTES,
+        **request_options,
     )
     try:
         return json.loads(data)
@@ -522,8 +531,22 @@ def _github_response_message(payload: object) -> str:
     return ""
 
 
-def _github_tree_entries(ref: GitHubEnvironmentRef, treeish: str, context: str) -> list[dict]:
-    payload = _download_github_json(ref, _github_tree_url(ref, treeish), context)
+def _github_tree_entries(
+    ref: GitHubEnvironmentRef,
+    treeish: str,
+    context: str,
+    *,
+    recursive: bool = False,
+    timeout: float = 120.0,
+    max_rate_limit_retries: int = 5,
+) -> list[dict]:
+    payload = _download_github_json(
+        ref,
+        _github_tree_url(ref, treeish, recursive=recursive),
+        context,
+        timeout=timeout,
+        max_rate_limit_retries=max_rate_limit_retries,
+    )
     if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
         raise RuntimeError(
             f"GitHub path {context!r} is not an environment directory"
@@ -966,3 +989,8 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
         contract_text=contract_text,
         package_root=base_dir,
     )
+
+
+from flash.envs.namespace_listing import (  # noqa: E402
+    list_managed_namespace_slugs as list_managed_namespace_slugs,
+)

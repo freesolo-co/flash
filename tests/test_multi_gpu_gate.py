@@ -1377,6 +1377,23 @@ def test_schema_preflight_applies_the_geometry_cap_to_provisional_sizing():
         monkey.setattr(pinned_geometry, "_PINNED_GEOMETRY_MEMO", {})
         _spec()
         assert seen == [8]
+
+        # an unset count must cross the same boundary (dev's auto-sizing case). parse time is
+        # offline, so the 8-head row previews at 8 here too -- the pre-fix expectation of 4 came
+        # from parse-time certification, which a hub outage could flip.
+        seen.clear()
+        monkey.setattr("flash.engine.plan.vram.model_required_vram_gb", lambda *_a, **_k: 700)
+        spec_from_dict(
+            {
+                "model": "Qwen/Qwen3.5-0.8B",
+                "model_revision": "a" * 40,
+                "algorithm": "sft",
+                "environment": {"id": "owner/env"},
+                "train": {"max_examples": 1},
+                "gpu": {},
+            }
+        )
+        assert seen == [8], "an unset count previews on the row, offline, in either hub state"
     finally:
         monkey.undo()
 
