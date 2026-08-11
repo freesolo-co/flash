@@ -567,6 +567,21 @@ def largest_rentable_count(max_gpu_count: int) -> int:
     return rentable_gpu_counts(min(max(1, int(max_gpu_count)), MAX_COMBINATION_CARDS))[0]
 
 
+def fitting_gpu_count(vram_gb: int, need: float, *, ceiling: int = MAX_COMBINATION_CARDS) -> int:
+    """Smallest rentable card count at which ``vram_gb`` cards hold ``need`` GB, else 0.
+
+    A fit failure is only worth reporting as unsatisfiable when NO shape the user can ask for
+    would fix it. `[gpu] count` is a user-authored ceiling, so a run that fails at the authored
+    count but fits at a wider one is a one-flag fix, not a dead end -- and the error is the only
+    place the user learns which flag. Returns the smallest such count so the suggestion is the
+    cheapest one that works rather than the widest shape on offer.
+    """
+    for count in sorted(rentable_gpu_counts(max(1, int(ceiling)))):
+        if combined_vram_gb(vram_gb, count) >= need:
+            return count
+    return 0
+
+
 @dataclass(frozen=True)
 class Candidate:
     provider: str

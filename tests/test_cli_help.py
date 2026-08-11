@@ -184,3 +184,22 @@ def test_help_page_is_ascii_locale_safe(monkeypatch) -> None:
         ["docs: https://docs.freesolo.co"],
     )
     page.encode("ascii")  # raises if any non-ASCII glyph slipped through
+
+
+def test_env_setup_project_help_states_the_noninteractive_requirement() -> None:
+    """`--project` is optional only when there is a prompt to choose one.
+
+    `_require_setup_project` hard-requires it with `--yes`, a redirected stdin, or any other
+    noninteractive run. argparse renders it as an ordinary optional flag, so help that omits the
+    condition sends scripted and CI callers into a failure the help text said would not happen.
+    """
+    # assert on the rendered page rather than the action object: the help text is only wrong if
+    # what the user READS is wrong, and format_help is what they read.
+    parser = cli._build_parser()
+    setup = parser._subparsers._group_actions[0].choices["env"]
+    page = setup._subparsers._group_actions[0].choices["setup"].format_help()
+
+    assert "--project" in page
+    project_help = page[page.index("--project") :]
+    assert "required" in project_help
+    assert "--yes" in project_help
