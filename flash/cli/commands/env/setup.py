@@ -524,11 +524,18 @@ def _warn_if_environment_form_disagrees(configs: tuple[Path, ...], *, can_publis
     Classify with the loader's own predicates, not a `github:` prefix test. The loader accepts a
     plain `https://github.com/OWNER/REPO/...` URL as the same self-hosted form, so a prefix test
     would warn about an id this plane resolves fine.
+
+    Three states, not two. A blank id is neither form: it is the hosted branch's own placeholder
+    (`id = ""`), which `validate_spec` rejects outright. Collapsing it into "not github" would let
+    the self-hosted branch tell an identity-backend operator their blank ids are "already right",
+    which is the one thing they certainly are not.
     """
     from flash.client import ClientError
-    from flash.envs.loader import is_github_environment_ref
+    from flash.envs.loader import is_github_environment_ref, is_managed_environment_slug
 
-    mismatched: list[Path] = []
+    github: list[Path] = []
+    managed: list[Path] = []
+    unfilled: list[Path] = []
     for cfg in configs:
         if not cfg.exists():
             continue
@@ -539,34 +546,49 @@ def _warn_if_environment_form_disagrees(configs: tuple[Path, ...], *, can_publis
         environment = raw.get("environment")
         environment_id = environment.get("id") if isinstance(environment, dict) else None
         env_id = environment_id.strip() if isinstance(environment_id, str) else ""
-        # blank is the hosted branch's own placeholder (`id = ""`), so it reads as hosted, not as
-        # "no opinion" -- it is exactly what a hosted scaffold leaves behind for `env push` to fill.
-        uses_github = is_github_environment_ref(env_id)
-        if uses_github == (not can_publish):
-            continue
-        mismatched.append(cfg)
+        if is_github_environment_ref(env_id):
+            github.append(cfg)
+        elif is_managed_environment_slug(env_id):
+            managed.append(cfg)
+        else:
+            unfilled.append(cfg)
 
-    if not mismatched:
-        return
-    names = ", ".join(str(cfg) for cfg in mismatched)
+    def _names(paths: list[Path]) -> str:
+        return ", ".join(str(cfg) for cfg in paths)
+
     if can_publish:
-        change = (
-            "use `github:` [environment] ids, but this hosted plane requires managed hub ids; "
-            "keeping the files unchanged. Run `flash env push`, then replace each [environment] "
-            "id with the returned id"
-        )
-    else:
+        # An unfilled id needs no warning here: it is what this branch scaffolds, and the printed
+        # next step is already `flash env push`.
+        if github:
+            _warn(
+                f"existing {_names(github)} use `github:` [environment] ids, but this hosted plane "
+                "requires managed hub ids; keeping the files unchanged. Run `flash env push`, then "
+                "replace each [environment] id with the returned id"
+            )
+        return
+
+    if managed:
         # hedged, unlike the hosted branch above: which form a self-hosted plane accepts depends on
         # server-side FLASH_STANDALONE, which the CLI cannot read. A standalone plane takes only
         # `github:` ids; an identity-backed one takes only managed slugs -- so a flat "replace it"
         # here would be advice to break the config on half of all self-hosted planes.
-        change = (
-            "use managed hub [environment] ids, which a standalone plane rejects; keeping the "
-            "files unchanged. If this plane runs with `FLASH_STANDALONE=1`, replace each "
-            "[environment] id with a `github:OWNER/REPO@REF:PATH` form; if it runs against an "
-            "identity backend, managed hub ids are the accepted form and these are already right"
+        _warn(
+            f"existing {_names(managed)} use managed hub [environment] ids, which a standalone "
+            "plane rejects; keeping the files unchanged. If this plane runs with "
+            "`FLASH_STANDALONE=1`, replace each [environment] id with a `github:OWNER/REPO@REF:PATH` "
+            "form; if it runs against an identity backend, managed hub ids are the accepted form "
+            "and these are already right"
         )
-    _warn(f"existing {names} {change}")
+    if unfilled:
+        # Unhedged, because no plane accepts a blank id: `validate_spec` fails the submit before the
+        # standalone-vs-identity question is ever reached. Both forms are still named, since which
+        # one to fill in does depend on that server setting.
+        _warn(
+            f"existing {_names(unfilled)} have no usable [environment] id, which fails validation on "
+            "any plane; keeping the files unchanged. Fill each one in -- with a "
+            "`github:OWNER/REPO@REF:PATH` form if this plane runs with `FLASH_STANDALONE=1`, or with "
+            "a managed hub id if it runs against an identity backend"
+        )
 
 
 def _existing_reasoning(configs: tuple[Path, ...]) -> bool | None:

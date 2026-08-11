@@ -654,13 +654,26 @@ def test_env_setup_keeps_the_push_workflow_on_the_managed_plane(monkeypatch, tmp
     assert "flash env push" in written["environment.py"]
 
 
-def test_env_setup_warns_when_hosted_configs_are_retained_on_a_self_hosted_plane(
+def test_env_setup_warns_when_filled_hub_ids_are_retained_on_a_self_hosted_plane(
     monkeypatch, tmp_path, capsys
 ) -> None:
+    """A managed slug on a self-hosted plane is the case that genuinely depends on the server.
+
+    Reached by filling the hosted scaffold's blank the way `env push` would, because the blank
+    itself is a different case -- see the unfilled test below.
+    """
     hosted = _scaffold(monkeypatch, tmp_path, "https://flash.freesolo.co")
+    for name in ("sft.toml", "rl.toml", "opd.toml"):
+        cfg = tmp_path / "configs" / name
+        cfg.write_text(cfg.read_text(encoding="utf-8").replace('id = ""', 'id = "acme/my-env"'))
+    filled = {
+        name: (tmp_path / "configs" / name).read_text(encoding="utf-8")
+        for name in ("sft.toml", "rl.toml", "opd.toml")
+    }
+    assert filled["sft.toml"] != hosted["sft.toml"]
     capsys.readouterr()
 
-    retained = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+    _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
     warning = capsys.readouterr().err
 
     assert "which a standalone plane rejects" in warning
@@ -670,6 +683,32 @@ def test_env_setup_warns_when_hosted_configs_are_retained_on_a_self_hosted_plane
     assert "FLASH_STANDALONE=1" in warning
     assert "identity backend" in warning
     assert "these are already right" in warning
+    for name in ("sft.toml", "rl.toml", "opd.toml"):
+        assert f"configs/{name}" in warning, name
+        assert (tmp_path / "configs" / name).read_text(encoding="utf-8") == filled[name], name
+
+
+def test_env_setup_warns_that_unfilled_ids_are_valid_nowhere(monkeypatch, tmp_path, capsys) -> None:
+    """The hosted scaffold's own `id = ""` is not a managed slug, and must not be blessed as one.
+
+    Rerunning a hosted scaffold against a self-hosted plane before `env push` filled the blanks used
+    to take the managed-slug branch, whose closing clause is "these are already right". Blank ids
+    are right nowhere: `validate_spec` rejects an empty `[environment] id` on every plane, standalone
+    or identity-backed, so that reassurance guaranteed a failed submit.
+    """
+    hosted = _scaffold(monkeypatch, tmp_path, "https://flash.freesolo.co")
+    assert 'id = ""' in hosted["sft.toml"]
+    capsys.readouterr()
+
+    retained = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+    warning = capsys.readouterr().err
+
+    assert "no usable [environment] id" in warning
+    assert "fails validation on any plane" in warning
+    assert "these are already right" not in warning
+    # which form to fill in still depends on the server setting, so both are named
+    assert "FLASH_STANDALONE=1" in warning
+    assert "identity backend" in warning
     for name in ("sft.toml", "rl.toml", "opd.toml"):
         assert f"configs/{name}" in warning, name
         assert retained[name] == hosted[name], name
@@ -733,6 +772,47 @@ def test_training_guide_caveats_the_standalone_requirement(monkeypatch, tmp_path
     assert "identity backend" in guide
     # same caveat on both surfaces -- they are generated separately and have drifted before
     assert "FLASH_STANDALONE=1" in written["rl.toml"]
+
+
+def test_training_guide_says_env_eval_rejects_the_id_it_scaffolds(monkeypatch, tmp_path) -> None:
+    """The guide recommends `env eval` for runs whose environment id that command refuses.
+
+    `_resolve_evaluation_environment` (flash/cli/commands/env/eval.py) gates on
+    `is_managed_environment_slug`, so every `github:` id -- the only form the self-hosted scaffold
+    writes -- fails before the suites load. The guide's `--split`/`--param` advice for `env eval`
+    is therefore unreachable on a standalone plane and has to say so.
+    """
+    from flash.envs.loader import is_managed_environment_slug
+
+    written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+
+    # the premise: what this scaffold writes is exactly what env eval rejects
+    scaffolded_id = tomllib.loads(written["rl.toml"])["environment"]["id"]
+    assert not is_managed_environment_slug(scaffolded_id)
+
+    guide = written["TRAINING.md"]
+    assert "`flash env eval` does not accept a `github:` id" in guide
+    assert "`flash env test` is unaffected" in guide
+
+
+def test_training_guide_names_the_self_hosted_opd_broker_settings(monkeypatch, tmp_path) -> None:
+    """The "key stays managed" line is hosted-only; a self-hoster runs the broker themselves.
+
+    `require_teacher_broker_configuration` (flash/server/domain/teacher_broker.py) demands both
+    `PARASAIL_API_KEY` and a valid `FLASH_PUBLIC_URL` on the control plane, and raises at
+    allocation -- after the submit is accepted. A guide that says there is nothing to declare walks
+    a self-hoster into a run that fails once the GPU is already held.
+    """
+    written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+
+    guide = written["TRAINING.md"]
+    assert "Running OPD on a self-hosted plane needs two server-side settings" in guide
+    assert "PARASAIL_API_KEY" in guide
+    assert "FLASH_PUBLIC_URL" in guide
+    # the managed passages that say otherwise must carry the pointer, since a reader can land there
+    # directly from the OPD section without passing the environment section above
+    assert "the broker is _your_ control plane" in guide
+    assert "applies to your _shell_, not your _server_" in guide
 
 
 def test_env_setup_accepts_a_browser_url_as_the_self_hosted_form(
