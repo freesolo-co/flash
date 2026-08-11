@@ -8608,6 +8608,38 @@ def test_publish_env_reports_a_cross_project_name_conflict_without_uploading(api
     assert "retry" not in detail.lower().replace("retrying will not change this", "")
 
 
+def test_publish_env_refuses_to_upload_when_the_org_cannot_be_resolved(api, monkeypatch):
+    """An org-id-less key must not bypass the guard and overwrite the hub anyway.
+
+    Auth requires only `org_slug`, so a key can authenticate with no `org_id`. The hub path is
+    namespaced by the SLUG, so such a publish still replaces `<org-slug>/<name>` -- while having
+    no org id to check ownership with. Gating the guard on the org id alone would skip it and
+    clobber the other project, then answer with the old misleading 502.
+    """
+    import flash.server.domain.envs as envs_mod
+    import flash.server.platform.deps as deps
+
+    monkeypatch.setitem(
+        api.app.dependency_overrides,
+        deps.require_key,
+        lambda: {"org_slug": "acme", "user_id": "u1", "api_key_id": "k1", "auth_kind": "user"},
+    )
+    monkeypatch.setattr(
+        envs_mod,
+        "publish_package",
+        lambda **_kwargs: pytest.fail("an unverifiable org must not reach the hub write"),
+    )
+
+    response = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": "env", "package_b64": "payload", "project_id": SPEC["project"]},
+    )
+
+    assert response.status_code == 400, response.text
+    assert "organization could not be resolved" in response.json()["detail"]
+
+
 def test_publish_env_reports_an_invalid_name_as_a_type_error_not_a_conflict(api, monkeypatch):
     """A malformed name must not be answered with a conflict about an unrelated environment.
 

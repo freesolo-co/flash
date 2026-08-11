@@ -73,8 +73,8 @@ def publish_env(
     # Only when the destination slug is knowable up front. Deriving it needs the caller's own org
     # namespace, which the org-agnostic internal key does not carry -- there, publish_package
     # resolves the namespace itself and raises its own error. Reporting that error from here
-    # instead would change which failure a caller sees, so a slug we cannot derive simply skips
-    # the guard and the conflict is still caught at the association step below.
+    # instead would change which failure a caller sees, so a slug we cannot derive skips the
+    # guard; that caller writes no org-namespaced directory, so nothing is at risk.
     intended_slug = ""
     org_for_conflict = str(resolved_key.get("org_id") or "").strip()
     # `isinstance` first: a non-string name (0, False, []) sanitizes to the generic "env", and
@@ -85,7 +85,21 @@ def publish_env(
         with suppress(envs.EnvPublishError):
             namespace, clean_name = envs.publish_slug_for_name(_name, key)
             intended_slug = f"{namespace}/{clean_name}"
-    if intended_slug and org_for_conflict:
+    if intended_slug:
+        if not org_for_conflict:
+            # A user key can carry an org slug (all auth requires) without an org id, and the
+            # hub slug is namespaced by the SLUG -- so this request would still overwrite
+            # `<org-slug>/<name>` while being unable to check who owns it. Refuse before the
+            # write instead of skipping the guard: the association step cannot save us here
+            # either, since it needs the same org id and returns False without it.
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "organization could not be resolved for this key, so the environment's "
+                    "project ownership cannot be verified; re-run `flash login` to refresh the "
+                    "key, or pass the organization explicitly"
+                ),
+            )
         try:
             raise_if_owned_by_another_project(
                 slug=intended_slug,
