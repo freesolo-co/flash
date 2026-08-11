@@ -230,6 +230,7 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
     selected_count = profile.selected_examples
     sampled_texts = prepared_workload.sampled_texts
     multiturn_targets = prepared_workload.multiturn_targets
+    coerced_singleturn_targets = prepared_workload.coerced_singleturn_targets
     if dropped:
         print(
             f"[sft] dropped {dropped} rows with no real completion target "
@@ -244,6 +245,12 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
         print(
             "[sft][warn] this is a multi-turn environment but no row ships a multi-turn "
             "target completion"
+        )
+    if selected_count > 1 and coerced_singleturn_targets == selected_count:
+        print(
+            f"[sft][warn] all {selected_count} selected rows use one bare assistant target coerced "
+            "from raw output; reasoning blocks or multi-turn structure may have been lost. encode "
+            "full target trajectories as message lists in output"
         )
     if _w.THINKING and not any("<think>" in text for text in sampled_texts[:256]):
         print(
