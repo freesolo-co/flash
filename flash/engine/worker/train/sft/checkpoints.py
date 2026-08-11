@@ -212,10 +212,14 @@ class _VerlCheckpointWatcher:
             )
         finally:
             # once the adapter is durable on hf the local copy is redundant, and keeping every
-            # step's copy leaves one directory per save on the container disk for the whole run
-            # (the rl path already drops its equivalent). gated on the publish having actually
-            # landed: `upload_resume_checkpoint` can also return before running `before_upload` at
-            # all, and an unpublished export is the one copy that still matters.
+            # step's copy leaves one directory per save on the container disk for the whole run.
+            # gated on the publish having actually landed: `upload_resume_checkpoint` can also
+            # return before running `before_upload` at all, and an unpublished export is the one
+            # copy that still matters.
+            #
+            # safe here but NOT in the rl uploader, which keeps its staged adapters deliberately:
+            # `_publish_ready` republishes from `staged_steps` on later sweeps, so an export there
+            # outlives its first publish. sft finishes with the directory inside this one call.
             if published:
                 shutil.rmtree(adapter_dir, ignore_errors=True)
         if step in self.required_steps and not uploaded:
