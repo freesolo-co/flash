@@ -611,6 +611,11 @@ def _readmit_teacher_request(conn, capability, existing, *, admitted_at, charge_
     before dispatch. Transient terminal rows completed after dispatch, so their reservation is
     still held and only in_flight is re-acquired.
     """
+    if existing["upstream_attempt_count"] >= capability["max_upstream_attempts"]:
+        # the upstream budget is spent, so readmission is refused before any counter moves: a
+        # readmitted-then-refused row would be bounced back through 'retryable' by the dispatch
+        # path, releasing its held reservation and staying readmissible forever.
+        raise TeacherLedgerError("upstream_attempt_quota_exhausted")
     if capability["in_flight"] >= capability["max_concurrency"]:
         raise TeacherLedgerError("broker_busy", retryable=True)
     token_delta = 0

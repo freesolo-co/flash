@@ -681,11 +681,12 @@ def _dispatch_to_teacher_provider(
             request_id=request_id,
         ) from exc
     if status < 200 or status >= 300:
-        # 429 and 5xx are provider-side conditions a retry can outlive, so those rows are
-        # recorded readmissible; other 4xx (400/401/403/404/422 ...) reject the request or
-        # credential itself, so a retry cannot change the outcome. the recorded error_class
-        # is the value readmission keys on.
-        transient = status == 429 or 500 <= status <= 599
+        # 408, 429 and 5xx are provider-side conditions a retry can outlive (a 408 is the
+        # provider timing out the request, not rejecting it), so those rows are recorded
+        # readmissible; other 4xx (400/401/403/404/422 ...) reject the request or credential
+        # itself, so a retry cannot change the outcome. the recorded error_class is the value
+        # readmission keys on.
+        transient = status in (408, 429) or 500 <= status <= 599
         with contextlib.suppress(Exception):
             db.complete_teacher_request(
                 capability_id,
