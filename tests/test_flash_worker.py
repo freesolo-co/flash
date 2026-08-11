@@ -236,6 +236,33 @@ def test_build_worker_env_forwards_declared_environment_runtime_secrets():
     assert "UNDECLARED_API_KEY" not in env
 
 
+def test_build_worker_env_lists_declared_secret_names_for_the_redactors():
+    """declared runtime secrets can carry any name (AWS_SECRET_ACCESS_KEY, ...), so the redactors
+    cannot rely on the name-shape heuristic; the env carries the applied names explicitly."""
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
+    from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
+    from flash.providers.runpod.serverless import build_worker_env
+
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="grpo",
+        environment=EnvironmentSpec(id="owner/env", secrets=("AWS_SECRET_ACCESS_KEY",)),
+        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
+        seed=0,
+    )
+
+    env = build_worker_env(
+        spec,
+        0,
+        runtime_secrets={"AWS_SECRET_ACCESS_KEY": "aws-user", "WANDB_API_KEY": "user-wb"},
+    )
+
+    listed = set(env[SECRET_ENV_KEYS_ENV].split(","))
+    assert listed == {"AWS_SECRET_ACCESS_KEY", "WANDB_API_KEY"}
+    # a run with no applied secrets carries no list at all.
+    assert SECRET_ENV_KEYS_ENV not in build_worker_env(_spec(), 0)
+
+
 def test_worker_console_always_uploaded_and_no_flag(monkeypatch):
     """The worker console is ALWAYS uploaded — live (periodic) while the worker runs and once more
     when it exits — so every print reaches `flash runs log`, not just a post-mortem tail on
@@ -693,7 +720,11 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
             uploaded_console = f.read()
         assert not uploaded_console.startswith("worker booting\n")
         assert uploaded_console.endswith("torch.cuda.OutOfMemoryError: CUDA OOM\n")
-        assert len(uploaded_console) == 64_000
+        # the 64k byte boundary fell inside the giant x-line, so that truncated line is dropped
+        # whole before redaction: a partial line could hold a credential suffix that no longer
+        # value-matches.
+        assert "x" not in uploaded_console
+        assert uploaded_console == "torch.cuda.OutOfMemoryError: CUDA OOM\n"
         assert [call["path_in_repo"] for call in list_calls] == [code_prefix, code_prefix]
         assert [call["filename"] for call in download_calls] == [
             f"{code_prefix}/__init__.py",

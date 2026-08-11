@@ -1826,6 +1826,23 @@ def test_child_tail_redaction_precedes_the_per_line_cap(monkeypatch):
     assert len(kept) <= vc._CHILD_TAIL_LINE_CHARS
 
 
+def test_child_tail_redacts_declared_secrets_with_arbitrary_names(monkeypatch):
+    """[environment] secrets accepts any env name; FLASH_SECRET_ENV_KEYS is what lets the worker
+    redact values whose names the suffix heuristic misses."""
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
+
+    secret = "aws-declared-childtail-0123456789abcdef"
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", secret)
+    monkeypatch.setenv(SECRET_ENV_KEYS_ENV, "AWS_SECRET_ACCESS_KEY")
+    tail = vc.ChildOutputTail()
+    tail.record(f"botocore.exceptions.ClientError: SignatureDoesNotMatch using {secret}\n")
+
+    kept = tail.tail()[0]
+
+    assert secret not in kept
+    assert kept == "botocore.exceptions.ClientError: SignatureDoesNotMatch using <redacted>"
+
+
 # ---------------------- child teardown escalates to SIGKILL ----------------------
 # these real-process tests require fork, /proc group membership, and libc subreaper support.
 # guard on those capabilities rather than platform names.

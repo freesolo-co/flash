@@ -71,17 +71,35 @@ def _train_body(input_data: dict) -> dict:
     from huggingface_hub import snapshot_download
 
     def _safe_detail(value, secrets=None, limit=1000):
+        import urllib.parse
+
         text = (
             f"{type(value).__name__}: {value}" if isinstance(value, BaseException) else str(value)
         )
-        values = {**os.environ, **(secrets or {})}
-        for key, secret in values.items():
+        mapping = {**os.environ, **(secrets or {})}
+        # declared runtime secrets can carry any name, so the control plane lists them in
+        # FLASH_SECRET_ENV_KEYS; the name-shape rule stays as the fail-closed fallback.
+        declared = {
+            name.strip().upper()
+            for name in str(mapping.get("FLASH_SECRET_ENV_KEYS") or "").split(",")
+            if name.strip()
+        }
+        needles = set()
+        for key, secret in mapping.items():
             upper = str(key).upper()
             if secret and (
                 upper in {"AUTHORIZATION", "HF_TOKEN"}
+                or upper in declared
                 or upper.endswith(("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD"))
             ):
-                text = text.replace(str(secret), "<redacted>")
+                needles.add(str(secret))
+                encoded = urllib.parse.quote(str(secret), safe="")
+                if encoded != str(secret):
+                    needles.add(encoded)
+        # longest-first so one secret containing another cannot leave a suffix of the longer
+        # one behind; encoded forms cover the percent-encoded urls http and git errors print.
+        for needle in sorted(needles, key=len, reverse=True):
+            text = text.replace(needle, "<redacted>")
         text = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", text)
         text = re.sub(
             r"(?i)(authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)"
@@ -373,8 +391,15 @@ def _train_body(input_data: dict) -> dict:
                 tail_bytes = 64_000
                 with open(console, "rb") as f:
                     f.seek(0, os.SEEK_END)
-                    f.seek(max(0, f.tell() - tail_bytes))
+                    start = max(0, f.tell() - tail_bytes)
+                    f.seek(start)
                     tail = f.read().decode("utf-8", "replace")
+                if start > 0:
+                    # the byte boundary can land inside a one-line credential, and a partial
+                    # value no longer matches full-value redaction, so the truncated first
+                    # line is dropped before sanitizing.
+                    cut = tail.find("\n")
+                    tail = tail[cut + 1 :] if cut >= 0 else ""
                 with open(console + ".tail", "w", encoding="utf-8", errors="replace") as f:
                     f.write(_safe_detail(tail, env, 64_000))
                 _require_deadline_allowance()
@@ -411,7 +436,11 @@ def _train_body(input_data: dict) -> dict:
                 uploader.start()
                 try:
                     for line in proc.stdout:
-                        print(line, end="")
+                        # the handler's own stdout is captured by runpod and surfaced in provider
+                        # status, where only this process knows the run's worker-env secret values,
+                        # so each echoed child line is sanitized here at the source. the console
+                        # file keeps the raw line; its upload path sanitizes the selected tail.
+                        print(_safe_detail(line, env, 100_000), end="")
                         cf.write(line)
                     proc.wait()
                 finally:

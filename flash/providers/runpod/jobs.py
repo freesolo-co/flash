@@ -55,8 +55,8 @@ endpoint_name = _endpoint_name
 logger = get_logger(__name__)
 
 # Per-part cap for sanitized terminal-failure text. The parts are already provider-bounded; the
-# limit exists so redaction can never silently truncate a tail we chose to surface, matching the
-# instance providers' "slice, then sanitize with the same bound" convention.
+# limit exists so redaction can never silently truncate a tail we chose to surface. It is applied
+# after sanitizing the complete text, keeping the newest bytes.
 FAILURE_TEXT_LIMIT = 64_000
 
 # Re-export for callers that import PollResult from here.
@@ -231,9 +231,12 @@ def _safe_failure_text(value: object, limit: int = FAILURE_TEXT_LIMIT) -> str:
 
     Provider errors and worker stdout tails reach the run log verbatim, so a control-plane secret
     the worker echoed would be printed. The instance providers sanitize every part of their failure
-    detail; this keeps RunPod symmetric with them.
+    detail; this keeps RunPod symmetric with them. The complete text is sanitized before the bound
+    is applied, and the bound keeps the newest bytes: slicing first could cut a credential at the
+    boundary so its surviving part no longer value-matches.
     """
-    return sanitize_diagnostic(value, limit=limit)
+    sanitized = sanitize_diagnostic(value, limit=1 << 30)
+    return sanitized[-max(0, int(limit)) :]
 
 
 def decode_output(output) -> dict:
@@ -243,7 +246,7 @@ def decode_output(output) -> dict:
             output = json.loads(output)
         except json.JSONDecodeError as exc:
             raise RuntimeError(
-                f"unexpected job output tail: {_safe_failure_text(output[-200:], 200)}"
+                f"unexpected job output tail: {_safe_failure_text(output, 200)}"
             ) from exc
     if not isinstance(output, dict):
         raise RuntimeError(f"unexpected job output type: {type(output)}")

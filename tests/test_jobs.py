@@ -157,6 +157,24 @@ def test_decode_output_error_redacts_credentials(monkeypatch):
     assert "--- worker stdout tail ---\n401 for <redacted>" in msg
 
 
+def test_decode_output_tail_is_sanitized_before_the_bound(monkeypatch):
+    """slicing the raw text first can cut a credential at the boundary, leaving a suffix that no
+    longer value-matches; the complete text is sanitized before the tail is selected."""
+    from flash.providers.runpod.jobs import decode_output
+
+    secret = "hf_ZZZboundarystraddler0123456789abcdef"
+    monkeypatch.setenv("HF_TOKEN", secret)
+    # non-json output whose 200-char boundary lands inside the secret.
+    raw = "x" * 500 + f"auth {secret}" + "y" * 180
+    with pytest.raises(RuntimeError) as ei:
+        decode_output(raw)
+    msg = str(ei.value)
+    assert secret not in msg
+    for fragment_length in range(6, len(secret)):
+        assert secret[-fragment_length:] not in msg
+    assert "<redacted>" in msg
+
+
 # ---------------------------------------------------------------------------
 # poll_job state machine (mocked runpod_api)
 # ---------------------------------------------------------------------------

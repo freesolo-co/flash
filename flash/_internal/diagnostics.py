@@ -14,17 +14,29 @@ _SECRET_KEY_RE = re.compile(
 _BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _SECRET_ENV_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
 
+# comma-separated env-variable names whose values are secrets regardless of naming shape: declared
+# runtime secrets can carry any name (AWS_SECRET_ACCESS_KEY, FLASH_TEACHER_CAPABILITY, ...), so the
+# control plane lists them explicitly in the worker env instead of relying on the suffix heuristic.
+SECRET_ENV_KEYS_ENV = "FLASH_SECRET_ENV_KEYS"
+
 # multiline secrets may appear only partially in truncated logs. register long component lines as
 # needles, but ignore short common fragments such as ``}`` that would erase innocent diagnostics.
 _MIN_SECRET_COMPONENT = 8
 
 
 def _configured_secrets() -> tuple[str, ...]:
+    declared = {
+        name.strip().upper()
+        for name in os.environ.get(SECRET_ENV_KEYS_ENV, "").split(",")
+        if name.strip()
+    }
     values: set[str] = set()
     for key, value in os.environ.items():
         upper = key.upper()
         if not value or not (
-            upper in {"AUTHORIZATION", "HF_TOKEN"} or upper.endswith(_SECRET_ENV_SUFFIXES)
+            upper in {"AUTHORIZATION", "HF_TOKEN"}
+            or upper in declared
+            or upper.endswith(_SECRET_ENV_SUFFIXES)
         ):
             continue
         parts = [value]

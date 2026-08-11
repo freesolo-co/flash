@@ -388,6 +388,8 @@ def build_user_data(payload: dict, *, image: str) -> str:
     payload = _spill_large_spec_to_hf(payload)
     payload_b64 = base64.encodebytes(json.dumps(payload).encode()).decode()
     bootstrap_src = (Path(__file__).parent / "bootstrap.py").read_text()
+    # shipped next to bootstrap.py: the bootstrap imports it as a bare sibling module on the box.
+    bootstrap_secrets_src = (Path(__file__).parent / "bootstrap_secrets.py").read_text()
     # Bind the host cache mount into the container at the fixed /weight-cache so prefetch persists; absent -> cold.
     cache_host_mount = payload.get("cache_host_mount")
     cache_bind = (
@@ -406,6 +408,8 @@ cat > /opt/flash/payload.b64 <<'FLASH_PAYLOAD_EOF'
 base64 -d /opt/flash/payload.b64 > /opt/flash/payload.json
 cat > /opt/flash/bootstrap.py <<'FLASH_BOOTSTRAP_EOF'
 {bootstrap_src}FLASH_BOOTSTRAP_EOF
+cat > /opt/flash/bootstrap_secrets.py <<'FLASH_BOOTSTRAP_SECRETS_EOF'
+{bootstrap_secrets_src}FLASH_BOOTSTRAP_SECRETS_EOF
 cat > /opt/flash/deadline_sleep.py <<'FLASH_DEADLINE_SLEEP_EOF'
 {_DEADLINE_SLEEP_PY}FLASH_DEADLINE_SLEEP_EOF
 cat > /opt/flash/hostlog.py <<'FLASH_HOSTLOG_EOF'

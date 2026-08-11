@@ -1910,6 +1910,101 @@ def test_attempt_marker_error_redacts_a_payload_env_secret(monkeypatch):
     assert marker["error"] == "worker died holding <redacted>"
 
 
+def test_safe_detail_redacts_declared_secrets_with_arbitrary_names(monkeypatch):
+    """[environment] secrets accepts any env name; the explicit FLASH_SECRET_ENV_KEYS list is what
+    lets the bootstrap redact names the suffix heuristic misses."""
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    payload = {
+        "env": {
+            "FLASH_SECRET_ENV_KEYS": "AWS_SECRET_ACCESS_KEY",
+            "AWS_SECRET_ACCESS_KEY": "aws-declared-3f9e1c7b5a2d4680",
+            "RUN_ID": "run-visible",
+        }
+    }
+
+    detail = b._safe_detail(
+        "boto3 auth failed with aws-declared-3f9e1c7b5a2d4680 for run-visible",
+        secrets=b._payload_secrets(payload),
+    )
+
+    assert detail == "boto3 auth failed with <redacted> for run-visible"
+
+
+def test_safe_detail_redacts_overlapping_secrets_longest_first():
+    """replacing a shorter secret first would turn the longer one into <redacted>+suffix and leave
+    the suffix behind; longest-first replacement cannot."""
+    secrets = {
+        "SHORT_TOKEN": "abc123456789",
+        "LONG_TOKEN": "abc1234567890diagnosticsuffix",
+    }
+
+    detail = b._safe_detail(
+        "rejected: abc1234567890diagnosticsuffix and abc123456789", secrets=secrets
+    )
+
+    assert detail == "rejected: <redacted> and <redacted>"
+
+
+def test_safe_detail_redacts_the_percent_encoded_form_of_a_secret():
+    """http and git errors print encoded request urls, so the encoded form leaks the secret even
+    when the configured value never appears literally."""
+    secrets = {"REPO_TOKEN": "abc/def+ghi="}
+
+    detail = b._safe_detail(
+        "fatal: unable to access https://x@host/abc%2Fdef%2Bghi%3D/repo.git", secrets=secrets
+    )
+
+    assert "abc%2Fdef%2Bghi%3D" not in detail
+    assert "<redacted>" in detail
+
+
+def test_console_snapshot_drops_the_truncated_first_line_before_redacting(tmp_path, monkeypatch):
+    """when the 64k tail boundary lands inside a one-line credential, the surviving suffix no
+    longer value-matches; the partial first line must go before sanitizing."""
+    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: None)
+    secret = "wandb-boundary-secret-0123456789abcdef"
+    console = tmp_path / "console_sft.txt"
+    head = f"key {secret}\n"
+    tail_line = "tail line survives\n"
+    # size the filler so the 64k byte boundary falls inside the secret on the first line.
+    boundary_offset = len(head) // 2
+    filler = "x" * (64_000 - len(head) - len(tail_line) + boundary_offset - 1) + "\n"
+    console.write_text(head + filler + tail_line)
+    assert len(head) + len(filler) + len(tail_line) - 64_000 == boundary_offset
+    payload = {"hf_repo": "o/r", "hf_prefix": "sft/run", "env": {"WANDB_API_KEY": secret}}
+
+    b._upload_console_snapshot(payload, str(console), "sft")
+
+    tail = (tmp_path / "console_sft.txt.tail").read_text()
+    assert secret not in tail
+    for fragment_length in range(6, len(secret)):
+        assert secret[-fragment_length:] not in tail
+    assert "tail line survives" in tail
+
+
+def test_hf_call_retry_log_redacts_payload_secrets(monkeypatch, capsys):
+    """the retried hf error message can echo the payload-only token, which os.environ does not
+    know; the retry path must redact against the payload env."""
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setattr(b.time, "sleep", lambda s: None)
+    secret = "hf_ZZZretrypathsecret0123456789"
+    payload = {"env": {"HF_TOKEN": secret}}
+    attempts = []
+
+    def call():
+        attempts.append(1)
+        if len(attempts) == 1:
+            error = RuntimeError(f"429 rate limited for token {secret}")
+            error.response = types.SimpleNamespace(status_code=429, headers={})
+            raise error
+        return "ok"
+
+    assert b._hf_call(call, "download spec", secrets=b._payload_secrets(payload)) == "ok"
+    printed = capsys.readouterr().out
+    assert secret not in printed
+    assert "<redacted>" in printed
+
+
 # ---------------------------------------------------------------------------
 # main(): the preload branch
 # ---------------------------------------------------------------------------

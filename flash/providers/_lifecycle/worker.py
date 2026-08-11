@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from io import BytesIO
 
+from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
 from flash._internal.logging import get_logger
 from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 from flash.core.spec import (
@@ -267,6 +268,13 @@ def build_worker_env(
             raise RuntimeError("managed opd control-panel teacher transport is missing")
         env[PUBLIC_URL_ENV] = public_url
         env[TEACHER_CAPABILITY_ENV] = capability
+    # declared runtime secrets can carry any name, so their names are listed explicitly for the
+    # redactors (flash._internal.diagnostics and the provider bootstraps): the name-shape
+    # heuristic alone would let AWS_SECRET_ACCESS_KEY-style values through. set last so no
+    # runtime secret can clobber it.
+    secret_keys = (set(allowed_runtime_secrets) | {TEACHER_CAPABILITY_ENV}) & set(env)
+    if secret_keys:
+        env[SECRET_ENV_KEYS_ENV] = ",".join(sorted(secret_keys))
     return env
 
 
