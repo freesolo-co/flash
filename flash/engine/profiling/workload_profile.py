@@ -52,9 +52,8 @@ def sft_sample_policy(max_examples: object) -> str:
 
 
 # why a run resolved to `exact-unpacked`, keyed by the architecture label the packing decision
-# froze alongside the mode (`sft_workload._packing_mode`). the label is the only part of that
-# decision that survives into the profile, so the message is derived from it rather than from a
-# generic string or a second guess at the same question.
+# froze alongside the mode (`sft_workload._packing_mode`). that label is the only part of the
+# decision that survives into the profile, so it is the only place the reason can come from.
 _UNPACKED_REASONS = {
     "multimodal": "this run is multimodal, and image rows are never packed",
     "gdn-hybrid": (
@@ -75,10 +74,10 @@ def unpacked_batch_warning(
 ) -> str | None:
     """One user-facing line for an sft run whose packing mode pins the optimizer batch to 1.
 
-    ``exact-unpacked`` is the deliberate boundary-safe design (see
-    ``sft_workload._resolve_sft_step_horizon``); this only makes the resulting override of the
-    authored ``batch_size`` audible. Returns None when packing is on, or when nothing was
-    overridden because the authored batch was already 1.
+    ``exact-unpacked`` is the boundary-safe design (see
+    ``sft_workload._resolve_sft_step_horizon``), and it overrides the authored ``batch_size``.
+    Returns None when packing is on, or when nothing was overridden because the authored batch
+    was already 1.
     """
     if packing_mode == "packed" or examples_per_update > 1:
         return None

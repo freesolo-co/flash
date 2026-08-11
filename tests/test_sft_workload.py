@@ -157,7 +157,7 @@ def test_exact_unpacked_mode_trains_one_example_per_update() -> None:
 
 
 def test_unpacked_run_warns_that_the_configured_batch_size_is_ignored(capsys) -> None:
-    """The one-example-per-update override has to be audible, not only present in train meta."""
+    """An unpacked prepare announces the one-example-per-update override on stderr."""
     _prepare(_spec(), packed=False)
     err = capsys.readouterr().err
 

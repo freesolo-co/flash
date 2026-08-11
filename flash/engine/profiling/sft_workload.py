@@ -642,11 +642,10 @@ def prepare_sft_workload(
         measurements=measurements,
         horizon=horizon,
     )
-    # the batch override is a large optimization-semantics change (one example per update instead
-    # of the authored batch) and its only other trace is `notes["packing"]` in the finished run's
-    # metrics, which nobody reads before paying for the run. say it out loud on the same stderr
-    # channel the truncation warning above uses; this runs in the profile job and again on the
-    # training worker, so both logs carry it.
+    # one example per update instead of the authored batch is an optimization-semantics change
+    # whose only other trace is `notes["packing"]` in the finished run's metrics, which is not
+    # visible until after the run is paid for. this function runs in the profile job and again on
+    # the training worker, so the warning lands in both logs.
     warning = unpacked_batch_warning(
         packing_mode=profile.packing_mode,
         architecture_mode=profile.architecture_mode,

@@ -254,11 +254,11 @@ def _exact_sft_cost_rows(spec, profile: dict) -> list[tuple[str, str | None]]:
 
 
 def _print_unpacked_batch_warning(status: object, spec) -> None:
-    """Say out loud that an unpacked SFT run trains 1 example per update, ignoring `batch_size`.
+    """Warn that an unpacked SFT run trains 1 example per update, ignoring `batch_size`.
 
-    The earliest point a user can see this: the quote/dry-run response already carries the frozen
-    packing decision, so the override is knowable before any training GPU is allocated. The reason
-    travels on the profile's `architecture_mode`, which is what the packing decision froze.
+    The quote/dry-run response already carries the frozen packing decision, so the override is
+    knowable before any training GPU is allocated. The reason travels on the profile's
+    `architecture_mode`, which is what the packing decision froze.
     """
     profile = status.get("workload_profile") if isinstance(status, dict) else None
     if not isinstance(profile, dict):

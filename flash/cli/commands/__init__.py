@@ -461,7 +461,7 @@ def cmd_train(args) -> int:
             )
         else:
             print(json.dumps(status, indent=2))
-        _print_unpacked_batch_warning(status, spec)  # last, and on stderr: see its docstring
+        _print_unpacked_batch_warning(status, spec)  # after the payload, so stdout stays parseable
         return 0
     try:
         status = client.create_run(

@@ -496,8 +496,7 @@ def test_sft_cost_warns_that_an_unpacked_run_ignores_the_configured_batch_size(
     """The batch override is a quote-time fact, so the user must hear it before submitting.
 
     A multimodal run is never packed, so ``batch_size = 8`` in the config buys nothing: verl takes
-    one optimizer step per example. Without this the only trace was ``notes["packing"]`` in the
-    finished run's metrics.
+    one optimizer step per example.
     """
     _use_client(
         monkeypatch,
@@ -511,7 +510,7 @@ def test_sft_cost_warns_that_an_unpacked_run_ignores_the_configured_batch_size(
 
     assert rc == 0
     assert "sequence packing is OFF" in err
-    # the reason travels from the packing decision on the profile, not a generic string
+    # the reason is the architecture label the packing decision froze on the profile
     assert "multimodal" in err
     assert "the configured batch_size 8 is ignored" in err
     assert "learning_rate" in err
