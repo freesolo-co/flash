@@ -19,11 +19,11 @@ from flash.providers.base import (
     _run_cost_key,
     canonical_gpu,
     combined_vram_gb,
-    fitting_gpu_count,
     largest_rentable_count,
     providers_for,
     rentable_gpu_counts,
     run_config_for_ranking,
+    wider_shape_remedy,
 )
 
 logger = get_logger(__name__)
@@ -210,16 +210,15 @@ def _resolve_exact_gpu(
     exact_info = GPU_INFO.get(exact)
     if exact_info is None or not exact_info.validated:
         raise UnsupportedGpuError(f"exact GPU {exact!r} is not an active validated GPU class")
+    # a card ceiling is the user's own `[gpu] count`, so a pin that fits at a wider rentable shape
+    # is one flag from working; `above` is the width already tried, so the remedy only ever names
+    # a wider one. bounded by the model's geometry cap so the suggestion is a width verl accepts
+    # rather than one it rejects after the box is rented.
     if exact_info.vram_gb < need and max_gpu_count <= 1:
-        # a single-card ceiling is the user's own `[gpu] count`, so a pin that fits at a wider
-        # rentable shape is one flag from working. name that shape rather than reporting the
-        # single-card need as if it were the whole story. bounded by the model's geometry cap so
-        # the suggested width is one verl accepts, not one it rejects after the box is rented.
-        fits_at = fitting_gpu_count(exact_info.vram_gb, need, ceiling=widest_cap)
-        remedy = f"; it fits on {fits_at} cards -- raise the ceiling with `--gpus {fits_at}`"
         raise UnsupportedGpuError(
             f"exact GPU {exact!r} has {exact_info.vram_gb} GB VRAM, "
-            f"but this run requires at least {need} GB" + (remedy if fits_at > 1 else "")
+            f"but this run requires at least {need} GB"
+            + wider_shape_remedy((exact_info.vram_gb,), need, ceiling=widest_cap, above=1)
         )
     # the widest shape providers actually rent for this ceiling, not the ceiling itself: a pin
     # that only fits at a non-rentable count (3) must be rejected here with a precise reason
@@ -229,14 +228,9 @@ def _resolve_exact_gpu(
         and max_gpu_count > 1
         and combined_vram_gb(exact_info.vram_gb, cap) < need
     ):
-        wider = fitting_gpu_count(exact_info.vram_gb, need, ceiling=widest_cap)
         raise UnsupportedGpuError(
             f"exact GPU {exact!r} cannot fit this run even as a {cap}-card combination"
-            + (
-                f"; it fits on {wider} cards -- raise the ceiling with `--gpus {wider}`"
-                if wider > cap
-                else ""
-            )
+            + wider_shape_remedy((exact_info.vram_gb,), need, ceiling=widest_cap, above=cap)
         )
     exact_providers = providers_for(exact)
     if provider and provider not in exact_providers:

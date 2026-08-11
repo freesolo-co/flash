@@ -431,48 +431,25 @@ def sft_seconds_for_tokens(config: RunConfig, gpu: str, train_tokens: float) -> 
     return flops / (peak * mfu)
 
 
-def _wider_shape_remedy(config: RunConfig, need: float, safe_gpu_count: int, provider: str) -> str:
-    """The `--gpus N` clause a fit failure carries, or "" when no wider shape would fit.
+def _wider_shape_remedy(config: RunConfig, need: float, names: tuple[str, ...]) -> str:
+    """The `--gpus N` clause this quote's fit failure carries; see ``base.wider_shape_remedy``.
 
-    A fit failure at the authored ceiling is a dead end only when no shape the user may ask for
-    holds the run. The search re-runs the SAME fit model over the SAME candidate pool at wider
-    counts, so a suggested N is one this function has proven, not one inferred from total VRAM.
-    Bounded by ``geometry_safe_gpu_cap`` for the model, so it never names a width verl would
-    reject at Ulysses init after the box is rented.
+    ``names`` is the pool the quote already ranked, so the remedy is searched over exactly the
+    classes that were considered -- reusing the caller's provider filtering instead of
+    reconstructing it here and risking a suggestion for a class it never had.
     """
-    from flash.providers.base import (
-        GPU_INFO,
-        MAX_COMBINATION_CARDS,
-        canonical_gpu,
-        combined_vram_gb,
-        providers_for,
-        rentable_gpu_counts,
-    )
+    from flash.providers.base import GPU_INFO, MAX_COMBINATION_CARDS, wider_shape_remedy
 
-    # the authored ceiling is what limited the search above; the geometry cap at the MAXIMUM
-    # rentable width is what actually bounds a suggestion.
-    widest = geometry_safe_gpu_cap(
-        config.model_id, MAX_COMBINATION_CARDS, model_revision=config.model_revision
+    # the authored ceiling limited the ranking above; the geometry cap at the MAXIMUM rentable
+    # width is what bounds a suggestion.
+    return wider_shape_remedy(
+        (GPU_INFO[gpu].vram_gb for gpu in names),
+        need,
+        ceiling=geometry_safe_gpu_cap(
+            config.model_id, MAX_COMBINATION_CARDS, model_revision=config.model_revision
+        ),
+        above=config.gpu_count,
     )
-    if widest <= safe_gpu_count:
-        return ""
-    names = (
-        (canonical_gpu(config.gpu_type),)
-        if config.gpu_type
-        else tuple(info.name for info in GPU_INFO.values() if info.validated)
-    )
-    best = 0
-    for gpu in names:
-        info = GPU_INFO.get(gpu)
-        if info is None or (provider != "auto" and provider not in providers_for(gpu)):
-            continue
-        for count in sorted(rentable_gpu_counts(widest)):
-            if count > safe_gpu_count and combined_vram_gb(info.vram_gb, count) >= need:
-                best = count if best == 0 else min(best, count)
-                break
-    if best == 0:
-        return ""
-    return f"; it fits on {best} cards -- raise the card ceiling with `--gpus {best}`"
 
 
 def _offline_gpu_shape(
@@ -519,14 +496,16 @@ def _offline_gpu_shape(
         # precheck - overstated cost against a cheaper shape `allocate()` would really pick. the
         # `providers_for` filter below narrows this pool to the classes the provider can provision.
         names = tuple(info.name for info in GPU_INFO.values() if info.validated)
+    # narrow the pool ONCE, here: the ranking below and the fit-failure remedy must consider the
+    # same classes, and a filter applied inside the loop is invisible to anything after it.
+    if provider != "auto":
+        names = tuple(gpu for gpu in names if provider in providers_for(gpu))
     safe_gpu_count = geometry_safe_gpu_cap(
         config.model_id, config.gpu_count, model_revision=config.model_revision
     )
     ranked = []
     for gpu in names:
         info = GPU_INFO[gpu]
-        if provider != "auto" and provider not in providers_for(gpu):
-            continue
         for count in rentable_gpu_counts(safe_gpu_count):
             if combined_vram_gb(info.vram_gb, count) < need:
                 continue
@@ -557,10 +536,7 @@ def _offline_gpu_shape(
                 )
             )
     if not ranked:
-        # the ceiling that produced this failure is the geometry-capped one, not the authored
-        # `[gpu] count`: a wider shape the geometry cap already excluded is not actually available,
-        # so suggesting it would send the user to a second, less obvious rejection.
-        remedy = _wider_shape_remedy(config, need, safe_gpu_count, provider)
+        remedy = _wider_shape_remedy(config, need, names)
         if config.gpu_type:
             info = GPU_INFO[canonical_gpu(config.gpu_type)]
             raise ValueError(
