@@ -130,10 +130,10 @@ def _api_error(exc: urllib.error.HTTPError) -> ApiError:
 def _unexpected_response(api_url: str, path: str, problem: str) -> ClientError:
     """The one error for a 2xx body this client cannot use.
 
-    A body that is not JSON and valid JSON of the wrong shape are the same user state -- something
-    other than a Flash control plane answered -- so both get the hint ``flash login`` already gives
-    (see ``_verify_key_against_plane``) instead of escaping as a bare ``json.JSONDecodeError`` or
-    ``KeyError``, which nothing in the CLI translates into an error message.
+    A body that is not JSON and valid JSON of the wrong shape are the same user state (something
+    other than a Flash control plane answered), so both carry the hint ``flash login`` already
+    gives, see ``_verify_key_against_plane``. Nothing in the CLI turns a raw
+    ``json.JSONDecodeError`` or ``KeyError`` into an error message, so neither may escape.
     """
     return ClientError(
         f"{api_url}{path} {problem}. Check that --api-url points at your Flash control plane "
@@ -516,7 +516,7 @@ class ApiClient:
 
         Every response body this client reads goes through here, so a proxy answering
         ``200 text/html`` and a plane answering the wrong shape both surface as the same
-        ``ClientError``. An empty body stays ``{}``, as it always did.
+        ``ClientError``. An empty body decodes to ``{}``.
         """
         try:
             payload = json.loads(raw) if raw else {}

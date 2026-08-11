@@ -157,8 +157,7 @@ def _stub_plane(content_type: str, body: bytes):
     """Stand in for the control plane, answering every GET 200 with one fixed body.
 
     `--api-url` is a supported path, so "a reverse proxy or an older plane answered" is a real
-    user state. Neither body below is something the CLI can use, and both used to reach the user
-    as a raw exception message.
+    user state. Neither body below is something the CLI can use.
     """
 
     class Handler(BaseHTTPRequestHandler):
@@ -182,7 +181,6 @@ def _stub_plane(content_type: str, body: bytes):
 
 
 def test_wrong_shape_plane_response_is_friendly():
-    # was: `KeyError: 'runs'` with a traceback, or a bare `error: 'runs'` on a TTY.
     with (
         _stub_plane("application/json", b'{"hello": "world"}') as url,
         tempfile.TemporaryDirectory() as tmp,
@@ -204,7 +202,6 @@ def test_wrong_shape_plane_response_is_friendly():
 
 
 def test_non_json_login_response_is_friendly():
-    # was: `error: Expecting value: line 1 column 1 (char 0)`, bypassing the login_failed card.
     with (
         _stub_plane("text/html", b"<html>hi</html>") as url,
         tempfile.TemporaryDirectory() as tmp,

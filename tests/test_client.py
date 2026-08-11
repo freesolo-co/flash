@@ -1001,7 +1001,7 @@ def test_deployment_for_bounds_the_read(monkeypatch):
 
 @contextlib.contextmanager
 def _fixed_2xx_server(content_type: str, body: bytes):
-    """A server that answers every GET 200 with one fixed body — a proxy, or another service."""
+    """A server that answers every GET 200 with one fixed body, like a proxy or another service."""
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -1024,7 +1024,7 @@ def _fixed_2xx_server(content_type: str, body: bytes):
 
 
 def test_wrong_shape_2xx_names_the_endpoint_and_the_missing_key():
-    """Valid JSON of the wrong shape used to escape as a bare KeyError nothing translates."""
+    """Valid JSON of the wrong shape must not escape as a bare KeyError nothing translates."""
     with _fixed_2xx_server("application/json", b'{"hello": "world"}') as url:
         client = ApiClient(url, "fslo-user-test", timeout=5)
         cases = [
@@ -1043,7 +1043,7 @@ def test_wrong_shape_2xx_names_the_endpoint_and_the_missing_key():
 
 
 def test_non_json_2xx_is_a_client_error_not_a_decode_error():
-    """A reverse proxy answering 200 text/html leaked `Expecting value: line 1 column 1`."""
+    """A reverse proxy answering 200 text/html must not leak `Expecting value: line 1 column 1`."""
     with _fixed_2xx_server("text/html", b"<html>hi</html>") as url:
         client = ApiClient(url, "fslo-user-test", timeout=5)
         with pytest.raises(ClientError) as caught:
@@ -1055,6 +1055,6 @@ def test_non_json_2xx_is_a_client_error_not_a_decode_error():
 
 
 def test_empty_2xx_body_still_decodes_to_an_empty_object():
-    """`_request` has always turned an empty 2xx body into {}; the decode guard must not change it."""
+    """An empty 2xx body decodes to {}, so callers reading a dict from it still get one."""
     with _fixed_2xx_server("application/json", b"") as url:
         assert ApiClient(url, "fslo-user-test", timeout=5).me() == {}
