@@ -500,6 +500,50 @@ def test_bootstrap_extra_pip_retries_a_network_interrupted_vcs_clone(monkeypatch
     assert len(calls) == 2  # retried the clone instead of failing the run as a user error
 
 
+def test_bootstrap_extra_pip_survives_undecodable_bytes_from_a_build_child(monkeypatch):
+    # a build or VCS child can emit bytes invalid under the worker's locale. text=True decodes
+    # strictly, so iterating the stream raised UnicodeDecodeError before the exit status was ever
+    # read, failing a paid run whose install had actually succeeded.
+    from flash.providers._lifecycle import bootstrap as lb
+
+    seen_kwargs = {}
+
+    class _StrictProc:
+        """Decodes its bytes the way Popen would, honouring the errors policy it was given."""
+
+        def __init__(self, raw, rc, errors):
+            self._text = raw.decode("utf-8", errors=errors or "strict")
+            self._rc = rc
+
+        @property
+        def stdout(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def __iter__(self):
+            return iter(self._text.splitlines(keepends=True))
+
+        def wait(self):
+            return self._rc
+
+    def fake_popen(cmd, *, env=None, errors=None, **_kwargs):
+        seen_kwargs["errors"] = errors
+        return _StrictProc(
+            b"Collecting some-pkg\n\xff\xfe bad bytes\nSuccessfully installed\n", 0, errors
+        )
+
+    monkeypatch.setattr(lb.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(lb.time, "sleep", lambda _s: None)
+
+    lb.install_extra_pip(_pip_payload())  # would raise UnicodeDecodeError under strict decoding
+    assert seen_kwargs["errors"] == "replace"
+
+
 def test_bootstrap_extra_pip_transient_only_text_still_retries(monkeypatch):
     # regression guard: transient text alone (no terminal-shape text anywhere in the tail) must
     # still walk the full retry ladder and end retriable, unchanged by the terminal-precedence check.
@@ -1132,6 +1176,58 @@ def test_interrupt_while_the_cacheless_launch_request_is_in_flight_reaps_by_labe
 
     assert calls == ["cached", "cold"]
     assert reaped == ["flash-1700000000-abcd1234"]  # only the label can name that box
+
+
+def test_cacheless_retry_that_never_reaches_its_request_does_not_reap_the_run_label(monkeypatch):
+    """A deadline miss before the cache-less create rented nothing, so the label must not be reaped.
+
+    terminate_run_instances(run_id) kills every concurrently-launched seed sharing the run id. Only
+    a window where this seed may hold an unnamed box justifies that, and the preflight is not one:
+    require_create_allowance raises before any create is issued.
+    """
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(
+        lambda_api, "ensure_filesystem", lambda n, r, deadline_at=None: f"/lambda/nfs/{n}"
+    )
+    reaped: list[str] = []
+    monkeypatch.setattr(jobs, "terminate_run_instances", lambda run_id: reaped.append(run_id) or [])
+
+    calls: list[str] = []
+
+    def fake_launch(*, file_system_names=None, **_kwargs):
+        calls.append("cold" if file_system_names is None else "cached")
+        if file_system_names is None:
+            raise AssertionError("the cache-less request must not be issued past the deadline")
+        raise lambda_api.LambdaApiError(
+            "POST /instance-operations/launch -> HTTP 400: file_system_names not attachable"
+        )
+
+    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
+
+    # the allowance check fails only on the retry, so the cached attempt still runs and rejects.
+    seen = []
+
+    def fake_allowance(_deadline_at):
+        seen.append(1)
+        if len(seen) > 1:
+            raise TimeoutError("no create allowance left")
+
+    monkeypatch.setattr(jobs, "require_create_allowance", fake_allowance)
+
+    with pytest.raises(TimeoutError):
+        _launch(
+            jobs,
+            _spec(network_volume="flash-weights"),
+            seed=0,
+            instances=[_inst()],
+            attempt=0,
+        )
+
+    assert calls == ["cached"]  # the cold request was never issued
+    assert reaped == []  # so no concurrent seed of this run was terminated
 
 
 def test_launch_raises_when_no_capacity(monkeypatch):

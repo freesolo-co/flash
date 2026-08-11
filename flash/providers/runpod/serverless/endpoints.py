@@ -232,12 +232,16 @@ def _train_body(input_data: dict) -> dict:
                 for pip_attempt in range(len(pip_retry_delays) + 1):
                     _require_deadline_allowance()
                     tail = collections.deque(maxlen=400)
+                    # errors="replace": a build or VCS child can emit bytes invalid under the
+                    # container's locale, and strict decoding raises mid-stream, failing a paid
+                    # run whose install actually succeeded.
                     pip_proc = subprocess.Popen(
                         args,
                         env=extra_env,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
                         text=True,
+                        errors="replace",
                     )
                     with pip_proc.stdout:  # tee so a long install still streams into the console
                         for line in pip_proc.stdout:
@@ -460,6 +464,7 @@ def _train_body(input_data: dict) -> dict:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
+                    errors="replace",
                 )
                 uploader = threading.Thread(target=_upload_loop, daemon=True)
                 uploader.start()

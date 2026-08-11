@@ -20,6 +20,7 @@ import threading
 import time
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from subprocess import PIPE, STDOUT
 
 PAYLOAD_PATH = "/root/flash/payload.json"
 CODE_ROOT = "/runcode"
@@ -576,8 +577,8 @@ def _extra_pip_env(payload: dict) -> tuple[dict[str, str], str | None]:
 def install_extra_pip(payload: dict) -> None:
     """Install the run's extra requirements; retry an index blip, fail fast on a bad package spec.
 
-    Same precedent as the pre-worker HF fetches: an index blip is infra, not user error, so it retries in place and then
-    surfaces as ``RetriableBootstrapError`` instead of terminally failing a paid run."""
+    Same precedent as the pre-worker HF fetches: an index blip is infra, not user error, so it
+    retries in place and surfaces as ``RetriableBootstrapError`` rather than failing a paid run."""
     extra_pip = payload.get("extra_pip") or []
     if not extra_pip:
         return
@@ -587,8 +588,11 @@ def install_extra_pip(payload: dict) -> None:
         for attempt in range(len(_PIP_RETRY_DELAYS_S) + 1):
             deadline_at = require_deadline_at(payload) if "deadline_at" in payload else None
             tail = collections.deque(maxlen=_PIP_OUTPUT_TAIL_LINES)
+            # errors="replace": a build or VCS child can emit bytes invalid under the worker's
+            # locale, and strict decoding raises mid-stream, failing a paid run whose install
+            # actually succeeded. undecodable bytes are diagnostics, never the exit status.
             proc = subprocess.Popen(
-                args, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+                args, env=env, stdout=PIPE, stderr=STDOUT, text=True, errors="replace"
             )
             with proc.stdout:  # tee so a long install still streams into the box console
                 for line in proc.stdout:
@@ -608,10 +612,8 @@ def install_extra_pip(payload: dict) -> None:
             delay = _PIP_RETRY_DELAYS_S[attempt]
             if deadline_at is not None:
                 delay = min(delay, max(0.0, deadline_at - time.time()))
-            print(
-                f"extra_pip install hit a transient index error; retrying in {delay:.0f}s",
-                flush=True,
-            )
+            msg = f"extra_pip install hit a transient index error; retrying in {delay:.0f}s"
+            print(msg, flush=True)
             if delay > 0:
                 time.sleep(delay)
     finally:
@@ -666,8 +668,7 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     upload_deadline_at, reaping_deadline_at = _upload_cleanup_deadlines(deadline_ts)
     worker_deadline_at = _worker_execution_deadline(upload_deadline_at)
     # cap work from its actual start: the absolute deadline includes boot grace, whose unused
-    # portion
-    # must not extend the declared wall-time budget.
+    # portion must not extend the declared wall-time budget.
     budget = payload.get("run_max_wall_seconds")
     if isinstance(budget, (int, float)) and not isinstance(budget, bool):
         budget = float(budget)
@@ -685,14 +686,11 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         proc = subprocess.Popen(
             [sys.executable, "-m", "flash.engine.worker_entrypoint"],
             cwd=code_dir,
-            env={
-                **env,
-                "RUN_MODE": mode,
-                "FLASH_RUN_DEADLINE_AT": str(worker_deadline_at),
-            },
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            env={**env, "RUN_MODE": mode, "FLASH_RUN_DEADLINE_AT": str(worker_deadline_at)},
+            stdout=PIPE,
+            stderr=STDOUT,
             text=True,
+            errors="replace",
         )
         pump_done = threading.Event()
         pump_write_lock = threading.Lock()

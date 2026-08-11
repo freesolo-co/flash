@@ -292,6 +292,25 @@ def _lambda_job_handle(instance_id: str, inst: LambdaInstance, name: str, attemp
 _EXACT_CLEANUP_ATTR = "_flash_exact_cleanup_done"
 
 
+class _CoarseReapGuard:
+    """Whether an unnamed box may be rented right now, so the run-label reap owes it a sweep.
+
+    Armed for exactly the window a launch request is in flight with no instance id in hand, and
+    disarmed the moment some path proves nothing stayed rented or that the exact instance was
+    already terminated. It is an object rather than a local so the cache-less retry can arm it
+    around its own request instead of the caller arming across that whole call.
+    """
+
+    def __init__(self) -> None:
+        self.armed = False
+
+    def arm(self) -> None:
+        self.armed = True
+
+    def disarm(self) -> None:
+        self.armed = False
+
+
 def _mark_exact_cleanup(error: BaseException) -> None:
     with contextlib.suppress(BaseException):  # builtin exceptions accept attributes; be safe anyway
         setattr(error, _EXACT_CLEANUP_ATTR, True)
@@ -324,11 +343,19 @@ def _publish_launched_instance(
 
 
 def _retry_launch_without_cache(
-    plan: _LaunchPlan, inst: LambdaInstance, say
+    plan: _LaunchPlan, inst: LambdaInstance, say, arm_reap
 ) -> tuple[LambdaJobHandle | None, Exception | None]:
+    """Rent a cache-less box for this region, arming the caller's coarse reap around the request.
+
+    ``arm_reap`` is called immediately before the launch request and only then: everything else
+    here (the preamble ``say``, the deadline precheck, an ambiguous reject that already reconciled)
+    rents nothing this seed owes a run-label reap for, and reaping on those paths would terminate
+    every other concurrent seed sharing the run id.
+    """
     say(f"retrying {inst.region} WITHOUT the weight cache (attach may have caused the reject)")
     try:
         require_create_allowance(plan.absolute_deadline)
+        arm_reap()
         instance_id = lambda_api.launch_instance(
             region_name=inst.region,
             instance_type_name=inst.instance_type,
@@ -339,6 +366,8 @@ def _retry_launch_without_cache(
             **deadline_kwargs(lambda_api.launch_instance, plan.absolute_deadline),
         )
     except lambda_api.LambdaApiError as error:
+        # a clean reject rented nothing and an ambiguous one is reconciled here, so neither leaves
+        # an unnamed box for the caller's coarse reap; it is disarmed on both paths by returning.
         cold_detail = sanitize_diagnostic(error, limit=1000)
         if not _launch_rejection_is_clean(error):
             _abort_ambiguous_launch(plan.spec.run_id, type(error).__name__)
@@ -525,7 +554,7 @@ def launch_and_submit(
     last_err: Exception | None = None
     # armed only while a launch request is in flight and no instance id is in hand yet: the
     # provider may have billed a box nothing can name, so the run label is the only way to reap it.
-    launch_attempted = False
+    reap = _CoarseReapGuard()
     try:
         while candidates:
             inst = candidates.pop(0)
@@ -538,7 +567,7 @@ def launch_and_submit(
                 continue
             try:
                 require_create_allowance(absolute_deadline)
-                launch_attempted = True
+                reap.arm()
                 instance_id = lambda_api.launch_instance(
                     region_name=inst.region,
                     instance_type_name=inst.instance_type,
@@ -551,7 +580,7 @@ def launch_and_submit(
             except lambda_api.LambdaApiError as e:
                 # a clean reject rented nothing, and an ambiguous one is reconciled by
                 # _abort_ambiguous_launch below, so neither owes the outer guard a label reap.
-                launch_attempted = False
+                reap.disarm()
                 last_err = e
                 detail = sanitize_diagnostic(e, limit=1000)
                 if not _launch_rejection_is_clean(e):
@@ -567,16 +596,14 @@ def launch_and_submit(
                     tok in str(e).lower() for tok in ("file_system", "filesystem", "file-system")
                 )
                 if mode != "preload" and fs_attach_reject:
-                    # the cache-less retry rents its own box. The guard stays ARMED across the whole
-                    # call: an interrupt while that request is in flight can leave an instance
-                    # created but unnamed, and only the run-label reap can find it. Disarming on
-                    # every exit (the previous shape) left exactly that window owned by nobody.
-                    # _publish_launched_instance stamps the exception when it terminates the exact
-                    # instance, which is what stands the coarse reap down.
-                    launch_attempted = True
-                    handle, last_err = _retry_launch_without_cache(plan, inst, say)
+                    # the cache-less retry rents its own box, and arms the guard itself immediately
+                    # before that request: an interrupt while it is in flight can leave an instance
+                    # created but unnamed, and only the run-label reap can find it. Arming across
+                    # the whole call instead would reap on paths that rented nothing (a deadline
+                    # miss in the precheck, a raising preamble) or that already cleaned up exactly.
+                    handle, last_err = _retry_launch_without_cache(plan, inst, say, reap.arm)
                     # a returned handle publishes the box; None means nothing stayed rented.
-                    launch_attempted = False
+                    reap.disarm()
                     if handle is not None:
                         return handle
                 # Preload must not refresh to a different region (would warm the wrong one).
@@ -602,13 +629,13 @@ def launch_and_submit(
             # stamps the exception and the outer guard stands down, so the reap never layers on top
             # of an exact cleanup (which would kill every other concurrent seed of this run).
             handle = _publish_launched_instance(plan, instance_id, inst, say, message)
-            launch_attempted = False
+            reap.disarm()
             return handle
         return _raise_all_regions_rejected(spec, tried_regions, last_err)
     except BaseException as error:
         # armed for every window where a box may be rented but unnamed; stands down only once some
         # inner path proved it already terminated that exact instance.
-        if launch_attempted and not _exact_cleanup_taken(error):
+        if reap.armed and not _exact_cleanup_taken(error):
             with contextlib.suppress(BaseException):
                 terminate_run_instances(spec.run_id)
         raise
