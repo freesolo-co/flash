@@ -423,15 +423,24 @@ def estimate_vram_gb(
 
 
 # gc-off activation factors are empirical and geometry-specific; the estimate scales with
-# layers*batch*seq*hidden. both are live-GPU fits: dense 65.0 from an RTX 5090, MoE 196.9 from a
-# B200 running Qwen3.6-35B-A3B. remeasure before widening the >=120 GB dense gate.
+# layers*batch*seq*hidden. dense 65.0 is a live RTX 5090 fit against successful peaks. remeasure
+# before widening the >=120 GB dense gate.
 #
 # the MoE factor was 18.0 -- a guess, carried on the assumption that ~3B active params imply small
 # activations. that is wrong: routing is per-token, so every one of the 40 layers still
-# materializes a full activation set, and the wide expert stack makes each one large. the measured
-# step (micro_batch=1, seq 1404, the smallest this platform can express) peaked at 180.3 GB where
-# 18.0 predicted 139.1 GB, so the gate called a run that OOMs a fit -- on BOTH an H200 and a B200.
-# see test_moe_activation_constant_matches_the_live_b200_peak.
+# materializes a full activation set, and the wide expert stack makes each one large. 18.0 called a
+# run that OOMs a fit, on BOTH an H200 and a B200.
+#
+# 196.9 is NOT a measured activation cost. It is the residual that makes this equation's TOTAL
+# (weights + overhead + adapter + activations) land on the allocated-at-OOM boundary of the run in
+# test_moe_activation_constant_matches_the_live_b200_peak, at that run's rank 64. Two reasons it
+# cannot be read as an activation measurement: the run died, so 180.3 GB is a lower bound on what
+# the step needed, not a peak it reached; and verl's "After FSDP" baseline is logged BEFORE the
+# optimizer is built (transformer_impl.py:565 vs :569) and divides by 1024**3, so the tempting
+# "allocated minus resident" subtraction mixes units AND counts optimizer state as activation.
+# Calibrating the total sidesteps both, since `base` already carries the adapter/optimizer term.
+# A true activation coefficient needs a post-optimizer baseline and a SUCCESSFUL peak measurement;
+# until someone takes one, treat this as a fit-gate boundary and re-derive it the same way.
 _GC_OFF_ACT_K_DENSE = 65.0
 _GC_OFF_ACT_K_MOE = 196.9
 

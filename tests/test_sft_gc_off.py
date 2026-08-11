@@ -2,7 +2,7 @@
 
 GC recomputes the forward in the backward (~+33% compute) to save activation memory. For a big MoE
 with a cheap ~3B active backbone + fused CE (Liger FLCE drops the [B,T,vocab] logit spike), the
-no-recompute activations FIT a 141 GB H200 / 180 GB B200 with margin — so GC is pure tax and we turn
+no-recompute activations were assumed to FIT an H200 / B200 with margin — so GC is pure tax and we turn
 it OFF. The gate is conservative: it only fires with the SFT signals (``allow_disable=True``), keeps
 GC on for the 80 GB H100 / long context / unknown dims, and never touches the colocated GRPO trainer.
 """
@@ -136,22 +136,27 @@ def test_dense_and_moe_activation_constants_are_separate():
 
 
 def test_moe_activation_constant_matches_the_live_b200_peak():
-    """The MoE K is a live measurement, and it must reject the run that actually OOM'd.
+    """The MoE K is calibrated to a live OOM boundary, and must reject the run that hit it.
 
     Run ``flash-1786414384-2273e8d6``, 1x B200, Qwen3.6-35B-A3B, LoRA rank 64, fused CE, at the
     SMALLEST step this platform can express (micro_batch=1, max_token_len_per_gpu=1404):
 
-        After FSDP, memory allocated (GB): 79.60
         torch.OutOfMemoryError ... Of the allocated memory 167.91 GiB is allocated by PyTorch
 
-    167.91 GiB is 180.3 decimal GB, which is what this estimator predicts in. The card reports
-    178.35 GiB == 191.5 decimal GB via ``torch.cuda.get_device_properties(0).total_memory / 1e9``,
-    the exact expression that feeds ``card_vram_gb``. So the gate must call this configuration a
-    NON-fit; at 18.0 it predicted 139.1 GB, declared "GC-off peak fits", and the run died at step 0.
+    167.91 GiB is 180.3 decimal GB, and this estimator predicts in decimal GB: the card reports
+    178.35 GiB == 191.5 GB via ``torch.cuda.get_device_properties(0).total_memory / 1e9``, the exact
+    expression that feeds ``card_vram_gb``. Because the run DIED there, 180.3 GB is a lower bound on
+    what the step needed, not a peak it achieved -- so the estimator's TOTAL is pinned to it as a
+    fit-gate boundary, and the gate must call this configuration a NON-fit. At 18.0 it predicted
+    139.1 GB, declared "GC-off peak fits", and the run died at step 0.
+
+    Do NOT re-derive this from "allocated minus After-FSDP": that baseline is logged before the
+    optimizer exists and in GiB despite its "(GB)" label, so the subtraction mixes units and counts
+    optimizer state as activation. See the note on ``_GC_OFF_ACT_K_MOE``.
     """
     moe64 = {**_MOE, "batch": 1, "lora_rank": 64}
     peak = sft_gc_off_peak_gb(35.0, seq_len=1404, **moe64)
-    assert 178.0 < peak < 183.0, f"estimate {peak:.1f} GB drifted from the 180.3 GB live peak"
+    assert 178.0 < peak < 183.0, f"estimate {peak:.1f} GB drifted from the 180.3 GB OOM boundary"
     # the decisive assertion: this exact configuration must NOT be allowed to run GC-off.
     assert sft_grad_checkpoint_can_disable(35.0, seq_len=1404, card_vram_gb=191.5, **moe64) is False
     # and the H200 it was first scheduled onto (139.80 GiB == 150.1 GB) is rejected too.
@@ -201,13 +206,13 @@ def test_can_disable_needs_a_short_step_not_just_a_big_card():
 
 def test_can_disable_keeps_gc_at_long_context():
     # A long (8k) SFT context pushes the no-recompute activations past the H200 -> keep GC on.
-    assert sft_grad_checkpoint_can_disable(35.0, seq_len=8192, card_vram_gb=141.0, **_MOE) is False
+    assert sft_grad_checkpoint_can_disable(35.0, seq_len=8192, card_vram_gb=150.1, **_MOE) is False
 
 
 def test_can_disable_conservative_on_unknown_card_or_dims():
     assert sft_grad_checkpoint_can_disable(35.0, seq_len=2368, card_vram_gb=0.0, **_MOE) is False
     bad = {**_MOE, "hidden": 0}
-    assert sft_grad_checkpoint_can_disable(35.0, seq_len=2368, card_vram_gb=141.0, **bad) is False
+    assert sft_grad_checkpoint_can_disable(35.0, seq_len=2368, card_vram_gb=150.1, **bad) is False
 
 
 def test_gate_turns_gc_off_for_35b_on_b200():
@@ -249,13 +254,13 @@ def test_gate_keeps_gc_on_for_the_step_that_oomed_the_b200():
 
 
 def test_gate_keeps_gc_on_for_35b_on_h200():
-    # the 141 GB H200 can no longer hold the GC-off peak once the experts are trained, so the gate
+    # the 150.1 GB H200 (139.80 GiB) can no longer hold the GC-off peak once the experts are trained, so the gate
     # must keep gradient checkpointing ON there rather than disabling it into an OOM.
     on = grad_checkpointing_on(
         "Qwen/Qwen3.6-35B-A3B",
         2368,
         allow_disable=True,
-        card_vram_gb=141.0,
+        card_vram_gb=150.1,
         capability=(9, 0),
         active_params_b=3.0,
         hidden=2048,
@@ -288,7 +293,7 @@ def test_gate_keeps_gc_on_when_fused_ce_off():
         "Qwen/Qwen3.6-35B-A3B",
         2368,
         allow_disable=True,
-        card_vram_gb=141.0,
+        card_vram_gb=150.1,
         capability=(9, 0),
         active_params_b=3.0,
         hidden=2048,
@@ -305,7 +310,7 @@ def test_gate_unchanged_without_disable_signal():
     # Even passing GPU signals positionally-free: without allow_disable they're ignored.
     assert (
         grad_checkpointing_on(
-            "Qwen/Qwen3.6-35B-A3B", 2368, card_vram_gb=141.0, capability=(9, 0), fused_ce=True
+            "Qwen/Qwen3.6-35B-A3B", 2368, card_vram_gb=150.1, capability=(9, 0), fused_ce=True
         )
         is True
     )
@@ -365,6 +370,7 @@ def test_size_gate_reads_the_catalog_not_a_dense_param_estimate():
     small catalog change (a narrower vocab, fewer layers) would silently flip it to "small model,
     no gradient checkpointing needed" on a 35B MoE.
     """
+    import flash.engine.worker.perf.liger as liger_mod
     from flash.core.catalog import MODELS
     from flash.engine.worker.perf.liger import _LIGER_MIN_PARAMS, _estimate_params
 
@@ -379,6 +385,16 @@ def test_size_gate_reads_the_catalog_not_a_dense_param_estimate():
     assert MODELS["Qwen/Qwen3.6-35B-A3B"].params_b == 35.0
     # the margin the old path depended on: 1% of the threshold, on an 11.5x-larger model.
     assert 1.0 < estimate / _LIGER_MIN_PARAMS < 1.02
+    # the assertions above only describe the formula -- they hold with or without the fix. this is
+    # the one that pins the BEHAVIOR: a cataloged model must answer without consulting the probe.
+    calls = []
+    original = liger_mod._estimate_params
+    try:
+        liger_mod._estimate_params = lambda cfg: calls.append(cfg) or original(cfg)
+        assert liger_mod._liger_default_for_model("Qwen/Qwen3.6-35B-A3B") is True
+    finally:
+        liger_mod._estimate_params = original
+    assert calls == [], "cataloged model fell through to the dense config probe"
 
 
 def test_size_gate_is_offline_and_fail_safe_for_cataloged_models(monkeypatch):
