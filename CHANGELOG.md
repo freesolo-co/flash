@@ -21,6 +21,12 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Fixed
 
+- `flash-server` reported missing operator configuration as an unhandled ASGI startup
+  exception, so the actionable message arrived under ~20 frames of starlette/contextlib. The
+  refusing half of the preflight now runs before uvicorn starts, and `flash-server` prints
+  `error: ...` and exits 3 (uvicorn's `STARTUP_FAILURE`, which this path already used, so
+  supervision keying on it is unaffected). The advisory warnings still come from the lifespan
+  alone, so a booted plane logs them once.
 - `flash env test` blamed the reward function for a gold answer that scored zero, when the
   gold completion is equally likely to be at fault: with no `sft_completion` hook the replayed
   answer is the dataset row's raw `output`, so a dataset whose `output` is a bare value fails a
