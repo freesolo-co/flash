@@ -245,7 +245,17 @@ def _validate_deploy_request(
 
     Returns the effective spec and the current deployment record for the caller to work from.
     """
-    if spec.model_revision:
+    # serving resolves the base model BY NAME (`deploy_adapter` takes no base-revision argument),
+    # so a pin the AUTHOR wrote is a request serving cannot honour: the run would train against one
+    # commit and serve whatever the catalog tag points at today. That silent mismatch stays refused.
+    #
+    # A pin the RUNNER assigned is different. SFT is force-pinned by
+    # `runner.submit.prepare_job` -> `_resolve_model_revision(required=True)` so workload profiling
+    # keys on an immutable commit; the user never asked for it and cannot opt out. Rejecting those
+    # made every SFT run, and every adapter warm-started from one, permanently undeployable --
+    # which also blocks `flash models chat` and `flash env eval`, since both require a deployment.
+    # The advice below ("train without model_revision") was impossible to follow for SFT.
+    if spec.model_revision and not spec.model_revision_auto:
         raise HTTPException(
             status_code=400,
             detail=(

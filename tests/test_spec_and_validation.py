@@ -986,6 +986,78 @@ def test_model_revision_strips_round_trips_and_rejects_non_strings() -> None:
             _job_from_dict({"model_revision": value})
 
 
+def test_model_revision_auto_is_platform_managed_and_survives_the_public_round_trip() -> None:
+    """The marker records WHO pinned the base model, and only the runner may set it.
+
+    It must survive `to_dict()` unlike the other platform-managed carriers: deploy rebuilds the
+    spec from the persisted PUBLIC status (submit stores `spec=public_spec.to_dict()`), so a
+    stripped marker would always read False there and the deploy guard could not tell a
+    runner-assigned pin from an authored one.
+    """
+    auto = JobSpec(model="Qwen/Qwen3.5-9B", model_revision="c" * 40, model_revision_auto=True)
+    assert auto.to_dict()["model_revision_auto"] is True
+    assert JobSpec.from_dict(auto.to_dict()).model_revision_auto is True
+    assert JobSpec.from_json(auto.to_json()).model_revision_auto is True
+
+    # a user cannot forge it: it is absent from _TOP_LEVEL_KEYS, so the public parser refuses it
+    with pytest.raises(ConfigError, match=r"unknown config key\(s\): model_revision_auto"):
+        spec_from_dict(_raw(model_revision="c" * 40, model_revision_auto=True))
+
+    # an authored pin, and a spec persisted before the field existed, both read False
+    assert spec_from_dict(_raw(model_revision="c" * 40)).model_revision_auto is False
+    assert _job_from_dict({"model": "Qwen/Qwen3.5-9B"}).model_revision_auto is False
+
+    # the marker qualifies a pin and cannot outlive one
+    assert replace(auto, model_revision="").model_revision_auto is False
+
+
+def test_model_revision_auto_does_not_change_pre_existing_preparation_digests() -> None:
+    """A snapshot prepared before this field existed must still rehash to its stored digest.
+
+    `_preparation_digest` has to reproduce the bytes that were hashed, not today's serialization,
+    or a still-valid warm-start or workload-profile run fails integrity validation on recovery.
+    """
+    from flash.runner.preparation import _preparation_digest
+
+    unmarked = JobSpec(model="Qwen/Qwen3.5-9B", algorithm="sft", model_revision="c" * 40)
+
+    # rebuild the pre-upgrade bytes: the same payload this build produces, minus the key that did
+    # not exist then. mirrors _preparation_digest's own omission list rather than re-deriving it,
+    # so the control cannot drift from the code under test.
+    worker_payload = unmarked.to_internal_dict()
+    for key in (
+        "workload_profile_kind",
+        "workload_profile_input_digest",
+        "workload_profile_producer_version",
+        "workload_profile",
+    ):
+        if not worker_payload.get(key):
+            worker_payload.pop(key, None)
+    worker_payload.pop("model_revision_auto", None)
+    public_payload = unmarked.to_dict()
+    public_payload.pop("model_revision_auto", None)
+
+    payload = json.dumps(
+        {
+            "version": 1,
+            "public_spec": public_payload,
+            "worker_spec": worker_payload,
+            "adapter_identity": None,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    import hashlib
+
+    legacy = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    assert _preparation_digest(unmarked, unmarked, None) == legacy
+
+    # a marked run still binds the marker into its digest, so tampering remains detectable
+    marked = replace(unmarked, model_revision_auto=True)
+    assert _preparation_digest(marked, marked, None) != legacy
+
+
 def test_unknown_top_level_scalar_and_jobspec_gpu_shapes_fail_closed() -> None:
     with pytest.raises(ConfigError, match=r"unknown config key\(s\): model_revison"):
         spec_from_dict(_raw(model_revison="main"))

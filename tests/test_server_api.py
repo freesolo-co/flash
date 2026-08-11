@@ -3008,6 +3008,39 @@ def test_deploy_rejects_revision_pinned_base_model(api):
     assert "does not support revision-pinned base models" in response.json()["detail"]
 
 
+def test_deploy_allows_runner_assigned_revision_pin(api):
+    """An SFT run pinned BY THE RUNNER stays deployable.
+
+    `runner.submit.prepare_job` calls `_resolve_model_revision(required=True)` for every SFT run,
+    so its stored spec always carries a revision the user never authored and cannot opt out of.
+    Rejecting it made every SFT run -- and every adapter warm-started from one -- permanently
+    undeployable, which also blocks `flash models chat` and `flash env eval`.
+
+    The paired control is `test_deploy_rejects_revision_pinned_base_model` above: same route, same
+    revision value, marker absent -> still 400. Only the marker differs, so a pass here with a pass
+    there isolates the change to who chose the pin.
+    """
+    import flash.runner as runner
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.spec["model_revision"] = "a" * 40
+    status.spec["model_revision_auto"] = True
+    runner._save_status(status)
+
+    response = api.post(
+        f"/v1/runs/{run_id}/deploy",
+        json={"dry_run": True},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code != 400, response.json()
+    assert "revision-pinned" not in json.dumps(response.json())
+
+
 def test_deploy_dry_run_does_not_reconcile_unknown_alias(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod

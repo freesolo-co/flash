@@ -234,6 +234,7 @@ def _preparation_digest(
     public_payload = public_spec.to_dict()
     # omit empty fields so existing version-1 snapshots keep their historical digest.
     for key in (
+        "model_revision_auto",
         "workload_profile_kind",
         "workload_profile_input_digest",
         "workload_profile_producer_version",
@@ -241,6 +242,14 @@ def _preparation_digest(
     ):
         if not worker_payload.get(key):
             worker_payload.pop(key, None)
+    # same reason, public side: unlike the workload_profile_* carriers, to_dict() KEEPS
+    # model_revision_auto when set (deploy reads the persisted public spec and needs it), so it can
+    # reach the public payload too. A snapshot prepared before this field existed hashed a public
+    # spec without the key, so emitting it would fail integrity validation on recovery for every
+    # pre-upgrade run. Omit it when falsy; a True marker binds into the digest from here on, so
+    # tampering with the persisted value is still caught.
+    if not public_payload.get("model_revision_auto"):
+        public_payload.pop("model_revision_auto", None)
     # Restore since-removed keys the STORED payload carried, for the same reason as the omissions
     # above: the digest has to reproduce the bytes that were hashed, not today's serialization. A
     # pre-upgrade snapshot hashed `model_policy` in (to_internal_dict was asdict, so it emitted the
@@ -392,7 +401,11 @@ def _resolve_model_revision(spec: JobSpec, *, required: bool = False) -> JobSpec
             f"could not resolve model_revision for model {spec.model!r}; "
             "verify that the revision exists and the operator token can access it"
         ) from exc
-    return replace(spec, model_revision=resolved)
+    # record WHO chose the pin, not just its value. `authored` is empty exactly when the caller
+    # asked for a pin the user never wrote (SFT, required=True), and that is the only case deploy
+    # may relax: serving resolves the base by name, so an auto pin asks nothing of it, while an
+    # authored one is a request serving cannot honour and must still be refused.
+    return replace(spec, model_revision=resolved, model_revision_auto=not authored)
 
 
 def _profile_producer_version() -> str:

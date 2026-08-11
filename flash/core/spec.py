@@ -420,6 +420,19 @@ class JobSpec:
     thinking: bool = False
     wandb: WandbSpec = field(default_factory=WandbSpec)
     model_revision: str = ""
+    # platform-managed marker: True when the runner resolved model_revision for a spec whose
+    # author left it blank (SFT, where `_resolve_model_revision(required=True)` pins the base so
+    # workload profiling keys on an immutable commit). serving resolves the base model BY NAME and
+    # `deploy_adapter` takes no base-revision argument, so an AUTHORED pin is a real mismatch and
+    # stays rejected at deploy. An auto-assigned one asks for nothing serving cannot honour, and
+    # rejecting it made every SFT run -- and every adapter warm-started from one -- permanently
+    # undeployable, unservable, and unscoreable by `flash env eval`.
+    #
+    # unlike the workload_profile_* carriers this is NOT stripped by to_dict(): deploy reads a spec
+    # rebuilt from the persisted PUBLIC status (submit persists `spec=public_spec.to_dict()`), so a
+    # stripped marker would always read False there and the guard could never tell the two apart.
+    # the public parser rejects it from user configs by omission from `_TOP_LEVEL_KEYS`.
+    model_revision_auto: bool = False
     # platform-managed workload-profile carrier. public configs never author these fields.
     workload_profile_kind: str = ""
     workload_profile_input_digest: str = ""
@@ -437,6 +450,11 @@ class JobSpec:
     def __post_init__(self) -> None:
         object.__setattr__(self, "seed", parse_seed(self.seed))
         object.__setattr__(self, "model_revision", _model_revision(self.model_revision))
+        # the marker qualifies a pin; it cannot outlive one. a spec carrying it with no revision
+        # would let a later edit that clears model_revision leave a True marker behind, and the
+        # deploy guard reads the pair.
+        if self.model_revision_auto and not self.model_revision:
+            object.__setattr__(self, "model_revision_auto", False)
         profile_kind = str(self.workload_profile_kind or "")
         if profile_kind not in {"", "sft"}:
             raise ValueError("unsupported workload profile kind")
@@ -465,6 +483,13 @@ class JobSpec:
         data = asdict(self)
         # server-assigned identity — never authored in a config.
         data.pop("run_id", None)
+        # deploy rebuilds the spec from the persisted PUBLIC status, so this marker has to survive
+        # to_dict() -- but the public parser rejects every key outside _TOP_LEVEL_KEYS, and
+        # to_dict() output must stay re-parseable. Emit it only when set: False is the dataclass
+        # default, so a submit round trip reconstructs it exactly, while a marked run keeps the one
+        # bit deploy needs. A user cannot forge it; the parser still refuses it on the way in.
+        if not data.get("model_revision_auto"):
+            data.pop("model_revision_auto", None)
         data.pop("workload_profile_kind", None)
         data.pop("workload_profile_input_digest", None)
         data.pop("workload_profile_producer_version", None)
@@ -613,6 +638,7 @@ class JobSpec:
             thinking=coerce_bool(data.get("thinking", False)),
             wandb=_coerce_wandb(data.get("wandb")),
             seed=parse_seed(data.get("seed", FIXED_SEED)),
+            model_revision_auto=coerce_bool(data.get("model_revision_auto", False)),
             workload_profile_kind=str(data.get("workload_profile_kind") or ""),
             workload_profile_input_digest=str(data.get("workload_profile_input_digest") or ""),
             workload_profile_producer_version=str(
