@@ -2474,6 +2474,41 @@ def test_main_marks_spilled_spec_fetch_failure_retriable(monkeypatch):
     assert retriable is True
 
 
+def test_shipped_bootstrap_secrets_is_stripped_but_behaves_identically():
+    """user_data is a hard-capped budget shared with the payload's runtime secrets, so the embedded
+    sources carry code, not prose. Stripping must be behaviour-preserving: the box imports this
+    text, so a stripper that broke a body or changed a redactor would leak or crash at launch."""
+    from pathlib import Path
+
+    from flash.providers._lifecycle import bootstrap_secrets
+    from flash.providers._lifecycle import instance as inst
+
+    source = Path(bootstrap_secrets.__file__).read_text()
+    stripped = inst._strip_docstrings(source)
+
+    assert len(stripped) < len(source)
+    assert '"""' not in stripped
+    # comments stay: they sit next to the line they explain, which is what a reader debugging ON
+    # the box needs.
+    assert "# a multiline secret" in stripped
+
+    shipped: dict = {}
+    exec(compile(stripped, "<shipped>", "exec"), shipped)
+    for name in ("_safe_detail", "_split_margin", "_read_console_tail", "_payload_secrets"):
+        assert name in shipped, f"stripping dropped {name}"
+    # the redactors behave exactly as the unstripped module does.
+    for text, secrets in (
+        ("worker rejected pin ati", {"PIN": "ati"}),
+        ("trainer crashed after validation", {"PIN": "ati"}),
+        ("boto3 failed with sk-live-abc123456789", {"K": "sk-live-abc123456789"}),
+    ):
+        assert shipped["_safe_detail"](text, 1000, secrets) == bootstrap_secrets._safe_detail(
+            text, 1000, secrets=secrets
+        )
+    jwt = "eyJ" + "A" * 900
+    assert shipped["_split_margin"]({jwt}) == bootstrap_secrets._split_margin({jwt}) == len(jwt)
+
+
 def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
     """A large job_spec_json must NOT be embedded inline in user_data (it can overflow the
     provider's cloud-init size cap and reject the launch). It is uploaded to HF and replaced by a

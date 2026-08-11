@@ -323,13 +323,12 @@ def test_the_handlers_inline_redactor_covers_multiline_secret_components():
     from flash.providers.runpod.serverless import endpoints
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
-    node = next(
-        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_safe_detail"
-    )
     # os/re come from _train_body's own local imports, which the handler makes at the top of its
     # body; urllib.parse it imports itself.
     namespace: dict = {"os": os, "re": re}
-    exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
+    for name in ("_needles", "_split_margin", "_safe_detail"):
+        node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
     safe_detail = namespace["_safe_detail"]
 
     pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----"
@@ -355,6 +354,12 @@ def test_the_handlers_inline_redactor_covers_multiline_secret_components():
     assert safe_detail("trainer crashed holding sk-live-abc123456", long) == (
         "trainer crashed holding <redacted>"
     )
+
+    # the console-tail margin is sized from the LONGEST configured needle, not a constant: a value
+    # split by the read boundary leaves up to len(value)-1 characters behind, and a fixed 512
+    # margin let a 903-char token keep a usable suffix in the uploaded console.
+    jwt = "eyJ" + "A" * 900
+    assert namespace["_split_margin"]({"FLASH_SECRET_ENV_KEYS": "JWT", "JWT": jwt}) >= len(jwt)
 
 
 def test_worker_console_always_uploaded_and_no_flag(monkeypatch):
@@ -834,7 +839,9 @@ def test_train_body_uploads_console_on_missing_metrics(
             # minus a leading margin wide enough to carry off a credential split by the boundary.
             assert uploaded_console.endswith("torch.cuda.OutOfMemoryError: CUDA OOM")
             assert "one unterminated line" in uploaded_console
-            assert len(uploaded_console) < 64_000
+            # the marker is paid for out of the body's front, so the whole upload still fits the
+            # tail bound rather than overflowing it and losing the end to the sanitizer's cut.
+            assert len(uploaded_console) <= 64_000
         assert [call["path_in_repo"] for call in list_calls] == [code_prefix, code_prefix]
         assert [call["filename"] for call in download_calls] == [
             f"{code_prefix}/__init__.py",

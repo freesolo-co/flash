@@ -255,7 +255,7 @@ def hf_upload(
 def _upload_console_snapshot(payload: dict, console: str, mode: str, extra: str = "") -> None:
     """Upload one console snapshot from an isolated process."""
     tail_path = console + ".tail"
-    tail = _read_console_tail(console, 64_000)
+    tail = _read_console_tail(console, 64_000, secrets=_payload_secrets(payload))
     if extra:
         tail += extra
     with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
@@ -672,7 +672,15 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
                         # control-plane sanitizer downstream cannot value-redact a runtime secret
                         # whose name it never sees. mirrors the runpod serverless handler. the
                         # console FILE keeps the raw line; its upload path sanitizes the tail.
-                        print(_safe_detail(line, 100_000, secrets=pump_secrets), end="", flush=True)
+                        # the bound keeps the END of an oversized line: the root cause sits at the
+                        # end of a native stack or json blob, and the control plane's failure
+                        # detail reads the provider's instance log rather than the uploaded
+                        # console, so a prefix cut here loses it everywhere.
+                        print(
+                            _safe_detail(line, 100_000, secrets=pump_secrets, keep="end"),
+                            end="",
+                            flush=True,
+                        )
                         cf.write(line)
             except BaseException as exc:
                 print(

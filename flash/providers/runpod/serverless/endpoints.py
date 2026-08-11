@@ -70,12 +70,22 @@ def _train_body(input_data: dict) -> dict:
 
     from huggingface_hub import snapshot_download
 
-    def _safe_detail(value, secrets=None, limit=1000):
+    def _needles(secrets=None):
+        """The (plain, bounded) credential needle sets for os.environ plus ``secrets``.
+
+        a value at or above the floor is a plain needle, replaced as a substring; a SHORTER one is
+        bounded, matched only where it is not adjacent to a word character. short values used to be
+        dropped outright, which leaked them verbatim -- [environment] secrets accepts any name and
+        any value. plain replacement is not the alternative: a 3-char needle corrupts every
+        diagnostic that merely contains those letters (the value "ati" rewrites "authentication").
+
+        a multiline secret (a PEM key) never appears whole in any single call: the child's stdout is
+        sanitized one line at a time, so only a component line is ever seen. component lines keep
+        the floor as a hard skip -- a short one is punctuation such as "}", not a credential.
+        Mirrors flash.providers._lifecycle.bootstrap_secrets._needles.
+        """
         import urllib.parse
 
-        text = (
-            f"{type(value).__name__}: {value}" if isinstance(value, BaseException) else str(value)
-        )
         mapping = {**os.environ, **(secrets or {})}
         # declared runtime secrets can carry any name, so the control plane lists them in
         # FLASH_SECRET_ENV_KEYS; the name-shape rule stays as the fail-closed fallback.
@@ -84,17 +94,6 @@ def _train_body(input_data: dict) -> dict:
             for name in str(mapping.get("FLASH_SECRET_ENV_KEYS") or "").split(",")
             if name.strip()
         }
-        # a value at or above the floor is replaced as a plain substring; a SHORTER one only where
-        # it is not adjacent to a word character. short values used to be dropped outright, which
-        # leaked them verbatim -- [environment] secrets accepts any name and any value. plain
-        # replacement is not the alternative: a 3-char needle corrupts every diagnostic that merely
-        # contains those letters (the value "ati" rewrites "authentication"), so the boundary form
-        # redacts the standalone occurrence and leaves the innocent substring alone.
-        # a multiline secret (a PEM key) never appears whole in any single call: the child's stdout
-        # is sanitized one line at a time below, so only a component line is ever seen. component
-        # lines keep the floor as a hard skip -- a short one is punctuation such as "}", not a
-        # credential, and bounding it would erase every standalone brace in a json diagnostic.
-        # Mirrors flash.providers._lifecycle.bootstrap_secrets._redact_values.
         plain, bounded = set(), set()
         for key, secret in mapping.items():
             upper = str(key).upper()
@@ -111,6 +110,25 @@ def _train_body(input_data: dict) -> dict:
                 for raw in value_str.splitlines():
                     if len(line := raw.strip()) >= 8:
                         plain.update({line, urllib.parse.quote(line, safe="")})
+        return plain, bounded
+
+    def _split_margin(secrets=None):
+        """Leading characters of a split line that could still hold part of a credential.
+
+        a value cut by the read boundary leaves at most len(value)-1 characters of itself at the
+        front of the retained region, and that fragment no longer matches full-value redaction. the
+        bound therefore comes from the LONGEST needle configured: a fixed margin only covers values
+        up to its own size, and a long token straddling the cut left a usable suffix behind.
+        Mirrors flash.providers._lifecycle.bootstrap_secrets._split_margin.
+        """
+        plain, bounded = _needles(secrets)
+        return max((len(needle) for needle in plain | bounded), default=0)
+
+    def _safe_detail(value, secrets=None, limit=1000):
+        text = (
+            f"{type(value).__name__}: {value}" if isinstance(value, BaseException) else str(value)
+        )
+        plain, bounded = _needles(secrets)
         # longest-first so one secret containing another cannot leave a suffix of the longer
         # one behind; encoded forms cover the percent-encoded urls http and git errors print.
         for needle in sorted(plain, key=len, reverse=True):
@@ -429,14 +447,24 @@ def _train_body(input_data: dict) -> dict:
                             # no newline at all: the whole tail is ONE unterminated line. dropping
                             # it uploaded an empty console and lost the root cause on exactly the
                             # crashes that emit a single huge line (a json blob, a native stack).
-                            # keep it, minus a leading margin wide enough to carry off a credential
-                            # split by the boundary; _safe_detail below still redacts whole values.
-                            split_margin = 512
-                            tail = (
-                                "[flash: the console tail is one unterminated line; its first "
-                                f"{split_margin} characters were dropped so a credential split by "
-                                "the read boundary cannot survive]\n" + tail[split_margin:]
+                            # keep it, minus the LONGEST configured credential: a value cut by the
+                            # boundary leaves at most len(value)-1 characters of itself at the
+                            # front, and that fragment no longer matches full-value redaction. a
+                            # fixed margin only covers values up to its own size, so a long token
+                            # straddling the cut left a usable suffix behind. with no bound
+                            # available the line is dropped -- the empty tail never leaked, so it
+                            # is the safe floor. mirrors bootstrap_secrets._read_console_tail.
+                            split_margin = _split_margin(env)
+                            marker = (
+                                "[flash: the console tail is one unterminated line; a leading "
+                                "fragment was dropped so a credential split by the read boundary "
+                                "cannot survive]\n"
                             )
+                            # the marker is paid for out of the body's FRONT: _safe_detail's bound
+                            # below cuts from the front, so overflowing tail_bytes here would drop
+                            # the end -- the root cause this branch exists to keep.
+                            cut_at = max(split_margin, len(tail) - tail_bytes + len(marker))
+                            tail = "" if split_margin >= len(tail) else marker + tail[cut_at:]
                 with open(console + ".tail", "w", encoding="utf-8", errors="replace") as f:
                     f.write(_safe_detail(tail, env, 64_000))
                 _require_deadline_allowance()

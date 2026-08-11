@@ -705,6 +705,42 @@ def test_run_mode_sanitizes_the_echoed_child_line_but_not_the_console_file(monke
         assert f.read() == f"boto3 auth failed with {secret}\nworker exiting\n"
 
 
+def test_run_mode_echoes_the_end_of_an_oversized_child_line(monkeypatch, capfd):
+    """the sanitizing bound must keep the END of a line, which is where the root cause is.
+
+    a native stack, a json blob or a progress stream puts its conclusion last, and the control
+    plane's failure detail reads the PROVIDER's instance log rather than the uploaded console
+    artifact -- so a prefix cut here loses the diagnosis everywhere, not just in one copy.
+    """
+    _disable_periodic_console_upload(monkeypatch)
+    monkeypatch.setattr(b, "_upload_console_tail_bounded", lambda *a, **k: True)
+    monkeypatch.setattr(b, "hf_upload", lambda *a, **k: None)
+    proc = _FakeProc(["x" * 120_000 + "ROOTCAUSE: CUDA OOM\n"], rc=1)
+    monkeypatch.setattr(b.subprocess, "Popen", lambda *a, **k: proc)
+
+    payload = {"hf_repo": "o/r", "hf_prefix": "sft/run", "code_prefix": CODE_PREFIX, "env": {}}
+    b.run_mode(payload, {"E": "1"}, "sft", deadline_ts=b.time.time() + 100)
+
+    echoed = capfd.readouterr().out
+    assert "ROOTCAUSE: CUDA OOM" in echoed
+    # the bound still applies -- this is a cut, not an unbounded echo.
+    assert len(echoed) <= 100_001
+
+
+def test_safe_detail_keeps_the_requested_side_of_an_over_limit_string():
+    """`keep` selects which side survives: a message whose subject comes first keeps its front, a
+    streamed console line keeps its end. redaction runs on the whole text before either cut, so
+    neither can split a credential into a fragment nothing matches."""
+    assert b._safe_detail("abcdef", 3) == "abc"
+    assert b._safe_detail("abcdef", 3, keep="end") == "def"
+    # a secret spanning the cut point is gone either way, not halved.
+    secret = "sk-live-abc123456789"
+    for keep in ("start", "end"):
+        out = b._safe_detail(f"aa{secret}zz", 12, secrets={"K": secret}, keep=keep)
+        assert not any(secret[-n:] in out for n in range(1, len(secret)))
+        assert not any(secret[:n] in out for n in range(8, len(secret)))
+
+
 def test_run_mode_caps_the_worker_at_the_declared_wall_budget(monkeypatch):
     """Unspent provisioning time must not become extra WORK time.
 
@@ -2096,17 +2132,15 @@ def test_read_console_tail_keeps_a_single_oversized_line(tmp_path):
     console = tmp_path / "console.txt"
     console.write_bytes(b"x" * 70_000 + b"ROOTCAUSE: cuda oom")
 
-    tail = b._read_console_tail(str(console), 64_000)
+    tail = b._read_console_tail(str(console), 64_000, secrets={"K": "sk-live-abc12345"})
 
     assert tail.endswith("ROOTCAUSE: cuda oom")
     assert bootstrap_secrets._TRUNCATED_LINE_MARKER in tail
-    # the retained region is the limit minus the dropped leading margin.
-    assert (
-        len(tail)
-        == len(bootstrap_secrets._TRUNCATED_LINE_MARKER)
-        + 64_000
-        - bootstrap_secrets._SPLIT_VALUE_MARGIN
-    )
+    # the dropped margin scales with the longest configured credential, and the ambient environment
+    # may carry its own (a developer's real API key), so assert the INVARIANT rather than an exact
+    # length: nearly the whole retained region survives, which is what the empty tail did not.
+    body = tail[len(bootstrap_secrets._TRUNCATED_LINE_MARKER) :]
+    assert 63_000 < len(body) <= 64_000
 
 
 def test_read_console_tail_drops_a_credential_split_into_an_oversized_line(tmp_path):
@@ -2114,19 +2148,63 @@ def test_read_console_tail_drops_a_credential_split_into_an_oversized_line(tmp_p
     rule exists to prevent: a value straddling the byte boundary no longer matches full-value
     redaction, so the leading margin has to carry it off. no suffix of it may survive either."""
     secret = "sk-live-" + "z" * 40
-    limit = 64_000
-    # the read starts at len(body) - limit; size the trailing filler so that boundary lands 20
-    # bytes INTO the secret, which is the case full-value redaction can no longer catch.
-    suffix = limit - len(secret) - 20
-    body = b"q" * 6_000 + secret.encode() + b"q" * suffix
-    console = tmp_path / "console.txt"
-    console.write_bytes(body)
+    console, limit = _console_with_secret_on_the_boundary(tmp_path, secret)
 
-    tail = b._read_console_tail(str(console), limit)
+    tail = b._read_console_tail(str(console), limit, secrets={"K": secret})
 
     assert secret not in tail
     # nor any usable fragment of it: the surviving suffix is what the margin exists to remove.
     assert "z" not in tail
+
+
+def _console_with_secret_on_the_boundary(tmp_path, secret, prefix=6_000, limit=64_000):
+    """One unterminated line whose read boundary lands 20 characters INTO ``secret``.
+
+    the byte math is the whole point of the fixture: `size - limit` must fall strictly inside the
+    secret, or the value sits wholly within the retained region and full-value redaction catches it
+    normally -- which tests the wrong thing and passes either way.
+    """
+    size = limit + prefix + 20
+    body = b"q" * prefix + secret.encode() + b"q" * (size - prefix - len(secret))
+    assert prefix < size - limit < prefix + len(secret), "boundary must split the secret"
+    console = tmp_path / "console.txt"
+    console.write_bytes(body)
+    return console, limit
+
+
+def test_read_console_tail_margin_covers_a_secret_longer_than_any_fixed_bound(tmp_path):
+    """the dropped fragment is sized from the LONGEST configured credential, not a constant.
+
+    a value cut by the boundary leaves up to len(value)-1 characters of itself at the front of the
+    retained region, and that fragment no longer matches full-value redaction. a fixed margin only
+    covers values up to its own size, so a 903-character service-account token or JWT straddling
+    the cut left a usable suffix in the uploaded console -- and the empty-tail behaviour it
+    replaced did not leak, so an unbounded margin would trade nothing for exposure.
+    """
+    secret = "eyJ" + "A" * 900
+    console, limit = _console_with_secret_on_the_boundary(tmp_path, secret)
+
+    tail = b._safe_detail(
+        b._read_console_tail(str(console), limit, secrets={"JWT": secret}),
+        200_000,
+        secrets={"JWT": secret},
+    )
+
+    # no suffix of the secret survives, at any length.
+    assert not any(secret[-n:] in tail for n in range(1, len(secret)))
+    # and the diagnostics either side of it are still there: the margin scales with the secret,
+    # it does not blank the console.
+    assert len(tail) > limit - len(secret) - 1_000
+
+
+def test_read_console_tail_drops_the_line_when_the_margin_would_consume_it(tmp_path):
+    """with no safe bound left there is nothing to keep: a retained fragment could still hold part
+    of a credential that nothing downstream can match, and the empty tail never leaked."""
+    secret = "sk-live-" + "y" * 200
+    console = tmp_path / "console.txt"
+    console.write_bytes(b"z" * 400 + secret.encode())
+
+    assert b._read_console_tail(str(console), 100, secrets={"K": secret}) == ""
 
 
 def test_safe_detail_redacts_the_percent_encoded_form_of_a_secret():

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import base64
 import hashlib
 import io
@@ -30,12 +31,12 @@ _USER_DATA_BUDGET = _USER_DATA_CAP - _USER_DATA_MARGIN
 # Fast path only: above this, the spec is spilled to HF without rendering a payload that cannot fit.
 # The budget is what is LEFT of the ~64,000-byte provider cap after the fixed framing: this module's
 # template plus every source file it heredocs in (bootstrap.py and bootstrap_secrets.py), which is
-# ~54,000 bytes and grows whenever that bootstrap does. base64 + json escaping inflate the spec
-# ~1.35x on the way in, so this ceiling must stay well under the remaining budget; shrink it again
-# whenever the embedded sources grow -- widening the redactors dropped it from 6,000 to 4,800.
-# test_user_data_spills_large_job_spec_to_hf pins the worst case (a spec of exactly this size)
-# against the cap so the two cannot drift apart silently.
-_SPEC_SPILL_THRESHOLD = 4_800
+# ~51,000 bytes and grows whenever that bootstrap does (docstrings are stripped on the way in, so
+# only real code counts). base64 + json escaping inflate the spec ~1.35x on the way in, so this
+# ceiling must stay well under the remaining budget; shrink it again whenever the embedded sources
+# grow. test_user_data_spills_large_job_spec_to_hf pins the worst case (a spec of exactly this
+# size) against the cap so the two cannot drift apart silently.
+_SPEC_SPILL_THRESHOLD = 6_000
 
 
 def run_label_prefix(run_id: str) -> str:
@@ -427,12 +428,58 @@ def build_user_data(payload: dict, *, image: str) -> str:
     return user_data
 
 
+def _strip_docstrings(source: str) -> str:
+    """``source`` with every module/class/function docstring removed, still valid Python.
+
+    Only docstrings go: comments stay, since a comment sits next to the line it explains and is
+    what a reader debugging ON the box needs. Docstrings are the bulk of the prose and none of the
+    behaviour, so dropping them buys user_data budget at no cost to the shipped module.
+    """
+    tree = ast.parse(source)
+    spans: list[tuple[int, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = getattr(node, "body", None)
+        if not body:
+            continue
+        first = body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            # a docstring is the ONLY statement in a body sometimes; leave a pass so it still parses.
+            spans.append((first.lineno, first.end_lineno, len(body) == 1, first.col_offset))
+    lines = source.splitlines(keepends=True)
+    drop: set[int] = set()
+    inserts: dict[int, str] = {}
+    for start, end, sole, col in spans:
+        drop.update(range(start, end + 1))
+        if sole:
+            inserts[start] = " " * col + "pass\n"
+    out = []
+    for number, text in enumerate(lines, start=1):
+        if number in inserts:
+            out.append(inserts[number])
+        if number not in drop:
+            out.append(text)
+    stripped = "".join(out)
+    ast.parse(stripped)  # never ship something that will not import on the box
+    return stripped
+
+
 def _render_user_data(payload: dict, *, image: str) -> str:
     """The user_data text for an already-spill-decided ``payload``."""
     payload_b64 = base64.encodebytes(json.dumps(payload).encode()).decode()
     bootstrap_src = (Path(__file__).parent / "bootstrap.py").read_text()
     # shipped next to bootstrap.py: the bootstrap imports it as a bare sibling module on the box.
-    bootstrap_secrets_src = (Path(__file__).parent / "bootstrap_secrets.py").read_text()
+    # docstrings are stripped on the way in. they are for the reader of the repo, not the box, and
+    # user_data is a hard-capped budget shared with the payload's runtime secrets -- prose that
+    # explains WHY a redactor is shaped a certain way must not be what pushes a launch over the cap.
+    bootstrap_secrets_src = _strip_docstrings(
+        (Path(__file__).parent / "bootstrap_secrets.py").read_text()
+    )
     # Bind the host cache mount into the container at the fixed /weight-cache so prefetch persists; absent -> cold.
     cache_host_mount = payload.get("cache_host_mount")
     cache_bind = (
