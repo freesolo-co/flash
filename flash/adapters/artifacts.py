@@ -9,6 +9,27 @@ coincidence, so they are defined once, here.
 # but older PEFT/default settings may emit adapter_model.bin.
 ADAPTER_WEIGHT_FILES = ("adapter_model.safetensors", "adapter_model.bin")
 
+# A PEFT save past its shard size splits the weights across `adapter_model-0000N-of-0000M.<ext>`
+# beside an `adapter_model.<ext>.index.json` mapping every tensor key to the shard holding it.
+ADAPTER_SHARD_PREFIX = "adapter_model-"
+ADAPTER_WEIGHT_SUFFIXES = (".safetensors", ".bin")
+ADAPTER_WEIGHT_INDEX_FILES = tuple(f"{name}.index.json" for name in ADAPTER_WEIGHT_FILES)
+
+
+def is_adapter_weight_filename(filename: str) -> bool:
+    """True for every adapter weight file shape the pipeline accepts, single-file or sharded.
+
+    One predicate for the same reason the filenames above are defined once: serving validation and
+    the exporter never share a call stack, and each spelling the shapes for itself makes them agree
+    by coincidence. When they disagree the failure is silent -- validation accepts a shape the
+    exporter skips, so the export ships weights peft loads as a no-op.
+    """
+    name = filename.rsplit("/", 1)[-1]
+    if name in ADAPTER_WEIGHT_FILES:
+        return True
+    return name.startswith(ADAPTER_SHARD_PREFIX) and name.endswith(ADAPTER_WEIGHT_SUFFIXES)
+
+
 # The largest attempt identity any artifact name may carry. An attempt number reaches a filename and
 # an HF path, so it is bounded rather than merely nonnegative: an unbounded int would still format,
 # and the resulting name is the one thing a later reader has to match exactly.

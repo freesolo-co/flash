@@ -13,16 +13,14 @@ from __future__ import annotations
 import json
 import os
 
-from flash.adapters.artifacts import ADAPTER_WEIGHT_FILES
+from flash.adapters.artifacts import is_adapter_weight_filename
 from flash.adapters.lora_rank import rank_from_adapter_config
 from flash.serve.errors import AdapterConfigMissing, AdapterTensorMissing, ServingError
 
-
-def _is_adapter_tensor_filename(filename: str) -> bool:
-    name = filename.rsplit("/", 1)[-1]
-    if name in ADAPTER_WEIGHT_FILES:
-        return True
-    return name.startswith("adapter_model-") and name.endswith((".safetensors", ".bin"))
+# The accepted weight-file shapes live beside the filenames themselves so serving validation and
+# `flash.serve.export` cannot drift apart. Kept under this name because `flash.serve.deploy`
+# re-exports it and the serving tests resolve it there.
+_is_adapter_tensor_filename = is_adapter_weight_filename
 
 
 def _is_hf_not_found_error(exc: Exception) -> bool:

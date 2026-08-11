@@ -13,11 +13,14 @@ import re
 import shutil
 import struct
 import tempfile
+from collections.abc import Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import BinaryIO
+from typing import IO, BinaryIO
 
 from flash._internal.fileio import reject_duplicate_keys
 from flash._internal.logging import get_logger
+from flash.adapters.artifacts import ADAPTER_WEIGHT_INDEX_FILES, is_adapter_weight_filename
 from flash.serve.deploy import ServingError
 
 logger = get_logger(__name__)
@@ -34,10 +37,22 @@ _MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024
 # namespaces only for a nonzero LoRA-B contribution or an unrecognized non-LM tensor; inert entries
 # alone do not prove those modules were trained.
 _NON_LM_KEY_SEGMENTS = (".visual.", ".vision_tower.", ".multi_modal_projector.", ".mtp.")
+_LANGUAGE_MODEL_INFIX_BYTES = b".language_model."
 
 
 def _references_non_lm_modules(key: str) -> bool:
     return any(segment in key for segment in _NON_LM_KEY_SEGMENTS)
+
+
+def _non_lm_liveness_from_key(key: str) -> bool | None:
+    """True/False when the key name alone settles liveness, None when the tensor data decides."""
+    is_lora_a = ".lora_A." in key
+    is_lora_b = ".lora_B." in key
+    if is_lora_a and not is_lora_b:
+        return False
+    if not is_lora_b or is_lora_a:
+        return True
+    return None
 
 
 def _non_lm_tensor_is_live(
@@ -48,12 +63,9 @@ def _non_lm_tensor_is_live(
     data_start: int,
     file_size: int,
 ) -> bool:
-    is_lora_a = ".lora_A." in key
-    is_lora_b = ".lora_B." in key
-    if is_lora_a and not is_lora_b:
-        return False
-    if not is_lora_b or is_lora_a:
-        return True
+    decided = _non_lm_liveness_from_key(key)
+    if decided is not None:
+        return decided
     if not isinstance(descriptor, dict):
         raise ValueError(f"safetensors descriptor for {key!r} is not an object")
     offsets = descriptor.get("data_offsets")
@@ -90,98 +102,263 @@ _json_object_without_duplicate_keys = reject_duplicate_keys(
 )
 
 
-def _normalize_export_adapter_keys(adapter_dir: Path) -> bool:
-    path = adapter_dir / "adapter_model.safetensors"
-    if not path.is_file():
-        logger.warning("exported adapter has no safetensors weights; leaving weights unchanged")
-        return False
+@dataclass
+class _WeightScan:
+    """One adapter weight file: its tensor keys, and whatever pins it to the multimodal namespace.
 
+    `header`/`data_start` are set for safetensors and `state` for `.bin`, so the rewrite phase can
+    reuse what the scan already read instead of parsing every file twice.
+    """
+
+    path: Path
+    keys: tuple[str, ...] = ()
+    live_non_lm_key: str | None = None
+    header: dict[str, object] | None = None
+    data_start: int = 0
+    state: dict[str, object] = field(default_factory=dict)
+
+
+@contextlib.contextmanager
+def _atomic_replacement(path: Path) -> Iterator[IO[bytes]]:
+    """Build a replacement for `path` beside it and swap it in only once it is complete."""
     temp_path: Path | None = None
     try:
-        file_size = path.stat().st_size
-        with path.open("rb") as source:
-            length_bytes = source.read(8)
-            if len(length_bytes) != 8:
-                raise ValueError("file is too small to contain a safetensors header")
-            (header_length,) = struct.unpack("<Q", length_bytes)
-            if header_length > file_size - 8 or header_length > _MAX_SAFETENSORS_HEADER_BYTES:
-                raise ValueError(
-                    f"declared header length {header_length} is implausible for {file_size}-byte file"
-                )
-            header_bytes = source.read(header_length)
-            if len(header_bytes) != header_length:
-                raise ValueError("safetensors header is truncated")
-            header = json.loads(
-                header_bytes,
-                object_pairs_hook=_json_object_without_duplicate_keys,
-            )
-            if not isinstance(header, dict):
-                raise ValueError("safetensors header is not a JSON object")
-
-            data_start = 8 + header_length
-            for key, descriptor in header.items():
-                if key == "__metadata__" or not _references_non_lm_modules(key):
-                    continue
-                if _non_lm_tensor_is_live(
-                    source,
-                    key,
-                    descriptor,
-                    data_start=data_start,
-                    file_size=file_size,
-                ):
-                    logger.info(
-                        "exported adapter has live non-lm weights (e.g. %s); keeping the "
-                        "multimodal key namespace unchanged",
-                        key,
-                    )
-                    return False
-
-            normalized: dict[str, object] = {}
-            remapped = 0
-            for key, value in header.items():
-                normalized_key = key if key == "__metadata__" else _strip_language_model_infix(key)
-                if normalized_key in normalized:
-                    raise ValueError(
-                        f"key {key!r} collides after stripping the '.language_model.' infix"
-                    )
-                normalized[normalized_key] = value
-                remapped += int(normalized_key != key)
-            if remapped == 0:
-                return False
-
-            new_header = json.dumps(
-                normalized,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
-            new_header += b" " * (-len(new_header) % 8)
-            source.seek(data_start)
-            with tempfile.NamedTemporaryFile(
-                mode="wb",
-                dir=path.parent,
-                prefix=f".{path.name}.",
-                delete=False,
-            ) as destination:
-                temp_path = Path(destination.name)
-                destination.write(struct.pack("<Q", len(new_header)))
-                destination.write(new_header)
-                shutil.copyfileobj(source, destination)
-                destination.flush()
-                os.fsync(destination.fileno())
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as destination:
+            temp_path = Path(destination.name)
+            yield destination
+            destination.flush()
+            os.fsync(destination.fileno())
         os.replace(temp_path, path)
         temp_path = None
-    except Exception as exc:
-        logger.warning(
-            "could not normalize exported adapter keys; leaving weights unchanged: %s", exc
-        )
-        return False
     finally:
         if temp_path is not None:
             with contextlib.suppress(OSError):
                 temp_path.unlink(missing_ok=True)
 
-    logger.info("normalized %d exported adapter weight keys", remapped)
-    return True
+
+def _adapter_weight_paths(adapter_dir: Path) -> list[Path]:
+    """Every adapter weight file in the export, single-file or sharded."""
+    if not adapter_dir.is_dir():
+        return []
+    return sorted(
+        p for p in adapter_dir.rglob("*") if p.is_file() and is_adapter_weight_filename(p.name)
+    )
+
+
+def _read_safetensors_header(path: Path) -> tuple[dict[str, object], int, int]:
+    """Return the parsed header, the offset its tensor data starts at, and the file size."""
+    file_size = path.stat().st_size
+    with path.open("rb") as source:
+        length_bytes = source.read(8)
+        if len(length_bytes) != 8:
+            raise ValueError(f"{path.name} is too small to contain a safetensors header")
+        (header_length,) = struct.unpack("<Q", length_bytes)
+        if header_length > file_size - 8 or header_length > _MAX_SAFETENSORS_HEADER_BYTES:
+            raise ValueError(
+                f"{path.name}: declared header length {header_length} is implausible for "
+                f"{file_size}-byte file"
+            )
+        header_bytes = source.read(header_length)
+        if len(header_bytes) != header_length:
+            raise ValueError(f"{path.name}: safetensors header is truncated")
+    header = json.loads(header_bytes, object_pairs_hook=_json_object_without_duplicate_keys)
+    if not isinstance(header, dict):
+        raise ValueError(f"{path.name}: safetensors header is not a JSON object")
+    return header, 8 + header_length, file_size
+
+
+def _scan_safetensors(path: Path) -> _WeightScan:
+    header, data_start, file_size = _read_safetensors_header(path)
+    live: str | None = None
+    with path.open("rb") as source:
+        for key, descriptor in header.items():
+            if key == "__metadata__" or not _references_non_lm_modules(key):
+                continue
+            if _non_lm_tensor_is_live(
+                source, key, descriptor, data_start=data_start, file_size=file_size
+            ):
+                live = key
+                break
+    return _WeightScan(
+        path=path,
+        keys=tuple(k for k in header if k != "__metadata__"),
+        live_non_lm_key=live,
+        header=header,
+        data_start=data_start,
+    )
+
+
+def _bin_may_carry_infixed_keys(path: Path) -> bool:
+    """Cheap pre-check: does this `.bin` mention the infix at all?
+
+    torch stores state-dict keys as uncompressed strings inside the archive, so a raw byte scan
+    answers "could this need rewriting?" without importing torch -- which the control plane does
+    not install (it is a `gpu` extra, not a `server` one). A `.bin` that never mentions the infix
+    has nothing to strip, so it stays a pass-through instead of failing an export that is fine.
+    """
+    overlap = len(_LANGUAGE_MODEL_INFIX_BYTES) - 1
+    tail = b""
+    with path.open("rb") as source:
+        while chunk := source.read(1 << 20):
+            if _LANGUAGE_MODEL_INFIX_BYTES in tail + chunk:
+                return True
+            tail = chunk[-overlap:]
+    return False
+
+
+def _torch_for(path: Path):
+    try:
+        import torch
+    except ImportError as exc:
+        raise ValueError(
+            f"{path.name} carries '.language_model.' keys that vanilla peft cannot load, and "
+            "torch is not installed here to rewrite them; re-save the adapter as safetensors "
+            "or install torch alongside the control plane"
+        ) from exc
+    return torch
+
+
+def _scan_bin(path: Path) -> _WeightScan:
+    if not _bin_may_carry_infixed_keys(path):
+        return _WeightScan(path=path)
+    torch = _torch_for(path)
+    state = torch.load(str(path), map_location="cpu", weights_only=True)
+    if not isinstance(state, dict):
+        raise ValueError(f"{path.name}: expected a tensor state dict, got {type(state).__name__}")
+    bad = [k for k, v in state.items() if not isinstance(k, str) or not isinstance(v, torch.Tensor)]
+    if bad:
+        raise ValueError(
+            f"{path.name}: contains non-tensor entries (e.g. {bad[:4]}); expected a plain PEFT "
+            "adapter state dict"
+        )
+    live = next((key for key, tensor in state.items() if _tensor_is_live_non_lm(key, tensor)), None)
+    return _WeightScan(path=path, keys=tuple(state), live_non_lm_key=live, state=state)
+
+
+def _tensor_is_live_non_lm(key: str, tensor: object) -> bool:
+    if not _references_non_lm_modules(key):
+        return False
+    decided = _non_lm_liveness_from_key(key)
+    return bool(tensor.any()) if decided is None else decided  # type: ignore[attr-defined]
+
+
+def _plan_key_renames(scans: list[_WeightScan]) -> dict[str, str]:
+    """Map every infixed key to its stripped form, refusing a rename that would shadow another key.
+
+    Planned across all shards at once: sharding splits one key namespace over several files, so a
+    collision is only visible in their union.
+    """
+    seen: dict[str, str] = {}
+    renames: dict[str, str] = {}
+    for scan in scans:
+        for key in scan.keys:
+            normalized = _strip_language_model_infix(key)
+            collided = seen.get(normalized)
+            if collided is not None:
+                raise ValueError(
+                    f"key {key!r} collides with {collided!r} after stripping the "
+                    "'.language_model.' infix"
+                )
+            seen[normalized] = key
+            if normalized != key:
+                renames[key] = normalized
+    return renames
+
+
+def _rewrite_safetensors_keys(scan: _WeightScan, renames: dict[str, str]) -> None:
+    header = scan.header or {}
+    normalized = {
+        (key if key == "__metadata__" else renames.get(key, key)): value
+        for key, value in header.items()
+    }
+    new_header = json.dumps(normalized, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    new_header += b" " * (-len(new_header) % 8)
+    with scan.path.open("rb") as source:
+        source.seek(scan.data_start)
+        with _atomic_replacement(scan.path) as destination:
+            destination.write(struct.pack("<Q", len(new_header)))
+            destination.write(new_header)
+            shutil.copyfileobj(source, destination)
+
+
+def _rewrite_bin_keys(scan: _WeightScan, renames: dict[str, str]) -> None:
+    torch = _torch_for(scan.path)
+    state = {renames.get(key, key): value for key, value in scan.state.items()}
+    with _atomic_replacement(scan.path) as destination:
+        torch.save(state, destination)
+
+
+def _rewrite_weight_index_keys(adapter_dir: Path, renames: dict[str, str]) -> None:
+    """Keep the shard index in step with the shards it points at."""
+    for name in ADAPTER_WEIGHT_INDEX_FILES:
+        path = adapter_dir / name
+        if not path.is_file():
+            continue
+        index = json.loads(path.read_text(encoding="utf-8"))
+        weight_map = index.get("weight_map") if isinstance(index, dict) else None
+        if not isinstance(weight_map, dict):
+            raise ValueError(f"{name}: no weight_map object to normalize")
+        index["weight_map"] = {renames.get(key, key): value for key, value in weight_map.items()}
+        path.write_text(json.dumps(index, indent=2) + "\n", encoding="utf-8")
+
+
+def _normalize_adapter_key_namespace(adapter_dir: Path) -> str:
+    paths = _adapter_weight_paths(adapter_dir)
+    if not paths:
+        raise ValueError("no adapter_model weight file to normalize")
+    scans = [
+        _scan_safetensors(path) if path.name.endswith(".safetensors") else _scan_bin(path)
+        for path in paths
+    ]
+    pinned = next((scan for scan in scans if scan.live_non_lm_key), None)
+    if pinned is not None:
+        logger.info(
+            "exported adapter has live non-lm weights (e.g. %s); keeping the multimodal key "
+            "namespace unchanged",
+            pinned.live_non_lm_key,
+        )
+        return "multimodal"
+
+    renames = _plan_key_renames(scans)
+    if not renames:
+        return "text_only"
+    for scan in scans:
+        if not any(key in renames for key in scan.keys):
+            continue
+        if scan.header is not None:
+            _rewrite_safetensors_keys(scan, renames)
+        else:
+            _rewrite_bin_keys(scan, renames)
+    _rewrite_weight_index_keys(adapter_dir, renames)
+    logger.info(
+        "normalized %d exported adapter weight keys across %d file(s)", len(renames), len(paths)
+    )
+    return "text_only"
+
+
+def _normalize_export_adapter_keys(adapter_dir: Path) -> str:
+    """Rewrite exported adapter keys into the namespace vanilla peft and vLLM load.
+
+    Returns the resulting namespace: ``"text_only"`` once the ``.language_model.`` infix is gone,
+    ``"multimodal"`` for an adapter whose live non-LM weights mean it must keep that namespace.
+
+    Raises rather than warning when normalization was needed and could not be applied. peft does
+    not error on mismatched adapter keys -- it emits a UserWarning and applies NOTHING -- so an
+    export that ships unnormalized weights hands the user a base model they will benchmark as
+    their adapter. A failed export is the only signal that ever reaches them.
+    """
+    try:
+        return _normalize_adapter_key_namespace(adapter_dir)
+    except Exception as exc:
+        raise ServingError(
+            f"could not normalize exported adapter keys ({exc}); refusing to export weights "
+            "vanilla peft would load as a no-op"
+        ) from exc
 
 
 def _rewrite_adapter_config_base_model(
@@ -312,14 +489,14 @@ def export_adapter(
             sorted(p for p in adapter_dir.rglob("*") if p.is_file()) if adapter_dir.is_dir() else []
         )
         names = {p.name for p in files}
-        has_weight = any(n.startswith("adapter_model") for n in names)
+        has_weight = any(is_adapter_weight_filename(n) for n in names)
         if not has_weight or "adapter_config.json" not in names:
             raise ValueError(
                 f"no loadable LoRA adapter at {source_repo}:{source_subfolder} "
                 "(need adapter_config.json + an adapter_model* weight; nothing to export)"
             )
         _repair_export_metadata(adapter_dir, base_model, base_model_revision)
-        _normalize_export_adapter_keys(adapter_dir)
+        namespace = _normalize_export_adapter_keys(adapter_dir)
         api = HfApi(token=dest_token)
         try:
             # Always create private first so the repo is never transiently exposed empty/partial.
@@ -343,6 +520,11 @@ def export_adapter(
                 raise
             raise ServingError(f"could not upload adapter to {dest_repo}: {exc}") from exc
     logger.info(
-        "exported %s:%s -> %s (%d files)", source_repo, source_subfolder, dest_repo, len(files)
+        "exported %s:%s -> %s (%d files, %s key namespace)",
+        source_repo,
+        source_subfolder,
+        dest_repo,
+        len(files),
+        namespace,
     )
     return f"https://huggingface.co/{dest_repo}"
