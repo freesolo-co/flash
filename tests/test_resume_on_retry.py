@@ -15,6 +15,7 @@ All HF/provider/network boundaries are stubbed; nothing here touches a GPU or th
 from __future__ import annotations
 
 import io
+import json
 import os
 import shutil
 
@@ -310,6 +311,127 @@ def test_hf_resume_checkpoint_pinned_without_numeric_dir_raises(monkeypatch, res
 
     with pytest.raises(RetriableInfraError, match="required resume checkpoint is missing"):
         worker.hf_resume_checkpoint(fail_closed=True, revision="pinned-sha")
+
+
+# ============================================================================================
+# worker resume: fsdp world-size guard when a retry lands on a different card count
+# ============================================================================================
+def _staged_checkpoint(root, step, *, world_size=None, shards=0, nested=True):
+    """Build a downloaded ``checkpoint-N`` shaped like the one verl uploaded.
+
+    ``nested`` mirrors verl's two trainers: RL/OPD put the shards under ``actor/``, SFT writes them
+    straight into the step dir. ``world_size`` writes verl's own ``fsdp_config.json`` stamp;
+    ``shards`` writes per-rank shard files, which encode the same width in their names.
+    """
+    src = root / f"checkpoint-{step}"
+    inner = src / "actor" if nested else src
+    (inner / "huggingface").mkdir(parents=True)
+    (inner / "model.safetensors").write_text("weights")
+    if world_size is not None:
+        (inner / "fsdp_config.json").write_text(
+            json.dumps({"FSDP_version": 2, "world_size": world_size})
+        )
+    for rank in range(shards):
+        (inner / f"model_world_size_{shards}_rank_{rank}.pt").write_bytes(b"shard")
+    return src
+
+
+def _rl_resume(monkeypatch, tmp_path, src, *, world_size):
+    from flash.engine.worker import rl_train
+
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    monkeypatch.setattr(rl_train._w, "hf_resume_checkpoint", lambda *a, **k: str(src))
+    return rl_train._restore_verl_resume(str(local_dir), world_size=world_size), local_dir
+
+
+def test_matching_world_size_resumes(monkeypatch, tmp_path):
+    src = _staged_checkpoint(tmp_path, 7, world_size=4, shards=4)
+
+    step, local_dir = _rl_resume(monkeypatch, tmp_path, src, world_size=4)
+
+    assert step == 7
+    assert (local_dir / "latest_checkpointed_iteration.txt").read_text().strip() == "7"
+    assert (local_dir / "global_step_7" / "actor" / "model.safetensors").exists()
+
+
+def test_mismatched_world_size_discards_instead_of_crashing(monkeypatch, tmp_path, capsys):
+    # the reachable case: recovery re-allocated a 4x run onto a 2x shape, and verl would look for
+    # model_world_size_2_rank_*.pt in a directory that only has the 4-rank shards.
+    src = _staged_checkpoint(tmp_path, 7, world_size=4, shards=4)
+
+    step, local_dir = _rl_resume(monkeypatch, tmp_path, src, world_size=2)
+
+    assert step == 0, "a shard set this attempt cannot load must not be staged"
+    assert not (local_dir / "latest_checkpointed_iteration.txt").exists()
+    assert not (local_dir / "global_step_7").exists()
+    line = capsys.readouterr().out
+    assert "discarding resume checkpoint checkpoint-7" in line
+    assert "world size 4" in line
+    assert "runs at 2" in line
+
+
+def test_world_size_falls_back_to_the_shard_filenames(monkeypatch, tmp_path):
+    # verl has always stamped fsdp_config.json, but the shard names carry the same width, so a
+    # checkpoint that lost the stamp is still classified rather than guessed at.
+    src = _staged_checkpoint(tmp_path, 3, shards=4)
+
+    assert _rl_resume(monkeypatch, tmp_path, src, world_size=4)[0] == 3
+
+
+@pytest.mark.parametrize(("world_size", "expected"), [(1, 5), (2, 0)])
+def test_unknown_topology_resumes_only_on_a_single_gpu_attempt(
+    monkeypatch, tmp_path, world_size, expected
+):
+    """Backward compatibility for a checkpoint whose topology cannot be read at all.
+
+    A single-gpu spec always retries at one card, so there is no other width its checkpoint could
+    have been written at. A multi-gpu spec is exactly the case recovery re-shapes, and staging
+    shards that may not load costs the whole attempt, so the unreadable case discards.
+    """
+    src = _staged_checkpoint(tmp_path, 5)
+
+    assert _rl_resume(monkeypatch, tmp_path, src, world_size=world_size)[0] == expected
+
+
+def test_sft_flat_layout_is_guarded_too(monkeypatch, tmp_path, capsys):
+    # SFT writes its shards into global_step_N itself rather than a nested actor/ dir.
+    from flash.engine.worker import sft_train
+
+    src = _staged_checkpoint(tmp_path, 9, world_size=2, shards=2, nested=False)
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    monkeypatch.setattr(sft_train._w, "hf_resume_checkpoint", lambda *a, **k: str(src))
+
+    assert sft_train._restore_verl_resume(str(local_dir), world_size=2) == 9
+    shutil.rmtree(local_dir)
+    local_dir.mkdir()
+    assert sft_train._restore_verl_resume(str(local_dir), world_size=4) == 0
+    assert not (local_dir / "global_step_9").exists()
+    assert "[SFT] discarding resume checkpoint checkpoint-9" in capsys.readouterr().out
+
+
+def test_opd_discards_a_mismatched_checkpoint_with_its_accounting(monkeypatch, tmp_path):
+    """OPD returns the fresh-run answer rather than half-restoring the loop state.
+
+    The accounting in opd_state.json describes steps a discarded resume simply redoes, so the pair
+    has to move together; reading it back beside shards this attempt cannot load would be worse.
+    """
+    from flash.engine.worker import opd_train
+
+    src = _staged_checkpoint(tmp_path, 2, world_size=4, shards=4)
+    (src / "opd_state.json").write_text(json.dumps({"unreadable": True}))
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    monkeypatch.setattr(opd_train._w, "OPD_RESUME_REVISION", "")
+    monkeypatch.setattr(opd_train._w, "hf_resume_checkpoint", lambda **_k: str(src))
+
+    step, state = opd_train._restore_verl_resume(
+        str(local_dir), prompt_pool_fingerprint="a" * 64, update_horizon=8, world_size=1
+    )
+
+    assert (step, state) == (0, None)
+    assert not (local_dir / "global_step_2").exists()
 
 
 # ============================================================================================

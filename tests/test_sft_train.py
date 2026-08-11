@@ -1354,7 +1354,7 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
     # torch is not installed in this test env; the real seeding is covered in test_training_controls.
     monkeypatch.setattr(sft_train, "seed_training_rngs", lambda seed: None)
     monkeypatch.setattr(sft_train, "_cached_model_path", lambda model, revision: model)
-    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir: 1)
+    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir, **_kwargs: 1)
     monkeypatch.setattr(sft_train, "_VerlCheckpointWatcher", Watcher)
     monkeypatch.setattr(sft_train, "_NvidiaSmiPeakSampler", PeakSampler)
     monkeypatch.setattr(
@@ -1595,7 +1595,7 @@ def test_a_single_step_run_with_no_gradient_is_rejected(monkeypatch):
     spec, _ = _stub_sft_run(monkeypatch, watcher_cls=_TolerantWatcher)
     # a fresh run, not a resume: the guard abstains on a resume because the restored weights carry
     # earlier updates this session never observed.
-    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir: 0)
+    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir, **_kwargs: 0)
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
         on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
@@ -1628,7 +1628,7 @@ def test_a_fresh_run_with_any_real_gradient_still_completes(monkeypatch, grads):
     from flash.engine.worker import sft_train
 
     spec, captured = _stub_sft_run(monkeypatch)
-    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir: 0)
+    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir, **_kwargs: 0)
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
         on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")

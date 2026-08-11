@@ -95,11 +95,16 @@ def _verl_image_message_content(content) -> str:
     return "".join(parts)
 
 
-def _restore_verl_resume(local_dir: str) -> int:
+def _restore_verl_resume(local_dir: str, *, world_size: int) -> int:
+    """stage this run's streamed resume checkpoint; 0 when there is nothing usable to resume from.
+
+    ``world_size`` is the rank count this attempt launches verl at; a checkpoint written at a
+    different one is discarded rather than staged (see ``resume_topology_matches``).
+    """
     resume = _w.hf_resume_checkpoint()
     if not resume:
         return 0
-    return stage_verl_resume(resume, local_dir, job_label="SFT")
+    return stage_verl_resume(resume, local_dir, job_label="SFT", world_size=world_size)
 
 
 def _durable_required_save_steps(required_steps: tuple[int, ...], resume_step: int) -> set[int]:

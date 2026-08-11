@@ -24,6 +24,7 @@ from flash.engine.worker.sft_train import (
     _VerlCheckpointWatcher,
 )
 from flash.engine.worker.train.opd.bridge import _TeacherAlignmentBridge
+from flash.engine.worker.verl.checkpoints import resume_topology_matches
 from flash.teacher.retry_contract import (
     OPD_RESUME_STATE_VERSION,
     validate_opd_resume_state_metadata,
@@ -281,6 +282,7 @@ def _restore_verl_resume(
     *,
     prompt_pool_fingerprint: str,
     update_horizon: int,
+    world_size: int,
 ) -> tuple[int, dict | None]:
     revision = _w.OPD_RESUME_REVISION or None
     resume = _w.hf_resume_checkpoint(fail_closed=bool(revision), revision=revision)
@@ -290,6 +292,10 @@ def _restore_verl_resume(
     if match is None:
         raise RuntimeError(f"invalid OPD resume checkpoint path {resume!r}")
     step = int(match.group(1))
+    # before the state is read, not after: a checkpoint this attempt's rank count cannot load is
+    # discarded whole, and the loop accounting it carries only describes steps that get redone.
+    if not resume_topology_matches(resume, world_size=world_size, job_label="OPD"):
+        return 0, None
     with open(os.path.join(resume, "opd_state.json"), encoding="utf-8") as file:
         state = validate_opd_resume_state_metadata(
             json.load(file), expected_seed=int(_w.SEED), checkpoint_step=step

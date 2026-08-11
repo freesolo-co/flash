@@ -91,19 +91,85 @@ def unprocessed_checkpoint_dirs(
     return sorted(found)
 
 
-def stage_verl_resume(resume_dir: str, local_dir: str, *, job_label: str) -> int:
+# verl stamps the writing topology next to the shards on every save
+# (`utils/checkpoint/fsdp_checkpoint_manager.py` writes `FSDPConfig(world_size=...)` here, and its
+# own model_merger reads the file back). flash reads that stamp instead of adding a second one: it
+# is already inside every checkpoint on the hub, including the ones written before this guard.
+VERL_FSDP_CONFIG_FILE = "fsdp_config.json"
+
+# the shards themselves carry the same number: verl saves and loads
+# `model_world_size_{W}_rank_{R}.pt`, which is exactly why a cross-count resume cannot open a file.
+_FSDP_SHARD_RE = re.compile(r"model_world_size_(\d+)_rank_\d+\.pt")
+
+
+def checkpoint_world_size(step_dir: str) -> int | None:
+    """the number of ranks that wrote ``step_dir``'s fsdp shards, or none when it is unreadable.
+
+    prefers verl's ``fsdp_config.json`` stamp and falls back to the shard filenames, which encode
+    the same width. a checkpoint carrying neither is unclassifiable rather than single-rank, so it
+    reports none and lets the caller decide.
+    """
+    actor_dir = resolve_checkpoint_actor_dir(step_dir)
+    try:
+        with open(os.path.join(actor_dir, VERL_FSDP_CONFIG_FILE), encoding="utf-8") as file:
+            stamped = json.load(file).get("world_size")
+    except (OSError, ValueError):
+        stamped = None
+    if isinstance(stamped, int) and not isinstance(stamped, bool) and stamped >= 1:
+        return stamped
+    try:
+        names = os.listdir(actor_dir)
+    except OSError:
+        return None
+    widths = {int(m.group(1)) for m in map(_FSDP_SHARD_RE.fullmatch, names) if m is not None}
+    # more than one width means a torn or merged directory: not a topology this code can vouch for.
+    return widths.pop() if len(widths) == 1 else None
+
+
+def resume_topology_matches(resume_dir: str, *, world_size: int, job_label: str) -> bool:
+    """whether an attempt running ``world_size`` ranks can load ``resume_dir``'s fsdp shards.
+
+    infra recovery deliberately re-allocates a retry across card counts (2x and 4x of the same
+    class are distinct rentable shapes), and the worker then launches verl at the new count. verl
+    loads exactly ``model_world_size_{world_size}_rank_{rank}.pt``, so a retry that changed shape
+    cannot open a single shard: the load dies with a missing-file error that is not oom-shaped, so
+    the supervisor burns another retry on it. discarding instead restarts from step 0, which is
+    what a failed resume fetch already does, and costs only the steps since the last save.
+
+    an unreadable topology is treated as a mismatch on a multi-gpu attempt (the shards may or may
+    not fit and being wrong costs the attempt) and as a match on a single-gpu one, where the spec's
+    card count can never have been anything but one.
+    """
+    written = checkpoint_world_size(resume_dir)
+    if written == world_size or (written is None and world_size <= 1):
+        return True
+    print(
+        f"[{job_label}] discarding resume checkpoint {os.path.basename(resume_dir)}: its fsdp "
+        f"shards were written at world size {written if written is not None else 'unknown'} but "
+        f"this attempt runs at {world_size}; restarting from step 0",
+        flush=True,
+    )
+    return False
+
+
+def stage_verl_resume(resume_dir: str, local_dir: str, *, job_label: str, world_size: int) -> int:
     """stage a downloaded ``checkpoint-N`` into local_dir where verl looks; return its step.
 
     the resume artifact is keyed on the run prefix, not the job type, so the control plane hands
     every trainer the same ``checkpoint-N`` layout. verl finds it via
     latest_checkpointed_iteration.txt under trainer.default_local_dir once resume_mode=auto.
-    ``job_label`` only names the job in the error raised for an unparseable path, which is the sole
-    thing the trainers ever varied here.
+    ``job_label`` names the job in the error raised for an unparseable path and in the discard log,
+    which is the sole thing the trainers ever varied here.
+
+    returns 0, staging nothing, when the checkpoint's world size does not match ``world_size``: see
+    ``resume_topology_matches``. 0 is the fresh-run answer every caller already handles.
     """
     match = re.fullmatch(r"checkpoint-(\d+)", os.path.basename(resume_dir))
     if match is None:
         raise RuntimeError(f"invalid {job_label} resume checkpoint path {resume_dir!r}")
     step = int(match.group(1))
+    if not resume_topology_matches(resume_dir, world_size=world_size, job_label=job_label):
+        return 0
     shutil.copytree(resume_dir, os.path.join(local_dir, f"global_step_{step}"), dirs_exist_ok=True)
     with open(os.path.join(local_dir, "latest_checkpointed_iteration.txt"), "w") as file:
         file.write(str(step))

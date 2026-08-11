@@ -2764,7 +2764,7 @@ def test_restore_verl_resume_returns_validated_accounting(monkeypatch, tmp_path)
     local_dir.mkdir()
 
     step, restored = _restore_verl_resume(
-        str(local_dir), prompt_pool_fingerprint="a" * 64, update_horizon=3
+        str(local_dir), prompt_pool_fingerprint="a" * 64, update_horizon=3, world_size=1
     )
 
     assert step == 2
