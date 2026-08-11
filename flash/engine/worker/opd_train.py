@@ -53,6 +53,7 @@ from flash.engine.worker.sft_train import (  # noqa: F401
     _export_checkpoint_adapter,
     _NvidiaSmiPeakSampler,
     _probe_gpu_in_subprocess,
+    _processed_resume_steps,
     _verl_image_message_content,
     _warmstart_adapter_path,
 )
@@ -408,7 +409,6 @@ from flash.engine.worker.train.opd.failures import (  # noqa: E402,F401
     _failure_accounting_metadata,
     _find_checkpoint_file,
     _OpdVerlCheckpointWatcher,
-    _processed_resume_steps,
     _raise_verl_failure,
     _read_classified_failure_fallback,
     _read_failure_fallback_records,

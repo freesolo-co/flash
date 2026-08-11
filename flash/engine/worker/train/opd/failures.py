@@ -19,11 +19,15 @@ from pathlib import Path
 
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.sft_train import (
-    _durable_required_save_steps,
     _export_checkpoint_adapter,
     _VerlCheckpointWatcher,
 )
 from flash.engine.worker.train.opd.bridge import _TeacherAlignmentBridge
+from flash.engine.worker.verl.checkpoints import (
+    checkpoint_world_size,
+    resume_checkpoint_is_loadable,
+    resume_topology_matches,
+)
 from flash.teacher.limits import OPD_NO_SIGNAL_ATTEMPTS
 from flash.teacher.retry_contract import (
     OPD_RESUME_STATE_VERSION,
@@ -300,8 +304,12 @@ def _restore_verl_resume(
     *,
     prompt_pool_fingerprint: str,
     update_horizon: int,
+    world_size: int,
 ) -> tuple[int, dict | None]:
     revision = _w.OPD_RESUME_REVISION or None
+    # no `prefer`: opd pins an exact commit via OPD_RESUME_REVISION with fail_closed, and
+    # validate_opd_resume_state_metadata is keyed to that checkpoint's step, so silently picking a
+    # different candidate here would violate the retry contract those enforce.
     resume = _w.hf_resume_checkpoint(fail_closed=bool(revision), revision=revision)
     if not resume:
         return 0, None
@@ -309,6 +317,26 @@ def _restore_verl_resume(
     if match is None:
         raise RuntimeError(f"invalid OPD resume checkpoint path {resume!r}")
     step = int(match.group(1))
+    # before the state is read, not after: a checkpoint this attempt's rank count cannot load is
+    # discarded whole, and the loop accounting it carries only describes steps that get redone.
+    if revision:
+        # a pinned revision means a prior attempt crossed optimizer.step(): the control-plane
+        # gate (verify_opd_replacement_safe) authorized this replacement only to continue from
+        # exactly this checkpoint. discarding it and restarting from step 0 would repeat
+        # already-billed teacher work and optimizer steps outside what the gate approved, so a
+        # topology mismatch fails closed here instead of falling through to a fresh run.
+        if not resume_checkpoint_is_loadable(resume, world_size=world_size):
+            written = checkpoint_world_size(resume)
+            raise RuntimeError(
+                f"permanent OPD resume failure: pinned resume revision {revision!r} names "
+                f"checkpoint {os.path.basename(resume)}, whose fsdp shards were written at "
+                f"world size {written if written is not None else 'unknown'} while this "
+                f"attempt runs at world size {world_size}. restarting from step 0 would "
+                "violate the pinned-resume contract, so this attempt refuses to train; "
+                "relaunch the retry at the checkpoint's gpu count."
+            )
+    elif not resume_topology_matches(resume, world_size=world_size, job_label="OPD"):
+        return 0, None
     with open(os.path.join(resume, "opd_state.json"), encoding="utf-8") as file:
         state = validate_opd_resume_state_metadata(
             json.load(file), expected_seed=int(_w.SEED), checkpoint_step=step
@@ -322,13 +350,6 @@ def _restore_verl_resume(
     with open(os.path.join(local_dir, "latest_checkpointed_iteration.txt"), "w") as file:
         file.write(str(step))
     return step, state
-
-
-def _processed_resume_steps(required_steps: tuple[int, ...], resume_step: int) -> set[int]:
-    processed = _durable_required_save_steps(required_steps, resume_step)
-    if resume_step and resume_step not in required_steps:
-        processed.add(resume_step)
-    return processed
 
 
 # the teacher exit codes the child uses, defined in the orchestrator. imported at the BOTTOM
