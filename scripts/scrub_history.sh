@@ -13,6 +13,8 @@
 #   - the same addresses and hostname where they appear in FILE CONTENT: earlier
 #     revisions of this script hardcoded them, and a rewrite that only touches
 #     identities and messages leaves those blobs serving the leak from every branch
+#   - the same addresses and hostname in ANNOTATED TAG messages, which are neither a
+#     commit message nor a blob and so survive a rewrite that only covers those two
 #
 # This rewrites every commit sha. Run it once, on a fresh mirror clone, while the
 # repository is still private. Rewriting after publication is pointless: the old
@@ -90,7 +92,13 @@ unset FLASH_ALIAS_EMAILS FLASH_LEAKED_HOST_RE
 # shellcheck source=/dev/null
 . "$IDENTITIES_FILE"
 CANONICAL_IDENTITY="${CANONICAL_OVERRIDE:-${FLASH_CANONICAL_IDENTITY:-}}"
-MAINTAINER_ALIAS_EMAILS="${FLASH_ALIAS_EMAILS:-}"
+# Normalized at LOAD, so the "list entries in LOWERCASE" contract documented below is
+# enforced rather than merely requested. Every consumer today already copes with a mixed-case
+# entry on its own -- the two awk lookups key on tolower(a[i]), and the counters and rewrites
+# are all case-insensitive -- so this changes no behaviour now. It removes the standing
+# requirement that the NEXT consumer remember to, which is how a mixed-case alias would
+# eventually reach a case-sensitive test and end up neither remapped nor counted.
+MAINTAINER_ALIAS_EMAILS="$(printf '%s' "${FLASH_ALIAS_EMAILS:-}" | tr '[:upper:]' '[:lower:]')"
 # Lowercased, because every identity test downcases the address before comparing and awk's
 # "~" is case-sensitive. Hostnames are case-insensitive and git preserves whatever case was
 # committed, so a mixed-case fragment would leave the identity counter and the mailmap
@@ -318,7 +326,13 @@ HOST_CONTENT_ALT="$HOST_CONTENT_ALT|$(printf '%s' "$HOST_PLAIN" | sed 's/[.]/\\\
 # the alias is a fragment of a longer address, not a complete one. the class feeds ERE and
 # python brackets directly; sed consumers must use a delimiter outside this set (comma) and
 # escape & in replacements.
-ALIAS_EDGE_CLASS="A-Za-z0-9._%+!#\$&'*/=?^\`{|}~@-"
+#
+# "'" and the backtick are deliberately LEFT OUT of that otherwise-complete set. Both are
+# legal in a local part, but prose and shell snippets QUOTE addresses constantly while an
+# address containing a quote is vanishingly rare -- and with "'" in the class a quoted
+# "'d@d'" reads as one longer address, so it matches neither the rewrite nor the gate and
+# the leak survives certified clean. Practical quoting beats RFC completeness here.
+ALIAS_EDGE_CLASS="A-Za-z0-9._%+!#\$&*/=?^{|}~@-"
 ALIAS_WORD_ERE="(^|[^$ALIAS_EDGE_CLASS])($ALIAS_ALT)([^$ALIAS_EDGE_CLASS]|\$)"
 LEAK_STRINGS_RE="$ALIAS_WORD_ERE|$HOST_CONTENT_ALT"
 
@@ -364,6 +378,42 @@ count_blob_leaks() {
   esac
 }
 
+count_tag_leaks() {
+  # Annotated TAG OBJECTS still carrying a scrubbed string. An annotated tag is neither a
+  # commit nor a blob, so neither count_pattern (which walks commit messages) nor
+  # count_blob_leaks sees one, and a tag message quoting an alias or the hostname would be
+  # certified clean and then force-pushed by the publish step.
+  #
+  # The whole raw object is scanned, headers included, so the TAGGER field is gated too:
+  # --mailmap rewrites it exactly as it rewrites author/committer, and a residual there is
+  # as real a leak as one in the message. Lightweight tags are skipped -- they are just a
+  # ref pointing at a commit that count_pattern already covers.
+  #
+  # Failures propagate for the same reason they do in count_blob_leaks: checked_count calls
+  # this inside an `if !`, so a swallowed error becomes a confident "0".
+  local tags out matches statuses
+  if ! tags="$(git for-each-ref --format='%(objectname) %(objecttype)' \
+    | awk '$2 == "tag" { print $1 }' \
+    | sort -u)"; then
+    return 1
+  fi
+  if [ -z "$tags" ]; then
+    echo 0
+    return 0
+  fi
+  out="$(
+    set +o pipefail
+    printf '%s\n' "$tags" | git cat-file --batch | grep -ac -iE -e "$LEAK_STRINGS_RE"
+    printf 'status=%s' "${PIPESTATUS[*]}"
+  )"
+  matches="${out%%status=*}"
+  statuses="${out#*status=}"
+  case "$statuses" in
+    "0 0 0" | "0 0 1") printf '%s' "${matches//[$'\n']/}" ;;
+    *) return 1 ;;
+  esac
+}
+
 report_counts() {
   echo "    total commits:         $(git rev-list --count --all)"
   echo "    Co-Authored-By Claude: $(count_pattern "$CO_AUTHORED_RE")"
@@ -374,6 +424,7 @@ report_counts() {
   echo "    leaking identities:    $(count_identities)"
   echo "    alias/host in prose:   $(count_pattern "$LEAK_STRINGS_RE")"
   echo "    leaks in file content: $(count_blob_leaks)"
+  echo "    leaks in tag objects:  $(count_tag_leaks)"
 }
 
 echo "==> before:"
@@ -457,7 +508,15 @@ REPLACEMENTS="$WORKDIR/flash-scrub-replacements"
 {
   # comma delimiter: the edge class now contains '|'. the class's own '&' must not expand
   # to the sed match, so a replacement-safe copy escapes it.
-  _edge_sed="${ALIAS_EDGE_CLASS//&/\\&}"
+  #
+  # Escaped with sed rather than "${ALIAS_EDGE_CLASS//&/\&}". Bash 5.2 made an unquoted '&'
+  # in a pattern-substitution REPLACEMENT expand to the matched text, which looks like it
+  # would break that spelling. It does not: the "\\" is consumed as an escaped backslash
+  # first, and the bare '&' left behind expands to the match, which here IS '&' -- so both
+  # forms emit "\&" (checked on 3.2 and on 5.3 with patsub_replacement on). It survives by
+  # coincidence, though, and reads like the bug it keeps being reported as. sed's
+  # replacement rules are the same on every version, so spell it there instead.
+  _edge_sed="$(printf '%s' "$ALIAS_EDGE_CLASS" | sed 's/&/\\&/g')"
   printf '%s' "$MAINTAINER_ALIAS_EMAILS" | tr ' ' '\n' | grep -v '^$' \
     | sed 's/[][^$.|?*+(){}\]/\\&/g' \
     | sed "s,^,regex:(?i)(?<![$_edge_sed]),; s,\$,(?![$_edge_sed])==>REDACTED,"
@@ -468,10 +527,15 @@ REPLACEMENTS="$WORKDIR/flash-scrub-replacements"
 
 # Drop whole trailer lines. Matching is line-anchored and trailer-shaped, so a commit
 # body that merely mentions Claude in prose is left alone.
+#
+# --message-callback, not --commit-callback: filter-repo runs this one over ANNOTATED TAG
+# messages as well as commit messages. --replace-text rewrites blobs only and --mailmap
+# rewrites the tagger field only, so a tag whose message carries an alias or the hostname
+# would otherwise sail through untouched and get force-pushed as part of the publish step.
 "${FILTER_REPO[@]}" \
   --mailmap "$MAILMAP" \
   --replace-text "$REPLACEMENTS" \
-  --commit-callback '
+  --message-callback '
 import os
 import re
 
@@ -512,7 +576,6 @@ patterns = [
     # non-ascii bytes (the footer is usually emoji-prefixed) plus whitespace.
     rb"(?im)^[ \t]*(?:[^\x00-\x7f][ \t]*)*Generated with[ \t]+[^\n]*Claude Code[^\n]*\n?",
 ]
-message = commit.message
 scrubbed = message
 for pattern in patterns:
     scrubbed = re.sub(pattern, b"", scrubbed)
@@ -540,13 +603,14 @@ scrubbed = b"\n".join(_kept)
 # leaving it would block publication forever rather than merely look untidy.
 scrubbed = _leak_strings.sub(b"REDACTED", scrubbed)
 
-# Only reformat commits we actually touched: collapsing blank lines or trimming
+# Only reformat messages we actually touched: collapsing blank lines or trimming
 # trailing newlines on every commit would rewrite unrelated message formatting.
-if scrubbed != message:
-    scrubbed = re.sub(rb"\n{3,}", b"\n\n", scrubbed)
-    scrubbed = scrubbed.rstrip(b"\n")
-    # a message that was nothing but trailers would otherwise become empty
-    commit.message = (scrubbed + b"\n") if scrubbed.strip() else b"(no message)\n"
+if scrubbed == message:
+    return message
+scrubbed = re.sub(rb"\n{3,}", b"\n\n", scrubbed)
+scrubbed = scrubbed.rstrip(b"\n")
+# a message that was nothing but trailers would otherwise become empty
+return (scrubbed + b"\n") if scrubbed.strip() else b"(no message)\n"
 ' \
   --force
 
@@ -601,6 +665,10 @@ residual=$((residual + n))
 # while leaving the addresses in a historical copy of a tracked file is exactly the
 # half-scrubbed history this gate exists to catch.
 n="$(checked_count blob-content count_blob_leaks)"
+residual=$((residual + n))
+# annotated tags are gated for the same reason blobs are: they are pushed by the publish
+# step's 'refs/tags/*' refspec, so a tag message the rewrite missed is published verbatim.
+n="$(checked_count tag-objects count_tag_leaks)"
 residual=$((residual + n))
 
 if [ "$residual" -ne 0 ]; then
