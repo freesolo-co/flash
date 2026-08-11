@@ -61,7 +61,7 @@ RUN pip install --no-cache-dir \
     "tilelang==0.1.11" \
     "apache-tvm-ffi==0.1.11" \
     "hf_transfer" \
-    "freesolo>=0.2.54" \
+    "freesolo>=0.4.0" \
     "runpod"
 # Gated-DeltaNet (Qwen3.5/3.6) runs on flash-linear-attention's Triton kernels. On consumer cards
 # (Ampere/Ada/Blackwell) the Triton path is correct. On Hopper (sm90) fla's GDN chunk_bwd is
@@ -91,13 +91,34 @@ RUN pip install --no-cache-dir \
 # tens of GB of RAM, including the hand-build command in this file's header.
 # NOTE: keep this default in sync with .github/workflows/worker-image.yml's FA2_SPEC.
 ARG FLASH_ATTN_SPEC=https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.0/flash_attn-2.8.3%2Bcu128torch2.10-cp312-cp312-linux_x86_64.whl
+# sha256 of the wheel FLASH_ATTN_SPEC defaults to, kept in lockstep with backend_common's
+# FLASH_ATTN_SHA256. The wheel is a community rebuild published by an individual, not Dao-AILab, and
+# a github release asset can be deleted and re-uploaded at the same url by whoever holds the account
+# -- so the url alone pins nothing, and this is the interpreter that trains. Same discipline as the
+# infisical .deb in Dockerfile: download, verify, THEN install. Bump it together with the url (and
+# worker-image.yml's FA2_SPEC). A url spec with an empty sha is refused, not installed unverified.
+ARG FLASH_ATTN_SHA256=a58c95a080363606e691c342d47dd173b510f4c013a8c5fcb8744def12e36a0f
 # Source-build only (ignored when FLASH_ATTN_SPEC is a wheel, i.e. by default): bound the compile so it
 # doesn't OOM. TORCH_CUDA_ARCH_LIST restricts to the catalog's arches — Ampere (8.0 A100 / 8.6
 # 3090/A40), Ada (8.9 4090), Hopper (9.0 H100), Blackwell datacenter (10.0 B200; sm100) + workstation (12.0 RTX 5090/Pro 6000; sm120); MAX_JOBS bounds
 # peak compile memory. (A from-source build still needs a big-RAM host; the wheel avoids all of it.)
-RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" MAX_JOBS=4 \
-    pip install --no-cache-dir "${FLASH_ATTN_SPEC}" --no-build-isolation \
-    && echo "flash-attn: installed (${FLASH_ATTN_SPEC})" || echo "flash-attn: build failed, SDPA fallback"
+# A download fault keeps the pre-existing best-effort semantics (SDPA fallback); a HASH MISMATCH
+# never does -- it fails the build, because the whole point is to not bake an unknown binary.
+RUN set -eu; \
+    spec="${FLASH_ATTN_SPEC}"; \
+    case "${spec}" in \
+        http*) \
+            [ -n "${FLASH_ATTN_SHA256}" ] || { echo "FLASH_ATTN_SHA256 is required for a wheel url" >&2; exit 1; }; \
+            wheel=/tmp/flash_attn.whl; \
+            curl -fsSL -o "${wheel}" "${spec}" \
+                || { rm -f "${wheel}"; echo "flash-attn: wheel download failed, SDPA fallback"; exit 0; }; \
+            echo "${FLASH_ATTN_SHA256}  ${wheel}" | sha256sum -c -; \
+            spec="${wheel}" ;; \
+    esac; \
+    TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" MAX_JOBS=4 \
+    pip install --no-cache-dir "${spec}" --no-build-isolation \
+    && echo "flash-attn: installed (${FLASH_ATTN_SPEC})" || echo "flash-attn: build failed, SDPA fallback"; \
+    rm -f /tmp/flash_attn.whl
 
 # FlashAttention-3 (used on Hopper sm90: H100/H200). transformers routes
 # attn_implementation="flash_attention_3" to a LOCAL ``flash_attn_interface`` module (the
@@ -114,12 +135,29 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" MAX_JOBS=4 \
 # install can't ship as "present" and then crash a run.
 # NOTE: keep this default in sync with .github/workflows/worker-image.yml's flash_attn_3_spec input.
 ARG FLASH_ATTN_3_SPEC=https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.03.19-850211f/flash_attn_3-3.0.0%2B20260318.cu128torch2100cxx11abitrue.8afc61-cp39-abi3-linux_x86_64.whl
+# sha256 of the wheel FLASH_ATTN_3_SPEC defaults to. Same argument as FLASH_ATTN_SHA256 above: an
+# unofficial rebuild repo owned by an individual, fetched into the interpreter that trains, so it is
+# verified before install rather than trusted by url. Override it together with FLASH_ATTN_3_SPEC
+# (worker-image.yml exposes both as workflow inputs); a url spec with an empty sha is refused.
+ARG FLASH_ATTN_3_SHA256=13ec39bc8cb37d37b1efd3bff76ee5e994f5cac3ca6a8ce35db6f54b98ca3862
 RUN if [ -n "${FLASH_ATTN_3_SPEC}" ]; then \
+      set -eu; \
+      spec="${FLASH_ATTN_3_SPEC}"; \
+      case "${spec}" in \
+          http*) \
+              [ -n "${FLASH_ATTN_3_SHA256}" ] || { echo "FLASH_ATTN_3_SHA256 is required for a wheel url" >&2; exit 1; }; \
+              wheel=/tmp/flash_attn_3.whl; \
+              curl -fsSL -o "${wheel}" "${spec}" \
+                  || { rm -f "${wheel}"; echo "flash-attn-3: wheel download failed -> SDPA fallback on Hopper"; exit 0; }; \
+              echo "${FLASH_ATTN_3_SHA256}  ${wheel}" | sha256sum -c -; \
+              spec="${wheel}" ;; \
+      esac; \
       FLASH_ATTN_CUDA_ARCHS=90 TORCH_CUDA_ARCH_LIST="9.0" MAX_JOBS=4 \
-      pip install --no-cache-dir "${FLASH_ATTN_3_SPEC}" --no-build-isolation \
+      pip install --no-cache-dir "${spec}" --no-build-isolation \
       && python -c "import flash_attn_interface; print('flash_attn_interface: import OK')" \
       && echo "flash-attn-3: installed (${FLASH_ATTN_3_SPEC})" \
       || echo "flash-attn-3: install failed -> SDPA fallback on Hopper"; \
+      rm -f /tmp/flash_attn_3.whl; \
     else echo "flash-attn-3: skipped (FLASH_ATTN_3_SPEC unset) -> SDPA on Hopper"; fi
 
 # causal_conv1d: the short depthwise causal conv kernel whose ``seq_idx`` arg resets the conv at

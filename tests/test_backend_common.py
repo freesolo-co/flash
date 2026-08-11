@@ -12,6 +12,7 @@ import inspect
 import json
 import os
 import pathlib
+import re
 import signal
 import subprocess
 import sys
@@ -393,7 +394,7 @@ def _flaky_wheel_install(calls, sleeps, *, failures: int):
             return
         # key on the SPEC, not on --no-build-isolation: causal_conv1d passes that flag too, and this
         # helper models a flaky flash-attn download specifically.
-        if vc.FLASH_ATTN_SPEC not in command:
+        if vc.FLASH_ATTN_INSTALL_SPEC not in command:
             return
         attempts["n"] += 1
         if attempts["n"] <= failures:
@@ -513,12 +514,12 @@ def test_provisioned_venv_gets_flash_attn_for_the_remove_padding_path(monkeypatc
     vc.resolve_verl_python(str(tmp_path))
 
     flat = [arg for command in calls for arg in command]
-    assert vc.FLASH_ATTN_SPEC in flat, (
+    assert vc.FLASH_ATTN_INSTALL_SPEC in flat, (
         "verl's remove-padding path imports flash_attn unguarded; the provisioned venv must hold it"
     )
     # the wheel is prebuilt, so it must skip build isolation exactly as the image install does --
     # a source build here would compile for minutes on a paid pod.
-    install = next(c for c in calls if vc.FLASH_ATTN_SPEC in c)
+    install = next(c for c in calls if vc.FLASH_ATTN_INSTALL_SPEC in c)
     assert "--no-build-isolation" in install
 
 
@@ -526,9 +527,19 @@ def test_flash_attn_spec_stays_in_lockstep_with_the_worker_image():
     # the fallback venv and /opt/verl-venv must resolve the same wheel: a run that lands on the
     # no-image path otherwise trains against a different flash_attn than every baked-image run.
     dockerfile = pathlib.Path(__file__).resolve().parents[1] / "Dockerfile.worker"
-    assert f"ARG FLASH_ATTN_SPEC={vc.FLASH_ATTN_SPEC}" in dockerfile.read_text(), (
+    text = dockerfile.read_text()
+    assert f"ARG FLASH_ATTN_SPEC={vc.FLASH_ATTN_SPEC}" in text, (
         "Dockerfile.worker's FLASH_ATTN_SPEC default drifted from backend_common.FLASH_ATTN_SPEC"
     )
+    # and so must the checksum: the wheel comes from an individual's github release repo, where the
+    # asset behind a fixed url can be replaced. two fetch sites verifying different digests would
+    # mean the no-image path and the image no longer agree on which bytes are the pinned wheel.
+    assert f"ARG FLASH_ATTN_SHA256={vc.FLASH_ATTN_SHA256}" in text, (
+        "Dockerfile.worker's FLASH_ATTN_SHA256 default drifted from backend_common.FLASH_ATTN_SHA256"
+    )
+    # the install must actually ASK for the digest -- a pinned constant nothing passes to uv is
+    # exactly the unverified fetch this pin exists to close.
+    assert f"{vc.FLASH_ATTN_SPEC}#sha256={vc.FLASH_ATTN_SHA256}" == vc.FLASH_ATTN_INSTALL_SPEC
 
 
 def test_the_capability_probe_imports_nothing_from_flash():
@@ -1173,7 +1184,8 @@ def test_transformers_pin_stays_in_lockstep_with_the_worker_image():
     # same argument as VERL_SPEC lockstep: the image bakes its own pin, this path resolves its own.
     # if they drift, the interpreter that TRAINS runs a different transformers depending on whether
     # an image supplied it -- and transformers owns the gdn modelling code the shim patches.
-    dockerfile = pathlib.Path(__file__).resolve().parents[1] / "Dockerfile.worker"
+    root = pathlib.Path(__file__).resolve().parents[1]
+    dockerfile = root / "Dockerfile.worker"
     text = dockerfile.read_text()
     quoted = f'"{vc.TRANSFORMERS_REQUIREMENT}"'
     assert quoted in text, (
@@ -1181,6 +1193,21 @@ def test_transformers_pin_stays_in_lockstep_with_the_worker_image():
     )
     # and specifically in the verl venv's override file, not only the main interpreter's install.
     assert f'"{vc.TRANSFORMERS_REQUIREMENT}" > /tmp/verl-overrides.txt' in text
+
+    # pyproject declares the same range for the gpu/server/dev extras. it used to be excluded from
+    # this check and drifted to a lower ceiling unnoticed, which put anyone installing the package
+    # (local worker, self-hosted plane) on a transformers line the image never runs.
+    pyproject = (root / "pyproject.toml").read_text()
+    declared = set(re.findall(r'"(transformers>=[^"]+)"', pyproject))
+    assert declared == {vc.TRANSFORMERS_REQUIREMENT}, (
+        f"pyproject.toml transformers ranges {sorted(declared)} drifted from "
+        f"backend_common.TRANSFORMERS_REQUIREMENT ({vc.TRANSFORMERS_REQUIREMENT!r}); every extra "
+        "must declare the range the worker image is built and tested against"
+    )
+    # and every extra that names transformers at all must name it (three today: gpu, server, dev).
+    assert pyproject.count(f'"{vc.TRANSFORMERS_REQUIREMENT}"') == 3, (
+        "expected the transformers range in exactly the gpu, server and dev extras"
+    )
 
 
 def test_the_venv_stamp_covers_the_transformers_pin_so_a_prepin_venv_is_rebuilt():
@@ -1239,7 +1266,7 @@ def test_the_stamp_identifies_flash_attn_so_a_prefix_venv_is_not_reused(monkeypa
     vc.resolve_verl_python(str(tmp_path))
 
     assert calls, "a venv stamped before flash-attn was installed must be rebuilt"
-    assert any(vc.FLASH_ATTN_SPEC in call for call in calls)
+    assert any(vc.FLASH_ATTN_INSTALL_SPEC in call for call in calls)
 
 
 def test_resolve_verl_python_reuses_a_venv_built_from_the_current_pin(monkeypatch, tmp_path):

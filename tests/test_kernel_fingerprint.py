@@ -132,6 +132,30 @@ def test_fa3_default_is_in_lockstep():
     )
 
 
+def test_the_flash_attn_wheel_digests_are_in_lockstep():
+    """Both FA wheels are verified before install, so both digests are declared twice.
+
+    Dockerfile.worker carries the ARG defaults it verifies against; worker-image.yml passes the same
+    values as build-args. A drifted pair means the build verifies against a digest nobody reviewed
+    alongside the url -- which is the unverified fetch again, wearing a checksum.
+    """
+    dockerfile = (ROOT / "Dockerfile.worker").read_text()
+    yml = (ROOT / ".github" / "workflows" / "worker-image.yml").read_text()
+
+    for arg, env in (("FLASH_ATTN_SHA256", "FA2_SHA256"), ("FLASH_ATTN_3_SHA256", "FA3_SHA256")):
+        docker_sha = re.search(rf"(?m)^ARG {arg}=([0-9a-f]{{64}})$", dockerfile)
+        assert docker_sha, f"Dockerfile.worker must pin a 64-hex ARG {arg}"
+        # FA3's is behind a workflow input (`${{ inputs || 'default' }}`); FA2's is a bare literal.
+        yml_sha = re.search(rf"{env}:.*?'([0-9a-f]{{64}})'", yml) or re.search(
+            rf"(?m)^\s*{env}:\s*([0-9a-f]{{64}})$", yml
+        )
+        assert yml_sha, f"worker-image.yml must carry {env}"
+        assert docker_sha.group(1) == yml_sha.group(1), (
+            f"{arg} drift: Dockerfile.worker={docker_sha.group(1)} vs "
+            f"worker-image.yml {env}={yml_sha.group(1)}"
+        )
+
+
 def test_huggingface_hub_floor_is_in_lockstep():
     """The huggingface_hub floor is declared twice for the worker: Dockerfile.worker bakes it into the
     per-arch image (the default run path) and WORKER_DEPS installs it on the no-image/live-function
@@ -151,6 +175,33 @@ def test_huggingface_hub_floor_is_in_lockstep():
     assert docker_hf[0] == worker_hf[0], (
         f"huggingface_hub floor drift: Dockerfile.worker={docker_hf[0]!r} vs WORKER_DEPS={worker_hf[0]!r}; "
         "bump both together so the baked image and the live-function path share the 429 retry floor"
+    )
+
+
+def test_freesolo_floor_is_in_lockstep():
+    """Same argument as the huggingface_hub floor, for the Freesolo SDK.
+
+    Dockerfile.worker bakes a freesolo floor into the per-arch image (the default run path) and
+    FREESOLO_WORKER_SPEC installs one on the no-image/live-function path. They must stay equal:
+    the image's floor is the one that actually governs, so a lower floor there means the default
+    path can resolve an SDK the no-image path would have rejected.
+    """
+    from flash.envs.base import FREESOLO_WORKER_SPEC
+    from flash.providers.runpod.serverless import WORKER_DEPS
+
+    dockerfile = (ROOT / "Dockerfile.worker").read_text()
+    docker_fs = [s for s in kf._pip_stack_specs(dockerfile) if kf._pkg_name(s) == "freesolo"]
+    worker_fs = [d for d in WORKER_DEPS if kf._pkg_name(d) == "freesolo"]
+    # Exactly one pin per source, else a duplicate/drifted entry could hide behind the first match.
+    assert len(docker_fs) == 1, f"expected one freesolo pin in Dockerfile.worker, found {docker_fs}"
+    assert len(worker_fs) == 1, f"expected one freesolo pin in WORKER_DEPS, found {worker_fs}"
+    assert worker_fs[0] == FREESOLO_WORKER_SPEC, (
+        "WORKER_DEPS must carry FREESOLO_WORKER_SPEC itself, not a copy that can drift from it"
+    )
+    assert docker_fs[0] == FREESOLO_WORKER_SPEC, (
+        f"freesolo floor drift: Dockerfile.worker={docker_fs[0]!r} vs "
+        f"FREESOLO_WORKER_SPEC={FREESOLO_WORKER_SPEC!r}; bump both together so the baked image and "
+        "the live-function path require the same SDK"
     )
 
 
