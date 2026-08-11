@@ -91,7 +91,13 @@ unset FLASH_ALIAS_EMAILS FLASH_LEAKED_HOST_RE
 . "$IDENTITIES_FILE"
 CANONICAL_IDENTITY="${CANONICAL_OVERRIDE:-${FLASH_CANONICAL_IDENTITY:-}}"
 MAINTAINER_ALIAS_EMAILS="${FLASH_ALIAS_EMAILS:-}"
-LEAKED_HOST_RE="${FLASH_LEAKED_HOST_RE:-}"
+# Lowercased, because every identity test downcases the address before comparing and awk's
+# "~" is case-sensitive. Hostnames are case-insensitive and git preserves whatever case was
+# committed, so a mixed-case fragment would leave the identity counter and the mailmap
+# builder blind to exactly the identities the case-insensitive trailer counter and message
+# rewrite do catch -- the two halves would disagree and the gate would certify a history
+# whose author/committer fields still carry the hostname.
+LEAKED_HOST_RE="$(printf '%s' "${FLASH_LEAKED_HOST_RE:-}" | tr '[:upper:]' '[:lower:]')"
 
 # A missing value must be fatal, never an empty pattern: an empty alias list would
 # match nothing and an empty hostname fragment would match EVERY identity, and either
@@ -273,13 +279,29 @@ count_identities() {
 ALIAS_ALT="$(alias_alternation)"
 ALIAS_TRAILER_RE="^[[:space:]]*Co-authored-by:.*<($ALIAS_ALT)>[[:space:]]*$"
 
-# The same strings, matched anywhere in FILE CONTENT rather than in a trailer. Earlier
-# revisions of this very script hardcoded the alias addresses and the hostname, so they sit
-# in the tree as ordinary blobs. --mailmap rewrites identity fields and the callback
-# rewrites messages; neither touches a blob. Without the --replace-text pass below, every
-# branch whose history contains those revisions keeps serving the leak from the FILES after
-# the force-push, while the tip looks clean.
-BLOB_LEAK_RE="($ALIAS_ALT)|$LEAKED_HOST_RE"
+# The hostname as it can appear in PROSE and in FILE CONTENT, which is not the same thing
+# as the identity fragment. LEAKED_HOST_RE spells its dots "[.]", so it matches the hostname
+# itself -- but earlier revisions of this script embedded that fragment IN SOURCE, once as a
+# shell/awk pattern ("internal[.]example[.]net") and once as a python one
+# ("internal\.example\.net"). A scan built from the fragment alone reads straight past its
+# own previous text, so the very blob this pass exists to remove would survive and be
+# counted clean. All three spellings are therefore matched.
+HOST_PLAIN="$(printf '%s' "$LEAKED_HOST_RE" | sed 's/\[\.\]/./g')"
+HOST_CONTENT_ALT="$(printf '%s' "$HOST_PLAIN" | sed 's/[.]/[.]/g')"
+HOST_CONTENT_ALT="$HOST_CONTENT_ALT|$(printf '%s' "$HOST_PLAIN" | sed 's/[.]/\\[\\.\\]/g')"
+HOST_CONTENT_ALT="$HOST_CONTENT_ALT|$(printf '%s' "$HOST_PLAIN" | sed 's/[.]/\\\\[.]/g')"
+
+# Every scrubbed string, matched ANYWHERE rather than in a trailer. Two places need this and
+# neither is covered by the trailer-anchored patterns above:
+#
+#   - file content. --mailmap rewrites identity fields and the callback rewrites messages;
+#     neither touches a blob, so without the --replace-text pass below every branch holding
+#     an old revision of this script keeps serving the leak from the FILES.
+#   - message PROSE. anchoring is right for the Claude trailers (a message that merely
+#     discusses one is not a leak, and counting it would deadlock the gate forever) but
+#     wrong for these: an address or an internal hostname written into a commit message IS
+#     the leak, wherever in the message it sits.
+LEAK_STRINGS_RE="($ALIAS_ALT)|$HOST_CONTENT_ALT"
 
 count_blob_leaks() {
   # Lines of file content, across every reachable blob, that still carry a scrubbed string.
@@ -288,19 +310,39 @@ count_blob_leaks() {
   # file unchanged, so walking commits instead would re-read the same content thousands of
   # times. Reachable objects only -- --batch-all-objects would also pick up the pre-rewrite
   # originals that filter-repo leaves unreferenced, and the gate would never clear.
-  local blobs
-  blobs="$(git rev-list --objects --all \
+  #
+  # Every failure here must PROPAGATE. checked_count calls this inside an `if !` condition,
+  # which disables `set -e` for the whole call, so a `|| true` anywhere in the function turns
+  # a scan that died halfway into a confident "0" and the gate certifies a history it never
+  # read. Only grep's exit 1 ("no match") may be swallowed, and only after it has printed the
+  # zero we want.
+  local blobs out matches statuses
+  if ! blobs="$(git rev-list --objects --all \
     | awk '{print $1}' \
     | git cat-file --batch-check='%(objectname) %(objecttype)' \
     | awk '$2 == "blob" { print $1 }' \
-    | sort -u)"
+    | sort -u)"; then
+    return 1
+  fi
   if [ -z "$blobs" ]; then
     echo 0
-    return
+    return 0
   fi
-  # -a: blobs are arbitrary bytes and grep would otherwise report "binary file matches"
-  # instead of a number. grep exits 1 on no match, having already printed the 0 we want.
-  printf '%s\n' "$blobs" | git cat-file --batch | grep -ac -iE -e "$BLOB_LEAK_RE" || true
+  # PIPESTATUS is read INSIDE the subshell: the parent's copy would describe the assignment,
+  # not the pipeline. -a because blobs are arbitrary bytes and grep would otherwise answer
+  # "binary file matches" instead of a number.
+  out="$(
+    set +o pipefail
+    printf '%s\n' "$blobs" | git cat-file --batch | grep -ac -iE -e "$LEAK_STRINGS_RE"
+    printf 'status=%s' "${PIPESTATUS[*]}"
+  )"
+  matches="${out%%status=*}"
+  statuses="${out#*status=}"
+  case "$statuses" in
+    # grep 0 = matched, 1 = no match; anything else, from any stage, is a broken scan.
+    "0 0 0" | "0 0 1") printf '%s' "${matches//[$'\n']/}" ;;
+    *) return 1 ;;
+  esac
 }
 
 report_counts() {
@@ -311,6 +353,7 @@ report_counts() {
   echo "    leaked hostname:       $(count_pattern "$HOSTNAME_RE")"
   echo "    alias co-author lines: $(count_pattern "$ALIAS_TRAILER_RE")"
   echo "    leaking identities:    $(count_identities)"
+  echo "    alias/host in prose:   $(count_pattern "$LEAK_STRINGS_RE")"
   echo "    leaks in file content: $(count_blob_leaks)"
 }
 
@@ -367,6 +410,10 @@ export FLASH_SCRUB_ALIAS_ALT="$ALIAS_ALT"
 export FLASH_SCRUB_CANON="$CANONICAL_IDENTITY"
 # same reason: the hostname fragment is operator-supplied data, not source.
 export FLASH_SCRUB_HOST_RE="$LEAKED_HOST_RE"
+# the strings that must not survive ANYWHERE in a message, trailer or not. see
+# LEAK_STRINGS_RE: unlike the Claude patterns, these are secrets rather than a common word,
+# so a prose mention is a leak and the gate counts it as one.
+export FLASH_SCRUB_LEAK_STRINGS="$LEAK_STRINGS_RE"
 
 # Blob-level redaction, for the copies of these strings that live in FILE CONTENT rather
 # than in an identity or a message. It is generated at runtime for the same reason the
@@ -380,7 +427,9 @@ REPLACEMENTS="$WORKDIR/flash-scrub-replacements"
 {
   printf '%s' "$MAINTAINER_ALIAS_EMAILS" | tr ' ' '\n' | grep -v '^$' \
     | sed 's/[][^$.|?*+(){}\]/\\&/g; s|^|regex:(?i)|; s|$|==>REDACTED|'
-  printf 'regex:(?i)%s==>REDACTED\n' "$LEAKED_HOST_RE"
+  # all three source spellings of the hostname, not just the fragment; see HOST_CONTENT_ALT.
+  printf '%s' "$HOST_CONTENT_ALT" | tr '|' '\n' \
+    | sed 's|^|regex:(?i)|; s|$|==>REDACTED|'
 } > "$REPLACEMENTS"
 
 # Drop whole trailer lines. Matching is line-anchored and trailer-shaped, so a commit
@@ -395,6 +444,10 @@ import re
 _alias_alt = os.environ["FLASH_SCRUB_ALIAS_ALT"].encode()
 _canon = os.environ["FLASH_SCRUB_CANON"].encode()
 _host_re = os.environ["FLASH_SCRUB_HOST_RE"].encode()
+# every alias and every source spelling of the hostname, matched anywhere in the message.
+# applied LAST, so the trailer rewrite below still gets to fold a Co-authored-by line onto
+# the canonical identity rather than having its address redacted out from under it.
+_leak_strings = re.compile(rb"(?i)(?:" + os.environ["FLASH_SCRUB_LEAK_STRINGS"].encode() + rb")")
 # the address must be the WHOLE bracketed value (anchored by "<" and ">"), so a longer
 # address that merely ends with an alias cannot match.
 _alias_trailer = re.compile(
@@ -435,6 +488,11 @@ for _line in scrubbed.split(b"\n"):
         _seen.add(_key)
     _kept.append(_line)
 scrubbed = b"\n".join(_kept)
+# whatever is LEFT: an alias address or the internal hostname written into ordinary prose.
+# the trailer patterns above are anchored deliberately, and rightly so for the Claude ones,
+# but an address in a message body is the leak itself and the residual gate counts it, so
+# leaving it would block publication forever rather than merely look untidy.
+scrubbed = _leak_strings.sub(b"REDACTED", scrubbed)
 
 # Only reformat commits we actually touched: collapsing blank lines or trimming
 # trailing newlines on every commit would rewrite unrelated message formatting.
@@ -485,7 +543,8 @@ for label_and_re in \
   "claude-session|$SESSION_RE" \
   "generated-with|$GENERATED_RE" \
   "leaked-hostname|$HOSTNAME_RE" \
-  "alias-co-author|$ALIAS_TRAILER_RE"
+  "alias-co-author|$ALIAS_TRAILER_RE" \
+  "alias-host-prose|$LEAK_STRINGS_RE"
 do
   n="$(checked_count "${label_and_re%%|*}" count_pattern "${label_and_re#*|}")"
   residual=$((residual + n))
