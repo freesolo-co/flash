@@ -733,6 +733,38 @@ def test_environment_pip_rejects_pip_options() -> None:
             spec_from_dict(raw)
 
 
+def test_environment_pip_rejects_url_credentials() -> None:
+    """A spec is not a secret store: pip entries are persisted and uploaded verbatim.
+
+    ``RunStatus.spec`` keeps the authored value and the worker's ``metrics.json`` carries it inside
+    ``notes.job_spec``, so a token in a direct or VCS URL would land on disk and in the run log.
+    """
+    for url in (
+        "git+https://user:ghp_SECRETTOKEN@github.com/org/repo.git#egg=pkg",
+        "https://tok:s3cret@example.com/pkg-1.0.tar.gz",
+        "pkg @ https://x:y@host/a.whl",
+        "git+ssh://git:deploykey@host/repo.git",
+    ):
+        raw = _raw()
+        raw["environment"]["pip"] = [url]
+        with pytest.raises(ConfigError, match="must not embed credentials") as caught:
+            spec_from_dict(raw)
+        # the message must not quote the requirement back -- that would copy the credential into
+        # the very logs this rejection exists to keep it out of.
+        for secret in ("ghp_SECRETTOKEN", "s3cret", "deploykey"):
+            assert secret not in str(caught.value)
+
+    # unauthenticated direct and VCS URLs stay usable; only inline userinfo is refused.
+    for url in (
+        "pkg @ https://host/a-1.0.whl",
+        "git+https://github.com/org/repo.git#egg=pkg",
+        "pymongo>=4.6",
+    ):
+        raw = _raw()
+        raw["environment"]["pip"] = [url]
+        assert spec_from_dict(raw).environment.pip == (url,)
+
+
 def test_submit_payload_carries_the_pip_key() -> None:
     """spec_payload is what the CLI actually sends, and the server re-parses it with this parser."""
     from flash.client.specs import spec_payload

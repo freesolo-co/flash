@@ -388,6 +388,32 @@ def _validate_environment_pip(value: Any) -> None:
                 "[environment] pip entries must be requirements, not pip options "
                 f"(got: {item.strip()!r})"
             )
+        _reject_pip_url_credentials(item.strip())
+
+
+# `scheme://userinfo@host` in a direct or VCS requirement. Anchored on `://` so a bare `pkg@1.2` or
+# a PEP 508 `name @ https://host/x.whl` without userinfo is untouched; `[^/\s]*:[^/\s]*@` requires
+# the colon-separated user:password shape inside a single URL authority.
+_PIP_URL_CREDENTIAL_RE = re.compile(r"://[^/\s]*:[^/\s]*@")
+
+
+def _reject_pip_url_credentials(requirement: str) -> None:
+    """Reject inline credentials in a pip requirement URL.
+
+    A spec is not a secret store: `[environment] pip` is persisted verbatim in ``RunStatus.spec``
+    and uploaded inside the worker's ``metrics.json`` job_spec, so a token embedded in a direct or
+    VCS URL would be written to disk and to the run log in plaintext. Credentials belong in
+    ``[environment] secrets``, whose values travel out-of-band and are never stored in the spec.
+
+    The offending requirement is deliberately NOT echoed: quoting it back would copy the very
+    credential this is here to keep out of logs.
+    """
+    if _PIP_URL_CREDENTIAL_RE.search(requirement):
+        raise ConfigError(
+            "[environment] pip entries must not embed credentials in a URL: the spec is stored and "
+            "uploaded in plaintext. Use [environment] secrets for the credential and an "
+            "unauthenticated requirement URL."
+        )
 
 
 def _validate_train_section(raw: dict[str, Any]) -> dict[str, Any]:
