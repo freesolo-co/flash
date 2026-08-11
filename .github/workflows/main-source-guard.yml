@@ -10,6 +10,31 @@ concurrency:
 jobs:
   source-is-dev:
     name: Source branch is dev
+    # This job carries NO `if:`, and no exemption of any kind. Both are security properties.
+    #
+    # `Source branch is dev` is a REQUIRED check under this repo's `main` ruleset (17887734), and a
+    # skipped required check counts as SUCCESS. So a job-level `if:` is not an exemption mechanism
+    # but a supersede primitive: run the guard, let it fail on a human head, then fire an event
+    # that takes the false branch, and the skip supersedes the failure on the same SHA. Close and
+    # reopen is enough -- `reopened` is in this workflow's trigger set, since no `types:` is
+    # declared and the defaults are opened+synchronize+reopened. With no `if:`, the job always
+    # produces a real pass or a real fail and a failure can never be replaced by a skip.
+    #
+    # There is also no dependabot carve-out here, because none is needed and none can be written
+    # safely. NEEDED: this guard only triggers on PRs into `main`, and dependabot never opens one.
+    # All 11 dependabot PRs in this repo's history target `dev` (`target-branch: dev` in
+    # .github/dependabot.yml), including under alert-driven security updates, which are enabled
+    # (`automated-security-fixes` -> enabled, not paused). This job has never run on a dependabot
+    # PR. SAFE: no commit-metadata tuple can prove dependabot authorship, because GitHub signs
+    # whatever a caller hands it. The signed payload of a real dependabot push contains only
+    # `author dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>` -- a
+    # caller-supplied header -- and `committer GitHub <noreply@github.com>`, the same generic
+    # identity used for every web-editor and contents-api commit. A write-capable maintainer
+    # calling the contents API with dependabot's noreply address in the `author` object reproduces
+    # that tuple exactly, so any check built from it exempts human content on a `dependabot/*`
+    # branch. If dependabot is ever pointed at `main`, exempt it with something outside the
+    # commit -- a separate workflow keyed on the API's PR-level bot identity, or a ruleset bypass
+    # actor -- rather than reintroducing a check on forgeable commit fields.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

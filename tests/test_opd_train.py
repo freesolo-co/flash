@@ -5635,10 +5635,17 @@ def test_worker_filters_over_budget_prompts_before_downloading_the_weights():
 
     source = inspect.getsource(run_opd_train)
     budget_raise = source.index('raise RuntimeError("every OPD prompt exceeds the configured')
-    prefetch = source.index("_w.prefetch_model(")
-    assert budget_raise < prefetch
-    # and the eos read, which needs the downloaded snapshot, must follow the prefetch.
-    assert prefetch < source.index("generation_eos_from_cached_config(")
+    # the download now lives behind `_load_opd_model`, so the entry point is checked against the
+    # CALL and the phase's own internal order is checked inside it. asserting on `run_opd_train`
+    # alone would silently stop testing anything the moment the phase moved out of it.
+    load_phase = source.index("_load_opd_model(")
+    assert budget_raise < load_phase
+
+    from flash.engine.worker.opd_train import _load_opd_model
+
+    phase = inspect.getsource(_load_opd_model)
+    # the eos read needs the downloaded snapshot, so it must follow the prefetch.
+    assert phase.index("_w.prefetch_model(") < phase.index("generation_eos_from_cached_config(")
 
 
 def test_worker_refuses_to_publish_a_loss_curve_shorter_than_the_final_checkpoint():
@@ -5735,7 +5742,9 @@ def test_worker_structured_validator_runs_before_model_download():
     from flash.engine.worker.opd_train import run_opd_train
 
     source = inspect.getsource(run_opd_train)
-    assert source.index("validate_opd_structured_outputs(") < source.index("_w.prefetch_model(")
+    # the prefetch moved into `_load_opd_model`; its call site is the boundary the cheap validator
+    # must still precede.
+    assert source.index("validate_opd_structured_outputs(") < source.index("_load_opd_model(")
     assert "resolve_vocab_size" not in source
 
 
