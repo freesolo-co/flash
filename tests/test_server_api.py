@@ -1599,6 +1599,72 @@ def test_create_run_does_not_blame_the_adapter_for_an_unrelated_failure(api, mon
     assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
 
 
+def test_create_run_keeps_ownership_when_submit_fails_after_persisting_status(api, monkeypatch):
+    """A submit that dies after saving status leaves a run the owner can still see and cancel.
+
+    ``submit_job`` persists ``RunStatus`` and then keeps working (dispatch, provisioning), so a
+    failure past that point leaves a real run behind: the charge sweep and recovery both walk the
+    status files, not the db. Deleting the ownership row there would strand it -- 404 on status,
+    logs and cancel for the only key entitled to it, while the provider footprint lives on.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.server.platform import db
+
+    submitted = []
+
+    def submit(spec, **_kwargs):
+        submitted.append(spec.run_id)
+        # mirror the real ordering: status lands first, the rest of the launch can still blow up.
+        runner._save_status(
+            runner.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
+        )
+        raise RuntimeError("provisioning died after status was written")
+
+    monkeypatch.setattr(app_mod, "submit_job", submit)
+
+    key = _login()
+    resp = api.post("/v1/runs", headers=_bearer(key), json={"spec": SPEC})
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    # the owner keeps its handle on the run the failed submit left behind.
+    assert db.run_owner(run_id) is not None
+    assert api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).status_code == 200
+    assert api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key)).status_code == 200
+    assert [r["run_id"] for r in api.get("/v1/runs", headers=_bearer(key)).json()["runs"]] == [
+        run_id
+    ]
+    # and can still drive it to a terminal state itself.
+    cancelled = api.post(f"/v1/runs/{run_id}/cancel", headers=_bearer(key))
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["state"] == "cancelled"
+
+
+def test_create_run_deletes_the_row_when_submit_fails_before_persisting_status(api, monkeypatch):
+    # the other half of the guard: no status file means the launch left nothing behind, so the
+    # ownership row is pure debris and must go rather than wedge the id forever.
+    import flash.server.app as app_mod
+    from flash.server.platform import db
+
+    submitted = []
+
+    def submit(spec, **_kwargs):
+        submitted.append(spec.run_id)
+        raise RuntimeError("provisioning died before status was written")
+
+    monkeypatch.setattr(app_mod, "submit_job", submit)
+
+    key = _login()
+    resp = api.post("/v1/runs", headers=_bearer(key), json={"spec": SPEC})
+
+    assert resp.status_code == 400, resp.text
+    run_id = submitted[0]
+    assert db.run_owner(run_id) is None
+    assert api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).status_code == 404
+    assert api.get("/v1/runs", headers=_bearer(key)).json()["runs"] == []
+
+
 def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
     # A freesolo key that verifies with the backend but whose db row was disabled (revoked)
     # must be rejected as 401 (authenticate -> None), not raise a 500.

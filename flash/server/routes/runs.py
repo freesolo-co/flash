@@ -452,7 +452,13 @@ def create_run(
             submit_kwargs["platform_context"] = platform_context
         status = _app.submit_job(prepared.public_spec, **submit_kwargs)
     except Exception as exc:
-        db.delete_run(run_id)
+        # drop the ownership row only when the launch left no run behind. once submit_job has
+        # persisted status the run exists to the sweeps and to recovery, so deleting the row
+        # would orphan it: 404 on status, logs and cancel for its owner while the provider
+        # footprint lives on. keep it visible instead and let the normal failure and reconcile
+        # machinery drive it to a terminal state.
+        if not os.path.exists(runs_file_path(run_id, ".json")):
+            db.delete_run(run_id)
         if isinstance(exc, HTTPException):
             raise
         raise HTTPException(status_code=400, detail=str(exc)) from exc
