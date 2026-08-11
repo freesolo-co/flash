@@ -752,6 +752,39 @@ def test_environment_pip_accepts_spaced_requirements() -> None:
         assert spec_from_dict(raw).environment.pip == (entry,)
 
 
+def test_environment_pip_rejection_messages_never_echo_a_url() -> None:
+    """Every rejection path must redact a URL, including the ones the credential guard never sees.
+
+    These messages are printed by the CLI and returned verbatim as the server's HTTP error detail
+    (``flash/server/platform/deps.py`` raises ``HTTPException(400, detail=str(exc))``), so quoting a
+    value back copies it into terminals, CI output and API logs. The scalar, non-string and
+    pip-option branches all raise BEFORE the URL credential guard is reached, so each has to redact
+    on its own -- an option is credential-bearing in its own right via
+    ``--extra-index-url=https://user:token@host``.
+    """
+    secret = "ghp_SECRETTOKEN"
+    for value in (
+        f"git+https://{secret}@github.com/org/repo.git",  # scalar: rejected as "not a list"
+        [f"--extra-index-url=https://user:{secret}@host/simple"],  # pip option
+        [f"git+https://{secret}@h/r.git".encode()],  # non-string entry
+        [{"url": f"https://{secret}@h"}],  # non-string entry, nested
+        [f"git+https://{secret}@github.com/o/r.git"],  # reaches the credential guard
+        [f"https://h/p-1.0.whl?private_token={secret}"],  # query-string credential
+    ):
+        raw = _raw()
+        raw["environment"]["pip"] = value
+        with pytest.raises(ConfigError) as caught:
+            spec_from_dict(raw)
+        assert secret not in str(caught.value)
+
+    # redaction is scoped to URL-shaped input: an ordinary typo still names itself, or the message
+    # would stop being actionable for the mistakes that are not credentials.
+    raw = _raw()
+    raw["environment"]["pip"] = ["--no-deps"]
+    with pytest.raises(ConfigError, match="--no-deps"):
+        spec_from_dict(raw)
+
+
 def test_environment_pip_rejects_url_credentials() -> None:
     """A spec is not a secret store: pip entries are persisted and uploaded verbatim.
 

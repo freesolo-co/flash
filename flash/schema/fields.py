@@ -327,6 +327,19 @@ _PIP_URL_USERINFO_RE = re.compile(r"://[^/@\s]+@")
 _PIP_URL_QUERY_RE = re.compile(r"://[^\s]*\?")
 
 
+def _pip_echo(value: Any) -> str:
+    """Quote a rejected pip value back to the author, redacting anything URL-shaped.
+
+    Every rejection message here is printed by the CLI and returned verbatim as the server's HTTP
+    error detail, so a value quoted into one lands in terminals, CI logs and API logs. A URL is the
+    only pip syntax that can carry a credential, and this runs on values that failed validation --
+    including before the credential guard is reached -- so URL-shaped input is never echoed at all.
+    Redacting the whole value rather than the userinfo keeps this sound for credential shapes the
+    guard does not model yet, which is the failure mode that produced this helper.
+    """
+    return "<redacted url>" if "://" in str(value) else repr(value)
+
+
 def _environment_pip(raw: Any) -> tuple[str, ...]:
     """Parse [environment].pip as the scorer's own third-party requirements.
 
@@ -337,8 +350,12 @@ def _environment_pip(raw: Any) -> tuple[str, ...]:
     if raw is None:
         return ()
     if isinstance(raw, str):
+        # the suggestion is meant to be pasted straight into the toml, so quote it the way toml
+        # does rather than the way repr() does.
+        suggestion = '"<redacted url>"' if "://" in raw else f'"{raw}"'
         raise ConfigError(
-            f'[environment] pip must be a list of requirement strings, not a string: use ["{raw}"]'
+            f"[environment] pip must be a list of requirement strings, not a string: "
+            f"use [{suggestion}]"
         )
     # tuple as well as list: to_dict() emits the spec's own tuple, and that payload is re-parsed
     # here on the submit round trip (mirrors _environment_secrets).
@@ -348,20 +365,23 @@ def _environment_pip(raw: Any) -> tuple[str, ...]:
     for item in raw:
         if not isinstance(item, str) or not item.strip():
             raise ConfigError(
-                f"[environment] pip entries must be non-empty requirement strings (got: {item!r})"
+                f"[environment] pip entries must be non-empty requirement strings "
+                f"(got: {_pip_echo(item)})"
             )
         requirement = item.strip()
         # entries are spliced straight into `python -m pip install` on the worker, so an option
         # flag is not just an odd requirement: `--no-deps` or `--target=...` would change how the
         # mandatory freesolo worker requirement installs, from a field that only names packages.
+        # `--extra-index-url=https://user:token@host` also makes this a credential-bearing branch,
+        # which is why the echo is redacted here rather than after the URL guard below.
         if requirement.startswith("-"):
             raise ConfigError(
-                f"[environment] pip entries must be requirements, not pip options (got: {requirement!r})"
+                "[environment] pip entries must be requirements, not pip options "
+                f"(got: {_pip_echo(requirement)})"
             )
         # A spec is not a secret store: pip is persisted verbatim in ``RunStatus.spec`` and uploaded
         # inside the worker's ``metrics.json`` job_spec, so a token embedded in a direct or VCS URL
-        # would be written to disk and to the run log in plaintext. The offending requirement is
-        # deliberately NOT echoed: quoting it back would copy the very credential this keeps out.
+        # would be written to disk and to the run log in plaintext.
         if _PIP_URL_USERINFO_RE.search(requirement) or _PIP_URL_QUERY_RE.search(requirement):
             raise ConfigError(
                 "[environment] pip entries must not embed credentials in a URL: the spec is stored "
