@@ -614,12 +614,12 @@ def test_build_verl_overrides_carries_fused_expert_target_parameters():
 def test_build_verl_training_cfg_resolves_expert_targets_from_the_catalog_id():
     """The fused-expert lookup must use the catalog id, NOT the local snapshot path.
 
-    The builder is handed a snapshot dir to load weights from, and previously passed that same
-    string to ``lora_target_parameters``, which matches an exact hf repo id. The lookup returned
-    None, PEFT adapted only ``all-linear``, and the routed-expert parameters were never trained --
-    on a run that completed, checkpointed, and reported healthy metrics. The test above renders
-    already-resolved targets, so it cannot see that; this one goes through the real builder with a
-    path that looks like what ``_cached_model_path`` actually returns.
+    The builder is handed a snapshot dir to load weights from, and handing that same string to
+    ``lora_target_parameters`` (which matches an exact hf repo id) resolves to None: PEFT then
+    adapts only ``all-linear`` and the routed-expert parameters are never trained, on a run that
+    completes, checkpoints, and reports healthy metrics. The test above renders already-resolved
+    targets, so it cannot see that; this one goes through the real builder with a path that looks
+    like what ``_cached_model_path`` actually returns.
     """
     inp = {**_mem_util_inp(model_id="Qwen/Qwen3.6-35B-A3B", engine_len=8192)}
     inp.update(

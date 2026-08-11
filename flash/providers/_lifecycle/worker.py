@@ -97,8 +97,8 @@ def worker_image_override() -> WorkerImageOverride | None:
 
     The credential cannot be derived from the image ref, so it stays configurable. The image's CUDA
     and disk floors are NOT configurable: the GPU class floor (min_cuda_modern) already encodes the
-    real constraint, and container disk is platform-managed -- ``disk_gb`` is in MANAGED_GPU_KEYS,
-    so it is stripped from the user-facing surface and the runner raises it to the model catalog's
+    real constraint, and container disk is platform-managed: ``disk_gb`` is in MANAGED_GPU_KEYS, so
+    it is stripped from the user-facing surface and the runner raises it to the model catalog's
     ``min_disk_gb`` (_with_model_disk). An image whose disk floor exceeds its model's catalog entry
     therefore has no override to reach for; raise the catalog floor instead.
     """

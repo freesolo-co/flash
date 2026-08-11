@@ -546,10 +546,10 @@ def _build_verl_training_cfg(
     *,
     train_files: str,
     val_files: str,
-    # the LOCAL SNAPSHOT DIR verl loads weights from, not the hf repo id -- it becomes
-    # actor_rollout_ref.model.path below. named model_path because it was previously called
-    # model_id, which invited lora_target_parameters(model_id) and silently matched nothing.
-    # anything that needs the catalog id reads inp["model_id"].
+    # the LOCAL SNAPSHOT DIR verl loads weights from, not the hf repo id. it becomes
+    # actor_rollout_ref.model.path below. the name must stay distinct from the catalog id, since a
+    # parameter called model_id here reads as one and any lookup keyed on an exact hf repo id
+    # silently matches nothing. anything that needs the catalog id reads inp["model_id"].
     model_path: str,
     thinking: bool,
     loggers: list[str],
@@ -580,10 +580,11 @@ def _build_verl_training_cfg(
         "lora_rank": inp["lora_rank"],
         "lora_alpha": inp["lora_alpha"],
         "target_modules": "all-linear",
-        # the CATALOG id, not model_path: lora_target_parameters matches an exact hf repo id, and
-        # model_path is a local snapshot dir (".../models--Qwen--Qwen3.6-35B-A3B/snapshots/<sha>"),
-        # which matches nothing and silently yields None -- leaving the fused routed-expert
-        # parameters unadapted on a run that otherwise looks completely healthy.
+        # must be the CATALOG id, never model_path: lora_target_parameters matches an exact hf repo
+        # id, and model_path is a local snapshot dir
+        # (".../models--Qwen--Qwen3.6-35B-A3B/snapshots/<sha>") which matches nothing and silently
+        # yields None, leaving the fused routed-expert parameters unadapted on a run that otherwise
+        # looks completely healthy.
         "target_parameters": _w.lora_target_parameters(inp["model_id"]),
         "multimodal": bool(inp.get("multimodal")),
         "lr": inp["lr"],

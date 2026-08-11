@@ -12,11 +12,11 @@ jobs:
     name: Source branch is dev
     # Dependabot SECURITY updates are alert-driven, not schedule-driven, so they ignore
     # `target-branch: dev` in .github/dependabot.yml and open against the default branch (main)
-    # from a `dependabot/...` head. That head can never be `dev`, so this guard failed by
-    # construction on every one of them -- a permanently red check on the exact PRs that carry
-    # CVE fixes, while their `lint + offline tests` legs passed in full. The rule this guard
-    # exists to enforce is that a HUMAN cannot sneak a feature branch into main; a bot bump
-    # that GitHub itself targets at main is not that.
+    # from a `dependabot/...` head. That head can never be `dev`, so without an exemption this
+    # guard fails by construction on every one of them, holding a permanently red check on the
+    # exact PRs that carry CVE fixes while their `lint + offline tests` legs pass in full. The
+    # rule this guard exists to enforce is that a HUMAN cannot sneak a feature branch into main;
+    # a bot bump that GitHub itself targets at main is not that.
     #
     # `||`, NOT `&&`: the job must run unless BOTH bot signals hold. With `&&` the job skips when
     # EITHER holds, so a human could open a feature branch named `dependabot/x` and bypass the
@@ -24,13 +24,13 @@ jobs:
     # in a username, so no human account can hold that login), which is what makes requiring both
     # safe rather than a hole.
     #
-    # The author is read from `pull_request.user.login`, NOT `github.actor`. This workflow declares
-    # no `types:`, so it takes the defaults opened+synchronize+reopened -- and on a reopen by a
-    # maintainer, or a synchronize pushed by anyone other than the bot, `github.actor` is that
-    # HUMAN, not `dependabot[bot]`. The condition would then go true, run the guard, and reject the
-    # `dependabot/*` head: the exact red required check this exemption exists to remove, reappearing
-    # on the second event instead of the first. `pull_request.user.login` is the PR opener and does
-    # not change with whoever triggered the event.
+    # The author must be read from `pull_request.user.login`, NOT `github.actor`. This workflow
+    # declares no `types:`, so it takes the defaults opened+synchronize+reopened, and on a reopen
+    # by a maintainer or a synchronize pushed by anyone other than the bot, `github.actor` is that
+    # HUMAN rather than `dependabot[bot]`. Keying on the actor would then go true, run the guard,
+    # and reject the `dependabot/*` head: the exact red required check this exemption exists to
+    # remove, reappearing on the second event instead of the first. `pull_request.user.login` is
+    # the PR opener and does not change with whoever triggered the event.
     if: >-
       github.event.pull_request.user.login != 'dependabot[bot]'
       || !startsWith(github.head_ref, 'dependabot/')
