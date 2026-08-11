@@ -35,13 +35,10 @@ PARASAIL_API_KEY_ENV = "PARASAIL_API_KEY"
 MAX_REQUEST_BODY_BYTES = 48 * 1024 * 1024
 MAX_RESPONSE_BODY_BYTES = 32 * 1024 * 1024
 MAX_PROVIDER_ERROR_BODY_BYTES = 64 * 1024
-# bounded upstream retry budget per logical request. transient provider rejections and
-# ambiguous transport outcomes readmit the same request_id through the ledger, and
-# mark_teacher_request_started refuses any dispatch past this bound. it matches the worker
-# client's max_retries, so each client attempt maps to at most one upstream attempt and
-# neither side retries past the other. retries reuse the request_id, so they spend this
-# per-request budget rather than the request/score-item quotas: the no-signal replacement
-# multiplier (x OPD_NO_SIGNAL_ATTEMPTS) composes with this bound instead of multiplying it.
+# per-logical-request upstream attempt budget, enforced by mark_teacher_request_started.
+# retries reuse the request_id, so they spend this budget rather than the request/score-item
+# quotas, and the no-signal replacement multiplier composes with it instead of multiplying it.
+# kept equal to the worker client's max_retries so neither side retries past the other.
 MAX_UPSTREAM_ATTEMPTS = 4
 MAX_REQUEST_TOKENS = 131_072
 MAX_TOTAL_SCORE_ITEMS = 1_000_000
@@ -667,10 +664,9 @@ def _dispatch_to_teacher_provider(
             request_id=request_id,
         ) from exc
     except (OSError, http.client.HTTPException) as exc:
-        # the connection failed mid-call, so the upstream outcome is genuinely unknown. the row
-        # is left readmissible: a worker retry re-dispatches the same request_id, and because the
-        # ledger records billed usage only on the single terminal 'succeeded' completion, the
-        # logical request is never billed twice regardless of what happened upstream.
+        # the connection failed mid-call, so the upstream outcome is unknown. the row stays
+        # readmissible for a re-dispatch of the same request_id; billed usage lands only on
+        # the terminal 'succeeded' completion, so re-dispatching cannot double-bill.
         with contextlib.suppress(Exception):
             db.complete_teacher_request(
                 capability_id,
@@ -685,13 +681,10 @@ def _dispatch_to_teacher_provider(
             request_id=request_id,
         ) from exc
     if status < 200 or status >= 300:
-        # provider status classification:
-        #   429, 5xx  -> transient: rate limiting and provider-side incidents. the row stays
-        #                readmissible and the worker client retries the same request_id with
-        #                its bounded, deadline-aware backoff, capped by max_upstream_attempts.
-        #   other 4xx -> permanent (400/401/403/404/422 ...): the request or credential itself
-        #                is rejected, so a retry cannot change the outcome.
-        # the error_class below is what reserve_teacher_request keys readmission on.
+        # 429 and 5xx are provider-side conditions a retry can outlive, so those rows are
+        # recorded readmissible; other 4xx (400/401/403/404/422 ...) reject the request or
+        # credential itself, so a retry cannot change the outcome. the recorded error_class
+        # is the value readmission keys on.
         transient = status == 429 or 500 <= status <= 599
         with contextlib.suppress(Exception):
             db.complete_teacher_request(

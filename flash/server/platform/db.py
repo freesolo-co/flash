@@ -648,13 +648,11 @@ def _resume_existing_teacher_request(conn, capability, existing, *, admitted_at)
         )
     if state in {"reserved", "started"}:
         raise TeacherLedgerError("request_in_progress", retryable=True)
-    # transient terminal states are readmitted for another bounded upstream attempt. a
-    # 'provider_rejected' row is readmitted only when the broker classified the provider
-    # status as transient (429 or 5xx, recorded as error_class); genuine 4xx rejections
-    # stay terminal. an 'outcome_unknown' row is always readmitted: the same request_id
-    # is re-dispatched, and billed usage is recorded only on the single terminal
-    # 'succeeded' completion, so the logical request is never billed twice.
-    # mark_teacher_request_started bounds total upstream attempts per request.
+    # transient terminal rows readmit for another upstream attempt, bounded by
+    # mark_teacher_request_started. 'provider_rejected' readmits only with the broker's
+    # error_class 'transient' (429/5xx); genuine 4xx stays terminal. 'outcome_unknown'
+    # always readmits, and billed usage lands only on the terminal 'succeeded'
+    # completion, so readmission cannot double-bill.
     if state == "outcome_unknown" or (
         state == "provider_rejected" and existing["error_class"] == "transient"
     ):
