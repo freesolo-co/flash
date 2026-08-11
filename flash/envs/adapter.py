@@ -339,6 +339,39 @@ class FreesoloEnvironment(BaseEnvironment):
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         return float(getattr(self._score_one(completion, example, state), "score", 0.0))
 
+    def reward_with_error(
+        self, completion: str, example: dict, state: dict | None = None
+    ) -> tuple[float, str, str]:
+        """This completion's reward, the scorer's ``RewardResult.error``, and the text scored.
+
+        ``reward`` above keeps only ``score``, so a scorer that crashed behind the SDK's guard and
+        one that judged the answer wrong both reach training as ``0.0``. All three values come from a
+        single scoring call because scoring is not guaranteed to be pure: a rate-limited judge or a
+        flaky dependency can answer differently the second time, so re-scoring to read the error
+        can report one that did not produce this reward -- and bills a paid judge twice.
+
+        The third value is what the grader received, which the caller cannot reconstruct: for a
+        multi-turn episode it is ``state["response_text"]``, which ``env_reply`` replaces outright
+        when ``step_episode`` returns a ``final_response_text`` override.
+        """
+        result = self._score_one(completion, example, state)
+        return (
+            float(getattr(result, "score", 0.0)),
+            str(getattr(result, "error", "") or ""),
+            self._scored_completion_text(completion, state),
+        )
+
+    def _scored_completion_text(self, completion: str, state: dict | None) -> str:
+        """The exact text ``_score_one`` hands the grader for this call.
+
+        Mirrors the branch in ``_score_one``: a multi-turn episode is graded from the rollout
+        state, whose ``response_text`` ``env_reply`` overrides when the env supplies a
+        ``final_response_text``; every other path grades the completion passed in.
+        """
+        if state and self.multi_turn:
+            return str(self._episode_from_state(state).response_text or "")
+        return str(_completion_for_scoring(completion, state) or "")
+
     @staticmethod
     def _turn_rewards_from_result(result) -> tuple[float, ...] | None:
         metadata = getattr(result, "metadata", None)

@@ -13,6 +13,7 @@ import tarfile
 import tempfile
 import time
 import urllib.parse
+from collections.abc import Callable
 from pathlib import Path
 
 from flash.envs.loader import _github_token
@@ -82,7 +83,12 @@ def _sanitize_name(name: str) -> str:
     return normalize_env_name_segment(name) or "env"
 
 
-def _publish_slug_for_name(name: str, key: dict) -> tuple[str, str]:
+def publish_slug_for_name(name: str, key: dict) -> tuple[str, str]:
+    """The ``(namespace, name)`` a publish of ``name`` by ``key`` would write.
+
+    Pure and side-effect free, so the publish route can resolve the destination slug and check
+    its ownership before uploading anything.
+    """
     caller_namespace = namespace_for(key)
     raw = str(name or "").strip()
     if "/" not in raw:
@@ -356,7 +362,13 @@ def _github_publish_once(
             _push_environment_commit(checkout=checkout, token=token)
 
 
-def _github_publish(dest: Path, *, name: str, key: dict) -> str:
+def _github_publish(
+    dest: Path,
+    *,
+    name: str,
+    key: dict,
+    before_write: Callable[[str], None] | None = None,
+) -> str:
     token = _github_token()
     if not token:
         raise EnvPublishError(
@@ -364,12 +376,17 @@ def _github_publish(dest: Path, *, name: str, key: dict) -> str:
             status=503,
         )
     repo = _DEFAULT_GITHUB_REPO
-    ns, clean = _publish_slug_for_name(name, key)
+    ns, clean = publish_slug_for_name(name, key)
     publish_root = f"{ns}/{clean}"
     if not (dest / _DEFAULT_ENVIRONMENT_FILE).is_file():
         raise EnvPublishError("env package must contain environment.py")
     if not any(path.is_file() for path in dest.rglob("*")):
         raise EnvPublishError("env package contains no files")
+    # Last point before the hub write, and the first at which the package is fully validated. A
+    # caller that needs to gate the write on the destination slug runs here so a request that
+    # could never publish keeps its own error instead of the gate's.
+    if before_write is not None:
+        before_write(f"{ns}/{clean}")
     message = f"Upload Flash environment {ns}/{clean}"
 
     last_error: EnvPublishError | None = None
@@ -394,7 +411,14 @@ def _github_publish(dest: Path, *, name: str, key: dict) -> str:
     raise last_error
 
 
-def publish_package(*, package_b64: str, name: str, key: dict) -> str:
+def validate_publish_inputs(*, package_b64: object, name: object) -> bytes:
+    """Check a publish request's own inputs and return its decoded package.
+
+    Pure and side-effect free, so the route can reject an unpublishable request before doing
+    anything observable — no ownership lookup, no backend call, no upload. Raises the same
+    :class:`EnvPublishError` (400/413) the publish itself would raise, so the failure a caller
+    sees does not depend on when the check ran.
+    """
     if not isinstance(name, str):
         raise EnvPublishError("env name must be a string")
     if not isinstance(package_b64, str):
@@ -418,10 +442,27 @@ def publish_package(*, package_b64: str, name: str, key: dict) -> str:
             f"env package upload is too large (limit {_human_mb(_MAX_UPLOAD_BYTES)} compressed)",
             status=413,
         )
+    return tar_bytes
+
+
+def publish_package(
+    *,
+    package_b64: str,
+    name: str,
+    key: dict,
+    before_write: Callable[[str], None] | None = None,
+) -> str:
+    """Publish a package to the hub, optionally gating the write on its destination slug.
+
+    ``before_write`` is called with the resolved ``namespace/name`` once the package is fully
+    validated and immediately before anything is written. Raising from it aborts the publish
+    without touching the hub, so a caller's gate cannot preempt the package's own errors.
+    """
+    tar_bytes = validate_publish_inputs(package_b64=package_b64, name=name)
     with tempfile.TemporaryDirectory(prefix="flash-env-publish-") as tmp:
         dest = Path(tmp)
         _safe_extract(tar_bytes, dest)
-        return _github_publish(dest, name=name, key=key)
+        return _github_publish(dest, name=name, key=key, before_write=before_write)
 
 
 _SLUG_SEGMENT_RE = re.compile(r"^[a-z0-9._-]+$")
@@ -584,6 +625,41 @@ def download_package(*, slug: str, key: dict) -> bytes:
     """Return a tar.gz package for a published environment from the GitHub hub."""
     canonical, token = _authorized_hub_request(slug, key, action="download")
     return _github_download(canonical, token=token)
+
+
+def list_namespace_slugs(*, key: dict) -> list[str]:
+    """Return the published ``namespace/name`` slugs the caller's org owns, sorted.
+
+    Reads the hub through the GitHub tree API rather than the clone the publish/delete paths use:
+    the hub is hundreds of MB and clones non-shallow, so a read-only list must not pay for a
+    checkout it would immediately throw away.
+
+    The namespace comes from the authenticated key, never from the caller, so this cannot enumerate
+    another org. The internal key is org-agnostic and has no namespace of its own to list, so it is
+    refused here instead of being silently answered with an empty list.
+    """
+    if key.get("auth_kind") == "internal":
+        raise EnvPublishError(
+            "listing environments requires a Freesolo user key, which carries the org namespace "
+            "to list; the internal service key is org-agnostic",
+            status=403,
+        )
+    namespace = namespace_for(key)
+    if not _github_token():
+        raise EnvPublishError(
+            "GITHUB_TOKEN is required for the Flash control plane to list environments",
+            status=503,
+        )
+    from flash.envs import loader
+
+    try:
+        return loader.list_managed_namespace_slugs(namespace)
+    except loader.GitHubRateLimitError as exc:
+        raise EnvPublishError(
+            f"Freesolo environment list is rate limited: {exc}", status=429
+        ) from exc
+    except RuntimeError as exc:
+        raise EnvPublishError(f"Freesolo environment list failed: {exc}", status=502) from exc
 
 
 def _staged_has_changes(checkout: Path) -> bool:

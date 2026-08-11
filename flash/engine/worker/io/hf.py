@@ -49,6 +49,34 @@ def ray_log_artifact_name(mode: str, attempt: int = 0) -> str:
     return attempt_scoped_artifact_name("raylogs", mode, attempt)
 
 
+def _disable_xet_upload_staging() -> None:
+    """Route this process's hf uploads through the streaming lfs path instead of xet.
+
+    `hf_xet` is an unconditional dependency of `huggingface-hub` on every arch flash runs on, and
+    `is_xet_available()` turns it on merely because it imports (utils/_runtime.py) -- so the xet
+    path is the default for `upload_folder`. Xet chunks and dedups through a local cache rooted at
+    `HF_XET_CACHE` (default `$HF_HOME/xet`), i.e. the SAME container disk holding the checkpoint
+    being uploaded. The legacy lfs path streams from the source file handle instead
+    (`CommitOperationAdd.as_file` -> `http_backoff(data=fileobj)`), so it adds no second on-disk
+    copy of a ~60 GB fsdp save.
+
+    The verl child, the rl child, and the model-merger subprocess already pin this. The parent is
+    the process that actually uploads checkpoints, and it was the one left reading the default --
+    which is where a real 35b run hit `No space left on device` under
+    `.../huggingface/xet/.../staging/`.
+
+    How much that staging holds at peak is not knowable from source (it lives in the compiled
+    `hf_xet` extension), which is the point: the streaming path needs no such assumption. The
+    checkpoint is already on this disk, so uploading it should not require room for a second copy
+    of unknown size.
+
+    `HF_HUB_DISABLE_XET` is captured into a module constant when `huggingface_hub.constants` is
+    imported, so this must run before the first import. Every `huggingface_hub` import in the
+    worker is function-local, so calling this during worker startup is early enough.
+    """
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
+
 def hf_api():
     from huggingface_hub import HfApi
 

@@ -820,6 +820,147 @@ def test_the_shim_patches_the_moe_arch_not_the_dense_one():
     assert dense != moe
 
 
+def test_the_shim_imports_nothing_heavy_at_interpreter_startup():
+    # THE multi-card bug: sitecustomize runs at interpreter startup, and ray starts each actor's
+    # interpreter BEFORE narrowing that actor's CUDA_VISIBLE_DEVICES to its own card. importing the
+    # modeling module here transitively calls transformers' is_flash_linear_attention_available /
+    # is_causal_conv1d_available -> torch.cuda.is_available(), initializing cuda against every gpu.
+    # a later env-only change cannot rebuild that device map, so every rank keeps device 0 and nccl
+    # aborts with "Duplicate GPU detected". assert on the executed shim, not on its source text.
+    # record import ATTEMPTS rather than sys.modules: python swallows a sitecustomize traceback, so
+    # on a machine without torch the eager version this replaced fails silently and leaves sys.modules
+    # exactly as empty as a correct lazy shim would. the attempt is the observable that separates them.
+    shim = vc.render_gdn_varlen_shim("qwen3_5")
+    with tempfile.TemporaryDirectory() as shim_dir:
+        recorder = textwrap.dedent(
+            """
+            import sys
+            _flash_seen = []
+
+            class _Recorder:
+                def find_spec(self, fullname, path=None, target=None):
+                    _flash_seen.append(fullname)
+                    return None
+
+            sys.meta_path.insert(0, _Recorder())
+            """
+        )
+        # write the record from an atexit hook so it survives even when the shim raises: python
+        # swallows a sitecustomize traceback, and a lost record must not masquerade as a pass.
+        tail = textwrap.dedent(
+            """
+
+            import atexit as _flash_atexit
+            import json as _flash_json
+
+            def _flash_dump(_path=__file__ + ".seen"):
+                with open(_path, "w") as _fh:
+                    _fh.write(_flash_json.dumps(_flash_seen))
+
+            _flash_atexit.register(_flash_dump)
+            """
+        )
+        site = pathlib.Path(shim_dir, "sitecustomize.py")
+        # the recorder and the dump bracket the shim: the dump registration has to run even if the
+        # shim body raises, so it goes FIRST and the shim body last.
+        site.write_text(recorder + tail + shim)
+        out = subprocess.run(
+            [sys.executable, "-c", ""],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env={**os.environ, "PYTHONPATH": shim_dir},
+        )
+        assert out.returncode == 0, out.stderr
+        attempted = json.loads(pathlib.Path(str(site) + ".seen").read_text())
+    # the shim itself may import stdlib; what it must never reach for is the cuda-initializing stack.
+    assert not [name for name in attempted if name.split(".")[0] in {"torch", "transformers"}], (
+        f"gdn shim imported the cuda stack at interpreter startup: {attempted}"
+    )
+
+
+def test_the_shim_patches_the_module_the_caller_actually_receives():
+    # patching from find_spec would run against a half-built module the real import then replaces:
+    # the marker still prints while the caller's class stays unpatched. drive the rendered shim
+    # against a stand-in module so the assertion needs no transformers install.
+    # the patch pulls transformers' packing helpers, which import torch at module scope.
+    pytest.importorskip("torch", reason="the gdn patch imports transformers' torch-backed helpers")
+    pytest.importorskip("transformers", reason="the patch imports transformers' packing helpers")
+    shim = vc.render_gdn_varlen_shim("qwen3_5")
+    namespace: dict = {}
+    # executing the shim arms its meta_path finder against THIS interpreter, so restore the list
+    # afterwards: leaving it installed would patch the real modeling module for whichever later
+    # test imports it first, which is an order-dependent failure rather than an honest one.
+    saved_meta_path = sys.meta_path[:]
+    try:
+        # the shim is our own render, not external input
+        exec(compile(shim, "<gdn-shim>", "exec"), namespace)
+    finally:
+        sys.meta_path[:] = saved_meta_path
+    patch = namespace["_flash_patch_gdn_varlen"]
+
+    class Stand:
+        def forward(self, *args, **kwargs):
+            return kwargs
+
+    module = SimpleNamespace(StandTextModel=Stand)
+    patch(module)
+    assert getattr(Stand.forward, "_flash_gdn_varlen_patched", False) is True
+    once = Stand.forward
+    patch(module)  # a second import must not double-wrap
+    assert Stand.forward is once
+    # fail closed: the gate promised a TextModel, so a module without one must refuse to start
+    # rather than train packed examples through an unpatched forward.
+    with pytest.raises(StopIteration):
+        patch(SimpleNamespace())
+
+
+def test_the_armed_finder_patches_the_module_on_a_real_import(tmp_path, monkeypatch):
+    # the test above calls the patch directly, so the finder and the loader that carry it are the
+    # one part of the fix nothing exercises: if the delegation loop stopped resolving the target,
+    # or wrapped a spec whose loader never ran, every other assertion here still passes while the
+    # shim silently patches nothing. drive a genuine `import` through the armed finder instead.
+    # stand-in modules keep this off transformers, so it runs wherever the suite runs.
+    import importlib
+
+    root = tmp_path / "site"
+    package = root / "transformers" / "models" / "qwen3_5"
+    package.mkdir(parents=True)
+    for parent in (root / "transformers", root / "transformers" / "models", package):
+        (parent / "__init__.py").write_text("")
+    (package / "modeling_qwen3_5.py").write_text(
+        "class Qwen3TextModel:\n    def forward(self, *args, **kwargs):\n        return kwargs\n"
+    )
+    # the patch imports these two names at patch time; supply them so no torch install is needed.
+    (root / "transformers" / "modeling_flash_attention_utils.py").write_text(
+        "def _is_packed_sequence(*args, **kwargs):\n    return False\n\n\n"
+        "def prepare_fa_kwargs_from_position_ids(*args, **kwargs):\n"
+        "    return ((None, None), (None, None))\n"
+    )
+    monkeypatch.syspath_prepend(str(root))
+    # snapshot the whole `transformers` subtree rather than deleting the keys that happen to exist
+    # now: the import below CREATES stand-in entries, and a rollback that only restores pre-existing
+    # keys leaves an empty stub `transformers` package shadowing the real one for every later test.
+    saved_modules = {n: m for n, m in sys.modules.items() if n.split(".")[0] == "transformers"}
+    saved_meta_path = sys.meta_path[:]
+    try:
+        for name in saved_modules:
+            del sys.modules[name]
+        # the shim is our own render, not external input
+        exec(compile(vc.render_gdn_varlen_shim("qwen3_5"), "<gdn-shim>", "exec"), {})
+        assert type(sys.meta_path[0]).__name__ == "_FlashGdnFinder", "the shim must arm its finder"
+        module = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
+        assert getattr(module.Qwen3TextModel.forward, "_flash_gdn_varlen_patched", False) is True
+        # and it must step back off meta_path once it has fired: leaving it armed would re-wrap
+        # every later import of the same name for the rest of the process.
+        assert not [f for f in sys.meta_path if type(f).__name__ == "_FlashGdnFinder"]
+    finally:
+        sys.meta_path[:] = saved_meta_path
+        for name in [n for n in sys.modules if n.split(".")[0] == "transformers"]:
+            del sys.modules[name]
+        sys.modules.update(saved_modules)
+
+
 def test_the_gate_hands_the_shim_the_arch_it_verified(monkeypatch):
     # derive model_type from the child module so the gate and shim cannot disagree. patch the module
     # object because test cleanup may replace the parent package and break dotted monkeypatch
@@ -1895,14 +2036,20 @@ def test_child_tail_redacts_declared_secrets_with_arbitrary_names(monkeypatch):
     assert kept == "botocore.exceptions.ClientError: SignatureDoesNotMatch using <redacted>"
 
 
-def test_sanitize_diagnostic_ignores_a_very_short_declared_secret(monkeypatch):
-    """a declared secret can carry any value, including a 3-char one. as an unconstrained global
-    replacement needle it would mangle every diagnostic containing those characters, so the same
-    floor the multiline components use applies to the whole value. long values still redact."""
+def test_sanitize_diagnostic_redacts_a_very_short_declared_secret_at_word_boundaries(monkeypatch):
+    """a declared secret can carry any value, including a 3-char one, and it must not leak.
+
+    the length floor used to drop such a value from the needle set entirely, so it printed
+    verbatim. it cannot become an unconstrained global needle either -- the value `ati` would
+    rewrite `authentication` -- so it is redacted only where it stands alone.
+    """
     from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV, sanitize_diagnostic
 
     monkeypatch.setenv(SECRET_ENV_KEYS_ENV, "PIN")
     monkeypatch.setenv("PIN", "ati")
+    # the standalone value is the leak the floor used to allow.
+    assert sanitize_diagnostic("worker rejected pin ati") == "worker rejected pin <redacted>"
+    # ... while the same letters inside a word stay readable.
     assert sanitize_diagnostic("trainer crashed after validation") == (
         "trainer crashed after validation"
     )
