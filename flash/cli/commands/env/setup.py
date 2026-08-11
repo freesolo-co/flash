@@ -828,7 +828,6 @@ def cmd_env_setup(args) -> int:
     _warn_if_retained_starter_files_describe_another_plane(
         (starter_env, starter_evaluations),
         can_publish=can_publish,
-        project_id=project_id,
         warn=_warn,
     )
     if not starter_env_exists:

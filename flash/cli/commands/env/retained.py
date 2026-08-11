@@ -17,7 +17,6 @@ def _warn_if_retained_starter_files_describe_another_plane(
     starter_files: tuple[Path, ...],
     *,
     can_publish: bool,
-    project_id: str,
     warn: Callable[[str], None],
 ) -> None:
     """Warn when a retained `environment.py` / `evaluations.py` documents the other plane kind.
@@ -31,13 +30,15 @@ def _warn_if_retained_starter_files_describe_another_plane(
 
     Detect by the marker each rewrite targets rather than by a plane flag, so the warning tracks
     what is actually ON DISK: an operator who already hand-edited the guidance is not warned, and a
-    file the rewrite missed still is. `_for_self_hosted_plane` matches text carrying the real uuid,
-    so this probe has to as well.
+    file the rewrite missed still is.
 
-    Warn rather than rewrite, matching every other retained-file path in this command: these are
-    files the user is expected to edit, and setup has never overwritten one.
+    Deliberately project-INDEPENDENT, unlike `_for_self_hosted_plane`, which interpolates the real
+    uuid because it must match one exact string to rewrite it. Detection has the opposite
+    requirement: a directory scaffolded under one project and rerun under another still holds the
+    OLD uuid, so an interpolated marker would miss it and silently leave both files directing the
+    operator to a command their plane cannot run. Match the project-invariant prefix instead.
     """
-    push_marker = f"`flash env push --project {project_id} --name my-env .`"
+    push_marker = "`flash env push --project "
     # `_for_self_hosted_plane` writes DIFFERENT replacement text into each file, so the reverse
     # direction needs both markers: matching only environment.py's would warn about that file while
     # silently keeping a stale evaluations.py beside it.

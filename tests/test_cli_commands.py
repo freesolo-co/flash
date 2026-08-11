@@ -727,6 +727,45 @@ def test_env_setup_warns_when_retained_starter_files_describe_the_other_plane(
     assert retained["evaluations.py"] == hosted["evaluations.py"]
 
 
+def test_training_guide_caveats_every_managed_hub_command_block(monkeypatch, tmp_path) -> None:
+    """The guide says `env push` is unavailable, then later prescribes it twice without caveat.
+
+    TRAINING.md is static prose read verbatim (only PROJECT_UUID is substituted), so it cannot
+    branch on the plane. The self-hosted section near the top is therefore contradicted further down
+    by the troubleshooting row that says to run `env push` after every edit, and by the command
+    reference. Both need the caveat, or a self-hoster who lands on either -- which is how a
+    reference gets read -- follows a command their plane cannot run.
+    """
+    guide = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")["TRAINING.md"]
+
+    # the troubleshooting row for a blank/stale id
+    assert "**Self-hosted:** `env push` targets the managed hub" in guide
+    # the command reference block: push/pull/delete are all managed-hub-only
+    assert "push/pull/delete act on Freesolo's managed hub" in guide
+
+
+def test_retained_hosted_docs_are_detected_across_a_project_change(tmp_path) -> None:
+    """Detection must not interpolate the current uuid, or a project change hides the stale files.
+
+    `_for_self_hosted_plane` interpolates the real project id because it must match one exact string
+    in order to rewrite it. Detection has the opposite requirement: a directory scaffolded under one
+    project and rerun under another still holds the OLD uuid on disk, so an interpolated marker
+    matches nothing and both files keep directing the operator to `flash env push` with no warning.
+    """
+    from flash.cli.commands.env.retained import (
+        _warn_if_retained_starter_files_describe_another_plane as check,
+    )
+
+    retained = tmp_path / "environment.py"
+    retained.write_text("upload with\n`flash env push --project OLD-UUID-1111 --name my-env .`.\n")
+
+    warnings: list[str] = []
+    check((retained,), can_publish=False, warn=warnings.append)
+
+    assert len(warnings) == 1, "a retained file from another project must still warn"
+    assert "flash env push" in warnings[0]
+
+
 def test_env_setup_warns_about_both_retained_files_switching_back_to_hosted(
     monkeypatch, tmp_path, capsys
 ) -> None:
