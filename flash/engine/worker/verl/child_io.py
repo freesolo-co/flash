@@ -101,32 +101,28 @@ def render_gdn_varlen_shim(model_type: str) -> str:
 
     keep padded input inert, preserve explicit kwargs, and fail closed because silent boundary
     contamination is worse than refusing to start.
+
+    defer every import to the moment the child imports the modeling module itself. sitecustomize
+    runs at INTERPRETER STARTUP, and ray starts each actor's interpreter before it narrows that
+    actor's ``CUDA_VISIBLE_DEVICES`` to its own card -- so an import here runs while the process
+    still sees every gpu. importing the modeling module transitively calls transformers'
+    ``is_flash_linear_attention_available``/``is_causal_conv1d_available``, both of which call
+    ``torch.cuda.is_available()``, and fla queries device capability at import. that initializes
+    cuda against the FULL device list, and a later env-only change cannot rebuild the device map,
+    so every rank keeps device 0 and nccl aborts with ``Duplicate GPU detected``. a meta_path
+    finder carries no import cost and fires after ray has pinned the actor.
     """
     return f'''
 # --- flash: reset gdn state at packed example boundaries (backend_common.render_gdn_varlen_shim) ---
-import importlib as _flash_gdn_importlib
+import sys as _flash_gdn_sys
 
-import torch as _flash_gdn_torch
-from transformers.modeling_flash_attention_utils import (
-    _is_packed_sequence as _flash_gdn_is_packed,
-    prepare_fa_kwargs_from_position_ids as _flash_gdn_prepare_fa_kwargs,
-)
-
-_flash_gdn_modeling = _flash_gdn_importlib.import_module(
-    "transformers.models.{model_type}.modeling_{model_type}"
-)
-# raises if absent, deliberately: this shim is only rendered once the gate says resets are honored,
-# so a missing TextModel means the gate and the model disagree -- refuse rather than train packed
-# with an unpatched forward.
-_flash_gdn_text_model = next(
-    c
-    for n, c in vars(_flash_gdn_modeling).items()
-    if isinstance(c, type) and n.endswith("TextModel")
-)
+_FLASH_GDN_TARGET = "transformers.models.{model_type}.modeling_{model_type}"
 
 
 def _flash_gdn_seq_idx(position_ids, cu_seq_lens):
     """per-token example ordinal, int32 (1, total_nnz) -- what causal_conv1d_fn wants."""
+    import torch as _flash_gdn_torch
+
     lengths = cu_seq_lens.diff()
     return (
         _flash_gdn_torch.repeat_interleave(
@@ -140,8 +136,24 @@ def _flash_gdn_seq_idx(position_ids, cu_seq_lens):
     )
 
 
-def _flash_patch_gdn_varlen():
-    original = _flash_gdn_text_model.forward
+def _flash_patch_gdn_varlen(modeling):
+    # raises if absent, deliberately: this shim is only rendered once the gate says resets are
+    # honored, so a missing TextModel means the gate and the model disagree -- refuse rather than
+    # train packed with an unpatched forward.
+    text_model = next(
+        c
+        for n, c in vars(modeling).items()
+        if isinstance(c, type) and n.endswith("TextModel")
+    )
+    if getattr(text_model.forward, "_flash_gdn_varlen_patched", False):
+        return
+    # imported here, not at module scope: these pull in torch and transformers' cuda probes.
+    from transformers.modeling_flash_attention_utils import (
+        _is_packed_sequence as _flash_gdn_is_packed,
+        prepare_fa_kwargs_from_position_ids as _flash_gdn_prepare_fa_kwargs,
+    )
+
+    original = text_model.forward
 
     def forward(self, *args, **kwargs):
         # only derive what the caller did not supply, and only for a genuinely packed batch.
@@ -164,13 +176,72 @@ def _flash_patch_gdn_varlen():
                     kwargs["seq_idx"] = _flash_gdn_seq_idx(text_position_ids, cu_seq_lens_q)
         return original(self, *args, **kwargs)
 
-    _flash_gdn_text_model.forward = forward
-
-
-if not getattr(_flash_gdn_text_model.forward, "_flash_gdn_varlen_patched", False):
-    _flash_patch_gdn_varlen()
-    _flash_gdn_text_model.forward._flash_gdn_varlen_patched = True
+    forward._flash_gdn_varlen_patched = True
+    text_model.forward = forward
     print({FLASH_GDN_VARLEN_MARKER!r}, "{model_type}", flush=True)
+
+
+class _FlashGdnLoader:
+    """wrap the real loader so the patch lands once the module is fully executed.
+
+    ``exec_module`` returning means the module object the importer will hand the caller is
+    finished, so patching here is the first safe moment. patching from ``find_spec`` instead
+    would run against a half-built module that the real import then replaces, leaving the
+    caller's class unpatched while the marker still printed.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def create_module(self, spec):
+        return self._inner.create_module(spec)
+
+    def exec_module(self, module):
+        self._inner.exec_module(module)
+        _flash_gdn_uninstall()
+        _flash_patch_gdn_varlen(module)
+
+    def __getattr__(self, name):  # keep the rest of the loader protocol intact
+        return getattr(self._inner, name)
+
+
+class _FlashGdnFinder:
+    """intercept the first import of the modeling module, then get out of the way.
+
+    delegating to the finders AFTER this one resolves the real spec without importing anything,
+    so nothing here touches torch or cuda; only the loader is wrapped.
+    """
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != _FLASH_GDN_TARGET:
+            return None
+        import importlib.util
+
+        rest = [f for f in _flash_gdn_sys.meta_path if not isinstance(f, _FlashGdnFinder)]
+        for finder in rest:
+            find = getattr(finder, "find_spec", None)
+            if find is None:
+                continue
+            spec = find(fullname, path, target)
+            if spec is not None and spec.loader is not None:
+                spec.loader = _FlashGdnLoader(spec.loader)
+                return spec
+        return None
+
+
+def _flash_gdn_uninstall():
+    _flash_gdn_sys.meta_path[:] = [
+        f for f in _flash_gdn_sys.meta_path if not isinstance(f, _FlashGdnFinder)
+    ]
+
+
+# already imported (a parent process may have loaded it): patch now, there is no import left to
+# intercept. otherwise arm the finder and let the child's own import trigger it.
+_flash_gdn_loaded = _flash_gdn_sys.modules.get(_FLASH_GDN_TARGET)
+if _flash_gdn_loaded is not None:
+    _flash_patch_gdn_varlen(_flash_gdn_loaded)
+else:
+    _flash_gdn_sys.meta_path.insert(0, _FlashGdnFinder())
 '''
 
 
