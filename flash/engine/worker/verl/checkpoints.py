@@ -21,38 +21,35 @@ class MergeDiskHeadroomError(RuntimeError):
 
 
 def _model_shard_bytes(path: str) -> int:
-    """apparent size of the fsdp model shards in `path`, counting each inode once.
+    """total size of the fsdp model shards directly in `path`.
 
     only `model_world_size_*_rank_*.pt` is measured, because only those files become merge output:
-    `_load_and_merge_state_dicts` loads exactly that glob, and the merged dict is what
+    `_load_and_merge_state_dicts` loads exactly those names, and the merged dict is what
     `save_pretrained` writes back out. the `optim_*` and `extra_state_*` files sitting beside them
     are read by resume, never by the merger, so including them would inflate the requirement by the
     whole optimizer state -- ~7.6 GB of adam moments on a 35b rank-32 run -- and refuse merges that
     would have fit.
 
-    checkpoints are staged with hardlinks, so the same inode can appear under several paths; counting
-    it twice would overstate the very number this guard compares against free space.
+    a flat scan, not a walk, because the merger's read is flat: it opens
+    `Path(local_dir) / f"model_world_size_{W}_rank_{r}.pt"` per rank and never recurses. walking
+    would add up nested files it will never read, which is the same over-estimate in a new form.
 
     shares `_FSDP_SHARD_RE` with `checkpoint_world_size` rather than matching the name a second way:
     one definition of what a shard filename is, so a future change to verl's layout cannot leave the
     two disagreeing about which files a merge reads.
     """
-    seen: set[tuple[int, int]] = set()
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return 0
     total = 0
-    for root, _dirs, files in os.walk(path, followlinks=False):
-        for name in files:
-            if _FSDP_SHARD_RE.fullmatch(name) is None:
-                continue
-            try:
-                stat = os.lstat(os.path.join(root, name))
-            except OSError:
-                continue
-            if stat.st_nlink > 1:
-                key = (stat.st_dev, stat.st_ino)
-                if key in seen:
-                    continue
-                seen.add(key)
-            total += stat.st_size
+    for name in names:
+        if _FSDP_SHARD_RE.fullmatch(name) is None:
+            continue
+        try:
+            total += os.stat(os.path.join(path, name)).st_size
+        except OSError:
+            continue
     return total
 
 
@@ -305,35 +302,41 @@ def export_peft_adapter(
     merge_env["HF_HUB_OFFLINE"] = "1"
     merge_env["TRANSFORMERS_OFFLINE"] = "1"
     merge_env["HF_HUB_DISABLE_XET"] = "1"
-    subprocess.run(
-        [
-            python_bin,
-            "-m",
-            "verl.model_merger",
-            "merge",
-            "--backend",
-            "fsdp",
-            "--local_dir",
-            ckpt_actor_dir,
-            "--target_dir",
-            merge_out,
-        ],
-        check=True,
-        env=merge_env,
-    )
-    lora_dir = os.path.join(merge_out, "lora_adapter")
-    if not os.path.exists(os.path.join(lora_dir, "adapter_config.json")):
-        raise RuntimeError(
-            f"verl model_merger did not produce a peft adapter at {lora_dir} (no adapter_config.json); "
-            "the merger output layout must be adjusted for this verl version."
+    # the merge tree is this function's to clean up for its whole lifetime, not just on success.
+    # it holds the full merged model -- the largest transient on the disk -- so leaving it behind
+    # when the merger dies or writes an unexpected layout would strand tens of gb on the exact
+    # disk this guard exists to protect, and the next save would inherit less room than this one.
+    try:
+        subprocess.run(
+            [
+                python_bin,
+                "-m",
+                "verl.model_merger",
+                "merge",
+                "--backend",
+                "fsdp",
+                "--local_dir",
+                ckpt_actor_dir,
+                "--target_dir",
+                merge_out,
+            ],
+            check=True,
+            env=merge_env,
         )
-    # rename rather than copy: `merge_out` is `out_adapter_dir + "_merge"`, so both sit in the same
-    # parent and therefore the same filesystem, and `os.replace` is a metadata operation that moves
-    # no bytes. copying instead would hold a second copy of the adapter beside the still-undeleted
-    # merge tree, which is a peak this function's own headroom check does not budget for.
-    for name in os.listdir(lora_dir):
-        os.replace(os.path.join(lora_dir, name), os.path.join(out_adapter_dir, name))
-    shutil.rmtree(merge_out, ignore_errors=True)
+        lora_dir = os.path.join(merge_out, "lora_adapter")
+        if not os.path.exists(os.path.join(lora_dir, "adapter_config.json")):
+            raise RuntimeError(
+                f"verl model_merger did not produce a peft adapter at {lora_dir} (no adapter_config.json); "
+                "the merger output layout must be adjusted for this verl version."
+            )
+        # rename rather than copy: every caller builds `out_adapter_dir` and `merge_out` as siblings
+        # in one run workdir, so the two are on one filesystem and `os.replace` is a metadata
+        # operation that moves no bytes. copying would hold a second copy of the adapter beside the
+        # still-undeleted merge tree, a peak this function's own headroom check does not budget for.
+        for name in os.listdir(lora_dir):
+            os.replace(os.path.join(lora_dir, name), os.path.join(out_adapter_dir, name))
+    finally:
+        shutil.rmtree(merge_out, ignore_errors=True)
 
 
 def stamp_adapter_dir_provenance(adapter_dir: str, model_id: str, model_revision: str = "") -> None:

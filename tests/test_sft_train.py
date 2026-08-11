@@ -2138,29 +2138,27 @@ def test_merge_is_refused_when_its_output_cannot_fit_beside_the_checkpoint(monke
     assert not launched, "the merger ran even though its output could not fit"
 
 
-def test_merge_headroom_counts_a_hardlinked_checkpoint_once(tmp_path):
-    """the size estimate must not double-count hardlinks.
+def test_merge_sizing_ignores_shards_nested_below_the_checkpoint(tmp_path):
+    """the estimate must count only the shards the merger actually opens.
 
-    `_staged_source` hardlinks the checkpoint before publishing, so the same inode is reachable
-    through two paths. Counting it twice would inflate the requirement and refuse a merge that
-    fits.
+    `_load_and_merge_state_dicts` reads exact top-level paths -- `Path(local_dir) /
+    f"model_world_size_{W}_rank_{r}.pt"`, one per rank -- and never recurses. A nested directory
+    that happens to hold shard-named files (a staging tree, a partially copied checkpoint) is not
+    merge input, so adding its bytes would inflate the requirement and refuse a merge that fits.
 
-    Both links must carry a SHARD name for this to test anything: the walk skips non-shard files
-    before it ever reaches the inode check, so linking to e.g. `staged.pt` would leave the
-    assertion green even with the dedup deleted. `_staged_source` copies the tree with
-    `copy_function=os.link` and keeps each filename, so a shard-named link in a sibling directory
-    is also what production actually produces.
+    That is the same over-estimate the optimizer-state exclusion exists to prevent, in a different
+    form, and it matters in the same direction: a guard that refuses a valid merge is a regression
+    this PR would have introduced, whereas one that underestimates merely leaves today's behavior.
     """
     from flash.engine.worker.verl import checkpoints as verl_checkpoints
 
-    source = tmp_path / "ckpt"
-    staged = source / "staged"
-    staged.mkdir(parents=True)
-    shard = source / "model_world_size_2_rank_0.pt"
-    shard.write_bytes(b"x" * 8192)
-    os.link(shard, staged / "model_world_size_2_rank_0.pt")
+    actor_dir = tmp_path / "ckpt"
+    nested = actor_dir / "staged"
+    nested.mkdir(parents=True)
+    (actor_dir / "model_world_size_2_rank_0.pt").write_bytes(b"x" * 8192)
+    (nested / "model_world_size_2_rank_0.pt").write_bytes(b"x" * 8192)
 
-    assert verl_checkpoints._model_shard_bytes(str(source)) == 8192
+    assert verl_checkpoints._model_shard_bytes(str(actor_dir)) == 8192
 
 
 def test_merge_headroom_allows_the_merge_when_there_is_room(monkeypatch, tmp_path):
@@ -2523,3 +2521,91 @@ def test_the_rl_and_opd_watchers_still_keep_their_exports():
         opd_failures._OpdVerlCheckpointWatcher._publish
         is not sft_checkpoints._VerlCheckpointWatcher._publish
     ), "opd no longer overrides _publish, so it now inherits the sft deletion"
+
+
+def test_a_failed_merge_does_not_strand_the_merge_tree(monkeypatch, tmp_path):
+    """the largest transient on the disk must not survive its own failure.
+
+    `merge_out` holds the full merged model, tens of gb on a real run. If the merger dies partway
+    through -- or writes a layout this code refuses -- deleting it only on the success path would
+    leave that tree behind on exactly the disk this module exists to protect, and the next save
+    would start with less room than this one had. Cleanup has to cover the resource's whole
+    lifetime, not just the happy path.
+    """
+    import subprocess
+
+    from flash.engine.worker.verl import checkpoints as verl_checkpoints
+
+    actor_dir = tmp_path / "global_step_3"
+    (actor_dir / "huggingface").mkdir(parents=True)
+    (actor_dir / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 512)
+    out_adapter = tmp_path / "adapter"
+    merge_out = tmp_path / "adapter_merge"
+
+    def dying_merge(*args, **kwargs):
+        # the merger writes most of the model, then fails: the exact shape of a disk-full death.
+        (merge_out / "model-00001-of-00002.safetensors").parent.mkdir(parents=True, exist_ok=True)
+        (merge_out / "model-00001-of-00002.safetensors").write_bytes(b"w" * 65536)
+        raise subprocess.CalledProcessError(1, "verl.model_merger")
+
+    monkeypatch.setattr(verl_checkpoints.subprocess, "run", dying_merge)
+    monkeypatch.setattr(
+        verl_checkpoints.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=1 << 40, used=0, free=1 << 40),
+    )
+
+    with pytest.raises(subprocess.CalledProcessError):
+        verl_checkpoints.export_peft_adapter(
+            str(actor_dir),
+            str(out_adapter),
+            base_model_id="org/model",
+            python_bin="/verl/python",
+        )
+
+    assert not merge_out.exists(), "a failed merge left its partial model tree on the disk"
+
+
+def test_a_failed_export_does_not_strand_a_partial_adapter(monkeypatch, tmp_path):
+    """the watcher must free an export that died while being written.
+
+    The cleanup used to begin after `_export_checkpoint_adapter` returned, so an export that raised
+    partway through left its directory behind with no reader and no later sweep to collect it. On a
+    run whose exports keep failing that is one partial adapter per save -- the accumulation this
+    class exists to bound, reached through the failure path instead of the success one.
+    """
+    import flash.engine.worker as worker
+    from flash.engine.worker import sft_train
+
+    local_dir = tmp_path / "checkpoints"
+    export_root = tmp_path / "exports"
+    checkpoint_dir = local_dir / "global_step_7"
+    (checkpoint_dir / "huggingface").mkdir(parents=True)
+
+    def dying_export(actor, adapter, **kwargs):
+        os.makedirs(adapter, exist_ok=True)
+        with open(os.path.join(adapter, "adapter_model.safetensors"), "wb") as fh:
+            fh.write(b"partial")
+        raise RuntimeError("merger died")
+
+    monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", dying_export)
+    monkeypatch.setattr(
+        worker, "publish_deployable_checkpoint", lambda adapter, step, **kwargs: f"step-{step}"
+    )
+    monkeypatch.setattr(worker, "upload_resume_checkpoint", lambda step, ckpt, **kwargs: True)
+
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(export_root),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(),
+    )
+
+    with pytest.raises(RuntimeError, match="merger died"):
+        watcher._publish(7, str(checkpoint_dir))
+
+    assert not os.path.exists(export_root / "step-7"), (
+        "a failed export left a partial adapter on the container disk"
+    )
