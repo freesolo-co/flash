@@ -201,11 +201,18 @@ class _Resp:
 
     def __init__(self, failure):
         self._failure = failure
+        self._done = False
         self.headers = {"Content-Type": "application/json"}
 
     def read(self, *_a):
         if isinstance(self._failure, BaseException):
             raise self._failure
+        # signal EOF after the body, as a real response does. Returning the same bytes on every call
+        # made this an ENDLESS body, which only looked fine while the client read it in one unbounded
+        # call -- a chunked reader would spin on it until it hit a cap.
+        if self._done:
+            return b""
+        self._done = True
         return self._failure
 
     def __enter__(self):
@@ -585,3 +592,84 @@ def test_the_client_budget_counts_the_body_read_not_just_the_connect():
     client_timeout = client_http.ENV_LIST_CLIENT_TIMEOUT_SECONDS
     assert mirrored_budget == real_ceiling
     assert client_timeout > real_ceiling
+
+
+def test_the_list_call_site_asks_for_a_bounded_success_body(monkeypatch):
+    """`list_envs` must bound the 200 body too, not just the error path.
+
+    Routed through the real `list_envs` rather than `_read_response_body` directly, for the same
+    reason as the error-body test above: a helper-only test passes unchanged while the call site still
+    says `resp.read()`. The unbounded request is `-1`/`None`, and only the call site chooses it.
+
+    This closes the gap the PR's own docstring otherwise claims shut: `timeout` is applied per socket
+    receive, so it does NOT bound a response, and a plane that drip-feeds a 200 body holds the command
+    open forever -- printing neither the remote list nor the local sources it already has.
+    """
+    import urllib.request
+
+    from flash.client.http import ApiClient
+
+    sizes: list[object] = []
+
+    class _RecordingResponse:
+        def __init__(self):
+            self._chunks = [b'{"environments": [{"id": "acme/env"}]}', b""]
+
+        def read(self, size=-1):
+            sizes.append(size)
+            return self._chunks.pop(0) if self._chunks else b""
+
+        @property
+        def headers(self):
+            return {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: _RecordingResponse())
+    client = ApiClient("https://api.freesolo.co", "fs-key")
+    assert client.list_envs() == ["acme/env"]
+
+    assert sizes, "the body must actually be read"
+    unbounded = [s for s in sizes if not isinstance(s, int) or s <= 0]
+    assert not unbounded, f"the list call site must request a bounded amount, got {sizes}"
+
+
+def test_a_stalled_list_body_gives_up_instead_of_hanging(monkeypatch):
+    """The deadline is what makes the bound real: a body that never ends must end the wait.
+
+    A byte cap alone would not do it -- a peer that drips forever without exceeding the cap keeps the
+    read alive indefinitely -- so the failure has to be time-based, and it has to be a ClientError so
+    the CLI degrades and still prints local sources.
+    """
+    import urllib.request
+
+    from flash.client.http import ApiClient, ClientError
+
+    clock = [0.0]
+
+    class _StalledResponse:
+        def read(self, *_a):
+            clock[0] += 600.0  # each chunk arrives inside the socket window, but time passes
+            return b"x" * 8
+
+        @property
+        def headers(self):
+            return {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    import time
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: _StalledResponse())
+    client = ApiClient("https://api.freesolo.co", "fs-key")
+    with pytest.raises(ClientError, match="stalled"):
+        client.list_envs()

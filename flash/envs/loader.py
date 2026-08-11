@@ -193,6 +193,13 @@ from flash.envs.github_urls import (  # noqa: E402
     _safe_contents_path,
 )
 
+# imported at the BOTTOM of the module's import block for the same reason as the two above: this one
+# calls back into `loader` for every GitHub helper it uses, so it must not be imported before the
+# names it reaches for exist. It resolves them lazily (inside each function), so the cycle is fine.
+from flash.envs.namespace_listing import (  # noqa: E402
+    list_managed_namespace_slugs as list_managed_namespace_slugs,
+)
+
 
 def _classify_github_http_error(
     exc: urllib.error.HTTPError,
@@ -428,7 +435,7 @@ def _download_github_json(
         ) from exc
 
 
-def _github_tree_entries(
+def _github_tree_entries_allowing_truncation(
     ref: GitHubEnvironmentRef,
     treeish: str,
     context: str,
@@ -437,7 +444,13 @@ def _github_tree_entries(
     timeout: float = 120.0,
     max_rate_limit_retries: int = 5,
     body_deadline: float | None = None,
-) -> list[dict]:
+) -> tuple[list[dict], bool]:
+    """The entries plus GitHub's own ``truncated`` flag, for callers that can still answer.
+
+    Separate from ``_github_tree_entries`` so that treating a truncated tree as usable is an explicit
+    choice at the call site. Every caller that needs the WHOLE tree must keep raising: a short tree
+    silently drops environments, which is the silent-empty failure this endpoint exists to remove.
+    """
     payload = _download_github_json(
         ref,
         _github_tree_url(ref, treeish, recursive=recursive),
@@ -451,13 +464,35 @@ def _github_tree_entries(
             f"GitHub path {context!r} is not an environment directory"
             f"{_github_response_message(payload)}"
         )
-    if payload.get("truncated"):
-        raise RuntimeError(
-            f"GitHub tree response for environment directory {context!r} was truncated"
-        )
     entries = payload["tree"]
     if not all(isinstance(entry, dict) for entry in entries):
         raise RuntimeError("GitHub tree response included an invalid entry")
+    return entries, bool(payload.get("truncated"))
+
+
+def _github_tree_entries(
+    ref: GitHubEnvironmentRef,
+    treeish: str,
+    context: str,
+    *,
+    recursive: bool = False,
+    timeout: float = 120.0,
+    max_rate_limit_retries: int = 5,
+    body_deadline: float | None = None,
+) -> list[dict]:
+    entries, truncated = _github_tree_entries_allowing_truncation(
+        ref,
+        treeish,
+        context,
+        recursive=recursive,
+        timeout=timeout,
+        max_rate_limit_retries=max_rate_limit_retries,
+        body_deadline=body_deadline,
+    )
+    if truncated:
+        raise RuntimeError(
+            f"GitHub tree response for environment directory {context!r} was truncated"
+        )
     return entries
 
 
@@ -496,96 +531,6 @@ _LIST_READ_BUDGET = {
     "max_rate_limit_retries": 1,
     "body_deadline": 20.0,
 }
-
-
-def list_managed_namespace_slugs(namespace: str) -> list[str]:
-    """List ``namespace/name`` slugs published under one managed-hub namespace, sorted.
-
-    Tree reads and no clone: find the namespace directory in the hub root, then read it one level
-    deep and keep the subdirectories that actually contain ``environment.py`` -- which is what
-    ``_github_publish`` writes, so a stray file at the namespace root is not an environment.
-    Authentication is the ambient ``GITHUB_TOKEN`` that every other GitHub read here uses.
-
-    An absent namespace directory means the org has published nothing yet and returns an empty
-    list. Every other failure propagates, because "no environments" must never be how a broken hub
-    read looks: that is indistinguishable from a publish that silently did nothing.
-
-    Both reads are deliberately bounded well below the publish path's budget. This serves a person
-    waiting at a terminal, and inheriting the batch default (6 attempts x 120s socket + up to 180s
-    backoff, twice over) would let a hard-down GitHub hold the request ~30 minutes before returning
-    the controlled 502 -- long enough that every caller times out first and sees a generic failure
-    instead of the upstream status. One retry at a 20s socket timeout answers within ~1 minute
-    worst case, which is what makes the 429/502 actually reachable by a client.
-    """
-    if not _is_safe_github_path_parts((namespace,)):
-        raise RuntimeError(f"unsafe managed environment namespace: {namespace!r}")
-    ref = _parse_github_environment_ref(
-        f"github:{_DEFAULT_MANAGED_ENV_REPO}@{_DEFAULT_GITHUB_REF}:"
-        f"{namespace}/{_DEFAULT_ENVIRONMENT_PATH}"
-    )
-    if ref is None:  # pragma: no cover - the literal above always parses
-        raise RuntimeError("could not build a managed environment reference")
-
-    # match on the PATH only, then validate type and sha below. folding either check into this
-    # predicate would make a malformed entry look like a MISSING one, so a broken hub response would
-    # report "nothing published" -- the exact failure this endpoint exists to remove.
-    root = next(
-        (
-            entry
-            for entry in _github_tree_entries(ref, ref.ref, ref.ref, **_LIST_READ_BUDGET)
-            if entry.get("path") == namespace
-        ),
-        None,
-    )
-    if root is None:
-        return []
-    root_type = root.get("type")
-    if not isinstance(root_type, str) or not root_type:
-        raise RuntimeError(
-            f"GitHub tree entry for environment namespace {namespace!r} has an unusable type; "
-            "the hub listing could not be read"
-        )
-    # a well-formed non-tree is a readable answer, not a broken one: `_github_publish` writes a
-    # directory, so a stray file at this path is unambiguously not an environment namespace.
-    if root_type != "tree":
-        return []
-    root_sha = root.get("sha")
-    if not isinstance(root_sha, str) or not root_sha:
-        raise RuntimeError(
-            f"GitHub tree entry for environment namespace {namespace!r} has no usable sha; "
-            "the hub listing could not be read"
-        )
-    # ONE recursive fetch of the namespace subtree, not a tree request per environment: an org with
-    # 100 envs would otherwise spend 102 calls of the shared GITHUB_TOKEN's budget on a list. Paths
-    # in a recursive response are relative to the namespace, so `<name>/environment.py` identifies an
-    # environment directly and no per-directory read is needed.
-    slugs = []
-    for entry in _github_tree_entries(
-        ref, root_sha, namespace, recursive=True, **_LIST_READ_BUDGET
-    ):
-        path = entry.get("path")
-        if not isinstance(path, str):
-            continue
-        parts = path.split("/")
-        if len(parts) != 2 or parts[1] != _DEFAULT_ENVIRONMENT_PATH:
-            continue
-        # the path says this IS an environment marker, so decide on its type only once we know the
-        # type is readable. skipping an entry whose type is missing or malformed would shorten the
-        # list -- to "nothing published" for a single-env org -- which is the silent-empty failure
-        # this endpoint exists to remove. a well-formed non-blob (a directory that happens to be
-        # named environment.py) is a legitimate skip and stays quiet.
-        kind = entry.get("type")
-        if not isinstance(kind, str) or not kind:
-            raise RuntimeError(
-                f"GitHub tree entry {path!r} in environment namespace {namespace!r} has an unusable "
-                "type; the hub listing could not be read"
-            )
-        if kind != "blob":
-            continue
-        if not _is_safe_github_path_parts((parts[0],)):
-            continue
-        slugs.append(f"{namespace}/{parts[0]}")
-    return sorted(slugs)
 
 
 def _download_github_directory(ref: GitHubEnvironmentRef, repo_dir: str, dest: Path) -> Path:

@@ -491,3 +491,116 @@ def test_rate_limit_error_still_reschedules_worker_retries():
     """
     assert issubclass(loader.GitHubRateLimitError, RuntimeError)
     assert isinstance(loader.GitHubRateLimitError("x", throttled=True), loader.GitHubRateLimitError)
+
+
+def _truncated(*entries: dict) -> dict:
+    """A recursive tree GitHub cut short: the entries are true, the tail is missing."""
+    return {"tree": list(entries), "truncated": True}
+
+
+def test_a_truncated_namespace_tree_keeps_the_envs_it_did_prove(monkeypatch):
+    """A truncated recursive tree must not make the whole namespace unlistable.
+
+    Truncation is reachable on valid input -- each package may hold up to `_MAX_ARCHIVE_MEMBERS`
+    files, so roughly twenty full ones exceed GitHub's response limit -- and raising there loses every
+    environment in the namespace, which is the silent-empty failure this endpoint exists to remove.
+    A truncated tree is a PREFIX, so what it listed is true and only the tail needs settling.
+    """
+    _fake_hub(
+        monkeypatch,
+        {
+            "main": _tree(_dir("acme", "sha-acme")),
+            # the prefix proves `early`, then is cut before reaching `late`
+            "sha-acme": _truncated(_blob("early/environment.py")),
+            # the recovery reads the namespace one level deep, then only the undecided package
+            "sha-late": _tree(_blob("environment.py")),
+        },
+    )
+    # the non-recursive first-level read reuses the namespace sha, so serve both shapes for it
+    calls: list[str] = []
+    real = loader._download_github_json
+
+    def routing_download(ref, url, context, **kwargs):
+        calls.append(url)
+        if "sha-acme" in url and "recursive" not in url:
+            return _tree(_dir("early", "sha-early"), _dir("late", "sha-late"))
+        return real(ref, url, context, **kwargs)
+
+    monkeypatch.setattr(loader, "_download_github_json", routing_download)
+
+    assert loader.list_managed_namespace_slugs("acme") == ["acme/early", "acme/late"]
+    # `early` was already proven by the prefix, so the recovery must not re-read it
+    assert not any("sha-early" in url for url in calls), (
+        f"a package the prefix settled must not be read again, got {calls}"
+    )
+
+
+def test_a_truncated_tree_still_skips_a_package_without_the_marker(monkeypatch):
+    """The recovery decides by the same rule as the prefix: no environment.py, not an environment."""
+    _fake_hub(
+        monkeypatch,
+        {
+            "main": _tree(_dir("acme", "sha-acme")),
+            "sha-acme": _truncated(),
+            "sha-real": _tree(_blob("environment.py")),
+            "sha-bare": _tree(_blob("readme.md")),
+        },
+    )
+    real = loader._download_github_json
+
+    def routing_download(ref, url, context, **kwargs):
+        if "sha-acme" in url and "recursive" not in url:
+            return _tree(_dir("real", "sha-real"), _dir("bare", "sha-bare"))
+        return real(ref, url, context, **kwargs)
+
+    monkeypatch.setattr(loader, "_download_github_json", routing_download)
+
+    assert loader.list_managed_namespace_slugs("acme") == ["acme/real"]
+
+
+def test_an_untruncated_tree_never_pays_for_the_recovery(monkeypatch):
+    """The common case stays at two reads: recovery is only for a tree GitHub actually cut."""
+    urls: list[str] = []
+    _fake_hub(
+        monkeypatch,
+        {
+            "main": _tree(_dir("acme", "sha-acme")),
+            "sha-acme": _tree(_blob("my-env/environment.py")),
+        },
+        record=urls,
+    )
+
+    assert loader.list_managed_namespace_slugs("acme") == ["acme/my-env"]
+    assert len(urls) == 2, f"an untruncated listing must stay at two reads, got {urls}"
+
+
+def test_a_truncated_tree_needing_too_many_reads_fails_loudly(monkeypatch):
+    """The recovery is bounded, and exceeding the bound must raise rather than answer short.
+
+    The caller's timeout is derived from a fixed number of reads, so an unbounded fan-out here would
+    blow it and fail the whole list. Answering with a partial list instead would be worse than the
+    truncation it repairs: it reads as "these are your environments" while silently omitting some.
+    """
+    from flash.envs import namespace_listing
+
+    packages = [
+        _dir(f"env-{i}", f"sha-{i}")
+        for i in range(namespace_listing._MAX_TRUNCATION_RECOVERY_READS + 2)
+    ]
+    trees = {
+        "main": _tree(_dir("acme", "sha-acme")),
+        "sha-acme": _truncated(),
+        **{f"sha-{i}": _tree(_blob("environment.py")) for i in range(len(packages))},
+    }
+    _fake_hub(monkeypatch, trees)
+    real = loader._download_github_json
+
+    def routing_download(ref, url, context, **kwargs):
+        if "sha-acme" in url and "recursive" not in url:
+            return _tree(*packages)
+        return real(ref, url, context, **kwargs)
+
+    monkeypatch.setattr(loader, "_download_github_json", routing_download)
+
+    with pytest.raises(RuntimeError, match="additional hub reads"):
+        loader.list_managed_namespace_slugs("acme")
