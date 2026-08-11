@@ -1,10 +1,11 @@
-"""Unit tests for docker/bake_kernel_cache.py's pod-create retry.
+"""unit tests for docker/bake_kernel_cache.py's pod-create retry.
 
-The bake rents a GPU of one arch, and RunPod picks the host at create time: a scarce class (sm86 /
-sm120) is regularly rejected with "This machine does not have the resources to deploy your pod",
-which used to fail the whole arch ~30s in and ship a stale kernel cache against a fresh worker
-image. What matters here is the split -- a capacity rejection must be retried, and a real error
-(auth, quota, bad image) must still fail on the first try instead of burning the attempt budget.
+the bake rents a GPU of one arch, and RunPod picks the host at create time: a scarce class (sm86 /
+sm120) is regularly rejected with "This machine does not have the resources to deploy your pod". an
+unretried create therefore fails the whole arch ~30s in and ships a stale kernel cache against a
+fresh worker image. these tests pin the split: a capacity rejection must be retried, and a real
+error (auth, quota, bad image) must still fail on the first try instead of burning the attempt
+budget.
 
 docker/ is not a package, so import the module by path (same style as test_kernel_fingerprint.py).
 """
@@ -52,7 +53,7 @@ class _FakeRunpod:
 
 @pytest.fixture
 def no_sleep(monkeypatch):
-    """Backoff sleeps are real seconds; record them instead of waiting."""
+    """backoff sleeps are real seconds; record them instead of waiting."""
     slept = []
     monkeypatch.setattr(bake.time, "sleep", slept.append)
     return slept
@@ -122,7 +123,7 @@ def test_backoff_grows_and_is_bounded(no_sleep):
 
 
 def test_bake_goes_through_the_retrying_helper():
-    """The warm step runs this script, and its create must not bypass the retry."""
+    """the warm step runs this script, and its create must not bypass the retry."""
     wf = (ROOT / ".github" / "workflows" / "bake-kernel-cache.yml").read_text()
     assert "uv run python docker/bake_kernel_cache.py" in wf
     body = BAKE_SCRIPT.read_text().split("def main()")[1]

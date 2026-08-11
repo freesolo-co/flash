@@ -47,9 +47,9 @@ _LORA_ADAMW_BYTES_PER_PARAM = 16.0
 
 def grpo_completion_len(max_tokens: int | None, thinking: bool) -> int:
     """The completion-token budget a GRPO run uses: an explicit ``max_tokens`` else the RL recipe
-    default (thinking uses the longer ``max_completion_len_thinking``). Single source of truth for the
-    three sites that must resolve the SAME integer — ``_resolve_sequence_lengths``'s worker-side
-    enforcement, ``grpo_rollout_seq_len``, and the spec-parse prompt-budget guard."""
+    default (thinking uses the longer ``max_completion_len_thinking``). Single source of truth for
+    the three sites that must resolve the SAME integer (``_resolve_sequence_lengths``'s worker-side
+    enforcement, ``grpo_rollout_seq_len``, and the spec-parse prompt-budget guard)."""
     from flash.engine.plan.recipe import RECIPE
 
     rl = RECIPE.rl
