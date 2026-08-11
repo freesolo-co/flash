@@ -234,6 +234,34 @@ def test_module_invocation_is_named_back_as_itself_not_as_flash():
     importlib.reload(channel)  # restore the pytest-invoked value for later tests
 
 
+def test_the_wordmark_does_not_follow_the_invoked_entry_point():
+    """BRAND_NAME identifies the product; CLI_NAME says what to type. Only the latter varies.
+
+    `flash version` prints `flash 1.2.3` -- a name and a version, not a command. Deriving it from
+    the invoked entry point yields `python -m flash.cli 1.2.3`, which reads as a half-typed command
+    and breaks the `flash <version>` contract tests/test_version.py pins. Reaching the same tool
+    through a different script does not rename the tool.
+    """
+    import importlib
+    import sys
+    from unittest import mock
+
+    from flash._internal import channel
+
+    for orig_argv, argv in (
+        ([sys.executable, "-m", "flash.cli", "version"], ["-m", "version"]),
+        ([sys.executable, "/usr/local/bin/flash-cli", "version"], ["/usr/local/bin/flash-cli"]),
+    ):
+        with (
+            mock.patch.object(sys, "orig_argv", orig_argv),
+            mock.patch.object(sys, "argv", argv),
+        ):
+            reloaded = importlib.reload(channel)
+            assert reloaded.BRAND_NAME == "flash", orig_argv
+
+    importlib.reload(channel)  # restore the pytest-invoked value for later tests
+
+
 def test_every_console_script_has_a_dev_rename():
     """A script key missing from SCRIPT_RENAMES ships unrenamed in the dev distribution.
 

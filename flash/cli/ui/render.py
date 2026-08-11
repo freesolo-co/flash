@@ -6,7 +6,7 @@ import os
 import sys
 import time
 
-from flash._internal.channel import CLI_NAME
+from flash._internal.channel import BRAND_NAME, CLI_NAME
 
 _ROWS = (
     ("email", "account"),
@@ -269,7 +269,7 @@ def _rule(width: int | None = None) -> str:
 
 def header(cmd: str, desc: str | None = None) -> str:
     """Brand header line + a faint rule: the wordmark, the command, and an optional descriptor."""
-    mark = _paint(CLI_NAME, _ACCENT, "1")
+    mark = _paint(BRAND_NAME, _ACCENT, "1")
     sep = _paint(_glyph("›", ">"), _FAINT)  # noqa: RUF001 (the glyph is the point)
     line = f"{mark} {sep} {_bold(cmd)}"
     if desc:
@@ -478,7 +478,7 @@ def _hide_provider_metadata(obj):
 
 def version(value: str) -> str:
     """The wordmark + version."""
-    mark = _paint(CLI_NAME, _ACCENT, "1")
+    mark = _paint(BRAND_NAME, _ACCENT, "1")
     return _safe(f"{mark} {_dim('v' + value)}")
 
 
@@ -947,7 +947,7 @@ def help_page(
     here. Only ever called on the styled path; piped/scripted ``--help`` keeps argparse's
     plain text (see ``flash.cli._FlashParser``), so existing greps stay byte-for-byte.
     """
-    mark = _paint(CLI_NAME, _ACCENT, "1")
+    mark = _paint(BRAND_NAME, _ACCENT, "1")
     banner = f"{mark}  {_paint(tagline, _GRAY)}"
     usage_line = f"{_dim('usage:')} {_paint(usage, _GRAY)}"
     # one name-column width across every group AND the options block, so every summary lines up

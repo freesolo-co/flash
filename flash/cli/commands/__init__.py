@@ -10,7 +10,7 @@ import uuid
 from pathlib import Path
 
 from flash import __version__
-from flash._internal.channel import CLI_NAME
+from flash._internal.channel import BRAND_NAME, CLI_NAME
 from flash._internal.logging import get_logger
 from flash.cli.ui import render
 from flash.cli.ui.tty import TtyStatusLine
@@ -90,7 +90,7 @@ def cmd_version(args) -> int:
     if render.styled():
         print(render.version(__version__))
     else:
-        print(f"{CLI_NAME} {__version__}")
+        print(f"{BRAND_NAME} {__version__}")
     return 0
 
 
