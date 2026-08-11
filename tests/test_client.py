@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 import urllib.request
@@ -730,7 +731,7 @@ def test_cancel_timeout_returns_authoritative_cancelled_status(monkeypatch):
     client = ApiClient("http://flash.example", "fslo-user-test")
     calls: list[tuple[str, str, float | None]] = []
 
-    def request(method, path, body=None, timeout=None, progress=None):
+    def request(method, path, body=None, timeout=None, progress=None, require=()):
         calls.append((method, path, timeout))
         if method == "POST":
             raise RequestTimeoutError("cancel timed out")
@@ -753,7 +754,7 @@ def test_cancel_timeout_returns_authoritative_cancelled_status(monkeypatch):
 def test_cancel_timeout_raises_when_backend_revocation_is_unconfirmed(monkeypatch, run_state):
     client = ApiClient("http://flash.example", "fslo-user-test")
 
-    def request(method, path, body=None, timeout=None, progress=None):
+    def request(method, path, body=None, timeout=None, progress=None, require=()):
         if method == "POST":
             raise RequestTimeoutError("cancel timed out")
         if method == "GET" and path == "/v1/runs/r1":
@@ -790,7 +791,7 @@ def test_cancel_timeout_keeps_polling_nonterminal_revocation_failure(monkeypatch
         ]
     )
 
-    def request(method, path, body=None, timeout=None, progress=None):
+    def request(method, path, body=None, timeout=None, progress=None, require=()):
         if method == "POST":
             raise RequestTimeoutError("cancel timed out")
         if method == "GET" and path == "/v1/runs/r1":
@@ -996,3 +997,64 @@ def test_deployment_for_bounds_the_read(monkeypatch):
 
     assert client.deployment_for("flash-1", timeout=3.0) is None
     assert calls == [("GET", "/v1/runs/flash-1/deploy", 3.0)]
+
+
+@contextlib.contextmanager
+def _fixed_2xx_server(content_type: str, body: bytes):
+    """A server that answers every GET 200 with one fixed body — a proxy, or another service."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_wrong_shape_2xx_names_the_endpoint_and_the_missing_key():
+    """Valid JSON of the wrong shape used to escape as a bare KeyError nothing translates."""
+    with _fixed_2xx_server("application/json", b'{"hello": "world"}') as url:
+        client = ApiClient(url, "fslo-user-test", timeout=5)
+        cases = [
+            (client.list_runs, "/v1/runs", "runs"),
+            (lambda: client.checkpoints("r1"), "/v1/runs/r1/checkpoints", "checkpoints"),
+            (client.deployments, "/v1/deployments", "deployments"),
+            (lambda: client.get_logs("r1"), "/v1/runs/r1/logs?offset=0", "logs"),
+        ]
+        for call, path, key in cases:
+            with pytest.raises(ClientError) as caught:
+                call()
+            message = str(caught.value)
+            assert f"{url}{path} returned an unexpected response shape" in message
+            assert repr(key) in message
+            assert "rather than at a proxy or another service" in message
+
+
+def test_non_json_2xx_is_a_client_error_not_a_decode_error():
+    """A reverse proxy answering 200 text/html leaked `Expecting value: line 1 column 1`."""
+    with _fixed_2xx_server("text/html", b"<html>hi</html>") as url:
+        client = ApiClient(url, "fslo-user-test", timeout=5)
+        with pytest.raises(ClientError) as caught:
+            client.me()
+    message = str(caught.value)
+    assert f"{url}/v1/me did not return JSON (Content-Type: text/html)" in message
+    assert "rather than at a proxy or another service" in message
+    assert "Expecting value" not in message
+
+
+def test_empty_2xx_body_still_decodes_to_an_empty_object():
+    """`_request` has always turned an empty 2xx body into {}; the decode guard must not change it."""
+    with _fixed_2xx_server("application/json", b"") as url:
+        assert ApiClient(url, "fslo-user-test", timeout=5).me() == {}

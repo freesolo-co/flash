@@ -127,6 +127,21 @@ def _api_error(exc: urllib.error.HTTPError) -> ApiError:
     return ApiError(exc.code, str(detail), detail=detail)
 
 
+def _unexpected_response(api_url: str, path: str, problem: str) -> ClientError:
+    """The one error for a 2xx body this client cannot use.
+
+    A body that is not JSON and valid JSON of the wrong shape are the same user state -- something
+    other than a Flash control plane answered -- so both get the hint ``flash login`` already gives
+    (see ``_verify_key_against_plane``) instead of escaping as a bare ``json.JSONDecodeError`` or
+    ``KeyError``, which nothing in the CLI translates into an error message.
+    """
+    return ClientError(
+        f"{api_url}{path} {problem}. Check that --api-url points at your Flash control plane "
+        '(its /v1/health should report "service": "flash") rather than at a proxy or another '
+        "service."
+    )
+
+
 def _read_capped_response(resp: object, max_bytes: int) -> bytes:
     chunks: list[bytes] = []
     total = 0
@@ -489,6 +504,38 @@ class ApiClient:
                 "check your network connection and FLASH_API_URL"
             ) from exc
 
+    def _decode_response(
+        self,
+        path: str,
+        raw: bytes,
+        content_type: str = "",
+        *,
+        require: tuple[str, ...] = (),
+    ) -> Any:
+        """Parse a 2xx body and require the top-level keys the caller is about to read.
+
+        Every response body this client reads goes through here, so a proxy answering
+        ``200 text/html`` and a plane answering the wrong shape both surface as the same
+        ``ClientError``. An empty body stays ``{}``, as it always did.
+        """
+        try:
+            payload = json.loads(raw) if raw else {}
+        except ValueError as exc:
+            raise _unexpected_response(
+                self.api_url,
+                path,
+                f"did not return JSON (Content-Type: {content_type or 'unset'})",
+            ) from exc
+        missing = [key for key in require if not isinstance(payload, dict) or key not in payload]
+        if missing:
+            raise _unexpected_response(
+                self.api_url,
+                path,
+                "returned an unexpected response shape "
+                f"(missing {', '.join(repr(key) for key in missing)})",
+            )
+        return payload
+
     def _request(
         self,
         method: str,
@@ -497,6 +544,7 @@ class ApiClient:
         timeout: float | None = None,
         progress: ProgressCallback | None = None,
         extra_headers: dict[str, str] | None = None,
+        require: tuple[str, ...] = (),
     ) -> Any:
         headers = {
             "Content-Type": "application/json",
@@ -519,8 +567,9 @@ class ApiClient:
             self._translate_http_errors(),
             urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp,
         ):
-            raw = resp.read()
-            return json.loads(raw) if raw else {}
+            return self._decode_response(
+                path, resp.read(), resp.headers.get("Content-Type", ""), require=require
+            )
 
     def _request_bytes(
         self,
@@ -620,6 +669,7 @@ class ApiClient:
             f"/v1/envs/{quoted}",
             timeout=1800.0,
             extra_headers={"X-Freesolo-Project-Id": project_id},
+            require=("deleted",),
         )
 
     def download_env_package(self, env_id: str) -> bytes:
@@ -659,16 +709,18 @@ class ApiClient:
             body["dry_run"] = True
         if client_train_schema is not None:
             body["client_train_schema"] = client_train_schema
-        return self._request("POST", "/v1/runs", body=body)
+        return self._request("POST", "/v1/runs", body=body, require=("run_id",))
 
     def list_runs(self) -> list[dict]:
-        return self._request("GET", "/v1/runs")["runs"]
+        return self._request("GET", "/v1/runs", require=("runs",))["runs"]
 
     def get_run(self, run_id: str) -> dict:
         return self._request("GET", f"/v1/runs/{run_id}")
 
     def get_logs(self, run_id: str, offset: int = 0) -> dict:
-        return self._request("GET", f"/v1/runs/{run_id}/logs?offset={int(offset)}")
+        return self._request(
+            "GET", f"/v1/runs/{run_id}/logs?offset={int(offset)}", require=("logs", "offset")
+        )
 
     def get_worker_output(self, run_id: str) -> dict[str, str]:
         try:
@@ -683,7 +735,9 @@ class ApiClient:
         # server may still have accepted the cancel and later persisted a terminal state. Resolve
         # that by polling the authoritative run status instead of surfacing a raw timeout.
         try:
-            return self._request("POST", f"/v1/runs/{run_id}/cancel", timeout=60.0)
+            return self._request(
+                "POST", f"/v1/runs/{run_id}/cancel", timeout=60.0, require=("state",)
+            )
         except RequestTimeoutError as exc:
             return self._poll_cancel_status(run_id, cause=exc)
 
@@ -719,7 +773,9 @@ class ApiClient:
 
     def checkpoints(self, run_id: str) -> list[dict]:
         """Deployable per-step RL checkpoints for a run (serve one with `flash models deploy RUN/step-N`)."""
-        return self._request("GET", f"/v1/runs/{run_id}/checkpoints")["checkpoints"]
+        return self._request("GET", f"/v1/runs/{run_id}/checkpoints", require=("checkpoints",))[
+            "checkpoints"
+        ]
 
     def deploy(
         self,
@@ -756,7 +812,9 @@ class ApiClient:
         return self._request("DELETE", f"/v1/runs/{run_id}/deploy")
 
     def deployments(self, timeout: float | None = None) -> list[dict]:
-        return self._request("GET", "/v1/deployments", timeout=timeout)["deployments"]
+        return self._request("GET", "/v1/deployments", timeout=timeout, require=("deployments",))[
+            "deployments"
+        ]
 
     def deployment_for(self, run_id: str, timeout: float | None = None) -> dict | None:
         """The current deployment record for one run, or None when it is not listed.
@@ -860,7 +918,9 @@ class ApiClient:
         ):
             content_type = resp.headers.get("Content-Type", "")
             if "application/json" in content_type:
-                payload = json.loads(resp.read() or b"{}")
+                payload = self._decode_response(
+                    f"/v1/runs/{base_run_id}/chat", resp.read(), content_type
+                )
                 content = ((payload.get("choices") or [{}])[0].get("message") or {}).get("content")
                 if content:
                     yield str(content)
