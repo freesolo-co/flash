@@ -58,8 +58,12 @@ def _default_cache_root() -> Path:
     if xdg and Path(xdg).is_absolute():
         return Path(xdg) / "flash" / _CACHE_ROOT_DIR_NAME
     home = Path(os.path.expanduser("~"))
-    if home.is_absolute() and home.is_dir() and cache_security.home_is_usable(home):
-        return home / ".cache" / "flash" / _CACHE_ROOT_DIR_NAME
+    if home.is_absolute() and home.is_dir():
+        # the whole path is vetted, not just `home`: an existing root-owned `~/.cache` makes
+        # the home-based root uncreatable even when home itself is fine.
+        home_root = home / ".cache" / "flash" / _CACHE_ROOT_DIR_NAME
+        if cache_security.cache_root_is_creatable(home_root):
+            return home_root
     uid = os.getuid() if hasattr(os, "getuid") else 0
     return Path(tempfile.gettempdir()) / f"flash-env-cache-{uid}"
 
@@ -757,11 +761,10 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
             return env_file
         # untrusted entry at this cache key (planted before the root's permissions were last
         # repaired, or swapped in since): never import it -- clear it and fall through to a
-        # fresh download. a symlink is unlinked rather than rmtree'd, which refuses symlinks.
-        if cache_dir.is_symlink():
-            cache_dir.unlink()
-        else:
-            shutil.rmtree(cache_dir, ignore_errors=True)
+        # fresh download. raises if the entry cannot be removed, which has to happen HERE:
+        # continuing would download the environment only for copytree to fail on the entry
+        # still sitting there, and the alternative -- using it -- is the thing being refused.
+        cache_security.discard_untrusted_entry(cache_dir)
     tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-github-"))
     resolved = GitHubEnvironmentRef(
         parsed.owner,

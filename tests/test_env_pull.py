@@ -997,6 +997,58 @@ def test_resolve_github_env_ignores_foreign_owned_cache_entry(monkeypatch, tmp_p
     assert second.read_bytes() == b"# refreshed\n"
 
 
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="posix-only uid check")
+def test_resolve_github_env_refuses_unremovable_foreign_cache_entry(monkeypatch, tmp_path):
+    # the planted entry is foreign-owned AND cannot be deleted by us -- its contents are
+    # readable but not writable, so rmtree fails partway. best-effort removal would swallow
+    # that, download the environment anyway, and then die in copytree on the entry still
+    # sitting there, every single run. refuse the key before the download, and never fall
+    # back to importing what the ownership check just rejected.
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **kwargs: "a" * 40)
+    monkeypatch.setattr(
+        adapter, "_download_github_tarball", lambda ref: _github_env_tarball(b"# original\n")
+    )
+    first = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+    cache_dir = first.parent
+    real_lstat = os.lstat
+
+    def fake_lstat(path, *args, **kwargs):
+        result = real_lstat(path, *args, **kwargs)
+        if Path(path) in (cache_dir, first):
+            fields = list(result)
+            fields[4] = result.st_uid + 1
+            return os.stat_result(tuple(fields))
+        return result
+
+    real_rmtree = shutil.rmtree
+
+    def refuse_rmtree(path, *args, **kwargs):
+        # honours ignore_errors, so the stub reproduces the pre-fix shape too: best-effort
+        # removal returns quietly and leaves the entry behind, rather than reporting failure.
+        if Path(path) == cache_dir:
+            if kwargs.get("ignore_errors"):
+                return None
+            raise PermissionError(13, "Permission denied", str(cache_dir))
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(adapter.os, "lstat", fake_lstat)
+    monkeypatch.setattr(adapter.shutil, "rmtree", refuse_rmtree)
+    downloaded = []
+    monkeypatch.setattr(
+        adapter,
+        "_download_github_tarball",
+        lambda ref: downloaded.append(ref) or _github_env_tarball(b"# refreshed\n"),
+    )
+
+    with pytest.raises(RuntimeError, match="could not be removed"):
+        adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+
+    assert downloaded == []
+    # refused, not trusted: the rejected entry is still there and still never imported.
+    assert (cache_dir / "environment.py").read_bytes() == b"# original\n"
+
+
 def test_cmd_env_pull_multi_component_in_env_path_is_not_a_destination(
     monkeypatch, tmp_path, capsys
 ):

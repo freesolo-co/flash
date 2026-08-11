@@ -112,6 +112,57 @@ def test_default_cache_root_falls_back_when_home_foreign_owned(monkeypatch, tmp_
     assert root == tmp_path / "tmp" / f"flash-env-cache-{os.getuid()}"
 
 
+def _report_foreign_owner(monkeypatch, attr, targets):
+    # ownership cannot be faked for real in a test (chown needs root), so make the stat call
+    # the check uses report someone else's uid for exactly these paths.
+    real = getattr(os, attr)
+    targets = {Path(t) for t in targets}
+
+    def fake(path, *args, **kwargs):
+        result = real(path, *args, **kwargs)
+        if Path(path) in targets:
+            fields = list(result)
+            fields[4] = result.st_uid + 1
+            return os.stat_result(tuple(fields))
+        return result
+
+    monkeypatch.setattr(adapter.os, attr, fake)
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="posix-only uid check")
+def test_default_cache_root_falls_back_when_existing_dot_cache_is_foreign(monkeypatch, tmp_path):
+    # HOME itself is writable and ours, but ~/.cache already exists owned by root at mode
+    # 0755 (an image artifact, or an earlier privileged run). a usability check that looks
+    # only at `home` selects the home-based root anyway, and _ensure_cache_root then dies
+    # with PermissionError creating ~/.cache/flash -- never reaching the temp fallback that
+    # exists for exactly this. the deepest EXISTING directory on the path is the one mkdir
+    # has to write into, so that is the one that has to be judged.
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    home = tmp_path / "home"
+    (home / ".cache").mkdir(parents=True)
+    monkeypatch.setattr(adapter.os.path, "expanduser", lambda _p: str(home))
+    _report_foreign_owner(monkeypatch, "stat", [home / ".cache"])
+    monkeypatch.setattr(adapter.tempfile, "gettempdir", lambda: str(tmp_path / "tmp"))
+
+    root = adapter._default_cache_root()
+
+    assert root == tmp_path / "tmp" / f"flash-env-cache-{os.getuid()}"
+
+
+def test_default_cache_root_uses_home_when_existing_dot_cache_is_ours(monkeypatch, tmp_path):
+    # the other side of the same walk: an existing ~/.cache we own must not push the cache
+    # into temp. the deepest-existing check only rejects, never relocates a usable home.
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    home = tmp_path / "home"
+    (home / ".cache" / "flash").mkdir(parents=True)
+    monkeypatch.setattr(adapter.os.path, "expanduser", lambda _p: str(home))
+    monkeypatch.setattr(adapter.tempfile, "gettempdir", lambda: str(tmp_path / "tmp"))
+
+    root = adapter._default_cache_root()
+
+    assert root == home / ".cache" / "flash" / "env-cache"
+
+
 def test_ensure_cache_root_creates_private_dir(monkeypatch, tmp_path):
     root = tmp_path / "cache" / "env-cache"
     monkeypatch.setattr(adapter, "_CACHE_ROOT", root)
