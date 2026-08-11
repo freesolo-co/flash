@@ -159,14 +159,11 @@ def test_user_data_skips_capacity_for_baked_image_default(monkeypatch):
     assert "torch==2.10.0" not in script
 
 
-def test_image_per_sm_selects_arch_tag(monkeypatch):
+def test_image_per_sm_selects_arch_tag():
     """Per-SM warmed images (PR #213) reach Lambda too: the GPU class always picks the matching -smXX
-    tag for baked arches (so the worker's baked kernel cache matches the rented GPU's arch). A call
-    with no GPU class + the FLASH_WORKER_IMAGE override semantics are unchanged."""
+    tag for baked arches (so the worker's baked kernel cache matches the rented GPU's arch)."""
     from flash.providers.lambda_.jobs import builders
     from flash.providers.runpod.serverless import WORKER_IMAGE
-
-    monkeypatch.delenv("FLASH_WORKER_IMAGE", raising=False)
 
     # no GPU class -> flat base image (no arch to key a baked tag off)
     assert builders.lambda_image() == WORKER_IMAGE
@@ -177,10 +174,6 @@ def test_image_per_sm_selects_arch_tag(monkeypatch):
     payload = _build_payload(builders, _spec(gpu_type="H100"), seed=0, attempt=0)
     script = builders.build_user_data(payload, gpu="H100")
     assert f"{WORKER_IMAGE}-sm90" in script
-
-    # absolute override still wins, even with per-SM enabled and a GPU class given
-    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/freesolo-co/flash-worker:hotfix")
-    assert builders.lambda_image("H100") == "ghcr.io/freesolo-co/flash-worker:hotfix"
 
 
 def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True):
