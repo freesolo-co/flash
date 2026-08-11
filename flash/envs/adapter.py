@@ -49,6 +49,24 @@ def _json_safe(value: Any) -> Any:
         return str(value)
 
 
+def _copied_message_list(value: Any, *, row_id: Any, source: str) -> list[dict]:
+    """Copy `value` as a chat message list, naming the offending row and entries on a bad shape."""
+    if not isinstance(value, list):
+        raise ValueError(
+            f"sft output for row id {row_id!r} has a {source} value of type "
+            f"{type(value).__name__}; expected a list of message objects"
+        )
+    invalid_indexes = [
+        index for index, message in enumerate(value) if not isinstance(message, dict)
+    ]
+    if invalid_indexes:
+        raise ValueError(
+            f"sft output for row id {row_id!r} contains non-object {source} entries at "
+            f"indexes {invalid_indexes}; expected a list of message objects"
+        )
+    return [dict(message) for message in value]
+
+
 class _ScoredResponseText(str):
     """String-compatible response passed to SDK scorers.
 
@@ -299,15 +317,7 @@ class FreesoloEnvironment(BaseEnvironment):
         row_id = example.get("id")
         value = example.get(_CANONICAL_OUTPUT_KEY)
         if isinstance(value, list) and any(isinstance(message, dict) for message in value):
-            invalid_indexes = [
-                index for index, message in enumerate(value) if not isinstance(message, dict)
-            ]
-            if invalid_indexes:
-                raise ValueError(
-                    f"sft output for row id {row_id!r} contains non-object message entries at "
-                    f"indexes {invalid_indexes}; expected a list of message objects"
-                )
-            return [dict(message) for message in value], False
+            return _copied_message_list(value, row_id=row_id, source="output"), False
         if isinstance(value, dict) and "messages" in value:
             sibling_keys = sorted(str(key) for key in value if key != "messages")
             if sibling_keys:
@@ -315,21 +325,9 @@ class FreesoloEnvironment(BaseEnvironment):
                     f"sft output for row id {row_id!r} has 'messages' alongside sibling keys "
                     f"{sibling_keys}; expected exactly {{'messages': [...]}}"
                 )
-            messages = value["messages"]
-            if not isinstance(messages, list):
-                raise ValueError(
-                    f"sft output for row id {row_id!r} has a 'messages' value of type "
-                    f"{type(messages).__name__}; expected a list of message objects"
-                )
-            invalid_indexes = [
-                index for index, message in enumerate(messages) if not isinstance(message, dict)
-            ]
-            if invalid_indexes:
-                raise ValueError(
-                    f"sft output for row id {row_id!r} contains non-object 'messages' entries at "
-                    f"indexes {invalid_indexes}; expected a list of message objects"
-                )
-            return [dict(message) for message in messages], False
+            return _copied_message_list(
+                value["messages"], row_id=row_id, source="'messages'"
+            ), False
         return [{"role": "assistant", "content": "" if value is None else str(value)}], True
 
     def _single(self, results, method: str):

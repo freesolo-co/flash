@@ -486,7 +486,7 @@ def test_freesolo_sft_completion_does_not_flag_structured_targets_as_coerced(mon
         (
             "bad-list-entry",
             [{"role": "assistant", "content": "4"}, "bad"],
-            "message entries at indexes [1]",
+            "non-object output entries at indexes [1]",
         ),
     ],
 )
