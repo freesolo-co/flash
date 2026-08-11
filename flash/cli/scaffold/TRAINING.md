@@ -145,7 +145,7 @@ A managed run references a **published** environment by id — so push your fold
 
 ```bash
 flash env push --project <project-uuid> --name my-env .       # uploads this project; prints an env id like "your-org/my-env"
-flash env list                       # local env sources you can push
+flash env list                       # your published env ids, plus local sources you can push
 ```
 
 To train against an env someone else published, just set its slug as `[environment] id` —

@@ -586,6 +586,41 @@ def download_package(*, slug: str, key: dict) -> bytes:
     return _github_download(canonical, token=token)
 
 
+def list_namespace_slugs(*, key: dict) -> list[str]:
+    """Return the published ``namespace/name`` slugs the caller's org owns, sorted.
+
+    Reads the hub through the GitHub tree API rather than the clone the publish/delete paths use:
+    the hub is hundreds of MB and clones non-shallow, so a read-only list must not pay for a
+    checkout it would immediately throw away.
+
+    The namespace comes from the authenticated key, never from the caller, so this cannot enumerate
+    another org. The internal key is org-agnostic and has no namespace of its own to list, so it is
+    refused here instead of being silently answered with an empty list.
+    """
+    if key.get("auth_kind") == "internal":
+        raise EnvPublishError(
+            "listing environments requires a Freesolo user key, which carries the org namespace "
+            "to list; the internal service key is org-agnostic",
+            status=403,
+        )
+    namespace = namespace_for(key)
+    if not _github_token():
+        raise EnvPublishError(
+            "GITHUB_TOKEN is required for the Flash control plane to list environments",
+            status=503,
+        )
+    from flash.envs import loader
+
+    try:
+        return loader.list_managed_namespace_slugs(namespace)
+    except loader.GitHubRateLimitError as exc:
+        raise EnvPublishError(
+            f"Freesolo environment list is rate limited: {exc}", status=429
+        ) from exc
+    except RuntimeError as exc:
+        raise EnvPublishError(f"Freesolo environment list failed: {exc}", status=502) from exc
+
+
 def _staged_has_changes(checkout: Path) -> bool:
     try:
         proc = subprocess.run(

@@ -407,8 +407,10 @@ def _add_env_setup_command(env_sub: argparse._SubParsersAction) -> None:
 
 
 def _add_env_test_commands(env_sub: argparse._SubParsersAction) -> None:
-    """`env list` and `env test`: local inspection before anything is published."""
-    env_list = env_sub.add_parser("list", help="list local environment sources")
+    """`env list` and `env test`: inspect published environments and local sources."""
+    env_list = env_sub.add_parser(
+        "list", help="list published environments and local environment sources"
+    )
     env_list.set_defaults(func=cmd_env_list)
 
     env_test = env_sub.add_parser(

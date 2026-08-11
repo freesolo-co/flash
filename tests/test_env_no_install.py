@@ -10,8 +10,18 @@ import argparse
 
 import pytest
 
+import flash.cli.commands as commands
 from flash.cli import _build_parser
 from flash.cli.commands import cmd_env_list
+
+
+def _no_published(monkeypatch):
+    """Pin the published half so these local-source cases can't reach the network.
+
+    Without this they read the ambient ``~/.flash/config.json``: on a logged-in machine they would
+    call the control plane, and the assertions below would depend on what that org has published.
+    """
+    monkeypatch.setattr(commands, "_published_envs", lambda: ([], None))
 
 
 def test_env_install_subcommand_is_gone():
@@ -57,6 +67,7 @@ def test_env_list_reports_local_only(tmp_path, monkeypatch, capsys):
         "FLASH_STYLE", "0"
     )  # force the plain renderer so substring asserts are stable
     monkeypatch.chdir(tmp_path)
+    _no_published(monkeypatch)
     (tmp_path / "environment.py").write_text("# env\n")
     rc = cmd_env_list(argparse.Namespace())
     assert rc == 0
@@ -72,6 +83,7 @@ def test_env_list_empty_hint(tmp_path, monkeypatch, capsys):
         "FLASH_STYLE", "0"
     )  # force the plain renderer so substring asserts are stable
     monkeypatch.chdir(tmp_path)
+    _no_published(monkeypatch)
     rc = cmd_env_list(argparse.Namespace())
     assert rc == 0
     assert "no environments yet" in capsys.readouterr().out

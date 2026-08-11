@@ -510,6 +510,55 @@ def _resolve_github_directory_tree_sha(ref: GitHubEnvironmentRef, repo_dir: str)
     return treeish
 
 
+def list_managed_namespace_slugs(namespace: str) -> list[str]:
+    """List ``namespace/name`` slugs published under one managed-hub namespace, sorted.
+
+    Tree reads and no clone: find the namespace directory in the hub root, then read it one level
+    deep and keep the subdirectories that actually contain ``environment.py`` -- which is what
+    ``_github_publish`` writes, so a stray file at the namespace root is not an environment.
+    Authentication is the ambient ``GITHUB_TOKEN`` that every other GitHub read here uses.
+
+    An absent namespace directory means the org has published nothing yet and returns an empty
+    list. Every other failure propagates, because "no environments" must never be how a broken hub
+    read looks: that is indistinguishable from a publish that silently did nothing.
+    """
+    if not _is_safe_github_path_parts((namespace,)):
+        raise RuntimeError(f"unsafe managed environment namespace: {namespace!r}")
+    ref = _parse_github_environment_ref(
+        f"github:{_DEFAULT_MANAGED_ENV_REPO}@{_DEFAULT_GITHUB_REF}:"
+        f"{namespace}/{_DEFAULT_ENVIRONMENT_PATH}"
+    )
+    if ref is None:  # pragma: no cover - the literal above always parses
+        raise RuntimeError("could not build a managed environment reference")
+
+    root = next(
+        (
+            entry
+            for entry in _github_tree_entries(ref, ref.ref, ref.ref)
+            if entry.get("path") == namespace
+            and entry.get("type") == "tree"
+            and isinstance(entry.get("sha"), str)
+        ),
+        None,
+    )
+    if root is None:
+        return []
+    slugs = []
+    for entry in _github_tree_entries(ref, root["sha"], namespace):
+        name = entry.get("path")
+        if entry.get("type") != "tree" or not isinstance(name, str):
+            continue
+        if not _is_safe_github_path_parts((name,)) or not isinstance(entry.get("sha"), str):
+            continue
+        children = _github_tree_entries(ref, entry["sha"], f"{namespace}/{name}")
+        if any(
+            child.get("path") == _DEFAULT_ENVIRONMENT_PATH and child.get("type") == "blob"
+            for child in children
+        ):
+            slugs.append(f"{namespace}/{name}")
+    return sorted(slugs)
+
+
 def _download_github_directory(ref: GitHubEnvironmentRef, repo_dir: str, dest: Path) -> Path:
     """Download one GitHub directory into a repo-shaped tree under ``dest``."""
     repo_root = dest / "repo"

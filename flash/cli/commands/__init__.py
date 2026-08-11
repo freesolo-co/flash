@@ -355,7 +355,7 @@ def cmd_gpus(args) -> int:
     return 0
 
 
-def cmd_env_list(args) -> int:
+def _local_env_sources() -> list[str]:
     paths: list[str] = []
     if Path("environment.py").is_file():
         paths.append(".")
@@ -372,17 +372,53 @@ def cmd_env_list(args) -> int:
                     paths.append(f"environments/{p.name}")
             elif p.suffix == ".py":
                 paths.append(f"environments/{p.name}")
+    return sorted(paths)
+
+
+def _published_envs() -> tuple[list[str], str | None]:
+    """The org's published environment ids, or ``(<empty>, reason)`` when they can't be listed.
+
+    A reason is NOT an error: local sources are still worth printing. But it must be reported
+    instead of being folded into the empty state, because "nothing published" and "didn't check" are
+    the same output otherwise, and reading the first as the second is what makes a successful
+    publish look like it silently failed.
+    """
+    api_url, api_key = load_credentials()
+    if not api_key:
+        return [], f"not logged in - run `{CLI_NAME} login` to list published environments"
+    if not has_freesolo_backend(api_url):
+        return [], "a self-hosted plane has no managed environment hub to list"
+    from flash.client import client_from_config
+
+    try:
+        return client_from_config().list_envs(), None
+    except ClientError as exc:
+        return [], str(exc)
+
+
+def cmd_env_list(args) -> int:
+    paths = _local_env_sources()
+    published, unavailable = _published_envs()
     if render.styled():
-        print(render.env_list(sorted(paths)))
+        print(render.env_list(paths, published=published, unavailable=unavailable))
         return 0
+    if published:
+        print('published environments (reference one with `[environment] id = "<id>"`):')
+        for env_id in published:
+            print(f"  {env_id}")
+    elif unavailable:
+        print(f"published environments unavailable: {unavailable}")
     if paths:
         print(
             "local env sources (publish with `flash env push --project <project-uuid> "
             "--name <name> <path>`):"
         )
-        for path in sorted(paths):
+        for path in paths:
             print(f"  {path}")
-    else:
+    if not paths and not published:
+        # still worth printing next to an `unavailable` line: that line already says the published
+        # list was not checked, so this reads as "and you have nothing local yet" rather than as a
+        # claim about the hub.
         print("no environments yet - scaffold one with `flash env setup`")
     return 0
 

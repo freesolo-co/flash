@@ -597,6 +597,24 @@ class ApiClient:
         body = {"name": name, "package_b64": package_b64, "project_id": project_id}
         return self._request("POST", "/v1/envs", body=body, timeout=1800.0, progress=progress)
 
+    def list_envs(self) -> list[str]:
+        """Return the published environment ids the authenticated org owns.
+
+        The server reads the hub over the GitHub API (a few requests, no clone), so this is a normal
+        request rather than one carrying publish's 1800s timeout.
+        """
+        payload = self._request("GET", "/v1/envs")
+        rows = payload.get("environments") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            raise ClientError("control plane returned a malformed environment list")
+        ids = []
+        for row in rows:
+            env_id = row.get("id") if isinstance(row, dict) else None
+            if not isinstance(env_id, str) or not env_id.strip():
+                raise ClientError("control plane returned an environment without an id")
+            ids.append(env_id.strip())
+        return ids
+
     def delete_env(self, env_id: str, *, project_id: str) -> dict:
         """Delete a published Freesolo environment from one explicit project.
 

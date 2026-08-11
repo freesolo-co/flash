@@ -51,8 +51,13 @@ def test_env_list_filters_non_environments_and_uses_styled_renderer(
     seen = []
     monkeypatch.setattr(commands.render, "styled", lambda: True)
     monkeypatch.setattr(
-        commands.render, "env_list", lambda paths: seen.extend(paths) or "styled-envs"
+        commands.render,
+        "env_list",
+        lambda paths, *, published, unavailable: seen.extend(paths) or "styled-envs",
     )
+    # this case is about local filtering; pin the published half so it can't reach the network or
+    # vary with whatever ~/.flash/config.json this machine happens to hold.
+    monkeypatch.setattr(commands, "_published_envs", lambda: ([], None))
 
     assert commands.cmd_env_list(SimpleNamespace()) == 0
 
