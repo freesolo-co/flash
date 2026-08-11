@@ -768,6 +768,10 @@ def test_environment_pip_rejects_url_credentials() -> None:
         "git+https://ghp_SECRETTOKEN@github.com/org/repo.git",
         # ...and the separator can arrive percent-encoded, which is the same credential.
         "git+https://user%3As3cret@github.com/org/repo.git",
+        # a query string carries credentials just as well as userinfo does, and naming a package
+        # never needs one: a private-index token and a presigned object-store signature.
+        "pkg @ https://host/pkg-1.0.whl?private_token=s3cret",
+        "https://host/pkg-1.0.whl?X-Amz-Signature=deploykey",
     ):
         raw = _raw()
         raw["environment"]["pip"] = [url]

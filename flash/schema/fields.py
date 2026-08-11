@@ -321,6 +321,11 @@ _RESERVED_ENVIRONMENT_SECRET_KEYS = frozenset(
 # `://` and stopping at `/` so a bare `pkg@1.2` or a PEP 508 `name @ https://host/x.whl` is untouched.
 _PIP_URL_USERINFO_RE = re.compile(r"://[^/@\s]+@")
 
+# a query string on a requirement URL (`...whl?private_token=x`, a presigned `?X-Amz-Signature=...`).
+# rejected wholesale rather than by parameter name: the credential-carrying names are unbounded, and
+# naming a package needs no query, so there is nothing legitimate to preserve by allowing some.
+_PIP_URL_QUERY_RE = re.compile(r"://[^\s]*\?")
+
 
 def _environment_pip(raw: Any) -> tuple[str, ...]:
     """Parse [environment].pip as the scorer's own third-party requirements.
@@ -357,11 +362,11 @@ def _environment_pip(raw: Any) -> tuple[str, ...]:
         # inside the worker's ``metrics.json`` job_spec, so a token embedded in a direct or VCS URL
         # would be written to disk and to the run log in plaintext. The offending requirement is
         # deliberately NOT echoed: quoting it back would copy the very credential this keeps out.
-        if _PIP_URL_USERINFO_RE.search(requirement):
+        if _PIP_URL_USERINFO_RE.search(requirement) or _PIP_URL_QUERY_RE.search(requirement):
             raise ConfigError(
                 "[environment] pip entries must not embed credentials in a URL: the spec is stored "
                 "and uploaded in plaintext. Use [environment] secrets for the credential and an "
-                "unauthenticated requirement URL."
+                "unauthenticated requirement URL without a query string."
             )
         # whitespace inside a bare requirement is almost always a typo (`pymongo >= 4.6` splits into
         # three operands, `not a req` into three names), and pip would only report it after the GPU
