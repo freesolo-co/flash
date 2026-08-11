@@ -172,24 +172,28 @@ class _OpdProgressState:
             self._condition.notify_all()
             return truncation_rate
 
-    def failure_accounting_snapshot(self, bridge: _TeacherAlignmentBridge) -> dict:
+    def truncation_window(
+        self,
+        bridge: _TeacherAlignmentBridge,
+        max_completion: int,
+    ) -> _TruncationWindow:
         snapshot = bridge.accounting_snapshot()
         with self._condition:
             # the fatal no-signal diagnosis must describe the attempts after the last completed step.
             # cumulative rollout history can otherwise blame an old truncation spike for a current
             # empty-alignment failure.
-            snapshot["truncated_rollouts"] = max(
-                0, int(snapshot["truncated_rollouts"]) - self._prev_truncated
+            return _TruncationWindow(
+                truncated_rollouts=max(
+                    0, int(snapshot["truncated_rollouts"]) - self._prev_truncated
+                ),
+                samples_seen=max(0, int(snapshot["samples_seen"]) - self._prev_samples_seen),
+                no_signal_skipped_steps=max(
+                    0,
+                    int(snapshot.get("no_signal_skipped_steps", 0))
+                    - self._prev_no_signal_skipped_steps,
+                ),
+                max_completion=max_completion,
             )
-            snapshot["samples_seen"] = max(
-                0, int(snapshot["samples_seen"]) - self._prev_samples_seen
-            )
-            snapshot["no_signal_skipped_steps"] = max(
-                0,
-                int(snapshot.get("no_signal_skipped_steps", 0))
-                - self._prev_no_signal_skipped_steps,
-            )
-        return snapshot
 
     def checkpoint_state(self, step: int, *, timeout_s: float = 300.0) -> dict:
         deadline = time.monotonic() + timeout_s
@@ -417,6 +421,7 @@ from flash.engine.worker.train.opd.failures import (  # noqa: E402,F401
     _reconcile_score_delivery_failure,
     _restore_verl_resume,
     _stage_retry_contract,
+    _TruncationWindow,
 )
 
 # hydra overrides, child env, and parquet writing, implemented in `.train.opd.overrides`.

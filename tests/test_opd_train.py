@@ -39,6 +39,7 @@ from flash.engine.worker.opd_train import (
     _TeacherAlignmentBridge,
     _TextTeacherBatcher,
     _trim_response_and_forced,
+    _TruncationWindow,
     _validate_forced_mask,
     _write_opd_parquet,
     build_opd_overrides,
@@ -2875,11 +2876,26 @@ def test_opd_progress_truncation_rate_clamps_split_inflight_snapshots():
 def test_opd_failure_accounting_defaults_optional_no_signal_counter():
     progress = _OpdProgressState()
 
-    snapshot = progress.failure_accounting_snapshot(
-        _progress_bridge_snapshot(samples_seen=2, truncated_rollouts=1)
+    window = progress.truncation_window(
+        _progress_bridge_snapshot(samples_seen=2, truncated_rollouts=1),
+        1536,
     )
 
-    assert snapshot["no_signal_skipped_steps"] == 0
+    assert window.no_signal_skipped_steps == 0
+
+
+def test_opd_failure_diagnosis_is_not_cumulative_accounting_dict():
+    progress = _OpdProgressState()
+
+    diagnosis = progress.truncation_window(
+        _progress_bridge_snapshot(samples_seen=2, truncated_rollouts=1),
+        1536,
+    )
+
+    assert isinstance(diagnosis, _TruncationWindow)
+    assert not isinstance(diagnosis, dict)
+    with pytest.raises(TypeError):
+        _failure_accounting_metadata(diagnosis)
 
 
 def test_restore_verl_resume_returns_validated_accounting(monkeypatch, tmp_path):
@@ -4996,7 +5012,7 @@ def test_mutation_marker_failure_survives_actor_exit_and_generic_driver_status(
             )
 
 
-def _reconcile_opd_failure(accounting: dict, *, max_completion: int = 1536):
+def _reconcile_opd_failure(truncation_window: _TruncationWindow):
     import flash.engine.worker.opd_train_runner as opd_runner
 
     bridge = SimpleNamespace(
@@ -5014,24 +5030,23 @@ def _reconcile_opd_failure(accounting: dict, *, max_completion: int = 1536):
         workload,
         bridge,
         1,
-        accounting=accounting,
-        max_completion=max_completion,
+        truncation_window=truncation_window,
     )
 
 
 def test_no_signal_failure_names_dominant_truncation_and_completion_cap():
-    accounting = {
-        "no_signal_skipped_steps": 1,
-        "samples_seen": 8,
-        "truncated_rollouts": 7,
-    }
+    truncation_window = _TruncationWindow(
+        no_signal_skipped_steps=1,
+        samples_seen=8,
+        truncated_rollouts=7,
+        max_completion=1536,
+    )
 
     with pytest.raises(RuntimeError) as excinfo:
         _raise_verl_failure(
             1,
             None,
-            accounting=accounting,
-            max_completion=1536,
+            truncation_window=truncation_window,
         )
 
     message = str(excinfo.value)
@@ -5040,42 +5055,41 @@ def test_no_signal_failure_names_dominant_truncation_and_completion_cap():
     assert "max_completion_tokens=1536" in message
 
     with pytest.raises(RuntimeError, match="7/8 rollouts were truncated") as parent_error:
-        _reconcile_opd_failure(accounting)
+        _reconcile_opd_failure(truncation_window)
     assert "max_completion_tokens=1536" in str(parent_error.value)
 
 
 def test_no_signal_failure_clamps_inflight_truncation_count_to_samples_seen():
-    accounting = {
-        "no_signal_skipped_steps": 1,
-        "samples_seen": 2,
-        "truncated_rollouts": 25,
-    }
+    truncation_window = _TruncationWindow(
+        no_signal_skipped_steps=1,
+        samples_seen=2,
+        truncated_rollouts=25,
+        max_completion=1536,
+    )
 
     with pytest.raises(RuntimeError) as excinfo:
         _raise_verl_failure(
             1,
             None,
-            accounting=accounting,
-            max_completion=1536,
+            truncation_window=truncation_window,
         )
 
     assert "2/2 rollouts were truncated" in str(excinfo.value)
 
 
 def test_no_signal_failure_does_not_blame_cap_without_dominant_truncation():
-    accounting = {
-        "no_signal_skipped_steps": 1,
-        "samples_seen": 8,
-        "truncated_rollouts": 2,
-        "skip_counts": {"empty_alignment": 6},
-    }
+    truncation_window = _TruncationWindow(
+        no_signal_skipped_steps=1,
+        samples_seen=8,
+        truncated_rollouts=2,
+        max_completion=1536,
+    )
 
     with pytest.raises(RuntimeError) as excinfo:
         _raise_verl_failure(
             1,
             None,
-            accounting=accounting,
-            max_completion=1536,
+            truncation_window=truncation_window,
         )
 
     assert str(excinfo.value) == "verl OPD subprocess exited with status 1"
@@ -5089,17 +5103,18 @@ def test_no_signal_failure_does_not_blame_cap_without_dominant_truncation():
         }
     )
     progress = _OpdProgressState(prior)
-    current_failure = progress.failure_accounting_snapshot(
+    current_failure = progress.truncation_window(
         SimpleNamespace(
             accounting_snapshot=lambda: {
                 "samples_seen": 108,
                 "truncated_rollouts": 90,
                 "no_signal_skipped_steps": 1,
             }
-        )
+        ),
+        1536,
     )
-    assert current_failure["samples_seen"] == 8
-    assert current_failure["truncated_rollouts"] == 0
+    assert current_failure.samples_seen == 8
+    assert current_failure.truncated_rollouts == 0
     with pytest.raises(RuntimeError) as parent_error:
         _reconcile_opd_failure(current_failure)
     assert str(parent_error.value) == "verl OPD subprocess exited with status 1"
@@ -5117,7 +5132,7 @@ def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch):
         def start_training(self):
             pass
 
-        def failure_accounting_snapshot(self, _bridge):
+        def truncation_window(self, _bridge, _max_completion):
             raise AssertionError("success path must not read failure accounting")
 
         def final_state(self, _bridge):
@@ -5165,7 +5180,7 @@ def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch):
     monkeypatch.setattr(
         opd_runner,
         "_reconcile_child_failures",
-        lambda *_args, accounting, max_completion: reconciled.append((accounting, max_completion)),
+        lambda *_args, truncation_window: reconciled.append(truncation_window),
     )
     monkeypatch.setattr(
         opd_runner._opd_train,
@@ -5189,7 +5204,7 @@ def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch):
         (),
     )
 
-    assert reconciled == [(None, None)]
+    assert reconciled == [None]
     assert result.final_accounting["loss_curve"] == [0.5]
 
 

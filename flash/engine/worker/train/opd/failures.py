@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 
 from flash.engine.worker.runtime.pkg_proxy import W as _w
@@ -38,6 +39,33 @@ from flash.teacher.retry_contract import (
 # which the resume state also reads. trl publishes the same condition as
 # alignment_empty, so translate it at the metadata boundary only.
 _CANONICAL_SKIP_REASONS = {"empty_alignment": "alignment_empty"}
+
+
+@dataclass(frozen=True)
+class _TruncationWindow:
+    truncated_rollouts: int
+    samples_seen: int
+    no_signal_skipped_steps: int
+    max_completion: int
+
+    def __post_init__(self) -> None:
+        # in-flight bridge counters can expose truncations before samples_seen catches up. clamp at
+        # the typed boundary so every consumer gets a coherent fraction.
+        object.__setattr__(
+            self,
+            "truncated_rollouts",
+            min(self.samples_seen, self.truncated_rollouts),
+        )
+
+    @property
+    def indicates_completion_cap(self) -> bool:
+        # no-signal batches can also come from teacher failures or empty alignments, so only a strict
+        # majority justifies naming the cap instead of the generic child status.
+        return (
+            self.no_signal_skipped_steps > 0
+            and self.samples_seen > 0
+            and self.truncated_rollouts * 2 > self.samples_seen
+        )
 
 
 def _canonical_skip_reasons(skip_counts: dict) -> dict:
@@ -138,8 +166,7 @@ def _raise_verl_failure(
     no_signal_failure: tuple[str, str] | None = None,
     score_delivery_failure: tuple[str, str] | None = None,
     *,
-    accounting: dict | None = None,
-    max_completion: int | None = None,
+    truncation_window: _TruncationWindow | None = None,
 ) -> None:
     if return_code == 0:
         return
@@ -174,21 +201,14 @@ def _raise_verl_failure(
         raise _w.RetriableInfraError("transient teacher bridge failure")
     if return_code == _PERMANENT_TEACHER_EXIT:
         raise RuntimeError("permanent teacher bridge failure")
-    if accounting is not None and max_completion is not None:
-        no_signal_steps = int(accounting.get("no_signal_skipped_steps", 0))
-        samples_seen = int(accounting.get("samples_seen", 0))
-        truncated = min(samples_seen, int(accounting.get("truncated_rollouts", 0)))
-        # require a strict majority of all scored rollouts before naming the cap. no-signal batches can
-        # also come from teacher failures or empty alignments, and a speculative diagnosis is worse
-        # than the generic child status when truncation is not the dominant observed outcome.
-        if no_signal_steps > 0 and samples_seen > 0 and truncated * 2 > samples_seen:
-            raise RuntimeError(
-                f"verl OPD subprocess exited with status {return_code}: flash OPD produced no "
-                f"aligned teacher signal after {OPD_NO_SIGNAL_ATTEMPTS} rollout attempts; "
-                f"{truncated}/{samples_seen} rollouts were truncated at the "
-                f"configured max_completion_tokens={int(max_completion)}, so the completion cap is "
-                "likely too small"
-            )
+    if truncation_window is not None and truncation_window.indicates_completion_cap:
+        raise RuntimeError(
+            f"verl OPD subprocess exited with status {return_code}: flash OPD produced no "
+            f"aligned teacher signal after {OPD_NO_SIGNAL_ATTEMPTS} rollout attempts; "
+            f"{truncation_window.truncated_rollouts}/{truncation_window.samples_seen} rollouts were "
+            f"truncated at the configured max_completion_tokens={int(truncation_window.max_completion)}, "
+            "so the completion cap is likely too small"
+        )
     raise RuntimeError(f"verl OPD subprocess exited with status {return_code}")
 
 
