@@ -243,6 +243,75 @@ def test_cancelled_charge_usd_prices_the_rented_topology(monkeypatch):
     assert runner.cancelled_charge_usd(stale, spec, steps=1) == auto
 
 
+def test_cancelled_charge_usd_pins_the_rented_card_count(monkeypatch):
+    # the live allocator rented 4 cards, but the offline shape search treats the spec's count as a
+    # ceiling and re-optimizes under it, repricing the run on the cheaper 1-card shape. the moe
+    # compile is fixed while step time scales with the card shape, so the wrong geometry shifts
+    # the work fraction instead of cancelling out of it; the durable handle stamps the rented
+    # count and both estimates must pin it.
+    from flash.cost.types import RunConfig
+
+    cfg = RunConfig("Qwen/Qwen3.6-35B-A3B", "sft", 1000, gpu_type="H100", gpu_count=4)
+    spec = _patched_cfg_spec(monkeypatch, cfg)
+    st = runner.RunStatus(
+        run_id="r",
+        state="cancelled",
+        spec={},
+        estimated_cost_usd=8.0,
+        remote={"provider": "runpod", "allocated_gpu": "H100", "allocated_gpu_count": 4},
+    )
+    charge = runner.cancelled_charge_usd(st, spec, steps=1)
+    # the ceiling search picks a different (cheaper) shape, so its fraction is not the rented one.
+    ceiling = (
+        8.0
+        * runner.charge_usd_for_spec(spec, steps=1, provider="runpod")
+        / runner.charge_usd_for_spec(spec, provider="runpod")
+    )
+    assert charge != ceiling
+    partial = runner.charge_usd_for_spec(
+        spec, steps=1, provider="runpod", gpu_type="H100", gpu_count=4
+    )
+    full = runner.charge_usd_for_spec(spec, provider="runpod", gpu_type="H100", gpu_count=4)
+    assert charge == 8.0 * partial / full
+    assert 0 < charge <= 8.0
+
+
+def test_cancelled_charge_usd_degrades_without_an_allocation_stamp(monkeypatch):
+    # a legacy handle predating the allocation stamp names only the provider: the shape falls back
+    # to the spec-derived search (today's behavior) and the charge stays clamped to the quote. a
+    # half stamp (count without card) cannot name a geometry and must degrade the same way.
+    from flash.cost.types import RunConfig
+
+    cfg = RunConfig("Qwen/Qwen3.6-35B-A3B", "sft", 1000, gpu_type="H100", gpu_count=4)
+    spec = _patched_cfg_spec(monkeypatch, cfg)
+    expected = (
+        8.0
+        * runner.charge_usd_for_spec(spec, steps=1, provider="runpod")
+        / runner.charge_usd_for_spec(spec, provider="runpod")
+    )
+    for legacy_remote in (
+        {"provider": "runpod"},
+        {"provider": "runpod", "allocated_gpu_count": 4},
+    ):
+        st = runner.RunStatus(
+            run_id="r",
+            state="cancelled",
+            spec={},
+            estimated_cost_usd=8.0,
+            remote=legacy_remote,
+        )
+        charge = runner.cancelled_charge_usd(st, spec, steps=1)
+        assert charge == expected
+        assert 0 < charge <= 8.0
+    # no handle at all (never-allocated run): the spec's own pricing, still clamped.
+    bare = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=8.0)
+    charge = runner.cancelled_charge_usd(bare, spec, steps=1)
+    assert charge == 8.0 * runner.charge_usd_for_spec(spec, steps=1) / runner.charge_usd_for_spec(
+        spec
+    )
+    assert 0 < charge <= 8.0
+
+
 def test_cancelled_charge_usd_falls_back_to_reprice_without_a_quote():
     # a run persisted before quotes existed has nothing to prorate; the spec reprice still bills it.
     spec = _spec()
@@ -374,6 +443,70 @@ def test_cancel_run_prorates_the_persisted_quote(monkeypatch, tmp_path):
     assert st.state == "cancelled"
     # half the steps -> half the accepted quote.
     assert st.cost_usd == 4.0
+
+
+def test_cancel_run_prices_the_rented_basis_after_teardown_clears_the_handle(monkeypatch, tmp_path):
+    """a confirmed teardown clears status.remote before billing runs, and the handle is the only
+    durable record of the rented substrate and card shape -- so cancel must capture it while it
+    still holds the handle, or the charge silently reprices on the offline auto topology."""
+    from flash.cost.types import RunConfig
+    from flash.runner.supervise import deploy, lifecycle
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    cfg = RunConfig("Qwen/Qwen3.6-35B-A3B", "sft", 1000, gpu_type="H100", gpu_count=2)
+    spec_stub = _patched_cfg_spec(monkeypatch, cfg)
+    torn_down = []
+
+    def teardown(handle, _run_id):
+        torn_down.append(handle.provider)
+        return True
+
+    monkeypatch.setattr(lifecycle, "_strict_teardown_handle", teardown)
+    spec = _spec()
+    runner._save_status(
+        runner.RunStatus(
+            run_id="run-1",
+            state="running",
+            spec=spec.to_dict(),
+            billing_context={"org_id": "o"},
+            billing_state="pending",
+            estimated_cost_usd=8.0,
+            remote={
+                "provider": "vast",
+                "instance_id": 101,
+                "offer_id": 7,
+                "machine_id": 3,
+                "label": "flash-run-1",
+                "gpu": "H100",
+                "hourly_usd": 1.0,
+                "attempt": 1,
+                "started_ts": 1.0,
+                "allocated_gpu": "H100",
+                "allocated_gpu_count": 2,
+            },
+            last_heartbeat={"stage": "sft_step", "step": 1},
+        )
+    )
+
+    deploy.cancel_run("run-1")
+
+    st = runner.get_status("run-1")
+    assert st.state == "cancelled"
+    # the scenario under test: the teardown really cleared the handle before billing ran.
+    assert torn_down == ["vast"]
+    assert st.remote is None
+    # not the auto/offline-shape fraction the cleared handle would degrade to.
+    auto = (
+        8.0 * runner.charge_usd_for_spec(spec_stub, steps=1) / runner.charge_usd_for_spec(spec_stub)
+    )
+    assert st.cost_usd != auto
+    partial = runner.charge_usd_for_spec(
+        spec_stub, steps=1, provider="vast", gpu_type="H100", gpu_count=2
+    )
+    full = runner.charge_usd_for_spec(spec_stub, provider="vast", gpu_type="H100", gpu_count=2)
+    assert st.cost_usd == 8.0 * partial / full
+    assert 0 < st.cost_usd <= 8.0
 
 
 def test_cancel_run_with_malformed_quote_still_settles_as_a_billing_failure(monkeypatch, tmp_path):

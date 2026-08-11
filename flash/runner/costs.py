@@ -37,16 +37,60 @@ def _gpu_rate(gpu_type: str, provider: str = "") -> float:
     return 0.80
 
 
+def _pinned_offline_allocation(provider: str, gpu_type: str, gpu_count: int):
+    """An offline-rate allocation pinning a rented shape, or ``None`` when there is nothing to pin.
+
+    the offline shape search treats the spec's card count as a ceiling and re-optimizes under it,
+    so a live allocator's 2/4/8-card rental would be repriced on whatever smaller shape the static
+    rate table prefers. an explicit allocation is the same mechanism the accepted quote was built
+    on (see seed submission), so an estimate that consumes it reproduces the quote's exact
+    geometry. the pin fixes geometry, not price: rates stay offline, mirroring the shape search's
+    own rate choice, and cancel out of any partial/full ratio. never raises -- an unpriceable pin
+    returns ``None`` so the caller degrades to the spec-derived shape instead of failing a charge.
+    """
+    if not gpu_type or gpu_count < 1:
+        return None
+    try:
+        from flash.providers.base import GPU_INFO, Allocation, canonical_gpu
+
+        gpu = canonical_gpu(gpu_type)
+        if provider == "lambda":
+            from flash.providers.lambda_.pricing import static_hourly_rate
+
+            hourly = static_hourly_rate(gpu)
+        else:
+            hourly = GPU_INFO[gpu].hourly_usd
+        return Allocation(
+            provider=provider,
+            gpu=gpu,
+            hourly_usd=float(hourly),
+            min_vram_gb=0,
+            candidates=(),
+            gpu_count=int(gpu_count),
+        )
+    except Exception:
+        return None
+
+
 def charge_usd_for_spec(
-    spec, *, steps: int | None = None, fallback: float = 0.0, provider: str = ""
+    spec,
+    *,
+    steps: int | None = None,
+    fallback: float = 0.0,
+    provider: str = "",
+    gpu_type: str = "",
+    gpu_count: int = 0,
 ) -> float:
     """Return the estimated customer charge, prorated by completed steps when requested.
 
     ``provider`` overrides the pricing substrate for a training estimate. the persisted worker spec
     of an auto-allocated run carries no provider, so its offline reprice would credit nvlink
     scaling on a substrate (vast) that cannot deliver it; the cancel path passes the provider the
-    run actually rented so the estimate reproduces the accepted quote's work model. a profile's
-    bounded-wall charge has no multi-card step term, so the override does not apply there.
+    run actually rented so the estimate reproduces the accepted quote's work model. ``gpu_type``
+    and ``gpu_count`` together pin the rented card shape the same way: the spec's count is only the
+    ceiling the allocator searched under, so without the pin a 4-card rental could be repriced on
+    the 1-card offline optimum. a profile's bounded-wall charge has no multi-card step term, so
+    the overrides do not apply there.
     """
     try:
         from flash.cost.analytical import estimate_cost
@@ -68,8 +112,9 @@ def charge_usd_for_spec(
             # own pricing substrate rather than turning a chargeable cancel into a pricing failure.
             with contextlib.suppress(ValueError):
                 cfg = replace(cfg, provider=provider)
+        allocation = _pinned_offline_allocation(provider, gpu_type, gpu_count)
         if steps is None:
-            return float(estimate_cost(cfg).total_usd)
+            return float(estimate_cost(cfg, allocation=allocation).total_usd)
         n = max(0, int(steps))
         if n == 0:
             return 0.0
@@ -85,33 +130,65 @@ def charge_usd_for_spec(
             cfg = replace(cfg, steps=n, train_tokens=scaled_tokens, save_at_steps=reached_saves)
         else:
             cfg = replace(cfg, steps=n, save_at_steps=reached_saves)
-        return float(estimate_cost(cfg).total_usd)
+        return float(estimate_cost(cfg, allocation=allocation).total_usd)
     except Exception:
         return float(fallback)
 
 
-def _selected_provider(status: RunStatus) -> str:
-    """The provider the run actually rented, from the durable handle, or "" when unknowable.
+def _rented_basis(remote) -> tuple[str, str, int]:
+    """The substrate a run actually rented: (provider, gpu type, card count) from its handle.
 
-    only a known provider name is returned: pricing must never raise, and an unrecognized name
-    would make the offline estimate unpriceable and degrade a chargeable cancel into a billing
-    failure, so anything else falls back to the spec's own (auto) pricing substrate.
+    the provider handle is the only durable record of the rented shape -- seed submission persists
+    ``allocated_gpu``/``allocated_gpu_count`` beside the provider precisely because the spec's own
+    count is just the ceiling the allocator searched under. a successful cancel tears the handle
+    down before billing runs, so the cancel path captures it pre-teardown and passes it here.
+    every field is validated and degrades to ""/0 rather than raising: an unrecognized value would
+    make the offline estimate unpriceable and turn a chargeable cancel into a billing failure, so
+    it falls back to the spec's own pricing substrate and shape instead. the shape pair is
+    all-or-nothing -- a card name without its count (or vice versa) cannot name a geometry.
     """
-    remote = getattr(status, "remote", None)
     if not isinstance(remote, dict):
-        return ""
-    name = remote.get("provider")
-    if not isinstance(name, str):
-        return ""
-    name = name.strip().lower()
-    try:
-        from flash.providers import PROVIDER_NAMES
-    except Exception:
-        return ""
-    return name if name in PROVIDER_NAMES else ""
+        return "", "", 0
+    provider = remote.get("provider")
+    provider = provider.strip().lower() if isinstance(provider, str) else ""
+    if provider:
+        try:
+            from flash.providers import PROVIDER_NAMES
+
+            if provider not in PROVIDER_NAMES:
+                provider = ""
+        except Exception:
+            provider = ""
+    gpu_type = ""
+    raw_gpu = remote.get("allocated_gpu")
+    if isinstance(raw_gpu, str) and raw_gpu.strip():
+        try:
+            from flash.providers.base import GPU_INFO, canonical_gpu
+
+            name = canonical_gpu(raw_gpu)
+            info = GPU_INFO.get(name)
+            if info is not None and info.validated:
+                gpu_type = name
+        except Exception:
+            gpu_type = ""
+    raw_count = remote.get("allocated_gpu_count")
+    gpu_count = raw_count if isinstance(raw_count, int) and not isinstance(raw_count, bool) else 0
+    # mirror the spec layer's 1..8 bound so a corrupt stamp cannot reach the estimator.
+    if not 1 <= gpu_count <= 8:
+        gpu_count = 0
+    if not gpu_type or not gpu_count:
+        gpu_type, gpu_count = "", 0
+    return provider, gpu_type, gpu_count
 
 
-def cancelled_charge_usd(status: RunStatus, spec, *, steps: int, fallback: float = 0.0) -> float:
+def cancelled_charge_usd(
+    status: RunStatus,
+    spec,
+    *,
+    steps: int,
+    fallback: float = 0.0,
+    rented_remote: dict | None = None,
+) -> float:
     """Price a mid-training cancellation from the accepted quote, scaled by the completed work.
 
     the persisted quote (``estimated_cost_usd``) carries the exact live rate the user accepted: the
@@ -127,20 +204,36 @@ def cancelled_charge_usd(status: RunStatus, spec, *, steps: int, fallback: float
     capped horizon the quote actually paid for rather than the uncapped step count. the fraction is
     capped at 1 so the charge never exceeds the quote. a run with no persisted quote has nothing to
     clamp to, so it falls back to the spec reprice.
+
+    ``rented_remote`` is the provider handle captured before teardown cleared it: a successful
+    cancel destroys ``status.remote`` before billing runs, and the handle is the only durable
+    record of the rented basis. absent (legacy callers, never-allocated runs), the status's own
+    handle is consulted, which still covers failed or unconfirmed teardowns.
     """
     n = max(0, int(steps))
     if n == 0:
         # cancelled before any training step: nothing rented, nothing owed.
         return 0.0
-    # the persisted worker spec of an auto-allocated run names no provider, and pricing it as
-    # "auto" credits nvlink scaling a vast rental cannot deliver. the topology error is a factor
-    # on the per-step term only, so it does not cancel out of partial / full whenever the estimate
-    # also carries fixed work (moe compile, required saves) or a wall cap: both estimates are
-    # computed on the substrate the run actually rented.
-    provider = _selected_provider(status)
+    # the persisted worker spec of an auto-allocated run names no provider and carries the card
+    # count only as the ceiling the allocator searched under, so pricing it bare credits nvlink
+    # scaling a vast rental cannot deliver and can re-optimize a 4-card rental onto the 1-card
+    # offline optimum. either topology error is a factor on the per-step term only, so it does not
+    # cancel out of partial / full whenever the estimate also carries fixed work (moe compile,
+    # required saves) or a wall cap: both estimates are computed on the substrate and card shape
+    # the run actually rented.
+    provider, gpu_type, gpu_count = _rented_basis(
+        rented_remote if rented_remote is not None else getattr(status, "remote", None)
+    )
     quote = getattr(status, "estimated_cost_usd", None)
     if quote is None:
-        return runner.charge_usd_for_spec(spec, steps=n, fallback=fallback, provider=provider)
+        return runner.charge_usd_for_spec(
+            spec,
+            steps=n,
+            fallback=fallback,
+            provider=provider,
+            gpu_type=gpu_type,
+            gpu_count=gpu_count,
+        )
     try:
         quote = float(quote)
     except (TypeError, ValueError):
@@ -152,13 +245,24 @@ def cancelled_charge_usd(status: RunStatus, spec, *, steps: int, fallback: float
         # billing retry predicate (cost_usd > 0) can never settle, silently stranding the run
         # unbilled, so the fallback propagates and the caller records the pricing failure.
         return float(fallback)
-    partial = runner.charge_usd_for_spec(spec, steps=n, fallback=float("nan"), provider=provider)
-    full = runner.charge_usd_for_spec(spec, fallback=float("nan"), provider=provider)
+    partial = runner.charge_usd_for_spec(
+        spec,
+        steps=n,
+        fallback=float("nan"),
+        provider=provider,
+        gpu_type=gpu_type,
+        gpu_count=gpu_count,
+    )
+    full = runner.charge_usd_for_spec(
+        spec, fallback=float("nan"), provider=provider, gpu_type=gpu_type, gpu_count=gpu_count
+    )
     if math.isfinite(partial) and math.isfinite(full) and full > 0:
         return quote * min(1.0, partial / full)
     # the work fraction is unpriceable: reprice the spec but never bill a cancel above the quote.
     # a non-finite reprice is a pricing failure and must propagate so the caller records it.
-    repriced = runner.charge_usd_for_spec(spec, steps=n, fallback=fallback, provider=provider)
+    repriced = runner.charge_usd_for_spec(
+        spec, steps=n, fallback=fallback, provider=provider, gpu_type=gpu_type, gpu_count=gpu_count
+    )
     if not math.isfinite(repriced):
         return repriced
     return min(repriced, quote)

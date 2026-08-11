@@ -3687,7 +3687,7 @@ def test_cancel_prices_and_cleans_up_with_effective_warmstart_spec(monkeypatch):
         priced = []
         cleaned = []
 
-        def fake_charge(spec, *, steps=None, fallback=0.0, provider=None):
+        def fake_charge(spec, *, steps=None, fallback=0.0, provider=None, gpu_type="", gpu_count=0):
             priced.append((spec.train.lora_rank, spec.train.init_from_adapter, steps))
             return 3.25
 
