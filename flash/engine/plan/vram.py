@@ -45,6 +45,19 @@ _LORA_PAGED_BYTES_PER_PARAM = 10.0
 _LORA_ADAMW_BYTES_PER_PARAM = 16.0
 
 
+def grpo_completion_len(max_tokens: int | None, thinking: bool) -> int:
+    """The completion-token budget a GRPO run uses: an explicit ``max_tokens`` else the RL recipe
+    default (thinking uses the longer ``max_completion_len_thinking``). Single source of truth for the
+    three sites that must resolve the SAME integer — ``_resolve_sequence_lengths``'s worker-side
+    enforcement, ``grpo_rollout_seq_len``, and the spec-parse prompt-budget guard."""
+    from flash.engine.plan.recipe import RECIPE
+
+    rl = RECIPE.rl
+    return int(
+        max_tokens or (rl.max_completion_len_thinking if thinking else rl.max_completion_len)
+    )
+
+
 def grpo_rollout_seq_len(
     max_length: int = 0,
     max_tokens: int | None = None,
@@ -53,11 +66,8 @@ def grpo_rollout_seq_len(
     """vLLM engine context a GRPO run uses, mirroring run_rl() — shared by allocator, sleep gate, and KV budget."""
     from flash.engine.plan.recipe import RECIPE
 
-    rl = RECIPE.rl
-    completion = int(
-        max_tokens or (rl.max_completion_len_thinking if thinking else rl.max_completion_len)
-    )
-    return int(max_length or max(1024, rl.max_prompt_len + completion))
+    completion = grpo_completion_len(max_tokens, thinking)
+    return int(max_length or max(1024, RECIPE.rl.max_prompt_len + completion))
 
 
 def opd_completion_len(max_tokens: int | None, thinking: bool) -> int:
