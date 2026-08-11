@@ -550,6 +550,25 @@ def test_opd_discards_a_mismatched_checkpoint_with_its_accounting(monkeypatch, t
     assert not (local_dir / "global_step_2").exists()
 
 
+def test_opd_pinned_revision_topology_mismatch_fails_closed(monkeypatch, tmp_path):
+    """A pinned OPD_RESUME_REVISION means an optimizer step already crossed and the replacement
+    gate approved continuation from exactly that checkpoint; discarding it and restarting from
+    step 0 would repeat billed teacher work, so a world-size mismatch must raise, not restart."""
+    from flash.engine.worker import opd_train
+
+    src = _staged_checkpoint(tmp_path, 2, world_size=4, shards=4)
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    monkeypatch.setattr(opd_train._w, "OPD_RESUME_REVISION", "pinned-sha")
+    monkeypatch.setattr(opd_train._w, "hf_resume_checkpoint", lambda **_k: str(src))
+
+    with pytest.raises(RuntimeError, match=r"permanent OPD resume failure.*'pinned-sha'"):
+        opd_train._restore_verl_resume(
+            str(local_dir), prompt_pool_fingerprint="a" * 64, update_horizon=8, world_size=1
+        )
+    assert not (local_dir / "global_step_2").exists()
+
+
 # ============================================================================================
 # 3. control plane - _submit_seed_supervised relaunches the same run on infra-shaped failure
 # ============================================================================================

@@ -24,7 +24,11 @@ from flash.engine.worker.sft_train import (
     _VerlCheckpointWatcher,
 )
 from flash.engine.worker.train.opd.bridge import _TeacherAlignmentBridge
-from flash.engine.worker.verl.checkpoints import resume_topology_matches
+from flash.engine.worker.verl.checkpoints import (
+    checkpoint_world_size,
+    resume_checkpoint_is_loadable,
+    resume_topology_matches,
+)
 from flash.teacher.retry_contract import (
     OPD_RESUME_STATE_VERSION,
     validate_opd_resume_state_metadata,
@@ -297,7 +301,23 @@ def _restore_verl_resume(
     step = int(match.group(1))
     # before the state is read, not after: a checkpoint this attempt's rank count cannot load is
     # discarded whole, and the loop accounting it carries only describes steps that get redone.
-    if not resume_topology_matches(resume, world_size=world_size, job_label="OPD"):
+    if revision:
+        # a pinned revision means a prior attempt crossed optimizer.step(): the control-plane
+        # gate (verify_opd_replacement_safe) authorized this replacement only to continue from
+        # exactly this checkpoint. discarding it and restarting from step 0 would repeat
+        # already-billed teacher work and optimizer steps outside what the gate approved, so a
+        # topology mismatch fails closed here instead of falling through to a fresh run.
+        if not resume_checkpoint_is_loadable(resume, world_size=world_size):
+            written = checkpoint_world_size(resume)
+            raise RuntimeError(
+                f"permanent OPD resume failure: pinned resume revision {revision!r} names "
+                f"checkpoint {os.path.basename(resume)}, whose fsdp shards were written at "
+                f"world size {written if written is not None else 'unknown'} while this "
+                f"attempt runs at world size {world_size}. restarting from step 0 would "
+                "violate the pinned-resume contract, so this attempt refuses to train; "
+                "relaunch the retry at the checkpoint's gpu count."
+            )
+    elif not resume_topology_matches(resume, world_size=world_size, job_label="OPD"):
         return 0, None
     with open(os.path.join(resume, "opd_state.json"), encoding="utf-8") as file:
         state = validate_opd_resume_state_metadata(
