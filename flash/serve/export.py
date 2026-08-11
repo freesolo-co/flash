@@ -14,13 +14,18 @@ import shutil
 import struct
 import tempfile
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, BinaryIO
 
 from flash._internal.fileio import reject_duplicate_keys
 from flash._internal.logging import get_logger
-from flash.adapters.artifacts import ADAPTER_WEIGHT_INDEX_FILES, is_adapter_weight_filename
+from flash.adapters.artifacts import (
+    ADAPTER_SHARD_PREFIX,
+    ADAPTER_WEIGHT_INDEX_FILES,
+    ADAPTER_WEIGHT_SUFFIXES,
+    is_adapter_weight_filename,
+)
 from flash.serve.deploy import ServingError
 
 logger = get_logger(__name__)
@@ -106,8 +111,9 @@ _json_object_without_duplicate_keys = reject_duplicate_keys(
 class _WeightScan:
     """One adapter weight file: its tensor keys, and whatever pins it to the multimodal namespace.
 
-    `header`/`data_start` are set for safetensors and `state` for `.bin`, so the rewrite phase can
-    reuse what the scan already read instead of parsing every file twice.
+    `header`/`data_start` are set for safetensors only, and are what tells the rewrite phase which
+    of the two file shapes it is replacing. A safetensors header is key metadata, so holding every
+    shard's is cheap; a `.bin` state dict is the tensors themselves, so none is held at all.
     """
 
     path: Path
@@ -115,7 +121,6 @@ class _WeightScan:
     live_non_lm_key: str | None = None
     header: dict[str, object] | None = None
     data_start: int = 0
-    state: dict[str, object] = field(default_factory=dict)
 
 
 @contextlib.contextmanager
@@ -142,12 +147,27 @@ def _atomic_replacement(path: Path) -> Iterator[IO[bytes]]:
 
 
 def _adapter_weight_paths(adapter_dir: Path) -> list[Path]:
-    """Every adapter weight file in the export, single-file or sharded."""
+    """The weight files peft will actually load, single-file or sharded.
+
+    peft binds exactly one representation: safetensors when it is present and `.bin` otherwise, and
+    within a suffix the single `adapter_model.<ext>` over its shards. The worker uploads a retry's
+    adapter on top of the previous attempt's without deleting what it no longer writes, so a stale
+    representation can survive beside the live one. Reading both as a single key namespace fails a
+    good export on a key that collides with itself, or lets a stale non-LM tensor pin live text-only
+    weights to the multimodal namespace. Normalizing exactly what peft loads is what makes the
+    exported adapter match the one the user runs.
+    """
     if not adapter_dir.is_dir():
         return []
-    return sorted(
+    files = sorted(
         p for p in adapter_dir.rglob("*") if p.is_file() and is_adapter_weight_filename(p.name)
     )
+    for suffix in ADAPTER_WEIGHT_SUFFIXES:
+        candidates = [p for p in files if p.name.endswith(suffix)]
+        if candidates:
+            single = [p for p in candidates if not p.name.startswith(ADAPTER_SHARD_PREFIX)]
+            return single or candidates
+    return []
 
 
 def _read_safetensors_header(path: Path) -> tuple[dict[str, object], int, int]:
@@ -223,9 +243,8 @@ def _torch_for(path: Path):
     return torch
 
 
-def _scan_bin(path: Path) -> _WeightScan:
-    if not _bin_may_carry_infixed_keys(path):
-        return _WeightScan(path=path)
+def _load_bin_state(path: Path) -> dict:
+    """The `.bin`'s tensor state dict, validated as the plain PEFT shape both phases assume."""
     torch = _torch_for(path)
     state = torch.load(str(path), map_location="cpu", weights_only=True)
     if not isinstance(state, dict):
@@ -236,8 +255,19 @@ def _scan_bin(path: Path) -> _WeightScan:
             f"{path.name}: contains non-tensor entries (e.g. {bad[:4]}); expected a plain PEFT "
             "adapter state dict"
         )
+    return state
+
+
+def _scan_bin(path: Path) -> _WeightScan:
+    """Keys and liveness only: the tensors are dropped so peak memory is one shard, not their sum.
+
+    Sharding exists precisely because the combined weights are large, so holding every shard's
+    payload until the last rewrite finishes is what would OOM the export. `_rewrite_bin_keys`
+    reloads the one shard it is about to replace.
+    """
+    state = _load_bin_state(path)
     live = next((key for key, tensor in state.items() if _tensor_is_live_non_lm(key, tensor)), None)
-    return _WeightScan(path=path, keys=tuple(state), live_non_lm_key=live, state=state)
+    return _WeightScan(path=path, keys=tuple(state), live_non_lm_key=live)
 
 
 def _tensor_is_live_non_lm(key: str, tensor: object) -> bool:
@@ -288,7 +318,7 @@ def _rewrite_safetensors_keys(scan: _WeightScan, renames: dict[str, str]) -> Non
 
 def _rewrite_bin_keys(scan: _WeightScan, renames: dict[str, str]) -> None:
     torch = _torch_for(scan.path)
-    state = {renames.get(key, key): value for key, value in scan.state.items()}
+    state = {renames.get(key, key): value for key, value in _load_bin_state(scan.path).items()}
     with _atomic_replacement(scan.path) as destination:
         torch.save(state, destination)
 
@@ -311,10 +341,19 @@ def _normalize_adapter_key_namespace(adapter_dir: Path) -> str:
     paths = _adapter_weight_paths(adapter_dir)
     if not paths:
         raise ValueError("no adapter_model weight file to normalize")
-    scans = [
-        _scan_safetensors(path) if path.name.endswith(".safetensors") else _scan_bin(path)
-        for path in paths
-    ]
+    if paths[0].name.endswith(".safetensors"):
+        scans = [_scan_safetensors(path) for path in paths]
+    elif any(_bin_may_carry_infixed_keys(path) for path in paths):
+        # one shard mentioning the infix commits every shard to a full scan. liveness and
+        # post-rename collisions are properties of the union of the shards, so a shard that never
+        # mentions the infix still holds keys and tensors the plan has to see: skipping it strips
+        # the language-model shard despite a live non-LM weight elsewhere, or misses a cross-shard
+        # collision and collapses entries in the rewritten index. below that bar nothing can be
+        # renamed at all, so the `.bin` files stay unread and torch stays unimported, which the
+        # control plane needs (torch is a `gpu` extra, not a `server` one).
+        scans = [_scan_bin(path) for path in paths]
+    else:
+        return "text_only"
     pinned = next((scan for scan in scans if scan.live_non_lm_key), None)
     if pinned is not None:
         logger.info(

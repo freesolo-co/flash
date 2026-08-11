@@ -502,6 +502,94 @@ def test_export_adapter_bin_needing_normalization_without_torch_is_refused(tmp_p
     assert path.read_bytes() == before
 
 
+def test_export_adapter_bin_without_the_infix_never_imports_torch(tmp_path, monkeypatch):
+    """The control plane installs no torch (it is a `gpu` extra), so a `.bin` that cannot need a
+    rename must not reach for it. Importing torch here would fail every legacy `.bin` export."""
+    from flash.serve import export
+
+    plain = "base_model.model.model.layers.0.self_attn.q_proj.lora_B.default.weight"
+    _write_fake_bin(tmp_path / "adapter_model.bin", {plain: [1.0]})
+    monkeypatch.setattr(
+        export, "_torch_for", lambda path: pytest.fail(f"torch imported for {path.name}")
+    )
+
+    assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
+
+
+def test_export_adapter_bin_shard_without_the_infix_still_pins_the_namespace(tmp_path, monkeypatch):
+    """A shard that never mentions the infix still carries keys the global plan has to see.
+
+    Sharding splits ONE key namespace across files, so liveness is a property of their union: a live
+    vision LoRA-B in the second shard means the first shard's language-model keys must stay put.
+    Reading only the shard that mentions the infix strips them anyway and ships a mixed namespace
+    peft binds to nothing."""
+    from flash.serve import export
+
+    infixed = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
+    vision_b = "base_model.model.model.visual.blocks.0.attn.proj.lora_B.default.weight"
+    _install_fake_torch(monkeypatch)
+    first = tmp_path / "adapter_model-00001-of-00002.bin"
+    second = tmp_path / "adapter_model-00002-of-00002.bin"
+    _write_fake_bin(first, {infixed: [1.0]})
+    _write_fake_bin(second, {vision_b: [0.5]})
+    before = (first.read_bytes(), second.read_bytes())
+
+    assert export._normalize_export_adapter_keys(tmp_path) == "multimodal"
+    assert (first.read_bytes(), second.read_bytes()) == before
+
+
+def test_export_adapter_bin_shard_collision_across_shards_is_refused(tmp_path, monkeypatch):
+    """The rename is planned over the union of the shards, so the collision is only visible there.
+
+    Missing it rewrites the infixed key onto a name the other shard already uses, and the index then
+    maps one key to two shards -- entries silently collapse instead of the export failing."""
+    from flash.serve import export
+    from flash.serve.errors import ServingError
+
+    infixed = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
+    plain = infixed.replace(".language_model.", ".", 1)
+    _install_fake_torch(monkeypatch)
+    first = tmp_path / "adapter_model-00001-of-00002.bin"
+    second = tmp_path / "adapter_model-00002-of-00002.bin"
+    _write_fake_bin(first, {infixed: [1.0]})
+    _write_fake_bin(second, {plain: [2.0]})
+    before = (first.read_bytes(), second.read_bytes())
+
+    with pytest.raises(ServingError, match="collides"):
+        export._normalize_export_adapter_keys(tmp_path)
+    assert (first.read_bytes(), second.read_bytes()) == before
+
+
+def test_export_adapter_normalizes_only_the_representation_peft_loads(tmp_path, monkeypatch):
+    """A retry's adapter lands on the previous attempt's path without deleting what it did not
+    write, so a stale `.bin` can outlive the safetensors peft actually binds.
+
+    Scanning both reads one namespace out of two: every shared key collides with itself and a valid
+    export fails. peft takes safetensors over `.bin`, so the exporter normalizes exactly that."""
+    from flash.serve import export
+
+    infixed = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
+    stale = tmp_path / "adapter_model.bin"
+    _write_fake_bin(stale, {infixed: [9.0]})
+    before = stale.read_bytes()
+    path = tmp_path / "adapter_model.safetensors"
+    path.write_bytes(
+        _safetensors_bytes(
+            {infixed: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]}}, b"\x01\x02"
+        )
+    )
+    monkeypatch.setattr(
+        export, "_torch_for", lambda p: pytest.fail(f"read the stale representation {p.name}")
+    )
+
+    assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
+
+    assert set(_parse_safetensors_bytes(path.read_bytes())[0]) == {
+        infixed.replace(".language_model.", ".", 1)
+    }
+    assert stale.read_bytes() == before
+
+
 def test_export_adapter_normalizes_sharded_safetensors_and_index(monkeypatch):
     """Sharded weights are a shape serving validation accepts, so the export must remap them all.
 
