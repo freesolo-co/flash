@@ -411,7 +411,7 @@ def test_bootstrap_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
 
 
 def test_bootstrap_extra_pip_retries_a_transient_index_failure(monkeypatch):
-    # A PyPI/network blip is the one pre-worker network step that used to fail a PAID run outright
+    # A PyPI/network blip is the one pre-worker network step that can fail a PAID run outright
     # (the adjacent HF fetches are already retriable). It must retry in place and then succeed.
     lb, calls = _wire_pip(
         monkeypatch,

@@ -594,7 +594,7 @@ def install_extra_pip(payload: dict) -> None:
             rc = proc.wait()
             if rc == 0:
                 return
-            # only an index/network shape earns a retry; a bad requirement fails fast as before.
+            # only an index/network shape earns a retry; a bad requirement fails fast.
             if not _PIP_TRANSIENT_RE.search("".join(tail)):
                 raise RuntimeError(f"extra_pip install failed: pip exited {rc}")
             if attempt >= len(_PIP_RETRY_DELAYS_S):

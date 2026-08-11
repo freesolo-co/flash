@@ -564,7 +564,7 @@ def _wire_train_body_pip(monkeypatch, results):
 
 
 def test_train_body_extra_pip_retries_a_transient_index_failure(monkeypatch):
-    # Same fix as the instance bootstrap: a PyPI blip is infra, not a bad requirement, so the
+    # Same contract as the instance bootstrap: a PyPI blip is infra, not a bad requirement, so the
     # handler retries in place instead of failing the paid run on the first connection error.
     from flash.providers.runpod.serverless import endpoints
 
