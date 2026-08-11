@@ -139,6 +139,17 @@ def test_cancelled_charge_usd_treats_a_malformed_quote_as_a_pricing_failure():
     assert math.isnan(runner.cancelled_charge_usd(st, spec, steps=10, fallback=float("nan")))
 
 
+def test_cancelled_charge_usd_treats_a_nonpositive_quote_as_a_pricing_failure():
+    # a negative persisted quote would prorate to a negative charge: the cancel would persist a
+    # negative cost_usd that the billing retry predicate (cost_usd > 0) can never settle, and no
+    # pricing-failure diagnostic would ever be recorded. a zero quote is the same defect with a
+    # zero product. both propagate the fallback so the caller records the billing failure.
+    spec = _spec()
+    for bad in (-8.0, 0.0):
+        st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=bad)
+        assert math.isnan(runner.cancelled_charge_usd(st, spec, steps=10, fallback=float("nan")))
+
+
 def _patched_cfg_spec(monkeypatch, cfg):
     """Route both the partial and full spec estimates through a fixed RunConfig."""
     from types import SimpleNamespace
@@ -193,6 +204,43 @@ def test_cancelled_charge_usd_bills_the_one_time_compile_with_the_first_step(mon
     st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=8.0)
     charge = runner.cancelled_charge_usd(st, spec, steps=1)
     assert 8.0 / 1000 < charge <= 8.0
+
+
+def test_cancelled_charge_usd_prices_the_rented_topology(monkeypatch):
+    # an auto-allocated worker spec persists no provider, so the reprice would credit nvlink
+    # scaling on a vast rental that cannot deliver it. the moe compile is fixed while step time
+    # scales with topology, so the wrong speedup shifts the work fraction instead of cancelling
+    # out of it; the durable handle names the rented substrate and both estimates must use it.
+    from flash.cost.types import RunConfig
+
+    cfg = RunConfig("Qwen/Qwen3.6-35B-A3B", "sft", 1000, gpu_type="H100", gpu_count=2)
+    spec = _patched_cfg_spec(monkeypatch, cfg)
+    st = runner.RunStatus(
+        run_id="r",
+        state="cancelled",
+        spec={},
+        estimated_cost_usd=8.0,
+        remote={"provider": "vast"},
+    )
+    charge = runner.cancelled_charge_usd(st, spec, steps=1)
+    partial = runner.charge_usd_for_spec(spec, steps=1, provider="vast")
+    full = runner.charge_usd_for_spec(spec, provider="vast")
+    assert charge == 8.0 * partial / full
+    # the auto reprice credits nvlink scaling, so its step time, fixed-cost weighting, and wall-cap
+    # decision all differ from the pcie substrate the run rented: on this plan the slower pcie
+    # steps trip the wall cap, shrinking the paid horizon and raising the first-step share.
+    auto = 8.0 * runner.charge_usd_for_spec(spec, steps=1) / runner.charge_usd_for_spec(spec)
+    assert charge != auto
+    assert 0 < charge <= 8.0
+    # an unknown handle provider must degrade to the spec's own pricing, never fail the charge.
+    stale = runner.RunStatus(
+        run_id="r",
+        state="cancelled",
+        spec={},
+        estimated_cost_usd=8.0,
+        remote={"provider": "gone-provider"},
+    )
+    assert runner.cancelled_charge_usd(stale, spec, steps=1) == auto
 
 
 def test_cancelled_charge_usd_falls_back_to_reprice_without_a_quote():

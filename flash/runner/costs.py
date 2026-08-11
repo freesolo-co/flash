@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 import time
 from dataclasses import replace
@@ -36,8 +37,17 @@ def _gpu_rate(gpu_type: str, provider: str = "") -> float:
     return 0.80
 
 
-def charge_usd_for_spec(spec, *, steps: int | None = None, fallback: float = 0.0) -> float:
-    """Return the estimated customer charge, prorated by completed steps when requested."""
+def charge_usd_for_spec(
+    spec, *, steps: int | None = None, fallback: float = 0.0, provider: str = ""
+) -> float:
+    """Return the estimated customer charge, prorated by completed steps when requested.
+
+    ``provider`` overrides the pricing substrate for a training estimate. the persisted worker spec
+    of an auto-allocated run carries no provider, so its offline reprice would credit nvlink
+    scaling on a substrate (vast) that cannot deliver it; the cancel path passes the provider the
+    run actually rented so the estimate reproduces the accepted quote's work model. a profile's
+    bounded-wall charge has no multi-card step term, so the override does not apply there.
+    """
     try:
         from flash.cost.analytical import estimate_cost
         from flash.cost.spec import estimate_for_spec, runconfig_from_spec
@@ -51,12 +61,18 @@ def charge_usd_for_spec(spec, *, steps: int | None = None, fallback: float = 0.0
             if steps is not None and int(steps) <= 0:
                 return 0.0
             return float(estimate_for_spec(spec).total_usd)
+        cfg = runconfig_from_spec(spec)
+        if provider:
+            # suppressed ValueError: the registry no longer maps this provider to the spec's
+            # class. the combination was rentable when the run launched, so degrade to the spec's
+            # own pricing substrate rather than turning a chargeable cancel into a pricing failure.
+            with contextlib.suppress(ValueError):
+                cfg = replace(cfg, provider=provider)
         if steps is None:
-            return float(estimate_for_spec(spec).total_usd)
+            return float(estimate_cost(cfg).total_usd)
         n = max(0, int(steps))
         if n == 0:
             return 0.0
-        cfg = runconfig_from_spec(spec)
         planned = int(cfg.steps or 0)
         if planned > 0:
             n = min(n, planned)
@@ -72,6 +88,27 @@ def charge_usd_for_spec(spec, *, steps: int | None = None, fallback: float = 0.0
         return float(estimate_cost(cfg).total_usd)
     except Exception:
         return float(fallback)
+
+
+def _selected_provider(status: RunStatus) -> str:
+    """The provider the run actually rented, from the durable handle, or "" when unknowable.
+
+    only a known provider name is returned: pricing must never raise, and an unrecognized name
+    would make the offline estimate unpriceable and degrade a chargeable cancel into a billing
+    failure, so anything else falls back to the spec's own (auto) pricing substrate.
+    """
+    remote = getattr(status, "remote", None)
+    if not isinstance(remote, dict):
+        return ""
+    name = remote.get("provider")
+    if not isinstance(name, str):
+        return ""
+    name = name.strip().lower()
+    try:
+        from flash.providers import PROVIDER_NAMES
+    except Exception:
+        return ""
+    return name if name in PROVIDER_NAMES else ""
 
 
 def cancelled_charge_usd(status: RunStatus, spec, *, steps: int, fallback: float = 0.0) -> float:
@@ -95,22 +132,33 @@ def cancelled_charge_usd(status: RunStatus, spec, *, steps: int, fallback: float
     if n == 0:
         # cancelled before any training step: nothing rented, nothing owed.
         return 0.0
+    # the persisted worker spec of an auto-allocated run names no provider, and pricing it as
+    # "auto" credits nvlink scaling a vast rental cannot deliver. the topology error is a factor
+    # on the per-step term only, so it does not cancel out of partial / full whenever the estimate
+    # also carries fixed work (moe compile, required saves) or a wall cap: both estimates are
+    # computed on the substrate the run actually rented.
+    provider = _selected_provider(status)
     quote = getattr(status, "estimated_cost_usd", None)
     if quote is None:
-        return runner.charge_usd_for_spec(spec, steps=n, fallback=fallback)
+        return runner.charge_usd_for_spec(spec, steps=n, fallback=fallback, provider=provider)
     try:
         quote = float(quote)
     except (TypeError, ValueError):
         # a malformed persisted quote is a pricing failure, not a license to reprice: the accepted
         # rate is unknowable, so the caller's fallback must propagate and settle the run.
         return float(fallback)
-    partial = runner.charge_usd_for_spec(spec, steps=n, fallback=float("nan"))
-    full = runner.charge_usd_for_spec(spec, fallback=float("nan"))
+    if quote <= 0:
+        # a non-positive quote is malformed the same way: prorating it would persist a charge the
+        # billing retry predicate (cost_usd > 0) can never settle, silently stranding the run
+        # unbilled, so the fallback propagates and the caller records the pricing failure.
+        return float(fallback)
+    partial = runner.charge_usd_for_spec(spec, steps=n, fallback=float("nan"), provider=provider)
+    full = runner.charge_usd_for_spec(spec, fallback=float("nan"), provider=provider)
     if math.isfinite(partial) and math.isfinite(full) and full > 0:
         return quote * min(1.0, partial / full)
     # the work fraction is unpriceable: reprice the spec but never bill a cancel above the quote.
     # a non-finite reprice is a pricing failure and must propagate so the caller records it.
-    repriced = runner.charge_usd_for_spec(spec, steps=n, fallback=fallback)
+    repriced = runner.charge_usd_for_spec(spec, steps=n, fallback=fallback, provider=provider)
     if not math.isfinite(repriced):
         return repriced
     return min(repriced, quote)
