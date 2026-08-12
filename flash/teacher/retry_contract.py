@@ -9,7 +9,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from flash._internal.fileio import reject_duplicate_keys
-from flash.adapters.artifacts import ADAPTER_WEIGHT_FILES
+from flash.adapters.artifacts import has_loadable_adapter_weights
 
 OPD_RETRY_CONTRACT_STATUS_KEY = "opd_retry_contract_version"
 OPD_RETRY_CONTRACT_VERSION = 1
@@ -293,7 +293,9 @@ def opd_resume_checkpoint_complete(basenames: Iterable[str]) -> bool:
     names = set(basenames)
     if not all(f in names for f in OPD_RESUME_STATE_REQUIRED_FILES):
         return False
-    return any(weight in names for weight in ADAPTER_WEIGHT_FILES)
+    # weights via the shared rule: a sharded save is complete only WITH its index, and an orphan
+    # shard is exactly the partial upload this gate exists to reject.
+    return has_loadable_adapter_weights(names)
 
 
 def opd_checkpoint_world_size(paths: Iterable[str]) -> int | None:

@@ -219,7 +219,7 @@ def test_adapter_identity_binds_config_and_weight_metadata(monkeypatch):
         def __init__(self, token=None):
             self.token = token
 
-        def get_paths_info(self, repo_id, paths, repo_type, revision=None):
+        def list_repo_tree(self, repo_id, path_in_repo, repo_type, recursive=False, revision=None):
             assert repo_id == "owner/runs"
             assert repo_type == "dataset"
             assert revision is None
@@ -251,7 +251,7 @@ def test_adapter_identity_digests_decimal_config_values_exactly(monkeypatch):
         def __init__(self, token=None):
             self.token = token
 
-        def get_paths_info(self, repo_id, paths, repo_type, revision=None):
+        def list_repo_tree(self, repo_id, path_in_repo, repo_type, recursive=False, revision=None):
             return [
                 SimpleNamespace(
                     path="sft/sft-run/adapter/adapter_model.safetensors",

@@ -532,6 +532,11 @@ def test_export_adapter_bin_shard_without_the_infix_still_pins_the_namespace(tmp
     second = tmp_path / "adapter_model-00002-of-00002.bin"
     _write_fake_bin(first, {infixed: [1.0]})
     _write_fake_bin(second, {vision_b: [0.5]})
+    # peft writes the index whenever it shards, and it is what makes the shards a representation
+    # peft can discover at all -- without it there is nothing to export.
+    (tmp_path / "adapter_model.bin.index.json").write_text(
+        json.dumps({"weight_map": {infixed: first.name, vision_b: second.name}})
+    )
     before = (first.read_bytes(), second.read_bytes())
 
     assert export._normalize_export_adapter_keys(tmp_path) == "multimodal"
@@ -553,6 +558,9 @@ def test_export_adapter_bin_shard_collision_across_shards_is_refused(tmp_path, m
     second = tmp_path / "adapter_model-00002-of-00002.bin"
     _write_fake_bin(first, {infixed: [1.0]})
     _write_fake_bin(second, {plain: [2.0]})
+    (tmp_path / "adapter_model.bin.index.json").write_text(
+        json.dumps({"weight_map": {infixed: first.name, plain: second.name}})
+    )
     before = (first.read_bytes(), second.read_bytes())
 
     with pytest.raises(ServingError, match="collides"):

@@ -3304,6 +3304,9 @@ def test_supervisor_oom_walks_only_to_strictly_larger_gpu(monkeypatch):
             def get_paths_info(self, **_kwargs):
                 return []
 
+            def list_repo_tree(self, **_kwargs):
+                return []
+
         fake_private_hf = FakePrivateHf()
         monkeypatch.setattr(huggingface_hub, "HfApi", lambda token=None: fake_private_hf)
         monkeypatch.setattr(
