@@ -849,7 +849,6 @@ from flash.runner.deadlines import _profile_wall_armed_at as _profile_wall_armed
 from flash.runner.preparation import (  # noqa: E402,F401
     _adopted_warmstart_revision,
     _inherit_warmstart_revision,
-    _legacy_rollout_optimizer_batch,
     _mark_warmstart_source,
     _preparation_digest,
     _prepare_init_from_adapter,
@@ -861,6 +860,7 @@ from flash.runner.preparation import (  # noqa: E402,F401
     _require_sft_workload_profile,
     _require_supported_adapter_continuation,
     _resolve_model_revision,
+    _stored_rollout_batch_spelling,
     _validate_effective_spec,
     _warmstart_source_is_authorized,
 )

@@ -75,11 +75,22 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     raw_public = status.spec if isinstance(status.spec, dict) else {}
     legacy_public_keys = {k: raw_public[k] for k in _DROPPED_TOP_LEVEL_KEYS if k in raw_public}
     legacy_public_alpha = runner._prepared_before_public_alpha(raw_public)
-    # the rollout optimizer batch was renamed, and `from_dict` moves it -- so a snapshot written
-    # under the old name has to be rehashed under the old name. Read from the WORKER payload: it is
-    # the authoritative half, and the public one is a stripped view of the same spec.
-    legacy_rollout_batch = runner._legacy_rollout_optimizer_batch(raw_worker)
-    legacy_rollout_batch_absent = "prompts_per_step" not in raw_worker.get("train", {})
+    # the rollout optimizer batch was renamed, and `from_dict` moves it -- so a snapshot has to be
+    # rehashed under the spelling it actually stored, including a key it did not carry. Read from
+    # the WORKER payload: it is the authoritative half, and the public one is a stripped view of
+    # the same spec.
+    stored_rollout_batch = runner._stored_rollout_batch_spelling(raw_worker)
+    # 1.1.40 predates `prompts_per_step`, so its payload carried no such key -- which hashes
+    # differently from the explicit null every later release wrote. The discriminator is carrying
+    # the OLD name while lacking the new one: a payload omitting BOTH says nothing about when it
+    # was written, and every digest is taken over a serialized JobSpec, which emits both names for
+    # every run. Treating a merely-absent key as 1.1.40 would drop a key that WAS hashed.
+    _raw_train = raw_worker.get("train") if isinstance(raw_worker.get("train"), dict) else {}
+    stored_rollout_batch_key_absent = (
+        stored_rollout_batch is not None
+        and "batch_size" in _raw_train
+        and "prompts_per_step" not in _raw_train
+    )
     has_workload_profile = bool(
         worker_spec.workload_profile_kind
         or worker_spec.workload_profile_input_digest
@@ -117,8 +128,8 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
             legacy_keys=legacy_keys,
             legacy_public_keys=legacy_public_keys,
             legacy_public_alpha=legacy_public_alpha,
-            legacy_rollout_batch=legacy_rollout_batch,
-            legacy_rollout_batch_absent=legacy_rollout_batch_absent,
+            stored_rollout_batch=stored_rollout_batch,
+            stored_rollout_batch_key_absent=stored_rollout_batch_key_absent,
         )
     ):
         raise ValueError("persisted effective preparation failed integrity validation")
@@ -135,8 +146,8 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
             legacy_keys=legacy_keys,
             legacy_public_keys=legacy_public_keys,
             legacy_public_alpha=legacy_public_alpha,
-            legacy_rollout_batch=legacy_rollout_batch,
-            legacy_rollout_batch_absent=legacy_rollout_batch_absent,
+            stored_rollout_batch=stored_rollout_batch,
+            stored_rollout_batch_key_absent=stored_rollout_batch_key_absent,
         ):
             raise ValueError("persisted effective preparation failed integrity validation")
     if verify_source and public_spec.train.init_from_adapter:

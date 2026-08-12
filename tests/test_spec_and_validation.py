@@ -1383,51 +1383,82 @@ def test_stripping_an_auto_pin_keeps_the_preparation_digest_stable() -> None:
 
 
 def test_migrating_a_legacy_rollout_batch_keeps_its_preparation_digest_valid() -> None:
-    """Recovering a pre-rename snapshot must not fail integrity validation.
+    """Recovering a persisted rollout snapshot must not fail integrity validation.
 
-    The digest hashes the bytes that were STORED, and those spelled the rollout batch
-    ``batch_size``. `from_dict` now moves it onto ``prompts_per_step``, so rehashing a legacy
-    snapshot with today's parse yields different bytes -- rejecting exactly the warm-start grpo/opd
-    runs this migration exists to rescue. Two stored shapes exist: 1.1.40 predates the field and
-    carried no such key, and 1.1.43+ stored an explicit null.
+    The digest hashes the bytes that were STORED, and `from_dict` now MOVES the rollout batch from
+    ``batch_size`` onto ``prompts_per_step``. Rehashing a snapshot with today's parse can therefore
+    yield different bytes than were hashed at persist time -- rejecting exactly the warm-start
+    grpo/opd runs this migration exists to rescue.
 
-    The restore must stay scoped to that population, so the tamper and modern cases below are the
-    controls: an assertion that only checked recovery would also pass if the digest stopped binding
-    the batch at all.
+    Every stored shape is covered, because three of them differ only in ways an assertion about
+    "the legacy value" cannot see: 1.1.40 predates the field and stored NO key, 1.1.43+ stored an
+    explicit null, a mid-upgrade payload stored BOTH names, and a snapshot that authored no batch
+    at all has nothing to migrate yet still changes shape. The last two were regressions found in
+    review after an earlier fix keyed only on "is there a legacy value to move".
+
+    Tamper and modern controls are included, since an assertion that only checked recovery would
+    also pass if the digest stopped binding the batch entirely.
     """
     import flash.runner as runner
 
-    def _stored(*, absent: bool, batch: int = 32):
-        """A snapshot as the pre-rename build persisted it, with the digest hashed from ITS bytes."""
+    def _spec(batch_size, prompts_per_step, *, algorithm="grpo"):
         spec = replace(
             JobSpec.from_dict(
                 {
                     "model": "Qwen/Qwen3.5-4B",
-                    "algorithm": "grpo",
+                    "algorithm": algorithm,
                     "run_id": "legacy",
                     "environment": {"id": "github:owner/repo@main:env/environment.py"},
                     "gpu": {"type": "H100", "count": 1},
-                    "train": {"epochs": 1, "group_size": 4, "batch_size": batch},
+                    "train": {"epochs": 1, "group_size": 4},
                 }
             ),
             model_revision="a" * 40,
             model_revision_auto=True,  # one of the two triggers for the digest check
         )
-        # the pre-rename parse: the old key retained, the new one unset.
-        legacy_spec = replace(
-            spec, train=replace(spec.train, batch_size=batch, prompts_per_step=None)
+        # force the shape the OLD build parsed, bypassing today's migration.
+        return replace(
+            spec,
+            train=replace(spec.train, batch_size=batch_size, prompts_per_step=prompts_per_step),
         )
-        worker, public = legacy_spec.to_internal_dict(), legacy_spec.to_dict()
-        if absent:
+
+    def _stored(batch_size, prompts_per_step, *, key_absent):
+        """A snapshot as the pre-fix build persisted it, digested over exactly ITS bytes.
+
+        `key_absent` reproduces 1.1.40, which predates ``prompts_per_step`` entirely -- so its
+        payload carried no such key, which hashes differently from an explicit null. Serializing
+        through today's dataclass always emits the key, so the digest has to be taken over the
+        historical bytes or the test would assert against a shape production never wrote.
+        """
+        spec = _spec(batch_size, prompts_per_step)
+        worker, public = spec.to_internal_dict(), spec.to_dict()
+        if key_absent:
             worker["train"].pop("prompts_per_step", None)
             public["train"].pop("prompts_per_step", None)
-        digest = _preparation_digest_for(legacy_spec, batch, absent)
+        original_internal, original_public = JobSpec.to_internal_dict, JobSpec.to_dict
+        if key_absent:
+            JobSpec.to_internal_dict = lambda self: {
+                **original_internal(self),
+                "train": {
+                    k: v
+                    for k, v in original_internal(self)["train"].items()
+                    if k != "prompts_per_step"
+                },
+            }
+            JobSpec.to_dict = lambda self: {
+                **original_public(self),
+                "train": {
+                    k: v
+                    for k, v in original_public(self)["train"].items()
+                    if k != "prompts_per_step"
+                },
+            }
+        try:
+            digest = runner._preparation_digest(spec, spec, None)
+        finally:
+            JobSpec.to_internal_dict = original_internal
+            JobSpec.to_dict = original_public
         return worker, public, digest
-
-    def _preparation_digest_for(spec, batch, absent):
-        return runner._preparation_digest(
-            spec, spec, None, legacy_rollout_batch=batch, legacy_rollout_batch_absent=absent
-        )
 
     def _recover(worker, public, digest):
         return runner.effective_spec_from_status(
@@ -1439,45 +1470,39 @@ def test_migrating_a_legacy_rollout_batch_keeps_its_preparation_digest_valid() -
             )
         )
 
-    for absent in (False, True):
-        worker, public, digest = _stored(absent=absent)
+    # (label, stored batch_size, stored prompts_per_step, key absent, migrated prompts_per_step)
+    for label, batch_size, prompts_per_step, key_absent, expected in (
+        ("1.1.40 authored 32", 32, None, True, 32),
+        # nothing to migrate, but the reparse still emits a key the stored bytes lacked.
+        ("1.1.40 authored nothing", None, None, True, None),
+        ("1.1.43+ authored 32", 32, None, False, 32),
+        ("1.1.43+ authored nothing", None, None, False, None),
+        # mid-upgrade: both names stored. the migration drops the old one, so it still has to be
+        # rehashed under the stored spelling.
+        ("mixed both names", 32, 16, False, 16),
+        ("modern new name only", None, 16, False, 16),
+        # a non-positive legacy value is discarded by the parser, changing the shape again.
+        ("legacy non-positive", 0, None, False, None),
+    ):
+        worker, public, digest = _stored(batch_size, prompts_per_step, key_absent=key_absent)
         recovered = _recover(worker, public, digest)
-        # recovered AND migrated: the batch survives under the name the workers now read.
-        assert (recovered.train.prompts_per_step, recovered.train.batch_size) == (32, None), absent
+        assert (recovered.train.prompts_per_step, recovered.train.batch_size) == (
+            expected,
+            None,
+        ), label
 
-        # control: the digest still binds the batch. without this, "recovery works" would also be
+        # control: the digest still binds BOTH names. without this, "recovery works" would also be
         # satisfied by a restore that let any value through.
-        tampered_worker, tampered_public, _ = _stored(absent=absent)
-        tampered_worker["train"]["batch_size"] = 128
-        tampered_public["train"]["batch_size"] = 128
-        with pytest.raises(ValueError, match="failed integrity validation"):
-            _recover(tampered_worker, tampered_public, digest)
+        for key in ("batch_size", "prompts_per_step"):
+            if key not in worker["train"]:
+                continue
+            tampered_worker = {**worker, "train": {**worker["train"], key: 999}}
+            tampered_public = {**public, "train": {**public["train"], key: 999}}
+            with pytest.raises(ValueError, match="failed integrity validation"):
+                _recover(tampered_worker, tampered_public, digest)
 
-    # control: a spec that authored the CURRENT name is not treated as legacy, so its digest keeps
-    # binding `prompts_per_step` normally.
-    modern = replace(
-        JobSpec.from_dict(
-            {
-                "model": "Qwen/Qwen3.5-4B",
-                "algorithm": "grpo",
-                "run_id": "modern",
-                "environment": {"id": "github:owner/repo@main:env/environment.py"},
-                "gpu": {"type": "H100", "count": 1},
-                "train": {"epochs": 1, "group_size": 4, "prompts_per_step": 32},
-            }
-        ),
-        model_revision="a" * 40,
-        model_revision_auto=True,
-    )
-    assert runner._legacy_rollout_optimizer_batch(modern.to_internal_dict()) is None
-    worker, public = modern.to_internal_dict(), modern.to_dict()
-    digest = runner._preparation_digest(modern, modern, None)
-    worker["train"]["prompts_per_step"] = 128
-    public["train"]["prompts_per_step"] = 128
-    with pytest.raises(ValueError, match="failed integrity validation"):
-        _recover(worker, public, digest)
-
-    # sft authors `batch_size` under its CURRENT name, so it must never be read as legacy.
+    # sft authors `batch_size` under its CURRENT name, so from_dict leaves it alone and the digest
+    # must not replay anything for it.
     sft = JobSpec.from_dict(
         {
             "model": "Qwen/Qwen3.5-4B",
@@ -1488,7 +1513,7 @@ def test_migrating_a_legacy_rollout_batch_keeps_its_preparation_digest_valid() -
             "train": {"epochs": 1, "batch_size": 4},
         }
     )
-    assert runner._legacy_rollout_optimizer_batch(sft.to_internal_dict()) is None
+    assert runner._stored_rollout_batch_spelling(sft.to_internal_dict()) is None
 
 
 def test_effective_spec_validation_accepts_the_asymmetric_auto_pin_shape() -> None:
