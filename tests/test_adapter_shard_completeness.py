@@ -49,6 +49,26 @@ def test_a_complete_indexed_shard_set_is_loadable():
     assert loadable_adapter_weight_files([*_SHARDS, _INDEX]) == list(_SHARDS)
 
 
+def test_a_complete_indexed_set_ignores_a_stale_shard_from_a_larger_total():
+    """retry residue is expected, so an orphan from another total cannot mask the live set."""
+    stale = "adapter_model-00001-of-00003.safetensors"
+    assert loadable_adapter_weight_files([*_SHARDS, _INDEX, stale]) == list(_SHARDS)
+
+
+def test_a_complete_larger_set_ignores_a_stale_shard_from_a_smaller_total():
+    """candidate totals are independent: completeness, not listing order or size, selects the set."""
+    live = tuple(f"adapter_model-{index:05d}-of-00003.safetensors" for index in range(1, 4))
+    stale = "adapter_model-00001-of-00002.safetensors"
+    assert loadable_adapter_weight_files([*live, _INDEX, stale]) == list(live)
+
+
+def test_two_complete_indexed_sets_are_rejected_as_ambiguous():
+    """the listing cannot reveal which complete set the index names, so serving either may be stale."""
+    larger = tuple(f"adapter_model-{index:05d}-of-00003.safetensors" for index in range(1, 4))
+    assert not has_loadable_adapter_weights([*_SHARDS, *larger, _INDEX])
+    assert loadable_adapter_weight_files([*_SHARDS, *larger, _INDEX]) == []
+
+
 def test_an_index_missing_one_of_its_shards_is_not_loadable():
     """the index names the complete set, so a listing short one member cannot be loaded either."""
     assert not has_loadable_adapter_weights([_SHARDS[0], _INDEX])

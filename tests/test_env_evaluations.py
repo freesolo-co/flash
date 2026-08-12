@@ -2333,6 +2333,30 @@ def test_env_eval_scores_on_the_calling_thread(monkeypatch, tmp_path, capsys) ->
     assert "overall: PASS" in capsys.readouterr().out
 
 
+def test_scored_response_preserves_existing_structure_and_still_parses_plain_text() -> None:
+    """Only the first parser has the raw generation needed to retain its structured views.
+
+    Episode turn recording already stores an answer-compatible string with raw and thinking attached.
+    Parsing that value again is answer-idempotent but metadata-destructive, while single-turn eval still
+    arrives as plain text and must continue to build the same structure here.
+    """
+    from flash.cli.commands.env.eval import _scored_response
+    from flash.envs.adapter import _ScoredResponseText
+
+    raw = "<think>2+2 is 4</think>4"
+    stored = _ScoredResponseText("4", raw=raw, thinking="2+2 is 4")
+
+    preserved = _scored_response(stored, thinking=True)
+    parsed = _scored_response(raw, thinking=True)
+
+    assert preserved is stored
+    assert preserved.raw == raw
+    assert preserved.thinking == "2+2 is 4"
+    assert parsed == "4"
+    assert parsed.raw == raw
+    assert parsed.thinking == "2+2 is 4"
+
+
 def test_env_eval_reports_the_whole_completion_it_graded() -> None:
     # stripping for the scorer must not shorten what is recorded: the reasoning is what makes a
     # failed case diagnosable, so the result keeps the full emission and the upload carries it.

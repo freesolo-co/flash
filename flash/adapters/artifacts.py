@@ -62,7 +62,7 @@ def loadable_adapter_weight_files(filenames) -> list[str]:
         if single in names:
             return [single]
         referenced = _index_shard_names(names, suffix)
-        if referenced and referenced <= names:
+        if referenced:
             return sorted(referenced)
     return []
 
@@ -81,7 +81,10 @@ def _index_shard_names(names: set[str], suffix: str) -> set[str]:
     parse json to answer "is this set complete". The exporter, which already has the files locally,
     still reads the real ``weight_map`` -- that is the authority on which shards are live.
 
-    Empty when no index is present, or when the shard names do not agree on a single total.
+    Empty when no index is present, when no candidate shard set is complete, or when multiple
+    candidate sets are complete. The last case is genuinely undecidable from filenames alone: the
+    index names exactly one set but the listing cannot say which, so rejecting loudly is safer than
+    silently serving stale weights.
     """
     if f"adapter_model{suffix}.index.json" not in names:
         return set()
@@ -93,13 +96,15 @@ def _index_shard_names(names: set[str], suffix: str) -> set[str]:
         shard, sep, total = stem.partition("-of-")
         if sep and shard.isdigit() and total.isdigit() and int(total) > 0:
             totals.add((total, len(shard)))
-    if len(totals) != 1:
-        return set()
-    total, width = totals.pop()
-    return {
-        f"{ADAPTER_SHARD_PREFIX}{index:0{width}d}-of-{total}{suffix}"
-        for index in range(1, int(total) + 1)
-    }
+    complete = []
+    for total, width in totals:
+        candidate = {
+            f"{ADAPTER_SHARD_PREFIX}{index:0{width}d}-of-{total}{suffix}"
+            for index in range(1, int(total) + 1)
+        }
+        if candidate <= names:
+            complete.append(candidate)
+    return complete[0] if len(complete) == 1 else set()
 
 
 # The largest attempt identity any artifact name may carry. An attempt number reaches a filename and

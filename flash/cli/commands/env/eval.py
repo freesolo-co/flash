@@ -159,13 +159,18 @@ def _scored_response(response: str, *, thinking: bool) -> str:
     """The response as a scorer should see it, matching what training grades.
 
     Strip reasoning only for `thinking` runs; raw reasoning mis-grades them, while unconditional
-    stripping can truncate non-thinking answers that mention `<think>`.
+    stripping can truncate non-thinking answers that mention `<think>`. Preserve a structured value
+    produced upstream because only that caller still had the raw generation; deriving it again from
+    the answer-only string destroys its raw and thinking views. Single-turn responses remain plain
+    strings, so they still take the parsing path below.
     """
     if not thinking:
         return response
     from flash.content.thinking import strip_think, thinking_text
     from flash.envs.adapter import _ScoredResponseText
 
+    if isinstance(response, _ScoredResponseText):
+        return response
     answer = strip_think(response)
     return _ScoredResponseText(
         answer if isinstance(answer, str) else response,
