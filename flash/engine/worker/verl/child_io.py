@@ -247,9 +247,12 @@ FLASH_FLASH_QLA_MARKER = "[flash-verl] flashqla gdn backend active"
 
 # Why the fragment below binds the kernel directly, on sm90 only, and never fails the run.
 #
-# MEASURED, on a real H200 (Qwen3.5-4B, seq 4096, LoRA r32): 1.055x end-to-end training step
-# against an A/A null of 1.0014, forward and all five gradients matching fla's own kernel to 8e-3,
-# identical peak memory. reproduced on a second H200 at 1.044x with a first-step loss gap of 1.6e-5.
+# MEASURED, on a real H200 (Qwen3.5-4B, seq 4096, 24 GDN layers), through THIS fragment as rendered
+# and wrapped by the shipped code path: 1.065x end-to-end training step, null-corrected against an
+# A/A null of 0.9914, 22/24 paired wins. both kernels timed in ONE process, ABBA-interleaved per
+# step and both pre-warmed, because two identical control PROCESSES differ by more than the effect.
+# a standalone kernel harness on the same shape independently measured 1.055x, with forward and all
+# five gradients matching fla's own kernel to 8e-3 at identical peak memory.
 #
 # sm90 ONLY, and that is a correctness floor rather than a preference. flashqla is tilelang-based
 # and on sm100 it computes WRONG gradients at the production call shapes: measured dq 1.006,
@@ -272,7 +275,7 @@ FLASH_FLASH_QLA_MARKER = "[flash-verl] flashqla gdn backend active"
 # its own card.
 #
 # FAIL-OPEN, unlike every other required fragment: the boundary shims fail closed because skipping
-# them corrupts training, while skipping this one only costs ~5% and leaves the child on the kernel
+# them corrupts training, while skipping this one only costs ~6% and leaves the child on the kernel
 # it used before. that matters for the deploy window -- `worker_image_for_gpu` returns a MUTABLE tag
 # whose image presets FLASH_VERL_PYTHON, so `resolve_verl_python` returns early and never installs
 # the wheel; until the image is rebuilt, every GDN child takes the unavailable path.
@@ -332,7 +335,7 @@ def _flash_qla_patch(module):
         # NOT fatal, and deliberately so. this is a pure speed swap: without it the child trains on
         # fla's own kernel, which is exactly what every run before this fragment did. the boundary
         # shims fail closed because skipping them CORRUPTS training; skipping this one only costs
-        # ~5%.
+        # ~6%.
         #
         # and the failure is expected in production for a window: the worker image is a mutable tag
         # (worker_image_for_gpu -> flash-worker:cu128-smXX) that presets FLASH_VERL_PYTHON, so
