@@ -300,6 +300,19 @@ def _error_for_status(status_code: int) -> str | None:
     return f"upstream returned status {status_code}" if _is_error_status(status_code) else None
 
 
+def _is_event_stream(response: httpx.Response) -> bool:
+    """Whether a streamed response's body is actually SSE.
+
+    Asked of the CONTENT TYPE rather than inferred from the status, because the two disagree: a
+    gateway can answer `stream: true` with a 200 JSON error envelope or an HTML interstitial. The
+    status-only test called that a stream, so the caller got `text/event-stream` for a body that is
+    not one and the accumulator parsed it for deltas that never arrive -- storing `None` where the
+    response bytes belong.
+    """
+    content_type = response.headers.get("content-type") or ""
+    return content_type.split(";", 1)[0].strip().casefold() == "text/event-stream"
+
+
 async def _record_trace(
     context: _UpstreamRequestContext, *, output_payload: Any, error: str | None
 ) -> None:
@@ -665,15 +678,18 @@ async def _stream_response(
 ) -> AsyncIterator[bytes]:
     accumulator = _SseAccumulator()
     raw_output = bytearray()
-    is_error = _is_error_status(upstream_response.status_code)
-    done_gate = _SseDoneGate() if context.record_trace and not is_error else None
+    # a body is parsed as SSE only if it says it is one. an error status is one way to get a
+    # non-SSE body, but a 2xx gateway envelope is another, and feeding either to the accumulator
+    # stores None in place of the bytes the caller actually received.
+    raw_body = not _is_event_stream(upstream_response)
+    done_gate = _SseDoneGate() if context.record_trace and not raw_body else None
     error = _error_for_status(upstream_response.status_code)
     client_disconnected = False
     try:
         async for chunk in upstream_response.aiter_bytes():
             if context.record_trace:
-                if is_error:
-                    # bounded: an error body is stored truncated anyway, so retaining an unbounded
+                if raw_body:
+                    # bounded: a raw body is stored truncated anyway, so retaining an unbounded
                     # one only to throw most of it away lets a single upstream response grow the
                     # plane's memory without limit. the caller still receives every byte below.
                     if len(raw_output) < _MAX_RECORDED_ERROR_BYTES:
@@ -707,7 +723,7 @@ async def _stream_response(
                     await client.aclose()
             finally:
                 if context.record_trace:
-                    if is_error:
+                    if raw_body:
                         try:
                             output_payload: Any = json.loads(raw_output)
                         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -860,11 +876,14 @@ async def chat_completions(
         response_headers = _safe_provider_response_headers(upstream_response.headers)
         response_headers.update({"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
         media_type: str | None = "text/event-stream"
-        if _is_error_status(upstream_response.status_code):
+        # relay the provider's own content type whenever the body is not an event stream, whatever
+        # its status. a 200 gateway envelope is not SSE either, and labelling it `text/event-stream`
+        # hands the caller a body their SSE reader discards as malformed.
+        if not _is_event_stream(upstream_response):
             content_type = upstream_response.headers.get("content-type")
             if content_type:
                 response_headers["content-type"] = content_type
-                media_type = None
+            media_type = None
         return StreamingResponse(
             _stream_response(
                 client=client,

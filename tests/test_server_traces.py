@@ -374,7 +374,9 @@ async def test_streaming_client_disconnect_stores_partial_trace(tmp_path, monkey
         b'data: {"choices":[{"index":0,"delta":{"content":"partial"}}]}\n\n'
     )
     request = httpx.Request("POST", context.url)
-    response = httpx.Response(200, stream=body, request=request)
+    response = httpx.Response(
+        200, headers={"content-type": "text/event-stream"}, stream=body, request=request
+    )
     client = _StaticAsyncClient()
     stream = traces._stream_response(client=client, upstream_response=response, context=context)
     chunks: list[bytes] = []
@@ -422,7 +424,12 @@ async def test_streaming_upstream_interruption_records_partial_trace(tmp_path, m
         [b'data: {"choices":[{"index":0,"delta":{"content":"partial"}}]}\n\n'],
         error=httpx.ReadError("broken stream"),
     )
-    response = httpx.Response(200, stream=body, request=httpx.Request("POST", context.url))
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        stream=body,
+        request=httpx.Request("POST", context.url),
+    )
     client = _StaticAsyncClient()
     stream = traces._stream_response(client=client, upstream_response=response, context=context)
 
@@ -1387,3 +1394,107 @@ def test_existing_database_is_upgraded_with_trace_tables(tmp_path, monkeypatch) 
     assert "input_payload" in span_columns
     assert "output_payload" in span_columns
     assert "otel_span_id" not in span_columns
+
+
+def test_a_successful_non_sse_stream_keeps_its_body_and_content_type(
+    trace_api, monkeypatch
+) -> None:
+    """A 2xx body that is not an event stream is still not an event stream. Classifying by STATUS
+    called a 200 gateway envelope a stream: the caller got `text/event-stream` for JSON their SSE
+    reader discards as malformed, and the accumulator parsed it for deltas that never arrive, so
+    the trace stored None where the response bytes belong."""
+    envelope = b'{"error": {"message": "upstream gateway: quota exhausted"}}'
+
+    class _JsonStreamingClient(_StreamingAsyncClient):
+        requests: ClassVar[list[dict]] = []
+        body = _StreamingBody([envelope])
+
+        async def send(self, request, *, stream) -> httpx.Response:
+            assert stream is True
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                stream=type(self).body,
+                request=request,
+            )
+
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _JsonStreamingClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.content == envelope
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["output_payload"] == {"error": {"message": "upstream gateway: quota exhausted"}}
+
+
+def test_the_export_budget_counts_encoded_bytes_not_characters() -> None:
+    """`ensure_ascii=False` keeps non-ASCII text as itself, so one character can be up to four
+    UTF-8 bytes on the wire. Counting characters let an emoji-heavy export ship several times the
+    nominal budget -- the exact exhaustion the budget exists to prevent."""
+    record = {"input": "q", "output": "\U0001f600" * 1000}
+    encoded = json.dumps(record, ensure_ascii=False)
+
+    assert len(encoded.encode("utf-8")) > len(encoded)
+
+
+def test_an_oversized_model_name_is_bounded_before_it_is_stored(trace_api) -> None:
+    """`model` lands in two columns outside the payload bounds, and a span is stored even for a
+    failed upstream call, so an unbounded value is database growth an authenticated caller controls
+    directly without ever making a successful request."""
+    owner = db.ensure_standalone_owner()
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="huge model",
+        metadata=None,
+        spans=[TraceSpan(model="m" * 50_000, input_payload={"prompt": "q"})],
+    )
+
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert len(span["model"]) <= 500
+    assert _raw(trace_api)["records"][0]["model"] is not None
+    assert len(_raw(trace_api)["records"][0]["model"]) <= 500
+
+
+def test_a_multimodal_prompt_is_skipped_rather_than_stripped_to_its_text(trace_api) -> None:
+    """`records` rows are text in and text out. Joining only the text parts of an image prompt
+    pairs an answer that may depend entirely on the image with an input that no longer contains
+    it -- a row whose target is unreachable from its prompt, and nothing downstream can detect it.
+    Losing the example is recoverable; a silently corrupted one is not."""
+    owner = db.ensure_standalone_owner()
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="vision",
+        metadata=None,
+        spans=[
+            TraceSpan(
+                input_payload={
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "what is in this photo?"},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": "https://example.test/cat.png"},
+                                },
+                            ],
+                        }
+                    ]
+                },
+                output_payload=_reply_envelope("a cat"),
+            )
+        ],
+    )
+
+    records = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+
+    assert records["records"] == []
+    assert records["skipped"] == 1

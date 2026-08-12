@@ -26,6 +26,9 @@ _MAX_ATTRIBUTE_VALUE_LENGTH = 8_192
 _MAX_ATTRIBUTE_DEPTH = 6
 _MAX_SEQUENCE_LENGTH = 128
 _MAX_TRACE_TITLE_LENGTH = 500
+# model/provider/span-name columns. far above any real model id ("gpt-4o-2024-11-20" is 18 chars)
+# and small enough that a caller cannot grow the database through them.
+_MAX_IDENTIFIER_LENGTH = 500
 # payloads are the product, not telemetry: a recorded completion is what `traces export` turns into
 # a training row, so cutting it at the 8 KiB attribute bound would ship a truncated target with an
 # ellipsis in it and no indication the text was ever longer. they still need A bound -- an untrimmed
@@ -122,7 +125,12 @@ def store_trace(
 
     created_at = time.time()
     trace_id = str(uuid.uuid4())
-    model = next((span.model for span in spans if span.model), None)
+    # bound the identifier columns. `model` is caller-supplied and lands in TWO columns outside the
+    # payload bounds -- once per span and once on the trace -- and a span is stored even for an
+    # upstream 4xx, so an authenticated caller could grow the shared database by an unbounded
+    # amount without ever making a successful call. these are identifiers, not content: nothing
+    # legitimate approaches the limit, unlike a payload.
+    model = next((_bounded_identifier(span.model) for span in spans if span.model), None)
 
     # sanitize and serialize BEFORE taking the write lock. payloads are megabyte-scale by design
     # here, and doing this inside `BEGIN IMMEDIATE` held the single writer for the whole encode --
@@ -134,9 +142,9 @@ def store_trace(
             str(uuid.uuid4()),
             created_at,
             trace_id,
-            span.name,
-            span.provider,
-            span.model,
+            _bounded_identifier(span.name),
+            _bounded_identifier(span.provider),
+            _bounded_identifier(span.model),
             span.duration_ms,
             span.input_tokens,
             span.output_tokens,
@@ -246,7 +254,10 @@ def export_traces(
             # can only overshoot by one row. a record is bounded by the payload caps, so that
             # overshoot is bounded too -- whereas refusing a too-large first record would return an
             # empty export the CLI reports as "no exportable traces".
-            remaining_bytes -= len(json.dumps(record, ensure_ascii=False))
+            # encoded LENGTH, not character count: `ensure_ascii=False` keeps non-ASCII text as
+            # itself, so one counted character can be up to four UTF-8 bytes on the wire. Counting
+            # characters let an emoji-heavy export ship several times the nominal budget.
+            remaining_bytes -= len(json.dumps(record, ensure_ascii=False).encode("utf-8"))
             if remaining_bytes <= 0:
                 truncated = True
                 break
@@ -367,15 +378,26 @@ def _chat_reply(payload: Any) -> str | None:
 
 
 def _message_text(content: Any) -> str | None:
+    """The text of a message's content, or None when it cannot be represented as text.
+
+    A content list holding a non-text part -- `image_url`, `input_audio`, a file -- returns None
+    rather than the text of the remaining parts. `records` rows are text in and text out, so
+    joining only the text would pair an answer that may depend entirely on the image with a prompt
+    that no longer contains it: a row whose target is unreachable from its input. Skipping the
+    example loses one row; keeping it corrupts the dataset in a way nothing downstream can detect.
+    """
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
         return None
-    parts = [
-        part.get("text")
-        for part in content
-        if isinstance(part, dict) and isinstance(part.get("text"), str)
-    ]
+    parts: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            return None
+        text = part.get("text")
+        if not isinstance(text, str):
+            return None
+        parts.append(text)
     return "".join(parts) if parts else None
 
 
@@ -407,3 +429,12 @@ def _json_load(value: str | None) -> Any:
 
 def _truncate(value: str, limit: int) -> str:
     return value if len(value) <= limit else f"{value[: limit - 3]}..."
+
+
+def _bounded_identifier(value: str | None) -> str | None:
+    """Bound a caller-supplied identifier column (model, provider, span name).
+
+    These sit outside the payload bounds and are stored even for a failed call, so an unbounded
+    value is database growth an authenticated caller controls directly.
+    """
+    return None if value is None else _truncate(str(value), _MAX_IDENTIFIER_LENGTH)
