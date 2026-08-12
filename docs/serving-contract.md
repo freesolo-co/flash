@@ -50,6 +50,10 @@ Compare the key in constant time (`hmac.compare_digest`). Reject with 401 when i
 `GET /healthz` returns a JSON object with a `capabilities` list. The client reads it before every
 deploy and refuses to proceed unless the required strings are present.
 
+It must be a **JSON array of strings**. An object mapping capability names to booleans carries the
+same information but is rejected: the client requires a list and raises
+`serving_contract_unsupported` on anything else, so every deploy fails before it starts.
+
 | capability                                | status    | what it promises                                               |
 | ----------------------------------------- | --------- | -------------------------------------------------------------- |
 | `immutable_adapter_revisions`             | required  | one revision id maps to exactly one artifact, forever          |
@@ -89,9 +93,13 @@ container that blocks health on a multi-minute weight load reads as an unreachab
 `requires_key` is optional and reports whether the backend authenticates writes at all - not
 whether the caller's own key is correct. `flash serve status` reads it to decide whether to verify
 the key: when it is `true`, status follows up with an authenticated `GET /adapters/{unknown-id}`
-and treats `401` as a misconfigured key. Health itself may stay unauthenticated (the generated app
-leaves it open so a cold backend is still diagnosable), which is exactly why status cannot conclude
-anything about the key from this endpoint alone.
+and treats `401` or `403` as a misconfigured key. Health itself may stay unauthenticated (the
+generated app leaves it open so a cold backend is still diagnosable), which is exactly why status
+cannot conclude anything about the key from this endpoint alone.
+
+Either rejection code is accepted, so a backend that answers `403` on a bad key is diagnosed
+correctly rather than reported as ready. `404` for the unknown id is the expected answer from an
+accepted key.
 
 ### `POST /adapters`
 
@@ -260,6 +268,12 @@ Disables the alias and every revision under it. Returns:
 `run_id` must match what was requested, and both lists must be lists of strings. `404` for an
 unknown run is normal - the client maps it to "nothing to undeploy", not an error.
 
+The response is a report, not the state change itself. The client performs no read-back, so a
+backend that returns these lists without disabling anything makes `flash models undeploy` report
+success over a run that keeps serving and keeps billing. After this call the alias and every
+revision it named must read back `disabled` (or be gone), and chat through the alias must stop
+succeeding.
+
 Disabling is a state change on the record, not necessarily an engine eviction. The contract is that
 the alias stops resolving; reclaiming GPU memory is your implementation's business.
 
@@ -305,6 +319,13 @@ error as `{"detail": {...}}` does not match, and the retry silently never happen
 `tests/serving_conformance/` runs this document against a live backend. It registers a revision,
 waits for `ready`, activates it, chats through the alias, checks that a stale compare-and-swap is
 rejected and that a mutated re-registration conflicts, then undeploys.
+
+Four of its checks go past the happy path, because those are the ones a plausible-looking backend
+fails: it re-registers under one revision id with **each** identity-bearing field changed in turn
+(not just `subfolder`), activates two revisions of one run **concurrently** and requires exactly
+one winner, **reads back** the records after undeploy rather than trusting the response, and drives
+a `structured_outputs` registration through to a real completion and matches the output against the
+grammar.
 
 The adapter it registers is real and must exist - point it at one your backend can load:
 

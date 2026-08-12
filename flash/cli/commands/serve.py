@@ -494,10 +494,10 @@ def cmd_serve_status(args) -> int:
     # That is the exact misconfiguration an operator runs this command to diagnose, so the key has
     # to be exercised against a route that actually checks it.
     #
-    # A GET of an id that cannot exist: authentication runs before the record read, so a wrong key
-    # is 401 and a right key is 404. Read-only and side-effect free either way, which registering
-    # something would not be. Only when the backend says it authenticates at all -- against one
-    # that does not, every key is accepted and there is nothing to verify.
+    # A GET of an id that cannot exist: authentication runs before the record read, so a rejected
+    # key is 401/403 and an accepted one is 404. Read-only and side-effect free either way, which
+    # registering something would not be. Only when the backend says it authenticates at all --
+    # against one that does not, every key is accepted and there is nothing to verify.
     if payload.get("requires_key") is True:
         import urllib.error
 
@@ -505,16 +505,31 @@ def cmd_serve_status(args) -> int:
         try:
             _status_request(base, internal_key_header(), f"/adapters/{probe}")
         except urllib.error.HTTPError as exc:
-            if exc.code == 401:
+            # BOTH rejection codes. The generated app answers 401, but the contract is written for
+            # any backend, and the conformance suite accepts 401 or 403 as a valid rejection -- so
+            # recognizing only 401 here reports `ready` against a backend the suite would pass and
+            # the very next deploy would fail on.
+            if exc.code in (401, 403):
                 print(
-                    f"\nthe backend at {shown} rejected the serving key (401). set "
+                    f"\nthe backend at {shown} rejected the serving key ({exc.code}). set "
                     f"FREESOLO_INTERNAL_KEY to the value of the app's FLASH_SERVING_KEY secret; "
                     f"deploys will fail until it matches.",
                     file=sys.stderr,
                 )
                 return 1
-            # Any other status means the key was ACCEPTED and the request got past
-            # authentication -- 404 for this made-up id is the expected answer. Nothing to report.
+            # 5xx is the backend failing, not the key being wrong. Either way the operator cannot
+            # deploy, and `ready` would be a false green -- so report it rather than swallow it.
+            if exc.code >= 500:
+                print(
+                    f"\nthe backend at {shown} returned {exc.code} when the serving key was "
+                    f"checked, so the key could not be verified. check the app's logs before "
+                    f"deploying.",
+                    file=sys.stderr,
+                )
+                return 1
+            # 404 for this made-up id is the expected answer and proves the key got past
+            # authentication. Any other 4xx is the backend answering on its own terms, not a
+            # rejection of the key. Nothing to report.
         except Exception as exc:
             # The backend answered /healthz a moment ago, so a transport failure here is a real
             # inconsistency worth surfacing rather than swallowing. Reported without claiming to

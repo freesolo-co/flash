@@ -708,13 +708,20 @@ def test_setup_defaults_are_safe():
     assert args.dry_run is False
 
 
-def test_status_verifies_the_serving_key_against_an_authenticated_route(monkeypatch, capsys):
-    """A wrong key must not read as `ready`.
+@pytest.mark.parametrize("status_code", [401, 403])
+def test_status_verifies_the_serving_key_against_an_authenticated_route(
+    monkeypatch, capsys, status_code
+):
+    """A wrong key must not read as `ready`, whichever rejection code the backend uses.
 
     /healthz is deliberately unauthenticated, so a missing or mismatched key sails through every
     check the command makes and it prints `ready` -- then the very next `models deploy` 401s on
     /adapters. That is the exact misconfiguration an operator runs `serve status` to diagnose, so
     the key has to be exercised against a route that actually checks it.
+
+    BOTH codes, because the contract is written for any backend, not just the generated app. The
+    conformance suite accepts 401 or 403 as a valid rejection, so recognizing only 401 here would
+    report `ready` against a backend that suite would certify and every deploy would then fail on.
     """
     import urllib.error
 
@@ -731,7 +738,7 @@ def test_status_verifies_the_serving_key_against_an_authenticated_route(monkeypa
                 "base_models": ["Qwen/Qwen3.5-4B"],
                 "capabilities": ["immutable_adapter_revisions", "alias_compare_and_swap"],
             }
-        raise urllib.error.HTTPError(url, 401, "invalid serving key", {}, None)
+        raise urllib.error.HTTPError(url, status_code, "invalid serving key", {}, None)
 
     monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "wrong")
@@ -740,17 +747,49 @@ def test_status_verifies_the_serving_key_against_an_authenticated_route(monkeypa
     code = serve_cmd.cmd_serve_status(_args())
     out = capsys.readouterr()
     assert code == 1, (
-        "status reported success against a backend that rejects the key, so the next deploy 401s "
-        "on a backend this command just called ready"
+        f"status reported success against a backend that rejects the key with {status_code}, so "
+        f"the next deploy fails on a backend this command just called ready"
     )
     assert "ready. deploy a run" not in out.out
-    assert "401" in out.err, f"the failure did not name the status it got: {out.err!r}"
+    assert str(status_code) in out.err, f"the failure did not name the status it got: {out.err!r}"
     assert "FREESOLO_INTERNAL_KEY" in out.err, (
         f"the failure did not name the variable to fix: {out.err!r}"
     )
     assert any(p != "/healthz" for p in asked), (
         "only /healthz was probed, which is unauthenticated -- nothing exercised the key"
     )
+
+
+def test_status_does_not_report_ready_when_the_key_probe_errors(monkeypatch, capsys):
+    """A 5xx on the probe means the key was never verified, which is not `ready`.
+
+    The backend answered /healthz a moment ago and then failed the authenticated call, so the
+    operator cannot deploy either way -- and treating "not a 401" as "the key was accepted" turns
+    a broken backend into a green status.
+    """
+    import urllib.error
+
+    from flash.serve import urls as urls_mod
+
+    def _fake_request(url, headers, path="/healthz"):
+        if path == "/healthz":
+            return {
+                "ok": True,
+                "requires_key": True,
+                "base_models": ["Qwen/Qwen3.5-4B"],
+                "capabilities": ["immutable_adapter_revisions", "alias_compare_and_swap"],
+            }
+        raise urllib.error.HTTPError(url, 500, "internal server error", {}, None)
+
+    monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "some-key")
+    monkeypatch.setattr(serve_cmd, "_status_request", _fake_request)
+
+    code = serve_cmd.cmd_serve_status(_args())
+    out = capsys.readouterr()
+    assert code == 1, "a 500 on the key probe was reported as ready"
+    assert "ready. deploy a run" not in out.out
+    assert "500" in out.err, f"the failure did not name the status it got: {out.err!r}"
 
 
 def test_status_reports_ready_when_the_serving_key_is_accepted(monkeypatch, capsys):

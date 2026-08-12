@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
 import time
 
 import pytest
@@ -47,6 +48,27 @@ PROVENANCE_FIELDS = ("record_type", "run_id", "checkpoint_step", "hf_revision")
 
 # Any nonempty value works: the contract is that whatever was sent comes back unchanged.
 CONFORMANCE_ORG_ID = "conformance-org"
+
+# One mutation per identity-bearing field CLASS, each changing something the client compares on
+# read-back. A backend that pins only the artifact path passes a subfolder-only check while still
+# letting a revision id resolve to different weights, rendering, tenancy, or grammar.
+#
+# `adapter_id` is deliberately absent: changing it is a DIFFERENT revision, not a mutation of this
+# one. The provenance fields are covered by their own test, which asserts the stronger property
+# that they must agree with the id itself.
+_MUTATIONS = {
+    "repo_id": lambda body: {**body, "repo_id": body["repo_id"] + "-other"},
+    "repo_type": lambda body: {
+        **body,
+        "repo_type": "dataset" if body.get("repo_type") == "model" else "model",
+    },
+    "subfolder": lambda body: {**body, "subfolder": body["subfolder"].rstrip("/") + "-other"},
+    "base_model": lambda body: {**body, "base_model": body["base_model"] + "-other"},
+    "checkpoint": lambda body: {**body, "checkpoint": str(body["checkpoint"]) + "-other"},
+    "thinking": lambda body: {**body, "thinking": not body.get("thinking")},
+    "org_id": lambda body: {**body, "org_id": str(body.get("org_id") or "") + "-other"},
+    "structured_outputs": lambda body: {**body, "structured_outputs": {"regex": r"[xy]+"}},
+}
 
 
 def _record(payload: object) -> dict:
@@ -141,13 +163,30 @@ def _activate(http, revision: str, expected: str | None):
 
 
 def test_healthz_advertises_the_required_capabilities(http):
-    """The client reads this before every deploy and refuses to proceed without both strings."""
+    """The client reads this before every deploy and refuses to proceed without both strings.
+
+    The WIRE SHAPE is asserted before the contents. `set()` accepts any iterable, so a backend that
+    returns `capabilities` as an object mapping names to booleans -- or as a bare string -- yields
+    the right names here and passes, while the client's own parse
+    (`flash/serve/deploy.py`: `isinstance(capabilities, list)` then every element a `str`) raises
+    `serving_contract_unsupported` and refuses every deploy. A green suite has to mean the client
+    accepts the payload, not just that the names appear somewhere in it.
+    """
     response = http.get("/healthz")
     assert response.status_code == 200, f"/healthz returned {response.status_code}"
     payload = response.json()
     assert isinstance(payload, dict), "/healthz must return a JSON object"
-    capabilities = set(payload.get("capabilities") or [])
-    missing = REQUIRED_CAPABILITIES - capabilities
+    capabilities = payload.get("capabilities")
+    assert isinstance(capabilities, list), (
+        f"/healthz returned capabilities as {type(capabilities).__name__}, not a list; the client "
+        f"requires a list of strings and refuses the deploy on anything else"
+    )
+    non_strings = [item for item in capabilities if not isinstance(item, str)]
+    assert not non_strings, (
+        f"/healthz capabilities contains non-string entries {non_strings!r}; the client requires "
+        f"every element to be a string"
+    )
+    missing = REQUIRED_CAPABILITIES - set(capabilities)
     assert not missing, f"/healthz does not advertise {sorted(missing)}; deploys will be refused"
 
 
@@ -179,8 +218,10 @@ def test_readback_echoes_the_identity_the_client_cross_checks(http, deployed):
         )
 
 
-def test_a_constrained_registration_is_echoed_back_unchanged(http, adapter_source, run_id):
-    """`structured_outputs` must survive the round trip byte for byte.
+def test_a_constrained_registration_serves_a_constrained_completion(
+    http, adapter_source, run_id, ready_timeout
+):
+    """`structured_outputs` must survive the round trip byte for byte AND reach generation.
 
     The client compares it exactly (`flash/serve/deploy.py`, alongside the scalar identity fields),
     and it is the one identity-bearing field that is OPTIONAL -- so a backend can accept the
@@ -188,6 +229,11 @@ def test_a_constrained_registration_is_echoed_back_unchanged(http, adapter_sourc
     without one, which means a suite that stops at those would certify a backend that fails every
     constrained deploy: `_wait_revision_ready` reads the constraint back as `None`, calls that a
     different artifact, and refuses. Constrained runs are ordinary, not an edge case.
+
+    Driven all the way through GENERATION, not just read back. Echoing the field costs a backend
+    nothing; the failure this catches is a constraint that is accepted and stored but never handed
+    to the engine, or one the engine rejects at load time so the revision settles `failed` -- and
+    reading the record immediately after an asynchronous registration sees neither.
     """
     body = {
         **_registration(run_id, adapter_source),
@@ -201,6 +247,32 @@ def test_a_constrained_registration_is_echoed_back_unchanged(http, adapter_sourc
             f"{body['structured_outputs']!r}. The client compares this exactly, so every "
             f"constrained deploy against this backend will be refused as a different artifact."
         )
+        # Reaching `ready` is itself the assertion for the load-time rejection case: a constraint
+        # the engine will not accept settles the revision `failed`, and `_wait_ready` fails on it.
+        _wait_ready(http, body["adapter_id"], ready_timeout)
+        assert _activate(http, body["adapter_id"], None).status_code == 200
+
+        response = http.post(
+            "/v1/chat/completions",
+            json={
+                "model": run_id,
+                "messages": [{"role": "user", "content": "Answer with letters only."}],
+                "max_tokens": 16,
+                "temperature": 0.0,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+        assert response.status_code == 200, (
+            f"chat on a constrained revision returned {response.status_code}: {response.text[:400]}"
+        )
+        content = (response.json().get("choices") or [{}])[0].get("message", {}).get(
+            "content"
+        ) or ""
+        assert re.fullmatch(r"[ab]+", content.strip()), (
+            f"the revision registered a structured_outputs regex of [ab]+ but generated "
+            f"{content.strip()[:120]!r}; the constraint was accepted and stored but never applied "
+            f"at generation, so every constrained deploy produces unconstrained output"
+        )
     finally:
         http.delete(f"/adapters/{run_id}")
 
@@ -210,13 +282,25 @@ def test_reregistering_identical_content_is_idempotent(http, deployed):
     _register(http, deployed)
 
 
-def test_reregistering_different_content_under_one_revision_conflicts(http, deployed):
-    """This IS `immutable_adapter_revisions`: one revision id, exactly one artifact, forever."""
-    mutated = {**deployed, "subfolder": deployed["subfolder"].rstrip("/") + "-other"}
+@pytest.mark.parametrize("field", sorted(_MUTATIONS))
+def test_reregistering_different_content_under_one_revision_conflicts(http, deployed, field):
+    """This IS `immutable_adapter_revisions`: one revision id, exactly one artifact, forever.
+
+    Every identity-bearing field class, not just `subfolder`. The client compares all of these on
+    its 5xx-recovery read-back and treats any difference as a different artifact, so a backend that
+    pins only the path still lets one revision id resolve to different weights (`repo_id`),
+    different artifact kind (`repo_type`), different prompt rendering (`thinking`), different
+    tenancy (`org_id`), a different grammar (`structured_outputs`), or different provenance -- and
+    an ambiguous registration retry then silently changes what the id names.
+    """
+    mutated = _MUTATIONS[field](deployed)
+    assert mutated != deployed, f"mutation for {field} did not change the registration body"
     response = http.post("/adapters", json=mutated)
-    assert response.status_code == 409, (
-        f"mutated re-registration returned {response.status_code}, expected 409; the backend "
-        "advertises immutable_adapter_revisions but lets a revision id change artifact"
+    assert response.status_code in (409, 422), (
+        f"re-registering {deployed['adapter_id']} with a different {field} returned "
+        f"{response.status_code}, expected 409 (or 422 when the field is pinned to the revision "
+        f"id); the backend advertises immutable_adapter_revisions but lets a revision id change "
+        f"artifact"
     )
 
 
@@ -274,6 +358,70 @@ def test_a_stale_compare_and_swap_is_rejected(http, deployed):
     )
 
 
+def test_concurrent_activations_of_one_alias_leave_exactly_one_winner(
+    http, serving_url, internal_key, adapter_source, run_id, ready_timeout
+):
+    """`alias_compare_and_swap` is an ATOMICITY claim, and only concurrency can test it.
+
+    The sequential test above returns 200 then 409 against an unlocked read/check/write too: the
+    second call simply observes the first call's result. Two SIMULTANEOUS deploys of one run are
+    the case that matters -- both read `None`, both find their expectation satisfied, both write,
+    and one silently overwrites the other while reporting success. That is exactly the race the
+    capability promises cannot happen.
+
+    Not a proof of atomicity (no finite number of attempts is), but it fails a backend whose
+    activation holds no lock often enough to be worth running, and it cannot false-fail a correct
+    one: exactly one winner is the contract.
+    """
+    import concurrent.futures
+
+    import httpx
+
+    first = _registration(run_id, adapter_source, step=10)
+    second = _registration(run_id, adapter_source, step=20)
+    try:
+        for body in (first, second):
+            _register(http, body)
+            _wait_ready(http, body["adapter_id"], ready_timeout)
+
+        headers = {"X-Freesolo-Internal-Key": internal_key} if internal_key else {}
+
+        def activate(revision: str) -> int:
+            with httpx.Client(base_url=serving_url, timeout=60.0, headers=headers) as client:
+                response = client.post(
+                    f"/adapters/{revision}/activate",
+                    json={"expected_adapter_revision": None},
+                )
+                return response.status_code
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            codes = list(
+                pool.map(activate, (first["adapter_id"], second["adapter_id"])),
+            )
+
+        winners = [code for code in codes if code == 200]
+        assert len(winners) == 1, (
+            f"two concurrent activations of {run_id} with the same expectation returned {codes}; "
+            f"exactly one must win. more than one success means the compare-and-swap is not "
+            f"atomic and two deploys can silently overwrite each other"
+        )
+        losers = [code for code in codes if code != 200]
+        assert all(code == 409 for code in losers), (
+            f"the losing concurrent activation returned {losers}, expected 409"
+        )
+
+        # The winner is what the alias actually points at -- a backend could return one 200 and one
+        # 409 while landing the loser's write.
+        alias = _record(http.get(f"/adapters/{run_id}").json())
+        metadata = alias.get("metadata") if isinstance(alias.get("metadata"), dict) else {}
+        assert metadata.get("alias_of") in (first["adapter_id"], second["adapter_id"]), (
+            f"after the race the alias points at {metadata.get('alias_of')!r}, which is neither "
+            f"revision that was activated"
+        )
+    finally:
+        http.delete(f"/adapters/{run_id}")
+
+
 def test_chat_resolves_the_alias_to_its_immutable_revision(http, deployed):
     """Users chat with a run id; the weights must come from the revision it currently targets."""
     run = deployed["metadata"]["run_id"]
@@ -297,6 +445,37 @@ def test_chat_resolves_the_alias_to_its_immutable_revision(http, deployed):
     assert choices, "chat returned no choices"
     assert isinstance(choices[0].get("message", {}).get("content"), str)
 
+    # The provenance is the POINT of this test: it is what proves the alias resolved to the
+    # revision it names rather than to whatever the engine happened to have loaded. Validating only
+    # the content certifies a backend that answers from the wrong weights -- and the deployment
+    # smoke (`flash/server/routes/serving_smoke.py`) rejects a missing or mismatched value in both
+    # the body and the headers, so every deploy against such a backend fails after generation.
+    revision = deployed["adapter_id"]
+    expected = {
+        "adapter_revision": revision,
+        "checkpoint": deployed["checkpoint"],
+        "hf_revision": revision.rsplit(".", 1)[-1],
+    }
+    provenance = payload.get("freesolo")
+    assert isinstance(provenance, dict), (
+        f"chat response omitted the `freesolo` provenance object (got {provenance!r}); the "
+        f"deployment smoke requires it and fails the deploy without it"
+    )
+    for field, value in expected.items():
+        assert provenance.get(field) == value, (
+            f"chat provenance {field}={provenance.get(field)!r}, expected {value!r}; the response "
+            f"does not prove it came from the revision the alias names"
+        )
+    for header, value in (
+        ("X-Freesolo-Adapter-Revision", expected["adapter_revision"]),
+        ("X-Freesolo-Checkpoint", expected["checkpoint"]),
+        ("X-Freesolo-HF-Revision", expected["hf_revision"]),
+    ):
+        assert response.headers.get(header) == value, (
+            f"chat response header {header}={response.headers.get(header)!r}, expected {value!r}; "
+            f"the deployment smoke compares all three headers and fails the deploy on a mismatch"
+        )
+
 
 def test_undeploy_disables_the_alias_and_its_revisions(http, adapter_source, run_id, ready_timeout):
     """Not using the `deployed` fixture: this test IS the teardown, so it owns the whole run."""
@@ -317,6 +496,38 @@ def test_undeploy_disables_the_alias_and_its_revisions(http, adapter_source, run
         )
     assert run_id in payload["disabled_aliases"]
     assert body["adapter_id"] in payload["disabled_revisions"]
+
+    # READ BACK, do not trust the response. A DELETE that returns the requested run and a
+    # fabricated pair of lists satisfies every assertion above while the alias and revision stay
+    # ready and callable -- and the shipped client performs no read-back of its own, so
+    # `flash models undeploy` would report success over a run that keeps serving and keeps
+    # billing. The authoritative state is what the backend answers on the next read.
+    for record_id in (run_id, body["adapter_id"]):
+        response = http.get(f"/adapters/{record_id}")
+        if response.status_code == 404:
+            continue  # deleting the record outright is a valid way to disable it
+        assert response.status_code == 200, (
+            f"read-back of {record_id} after undeploy returned {response.status_code}"
+        )
+        record = _record(response.json())
+        state = _lifecycle_state(record)
+        assert record.get("status") == "disabled" or state in ("disabled", "failed"), (
+            f"after undeploy, {record_id} still reads back status={record.get('status')!r} "
+            f"lifecycle_state={state!r}; undeploy reported success without disabling it, so the "
+            f"run keeps serving and keeps costing money"
+        )
+
+    chat = http.post(
+        "/v1/chat/completions",
+        json={
+            "model": run_id,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8,
+        },
+    )
+    assert chat.status_code != 200, (
+        "chat still succeeds after undeploy; the alias was reported disabled but is live"
+    )
 
 
 def test_provenance_contradicting_the_revision_id_is_refused(http, adapter_source, run_id):
