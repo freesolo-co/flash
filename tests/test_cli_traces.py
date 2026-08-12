@@ -426,6 +426,39 @@ def test_env_setup_can_start_from_a_projects_traces(
     assert "exported 2 rows from your traces" in capsys.readouterr().out
 
 
+def test_env_setup_says_when_the_scaffolded_traces_are_only_the_newest(
+    fake_traces, monkeypatch, tmp_path, capsys
+) -> None:
+    """The export reads a bounded window -- newest-traces cap, response byte budget -- so a large
+    project comes back cut short. `traces export` says so; scaffolding a dataset silently would let
+    someone train on a partial project believing it held everything they had recorded."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(env_setup, "_setup_interactive", lambda args: True)
+    monkeypatch.setattr(
+        traces,
+        "export_trace_records",
+        lambda project_id, api_key, base_url=None, limit=None, export_format=None: {
+            "records": _RECORDS,
+            "traces": 2,
+            "skipped": 0,
+            "format": "records",
+            "truncated": True,
+        },
+    )
+
+    def fake_select(title, options, default=0):
+        return options[0][0] if title.startswith("Use this project") else options[default][0]
+
+    monkeypatch.setattr(env_setup.render, "select", fake_select)
+
+    assert cli.main(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
+
+    captured = capsys.readouterr()
+    assert "exported 2 rows from your traces" in captured.out
+    assert "newest" in captured.err
+    assert "traces export" in captured.err
+
+
 def test_env_setup_scaffolds_starter_rows_when_declined(fake_traces, monkeypatch, tmp_path) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(env_setup, "_setup_interactive", lambda args: True)

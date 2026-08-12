@@ -566,6 +566,14 @@ def _traces_dataset(args, project_id: str) -> str | None:
     skipped = int(exported.get("skipped") or 0)
     detail = f" ({skipped} skipped)" if skipped else ""
     print(render.ok(f"exported {len(records)} rows from your traces{detail}"))
+    # the export reads a bounded window -- newest-traces cap and response byte budget -- so a large
+    # project comes back cut short. `traces export` says so; scaffolding a dataset silently would
+    # let someone train on a partial project believing it was the whole one.
+    if exported.get("truncated"):
+        _warn(
+            f"{project_id} holds more traces than one export can read, so these are the newest "
+            f"rows only. Run `{CLI_NAME} traces export` to page through the rest"
+        )
     return traces.records_to_jsonl(records)
 
 
