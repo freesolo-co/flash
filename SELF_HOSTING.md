@@ -36,15 +36,23 @@ export RUNPOD_API_KEY=...              # or LAMBDA_API_KEY, or VAST_API_KEY
 flash-server --host 0.0.0.0 --port 8080
 ```
 
-`flash env test` and `flash env eval` run a scaffolded environment **locally**, so they need the
-`freesolo` SDK in the interpreter you run them from. The `[server]` extra above already includes it.
-The bare `pip install freesolo-flash` does not - it is client-only and pulls nothing - so on a
-machine where you author environments without the server extra, validation fails with
-`ModuleNotFoundError: No module named 'freesolo'` until you add it:
+`flash env test` runs a scaffolded environment **locally**, so it needs the `freesolo` SDK in the
+interpreter that loads your `environment.py`. The `[server]` extra above already includes it. The
+bare `pip install freesolo-flash` does not - it is client-only and pulls nothing - so on a machine
+where you author environments without the server extra, validation fails until you add it:
 
 ```bash
-pip install freesolo   # only if you did NOT install the [server] extra
+pip install freesolo                            # same interpreter as the CLI
+uv tool install freesolo-flash --with freesolo  # isolated tool venv: inject it there instead
 ```
+
+The second form matters if you installed the CLI with `uv tool` or `pipx`: the `flash` executable
+then lives in its own venv, and a plain `pip install freesolo` lands in your shell's interpreter
+instead - `python -c "import freesolo"` works while `flash env test` still fails.
+
+(`flash env eval` is not local in this sense. It evaluates a run against a **published** hub
+environment and refuses a generic `github:` ref outright, which is the only kind a standalone plane
+accepts - so installing the SDK does not make it usable self-hosted.)
 
 The `server` extra pulls in `runpod-flash`, which declares its own `flash` console script.
 Whichever distribution installs last wins, so on a plane host the bare `flash` command may launch
