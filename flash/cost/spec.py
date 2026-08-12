@@ -94,16 +94,21 @@ def _rollout_profile(spec):
 
 
 def _on_policy_example_count(spec) -> int:
-    """Retained prompts the run will iterate, from the only two places that state a row count.
+    """Retained prompts the run will iterate, from the one field that states a row count.
 
-    Deliberately NOT ``min()`` of the two caps. ``[train] max_examples`` is a validated ``TrainSpec``
-    field the worker enforces unconditionally as ``train[:max_examples]``, so it is a real ceiling on
-    the retained pool. ``[environment.params] max_examples`` is not a flash contract at all: params
-    are opaque kwargs forwarded to the user's own environment factory, and neither flash nor the
-    freesolo sdk applies the name to a dataset. An environment free to ignore it can return every
-    row while the key says 2, and since a completed run is billed from this persisted quote, taking
-    the smaller value would underquote real training. The train cap can overquote when the
-    environment returns fewer rows, which is the safe direction.
+    Only ``[train] max_examples`` counts. It is a validated ``TrainSpec`` field the worker enforces
+    unconditionally as ``train[:max_examples]`` (rl/inputs.py:195, opd_train_runner.py:166), so it
+    is a real ceiling on the retained pool.
+
+    ``[environment.params] max_examples`` is deliberately NOT read, in either direction. It is not a
+    flash contract: params are opaque kwargs forwarded to the user's own environment factory, and
+    neither flash nor the freesolo sdk applies the name to a dataset -- the starter templates
+    swallow it into ``**kwargs`` and ignore it. Whether the run honours it is therefore unknowable
+    here, and the value is wrong BOTH ways for a spec that states nothing else. Against
+    ``prompts_per_step = 128`` and an env-params cap of 2: an environment that honours it trains 2
+    prompts, so pricing an uncapped 128-prompt step overcharges 64x; one that ignores it yields
+    every row, so deriving a 1-step horizon from the 2 underquotes a 1153-row pool 10x. A number
+    nothing enforces cannot bound a price in either direction, so it is not evidence of a horizon.
 
     Falling back to one step's worth of prompts is what this raises instead of. The worker sizes
     the horizon from ``len(prompts)`` -- every row the environment yields -- so a pool the config
@@ -114,35 +119,10 @@ def _on_policy_example_count(spec) -> int:
     pinned_examples = int(spec.train.max_examples) if spec.train.max_examples else 0
     if pinned_examples > 0:
         return pinned_examples
-    env_examples = _env_max_examples(spec)
-    if env_examples > 0:
-        return env_examples
-    # only [train] max_examples is named here. [environment.params] max_examples is still READ
-    # above, because an environment that honours it really does bound the pool -- but it reaches
-    # the environment as an opaque `load_environment(**params)` kwarg, and the starter templates
-    # swallow it into **kwargs and ignore it. Only [train] max_examples is applied by the worker
-    # itself (rl/inputs.py:195, opd_train_runner.py:166), so it is the one this can promise.
     raise UnknownPromptPoolSize(
         f"cannot price {spec.algorithm} without a prompt-pool size: set [train] max_examples to "
         "the row count the run will train on, or [train] max_steps to state the horizon directly"
     )
-
-
-def _env_max_examples(spec) -> int:
-    params = getattr(getattr(spec, "environment", None), "params", {}) or {}
-    if not isinstance(params, dict):
-        return 0
-    try:
-        value = int(params.get("max_examples") or 0)
-    except (TypeError, ValueError, OverflowError):
-        # OverflowError is the one that is easy to miss: `int(nan)` raises ValueError but
-        # `int(inf)` raises OverflowError, and `max_examples = inf` is valid toml an environment
-        # may well use to mean "uncapped". params are opaque kwargs flash does not define, so
-        # anything unreadable here means "no cap I can price", never a reason to abort. this
-        # feeds an advisory warning that runs before `create_run`, so raising would turn a
-        # courtesy line into a submit-blocking traceback.
-        return 0
-    return max(0, value)
 
 
 def _on_policy_requested_prompts_per_step(spec) -> int:
@@ -168,21 +148,20 @@ def _rollout_batch_for_quote(spec) -> int:
     against the capped batch -- so without this one quote mixes a capped step COUNT with an uncapped
     per-step PRICE.
 
-    Only ``[train] max_examples`` caps here, NOT the pool size ``_on_policy_example_count`` reports.
-    That one also accepts ``[environment.params] max_examples``, which is an opaque kwarg forwarded
-    to the user's environment factory that neither worker applies -- an environment free to ignore
-    it can yield every row and really train the full batch. Capping the price by a number nothing
-    enforces underquotes the run, and the run is billed from this estimate. The step COUNT may still
-    read it, because overstating the pool there is the safe direction; understating the batch is not.
+    The cap is the pool ``_on_policy_example_count`` reports, which is exactly the enforced
+    ``[train] max_examples`` -- the only row count anything applies. It deliberately does not read
+    ``[environment.params] max_examples`` (see there), so capping against it here cannot price a
+    batch by a number nothing enforces.
 
     A pool size is not always knowable, and that is not a pricing failure here. ``max_steps`` states
     the horizon outright, so ``spec_steps`` returns before ever asking for a row count; asking for
     one anyway would reject a fully specified run. There is nothing to cap against in that case, so
     the requested batch stands -- the same number this priced before the cap existed.
     """
-    requested = _on_policy_requested_prompts_per_step(spec)
-    enforced_cap = int(spec.train.max_examples) if spec.train.max_examples else 0
-    return min(requested, enforced_cap) if enforced_cap > 0 else requested
+    try:
+        return _on_policy_prompts_per_step(spec, _on_policy_example_count(spec))
+    except UnknownPromptPoolSize:
+        return _on_policy_requested_prompts_per_step(spec)
 
 
 def spec_steps(spec) -> int:

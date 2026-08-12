@@ -546,12 +546,14 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
     with pytest.raises(UnknownPromptPoolSize):
         runconfig_from_spec(unbounded)
 
-    # [environment.params] max_examples must NOT cap the priced batch. it is an opaque kwarg
-    # forwarded to the user's environment factory that neither worker applies, so an environment
-    # free to ignore it trains the full batch -- pricing 2 there underquotes by 64x, and the run is
-    # billed from this estimate. the step COUNT may still read it (overstating the pool is safe);
-    # understating the batch is not.
-    env_capped = JobSpec.from_dict(
+    # [environment.params] max_examples is not horizon evidence at all, so a spec stating only that
+    # is refused rather than priced from it. it is an opaque kwarg forwarded to the user's
+    # environment factory that neither worker applies, which makes it wrong in BOTH directions
+    # against `prompts_per_step = 128`: an environment that honours it trains 2 prompts, so pricing
+    # an uncapped 128-prompt step overcharges 64x, while one that ignores it yields every row, so
+    # deriving a 1-step horizon from the 2 underquotes a 1153-row pool 10x. Neither branch is a
+    # quote, and the run is billed from this estimate.
+    env_only = JobSpec.from_dict(
         {
             **base,
             "algorithm": "grpo",
@@ -563,7 +565,8 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
             "train": {"epochs": 1, "group_size": 4, "prompts_per_step": 128},
         }
     )
-    assert runconfig_from_spec(env_capped).normalized().batch_size == 128
+    with pytest.raises(UnknownPromptPoolSize):
+        runconfig_from_spec(env_only)
 
     # and when both are stated, the enforced [train] cap is the one that binds.
     both = JobSpec.from_dict(
