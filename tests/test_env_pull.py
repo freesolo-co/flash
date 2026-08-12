@@ -579,6 +579,9 @@ def test_resolve_managed_hub_env_downloads_only_requested_package(monkeypatch, t
 
     monkeypatch.setattr(adapter, "_download_github_tarball", fail_tarball)
 
+    # the walk descends one non-recursive tree per slug segment, then lists the package root
+    # recursively. the recursive listing is rooted at the ENVIRONMENT, so a sibling environment
+    # in the same project is never enumerated -- `sibling-env` below must stay unvisited.
     trees = {
         ("a" * 40, False): {
             "truncated": False,
@@ -588,26 +591,33 @@ def test_resolve_managed_hub_env_downloads_only_requested_package(monkeypatch, t
             "truncated": False,
             "tree": [{"type": "tree", "path": "my-project", "sha": "project-sha"}],
         },
-        ("project-sha", True): {
+        ("project-sha", False): {
+            "truncated": False,
+            "tree": [
+                {"type": "tree", "path": "stuff", "sha": "env-sha"},
+                {"type": "tree", "path": "sibling-env", "sha": "sibling-sha"},
+            ],
+        },
+        ("env-sha", True): {
             "truncated": False,
             "tree": [
                 {
                     "type": "blob",
-                    "path": "stuff/environment.py",
+                    "path": "environment.py",
                     "mode": "100644",
                     "size": len(b"# env\n"),
                 },
-                {"type": "tree", "path": "stuff/datasets", "sha": "datasets-sha"},
+                {"type": "tree", "path": "datasets", "sha": "datasets-sha"},
                 {
                     "type": "blob",
-                    "path": "stuff/datasets/train.jsonl",
+                    "path": "datasets/train.jsonl",
                     "mode": "100644",
                     "size": len(b'{"a":1}\n'),
                 },
-                {"type": "tree", "path": "stuff/bin", "sha": "bin-sha"},
+                {"type": "tree", "path": "bin", "sha": "bin-sha"},
                 {
                     "type": "blob",
-                    "path": "stuff/bin/run-helper",
+                    "path": "bin/run-helper",
                     "mode": "100755",
                     "size": len(b"#!/bin/sh\n"),
                 },
@@ -648,6 +658,10 @@ def test_resolve_managed_hub_env_downloads_only_requested_package(monkeypatch, t
     assert stat.S_IMODE((env_file.parent / "bin" / "run-helper").stat().st_mode) == 0o755
     assert not (env_file.parents[2] / "other-org").exists()
     assert all("other-org" not in url for url in seen_urls)
+    # a sibling environment in the same project is neither fetched nor written: the package root
+    # is the environment directory, not the project directory holding every environment.
+    assert not (env_file.parent.parent / "sibling-env").exists()
+    assert all("sibling" not in url for url in seen_urls)
 
 
 def test_explicit_environment_hub_github_ref_downloads_only_requested_package(
@@ -669,18 +683,22 @@ def test_explicit_environment_hub_github_ref_downloads_only_requested_package(
             "truncated": False,
             "tree": [{"type": "tree", "path": "my-project", "sha": "project-sha"}],
         },
-        ("project-sha", True): {
+        ("project-sha", False): {
+            "truncated": False,
+            "tree": [{"type": "tree", "path": "stuff", "sha": "env-sha"}],
+        },
+        ("env-sha", True): {
             "truncated": False,
             "tree": [
                 {
                     "type": "blob",
-                    "path": "stuff/environment.py",
+                    "path": "environment.py",
                     "mode": "100644",
                     "size": len(b"# env\n"),
                 },
                 {
                     "type": "blob",
-                    "path": "stuff/datasets/train.jsonl",
+                    "path": "datasets/train.jsonl",
                     "mode": "100644",
                     "size": len(b'{"a":1}\n'),
                 },
