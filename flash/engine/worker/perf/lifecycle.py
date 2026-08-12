@@ -75,7 +75,7 @@ def total_vram_gb() -> float | None:
         return None
 
 
-def preflight_free_vram(*, max_occupied_fraction: float = 0.25) -> None:
+def preflight_free_vram(*, max_occupied_fraction: float = 0.05) -> None:
     """Fail fast when the allocated card arrives already occupied by somebody else.
 
     Flash sizes the run, asks the provider for a card that fits, and then trains on whatever comes
@@ -95,9 +95,17 @@ def preflight_free_vram(*, max_occupied_fraction: float = 0.25) -> None:
     budget is gone -- strictly worse than the OOM this exists to prevent.
 
     Occupancy has neither failure mode: it needs no requirement, no profile, and no catalog number.
-    An empty card reads ~0 whatever is scheduled on it. The threshold is deliberately loose -- a
-    quarter of the card gone before any of our work starts is not a rounding error or a driver
-    reserve, it is another tenant.
+    An empty card reads ~0 whatever is scheduled on it, so the threshold can sit near zero rather
+    than being padded to cover a requirement it never consults. 5% is the driver's own reserve plus
+    slack; the observed dirty card was at 83%. Nothing of ours has allocated at either call site --
+    boot is before any work, and ``wait_for_gpu`` runs before the trainer starts -- so anything
+    above that floor belongs to somebody else.
+
+    The floor is low BECAUSE the check is occupancy: a loose threshold has to be justified against
+    the biggest run that could be scheduled, and a 5 GB co-tenant that leaves a 20 GB run 17.5 GB on
+    a 22.5 GB card is 22% occupied and fatal. Sizing the threshold to survive that means re-deriving
+    the requirement, which is the failure above. Refusing every card with a stranger on it needs no
+    requirement and covers the close-fitting case too.
     """
     free = free_vram_gb()
     total = total_vram_gb()
@@ -313,6 +321,12 @@ def wait_for_gpu(requested_gpu: str | None = None, *, gpu_type: str = ""):
                 torch.cuda.synchronize()
                 print(f"GPU ready after {i} retries: {torch.cuda.get_device_name(0)}")
                 verify_gpu(requested_gpu, gpu_type=gpu_type)
+                # here, not only at boot: CUDA can be unavailable when the boot probe runs, and
+                # `free_vram_gb`/`total_vram_gb` answer None for that, which is correctly treated as
+                # "no evidence" rather than as a dirty card. this is the first moment the driver is
+                # provably answering, so it is the first moment absence of evidence stops being the
+                # honest reading. cheap enough to repeat: two mem_get_info calls.
+                preflight_free_vram()
                 return True
             last = "cuda not available"
         except RetriableInfraError:

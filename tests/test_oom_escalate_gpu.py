@@ -405,9 +405,9 @@ def test_a_dirty_card_is_infra_retriable_and_never_an_oom(monkeypatch):
 @pytest.mark.parametrize(
     ("free_gb", "total_gb"),
     [
-        (22.1, 22.5),  # a clean card: only the driver's own reserve is gone
-        (19.0, 22.5),  # 16% gone at boot -- context, cudnn workspace, slack. not a tenant
-        (140.0, 180.0),  # 22% gone on a big card: still under the threshold, still accepted
+        (22.5, 22.5),  # nothing on it at all
+        (22.1, 22.5),  # a clean card: only the driver's own reserve is gone (1.8%)
+        (174.0, 180.0),  # same 3.3% reserve on a big card, which is more absolute GB
     ],
 )
 def test_preflight_accepts_a_card_nobody_else_is_using(monkeypatch, free_gb, total_gb):
@@ -438,6 +438,53 @@ def test_preflight_is_inert_when_the_driver_will_not_answer(monkeypatch):
     monkeypatch.setattr(lc, "free_vram_gb", lambda: 0.0)
     monkeypatch.setattr(lc, "total_vram_gb", lambda: 0.0)
     lc.preflight_free_vram()
+
+
+def test_a_small_co_tenant_that_still_breaks_a_close_fitting_run_is_refused(monkeypatch):
+    """A tenant does not have to be large to be fatal, so the threshold cannot be sized to a run.
+
+    5 GB held on a 22.5 GB card leaves 17.5 GB, which OOMs a 20 GB run -- exactly the delayed OOM
+    this exists to prevent -- while being only 22% occupancy. Any threshold loose enough to call
+    that acceptable is implicitly asserting what the run needs, which is the sizing model this
+    check refuses to own. Refusing every card with a stranger on it needs no such assertion.
+    """
+    from flash.engine.worker.perf import lifecycle as lc
+
+    monkeypatch.setattr(lc, "free_vram_gb", lambda: 17.5)
+    monkeypatch.setattr(lc, "total_vram_gb", lambda: 22.5)
+    with pytest.raises(lc.DirtyGpuError):
+        lc.preflight_free_vram()
+
+
+def test_occupancy_is_rechecked_once_cuda_is_provably_up(monkeypatch):
+    """CUDA missing at boot reads as "no evidence", so the check must run again when it is up.
+
+    Both probes answer None when CUDA is unavailable, and treating that as a clean card is the only
+    honest reading -- but `wait_for_gpu` polls for up to 12 attempts, so a card that readies during
+    that wait would otherwise never be looked at, and the co-tenant reaches training unexamined.
+    """
+    import sys
+    import types
+
+    from flash.engine.worker.perf import lifecycle as lc
+
+    class _Tensor:
+        def __add__(self, _other):
+            return self
+
+    torch = types.ModuleType("torch")
+    torch.zeros = lambda *_a, **_k: _Tensor()
+    torch.cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        synchronize=lambda: None,
+        get_device_name=lambda _i: "NVIDIA GeForce RTX 4090",
+        mem_get_info=lambda: (int(3.4 * 1024**3), int(22.5 * 1024**3)),
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setattr(lc, "verify_gpu", lambda *_a, **_k: None)
+
+    with pytest.raises(lc.DirtyGpuError):
+        lc.wait_for_gpu("RTX 4090", gpu_type="RTX 4090")
 
 
 def test_preflight_never_re_derives_what_the_run_needs(monkeypatch):
