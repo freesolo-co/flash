@@ -101,9 +101,12 @@ Single-turn and bounded multi-turn environments are supported.
 
 ### Calling a deployed adapter from your own app
 
-Deploy once, then POST chat requests with your API key:
+Deploy once with `flash models deploy RUN_ID`, then POST chat requests with your API key:
 
 ```bash
+export RUN_ID=flash-1782194170-ce1cfcff
+export FREESOLO_API_KEY=fslo_...
+
 curl -X POST "https://flash.freesolo.co/v1/runs/$RUN_ID/chat" \
   -H "Authorization: Bearer $FREESOLO_API_KEY" \
   -H "Content-Type: application/json" \
