@@ -153,6 +153,36 @@ no separate step is needed. Paste the returned id into `[environment] id` in **b
 Re-push after any
 edit to `environment.py` or `dataset/` so the managed run uses your change.
 
+**Self-hosted plane?** `flash env push` publishes to Freesolo's managed environment hub, which
+your plane cannot write to, and a bare `your-org/my-env` slug resolves against that same hub. Use
+the git form instead — commit this folder to a repo your plane can read, then name it directly:
+
+```toml
+[environment]
+id = "github:OWNER/REPO@main:environment.py"   # REF is a branch/tag name without `/`, or a commit
+                                               # sha; the path is the file, or a directory holding
+                                               # environment.py
+```
+
+The ref is resolved at submit time, so re-pushing the repo and re-submitting picks up your edits
+the same way `flash env push` does on the managed plane. Pin a commit sha instead of a branch when
+you want a run to stay reproducible.
+
+A `github:` id is accepted only by a plane running with `FLASH_STANDALONE=1`. An identity-backed
+plane takes managed hub ids only and answers this form with a 400 naming the id.
+
+**A private repository needs `GITHUB_TOKEN` on the plane, not in your shell.** The ref is fetched by
+the control plane, which authenticates with its own `GITHUB_TOKEN` and forwards no credential of
+yours — so a private repo that you can clone locally still resolves as missing unless the plane
+itself holds a token that can read it. Either keep the environment repo public, or export a
+`GITHUB_TOKEN` with read access in the control plane's environment.
+
+`flash env eval` does not accept a `github:` id. It grades against a _published_ environment so the
+report can be filed under that identity, and refuses any reference that names no hub page — so on a
+standalone plane, the two commands below that mention it (`env eval` with `--split`/`--param`, and
+the held-out-suite workflow) are unavailable. `flash env test` is unaffected and remains the local
+gate.
+
 **Validate locally before you push** — but know what the local gate does and does not
 cover:
 
@@ -215,6 +245,7 @@ algorithm = "sft"           # "sft" (supervised), "grpo" (RL), or "opd" (on-poli
 
 [environment]
 id = "your-org/my-env"      # the id printed by `flash env push`
+                            # self-hosted plane: "github:OWNER/REPO@main:environment.py" (see above)
 # params = { split = "train" }    # kwargs passed to load_environment(); the table is
                                    # `params` — NOT `args`
 # secrets = ["SERPAPI_API_KEY"]   # only the NAMES of env vars your environment reads;
@@ -626,7 +657,7 @@ spending another GPU run:
 
 | Issue                                                        | Symptom                                                                                                                                                                                  | Mitigation                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Environment id is blank or stale                             | A blank id fails config validation. A stale published id can pass `flash train --dry-run` because dry-run does not import or run `environment.py`; the worker then uses old reward/data. | Run `flash env push --project <project-uuid> --name my-env .` after every environment/data edit and paste the returned id into every config you submit.                                                                                                                                                                                                                                                                         |
+| Environment id is blank or stale                             | A blank id fails config validation. A stale published id can pass `flash train --dry-run` because dry-run does not import or run `environment.py`; the worker then uses old reward/data. | Run `flash env push --project <project-uuid> --name my-env .` after every environment/data edit and paste the returned id into every config you submit. **Self-hosted:** `env push` targets the managed hub, so instead commit the edit and re-point `[environment] id` at the new ref -- see "Publish the environment" above.                                                                                                  |
 | Local-only env path in config                                | Config validation says there is no local path mode                                                                                                                                       | Publish first, then use the returned slug in `[environment] id`. `flash train` only runs published env ids, not local paths.                                                                                                                                                                                                                                                                                                    |
 | Config knobs are in the wrong table                          | Validation rejects `[grpo]`, `[sft]`, or unknown `[train]` keys                                                                                                                          | Put `epochs`, `group_size`, `max_completion_tokens`, `temperature`, `max_context_tokens`, LoRA, and other training knobs under `[train]`.                                                                                                                                                                                                                                                                                       |
 | GPU selection is not what you expected                       | Leaving `[gpu] type` unset may select a different fitting class as prices or capacity change                                                                                             | Set `[gpu] type` to an active validated class to hard-pin it, or leave it unset for managed cheapest-fit allocation. `train.hf_repo` remains platform-managed.                                                                                                                                                                                                                                                                  |
@@ -1043,7 +1074,7 @@ in a sensible value, so only override with a reason.
 | `kl_penalty_coef`              | Keeps the trained model from drifting too far from the base. Raise it to anchor against entropy collapse; lower it for more freedom to move.                                                                                                                                                                                                                                                                      |
 | `thinking_length_penalty_coef` | Per-reasoning-token reward deduction — curb overthinking, but watch it doesn't push the model into terse degeneracy.                                                                                                                                                                                                                                                                                              |
 | `learning_rate`                | Change it in small steps. Too high destabilizes RL and degrades output quality; if the model is collapsing, lower it.                                                                                                                                                                                                                                                                                             |
-| `prompts_per_step`                   | The effective prompts-per-step. Too small and the reward trend is pure noise; size it so the trend is readable.                                                                                                                                                                                                                                                                                                   |
+| `prompts_per_step`             | The effective prompts-per-step. Too small and the reward trend is pure noise; size it so the trend is readable.                                                                                                                                                                                                                                                                                                   |
 | `structured_outputs`           | Guided decoding for every GRPO/OPD rollout: a JSON schema (inline table or JSON string), `regex`, or `choice`. The sampler then _cannot_ emit off-format text, so the reward measures content instead of formatting. Works with `thinking = true`: the grammar is held until the `</think>` boundary (via a reasoning-aware decoding gate), so the model reasons freely first and only its answer is constrained. |
 
 For thinking models, `max_completion_tokens` is shared between `<think>` reasoning and the final
@@ -1408,6 +1439,8 @@ flash env test .                      # load + run the environment locally, befo
 flash env push --project <project-uuid> --name my-env .        # publish the environment; paste the returned id into [environment]
 flash env pull your-org/my-env        # download a published environment into the current folder
 flash env delete --project <project-uuid> your-org/my-env -y   # delete a published environment
+# ^ push/pull/delete act on Freesolo's managed hub. On a self-hosted plane they do not apply:
+#   your environment lives in your own git repo, named directly by [environment] id.
 flash train configs/sft.toml --dry-run # validate the config on the server (no GPU, no charge)
 flash train configs/sft.toml --cost    # pre-flight USD estimate, then exit
 flash train configs/sft.toml           # submit and follow logs (Ctrl-C detaches; --background to skip following)

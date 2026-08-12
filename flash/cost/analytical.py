@@ -440,13 +440,31 @@ def _wider_shape_remedy(config: RunConfig, need: float, names: tuple[str, ...]) 
     ``names`` is the pool the quote already ranked, so the remedy is searched over exactly the
     classes that were considered -- reusing the caller's provider filtering instead of
     reconstructing it here and risking a suggestion for a class it never had.
+
+    A class is dropped when every provider that would serve it here names the card count in the
+    SKU, since this path is offline by contract and cannot confirm such a shape is sold. Quoting an
+    unverifiable width is worse than a bare dead end: `--cost` is consulted precisely to avoid a
+    doomed launch. A pinned provider narrows that question to itself -- H100 is on RunPod, but a
+    lambda-pinned quote may not borrow RunPod's freedom to rent any count.
     """
-    from flash.providers.base import GPU_INFO, MAX_COMBINATION_CARDS, wider_shape_remedy
+    from flash.providers.base import (
+        GPU_INFO,
+        MAX_COMBINATION_CARDS,
+        providers_for,
+        wider_shape_remedy,
+    )
+    from flash.providers.fit_errors import rents_arbitrary_card_counts
+
+    def _in_play(gpu: str) -> tuple[str, ...]:
+        carriers = providers_for(gpu)
+        if config.provider == "auto":
+            return carriers
+        return tuple(name for name in carriers if name == config.provider)
 
     # the authored ceiling limited the ranking above; the geometry cap at the MAXIMUM rentable
     # width is what bounds a suggestion.
     return wider_shape_remedy(
-        (GPU_INFO[gpu].vram_gb for gpu in names),
+        (GPU_INFO[gpu].vram_gb for gpu in names if rents_arbitrary_card_counts(_in_play(gpu))),
         need,
         ceiling=geometry_safe_gpu_cap(
             config.model_id, MAX_COMBINATION_CARDS, model_revision=config.model_revision
@@ -455,6 +473,36 @@ def _wider_shape_remedy(config: RunConfig, need: float, names: tuple[str, ...]) 
         # been "already tried" and the search must exclude nothing. 0 is that empty exclusion --
         # passing none compares int > none and crashes the quote.
         above=config.gpu_count or 0,
+    )
+
+
+def _catalog_check_remedy(config: RunConfig, need: float, names: tuple[str, ...]) -> str:
+    """The width to ASK a fixed-count provider for, when no width can be promised offline.
+
+    ``_wider_shape_remedy`` drops classes whose providers name the count in the SKU, which leaves a
+    Lambda- or Vast-pinned exact quote with no remedy at all -- so it fell through to knob advice
+    telling the user to shrink a run that already fits at a wider count. `live_capacity` means the
+    count is confirmed dynamically, not that the SKU is absent: Lambda resolves `gpu_4x_h100_pcie`
+    against its own catalog. This mirrors the allocator's ``_catalog_check_hint`` so the same
+    shortfall reads the same whether it surfaced from `--cost` or from submit.
+
+    Still a check and never a promise: nothing offline proved the wider SKU is purchasable.
+    """
+    from flash.providers.base import MAX_COMBINATION_CARDS, smallest_fitting_gpu_count
+
+    width = smallest_fitting_gpu_count(
+        need,
+        max_gpu_count=geometry_safe_gpu_cap(
+            config.model_id, MAX_COMBINATION_CARDS, model_revision=config.model_revision
+        ),
+        gpu_names=names,
+    )
+    if width is None or width <= (config.gpu_count or 0):
+        return ""
+    pinned = names[0] if len(names) == 1 else "multi-card"
+    return (
+        f". Their catalog may list a {width}-card {pinned} instance -- raise the card ceiling "
+        f"with `--gpus {width}` to check it against their catalog"
     )
 
 
@@ -486,9 +534,8 @@ def _offline_gpu_shape(
         providers_for,
         rentable_gpu_counts,
         smallest_fitting_gpu_count,
-        vram_fit_error_message,
-        vram_knob_advice,
     )
+    from flash.providers.fit_errors import vram_fit_error_message, vram_knob_advice
 
     provider = config.provider if config.provider != "auto" else "auto"
     if config.gpu_type:
@@ -571,7 +618,11 @@ def _offline_gpu_shape(
             info = GPU_INFO[canonical_gpu(config.gpu_type)]
             raise ValueError(
                 f"exact GPU {info.name!r} cannot fit this run: it requires at least {need} GB"
-                + (remedy or f". {vram_knob_advice(config.method).capitalize()}.")
+                + (
+                    remedy
+                    or _catalog_check_remedy(config, need, names)
+                    or f". {vram_knob_advice(config.method).capitalize()}."
+                )
             )
         raise ValueError(
             vram_fit_error_message(
@@ -581,6 +632,10 @@ def _offline_gpu_shape(
                 effective_gpu_count=safe_gpu_count,
                 max_gpu_count=auto_cap,
                 gpu_names=names,
+                providers=None if provider == "auto" else (provider,),
+                # an offline quote does not know the configured fleet, so it cannot claim that
+                # dropping a provider pin would make a wider shape purchasable.
+                widenable_without_pin=None,
             )
         )
     _cost, count, _combined, _per_card, gpu, hourly = min(ranked)
