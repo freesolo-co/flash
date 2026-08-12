@@ -26,7 +26,7 @@ GRPO_RAW = {
         "epochs": 1,
         "max_examples": 800,
         "group_size": 8,
-        "batch_size": 16,
+        "prompts_per_step": 16,
         "max_completion_tokens": 512,
         "max_context_tokens": 2048,
     },
@@ -201,7 +201,7 @@ def test_partial_reprice_counts_reached_saves_and_drops_future_saves():
 def test_opd_epochs_derive_steps_from_max_examples():
     raw = copy.deepcopy(GRPO_RAW)
     raw["algorithm"] = "opd"
-    raw["train"].update({"epochs": 2, "max_examples": 17, "batch_size": 8, "group_size": 1})
+    raw["train"].update({"epochs": 2, "max_examples": 17, "prompts_per_step": 8, "group_size": 1})
     spec = spec_from_dict(raw)
     assert _spec_steps(spec) == 5  # ceil(17 rows * 2 epochs / batch_size 8)
 
@@ -210,7 +210,7 @@ def test_opd_positive_max_steps_is_authoritative():
     raw = copy.deepcopy(GRPO_RAW)
     raw["algorithm"] = "opd"
     raw["train"].update(
-        {"epochs": 2, "max_examples": 17, "batch_size": 8, "group_size": 1, "max_steps": 31}
+        {"epochs": 2, "max_examples": 17, "prompts_per_step": 8, "group_size": 1, "max_steps": 31}
     )
     assert _spec_steps(spec_from_dict(raw)) == 31
 
@@ -222,7 +222,9 @@ def test_opd_runconfig_carries_selected_teacher_and_prices_it():
         raw = copy.deepcopy(GRPO_RAW)
         raw["model"] = "Qwen/Qwen3.5-4B"
         raw["algorithm"] = "opd"
-        raw["train"].update({"epochs": 1, "max_examples": 40, "batch_size": 8, "group_size": 1})
+        raw["train"].update(
+            {"epochs": 1, "max_examples": 40, "prompts_per_step": 8, "group_size": 1}
+        )
         if teacher is not None:
             raw["train"]["teacher_model"] = teacher
         return spec_from_dict(raw)
@@ -333,7 +335,7 @@ def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):
         "[train]\n"
         "epochs = 1\n"
         "max_examples = 800\n"
-        "batch_size = 16\n"
+        "prompts_per_step = 16\n"
         "[gpu]\n"
         ""
     )
@@ -854,7 +856,7 @@ def test_non_sft_cost_stays_offline(tmp_path, monkeypatch, capsys, algorithm):
     monkeypatch.setenv("FLASH_STYLE", "0")
     # group_size 2 is grpo's floor (advantages are group-relative) and is valid for opd too.
     body = SFT_TOML.replace('algorithm = "sft"', f'algorithm = "{algorithm}"').replace(
-        "batch_size = 8\n", "batch_size = 8\nmax_examples = 40\ngroup_size = 2\n"
+        "batch_size = 8\n", "prompts_per_step = 8\nmax_examples = 40\ngroup_size = 2\n"
     )
 
     assert cmd_train(_sft_args(tmp_path, body)) == 0

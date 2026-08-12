@@ -32,6 +32,13 @@ _HB_SETUP_LIVENESS_STAGES = frozenset(
     {
         "model_prefetching",
         "checkpoint_prefetching",
+        # the post-download model setup span (adapter/tokenizer/architecture config reads). it is
+        # emitted as a one-shot transition FIRST and then held open by a liveness wrap, so it has to
+        # be throttled here like the other setup stages or a slow cold mount spends commits on it.
+        # the one-shot transition itself is exempted in ``heartbeat`` (see _HB_MODEL_LOAD_STAGES):
+        # only the repeated liveness ticks are what this throttle is for.
+        "sft_model_load",
+        "opd_model_load",
         "sft_data_loading",
         "rl_data_loading",
         "rl_adapter_loading",
@@ -65,6 +72,11 @@ LATEST_GRPO_METRICS_LAST: list = []
 # without throttling, these opd stages can make roughly 120 commit attempts per hour. tight-liveness,
 # per-step training, and checkpoint_uploading keepalive stages share the same throttle.
 _HB_THROTTLED_STAGES = _HB_TIGHT_LIVENESS_STAGES | frozenset({"rl_step", "sft_step", "opd_step"})
+# stages whose one-shot transition must always commit even though their liveness ticks are
+# throttled: the transition is the only record that the run reached the stage, and it is emitted
+# right after a download that has been pinging throughout, so the throttle would almost always
+# swallow it. the wrap that follows re-emits with liveness=True and stays throttled.
+_HB_MODEL_LOAD_STAGES = frozenset({"sft_model_load", "opd_model_load"})
 _HB_TERMINAL_STAGES = frozenset({"done", "already_done"})
 # 600s -> ~6 commits/hr; keeps stall detector alive without hitting the HF commit cap.
 _HB_TERMINAL_ONLY_INTERVAL_S = 600.0
@@ -170,6 +182,14 @@ def heartbeat(
             )
         else:
             throttled = stage in _HB_THROTTLED_STAGES
+            # a one-shot STAGE TRANSITION into a model-load stage is the only ping that says the run
+            # reached it. the repeated liveness ticks that follow are what the throttle exists to
+            # coalesce, and they carry liveness=True -- so throttling the stage as a whole silently
+            # drops the transition whenever the preceding setup ping (usually model_prefetching,
+            # which pings all through the download right before it) committed inside the interval.
+            # that is the common case, and losing it defeats the stage this set was extended for.
+            if stage in _HB_MODEL_LOAD_STAGES and not liveness:
+                throttled = False
             interval_s = _w._HB_MIN_INTERVAL_S
             if stage in _HB_TIGHT_LIVENESS_STAGES:
                 interval_s = min(interval_s, _w._HB_SETUP_LIVENESS_INTERVAL_S)

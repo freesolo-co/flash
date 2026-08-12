@@ -9,6 +9,7 @@ from flash._internal.logging import get_logger
 from flash.providers import PROVIDER_NAMES, available_providers, get_provider
 from flash.providers.base import (
     GPU_INFO,
+    MAX_COMBINATION_CARDS,
     SHARD_VRAM_EFFICIENCY,
     Allocation,
     AllocationConstraints,
@@ -16,12 +17,16 @@ from flash.providers.base import (
     CapacityLookupError,
     UnsupportedGpuError,
     _run_cost_key,
+    authored_gpu_ceiling,
     canonical_gpu,
     combined_vram_gb,
     largest_rentable_count,
     providers_for,
     rentable_gpu_counts,
     run_config_for_ranking,
+    smallest_fitting_gpu_count,
+    vram_fit_error_message,
+    wider_shape_remedy,
 )
 
 logger = get_logger(__name__)
@@ -140,7 +145,17 @@ def _structurally_fits(available, need: int, cap: int) -> bool:
     return False
 
 
-def geometry_safe_gpu_cap(model_id: str, max_gpu_count: int, *, model_revision: str = "") -> int:
+# Widest count safe to rent when a model's true head geometry could not be certified. Named because
+# the guard that skips certification (`cap > _UNCERTIFIED_CAP`) is only correct while it matches the
+# ceiling certification would otherwise apply: raise one without the other and a run either takes a
+# hub round trip that cannot widen it, or skips the round trip that would have. ALLOC-004 tracks
+# validating arbitrary off-catalog head geometry at every width.
+_UNCERTIFIED_CAP = 4
+
+
+def geometry_safe_gpu_cap(
+    model_id: str, max_gpu_count: int, *, model_revision: str = "", certify: bool = False
+) -> int:
     """Rentable ceiling whose sequence-parallel divisibility is known before paid allocation.
 
     The width becomes ``ulysses_sequence_parallel_size``, and verl requires
@@ -152,29 +167,59 @@ def geometry_safe_gpu_cap(model_id: str, max_gpu_count: int, *, model_revision: 
     The head count is READ from the row (``num_attention_heads``), never derived: ``hidden_size //
     head_dim`` is a different number on four of the six rows -- see ``_query_attention_heads``.
 
-    A pinned or unreadable revision keeps the pre-existing four-card ceiling rather than renting 8
-    cards verl may reject at startup, but that ceiling only NARROWS the divisor search; it is not a
-    substitute for it. A ceiling is a bound, not a divisibility proof -- 4 divides 24 but not 20 --
-    and SFT reaches allocation with the revision already resolved to a sha
-    (``runner.submit.prepare_job`` -> ``_resolve_model_revision`` with ``required=True``), so a
-    catalog row keyed on revision-emptiness alone would skip its own geometry on exactly the runs
-    that need it. Match the row by id and check the heads either way.
-    ALLOC-004 tracks validating arbitrary off-catalog head geometry at every width.
+    A revision whose geometry cannot be certified keeps the pre-existing four-card ceiling rather
+    than renting 8 cards verl may reject at startup, but that ceiling only NARROWS the divisor
+    search; it is not a substitute for it. A ceiling is a bound, not a divisibility proof -- 4
+    divides 24 but not 20 -- so the heads are checked either way.
+
+    A pin is not by itself unknown geometry. SFT reaches allocation with a revision ALWAYS resolved
+    to a sha (``runner.submit.prepare_job`` -> ``_resolve_model_revision`` with ``required=True``),
+    so treating "pinned" as "uncertifiable" capped every SFT run in the catalog at four cards and
+    made ``--gpus 8`` unreachable for the algorithm that always pins -- including for a run that
+    only fits at eight. The pinned commit's own ``config.json`` is what settles it: read the head
+    count from that commit (validated against the catalog row, fail-closed, so a drifted pin is
+    rejected rather than widened) and cap on the real number. An unreadable pin certifies nothing:
+    it keeps the four-card ceiling AND falls back to the row's own head count for the divisor
+    search, so it can only ever be narrower than the same run unpinned, never wider.
+
+    ``certify`` is what permits the hub round trip, and ONLY the submission path passes it. Reading a
+    pinned commit's config is network i/o, so a transient hub failure returns the uncertified
+    four-card ceiling. On the submit path that is a safe conservative answer the allocator can still
+    act on. On an OFFLINE path it is not: `spec_from_dict` feeds this cap to `provisional_gpu`, whose
+    job is to REJECT an unplaceable run, so a blip would narrow a 35B that genuinely needs eight
+    cards down to four and reject it as unplaceable during config parsing that is otherwise entirely
+    offline -- turning a transient network error into a terminal, and wrong, user-facing rejection.
+    The cost quote has the same shape (`_offline_gpu_shape` is documented as structural and must not
+    consume live failures). Both keep the default and stay offline; certification belongs where a
+    healthy retry and a real allocation decision live.
     """
     from flash.core.catalog import MODELS
 
     cap = largest_rentable_count(max_gpu_count)
-    if model_revision or model_id not in MODELS:
-        # an unvalidated revision keeps the pre-existing four-card ceiling, but that ceiling is a
-        # BOUND, not a divisibility proof -- it happens to divide 24 and would not divide 20. So it
-        # only narrows the search below, never substitutes for it.
-        cap = min(cap, 4)
     info = MODELS.get(model_id)
     heads = _query_attention_heads(info) if info is not None else 0
+    if info is None:
+        # nothing to certify a width against, and nothing to cross-check a pin's own config with.
+        cap = min(cap, _UNCERTIFIED_CAP)
+    elif certify and model_revision and cap > _UNCERTIFIED_CAP:
+        # the weights the worker really loads are the pinned commit's, so its config -- not the
+        # row's default-revision geometry -- is what may widen this run. only worth a hub round trip
+        # when there is something to widen TO: at or below the uncertified cap, certification
+        # cannot raise the ceiling.
+        from flash.engine.plan.vram import certified_attention_heads
+
+        certified = certified_attention_heads(model_id, model_revision)
+        if certified > 0:
+            heads = certified
+        else:
+            # uncertified: fall back to the ceiling, but keep checking the ROW's heads below. the
+            # ceiling narrows the divisor search, it does not replace it, so a row whose heads do
+            # not divide it is still narrowed further instead of rented at a width verl rejects.
+            cap = min(cap, _UNCERTIFIED_CAP)
     if heads <= 0:
         # geometry we cannot read is geometry we cannot certify, so a catalog row that records no
-        # head count is treated exactly like an unvalidated revision rather than trusted for 8.
-        return min(cap, 4)
+        # head count is treated exactly like an uncertifiable revision rather than trusted for 8.
+        return min(cap, _UNCERTIFIED_CAP)
     for count in rentable_gpu_counts(cap):
         if heads % count == 0:
             return count
@@ -201,16 +246,22 @@ def _resolve_exact_gpu(
     max_gpu_count: int,
     provider: str,
     available: tuple[str, ...],
+    widest_cap: int = 1,
 ) -> tuple[str, tuple[str, ...]]:
     """Validate an explicitly pinned GPU class and narrow ``available`` to providers that offer it."""
     exact = canonical_gpu(gpu_type)
     exact_info = GPU_INFO.get(exact)
     if exact_info is None or not exact_info.validated:
         raise UnsupportedGpuError(f"exact GPU {exact!r} is not an active validated GPU class")
+    # a card ceiling is the user's own `[gpu] count`, so a pin that fits at a wider rentable shape
+    # is one flag from working; `above` is the width already tried, so the remedy only ever names
+    # a wider one. bounded by the model's geometry cap so the suggestion is a width verl accepts
+    # rather than one it rejects after the box is rented.
     if exact_info.vram_gb < need and max_gpu_count <= 1:
         raise UnsupportedGpuError(
             f"exact GPU {exact!r} has {exact_info.vram_gb} GB VRAM, "
             f"but this run requires at least {need} GB"
+            + wider_shape_remedy((exact_info.vram_gb,), need, ceiling=widest_cap, above=1)
         )
     # the widest shape providers actually rent for this ceiling, not the ceiling itself: a pin
     # that only fits at a non-rentable count (3) must be rejected here with a precise reason
@@ -222,11 +273,73 @@ def _resolve_exact_gpu(
     ):
         raise UnsupportedGpuError(
             f"exact GPU {exact!r} cannot fit this run even as a {cap}-card combination"
+            + wider_shape_remedy((exact_info.vram_gb,), need, ceiling=widest_cap, above=cap)
         )
     exact_providers = providers_for(exact)
     if provider and provider not in exact_providers:
         raise UnsupportedGpuError(f"provider {provider!r} cannot provision exact GPU {exact!r}")
     return exact, tuple(name for name in available if name in exact_providers)
+
+
+def _structural_gpu_names(available: tuple[str, ...], exact: str) -> tuple[str, ...]:
+    """Validated classes the requested provider set can structurally provision."""
+    return tuple(
+        info.name
+        for info in GPU_INFO.values()
+        if info.validated
+        and (not exact or info.name == exact)
+        and any(provider in available for provider in providers_for(info.name))
+    )
+
+
+def _resolved_gpu_count(
+    model_id: str,
+    algorithm: str,
+    *,
+    need: float,
+    requested_gpu_count: int | None,
+    model_revision: str,
+    available: tuple[str, ...],
+    exact: str,
+) -> int:
+    """Resolve auto-size or validate that an authored ceiling can structurally fit.
+
+    Certifies the pin (``certify=True``): this runs inside ``allocate()``, which already does
+    network i/o and can retry, and the width decided here is the one the run is really rented at. A
+    hub failure degrades to the conservative ceiling rather than raising, so an outage can only
+    narrow the shape, never reject a run that fits. The offline parse and quote paths deliberately
+    do NOT certify -- see ``geometry_safe_gpu_cap``.
+    """
+    auto_cap = geometry_safe_gpu_cap(
+        model_id, MAX_COMBINATION_CARDS, model_revision=model_revision, certify=True
+    )
+    gpu_names = _structural_gpu_names(available, exact)
+    if requested_gpu_count is None:
+        fitting_count = smallest_fitting_gpu_count(
+            need, max_gpu_count=auto_cap, gpu_names=gpu_names
+        )
+        if fitting_count is not None:
+            return fitting_count
+        effective_count = auto_cap
+    else:
+        effective_count = geometry_safe_gpu_cap(
+            model_id, requested_gpu_count, model_revision=model_revision, certify=True
+        )
+        if (
+            smallest_fitting_gpu_count(need, max_gpu_count=effective_count, gpu_names=gpu_names)
+            is not None
+        ):
+            return effective_count
+    raise UnsupportedGpuError(
+        vram_fit_error_message(
+            algorithm,
+            need,
+            requested_gpu_count=requested_gpu_count,
+            effective_gpu_count=effective_count,
+            max_gpu_count=auto_cap,
+            gpu_names=gpu_names,
+        )
+    )
 
 
 def _gather_candidates(
@@ -341,15 +454,13 @@ def allocate(
     provider: str = "",
     gpu_type: str = "",
     model_revision: str = "",
-    max_gpu_count: int = 1,
+    max_gpu_count: int | None = None,
     workload_profile: bool = False,
 ) -> Allocation:
     """Pick the cheapest fitting combination of (provider, GPU class, count) able to run the job.
 
-    With ``max_gpu_count=1`` (the default) this is exactly the classic cheapest single-class
-    allocation. A caller whose algorithm can shard across cards passes a higher cap, and fitting
-    multi-card combinations (same class x count) then compete on TOTAL hourly cost — e.g.
-    2 x A100 beats 1 x H200 whenever 2 * $A100 < $H200 and the sharded fit clears the need.
+    ``max_gpu_count=None`` auto-sizes to the smallest geometry-safe ceiling that can fit. an integer
+    is an authored hard ceiling; fitting shapes up to that ceiling still compete on dollars per step.
 
     ``workload_profile=True`` allocates the cpu-only profile job instead of the run it measures: it
     needs no training VRAM and gains nothing from a faster card, so it ranks on rate alone.
@@ -376,17 +487,43 @@ def allocate(
             raise UnsupportedGpuError(f"requested provider {provider!r} is not configured")
         available = (provider,)
 
-    cap = geometry_safe_gpu_cap(model_id, max_gpu_count, model_revision=model_revision)
+    # allocate() is reachable directly, bypassing the parse gate entirely, so it resolves the
+    # author's ceiling from the same shared predicate rather than trusting a caller to have applied
+    # it. this has to precede the pinned-fit checks below, which read the ceiling to decide whether
+    # a wider shape would fix the run. see `authored_gpu_ceiling` for what a bare pin means and why.
+    max_gpu_count = authored_gpu_ceiling(gpu_type, max_gpu_count)
     exact = ""
     if gpu_type:
+        # an auto-sized run has no authored ceiling, so the pinned-fit checks below read the widest
+        # width the platform would ever rent -- the same interpretation `_resolved_gpu_count` gives
+        # `None`. using 1 here would reject a fitting multi-card shape as unsatisfiable.
+        pin_ceiling = MAX_COMBINATION_CARDS if max_gpu_count is None else max_gpu_count
         exact, available = _resolve_exact_gpu(
             gpu_type,
             need=need,
-            cap=cap,
-            max_gpu_count=max_gpu_count,
+            cap=geometry_safe_gpu_cap(
+                model_id, pin_ceiling, model_revision=model_revision, certify=True
+            ),
+            max_gpu_count=pin_ceiling,
             provider=provider,
             available=available,
+            # the ceiling a `--gpus` suggestion may name: the authored count is what rejected this
+            # run, so the remedy has to be searched against the widest width the model allows.
+            widest_cap=geometry_safe_gpu_cap(
+                model_id, MAX_COMBINATION_CARDS, model_revision=model_revision, certify=True
+            ),
         )
+        if not available:
+            raise UnsupportedGpuError(f"exact GPU {exact!r} has no configured active provider")
+    cap = _resolved_gpu_count(
+        model_id,
+        algorithm,
+        need=need,
+        requested_gpu_count=max_gpu_count,
+        model_revision=model_revision,
+        available=available,
+        exact=exact,
+    )
 
     constraints = AllocationConstraints(
         disk_gb=disk_gb,

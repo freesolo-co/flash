@@ -575,7 +575,12 @@ def _build_child_callbacks(
     bridge: Any,
     resume_step: int,
 ) -> _ChildCallbacks:
-    progress = {"step": resume_step, "loss": None}
+    progress = {
+        "step": resume_step,
+        "loss": None,
+        "truncation_rate": None,
+        "truncation_step": None,
+    }
     wandb_link: dict[str, str | None] = {}
 
     def on_line(line: str) -> None:
@@ -597,13 +602,16 @@ def _build_child_callbacks(
             # when NO step ever produced a distillation loss.
             return
         progress["loss"] = loss
-        progress_state.record_step(step_number, loss, bridge)
+        progress["truncation_rate"] = progress_state.record_step(step_number, loss, bridge)
+        progress["truncation_step"] = step_number
 
     def on_step(step: int) -> None:
         progress["step"] = step
         payload = {"step": step}
         if progress["loss"] is not None:
             payload["loss"] = progress["loss"]
+        if progress["truncation_step"] == step and progress["truncation_rate"] is not None:
+            payload["truncation_rate"] = progress["truncation_rate"]
         _opd_train._w.heartbeat("opd_step", **payload)
 
     def child_heartbeat() -> None:
@@ -670,7 +678,18 @@ def _run_child(
     finally:
         watcher.stop(require_complete=training_completed)
     peak_gpu_gb = gpu_sampler.stop_gb()
-    _reconcile_child_failures(workload, runtime.bridge, return_code)
+    truncation_window = None
+    if return_code != 0:
+        truncation_window = progress_state.truncation_window(
+            runtime.bridge,
+            request.knobs.max_completion,
+        )
+    _reconcile_child_failures(
+        workload,
+        runtime.bridge,
+        return_code,
+        truncation_window=truncation_window,
+    )
     final_accounting = progress_state.final_state(runtime.bridge)
     actor_dir, final_step = _opd_train.latest_global_step_dir(workload.local_dir)
     result = _ChildResult(
@@ -746,6 +765,8 @@ def _reconcile_child_failures(
     workload: _WorkloadState,
     bridge: Any,
     return_code: int,
+    *,
+    truncation_window: _opd_train._TruncationWindow | None,
 ) -> None:
     score_delivery_failure = _opd_train._reconcile_score_delivery_failure(
         bridge,
@@ -773,6 +794,7 @@ def _reconcile_child_failures(
         cycle_commit_failure,
         no_signal_failure,
         score_delivery_failure,
+        truncation_window=truncation_window,
     )
 
 

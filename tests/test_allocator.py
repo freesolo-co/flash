@@ -280,11 +280,12 @@ def test_allocate_gpu_type_enforces_vram_and_provider_support(monkeypatch):
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 80)
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda"))
-    with pytest.raises(UnsupportedGpuError, match="requires at least"):
+    with pytest.raises(UnsupportedGpuError, match=r"requires at least 80 GB.*--gpus"):
         allocator.allocate(
             "Qwen/Qwen3.5-9B",
             "grpo",
             gpu_type="RTX 4090",
+            max_gpu_count=1,
         )
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
     with pytest.raises(UnsupportedGpuError, match="cannot provision"):
@@ -646,6 +647,51 @@ def test_opd_applies_the_colocated_vllm_floor():
     assert model_required_vram_gb("Qwen/Qwen3.5-0.8B", "opd", train=train, headroom=1.0) == 24
 
 
+def test_opd_sizes_on_the_authored_prompts_per_step():
+    """The rl optimizer batch is named ``prompts_per_step``, and sizing must read THAT key.
+
+    Regression: the sizer only ever read ``batch_size``. Once the rl batch was split out under its
+    own name, an rl spec's ``batch_size`` was always None, so every authored ``prompts_per_step``
+    fell through to the recipe default -- a wide batch sized as if it were the default one and
+    under-provisioned the card it was then rented on. Sizing has to move with the knob, on the
+    TrainSpec the submit path passes and on the raw dict the parse gate passes.
+    """
+    from flash.engine.plan.vram import model_required_vram_gb
+    from flash.schema import spec_from_dict
+
+    def _train(**over):
+        return {
+            "epochs": 1,
+            "group_size": 1,
+            "max_context_tokens": 1536,
+            "max_completion_tokens": 512,
+            "lora_rank": 16,
+            **over,
+        }
+
+    narrow = model_required_vram_gb("Qwen/Qwen3.5-4B", "opd", train=_train(prompts_per_step=1))
+    wide = model_required_vram_gb("Qwen/Qwen3.5-4B", "opd", train=_train(prompts_per_step=32))
+    assert wide > narrow, "an authored prompts_per_step must move the opd vram floor"
+
+    # the submit path allocates from the parsed TrainSpec, not the raw dict, and that object carries
+    # the batch ONLY under prompts_per_step -- so it has to size identically to the dict above.
+    def _spec_need(pps):
+        spec = spec_from_dict(
+            {
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": "opd",
+                "environment": {"id": "github:owner/repo@main:env/environment.py"},
+                "gpu": {},
+                "train": _train(prompts_per_step=pps),
+            },
+            run_id="pps",
+        )
+        return model_required_vram_gb(spec.model, "opd", train=spec.train)
+
+    assert _spec_need(1) == narrow
+    assert _spec_need(32) == wide
+
+
 def test_vram_headroom_consistent_across_sizing_paths():
     """provisional_gpu (parse-time) and required_vram_gb (submit-time) must size with the SAME
     headroom (a validated constant), so they never disagree."""
@@ -919,24 +965,24 @@ def test_observed_qwen4b_opd_vllm_startup_case_routes_off_40gb_cards(monkeypatch
 
 
 def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch):
-    """OPD-specific matrix guard: each catalog OPD model across representative train configs must
-    resolve to a GPU that satisfies the shared VRAM requirement, or reject before provisioning when
-    the config exceeds every managed single-GPU class."""
+    """opd configs auto-size unpinned shapes while exact type pins keep single-card validation."""
     from flash.core.catalog import MODELS
     from flash.cost import RunConfig, estimate_cost
     from flash.providers import allocator
     from flash.providers.allocator import required_vram_gb
     from flash.providers.base import (
         GPU_INFO,
+        MAX_COMBINATION_CARDS,
         UnsupportedGpuError,
+        combined_vram_gb,
         get_gpu_info,
         providers_for,
         provisional_gpu,
+        provisional_gpu_count,
     )
     from flash.schema import ConfigError, spec_from_dict
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
-    max_managed_vram = max(g.vram_gb for g in GPU_INFO.values() if g.validated)
     configured_gpu_types = tuple(name for name, gpu_info in GPU_INFO.items() if gpu_info.validated)
     configs = {
         # Matches the failed continuation shape from the OPD/vLLM RTX 5090 report.
@@ -948,7 +994,7 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
         "recipe_default": {"epochs": 1},
         "opd_prompt_batch": {
             "epochs": 1,
-            "batch_size": 8,
+            "prompts_per_step": 8,
             "group_size": 1,
             "max_context_tokens": 1536,
             "max_completion_tokens": 512,
@@ -956,7 +1002,7 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
         },
         "longer_context": {
             "epochs": 1,
-            "batch_size": 8,
+            "prompts_per_step": 8,
             "group_size": 1,
             "max_context_tokens": 4096,
             "max_completion_tokens": 512,
@@ -964,7 +1010,7 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
         },
         "longer_completion": {
             "epochs": 1,
-            "batch_size": 1,
+            "prompts_per_step": 1,
             "group_size": 1,
             "max_context_tokens": 4096,
             "max_completion_tokens": 2048,
@@ -972,7 +1018,7 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
         },
         "wide_rollout_batch": {
             "epochs": 1,
-            "batch_size": 8,
+            "prompts_per_step": 8,
             "group_size": 4,
             "max_context_tokens": 4096,
             "max_completion_tokens": 512,
@@ -993,18 +1039,23 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
                 int(train.get("epochs", 1)),
                 seq_len=train.get("max_context_tokens"),
                 completion_len=train.get("max_completion_tokens"),
-                batch_size=train.get("batch_size"),
+                batch_size=train.get("prompts_per_step"),
                 group_size=train.get("group_size"),
                 lora_rank=train.get("lora_rank"),
                 provider="runpod",
             )
 
-            if need > max_managed_vram:
+            auto_count = provisional_gpu_count(model_id, "opd", train=train)
+            auto_cap = allocator.geometry_safe_gpu_cap(model_id, MAX_COMBINATION_CARDS)
+            max_auto_vram = max(
+                combined_vram_gb(gpu.vram_gb, auto_cap)
+                for gpu in GPU_INFO.values()
+                if gpu.enum_member and gpu.validated
+            )
+            if need > max_auto_vram:
                 with pytest.raises(UnsupportedGpuError):
                     allocator.allocate(model_id, "opd", train=train)
-                # Cost preflight is deliberately offline so a capacity lookup cannot consume a
-                # lifecycle retry before the run exists. It still rejects the same impossible shape.
-                with pytest.raises(ValueError, match="no GPU class fits"):
+                with pytest.raises(ValueError, match="opd needs"):
                     estimate_cost(rc)
                 rejected.add((model_id, label))
                 continue
@@ -1012,21 +1063,32 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
             preview_gpu = provisional_gpu(model_id, "opd", train=train)
             preview_info = get_gpu_info(preview_gpu)
             assert preview_info.validated
-            assert preview_info.vram_gb >= need, (model_id, label, preview_gpu, need)
+            assert combined_vram_gb(preview_info.vram_gb, auto_count) >= need, (
+                model_id,
+                label,
+                preview_gpu,
+                auto_count,
+                need,
+            )
 
             alloc = allocator.allocate(model_id, "opd", train=train)
             alloc_info = get_gpu_info(alloc.gpu)
             assert alloc.provider == "runpod"
             assert alloc.min_vram_gb == need
             assert alloc.gpu == preview_gpu
+            assert alloc.gpu_count == auto_count
             assert alloc_info.validated
-            assert alloc_info.vram_gb >= need, (model_id, label, alloc.gpu, need)
-            assert all(c.vram_gb >= need for c in alloc.candidates)
+            assert combined_vram_gb(alloc_info.vram_gb, alloc.gpu_count) >= need
+            assert all(
+                combined_vram_gb(candidate.vram_gb, candidate.gpu_count) >= need
+                for candidate in alloc.candidates
+            )
 
             estimate = estimate_cost(rc)
             assert estimate.required_vram_gb == need
-            assert estimate.gpu == preview_gpu
-            assert estimate.gpu_vram_gb >= need, (model_id, label, estimate.gpu, need)
+            assert estimate.gpu == alloc.gpu
+            assert estimate.gpu_count == alloc.gpu_count
+            assert combined_vram_gb(estimate.gpu_vram_gb, estimate.gpu_count) >= need
 
             for configured_gpu in configured_gpu_types:
                 raw = {
@@ -1056,7 +1118,6 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
     }
     assert checked | rejected == expected
     assert checked
-    assert rejected
 
 
 def test_catalog_model_algorithm_gpu_matrix_routes_to_fitting_cards(monkeypatch):
@@ -1168,18 +1229,9 @@ def test_catalog_model_algorithm_config_gpu_matrix_enforces_pins(monkeypatch):
                 }
                 key = (model_id, algo, configured_gpu)
                 if get_gpu_info(configured_gpu).vram_gb < need:
-                    # two distinct rejections, both correct: a pin that is merely too small names the
-                    # shortfall, while a run that outgrows EVERY validated class (35B GRPO/OPD, once
-                    # the routed experts train) fails earlier with no fitting class at all.
-                    biggest = max(g.vram_gb for g in GPU_INFO.values() if g.validated)
-                    # opd words its over-capacity error differently from the generic allocator one,
-                    # so match the shared "no ... validated GPU" shape rather than either wording.
-                    reason = (
-                        "requires at least"
-                        if need <= biggest
-                        else r"(no validated GPU class has|more than any single validated GPU)"
-                    )
-                    with pytest.raises(ConfigError, match=reason):
+                    # a type pin with no authored count keeps the historical one-card constraint, so
+                    # its own shortfall is always the actionable error even when every class is small.
+                    with pytest.raises(ConfigError, match="requires at least"):
                         spec_from_dict(raw, run_id="matrix")
                     rejected.add(key)
                     continue
@@ -1564,6 +1616,105 @@ def test_combo_default_single_gpu_behavior_unchanged(monkeypatch):
     assert (a.gpu, a.gpu_count) == ("H200", 1)  # only class fitting 100 GB alone
 
 
+def test_unset_count_auto_sizes_the_27b_grpo_run_to_two_cards(monkeypatch):
+    from flash.providers import allocator
+    from flash.providers.base import Candidate
+
+    cands = [
+        Candidate(provider="runpod", gpu="H200", hourly_usd=4.39, vram_gb=141),
+        Candidate(provider="runpod", gpu="B200", hourly_usd=5.89, vram_gb=180),
+    ]
+    _stub_provider(monkeypatch, allocator, cands)
+    allocation = allocator.allocate(
+        "Qwen/Qwen3.6-27B",
+        "grpo",
+        train={"max_context_tokens": 8192, "max_completion_tokens": 4096},
+    )
+    assert allocation.gpu_count == 2
+    assert all(candidate.gpu_count <= 2 for candidate in allocation.candidates)
+
+
+def test_a_pinned_gpu_type_without_a_count_stays_one_card_in_allocate(monkeypatch):
+    """`allocate()` is the THIRD boundary that decides this, and it decides independently.
+
+    The parse gate and the offline quote already keep a pinned class at one card when no count was
+    authored. `allocate()` resolved its own ceiling from `max_gpu_count`, so a direct call with a
+    pinned type and no count auto-sized the pinned class: measured, a 24 GB RTX 4090 resolved to 8
+    cards for an 80 GB run and would have rented them. Auto-sizing applies only when NEITHER the
+    class nor the count is authored.
+    """
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, UnsupportedGpuError
+
+    cands = [Candidate(provider="runpod", gpu="RTX 4090", hourly_usd=0.69, vram_gb=24)]
+    _stub_provider(monkeypatch, allocator, cands)
+    with pytest.raises(UnsupportedGpuError) as exc:
+        allocator.allocate("Qwen/Qwen3.5-9B", "grpo", gpu_type="RTX 4090")
+    # the run is REJECTED rather than silently widened, and the wider shape is offered as an
+    # opt-in remedy the author must name -- never taken on their behalf.
+    message = str(exc.value)
+    assert "requires at least 80 GB" in message
+    assert "--gpus 8" in message
+
+
+def test_every_boundary_reads_the_authored_ceiling_from_one_predicate():
+    """The four sizing boundaries must not re-derive "did the author choose a shape?" themselves.
+
+    This rule drifted three times in review because each boundary spelled it differently, and a
+    test at one boundary cannot fail for a bug at another. `authored_gpu_ceiling` is now the single
+    definition; this pins its truth table so a future edit to any one caller cannot quietly
+    reintroduce a fourth dialect.
+    """
+    from flash.providers.base import authored_gpu_ceiling
+
+    # nothing authored -> auto-size (the only case that may widen)
+    assert authored_gpu_ceiling("", None) is None
+    # a bare class pin is a ONE-CARD pin, never an invitation to widen
+    assert authored_gpu_ceiling("RTX 4090", None) == 1
+    # an authored count is a hard ceiling, with or without a class
+    assert authored_gpu_ceiling("", 4) == 4
+    assert authored_gpu_ceiling("RTX 4090", 2) == 2
+
+
+def test_unset_count_quote_prices_the_auto_sized_shape():
+    from flash.cost import RunConfig, estimate_cost
+
+    estimate = estimate_cost(
+        RunConfig(
+            model_id="Qwen/Qwen3.6-27B",
+            method="grpo",
+            steps=1,
+            seq_len=8192,
+            completion_len=4096,
+            gpu_count=None,
+        )
+    )
+    assert estimate.gpu_count == 2
+    assert estimate.required_vram_gb == 229
+
+
+def test_explicit_two_card_pin_never_escalates_to_four(monkeypatch):
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, UnsupportedGpuError
+
+    cands = [Candidate(provider="runpod", gpu="A100 PCIe", hourly_usd=1.39, vram_gb=80)]
+    _stub_provider(monkeypatch, allocator, cands)
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 200)
+
+    with pytest.raises(UnsupportedGpuError) as exc:
+        allocator.allocate(
+            "Qwen/Qwen3.5-4B",
+            "sft",
+            gpu_type="A100 PCIe",
+            max_gpu_count=2,
+        )
+    message = str(exc.value)
+    # the pin is rejected AT the authored width and the remedy names the width that fits. wording
+    # comes from `wider_shape_remedy`, the one searched helper every fit rejection routes through.
+    assert "2-card combination" in message
+    assert "--gpus 4" in message
+
+
 def test_combo_two_cheap_cards_beat_one_expensive(monkeypatch):
     # 2 x A100 ($3.00 total, 160 GB * 0.85 = 136 GB effective) beats 1 x H200 ($4.00) for a 100 GB need.
     from flash.providers import allocator
@@ -1679,3 +1830,96 @@ def test_sft_default_context_tracks_thinking_mode():
     plain = model_required_vram_gb(mid, "sft", thinking=False)
     thinking = model_required_vram_gb(mid, "sft", thinking=True)
     assert thinking > plain, (plain, thinking)
+
+
+def test_pinned_gpu_fit_failure_names_the_card_count_that_fixes_it():
+    """A pin that fails only at the authored ceiling must name the width that works.
+
+    `[gpu] count` is a user-authored ceiling, so this rejection is one flag from success. Without
+    the remedy the message states the shortfall and stops, and the user cannot tell an
+    unsatisfiable run apart from one that fits on two cards -- the difference between abandoning
+    the run and passing `--gpus 2`.
+    """
+    from flash.providers.allocator import _resolve_exact_gpu
+    from flash.providers.base import GPU_INFO, UnsupportedGpuError
+
+    need = GPU_INFO["H200"].vram_gb + 40  # fits on 2 cards, never on 1
+    with pytest.raises(UnsupportedGpuError, match=r"--gpus 2") as single:
+        _resolve_exact_gpu(
+            "H200",
+            need=need,
+            cap=1,
+            max_gpu_count=1,
+            provider="",
+            available=("runpod",),
+            widest_cap=8,
+        )
+    assert "it fits on 2 cards" in str(single.value)
+
+    # the multi-card rejection carries the same remedy, measured from ITS cap rather than 1.
+    with pytest.raises(UnsupportedGpuError, match=r"--gpus 4") as pair:
+        _resolve_exact_gpu(
+            "H200",
+            need=GPU_INFO["H200"].vram_gb * 3,
+            cap=2,
+            max_gpu_count=2,
+            provider="",
+            available=("runpod",),
+            widest_cap=8,
+        )
+    assert "even as a 2-card combination" in str(pair.value)
+
+
+def test_pinned_gpu_fit_failure_stays_a_dead_end_when_no_width_fits():
+    """A genuinely unsatisfiable run must NOT be told to raise the ceiling.
+
+    The remedy is only useful if it is true. Suggesting `--gpus 8` for a run no shape can hold
+    would trade one dead end for a second, slower one -- so the suggestion is searched, not
+    assumed, and absent when nothing fits.
+    """
+    from flash.providers.allocator import _resolve_exact_gpu
+    from flash.providers.base import UnsupportedGpuError
+
+    with pytest.raises(UnsupportedGpuError) as exc:
+        _resolve_exact_gpu(
+            "H200",
+            need=100_000,
+            cap=1,
+            max_gpu_count=1,
+            provider="",
+            available=("runpod",),
+            widest_cap=8,
+        )
+    assert "--gpus" not in str(exc.value)
+
+
+def test_wider_shape_remedy_is_bounded_by_the_geometry_cap():
+    """A suggested width must be one the model's head geometry allows.
+
+    `geometry_safe_gpu_cap` exists because verl rejects `num_attention_heads % sp_size != 0` at
+    Ulysses init -- AFTER the box is rented. A remedy that ignored it would bill the user for a
+    box that cannot start.
+    """
+    from flash.providers.base import GPU_INFO, wider_shape_remedy
+
+    vram = GPU_INFO["H200"].vram_gb
+    need = vram + 40
+    assert "--gpus 2" in wider_shape_remedy((vram,), need, ceiling=8, above=1)
+    # capped below the fitting width: report no remedy rather than an unrentable one.
+    assert wider_shape_remedy((vram,), need, ceiling=1, above=1) == ""
+    # `above` excludes widths already tried, so a remedy never restates the failing shape: at
+    # above=2 the fitting width 2 is suppressed and the next one that fits is named instead.
+    assert "--gpus 4" in wider_shape_remedy((vram,), need, ceiling=8, above=2)
+    # ...and once no untried width fits, there is nothing to suggest.
+    assert wider_shape_remedy((vram,), need, ceiling=8, above=8) == ""
+
+
+def test_wider_shape_remedy_names_the_cheapest_fitting_width():
+    """The remedy must name the smallest shape that works, not the widest on offer.
+
+    Suggesting 8 cards for a run that fits on 2 would quadruple the bill to fix a fit error.
+    """
+    from flash.providers.base import GPU_INFO, wider_shape_remedy
+
+    vram = GPU_INFO["H200"].vram_gb
+    assert "--gpus 2" in wider_shape_remedy((vram,), vram + 40, ceiling=8, above=1)

@@ -1171,7 +1171,7 @@ def test_opd_worker_fp8_kv_flag_matches_the_sizing_assumption():
     assert 'if config.get("fp8_kv")' in inspect.getsource(opd_train.build_opd_overrides)
 
 
-def test_opd_oversized_reject_names_the_knobs_to_shrink():
+def test_opd_oversized_reject_names_the_knobs_to_shrink(monkeypatch):
     """When even the biggest GPU can't hold an OPD run, the reject must be actionable: it names that
     OPD is resident-only (trainer + colocated vLLM student = two weight copies + rollout KV) and the
     knobs that shrink it, not the opaque 'no GPU that big' message the raw cheapest_gpu emits."""
@@ -1180,15 +1180,19 @@ def test_opd_oversized_reject_names_the_knobs_to_shrink():
     train = {
         "max_context_tokens": 4096,
         "max_completion_tokens": 2048,
-        "batch_size": 8,
+        "prompts_per_step": 8,
         "group_size": 4,
     }
+    monkeypatch.setattr("flash.engine.plan.vram.model_required_vram_gb", lambda *_a, **_k: 2000)
     with pytest.raises(UnsupportedGpuError) as exc:
         provisional_gpu("Qwen/Qwen3.6-35B-A3B", "opd", train=train)
     msg = str(exc.value)
     assert "resident-only" in msg
     assert "group_size" in msg
-    assert "batch_size" in msg
+    # the remedy must name the key opd ACCEPTS: batch_size is rejected at parse time, so advising
+    # it sent a user whose run did not fit straight into a config error.
+    assert "prompts_per_step" in msg
+    assert "[train].batch_size" not in msg
     assert "max_completion_tokens" in msg
 
 
@@ -1200,9 +1204,9 @@ def test_opd_oversized_reject_reports_the_rentable_odd_ceiling(monkeypatch):
     with pytest.raises(UnsupportedGpuError) as exc:
         provisional_gpu("Qwen/Qwen3.6-35B-A3B", "opd", gpu_count=7)
     msg = str(exc.value)
-    assert "any 4-card validated GPU combination" in msg
-    assert "7-card" not in msg
-    assert "592.8 GB max" in msg
+    assert "gpu.count=7 provides at most 592.8 GB (4x B200)" in msg
+    assert "--gpus 8" in msg
+    assert "7x" not in msg
 
 
 def test_opd_vram_keeps_chunked_text_peak_when_it_exceeds_dense_image_peak():
@@ -1331,6 +1335,43 @@ def test_resolve_opd_knobs_rejects_zero_kl_penalty(monkeypatch):
     assert opd_mod._resolve_opd_knobs().kl_coef > 0.0
 
 
+def test_resolve_opd_knobs_trains_the_authored_prompts_per_step(monkeypatch):
+    """Regression (opd.py:86): the worker read the optimizer batch from ``batch_size``.
+
+    opd REJECTS ``batch_size`` at parse time, so an opd spec carries the batch only under
+    ``prompts_per_step`` -- the old read found None on every run and trained the recipe default no
+    matter what the user authored. That is silent: the run completes and bills normally, having
+    trained a fraction of the requested prompts per update.
+
+    Driven through the real schema parse rather than a stub, so it fails if either the parser or the
+    worker stops agreeing on the key.
+    """
+    from flash.engine.plan.recipe import RECIPE
+    from flash.engine.worker.entry import opd as opd_mod
+    from flash.schema import spec_from_dict
+
+    def _knobs(**train):
+        spec = spec_from_dict(
+            {
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": "opd",
+                "environment": {"id": "github:owner/repo@main:env/environment.py"},
+                "gpu": {},
+                "train": {"epochs": 1, "group_size": 1, **train},
+            },
+            run_id="pps",
+        )
+        monkeypatch.setattr(
+            opd_mod, "_w", SimpleNamespace(JOB_SPEC=spec, THINKING=False), raising=False
+        )
+        return opd_mod._resolve_opd_knobs()
+
+    assert _knobs(prompts_per_step=32).prompts_per_step == 32
+    assert _knobs(prompts_per_step=1).prompts_per_step == 1
+    # omitted -> recipe default, which is the value the broken read returned for EVERY spec.
+    assert _knobs().prompts_per_step == RECIPE.opd.prompts_per_step
+
+
 def test_resolve_opd_knobs_maps_alias_to_parasail_model(monkeypatch):
     from flash.engine.worker.entry import opd as opd_mod
 
@@ -1398,7 +1439,7 @@ def test_opd_spec_json_round_trip():
             "train": {
                 "epochs": 25,
                 "max_examples": 8,
-                "batch_size": 8,
+                "prompts_per_step": 8,
             },
         },
         run_id="x",

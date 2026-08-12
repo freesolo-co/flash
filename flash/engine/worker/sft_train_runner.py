@@ -23,9 +23,17 @@ _LORAPLUS_READY_MARKER = _sft_train._LORAPLUS_READY_MARKER
 _VERL_OPTIMIZER_IMPL = _sft_train._VERL_OPTIMIZER_IMPL
 _VERL_OPTIMIZER_NAME = _sft_train._VERL_OPTIMIZER_NAME
 build_sft_overrides = _sft_train.build_sft_overrides
+# taken from the parent like every other name here, so the runner and `sft_train`'s own
+# `sft_data_loading`/`sft_configuring` wraps use one object rather than two imports of it.
+liveness_heartbeat = _sft_train.liveness_heartbeat
 gdn_reset_arch_from_caps = _sft_train.gdn_reset_arch_from_caps
 render_gdn_varlen_shim = _sft_train.render_gdn_varlen_shim
+render_shim_marker_prologue = _sft_train.render_shim_marker_prologue
 render_wandb_link_shim = _sft_train.render_wandb_link_shim
+shim_marker_file = _sft_train.shim_marker_file
+verify_applied_shim_markers = _sft_train.verify_applied_shim_markers
+wrap_shim_fragment = _sft_train.wrap_shim_fragment
+SHIM_FRAGMENT_FAILED_EXIT_CODE = _sft_train.SHIM_FRAGMENT_FAILED_EXIT_CODE
 sft_tokens_for_updates = _sft_train.sft_tokens_for_updates
 sft_under_ran = _sft_train.sft_under_ran
 validate_save_steps = _sft_train.validate_save_steps
@@ -108,6 +116,8 @@ class _SftChild:
     watcher: object
     child_env: dict[str, str]
     command: list[str]
+    shim_markers: str
+    expected_shims: tuple[str, ...]
 
 
 @dataclass
@@ -119,6 +129,11 @@ class _SftProgress:
     train_tokens: int
     loraplus_applied: bool
     wandb_link: dict[str, str | None]
+    # what the child's wrapped sitecustomize fragments must prove applied (see
+    # wrap_shim_fragment); verified at the first optimizer step and again at child exit.
+    shim_markers: str = ""
+    expected_shims: tuple[str, ...] = ()
+    shims_verified: bool = False
 
 
 @dataclass(frozen=True)
@@ -227,6 +242,7 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
     selected_count = profile.selected_examples
     sampled_texts = prepared_workload.sampled_texts
     multiturn_targets = prepared_workload.multiturn_targets
+    coerced_singleturn_targets = prepared_workload.coerced_singleturn_targets
     if dropped:
         print(
             f"[sft] dropped {dropped} rows with no real completion target "
@@ -241,6 +257,12 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
         print(
             "[sft][warn] this is a multi-turn environment but no row ships a multi-turn "
             "target completion"
+        )
+    if selected_count > 1 and coerced_singleturn_targets == selected_count:
+        print(
+            f"[sft][warn] all {selected_count} selected rows use one bare assistant target coerced "
+            "from raw output; reasoning blocks or multi-turn structure may have been lost. encode "
+            "full target trajectories as message lists in output"
         )
     if _w.THINKING and not any("<think>" in text for text in sampled_texts[:256]):
         print(
@@ -278,15 +300,28 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
         setup_seconds=setup_seconds,
         gpu=_w.gpu_diagnostics(include_torch=False),
     )
-    lora_config = _w.make_lora(options.model_id)
-    lora_rank = int(lora_config.r)
-    target_modules = lora_config.target_modules
-    if isinstance(target_modules, set | frozenset):
-        target_modules = sorted(target_modules)
-    warmstart_adapter = _sft_train._warmstart_adapter_path(
-        options.model_id, options.model_revision, lora_rank
-    )
-    vocab_size = _sft_train._resolve_sft_vocab_size(options.model_id, options.model_revision)
+    # everything below reads adapter/tokenizer/architecture config from the hub or cache, which is
+    # minutes on a cold mount and emits nothing of its own. without this the run's last ping is the
+    # one-shot above, so `runs status` freezes on sft_model_load for the whole span and a healthy
+    # cold cache is indistinguishable from a dead worker -- the exact ambiguity the stage was added
+    # to resolve. same stage name, so the provider's setup-grace classification is unchanged.
+    with liveness_heartbeat("sft_model_load"):
+        lora_config = _w.make_lora(options.model_id)
+        lora_rank = int(lora_config.r)
+        target_modules = lora_config.target_modules
+        if isinstance(target_modules, set | frozenset):
+            target_modules = sorted(target_modules)
+        warmstart_adapter = _sft_train._warmstart_adapter_path(
+            options.model_id, options.model_revision, lora_rank
+        )
+        vocab_size = _sft_train._resolve_sft_vocab_size(options.model_id, options.model_revision)
+        # hoisted into the span: on a PINNED revision this falls through to a live AutoConfig read
+        # with no local_files_only, so it is the same cold-mount/hub stall as the reads above. it
+        # only needs the model id, and everything between here and its old call site is arithmetic
+        # on already-resolved values, so moving it up changes ordering but not results.
+        hidden, layers = _sft_train._model_arch_dims(
+            options.model_id, revision=options.model_revision
+        )
     fused_ce = sft_chunked_nll_enabled(options.model_id)
     per_device_batch, _ = _sft_train._resolve_sft_grad_accum(
         options.effective_batch,
@@ -305,7 +340,6 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
     card_vram_gb = float(options.gpu_probe.get("memory_gb") or 0.0)
     raw_capability = options.gpu_probe.get("capability")
     capability = tuple(raw_capability) if raw_capability else None
-    hidden, layers = _sft_train._model_arch_dims(options.model_id, revision=options.model_revision)
     info = MODELS.get(options.model_id)
     active_params_b = float(getattr(info, "active_params_b", 0.0) or 0.0) or None
     gradient_checkpointing = _sft_train._resolve_sft_gradient_checkpointing(
@@ -409,7 +443,7 @@ def _prepare_sft_child(
         "fused_ce_backend": _sft_train._resolve_sft_fused_ce_backend(capabilities.caps),
     }
     overrides = build_sft_overrides(config)
-    shim_source = _render_sft_sitecustomize(
+    core_source = _render_sft_sitecustomize(
         seed=config["seed"],
         loraplus_ratio=_SFT_LORAPLUS_RATIO,
         save_at_steps=options.save_at_steps,
@@ -420,9 +454,20 @@ def _prepare_sft_child(
     # row order matches the profile's byte for byte, and the gdn one patches the model's text
     # forward to reset linear-attention state at packed example boundaries. different objects,
     # no interaction -- a gdn hybrid needs both, and dropping either is a silent correctness bug.
-    shim_source = _sft_train._append_exact_sft_dataloader_shim(shim_source)
+    core_source = _sft_train._append_exact_sft_dataloader_shim(core_source)
+    # every required fragment is wrapped fail-closed (see wrap_shim_fragment): execsitecustomize
+    # would otherwise swallow a fragment's exception and the child would train unpatched (no
+    # seeding, no exact dataloader order, no lora+, no boundary resets) while looking healthy.
+    # the wandb link shim stays unwrapped: it swallows its own failures by design and a logging
+    # link must not be able to abort paid training.
+    required_fragments = [("sft-core", core_source)]
     if gdn_reset_arch is not None:
-        shim_source += render_gdn_varlen_shim(gdn_reset_arch)
+        required_fragments.append(("gdn-varlen", render_gdn_varlen_shim(gdn_reset_arch)))
+    shim_markers = shim_marker_file(shim_dir)
+    # the workdir is wiped per attempt (_resolve_sft_options), so no stale marker can survive here.
+    shim_source = render_shim_marker_prologue(shim_markers) + "".join(
+        wrap_shim_fragment(name, source) for name, source in required_fragments
+    )
     if "wandb" in loggers:
         shim_source += render_wandb_link_shim()
     with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
@@ -479,10 +524,13 @@ def _prepare_sft_child(
         watcher=watcher,
         child_env=child_env,
         command=command,
+        shim_markers=shim_markers,
+        expected_shims=tuple(name for name, source in required_fragments if source),
     )
 
 
-def _prepare_sft_progress(data: _SftData, model: _SftModelSetup, resume_step: int) -> _SftProgress:
+def _prepare_sft_progress(data: _SftData, model: _SftModelSetup, child: _SftChild) -> _SftProgress:
+    resume_step = child.resume_step
     progress = {"step": resume_step, "loss": None, "grad_norm": None, "lr": None}
     # consecutive steps seen with grad_norm == 0.0 at a nonzero lr. one step can legitimately be
     # zero (a fully-masked micro-batch), so require a short run of them before failing.
@@ -510,6 +558,11 @@ def _prepare_sft_progress(data: _SftData, model: _SftModelSetup, resume_step: in
         train_tokens=train_tokens,
         loraplus_applied=resume_step >= model.update_horizon,
         wandb_link={},
+        shim_markers=child.shim_markers,
+        expected_shims=child.expected_shims,
+        # like loraplus_applied above: a resume already at the horizon never launches the child,
+        # so there is no marker file to verify and nothing left for the shims to patch.
+        shims_verified=resume_step >= model.update_horizon,
     )
 
 
@@ -557,6 +610,11 @@ def _consume_sft_marker_line(progress: _SftProgress, line: str) -> bool:
         progress.wandb_link.update(link)
     if _sft_train.verl_step_number(line) is None:
         return False
+    # the marker set first: a skipped sitecustomize also loses the lora+ shim, and "no fragment
+    # ran at all" is the root cause worth reporting over its lora+ symptom.
+    if progress.expected_shims and not progress.shims_verified:
+        verify_applied_shim_markers(progress.shim_markers, progress.expected_shims)
+        progress.shims_verified = True
     if _SFT_LORAPLUS_RATIO > 1 and not progress.loraplus_applied:
         raise RuntimeError(
             "verl reached an optimizer step before the required lora+ shim succeeded"
@@ -609,8 +667,22 @@ def _finish_sft_child(
 ) -> tuple[float, float]:
     train_wall = time.time() - train_started_at
     device_peak_gpu_gb = gpu_sampler.stop_gb()
+    if return_code == SHIM_FRAGMENT_FAILED_EXIT_CODE:
+        # permanent, not retriable infra: the same interpreter fails the same fragment on retry.
+        raise RuntimeError(
+            f"verl SFT subprocess exited {return_code}: a required flash runtime patch failed to "
+            "apply in the child interpreter (its traceback names the fragment in the flash log). "
+            "the verl/transformers stack at the child python is incompatible with this flash "
+            "version; rebuild the worker image or fix FLASH_VERL_PYTHON rather than retrying."
+        )
     if return_code != 0:
         raise RuntimeError(f"verl SFT subprocess exited with status {return_code}")
+    # belt and braces behind the first-step check in _consume_sft_marker_line, for a child whose
+    # step lines the parent never parsed. shims_verified starts True when the child is not
+    # launched at all (resume already at the horizon), exactly like loraplus_applied above.
+    if progress.expected_shims and not progress.shims_verified:
+        verify_applied_shim_markers(progress.shim_markers, progress.expected_shims)
+        progress.shims_verified = True
     if _SFT_LORAPLUS_RATIO > 1 and not progress.loraplus_applied:
         raise RuntimeError("required lora+ shim did not emit its success marker")
     return train_wall, device_peak_gpu_gb

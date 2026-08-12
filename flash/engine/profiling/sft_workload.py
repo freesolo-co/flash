@@ -40,6 +40,7 @@ class PreparedSftWorkload:
     processor: Any | None
     sampled_texts: list[str]
     multiturn_targets: int
+    coerced_singleturn_targets: int
 
 
 def _serialize_multimodal_inputs(values: dict) -> bytes:
@@ -256,6 +257,7 @@ class _TokenizedSftRows:
     untruncated_by_index: dict[int, int]
     sampled_texts: list[str]
     multiturn_targets: int
+    coerced_singleturn_targets: int
     dropped: int
 
 
@@ -286,9 +288,16 @@ class _SftStepHorizon:
     authoritative_supervised_tokens: int
 
 
+def _sft_completion_with_provenance(env, example: dict) -> tuple[list[dict], bool]:
+    completion_with_provenance = getattr(env, "sft_completion_with_provenance", None)
+    if callable(completion_with_provenance):
+        return completion_with_provenance(example)
+    return env.sft_completion(example), False
+
+
 def _tokenize_prompt_rows(
     spec,
-    prompt_rows: list[tuple[Any, list[dict], list[dict]]],
+    prompt_rows: list[tuple[Any, list[dict], list[dict], bool]],
     *,
     package_root,
     tokenizer,
@@ -308,10 +317,22 @@ def _tokenize_prompt_rows(
     text_specs: list[dict[str, Any]] = []
     sampled_texts: list[str] = []
     multiturn_targets = 0
-    for row_index, (example, prompt_messages, completion_messages) in enumerate(prompt_rows):
+    coerced_singleturn_targets = 0
+    for row_index, (
+        example,
+        prompt_messages,
+        completion_messages,
+        coerced_scalar_output,
+    ) in enumerate(prompt_rows):
         _reject_image_completion(completion_messages)
         if len(completion_messages) > 1:
             multiturn_targets += 1
+        elif (
+            coerced_scalar_output
+            and len(completion_messages) == 1
+            and completion_messages[0].get("role") == "assistant"
+        ):
+            coerced_singleturn_targets += 1
         if record_has_images(example, prompt_messages):
             if processor is None:
                 raise RuntimeError("multimodal sft row has no processor")
@@ -384,6 +405,7 @@ def _tokenize_prompt_rows(
         untruncated_by_index=untruncated_by_index,
         sampled_texts=sampled_texts,
         multiturn_targets=multiturn_targets,
+        coerced_singleturn_targets=coerced_singleturn_targets,
         dropped=dropped,
     )
 
@@ -574,13 +596,15 @@ def prepare_sft_workload(
 
     source = list(env.dataset())
     selected = select_sft_examples(source, max_examples, spec.seed)
-    prompt_rows = [
-        (example, env.prompt_messages(example), env.sft_completion(example)) for example in selected
-    ]
+    prompt_rows = []
+    for example in selected:
+        prompt_messages = env.prompt_messages(example)
+        completion_messages, coerced_scalar_output = _sft_completion_with_provenance(env, example)
+        prompt_rows.append((example, prompt_messages, completion_messages, coerced_scalar_output))
     package_root = getattr(env, "package_root", None)
     multimodal = any(
         record_has_images(example, prompt_messages)
-        for example, prompt_messages, _completion in prompt_rows
+        for example, prompt_messages, _completion, _used_fallback in prompt_rows
     )
     processor = None
     if multimodal:
@@ -664,4 +688,5 @@ def prepare_sft_workload(
         processor=processor,
         sampled_texts=tokenized.sampled_texts,
         multiturn_targets=tokenized.multiturn_targets,
+        coerced_singleturn_targets=tokenized.coerced_singleturn_targets,
     )

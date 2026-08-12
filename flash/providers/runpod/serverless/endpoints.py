@@ -70,18 +70,68 @@ def _train_body(input_data: dict) -> dict:
 
     from huggingface_hub import snapshot_download
 
+    def _needles(secrets=None):
+        """The (plain, bounded) credential needle sets for os.environ plus ``secrets``.
+
+        a value at or above the floor is a plain needle, replaced as a substring; a SHORTER one is
+        bounded, matched only where it is not adjacent to a word character. short values used to be
+        dropped outright, which leaked them verbatim -- [environment] secrets accepts any name and
+        any value. plain replacement is not the alternative: a 3-char needle corrupts every
+        diagnostic that merely contains those letters (the value "ati" rewrites "authentication").
+
+        a multiline secret (a PEM key) never appears whole in any single call: the child's stdout is
+        sanitized one line at a time, so only a component line is ever seen. component lines keep
+        the floor as a hard skip -- a short one is punctuation such as "}", not a credential.
+        Mirrors flash.providers._lifecycle.bootstrap_secrets._needles.
+        """
+        import urllib.parse
+
+        mapping = {**os.environ, **(secrets or {})}
+        # declared runtime secrets can carry any name, so the control plane lists them in
+        # FLASH_SECRET_ENV_KEYS; the name-shape rule stays as the fail-closed fallback.
+        declared = {
+            name.strip().upper()
+            for name in str(mapping.get("FLASH_SECRET_ENV_KEYS") or "").split(",")
+            if name.strip()
+        }
+        plain, bounded = set(), set()
+        for key, secret in mapping.items():
+            upper = str(key).upper()
+            if not secret or not (
+                upper in {"AUTHORIZATION", "HF_TOKEN"}
+                or upper in declared
+                or upper.endswith(("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD"))
+            ):
+                continue
+            value_str = str(secret)
+            target = plain if len(value_str) >= 8 else bounded
+            target.update({value_str, urllib.parse.quote(value_str, safe="")})
+            if "\n" in value_str:
+                for raw in value_str.splitlines():
+                    if len(line := raw.strip()) >= 8:
+                        plain.update({line, urllib.parse.quote(line, safe="")})
+        return plain, bounded
+
     def _safe_detail(value, secrets=None, limit=1000):
         text = (
             f"{type(value).__name__}: {value}" if isinstance(value, BaseException) else str(value)
         )
-        values = {**os.environ, **(secrets or {})}
-        for key, secret in values.items():
-            upper = str(key).upper()
-            if secret and (
-                upper in {"AUTHORIZATION", "HF_TOKEN"}
-                or upper.endswith(("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD"))
-            ):
-                text = text.replace(str(secret), "<redacted>")
+        plain, bounded = _needles(secrets)
+        # longest-first so one secret containing another cannot leave a suffix of the longer
+        # one behind; encoded forms cover the percent-encoded urls http and git errors print.
+        for needle in sorted(plain, key=len, reverse=True):
+            text = text.replace(needle, "<redacted>")
+        for needle in sorted(bounded, key=len, reverse=True):
+            # the word guard is applied per EDGE, and only where the needle's own edge is a word
+            # character. a value with a punctuation edge already separates itself from neighbouring
+            # text, and demanding a non-word character beyond it asks the wrong question: "/a"
+            # inside "https://host/a/repo" is preceded by the "t" of "host", so an unconditional
+            # left guard fails and the secret prints verbatim. "ati" keeps both guards and so still
+            # cannot rewrite "authentication".
+            # Mirrors flash.providers._lifecycle.bootstrap_secrets._bounded_pattern.
+            left = r"(?<!\w)" if needle[:1].isalnum() or needle[:1] == "_" else ""
+            right = r"(?!\w)" if needle[-1:].isalnum() or needle[-1:] == "_" else ""
+            text = re.sub(f"{left}{re.escape(needle)}{right}", "<redacted>", text)
         text = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", text)
         text = re.sub(
             r"(?i)(authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)"
@@ -373,8 +423,29 @@ def _train_body(input_data: dict) -> dict:
                 tail_bytes = 64_000
                 with open(console, "rb") as f:
                     f.seek(0, os.SEEK_END)
-                    f.seek(max(0, f.tell() - tail_bytes))
-                    tail = f.read().decode("utf-8", "replace")
+                    start = max(0, f.tell() - tail_bytes)
+                    # over-read one byte so a boundary landing exactly after a newline is
+                    # recognized as starting a COMPLETE line rather than assumed partial.
+                    f.seek(max(0, start - 1))
+                    raw = f.read()
+                if start == 0:
+                    tail = raw.decode("utf-8", "replace")
+                else:
+                    tail = raw[1:].decode("utf-8", "replace")
+                    # the byte boundary can land inside a one-line credential, and a partial
+                    # value no longer matches full-value redaction, so a truncated first line is
+                    # dropped before sanitizing. a line the boundary did not split is kept: it
+                    # may hold the root-cause exception.
+                    # a tail that is ONE unterminated line is dropped whole. that loses the only
+                    # diagnostic on a crash whose evidence is a single huge line, but any bound
+                    # that would let it through is measured against the credentials this process
+                    # KNOWS, and the value at risk is the one it does not: a capability minted at
+                    # runtime contributes no needle, so a margin sized from an unrelated configured
+                    # secret leaves a long fragment of it behind. an empty tail never leaked.
+                    # mirrors bootstrap_secrets._read_console_tail.
+                    if raw[:1] != b"\n":
+                        cut = tail.find("\n")
+                        tail = tail[cut + 1 :] if cut >= 0 else ""
                 with open(console + ".tail", "w", encoding="utf-8", errors="replace") as f:
                     f.write(_safe_detail(tail, env, 64_000))
                 _require_deadline_allowance()
@@ -411,7 +482,11 @@ def _train_body(input_data: dict) -> dict:
                 uploader.start()
                 try:
                     for line in proc.stdout:
-                        print(line, end="")
+                        # the handler's own stdout is captured by runpod and surfaced in provider
+                        # status, where only this process knows the run's worker-env secret values,
+                        # so each echoed child line is sanitized here at the source. the console
+                        # file keeps the raw line; its upload path sanitizes the selected tail.
+                        print(_safe_detail(line, env, 100_000), end="")
                         cf.write(line)
                     proc.wait()
                 finally:
@@ -575,11 +650,10 @@ def get_train_endpoint(
         kwargs.update(weight_cache_endpoint_kwargs(spec))
         ep = Endpoint(**kwargs)
         handler = ep(_train_body)
-        from flash.providers.runpod.jobs import apply_disk_gb, apply_image_override_constraints
+        from flash.providers.runpod.jobs import apply_disk_gb
 
         cfg = ep._build_resource_config()
         apply_disk_gb(cfg, disk_gb)
-        apply_image_override_constraints(cfg)
         if cache_handler:
             _ENDPOINT_CACHE[name] = handler
         return handler

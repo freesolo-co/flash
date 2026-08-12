@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from typing import Any
 
 from flash.content.structured_outputs import CONSTRAINT_KEYS as _SO_CONSTRAINT_KEYS
@@ -287,11 +288,16 @@ def _coerce_scalar(value: str):
 
 
 def _validate_env_var_names(names, context: str) -> None:
-    bad_names = sorted(repr(k) for k in names if (not k) or any(c in k for c in "=\0 \t\n\r"))
+    # ',' is rejected because declared secret names travel to every redactor as the comma-joined
+    # FLASH_SECRET_ENV_KEYS list (flash._internal.diagnostics): a name containing a comma is
+    # indistinguishable from two names there, so the real key goes unrecognized and its value
+    # reaches diagnostics verbatim. Rejecting it here keeps that channel unambiguous by
+    # construction rather than needing an escape.
+    bad_names = sorted(repr(k) for k in names if (not k) or any(c in k for c in "=,\0 \t\n\r"))
     if bad_names:
         raise ConfigError(
             f"{context} has invalid environment variable name(s): {', '.join(bad_names)}; an "
-            "env var name must be non-empty and contain no '=', whitespace, or NUL byte"
+            "env var name must be non-empty and contain no '=', ',', whitespace, or NUL byte"
         )
 
 
@@ -308,6 +314,84 @@ _RESERVED_ENVIRONMENT_SECRET_KEYS = frozenset(
 )
 
 
+# `scheme://userinfo@host` in a direct or VCS requirement, where userinfo is anything before the
+# authority's `@`. ANY nonempty userinfo is rejected, not just the `user:password` shape: a github
+# token is conventionally supplied username-only (`https://ghp_xxx@github.com/...`), and a colon can
+# also arrive percent-encoded, so matching on the colon would miss the most likely leak. Anchored on
+# `://` and stopping at `/` so a bare `pkg@1.2` or a PEP 508 `name @ https://host/x.whl` is untouched.
+_PIP_URL_USERINFO_RE = re.compile(r"://[^/@\s]+@")
+
+# a query string on a requirement URL (`...whl?private_token=x`, a presigned `?X-Amz-Signature=...`).
+# rejected wholesale rather than by parameter name: the credential-carrying names are unbounded, and
+# naming a package needs no query, so there is nothing legitimate to preserve by allowing some.
+_PIP_URL_QUERY_RE = re.compile(r"://[^\s]*\?")
+
+
+def _pip_echo(value: Any) -> str:
+    """Quote a rejected pip value back to the author, redacting anything URL-shaped.
+
+    Every rejection message here is printed by the CLI and returned verbatim as the server's HTTP
+    error detail, so a value quoted into one lands in terminals, CI logs and API logs. A URL is the
+    only pip syntax that can carry a credential, and this runs on values that failed validation --
+    including before the credential guard is reached -- so URL-shaped input is never echoed at all.
+    Redacting the whole value rather than the userinfo keeps this sound for credential shapes the
+    guard does not model yet, which is the failure mode that produced this helper.
+    """
+    return "<redacted url>" if "://" in str(value) else repr(value)
+
+
+def _environment_pip(raw: Any) -> tuple[str, ...]:
+    """Parse [environment].pip as the scorer's own third-party requirements.
+
+    A malformed entry would otherwise reach the worker's pip invocation, where it fails mid-install
+    after the GPU is already allocated and billing. A bare string is called out separately: TOML has
+    no implicit one-element list, so `pip = "pymongo"` is the natural first mistake to make here.
+    """
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        # the suggestion is meant to be pasted straight into the toml, so quote it the way toml
+        # does rather than the way repr() does.
+        suggestion = '"<redacted url>"' if "://" in raw else f'"{raw}"'
+        raise ConfigError(
+            f"[environment] pip must be a list of requirement strings, not a string: "
+            f"use [{suggestion}]"
+        )
+    # tuple as well as list: to_dict() emits the spec's own tuple, and that payload is re-parsed
+    # here on the submit round trip (mirrors _environment_secrets).
+    if not isinstance(raw, (list, tuple)):
+        raise ConfigError("[environment] pip must be a list of requirement strings")
+    requirements = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise ConfigError(
+                f"[environment] pip entries must be non-empty requirement strings "
+                f"(got: {_pip_echo(item)})"
+            )
+        requirement = item.strip()
+        # entries are spliced straight into `python -m pip install` on the worker, so an option
+        # flag is not just an odd requirement: `--no-deps` or `--target=...` would change how the
+        # mandatory freesolo worker requirement installs, from a field that only names packages.
+        # `--extra-index-url=https://user:token@host` also makes this a credential-bearing branch,
+        # which is why the echo is redacted here rather than after the URL guard below.
+        if requirement.startswith("-"):
+            raise ConfigError(
+                "[environment] pip entries must be requirements, not pip options "
+                f"(got: {_pip_echo(requirement)})"
+            )
+        # A spec is not a secret store: pip is persisted verbatim in ``RunStatus.spec`` and uploaded
+        # inside the worker's ``metrics.json`` job_spec, so a token embedded in a direct or VCS URL
+        # would be written to disk and to the run log in plaintext.
+        if _PIP_URL_USERINFO_RE.search(requirement) or _PIP_URL_QUERY_RE.search(requirement):
+            raise ConfigError(
+                "[environment] pip entries must not embed credentials in a URL: the spec is stored "
+                "and uploaded in plaintext. Use [environment] secrets for the credential and an "
+                "unauthenticated requirement URL without a query string."
+            )
+        requirements.append(requirement)
+    return tuple(requirements)
+
+
 def _environment_secrets(raw: Any) -> tuple[str, ...]:
     """Parse [environment].secrets as declared worker env-var secret names."""
     if raw is None:
@@ -318,7 +402,11 @@ def _environment_secrets(raw: Any) -> tuple[str, ...]:
         raise ConfigError("[environment] secrets entries must be strings")
     secrets = tuple(dict.fromkeys(raw))
     _validate_env_var_names(secrets, "[environment] secrets")
-    reserved = sorted(set(secrets) & _RESERVED_ENVIRONMENT_SECRET_KEYS)
+    # matched case-insensitively even though linux env names are case-sensitive: build_worker_env
+    # tests ownership on the UPPERCASED name, so a declared `flash_secret_env_keys` would pass this
+    # check and then be silently dropped from the worker env, launching the job without the secret
+    # it declared as required. reserving the whole case-space keeps parse and dispatch agreed.
+    reserved = sorted(k for k in secrets if k.upper() in _RESERVED_ENVIRONMENT_SECRET_KEYS)
     if reserved:
         raise ConfigError(
             f"[environment] secrets must not include platform-managed key(s): {', '.join(reserved)}"

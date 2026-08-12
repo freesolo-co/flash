@@ -14,7 +14,7 @@ SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
     "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-    "train": {"epochs": 20, "max_examples": 20, "batch_size": 20},
+    "train": {"epochs": 20, "max_examples": 20, "prompts_per_step": 20},
     "gpu": {},
 }
 
@@ -133,7 +133,7 @@ def _unbounded_on_policy_spec(algorithm: str):
             "model": "Qwen/Qwen3.5-4B",
             "algorithm": algorithm,
             "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-            "train": {"epochs": 1, "batch_size": 8, "group_size": 4},
+            "train": {"epochs": 1, "prompts_per_step": 8, "group_size": 4},
             "gpu": {},
         },
         run_id="run-unbounded",

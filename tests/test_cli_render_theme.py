@@ -585,7 +585,11 @@ def test_run_status_omits_warmup_claim_for_stale_heartbeat(monkeypatch, stage: s
 
     assert stage in out
     assert "20m ago" in out
-    assert "quiet is not dead" in out
+    # the silence is still explained, but WHICH explanation depends on the stage: a liveness-backed
+    # setup stage pings every ~4 min, so at 20m the panel says so and names the vanished-instance
+    # possibility, while a one-shot ping like rl_train_start has only the generic throttle hint.
+    # what must hold for both is that the age is accounted for and nothing reassures.
+    assert ("quiet is not dead" in out) or ("longer than throttling explains" in out)
     assert "warming up" not in out
     assert "do not cancel" not in out
 
@@ -753,3 +757,588 @@ def test_stale_training_step_is_labelled_as_reporting_lag(monkeypatch):
     # and so is never absent.
     assert "the age above" in out
     assert "if configured" in out
+
+
+def test_long_silence_at_a_liveness_setup_stage_names_both_causes(monkeypatch):
+    """A frozen setup stage must not read as ordinary throttling (issue 26).
+
+    These stages hold a liveness thread on a ~240s cadence, so a much older heartbeat is NOT the
+    upload throttle. It is either one long blocking call (a cold per-datacenter weight cache) or a
+    vanished instance -- and the panel cannot tell which. The generic quiet hint says "quiet is not
+    dead", which asserts the healthy reading of exactly the ambiguity it cannot resolve.
+    """
+    import time as _time
+
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    base = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+    }
+
+    # model_prefetching is the stage that actually pulls base weights, so it is the one whose
+    # silence the cold-cache reading describes.
+    frozen = dict(base, last_heartbeat={"stage": "model_prefetching", "ts": _time.time() - 1200})
+    out = render.run_status(frozen)
+    assert "longer than throttling explains" in out
+    # every reading, because the panel genuinely cannot distinguish them -- naming only one is how
+    # a user either cancels a healthy download or waits on a box that is already gone.
+    assert "cold weight cache" in out
+    assert "instance is gone" in out
+    # heartbeat uploads are best-effort and roll the throttle slot back on failure, so a healthy
+    # worker can keep running while its age grows without bound. presenting only "blocked or dead"
+    # sends that user to wait for an attempt change that is never coming.
+    assert "uploads may be failing" in out
+    # one explanation per silence: the generic hint must not ride along with the specific one.
+    assert render._QUIET_HEARTBEAT_HINT not in out
+
+    # inside the cadence, silence is ordinary and must stay unremarked by this hint.
+    fresh = dict(base, last_heartbeat={"stage": "sft_model_load", "ts": _time.time() - 300})
+    assert "longer than throttling explains" not in render.run_status(fresh)
+
+    # a one-shot ping (no liveness thread) has no 240s cadence to be measured against, so the
+    # generic throttle hint remains the honest reading there.
+    one_shot = dict(base, last_heartbeat={"stage": "rl_train_start", "ts": _time.time() - 1200})
+    assert "longer than throttling explains" not in render.run_status(one_shot)
+
+    # a terminal run is not waiting on anything.
+    done = dict(frozen, state="done")
+    assert "longer than throttling explains" not in render.run_status(done)
+
+    # a superseded attempt's ping describes a worker that is already gone; calling that a possibly
+    # healthy download would hide that the replacement has published nothing at all.
+    superseded = dict(
+        base,
+        remote={"attempt": 2},
+        last_heartbeat={"stage": "sft_model_load", "attempt": 1, "ts": _time.time() - 1200},
+    )
+    assert "longer than throttling explains" not in render.run_status(superseded)
+
+    # a training step is the other hint's job; the two must never both fire.
+    stepping = dict(
+        base, last_heartbeat={"stage": "sft_step", "step": 3, "ts": _time.time() - 1200}
+    )
+    stepping_out = render.run_status(stepping)
+    assert "longer than throttling explains" not in stepping_out
+    assert "last one UPLOADED" in stepping_out
+
+
+def test_setup_hint_does_not_blame_a_download_on_a_stage_that_never_downloads(monkeypatch):
+    """The hint fires for every liveness setup stage, but only some of them fetch weights.
+
+    Telling a user that `sft_configuring` is "downloading tens of GB" sends them hunting for a
+    transfer that stage never performs. A wrong explanation is its own misdiagnosis, which is the
+    failure class this hint was added to remove -- so the download clause has to be conditional.
+    """
+    import time as _time
+
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    base = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+    }
+
+    frozen = dict(base, last_heartbeat={"stage": "sft_configuring", "ts": _time.time() - 1200})
+    out = render.run_status(frozen)
+    # still flagged: the silence is just as unexplained by throttling here.
+    assert "longer than throttling explains" in out
+    assert "instance is gone" in out
+    # but not attributed to a download this stage does not perform.
+    assert "downloads tens of GB" not in out
+
+
+def test_warmup_reassurance_yields_once_the_silence_is_unexplained(monkeypatch):
+    """The warmup and stale-setup windows overlap, and they say opposite things.
+
+    `rl_initializing` counts as fresh for 1200s but goes silent-unexplained at 900s, so between
+    those the panel printed "setup is not billed; do not cancel" directly above "the instance may
+    be gone ... check before cancelling". A panel that contradicts itself is worse than either row
+    alone: the user cannot act on it at all.
+    """
+    import time as _time
+
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    base = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "rl"},
+    }
+
+    # inside the overlap: the specific hint wins, the reassurance stands down.
+    overlap = dict(base, last_heartbeat={"stage": "rl_initializing", "ts": _time.time() - 1080})
+    out = render.run_status(overlap)
+    assert "longer than throttling explains" in out
+    assert "do not cancel" not in out, "reassurance printed alongside a possible-dead-instance hint"
+
+    # and warmup still reassures where it is the honest reading.
+    fresh = dict(base, last_heartbeat={"stage": "rl_initializing", "ts": _time.time() - 300})
+    fresh_out = render.run_status(fresh)
+    assert "do not cancel" in fresh_out
+    assert "longer than throttling explains" not in fresh_out
+
+
+def test_opd_model_load_is_not_described_as_a_weight_download(monkeypatch):
+    """`opd_model_load` reads the cached config with local_files_only; it downloads nothing.
+
+    Both model-load stages are emitted only after `prefetch_model` returns, so neither is the
+    tens-of-GB base-weight transfer (that is `model_prefetching`). SFT still fetches a warm-start
+    adapter inside its span, so it keeps a download explanation -- a smaller one.
+    """
+    import time as _time
+
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    base = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "opd"},
+    }
+
+    opd = dict(base, last_heartbeat={"stage": "opd_model_load", "ts": _time.time() - 1200})
+    opd_out = render.run_status(opd)
+    assert "longer than throttling explains" in opd_out
+    assert "tens of GB" not in opd_out
+    assert "can block for minutes" in opd_out
+
+    # sft's span MAY fetch an adapter, but only when the run warm-starts from one -- most do not,
+    # so the wording has to hedge rather than assert a transfer that usually is not happening.
+    sft = dict(base, last_heartbeat={"stage": "sft_model_load", "ts": _time.time() - 1200})
+    sft_out = render.run_status(sft)
+    assert "if the run warm-starts from one" in sft_out
+    assert "tens of GB" not in sft_out
+    # the hub pull is not the per-datacenter weight volume, so the region is not the explanation.
+    sft_dc = dict(
+        base,
+        last_heartbeat={"stage": "sft_model_load", "ts": _time.time() - 1200, "dc": "EU-RO-1"},
+    )
+    assert "datacenter above" not in render.run_status(sft_dc)
+
+
+def test_stale_datacenter_is_labelled_as_the_previous_attempt(monkeypatch):
+    """A retry reuses the heartbeat path, so `dc` can belong to the worker that already died.
+
+    This row exists so two runs of the same config are comparable by region. Presenting the dead
+    attempt's region as the live one's corrupts exactly that comparison: the replacement may still
+    be provisioning, or may have landed somewhere with a completely different cache state.
+    """
+    import time as _time
+
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    base = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+    }
+
+    superseded = dict(
+        base,
+        remote={"attempt": 2},
+        last_heartbeat={
+            "stage": "sft_model_load",
+            "attempt": 1,
+            "ts": _time.time() - 1200,
+            "dc": "EU-RO-1",
+        },
+    )
+    out = render.run_status(superseded).split("details", 1)[0]
+    assert "EU-RO-1" in out, "the previous region is still worth showing"
+    assert "previous attempt" in out, "it is presented as the live attempt's region"
+
+    # when the heartbeat IS the live attempt, the row stays unqualified.
+    current = dict(
+        base,
+        remote={"attempt": 2},
+        last_heartbeat={
+            "stage": "sft_model_load",
+            "attempt": 2,
+            "ts": _time.time() - 1200,
+            "dc": "EU-RO-1",
+        },
+    )
+    current_out = render.run_status(current).split("details", 1)[0]
+    assert "EU-RO-1" in current_out
+    assert "previous attempt" not in current_out
+
+
+def test_cadence_is_asserted_as_fact_only_when_a_liveness_ping_proves_it():
+    """Worker code is content-addressed per submission, so a pre-upgrade run still emits one-shot
+    pings while a newer CLI reads them. Claiming "pings every ~4 min" as fact is then false, and
+    every reading built on that premise inherits the error.
+
+    The hint must still FIRE in both cases: a run frozen inside its very first 240s window has no
+    liveness ping either, and that is the primary freeze this hint was written to diagnose. So the
+    distinction belongs in the wording, not in whether the diagnosis appears at all.
+    """
+    from flash.cli.ui.heartbeat import _stale_setup_hint
+
+    proven = _stale_setup_hint({"stage": "sft_model_load", "liveness": True}, 1200.0, running=True)
+    assert "pings every ~4 min" in proven
+    assert "expected to ping" not in proven
+
+    unproven = _stale_setup_hint({"stage": "sft_model_load"}, 1200.0, running=True)
+    assert unproven, "the hint must still fire; a first-window freeze has no liveness ping either"
+    assert "expected to ping" in unproven
+    assert "unless this run predates that" in unproven
+
+
+def test_no_stage_clause_contradicts_the_sentence_it_completes():
+    """The clause is a parenthetical inside "it may be inside one long blocking call (...)".
+
+    A clause saying no long call is expected there negates the sentence mid-parenthesis and steers
+    the user away from the healthy reading. Every one of these stages holds a liveness wrap
+    BECAUSE it can block for minutes, so no stage may deny that. Checked across the whole set
+    rather than per-stage: this bug arrived via an else branch that no single-stage test covered.
+    """
+    from flash.cli.ui.heartbeat import _LIVENESS_SETUP_STAGES, _stale_setup_hint
+
+    denials = ("no long call", "does no download", "is unusual here")
+    for stage in sorted(_LIVENESS_SETUP_STAGES):
+        hint = _stale_setup_hint({"stage": stage}, 1200.0, running=True)
+        assert hint, f"{stage} is in the set but produced no hint"
+        clause = hint.split("one long blocking call (", 1)[1].split(")", 1)[0]
+        assert clause, f"{stage} produced an empty clause"
+        for denial in denials:
+            assert denial not in clause, (
+                f"{stage} clause denies the call it is describing: {clause}"
+            )
+
+
+@pytest.mark.parametrize("stage", ["sft_finalizing", "rl_finalizing", "opd_finalizing"])
+def test_finalizing_silence_is_not_called_unusual(stage, monkeypatch):
+    """These export and upload the adapter, so a long blocking stretch is expected, not anomalous.
+
+    They still earn the stale hint (they hold a keepalive wrap on the 240s cadence), but telling a
+    user their silence is unusual is worst here: training is done and only the upload stands between
+    them and their result, so a nudge toward cancelling destroys finished work.
+    """
+    import time as _time
+
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    obj = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+        "last_heartbeat": {"stage": stage, "ts": _time.time() - 1200},
+    }
+    out = render.run_status(obj)
+    assert "longer than throttling explains" in out
+    assert "cold mount or a venv install" not in out, "the generic fallback misnames this wait"
+    assert "exports and uploads the adapter" in out
+
+
+def test_setup_hint_cites_the_datacenter_only_when_the_row_is_rendered(monkeypatch):
+    """`dc` is optional, and the datacenter row is omitted when it is absent.
+
+    The hint says "the datacenter above", so without this the text points at a row that was never
+    rendered. Both read the same heartbeat dict, so the reference must follow the row.
+    """
+    import time as _time
+
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    base = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+    }
+
+    without_dc = dict(
+        base, last_heartbeat={"stage": "model_prefetching", "ts": _time.time() - 1200}
+    )
+    out = render.run_status(without_dc)
+    assert "datacenter above" not in out, "cites a row that is not on the panel"
+    # the download itself is still the right explanation for this stage.
+    assert "downloads tens of GB" in out
+
+    with_dc = dict(
+        base,
+        last_heartbeat={"stage": "model_prefetching", "ts": _time.time() - 1200, "dc": "EU-RO-1"},
+    )
+    out_dc = render.run_status(with_dc)
+    assert "datacenter above" in out_dc
+    assert "EU-RO-1" in out_dc
+
+
+def test_status_shows_the_datacenter_the_worker_landed_in(monkeypatch):
+    """Base weights come from a per-datacenter cache volume and the allocator does not pin a region.
+
+    The worker already stamps `dc` on every heartbeat, but nothing rendered it -- so an identical
+    config that relaunched into a cold region looked like an unexplainable freeze.
+    """
+    import time as _time
+
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    base = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+    }
+
+    located = dict(
+        base, last_heartbeat={"stage": "sft_model_load", "ts": _time.time() - 60, "dc": "EU-RO-1"}
+    )
+    assert "EU-RO-1" in render.run_status(located).split("details")[0]
+
+    # absent on providers that do not report one: render nothing rather than an empty row.
+    unlocated = dict(base, last_heartbeat={"stage": "sft_model_load", "ts": _time.time() - 60})
+    assert "datacenter" not in render.run_status(unlocated).split("details")[0]
+
+
+def test_quiet_hint_does_not_send_users_to_an_hourly_log(monkeypatch):
+    """Worker stdout uploads hourly, so `runs log` cannot answer "is it alive?" mid-run.
+
+    The hint used to point there, which is what made a healthy short run look hung.
+    """
+    import time as _time
+
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    quiet = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+        "last_heartbeat": {"stage": "rl_train_start", "ts": _time.time() - 400},
+    }
+    out = render.run_status(quiet).split("details")[0]
+
+    assert render._QUIET_HEARTBEAT_HINT in out
+    assert "runs log" not in out
+    # it has to name the surfaces that do update while the run is live.
+    assert "the age above" in out
+    assert "hourly" in out
+
+
+def test_a_cleared_remote_does_not_present_a_dead_attempts_region_as_live(monkeypatch):
+    """`remote: null` is the relaunch window, so its attached `dc` is the torn-down worker's.
+
+    `heartbeat_is_current_attempt` answers True here because it cannot prove otherwise from the
+    identity alone: there is no live attempt number to compare against. Reading that True as
+    "current" printed the dead attempt's region unqualified, which corrupts the exact comparison the
+    row exists for -- the replacement may land in a region with a completely different cache state.
+
+    The log-follow spinner already draws this line the same way (`_log_follow_progress`), so this
+    asserts the two surfaces agree rather than inventing a second contract.
+    """
+    import time as _time
+
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    base = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+    }
+    heartbeat = {
+        "stage": "sft_model_load",
+        "attempt": 1,
+        "ts": _time.time() - 1200,
+        "dc": "EU-RO-1",
+    }
+
+    cleared = dict(base, remote=None, last_heartbeat=dict(heartbeat))
+    out = render.run_status(cleared).split("details", 1)[0]
+    assert "EU-RO-1" in out, "the region is still worth showing"
+    assert "previous attempt" in out, "a cleared remote means that worker is already gone"
+
+    # an ABSENT `remote` is a plane that never surfaces the field, not a teardown. it must keep
+    # falling back, or every such plane labels a perfectly live worker as dead.
+    absent = dict(base, last_heartbeat=dict(heartbeat))
+    assert "previous attempt" not in render.run_status(absent).split("details", 1)[0]
+
+
+def test_a_superseded_ping_is_not_called_alive_by_the_quiet_hint(monkeypatch):
+    """The panel must not label a row `previous attempt` and then reassure about that same ping.
+
+    `quiet is not dead` is written about a live worker holding uploads on the throttle. Printed
+    beside a heartbeat whose worker is provably torn down it is simply false, and it is the longer,
+    more reassuring of the two readings, so it wins: a run between attempts reads as healthy.
+    """
+    import time as _time
+
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    base = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+    }
+    # rl_train_start is deliberate: it is in neither hint's stage set, so before this fix nothing
+    # suppressed the quiet hint and the contradiction was reachable.
+    superseded = dict(
+        base,
+        remote={"attempt": 2},
+        last_heartbeat={"stage": "rl_train_start", "attempt": 1, "ts": _time.time() - 400},
+    )
+    out = render.run_status(superseded).split("details", 1)[0]
+    assert "quiet is not dead" not in out, "that ping's worker is gone; quiet IS dead there"
+    # it is replaced, not merely dropped: the silence still needs an explanation, and this one is
+    # true. it must also not send the user to cancel, since the replacement may be provisioning.
+    assert "already gone" in out
+    assert "has not published one yet" in out
+
+    # the control: same age, same stage, live attempt. the ordinary reassurance must survive.
+    live = dict(
+        base,
+        remote={"attempt": 2},
+        last_heartbeat={"stage": "rl_train_start", "attempt": 2, "ts": _time.time() - 400},
+    )
+    live_out = render.run_status(live).split("details", 1)[0]
+    assert "quiet is not dead" in live_out
+    assert "already gone" not in live_out
+
+
+def test_at_most_one_progress_hint_can_ever_fire():
+    """The `or` chain in `_heartbeat_pairs` must not be what keeps the panel to a single reading.
+
+    Only one `progress` row is rendered, so if two hints could both fire, the chain's hand-written
+    order would silently decide which diagnosis a user sees -- and reordering it would change the
+    displayed reading with nothing failing. The three predicates are meant to be mutually exclusive
+    by their own gates instead: `current_attempt` splits `_superseded_hint` from the other two, and
+    disjoint stage sets split those two from each other. That is the property worth pinning, because
+    it is what makes the order an implementation detail rather than load-bearing behavior.
+
+    Asserted by exhaustive enumeration rather than a few samples: the gates interact across four
+    inputs, and a hand-picked case cannot show that no combination overlaps.
+    """
+    import itertools
+    import time as _time
+
+    from flash.cli.ui import heartbeat as hb_mod
+
+    stages = sorted(
+        hb_mod._LIVENESS_SETUP_STAGES
+        | hb_mod._TRAINING_STEP_STAGES
+        | hb_mod._WARMUP_STAGES
+        | {"unknown_stage"}
+    )
+    now = _time.time()
+    overlaps = []
+    for stage, age, current, running, step in itertools.product(
+        stages,
+        # straddle both gates (300s quiet, 900s setup-silent) from either side.
+        [10.0, 400.0, 1000.0, 5000.0],
+        [True, False],
+        [True, False],
+        [None, 0, 455],
+    ):
+        heartbeat = {"stage": stage, "ts": now - age, "step": step}
+        fired = [
+            name
+            for name, hint in (
+                (
+                    "stale_step",
+                    hb_mod._stale_step_hint(
+                        heartbeat, age, running=running, current_attempt=current
+                    ),
+                ),
+                (
+                    "stale_setup",
+                    hb_mod._stale_setup_hint(
+                        heartbeat, age, running=running, current_attempt=current
+                    ),
+                ),
+                (
+                    "superseded",
+                    hb_mod._superseded_hint(age, running=running, current_attempt=current),
+                ),
+            )
+            if hint
+        ]
+        if len(fired) > 1:
+            overlaps.append((stage, age, current, running, step, fired))
+    assert not overlaps, (
+        f"two hints fire for the same heartbeat, so the chain order decides: {overlaps[:3]}"
+    )
+
+
+def test_each_hint_owns_the_heartbeats_it_is_written_for():
+    """Mutual exclusivity is worthless if the wrong hint owns a case, or none does.
+
+    Pairs with the test above: that one proves at most one fires, this one proves the right one
+    does. A superseded ping must get the superseded reading on BOTH a setup stage and a training
+    stage -- and in particular must never be told its dead worker's step is merely lagging.
+    """
+    import time as _time
+
+    from flash.cli.ui.heartbeat import _heartbeat_pairs
+
+    def progress(stage: str, *, attempt: int, **hb) -> str:
+        pairs = _heartbeat_pairs(
+            {
+                "state": "running",
+                "remote": {"attempt": 2},
+                "last_heartbeat": {
+                    "stage": stage,
+                    "attempt": attempt,
+                    "ts": _time.time() - 1200,
+                    **hb,
+                },
+            }
+        )
+        return dict(pairs).get("progress", "")
+
+    # superseded: the stage-aware hints decline it, and the superseded reading is what is left.
+    assert "already gone" in progress("sft_model_load", attempt=1)
+    assert "already gone" in progress("sft_step", attempt=1, step=455)
+    assert "last one UPLOADED" not in progress("sft_step", attempt=1, step=455)
+
+    # live: the stage-aware hints own it, and each says the more specific thing.
+    assert "longer than throttling explains" in progress("sft_model_load", attempt=2)
+    assert "last one UPLOADED" in progress("sft_step", attempt=2, step=455)
+    assert "already gone" not in progress("sft_step", attempt=2, step=455)
+
+
+def test_superseded_hint_stays_quiet_when_there_is_no_silence_to_explain():
+    """Below the quiet threshold the label alone is accurate and nothing contradicts it.
+
+    A hint about a stale heartbeat printed next to a 30-second-old one is noise, and noise on the
+    panel is what trained users to ignore it.
+    """
+    from flash.cli.ui.heartbeat import _superseded_hint
+
+    assert _superseded_hint(30.0, running=True, current_attempt=False) is None
+    assert _superseded_hint(1200.0, running=True, current_attempt=False)
+    # terminal runs are not waiting on anything, and a live attempt is the other hints' business.
+    assert _superseded_hint(1200.0, running=False, current_attempt=False) is None
+    assert _superseded_hint(1200.0, running=True, current_attempt=True) is None
+    assert _superseded_hint(None, running=True, current_attempt=False) is None

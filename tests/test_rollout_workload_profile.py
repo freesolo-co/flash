@@ -75,6 +75,7 @@ class _Env:
     id = "freesolo-co/autoslm-bench"
     resolved_sha = "env-sha"
     params: ClassVar[dict] = {}
+    pip: ClassVar[tuple[str, ...]] = ()
 
 
 class _Spec:
@@ -83,6 +84,9 @@ class _Spec:
     model_revision = "main"
     seed = 0
     thinking = False
+    # mirrors JobSpec's default: this fake stands in for an authored spec, and an authored gpu.count
+    # is exactly what `count = 1` below represents.
+    gpu_count_auto = False
     train = _Train()
     environment = _Env()
 
@@ -411,7 +415,7 @@ class _QuotableTrain(_Train):
     """`_Train` plus the fields the quote path reads. Kept separate so the digest tests above keep
     exercising the minimal spec surface they were written against."""
 
-    batch_size = 8
+    prompts_per_step = 8
     lora_rank = 32
     save_at_steps: ClassVar[list] = []
 
