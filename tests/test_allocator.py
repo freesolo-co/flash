@@ -1907,40 +1907,6 @@ def test_wider_shape_remedy_is_bounded_by_the_geometry_cap():
     assert wider_shape_remedy((vram,), need, ceiling=8, above=8) == ""
 
 
-def test_the_geometry_cap_keeps_eight_cards_for_a_twenty_four_head_row():
-    """A 24-head row is rentable at eight cards, and a profile inherits that width.
-
-    Pins the arithmetic because review twice read this cap as clipping 8 to 4 for the 27B, on the
-    premise that 8 does not divide 24. It does (24 % 8 == 0), and the search walks
-    ``rentable_gpu_counts`` largest-first, so it returns 8 on the first try. The counts that would
-    genuinely narrow this row are the ones 24 does NOT divide by -- none below 8, since 24 is
-    divisible by 8, 4, 2 and 1 alike.
-
-    Narrowing to four is a different mechanism with a different cause: an unreadable pinned
-    revision certifies no geometry, so it falls back to ``_UNCERTIFIED_CAP``. That is a fail-safe
-    about provenance, not about head divisibility, and it applies to the training run and its
-    profile identically.
-    """
-    from flash.providers.allocator import (
-        _UNCERTIFIED_CAP,
-        _profile_gpu_ceiling,
-        geometry_safe_gpu_cap,
-    )
-    from flash.providers.base import rentable_gpu_counts
-
-    assert 24 % 8 == 0  # the premise the finding rested on
-    assert rentable_gpu_counts(8) == (8, 4, 2, 1)
-
-    # offline (no certification attempted): the row's own head count settles it at eight.
-    assert geometry_safe_gpu_cap("Qwen/Qwen3.6-27B", 8) == 8
-    # ...and a profile ceiling is not clipped on the way through.
-    assert geometry_safe_gpu_cap("Qwen/Qwen3.6-27B", _profile_gpu_ceiling(None)) == 8
-
-    # an unknown row certifies nothing, which IS narrowed -- the contrast that shows the cap is
-    # live rather than vacuously returning its input.
-    assert geometry_safe_gpu_cap("not/a-catalog-row", 8) == _UNCERTIFIED_CAP
-
-
 def test_wider_shape_remedy_names_the_cheapest_fitting_width():
     """The remedy must name the smallest shape that works, not the widest on offer.
 

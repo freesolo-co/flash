@@ -829,8 +829,8 @@ def _warn_if_login_shadowed(args) -> None:
         return
     # `train --cost` cannot be classified here: the algorithm is only known once the config is
     # parsed, which happens inside the command. grpo/opd stay catalog-only and must not warn about
-    # an org they never reach; sft authenticates and can start a billed profile run, so it emits
-    # this warning itself (see commands._cmd_train_cost_sft).
+    # an org they never reach; sft authenticates to request the server-side dataset estimate, so it
+    # emits this warning itself (see commands._cmd_train_cost_sft).
     if getattr(args, "cost", False):
         return
     message = shadowed_login_warning()

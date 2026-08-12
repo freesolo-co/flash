@@ -373,9 +373,8 @@ def cmd_train(args) -> int:
     _warn_if_wandb_requested_without_key(spec, runtime_secrets, dry_run=bool(args.dry_run))
     if args.dry_run:
         # dry-run runs submit-time server preflights without allocating a training gpu or charging
-        # for training. a rejection surfaces as the server's error with exit status 1. for sft it
-        # also requires an exact workload profile, so a miss starts a separate billed profile run
-        # (see _raise_if_workload_profile_pending) instead of previewing anything.
+        # for training. a rejection surfaces as the server's error with exit status 1. for sft the
+        # server reads the packaged dataset file and builds the quote without executing environment.py.
         try:
             status = client.create_run(
                 payload,
@@ -384,7 +383,6 @@ def cmd_train(args) -> int:
                 client_train_schema=client_train_schema,
             )
         except ApiError as exc:
-            _raise_if_workload_profile_pending(client, exc)
             detail = _legacy_train_key_rejection_detail(exc, authored_train_keys)
             if detail is None:
                 raise
@@ -396,13 +394,11 @@ def cmd_train(args) -> int:
         # equally not a verification -- so treat anything but an explicit True as unverified.
         affordability_verified = status.pop("affordability_verified", None) is True
         cost = "and cost" if affordability_verified else "but NOT cost"
-        # sft additionally required a matching workload profile to get this far, and that profile
-        # run already imported environment.py and tokenized the dataset. claiming otherwise here
-        # would understate what has been checked -- and what has already been billed.
         environment = (
-            "your environment.py and the exact dataset were already loaded and tokenized by the "
-            "workload profile this quote is built on; model load and gpu/training are first "
-            "exercised on the worker after cold-start."
+            "it did NOT import or run your environment.py. packaged input/output fields and the "
+            "statically readable training contract were tokenized together; tokens, retention, "
+            "truncation, and steps can still miss other environment transformations. environment "
+            "execution, model load, and gpu/training are first exercised on the worker after cold-start."
             if spec.algorithm == "sft"
             else "it did NOT import or run your environment.py; dataset loading, "
             "start_episode/episode shapes, reward/scorer, worker imports, model load, and "
@@ -430,18 +426,11 @@ def cmd_train(args) -> int:
             print(json.dumps(status, indent=2))
         _print_unpacked_batch_warning(status, spec)  # after the payload, so stdout stays parseable
         return 0
-    try:
-        status = client.create_run(
-            payload,
-            runtime_secrets=runtime_secrets,
-            client_train_schema=client_train_schema,
-        )
-    except ApiError as exc:
-        # a real submit misses the profile cache the same way a preview does, and the miss starts a
-        # separately billed profile run. without this the user sees a bare 409 for a charge they
-        # were never told about (see _raise_if_workload_profile_pending).
-        _raise_if_workload_profile_pending(client, exc)
-        raise
+    status = client.create_run(
+        payload,
+        runtime_secrets=runtime_secrets,
+        client_train_schema=client_train_schema,
+    )
     run_id = status["run_id"]
     _print_unpacked_batch_warning(status, spec)  # a real submit overrides batch_size the same way
     logger.info(
@@ -956,12 +945,10 @@ from flash.cli.commands.train_cost import (  # noqa: E402,F401
     _cmd_train_cost,
     _cmd_train_cost_offline,
     _cmd_train_cost_sft,
-    _exact_sft_cost_rows,
     _legacy_train_key_rejection_detail,
-    _print_exact_sft_cost,
+    _print_sft_cost,
     _print_train_schema_compatibility,
     _print_unpacked_batch_warning,
-    _profile_charge,
-    _raise_if_workload_profile_pending,
+    _sft_cost_rows,
     _warn_if_wandb_requested_without_key,
 )

@@ -293,7 +293,7 @@ class TrainSpec:
     hf_repo: str = ""
     # None -> worker's tuned recipe default.
     learning_rate: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
-    # sft ONLY. a measured workload profile resolves this against the real tokenized dataset into
+    # sft only. the packaged-dataset estimate resolves this against the selected row count into
     # examples_per_update (packed) or pins the optimizer batch to 1 (unpacked). grpo/opd have no
     # profile, so they take prompts_per_step instead and reject this key: the two are not the same
     # quantity, and accepting one name for both let the standard sft memory workaround
@@ -450,7 +450,6 @@ class JobSpec:
     # "auto-size"; a type pin or authored count=1 leaves it false and remains a hard ceiling.
     gpu_count_auto: bool = False
     # platform-managed workload-profile carrier. public configs never author these fields.
-    workload_profile_kind: str = ""
     workload_profile_input_digest: str = ""
     # the flash version that keyed the digest above. it has to travel with the spec because the
     # worker cannot re-derive it: `flash.__version__` reads distribution metadata, and the worker
@@ -478,9 +477,6 @@ class JobSpec:
         # the placeholder count=1 for digest stability), so a recovered auto-sized run came back
         # hard-pinned to one card and could never be re-offered its multi-card shape. consumers that
         # mean "auto-size NOW" must additionally check that no shape has been resolved yet.
-        profile_kind = str(self.workload_profile_kind or "")
-        if profile_kind not in {"", "sft"}:
-            raise ValueError("unsupported workload profile kind")
         profile_digest = str(self.workload_profile_input_digest or "")
         if profile_digest and (
             len(profile_digest) != 64 or any(c not in "0123456789abcdef" for c in profile_digest)
@@ -493,8 +489,6 @@ class JobSpec:
 
     @property
     def phase(self) -> str:
-        if self.workload_profile_kind:
-            return "profile"
         return "rl" if self.algorithm == "grpo" else self.algorithm
 
     @property
@@ -536,7 +530,6 @@ class JobSpec:
         # keep gpu.count=1 in the public gpu object for preparation-digest stability. only the
         # platform-managed provenance marker is stripped; internal round trips carry it verbatim.
         data.pop("gpu_count_auto", None)
-        data.pop("workload_profile_kind", None)
         data.pop("workload_profile_input_digest", None)
         data.pop("workload_profile_producer_version", None)
         data.pop("workload_profile", None)
@@ -688,7 +681,6 @@ class JobSpec:
             seed=parse_seed(data.get("seed", FIXED_SEED)),
             model_revision_auto=coerce_bool(data.get("model_revision_auto", False)),
             gpu_count_auto=coerce_bool(data.get("gpu_count_auto", False)),
-            workload_profile_kind=str(data.get("workload_profile_kind") or ""),
             workload_profile_input_digest=str(data.get("workload_profile_input_digest") or ""),
             workload_profile_producer_version=str(
                 data.get("workload_profile_producer_version") or ""

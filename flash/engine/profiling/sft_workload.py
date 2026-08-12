@@ -1,4 +1,4 @@
-"""Shared exact SFT preprocessing for profile and training workers."""
+"""shared sft tokenization and workload construction for estimates and training."""
 
 from __future__ import annotations
 
@@ -142,7 +142,7 @@ def _materialize_verl_images(
     image_dir: str | None,
     row_index: int,
 ) -> list[str]:
-    """Decode image descriptors to files verl can load; a profile run passes no dir and writes none."""
+    """decode image descriptors to files verl can load; estimate-only callers write none."""
     if image_dir is None:
         return []
     from flash.content.multimodal import decode_image_descriptors
@@ -194,10 +194,9 @@ def _packing_mode(
                 # both, transformers' fallbacks accept the kwargs and DISCARD them, so state bleeds
                 # across examples inside a packed block while looking patched.
                 #
-                # the contract probe is device-independent on purpose: this same function runs in
-                # the cpu-only profile job that freezes the quote AND on the gpu worker, and
-                # sft_train compares the two profiles byte-for-byte. see
-                # gdn_packing_contract_available.
+                # the contract probe is device-independent on purpose: the control-plane estimate
+                # and gpu worker must derive the same packing capability from the pinned stack, not
+                # from whether cuda is locally visible. see gdn_packing_contract_available.
                 supported = gdn_packing_contract_available(model_id, revision=revision)
                 architecture_mode = "gdn-hybrid"
             else:
@@ -672,9 +671,9 @@ def prepare_sft_workload(
     )
     # one example per update instead of the authored batch is an optimization-semantics change
     # whose only other trace is `notes["packing"]` in the finished run's metrics, which is not
-    # visible until after the run is paid for. this function runs in the profile job and again on
-    # the training worker, so the warning lands in both logs. pass the authored batch_size rather
-    # than `effective_batch`: the helper resolves None to the same recipe default but keeps the
+    # visible until after the run is paid for. this function runs for the control-plane estimate and
+    # again on the training worker, so the warning lands in both logs. pass the authored batch_size
+    # rather than `effective_batch`: the helper resolves None to the same recipe default but keeps the
     # value's source, so an omitted knob is not reported to the user as one they configured.
     warning = unpacked_batch_warning(
         packing_mode=profile.packing_mode,

@@ -233,12 +233,10 @@ def test_seed_training_rngs_initializes_all_supported_generators(monkeypatch):
 
 
 def test_seed_host_rngs_reaches_the_dataset_generators_without_importing_torch(monkeypatch):
-    """The workload-profile run seeds these and nothing else.
+    """host seeding reaches python and numpy without importing the model stack.
 
-    Environment code is user code and may consume Python's or NumPy's global generator while
-    building its dataset, so a profile that skipped them could select a different sample than
-    training and fail the parity check. torch is the opposite case: seeding it would import the
-    model stack into a job that is allocated and billed as cpu-only.
+    environment code may consume python's or numpy's global generator while building training rows.
+    torch is the opposite case: importing it here would make a host-only helper load the model stack.
     """
     from flash.engine.worker.runtime import rng
 

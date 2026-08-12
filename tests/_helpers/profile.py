@@ -36,7 +36,7 @@ def sft_profile_for(spec: Any, *, input_digest: str, producer_version: str):
     """A schema-valid profile whose shape follows ``spec``'s own train fields.
 
     The token counts are synthetic: these tests assert that a *matching* profile unblocks
-    preparation, not that the measured workload is right (``tests/test_sft_workload.py`` owns
+    preparation, not that the synthetic token totals are right (``tests/test_sft_workload.py`` owns
     that). What must stay faithful is the identity the runner and the cost path re-derive --
     digest, producer version, tokenizer revision -- and the internal consistency the schema
     enforces.
@@ -143,21 +143,10 @@ def attach_sft_profile(spec: Any) -> Any:
     )
 
 
-def record_sft_profile(runner, spec: Any) -> str:
-    """Store the completed profile record for an ALREADY-pinned ``spec``; return its digest.
-
-    This is the state a real resubmit finds: the profile job ran to completion and its record is in
-    the store, so ``prepare_job`` re-derives the digest and reads the profile instead of queueing
-    another one. Nothing is stubbed, so a test whose subject IS the pinning can pin for real and
-    still get past the gate. Call it after ``RUNS_DIR`` is redirected -- it writes through the
-    runner's own state store -- and pass the same shas the runner will resolve, because a digest
-    keyed on anything else is exactly the mismatch the gate is built to reject.
-    """
-    from flash.engine.profiling.workload_profile import (
-        SFT_PROFILE_KIND,
-        sft_profile_input_digest,
-        sft_profile_run_id,
-    )
+def record_sft_profile(runner, spec: Any, monkeypatch=None) -> str:
+    """stub control-plane packaged-dataset profiling for tests about another boundary."""
+    import flash.engine.profiling.dataset_profile as dataset_profile
+    from flash.engine.profiling.workload_profile import sft_profile_input_digest
 
     producer_version = runner._profile_producer_version()
     digest = sft_profile_input_digest(
@@ -166,16 +155,14 @@ def record_sft_profile(runner, spec: Any) -> str:
         producer_version=producer_version,
     )
     profile = sft_profile_for(spec, input_digest=digest, producer_version=producer_version)
-    runner._save_status(
-        runner.RunStatus(
-            run_id=sft_profile_run_id(digest),
-            state="done",
-            spec=spec.to_dict(),
-            workload_profile_kind=SFT_PROFILE_KIND,
-            workload_profile_input_digest=digest,
-            workload_profile=profile.to_dict(),
-        )
-    )
+
+    def replacement(*_args, **_kwargs):
+        return profile
+
+    if monkeypatch is None:
+        dataset_profile.profile_packaged_sft_dataset = replacement
+    else:
+        monkeypatch.setattr(dataset_profile, "profile_packaged_sft_dataset", replacement)
     return digest
 
 
@@ -190,13 +177,12 @@ def satisfy_sft_profile(runner, monkeypatch, spec: Any):
     if spec.algorithm != "sft":
         return spec
 
-    # The three hub/github round-trips a pinned sft submission performs, replaced in place. Each
-    # has its own dedicated coverage (revision resolution, env-sha pinning, revision geometry);
-    # reaching the network here would make every sft submit test an integration test.
+    # Hub/model round-trips are replaced in place. Each has dedicated coverage; reaching the network
+    # here would make every sft submit test an integration test.
     monkeypatch.setattr(runner, "_resolve_model_revision", lambda s, **_kw: _pin_model_revision(s))
     monkeypatch.setattr(runner, "_assign_resolved_env_sha", _pin_env_revision)
     stub_revision_geometry(monkeypatch)
 
     pinned = _pin_env_revision(_pin_model_revision(spec))
-    record_sft_profile(runner, pinned)
+    record_sft_profile(runner, pinned, monkeypatch)
     return pinned

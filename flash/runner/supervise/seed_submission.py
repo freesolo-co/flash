@@ -388,9 +388,6 @@ def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
             # spec is only a placeholder, so the marker must reach allocation as none or auto-sizing
             # silently collapses back to one card after the preparation round trips.
             max_gpu_count=prepared.attempt_spec.authored_gpu_count,
-            # a profile job tokenizes on cpu and exits before weights load, so it allocates the
-            # cheapest rentable card rather than the training shape it is measuring.
-            workload_profile=bool(prepared.attempt_spec.workload_profile_kind),
         )
     except Exception as exc:
         if isinstance(exc, UnsupportedGpuError):

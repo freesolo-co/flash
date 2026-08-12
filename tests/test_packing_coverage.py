@@ -87,18 +87,12 @@ def test_gdn_forward_probe_swallows_import_and_inspection_failures(monkeypatch) 
 
 
 def test_the_packing_contract_gate_never_consults_the_device() -> None:
-    """The quote-side gate must decide without a gpu, or every catalog sft run fails.
+    """the control-plane gate must decide without a gpu.
 
-    ``prepare_sft_workload`` runs twice on DIFFERENT hardware: once in the cpu-only profile job
-    that freezes the quote (``runner`` drops the gpu type so it does not rent an H100 to tokenize)
-    and once on the gpu worker. ``sft_train`` then compares the two profiles byte-for-byte and
-    raises "sft workload changed after the quote was frozen" on any difference.
-
-    So a device-dependent packing gate answers False in the quote and True in training, mints two
-    different ``packing_mode``/``examples_per_update`` values, and fails EVERY gdn sft run on the
-    main path. ``is_flash_linear_attention_available`` / ``is_causal_conv1d_available`` are banned
-    here specifically: both open with ``is_torch_cuda_available()``.
-
+    ``prepare_sft_workload`` runs for the static estimate and again on the gpu worker. a
+    device-dependent gate would answer false on the control plane and true in training, producing
+    different ``packing_mode`` or ``examples_per_update`` values. the availability helpers below
+    are banned specifically because both open with ``is_torch_cuda_available()``.
     """
     import ast
     import inspect
@@ -115,9 +109,8 @@ def test_the_packing_contract_gate_never_consults_the_device() -> None:
         "get_device_capability",
     ):
         assert banned not in code, (
-            f"gdn_packing_contract_available consults {banned!r}, so the cpu-only profile job and "
-            "the gpu worker can disagree on packing_mode -- which fails the frozen-quote parity "
-            "check in sft_train for every gdn model"
+            f"gdn_packing_contract_available consults {banned!r}, so the control plane and gpu "
+            "worker can disagree on packing_mode"
         )
 
 

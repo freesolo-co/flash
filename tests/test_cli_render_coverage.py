@@ -477,9 +477,9 @@ def test_a_failed_run_that_never_measured_a_charge_is_not_reported_as_settled_ze
     """A terminal 0.0 is the absence of a measurement, not a measurement of zero.
 
     ``cost_usd`` comes from the worker's metrics, so a run whose every attempt died before the
-    worker produced any never gets one -- and that is exactly the run most likely to have rented
-    hardware over and over. One profile run rented 47 instances, failed to confirm teardown on 44,
-    and printed $0.0000 with no estimate marker, which reads as "this cost nothing".
+    worker produced any never gets one, and that is exactly the run most likely to have rented
+    hardware over and over. one historical failure rented 47 instances, failed to confirm teardown
+    on 44, and printed $0.0000 with no estimate marker, which reads as "this cost nothing".
     """
     amount, is_estimate = render.run_cost(
         {"state": "failed", "cost_usd": 0.0, "estimated_cost_usd": 3.5}

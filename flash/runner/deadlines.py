@@ -23,17 +23,6 @@ def _require_valid_deadline(value: object) -> float:
     )
 
 
-def _profile_wall_armed_at(raw: dict) -> float | None:
-    """Return when this profile's work budget started, or None if it has not started yet.
-
-    Absent means no worker has spoken for this profile yet, which is the normal state while it
-    queues. A stored value is validated like any other deadline input: a corrupt one fails closed
-    rather than silently reverting to the submission basis and shortening the budget."""
-    if runner._PROFILE_WALL_ARMED_AT_KEY not in raw:
-        return None
-    return runner._require_valid_deadline(raw[runner._PROFILE_WALL_ARMED_AT_KEY])
-
-
 def _canonical_run_deadline(raw: dict) -> tuple[RunStatus, float]:
     status = runner._runstatus_from_json(raw)
     # max_wall_seconds is platform-managed and stripped from the public status.spec, so source the
@@ -41,19 +30,6 @@ def _canonical_run_deadline(raw: dict) -> tuple[RunStatus, float]:
     spec = runner._internal_spec_from_status(status)
     created_at = runner._require_valid_deadline(status.created_at)
     max_wall_seconds = runner._require_valid_deadline(spec.gpu.max_wall_seconds)
-    if spec.workload_profile_kind:
-        # a profile's wall budget bounds its work. before a worker speaks, the run is still waiting
-        # on capacity, so it holds the queue allowance on top of its untouched work budget; once one
-        # speaks, the work budget runs from that moment and the remaining queue allowance is
-        # dropped. the basis is recomputed from persisted state (never from the wall clock), so this
-        # stays a pure function of the record and _checked_stored_run_deadline still validates it.
-        armed_at = runner._profile_wall_armed_at(raw)
-        basis = (
-            created_at + runner._WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS
-            if armed_at is None
-            else armed_at
-        )
-        return status, runner._require_valid_deadline(basis + max_wall_seconds)
     return status, runner._require_valid_deadline(created_at + max_wall_seconds)
 
 
@@ -99,14 +75,7 @@ def _worker_deadline_at(run_id: str, spec: JobSpec, *, now: float | None = None)
     fetch all come out of the work budget, and a slow-to-boot box self-terminates before it can emit
     the first heartbeat that would have armed the plane's own clock.
     """
-    stored = runner._load_run_deadline_at(run_id)
-    if not spec.workload_profile_kind:
-        return stored
-    current = time.time() if now is None else now
-    work_budget_at = float(current) + float(runner._WORKLOAD_PROFILE_WALL_SECONDS)
-    if runner._profile_wall_armed_at(runner._load_status_json(run_id)) is None:
-        return work_budget_at + float(runner._WORKLOAD_PROFILE_PROVISION_ALLOWANCE_SECONDS)
-    return min(stored, work_budget_at)
+    return runner._load_run_deadline_at(run_id)
 
 
 def _spec_with_remaining_wall(
@@ -117,18 +86,8 @@ def _spec_with_remaining_wall(
 ) -> JobSpec:
     """Copy a spec with only the run-global wall allowance still available."""
     remaining = runner._remaining_run_wall_seconds(spec.run_id, now=now)
-    # exhaustion is judged on the real remaining allowance, before any profile substitution below.
-    # a profile's grant replaces `remaining` outright, so deferring this check past that assignment
-    # would make it unreachable for profiles and let a run provision after its own deadline had
-    # passed -- and the first heartbeat would then arm a fresh work window from that moment,
-    # turning the bounded queue allowance into an unbounded one.
     if remaining <= 0:
         raise RuntimeError("run wall deadline exhausted; no further provisioning is allowed")
-    if spec.workload_profile_kind:
-        # grant an unarmed profile its full work budget, not remaining submission allowance. the latter
-        # still contains queue time and later truncates work after a long capacity wait; the run-global
-        # deadline remains enforced by ``_worker_deadline_at``.
-        remaining = float(runner._WORKLOAD_PROFILE_WALL_SECONDS)
     if require_provider_minimum and remaining < runner.MIN_PROVIDER_WALL_SECONDS:
         raise RuntimeError(
             "run wall deadline has less than the 60-second minimum provider allowance remaining; "

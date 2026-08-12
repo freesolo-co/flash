@@ -1701,23 +1701,22 @@ def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatc
     assert [step for _adapter, step in captured["published"]] == [2]
 
 
-def test_a_workload_that_moved_under_the_frozen_quote_stops_before_training(monkeypatch):
-    """The worker re-derives the workload and refuses to train on one the quote never priced.
+def test_environment_processing_may_change_the_static_estimate_without_repricing(
+    monkeypatch, capsys
+):
+    """the worker reports estimate drift and trains the environment-produced rows.
 
-    The environment is pinned by SHA, so this is not the ordinary case: it is the one where the
-    pinned inputs still produce different rows (a non-deterministic dataset build, a tokenizer
-    resolving differently). Training anyway would bill a run against a quote measured on other
-    data, so the profile is evidence to check rather than metadata to carry.
-
-    The drift has to come from the workload, not from the artifact. A profile carries its own
-    content digest, so an edited one is rejected as corrupt before this guard is reached; only a
-    re-derivation that legitimately disagrees can exercise it.
+    the control plane tokenizes only packaged input and output fields, while the worker executes
+    environment prompt construction and filtering. those profiles are not expected to match. the
+    accepted quote remains on the spec, and the worker uses its recomputed rows for training.
     """
     from flash.engine.profiling import sft_workload
     from flash.engine.worker import sft_train
 
     spec, _captured = _stub_sft_run(monkeypatch)
+    frozen_quote = dict(spec.workload_profile)
     honest = sft_workload.prepare_sft_workload
+    training_calls = []
 
     def drifted(*args, **kwargs):
         prepared = honest(*args, **kwargs)
@@ -1726,15 +1725,25 @@ def test_a_workload_that_moved_under_the_frozen_quote_stops_before_training(monk
         )
         return replace(prepared, profile=moved)
 
+    def completed_training(command, *, env, on_step, on_line, heartbeat):
+        training_calls.append(command)
+        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
+        on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
+        on_step(2)
+        heartbeat()
+        return 0
+
     monkeypatch.setattr(sft_train, "prepare_sft_workload", drifted)
+    monkeypatch.setattr(sft_train, "run_verl_training", completed_training)
 
-    def unreachable_training(command, *, env, on_step, on_line, heartbeat):
-        raise AssertionError("training must not start on a workload the quote did not price")
+    sft_train.run_sft_train(spec)
 
-    monkeypatch.setattr(sft_train, "run_verl_training", unreachable_training)
-
-    with pytest.raises(ValueError, match="workload changed after the quote was frozen"):
-        sft_train.run_sft_train(spec)
+    assert training_calls
+    assert spec.workload_profile == frozen_quote
+    assert (
+        "environment processing changed the packaged-dataset token estimate"
+        in capsys.readouterr().out
+    )
 
 
 def test_a_guard_failure_is_not_replaced_by_the_watcher_completeness_error(monkeypatch):

@@ -126,12 +126,9 @@ def _gdn_forward_threads_reset_kwargs(model_id: str | None, revision: str = "") 
 def gdn_packing_contract_available(model_id: str | None = None, revision: str = "") -> bool:
     """True when the installed gdn stack exposes the boundary-reset contract without opening cuda.
 
-    DEVICE-INDEPENDENT by construction, because the two callers of ``prepare_sft_workload`` run on
-    different hardware: the quote is produced by the cpu-only profile job (runner drops the gpu type
-    so it does not rent an H100 to tokenize), and training runs on the gpu worker. ``sft_train``
-    compares the two profiles byte-for-byte and raises "sft workload changed after the quote was
-    frozen" on any difference, so a packing gate that consults ``torch.cuda`` answers False in the
-    quote and True in training and fails EVERY run on the main path.
+    device-independent by construction because the control-plane estimate and gpu worker both use
+    this answer. a gate that consults ``torch.cuda`` would answer false on the control plane and true
+    during training, changing the packing contract between quoting and execution.
 
     So this asks only what both machines can answer identically: does the installed transformers
     thread the reset kwargs into this arch's GDN forward, and are the kernels importable. Both are

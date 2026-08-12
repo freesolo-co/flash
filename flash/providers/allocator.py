@@ -62,47 +62,6 @@ def required_vram_gb(
     )
 
 
-def profile_required_vram_gb() -> int:
-    """VRAM a workload-profile job needs: none beyond the smallest rentable card.
-
-    A profile job renders and tokenizes the exact dataset on cpu and exits before model weights or
-    cuda are touched, so sizing it like the training run it measures would rent (and bill) a card the
-    work never uses.
-    """
-    return 1
-
-
-def _profile_gpu_ceiling(max_gpu_count: int | None) -> int:
-    """Card ceiling for a profile allocation: the author's ceiling, else the platform maximum.
-
-    One card is what this job USES, not a shape it requires, and a ceiling is not a request: every
-    count up to it is QUERIED and the cheapest live one wins. So the ceiling's only job here is to
-    keep shapes reachable.
-
-    Capping it at one made the narrow shape the only one ever asked for. Providers sell a card count
-    as a distinct product rather than a divisible pool -- ``rentable_gpu_counts`` walks the counts
-    and vast searches each as its own market, so a count with no live host simply returns nothing --
-    and a class whose 4-card shape is live while its 1-card shape is sold out therefore yielded NO
-    candidate at all. The run itself auto-sizes against ``MAX_COMBINATION_CARDS`` and stays
-    allocatable, so its mandatory profile became the thing that blocked it: the exact deadlock
-    inheriting the run's pins exists to break (see ``preparation._prepared_sft_profile_job``).
-
-    Widening cannot widen the bill, which is what makes this safe rather than a tradeoff. Ranking is
-    on ``total_hourly_usd``, which bills every card, so a live single card always outranks the same
-    class in fours; the multi-card shape wins only when it is the one that exists.
-    """
-    return MAX_COMBINATION_CARDS if max_gpu_count is None else max_gpu_count
-
-
-def _profile_cost_ranker():
-    """``candidate -> dollars for the profile job``, which is rate alone.
-
-    The profile's wall is a fixed cap rather than a function of the hardware, so no card finishes it
-    sooner and the cheapest rentable shape always wins.
-    """
-    return lambda candidate: candidate.total_hourly_usd
-
-
 def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision=""):
     """``candidate -> dollars for one optimizer step``, or None when the run cannot be priced.
 
@@ -574,27 +533,20 @@ def allocate(
     gpu_type: str = "",
     model_revision: str = "",
     max_gpu_count: int | None = None,
-    workload_profile: bool = False,
 ) -> Allocation:
     """Pick the cheapest fitting combination of (provider, GPU class, count) able to run the job.
 
     ``max_gpu_count=None`` auto-sizes to the smallest geometry-safe ceiling that can fit. an integer
     is an authored hard ceiling; fitting shapes up to that ceiling still compete on dollars per step.
 
-    ``workload_profile=True`` allocates the cpu-only profile job instead of the run it measures: it
-    needs no training VRAM and gains nothing from a faster card, so it ranks on rate alone.
     """
-    if workload_profile:
-        need = profile_required_vram_gb()
-        max_gpu_count = _profile_gpu_ceiling(max_gpu_count)
-    else:
-        need = required_vram_gb(
-            model_id,
-            algorithm,
-            train=train,
-            thinking=thinking,
-            model_revision=model_revision,
-        )
+    need = required_vram_gb(
+        model_id,
+        algorithm,
+        train=train,
+        thinking=thinking,
+        model_revision=model_revision,
+    )
     provider = (provider or "").strip().lower()
     if provider and provider not in PROVIDER_NAMES:
         raise UnsupportedGpuError(
@@ -688,11 +640,7 @@ def allocate(
     # to pay for itself. ties prefer fewer cards (less inter-card overhead), then combined VRAM, then
     # class name. sorting is stable, so provider and provider-local order apply only when all key
     # fields match. a run the cost model cannot price falls back to total $/hr.
-    cost_per_step = (
-        _profile_cost_ranker()
-        if workload_profile
-        else _step_cost_ranker(model_id, algorithm, train, thinking, model_revision)
-    )
+    cost_per_step = _step_cost_ranker(model_id, algorithm, train, thinking, model_revision)
     primary = cost_per_step if cost_per_step is not None else (lambda c: c.total_hourly_usd)
     ranked = sorted(
         candidates,

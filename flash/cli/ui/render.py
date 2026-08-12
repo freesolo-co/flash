@@ -661,7 +661,7 @@ def cost_panel(est) -> str:
     return _safe(out)
 
 
-def exact_cost_panel(rows: list[tuple[str, str | None]], total_usd: float) -> str:
+def sft_cost_panel(rows: list[tuple[str, str | None]], total_usd: float) -> str:
     """Profile-backed cost estimate (sft), whose inputs are measured rather than modelled.
 
     Deliberately not cost_panel(): that panel's gpu/per-step/wall rows come from a local
@@ -673,7 +673,7 @@ def exact_cost_panel(rows: list[tuple[str, str | None]], total_usd: float) -> st
         f"  {_paint('TOTAL'.ljust(8), _GRAY, '1')} {_paint(_glyph('·', '-'), _FAINT)} "
         f"{_paint(f'${total_usd:.2f}', _TEAL, '1')}"
     )
-    head = header("train", "exact cost estimate (measured workload)")
+    head = header("train", "cost estimate (packaged dataset rows)")
     return _safe(f"{head}\n{panel}\n{_rule()}\n{total}")
 
 

@@ -282,8 +282,8 @@ ignored. Everything in the block above (`epochs`, `max_examples`, `max_steps`, `
 | `teacher_model`                                                                                                 | rejected | rejected | yes      |
 
 **The optimizer batch has a different name per algorithm because it is a different quantity.**
-Under SFT, `batch_size` is an input to a measured workload profile, which resolves it against the
-real tokenized dataset into the optimizer batch (and pins it to 1 when packing is off). Under
+Under SFT, `batch_size` is an input to the packaged-dataset estimate, which resolves it against the
+selected row count into the optimizer batch (and pins it to 1 when packing is off). Under
 GRPO/OPD there is no profile: `prompts_per_step` IS the optimizer batch, straight through to verl's
 `data.train_batch_size` and `ppo_mini_batch_size`. They were one key once, which meant the standard
 SFT out-of-memory workaround `batch_size = 1`, copied into an RL config, silently trained one prompt

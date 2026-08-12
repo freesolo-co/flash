@@ -80,8 +80,8 @@ _DEAD_STATES = {"exited", "stopped", "offline", "deleted", "frozen"}
 # ``deploy_and_submit``'s own ``tried`` list is rebuilt per call and only covers offers that
 # REJECTED the create. A machine that accepts the rental and then never boots is the worse case: it
 # is not in ``tried``, it stays in the market at the top of the cheapest-first ranking, and the next
-# attempt rents it again. One profile run rented offer 43982815 eleven times and 43688757 seven
-# times that way, spending its whole retry budget re-renting known-dead boxes.
+# attempt rents it again. a failed run once rented the same two dead offers eleven and seven times,
+# spending its whole retry budget re-renting known-dead boxes.
 #
 # Process-local and best-effort by design. It is an optimisation over the ranking, not a
 # correctness gate: a control plane restart or a second process legitimately starts with an empty
@@ -138,18 +138,7 @@ def dead_machine_ids(run_id: str) -> frozenset[int]:
 
 
 def forget_dead_machines(run_id: str) -> None:
-    """Drop a finished run's blacklist so the map does not grow for the process's lifetime.
-
-    A profile run id is derived from the workload, not from the attempt, so a spent profile is
-    relaunched under this same id. Dropping its blacklist at GC would hand the replacement a clean
-    slate and let it re-rent the host that just took the money -- the repeated-rental loop this
-    blacklist exists to break, arriving one lifecycle later. Those entries age out through
-    ``_DEAD_MACHINE_RUNS_MAX`` instead.
-    """
-    from flash.engine.profiling.workload_profile import is_profile_run_id
-
-    if is_profile_run_id(run_id):
-        return
+    """Drop a finished run's blacklist so the map does not grow for the process's lifetime."""
     with _dead_machines_lock:
         _run_dead_machines.pop(run_id, None)
 

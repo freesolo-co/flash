@@ -1169,7 +1169,7 @@ def test_model_revision_auto_does_not_change_pre_existing_preparation_digests() 
     """A snapshot prepared before this field existed must still rehash to its stored digest.
 
     `_preparation_digest` has to reproduce the bytes that were hashed, not today's serialization,
-    or a still-valid warm-start or workload-profile run fails integrity validation on recovery.
+    or a still-valid warm-start or profile-bearing training run fails integrity validation on recovery.
     """
     from flash.runner.preparation import _preparation_digest
 
@@ -1180,7 +1180,6 @@ def test_model_revision_auto_does_not_change_pre_existing_preparation_digests() 
     # so the control cannot drift from the code under test.
     worker_payload = unmarked.to_internal_dict()
     for key in (
-        "workload_profile_kind",
         "workload_profile_input_digest",
         "workload_profile_producer_version",
         "workload_profile",

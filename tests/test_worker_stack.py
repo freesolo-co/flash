@@ -1798,9 +1798,9 @@ def test_grpo_and_opd_do_not_launch_into_the_unrunnable_padded_fallback():
         )
 
     # sft is conditional where grpo/opd are unconditional, and the condition is the whole point: a
-    # PACKED gdn profile has packed neighbours to contaminate, so it must take the raising gate. the
-    # quote-side gate cannot answer this -- it is device-independent by construction (the profile job
-    # is cpu-only), so it proves the kernels are installed, never that the conv kernel runs on this
+    # packed gdn profile has packed neighbours to contaminate, so it must take the raising gate. the
+    # control-plane gate cannot answer this because it is device-independent by construction, so it
+    # proves the kernels are installed, never that the conv kernel runs on this
     # card. only the child probe knows. an exact-unpacked run keeps the soft form because
     # examples_per_update is 1.
     sft_src = _inspect.getsource(sft_train.run_sft_train)

@@ -226,16 +226,17 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
         producer_version=producer_version,
         tokenizer_revision=options.model_revision,
     )
-    if prepared_workload.profile != expected_profile:
-        raise ValueError("sft workload changed after the quote was frozen")
-
     rows = prepared_workload.rows
     profile = prepared_workload.profile
-    # the context window comes from the profile, not a second reading of the train fields. the
-    # rows were truncated at the profile's max_length and the quote was priced at it, so a
-    # locally re-derived value could disagree with both while the parity check above still
-    # passed: that check compares two values the workload module produced, so it cannot see a
-    # third derivation living here.
+    # the control-plane profile uses raw packaged record fields and deliberately does not execute
+    # environment.py. training does execute the environment, so filtering and prompt construction may
+    # change token totals. keep the quote profile as the cost contract and use the recomputed profile
+    # only for the rows training actually consumes.
+    if prepared_workload.profile != expected_profile:
+        print(
+            "[sft][warn] environment processing changed the packaged-dataset token estimate; "
+            "training continues on the environment-produced rows, and the accepted quote is unchanged"
+        )
     max_length = _sft_train._sft_profile_max_length(profile)
     dropped = profile.dropped_examples
     selected_count = profile.selected_examples

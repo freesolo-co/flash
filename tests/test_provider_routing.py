@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import threading
+from dataclasses import replace
 
 import pytest
 
@@ -114,6 +115,21 @@ def _seed_status(orch, spec):
     st = orch.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
     orch._save_status(st)
     return st
+
+
+def test_control_plane_rejects_a_profiler_result_with_the_wrong_identity(orch, monkeypatch):
+    import flash.engine.profiling.dataset_profile as dataset_profile
+
+    spec = satisfy_sft_profile(orch, monkeypatch, _spec(type="H200"))
+    honest = dataset_profile.profile_packaged_sft_dataset(spec, producer_version="ignored")
+    monkeypatch.setattr(
+        dataset_profile,
+        "profile_packaged_sft_dataset",
+        lambda *_args, **_kwargs: replace(honest, input_digest="f" * 64),
+    )
+
+    with pytest.raises(ValueError, match="input digest"):
+        orch._require_sft_workload_profile(spec)
 
 
 def test_exact_only_preflight_rejects_unconfigured_provider_set_before_persistence(
@@ -543,9 +559,8 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
     monkeypatch.setattr(lifecycle, "_register_checkpoints_best_effort", lambda *a, **k: None)
 
     public = _public_spec()
-    # the profile job for this workload already ran, so preparation reads its record instead of
-    # queueing another one. it is keyed on the two shas submission itself resolves above, so it has
-    # to be recorded against those -- not against the helper's stand-ins.
+    # stub the static dataset estimate against the two revisions submission resolves above, not
+    # against the helper's stand-ins.
     record_sft_profile(
         orch,
         replace(
@@ -553,6 +568,7 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
             model_revision=resolved_model_sha,
             environment=replace(public.environment, resolved_sha=resolved_sha),
         ),
+        monkeypatch,
     )
 
     status = orch.submit_job(public)
@@ -606,7 +622,9 @@ def test_sft_submission_fails_closed_when_the_environment_cannot_be_pinned(orch,
         allocator, "allocate", lambda *a, **k: pytest.fail("allocated without a profile")
     )
 
-    with pytest.raises(orch.WorkloadProfileUnavailable, match="immutable resolved environment"):
+    with pytest.raises(
+        orch.WorkloadProfileUnavailable, match="pinned environment package revision"
+    ):
         orch.submit_job(_public_spec())
 
     assert persisted == []

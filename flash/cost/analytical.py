@@ -639,42 +639,8 @@ def _offline_gpu_shape(
     return gpu, need, count, provider, hourly
 
 
-def _offline_profile_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
-    """Offline structural quote for a cpu-only profile job: the cheapest rentable single card.
-
-    Mirrors ``_offline_gpu_shape``'s offline-only rule, but not its ranking: the profile job's wall
-    is a fixed cap, so no card finishes it sooner and rate alone decides.
-    """
-    from flash.providers.allocator import profile_required_vram_gb
-    from flash.providers.base import GPU_INFO, canonical_gpu, providers_for
-
-    need = profile_required_vram_gb()
-    provider = config.provider if config.provider != "auto" else "auto"
-    names = (
-        (canonical_gpu(config.gpu_type),)
-        if config.gpu_type
-        else tuple(info.name for info in GPU_INFO.values() if info.enum_member and info.validated)
-    )
-    ranked = []
-    for gpu in names:
-        info = GPU_INFO[gpu]
-        if provider != "auto" and provider not in providers_for(gpu):
-            continue
-        if provider == "lambda":
-            from flash.providers.lambda_.pricing import static_hourly_rate
-
-            hourly = static_hourly_rate(gpu)
-        else:
-            hourly = info.hourly_usd
-        ranked.append((hourly, info.vram_gb, gpu))
-    if not ranked:
-        raise ValueError("no GPU class can host the workload profile job")
-    hourly, _vram, gpu = min(ranked)
-    return gpu, need, 1, provider, hourly
-
-
 def _quote_shape(
-    config: RunConfig, allocation, market_wall_s: float, *, profile: bool = False
+    config: RunConfig, allocation, market_wall_s: float
 ) -> tuple[str, int, int, str, float]:
     """The (gpu, need, count, provider, per-card rate) a quote bills against.
 
@@ -682,11 +648,7 @@ def _quote_shape(
     offline structural pick, which must never touch a live market (see ``_offline_gpu_shape``).
     """
     if allocation is None:
-        return (
-            _offline_profile_shape(config)
-            if profile
-            else _offline_gpu_shape(config, max_wall_seconds=market_wall_s)
-        )
+        return _offline_gpu_shape(config, max_wall_seconds=market_wall_s)
     need = int(
         getattr(allocation, "min_vram_gb", 0)
         or required_vram_gb(
@@ -703,41 +665,6 @@ def _quote_shape(
         int(getattr(allocation, "gpu_count", 1) or 1),
         allocation.provider,
         float(allocation.hourly_usd),
-    )
-
-
-def estimate_profile_cost(config: RunConfig, *, allocation=None) -> CostEstimate:
-    """Price a workload profile from its wall cap.
-
-    Pricing through the workload it exists to measure would be circular. It runs no optimizer steps;
-    charge only the rented shape held up to the cap.
-    """
-    wall_s = max(60.0, float(config.max_wall_seconds or 0.0))
-    gpu, need, billed_gpu_count, quote_provider, hourly = _quote_shape(
-        config, allocation, wall_s, profile=True
-    )
-    return CostEstimate(
-        model_id=config.model_id,
-        method=config.method,
-        steps=config.steps,
-        gpu=gpu,
-        provider=quote_provider,
-        gpu_vram_gb=gpu_vram_gb(gpu),
-        required_vram_gb=need,
-        gpu_hourly_usd=hourly,
-        setup_seconds=0.0,
-        seconds_per_step=wall_s,
-        train_seconds=wall_s,
-        wall_clock_seconds=wall_s,
-        wall_capped=True,
-        gpu_count=billed_gpu_count,
-        total_usd=wall_s / 3600.0 * hourly * billed_gpu_count,
-        notes=(
-            (
-                f"workload profile job: billed at most its {_fmt_duration(wall_s)} wall cap "
-                "(no optimizer steps)"
-            ),
-        ),
     )
 
 

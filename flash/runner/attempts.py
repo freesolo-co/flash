@@ -38,14 +38,7 @@ def _heartbeat_attempt_is_current(hb: object, raw: dict) -> bool:
     # the worker's first heartbeat can be read back in either order, and refusing to arm would hand
     # the run a budget measured from a moment before it started working.
     expected = next_attempt - 1 if next_attempt > 0 else 0
-    if runner._attempt_int(hb.get("attempt")) != expected:
-        return False
-    # it must also belong to this lifecycle. a relaunch reuses the run id and carries the counter,
-    # so until it reserves an attempt of its own, `expected` still names the spent lifecycle's. a
-    # prior worker that outlived its record stamps exactly that, recently enough to pass every other
-    # check. the floor is that carried counter, so a heartbeat below it predates this run.
-    floor = runner._attempt_int(raw.get(runner._PROFILE_ATTEMPT_FLOOR_KEY))
-    return floor is None or expected >= floor
+    return runner._attempt_int(hb.get("attempt")) == expected
 
 
 def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None]:

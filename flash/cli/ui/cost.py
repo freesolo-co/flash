@@ -28,9 +28,9 @@ def run_cost(obj: dict) -> tuple[float, bool]:
 
     A FAILED run reporting 0.0 is the one terminal case where that zero is not a measurement
     either. ``cost_usd`` is derived from the WORKER's metrics, so a run whose attempts all died
-    before producing any never had one written -- and a failed run is the case most likely to have
-    rented hardware repeatedly. One profile run rented 47 instances, could not confirm teardown on
-    44 of them, and still reported $0.0000 as settled fact.
+    before producing any never had one written, and a failed run is the case most likely to have
+    rented hardware repeatedly. one historical failure rented 47 instances, could not confirm
+    teardown on 44 of them, and still reported $0.0000 as settled fact.
 
     Only ``failed`` gets that treatment. The other settled states earn their zero: ``dry_run``
     never rents anything, and a ``cancelled``/``done`` run with no charge went through the normal

@@ -8,7 +8,7 @@ from __future__ import annotations
 import time
 
 from flash.core.catalog import samples_on_policy
-from flash.cost.analytical import estimate_cost, estimate_profile_cost
+from flash.cost.analytical import estimate_cost
 from flash.cost.types import CostEstimate, RunConfig
 from flash.engine.plan.steps import on_policy_steps, resolve_update_horizon
 from flash.engine.profiling.workload_profile import (
@@ -164,43 +164,12 @@ def spec_steps(spec) -> int:
     return _sft_profile(spec).authoritative_steps
 
 
-def profile_runconfig_from_spec(spec) -> RunConfig:
-    """Map a workload-profile ``JobSpec`` to the ``RunConfig`` its bounded-wall quote reads.
-
-    Deliberately not the training shape: a profile job runs no optimizer steps and loads no weights,
-    so the only fields that survive are the ones a wall-cap charge needs (rate constraints and the
-    cap itself). ``steps=1`` satisfies ``RunConfig``'s positive-step invariant and is never priced.
-    """
-    if not spec.workload_profile_kind:
-        raise ValueError("profile_runconfig_from_spec requires a workload-profile spec")
-    g = spec.gpu
-    return RunConfig(
-        model_id=spec.model,
-        method=spec.algorithm,
-        steps=1,
-        thinking=spec.thinking,
-        provider=g.provider or "auto",
-        gpu_type=g.type,
-        model_revision=spec.model_revision,
-        disk_gb=float(getattr(g, "disk_gb", 0.0) or 0.0),
-        # the workload profile never loads model weights and always rents one cheapest card.
-        gpu_count=1,
-        max_wall_seconds=g.max_wall_seconds,
-        environment=spec.environment.id or None,
-    )
-
-
 def runconfig_from_spec(spec) -> RunConfig:
     """Map a parsed ``JobSpec`` to a cost ``RunConfig`` for one adapter-training job.
 
     unconstrained runs retain cheapest-fit pricing; authored provider/exact-type constraints are
     preserved so the quote matches the allocatable hardware contract.
     """
-    if spec.workload_profile_kind:
-        raise ValueError(
-            "a workload-profile job cannot be priced as training; use estimate_for_spec, which "
-            "routes profile specs to their bounded-wall charge"
-        )
     t, g = spec.train, spec.gpu
     # Both grpo and opd sample on-policy student completions, so both carry the rollout
     # dimensions (completion length + group size) into the cost model.
@@ -272,11 +241,5 @@ def runconfig_from_spec(spec) -> RunConfig:
 
 
 def estimate_for_spec(spec, *, allocation=None) -> CostEstimate:
-    """Cost estimate for a parsed spec, optionally pinned to the selected live candidate.
-
-    A workload-profile job is priced from its bounded wall cap rather than the workload it exists to
-    measure: routing it through the training estimator would require the very profile it produces.
-    """
-    if spec.workload_profile_kind:
-        return estimate_profile_cost(profile_runconfig_from_spec(spec), allocation=allocation)
+    """Cost estimate for a parsed spec, optionally pinned to the selected live candidate."""
     return estimate_cost(runconfig_from_spec(spec), allocation=allocation)

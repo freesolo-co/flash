@@ -6,7 +6,6 @@ The Vast API and HF readers are mocked; no API key is needed.
 from __future__ import annotations
 
 import base64
-import dataclasses
 import http.client
 import io
 import itertools
@@ -2222,30 +2221,6 @@ def test_gc_frees_the_runs_dead_machine_set(monkeypatch):
     PROVIDER.gc(spec)
 
     assert vast.dead_machine_ids(spec.run_id) == frozenset()
-
-
-def test_gc_keeps_the_blacklist_for_a_relaunchable_profile_run(monkeypatch):
-    """A profile id is derived from the workload, so the next attempt reuses it.
-
-    Freeing the blacklist at GC hands the replacement profile a clean slate and lets it re-rent the
-    host that just took the money -- the repeated-rental loop, one lifecycle later.
-    """
-    from flash.engine.profiling.workload_profile import sft_profile_run_id
-    from flash.providers.vast import PROVIDER
-    from flash.providers.vast import jobs as vast
-
-    spec = dataclasses.replace(_spec(), run_id=sft_profile_run_id("a" * 64))
-    vast.forget_dead_machines(spec.run_id)
-    try:
-        vast._note_dead_machine(spec.run_id, 10)
-        monkeypatch.setattr(vast, "destroy_run_instances", lambda _run_id: [])
-
-        PROVIDER.gc(spec)
-
-        assert vast.dead_machine_ids(spec.run_id) == frozenset({10})
-    finally:
-        with vast._dead_machines_lock:
-            vast._run_dead_machines.pop(spec.run_id, None)
 
 
 def test_runner_destroys_on_exception(monkeypatch):

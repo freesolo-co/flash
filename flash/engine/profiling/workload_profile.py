@@ -21,7 +21,6 @@ WORKLOAD_PROFILE_SCHEMA_VERSION = 4
 # to be a different identity rather than a cache hit.
 SFT_PACKING_POLICY_VERSION = 2
 ROLLOUT_SAMPLE_POLICY_VERSION = 1
-_PROFILE_RUN_PREFIX = "profile-sft-"
 
 # measured generation latency ages out; the shape it was measured from does not. a provider that
 # slows down, or a card whose neighbours change, invalidates the seconds without invalidating the
@@ -110,9 +109,9 @@ def unpacked_batch_warning(
     return (
         f"sequence packing is OFF for this SFT run ({architecture_mode}): {reason}. "
         f"every optimizer update therefore trains exactly 1 example, so {authored} no longer "
-        "groups examples into an update. it is not inert: it still keys the workload profile and "
-        "sizes the gpu for an auto-sized run, so changing it can bill another profile and move "
-        "the card. the default learning rate is tuned for a batched update: expect noisier steps, "
+        "groups examples into an update. it is not inert: it still keys the workload estimate and "
+        "sizes the gpu for an auto-sized run, so changing it can change the quote and move the card. "
+        "the default learning rate is tuned for a batched update: expect noisier steps, "
         "and lower train.learning_rate if you are comparing against a packed run."
     )
 
@@ -199,29 +198,6 @@ def sft_profile_input_digest(
     )
 
 
-def _profile_run_id(prefix: str, input_digest: str) -> str:
-    """build a profile run id, validating the digest first.
-
-    validation prevents raw paths or truncated hashes from creating unreachable profile directories.
-    """
-    if len(input_digest) != 64 or any(c not in "0123456789abcdef" for c in input_digest):
-        raise ValueError("input_digest must be a lowercase sha256 hex digest")
-    return f"{prefix}{input_digest}"
-
-
-def sft_profile_run_id(input_digest: str) -> str:
-    return _profile_run_id(_PROFILE_RUN_PREFIX, input_digest)
-
-
-def is_profile_run_id(run_id: str) -> bool:
-    """True for the deterministic profile ids that a later attempt can reuse.
-
-    A profile id is derived from the workload alone, so a spent profile is relaunched under this
-    exact id. Per-run state keyed by it therefore outlives the run that created it.
-    """
-    return run_id.startswith(_PROFILE_RUN_PREFIX)
-
-
 def _profile_from_dict(cls, raw: object):
     """rebuild a profile and verify its serialized digest.
 
@@ -244,12 +220,11 @@ def _profile_from_dict(cls, raw: object):
 
 @dataclass(frozen=True)
 class SftWorkloadProfile:
-    """describe the exact aggregate sft workload consumed by training.
+    """describe an sft estimate derived from packaged records and the static training contract.
 
-    measurement fields derive from immutable digest-keyed inputs. ``created_at`` is provenance and
-    stays outside ``_content()`` so repeated preprocessing yields the same workload identity.
-
-    sft profiles are exact or fail; unlike sampled rollout profiles, they need no trust verdict.
+    tokens, retention, truncation, and step horizon share one token stream. other environment prompt
+    transformations can still change all four during training. ``created_at`` is provenance and stays
+    outside ``_content()`` so repeated preprocessing yields the same profile identity.
     """
 
     input_digest: str
@@ -285,8 +260,7 @@ class SftWorkloadProfile:
     sample_policy: str
     schema_version: int = WORKLOAD_PROFILE_SCHEMA_VERSION
     kind: str = SFT_PROFILE_KIND
-    # unix seconds stamped by the profile run that produced this artifact. 0.0 on a recomputation
-    # (the training worker re-derives the measurement to check parity and is not a producer).
+    # unix seconds stamped by the control-plane profile producer. 0.0 on worker recomputation.
     created_at: float = field(default=0.0, compare=False)
 
     def __post_init__(self) -> None:
@@ -394,7 +368,7 @@ class SftWorkloadProfile:
 
     @property
     def content_digest(self) -> str:
-        """Digest of the measurement, so the same workload digests the same on any profile run."""
+        """digest of the estimate content, stable across equivalent control-plane computations."""
         return _sha256(self._content())
 
     def to_dict(self) -> dict[str, object]:
