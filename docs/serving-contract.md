@@ -298,11 +298,14 @@ uv run pytest tests/serving_conformance \
   --serving-url "$FREESOLO_SERVING_URL" \
   --conformance-repo acme/artifacts \
   --conformance-subfolder sft/run-abc/adapter \
-  --conformance-base-model Qwen/Qwen3.5-4B
+  --conformance-base-model Qwen/Qwen3.5-4B \
+  --conformance-hf-revision 8f2c1b0e5d4a39c7b6e2f014a8d35c9b7e10426f
 ```
 
-Pass `--conformance-hf-revision` to pin the commit; it defaults to a synthetic 40-hex string, which
-is fine for backends that resolve the subfolder at the repo tip.
+`--conformance-hf-revision` is required and must be a real 40-character commit sha. It is both the
+commit the backend downloads and the suffix of the immutable revision id, so a branch name or a
+placeholder would pass the id grammar and then fail minutes later, on the GPU, as an unresolvable
+revision rather than as the missing argument it is.
 
 It writes: registering, activating, and deleting adapters are all real state changes on the target.
 Run it against a backend you own.

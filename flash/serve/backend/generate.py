@@ -77,6 +77,7 @@ def render_app(
         kv_cache_dtype="fp8",
         max_model_len=serving.max_model_len,
         max_num_seqs=serving.max_num_seqs or 8,
+        max_num_batched_tokens=serving.max_num_batched_tokens or 0,
         max_loras=serving.max_loras,
         max_lora_rank=serving.max_lora_rank,
         gpu_memory_utilization=serving.gpu_memory_utilization or 0.90,

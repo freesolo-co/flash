@@ -130,10 +130,13 @@ def _run_awaitable(awaitable):
         raise error[0]
 
 
-def _stub_modal(monkeypatch, engine_methods, spawned=None):
+def _stub_modal(monkeypatch, engine_methods, spawned=None, engine_classes=None):
     modal = types.ModuleType("modal")
     # Every `.spawn()` the app makes, so a test can assert that a settle was (or was not) driven.
     spawned = [] if spawned is None else spawned
+    # The real classes `@app.cls` was applied to. The handle below stands in for the GPU, so the
+    # class body is otherwise unreachable -- and it holds the vLLM call the engine tests assert on.
+    engine_classes = [] if engine_classes is None else engine_classes
 
     class _Named:
         @classmethod
@@ -194,7 +197,11 @@ def _stub_modal(monkeypatch, engine_methods, spawned=None):
             pass
 
         def cls(self, *args, **kwargs):
-            return lambda klass: lambda *a, **k: _EngineHandle()
+            def decorate(klass):
+                engine_classes.append(klass)
+                return lambda *a, **k: _EngineHandle()
+
+            return decorate
 
         def function(self, *args, **kwargs):
             return _Spawnable
@@ -233,20 +240,75 @@ def client(monkeypatch, tmp_path):
         }
 
     spawned: list = []
+    engine_classes: list = []
     _stub_modal(
         monkeypatch,
         {"register": register, "unregister": unregister, "generate": generate},
         spawned=spawned,
+        engine_classes=engine_classes,
     )
     source = render_app(MODELS[BASE_MODEL])
     module = types.ModuleType("generated_serving_app")
     exec(compile(source, str(tmp_path / "app.py"), "exec"), module.__dict__)
     module.spawned = spawned
+    module.engine_classes = engine_classes
     test_client = TestClient(module.api())
     # Reach the generated module from a test: its Dict and its functions ARE the durable state,
     # so lifecycle races have to be driven through them rather than simulated alongside.
     test_client.app.state.generated_module = module
     return test_client
+
+
+@pytest.fixture
+def engine(client):
+    """The real `Engine` class the generated app defines, not the fixture's stand-in handle.
+
+    `@app.cls` replaces the class with a Modal handle, so the GPU-side code is unreachable through
+    the HTTP client. Everything the class touches at generation time (vLLM, the tokenizer, the
+    adapter load) is substituted per test, which leaves the method's own logic as what runs.
+    """
+    classes = client.app.state.generated_module.engine_classes
+    assert len(classes) == 1, f"expected one @app.cls engine, got {len(classes)}"
+    return classes[0]
+
+
+def _generate_with(monkeypatch, engine_class, record, payload=None):
+    """Run the real `Engine.generate` against a stubbed vLLM and return its SamplingParams."""
+    seen: list = []
+
+    class _SamplingParams:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class _StructuredOutputsParams:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    vllm = types.ModuleType("vllm")
+    vllm.SamplingParams = _SamplingParams
+    sampling_params = types.ModuleType("vllm.sampling_params")
+    sampling_params.StructuredOutputsParams = _StructuredOutputsParams
+    monkeypatch.setitem(sys.modules, "vllm", vllm)
+    monkeypatch.setitem(sys.modules, "vllm.sampling_params", sampling_params)
+
+    async def _generated(prompt, sampling, request_id, lora_request=None):
+        seen.append(sampling)
+        yield types.SimpleNamespace(
+            outputs=[types.SimpleNamespace(text="ok", finish_reason="stop", token_ids=[1, 2])],
+            prompt_token_ids=[1],
+        )
+
+    instance = engine_class.__new__(engine_class)
+    instance.engine = types.SimpleNamespace(generate=_generated)
+    instance.tokenizer = types.SimpleNamespace(apply_chat_template=lambda *a, **k: [1, 2, 3])
+
+    async def _lora_request(_record):
+        return None
+
+    instance._lora_request = _lora_request
+    _run_awaitable(engine_class.generate(instance, dict(payload or {}), record))
+    assert seen, "the engine never reached vLLM"
+    return seen[-1]
 
 
 def _lifecycle(
@@ -316,6 +378,84 @@ def test_reregistering_different_content_under_one_revision_is_a_conflict(client
     _register_and_ready(client)
     mutated = {**REGISTRATION, "repo_id": "acme/somewhere-else"}
     assert client.post("/adapters", json=mutated).status_code == 409
+
+
+def test_chat_reports_which_immutable_revision_answered(client):
+    """A plane smoke-tests the revision before flipping its alias, and rejects a response that
+    does not say which artifact served it -- as a top-level `freesolo` object AND as the matching
+    `X-Freesolo-*` headers. Without both, generation succeeds but every deploy fails at smoke.
+
+    Reported from the resolved record, so asking by alias still names the revision.
+    """
+    _register_and_ready(client)
+    assert (
+        client.post(
+            f"/adapters/{REVISION}/activate", json={"expected_adapter_revision": None}
+        ).status_code
+        == 200
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": RUN_ID, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    provenance = payload.get("freesolo")
+    assert isinstance(provenance, dict), "chat response carried no freesolo provenance object"
+    assert provenance["adapter_revision"] == REVISION
+    assert provenance["checkpoint"] == REGISTRATION["checkpoint"]
+    assert provenance["hf_revision"] == REVISION.rsplit(".", 1)[-1]
+    for header, expected in (
+        ("X-Freesolo-Adapter-Revision", provenance["adapter_revision"]),
+        ("X-Freesolo-Checkpoint", provenance["checkpoint"]),
+        ("X-Freesolo-HF-Revision", provenance["hf_revision"]),
+    ):
+        assert response.headers.get(header) == expected, header
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        ({"json": {"type": "object"}}, {"json": {"type": "object"}}),
+        # Registered without a grammar: sampling must stay unconstrained rather than be handed an
+        # empty constraint object, which vLLM would try to compile.
+        (None, None),
+        ({"json": None, "regex": None}, None),
+    ],
+)
+def test_a_registered_grammar_reaches_the_sampling_params(monkeypatch, engine, stored, expected):
+    """The run's declared output contract has to reach SamplingParams.
+
+    Stored on the record at registration but never applied, the adapter serves unconstrained text
+    while claiming to honour the constraint -- and a plane's deployment smoke validates the
+    constraint before it activates the revision.
+
+    This drives the real `Engine.generate`, not the fixture's stub: the constraint is built inside
+    that method, so a test that goes through the stubbed engine cannot see it at all.
+    """
+    record = {**REGISTRATION, "structured_outputs": stored}
+    sampling = _generate_with(monkeypatch, engine, record)
+    structured = sampling.structured_outputs
+    if expected is None:
+        assert structured is None, "an absent grammar became a constraint"
+    else:
+        assert structured is not None, "the registered grammar did not reach the sampling params"
+        assert structured.json == expected["json"]
+
+
+def test_generation_is_constrained_by_the_record_not_the_request(monkeypatch, engine):
+    """A caller must not be able to loosen (or impose) the run's declared output contract.
+
+    The grammar comes off the stored record; a request field of the same name is not a channel for
+    changing it, or a deployed adapter's contract is whatever the last caller asked for.
+    """
+    record = {**REGISTRATION, "structured_outputs": {"json": {"type": "object"}}}
+    sampling = _generate_with(
+        monkeypatch, engine, record, payload={"structured_outputs": {"regex": "^liberated$"}}
+    )
+    assert sampling.structured_outputs is not None
+    assert sampling.structured_outputs.json == {"type": "object"}
+    assert getattr(sampling.structured_outputs, "regex", None) is None
 
 
 def test_reregistering_a_different_grammar_under_one_revision_is_a_conflict(client):
@@ -447,6 +587,46 @@ def test_a_stale_compare_and_swap_is_rejected(client):
     assert first.status_code == 200
     stale = client.post(f"/adapters/{REVISION}/activate", json={"expected_adapter_revision": None})
     assert stale.status_code == 409
+
+
+def test_releasing_the_run_lock_removes_only_this_holders_lease(client):
+    """A lock release must be conditional on still owning the lease.
+
+    Two waiters can read the same expired lease before either acts on it. With an unconditional
+    delete, the second one removes the lease the FIRST has already acquired and then takes its
+    own, putting both inside the critical section -- the lost update `alias_compare_and_swap`
+    promises cannot happen. Modal Dicts are atomic per key, so the guard is a re-read of the
+    value, not an expiry check. Driven here by letting another lease land while the lock is held.
+    """
+    module = client.app.state.generated_module
+    key = module._lock_key(RUN_ID)
+    newer = {"token": "another-holder", "expires_at": time.time() + 30}
+
+    async def _release_over_a_newer_lease():
+        async with module._run_lock(RUN_ID):
+            module.adapter_records[key] = newer
+
+    _run_awaitable(_release_over_a_newer_lease())
+    assert module.adapter_records.get(key) == newer, "release deleted a lease it did not hold"
+
+
+def test_a_run_lock_is_released_by_its_owner(client):
+    """The guard above must not leave the lock held forever, which would wedge every later deploy.
+
+    Paired with the test above deliberately: conditional-delete is only correct if the ordinary
+    release still clears the key.
+    """
+    module = client.app.state.generated_module
+    key = module._lock_key(RUN_ID)
+    # An expired lease from a container that died mid-update is reclaimed, not waited on.
+    module.adapter_records[key] = {"token": "dead-holder", "expires_at": time.time() - 60}
+
+    async def _acquire_and_release():
+        async with module._run_lock(RUN_ID):
+            assert (module.adapter_records.get(key) or {}).get("token") != "dead-holder"
+
+    _run_awaitable(_acquire_and_release())
+    assert module.adapter_records.get(key) is None, "the lock outlived its holder"
 
 
 def test_chat_resolves_the_run_alias_to_its_immutable_revision(client):

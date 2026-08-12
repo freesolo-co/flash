@@ -11,11 +11,14 @@ backend you own.
 from __future__ import annotations
 
 import os
+import re
 import uuid
 
 import pytest
 
 from tests.conftest import PLACEHOLDER_HF_REVISION
+
+_COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
 
 # `pytest_addoption` for these flags lives in `tests/conftest.py`, not here: pytest only calls that
 # hook on INITIAL conftests, so registering it in this subdirectory makes `--serving-url` an
@@ -48,29 +51,36 @@ def adapter_source(request) -> dict:
     repo_id = _option(request, "--conformance-repo", "FLASH_CONFORMANCE_REPO")
     subfolder = _option(request, "--conformance-subfolder", "FLASH_CONFORMANCE_SUBFOLDER")
     base_model = _option(request, "--conformance-base-model", "FLASH_CONFORMANCE_BASE_MODEL")
+    # Required, not defaulted. It is the commit the backend downloads AND the suffix of the
+    # revision id, so the placeholder shape satisfies the grammar while naming a commit that does
+    # not exist -- registration would fail minutes later, on the GPU, as an unresolvable revision
+    # rather than as the missing argument it actually is.
+    hf_revision = _option(request, "--conformance-hf-revision", "FLASH_CONFORMANCE_HF_REVISION")
     missing = [
         flag
         for flag, value in (
             ("--conformance-repo", repo_id),
             ("--conformance-subfolder", subfolder),
             ("--conformance-base-model", base_model),
+            ("--conformance-hf-revision", hf_revision),
         )
         if not value
     ]
     if missing:
         pytest.skip(f"serving conformance needs a real adapter to register; missing {missing}")
+    if not _COMMIT_SHA.fullmatch(hf_revision or "") or hf_revision == PLACEHOLDER_HF_REVISION:
+        pytest.fail(
+            f"--conformance-hf-revision must be a real 40-character commit sha, got "
+            f"{hf_revision!r}. It is both the artifact's pinned commit and part of the immutable "
+            f"revision id, so a branch name or placeholder cannot stand in for it."
+        )
     return {
         "repo_id": repo_id,
         "subfolder": subfolder,
         "base_model": base_model,
         "repo_type": _option(request, "--conformance-repo-type", "FLASH_CONFORMANCE_REPO_TYPE")
         or "dataset",
-        "hf_revision": _option(
-            request,
-            "--conformance-hf-revision",
-            "FLASH_CONFORMANCE_HF_REVISION",
-            PLACEHOLDER_HF_REVISION,
-        ),
+        "hf_revision": hf_revision,
     }
 
 

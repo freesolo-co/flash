@@ -44,6 +44,10 @@ QUANTIZATION = {quantization}
 KV_CACHE_DTYPE = "{kv_cache_dtype}"
 MAX_MODEL_LEN = {max_model_len}
 MAX_NUM_SEQS = {max_num_seqs}
+# 0 means "let vLLM pick". The catalog pins this only where the validated configuration depends
+# on it -- the 35B MoE on H200 is memory-tight, and the scheduler/graph-capture footprint of
+# vLLM's version-dependent default is not what was verified to fit.
+MAX_NUM_BATCHED_TOKENS = {max_num_batched_tokens}
 # vLLM PRE-ALLOCATES the GPU LoRA buffers at max_loras x max_lora_rank at engine init, NOT by how
 # many adapters are actually loaded, so both are linear VRAM levers. Raising either can make a
 # previously-fitting model fail to start. `flash serve gpus --model {base_model}` shows the cost.
@@ -149,13 +153,31 @@ async def _run_lock(run_id: str):
     """
     deadline = time.monotonic() + LOCK_TTL_SECONDS
     key = _lock_key(run_id)
+    # An ownership token, not just an expiry. Two waiters can both observe the same stale lease,
+    # and an unconditional delete would let the second one drop the FIRST one's freshly acquired
+    # lease and then take its own -- putting both inside the critical section, which is exactly
+    # the lost update `alias_compare_and_swap` promises cannot happen. Every removal below is
+    # therefore conditional on the value still being the lease this caller is entitled to remove.
+    token = uuid.uuid4().hex
+
+    async def _drop_if(expected: Any) -> None:
+        """Delete the lock only while it still holds `expected`. Modal Dicts are single-key
+        atomic, so re-reading before the delete is the strongest guard available here; it closes
+        the window that matters (a slow waiter reclaiming a lease acquired after its own read)."""
+        current = await adapter_records.get.aio(key)
+        if current == expected:
+            await adapter_records.pop.aio(key, None)
+
     while True:
-        if await adapter_records.put.aio(key, time.time() + LOCK_TTL_SECONDS, skip_if_exists=True):
+        lease = {{"token": token, "expires_at": time.time() + LOCK_TTL_SECONDS}}
+        if await adapter_records.put.aio(key, lease, skip_if_exists=True):
             break
         holder = await adapter_records.get.aio(key)
-        # a stale lock (holder crashed) is reclaimed rather than waited on forever.
-        if not isinstance(holder, (int, float)) or holder < time.time():
-            await adapter_records.pop.aio(key, None)
+        expires_at = holder.get("expires_at") if isinstance(holder, dict) else None
+        # a stale lock (holder crashed) is reclaimed rather than waited on forever, but only if
+        # the exact lease we judged stale is still the one there.
+        if not isinstance(expires_at, (int, float)) or expires_at < time.time():
+            await _drop_if(holder)
             continue
         if time.monotonic() > deadline:
             raise TimeoutError(f"timed out waiting for the {{run_id}} lock")
@@ -163,7 +185,7 @@ async def _run_lock(run_id: str):
     try:
         yield
     finally:
-        await adapter_records.pop.aio(key, None)
+        await _drop_if(lease)
 
 
 def _fingerprint(record: dict[str, Any]) -> tuple:
@@ -222,6 +244,11 @@ class Engine:
             max_loras=MAX_LORAS,
             max_lora_rank=MAX_LORA_RANK,
             trust_remote_code=True,
+            **(
+                {{"max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS}}
+                if MAX_NUM_BATCHED_TOKENS
+                else {{}}
+            ),
         )
         self.engine = AsyncLLMEngine.from_engine_args(engine_args)
 
@@ -296,11 +323,26 @@ class Engine:
                 )
             )
         )
+        # The run's declared output contract, decided at registration and stored on the record --
+        # not taken from the request, which must not be able to loosen it. Without this the
+        # adapter serves unconstrained text while claiming to honour a JSON/regex/choice
+        # constraint, and a plane's deployment smoke validates the constraint before activating.
+        structured = record.get("structured_outputs") or None
+        structured_params = None
+        if isinstance(structured, dict) and any(
+            structured.get(key) is not None for key in ("json", "regex", "choice", "json_object")
+        ):
+            from vllm.sampling_params import StructuredOutputsParams
+
+            structured_params = StructuredOutputsParams(
+                **{{k: v for k, v in structured.items() if v is not None}}
+            )
         sampling = SamplingParams(
             temperature=float(payload.get("temperature") or 0.0),
             max_tokens=int(payload.get("max_tokens") or 512),
             top_p=float(payload.get("top_p") or 1.0),
             stop=payload.get("stop") or None,
+            structured_outputs=structured_params,
         )
         final = None
         async for out in self.engine.generate(
@@ -606,7 +648,21 @@ def api():
             )
         started = time.time()
         result = await engine.generate.remote.aio(payload, record)
-        return {{
+        served_revision = record["adapter_id"]
+        served_metadata = record.get("metadata") or {{}}
+        checkpoint = record.get("checkpoint") or ""
+        hf_revision = served_metadata.get("hf_revision") or served_revision.rsplit(".", 1)[-1]
+        # Provenance: which immutable revision actually answered. A plane runs a bounded smoke
+        # before it flips an alias, and it rejects the deploy unless the response says exactly
+        # which artifact served it -- both as this object and as the matching headers below.
+        # Reported from the RESOLVED record, never echoed from the request, so it states what
+        # served rather than what was asked for.
+        provenance = {{
+            "adapter_revision": served_revision,
+            "checkpoint": checkpoint,
+            "hf_revision": hf_revision,
+        }}
+        body = {{
             "id": f"chatcmpl-{{uuid.uuid4().hex}}",
             "object": "chat.completion",
             "created": int(started),
@@ -624,6 +680,15 @@ def api():
                 "total_tokens": (result.get("prompt_tokens") or 0)
                 + (result.get("completion_tokens") or 0),
             }},
+            "freesolo": provenance,
         }}
+        return JSONResponse(
+            content=body,
+            headers={{
+                "X-Freesolo-Adapter-Revision": served_revision,
+                "X-Freesolo-Checkpoint": checkpoint,
+                "X-Freesolo-HF-Revision": hf_revision,
+            }},
+        )
 
     return web

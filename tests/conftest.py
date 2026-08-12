@@ -10,9 +10,9 @@ import contextlib
 
 import pytest
 
-# The synthetic adapter commit the serving conformance suite falls back to, for a backend that
-# resolves the subfolder at the repo tip. 40 hex chars because that is the revision grammar flash's
-# own immutable adapter ids are built from.
+# A revision-shaped value that names no commit. 40 hex chars because that is the grammar flash's
+# immutable adapter ids are built from -- which is exactly why it is REJECTED rather than used as a
+# default: it satisfies the id grammar while being unresolvable to download.
 PLACEHOLDER_HF_REVISION = "0" * 40
 
 
@@ -48,7 +48,7 @@ def pytest_addoption(parser):
     group.addoption(
         "--conformance-hf-revision",
         default=None,
-        help=f"commit the adapter is pinned to (default: {PLACEHOLDER_HF_REVISION})",
+        help="40-char commit sha the adapter is pinned to; required, and part of the revision id",
     )
     group.addoption(
         "--conformance-repo-type",

@@ -106,6 +106,26 @@ def test_engine_values_come_from_the_catalog(model_id):
     assert values["VLLM_VERSION"] == VLLM_VERSION
 
 
+@pytest.mark.parametrize("model_id", _MODEL_IDS)
+def test_a_catalog_prefill_budget_reaches_the_engine_args(model_id):
+    """`max_num_batched_tokens` is a memory bound, not a tuning hint.
+
+    The 35B-A3B is the one model that sets it, and it is what keeps the prefill activation peak off
+    a card whose LoRA pool is already at its limit. Rendered as a constant but never passed to
+    AsyncEngineArgs, the app deploys with vLLM's much larger default and OOMs during prefill --
+    after a multi-minute cold start, on the largest and most expensive GPU in the table.
+    """
+    info = MODELS[model_id]
+    source = render_app(info)
+    budget = info.serving.max_num_batched_tokens or 0
+    assert _constants(source)["MAX_NUM_BATCHED_TOKENS"] == budget
+    passed = re.search(r'"max_num_batched_tokens":\s*MAX_NUM_BATCHED_TOKENS', source)
+    assert passed, "the rendered prefill budget never reaches AsyncEngineArgs"
+    # Passed only when the catalog sets one: vLLM computes its own default otherwise, and pinning
+    # it to 0 would be rejected rather than meaning "no limit".
+    assert "if MAX_NUM_BATCHED_TOKENS" in source
+
+
 def test_moe_renders_bf16_and_dense_renders_fp8():
     """Quantization is per model and getting it wrong is not a performance detail.
 

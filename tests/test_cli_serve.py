@@ -150,6 +150,33 @@ def test_missing_modal_setup_is_reported_before_deploying(tmp_path, monkeypatch,
     assert "modal secret create" in err
 
 
+def test_the_rerun_those_instructions_ask_for_actually_works(tmp_path, monkeypatch, capsys):
+    """Nothing may be written before the Modal check that ends with "re-run this command".
+
+    A file written on the way out is precisely what makes the re-run die with FileExistsError, so
+    the user follows correct instructions and gets an error telling them to pass --force.
+    """
+    args = _setup_args(tmp_path, dry_run=False, yes=True)
+    monkeypatch.setattr(serve_cmd, "_modal_cli", lambda: None)
+    assert serve_cmd.cmd_serve_setup(args) == 1
+    assert not Path(args.output).exists(), "the app was written before modal was even checked"
+
+    # Now satisfy what the instructions asked for and re-run exactly as told, no --force.
+    monkeypatch.setattr(serve_cmd, "_modal_cli", lambda: "/usr/bin/modal")
+    monkeypatch.setattr(serve_cmd, "_modal_is_authenticated", lambda: True)
+    monkeypatch.setattr(serve_cmd, "_deploy", lambda app_file: 0)
+    assert serve_cmd.cmd_serve_setup(args) == 0
+    assert Path(args.output).exists()
+
+
+def test_a_dry_run_does_not_require_modal_to_be_installed(tmp_path, monkeypatch):
+    """`--dry-run` deploys nothing, so it must still work with no modal CLI and no account."""
+    monkeypatch.setattr(serve_cmd, "_modal_cli", lambda: None)
+    args = _setup_args(tmp_path, dry_run=True)
+    assert serve_cmd.cmd_serve_setup(args) == 0
+    assert Path(args.output).exists()
+
+
 def test_setup_refuses_to_overwrite_an_existing_app(tmp_path, capsys):
     """The generated app is meant to be edited; silently regenerating over it destroys that work."""
     destination = tmp_path / "flash_serving_app.py"
@@ -259,6 +286,21 @@ def test_a_keyless_deploy_warns_that_anyone_can_spend_the_gpu_budget(
     assert serve_cmd._deploy(tmp_path / "app.py") == 0
     err = capsys.readouterr().err
     assert ("no FLASH_SERVING_KEY" in err) is warns
+
+
+def test_the_printed_key_is_kept_where_the_user_can_send_it_back(monkeypatch, capsys):
+    """Both key-setup paths must generate into a variable, not inline into `modal secret create`.
+
+    The key is symmetric: flash sends the same value back on every request. Generated inline, the
+    only copy goes into Modal and is unrecoverable, so the app is authenticated against a secret
+    nobody holds and every deploy 401s -- with a setup transcript that looked like it worked.
+    """
+    monkeypatch.setattr(serve_cmd, "_healthz", lambda url: {"ok": True, "requires_key": False})
+    serve_cmd._warn_if_unauthenticated("https://acme--flash-serve-api.modal.run")
+    for text in (serve_cmd._setup_instructions(), capsys.readouterr().err):
+        assert "export FREESOLO_INTERNAL_KEY=$(" in text
+        assert 'FLASH_SERVING_KEY="$FREESOLO_INTERNAL_KEY"' in text
+        assert "FLASH_SERVING_KEY=$(python" not in text, "the generated key is discarded inline"
 
 
 def test_a_failed_deploy_is_reported_as_a_failure(tmp_path, monkeypatch, capsys):

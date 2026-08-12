@@ -141,9 +141,13 @@ def _setup_instructions() -> str:
         f"  modal setup\n"
         f"Then create the secret. The app pulls weights with HF_TOKEN, and authenticates "
         f"callers with FLASH_SERVING_KEY -- a Modal URL is public, so without a key anyone "
-        f"who finds it can load adapters and spend your GPU budget:\n"
+        f"who finds it can load adapters and spend your GPU budget.\n"
+        f"Keep the key: flash has to send the same value back, so generate it into a variable "
+        f"rather than inline, or every request gets a 401.\n"
+        f"  export FREESOLO_INTERNAL_KEY=$(python -c "
+        f"'import secrets; print(secrets.token_urlsafe(32))')\n"
         f"  modal secret create {SECRET_NAME} HF_TOKEN=hf_... "
-        f"FLASH_SERVING_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')\n"
+        f'FLASH_SERVING_KEY="$FREESOLO_INTERNAL_KEY"\n'
         f"Then re-run: {CLI_NAME} serve setup --model <model>"
     )
 
@@ -177,6 +181,14 @@ def cmd_serve_setup(args) -> int:
         print(f"note: {info.id} has no production-validated card; using the cheapest that fits.")
 
     destination = Path(getattr(args, "output", None) or DEFAULT_APP_FILE).resolve()
+    dry_run = bool(getattr(args, "dry_run", False))
+    # Before writing anything. The instructions below end with "re-run this command", and a file
+    # written on the way out is exactly what makes that re-run fail with FileExistsError. `--dry-run`
+    # deploys nothing, so it does not need Modal at all.
+    if not dry_run and (_modal_cli() is None or not _modal_is_authenticated()):
+        print(_setup_instructions(), file=sys.stderr)
+        return 1
+
     try:
         write_app(
             info,
@@ -200,13 +212,9 @@ def cmd_serve_setup(args) -> int:
     print(f"  model  {info.id}")
     print(f"  gpu    {gpu.name}  (~${gpu.usd_hr:.2f}/hr while serving, $0 idle)")
 
-    if getattr(args, "dry_run", False):
+    if dry_run:
         print(f"\ndry run: not deploying. deploy it yourself with:\n  modal deploy {destination}")
         return 0
-
-    if _modal_cli() is None or not _modal_is_authenticated():
-        print(f"\n{_setup_instructions()}", file=sys.stderr)
-        return 1
 
     if not getattr(args, "yes", False):
         prompt = (
@@ -278,9 +286,11 @@ def _warn_if_unauthenticated(url: str) -> None:
     print(
         "\nwarning: this app has no FLASH_SERVING_KEY, so anyone with the URL can register "
         "adapters and spend your GPU budget. set one and redeploy:\n"
+        "  export FREESOLO_INTERNAL_KEY=$(python -c "
+        "'import secrets; print(secrets.token_urlsafe(32))')\n"
         f"  modal secret create {SECRET_NAME} HF_TOKEN=hf_... "
-        "FLASH_SERVING_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')\n"
-        "  then export FREESOLO_INTERNAL_KEY to the same value",
+        'FLASH_SERVING_KEY="$FREESOLO_INTERNAL_KEY"\n'
+        f"  modal deploy {DEFAULT_APP_FILE}",
         file=sys.stderr,
     )
 
