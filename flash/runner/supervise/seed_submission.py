@@ -328,12 +328,17 @@ def _mark_attempt_boundary(ctx: _SubmitContext, attempt: int) -> None:
 
     Written for attempt > 0 only. Attempt 0 has nothing above it to disown, and a header on every
     single-attempt run would be noise on the common path.
+
+    The line names only where attempt N BEGINS. Saying "everything above is attempt N-1" is false
+    from the second retry on: above attempt 2 sit attempts 0 and 1, and the log is also written by
+    the poller and the billing retry path, so no single attempt owns the preceding bytes anyway. A
+    boundary the reader can trust is worth more than an attribution that is right once.
     """
     if attempt <= 0:
         return
     with contextlib.suppress(Exception):
         print(
-            f"---- attempt {attempt} starting; everything above is attempt {attempt - 1} ----",
+            f"---- attempt {attempt} starts here; everything above it is from earlier attempts ----",
             file=ctx.log,
             flush=True,
         )
