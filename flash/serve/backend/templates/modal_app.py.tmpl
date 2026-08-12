@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 import hashlib
 import hmac
+import json
 import os
 import time
 import uuid
@@ -29,7 +30,7 @@ import modal
 # MODULE globals: names visible only inside the factory cannot be resolved, so `request: Request`
 # degrades into a required query parameter and every POST fails with a 422.
 from fastapi import FastAPI, HTTPException, Request, Response, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 # ---------------------------------------------------------------------------------------------
 # Configuration. Every value below came from the flash catalog entry for this base model, which
@@ -373,8 +374,13 @@ class Engine:
                 await self.engine.remove_lora(_lora_int_id(adapter_id))
         return {{"ok": True}}
 
-    @modal.method()
-    async def generate(self, payload: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
+    async def _prepare(self, payload: dict[str, Any], record: dict[str, Any]):
+        """Everything both generate paths need: the adapter, the prompt, and the sampling params.
+
+        Shared so the streaming and one-shot routes cannot drift apart on the two things that are
+        not the caller's to choose -- the adapter's trained thinking mode and the run's registered
+        output grammar.
+        """
         from vllm import SamplingParams
 
         lora_request = await self._lora_request(record)
@@ -415,6 +421,11 @@ class Engine:
             stop=payload.get("stop") or None,
             structured_outputs=structured_params,
         )
+        return prompt_token_ids, sampling, lora_request
+
+    @modal.method()
+    async def generate(self, payload: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
+        prompt_token_ids, sampling, lora_request = await self._prepare(payload, record)
         final = None
         async for out in self.engine.generate(
             {{"prompt_token_ids": prompt_token_ids}},
@@ -432,6 +443,38 @@ class Engine:
             "prompt_tokens": len(getattr(final, "prompt_token_ids", None) or prompt_token_ids),
             "completion_tokens": len(getattr(completion, "token_ids", None) or []),
         }}
+
+    @modal.method(is_generator=True)
+    async def generate_stream(self, payload: dict[str, Any], record: dict[str, Any]):
+        """Yield the completion in deltas, for `stream: true`.
+
+        A SEPARATE method rather than a flag on `generate`: Modal decides generator-ness per
+        function, and `.remote()` on a generator (or `.remote_gen()` on a non-generator) is an
+        InvalidError, so one method cannot serve both shapes.
+
+        vLLM's `generate` yields the CUMULATIVE text each step, but the OpenAI wire format carries
+        per-chunk deltas -- forwarding vLLM's output directly would make every chunk repeat the
+        whole answer so far, and a client that concatenates chunks would render the response
+        quadratically duplicated.
+        """
+        prompt_token_ids, sampling, lora_request = await self._prepare(payload, record)
+        sent = 0
+        finish_reason = None
+        async for out in self.engine.generate(
+            {{"prompt_token_ids": prompt_token_ids}},
+            sampling,
+            str(uuid.uuid4()),
+            lora_request=lora_request,
+        ):
+            completion = out.outputs[0]
+            finish_reason = getattr(completion, "finish_reason", None)
+            text = completion.text or ""
+            if len(text) > sent:
+                yield {{"delta": text[sent:], "finish_reason": None}}
+                sent = len(text)
+        # Always last, even for an empty generation: a client waits for a chunk carrying a finish
+        # reason, so ending without one leaves it hanging on a stream that is already over.
+        yield {{"delta": "", "finish_reason": finish_reason or "stop"}}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -794,14 +837,18 @@ def api():
                 }},
             )
         started = time.time()
-        result = await engine.generate.remote.aio(payload, record)
         served_revision = record["adapter_id"]
         served_metadata = record.get("metadata") or {{}}
         checkpoint = record.get("checkpoint") or ""
         hf_revision = served_metadata.get("hf_revision") or served_revision.rsplit(".", 1)[-1]
+        provenance_headers = {{
+            "X-Freesolo-Adapter-Revision": served_revision,
+            "X-Freesolo-Checkpoint": checkpoint,
+            "X-Freesolo-HF-Revision": hf_revision,
+        }}
         # Provenance: which immutable revision actually answered. A plane runs a bounded smoke
         # before it flips an alias, and it rejects the deploy unless the response says exactly
-        # which artifact served it -- both as this object and as the matching headers below.
+        # which artifact served it -- both as this object and as the matching headers above.
         # Reported from the RESOLVED record, never echoed from the request, so it states what
         # served rather than what was asked for.
         provenance = {{
@@ -809,6 +856,53 @@ def api():
             "checkpoint": checkpoint,
             "hf_revision": hf_revision,
         }}
+
+        if payload.get("stream"):
+            # The route advertises OpenAI compatibility, so `stream: true` has to produce SSE. A
+            # one-shot JSON body here is not merely non-incremental: an OpenAI client parses the
+            # response as an event stream and fails outright. flash's own client happens to carry a
+            # JSON fallback, which is exactly why this would have gone unnoticed in-house while
+            # breaking every direct client.
+            async def _events():
+                chunk_id = f"chatcmpl-{{uuid.uuid4().hex}}"
+                created = int(started)
+
+                def _chunk(delta: dict[str, Any], finish_reason) -> str:
+                    frame = {{
+                        "id": chunk_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": requested,
+                        "choices": [
+                            {{"index": 0, "delta": delta, "finish_reason": finish_reason}}
+                        ],
+                        # Same provenance the one-shot body carries, on every chunk: a streaming
+                        # caller never sees the JSON body, so omitting it here would make which
+                        # artifact answered depend on how the caller asked.
+                        "freesolo": provenance,
+                    }}
+                    return f"data: {{json.dumps(frame)}}\n\n"
+
+                yield _chunk({{"role": "assistant", "content": ""}}, None)
+                async for piece in engine.generate_stream.remote_gen.aio(payload, record):
+                    if piece.get("finish_reason"):
+                        yield _chunk({{}}, piece["finish_reason"])
+                    elif piece.get("delta"):
+                        yield _chunk({{"content": piece["delta"]}}, None)
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                _events(),
+                media_type="text/event-stream",
+                headers={{
+                    **provenance_headers,
+                    # Proxies that buffer would defeat the point of streaming at all.
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                }},
+            )
+
+        result = await engine.generate.remote.aio(payload, record)
         body = {{
             "id": f"chatcmpl-{{uuid.uuid4().hex}}",
             "object": "chat.completion",
@@ -829,13 +923,6 @@ def api():
             }},
             "freesolo": provenance,
         }}
-        return JSONResponse(
-            content=body,
-            headers={{
-                "X-Freesolo-Adapter-Revision": served_revision,
-                "X-Freesolo-Checkpoint": checkpoint,
-                "X-Freesolo-HF-Revision": hf_revision,
-            }},
-        )
+        return JSONResponse(content=body, headers=provenance_headers)
 
     return web

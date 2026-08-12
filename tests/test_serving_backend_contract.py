@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import json
 import sys
 import threading
 import time
@@ -163,8 +164,18 @@ def _stub_modal(monkeypatch, engine_methods, spawned=None, engine_classes=None):
             return self
 
     class _EngineHandle:
+        """Modal exposes a generator method as `.remote_gen`, NOT `.remote`.
+
+        Modelled because Modal decides generator-ness per function and raises InvalidError on the
+        wrong one, so a stub offering `.remote` for everything would pass while the deployed app
+        fails on the first streaming request.
+        """
+
         def __getattr__(self, name):
-            return types.SimpleNamespace(remote=types.SimpleNamespace(aio=engine_methods[name]))
+            method = engine_methods[name]
+            if inspect.isasyncgenfunction(method):
+                return types.SimpleNamespace(remote_gen=types.SimpleNamespace(aio=method))
+            return types.SimpleNamespace(remote=types.SimpleNamespace(aio=method))
 
     class _Spawnable:
         """A Modal function handle.
@@ -240,11 +251,22 @@ def client(monkeypatch, tmp_path):
             "completion_tokens": 4,
         }
 
+    async def generate_stream(payload, record):
+        # Deltas, the way the real generator yields them: pieces plus a final finish_reason frame.
+        for piece in ("served ", "by ", record["adapter_id"]):
+            yield {"delta": piece, "finish_reason": None}
+        yield {"delta": "", "finish_reason": "stop"}
+
     spawned: list = []
     engine_classes: list = []
     _stub_modal(
         monkeypatch,
-        {"register": register, "unregister": unregister, "generate": generate},
+        {
+            "register": register,
+            "unregister": unregister,
+            "generate": generate,
+            "generate_stream": generate_stream,
+        },
         spawned=spawned,
         engine_classes=engine_classes,
     )
@@ -673,6 +695,48 @@ def test_chat_fails_closed_on_a_terminal_revision(client):
     assert response.status_code == 404, (
         f"a terminally failed revision answered {response.status_code}, which the smoke retries"
     )
+
+
+def test_a_streaming_request_gets_sse_not_a_json_body(client):
+    """`stream: true` on an OpenAI-compatible route must produce SSE.
+
+    Ignored, the route returns a one-shot JSON body: a direct OpenAI client parses it as an event
+    stream and fails outright, and long generations produce no incremental output. flash's own
+    client carries a JSON fallback, which is exactly why this would look fine in-house while
+    breaking every other client.
+    """
+    _register_and_ready(client)
+    client.post(f"/adapters/{REVISION}/activate", json={"expected_adapter_revision": None})
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": RUN_ID,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16,
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream"), (
+        f"stream: true returned {response.headers['content-type']}, which an OpenAI client "
+        "cannot parse as events"
+    )
+    frames = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    assert response.text.rstrip().endswith("data: [DONE]"), "the stream never terminated"
+    assert all(frame["object"] == "chat.completion.chunk" for frame in frames)
+    # Deltas, not cumulative text: vLLM yields the whole answer so far each step, so forwarding it
+    # unchanged makes a concatenating client render the response duplicated quadratically.
+    content = "".join(frame["choices"][0]["delta"].get("content") or "" for frame in frames)
+    assert content == f"served by {REVISION}", f"reassembled stream was {content!r}"
+    assert frames[-1]["choices"][0]["finish_reason"] == "stop", "no chunk carried a finish reason"
+    # Provenance has to reach a streaming caller too -- it never sees the JSON body, so otherwise
+    # which artifact answered would depend on how the caller asked.
+    assert frames[0]["freesolo"]["adapter_revision"] == REVISION
+    assert response.headers["X-Freesolo-Adapter-Revision"] == REVISION
 
 
 def test_an_image_request_is_refused_rather_than_answered_blind(client):

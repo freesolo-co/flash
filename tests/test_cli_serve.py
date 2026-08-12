@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from flash.cli.commands import serve as serve_cmd
+from flash.core.catalog import MODELS
 
 
 def _args(**kwargs):
@@ -251,6 +252,34 @@ def test_an_explicit_scaledown_window_is_not_collapsed_by_the_default(tmp_path, 
     args = _setup_args(tmp_path, scaledown_window=0)
     assert serve_cmd.cmd_serve_setup(args) == 1
     assert "outside Modal's supported range" in capsys.readouterr().err
+
+
+def test_a_gpu_that_cannot_hold_the_model_is_refused(tmp_path, capsys):
+    """An explicit `--gpu` must face the same fit check `serve gpus` shows.
+
+    Skipped on the one path that spends money: setup writes the catalog's fixed 32K config,
+    deploys, pulls the weights, and the engine OOMs on a cold start the user paid for. The refusal
+    carries the numbers so the choice is actionable rather than a bare verdict.
+    """
+    args = _setup_args(tmp_path, model="Qwen/Qwen3.6-35B-A3B", gpu="L4")
+    assert serve_cmd.cmd_serve_setup(args) == 1
+    err = capsys.readouterr().err
+    assert "cannot serve" in err
+    assert "L4" in err
+    assert not Path(args.output).exists(), "an app was written for a card that cannot run it"
+
+
+def test_the_validated_gpu_for_every_model_still_passes_the_fit_check(tmp_path):
+    """The guard must not reject the catalog's own production-validated card.
+
+    A fit estimate stricter than reality would make `serve setup` refuse exactly the configuration
+    Freesolo runs in production, which is worse than the bug being fixed.
+    """
+    for model_id in MODELS:
+        args = _setup_args(tmp_path, model=model_id, output=str(tmp_path / f"{hash(model_id)}.py"))
+        assert serve_cmd.cmd_serve_setup(args) == 0, (
+            f"the validated card was refused for {model_id}"
+        )
 
 
 def test_a_valid_non_default_scaledown_window_reaches_the_generated_app(tmp_path):

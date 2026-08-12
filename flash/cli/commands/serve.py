@@ -23,7 +23,13 @@ from flash.serve.backend.generate import (
     gpu_named,
     write_app,
 )
-from flash.serve.backend.gpus import MODAL_GPUS, cheapest_fitting, default_gpu, recommend
+from flash.serve.backend.gpus import (
+    MODAL_GPUS,
+    cheapest_fitting,
+    default_gpu,
+    estimate_fit,
+    recommend,
+)
 
 DEFAULT_APP_FILE = "flash_serving_app.py"
 SECRET_NAME = "flash-serving"
@@ -175,6 +181,17 @@ def cmd_serve_setup(args) -> int:
         if gpu is None:
             offered = ", ".join(card.name for card in MODAL_GPUS)
             return _err(f"unknown Modal GPU {args.gpu!r}. choose one of: {offered}")
+        # An explicit card still has to hold the model. Without this the same estimate that
+        # `serve gpus` shows as "no" is skipped on the one path that spends money: setup writes
+        # the catalog's fixed config, deploys, pulls the weights, and the engine OOMs on a cold
+        # start the user paid for. Refused with the number, not just a verdict.
+        fit = estimate_fit(info, gpu)
+        if not fit.fits:
+            return _err(
+                f"{gpu.name} cannot serve {info.id}: needs about {fit.total_gb:.0f} GB but "
+                f"{gpu.name} offers about {fit.budget_gb:.0f} GB usable. "
+                f"run `{CLI_NAME} serve gpus --model {info.id}` to see what fits."
+            )
     if gpu is None:
         # no validated card for this model; fall back to the cheapest that fits and say so.
         fit = cheapest_fitting(recommend(info))
