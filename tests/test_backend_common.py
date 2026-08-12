@@ -4271,3 +4271,118 @@ def test_every_trainer_probes_capabilities_for_every_model_not_just_gdn():
                     "non-gdn runs would get empty caps and lose the triton backend"
                 )
                 break
+
+
+# ---------------------- fail-closed sitecustomize fragments (child_io) ----------------------
+
+
+def _compose_wrapped_sitecustomize(tmp_path, *fragments):
+    """write a sitecustomize from the real prologue + wrapper; return (shim_dir, marker_file)."""
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir(exist_ok=True)
+    marker_file = vc.shim_marker_file(str(shim_dir))
+    source = vc.render_shim_marker_prologue(marker_file)
+    for name, fragment in fragments:
+        source += vc.wrap_shim_fragment(name, fragment)
+    (shim_dir / "sitecustomize.py").write_text(source)
+    return shim_dir, marker_file
+
+
+def _run_child_with_sitecustomize(shim_dir):
+    """launch a real interpreter through the production mechanism: PYTHONPATH -> sitecustomize."""
+    env = dict(os.environ, PYTHONPATH=str(shim_dir))
+    return subprocess.run(
+        [sys.executable, "-c", "print('trained-unpatched')"],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+
+
+def test_execsitecustomize_swallows_an_unwrapped_fragment_failure(tmp_path):
+    """the defect the wrapper closes: cpython catches every Exception a sitecustomize import
+    raises, prints a note, and starts the interpreter anyway, so an unwrapped failing fragment
+    silently disables itself and everything after it, and the child trains unpatched."""
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    (shim_dir / "sitecustomize.py").write_text(
+        "raise RuntimeError('transformers drift moved a private symbol')\n"
+    )
+    result = _run_child_with_sitecustomize(shim_dir)
+    assert result.returncode == 0
+    assert "trained-unpatched" in result.stdout
+
+
+def test_a_failing_wrapped_fragment_hard_exits_the_child_with_the_shim_code(tmp_path):
+    """the wrapped form of the scenario above: os._exit bypasses execsitecustomize's swallow, the
+    child never trains, and the failure is attributed to the fragment by name."""
+    shim_dir, marker_file = _compose_wrapped_sitecustomize(
+        tmp_path,
+        ("good-fragment", "\n_flash_good = 1\n"),
+        ("boom-fragment", "\nraise RuntimeError('transformers drift moved a private symbol')\n"),
+        ("after-fragment", "\n_flash_after = 1\n"),
+    )
+    result = _run_child_with_sitecustomize(shim_dir)
+    assert result.returncode == vc.SHIM_FRAGMENT_FAILED_EXIT_CODE
+    assert "trained-unpatched" not in result.stdout
+    # attributed: the fragment names itself and the underlying traceback survives.
+    assert "boom-fragment" in result.stderr
+    assert "transformers drift moved a private symbol" in result.stderr
+    # the fragments before the failure recorded themselves; nothing after it could.
+    assert vc.read_applied_shim_markers(marker_file) == {"good-fragment"}
+
+
+def test_wrapped_fragments_record_their_markers_and_leave_the_child_running(tmp_path):
+    shim_dir, marker_file = _compose_wrapped_sitecustomize(
+        tmp_path,
+        ("good-fragment", "\n_flash_good = 1\n"),
+        ("second-fragment", "\n_flash_second = 2\n"),
+    )
+    result = _run_child_with_sitecustomize(shim_dir)
+    assert result.returncode == 0
+    assert "trained-unpatched" in result.stdout
+    assert vc.read_applied_shim_markers(marker_file) == {"good-fragment", "second-fragment"}
+
+
+def test_verify_applied_shim_markers_raises_only_on_missing_names(tmp_path):
+    marker_file = tmp_path / "applied_shims.txt"
+    marker_file.write_text("entropy-quantile\nkl-ref-adapter\n")
+    # complete (and over-complete: ray actors re-record) sets pass.
+    vc.verify_applied_shim_markers(str(marker_file), ["entropy-quantile"])
+    vc.verify_applied_shim_markers(str(marker_file), ["entropy-quantile", "kl-ref-adapter"])
+    with pytest.raises(RuntimeError, match=r"never proved.*\['stop-sequences'\]"):
+        vc.verify_applied_shim_markers(str(marker_file), ["entropy-quantile", "stop-sequences"])
+    # an absent file is every marker missing, not a pass.
+    with pytest.raises(RuntimeError, match="never proved"):
+        vc.verify_applied_shim_markers(str(tmp_path / "missing.txt"), ["entropy-quantile"])
+
+
+def test_wrapping_the_real_rendered_fragments_stays_valid_python(tmp_path):
+    """the wrapper indents whole rendered fragments into a try block; a syntax slip there turns
+    every child patch into a silent no-op, so compiling the composed file is the real gate."""
+    from flash.engine.worker.train.rl import shims as rl_shims
+
+    _shim_dir, marker_file = _compose_wrapped_sitecustomize(tmp_path)
+    source = vc.render_shim_marker_prologue(marker_file)
+    for name, fragment in (
+        (
+            "reentrant-checkpointing",
+            rl_shims.render_reentrant_checkpointing_shim(True, multimodal=True),
+        ),
+        ("entropy-quantile", rl_shims.render_entropy_quantile_shim(0.2)),
+        ("per-turn-credit", rl_shims.render_per_turn_credit_shim(True)),
+        ("stop-sequences", rl_shims.render_stop_sequences_shim(("</answer>",))),
+        ("image-pad-ban", rl_shims.render_image_pad_ban_shim(151655)),
+        (
+            "structured-outputs",
+            rl_shims.render_structured_outputs_shim({"json": {"type": "object"}}),
+        ),
+        ("exact-save-steps", rl_shims.render_exact_save_steps_shim((7, 13), 20)),
+        ("kl-ref-adapter", rl_shims.render_kl_ref_adapter_shim(True)),
+        ("gdn-varlen", vc.render_gdn_varlen_shim("qwen3_5")),
+    ):
+        source += vc.wrap_shim_fragment(name, fragment)
+    compile(source, "sitecustomize.py", "exec")
+    # and the empty fragment stays empty: a feature that is off has nothing to prove.
+    assert vc.wrap_shim_fragment("off-feature", "") == ""

@@ -138,6 +138,18 @@ def _offline(monkeypatch):
 
     _providers._get_provider.cache_clear()
 
+    # Pinned-revision geometry and size are memoized for the life of the PROCESS: a pinned commit is
+    # immutable, so production reads it once and shares it. Tests stub the hub UNDER those memos
+    # (huggingface_hub.HfApi / hf_hub_download), so a file that resolves a pin for real leaves the
+    # true geometry cached under a key a later test then stubs differently -- and the later test
+    # silently reads the earlier answer. Clear around every test: the memo exists to avoid a round
+    # trip, not to freeze one test's stub into the next.
+    import flash.cost.facts as _facts
+    import flash.engine.plan.model_config_probe as _probe
+
+    _probe._CONFIG_PROBE_MEMO.clear()
+    _facts._PINNED_SIZE_MEMO.clear()
+
     # Always-on artifact GC: the control-plane lifespan sweeps ONCE on startup (when an operator
     # HF_TOKEN is set). Stub it to a no-op so offline TestClient startups never reach HF/serving;
     # tests/test_repo_cleanup.py restores the real function to exercise the genuine sweep.
@@ -148,6 +160,8 @@ def _offline(monkeypatch):
     yield
     rp_keys.reset()
     _providers._get_provider.cache_clear()
+    _probe._CONFIG_PROBE_MEMO.clear()
+    _facts._PINNED_SIZE_MEMO.clear()
 
 
 @pytest.fixture(autouse=True)

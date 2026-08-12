@@ -28,7 +28,12 @@ build_sft_overrides = _sft_train.build_sft_overrides
 liveness_heartbeat = _sft_train.liveness_heartbeat
 gdn_reset_arch_from_caps = _sft_train.gdn_reset_arch_from_caps
 render_gdn_varlen_shim = _sft_train.render_gdn_varlen_shim
+render_shim_marker_prologue = _sft_train.render_shim_marker_prologue
 render_wandb_link_shim = _sft_train.render_wandb_link_shim
+shim_marker_file = _sft_train.shim_marker_file
+verify_applied_shim_markers = _sft_train.verify_applied_shim_markers
+wrap_shim_fragment = _sft_train.wrap_shim_fragment
+SHIM_FRAGMENT_FAILED_EXIT_CODE = _sft_train.SHIM_FRAGMENT_FAILED_EXIT_CODE
 sft_tokens_for_updates = _sft_train.sft_tokens_for_updates
 sft_under_ran = _sft_train.sft_under_ran
 validate_save_steps = _sft_train.validate_save_steps
@@ -111,6 +116,8 @@ class _SftChild:
     watcher: object
     child_env: dict[str, str]
     command: list[str]
+    shim_markers: str
+    expected_shims: tuple[str, ...]
 
 
 @dataclass
@@ -122,6 +129,11 @@ class _SftProgress:
     train_tokens: int
     loraplus_applied: bool
     wandb_link: dict[str, str | None]
+    # what the child's wrapped sitecustomize fragments must prove applied (see
+    # wrap_shim_fragment); verified at the first optimizer step and again at child exit.
+    shim_markers: str = ""
+    expected_shims: tuple[str, ...] = ()
+    shims_verified: bool = False
 
 
 @dataclass(frozen=True)
@@ -431,7 +443,7 @@ def _prepare_sft_child(
         "fused_ce_backend": _sft_train._resolve_sft_fused_ce_backend(capabilities.caps),
     }
     overrides = build_sft_overrides(config)
-    shim_source = _render_sft_sitecustomize(
+    core_source = _render_sft_sitecustomize(
         seed=config["seed"],
         loraplus_ratio=_SFT_LORAPLUS_RATIO,
         save_at_steps=options.save_at_steps,
@@ -442,9 +454,20 @@ def _prepare_sft_child(
     # row order matches the profile's byte for byte, and the gdn one patches the model's text
     # forward to reset linear-attention state at packed example boundaries. different objects,
     # no interaction -- a gdn hybrid needs both, and dropping either is a silent correctness bug.
-    shim_source = _sft_train._append_exact_sft_dataloader_shim(shim_source)
+    core_source = _sft_train._append_exact_sft_dataloader_shim(core_source)
+    # every required fragment is wrapped fail-closed (see wrap_shim_fragment): execsitecustomize
+    # would otherwise swallow a fragment's exception and the child would train unpatched (no
+    # seeding, no exact dataloader order, no lora+, no boundary resets) while looking healthy.
+    # the wandb link shim stays unwrapped: it swallows its own failures by design and a logging
+    # link must not be able to abort paid training.
+    required_fragments = [("sft-core", core_source)]
     if gdn_reset_arch is not None:
-        shim_source += render_gdn_varlen_shim(gdn_reset_arch)
+        required_fragments.append(("gdn-varlen", render_gdn_varlen_shim(gdn_reset_arch)))
+    shim_markers = shim_marker_file(shim_dir)
+    # the workdir is wiped per attempt (_resolve_sft_options), so no stale marker can survive here.
+    shim_source = render_shim_marker_prologue(shim_markers) + "".join(
+        wrap_shim_fragment(name, source) for name, source in required_fragments
+    )
     if "wandb" in loggers:
         shim_source += render_wandb_link_shim()
     with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
@@ -501,10 +524,13 @@ def _prepare_sft_child(
         watcher=watcher,
         child_env=child_env,
         command=command,
+        shim_markers=shim_markers,
+        expected_shims=tuple(name for name, source in required_fragments if source),
     )
 
 
-def _prepare_sft_progress(data: _SftData, model: _SftModelSetup, resume_step: int) -> _SftProgress:
+def _prepare_sft_progress(data: _SftData, model: _SftModelSetup, child: _SftChild) -> _SftProgress:
+    resume_step = child.resume_step
     progress = {"step": resume_step, "loss": None, "grad_norm": None, "lr": None}
     # consecutive steps seen with grad_norm == 0.0 at a nonzero lr. one step can legitimately be
     # zero (a fully-masked micro-batch), so require a short run of them before failing.
@@ -532,6 +558,11 @@ def _prepare_sft_progress(data: _SftData, model: _SftModelSetup, resume_step: in
         train_tokens=train_tokens,
         loraplus_applied=resume_step >= model.update_horizon,
         wandb_link={},
+        shim_markers=child.shim_markers,
+        expected_shims=child.expected_shims,
+        # like loraplus_applied above: a resume already at the horizon never launches the child,
+        # so there is no marker file to verify and nothing left for the shims to patch.
+        shims_verified=resume_step >= model.update_horizon,
     )
 
 
@@ -579,6 +610,11 @@ def _consume_sft_marker_line(progress: _SftProgress, line: str) -> bool:
         progress.wandb_link.update(link)
     if _sft_train.verl_step_number(line) is None:
         return False
+    # the marker set first: a skipped sitecustomize also loses the lora+ shim, and "no fragment
+    # ran at all" is the root cause worth reporting over its lora+ symptom.
+    if progress.expected_shims and not progress.shims_verified:
+        verify_applied_shim_markers(progress.shim_markers, progress.expected_shims)
+        progress.shims_verified = True
     if _SFT_LORAPLUS_RATIO > 1 and not progress.loraplus_applied:
         raise RuntimeError(
             "verl reached an optimizer step before the required lora+ shim succeeded"
@@ -631,8 +667,22 @@ def _finish_sft_child(
 ) -> tuple[float, float]:
     train_wall = time.time() - train_started_at
     device_peak_gpu_gb = gpu_sampler.stop_gb()
+    if return_code == SHIM_FRAGMENT_FAILED_EXIT_CODE:
+        # permanent, not retriable infra: the same interpreter fails the same fragment on retry.
+        raise RuntimeError(
+            f"verl SFT subprocess exited {return_code}: a required flash runtime patch failed to "
+            "apply in the child interpreter (its traceback names the fragment in the flash log). "
+            "the verl/transformers stack at the child python is incompatible with this flash "
+            "version; rebuild the worker image or fix FLASH_VERL_PYTHON rather than retrying."
+        )
     if return_code != 0:
         raise RuntimeError(f"verl SFT subprocess exited with status {return_code}")
+    # belt and braces behind the first-step check in _consume_sft_marker_line, for a child whose
+    # step lines the parent never parsed. shims_verified starts True when the child is not
+    # launched at all (resume already at the horizon), exactly like loraplus_applied above.
+    if progress.expected_shims and not progress.shims_verified:
+        verify_applied_shim_markers(progress.shim_markers, progress.expected_shims)
+        progress.shims_verified = True
     if _SFT_LORAPLUS_RATIO > 1 and not progress.loraplus_applied:
         raise RuntimeError("required lora+ shim did not emit its success marker")
     return train_wall, device_peak_gpu_gb

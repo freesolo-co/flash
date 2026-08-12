@@ -48,6 +48,7 @@ from flash.engine.worker.backend_common import (  # noqa: F401
     stamp_adapter_dir_provenance,
     verl_declares_rollout_field,
     verl_device_capability,
+    wrap_shim_fragment,
 )
 from flash.engine.worker.io.heartbeat import liveness_heartbeat
 
@@ -262,8 +263,12 @@ def _configure_rl_child(
     # case cannot complete a step on verl's fsdp engine. see require_gdn_boundary_resets.
     gdn_reset_arch = require_gdn_boundary_resets(caps, gdn_module)
     if gdn_reset_arch is not None:
+        # wrapped like the fragments _write_rl_shim composed: the marker prologue is already in
+        # the file, and an unpatched gdn child training across packed example boundaries is
+        # exactly the silent failure the wrapper exists to prevent.
         with open(files["shim_py"], "a") as f:
-            f.write(render_gdn_varlen_shim(gdn_reset_arch))
+            f.write(wrap_shim_fragment("gdn-varlen", render_gdn_varlen_shim(gdn_reset_arch)))
+        files["expected_shims"].append("gdn-varlen")
 
     expected_steps, loggers, project_name, experiment_name, cc_ok = _resolve_training_settings(
         inp, caps
@@ -396,13 +401,10 @@ def run_rl_train():
                 state=state,
                 reward_runtime=reward_runtime,
                 _reward_observability=_reward_observability,
+                files=files,
             )
         _validate_rl_child(
-            rc,
-            state,
-            files["resume_step"],
-            expected_steps,
-            resume_uploader,
+            rc, state, files["resume_step"], expected_steps, resume_uploader, files=files
         )
     finally:
         # drain before the reward server goes down: on a cancel or crash the last completed
