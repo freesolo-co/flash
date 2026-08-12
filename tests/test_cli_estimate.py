@@ -8,6 +8,7 @@ import types
 
 import pytest
 
+from flash._internal.channel import CLI_NAME
 from flash.cli.commands import cmd_train
 from flash.cost.spec import runconfig_from_spec as _runconfig_from_spec
 from flash.cost.spec import spec_steps as _spec_steps
@@ -622,7 +623,7 @@ def test_sft_cost_on_a_profile_miss_explains_the_separate_charge_and_fails(
     assert "$0.25" in err
     assert "billed on its own" in err
     assert "no training run was created" in err
-    assert f"flash runs status {PROFILE_RUN_ID}" in err
+    assert f"{CLI_NAME} runs status {PROFILE_RUN_ID}" in err
     assert client.get_run_calls == [PROFILE_RUN_ID]
 
 
@@ -683,7 +684,7 @@ def test_sft_cost_pending_without_an_ownership_flag_keeps_the_owner_wording(
 
     err = capsys.readouterr().err
     assert "billed on its own" in err
-    assert f"flash runs status {PROFILE_RUN_ID}" in err
+    assert f"{CLI_NAME} runs status {PROFILE_RUN_ID}" in err
     assert client.get_run_calls == [PROFILE_RUN_ID]
 
 
@@ -709,7 +710,7 @@ def test_sft_cost_pending_on_your_own_running_profile_names_no_second_charge(
     assert "the server started a separate profile run" not in err
     assert "billed on its own" not in err
     # still the owner's run, so the poll instruction stays.
-    assert f"flash runs status {PROFILE_RUN_ID}" in err
+    assert f"{CLI_NAME} runs status {PROFILE_RUN_ID}" in err
     # no charge is quoted for a launch that did not happen, so the run is never priced.
     assert "$" not in err
     assert client.get_run_calls == []
@@ -767,7 +768,7 @@ def test_sft_real_submit_shares_the_profile_pending_path(tmp_path, monkeypatch, 
     err = capsys.readouterr().err
     assert "billed on its own" in err
     assert "no training run was created" in err
-    assert f"flash runs status {PROFILE_RUN_ID}" in err
+    assert f"{CLI_NAME} runs status {PROFILE_RUN_ID}" in err
 
 
 def test_sft_cost_leaves_unrelated_api_errors_alone(tmp_path, monkeypatch):

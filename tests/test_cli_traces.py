@@ -215,7 +215,7 @@ def test_traces_export_requires_login(monkeypatch, tmp_path, capsys) -> None:
     monkeypatch.setattr(traces, "load_credentials", lambda: (_HOSTED_URL, None))
 
     assert cli.main(["traces", "export", "--project", "11111111-1111-4111-8111-111111111111"]) == 1
-    assert "flash login" in capsys.readouterr().err
+    assert f"{traces.CLI_NAME} login" in capsys.readouterr().err
 
 
 def test_traces_export_sends_the_key_from_the_url_it_decided_on(monkeypatch, tmp_path) -> None:
@@ -264,7 +264,7 @@ def test_a_logged_out_snapshot_does_not_reread_the_config(monkeypatch, tmp_path,
     )
 
     assert cli.main(["traces", "export", "--project", "11111111-1111-4111-8111-111111111111"]) == 1
-    assert "flash login" in capsys.readouterr().err
+    assert f"{traces.CLI_NAME} login" in capsys.readouterr().err
 
 
 def test_traces_export_reports_a_project_with_no_usable_traces(
@@ -447,7 +447,10 @@ def test_records_export_hint_includes_required_project(
 
     assert cli.main(["traces", "export", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
 
-    assert "flash env push --project <project-uuid> --name my-env ." in capsys.readouterr().out
+    assert (
+        f"{traces.CLI_NAME} env push --project <project-uuid> --name my-env ."
+        in capsys.readouterr().out
+    )
 
 
 def test_traces_export_prompts_shape_keeps_reply_less_calls(
