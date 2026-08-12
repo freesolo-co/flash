@@ -2856,6 +2856,34 @@ def test_sft_resume_guard_checks_the_launched_width_not_the_allocation():
     )
 
 
+def test_reported_grad_accum_reconstructs_the_global_batch_under_data_parallelism():
+    """notes must satisfy micro_batch x grad_accum x dp_size == the global batch.
+
+    That product is how a reader reconstructs the token budget, and every factor in it is per-rank:
+    `_resolve_sft_width_and_micro_batch` caps `micro_batch` to `train_batch_size // world_size`. So
+    dividing the GLOBAL batch by the micro-batch -- the sequence-parallel formula, where each rank
+    sees the whole batch -- reports an accumulation count world_size times too high, and the
+    reconstruction lands world_size times over.
+    """
+    import math
+
+    # (global batch, world size, requested micro-batch)
+    for train_batch_size, world_size, requested in (
+        (8, 4, 4),
+        (8, 1, 2),
+        (16, 2, 8),
+        (6, 3, 4),
+        (8, 8, 1),
+    ):
+        per_rank = max(1, train_batch_size // max(1, world_size))
+        micro_batch = max(1, min(requested, per_rank))
+        grad_accum = math.ceil((train_batch_size / max(1, world_size)) / micro_batch)
+        assert micro_batch * grad_accum * world_size == train_batch_size, (
+            f"batch {train_batch_size} over {world_size} ranks: "
+            f"{micro_batch} x {grad_accum} x {world_size}"
+        )
+
+
 def test_publish_does_not_leave_every_step_adapter_on_the_container_disk(monkeypatch, tmp_path):
     """the exported adapter is deleted once it is durable on hf.
 
@@ -3651,7 +3679,11 @@ def test_sft_result_records_the_micro_batch_that_ran_not_the_one_requested():
 
     src = inspect.getsource(sft_train._write_sft_result)
     assert '"per_device_train_batch_size": child.micro_batch,' in src
-    assert "child.micro_batch)" in src, "gradient accumulation must derive from the executed value"
+    assert "/ child.micro_batch" in src, "gradient accumulation must derive from the executed value"
+    # over one rank's share, since `child.micro_batch` is itself per-rank: dividing the GLOBAL batch
+    # by it is the sequence-parallel formula and over-counts by the world size.
+    assert "(model.train_batch_size / max(1, child.world_size)) / child.micro_batch" in src
+    assert "math.ceil(model.train_batch_size / child.micro_batch)" not in src
     # the uncapped request must not reach the result under either key.
     assert '"per_device_train_batch_size": model.micro_batch,' not in src
     assert "math.ceil(model.train_batch_size / model.micro_batch)" not in src
