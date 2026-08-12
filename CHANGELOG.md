@@ -27,6 +27,13 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   `flash runs cancel <run-id>` exited 0 without cancelling, leaving a run billing while the
   operator believed they had stopped it.
 
+- `flash env setup` scaffolded hosted-only environment instructions on every plane. A
+  self-hosted plane cannot publish to Freesolo's managed environment hub, so the generated
+  configs left `[environment] id` empty (which fails validation) beside a `flash env push`
+  command that could not work. Against a self-hosted plane the scaffold now emits the
+  `github:owner/repo@ref:path` id form, which such a plane resolves directly. Output against
+  the managed plane is unchanged.
+
 ### Changed
 
 - CI runs the offline test suite on both supported interpreters (3.11 and 3.12) rather than

@@ -485,80 +485,6 @@ def smallest_fitting_gpu_count(
     return None
 
 
-def _shape_label(gpu: GpuClass, count: int) -> str:
-    return f"{count}x {gpu.name}" if count > 1 else gpu.name
-
-
-def vram_knob_advice(algorithm: str) -> str:
-    """Return the algorithm knobs that actually reduce its measured vram floor."""
-    algorithm = (algorithm or "").lower()
-    if algorithm == "grpo":
-        return (
-            "lower [train].max_context_tokens / [train].max_completion_tokens / "
-            "[train].lora_rank to fit"
-        )
-    if algorithm == "opd":
-        # names prompts_per_step, not batch_size: opd REJECTS batch_size at parse time, so the old
-        # wording sent a user whose run did not fit straight into a config error.
-        return (
-            "lower [train].group_size and/or [train].prompts_per_step (rollout concurrency = "
-            "prompts_per_step x group_size; distillation needs no group variance, so group_size=1 "
-            "is fine) and/or [train].max_completion_tokens / [train].max_context_tokens to fit"
-        )
-    return "lower [train].batch_size / [train].max_context_tokens / [train].lora_rank to fit"
-
-
-def vram_fit_error_message(
-    algorithm: str,
-    need: float,
-    *,
-    requested_gpu_count: int | None,
-    effective_gpu_count: int,
-    max_gpu_count: int,
-    gpu_names: tuple[str, ...] | None = None,
-) -> str:
-    """Build an actionable pinned-count or terminal vram rejection."""
-    algorithm = (algorithm or "").lower()
-    fitting_count = smallest_fitting_gpu_count(
-        need, max_gpu_count=max_gpu_count, gpu_names=gpu_names
-    )
-    if requested_gpu_count is not None and fitting_count is not None:
-        provided = gpu_capacity_shape(effective_gpu_count, gpu_names=gpu_names)
-        fitting = gpu_capacity_shape(fitting_count, min_vram_gb=need, gpu_names=gpu_names)
-        if provided is not None and fitting is not None:
-            provided_gpu, provided_count, provided_vram = provided
-            fitting_gpu, fitting_count, fitting_vram = fitting
-            # `--gpus {n}` is spelled exactly as `wider_shape_remedy` spells it, so the flag a user
-            # copies out of a fit failure is the same string on every path that can reject one.
-            return (
-                f"{algorithm} needs >= {need:g} GB VRAM; gpu.count={requested_gpu_count} provides "
-                f"at most {provided_vram:g} GB ({_shape_label(provided_gpu, provided_count)}). "
-                f"Raise the card ceiling with `--gpus {fitting_count}` "
-                f"({_shape_label(fitting_gpu, fitting_count)} = {fitting_vram:g} GB), or "
-                f"{vram_knob_advice(algorithm)}."
-            )
-
-    widest = gpu_capacity_shape(max_gpu_count, gpu_names=gpu_names)
-    widest_count = largest_rentable_count(max_gpu_count)
-    biggest = widest[2] if widest is not None else 0.0
-    shape = (
-        f"any {widest_count}-card validated GPU combination"
-        if widest_count > 1
-        else "any single validated GPU"
-    )
-    if algorithm == "opd":
-        return (
-            f"opd needs >= {need:g} GB VRAM, more than {shape} ({biggest:g} GB max). "
-            "opd is resident-only: the trainer and the colocated vLLM student rollout engine hold "
-            "two model-weight copies plus the rollout KV cache at once. "
-            f"{vram_knob_advice(algorithm).capitalize()}."
-        )
-    return (
-        f"{algorithm} needs >= {need:g} GB VRAM, more than {shape} ({biggest:g} GB max). "
-        f"{vram_knob_advice(algorithm).capitalize()}."
-    )
-
-
 def cheapest_gpu(min_vram_gb: int, *, gpu_count: int = 1, cost_key=None) -> str:
     """Return the cheapest fitting validated GPU class for the card ceiling.
 
@@ -678,6 +604,9 @@ def provisional_gpu(
             ),
         )
     except UnsupportedGpuError as exc:
+        # deferred: fit_errors imports from here, so a module-level import would be circular.
+        from flash.providers.fit_errors import vram_fit_error_message
+
         raise UnsupportedGpuError(
             vram_fit_error_message(
                 algorithm,
@@ -758,6 +687,10 @@ def wider_shape_remedy(
     must be the caller's ``geometry_safe_gpu_cap`` so the suggestion is never a width verl rejects
     at Ulysses init after the box is rented, and ``above`` excludes the counts already tried. The
     smallest fitting count wins: the cheapest shape that works, not the widest on offer.
+
+    ``vram_options`` carries only classes a provider in play will actually rent at a wider count
+    (see ``rents_arbitrary_card_counts``); passing none leaves the failure a bare dead end, which
+    is the honest answer when no offline check can confirm the wider SKU exists.
 
     Every fit-rejection message routes through here so the remedy cannot drift in wording or in
     the rule that produces it.

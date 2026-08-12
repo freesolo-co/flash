@@ -1916,3 +1916,437 @@ def test_wider_shape_remedy_names_the_cheapest_fitting_width():
 
     vram = GPU_INFO["H200"].vram_gb
     assert "--gpus 2" in wider_shape_remedy((vram,), vram + 40, ceiling=8, above=1)
+
+
+def test_provider_incompatible_pin_reports_the_incompatibility_not_a_fit_remedy():
+    """A class the pinned provider does not carry is a provider error at EVERY width.
+
+    H200 is RunPod-only, so a Lambda-pinned H200 that also misses on VRAM must report the pairing.
+    Checking fit first made the message name `--gpus 2` -- a flag that cannot help, because no
+    Lambda H200 exists at any count. The user would raise the ceiling and fail identically.
+    """
+    from flash.providers.allocator import _resolve_exact_gpu
+    from flash.providers.base import GPU_INFO, UnsupportedGpuError, providers_for
+
+    assert "lambda" not in providers_for("H200")
+    need = GPU_INFO["H200"].vram_gb + 40  # would fit on 2 cards, were they purchasable
+    with pytest.raises(UnsupportedGpuError) as exc:
+        _resolve_exact_gpu(
+            "H200",
+            need=need,
+            cap=1,
+            max_gpu_count=1,
+            provider="lambda",
+            available=("lambda",),
+            widest_cap=8,
+        )
+    assert "cannot provision exact GPU 'H200'" in str(exc.value)
+    assert "--gpus" not in str(exc.value)
+
+
+def test_unpurchasable_width_names_a_remedy_the_user_can_actually_apply():
+    """The remedy must depend on whether dropping the pin would actually change the pool.
+
+    Three cases collapse to the same narrow ``available`` tuple and must not get the same advice:
+    a pin over a fleet that also has RunPod (dropping it really does buy the wider shape), a pin
+    over a Lambda-only fleet (dropping it lands on the identical pool and the identical rejection),
+    and no pin at all (a knob the operator never set). ``available`` cannot separate them, so the
+    pre-pin fleet has to travel with it.
+
+    Driven through ``_resolved_gpu_count`` rather than the message builder directly: the pin
+    context is LOST at that boundary, so a builder-only test would pass against the defect.
+    """
+    from flash.providers.allocator import _resolved_gpu_count
+    from flash.providers.base import UnsupportedGpuError
+
+    shared = {
+        "need": 188.0,
+        "requested_gpu_count": 1,
+        "model_revision": "",
+        "exact": "",
+    }
+
+    def reject(available, unpinned, requested=1, need=None):
+        overrides = {"requested_gpu_count": requested}
+        if need is not None:
+            overrides["need"] = need
+        with pytest.raises(UnsupportedGpuError) as exc:
+            _resolved_gpu_count(
+                "Qwen/Qwen3.6-35B-A3B",
+                "grpo",
+                available=available,
+                unpinned=unpinned,
+                **{**shared, **overrides},
+            )
+        return str(exc.value)
+
+    # a pin worth dropping: the fleet behind it carries RunPod, which rents the width freely.
+    droppable = reject(("lambda",), ("lambda", "runpod"))
+    assert "Drop the provider pin" in droppable
+
+    # reaching this branch means the authored ceiling ALSO failed, so a remedy naming only the
+    # provider buys a second rejection that finally reveals `--gpus N`. both halves, one message.
+    assert "`--gpus 2`" in droppable
+    # and the advice has to actually work: following it verbatim allocates rather than re-rejecting.
+    assert (
+        _resolved_gpu_count(
+            "Qwen/Qwen3.6-35B-A3B",
+            "grpo",
+            available=("lambda", "runpod"),
+            unpinned=None,
+            **{**shared, "requested_gpu_count": 2},
+        )
+        == 2
+    )
+
+    # the same pin over a LAMBDA-ONLY fleet. dropping it leaves the identical pool, so the advice
+    # would send the user in a circle back to this exact error.
+    futile = reject(("lambda",), ("lambda",))
+    assert "Drop the provider pin" not in futile
+    assert "configure a provider that rents card counts directly (RunPod)" in futile
+
+    # nothing pinned: a narrow fleet is simply the whole configured fleet.
+    unpinned = reject(("lambda", "vast"), None)
+    assert "Drop the provider pin" not in unpinned
+    assert "configure a provider that rents card counts directly (RunPod)" in unpinned
+
+    # these two have no arbitrary-count provider behind them, so the width can only be OFFERED to
+    # try against the provider's own catalog -- `live_capacity` means "confirm dynamically", not
+    # "the wider SKU is absent". Lambda really does resolve gpu_4x_h100_pcie.
+    for message in (futile, unpinned):
+        assert "`--gpus 2`" in message
+        assert "check it against their catalog" in message
+        # so the message must not assert non-existence it cannot prove offline.
+        assert "no available provider sells" not in message
+
+    # a raise clause may only appear when the ceiling really does have to rise. the unpinned pool
+    # can carry a BIGGER class the pin hid (Vast tops out at 80 GB/card, RunPod has H200/B200), and
+    # then the same width fits and "--gpus 1" would name the ceiling the user already set.
+    # 100 GB: two 80 GB Vast cards, but ONE RunPod H200/B200. the width does not rise.
+    same_width = reject(("vast",), ("runpod", "vast"), need=100.0)
+    assert "Drop the provider pin" in same_width
+    assert "raise the card ceiling" not in same_width
+    assert "--gpus" not in same_width
+    # and the DESCRIPTION must agree with that remedy: the fallback is a bigger card at the same
+    # count, so claiming the run "fits only on a multi-card shape" contradicts the very next
+    # sentence. the obstacle is the pin hiding a large enough class, not the width.
+    assert "fits only on a multi-card shape" not in same_width
+    assert "at 1 card:" in same_width
+    assert "the pinned provider's largest card is too small" in same_width
+
+    # no message may claim the run exceeds every class -- it fits, it just cannot be bought.
+    for message in (droppable, futile, unpinned):
+        assert "more than any" not in message
+
+
+def test_exact_gpu_rejection_reports_a_pin_that_hides_a_wider_count():
+    """A pin can be the only reason an exact class has no offerable width.
+
+    `_resolve_exact_gpu` narrows to providers carrying the class, and offers a `--gpus N` remedy
+    only when one of them rents counts freely. A Lambda pin on a fleet that also has RunPod
+    suppresses that entirely -- yet RunPod carries the very same H100 and rents it at any count, so
+    dropping the pin is a real fix the bare shortfall message hides.
+    """
+    from flash.providers.allocator import _resolve_exact_gpu
+    from flash.providers.base import UnsupportedGpuError
+
+    def reject(provider, available, unpinned, need=188.0):
+        with pytest.raises(UnsupportedGpuError) as exc:
+            _resolve_exact_gpu(
+                "H100",
+                need=need,
+                cap=1,
+                max_gpu_count=1,
+                provider=provider,
+                available=available,
+                unpinned=unpinned,
+                widest_cap=8,
+            )
+        return str(exc.value)
+
+    hidden = reject("lambda", ("lambda",), ("runpod", "lambda"))
+    assert "Drop the provider pin" in hidden
+    # the authored ceiling already failed too, so the pin clause alone would buy a second
+    # rejection. both halves, as the sibling `vram_fit_error_message` path does.
+    assert "`--gpus 4`" in hidden
+
+    # an OVERSIZED pin gets no hint at all: 8x H100 is 497.6 GB, so dropping the pin cannot help
+    # and promising it would be false. routed through `wider_shape_remedy`, which proves the width.
+    oversized = reject("lambda", ("lambda",), ("runpod", "lambda"), need=900.0)
+    assert "Drop the provider pin" not in oversized
+    assert "--gpus" not in oversized
+
+    # no pin, and a pin with nothing better behind it, must stay silent rather than invent advice.
+    assert "Drop the provider pin" not in reject("", ("lambda",), None)
+    assert "Drop the provider pin" not in reject("lambda", ("lambda",), ("lambda",))
+
+    # where a width IS offerable the existing remedy stands; the hint must not displace it.
+    runpod = reject("runpod", ("runpod",), None)
+    assert "`--gpus 4`" in runpod
+    assert "Drop the provider pin" not in runpod
+
+
+def test_fit_remedy_is_withheld_when_only_fixed_count_sku_providers_remain():
+    """A width is only PROMISED when a provider in play rents card counts freely.
+
+    Lambda names the count in the instance type and Vast bakes it into the offer, so a wider shape
+    exists only if their live catalog lists one -- unknowable here. RunPod takes the count as a
+    launch parameter, so its remedy stays. The distinction is what the message CLAIMS: RunPod gets
+    "it fits on N cards" because the fit was proved offline, while a fixed-count provider is only
+    offered the width to ask its catalog for. Naming a width to check beats a bare shortfall the
+    user cannot act on; asserting one exists would send them to buy a shape that may not be sold.
+    """
+    from flash.providers.allocator import _resolve_exact_gpu
+    from flash.providers.base import GPU_INFO, UnsupportedGpuError, providers_for
+
+    assert {"lambda", "vast"} <= set(providers_for("H100"))
+    need = GPU_INFO["H100"].vram_gb + 40  # fits on 2 H100s
+
+    with pytest.raises(UnsupportedGpuError) as lambda_only:
+        _resolve_exact_gpu(
+            "H100",
+            need=need,
+            cap=1,
+            max_gpu_count=1,
+            provider="lambda",
+            available=("lambda",),
+            widest_cap=8,
+        )
+    lambda_message = str(lambda_only.value)
+    assert f"{GPU_INFO['H100'].vram_gb} GB VRAM" in lambda_message
+    # the width may be named, but only ever as a catalog check -- never as a proved fit.
+    assert "it fits on" not in lambda_message
+    if "--gpus" in lambda_message:
+        assert "check it against their catalog" in lambda_message
+
+    # an oversized pin gets NO width at any tier: no rentable count would help, so the honest
+    # answer is the shortfall alone rather than a catalog check that cannot succeed.
+    with pytest.raises(UnsupportedGpuError) as oversized:
+        _resolve_exact_gpu(
+            "H100",
+            need=float(GPU_INFO["H100"].vram_gb) * 100,
+            cap=1,
+            max_gpu_count=1,
+            provider="lambda",
+            available=("lambda",),
+            widest_cap=8,
+        )
+    assert "--gpus" not in str(oversized.value)
+
+    # the SAME pin on runpod keeps the remedy: withholding it everywhere would trade a wrong
+    # suggestion for a missing one.
+    with pytest.raises(UnsupportedGpuError, match=r"--gpus 2"):
+        _resolve_exact_gpu(
+            "H100",
+            need=need,
+            cap=1,
+            max_gpu_count=1,
+            provider="runpod",
+            available=("runpod",),
+            widest_cap=8,
+        )
+
+    # a mixed pool still counts as purchasable: runpod alone can sell the wider shape.
+    with pytest.raises(UnsupportedGpuError, match=r"--gpus 2"):
+        _resolve_exact_gpu(
+            "H100",
+            need=need,
+            cap=1,
+            max_gpu_count=1,
+            provider="",
+            available=("lambda", "runpod"),
+            widest_cap=8,
+        )
+
+
+def test_exact_pin_on_a_fixed_count_provider_still_names_a_width_to_check():
+    """The exact-GPU path must not withhold the catalog check its non-exact sibling gives.
+
+    An exact Lambda H100 pin that needs more than one card previously died on a bare shortfall,
+    while the same run without the exact pin was told which width to try. `live_capacity` means
+    the count is confirmed dynamically, not that the SKU is absent -- Lambda resolves
+    `gpu_4x_h100_pcie` against its own catalog and rejects what it does not sell with a precise
+    error. Naming the width to try is one flag from working; the bare shortfall is a dead end.
+    """
+    from flash.providers.allocator import _resolve_exact_gpu
+    from flash.providers.base import GPU_INFO, UnsupportedGpuError
+
+    need = GPU_INFO["H100"].vram_gb * 2.35  # 188 GB: needs 4 cards, not 2
+
+    with pytest.raises(UnsupportedGpuError) as pinned:
+        _resolve_exact_gpu(
+            "H100",
+            need=need,
+            cap=1,
+            max_gpu_count=1,
+            provider="lambda",
+            available=("lambda",),
+            widest_cap=8,
+            unpinned=("lambda",),
+        )
+    message = str(pinned.value)
+    # the width is SEARCHED, not guessed: 2 cards is 160 GB and does not fit, so 4 is the answer.
+    assert "`--gpus 4`" in message
+    assert "check it against their catalog" in message
+    # still a catalog check, never a promise -- nothing here proved the SKU is purchasable.
+    assert "it fits on" not in message
+
+    # the same shortfall reached through the multi-card branch names a width above the tried cap.
+    with pytest.raises(UnsupportedGpuError) as combo:
+        _resolve_exact_gpu(
+            "H100",
+            need=need,
+            cap=2,
+            max_gpu_count=4,
+            provider="lambda",
+            available=("lambda",),
+            widest_cap=8,
+            unpinned=("lambda",),
+        )
+    assert "`--gpus 4`" in str(combo.value)
+
+
+def test_the_obstacle_never_contradicts_the_remedy_printed_after_it():
+    """Whenever dropping the pin is the fix, the diagnosis must blame the PIN.
+
+    The message states an obstacle and then a remedy in adjacent sentences. Claiming "no available
+    provider is confirmed to sell" this shape while the remedy offers to drop the pin and rent
+    exactly that shape is a self-contradiction: the run is one or two flags from working, not
+    unsellable. The fixed-count catalog wording is only true when nothing behind the pin fits.
+    """
+    from flash.providers.fit_errors import vram_fit_error_message
+
+    def message(need, *, requested, widenable):
+        return vram_fit_error_message(
+            "sft",
+            need,
+            requested_gpu_count=requested,
+            effective_gpu_count=requested,
+            max_gpu_count=8,
+            gpu_names=("H100",),
+            providers=("vast",),
+            widenable_without_pin=widenable,
+        )
+
+    # dropping the pin unlocks a WIDER freely-rented shape: blame the pin, not the market.
+    wider = message(188.0, requested=1, widenable=("H200",))
+    assert "Drop the provider pin" in wider
+    assert "no available provider is confirmed to sell" not in wider
+    assert "the pinned provider is not confirmed to sell" in wider
+
+    # dropping the pin unlocks a bigger card at the SAME count: no width has to change.
+    same = message(100.0, requested=1, widenable=("H200",))
+    assert "Drop the provider pin" in same
+    assert "at 1 card:" in same
+    assert "fits only on a multi-card shape" not in same
+
+    # nothing behind the pin fits: the catalog wording is now the honest diagnosis.
+    catalog = message(188.0, requested=1, widenable=())
+    assert "Drop the provider pin" not in catalog
+    assert "fits only on a multi-card shape" in catalog
+
+    # the invariant itself: a drop-pin remedy never rides a claim that the shape is unsellable
+    # OUTRIGHT. the same-width branch does say "no available provider is confirmed to sell at 1
+    # card", which is compatible with its remedy -- it is scoped to the authored count and the very
+    # next clause names the excluded providers that do sell it. what must never appear alongside a
+    # drop-pin remedy is the unscoped "exists only if their live catalog lists one".
+    for msg in (wider, same, catalog):
+        if "Drop the provider pin" in msg:
+            assert "exists only if their live catalog lists one" not in msg
+
+
+def test_unreachable_class_reports_the_configuration_not_the_vram_shortfall():
+    """One root cause must not produce two different errors depending on the run's size.
+
+    A class no configured provider carries is blocked by the CONFIGURATION. Deciding fit first meant
+    an oversized run got a VRAM shortfall while the same fleet with a smaller need correctly got
+    ``no configured active provider`` -- so the diagnostic depended on how big the run happened to
+    be rather than on what actually blocked it, and the shortfall pointed at a knob that cannot help.
+    """
+    from flash.providers.allocator import _resolve_exact_gpu
+    from flash.providers.base import GPU_INFO, UnsupportedGpuError, providers_for
+
+    assert "lambda" not in providers_for("H200")
+    over = GPU_INFO["H200"].vram_gb * 2.5  # far beyond one card
+    under = GPU_INFO["H200"].vram_gb - 40  # comfortably inside one card
+
+    for need in (over, under):
+        with pytest.raises(UnsupportedGpuError, match="no configured active provider"):
+            _resolve_exact_gpu(
+                "H200",
+                need=need,
+                cap=1,
+                max_gpu_count=1,
+                provider="",
+                available=("lambda",),
+                widest_cap=8,
+                unpinned=("lambda",),
+            )
+
+    # a plane that DOES carry the class still reports the fit failure, not a configuration error.
+    with pytest.raises(UnsupportedGpuError, match="requires at least"):
+        _resolve_exact_gpu(
+            "H200",
+            need=over,
+            cap=1,
+            max_gpu_count=1,
+            provider="",
+            available=("runpod",),
+            widest_cap=8,
+            unpinned=("runpod",),
+        )
+
+
+def test_catalog_check_is_withheld_when_no_configured_provider_carries_the_class():
+    """A width cannot rescue a class nobody in the fleet sells.
+
+    The catalog-check tier answers "this provider may sell a wider SKU". When NO configured
+    provider carries the class at all, the obstacle is the class rather than the width, and
+    `--gpus N` cannot succeed at any N -- that run belongs to the `no configured active provider`
+    rejection, which names the real problem instead of sending the user to retry a dead end.
+    """
+    from flash.providers.allocator import _resolve_exact_gpu
+    from flash.providers.base import UnsupportedGpuError, providers_for
+
+    # H200 is runpod-only, so a lambda-only plane cannot rent it at any width.
+    assert "lambda" not in providers_for("H200")
+
+    with pytest.raises(UnsupportedGpuError) as unreachable:
+        _resolve_exact_gpu(
+            "H200",
+            need=300.0,
+            cap=1,
+            max_gpu_count=1,
+            provider="",
+            available=("lambda",),
+            widest_cap=8,
+            unpinned=("lambda",),
+        )
+    assert "--gpus" not in str(unreachable.value)
+
+    # the same class on a plane that DOES carry it keeps its remedy: the gate is reachability,
+    # not a blanket suppression.
+    with pytest.raises(UnsupportedGpuError, match=r"--gpus"):
+        _resolve_exact_gpu(
+            "H200",
+            need=300.0,
+            cap=1,
+            max_gpu_count=1,
+            provider="",
+            available=("runpod",),
+            widest_cap=8,
+            unpinned=("runpod",),
+        )
+
+
+def test_rents_arbitrary_card_counts_splits_providers_by_how_counts_are_sold():
+    """The predicate must track how a count is PURCHASED, not whether the provider is configured."""
+    from flash.providers.fit_errors import rents_arbitrary_card_counts
+
+    assert rents_arbitrary_card_counts(("runpod",)) is True
+    assert rents_arbitrary_card_counts(("lambda",)) is False
+    assert rents_arbitrary_card_counts(("vast",)) is False
+    assert rents_arbitrary_card_counts(("lambda", "vast")) is False
+    assert rents_arbitrary_card_counts(("lambda", "runpod")) is True
+    # no provider left in play cannot promise a width either.
+    assert rents_arbitrary_card_counts(()) is False

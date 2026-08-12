@@ -533,6 +533,363 @@ def test_env_setup_resolves_the_project_locally_on_a_self_hosted_plane(monkeypat
     assert resolved == "11111111-1111-4111-8111-111111111111"
 
 
+_SCAFFOLD_PROJECT = "11111111-1111-4111-8111-111111111111"
+
+
+def _scaffold(monkeypatch, tmp_path, api_url: str | None, *, turn_mode: str | None = None):
+    """Run `flash env setup` in tmp_path against a plane at api_url; return the written files."""
+    from argparse import Namespace
+
+    from flash.cli.commands.env import setup as env_setup
+
+    monkeypatch.setattr(env_setup, "_require_setup_project", lambda _args: _SCAFFOLD_PROJECT)
+    monkeypatch.setattr("flash.client.config.load_credentials", lambda: (api_url, "key"))
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(tmp_path)
+    rc = env_setup.cmd_env_setup(
+        Namespace(
+            project=_SCAFFOLD_PROJECT,
+            yes=True,
+            turn_mode=turn_mode,
+            reasoning=None,
+            from_traces=None,
+            trace=None,
+            force=False,
+        )
+    )
+    assert rc == 0
+    return {p.name: p.read_text(encoding="utf-8") for p in tmp_path.rglob("*") if p.is_file()}
+
+
+def test_env_setup_scaffolds_the_github_form_on_a_self_hosted_plane(monkeypatch, tmp_path) -> None:
+    """`flash env push` publishes to Freesolo's managed hub, which a self-hosted plane cannot write.
+
+    The scaffold used to emit `id = ""` plus instructions to run that command regardless of plane,
+    so a self-hoster following SELF_HOSTING.md got a config that fails validation and a next step
+    that cannot work. `github:owner/repo@ref:path` is the id form their own plane resolves.
+    """
+    import tomllib
+
+    from flash.cli.commands.env import setup as setup_mod
+    from flash.envs.loader import _parse_github_environment_ref
+
+    written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+
+    for name in ("sft.toml", "rl.toml", "opd.toml"):
+        assert 'id = "github:OWNER/REPO@main:environment.py"' in written[name], name
+        assert "flash env push --project" not in written[name], name
+        # the id must PARSE, or the scaffold just trades one unusable id for another:
+        # `github:OWNER/REPO@main:.` reads naturally and `_normalize_env_path` rejects it.
+        env_id = tomllib.loads(written[name])["environment"]["id"]
+        assert _parse_github_environment_ref(env_id) is not None, (
+            f"{name} scaffolds {env_id!r}, which the environment loader cannot parse"
+        )
+    # the generated .py files carry the same guidance in their docstrings, with every placeholder
+    # filled: one left unrendered is valid python, so nothing raises and the operator reads an
+    # internal token where the workflow should be.
+    placeholders = set(setup_mod._HOSTED_GUIDANCE) | set(setup_mod._SELF_HOSTED_GUIDANCE)
+    assert placeholders, "no guidance placeholders found; the render contract moved"
+    for name in ("environment.py", "evaluations.py"):
+        assert "flash env push" not in written[name], name
+        for placeholder in placeholders | {"PROJECT_UUID"}:
+            assert placeholder not in written[name], f"{name} still contains {placeholder}"
+
+
+def test_env_setup_keeps_the_push_workflow_on_the_managed_plane(monkeypatch, tmp_path) -> None:
+    """The hosted path is the common one and must be untouched by the self-hosted branch.
+
+    An unset api_url is the managed plane too: it means the built-in default.
+    """
+    from flash.cli.commands.env import setup as setup_mod
+
+    placeholders = set(setup_mod._HOSTED_GUIDANCE) | set(setup_mod._SELF_HOSTED_GUIDANCE)
+    for index, api_url in enumerate(("https://flash.freesolo.co", None)):
+        written = _scaffold(monkeypatch, tmp_path / f"case{index}", api_url)
+
+        for name in ("sft.toml", "rl.toml", "opd.toml"):
+            assert (
+                f"flash env push --project {_SCAFFOLD_PROJECT} --name my-env ." in written[name]
+            ), name
+            assert 'id = ""' in written[name], name
+            assert "github:OWNER" not in written[name], name
+        assert "flash env push" in written["environment.py"]
+        for name in ("environment.py", "evaluations.py"):
+            for placeholder in placeholders | {"PROJECT_UUID"}:
+                assert placeholder not in written[name], f"{name} still contains {placeholder}"
+
+
+def test_env_setup_warns_when_a_hosted_scaffold_is_rerun_on_a_self_hosted_plane(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A rerun against the other plane kind leaves every scaffolded file describing the old workflow.
+
+    Setup is idempotent: configs are written only when absent, and the starter .py files only under
+    `if not starter_env_exists`. So a hosted-then-self-hosted rerun keeps blank ids and files telling
+    the operator to run `flash env push` -- a command their plane cannot use -- while the printed
+    next step describes the new plane. The files are deliberately not rewritten, so the warning is
+    the whole remedy and has to name all five.
+    """
+    hosted = _scaffold(monkeypatch, tmp_path, "https://flash.freesolo.co")
+    assert "flash env push" in hosted["environment.py"]
+    assert "flash env push" in hosted["evaluations.py"]
+    capsys.readouterr()
+
+    retained = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+    warning = capsys.readouterr().err
+
+    assert "still tell you to run `flash env push`, which this plane cannot do" in warning
+    assert "no usable [environment] id, which fails validation on any plane" in warning
+    assert "`github:OWNER/REPO@REF:PATH`" in warning
+    for name in ("environment.py", "evaluations.py"):
+        assert name in warning, name
+    for name in ("sft.toml", "rl.toml", "opd.toml"):
+        assert f"configs/{name}" in warning, name
+    # the premise the warning exists for: the files really are retained unrewritten
+    assert retained["environment.py"] == hosted["environment.py"]
+    assert retained["evaluations.py"] == hosted["evaluations.py"]
+    for name in ("sft.toml", "rl.toml", "opd.toml"):
+        assert retained[name] == hosted[name], name
+
+
+def test_env_setup_names_the_self_hosted_id_form_in_both_next_step_renderings(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """The printed next step is the last thing setup says, and it named the hosted-only command.
+
+    Both branches are asserted because they are separate code paths (`setup.py` and
+    `render.env_setup`), and fixing one alone leaves whichever the operator's terminal selects.
+    """
+    from flash.cli.ui import render
+
+    # force the plain branch: render.styled() decides which of the two runs
+    monkeypatch.setattr(render, "styled", lambda: False)
+    _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+    plain = capsys.readouterr().out
+    assert "next: push this folder to a git repo" in plain
+    assert "flash env push" not in plain
+
+    styled = render.env_setup(["environment.py"], "UUID", can_publish=False)
+    assert "github:OWNER/REPO@main:environment.py" in styled
+    assert "flash env push" not in styled
+
+
+def test_env_setup_warns_when_a_self_hosted_scaffold_is_rerun_on_a_hosted_plane(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """The reverse direction, which carries different retained text and a different remedy.
+
+    `_render_starter` writes distinct guidance into each file, and the retained configs hold
+    `github:` ids a hosted plane will not take. Detecting only one of the two would leave the other
+    stale beside it -- the same half-fix this warning exists to prevent in the other direction.
+    """
+    self_hosted = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+    assert "this plane is self-hosted, so publishing" in self_hosted["environment.py"]
+    capsys.readouterr()
+
+    retained = _scaffold(monkeypatch, tmp_path, "https://flash.freesolo.co")
+    warning = capsys.readouterr().err
+
+    assert "document a self-hosted plane" in warning
+    assert "hosted plane requires managed hub ids" in warning
+    assert "Run `flash env push`" in warning
+    for name in ("environment.py", "evaluations.py"):
+        assert name in warning, name
+    for name in ("sft.toml", "rl.toml", "opd.toml"):
+        assert f"configs/{name}" in warning, name
+        assert retained[name] == self_hosted[name], name
+
+
+@pytest.mark.parametrize("api_url", ["https://flash.freesolo.co", "https://plane.example.test"])
+def test_env_setup_clean_scaffold_has_no_environment_form_warning(
+    monkeypatch, tmp_path, capsys, api_url
+) -> None:
+    """A same-plane rerun stays silent: the detector reads what is on disk, not a plane flag.
+
+    Guards the obvious failure of the two transition tests -- a warning that fired on every rerun
+    would satisfy both while making the idempotent path noisy.
+    """
+    _scaffold(monkeypatch, tmp_path, api_url)
+    capsys.readouterr()
+
+    _scaffold(monkeypatch, tmp_path, api_url)
+
+    assert capsys.readouterr().err == ""
+
+
+def test_env_setup_survives_a_retained_starter_it_cannot_decode(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A non-UTF-8 retained starter must not abort setup.
+
+    `# -*- coding: latin-1 -*-` is valid Python, and this path only decides whether to PRINT an
+    advisory -- the files are left untouched either way. Reading them strictly turned an operator's
+    perfectly runnable environment.py into a UnicodeDecodeError traceback out of `env setup`.
+    """
+    from argparse import Namespace
+
+    from flash.cli.commands.env import setup as env_setup
+
+    _scaffold(monkeypatch, tmp_path, "https://flash.freesolo.co")
+    capsys.readouterr()
+    (tmp_path / "environment.py").write_bytes(b"# -*- coding: latin-1 -*-\n# caf\xe9\n")
+
+    # not through `_scaffold`: its read-back of every written file is itself strict UTF-8, so it
+    # would raise on the byte this test just wrote and hide whether the CLI survived.
+    monkeypatch.setattr(env_setup, "_require_setup_project", lambda _args: _SCAFFOLD_PROJECT)
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("https://plane.example.test", "key")
+    )
+    monkeypatch.chdir(tmp_path)
+    rc = env_setup.cmd_env_setup(
+        Namespace(
+            project=_SCAFFOLD_PROJECT,
+            yes=True,
+            turn_mode=None,
+            reasoning=None,
+            from_traces=None,
+            trace=None,
+            force=False,
+        )
+    )
+
+    assert rc == 0  # completed rather than raising UnicodeDecodeError
+    # the undecodable file carries no marker, so it is simply not named in the advisory
+    assert "environment.py" not in capsys.readouterr().err
+
+
+def test_env_setup_reports_an_undecodable_config_as_an_error(monkeypatch, tmp_path) -> None:
+    """A config that cannot be decoded is a hard error, unlike a starter .py.
+
+    The distinction is deliberate: `[environment] id` is read to classify the plane, so an
+    unreadable config cannot be skipped. UnicodeDecodeError is not an OSError, so it needs naming
+    explicitly or it escapes as a traceback instead of this message.
+    """
+    from flash.client import ClientError
+
+    _scaffold(monkeypatch, tmp_path, "https://flash.freesolo.co")
+    (tmp_path / "configs" / "sft.toml").write_bytes(b'[environment]\nid = "caf\xe9"\n')
+
+    with pytest.raises(ClientError, match="cannot read existing"):
+        _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+
+
+def test_env_setup_does_not_let_an_unreadable_env_override_the_turn_flag(
+    monkeypatch, tmp_path
+) -> None:
+    """An environment.py we cannot decode must not silently resolve the turn mode.
+
+    The anchor probe has three states, not two: "carries the marker", "does not", and "cannot be
+    read". Collapsing the last into False classified an undecodable multi-turn env as single-turn
+    AND then took that guess as authoritative, overriding an explicit --multi-turn without a word.
+    """
+    from argparse import Namespace
+    from pathlib import Path
+
+    from flash.cli.commands.env import setup as env_setup
+
+    starter = tmp_path / "environment.py"
+    starter.write_bytes(b"# -*- coding: latin-1 -*-\nclass E(EnvironmentMultiTurn):  # caf\xe9\n")
+
+    assert env_setup._marker_present(starter, "EnvironmentMultiTurn") is None
+
+    multi_turn, _ = env_setup._resolve_turn_mode(
+        Namespace(turn_mode="multi", yes=True),
+        starter,
+        Path(tmp_path / "dataset" / "train.jsonl"),
+    )
+    assert multi_turn is True  # the flag decides, because the anchor could not be read
+
+
+def test_env_setup_names_the_plane_side_opd_teacher_setup_when_self_hosted(
+    monkeypatch, tmp_path
+) -> None:
+    """ "nothing to set up" is true only where the platform holds the key.
+
+    `require_teacher_broker_configuration` reads PARASAIL_API_KEY and FLASH_PUBLIC_URL from the
+    CONTROL PLANE's environment, so on a self-hosted plane the operator sets both. Telling them
+    otherwise moves the discovery to a submit-time failure.
+    """
+    hosted = _scaffold(monkeypatch, tmp_path / "hosted", "https://flash.freesolo.co")["opd.toml"]
+    assert "nothing to set up or export" in hosted
+
+    self_hosted = _scaffold(monkeypatch, tmp_path / "own", "https://plane.example.test")["opd.toml"]
+    assert "nothing to set up or export" not in self_hosted
+    assert "PARASAIL_API_KEY" in self_hosted
+    assert "FLASH_PUBLIC_URL" in self_hosted
+
+
+def test_env_setup_caveats_that_a_github_id_needs_a_standalone_plane(monkeypatch, tmp_path) -> None:
+    """The scaffolded github: id is rejected by an identity-backed self-hosted plane.
+
+    `_require_hosted_environment_form` accepts a non-slug id only when `auth.standalone()`, which
+    reads the plane's OWN environment. Setup classifies on the API URL and cannot see that, so the
+    scaffold writes an id that a non-standalone plane answers with a 400 -- name the requirement
+    rather than let it surface as an unexplained submit failure.
+    """
+    written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+    assert "FLASH_STANDALONE=1" in written["sft.toml"]
+    # the guide prescribes the same id form, so it carries the same requirement
+    assert "FLASH_STANDALONE=1" in written["TRAINING.md"]
+
+
+def test_training_guide_says_a_private_env_repo_needs_a_plane_side_token(
+    monkeypatch, tmp_path
+) -> None:
+    """The scaffold tells a self-hoster to point at their own repo without naming the token it needs.
+
+    `_github_token` (flash/envs/loader.py) reads `GITHUB_TOKEN` from the resolving process's own
+    environment and there is no spec or client field that carries one, so a private repo resolves as
+    missing no matter what the operator has exported locally. The guide has to name where the token
+    belongs, since the failure surfaces as an unreadable ref rather than an auth error.
+    """
+    import inspect
+
+    from flash.envs import loader
+
+    # the premise: the token comes from the plane's process env, not from anything the client sends
+    source = inspect.getsource(loader._github_token)
+    assert 'os.environ.get("GITHUB_TOKEN")' in source
+
+    guide = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")["TRAINING.md"]
+    assert "A private repository needs `GITHUB_TOKEN` on the plane, not in your shell" in guide
+    assert "forwards no credential of" in guide
+
+
+def test_training_guide_says_env_eval_rejects_a_github_id(monkeypatch, tmp_path) -> None:
+    """The guide prescribes `env eval` further down, but a `github:` id never reaches the suites.
+
+    `_resolve_evaluation_environment` requires `is_managed_environment_slug` and refuses anything
+    else before loading anything, so on a standalone plane every `env eval` line in this guide
+    deterministically fails. TRAINING.md is static prose and cannot branch on the plane, so the
+    caveat has to sit beside the `github:` form it contradicts.
+    """
+    import inspect
+
+    from flash.cli.commands.env import eval as env_eval
+
+    # the premise: the gate is a managed-slug check, not a soft preference
+    source = inspect.getsource(env_eval._resolve_evaluation_environment)
+    assert "is_managed_environment_slug" in source
+
+    guide = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")["TRAINING.md"]
+    assert "`flash env eval` does not accept a `github:` id" in guide
+
+
+def test_training_guide_caveats_the_managed_hub_commands(monkeypatch, tmp_path) -> None:
+    """The guide says `env push` is unavailable, then later prescribes it without caveat.
+
+    TRAINING.md is static prose read verbatim (only PROJECT_UUID is substituted), so it cannot
+    branch on the plane. The self-hosted section near the top is therefore contradicted further down
+    by the troubleshooting row and the command reference. Both need the caveat, or a self-hoster who
+    lands on either -- which is how a reference gets read -- follows a command their plane cannot run.
+    """
+    guide = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")["TRAINING.md"]
+
+    assert 'id = "github:OWNER/REPO@main:environment.py"' in guide
+    assert "**Self-hosted:** `env push` targets the managed hub" in guide
+    assert "push/pull/delete act on Freesolo's managed hub" in guide
+
+
 def test_env_setup_still_rejects_a_malformed_project_when_self_hosted(monkeypatch) -> None:
     """Skipping the ownership lookup must not skip the shape check that stands in for it."""
     from argparse import Namespace
@@ -3455,9 +3812,14 @@ def test_hosted_key_rejection_names_the_url_that_rejected_it(monkeypatch):
     """A 401 must name the service that answered, not only the key.
 
     The same 401 is what a perfectly VALID key gets when the request reached the wrong issuer --
-    a stale saved `--api-url`, a leftover localhost from a self-hosted experiment, an overridden
-    FREESOLO_BASE_URL. A message that names only the key accuses the one input the user just
-    copied correctly and never shows the one that was actually wrong.
+    a leftover localhost from a self-hosted experiment, an overridden FREESOLO_BASE_URL. A message
+    that names only the key accuses the one input the user just copied correctly and never shows
+    the one that was actually wrong.
+
+    The remedy must name the knobs this URL is actually read from. ``verify_freesolo_key`` resolves
+    through ``freesolo_base_url`` (--freesolo-url / FREESOLO_BASE_URL); --api-url selects the Flash
+    control plane and cannot change who answered here, so naming it sends the user to a flag that
+    does nothing.
     """
     import urllib.error
 
@@ -3472,3 +3834,99 @@ def test_hosted_key_rejection_names_the_url_that_rejected_it(monkeypatch):
     with pytest.raises(ClientError) as exc:
         verify_freesolo_key("fs-key")
     assert "localhost:9999" in str(exc.value)
+    assert "--freesolo-url" in str(exc.value)
+    assert "--api-url" not in str(exc.value)
+
+
+def test_key_rejection_survives_a_url_whose_port_is_not_a_number(monkeypatch):
+    """A malformed port must not turn the login failure into a traceback.
+
+    ``urlsplit`` defers validation to its accessors, so a bad port raises on the ``.port`` read
+    rather than at parse time. This helper builds the ERROR message, so a raise inside it replaces
+    the friendly ClientError with a ValueError from the reporting path -- the user then sees a
+    stack trace instead of being told their key was rejected.
+    """
+    import urllib.error
+
+    from flash.client.http import ClientError, verify_freesolo_key
+
+    def _reject(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr("urllib.request.urlopen", _reject)
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://identity.example:notaport")
+
+    with pytest.raises(ClientError) as exc:
+        verify_freesolo_key("fs-key")
+    assert "rejected this API key" in str(exc.value)
+
+
+def test_displayable_url_keeps_ipv6_brackets_and_rejects_bad_ports():
+    """An IPv6 host must stay bracketed, and an unreadable authority must degrade, not raise.
+
+    ``hostname`` strips the brackets an IPv6 literal needs, so appending a port yields
+    ``2001:db8::1:8443`` -- an address the reader cannot split back into host and port. A URL
+    printed in an error is meant to be copied, so it has to survive the round trip.
+    """
+    from flash.serve.urls import displayable_url
+
+    assert displayable_url("https://[2001:db8::1]:8443") == "https://[2001:db8::1]:8443"
+    assert displayable_url("https://[2001:db8::1]") == "https://[2001:db8::1]"
+    assert displayable_url("https://[::1]:80") == "https://[::1]:80"
+    # userinfo is still dropped when the host is IPv6.
+    assert displayable_url("https://user:pw@[2001:db8::1]:443") == "https://[2001:db8::1]:443"
+    # every unreadable authority degrades to the placeholder rather than raising.
+    for bad in ("https://identity.example:notaport", "https://host:99999999", "https://[bad::ipv6"):
+        assert displayable_url(bad) == "(unparseable url)", bad
+
+    # port 0 is a real configured value and an invalid endpoint. dropping it on truthiness renders
+    # the default port instead, hiding the exact setting the reader has to correct.
+    assert displayable_url("http://localhost:0") == "http://localhost:0"
+    assert displayable_url("http://localhost") == "http://localhost"
+
+
+def test_hosted_key_rejection_does_not_echo_credentials_from_the_base_url(monkeypatch):
+    """The URL named in the error must never carry the secret it was configured with.
+
+    A base URL is user-supplied and can hold credentials in its authority or a token in its query.
+    This message is printed to stderr and pasted into bug reports, so echoing the configured URL
+    verbatim turns a login failure into credential disclosure.
+    """
+    import urllib.error
+
+    from flash.client.http import ClientError, verify_freesolo_key
+
+    def _reject(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr("urllib.request.urlopen", _reject)
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://admin:hunter2@api.example.co/?token=t0ps3cret")
+
+    with pytest.raises(ClientError) as exc:
+        verify_freesolo_key("fs-key")
+    message = str(exc.value)
+    assert "api.example.co" in message  # the service that answered is still named
+    for secret in ("hunter2", "admin", "t0ps3cret"):
+        assert secret not in message, message
+
+
+def test_unreachable_backend_error_does_not_echo_credentials_from_the_base_url(monkeypatch):
+    """The connection-failure path prints the same URL and needs the same redaction.
+
+    Fixing only the 401 leaves the secret to escape through whichever error the user actually hits;
+    an unreachable host is the more common one.
+    """
+    import urllib.error
+
+    from flash.client.http import ClientError, verify_freesolo_key
+
+    def _unreachable(req, timeout=None):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr("urllib.request.urlopen", _unreachable)
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://admin:hunter2@api.example.co")
+
+    with pytest.raises(ClientError) as exc:
+        verify_freesolo_key("fs-key")
+    assert "api.example.co" in str(exc.value)
+    assert "hunter2" not in str(exc.value)
