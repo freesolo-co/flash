@@ -497,15 +497,27 @@ def smallest_fitting_gpu_count(
     rank count), and every consumer of this function is deciding something the user pays for -- an
     auto-sized ceiling, an authored-ceiling check, a `--gpus N` suggestion. Crediting cards that
     never join makes all three name a width that cannot hold the run.
+
+    The rank count is valued directly rather than through ``gpu_capacity_shape``, which snaps its
+    argument to a RENTABLE count (``largest_rentable_count``). That is right for cards you buy and
+    wrong for ranks that launch: sft widths are not powers of two (batch 3 over 3 rows launches 3),
+    and snapping 3 to 2 under-credits a shape that fits. Rented counts are still searched over
+    ``rentable_gpu_counts``, so only the width being VALUED changes.
+
+    The search visits every rentable count rather than stopping at the first miss, because the
+    executed width is not monotonic in the rented count: batch 3 over 3 rows launches 1 rank on 2
+    cards but 3 on 4. Returning the SMALLEST fitting count keeps the cheapest shape winning.
     """
     launched = executed_width or (lambda count: count)
-    for count in reversed(rentable_gpu_counts(max_gpu_count)):
-        if (
-            gpu_capacity_shape(launched(count), min_vram_gb=min_vram_gb, gpu_names=gpu_names)
-            is not None
-        ):
-            return count
-    return None
+    fitting = [
+        count
+        for count in rentable_gpu_counts(max_gpu_count)
+        if any(
+            combined_vram_gb(gpu.vram_gb, launched(count)) >= min_vram_gb
+            for gpu in _eligible_gpu_infos(gpu_names)
+        )
+    ]
+    return min(fitting) if fitting else None
 
 
 def cheapest_gpu(min_vram_gb: int, *, gpu_count: int = 1, cost_key=None) -> str:

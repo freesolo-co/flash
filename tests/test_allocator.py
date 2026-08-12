@@ -2097,6 +2097,34 @@ def test_width_search_credits_only_the_ranks_that_join():
     )
 
 
+def test_width_search_finds_a_shape_the_executed_width_reaches_non_monotonically():
+    """Crediting the executed width is not enough on its own: it must be VALUED as a rank count.
+
+    Two things break a first-hit search once the width rule is applied. The executed width is not
+    monotonic in the rented count -- sft over 3 rows with batch 3 launches 1 rank on 2 cards but 3
+    on 4 -- so a search that stops at the first miss abandons a wider shape that does fit. And a
+    rank count is not a rentable count, so valuing it through the rentable snap floors 3 ranks to
+    2, under-crediting a combination by a whole card.
+
+    Together they made a run that fits on 4 cards report that no width could hold it, which the
+    caller turns into a terminal rejection of a job the allocator would have launched.
+    """
+    from flash.engine.plan.steps import sft_data_parallel_cards
+    from flash.providers.base import GPU_INFO, combined_vram_gb, smallest_fitting_gpu_count
+
+    width = lambda count: sft_data_parallel_cards(count, 3, 3)  # noqa: E731
+    assert (width(2), width(4)) == (1, 3), "premise: the executed width dips, then climbs"
+
+    vram = GPU_INFO["H100"].vram_gb
+    need = combined_vram_gb(vram, 2) + 1.0  # over 2 ranks, under 3
+    assert combined_vram_gb(vram, 3) >= need > combined_vram_gb(vram, 2)
+
+    assert (
+        smallest_fitting_gpu_count(need, max_gpu_count=8, gpu_names=("H100",), executed_width=width)
+        == 4
+    ), "4 rented cards launch 3 ranks, which hold the run -- the search must not stop at 2"
+
+
 def test_catalog_hint_is_withheld_when_the_width_would_not_launch():
     """The `--gpus N` catalog hint searched widths crediting rented cards, like the remedy did.
 

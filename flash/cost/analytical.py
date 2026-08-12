@@ -525,6 +525,36 @@ def _catalog_check_remedy(config: RunConfig, need: float, names: tuple[str, ...]
     )
 
 
+def _quote_gpu_ceiling(
+    config: RunConfig, need: float, names: tuple[str, ...], *, ceiling: int | None, auto_cap: int
+) -> int:
+    """The widest count this quote ranks over: the authored ceiling, or the smallest that fits.
+
+    An authored ceiling is the user's own `[gpu] count`, narrowed only by the model's geometry cap.
+    Auto-sizing instead searches for the smallest fitting count, with the SAME executed-width rule
+    the ranking loop applies -- without it the ceiling is chosen on rented cards and can land below
+    the shape that actually fits, because sft's executed width is not monotonic in the rented count
+    (batch 3 over 3 rows launches 1 rank on 2 cards but 3 on 4). A ceiling of 2 would then hide the
+    4-card shape and the quote would reject a job submit accepts.
+
+    Falls back to ``auto_cap`` when nothing fits, so the caller reports the shortfall against the
+    widest shape rather than silently ranking a narrow one.
+    """
+    if ceiling is not None:
+        return geometry_safe_gpu_cap(config.model_id, ceiling, model_revision=config.model_revision)
+    from flash.providers.base import smallest_fitting_gpu_count
+
+    return (
+        smallest_fitting_gpu_count(
+            need,
+            max_gpu_count=auto_cap,
+            gpu_names=names,
+            executed_width=lambda count: executed_gpu_count(config, count),
+        )
+        or auto_cap
+    )
+
+
 def _offline_gpu_shape(
     config: RunConfig, *, max_wall_seconds: float = 0.0
 ) -> tuple[str, int, int, str, float]:
@@ -552,7 +582,6 @@ def _offline_gpu_shape(
         combined_vram_gb,
         providers_for,
         rentable_gpu_counts,
-        smallest_fitting_gpu_count,
     )
     from flash.providers.fit_errors import vram_fit_error_message, vram_knob_advice
 
@@ -586,14 +615,7 @@ def _offline_gpu_shape(
         config.model_id, MAX_COMBINATION_CARDS, model_revision=config.model_revision
     )
     ceiling = authored_gpu_ceiling(config.gpu_type, config.gpu_count)
-    if ceiling is None:
-        safe_gpu_count = (
-            smallest_fitting_gpu_count(need, max_gpu_count=auto_cap, gpu_names=names) or auto_cap
-        )
-    else:
-        safe_gpu_count = geometry_safe_gpu_cap(
-            config.model_id, ceiling, model_revision=config.model_revision
-        )
+    safe_gpu_count = _quote_gpu_ceiling(config, need, names, ceiling=ceiling, auto_cap=auto_cap)
     ranked = []
     for gpu in names:
         info = GPU_INFO[gpu]
