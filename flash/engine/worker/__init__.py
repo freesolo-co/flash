@@ -91,7 +91,7 @@ from flash.engine.worker.train.rl.config import (
     grpo_overrides,
     resolve_grpo_prompts_per_step,
 )
-from flash.envs.adapter import GitHubRateLimitError
+from flash.envs.adapter import GitHubTransientError
 from flash.envs.base import load_environment
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
@@ -213,7 +213,10 @@ def require_active_env():
 
 
 def _worker_failure_flags(exc: BaseException) -> dict[str, bool]:
-    retriable = isinstance(exc, (RetriableInfraError, GitHubRateLimitError))
+    # GitHubTransientError covers both the quota case and GitHub being unreachable. The worker's
+    # answer to either is the same -- reschedule -- so it catches the base; only the control plane,
+    # which has a status code to report, distinguishes them.
+    retriable = isinstance(exc, (RetriableInfraError, GitHubTransientError))
     return {"retriable": retriable, "oom": (not retriable and is_cuda_oom(exc))}
 
 

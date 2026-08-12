@@ -23,11 +23,83 @@ def is_adapter_weight_filename(filename: str) -> bool:
     the exporter never share a call stack, and each spelling the shapes for itself makes them agree
     by coincidence. A disagreement fails silently, because validation accepts a shape the exporter
     skips and the export then ships weights peft loads as a no-op.
+
+    Filename shape only. Whether a SET of these files is loadable is a different question, because a
+    lone shard is not: see :func:`has_loadable_adapter_weights`.
     """
     name = filename.rsplit("/", 1)[-1]
     if name in ADAPTER_WEIGHT_FILES:
         return True
     return name.startswith(ADAPTER_SHARD_PREFIX) and name.endswith(ADAPTER_WEIGHT_SUFFIXES)
+
+
+def loadable_adapter_weight_files(filenames) -> list[str]:
+    """The files peft would load out of ``filenames``, or ``[]`` when it could load none.
+
+    The set, not the filename, is what decides this, and the difference is the whole point. peft
+    binds one representation per suffix -- the single ``adapter_model.<ext>`` when present, otherwise
+    the shards -- and it discovers the sharded form ONLY through ``adapter_model.<ext>.index.json``.
+    A directory holding ``adapter_model-00001-of-00002.safetensors`` and no index therefore has no
+    loadable representation at all: nothing tells peft the sharded form exists, or which shards
+    complete it.
+
+    Accepting that orphan is what let an incomplete upload pass validation. Export then falls back to
+    shipping every matching shard when it finds no index, so deployment and export both "succeeded"
+    while producing weights peft loads as a no-op -- the silent-disagreement failure this module
+    exists to prevent, arriving one level up at the set instead of at the name.
+
+    A partial shard set is rejected for the same reason: the index names the complete set, so a
+    listing missing one of its members cannot be loaded either. Shards the index would not name are
+    left out rather than treated as fatal -- a retry uploads over the previous attempt without
+    deleting what it no longer writes, so a stale shard beside a complete live set is expected.
+
+    Returned in peft's own precedence order, so the caller that reads tensor keys reads exactly the
+    files the serving engine will.
+    """
+    names = {str(name).rsplit("/", 1)[-1] for name in filenames}
+    for suffix in ADAPTER_WEIGHT_SUFFIXES:
+        single = f"adapter_model{suffix}"
+        if single in names:
+            return [single]
+        referenced = _index_shard_names(names, suffix)
+        if referenced and referenced <= names:
+            return sorted(referenced)
+    return []
+
+
+def has_loadable_adapter_weights(filenames) -> bool:
+    """True when ``filenames`` holds weights peft can actually load."""
+    return bool(loadable_adapter_weight_files(filenames))
+
+
+def _index_shard_names(names: set[str], suffix: str) -> set[str]:
+    """The shard names an index for ``suffix`` would have to be accompanied by, from names alone.
+
+    Derived from the ``adapter_model-{k}-of-{n}.<ext>`` convention rather than by reading the index
+    file, because every caller here works from a LISTING: serving validates against a remote repo
+    listing and the worker against a directory listing, and neither should have to download and
+    parse json to answer "is this set complete". The exporter, which already has the files locally,
+    still reads the real ``weight_map`` -- that is the authority on which shards are live.
+
+    Empty when no index is present, or when the shard names do not agree on a single total.
+    """
+    if f"adapter_model{suffix}.index.json" not in names:
+        return set()
+    totals = set()
+    for name in names:
+        if not name.startswith(ADAPTER_SHARD_PREFIX) or not name.endswith(suffix):
+            continue
+        stem = name[len(ADAPTER_SHARD_PREFIX) : -len(suffix)]
+        shard, sep, total = stem.partition("-of-")
+        if sep and shard.isdigit() and total.isdigit() and int(total) > 0:
+            totals.add((total, len(shard)))
+    if len(totals) != 1:
+        return set()
+    total, width = totals.pop()
+    return {
+        f"{ADAPTER_SHARD_PREFIX}{index:0{width}d}-of-{total}{suffix}"
+        for index in range(1, int(total) + 1)
+    }
 
 
 # The largest attempt identity any artifact name may carry. An attempt number reaches a filename and

@@ -564,7 +564,7 @@ def test_retry_gate_uses_authoritative_jobspec_seed(monkeypatch, tmp_path):
 
     monkeypatch.setattr(_hf_artifacts, "verify_opd_replacement_safe", verify)
 
-    assert runner._verified_opd_retry_state(spec.run_id) == (1, None)
+    assert runner._verified_opd_retry_state(spec.run_id) == (1, None, None)
     assert seen["seed"] == 987
 
 
@@ -987,7 +987,9 @@ def test_gate_allows_replacement_when_marker_paired_with_valid_metadata(monkeypa
     seen = _install_marker_gate(
         monkeypatch, tmp_path, checkpoint_files=_ckpt_files("opd", "run-1", 40, _COMPLETE_CKPT)
     )
-    assert _run_gate() == "pinned-sha"
+    # no fsdp shards in this listing, so the width is unreadable and reported as None rather than
+    # guessed -- the caller then leaves the retry's shape unconstrained.
+    assert _run_gate() == ("pinned-sha", None)
     assert seen["list_revision"] == "pinned-sha"
     metadata_download = seen["downloads"][-1]
     assert metadata_download["revision"] == "pinned-sha"
@@ -1037,6 +1039,98 @@ def test_gate_blocks_pinned_checkpoint_metadata_download_failure(monkeypatch, tm
 
     with pytest.raises(RuntimeError, match="metadata is unverifiable"):
         _run_gate()
+
+
+def _sharded_ckpt(step: int, world_size: int) -> list[str]:
+    """A complete checkpoint listing plus the fsdp shards one world size writes."""
+    return _ckpt_files("opd", "run-1", step, _COMPLETE_CKPT) + _ckpt_files(
+        "opd",
+        "run-1",
+        step,
+        tuple(f"actor/model_world_size_{world_size}_rank_{rank}.pt" for rank in range(world_size)),
+    )
+
+
+def test_gate_reports_the_width_the_checkpoint_was_written_at(monkeypatch, tmp_path):
+    """The retry has to be allocated at this width, so the gate has to report it.
+
+    Read from the shard filenames in the listing the gate already fetches: verl loads exactly
+    `model_world_size_W_rank_R.pt`, so the width is recoverable remotely with no extra request and
+    no new field in opd_state.json -- which matters because the control plane picks the retry's
+    card count before any worker exists to open the checkpoint.
+    """
+    _install_marker_gate(monkeypatch, tmp_path, checkpoint_files=_sharded_ckpt(40, 2))
+    assert _run_gate() == ("pinned-sha", 2)
+
+
+def test_gate_reports_no_width_for_torn_shards(monkeypatch, tmp_path):
+    """Two widths in one directory is a torn or merged save, not a topology to pin a retry to.
+
+    Reporting either number would pin the retry to a shape half the shards cannot be loaded on.
+    None means "do not constrain", which leaves the retry ranking exactly as it is today.
+    """
+    _install_marker_gate(
+        monkeypatch,
+        tmp_path,
+        checkpoint_files=_sharded_ckpt(40, 2)
+        + _ckpt_files("opd", "run-1", 40, ("actor/model_world_size_4_rank_0.pt",)),
+    )
+    assert _run_gate() == ("pinned-sha", None)
+
+
+def test_nested_shards_do_not_count_toward_checkpoint_completeness(monkeypatch, tmp_path):
+    """Collecting the nested shards must not let them stand in for a missing required file.
+
+    The completeness rule is about DIRECT children (adapter, optimizer.pt, rng_state.pth,
+    opd_state.json). Shards live one level down, so a torn upload that has shards but no optimizer
+    is still not resumable, and the gate must still fail closed.
+    """
+    _install_marker_gate(
+        monkeypatch,
+        tmp_path,
+        checkpoint_files=_ckpt_files("opd", "run-1", 40, _INCOMPLETE_CKPT)
+        + _ckpt_files("opd", "run-1", 40, ("actor/model_world_size_2_rank_0.pt",)),
+    )
+    with pytest.raises(RuntimeError, match="no complete resume checkpoint is available"):
+        _run_gate()
+
+
+def test_retry_allocation_is_pinned_to_the_resume_checkpoint_width():
+    """A pinned resume drops every shape whose card count the checkpoint cannot be loaded on.
+
+    This is the defect: allocation re-ranks each retry from scratch, so a 2-card attempt could be
+    re-ranked onto 4 cards, and the worker -- which fails closed on a width mismatch for a PINNED
+    resume -- would then permanently refuse the only checkpoint it is authorized to continue from.
+    """
+    from flash.providers.base import Allocation, Candidate
+    from flash.runner.supervise.seed_submission import _pinned_to_resume_width
+
+    def candidate(gpu: str, count: int) -> Candidate:
+        return Candidate(provider="runpod", gpu=gpu, hourly_usd=1.0, vram_gb=80, gpu_count=count)
+
+    four, two, one = candidate("h100", 4), candidate("h100", 2), candidate("h200", 1)
+    allocation = Allocation(
+        provider="runpod",
+        gpu="h100",
+        hourly_usd=1.0,
+        min_vram_gb=80,
+        candidates=(four, two, one),
+        gpu_count=4,
+    )
+
+    pinned = _pinned_to_resume_width(allocation, 2)
+    assert pinned.candidates == (two,)
+    # the headline shape follows the surviving candidate, or the run would be submitted at a count
+    # no remaining candidate offers.
+    assert (pinned.gpu_count, pinned.gpu) == (2, "h100")
+
+    # no pin (nothing mutated, or an unreadable width) leaves the ranking completely untouched.
+    assert _pinned_to_resume_width(allocation, None) is allocation
+    assert _pinned_to_resume_width(allocation, 0) is allocation
+
+    # no loadable shape: empty rather than silently resuming on a width that cannot load, which
+    # would burn the retry and reject the checkpoint.
+    assert _pinned_to_resume_width(allocation, 8).candidates == ()
 
 
 @pytest.mark.parametrize(

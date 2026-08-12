@@ -9,7 +9,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from flash._internal.fileio import reject_duplicate_keys
-from flash.adapters.artifacts import ADAPTER_WEIGHT_FILES
+from flash.adapters.artifacts import has_loadable_adapter_weights
 
 OPD_RETRY_CONTRACT_STATUS_KEY = "opd_retry_contract_version"
 OPD_RETRY_CONTRACT_VERSION = 1
@@ -36,6 +36,10 @@ OPD_RESUME_STATE_REQUIRED_FILES = (
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _OPD_PROMPT_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
+# verl's fsdp shard filename, which encodes the world size that wrote it. Mirrors
+# `flash.engine.worker.verl.checkpoints._FSDP_SHARD_RE`; that one reads a local directory, this one
+# a remote listing, and a retry is rejected when they disagree -- so they must match the same name.
+_FSDP_SHARD_RE = re.compile(r"model_world_size_(\d+)_rank_\d+\.pt")
 _PAYLOAD_KEYS = frozenset({"attempt", "contract", "phase", "run_id", "seed", "version"})
 _OPD_RESUME_ACCOUNTING_SCHEMA = {
     "generated_tokens": "nonneg_int",
@@ -289,4 +293,30 @@ def opd_resume_checkpoint_complete(basenames: Iterable[str]) -> bool:
     names = set(basenames)
     if not all(f in names for f in OPD_RESUME_STATE_REQUIRED_FILES):
         return False
-    return any(weight in names for weight in ADAPTER_WEIGHT_FILES)
+    # weights via the shared rule: a sharded save is complete only WITH its index, and an orphan
+    # shard is exactly the partial upload this gate exists to reject.
+    return has_loadable_adapter_weights(names)
+
+
+def opd_checkpoint_world_size(paths: Iterable[str]) -> int | None:
+    """The rank count that wrote a checkpoint's fsdp shards, from their names alone.
+
+    verl names every shard ``model_world_size_{W}_rank_{R}.pt`` and loads exactly that name back,
+    so the width is recoverable from a bare file listing -- no download, and no new field in
+    ``opd_state.json``. That matters because the control plane decides the retry's card count
+    before any worker exists to read the checkpoint.
+
+    ``paths`` may be full repo paths or bare names; only the basename is matched. More than one
+    distinct width means a torn or merged directory, which is not a topology to vouch for, so it
+    reports ``None`` -- the same unclassifiable-rather-than-guess rule
+    ``verl.checkpoints.checkpoint_world_size`` applies locally. This is the remote counterpart of
+    that function, and lives here because both sides of the retry contract read it.
+    """
+    widths = set()
+    for path in paths:
+        if not isinstance(path, str):
+            continue
+        match = _FSDP_SHARD_RE.fullmatch(path.rsplit("/", 1)[-1])
+        if match is not None:
+            widths.add(int(match.group(1)))
+    return widths.pop() if len(widths) == 1 else None

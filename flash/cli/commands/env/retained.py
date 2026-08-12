@@ -11,6 +11,8 @@ import tomllib
 from collections.abc import Callable
 from pathlib import Path
 
+from flash._internal.channel import CLI_NAME
+
 
 def _text(path: Path) -> str:
     """The file's text, or "" if it cannot be decoded as UTF-8.
@@ -40,8 +42,15 @@ def _warn_if_retained_starter_files_describe_another_plane(
     Deliberately project-INDEPENDENT, unlike `_render_starter`, which interpolates the real uuid: a
     directory scaffolded under one project and rerun under another still holds the OLD uuid, so an
     interpolated marker would miss it. Match the project-invariant prefix instead.
+
+    CLI-name-independent for the same reason: the guidance names the executable the operator invoked
+    (`flash`, `flash-cli`, `python -m flash.cli`), so a scaffold written under the alias carries a
+    different command than one written under `flash`. Anchoring on `flash` would silently stop
+    recognising those files as hosted scaffolds -- the retained-file warning is the only thing that
+    tells the operator their guidance now describes the wrong plane, so it must not depend on which
+    entry point happened to write it.
     """
-    push_marker = "`flash env push --project "
+    push_marker = "env push --project "
     # `_render_starter` writes DIFFERENT guidance into each file, so the reverse direction needs
     # both markers: matching only environment.py's would warn about that file while silently
     # keeping a stale evaluations.py beside it.
@@ -63,11 +72,12 @@ def _warn_if_retained_starter_files_describe_another_plane(
         warn(
             f"existing {names} document a self-hosted plane, but this one publishes to the managed "
             "hub; keeping the files unchanged. Their guidance to commit the environment to your own "
-            "git repo does not apply here -- run `flash env push` and use the returned id instead"
+            f"git repo does not apply here -- run `{CLI_NAME} env push` and use the returned id "
+            "instead"
         )
         return
     warn(
-        f"existing {names} still tell you to run `flash env push`, which this plane cannot do; "
+        f"existing {names} still tell you to run `{CLI_NAME} env push`, which this plane cannot do; "
         "keeping the files unchanged. Commit the environment to a git repo your plane can read and "
         "name it in [environment] id"
     )

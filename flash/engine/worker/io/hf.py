@@ -14,7 +14,7 @@ import time
 from collections.abc import Callable
 
 from flash._internal.diagnostics import sanitize_diagnostic
-from flash.adapters.artifacts import ADAPTER_WEIGHT_FILES, attempt_scoped_artifact_name
+from flash.adapters.artifacts import attempt_scoped_artifact_name, has_loadable_adapter_weights
 from flash.engine.profiling.tokenizer import (  # noqa: F401
     load_tokenizer,
     model_revision_kwargs,
@@ -324,10 +324,20 @@ _CHECKPOINT_TRAINER_STATE = (
 
 
 def _has_deployable_adapter(ckpt_dir: str) -> bool:
-    """Return True if ckpt_dir has a loadable LoRA adapter (config + weights)."""
-    return os.path.isfile(os.path.join(ckpt_dir, "adapter_config.json")) and any(
-        os.path.isfile(os.path.join(ckpt_dir, w)) for w in ADAPTER_WEIGHT_FILES
-    )
+    """Return True if ckpt_dir has a loadable LoRA adapter (config + weights).
+
+    Weights via the shared rule rather than the two single-file names, because a save past peft's
+    shard size writes ``adapter_model-0000N-of-0000M.<ext>`` plus an index instead. Spelling only the
+    single-file names here made this the strict side of a disagreement: serving and export accept the
+    sharded save, so a sharded per-step adapter was silently skipped -- or failed a required save --
+    for an artifact the rest of the pipeline would have deployed.
+    """
+    if not os.path.isfile(os.path.join(ckpt_dir, "adapter_config.json")):
+        return False
+    try:
+        return has_loadable_adapter_weights(os.listdir(ckpt_dir))
+    except OSError:
+        return False
 
 
 def _write_deployable_provenance(ckpt_dir: str) -> None:

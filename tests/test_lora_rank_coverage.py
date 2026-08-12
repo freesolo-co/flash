@@ -92,7 +92,7 @@ def test_adapter_artifact_identity_fails_closed_on_remote_metadata(monkeypatch, 
         def __init__(self, token=None):
             self.token = token
 
-        def get_paths_info(self, *args, **kwargs):
+        def list_repo_tree(self, *args, **kwargs):
             if mode == "api-error":
                 raise RuntimeError("hub unavailable")
             return [SimpleNamespace(path="sft/run/adapter/README.md")]

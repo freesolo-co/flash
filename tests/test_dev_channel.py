@@ -242,6 +242,61 @@ def test_operator_hints_follow_flash_cli_invocation():
         assert match is None, f"{site} rendered a bare flash command: {output!r}"
 
 
+def test_scaffolded_files_follow_flash_cli_invocation(tmp_path, monkeypatch):
+    """The GENERATED environment.py / evaluations.py must name the invoked CLI too.
+
+    The terminal output above already did, but the scaffold guidance was a literal `flash env push`.
+    Those files outlive the terminal session -- an operator on a host where `flash` is RunPod's CLI
+    reads the docstring later, runs the shadowed binary, and it exits 0 having published nothing.
+    That is the failure mode the alias exists to prevent, so the two renderings have to agree.
+    """
+    import importlib
+    import sys
+    from argparse import Namespace
+    from unittest import mock
+
+    from flash._internal import channel
+    from flash.cli.commands.env import retained as retained_module
+    from flash.cli.commands.env import setup as setup_module
+
+    project = "11111111-1111-4111-8111-111111111111"
+    original_argv = list(sys.argv)
+    try:
+        with mock.patch.object(sys, "argv", ["/usr/local/bin/flash-cli"]):
+            importlib.reload(channel)
+            importlib.reload(retained_module)
+            env_setup = importlib.reload(setup_module)
+            monkeypatch.setattr(env_setup, "_require_setup_project", lambda _args: project)
+            monkeypatch.setattr(
+                "flash.client.config.load_credentials",
+                lambda: ("https://flash.freesolo.co", "key"),
+            )
+            monkeypatch.chdir(tmp_path)
+            rc = env_setup.cmd_env_setup(
+                Namespace(
+                    project=project,
+                    yes=True,
+                    turn_mode=None,
+                    reasoning=None,
+                    from_traces=None,
+                    trace=None,
+                    force=False,
+                )
+            )
+            assert rc == 0
+    finally:
+        with mock.patch.object(sys, "argv", original_argv):
+            importlib.reload(channel)
+            importlib.reload(retained_module)
+            importlib.reload(setup_module)
+
+    written = {p.name: p.read_text(encoding="utf-8") for p in tmp_path.rglob("*") if p.is_file()}
+    for name in ("environment.py", "evaluations.py"):
+        assert "flash-cli env push" in written[name], f"{name}: {written[name]!r}"
+        assert "`flash env push" not in written[name], f"{name} names the shadowed binary"
+    assert "flash-cli env eval" in written["evaluations.py"]
+
+
 def test_module_invocation_is_named_back_as_itself_not_as_flash():
     """`python -m flash.cli` must print itself, because it is the escape hatch FROM `flash`.
 

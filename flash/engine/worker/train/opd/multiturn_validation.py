@@ -46,8 +46,14 @@ def validated_multiturn_response(
         if response_ids != raw_response_ids:
             raise ValueError("multi-turn truncated assistant ids must preserve the sampled span")
     elif termination == "eos":
-        if eos_token_ids.isdisjoint(raw_response_ids):
-            raise ValueError("multi-turn eos termination is not present in the sampled ids")
+        # the LAST sampled token, not merely one somewhere in the span. a set-intersection test
+        # accepts a backend or child bridge that kept emitting after its own declared terminal
+        # boundary, and the parent then records and teacher-scores that trailing span -- corrupting
+        # the transcript and the loss targets with tokens generation had already ended before. this
+        # validator is the fail-closed boundary for child-reported termination, so it has to check
+        # the boundary itself.
+        if not raw_response_ids or raw_response_ids[-1] not in eos_token_ids:
+            raise ValueError("multi-turn eos termination must end the sampled ids")
         if response_ids != raw_response_ids:
             raise ValueError("multi-turn eos response ids must preserve the sampled span")
     elif termination == "stop":

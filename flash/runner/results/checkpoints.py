@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 import re
 
-from flash.adapters.artifacts import ADAPTER_WEIGHT_FILES
+from flash.adapters.artifacts import has_loadable_adapter_weights
 from flash.core.spec import JobSpec
 from flash.runner import adapter_prefix
 
@@ -33,7 +33,14 @@ def checkpoint_adapter_prefix(spec: JobSpec, step: int) -> str:
 
 
 def _has_required_adapter_files(names: set[str]) -> bool:
-    return "adapter_config.json" in names and not names.isdisjoint(ADAPTER_WEIGHT_FILES)
+    """True when this listing is a checkpoint the deploy path could actually serve.
+
+    Weights via the shared rule so this listing agrees with serving validation: offering a step
+    ``flash models deploy`` then refuses is a worse answer than not listing it, and a save past
+    peft's shard size is named ``adapter_model-0000N-of-0000M.<ext>`` rather than either single-file
+    name.
+    """
+    return "adapter_config.json" in names and has_loadable_adapter_weights(names)
 
 
 def _adapter_folder_has_required_files(files: list[str], prefix: str) -> bool:

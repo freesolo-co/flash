@@ -32,6 +32,7 @@ from flash.providers._lifecycle.deadline import (
 from flash.providers._lifecycle.poll import _attempt_int
 from flash.teacher.retry_contract import (
     decode_opd_optimizer_start_json,
+    opd_checkpoint_world_size,
     opd_optimizer_start_marker_path,
     opd_resume_checkpoint_complete,
     require_opd_retry_contract_version,
@@ -41,20 +42,26 @@ from flash.teacher.retry_contract import (
 
 def _opd_resume_checkpoint_step(
     api, *, hf_repo: str, phase: str, run_id: str, revision: str
-) -> int | None:
-    """Return the newest filename-complete OPD checkpoint step at the pinned revision."""
+) -> tuple[int, int | None] | None:
+    """The newest filename-complete OPD checkpoint step at the pinned revision, and its world size.
+
+    The world size rides along because it comes from the same listing: the shards are nested under
+    the step directory, so reading it separately would repeat this call. ``None`` for the width
+    means the shard names did not agree on one -- the caller decides what an unreadable topology
+    costs, rather than this guessing a number a retry would then be pinned to.
+    """
     base = f"{phase}/{run_id}/checkpoint/"
     try:
         files = api.list_repo_files(repo_id=hf_repo, repo_type="dataset", revision=revision)
     except Exception:
         return None
     by_step: dict[int, set[str]] = {}
+    nested: dict[int, list[str]] = {}
     for path in files:
         if not isinstance(path, str) or not path.startswith(base):
             continue
         seg, sep, tail = path[len(base) :].partition("/")
-        # only files directly inside a checkpoint-n dir count toward filename completeness.
-        if not sep or not tail or "/" in tail or not seg.startswith("checkpoint-"):
+        if not sep or not tail or not seg.startswith("checkpoint-"):
             continue
         suffix = seg[len("checkpoint-") :]
         if not suffix.isdigit():
@@ -62,11 +69,18 @@ def _opd_resume_checkpoint_step(
         step = int(suffix)
         if step <= 0 or suffix != str(step):
             continue
+        if "/" in tail:
+            # the fsdp shards sit one level down (`actor/model_world_size_W_rank_R.pt`), so they
+            # are collected separately: only DIRECT children count toward filename completeness.
+            nested.setdefault(step, []).append(tail)
+            continue
         by_step.setdefault(step, set()).add(tail)
     if not by_step:
         return None
     step = max(by_step)
-    return step if opd_resume_checkpoint_complete(by_step[step]) else None
+    if not opd_resume_checkpoint_complete(by_step[step]):
+        return None
+    return step, opd_checkpoint_world_size(nested.get(step, ()))
 
 
 def verify_opd_replacement_safe(
@@ -77,7 +91,7 @@ def verify_opd_replacement_safe(
     next_attempt: int,
     contract_version: int,
     phase: str,
-) -> str | None:
+) -> tuple[str, int | None] | None:
     """Return only when replacing an OPD run's worker is safe.
 
     Safe means either no reserved attempt crossed the first ``optimizer.step()`` (no mutation marker),
@@ -85,6 +99,13 @@ def verify_opd_replacement_safe(
     revision, so the replacement worker resumes from it (via ``hf_resume_checkpoint``) instead of
     training fresh. Fails closed (raises) on marker presence without a usable checkpoint, malformed
     evidence, or any listing/download/parse uncertainty.
+
+    Returns ``None`` when nothing mutated, else ``(revision, world_size)``. The world size is the
+    rank count that wrote the pinned checkpoint, and the retry MUST be allocated at it: the worker
+    fails closed when a pinned resume's fsdp width does not match the attempt's, so a retry that
+    re-ranked onto a different card count would permanently reject the only checkpoint it is
+    authorized to continue from. ``None`` means the shards named no single width, which the caller
+    treats as "do not constrain" rather than inventing one.
     """
     try:
         version = require_opd_retry_contract_version(contract_version)
@@ -172,14 +193,15 @@ def verify_opd_replacement_safe(
     # replacement only when the newest canonical checkpoint is filename-complete and its lightweight
     # metadata validates at the same pinned revision. tensor, optimizer, rng, tokenizer, and model checks
     # remain worker-side.
-    checkpoint_step = _opd_resume_checkpoint_step(
+    selected = _opd_resume_checkpoint_step(
         api, hf_repo=hf_repo, phase=phase, run_id=run_id, revision=revision
     )
-    if checkpoint_step is None:
+    if selected is None:
         raise RuntimeError(
             "opd optimizer state may have mutated and no complete resume checkpoint is available; "
             "replacement is blocked"
         )
+    checkpoint_step, checkpoint_world_size = selected
     state_path = f"{phase}/{run_id}/checkpoint/checkpoint-{checkpoint_step}/opd_state.json"
     try:
         from huggingface_hub import hf_hub_download
@@ -203,7 +225,7 @@ def verify_opd_replacement_safe(
         raise RuntimeError(
             "opd resume checkpoint metadata is unverifiable; replacement is blocked"
         ) from exc
-    return revision
+    return revision, checkpoint_world_size
 
 
 def make_hf_text_reader(

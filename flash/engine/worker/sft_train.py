@@ -448,7 +448,15 @@ def _write_sft_result(options, data, model, child, progress, verified, outputs) 
             # share of the batch, so a reader reconstructing the token budget off the request would
             # believe each rank held rows it never received.
             "per_device_train_batch_size": child.micro_batch,
-            "gradient_accumulation_steps": math.ceil(model.train_batch_size / child.micro_batch),
+            # over one RANK'S share of the batch, not the global batch. `micro_batch` is already
+            # capped to `train_batch_size // world_size` (see `_resolve_sft_width_and_micro_batch`),
+            # so dividing the global batch by it was the sequence-parallel formula, where every rank
+            # sees the whole batch. under data parallelism it over-counts by the world size, and a
+            # reader reconstructing tokens as micro-batch x grad-accum x DP size lands world_size
+            # times too high.
+            "gradient_accumulation_steps": math.ceil(
+                (model.train_batch_size / max(1, child.world_size)) / child.micro_batch
+            ),
             # verl concatenates either way; the profile's mode records whether more than one
             # example was allowed to share a concatenated batch, which is what a reader of these
             # metrics needs in order to compare a run's step count against its row count.
