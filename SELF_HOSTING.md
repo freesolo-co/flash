@@ -396,7 +396,7 @@ without `FLASH_STANDALONE` and set `FREESOLO_BASE_URL` to point at it.
 | `GITHUB_TOKEN`         | Environments in **private** GitHub repos cannot be fetched and `flash env push` is unavailable. Environments in **public** GitHub repos still work. Warns at startup.                                                                                                                                                                                                                                                                                                      |
 | `PARASAIL_API_KEY`     | On-policy distillation (`opd`) submissions fail before GPU allocation. Set it on the control plane; workers never receive it. `sft` and `grpo` do not use it.                                                                                                                                                                                                                                                                                                              |
 | `FLASH_PUBLIC_URL`     | On-policy distillation (`opd`) submissions fail before GPU allocation. This is **this plane's own public HTTPS origin** - the address a rented GPU worker dials back to reach the teacher broker. It is not the same setting as the client's `FLASH_API_URL` / `--api-url`, which may point at a private address (`http://your-plane:8080`, a tunnel, a VPN) that no worker can resolve; set this one to an origin reachable from outside. `sft` and `grpo` do not use it. |
-| `FREESOLO_SERVING_URL` | In standalone mode `flash deploy`/`undeploy`/`chat` **refuse to run** rather than send your plane's key to Freesolo's serving app - and refuse the same way if you point it AT that app. Training is unaffected. See below.                                                                                                                                                                                                                                                |
+| `FREESOLO_SERVING_URL` | In standalone mode `flash models deploy`/`undeploy`/`chat` **refuse to run** rather than send your plane's key to Freesolo's serving app - and refuse the same way if you point it AT that app. Training is unaffected. See below.                                                                                                                                                                                                                                         |
 
 ## Serving
 
@@ -407,7 +407,8 @@ include that serving backend.
 Training, checkpoint streaming, and adapter export are fully self-hostable and do not
 depend on it. Your trained adapters land in your own HuggingFace repos and can be served
 by any stack that loads LoRA adapters - vLLM, TGI, or your own. Point `FREESOLO_SERVING_URL`
-at a compatible deployment if you want `flash deploy` and `flash chat` to work end to end.
+at a compatible deployment if you want `flash models deploy` and `flash models chat` to work
+end to end.
 
 On a standalone plane those three commands **error out** until you point it at a backend
 you operate. Every serving request carries `FREESOLO_INTERNAL_KEY`, and on your plane that
