@@ -401,9 +401,11 @@ def test_ranking_caps_the_rollout_batch_at_the_retained_prompt_count():
     from types import SimpleNamespace
 
     from flash.cost.spec import _on_policy_prompts_per_step, _on_policy_requested_prompts_per_step
+    from flash.engine.plan.recipe import RECIPE
     from flash.providers.base import run_config_for_ranking
 
     for algorithm in ("grpo", "opd"):
+        default = int((RECIPE.opd if algorithm == "opd" else RECIPE.rl).prompts_per_step)
         # (authored prompts_per_step, max_examples, expected ranked batch)
         for authored, retained, expected in (
             (128, 2, 2),  # the reported shape: pool far below the authored batch
@@ -411,12 +413,24 @@ def test_ranking_caps_the_rollout_batch_at_the_retained_prompt_count():
             (8, 8, 8),  # equal
             (8, 0, 8),  # 0 means uncapped, not "a pool of zero"
             (8, None, 8),  # unset
+            # UNAUTHORED batch: the recipe default must be capped too, because the workers clamp
+            # whatever the batch resolved to. Leaving this to `normalized()` ranked 64/8 uncapped.
+            (None, 2, 2),
+            (None, None, None),  # nothing to cap; `normalized()` fills the default
+            (None, 0, None),  # 0 is uncapped, so there is still nothing to resolve
+            (None, 10**6, default),  # pool far above the default
         ):
-            train = {"epochs": 1, "group_size": 4, "prompts_per_step": authored}
+            train = {"epochs": 1, "group_size": 4}
+            if authored is not None:
+                train["prompts_per_step"] = authored
             if retained is not None:
                 train["max_examples"] = retained
             config = run_config_for_ranking("Qwen/Qwen3.5-4B", algorithm, train=train)
             assert config.batch_size == expected, (algorithm, authored, retained)
+            # what actually gets priced, after the recipe fills any remaining None.
+            assert config.normalized().batch_size == (
+                expected if expected is not None else default
+            ), (algorithm, authored, retained)
 
     # sft is untouched: its `batch_size` is examples per update on a dataset it may revisit across
     # epochs, so a small `max_examples` does not bound it the way a rollout pool bounds a step.

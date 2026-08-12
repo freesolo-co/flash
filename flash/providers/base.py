@@ -355,16 +355,24 @@ def run_config_for_ranking(
         """Prompts a rollout step really trains on: the authored batch, capped by the pool.
 
         Both workers retain at most ``max_examples`` rows and then clamp the batch to what is left
-        (`resolve_grpo_prompts_per_step`, and opd's `_prepare_workload` slice), so an authored 128
-        against `max_examples = 2` trains on 2. Ranking the raw 128 would size hardware for a step
-        that cannot happen. `flash.cost.spec._on_policy_prompts_per_step` already takes this same
-        minimum, so skipping it here also left ranking and the persisted quote disagreeing.
+        (`resolve_grpo_prompts_per_step`, and opd's `min(knobs.prompts_per_step, len(prompts))`), so
+        an authored 128 against `max_examples = 2` trains on 2. Ranking the raw 128 would size
+        hardware for a step that cannot happen. `flash.cost.spec._on_policy_prompts_per_step` already
+        takes this same minimum, so skipping it here left ranking and the persisted quote disagreeing.
+
+        The recipe default is resolved BEFORE the minimum, because the workers clamp it too: they
+        cap whatever the batch resolved to, authored or defaulted. Returning None for an unauthored
+        batch would let `normalized()` fill 64 (grpo) or 8 (opd) uncapped, so a run whose whole pool
+        is 2 rows would still rank for 64.
         """
+        from flash.engine.plan.recipe import RECIPE
+
         authored = knob("prompts_per_step")
         retained = knob("max_examples")
-        if authored is None or retained is None:
+        if retained is None:
             return authored
-        return min(authored, retained)
+        recipe = RECIPE.opd if algorithm == "opd" else RECIPE.rl
+        return min(authored if authored is not None else int(recipe.prompts_per_step), retained)
 
     return RunConfig(
         model_id=model_id,
