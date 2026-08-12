@@ -718,10 +718,12 @@ def env_setup(paths: list[str], project_id: str, *, can_publish: bool = True) ->
     if can_publish:
         next_step = arrow(f"publish it: flash env push --project {project_id} --name my-env .")
     else:
-        # `env push` targets the managed hub, which a self-hosted plane cannot write to.
+        # `env push` targets the managed hub, which a self-hosted plane cannot write to. The
+        # standalone caveat is part of the wording: a github: id is accepted only by a plane
+        # running FLASH_STANDALONE=1, and setup classifies on the API URL, which cannot see it.
         next_step = arrow(
             "publish it: push to a git repo, then set [environment] id = "
-            "github:OWNER/REPO@main:environment.py"
+            "github:OWNER/REPO@main:environment.py (needs FLASH_STANDALONE=1 on the plane)"
         )
     return _safe(f"{head}\n{tree}\n\n{next_step}")
 

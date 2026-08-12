@@ -462,6 +462,9 @@ def _environment_comment(project_id: str, *, can_publish: bool, extra: str = "")
             "# publishes to Freesolo's managed environment hub. Name a git repo instead:\n"
             "#   github:OWNER/REPO@REF:PATH   (PATH is the file, or the directory holding environment.py)\n"
             "# Push this folder to a repo your plane can read, then fill in the id below.\n"
+            "# A github: id needs a plane running with FLASH_STANDALONE=1; an identity-backed plane\n"
+            "# accepts managed hub ids only. Setup classifies on the API URL and cannot see that\n"
+            "# server-side setting, so if submit returns a 400 naming this id, that is the cause.\n"
         )
         placeholder = 'id = "github:OWNER/REPO@main:environment.py"\n\n'
     return f"{head}{extra}[environment]\n{placeholder}"
@@ -568,17 +571,19 @@ def _setup_interactive(args) -> bool:
     return render.can_prompt()
 
 
-def _marker_text(path: Path) -> str:
-    """The file's text for a marker probe, or "" if it cannot be decoded as UTF-8.
+def _marker_present(path: Path, marker: str) -> bool | None:
+    """Whether `path` carries `marker`, or None when the file cannot be read as UTF-8.
 
     Probing for a marker is a best-effort read of a file the operator owns: `# -*- coding:
-    latin-1 -*-` is valid Python, and a file we cannot decode simply does not carry the marker.
-    Reading strictly here aborted `env setup` before it did anything.
+    latin-1 -*-` is valid Python, and reading strictly here aborted `env setup` before it did
+    anything. But "cannot read" is NOT "marker absent": collapsing the two would classify an
+    undecodable multi-turn environment.py as single-turn and then override an explicit
+    --multi-turn with that guess. Three states, so an unreadable anchor can defer to the flag.
     """
     try:
-        return path.read_text(encoding="utf-8")
+        return marker in path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
-        return ""
+        return None
 
 
 def _resolve_turn_mode(args, starter_env: Path, dataset: Path) -> tuple[bool, bool]:
@@ -591,11 +596,13 @@ def _resolve_turn_mode(args, starter_env: Path, dataset: Path) -> tuple[bool, bo
     anchor = "environment.py"
     starter_env_exists = starter_env.exists()
     if starter_env_exists:
-        existing_multi = "EnvironmentMultiTurn" in _marker_text(starter_env)
+        # None (unreadable) stays None: an anchor we cannot read decides nothing, so the flag or
+        # the prompt below resolves the mode instead of an unreadable file silently forcing one.
+        existing_multi = _marker_present(starter_env, "EnvironmentMultiTurn")
     elif dataset.exists():
         # No env.py to anchor on, but the starter multi-turn dataset carries a
         # distinctive prompt; use it so we don't drop a single-turn env beside it.
-        existing_multi = "secret whole number" in _marker_text(dataset)
+        existing_multi = _marker_present(dataset, "secret whole number")
         anchor = "dataset/train.jsonl"
 
     # Resolve the turn mode. An existing scaffold wins (warn if a flag disagrees); otherwise an
@@ -713,6 +720,16 @@ _OPD_MANAGED_TEACHER_NOTE = (
     "# the teacher and its parasail key are platform-managed; nothing to set up or export.\n"
 )
 
+# Only the managed plane manages the key. `require_teacher_broker_configuration` reads
+# PARASAIL_API_KEY and FLASH_PUBLIC_URL from the CONTROL PLANE's environment, so on a self-hosted
+# plane the operator sets both -- and the failure lands at submit, after the scaffold has already
+# claimed there was nothing to do.
+_OPD_SELF_HOSTED_TEACHER_NOTE = (
+    "# opd uses a managed parasail teacher, which this plane brokers itself: set PARASAIL_API_KEY\n"
+    "# and FLASH_PUBLIC_URL in the CONTROL PLANE's environment (not your shell) before submitting.\n"
+    "# FLASH_PUBLIC_URL must be an origin the rented worker can reach, not localhost or a tunnel.\n"
+)
+
 
 def _write_opd_config(
     opd: Path,
@@ -745,7 +762,7 @@ def _write_opd_config(
             + _environment_comment(
                 project_id,
                 can_publish=can_publish,
-                extra=_OPD_MANAGED_TEACHER_NOTE,
+                extra=(_OPD_MANAGED_TEACHER_NOTE if can_publish else _OPD_SELF_HOSTED_TEACHER_NOTE),
             )
             + "[train]\n"
             "epochs = 1\n"
@@ -903,9 +920,10 @@ def cmd_env_setup(args) -> int:
         print(f"next: flash env push --project {project_id} --name my-env .")
     else:
         # `env push` targets the managed hub, which a self-hosted plane cannot write to. Same
-        # wording as the styled path in `render.env_setup`, which is what a TTY actually shows.
+        # wording as the styled path in `render.env_setup`, which is what a TTY actually shows --
+        # including the standalone caveat, so the two paths cannot drift apart again.
         print(
             "next: push this folder to a git repo, then set [environment] id = "
-            "github:OWNER/REPO@main:environment.py"
+            "github:OWNER/REPO@main:environment.py (needs FLASH_STANDALONE=1 on the plane)"
         )
     return 0

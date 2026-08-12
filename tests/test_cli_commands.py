@@ -773,6 +773,108 @@ def test_env_setup_reports_an_undecodable_config_as_an_error(monkeypatch, tmp_pa
         _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
 
 
+def test_env_setup_does_not_let_an_unreadable_env_override_the_turn_flag(
+    monkeypatch, tmp_path
+) -> None:
+    """An environment.py we cannot decode must not silently resolve the turn mode.
+
+    The anchor probe has three states, not two: "carries the marker", "does not", and "cannot be
+    read". Collapsing the last into False classified an undecodable multi-turn env as single-turn
+    AND then took that guess as authoritative, overriding an explicit --multi-turn without a word.
+    """
+    from argparse import Namespace
+    from pathlib import Path
+
+    from flash.cli.commands.env import setup as env_setup
+
+    starter = tmp_path / "environment.py"
+    starter.write_bytes(b"# -*- coding: latin-1 -*-\nclass E(EnvironmentMultiTurn):  # caf\xe9\n")
+
+    assert env_setup._marker_present(starter, "EnvironmentMultiTurn") is None
+
+    multi_turn, _ = env_setup._resolve_turn_mode(
+        Namespace(turn_mode="multi", yes=True),
+        starter,
+        Path(tmp_path / "dataset" / "train.jsonl"),
+    )
+    assert multi_turn is True  # the flag decides, because the anchor could not be read
+
+
+def test_env_setup_names_the_plane_side_opd_teacher_setup_when_self_hosted(
+    monkeypatch, tmp_path
+) -> None:
+    """ "nothing to set up" is true only where the platform holds the key.
+
+    `require_teacher_broker_configuration` reads PARASAIL_API_KEY and FLASH_PUBLIC_URL from the
+    CONTROL PLANE's environment, so on a self-hosted plane the operator sets both. Telling them
+    otherwise moves the discovery to a submit-time failure.
+    """
+    hosted = _scaffold(monkeypatch, tmp_path / "hosted", "https://flash.freesolo.co")["opd.toml"]
+    assert "nothing to set up or export" in hosted
+
+    self_hosted = _scaffold(monkeypatch, tmp_path / "own", "https://plane.example.test")["opd.toml"]
+    assert "nothing to set up or export" not in self_hosted
+    assert "PARASAIL_API_KEY" in self_hosted
+    assert "FLASH_PUBLIC_URL" in self_hosted
+
+
+def test_env_setup_caveats_that_a_github_id_needs_a_standalone_plane(monkeypatch, tmp_path) -> None:
+    """The scaffolded github: id is rejected by an identity-backed self-hosted plane.
+
+    `_require_hosted_environment_form` accepts a non-slug id only when `auth.standalone()`, which
+    reads the plane's OWN environment. Setup classifies on the API URL and cannot see that, so the
+    scaffold writes an id that a non-standalone plane answers with a 400 -- name the requirement
+    rather than let it surface as an unexplained submit failure.
+    """
+    written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+    assert "FLASH_STANDALONE=1" in written["sft.toml"]
+    # the guide prescribes the same id form, so it carries the same requirement
+    assert "FLASH_STANDALONE=1" in written["TRAINING.md"]
+
+
+def test_training_guide_says_a_private_env_repo_needs_a_plane_side_token(
+    monkeypatch, tmp_path
+) -> None:
+    """The scaffold tells a self-hoster to point at their own repo without naming the token it needs.
+
+    `_github_token` (flash/envs/loader.py) reads `GITHUB_TOKEN` from the resolving process's own
+    environment and there is no spec or client field that carries one, so a private repo resolves as
+    missing no matter what the operator has exported locally. The guide has to name where the token
+    belongs, since the failure surfaces as an unreadable ref rather than an auth error.
+    """
+    import inspect
+
+    from flash.envs import loader
+
+    # the premise: the token comes from the plane's process env, not from anything the client sends
+    source = inspect.getsource(loader._github_token)
+    assert 'os.environ.get("GITHUB_TOKEN")' in source
+
+    guide = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")["TRAINING.md"]
+    assert "A private repository needs `GITHUB_TOKEN` on the plane, not in your shell" in guide
+    assert "forwards no credential of" in guide
+
+
+def test_training_guide_says_env_eval_rejects_a_github_id(monkeypatch, tmp_path) -> None:
+    """The guide prescribes `env eval` further down, but a `github:` id never reaches the suites.
+
+    `_resolve_evaluation_environment` requires `is_managed_environment_slug` and refuses anything
+    else before loading anything, so on a standalone plane every `env eval` line in this guide
+    deterministically fails. TRAINING.md is static prose and cannot branch on the plane, so the
+    caveat has to sit beside the `github:` form it contradicts.
+    """
+    import inspect
+
+    from flash.cli.commands.env import eval as env_eval
+
+    # the premise: the gate is a managed-slug check, not a soft preference
+    source = inspect.getsource(env_eval._resolve_evaluation_environment)
+    assert "is_managed_environment_slug" in source
+
+    guide = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")["TRAINING.md"]
+    assert "`flash env eval` does not accept a `github:` id" in guide
+
+
 def test_training_guide_caveats_the_managed_hub_commands(monkeypatch, tmp_path) -> None:
     """The guide says `env push` is unavailable, then later prescribes it without caveat.
 

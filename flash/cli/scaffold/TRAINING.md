@@ -168,6 +168,21 @@ The ref is resolved at submit time, so re-pushing the repo and re-submitting pic
 the same way `flash env push` does on the managed plane. Pin a commit sha instead of a branch when
 you want a run to stay reproducible.
 
+A `github:` id is accepted only by a plane running with `FLASH_STANDALONE=1`. An identity-backed
+plane takes managed hub ids only and answers this form with a 400 naming the id.
+
+**A private repository needs `GITHUB_TOKEN` on the plane, not in your shell.** The ref is fetched by
+the control plane, which authenticates with its own `GITHUB_TOKEN` and forwards no credential of
+yours — so a private repo that you can clone locally still resolves as missing unless the plane
+itself holds a token that can read it. Either keep the environment repo public, or export a
+`GITHUB_TOKEN` with read access in the control plane's environment.
+
+`flash env eval` does not accept a `github:` id. It grades against a _published_ environment so the
+report can be filed under that identity, and refuses any reference that names no hub page — so on a
+standalone plane, the two commands below that mention it (`env eval` with `--split`/`--param`, and
+the held-out-suite workflow) are unavailable. `flash env test` is unaffected and remains the local
+gate.
+
 **Validate locally before you push** — but know what the local gate does and does not
 cover:
 
@@ -1059,7 +1074,7 @@ in a sensible value, so only override with a reason.
 | `kl_penalty_coef`              | Keeps the trained model from drifting too far from the base. Raise it to anchor against entropy collapse; lower it for more freedom to move.                                                                                                                                                                                                                                                                      |
 | `thinking_length_penalty_coef` | Per-reasoning-token reward deduction — curb overthinking, but watch it doesn't push the model into terse degeneracy.                                                                                                                                                                                                                                                                                              |
 | `learning_rate`                | Change it in small steps. Too high destabilizes RL and degrades output quality; if the model is collapsing, lower it.                                                                                                                                                                                                                                                                                             |
-| `prompts_per_step`                   | The effective prompts-per-step. Too small and the reward trend is pure noise; size it so the trend is readable.                                                                                                                                                                                                                                                                                                   |
+| `prompts_per_step`             | The effective prompts-per-step. Too small and the reward trend is pure noise; size it so the trend is readable.                                                                                                                                                                                                                                                                                                   |
 | `structured_outputs`           | Guided decoding for every GRPO/OPD rollout: a JSON schema (inline table or JSON string), `regex`, or `choice`. The sampler then _cannot_ emit off-format text, so the reward measures content instead of formatting. Works with `thinking = true`: the grammar is held until the `</think>` boundary (via a reasoning-aware decoding gate), so the model reasons freely first and only its answer is constrained. |
 
 For thinking models, `max_completion_tokens` is shared between `<think>` reasoning and the final
