@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import sys
 
 import pytest
 
@@ -201,11 +202,10 @@ def _stub_download(monkeypatch, contents: dict[str, bytes], tmp_path):
         path.write_bytes(contents[filename])
         return str(path)
 
-    monkeypatch.setattr(
-        encoding_module, "_download_files", encoding_module._download_files, raising=True
-    )
+    # _download_files imports huggingface_hub inside the function body, so the stub has to be in
+    # sys.modules at call time rather than patched onto the module under test.
     monkeypatch.setitem(
-        __import__("sys").modules,
+        sys.modules,
         "huggingface_hub",
         type("_HubStub", (), {"hf_hub_download": staticmethod(fake_download)}),
     )
