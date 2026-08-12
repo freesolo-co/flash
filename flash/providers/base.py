@@ -686,7 +686,7 @@ def largest_rentable_count(max_gpu_count: int) -> int:
 
 
 def wider_shape_remedy(
-    vram_options: Iterable[int], need: float, *, ceiling: int, above: int = 0
+    vram_options: Iterable[int], need: float, *, ceiling: int, above: int = 0, executed_width=None
 ) -> str:
     """The ``--gpus N`` clause a fit failure carries, or ``""`` when no wider shape would fit.
 
@@ -705,13 +705,19 @@ def wider_shape_remedy(
     (see ``rents_arbitrary_card_counts``); passing none leaves the failure a bare dead end, which
     is the honest answer when no offline check can confirm the wider SKU exists.
 
+    ``executed_width`` maps a rented count to the ranks that actually JOIN the run, defaulting to
+    "all of them". Only sft narrows it, and a suggestion has to respect it: `--gpus 2` on a run whose
+    batch launches one rank buys a second card that contributes no memory, so the user pays twice to
+    fail identically. Advice must be searched with the same rule that will judge the retry.
+
     Every fit-rejection message routes through here so the remedy cannot drift in wording or in
     the rule that produces it.
     """
+    launched = executed_width or (lambda count: count)
     best = 0
     for vram_gb in vram_options:
         for count in sorted(rentable_gpu_counts(max(1, int(ceiling)))):
-            if count > above and combined_vram_gb(vram_gb, count) >= need:
+            if count > above and combined_vram_gb(vram_gb, launched(count)) >= need:
                 best = count if best == 0 else min(best, count)
                 break
     if best == 0:

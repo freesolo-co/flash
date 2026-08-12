@@ -483,6 +483,9 @@ def _wider_shape_remedy(config: RunConfig, need: float, names: tuple[str, ...]) 
         # been "already tried" and the search must exclude nothing. 0 is that empty exclusion --
         # passing none compares int > none and crashes the quote.
         above=config.gpu_count or 0,
+        # the same width rule the ranking loop above rejected shapes with, so the remedy cannot
+        # promise a count the retry will not launch on.
+        executed_width=lambda count: executed_gpu_count(config, count),
     )
 
 

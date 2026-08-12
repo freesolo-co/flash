@@ -350,6 +350,44 @@ def test_sft_width_that_never_fits_is_terminal_not_a_capacity_retry(monkeypatch,
     )
 
 
+def test_lookup_blip_is_only_retryable_when_a_launchable_shape_exists(monkeypatch):
+    """Regression: the lookup-failure branch returned retryable before consulting executed width.
+
+    A live-capacity blip is retryable because the outage may be HIDING a shape that fits. When the
+    run's executed width fits no advertised class, the outage is not what stands in the way and a
+    retry cannot help -- `_allocate_attempt` turns it into `poll_error` and burns the infra budget on
+    a deterministic miss. The advertised class list is static and readable during the outage, so this
+    is decidable exactly when it matters.
+
+    Both halves are asserted: the blip must STILL be retryable when a launchable shape does exist, or
+    this guard would trade a retry bug for an outage that kills every run.
+    """
+    from flash.providers import allocator, get_provider
+    from flash.providers.base import CapacityLookupError, UnsupportedGpuError
+
+    def _blip(need, constraints):
+        raise CapacityLookupError("lambda live capacity lookup failed")
+
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("lambda",))
+    monkeypatch.setattr(get_provider("lambda"), "live_candidates", _blip)
+
+    # 200 GB against an sft run clamped to one rank: no advertised class holds it at any count.
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 200)
+    with pytest.raises(UnsupportedGpuError) as ei:
+        allocator.allocate(
+            "Qwen/Qwen3.5-0.8B", "sft", train={"batch_size": 1}, max_gpu_count=8
+        )
+    assert not isinstance(ei.value, CapacityLookupError), (
+        "the blip did not cause this and cannot cure it -- no lookup makes a batch of 1 use more "
+        "ranks, so retrying spends the infra budget on a shape that will never exist"
+    )
+
+    # same blip, same provider, but a need one card CAN hold: still retryable, as before.
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
+    with pytest.raises(CapacityLookupError):
+        allocator.allocate("Qwen/Qwen3.5-0.8B", "sft", train={"batch_size": 1}, max_gpu_count=8)
+
+
 def test_exact_runpod_empty_capacity_stays_terminal(monkeypatch):
     from flash.providers import allocator, get_provider
     from flash.providers.base import UnsupportedGpuError
@@ -1960,6 +1998,31 @@ def test_wider_shape_remedy_names_the_cheapest_fitting_width():
 
     vram = GPU_INFO["H200"].vram_gb
     assert "--gpus 2" in wider_shape_remedy((vram,), vram + 40, ceiling=8, above=1)
+
+
+def test_remedy_never_names_a_width_the_run_will_not_launch_on():
+    """Regression: `--gpus N` was searched with the RENTED count, not the ranks that join.
+
+    The fit gate credits only launched ranks, so an unpacked sft run (batch 1, one rank however many
+    cards are rented) is rejected at every width. The remedy searched the same failure with the full
+    count and answered `--gpus 2`: the user pays for a second card that contributes no memory and
+    fails identically. Advice has to be proved with the rule that will judge the retry.
+
+    Codex's shape exactly: a batch-1 4B at 32k needs 28 GB and does not fit a 24 GB card.
+    """
+    from flash.providers.base import wider_shape_remedy
+
+    need, card = 28.0, 24
+    assert wider_shape_remedy((card,), need, ceiling=8, above=1, executed_width=lambda _n: 1) == "", (
+        "an sft run pinned to one rank gains nothing from more cards, so no width is a remedy -- "
+        "naming one sends the user to pay twice for the same failure"
+    )
+    # the default is unchanged for everything that DOES launch what it rents, so this cannot
+    # silently suppress a real remedy on grpo/opd.
+    assert "--gpus 2" in wider_shape_remedy((card,), need, ceiling=8, above=1)
+    assert "--gpus 2" in wider_shape_remedy(
+        (card,), need, ceiling=8, above=1, executed_width=lambda n: n
+    )
 
 
 def test_provider_incompatible_pin_reports_the_incompatibility_not_a_fit_remedy():

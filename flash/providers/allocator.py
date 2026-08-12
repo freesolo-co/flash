@@ -215,28 +215,25 @@ def _executed_gpu_count(algorithm: str, train, overrides, gpu_count: int) -> int
 def _executed_width(algorithm: str, train, overrides):
     """The executed-width rule for one run, as a function of a rentable card count.
 
-    Bound ONCE per allocation and shared by the two places an empty candidate set gets decided: the
-    filter that removes shapes, and the classification that says why none were left. Handing both
-    the same callable is what keeps them from drifting -- when only the filter knew about the sft
-    clamp, a width it deterministically rejected was still reported as "structurally offered", so a
-    structural miss was raised as retryable ``CapacityLookupError`` and the run re-polled a market
-    that could never make the batch use more ranks.
+    Bound ONCE per allocation and handed to every site that asks a question about a card count: the
+    filter that removes shapes, the classification that says why none were left, the pinned-class
+    precheck, and each ``--gpus N`` remedy. One rule for all of them is the invariant -- each time a
+    site was left crediting the RENTED count instead, it contradicted the filter: a width the filter
+    deterministically rejects was reported as "structurally offered" (a terminal miss raised as
+    retryable, re-polling a market that cannot widen a batch), and advice named a card count that
+    buys memory the run never joins.
     """
     return lambda gpu_count: _executed_gpu_count(algorithm, train, overrides, gpu_count)
 
 
-def _fitting_candidates(candidates, need: int, algorithm: str, train, overrides):
-    """The shapes that hold the run on the ranks they will launch, and the rule that decided it.
+def _fitting_candidates(candidates, need: int, executed_width) -> list:
+    """The shapes that hold the run on the ranks they will actually launch.
 
     Providers report the shapes they can genuinely rent (RunPod takes a count, Lambda names it in the
     instance type, Vast bakes it into the offer); the allocator owns only whether a shape fits. The
     executed width is per-candidate because it is bounded by that candidate's own card count.
-
-    Returns the rule alongside the survivors so the caller cannot classify an empty result by a
-    different standard than the one that emptied it -- see ``_executed_width``.
     """
-    executed_width = _executed_width(algorithm, train, overrides)
-    return [c for c in candidates if _fits(c, need, executed_width(c.gpu_count))], executed_width
+    return [c for c in candidates if _fits(c, need, executed_width(c.gpu_count))]
 
 
 def _sizing_int(train, name: str, default: int) -> int:
@@ -384,13 +381,19 @@ def _resolve_exact_gpu(
     available: tuple[str, ...],
     widest_cap: int = 1,
     unpinned: tuple[str, ...] | None = None,
+    executed_width=None,
 ) -> tuple[str, tuple[str, ...]]:
     """Validate an explicitly pinned GPU class and narrow ``available`` to providers that offer it.
 
     ``unpinned`` is the configured fleet before a provider pin narrowed ``available``, or ``None``
     when nothing was pinned. A pin can hide the only provider that rents this class at a wider
     count, and suppressing the remedy entirely would hide a fix the user can actually apply.
+
+    ``executed_width`` maps a rented count to the ranks that join the run (see ``_executed_width``).
+    Both the combination precheck below and every ``--gpus N`` remedy have to apply it, or a pinned
+    sft run whose batch caps it at one rank is told to buy cards that cannot hold it.
     """
+    launched = executed_width or (lambda count: count)
     exact = canonical_gpu(gpu_type)
     exact_info = GPU_INFO.get(exact)
     if exact_info is None or not exact_info.validated:
@@ -435,7 +438,9 @@ def _resolve_exact_gpu(
         pin cannot help), and the ceiling is named alongside the pin -- reaching here means the
         authored count already failed, so advice omitting it just buys a second rejection.
         """
-        remedy = wider_shape_remedy(unpinned_widths, need, ceiling=widest_cap, above=above)
+        remedy = wider_shape_remedy(
+            unpinned_widths, need, ceiling=widest_cap, above=above, executed_width=launched
+        )
         if not remedy:
             return ""
         # the shared helper opens with "; it fits on N cards -- ...", so splice the pin clause in
@@ -472,7 +477,9 @@ def _resolve_exact_gpu(
             f"exact GPU {exact!r} has {exact_info.vram_gb} GB VRAM, "
             f"but this run requires at least {need} GB"
             + (
-                wider_shape_remedy(widths, need, ceiling=widest_cap, above=1)
+                wider_shape_remedy(
+                    widths, need, ceiling=widest_cap, above=1, executed_width=launched
+                )
                 or _drop_pin_hint(1)
                 or _catalog_check_hint(1)
             )
@@ -483,12 +490,14 @@ def _resolve_exact_gpu(
     if (
         exact_info.vram_gb < need
         and max_gpu_count > 1
-        and combined_vram_gb(exact_info.vram_gb, cap) < need
+        and combined_vram_gb(exact_info.vram_gb, launched(cap)) < need
     ):
         raise UnsupportedGpuError(
             f"exact GPU {exact!r} cannot fit this run even as a {cap}-card combination"
             + (
-                wider_shape_remedy(widths, need, ceiling=widest_cap, above=cap)
+                wider_shape_remedy(
+                    widths, need, ceiling=widest_cap, above=cap, executed_width=launched
+                )
                 or _drop_pin_hint(cap)
                 or _catalog_check_hint(cap)
             )
@@ -638,10 +647,19 @@ def _raise_no_candidate_error(
         # Every configured provider rejected the shape structurally. Surface one provider's
         # concrete reason rather than misclassifying an impossible SKU as temporary capacity.
         raise next(iter(structurally_unsupported.values()))
-    if lookup_failed:
+    # THE precondition for every retryable answer below: a shape the run could execute on is
+    # advertised somewhere, so "come back later" is a coherent thing to say. Evaluated once -- three
+    # copies of this question is what let the sft width clamp reach one branch and not the others.
+    could_fit = _structurally_fits(supported_available, need, cap, executed_width, exact)
+    if lookup_failed and could_fit:
         # No candidate fit, but a live capacity lookup blipped and was the only possible source of one
         # -> retryable, NOT terminal: a Vast/Lambda-only run must ride out a market/API outage on its
         # infra budget instead of dying as if the job exceeds every GPU class.
+        #
+        # Gated on the shape being one the outage could actually have hidden. The advertised class
+        # list is readable during the outage (it is static), so a run whose EXECUTED width fits no
+        # offered class is a dead end the blip did not cause and cannot cure -- retrying it just
+        # spends the infra budget. Only a blip standing between the run and a real shape is retryable.
         raise CapacityLookupError(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}): a provider's live capacity lookup "
             f"failed transiently and was the only source of a fitting class — retry may find hidden capacity"
@@ -654,7 +672,7 @@ def _raise_no_candidate_error(
         getattr(get_provider(name), "live_capacity", False) for name in supported_available
     )
     if exact:
-        if live_only and _structurally_fits(supported_available, need, cap, executed_width, exact):
+        if live_only and could_fit:
             raise CapacityLookupError(
                 f"exact GPU {exact!r} is structurally supported but currently has no capacity on "
                 f"{', '.join(supported_available)}"
@@ -666,7 +684,7 @@ def _raise_no_candidate_error(
     # unpinned: only retryable when SOME structurally-offered shape could have held the run.
     # without that guard a genuinely oversized run would retry until its infra budget ran out
     # instead of failing immediately with the reason.
-    if live_only and _structurally_fits(supported_available, need, cap, executed_width):
+    if live_only and could_fit:
         raise CapacityLookupError(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}) right now: a fitting class is "
             f"structurally offered on {', '.join(supported_available)} but has no capacity — "
@@ -707,6 +725,9 @@ def allocate(
     # off the authored batch over-reserves (4 GB on a 4B at batch 8 / 4096) and can reject a card the
     # run would have fit on. `_fits` reads it too, so the requirement and the fit cannot disagree.
     sized_train = _overridden_train(train, overrides)
+    # bound before the pinned-class checks below, which need it too: every question about a card
+    # count in this function is asked through this one rule. see `_executed_width`.
+    executed_width = _executed_width(algorithm, sized_train, overrides)
     if workload_profile:
         need = profile_required_vram_gb()
         max_gpu_count = 1
@@ -758,6 +779,7 @@ def allocate(
                 model_id, MAX_COMBINATION_CARDS, model_revision=model_revision, certify=True
             ),
             unpinned=unpinned,
+            executed_width=executed_width,
         )
         if not available:
             raise UnsupportedGpuError(f"exact GPU {exact!r} has no configured active provider")
@@ -792,9 +814,7 @@ def allocate(
         exact=exact,
         provider=provider,
     )
-    candidates, executed_width = _fitting_candidates(
-        candidates, need, algorithm, sized_train, overrides
-    )
+    candidates = _fitting_candidates(candidates, need, executed_width)
     supported_available = tuple(name for name in available if name not in structurally_unsupported)
     if not candidates:
         _raise_no_candidate_error(
