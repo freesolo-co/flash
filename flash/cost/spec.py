@@ -159,6 +159,26 @@ def _on_policy_prompts_per_step(spec, examples: int) -> int:
     return min(_on_policy_requested_prompts_per_step(spec), max(1, int(examples)))
 
 
+def _rollout_batch_for_quote(spec) -> int:
+    """Prompts one priced rollout step trains on: the requested batch, capped by the retained pool.
+
+    The workers retain at most ``max_examples`` rows and then clamp the batch to what is left, so
+    `prompts_per_step = 128` against `max_examples = 2` trains on 2. Pricing the raw 128 charges a
+    completed or cancelled run for the work it did not do, and ``spec_steps`` already counts steps
+    against the capped batch -- so without this one quote mixes a capped step COUNT with an uncapped
+    per-step PRICE.
+
+    A pool size is not always knowable, and that is not a pricing failure here. ``max_steps`` states
+    the horizon outright, so ``spec_steps`` returns before ever asking for a row count; asking for
+    one anyway would reject a fully specified run. There is nothing to cap against in that case, so
+    the requested batch stands -- the same number this priced before the cap existed.
+    """
+    try:
+        return _on_policy_prompts_per_step(spec, _on_policy_example_count(spec))
+    except UnknownPromptPoolSize:
+        return _on_policy_requested_prompts_per_step(spec)
+
+
 def spec_steps(spec) -> int:
     """Per-seed optimizer steps implied by a train spec (mirrors the worker).
 
@@ -246,12 +266,19 @@ def runconfig_from_spec(spec) -> RunConfig:
         completion_len=t.max_completion_tokens if has_rollout else None,
         # RunConfig.batch_size is the cost model's own name for "examples per optimizer update", and
         # each algorithm reaches it by a different key: sft through the measured profile, grpo/opd
-        # straight from prompts_per_step. reading t.batch_size for rl would always find None now and
+        # through the retained-prompt cap. reading t.batch_size for rl would always find None now and
         # silently price the recipe default, ignoring an authored batch.
+        #
+        # the cap matters because the workers apply it: they retain at most `max_examples` rows and
+        # then clamp the batch to what is left, so `prompts_per_step = 128` against `max_examples = 2`
+        # trains on 2. pricing the raw 128 charges a completed or cancelled run for ~64x the work it
+        # performed, and can reject an affordable run on the pre-submit affordability check.
+        # `spec_steps` above already counts steps against the capped batch, so taking it here also
+        # stops one quote from mixing a capped step COUNT with an uncapped per-step PRICE.
         batch_size=(
             profile.examples_per_update
             if profile is not None
-            else (t.prompts_per_step if has_rollout else t.batch_size)
+            else (_rollout_batch_for_quote(spec) if has_rollout else t.batch_size)
         ),
         group_size=t.group_size if has_rollout else None,
         lora_rank=t.lora_rank,
