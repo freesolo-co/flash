@@ -864,7 +864,7 @@ def _verify_sft_run(
     resume_step: int,
 ) -> _SftVerified:
     actor_dir, final_step = _sft_train.latest_global_step_dir(options.paths.local_dir)
-    if sft_under_ran(final_step, model.update_horizon, options.max_steps):
+    if sft_under_ran(final_step, model.update_horizon):
         raise RuntimeError(
             f"sft completed {final_step}/{model.update_horizon} requested optimizer updates"
         )

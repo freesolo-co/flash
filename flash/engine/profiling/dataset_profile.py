@@ -20,6 +20,7 @@ from flash.engine.profiling.sft_workload import prepare_sft_workload
 from flash.engine.profiling.tokenizer import load_control_plane_tokenizer
 from flash.engine.worker.entry.sft import select_sft_examples
 from flash.engine.worker.model.packing import worker_image_packing_support
+from flash.envs.base import with_system_prompt
 from flash.envs.dataset_selection import (
     _packaged_dataset_file,
     _validate_packaged_dataset_split,
@@ -43,19 +44,20 @@ class _RawRecordEnvironment:
     rows: list[dict[str, Any]]
     package_root: Path
     contract_text: str = ""
-    multi_turn: bool = False
 
     def dataset(self) -> list[dict[str, Any]]:
         return list(self.rows)
 
     def prompt_messages(self, row: dict[str, Any]) -> list[dict[str, Any]]:
         # the worker never reads the raw input itself: it builds a TaskExample, whose .input the sdk
-        # has already rendered to text, and the scaffolded env puts exactly that string in one user
-        # turn (flash/envs/adapter.py:_task_example). so render it through the sdk here too. str()
-        # would tokenize a python repr, and reading a message-shaped input as a transcript would
-        # quote a prompt the sdk never produces.
-        messages = [{"role": "user", "content": _task_example_input(row)}]
-        return _with_system_prompt(messages, self.contract_text)
+        # has already rendered through serialize_value, and the scaffolded env puts exactly that
+        # string in one user turn (flash/envs/adapter.py:_task_example). so call the sdk here too
+        # rather than restating its rules. str() would tokenize a python repr, and reading a
+        # message-shaped input as a transcript would quote a prompt the sdk never produces.
+        from freesolo.datasets.records import task_example_from_record
+
+        content = str(task_example_from_record(row).input)
+        return with_system_prompt([{"role": "user", "content": content}], self.contract_text)
 
     def sft_completion_with_provenance(
         self, row: dict[str, Any]
@@ -80,39 +82,6 @@ def _is_message_list(value: object) -> bool:
     return isinstance(value, list) and any(isinstance(message, dict) for message in value)
 
 
-def _task_example_input(row: dict[str, Any]) -> str:
-    """the prompt text the sdk would hand the environment for ``row``.
-
-    ``task_example_from_record`` is what the worker calls, and it renders ``input`` through
-    ``serialize_value``: a string is stripped and anything else becomes sorted-key json. calling the
-    sdk rather than restating its rules keeps the quote on the worker's exact token stream.
-    """
-    from freesolo.datasets.records import task_example_from_record
-
-    return str(task_example_from_record(row).input)
-
-
-def _with_system_prompt(messages: list[dict[str, Any]], contract_text: str) -> list[dict[str, Any]]:
-    system_text = str(contract_text or "").strip()
-    out = [dict(message) for message in messages]
-    if not system_text:
-        return out
-    first_blank_system_index: int | None = None
-    for index, message in enumerate(out):
-        if str(message.get("role") or "").strip().lower() != "system":
-            continue
-        content = message.get("content")
-        has_content = bool(content.strip()) if isinstance(content, str) else bool(content)
-        if has_content:
-            return out
-        if first_blank_system_index is None:
-            first_blank_system_index = index
-    if first_blank_system_index is not None:
-        out[first_blank_system_index]["content"] = system_text
-        return out
-    return [{"role": "system", "content": system_text}, *out]
-
-
 def _copied_messages(value: object, *, field: str) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise ValueError(f"sft {field} messages must be a list of message objects")
@@ -130,8 +99,12 @@ def _contract_text(base_dir: Path, params: dict[str, Any]) -> str:
     if authored:
         return _bounded_contract_text(str(authored), source="[environment.params] contract_text")
     configured_path = params.get("contract_path")
-    if not isinstance(configured_path, str) or not configured_path:
+    if not isinstance(configured_path, str):
+        # the loader defaults only when the key is absent or non-string (loader.py:838-841). an
+        # empty string is a string, so it means "no contract" there and must mean that here too.
         path = base_dir / "TRAINING_CONTRACT.md"
+    elif not configured_path:
+        return ""
     else:
         # NOT _resolve_path_arg: it leaves a relative path unresolved when the file is absent, which
         # would read here as an escape from the package and refuse a config the worker trains on
