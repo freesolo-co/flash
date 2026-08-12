@@ -319,6 +319,33 @@ def test_undeploy_disables_the_alias_and_its_revisions(http, adapter_source, run
     assert body["adapter_id"] in payload["disabled_revisions"]
 
 
+def test_provenance_contradicting_the_revision_id_is_refused(http, adapter_source, run_id):
+    """A backend must not store provenance that disagrees with the id it is filed under.
+
+    The revision id already encodes run, step, and commit. `run_id` is the damaging one: it decides
+    which run's alias and membership the revision joins, so a backend that trusts a contradicting
+    value files the artifact under a DIFFERENT run -- undeploying that run then reports success
+    while the revision keeps serving under its own immutable id, which no client call can detect.
+
+    Refused, not merely fingerprinted: the first registration has nothing to compare against, and
+    by the second one the alias has already been written to the wrong run.
+    """
+    body = _registration(run_id, adapter_source)
+    body["metadata"] = {**body["metadata"], "run_id": f"{run_id}-elsewhere"}
+    response = http.post("/adapters", json=body)
+    # Cleaned up whatever the backend decided, because a backend that DID accept it has now created
+    # records under a run this test never otherwise touches.
+    try:
+        assert response.status_code in (400, 409, 422), (
+            f"registering metadata.run_id that contradicts the revision id returned "
+            f"{response.status_code}; the revision is now filed under a different run than its id "
+            f"names, so undeploying that run reports success while this revision keeps serving"
+        )
+    finally:
+        http.delete(f"/adapters/{run_id}")
+        http.delete(f"/adapters/{run_id}-elsewhere")
+
+
 def test_undeploying_an_unknown_run_is_a_clean_404(http):
     """The client maps 404 to "nothing to undeploy" rather than an error."""
     response = http.delete("/adapters/conformance-run-never-existed")
