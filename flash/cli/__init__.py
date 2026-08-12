@@ -117,6 +117,15 @@ _HELP_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
             ("models export", "export an adapter to your HuggingFace repo"),
         ],
     ),
+    (
+        "self-hosted serving",
+        [
+            ("serve gpus", "show Modal GPUs that can serve a model"),
+            ("serve setup", "generate and deploy a serving app you own"),
+            ("serve status", "check the configured serving backend"),
+            ("serve teardown", "stop the Modal serving app"),
+        ],
+    ),
 ]
 
 _HELP_OPTIONS: list[tuple[str, str]] = [
@@ -262,6 +271,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_train_commands(sub)
     _add_runs_commands(sub)
     _add_deployment_commands(models_sub)
+    _add_serve_commands(sub)
     # The control plane is operator-only and run as a separate one-off service via the
     # `flash-server` console script (flash.server.__main__:main), not a `flash` subcommand.
 
@@ -340,6 +350,58 @@ def _add_model_commands(sub: argparse._SubParsersAction) -> argparse._SubParsers
     gpus = sub.add_parser("gpus", help="list managed GPU classes with estimated $/hr")
     gpus.set_defaults(func=cmd_gpus)
     return models_sub
+
+
+def _add_serve_commands(sub: argparse._SubParsersAction) -> None:
+    """`serve gpus|setup|status|teardown`: run a serving backend on your own Modal account.
+
+    Kept separate from `models deploy` on purpose: those commands USE a serving backend, these
+    ones stand one up. A hosted-plane user never needs these.
+    """
+    from flash.cli.commands.serve import (
+        cmd_serve_gpus,
+        cmd_serve_setup,
+        cmd_serve_status,
+        cmd_serve_teardown,
+    )
+
+    serve = sub.add_parser("serve", help="host a serving backend on your own Modal account")
+    serve_sub = serve.add_subparsers(dest="serve_cmd", required=True)
+
+    gpus = serve_sub.add_parser("gpus", help="show Modal GPUs that can serve a model")
+    gpus.add_argument("--model", required=True, help="base model id, e.g. Qwen/Qwen3.5-4B")
+    gpus.add_argument(
+        "--context-len",
+        type=int,
+        default=0,
+        help="context length to size the KV cache for (default: the model's serving context)",
+    )
+    gpus.set_defaults(func=cmd_serve_gpus)
+
+    setup = serve_sub.add_parser("setup", help="generate and deploy a serving app for a model")
+    setup.add_argument("--model", required=True, help="base model id to serve")
+    setup.add_argument("--gpu", default=None, help="Modal GPU class (default: the validated one)")
+    setup.add_argument(
+        "--output", default=None, help="where to write the app (default: flash_serving_app.py)"
+    )
+    setup.add_argument(
+        "--scaledown-window",
+        type=int,
+        default=None,
+        help="seconds of idle before the GPU container stops (default: 300)",
+    )
+    setup.add_argument("--dry-run", action="store_true", help="write the app but do not deploy it")
+    setup.add_argument("--force", action="store_true", help="overwrite an existing app file")
+    setup.add_argument("-y", "--yes", action="store_true", help="deploy without confirming")
+    setup.set_defaults(func=cmd_serve_setup)
+
+    status = serve_sub.add_parser("status", help="check the configured serving backend")
+    status.set_defaults(func=cmd_serve_status)
+
+    teardown = serve_sub.add_parser("teardown", help="stop the Modal serving app")
+    teardown.add_argument("--model", required=True, help="base model id whose app to stop")
+    teardown.add_argument("-y", "--yes", action="store_true", help="stop without confirming")
+    teardown.set_defaults(func=cmd_serve_teardown)
 
 
 def _add_env_commands(sub: argparse._SubParsersAction) -> None:
