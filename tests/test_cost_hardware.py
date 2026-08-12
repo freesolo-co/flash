@@ -546,6 +546,40 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
     with pytest.raises(UnknownPromptPoolSize):
         runconfig_from_spec(unbounded)
 
+    # [environment.params] max_examples must NOT cap the priced batch. it is an opaque kwarg
+    # forwarded to the user's environment factory that neither worker applies, so an environment
+    # free to ignore it trains the full batch -- pricing 2 there underquotes by 64x, and the run is
+    # billed from this estimate. the step COUNT may still read it (overstating the pool is safe);
+    # understating the batch is not.
+    env_capped = JobSpec.from_dict(
+        {
+            **base,
+            "algorithm": "grpo",
+            "run_id": "q",
+            "environment": {
+                "id": "github:owner/repo@main:env/environment.py",
+                "params": {"max_examples": 2},
+            },
+            "train": {"epochs": 1, "group_size": 4, "prompts_per_step": 128},
+        }
+    )
+    assert runconfig_from_spec(env_capped).normalized().batch_size == 128
+
+    # and when both are stated, the enforced [train] cap is the one that binds.
+    both = JobSpec.from_dict(
+        {
+            **base,
+            "algorithm": "grpo",
+            "run_id": "q",
+            "environment": {
+                "id": "github:owner/repo@main:env/environment.py",
+                "params": {"max_examples": 2},
+            },
+            "train": {"epochs": 1, "group_size": 4, "prompts_per_step": 128, "max_examples": 4},
+        }
+    )
+    assert runconfig_from_spec(both).normalized().batch_size == 4
+
 
 def test_allocator_ranking_narrows_a_vast_combination_it_is_pricing():
     """The ranking config carries NO provider, so reading it off the config alone was inert.

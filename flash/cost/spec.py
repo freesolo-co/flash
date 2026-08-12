@@ -168,15 +168,21 @@ def _rollout_batch_for_quote(spec) -> int:
     against the capped batch -- so without this one quote mixes a capped step COUNT with an uncapped
     per-step PRICE.
 
+    Only ``[train] max_examples`` caps here, NOT the pool size ``_on_policy_example_count`` reports.
+    That one also accepts ``[environment.params] max_examples``, which is an opaque kwarg forwarded
+    to the user's environment factory that neither worker applies -- an environment free to ignore
+    it can yield every row and really train the full batch. Capping the price by a number nothing
+    enforces underquotes the run, and the run is billed from this estimate. The step COUNT may still
+    read it, because overstating the pool there is the safe direction; understating the batch is not.
+
     A pool size is not always knowable, and that is not a pricing failure here. ``max_steps`` states
     the horizon outright, so ``spec_steps`` returns before ever asking for a row count; asking for
     one anyway would reject a fully specified run. There is nothing to cap against in that case, so
     the requested batch stands -- the same number this priced before the cap existed.
     """
-    try:
-        return _on_policy_prompts_per_step(spec, _on_policy_example_count(spec))
-    except UnknownPromptPoolSize:
-        return _on_policy_requested_prompts_per_step(spec)
+    requested = _on_policy_requested_prompts_per_step(spec)
+    enforced_cap = int(spec.train.max_examples) if spec.train.max_examples else 0
+    return min(requested, enforced_cap) if enforced_cap > 0 else requested
 
 
 def spec_steps(spec) -> int:
