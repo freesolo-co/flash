@@ -176,7 +176,9 @@ class RunConfig:
         n = self.normalized()
         knobs: dict[str, int] = {"lora_rank": n.lora_rank}
         if self.batch_size is not None:
-            knobs["batch_size"] = self.batch_size
+            # this field is the cost model's own name for examples-per-update, but the sizing
+            # helper reads the knob a spec would author, and opd spells that prompts_per_step.
+            knobs["prompts_per_step" if self.method == "opd" else "batch_size"] = self.batch_size
         if n.seq_len is not None:
             knobs["max_context_tokens"] = n.seq_len
         if n.completion_len is not None:

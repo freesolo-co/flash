@@ -938,9 +938,11 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
             "lora_rank": 32,
         },
         "recipe_default": {"epochs": 1},
+        # opd takes the optimizer batch as `prompts_per_step`; `batch_size` is sft-only and is
+        # rejected outright, so spelling it here would fail the parse rather than size a shape.
         "opd_prompt_batch": {
             "epochs": 1,
-            "batch_size": 8,
+            "prompts_per_step": 8,
             "group_size": 1,
             "max_context_tokens": 1536,
             "max_completion_tokens": 512,
@@ -948,7 +950,7 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
         },
         "longer_context": {
             "epochs": 1,
-            "batch_size": 8,
+            "prompts_per_step": 8,
             "group_size": 1,
             "max_context_tokens": 4096,
             "max_completion_tokens": 512,
@@ -956,7 +958,7 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
         },
         "longer_completion": {
             "epochs": 1,
-            "batch_size": 1,
+            "prompts_per_step": 1,
             "group_size": 1,
             "max_context_tokens": 4096,
             "max_completion_tokens": 2048,
@@ -964,7 +966,7 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
         },
         "wide_rollout_batch": {
             "epochs": 1,
-            "batch_size": 8,
+            "prompts_per_step": 8,
             "group_size": 4,
             "max_context_tokens": 4096,
             "max_completion_tokens": 512,
@@ -985,7 +987,7 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
                 int(train.get("epochs", 1)),
                 seq_len=train.get("max_context_tokens"),
                 completion_len=train.get("max_completion_tokens"),
-                batch_size=train.get("batch_size"),
+                batch_size=train.get("prompts_per_step"),
                 group_size=train.get("group_size"),
                 lora_rank=train.get("lora_rank"),
                 provider="runpod",

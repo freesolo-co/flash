@@ -855,7 +855,13 @@ def model_required_vram_gb(
         batch_size_default = _sft_per_device_bs()
         group_size_default = 8
     group_size = _positive_int_or_default(_sizing_value(train, "group_size"), group_size_default)
-    batch_size = _positive_int_or_default(_sizing_value(train, "batch_size"), batch_size_default)
+    # opd authors the examples-per-update knob as prompts_per_step, sft as batch_size. reading
+    # batch_size for opd finds None on every spec and sizes the rollout at the recipe default,
+    # ignoring the authored batch. grpo never reads this term, so it keeps the sft spelling.
+    batch_size = _positive_int_or_default(
+        _sizing_value(train, "prompts_per_step" if _algo == "opd" else "batch_size"),
+        batch_size_default,
+    )
 
     from flash.core.catalog import MODELS, vocab_size_for
 

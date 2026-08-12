@@ -1399,7 +1399,7 @@ def test_opd_spec_json_round_trip():
             "train": {
                 "epochs": 25,
                 "max_examples": 8,
-                "batch_size": 8,
+                "prompts_per_step": 8,
             },
         },
         run_id="x",
@@ -1409,6 +1409,62 @@ def test_opd_spec_json_round_trip():
     assert restored.phase == "opd"
     # the provider credential is control-plane-only and is never added to environment.secrets.
     assert "PARASAIL_API_KEY" not in restored.environment.secrets
+
+
+def test_opd_sizing_reads_the_authored_prompt_batch():
+    """VRAM sizing must key off the knob an opd spec actually authors.
+
+    `prompts_per_step` is the opd optimizer batch and it drives rollout concurrency, so reading the
+    sft-only `batch_size` here would find None on every opd spec and size every run at the recipe
+    default -- renting one card for a batch that needs a bigger one.
+    """
+    from flash.engine.plan.vram import model_required_vram_gb
+    from flash.schema import spec_from_dict
+
+    def _need(prompts_per_step: int) -> int:
+        spec = spec_from_dict(
+            {
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": "opd",
+                "environment": {"id": "github:owner/repo@main:env/environment.py"},
+                "gpu": {},
+                "train": {
+                    "epochs": 1,
+                    "prompts_per_step": prompts_per_step,
+                    "group_size": 1,
+                    "max_context_tokens": 4096,
+                    "max_completion_tokens": 512,
+                    "lora_rank": 16,
+                },
+            },
+            run_id="x",
+        )
+        return model_required_vram_gb("Qwen/Qwen3.5-4B", "opd", train=spec.train)
+
+    assert _need(64) > _need(8) > _need(1)
+
+
+def test_opd_worker_resolves_the_authored_prompt_batch(monkeypatch):
+    """The paid worker must train on the authored batch, not silently on the recipe default."""
+    from flash.engine.plan.recipe import RECIPE
+    from flash.engine.worker.entry import opd as opd_entry
+    from flash.engine.worker.runtime.pkg_proxy import W
+    from flash.schema import spec_from_dict
+
+    authored = int(RECIPE.opd.prompts_per_step) * 4
+    spec = spec_from_dict(
+        {
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "opd",
+            "environment": {"id": "github:owner/repo@main:env/environment.py"},
+            "gpu": {},
+            "train": {"epochs": 1, "prompts_per_step": authored},
+        },
+        run_id="x",
+    )
+    monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
+    monkeypatch.setattr(W, "THINKING", False, raising=False)
+    assert opd_entry._resolve_opd_knobs().prompts_per_step == authored
 
 
 def test_opd_cost_is_step_priced_and_bills_teacher_tokens():
