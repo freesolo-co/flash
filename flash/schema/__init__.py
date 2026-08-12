@@ -287,7 +287,7 @@ def validate_train_keys(keys: Collection[str]) -> None:
 
 
 # the optimizer batch has a different name per algorithm because it is a different quantity, and one
-# name for both was a silent trap: under sft a measured workload profile turns `batch_size` into
+# name for both was a silent trap: under sft the packaged-dataset estimate turns `batch_size` into
 # examples_per_update, while under grpo/opd the key IS prompts-per-step. so the standard sft
 # out-of-memory workaround, `batch_size = 1`, copied into an rl config meant one prompt per optimizer
 # update -- the run trained, logged and billed, and nothing errored. rejecting the wrong name makes

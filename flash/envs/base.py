@@ -151,6 +151,32 @@ class BaseEnvironment:
         return bool(gold) and gold in (completion or "")
 
 
+def with_system_prompt(messages: list[dict], contract_text: str) -> list[dict]:
+    """Ensure the training contract rides as the system prompt (fill blank / prepend).
+
+    Shared, not duplicated: the control-plane quote and the worker must place the contract
+    identically or they tokenize different prompts, and the frozen quote is the invoice.
+    """
+    system_text = str(contract_text or "").strip()
+    out = [dict(message) for message in messages]
+    if not system_text:
+        return out
+    first_blank_system_index: int | None = None
+    for index, message in enumerate(out):
+        if str(message.get("role") or "").strip().lower() != "system":
+            continue
+        content = message.get("content")
+        has_content = bool(content.strip()) if isinstance(content, str) else bool(content)
+        if has_content:
+            return out
+        if first_blank_system_index is None:
+            first_blank_system_index = index
+    if first_blank_system_index is not None:
+        out[first_blank_system_index]["content"] = system_text
+        return out
+    return [{"role": "system", "content": system_text}, *out]
+
+
 FREESOLO_WORKER_SPEC = "freesolo>=0.4.1"
 
 

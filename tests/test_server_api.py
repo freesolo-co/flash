@@ -879,6 +879,12 @@ def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
             # size, so the run is pinned to two below; otherwise the valid-context case would fail
             # allocation instead of exercising the ordering this test is about.
             "prompts_per_step": 4,
+            # both cards only JOIN a step wide enough to give each one a share, and the RETAINED pool
+            # bounds that width, not the requested batch: `SPEC["train"]` retains one row, which caps
+            # the priced step at one prompt however many this asks for, so the second rank holds no
+            # share, contributes no memory, and the 213 GB need is refused on one 180 GB card. two
+            # retained rows are what make the pin above real.
+            "max_examples": 2,
             "max_completion_tokens": max_completion_tokens,
             "structured_outputs": {"choice": ["4"]},
         },
@@ -1133,259 +1139,6 @@ def test_create_run_rejects_authored_warmstart_rank_before_prepare_or_persist(ap
     assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
 
 
-def test_sft_profile_miss_starts_a_separate_profile_run(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.server.platform import db
-
-    profile_run_id = "profile-sft-" + "a" * 64
-    submitted = []
-
-    def prepare(spec, **_kwargs):
-        profile_spec = replace(
-            spec,
-            run_id=profile_run_id,
-            workload_profile_kind="sft",
-            workload_profile_input_digest="a" * 64,
-            workload_profile_producer_version="1.2.3",
-        )
-        pending = runner.PreparedJob(
-            public_spec=profile_spec,
-            worker_spec=profile_spec,
-            estimated_cost_usd=0.25,
-        )
-        raise runner.WorkloadProfilePending(
-            profile_run_id,
-            "required",
-            prepared_job=pending,
-        )
-
-    monkeypatch.setattr(app_mod, "prepare_job", prepare)
-    monkeypatch.setattr(
-        app_mod,
-        "submit_job",
-        lambda spec, **kwargs: submitted.append((spec, kwargs)),
-    )
-
-    spec = {
-        **SPEC,
-        "algorithm": "sft",
-        "train": {"epochs": 1, "max_examples": 8},
-    }
-    resp = api.post(
-        "/v1/runs",
-        headers=_bearer("fslo-internal-test"),
-        json={"spec": spec},
-    )
-
-    assert resp.status_code == 409
-    assert resp.json()["detail"] == {
-        "code": "workload_profile_pending",
-        "profile_run_id": profile_run_id,
-        "state": "queued",
-        # this key launched it, so it may poll it and is the one being charged for it.
-        "owned": True,
-        "launched": True,
-    }
-    # the real row, not a stubbed recorder: the profile is persisted as its own run under its own
-    # kind, which is what keeps its charge separate from the training run it unblocks.
-    assert db.run_owner(profile_run_id) is not None
-    assert [r["kind"] for r in db.all_runs() if r["run_id"] == profile_run_id] == ["profile"]
-    assert len(submitted) == 1
-    assert submitted[0][0].run_id == profile_run_id
-    assert submitted[0][1]["prepared_job"].estimated_cost_usd == 0.25
-
-
-def test_the_route_never_makes_submit_job_launch_the_profile_itself(api, monkeypatch):
-    """The server must hand ``submit_job`` a prepared job, never let it re-prepare and self-launch.
-
-    The route is what prevents it: it prepares, claims, and passes ``prepared_job``, which
-    short-circuits ``submit_job`` before the recursion is reachable. This drives the actual route
-    with the REAL ``submit_job`` and fails if a future refactor drops ``prepared_job`` from either
-    call site -- the runner would then re-prepare, raise pending a second time, and take the
-    unclaimed path.
-    """
-    import flash.runner as runner
-    import flash.server.app as app_mod
-
-    profile_run_id = "profile-sft-" + "b" * 64
-    prepare_calls = []
-
-    def prepare(spec, **_kwargs):
-        prepare_calls.append(spec.run_id)
-        profile_spec = replace(
-            spec,
-            run_id=profile_run_id,
-            workload_profile_kind="sft",
-            workload_profile_input_digest="b" * 64,
-            # JobSpec rejects a digest with no producer version: the digest is keyed BY that
-            # version, so a spec carrying one without the other cannot be validated by any reader.
-            workload_profile_producer_version="1.2.3",
-        )
-        raise runner.WorkloadProfilePending(
-            profile_run_id,
-            "required",
-            prepared_job=runner.PreparedJob(
-                public_spec=profile_spec,
-                worker_spec=profile_spec,
-                estimated_cost_usd=0.25,
-            ),
-        )
-
-    # BOTH bindings, and that is the whole point of the test. the route calls
-    # ``_app.prepare_job`` (app.py's import), but submit_job calls ``prepare_job`` as a BARE NAME,
-    # which resolves through flash.runner's own globals. patching only app_mod would leave the
-    # recursion calling the real prepare_job, so the counter below could never see the second call
-    # it exists to detect -- the assertion would read as passing while testing nothing.
-    monkeypatch.setattr(app_mod, "prepare_job", prepare)
-    monkeypatch.setattr(runner, "prepare_job", prepare)
-    launched = []
-    # submit_job stays real. the route submits with background=True, so stubbing the thread body is
-    # what keeps this offline -- the whole of submit_job, including the profile branch, runs for real.
-    monkeypatch.setattr(runner, "_run_job_background", lambda *a, **k: launched.append(a))
-
-    resp = api.post(
-        "/v1/runs",
-        headers=_bearer("fslo-internal-test"),
-        json={"spec": {**SPEC, "algorithm": "sft", "train": {"epochs": 1, "max_examples": 8}}},
-    )
-
-    # the INVARIANT assertion comes first, deliberately. under mutation the route also returns a
-    # different status, and asserting that first would mask this one -- the test would fail for a
-    # reason unrelated to the invariant it names, which is how an assertion ends up inert.
-    # exactly one entry: a second means submit_job re-prepared, i.e. it took the recursive branch
-    # that skips the ownership claim and bills an unclaimed profile run.
-    assert len(prepare_calls) == 1, (
-        f"submit_job re-prepared: {prepare_calls}. the route must pass prepared_job so the "
-        "unclaimed self-launch branch stays unreachable"
-    )
-    assert resp.status_code == 409
-    assert resp.json()["detail"]["code"] == "workload_profile_pending"
-
-
-def test_a_second_owner_needing_the_same_profile_is_not_blocked_by_the_first(api, monkeypatch):
-    """The profile run id is deterministic in the workload, so two owners collide on it by design.
-
-    ``runs.run_id`` is a primary key, so a plain insert raises for the second owner. That must not
-    surface as a leaked sqlite error on a submission that is otherwise fine: the profile they need
-    already exists and is already running, which is exactly the reuse the deterministic id is for.
-    """
-    import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.server.platform import db
-
-    profile_run_id = "profile-sft-" + "b" * 64
-    submitted = []
-
-    def prepare(spec, **_kwargs):
-        profile_spec = replace(
-            spec,
-            run_id=profile_run_id,
-            workload_profile_kind="sft",
-            workload_profile_input_digest="b" * 64,
-            workload_profile_producer_version="1.2.3",
-        )
-        raise runner.WorkloadProfilePending(
-            profile_run_id,
-            "required",
-            prepared_job=runner.PreparedJob(
-                public_spec=profile_spec,
-                worker_spec=profile_spec,
-                estimated_cost_usd=0.25,
-            ),
-        )
-
-    monkeypatch.setattr(app_mod, "prepare_job", prepare)
-    monkeypatch.setattr(
-        app_mod, "submit_job", lambda spec, **kwargs: submitted.append((spec, kwargs))
-    )
-
-    spec = {**SPEC, "algorithm": "sft", "train": {"epochs": 1, "max_examples": 8}}
-    first = api.post("/v1/runs", headers=_bearer(_login()), json={"spec": spec})
-    assert first.status_code == 409
-    first_owner = db.run_owner(profile_run_id)
-    assert first_owner is not None
-
-    second_token = _login()
-    second = api.post("/v1/runs", headers=_bearer(second_token), json={"spec": spec})
-
-    assert second.status_code == 409, second.text
-    detail = second.json()["detail"]
-    assert detail["code"] == "workload_profile_pending"
-    assert detail["profile_run_id"] == profile_run_id
-    # and it is told the run is not its own, because polling that id would answer 404 for this key.
-    assert detail["owned"] is False
-    # it lost the claim, so it launched nothing and is not the one paying for the profile.
-    assert detail["launched"] is False
-    # but the profile IS running, started by the winner, so the loser must be told that and not the
-    # synthetic "required" this route invents for a cache miss. the CLI prints this word back at the
-    # user ("the profile run you already started is still ..."), and `required` reads as "nothing has
-    # started" for a run that is queued and billing.
-    assert detail["state"] == "queued"
-    # ownership does not transfer, and the existing profile run is not launched a second time.
-    assert db.run_owner(profile_run_id) == first_owner
-    assert len(submitted) == 1
-    # the second submitter is not billed for a profile it did not start.
-    assert [r["run_id"] for r in db.all_runs()] == [profile_run_id]
-
-
-def test_an_owner_retrying_its_own_pending_profile_is_not_billed_again(api, monkeypatch):
-    """Re-running the same command while your own profile is in flight joins it, it does not relaunch.
-
-    Only the winning claim launches, so the retry starts nothing and is charged nothing -- but it
-    still owns the run, so ``owned`` alone cannot distinguish it from the submit that did the
-    launching. Without a separate launch signal the client has no choice but to repeat the
-    start-and-bill wording, naming one profile charge per retry against an account that was charged
-    exactly once.
-    """
-    import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.server.platform import db
-
-    profile_run_id = "profile-sft-" + "c" * 64
-    submitted = []
-
-    def prepare(spec, **_kwargs):
-        profile_spec = replace(
-            spec,
-            run_id=profile_run_id,
-            workload_profile_kind="sft",
-            workload_profile_input_digest="c" * 64,
-            workload_profile_producer_version="1.2.3",
-        )
-        raise runner.WorkloadProfilePending(
-            profile_run_id,
-            "required",
-            prepared_job=runner.PreparedJob(
-                public_spec=profile_spec,
-                worker_spec=profile_spec,
-                estimated_cost_usd=0.25,
-            ),
-        )
-
-    monkeypatch.setattr(app_mod, "prepare_job", prepare)
-    monkeypatch.setattr(
-        app_mod, "submit_job", lambda spec, **kwargs: submitted.append((spec, kwargs))
-    )
-
-    spec = {**SPEC, "algorithm": "sft", "train": {"epochs": 1, "max_examples": 8}}
-    token = _login()
-    first = api.post("/v1/runs", headers=_bearer(token), json={"spec": spec})
-    assert first.status_code == 409
-    assert first.json()["detail"]["launched"] is True
-
-    retry = api.post("/v1/runs", headers=_bearer(token), json={"spec": spec})
-
-    assert retry.status_code == 409, retry.text
-    detail = retry.json()["detail"]
-    # same key, so the run is still readable and pollable by this submitter...
-    assert detail["owned"] is True
-    # ...but the retry lost the claim, so it launched nothing and added no second charge.
-    assert detail["launched"] is False
-    assert len(submitted) == 1
-    assert [r["run_id"] for r in db.all_runs()] == [profile_run_id]
-
-
 def test_warmstart_dry_run_persists_source_adapter_alpha(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
@@ -1631,6 +1384,32 @@ def test_create_run_redacts_internal_warmstart_preparation_error(api, monkeypatc
     assert "source-run/step-20" in detail
     assert "private-owner" not in resp.text
     assert "private-repo" not in resp.text
+    assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
+
+
+def test_sft_missing_dataset_is_a_400_with_packaging_remediation(api, monkeypatch):
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(
+        app_mod,
+        "prepare_job",
+        lambda *a, **k: (_ for _ in ()).throw(
+            _orch.WorkloadProfileUnavailable(
+                "environment package has no readable dataset for split 'train'. "
+                "Add dataset/train.jsonl to the environment package."
+            )
+        ),
+    )
+
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer("fslo-internal-test"),
+        json={"spec": SPEC, "dry_run": True},
+    )
+
+    assert response.status_code == 400
+    assert "no readable dataset" in response.json()["detail"]
+    assert "dataset/train.jsonl" in response.json()["detail"]
     assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
 
 

@@ -10,7 +10,12 @@ import urllib.request
 
 import pytest
 
-from flash.envs.loader import GitHubRateLimitError, _urlopen
+from flash.envs.loader import (
+    GitHubRateLimitError,
+    GitHubTransientError,
+    GitHubUnavailableError,
+    _urlopen,
+)
 
 
 def _http_error(code: int, body: str) -> urllib.error.HTTPError:
@@ -117,8 +122,10 @@ def test_urlopen_retries_5xx_then_succeeds(monkeypatch):
 
 
 def test_urlopen_persistent_5xx_becomes_retriable_signal(monkeypatch):
-    # A persistent 5xx must surface as the retriable GitHubRateLimitError (worker reschedules), NOT a
-    # fatal RuntimeError that permanently fails the run — mirroring the rate-limit/TCP-transient paths.
+    # A persistent 5xx must surface as retriable (worker reschedules), NOT a fatal RuntimeError that
+    # permanently fails the run — mirroring the rate-limit/TCP-transient paths. It is specifically
+    # NOT the rate-limit type: GitHub being down is not a quota, and the control plane reports the
+    # two with different statuses.
     calls = []
 
     def fake_urlopen(req, timeout):
@@ -129,8 +136,10 @@ def test_urlopen_persistent_5xx_becomes_retriable_signal(monkeypatch):
     monkeypatch.setattr(time, "sleep", lambda _: None)
     monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)
 
-    with pytest.raises(GitHubRateLimitError, match="server error"):
+    with pytest.raises(GitHubUnavailableError, match="server error") as exc:
         _urlopen(urllib.request.Request("https://api.github.com/test"))
+    assert not isinstance(exc.value, GitHubRateLimitError)
+    assert isinstance(exc.value, GitHubTransientError)  # still retriable for the worker
     assert len(calls) == 6  # initial + 5 retries
 
 
@@ -155,8 +164,9 @@ def test_urlopen_retries_transient_url_error_then_succeeds(monkeypatch):
 
 def test_urlopen_transient_network_becomes_retriable_signal(monkeypatch):
     # A persistent transient failure (URLError every attempt, or a read-phase TimeoutError that is
-    # NEITHER an HTTPError NOR a URLError) must surface as the typed retriable GitHubRateLimitError
-    # — NOT a plain RuntimeError/bare TimeoutError that the worker would classify as a fatal crash.
+    # NEITHER an HTTPError NOR a URLError) must surface as a typed retriable error — NOT a plain
+    # RuntimeError/bare TimeoutError that the worker would classify as a fatal crash. A connection
+    # that never landed is unreachability, not a quota refusal.
     for exc in (urllib.error.URLError("dns failure"), TimeoutError("read timed out")):
         calls = []
 
@@ -168,8 +178,10 @@ def test_urlopen_transient_network_becomes_retriable_signal(monkeypatch):
         monkeypatch.setattr(time, "sleep", lambda _: None)
         monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)
 
-        with pytest.raises(GitHubRateLimitError, match="transient network"):
+        with pytest.raises(GitHubUnavailableError, match="transient network") as raised:
             _urlopen(urllib.request.Request("https://api.github.com/test"))
+        assert not isinstance(raised.value, GitHubRateLimitError)
+        assert isinstance(raised.value, GitHubTransientError)
         assert len(calls) == 6  # initial + 5 retries
 
 

@@ -242,6 +242,16 @@ class UnreconciledCreateError(RuntimeError):
     """
 
 
+class RunExhaustedProviderPoolError(RuntimeError):
+    """Every fitting offer for this class is one THIS run already rented and lost.
+
+    Distinct from an empty pool: the operator fix is another class or provider, not waiting. The
+    message is authored by Flash rather than quoted from a provider response, which is what lets
+    supervision surface it verbatim -- generic provider text is withheld from the run record
+    because it can quote a request that carried a credential.
+    """
+
+
 def canonical_gpu(name: str) -> str:
     """Normalize a friendly GPU name to a managed GPU class; raise otherwise."""
     key = (name or "").strip().lower()
@@ -745,14 +755,14 @@ class PollResult:
 def rentable_gpu_counts(max_gpu_count: int) -> tuple[int, ...]:
     """Return rentable card counts, largest first, up to ``max_gpu_count``.
 
-    Use powers of two: providers sell those shapes, and verl requires ``num_attention_heads %
-    sp_size == 0`` wherever ulysses runs (grpo and opd; sft pins it off and shards by data, so its
-    width is bounded by the batch instead -- see ``sft_data_parallel_cards``). Every current catalog
-    head count (8, 8, 16, 16, 24, 16) divides 1, 2, 4, and 8,
-    so today every rentable shape is legal for every row. That is a property of today's catalog, not
-    an invariant: ``allocator.geometry_safe_gpu_cap`` checks each row's own recorded head count so a
-    future row with, say, 20 heads is capped rather than rented and failed at Ulysses init. This
-    function only enumerates the shapes providers rent.
+    Use powers of two: providers sell those shapes, and vLLM requires ``num_attention_heads %
+    tp_size == 0`` wherever the rollout engine runs tensor-parallel (grpo and opd hand it the rented
+    card count; sft has no rollout engine, and its width is bounded by the batch instead -- see
+    ``sft_data_parallel_cards``). Every current catalog head count (8, 8, 16, 16, 24, 16) divides 1,
+    2, 4, and 8, so today every rentable shape is legal for every row. That is a property of today's
+    catalog, not an invariant: ``allocator.geometry_safe_gpu_cap`` checks each row's own recorded head
+    count so a future row with, say, 20 heads is capped rather than rented and failed at rollout
+    engine init. This function only enumerates the shapes providers rent.
     """
     cap = max(1, int(max_gpu_count))
     counts, count = [], 1
@@ -782,9 +792,9 @@ def wider_shape_remedy(
 
     The width is SEARCHED with ``combined_vram_gb``, the same fit model that rejected the run, so
     a suggested N is one this function proved rather than one inferred from total VRAM. ``ceiling``
-    must be the caller's ``geometry_safe_gpu_cap`` so the suggestion is never a width verl rejects
-    at Ulysses init after the box is rented, and ``above`` excludes the counts already tried. The
-    smallest fitting count wins: the cheapest shape that works, not the widest on offer.
+    must be the caller's ``geometry_safe_gpu_cap`` so the suggestion is never a width the rollout
+    engine rejects at init after the box is rented, and ``above`` excludes the counts already tried.
+    The smallest fitting count wins: the cheapest shape that works, not the widest on offer.
 
     ``vram_options`` carries only classes a provider in play will actually rent at a wider count
     (see ``rents_arbitrary_card_counts``); passing none leaves the failure a bare dead end, which

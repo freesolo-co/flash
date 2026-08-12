@@ -1,12 +1,11 @@
-"""Everything a submission has to settle before a run exists: warm-start, validation, profile.
+"""submission preparation for warm starts, validation, and sft dataset estimates.
 
-Continuing from an existing adapter is the bulk of it. The parent run's identity, ownership and
-preparation digest all have to be verified before its weights are reused, because a run that
-silently continued from the wrong adapter would train and bill normally and only look wrong much
-later. `_require_sft_workload_profile` is the other half: SFT cannot be quoted without a measured
-profile for the exact config, so it either finds one or launches the job that produces it.
+continuing from an existing adapter requires verifying the parent run's identity, ownership, and
+preparation digest before reusing its weights. sft preparation separately resolves the pinned
+environment package, reads its dataset file without importing user code, and attaches the raw-record
+token estimate required for quoting and training preparation.
 
-Split out of `flash.runner` to keep that module under the file-size limit.
+split out of `flash.runner` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations
@@ -17,15 +16,10 @@ import json
 import os
 import re
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from flash.core.catalog import normalize_algorithm, samples_on_policy
 from flash.core.spec import JobSpec
-
-if TYPE_CHECKING:
-    # annotation-only: defined in `flash.runner` above the point where it imports this module, so a
-    # runtime import would be circular. the value is read through `_runner()` where it is needed.
-    from flash.runner import PreparedJob
 
 
 def _runner():
@@ -427,7 +421,6 @@ def _preparation_digest(
     for key in (
         "model_revision_auto",
         "gpu_count_auto",
-        "workload_profile_kind",
         "workload_profile_input_digest",
         "workload_profile_producer_version",
         "workload_profile",
@@ -487,7 +480,6 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
         # auto-pinned run here -- the same runs the deploy guard was just relaxed to admit.
         "model_revision_auto",
         "gpu_count_auto",
-        "workload_profile_kind",
         "workload_profile_input_digest",
         "workload_profile_producer_version",
         "workload_profile",
@@ -634,55 +626,17 @@ def _require_pinned_profile_environment(spec: JobSpec) -> JobSpec:
         )
     if not pinned.environment.resolved_sha:
         raise _runner().WorkloadProfileUnavailable(
-            "sft workload profiling requires an immutable resolved environment revision"
+            "sft workload profiling requires a pinned environment package revision"
         )
     return pinned
 
 
-def _prepared_sft_profile_job(spec: JobSpec, *, input_digest: str) -> PreparedJob:
-    """Prepare the cpu-only profile job that measures ``spec``'s exact sft workload.
-
-    The profile loads a tokenizer and the pinned environment, then exits. GPU type and provider pins
-    are dropped: they describe where the training run must land, and inheriting them would rent an
-    H100 to tokenize on cpu.
-    """
-    from flash.engine.profiling.workload_profile import SFT_PROFILE_KIND, sft_profile_run_id
-
-    profile_spec = replace(
-        spec,
-        run_id=sft_profile_run_id(input_digest),
-        gpu=replace(
-            spec.gpu,
-            type="",
-            provider="",
-            count=1,
-            disk_gb=_runner().GpuSpec.disk_gb,
-            network_volume=None,
-            max_wall_seconds=_runner()._WORKLOAD_PROFILE_WALL_SECONDS,
-            max_retries=_runner()._WORKLOAD_PROFILE_MAX_RETRIES,
-        ),
-        workload_profile_kind=SFT_PROFILE_KIND,
-        workload_profile_input_digest=input_digest,
-        workload_profile_producer_version=_runner()._profile_producer_version(),
-        workload_profile={},
-    )
-    profile_spec = _runner()._assign_managed_hf_repo(profile_spec)
-    from flash.cost.spec import estimate_for_spec
-
-    return _runner().PreparedJob(
-        public_spec=profile_spec,
-        worker_spec=profile_spec,
-        estimated_cost_usd=float(estimate_for_spec(profile_spec).total_usd),
-    )
-
-
 def _require_sft_workload_profile(spec: JobSpec) -> JobSpec:
-    """Attach the exact sft workload profile for ``spec``, or fail closed until one exists."""
+    """attach the control-plane sft estimate built from the packaged dataset file."""
+    from flash.engine.profiling import dataset_profile
     from flash.engine.profiling.workload_profile import (
-        SFT_PROFILE_KIND,
         require_matching_sft_profile,
         sft_profile_input_digest,
-        sft_profile_run_id,
     )
 
     producer_version = _runner()._profile_producer_version()
@@ -692,67 +646,25 @@ def _require_sft_workload_profile(spec: JobSpec) -> JobSpec:
         tokenizer_revision=tokenizer_revision,
         producer_version=producer_version,
     )
-    if spec.workload_profile:
+    profiled_spec = replace(
+        spec,
+        workload_profile_input_digest=input_digest,
+        workload_profile_producer_version=producer_version,
+        workload_profile={},
+    )
+    try:
+        measured = dataset_profile.profile_packaged_sft_dataset(
+            profiled_spec,
+            producer_version=producer_version,
+        )
         profile = require_matching_sft_profile(
-            spec.workload_profile,
+            measured.to_dict(),
             input_digest=input_digest,
             producer_version=producer_version,
             tokenizer_revision=tokenizer_revision,
         )
-        return replace(
-            spec,
-            workload_profile_kind="",
-            workload_profile_input_digest=input_digest,
-            workload_profile_producer_version=producer_version,
-            workload_profile=profile.to_dict(),
-        )
-
-    profile_run_id = sft_profile_run_id(input_digest)
-    try:
-        status = _runner().get_status(profile_run_id)
-    except FileNotFoundError as exc:
-        prepared = _runner()._prepared_sft_profile_job(spec, input_digest=input_digest)
-        raise _runner().WorkloadProfilePending(
-            profile_run_id,
-            "required",
-            prepared_job=prepared,
-        ) from exc
-
-    if (
-        status.workload_profile_kind != SFT_PROFILE_KIND
-        or status.workload_profile_input_digest != input_digest
-    ):
-        raise _runner().WorkloadProfileUnavailable(
-            "stored workload profile identity does not match"
-        )
-    if status.state == "done":
-        try:
-            profile = require_matching_sft_profile(
-                status.workload_profile,
-                input_digest=input_digest,
-                producer_version=producer_version,
-                tokenizer_revision=tokenizer_revision,
-            )
-        except ValueError as exc:
-            raise _runner().WorkloadProfileUnavailable(
-                "stored sft workload profile failed integrity validation"
-            ) from exc
-        return replace(
-            spec,
-            workload_profile_input_digest=input_digest,
-            workload_profile_producer_version=producer_version,
-            workload_profile=profile.to_dict(),
-        )
-    if status.state in {"failed", "cancelled", "dry_run"}:
-        # a spent profile is not a verdict on the workload. the id is derived from the workload
-        # alone, so a preempted pod or a cancel would otherwise make this exact config unquotable
-        # for everyone, forever, with nothing in the system that could ever clear it. offer a fresh
-        # profile job the same way a missing one is offered; the claim decides who actually runs it.
-        prepared = _runner()._prepared_sft_profile_job(spec, input_digest=input_digest)
-        raise _runner().WorkloadProfilePending(
-            profile_run_id,
-            status.state,
-            prepared_job=prepared,
-            spent_at=status.created_at,
-        )
-    raise _runner().WorkloadProfilePending(profile_run_id, status.state)
+    except _runner().WorkloadProfileUnavailable:
+        raise
+    except dataset_profile.PackagedDatasetUnavailable as exc:
+        raise _runner().WorkloadProfileUnavailable(str(exc)) from exc
+    return replace(profiled_spec, workload_profile=profile.to_dict())

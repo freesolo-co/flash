@@ -1090,9 +1090,13 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
             "max_completion_tokens": 512,
             "lora_rank": 16,
         },
+        # this case varies the COMPLETION length, so its batch only has to be wide enough not to
+        # bound the rank count: one prompt in a group of one is a single sequence, which launches one
+        # rank however many cards are rented (see `rl_data_parallel_cards`) and would make this a test
+        # of the width clamp rather than of long completions.
         "longer_completion": {
             "epochs": 1,
-            "prompts_per_step": 1,
+            "prompts_per_step": 8,
             "group_size": 1,
             "max_context_tokens": 4096,
             "max_completion_tokens": 2048,
@@ -1832,8 +1836,9 @@ def test_combo_single_kept_when_cheaper_than_combination(monkeypatch):
 def test_combo_uses_smallest_fitting_count_and_shard_margin(monkeypatch):
     """The smallest RENTABLE count that fits, with the shard margin actually deciding the boundary.
 
-    Counts are powers of two (verl shards over them: num_attention_heads % sp_size != 0 aborts at
-    step 0), so on 80 GB cards with the replicated-floor model, usable = n*(80-8)*0.85 + 8:
+    Counts are powers of two (the rollout engine shards heads over them: num_attention_heads %
+    tp_size != 0 aborts at init), so on 80 GB cards with the replicated-floor model,
+    usable = n*(80-8)*0.85 + 8:
     2 cards = 130.4 GB, 4 cards = 252.8 GB.
 
     Both needs are asserted because they pin different halves of the rule. 200 GB pins
@@ -1978,9 +1983,11 @@ def test_pinned_gpu_fit_failure_stays_a_dead_end_when_no_width_fits():
 def test_wider_shape_remedy_is_bounded_by_the_geometry_cap():
     """A suggested width must be one the model's head geometry allows.
 
-    `geometry_safe_gpu_cap` exists because verl rejects `num_attention_heads % sp_size != 0` at
-    Ulysses init -- AFTER the box is rented. A remedy that ignored it would bill the user for a
-    box that cannot start.
+    `geometry_safe_gpu_cap` exists because vllm rejects `num_attention_heads % tp_size != 0` at
+    rollout-engine init -- AFTER the box is rented. A remedy that ignored it would bill the user for
+    a box that cannot start. (This gate outlived Ulysses: sequence parallelism is pinned off on all
+    three algorithms now, but grpo and opd still hand the rented width to the rollout engine as
+    `tensor_model_parallel_size`, so head divisibility is still load-bearing.)
     """
     from flash.providers.base import GPU_INFO, wider_shape_remedy
 
@@ -2604,6 +2611,42 @@ def test_a_shape_label_reconciles_with_the_capacity_printed_beside_it():
     ):
         assert "of which" not in control
         assert reason not in control
+
+
+def test_pinned_class_names_the_bounding_knob_of_the_algorithm_it_rejected():
+    """A pinned small-batch grpo/opd run must not be told that sft's rows bound its ranks.
+
+    `_resolve_exact_gpu` spelled this reason itself and hardcoded "sft", so once the width clamp let
+    an rl run narrow below its ceiling, a pinned rl rejection pointed at `batch_size` -- which opd
+    rejects at parse time -- and at retained rows, which rl has no concept of. The reason now comes
+    from the one shared formatter, so the two cannot drift apart again.
+    """
+    from flash.providers.allocator import _executed_width, _resolve_exact_gpu
+    from flash.providers.base import UnsupportedGpuError
+
+    def reject(algorithm, train):
+        with pytest.raises(UnsupportedGpuError) as exc:
+            _resolve_exact_gpu(
+                "H100",
+                need=400.0,
+                cap=8,
+                max_gpu_count=8,
+                provider="",
+                available=("runpod",),
+                widest_cap=8,
+                executed_width=_executed_width(algorithm, train, None),
+                algorithm=algorithm,
+            )
+        return str(exc.value)
+
+    rl = reject("opd", {"prompts_per_step": 1, "group_size": 1})
+    assert "only 1 joins this run" in rl
+    assert "prompts_per_step x group_size bounds the rank count" in rl
+    assert "batch and retained rows" not in rl
+
+    sft = reject("sft", {"batch_size": 1})
+    assert "sft shards by data, so the batch and retained rows bound the rank count" in sft
+    assert "prompts_per_step" not in sft
 
 
 def test_unreachable_class_reports_the_configuration_not_the_vram_shortfall():

@@ -23,8 +23,26 @@ _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 _GITHUB_SAFE_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
-class GitHubRateLimitError(RuntimeError):
-    """Persistent GitHub rate-limit; worker handler stamps retriable=True for rescheduling."""
+class GitHubTransientError(RuntimeError):
+    """A GitHub failure worth retrying later; worker handler stamps retriable=True.
+
+    The base of the two causes below, which the worker treats identically -- reschedule -- and the
+    control plane does not: a caller told "rate limited" backs off against a quota, and there is no
+    quota to back off against when GitHub is simply down.
+    """
+
+
+class GitHubRateLimitError(GitHubTransientError):
+    """The request was refused against a quota: a 429, or a 403 that says rate limit."""
+
+
+class GitHubUnavailableError(GitHubTransientError):
+    """GitHub could not answer at all: a 5xx, a timeout, or a connection failure.
+
+    Distinct from the quota case because the honest status differs. Reporting this as 429 tells the
+    caller to slow down and, if they honour a Retry-After they were never given, to wait out a limit
+    that was never reached -- while the actual cause, GitHub being unreachable, goes unreported.
+    """
 
 
 @dataclass(frozen=True)

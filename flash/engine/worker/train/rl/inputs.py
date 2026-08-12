@@ -20,11 +20,12 @@ from flash.content.structured_outputs import (
     describe_structured_outputs,
     parse_structured_outputs,
 )
-from flash.core.spec import DEFAULT_CREDIT_ASSIGNMENT
+from flash.core.spec import DEFAULT_CREDIT_ASSIGNMENT, gpu_count_of
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import (
     on_policy_steps,
     resolve_update_horizon,
+    rl_data_parallel_cards,
     validate_save_steps,
 )
 from flash.engine.worker.backend_common import clamp_engine_len
@@ -408,6 +409,16 @@ def _assemble_grpo_inputs(
         "prompts": prompts,
         "prompts_per_step": schedule["prompts_per_step"],
         "group_size": options["group_size"],
+        # the ranks this attempt launches verl at, resolved ONCE here because two phases ask: the
+        # child config (`_configure_rl_child`) and the resume probe, which discards a checkpoint whose
+        # shard count disagrees with the width it is handed. deriving it twice from the raw knobs let
+        # them drift -- resume compared the RENTED count while the child launched the clamped one, so
+        # a checkpoint written at the executed width read as the wrong topology and every retry
+        # restarted from step 0. opd binds one value for both phases; this is grpo's.
+        "dp_cards": rl_data_parallel_cards(
+            gpu_count_of(_w.JOB_SPEC),
+            int(schedule["prompts_per_step"]) * int(options["group_size"]),
+        ),
         "mask_truncated_completions": options["mask_truncated_completions"],
         "temperature": options["temperature"],
         "top_p": float(RECIPE.rl.sampling_top_p),
