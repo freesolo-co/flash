@@ -354,6 +354,38 @@ def test_a_vast_sharded_quote_reads_the_provider_off_the_run_config():
         assert method_card_speedup(cfg("auto", method), 2, "H100", "vast") == vast
 
 
+def test_ranking_prices_the_authored_rollout_batch_not_the_recipe_default():
+    """Regression: hardware ranking read the optimizer batch from the sft-only key.
+
+    `RunConfig.batch_size` means "examples per optimizer update", but grpo/opd author that as
+    `prompts_per_step` -- the schema rejects `batch_size` for them outright. Reading only the sft
+    name left the ranker at None for every authored rollout batch, so it priced the recipe default
+    (64) against an authored 32 and could select a costlier shape than the run needs. The persisted
+    quote already reads the new key, so the two silently disagreed.
+    """
+    from flash.engine.plan.recipe import RECIPE
+    from flash.providers.base import run_config_for_ranking
+
+    authored = int(RECIPE.rl.prompts_per_step) // 2
+    assert authored >= 1
+    # must differ from the default, or the assertions below pass on the broken read too.
+    assert authored != RECIPE.rl.prompts_per_step
+
+    for algorithm in ("grpo", "opd"):
+        train = {"epochs": 1, "group_size": 4, "prompts_per_step": authored}
+        config = run_config_for_ranking("Qwen/Qwen3.5-4B", algorithm, train=train)
+        assert config.batch_size == authored, algorithm
+        assert config.normalized().batch_size == authored, algorithm
+
+    # sft still authors the batch under its own name, and it is a different quantity.
+    sft = run_config_for_ranking("Qwen/Qwen3.5-4B", "sft", train={"epochs": 1, "batch_size": 4})
+    assert sft.batch_size == 4
+    # an unauthored rollout batch still falls through to the recipe default.
+    bare = run_config_for_ranking("Qwen/Qwen3.5-4B", "grpo", train={"epochs": 1})
+    assert bare.batch_size is None
+    assert bare.normalized().batch_size == RECIPE.rl.prompts_per_step
+
+
 def test_allocator_ranking_narrows_a_vast_combination_it_is_pricing():
     """The ranking config carries NO provider, so reading it off the config alone was inert.
 

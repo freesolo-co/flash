@@ -10,7 +10,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
-from flash.core.catalog import DEFAULT_MODEL, normalize_algorithm
+from flash.core.catalog import DEFAULT_MODEL, normalize_algorithm, samples_on_policy
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
 _FALSE_STRINGS = {"", "0", "false", "no", "off", "none"}
@@ -134,6 +134,22 @@ def _opt_float(value: Any) -> float | None:
     if isinstance(value, bool):
         raise TypeError(f"expected a number, got bool {value!r}")
     return float(value)
+
+
+def _migrated_prompts_per_step(train: dict, algorithm: str) -> int | None:
+    """The rollout optimizer batch, reading the pre-1.1.43 spelling on persisted specs.
+
+    grpo/opd authored this as ``batch_size`` until it was split into ``prompts_per_step``. The
+    schema now rejects the old name on SUBMISSION, but `from_dict` also reparses specs persisted
+    before the split, and every run in flight across that upgrade carries only the old key. The
+    workers read ``prompts_per_step`` alone, so without this a recovered run silently resumes on
+    the recipe default -- 64 instead of an authored 32 on grpo (an OOM on hardware rented for 32),
+    8 instead of 32 on opd. Submission is unaffected: a live spec cannot carry ``batch_size`` here.
+    """
+    value = _opt_int(train.get("prompts_per_step"))
+    if value is not None or not samples_on_policy(algorithm):
+        return value
+    return _opt_int(train.get("batch_size"))
 
 
 _MAX_GPU_COUNT = 8
@@ -652,7 +668,9 @@ class JobSpec:
                 hf_repo=str(train.get("hf_repo") or ""),
                 learning_rate=_opt_float(train.get("learning_rate")),
                 batch_size=_opt_int(train.get("batch_size")),
-                prompts_per_step=_opt_int(train.get("prompts_per_step")),
+                prompts_per_step=_migrated_prompts_per_step(
+                    train, normalize_algorithm(data.get("algorithm", cls.algorithm))
+                ),
                 max_context_tokens=_opt_int(train.get("max_context_tokens")),
                 save_every=_opt_int(train.get("save_every")),
                 max_steps=parse_max_steps(train.get("max_steps")),

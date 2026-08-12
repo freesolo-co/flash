@@ -161,6 +161,44 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
     } == {"0.2.0"}
 
 
+def test_persisted_rollout_batch_survives_the_prompts_per_step_rename() -> None:
+    """Regression: a run persisted before 1.1.43 carries the batch only as ``batch_size``.
+
+    Production (main, 1.1.40) authors the rollout batch under ``batch_size`` and the workers read
+    it there; dev reads ``prompts_per_step``. Every run in flight across that release therefore
+    reparses through `from_dict` with the new key unset, and the worker falls back to the recipe
+    default -- 64 for an authored 32 on grpo, which OOMs hardware rented for 32, and 8 on opd.
+    `from_dict` is the recovery path (`platform/runtime.py` reattach/resubmit), NOT submission:
+    the schema still rejects an authored `batch_size` on a live rollout spec.
+    """
+    from flash.engine.plan.recipe import RECIPE
+
+    def _train(algorithm: str, train: dict) -> TrainSpec:
+        return _job_from_dict(
+            {
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": algorithm,
+                "environment": {"id": "github:owner/repo@main:env/environment.py"},
+                "train": {"epochs": 1, "group_size": 4, **train},
+            }
+        ).train
+
+    for algorithm in ("grpo", "opd"):
+        legacy = _train(algorithm, {"batch_size": 32})
+        assert legacy.prompts_per_step == 32, algorithm
+        # the value the broken read resumed on, asserted so the test fails loudly rather than
+        # coincidentally matching if a recipe default ever becomes 32.
+        assert legacy.prompts_per_step != RECIPE.rl.prompts_per_step or algorithm != "grpo"
+        # the current spelling is untouched, and wins when a spec somehow carries both.
+        assert _train(algorithm, {"prompts_per_step": 16}).prompts_per_step == 16
+        assert _train(algorithm, {"batch_size": 32, "prompts_per_step": 16}).prompts_per_step == 16
+
+    # sft is NOT migrated: there `batch_size` is a different quantity (examples per update, resolved
+    # against a measured workload profile), so copying it into prompts_per_step would be wrong.
+    sft = _train("sft", {"batch_size": 4})
+    assert (sft.batch_size, sft.prompts_per_step) == (4, None)
+
+
 def test_credit_assignment_defaults_accepts_and_roundtrips() -> None:
     default = spec_from_dict(_raw())
     assert default.train.credit_assignment == "per_episode"

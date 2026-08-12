@@ -6,6 +6,8 @@ import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from flash.core.catalog import samples_on_policy
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
@@ -356,7 +358,15 @@ def run_config_for_ranking(
         steps=1,
         seq_len=knob("max_context_tokens"),
         completion_len=knob("max_completion_tokens"),
-        batch_size=knob("batch_size"),
+        # RunConfig.batch_size is "examples per optimizer update", which each algorithm authors
+        # under a different key: sft as `batch_size`, grpo/opd as `prompts_per_step` (the schema
+        # rejects `batch_size` outright for them). Reading only the sft name left every authored
+        # rollout batch as None here, so ranking priced the recipe default -- 64 against an
+        # authored 32 -- and could select a costlier shape than the run actually needs. Mirrors
+        # the same split in `flash.cost.spec.estimate_for_spec`.
+        batch_size=(
+            knob("prompts_per_step") if samples_on_policy(algorithm) else knob("batch_size")
+        ),
         group_size=knob("group_size"),
         lora_rank=knob("lora_rank"),
         thinking=thinking,
